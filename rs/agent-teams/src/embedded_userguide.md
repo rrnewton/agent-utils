@@ -148,6 +148,14 @@ explicit rule.
     declaration is readable locally; a remote destination must allow
     24 hours (`max_ttl_seconds` >= 86400 — the declaration default is
     7 days, so only a team that lowered it is affected).
+  - A team's declaration may carry a `may_send_to` allow list: entries are
+    `team` (any host) or `team@host` (only that host — the front door).
+    `send` and `reply` refuse a destination outside the sender team's list
+    (`refused: may-send-to`, naming the allowed front door; exit non-zero,
+    nothing queued). Same-team sends are always allowed, and an absent or
+    empty list means no restriction. The check runs once, on the sending
+    host; a relay/serve hop does not re-check, because the envelope was
+    already admitted under the sender team's list.
   - The ID is fixed at the outbox write and carried on every route. Without
     `--key` the key derives from (kind, topic, body), so re-running is a
     retry. Same key with a different body is refused as a conflict; a repeat

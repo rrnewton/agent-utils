@@ -62,6 +62,9 @@ MESSAGING
       [--topic SLUG] [--supersedes KEY]... [--ttl DUR | --expires TIME]
       [--kind info|request|hold|resume] [--private] [--from-service NAME]
       [--from-team TEAM] [--json]
+                                       The sender team's declaration may allow-list
+                                       destinations (may_send_to: team or team@host);
+                                       refused destinations name the allowed front door.
   reply ID (--file FILE | --text TEXT) [--key KEY] [--json]
   retract ID [--json]
   status ID [--json]                   One message, from the outbox and receipts.
@@ -1416,6 +1419,46 @@ fn mirror_routes_for(
         .collect()
 }
 
+/// The send allow list (#843): a team's declaration may name where its agents
+/// may send, as `team` (any host) or `team@host` (only that host — the front
+/// door). Same-team traffic is always allowed; an empty list allows everything
+/// (today's behaviour). Returns the refusal text, naming the allowed front
+/// door, when the destination is not allowed. The check runs on the sending
+/// host, in `send` (and so in `reply`, which delegates to it); a relay/serve
+/// hop does NOT re-check, because the envelope was already admitted by the
+/// sender's host under the sender team's list — re-checking there would apply
+/// the relay team's list to another team's traffic.
+fn may_send_refusal(own: &Declaration, to_team: &str, to_host: &str) -> Option<String> {
+    if to_team == own.team || own.may_send_to.is_empty() {
+        return None;
+    }
+    let addressed = format!("{to_team}@{to_host}");
+    let allowed = own
+        .may_send_to
+        .iter()
+        .any(|entry| entry == to_team || entry == addressed.as_str());
+    if allowed {
+        return None;
+    }
+    let doors = own
+        .may_send_to
+        .iter()
+        .map(|entry| {
+            if entry.contains('@') {
+                entry.clone()
+            } else {
+                format!("{entry}@*")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "refused: may-send-to (team {} may not send to {addressed}; allowed: {doors}; \
+         same-team sends are always allowed)",
+        own.team
+    ))
+}
+
 fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     let target = positional(args)
         .into_iter()
@@ -1426,15 +1469,6 @@ fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     let teams = globals.load_teams()?;
     let routes = globals.load_routes()?;
     let (sender, proof_kind, own) = prove_sender(globals, &teams, args)?;
-    if !own.may_send_to.is_empty() && !own.may_send_to.iter().any(|t| t == &to_team) {
-        return Err(err(
-            "refused",
-            format!(
-                "refused: may-send-to (team {} may not send to {to_team})",
-                own.team
-            ),
-        ));
-    }
     let from_team = sender
         .strip_prefix("service:")
         .map(|name| format!("svc.{name}"))
@@ -1466,6 +1500,9 @@ fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         }
     };
     let to_host = entry.host.clone();
+    if let Some(refusal) = may_send_refusal(&own, &to_team, &to_host) {
+        return Err(err("refused", refusal));
+    }
     let addressed_to = if to_host_arg.is_some() || entry.host != globals.host {
         format!("{to_team}@{to_host}")
     } else {

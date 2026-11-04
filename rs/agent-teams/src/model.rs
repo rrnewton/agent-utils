@@ -589,7 +589,8 @@ pub struct Declaration {
     pub designation: Designation,
     /// Who may send to this team.
     pub accepts_from: Vec<AcceptRule>,
-    /// Teams this team's coordinator may send to (empty means unset).
+    /// Where this team's agents may send (empty means unset: no restriction).
+    /// Each entry is `team` (any host) or `team@host` (only that host) (#843).
     pub may_send_to: Vec<String>,
     /// Maximum body bytes.
     pub max_bytes: usize,

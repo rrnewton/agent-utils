@@ -194,6 +194,111 @@ fn show_check_send_hook_reply_round_trip() {
     );
 }
 
+fn set_may_send_to(world: &World, team: &str, entries: &[&str]) {
+    let path = world
+        .state
+        .join("teams.d")
+        .join(team)
+        .join("declaration.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("declaration")).expect("json");
+    value["may_send_to"] = serde_json::json!(entries);
+    std::fs::write(&path, serde_json::to_string_pretty(&value).expect("json")).expect("write");
+}
+
+#[test]
+fn may_send_to_allows_the_front_door_and_refuses_the_rest() {
+    let world = World::new();
+    world.init_both();
+
+    // tools may reach sim only at a host that is not this one: refused here,
+    // with the allowed front door named, and nothing queued anywhere.
+    set_may_send_to(&world, "tools", &["sim@lead-host"]);
+    let (code, out, err) = world.run(&[
+        "send",
+        "sim",
+        "--from-team",
+        "tools",
+        "--text",
+        "hello",
+        "--json",
+    ]);
+    assert_ne!(code, 0, "{out} {err}");
+    assert!(
+        format!("{out}{err}").contains("refused: may-send-to"),
+        "{out} {err}"
+    );
+    assert!(
+        format!("{out}{err}").contains("sim@lead-host"),
+        "{out} {err}"
+    );
+    assert_eq!(world.hook_inbox_count("sim"), 0);
+
+    // The named front door itself is allowed.
+    set_may_send_to(&world, "tools", &["sim@host-a"]);
+    let (code, out, err) = world.run(&[
+        "send",
+        "sim",
+        "--from-team",
+        "tools",
+        "--text",
+        "hello",
+        "--kind",
+        "request",
+        "--topic",
+        "front-door",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "{out} {err}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+    let id = value["id"].as_str().expect("id").to_string();
+    assert_eq!(world.hook_inbox_count("sim"), 1);
+
+    // A bare team entry allows any host; same-team sends are always allowed,
+    // even when the list names other teams only.
+    set_may_send_to(&world, "tools", &["sim"]);
+    let (code, out, err) = world.run(&[
+        "send",
+        "sim",
+        "--from-team",
+        "tools",
+        "--text",
+        "again",
+        "--topic",
+        "bare",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "{out} {err}");
+    set_may_send_to(&world, "tools", &["sim@lead-host"]);
+    let (_code, out, err) = world.run(&[
+        "send",
+        "tools",
+        "--from-team",
+        "tools",
+        "--text",
+        "self",
+        "--topic",
+        "same-team",
+        "--json",
+    ]);
+    // The allow list lets it through (delivery then refuses it on the
+    // receiver's accepts_from, which names only the other team here).
+    assert!(
+        !format!("{out}{err}").contains("may-send-to"),
+        "same team must not hit the allow list: {out} {err}"
+    );
+
+    // Reply obeys the same list: sim may not reply to tools off its front door.
+    set_may_send_to(&world, "sim", &["tools@lead-host"]);
+    let (code, out, err) = world.run(&["reply", &id, "--from-team", "sim", "--text", "answer"]);
+    assert_ne!(code, 0, "{out} {err}");
+    assert!(
+        format!("{out}{err}").contains("refused: may-send-to"),
+        "{out} {err}"
+    );
+    assert_eq!(world.hook_inbox_count("tools"), 0);
+}
+
 #[test]
 fn foreign_sender_is_refused_by_policy() {
     let world = World::new();
