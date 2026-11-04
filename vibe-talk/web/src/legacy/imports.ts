@@ -107,7 +107,7 @@ export {
   shownNode,
   tagNameOf,
 } from "../view/dom/index.ts";
-export { SCREENS, createActionMenu, createChannelPick, createChipsOverComposer, createRowShortcuts, createScreens, createShellNotices, createUndoOffer, createUndoStamps } from "../view/shell/index.ts";
+export { MAC_FIELD_EDIT_LETTERS, SCREENS, chordMatches, createActionMenu, createChannelPick, createChipsOverComposer, createRowShortcuts, createScreens, createShellNotices, createUndoOffer, createUndoStamps, modHeld, swallow, typedKey, typesCharacter } from "../view/shell/index.ts";
 export {
   COMPOSER_FIELDS,
   COMPOSER_GROW_BOXES,

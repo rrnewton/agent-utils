@@ -8386,57 +8386,14 @@ function isBarPicker(node) {
   return screens.screen() === "main" && Boolean(node) && ["discord-channel", "thread-select"].includes(String(node.id || ""));
 }
 
-/** Keep a key from the browser's own default for it. */
-function swallow(event) {
-  if (event && typeof event.preventDefault === "function") event.preventDefault();
-}
-
-/** Whether the key is `letter`, on any layout: by the character, or by the place of the key on a layout that types no Latin letter there. */
-function isLetterKey(event, letter) {
-  const key = String(event.key || "");
-  if (/^[a-z]$/i.test(key)) return key.toLowerCase() === letter;
-  // A key that types ASCII punctuation or a digit means that character, never the letter its place
-  // would type on QWERTY: on Dvorak ";" sits where QWERTY has Z, and read by its place it was z, Undo.
-  // Only a key that types no ASCII at all (a layout for another script) is read by its place.
-  if (/^[\x21-\x7e]$/.test(key)) return false;
-  return event.code === `Key${letter.toUpperCase()}`;
-}
-
 /**
- * The character a key typed, as the keymap reads it: what the browser says, with one correction made
- * only while Cmd is held. Cmd and Shift on the key that types "/" and "?" (US, UK and the like) is "?",
- * the list of keys, even where the browser says "/": a Mac browser may report the key as if Shift were
- * not held while Cmd is, as it does for a letter. `#344 search-shortcut`. Whether one does for this key
- * has not been seen on a Mac here; reading it so costs nothing where it does not. Never without Cmd, so
- * Ctrl+/ on Linux or Windows is what the browser says, whatever the layout. On a layout where "/" takes
- * Shift (Shift+7 on German), the key is not the Slash key and "/" stays "/": Cmd+/ there is the search.
- * Cmd+: (Cmd+Shift+;) has no such correction, and no report has said it needs one.
- */
-function typedKey(event) {
-  const key = String(event.key || "");
-  return key === "/" && event.metaKey && event.shiftKey && event.code === "Slash" ? "?" : key;
-}
-
-/**
- * Whether Ctrl or Cmd is held: every chord takes either, on every platform (see `modKeyName`), but
- * for the one exception `macFieldEditKey` makes in a text field on a Mac.
- */
-const modHeld = (event) => Boolean(event.ctrlKey || event.metaKey);
-
-/**
- * The letters whose Ctrl chord edits text in every field on a Mac: the Emacs-style keys macOS gives
- * all its text fields, and Chrome honours in a page's. Ctrl+A and Ctrl+E go to the ends of the line,
- * Ctrl+K deletes to its end and Ctrl+Y puts that back, Ctrl+F, B, N and P move the caret, Ctrl+D and
- * Ctrl+H delete, Ctrl+O opens a line, Ctrl+T swaps two letters, Ctrl+L centres and Ctrl+V pages.
- */
-const MAC_FIELD_EDIT_LETTERS = "abdefhklnoptvy";
-
-/**
- * Whether `event` is one of those keys, pressed in a text field on an Apple keyboard: Ctrl and one
- * of `MAC_FIELD_EDIT_LETTERS`, without Cmd. Such a key is the field's, never a chord of the page, so
- * in a message box on a Mac Ctrl+K deletes to the end of the line as it does everywhere else there,
- * and Cmd+K is the channel picker. Off the field, and on other keyboards, Ctrl works as Cmd does.
- * Ctrl+S is not one of them, and goes to the message box on a Mac as it does everywhere else.
+ * Whether `event` is one of the keys that edit text in every field on a Mac, pressed in a text field on an
+ * Apple keyboard: Ctrl and one of `MAC_FIELD_EDIT_LETTERS`, without Cmd. Such a key is the field's, never
+ * a chord of the page, so in a message box on a Mac Ctrl+K deletes to the end of the line as it does
+ * everywhere else there, and Cmd+K is the channel picker. Off the field, and on other keyboards, Ctrl
+ * works as Cmd does. Ctrl+S is not one of them, and goes to the message box on a Mac as it does
+ * everywhere else. What key a keydown is, and whether it is a chord of the keymap, is
+ * web/src/view/shell/chords.ts (`#624 voice-page-modularity`).
  */
 function macFieldEditKey(event, target) {
   if (!event.ctrlKey || event.metaKey || !isTextField(target) || !appleKeyboard()) return false;
@@ -8960,51 +8917,6 @@ const KEYMAP = [
     run: (event, target) => newestFromComposer(target),
   },
 ];
-
-/** Whether `chord` is the key `event` reports. Shift counts for letters and named keys only. */
-function chordMatches(chord, event) {
-  if (Boolean(chord.mod) !== modHeld(event) || Boolean(chord.alt) !== Boolean(event.altKey)) return false;
-  if (/^[a-z]$/.test(chord.key)) {
-    return Boolean(chord.shift) === Boolean(event.shiftKey) && isLetterKey(event, chord.key);
-  }
-  const key = typedKey(event);
-  // A shifted 0 is never the Ctrl+0 chord: on the Digit0 key it is the ")" of the collapsed-lines
-  // chord, which `parenByPlace` reads for that chord below — a browser reporting the digit itself
-  // while Shift is held must not hand it to Ctrl+0 (`#525 cmd-0-voice-view`). (Shifted digits 1 to 4
-  // keep matching: on AZERTY Shift is what types the digit, and the view chords read it as such.)
-  if (chord.key.length === 1 && chord.key !== " ") return (key === chord.key && !(chord.key === "0" && event.shiftKey)) || digitByPlace(chord, event) || parenByPlace(chord, event);
-  return key === chord.key && Boolean(chord.shift) === Boolean(event.shiftKey);
-}
-
-/**
- * Whether `event` is the digit chord `chord` by the place of its key, on a layout whose digit row types
- * something else without Shift: on AZERTY Ctrl+1 reports "&", on the key a browser's own Ctrl+1 is read
- * from. `#281 view-keys`. Never for a key that types a digit, which is read as that digit; nor with
- * Shift held, which on QWERTY makes Ctrl+2 Ctrl+@ — another key, and not the view key.
- */
-function digitByPlace(chord, event) {
-  return Boolean(chord.mod) && /^[0-9]$/.test(chord.key) && !event.shiftKey &&
-    !/^[0-9]$/.test(String(event.key || "")) && event.code === `Digit${chord.key}`;
-}
-
-/**
- * Whether `event` is the bracket chord `chord` by the place of its key: Ctrl or Cmd and Shift on
- * Digit9 for "(", on Digit0 for ")", where that key types no bracket — a layout whose shifted
- * digit row is digits, or a browser that reports the digit while Cmd is held, as it may report a
- * letter (`typedKey`). `#425 collapsed-lines`. Never for a key that DID type a bracket, which
- * means the bracket it typed: on a German layout Shift+9 is ")" by place for "(", and it is the
- * ")" chord there, by its character, as every character chord is read. Never without Shift, which
- * is the browser's own tab key, Ctrl+9 or Ctrl+0.
- */
-function parenByPlace(chord, event) {
-  const place = chord.key === "(" ? "Digit9" : chord.key === ")" ? "Digit0" : null;
-  if (place === null || !chord.mod || !event.shiftKey) return false;
-  const key = String(event.key || "");
-  return key !== "(" && key !== ")" && event.code === place;
-}
-
-/** A chord of one key that types a character: what the Settings switch turns off, and what never fires in a field. */
-const typesCharacter = (chord) => !chord.mod && !chord.alt && chord.key.length === 1 && chord.key !== " ";
 
 /** Whether the single-key shortcuts are on. ON unless the reader turned them off: see `storedSingleKeys`. */
 let singleKeys = true;

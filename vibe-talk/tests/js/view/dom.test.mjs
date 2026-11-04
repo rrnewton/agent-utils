@@ -329,3 +329,29 @@ test("`#624 voice-page-modularity`: the Undo offer for the last Done stands unti
   offer.set(null);
   assert.equal(offer.current(), null);
 });
+
+test("chords: Ctrl and Cmd alike, letters by place only off ASCII, digits and brackets by place, ? under Cmd", () => {
+  const { chordMatches, typedKey, typesCharacter, swallow, MAC_FIELD_EDIT_LETTERS } = VIEW_SHELL;
+  const key = (fields) => ({ key: "", code: "", ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, ...fields });
+  assert.equal(chordMatches({ key: "k", mod: true }, key({ key: "k", ctrlKey: true })), true);
+  assert.equal(chordMatches({ key: "k", mod: true }, key({ key: "k", metaKey: true })), true, "Cmd is Ctrl");
+  assert.equal(chordMatches({ key: "k" }, key({ key: "k", ctrlKey: true })), false, "a held Ctrl is another chord");
+  assert.equal(chordMatches({ key: "e" }, key({ key: "у", code: "KeyE" })), true, "a layout for another script is read by place");
+  assert.equal(chordMatches({ key: "z" }, key({ key: ";", code: "KeyZ" })), false, "ASCII punctuation is that character, not z");
+  assert.equal(chordMatches({ key: "e", shift: true }, key({ key: "E", shiftKey: true })), true);
+  assert.equal(chordMatches({ key: "1", mod: true }, key({ key: "&", code: "Digit1", ctrlKey: true })), true, "AZERTY's Ctrl+1");
+  assert.equal(chordMatches({ key: "2", mod: true }, key({ key: "@", code: "Digit2", ctrlKey: true, shiftKey: true })), false);
+  assert.equal(chordMatches({ key: "0", mod: true }, key({ key: "0", code: "Digit0", ctrlKey: true, shiftKey: true })), false, "a shifted 0 is never Ctrl+0");
+  assert.equal(chordMatches({ key: ")", mod: true }, key({ key: "0", code: "Digit0", ctrlKey: true, shiftKey: true })), true, "the bracket chord by place");
+  assert.equal(chordMatches({ key: "(", mod: true }, key({ key: ")", code: "Digit9", ctrlKey: true, shiftKey: true })), false, "a typed bracket is that bracket");
+  assert.equal(typedKey(key({ key: "/", code: "Slash", metaKey: true, shiftKey: true })), "?");
+  assert.equal(typedKey(key({ key: "/", code: "Slash", ctrlKey: true, shiftKey: true })), "/", "only under Cmd");
+  assert.equal(chordMatches({ key: "Escape" }, key({ key: "Escape" })), true);
+  assert.deepStrictEqual([typesCharacter({ key: "j" }), typesCharacter({ key: " " }), typesCharacter({ key: "j", mod: true }), typesCharacter({ key: "Escape" })], [true, false, false, false]);
+  let prevented = 0;
+  swallow({ preventDefault: () => prevented++ });
+  swallow(null);
+  assert.equal(prevented, 1);
+  assert.equal(MAC_FIELD_EDIT_LETTERS.includes("k"), true);
+  assert.equal(MAC_FIELD_EDIT_LETTERS.includes("s"), false, "Ctrl+S is the page's on a Mac too");
+});
