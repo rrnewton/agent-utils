@@ -1,10 +1,11 @@
 ---
 title: 'page-test-runaway-memory: a page test failing with an unhandled rejection can grow without bound'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-04T15:37:04.174037341+00:00
-updated_at: 2026-11-04T15:37:04.174037341+00:00
+updated_at: 2026-11-04T16:49:10.499055299+00:00
+closed_at: 2026-11-04T16:49:10.499055189+00:00
 ---
 
 # Description
