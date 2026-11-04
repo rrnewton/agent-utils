@@ -30,8 +30,6 @@ Owner rule (2026-11-02): an agent of one team may message the other team only th
 
 P2 by owner rule, via the lead (2026-11-04).
 
-# Notes
-
 ## Done (mu-validate, 2026-11-04)
 
 [muse watermelon-full-preview] `may_send_to` already existed at team granularity and was enforced in `cmd_send`; this change makes it team@host-granular (bare `team` = any host, `team@host` = only that host), checks it after destination resolution with a refusal naming the allowed front door, and documents that a relay/serve hop does not re-check (the sender's host admitted the envelope under the sender team's list). `reply` inherits the check via `cmd_send`. Tests: `may_send_to_allows_the_front_door_and_refuses_the_rest` covers refused cross-team (text + nothing queued), allowed front door, bare-team any-host, same-team always allowed, refused reply; absent list unchanged (existing round-trip tests). Help and userguide updated. Rollout diffs: /tmp/dev-agent-utils-handoffs/843-rollout.md (coordinator applies; no live declaration edited).
