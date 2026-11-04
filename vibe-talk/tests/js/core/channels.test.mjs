@@ -790,3 +790,16 @@ test("`#624 voice-page-modularity`: the selected service's facts come from its p
   facts.setThreading(true);
   assert.equal(facts.threading(), true);
 });
+
+test("thread presence: what the last page said, yes while a thread is open, nothing after a channel change", () => {
+  const presence = CHANNELS.createThreadPresence();
+  assert.equal(presence.any(), false, "nothing is known before a page");
+  presence.note(true, false);
+  assert.equal(presence.any(), true);
+  presence.note("yes", false);
+  assert.equal(presence.any(), false, "only a literal true says the channel has threads");
+  presence.note(undefined, true);
+  assert.equal(presence.any(), true, "a page read in an open thread proves one");
+  presence.forget();
+  assert.equal(presence.any(), false);
+});

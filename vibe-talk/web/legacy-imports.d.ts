@@ -147,6 +147,7 @@ declare const createSummaries: LegacyImports["createSummaries"];
 declare const summaryKey: LegacyImports["summaryKey"];
 declare const createIdentities: LegacyImports["createIdentities"];
 declare const createProviderFacts: LegacyImports["createProviderFacts"];
+declare const createThreadPresence: LegacyImports["createThreadPresence"];
 declare const createPlainReach: LegacyImports["createPlainReach"];
 declare const createTodoView: LegacyImports["createTodoView"];
 declare const exactReplyCount: LegacyImports["exactReplyCount"];

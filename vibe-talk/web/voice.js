@@ -2214,7 +2214,13 @@ const viewScroll = createViewPlaces();
  * voice-page-modularity`).
  */
 const providerFacts = createProviderFacts();
-let channelHasThreads = false;
+/**
+ * Whether the selected channel holds any thread at all, from its last history page (or yes while a thread is
+ * open): one owner in web/src/core/channels/threadpresence.ts (`#624 voice-page-modularity`).
+ *
+ * @type {import("./src/core/channels/index.ts").ThreadPresence}
+ */
+const threadPresence = createThreadPresence();
 /**
  * A column's own record of what it is showing (`#624 voice-page-modularity`, plan step 15, as
  * `freshOlderPages`): `view`, which list (main, threads, flat or thread); `threadId` and `thread`, the
@@ -11556,7 +11562,7 @@ function reconcileChannelSnapshot(before) {
   if (before.key === channelContextKey() && before.threading === providerFacts.threading()) return;
   clearChannelScreen();
   openChannelView();
-  channelHasThreads = false;
+  threadPresence.forget();
   hydrateChannelScope();
   restoreChannelComposer();
   voiceCall().renderControls();
@@ -14688,7 +14694,7 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
   }
   const cover = channelStore.current().views.get(viewKey());
   if (cover && !saved && !delta) cover.cursor = olderPages().cursor;
-  channelHasThreads = payload.has_threads === true || selection().view === "thread";
+  threadPresence.note(payload.has_threads, selection().view === "thread");
   if (payload.thread) selection().thread = payload.thread;
   noteArchived(payload, !delta && !older && merged.length <= incoming.length);
   const keeps = readFilterKeeps();
@@ -21852,7 +21858,7 @@ function historyReach() {
   const weight = (row) => Math.max(1, idsOf(row).length);
   const total = rows.reduce((sum, row) => sum + weight(row), 0);
   // A channel with no thread at all has nothing in All but its top-level messages.
-  const topLevel = providerFacts.threading() && selection().view === "flat" && channelHasThreads;
+  const topLevel = providerFacts.threading() && selection().view === "flat" && threadPresence.any();
   /** @type {HistoryReach} */
   const reach = { total, proven: false, saved: false, dense: 0, scattered: total, from: null, start: false,
     whole: false, topLevel, threads: 0, full: 0 };
@@ -33478,7 +33484,7 @@ function changeSelectedChannel() {
   // that channel's, and it waits there for the reader to come back. The first read is the view's.
   uiState.settle();
   openChannelView();
-  channelHasThreads = false;
+  threadPresence.forget();
   timelineRows().messages = [];
   timelineRows().threads = [];
   channelContexts.clear();
