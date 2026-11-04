@@ -406,10 +406,12 @@ slot keeps its checkout between validations. A failed attempt to take the writer
 the daemon's last error until the daemon gets the lock or has nothing queued. Requests recorded
 while a run held the lock show as `intake: N request(s) ...` until they are applied. Requests
 refused when applied show as `intake refused: ...`, and the newest three are named (JSON `intake`).
+A pending drain request shows as `drain: requested at ...` (JSON `drain`; see **Upgrading the
+daemon** below).
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--json` | off | Print the status report as JSON (`daemon`, `pid`, `heartbeat`, queue counts, `active_batches`, slots, `intake`, `remedy`). |
+| `--json` | off | Print the status report as JSON (`daemon`, `pid`, `heartbeat`, queue counts, `active_batches`, slots, `intake`, `drain`, `remedy`). |
 | `--stale-after-secs N` | `10` | Heartbeat age in seconds after which a live daemon counts as stale. |
 
 ### Running `serve` as a service
@@ -448,6 +450,38 @@ The tick-hub launcher alternative ships at `rs/merge-queue/tick-hub-merge-queue.
 runs `merge-queue status` as a gate and emits an action asking for a restart when the daemon is
 not healthy, plus a heartbeat-freshness health check. Edit its paths, then
 `tick-hub tick --config rs/merge-queue/tick-hub-merge-queue.yaml`.
+
+### Upgrading the daemon (`merge-queue drain-for-upgrade`)
+
+Stopping or restarting the daemon cancels the validations in flight, and the daemon that replaces
+it validates those batches again from scratch: a restart in the middle of a long validation
+throws that validation away. When validations run detached from their launcher (as their own
+service units, say), the cancelled one may even keep running to its end with nobody reading its
+verdict. A drain avoids both. The running daemon finishes the validations already in flight and
+acts on their verdicts (a green batch lands), starts no new validation (no new batch, no
+culprit-search probe, no rerun), and exits 0 once no run is in progress. The changes it did not
+decide stay queued, and nothing is ejected for the drain. A red batch whose culprit search the
+drain prevented is validated again by the next daemon.
+
+```bash
+install -m 755 merge-queue.new /path/to/merge-queue   # the running daemon keeps its own copy
+merge-queue drain-for-upgrade --reason "new binary" --wait --timeout 3600
+systemctl --user start merge-queue-serve               # Restart=on-failure does not restart an exit 0
+```
+
+The request is `serve.drain.json` in the state directory and names the daemon's pid. Only that
+daemon honours it, and a daemon removes any request on file when it starts, so a request left by
+a daemon that died never drains its replacement. An idle daemon exits within one poll; a daemon
+in a run exits when the run ends.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--reason TEXT` | empty | Kept with the request, shown by `status`, and written to the daemon's log. |
+| `--wait` | off | Wait for the daemon to exit, checking every second, then exit 0. |
+| `--timeout SECS` | `7200` | With `--wait`: seconds to wait before giving up with exit 1. The request stands. |
+| `--cancel` | off | Withdraw a pending request instead. |
+
+With no daemon running, `drain-for-upgrade` exits 1: there is nothing to drain.
 
 ### `merge-queue donor`
 
@@ -632,6 +666,7 @@ on which files two changes share.
   serve.lock             fixed: single-daemon lock (flock held by a running `serve`)
   serve.pid              fixed: `serve` daemon pid (informational; removed on a graceful stop)
   serve.heartbeat.json   fixed: `serve` heartbeat, rewritten every cycle
+  serve.drain.json       fixed: a pending `drain-for-upgrade` request, naming the daemon's pid
   union.attributes       fixed: generated from union_paths, when set
   items/<pr>.json        one record per submitted change
   notifications/        notification report files the daemon sends with `--file`

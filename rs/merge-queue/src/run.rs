@@ -64,6 +64,9 @@ pub struct RunOptions {
     pub with_peers: bool,
     /// Override `validator.offload` (`off`, `compare` or `decide`).
     pub offload: Option<String>,
+    /// The `serve` daemon running this run: once a drain of it is requested, the run finishes
+    /// the validations in flight and starts no new one (see [`crate::drain`]).
+    pub drain_pid: Option<u32>,
 }
 
 /// Donor validators for this run (offload `compare` or `decide`).
@@ -840,6 +843,13 @@ impl<'a> Runner<'a> {
 
     fn simulating(&self) -> bool {
         self.options.shadow || self.options.dry_run
+    }
+
+    /// Whether the daemon running this run has been asked to drain (see [`crate::drain`]).
+    fn draining(&self) -> bool {
+        self.options
+            .drain_pid
+            .is_some_and(|pid| crate::drain::requested_for(self.state, pid).is_some())
     }
 
     fn event(&self, kind: &str, detail: &str) {
@@ -1966,6 +1976,14 @@ impl<'a> Runner<'a> {
 
     fn validate_one(&self, job: Job, cancel: &AtomicBool) -> JobResult {
         crate::interrupt::check(&format!("validating {}", list(&job.prs)))?;
+        if self.draining() {
+            return Err(format!(
+                "{}: not starting the {} validation of {}; the changes stay queued",
+                crate::drain::DRAINED,
+                job.purpose,
+                list(&job.prs)
+            ));
+        }
         let id = {
             let mut next = lock(&self.next_validation);
             *next += 1;
@@ -2334,6 +2352,8 @@ impl<'a> Runner<'a> {
         }
         let mut stop = match self.drive() {
             Ok(stop) => stop,
+            // A drain declining to start a validation stops the run; it is not a failure.
+            Err(error) if error.contains(crate::drain::DRAINED) => error,
             Err(error) => format!("error: {error}"),
         };
         if !stop.is_empty() {
@@ -2602,8 +2622,11 @@ impl<'a> Runner<'a> {
                     // execution: any batch already in flight keeps
                     // validating on its own thread while this thread
                     // waits for the remaining pairwise probes.
-                    let want_more =
-                        self.options.max_batches == 0 || started < self.options.max_batches;
+                    // A drain starts no new batch: the batches in flight finish, and the run
+                    // ends once they are decided.
+                    let want_more = (self.options.max_batches == 0
+                        || started < self.options.max_batches)
+                        && !self.draining();
                     if pending.is_empty() && !full_loaded && want_more {
                         let handle = plan_join
                             .take()
@@ -2618,6 +2641,7 @@ impl<'a> Runner<'a> {
                     while flights.len() < window
                         && !pending.is_empty()
                         && (self.options.max_batches == 0 || started < self.options.max_batches)
+                        && !self.draining()
                     {
                         crate::interrupt::check("building the next batch")?;
                         let parent = match flights.back() {
@@ -2670,8 +2694,9 @@ impl<'a> Runner<'a> {
                     // flight keep validating meanwhile) and fill the
                     // window from it before waiting for any result. This
                     // is what keeps speculation concurrent.
-                    let want_more =
-                        self.options.max_batches == 0 || started < self.options.max_batches;
+                    let want_more = (self.options.max_batches == 0
+                        || started < self.options.max_batches)
+                        && !self.draining();
                     if flights.len() < window && pending.is_empty() && !full_loaded && want_more {
                         let handle = plan_join
                             .take()
@@ -2684,6 +2709,12 @@ impl<'a> Runner<'a> {
                         continue;
                     }
                     if flights.is_empty() {
+                        if self.draining() && (!pending.is_empty() || !full_loaded) {
+                            return Ok(format!(
+                                "{}: no new batch started; the undecided changes stay queued",
+                                crate::drain::DRAINED
+                            ));
+                        }
                         return Ok(String::new());
                     }
                     let (id, result) = rx

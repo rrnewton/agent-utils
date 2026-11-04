@@ -32,6 +32,7 @@ Examples:
   merge-queue serve
   merge-queue serve --shadow
   merge-queue status
+  merge-queue drain-for-upgrade --wait
   merge-queue donor run --queue 'ssh qhost merge-queue --repo /srv/q' --clone ~/q --name h2 --jobs 2
   merge-queue donor status";
 
@@ -811,6 +812,25 @@ enum Command {
         /// Heartbeat age in seconds after which a live daemon counts as stale.
         #[arg(long, default_value_t = serve::DEFAULT_STALE_AFTER_SECS)]
         stale_after_secs: u64,
+    },
+    /// Let the serve daemon finish the validations in flight, start no new one, and exit 0, so
+    /// a new binary can replace it without throwing a validation away. Replace the binary
+    /// file first (the running daemon keeps the file it started from), then drain, then start
+    /// the service again. Stopping the daemon instead cancels its validations, and the next
+    /// daemon starts them again from scratch.
+    DrainForUpgrade {
+        /// Why: kept with the request and in the daemon's log.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Wait for the daemon to exit, checking every second, up to --timeout; then exit 0.
+        #[arg(long)]
+        wait: bool,
+        /// Seconds --wait waits before giving up with exit 1 (the request stands).
+        #[arg(long, default_value_t = 7200, value_name = "SECS", requires = "wait")]
+        timeout: u64,
+        /// Withdraw a pending drain request instead.
+        #[arg(long, conflicts_with_all = ["reason", "wait"])]
+        cancel: bool,
     },
     /// Run the complete suite on the base and discharge the obligations it covers.
     Widen {
@@ -1592,6 +1612,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     quiet: false,
                     with_peers,
                     offload,
+                    // A drain is for the serve daemon; a one-shot run never drains.
+                    drain_pid: None,
                 },
             )?;
             let report = runner.run()?;
@@ -1685,6 +1707,60 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 print!("{}", serve::render_status(&report));
             }
             Ok(if report.healthy() { 0 } else { 1 })
+        }
+        Command::DrainForUpgrade {
+            reason,
+            wait,
+            timeout,
+            cancel,
+        } => {
+            if cancel {
+                println!(
+                    "{}",
+                    if crate::drain::clear(&state)? {
+                        "withdrew the drain request"
+                    } else {
+                        "no drain request to withdraw"
+                    }
+                );
+                return Ok(0);
+            }
+            let (daemon, pid, _, _) = serve::liveness(&state, serve::DEFAULT_STALE_AFTER_SECS);
+            let pid = match (daemon, pid) {
+                (serve::Liveness::Running | serve::Liveness::Stale, Some(pid)) => pid,
+                _ => {
+                    return Err(format!(
+                        "no serve daemon is running for {} ({}); there is nothing to drain",
+                        state.root.display(),
+                        daemon.as_str()
+                    ))
+                }
+            };
+            let request = crate::drain::request(&state, pid, &reason)?;
+            println!(
+                "asked the serve daemon (pid {pid}) to drain at {}: it finishes the validations in flight, starts no new one, and exits 0",
+                request.requested_at
+            );
+            if !wait {
+                return Ok(0);
+            }
+            let started = std::time::Instant::now();
+            loop {
+                if !serve::pid_alive(pid) || serve::serve_lock_held(&state) == Some(false) {
+                    println!(
+                        "the serve daemon (pid {pid}) exited {}s after the request",
+                        started.elapsed().as_secs()
+                    );
+                    return Ok(0);
+                }
+                if started.elapsed() >= std::time::Duration::from_secs(timeout) {
+                    eprintln!(
+                        "merge-queue drain-for-upgrade: the serve daemon (pid {pid}) is still running after {timeout}s; the request stands (withdraw it with --cancel)"
+                    );
+                    return Ok(1);
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
         }
         Command::Widen { json } => {
             let _lock = state.lock()?;

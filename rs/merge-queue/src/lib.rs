@@ -13,6 +13,7 @@ pub mod build_info;
 pub mod cli;
 pub mod decisions;
 pub mod donor;
+pub mod drain;
 pub mod git;
 pub mod github;
 pub mod intake;

@@ -882,6 +882,7 @@ fn run_cycle(
         max_batch: options.max_batch,
         quiet: true,
         offload: options.offload.clone(),
+        drain_pid: Some(std::process::id()),
         ..RunOptions::default()
     };
     let outcome = Runner::new(state, run_options)
@@ -1150,6 +1151,17 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
     crate::interrupt::install();
     write_pid(state)?;
     let pid_file = PidFile(state);
+    // A drain request on file was for an earlier daemon (this one holds `serve.lock`, so that
+    // daemon is gone): it must not drain this one.
+    if let Some(request) = crate::drain::read(state) {
+        if crate::drain::clear(state).unwrap_or(false) {
+            eprintln!(
+                "merge-queue serve: removed a drain request for pid {} ({}): it was for an earlier daemon",
+                request.pid,
+                request.describe()
+            );
+        }
+    }
     let git = ops::repo(state, &config)?;
     let window = options.depth.unwrap_or(config.depth).max(1);
     let mut heartbeat = Heartbeat::new(std::process::id(), window, options.shadow);
@@ -1195,6 +1207,23 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
 
     'outer: loop {
         if shutdown_requested() {
+            break 'outer;
+        }
+        // Drained: no run is in progress here (a run ends before the loop comes back), so the
+        // daemon exits and its replacement starts with nothing thrown away.
+        if let Some(request) = crate::drain::requested_for(state, heartbeat.pid) {
+            // Requests recorded during the last run go in first, so the queue lists them.
+            if crate::intake::has_pending(state) {
+                if let Ok(lock) = state.lock() {
+                    apply_intake(state, &config, &lock);
+                }
+            }
+            let _ = crate::drain::clear(state);
+            eprintln!(
+                "merge-queue serve: {} ({}); no run in progress, exiting",
+                crate::drain::DRAINED,
+                request.describe()
+            );
             break 'outer;
         }
         heartbeat.cycles += 1;
@@ -1383,6 +1412,9 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
             if shutdown_requested() {
                 break 'outer;
             }
+            if crate::drain::requested_for(state, heartbeat.pid).is_some() {
+                continue 'outer;
+            }
             let slice = Duration::from_millis(50).min(options.poll - slept);
             std::thread::sleep(slice);
             slept += slice;
@@ -1483,6 +1515,9 @@ pub struct StatusReport {
     /// Requests recorded while another writer held the queue: waiting for the
     /// lock, and refused when applied (see `crate::intake`).
     pub intake: crate::intake::Summary,
+    /// A drain request on file (`merge-queue drain-for-upgrade`), whichever daemon it names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drain: Option<crate::drain::Request>,
     /// Why the item records cannot be read, when they cannot. The queue is
     /// then unhealthy whatever the daemon's liveness: nothing can be planned.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -1612,6 +1647,7 @@ pub fn collect_status(state: &State, stale_after_secs: u64) -> Result<StatusRepo
         shadow,
         working_secs,
         intake: crate::intake::summary(state),
+        drain: crate::drain::read(state),
         items_error,
         remedy,
     })
@@ -1652,6 +1688,20 @@ pub fn render_status(report: &StatusReport) -> String {
                 } else {
                     "  mode: live\n"
                 });
+                if let Some(request) = &report.drain {
+                    out.push_str(&if Some(request.pid) == report.pid {
+                        format!(
+                            "  drain: {}; finishing the validations in flight, starting none, then exiting\n",
+                            request.describe()
+                        )
+                    } else {
+                        format!(
+                            "  drain: a request for pid {} ({}) is not for this daemon and is ignored\n",
+                            request.pid,
+                            request.describe()
+                        )
+                    });
+                }
                 if !h.next_retry_at.is_empty() {
                     out.push_str(&format!("  next retry: {}\n", h.next_retry_at));
                 }
