@@ -325,3 +325,22 @@ test("`#624 voice-page-modularity`: a request given up on by `within` times out 
   assert.equal(await quick.server.within(5_000, async () => "ok"), "ok");
   assert.deepStrictEqual(quick.record.cleared, [1]);
 });
+
+test("`#841 page-test-runaway-memory`: a failing equality of two elements names them, small, and never inspects the page", async () => {
+  // Node's assert inspects both sides of a failing equality whole, any depth, and diffs the two texts in
+  // memory that grows with the product of their lengths: two elements of a signed-in page, inspected
+  // that way, once grew a test process by gigabytes. The fixture answers equality on elements itself.
+  const page = newPage();
+  await signIn(page);
+  const [box, other] = [page.el("channel-compose-text"), page.el("api-token")];
+  const started = Date.now();
+  assert.throws(() => assert.equal(box, other, "two elements"), (error) =>
+    error.message === "two elements" && error.actual === "<textarea#channel-compose-text>" && error.expected.startsWith("<input#api-token"));
+  assert.throws(() => assert.strictEqual(box, other), /<textarea#channel-compose-text> is not <input#api-token/);
+  assert.throws(() => assert.notStrictEqual(box, box), /is <textarea#channel-compose-text>/);
+  assert.ok(Date.now() - started < 1000, "comparing two elements took a second or more");
+  // What passes still passes: an element is itself, and is not another; plain values are untouched.
+  assert.equal(box, box);
+  assert.notEqual(box, other);
+  assert.throws(() => assert.equal(1, 2), assert.AssertionError);
+});

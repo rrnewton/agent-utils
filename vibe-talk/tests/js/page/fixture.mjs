@@ -34,6 +34,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import vm from "node:vm";
+import { Worker } from "node:worker_threads";
 
 import { LEGACY_SCRIPT, legacyPrelude, loadTool, moduleForTests } from "../../../web/build.mjs";
 import { SHELL, WEB, moduleSources, occurrences, readWeb, shellScripts } from "../../../web/page_sources.mjs";
@@ -61,6 +62,27 @@ const SHARD = (() => {
   }
   return { index: Number(parts[1]), count: Number(parts[2]) };
 })();
+/**
+ * `#841 page-test-runaway-memory`. A test process that grows past this many MiB is killed, by a thread of its
+ * own that watches it, since the main thread may be stuck in one synchronous call when it happens (a
+ * failing assertion's diff once grew a file's process by gigabytes a minute, past every heap limit,
+ * until the host's out-of-memory killer took down the sandbox it ran in). The suite's files peak under
+ * 600 MiB. `VIBE_TALK_PAGE_RSS_LIMIT_MB` sets another limit; 0 turns the watch off.
+ */
+const PAGE_RSS_LIMIT_MB = Number(process.env.VIBE_TALK_PAGE_RSS_LIMIT_MB ?? 2048);
+if (PAGE_RSS_LIMIT_MB > 0) {
+  new Worker(`
+    const { workerData } = require("node:worker_threads");
+    setInterval(() => {
+      const rss = process.memoryUsage.rss();
+      if (rss <= workerData.limit) return;
+      process._rawDebug(\`voice_page: this test process reached \${Math.round(rss / 1048576)} MiB, over its \` +
+        \`limit of \${workerData.limitMb} MiB (VIBE_TALK_PAGE_RSS_LIMIT_MB), and is stopped: #841 page-test-runaway-memory\`);
+      process.kill(process.pid, "SIGKILL");
+    }, 100);
+  `, { eval: true, workerData: { limit: PAGE_RSS_LIMIT_MB * 1048576, limitMb: PAGE_RSS_LIMIT_MB } }).unref();
+}
+
 let testsDefined = 0;
 let testsSelected = 0;
 const test = (...args) => {
@@ -1337,6 +1359,33 @@ class FakeElement {
   text() {
     return [this, ...this.descendants()].map((node) => node.textContent).join("");
   }
+}
+
+/**
+ * `#841 page-test-runaway-memory`. Equality on the fixture's elements, kept to what it means. Node's assert
+ * builds a diff for every failing equality, message or not, out of both values inspected to any depth
+ * with their own inspectors ignored, and in memory that grows with the product of the two lengths; an
+ * element inspected that way is the whole page it hangs in, so one failing `assert.equal(focused(page),
+ * page.el("reply-text"), ...)` grew its test process by gigabytes, past every heap limit, until the
+ * host's out-of-memory killer stopped the sandbox. Where either side is an element, identity is the whole
+ * question, answered here, and a failure names the two elements.
+ */
+const describeElement = (value) => (value instanceof FakeElement
+  ? `<${String(value.tagName || "element").toLowerCase()}${value.id ? `#${value.id}` : ""}${value.className ? `.${String(value.className).trim().split(/\s+/).join(".")}` : ""}>`
+  : typeof value === "object" && value !== null ? Object.prototype.toString.call(value) : String(value));
+for (const [name, same] of [["strictEqual", true], ["equal", true], ["notStrictEqual", false], ["notEqual", false]]) {
+  const original = assert[name];
+  assert[name] = function equalityOnElements(actual, expected, message) {
+    if (!(actual instanceof FakeElement) && !(expected instanceof FakeElement)) return original.apply(this, arguments);
+    if (Object.is(actual, expected) === same) return undefined;
+    const said = message instanceof Error ? message : null;
+    if (said) throw said;
+    const error = new assert.AssertionError({
+      message: message ?? `${describeElement(actual)} ${same ? "is not" : "is"} ${describeElement(expected)}`,
+      actual: describeElement(actual), expected: describeElement(expected), operator: name,
+    });
+    throw error;
+  };
 }
 
 /**
