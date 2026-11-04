@@ -522,3 +522,12 @@ test("`#624 voice-page-modularity`: the rows on screen belong to the credential 
   // No token at all is a credential of its own: rows drawn signed out are not a token's.
   assert.equal(createScreenIdentity("").belongsTo("aaaa"), false);
 });
+
+test("away clock: the first hide counts, coming back says how long and starts over", () => {
+  const clock = SYNC.createAwayClock();
+  assert.equal(clock.show(500), 0, "a page that was never hidden was not away");
+  clock.hide(1000);
+  clock.hide(4000);
+  assert.equal(clock.show(6000), 5000, "a second hide keeps the first time");
+  assert.equal(clock.show(9000), 0, "the clock starts over once visible");
+});

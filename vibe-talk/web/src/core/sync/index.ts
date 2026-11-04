@@ -40,3 +40,5 @@ export { createReopenRead } from "./reopen.ts";
 export type { OwedRead, ReopenRead } from "./reopen.ts";
 export { createScreenIdentity } from "./screenidentity.ts";
 export type { ScreenIdentity } from "./screenidentity.ts";
+export { createAwayClock } from "./away.ts";
+export type { AwayClock } from "./away.ts";

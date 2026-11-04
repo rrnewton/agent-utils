@@ -10480,13 +10480,18 @@ const readingWidthControl = mountReadingWidth({
   keptAs: (ch) => deviceSettings().keptAs(DEVICE_SETTINGS.readingWidth, ch),
 });
 
-// When the page was last hidden, or 0 while it is visible. `#203 incremental-refresh`.
-let hiddenAt = 0;
+/**
+ * When the page was last hidden, and so how long the reader was away (`#203 incremental-refresh`): one owner
+ * in web/src/core/sync/away.ts (`#624 voice-page-modularity`).
+ *
+ * @type {import("./src/core/sync/index.ts").AwayClock}
+ */
+const awayClock = createAwayClock();
 
 function onVisibility() {
   voiceCall().syncScreenWakeLock();
   if (document.visibilityState === "hidden") {
-    if (!hiddenAt) hiddenAt = Date.now();
+    awayClock.hide(Date.now());
     // Only a call can be suspended. Hiding an idle page is not an event.
     if (voiceCall().session.socket) {
       voiceCall().hiddenDuringCall = true;
@@ -10496,8 +10501,7 @@ function onVisibility() {
     return;
   }
   voiceCall().visibleAt = Date.now();
-  const away = hiddenAt ? voiceCall().visibleAt - hiddenAt : 0;
-  hiddenAt = 0;
+  const away = awayClock.show(voiceCall().visibleAt);
   // `#195 send-resilience`. A phone holds a hidden page's timers; a send whose wait ran out while
   // the reader was away goes now, not a further wait after they are back.
   resumeOutgoingRetries();

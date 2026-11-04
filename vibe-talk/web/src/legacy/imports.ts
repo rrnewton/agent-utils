@@ -34,6 +34,7 @@ export {
   TIMELINE_RECONCILE_MS,
   VISIBLE_REFRESH_MS,
   createArrivalCount,
+  createAwayClock,
   createChannelFollow,
   createChannelInFlight,
   createChannelPoll,
