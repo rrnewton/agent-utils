@@ -40,7 +40,7 @@ use crate::forward_compat::KeptKeys;
 pub const DEFAULT_AFTER: Duration = Duration::from_secs(5 * 60);
 /// The waits between one episode's warnings, as multiples of the alarm's duration: after the
 /// first warning, after the second, and so on; the last repeats.
-const BACKOFF: [u64; 5] = [1, 3, 6, 12, 36];
+pub(crate) const BACKOFF: [u64; 5] = [1, 3, 6, 12, 36];
 /// The saved episode, in the state directory.
 pub(crate) const STATE_FILE: &str = "owner-alarm.json";
 /// The operator's acknowledgement or snooze, in the state directory.
@@ -156,7 +156,7 @@ pub(crate) struct OwnerAlarm {
 /// The kind of `reason`, which the backoff follows rather than its exact words: the words
 /// change with every attempt (a pane, a count of characters), the kind only when something
 /// different holds the requests.
-fn reason_kind(reason: &str, disagreement: bool) -> &'static str {
+pub(crate) fn reason_kind(reason: &str, disagreement: bool) -> &'static str {
     if disagreement {
         "status-disagreement"
     } else if reason.contains("did not type") || reason.contains("last status=staged") {

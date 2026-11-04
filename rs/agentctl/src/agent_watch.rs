@@ -823,6 +823,12 @@ struct WatchState {
     /// last reported, so the notice repeats every `owner_stuck` until they are delivered.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     owner_stuck_reported: BTreeMap<String, f64>,
+    /// For each agent whose owner requests wait undelivered and were reported, the backoff
+    /// episode (#840 watch-notice-backoff): the kind of reason, how many notices, when the next
+    /// is due, and the last notice's message ID, which a repeat replaces while it is unread.
+    /// `owner_stuck_reported` keeps the last notice time for older builds.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    owner_stuck_backoff: BTreeMap<String, OwnerStuckEpisode>,
     /// Each probable-misroute quarantine reported, as `AGENT/ID`, with when it was quarantined,
     /// so each is reported once; forgotten once older than [`QUARANTINE_LOOKBACK_SECONDS`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -991,6 +997,13 @@ pub trait Notifier {
     /// as a priority sender. The default sends it as any other.
     fn notify_urgent(&mut self, coordinator: &str, text: &str, message_id: &str) -> Result<String> {
         self.notify(coordinator, text, message_id)
+    }
+    /// Withdraw an earlier notice from `recipient`'s queue so a newer one replaces it (#840
+    /// watch-notice-backoff): a copy still waiting there is never typed, and one already
+    /// typed is left alone. Returns the queue's outcome. The default cannot withdraw.
+    fn withdraw(&mut self, recipient: &str, message_id: &str) -> Result<String> {
+        let _ = (recipient, message_id);
+        Err(fail("this notifier cannot withdraw notices"))
     }
     /// Press Enter on a draft agentctl itself typed that sits unsent in
     /// `agent`'s editor, verifying the editor cleared (#731
@@ -3021,15 +3034,36 @@ fn report_delivery_jams(
     rows
 }
 
+/// One agent's owner-stuck notice episode (#840 watch-notice-backoff).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+struct OwnerStuckEpisode {
+    /// The kind of reason the notices gave (`owner_alarm::reason_kind`); a change restarts the
+    /// backoff.
+    kind: String,
+    /// Notices sent in this episode at the current kind.
+    step: u32,
+    /// When the last notice was queued (Unix seconds).
+    last_at: f64,
+    /// When the next notice is due (Unix seconds).
+    next_at: f64,
+    /// The last notice's queue message ID, withdrawn when a repeat replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_id: Option<String>,
+}
+
 /// Report each agent whose owner (chat-bridge) requests have waited undelivered in its queue
-/// longer than `--owner-stuck-minutes`, with how many, how long, and the reason the last attempt
-/// gave, and report it again every as many minutes until they are delivered (#720
-/// agentctl-muse-stale-draft); about the coordinator itself, whose own queue the notice would
-/// wait in, once per episode. A request that waits only because its agent is busy is no fault
-/// and is not counted. Behind a draft in the agent's editor, for one, every delivery is
-/// refused while the agent can look busy all the while, so nothing else would say so. The notice
-/// goes to the coordinator as a priority sender. Returns a row for every agent with an owner
-/// request waiting, for the pass report.
+/// longer than `--owner-stuck-minutes`, with how many, since when, and the reason the last
+/// attempt gave (#720 agentctl-muse-stale-draft). Repeats back off (#840 watch-notice-backoff,
+/// the schedule of the chat bridge's owner alarm, #830): after 1, 3, 6 and 12 thresholds, then
+/// every 36, restarting at one threshold after the last notice when the kind of reason changes.
+/// Each notice names the time it was written (ET) and the age of the oldest held request, and a
+/// repeat first withdraws the previous copy from the coordinator's queue, so at most one copy
+/// waits there. About the coordinator itself, whose own queue the notice would wait in, it is
+/// sent once per episode. A request that waits only because its agent is busy is no fault and
+/// is not counted. Behind a draft in the agent's editor, for one, every delivery is refused
+/// while the agent can look busy all the while, so nothing else would say so. The notice goes
+/// to the coordinator as a priority sender. Returns a row for every agent with an owner request
+/// waiting, for the pass report.
 fn report_waiting_owner_prompts(
     probe: &mut dyn Probe,
     notifier: &mut dyn Notifier,
@@ -3037,8 +3071,10 @@ fn report_waiting_owner_prompts(
     now: f64,
     options: &WatchAgentsOptions,
 ) -> Vec<Value> {
+    use crate::chat_service::owner_alarm::{reason_kind, BACKOFF};
     if options.owner_stuck.is_zero() {
         state.owner_stuck_reported.clear();
+        state.owner_stuck_backoff.clear();
         return Vec::new();
     }
     let threshold = options.owner_stuck.as_secs_f64();
@@ -3051,6 +3087,7 @@ fn report_waiting_owner_prompts(
     }
     let mut rows = Vec::new();
     let mut still = BTreeMap::new();
+    let mut episodes = BTreeMap::new();
     for (agent, mut prompts) in by_agent {
         prompts.sort_by(|left, right| left.queued_at.total_cmp(&right.queued_at));
         let oldest = (now - prompts[0].queued_at).max(0.0);
@@ -3072,42 +3109,123 @@ fn report_waiting_owner_prompts(
             .find_map(|prompt| prompt.reason.as_deref())
             .unwrap_or("no attempt has recorded why");
         row["reason"] = json!(reason);
-        let last = state.owner_stuck_reported.get(&agent).copied();
+        let kind = reason_kind(reason, false);
+        // The episode as it stands: a changed kind of reason restarts the backoff, one
+        // threshold after the last notice.
+        let episode = state
+            .owner_stuck_backoff
+            .get(&agent)
+            .cloned()
+            .or_else(|| {
+                // A state written by an older build knows only when it last told.
+                state
+                    .owner_stuck_reported
+                    .get(&agent)
+                    .map(|at| OwnerStuckEpisode {
+                        kind: kind.to_owned(),
+                        step: 1,
+                        last_at: *at,
+                        next_at: at + threshold,
+                        message_id: None,
+                    })
+            })
+            .map(|mut episode| {
+                if episode.kind != kind {
+                    episode.kind = kind.to_owned();
+                    episode.step = 0;
+                    episode.next_at = episode.last_at + threshold;
+                }
+                episode
+            });
         // A notice about the coordinator's own queue waits in that same queue, so it is sent
         // once per episode: repeats would only pile up behind whatever holds the queue.
-        if last.is_some_and(|at| now - at < threshold || agent == options.coordinator) {
-            still.insert(agent.clone(), last.unwrap_or(now));
+        let due = match &episode {
+            None => true,
+            Some(_) if agent == options.coordinator => false,
+            Some(episode) => now >= episode.next_at,
+        };
+        if !due {
+            if let Some(episode) = episode {
+                still.insert(agent.clone(), episode.last_at);
+                row["next_notice_in_seconds"] = json!((episode.next_at - now).max(0.0).round());
+                episodes.insert(agent.clone(), episode);
+            }
             row["reported"] = json!(true);
-        } else if options.check_only {
+            rows.push(row);
+            continue;
+        }
+        if options.check_only {
             row["due"] = json!(true);
+            if let Some(episode) = episode {
+                still.insert(agent.clone(), episode.last_at);
+                episodes.insert(agent.clone(), episode);
+            }
+            rows.push(row);
+            continue;
+        }
+        let step = episode.as_ref().map_or(0, |episode| episode.step) + 1;
+        let wait = threshold * BACKOFF[(step as usize - 1).min(BACKOFF.len() - 1)] as f64;
+        let held_since = stuck[0].queued_at;
+        let held_minutes = ((now - held_since).max(0.0) / 60.0).floor();
+        let next = if agent == options.coordinator {
+            "It is sent once while this lasts, since it waits in the same queue.".to_owned()
         } else {
-            let minutes = (oldest / 60.0).floor();
-            let text = format!(
-                "[agentctl watch-agents] the owner's chat messages to {agent} are not being \
-                 delivered: {} request(s) waiting, the oldest for {minutes:.0} min. Why: {reason}. \
-                 {}This notice repeats every {} min until they are delivered.",
-                stuck.len(),
-                owner_wait_hint(&agent, reason),
-                threshold as u64 / 60
-            );
-            let message_id = format!("agent-watch-owner-stuck-{agent}-{}", now as u64);
-            match notifier.notify_urgent(&options.coordinator, &text, &message_id) {
+            format!(
+                "The next reminder comes in {} min unless they are delivered, and replaces this \
+                 one if it is still unread.",
+                (wait / 60.0).round()
+            )
+        };
+        let text = format!(
+            "[agentctl watch-agents] {}: the owner's chat messages to {agent} are not being \
+             delivered: {} request(s) waiting, the oldest for {held_minutes:.0} min (since {}). \
+             Why: {reason}. {}{next}",
+            crate::chat_trace::et_clock(now),
+            stuck.len(),
+            crate::chat_trace::et_clock(held_since),
+            owner_wait_hint(&agent, reason),
+        );
+        // Replace, never append: the previous copy, if still unread, is withdrawn first.
+        if let Some(previous) = episode
+            .as_ref()
+            .and_then(|episode| episode.message_id.as_deref())
+        {
+            match notifier.withdraw(&options.coordinator, previous) {
                 Ok(outcome) => {
-                    still.insert(agent.clone(), now);
-                    row["reported"] = json!(true);
-                    row["outcome"] = json!(outcome);
+                    row["replaced"] = json!({"message_id": previous, "outcome": outcome})
                 }
-                Err(error) => {
-                    if let Some(at) = last {
-                        still.insert(agent.clone(), at);
-                    }
-                    row["error"] = json!(error.to_string());
+                Err(error) => row["replace_error"] = json!(error.to_string()),
+            }
+        }
+        let message_id = format!("agent-watch-owner-stuck-{agent}-{}", now as u64);
+        match notifier.notify_urgent(&options.coordinator, &text, &message_id) {
+            Ok(outcome) => {
+                still.insert(agent.clone(), now);
+                episodes.insert(
+                    agent.clone(),
+                    OwnerStuckEpisode {
+                        kind: kind.to_owned(),
+                        step,
+                        last_at: now,
+                        next_at: now + wait,
+                        message_id: Some(message_id),
+                    },
+                );
+                row["reported"] = json!(true);
+                row["outcome"] = json!(outcome);
+            }
+            Err(error) => {
+                if let Some(episode) = episode {
+                    still.insert(agent.clone(), episode.last_at);
+                    episodes.insert(agent.clone(), episode);
                 }
+                row["error"] = json!(error.to_string());
             }
         }
         rows.push(row);
     }
     state.owner_stuck_reported = still;
+    state.owner_stuck_backoff = episodes;
     rows
 }
 
@@ -4708,6 +4826,17 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
         )
     }
 
+    fn withdraw(&mut self, recipient: &str, message_id: &str) -> Result<String> {
+        let result = ManagedAgents::new(self.client, &self.registry)?.cancel_message(
+            recipient,
+            message_id,
+            "replaced by a newer watch-agents notice",
+        )?;
+        Ok(result["outcome"]
+            .as_str()
+            .map_or_else(|| result["outcome"].to_string(), str::to_owned))
+    }
+
     fn flush_draft(&mut self, agent: &str) -> Result<String> {
         ManagedAgents::new(self.client, &self.registry)?.flush_stale_draft(agent)
     }
@@ -5233,7 +5362,10 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("`agentctl attach coord5`"), "{text}");
-        assert!(text.contains("repeats every 5 min"), "{text}");
+        assert!(
+            text.contains("The next reminder comes in 5 min unless they are delivered"),
+            "{text}"
+        );
         assert_eq!(notifier.urgent, vec![id.clone()]);
         // Not again within the threshold; again once it has passed.
         watch_agents_once(&mut probe, &mut notifier, &mut state, 1_500.0, &options);
@@ -5243,6 +5375,12 @@ mod tests {
         assert!(notifier.sent[1]
             .1
             .contains("2 request(s) waiting, the oldest for 10 min"));
+        // The repeat replaced the first copy instead of piling up behind it (#840).
+        let first_id = notifier.sent[0].2.clone();
+        assert_eq!(
+            notifier.withdrawn,
+            vec![("coordinator".to_owned(), first_id)]
+        );
         // Delivered: the episode ends, and a new one starts its own clock.
         probe.waiting.clear();
         let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_660.0, &options);
@@ -5264,6 +5402,145 @@ mod tests {
         let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 9_000.0, &off);
         assert_eq!(report["owner_waits"], json!([]));
         assert_eq!(notifier.sent.len(), 3);
+    }
+
+    #[test]
+    fn owner_stuck_notices_back_off_reset_on_a_new_reason_and_replace_the_unread_copy() {
+        // #840 watch-notice-backoff, on a fake clock: 2026-11-04 19:00 ET is T0.
+        const T0: f64 = 1_793_836_800.0;
+        let minute = 60.0;
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let draft = "pane wJ:pGY did not become idle/done within 0s; last status=staged: pane \
+                     wJ:pGY: the Muse editor holds a draft that agentctl did not type (9 \
+                     characters on 1 row(s))";
+        let mut probe = DeliveryProbe {
+            waiting: vec![waiting("lane", "chat-a", T0, draft)],
+            ..DeliveryProbe::default()
+        };
+        // Four hours, one pass a minute: notices at 5, 10, 25, 55 and 115 min, then every
+        // 3 h (295 min), never every 5 min.
+        let mut at = Vec::new();
+        for step in 0..=240 {
+            let now = T0 + f64::from(step) * minute;
+            let before = notifier.sent.len();
+            watch_agents_once(&mut probe, &mut notifier, &mut state, now, &options);
+            if notifier.sent.len() > before {
+                at.push(step);
+            }
+        }
+        assert_eq!(at, [5, 10, 25, 55, 115], "{:?}", notifier.sent);
+        // Each names the time (ET) and the age, and says when the next comes.
+        let first = &notifier.sent[0].1;
+        assert!(
+            first.starts_with(
+                "[agentctl watch-agents] 19:05 ET: the owner's chat messages to lane are not \
+                 being delivered: 1 request(s) waiting, the oldest for 5 min (since 19:00 ET)."
+            ),
+            "{first}"
+        );
+        assert!(
+            first.contains("The next reminder comes in 5 min"),
+            "{first}"
+        );
+        assert!(
+            notifier.sent[4]
+                .1
+                .starts_with("[agentctl watch-agents] 20:55 ET:"),
+            "{}",
+            notifier.sent[4].1
+        );
+        assert!(
+            notifier.sent[4]
+                .1
+                .contains("the oldest for 115 min (since 19:00 ET)"),
+            "{}",
+            notifier.sent[4].1
+        );
+        assert!(
+            notifier.sent[4]
+                .1
+                .contains("The next reminder comes in 180 min"),
+            "{}",
+            notifier.sent[4].1
+        );
+        // Every repeat withdrew the copy before it: one copy at most waits in the queue.
+        let ids: Vec<&String> = notifier.sent.iter().map(|(_, _, id)| id).collect();
+        let withdrawn: Vec<&String> = notifier.withdrawn.iter().map(|(_, id)| id).collect();
+        assert_eq!(withdrawn, ids[..ids.len() - 1].to_vec());
+        // A different kind of reason restarts the backoff, one interval after the last notice.
+        probe.waiting = vec![waiting(
+            "lane",
+            "chat-a",
+            T0,
+            "refusing input to agent 'lane': the anchored claude process (pid 7) has exited",
+        )];
+        let before = notifier.sent.len();
+        watch_agents_once(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            T0 + 241.0 * minute,
+            &options,
+        );
+        assert_eq!(
+            notifier.sent.len(),
+            before + 1,
+            "115 + 5 is long past: due at once"
+        );
+        assert!(notifier.sent[before]
+            .1
+            .contains("The next reminder comes in 5 min"));
+        watch_agents_once(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            T0 + 245.0 * minute,
+            &options,
+        );
+        assert_eq!(notifier.sent.len(), before + 1);
+        watch_agents_once(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            T0 + 246.0 * minute,
+            &options,
+        );
+        assert_eq!(notifier.sent.len(), before + 2, "then 1x, 3x, ... again");
+        // Delivered: the episode ends.
+        probe.waiting.clear();
+        watch_agents_once(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            T0 + 247.0 * minute,
+            &options,
+        );
+        assert!(state.owner_stuck_backoff.is_empty());
+        assert!(state.owner_stuck_reported.is_empty());
+    }
+
+    #[test]
+    fn a_state_from_an_older_watcher_carries_its_last_notice_into_the_backoff() {
+        let options = options();
+        let mut state = WatchState::default();
+        state
+            .owner_stuck_reported
+            .insert("lane".to_owned(), 1_000.0);
+        let mut notifier = RecordingNotifier::default();
+        let mut probe = DeliveryProbe {
+            waiting: vec![waiting("lane", "chat-a", 0.0, "a draft is there")],
+            ..DeliveryProbe::default()
+        };
+        // The older watcher told at 1,000 s: the next is one interval later, then 3x.
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 1_200.0, &options);
+        assert!(notifier.sent.is_empty());
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 1_300.0, &options);
+        assert_eq!(notifier.sent.len(), 1);
+        assert!(notifier.sent[0]
+            .1
+            .contains("The next reminder comes in 15 min"));
     }
 
     #[test]
@@ -5376,9 +5653,17 @@ mod tests {
         flushes: Vec<String>,
         /// Whether every flush attempt fails (#731).
         flush_fails: bool,
+        /// Notices withdrawn so a newer one replaces them, as (recipient, message ID) (#840).
+        withdrawn: Vec<(String, String)>,
     }
 
     impl Notifier for RecordingNotifier {
+        fn withdraw(&mut self, recipient: &str, message_id: &str) -> Result<String> {
+            self.withdrawn
+                .push((recipient.to_owned(), message_id.to_owned()));
+            Ok("set_aside".to_owned())
+        }
+
         fn flush_draft(&mut self, agent: &str) -> Result<String> {
             self.flushes.push(agent.to_owned());
             if self.flush_fails {

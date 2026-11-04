@@ -587,16 +587,31 @@ impl Collector {
 /// the first Sunday of November).
 #[must_use]
 pub fn et_date(unix_secs: f64) -> String {
+    let et_days = ((unix_secs + et_offset_secs(unix_secs)).div_euclid(86_400.0)) as i64;
+    let (yy, mm, dd) = civil_from_days(et_days);
+    format!("{yy:04}-{mm:02}-{dd:02}")
+}
+
+/// The ET wall-clock time of a Unix time as `HH:MM ET`, with the DST rule of [`et_date`].
+#[must_use]
+pub fn et_clock(unix_secs: f64) -> String {
+    let seconds = (unix_secs + et_offset_secs(unix_secs)).rem_euclid(86_400.0) as u64;
+    format!("{:02}:{:02} ET", seconds / 3600, seconds / 60 % 60)
+}
+
+/// The ET offset from UTC in seconds at a Unix time (EDT -4 h, EST -5 h).
+fn et_offset_secs(unix_secs: f64) -> f64 {
     // Decide DST from the ET-local date: try EST, and if that local date
     // is in the DST window the offset is EDT (the one-hour ambiguity on
     // change days resolves to the post-change offset within the day).
     let est_days = ((unix_secs - 5.0 * 3600.0).div_euclid(86_400.0)) as i64;
     let (y, _, _) = civil_from_days(est_days);
     let in_dst = (nth_sunday(y, 3, 2)..nth_sunday(y, 11, 1)).contains(&est_days);
-    let offset = if in_dst { -4.0 * 3600.0 } else { -5.0 * 3600.0 };
-    let et_days = ((unix_secs + offset).div_euclid(86_400.0)) as i64;
-    let (yy, mm, dd) = civil_from_days(et_days);
-    format!("{yy:04}-{mm:02}-{dd:02}")
+    if in_dst {
+        -4.0 * 3600.0
+    } else {
+        -5.0 * 3600.0
+    }
 }
 
 fn nth_sunday(year: i64, month: i64, n: i64) -> i64 {

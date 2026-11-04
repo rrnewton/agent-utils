@@ -1377,11 +1377,16 @@ are sent as priority notices, ahead of ordinary sends, to the coordinator:
   is no fault and is not counted. The notice names the agent, how many of the
   owner's requests wait and how long the oldest has, and the reason the last
   attempt recorded, such as a draft agentctl did not type in the agent's
-  editor, with what to do about it. It is sent again every
-  `--owner-stuck-minutes` until the requests are delivered, since the agent can
-  look busy all the while (a Muse agent with scheduled tasks keeps starting
-  turns); about the coordinator's own queue, where the notice itself waits, it
-  is sent once per episode. The pass is not `ok` while
+  editor, with what to do about it, and it opens with the time it was written
+  (ET) and says since when the oldest request has waited. It is sent again
+  until the requests are delivered, since the agent can look busy all the while
+  (a Muse agent with scheduled tasks keeps starting turns), with a backoff
+  (`watch-agents`): after 1, 3, 6 and 12 times `--owner-stuck-minutes`, then
+  every 36 times (with the default 5: at 5, 10, 25, 55 and 115 minutes, then
+  every 3 hours), restarting when the kind of reason changes. Each repeat
+  first withdraws the previous copy from the coordinator's queue if it is
+  still unread, so copies never pile up there. About the coordinator's own
+  queue, where the notice itself waits, it is sent once per episode. The pass is not `ok` while
   one is held, and its JSON lists every agent with an owner request waiting
   under `owner_waits`.
 - A prompt a drain quarantined as a PROBABLE MISROUTE (it may have reached
