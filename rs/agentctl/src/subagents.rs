@@ -9754,7 +9754,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     /// Resolve and verify the exact live pane owned by one registered agent.
     pub fn pane_info(&self, agent_name: &str) -> Result<AgentPaneInfo> {
-        self.checked(&self.load(agent_name)?)
+        let record = self.load(agent_name)?;
+        if record.is_cloud() {
+            return self.cloud_pane_info(&record);
+        }
+        self.checked(&record)
     }
 
     /// Move one owned interactive agent into the workspace required by the
@@ -10044,6 +10048,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<AgentPaneInfo> {
         let _lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
+        if record.is_cloud() {
+            return self.cloud_pane_info(&record);
+        }
         agent::resolve_target_with_runtime(
             &WorkspaceClient {
                 client: self.client,
@@ -10570,6 +10577,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<Option<String>> {
         let _lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
+        if record.is_cloud() {
+            // Journaled at once; there is no queue that could also be typed.
+            self.cloud_send_record(&record, text, Some(message_id))?;
+            return Ok(None);
+        }
         record.input_allowed()?;
         let queue = self.queue(&record.name)?;
         let queued = agent::queued_prompts(&queue)?;
@@ -11048,6 +11060,12 @@ its drain would also type, so it was not queued",
     ) -> Result<bool> {
         let _lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
+        // A cloud prompt is journaled into its session at submission; there
+        // is no queued copy to take back, and its message state already
+        // answers Processed, so a repoint never needs this to move it.
+        if record.is_cloud() {
+            return Ok(false);
+        }
         // A headless agent's wrapper drains its queue under the same delivery lock, so a prompt
         // still in its inbox can be taken back as safely as a pane agent's (#677
         // chat-bridge-repoint).
@@ -11138,6 +11156,10 @@ its drain would also type, so it was not queued",
         if record.is_headless() {
             return self.headless_message_state(agent_name, message_id);
         }
+        if record.is_cloud() {
+            // Journaled at submission: delivered, with no queue state.
+            return Ok(Some(agent::QueueMessageState::Processed));
+        }
         record.supported()?;
         agent::message_state(&self.queue(agent_name)?, message_id)
     }
@@ -11152,6 +11174,10 @@ its drain would also type, so it was not queued",
         let record = self.load(agent_name)?;
         if record.is_headless() {
             return self.headless_message_state(agent_name, message_id);
+        }
+        if record.is_cloud() {
+            // Journaled at submission: delivered, with no queue state.
+            return Ok(Some(agent::QueueMessageState::Processed));
         }
         record.supported()?;
         agent::message_state(&self.queue(agent_name)?, message_id)
@@ -11197,6 +11223,36 @@ its drain would also type, so it was not queued",
     ) -> Result<QueueResult> {
         if record.is_headless() {
             return self.send_headless_record(record, text, message_id, &options);
+        }
+        if record.is_cloud() {
+            // Journaled into the session at once, as `agentctl send` does
+            // for a cloud agent: delivered means the orchestrator holds it.
+            let generated;
+            let identifier = match message_id {
+                Some(identifier) => identifier,
+                None => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|error| fail(error.to_string()))?;
+                    generated = format!(
+                        "agentctl-{}-{}-{}",
+                        record.name,
+                        now.as_nanos(),
+                        std::process::id()
+                    );
+                    &generated
+                }
+            };
+            self.cloud_send_record(record, text, Some(identifier))?;
+            return Ok(agent::QueueResult {
+                message_id: identifier.to_owned(),
+                delivered: vec![identifier.to_owned()],
+                quarantined: Vec::new(),
+                pending: Vec::new(),
+                cancelled: Vec::new(),
+                blocked: None,
+                outcome: agent::QueueOutcome::Delivered,
+            });
         }
         record.input_allowed()?;
         let queue = self.queue(&record.name)?;
@@ -11414,6 +11470,19 @@ its drain would also type, so it was not queued",
 
     /// Drain only prompts known not to have been injected.
     pub fn drain(&self, agent_name: &str, options: DrainOptions) -> Result<QueueResult> {
+        // A cloud agent has no queue to drain: its prompts were journaled
+        // into its session at submission.
+        if self.is_cloud(agent_name).unwrap_or(false) {
+            return Ok(agent::QueueResult {
+                message_id: String::new(),
+                delivered: Vec::new(),
+                quarantined: Vec::new(),
+                pending: Vec::new(),
+                cancelled: Vec::new(),
+                blocked: None,
+                outcome: agent::QueueOutcome::Delivered,
+            });
+        }
         // A drain asked to terminate ends its waits and releases its locks (#734
         // chat-status-disagreement); only send/drain install this, so other commands
         // keep their own signal handling.
@@ -11526,6 +11595,19 @@ its drain would also type, so it was not queued",
         if record.is_headless() {
             return self.wake_headless_record(lock, &record);
         }
+        if record.is_cloud() {
+            // Journaled at submission; nothing waits in a queue.
+            drop(lock);
+            return Ok(agent::QueueResult {
+                message_id: String::new(),
+                delivered: Vec::new(),
+                quarantined: Vec::new(),
+                pending: Vec::new(),
+                cancelled: Vec::new(),
+                blocked: None,
+                outcome: agent::QueueOutcome::Delivered,
+            });
+        }
         record.input_allowed()?;
         let queue = self.queue(&record.name)?;
         agent::drain_managed_with_runtime(
@@ -11625,6 +11707,11 @@ its drain would also type, so it was not queued",
     pub(crate) fn read_capture(&self, agent_name: &str, lines: usize) -> Result<String> {
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
+        if record.is_cloud() {
+            let text = self.cloud_capture_record(&record, lines)?;
+            self.snapshot(&record, &text)?;
+            return Ok(text);
+        }
         self.checked_policy(&record, false)?;
         let text = agent::read_capture(self.client, &self.target(&record)?, lines)?;
         self.snapshot(&record, &text)?;
@@ -11668,6 +11755,15 @@ its drain would also type, so it was not queued",
         // only through `agentctl chat reply`, and no screen holds a reply block.
         if record.is_headless() {
             return Ok(String::new());
+        }
+        // A cloud agent's replies are its session's own text blocks, read
+        // from its journal — never a scrape of its `agentterm` pane.
+        if record.is_cloud() {
+            let text = self.cloud_capture_record(&record, lines)?;
+            if persist {
+                self.snapshot(&record, &text)?;
+            }
+            return Ok(text);
         }
         let target = self.policy_target(&record)?;
         let info = agent::resolve_target_with_runtime(

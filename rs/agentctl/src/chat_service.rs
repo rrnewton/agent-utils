@@ -1770,6 +1770,10 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     // its queue, which its wrapper drains, and it replies only through `chat reply` (#594
     // headless-slack-trial).
     let headless = manager.is_headless(&state.config().agent_name)?;
+    // A cloud target is not command-only (its markers are read from its
+    // session output), but its prompt is journaled at submission, which is
+    // when its receipt belongs, as with a headless target's started prompt.
+    let cloud = manager.is_cloud(&state.config().agent_name)?;
     let prompt_commands = settings
         .registry
         .as_deref()
@@ -1781,7 +1785,7 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         .with_prompt_commands(prompt_commands)
         .with_reply_command_offered(offer_reply_command)
         .with_command_only_replies(headless)
-        .with_receipt_when_started(headless)
+        .with_receipt_when_started(headless || cloud)
         .with_latency_profile(Some(manager.registry().to_path_buf()), headless);
     // A headless coordinator's screen is never read, so it needs no clean text for screen
     // blocks; every other coordinator's reply text comes from its transcript where that holds it

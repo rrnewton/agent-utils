@@ -4470,6 +4470,16 @@ fn chat_target(
     let caller = |candidate: &Path| -> Option<String> {
         let client = HerdrClient::with_executable("direct", herdr_bin).ok()?;
         let manager = ManagedAgents::new(&client, candidate).ok()?;
+        // Inside an agentcloud session there is no local harness process to
+        // find in the ancestry: the session itself names the caller.
+        if let Some(session) = std::env::var("AGENTCLOUD_SESSION_ID")
+            .ok()
+            .filter(|session| !session.is_empty())
+        {
+            if let Some(agent) = manager.agent_for_cloud_session(&session) {
+                return Some(agent);
+            }
+        }
         manager.caller_edge().map(|edge| edge.agent)
     };
     crate::chat_lookup::resolve(

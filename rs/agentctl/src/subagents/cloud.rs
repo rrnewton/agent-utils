@@ -419,6 +419,34 @@ fn with_endpoint(mut arguments: Vec<String>, endpoint: &str) -> Vec<String> {
 /// Fleet listings fetched during one invocation, keyed by endpoint.
 pub(crate) type FleetCache = BTreeMap<String, std::result::Result<Vec<Value>, String>>;
 
+/// The assistant text of a session's journal, from `agentcloudctl history
+/// --raw` (one WireFrame JSON per line): every `block` event whose block is
+/// text, in journal order. Prompts, tool traffic and thinking are not the
+/// agent's printed replies, so only text blocks are the session's output —
+/// this is what a chat bridge scans for `<CHAT_REPLY_NNN>` markers, never a
+/// scrape of the `agentterm` pane.
+pub(super) fn reply_text_from_history(jsonl: &str) -> String {
+    let mut blocks = Vec::new();
+    for line in jsonl.lines() {
+        let Ok(frame) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let event = &frame["event"];
+        if event["type"].as_str() != Some("block") {
+            continue;
+        }
+        let block = &event["block"];
+        if block["kind"].as_str() == Some("text") {
+            if let Some(text) = block["text"].as_str() {
+                if !text.is_empty() {
+                    blocks.push(text.to_owned());
+                }
+            }
+        }
+    }
+    blocks.join("\n")
+}
+
 /// A fleet-listing activity word such as `waiting`; never a session identity.
 fn valid_activity(value: &str) -> bool {
     (1..=32).contains(&value.len())
@@ -1348,7 +1376,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         Ok(result)
     }
 
-    fn cloud_send_record(
+    pub(super) fn cloud_send_record(
         &self,
         record: &AgentRecord,
         text: &str,
@@ -1659,6 +1687,88 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         };
         self.snapshot(&record, &text)?;
         Ok(text)
+    }
+
+    /// What a chat bridge reads of a cloud agent: the session's own recent
+    /// assistant text (its journal's text blocks), bounded to the last
+    /// `lines` lines. The caller holds the agent's lock. A session whose
+    /// journal cannot be read answers with the probe error, so a bridge
+    /// pass fails loudly instead of scanning an empty screen forever.
+    pub(super) fn cloud_capture_record(
+        &self,
+        record: &AgentRecord,
+        lines: usize,
+    ) -> Result<String> {
+        let session = self.cloud_session_of(record)?;
+        let executable = resolve_tool(&self.cloud_tools.agentcloudctl, "--agentcloudctl-bin")?;
+        let run = run_tool(
+            &executable,
+            &with_endpoint(
+                vec![
+                    "history".to_owned(),
+                    "--raw".to_owned(),
+                    "--last".to_owned(),
+                    "300".to_owned(),
+                    "--session".to_owned(),
+                    session.to_owned(),
+                ],
+                &self.cloud_endpoint(record)?,
+            ),
+            control_timeout(),
+            self.child_session(),
+        )?;
+        if run.code != Some(0) {
+            return Err(client_error(failure("history", &run)));
+        }
+        let text = reply_text_from_history(&run.stdout);
+        let all: Vec<&str> = text.lines().collect();
+        let start = all.len().saturating_sub(lines.max(1));
+        Ok(all[start..].join("\n"))
+    }
+
+    /// The pane a cloud agent's bridge bookkeeping names: its recorded
+    /// `agentterm` pane, with the session's orchestrator-reported status in
+    /// place of Herdr's harness detection (the pane runs `agentterm`, which
+    /// Herdr never reports as a harness). Only the identity fields the
+    /// bridge compares are promised; `agent` stays `None`.
+    pub(super) fn cloud_pane_info(&self, record: &AgentRecord) -> Result<AgentPaneInfo> {
+        let pane_id = record.pane_id.clone().ok_or_else(|| {
+            fail(format!(
+                "agent {:?} has no recorded agentterm pane; inspect it with `{}`",
+                record.name,
+                self.agentctl_command(&["status", &record.name])
+            ))
+        })?;
+        let status = self.cloud_status_record(record, &mut FleetCache::new())?;
+        let agent_status = status["agent_status"].as_str().unwrap_or("unknown");
+        Ok(AgentPaneInfo {
+            pane_id,
+            workspace_id: record.workspace_id.clone().unwrap_or_default(),
+            cwd: record.cwd.clone(),
+            agent: None,
+            status: agent_status.to_owned(),
+            session_agent: Some(record.name.clone()),
+            session_value: record.session_value.clone(),
+            scroll: None,
+            terminal_id: record.terminal_id.clone(),
+            tab_id: record.tab_id.clone(),
+            reported_status: None,
+        })
+    }
+
+    /// The registered agentcloud agent running session `session`, when one
+    /// is registered here: how a process inside that session (a chat reply,
+    /// say) names the agent it acts as, since no local harness process of
+    /// its exists in any ancestry on this host.
+    pub fn agent_for_cloud_session(&self, session: &str) -> Option<String> {
+        if session.is_empty() {
+            return None;
+        }
+        self.registered_names().ok()?.into_iter().find(|name| {
+            self.load(name).is_ok_and(|record| {
+                record.is_cloud() && record.session_value.as_deref() == Some(session)
+            })
+        })
     }
 
     /// Focus the agent's terminal tab after confirming it is still the recorded pane.
@@ -2963,33 +3073,80 @@ exit 0
     }
 
     #[test]
+    fn bridge_paths_deliver_capture_and_name_a_cloud_coordinator() {
+        // The chat bridge drives a cloud target through the same manager
+        // paths as any other: submission journals into the session, the
+        // queue state answers delivered, capture reads the session's own
+        // text blocks, and the session names its agent.
+        let fixture = Fixture::new();
+        fixture.list_row(false);
+        fixture.start(None).unwrap();
+        let manager = fixture.manager();
+        let sent = manager
+            .send("sub-worker", "bridge prompt", DrainOptions::default())
+            .unwrap();
+        assert_eq!(sent.outcome, crate::agent::QueueOutcome::Delivered);
+        assert_eq!(sent.delivered.len(), 1);
+        assert!(fixture.verbs().contains(&"send".to_owned()));
+        assert_eq!(
+            manager.message_state("sub-worker", "any-id").unwrap(),
+            Some(crate::agent::QueueMessageState::Processed)
+        );
+        let drained = manager
+            .drain("sub-worker", DrainOptions::default())
+            .unwrap();
+        assert!(drained.delivered.is_empty() && drained.pending.is_empty());
+        let info = manager.pane_info("sub-worker").unwrap();
+        assert_eq!(info.pane_id, "cloud-pane");
+        assert_eq!(info.status, "idle");
+        fixture.respond(
+            "history",
+            Some(
+                "{\"frame\":\"durable\",\"event\":{\"type\":\"block\",\"block\":{\"kind\":\"thinking\",\"text\":\"secret\"}}}\n\
+                 {\"frame\":\"durable\",\"event\":{\"type\":\"block\",\"block\":{\"kind\":\"text\",\"text\":\"<CHAT_REPLY_ABC_1>\\nhi owner\\n</CHAT_REPLY_ABC_1>\"}}}\n",
+            ),
+            None,
+            None,
+        );
+        let captured = manager.read_capture("sub-worker", 100).unwrap();
+        assert!(captured.contains("<CHAT_REPLY_ABC_1>"), "{captured}");
+        assert!(!captured.contains("secret"), "{captured}");
+        assert_eq!(
+            manager.agent_for_cloud_session(SESSION).as_deref(),
+            Some("sub-worker")
+        );
+        assert_eq!(manager.agent_for_cloud_session("no-such-session"), None);
+    }
+
+    #[test]
+    fn reply_text_keeps_only_text_blocks() {
+        let jsonl = concat!(
+            "{\"event\":{\"type\":\"input\",\"text\":\"prompt\"}}\n",
+            "{\"event\":{\"type\":\"block\",\"block\":{\"kind\":\"tool_use\",\"text\":\"tool\"}}}\n",
+            "{\"event\":{\"type\":\"block\",\"block\":{\"kind\":\"text\",\"text\":\"first\"}}}\n",
+            "not json\n",
+            "{\"event\":{\"type\":\"block\",\"block\":{\"kind\":\"text\",\"text\":\"second\"}}}\n",
+        );
+        assert_eq!(reply_text_from_history(jsonl), "first\nsecond");
+    }
+
+    #[test]
     fn herdr_only_operations_redirect_to_the_cloud_interface() {
         let fixture = Fixture::new();
         fixture.list_row(false);
         fixture.start(None).unwrap();
         let manager = fixture.manager();
-        for message in [
-            manager
-                .drain("sub-worker", DrainOptions::default())
-                .unwrap_err()
-                .to_string(),
-            manager
-                .goal(
-                    "sub-worker",
-                    Some("objective"),
-                    DrainOptions::default(),
-                    None,
-                )
-                .unwrap_err()
-                .to_string(),
-            manager
-                .send("sub-worker", "via herdr", DrainOptions::default())
-                .unwrap_err()
-                .to_string(),
-        ] {
-            assert!(message.contains("agentcloud session"), "{message}");
-            assert!(message.contains("agentctl send"), "{message}");
-        }
+        let message = manager
+            .goal(
+                "sub-worker",
+                Some("objective"),
+                DrainOptions::default(),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("agentcloud session"), "{message}");
+        assert!(message.contains("agentctl send"), "{message}");
         let attached = manager.attach("sub-worker").unwrap();
         assert_eq!(attached["pane_id"], "cloud-pane");
         assert_eq!(*fixture.herdr.focused.lock().unwrap(), ["cloud-pane"]);

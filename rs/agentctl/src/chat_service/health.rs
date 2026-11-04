@@ -112,6 +112,30 @@ fn probe_target<A: ManagedApi + ?Sized>(
                 )),
             ),
         },
+        Ok(false) if manager.is_cloud(agent).unwrap_or(false) => match manager.status(agent) {
+            Ok(status) => {
+                let agent_status = status["agent_status"].as_str().unwrap_or("unknown");
+                let alive = matches!(agent_status, "working" | "idle" | "starting" | "waiting");
+                (
+                    json!({"agent": agent, "headless": false, "cloud": true, "status": agent_status, "alive": alive}),
+                    (!alive).then(|| {
+                        format!(
+                            "agentcloud target {agent} is {agent_status}{}",
+                            status["probe_error"]
+                                .as_str()
+                                .map(|error| format!(": {error}"))
+                                .unwrap_or_default()
+                        )
+                    }),
+                )
+            }
+            Err(error) => (
+                json!({"agent": agent, "headless": false, "cloud": true, "alive": false, "problem": error.to_string()}),
+                Some(format!(
+                    "agentcloud target {agent}'s status is unreadable: {error}"
+                )),
+            ),
+        },
         Ok(false) => match manager.pane_info(agent) {
             Ok(info) => {
                 let problem = info.agent.is_none().then(|| {

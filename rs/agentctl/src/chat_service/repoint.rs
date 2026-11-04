@@ -28,12 +28,41 @@ pub const EXIT_REFUSED: i32 = 1;
 
 /// Check that `agent` can be the bridge's target, and give the pane it is in: registered, and
 /// either a pane agent whose pane is alive with a harness Herdr recognizes (in `pane` when one is
-/// named), or a headless agent whose wrapper answers. The error says why not.
+/// named), or a headless agent whose wrapper answers, or an agentcloud agent whose session the
+/// orchestrator reports active. The error says why not.
 pub fn validate_target<A: ManagedApi + ?Sized>(
     manager: &ManagedAgents<'_, A>,
     agent: &str,
     pane: Option<&str>,
 ) -> Result<Option<String>, String> {
+    let cloud = manager
+        .is_cloud(agent)
+        .map_err(|error| format!("{agent} is not a usable registered agent: {error}"))?;
+    if cloud {
+        let status = manager.status(agent).map_err(|error| {
+            format!("the status of agentcloud agent {agent} is unreadable: {error}")
+        })?;
+        let recorded_pane = status["pane_id"].as_str().map(str::to_owned);
+        if let (Some(expected), Some(recorded)) = (pane, recorded_pane.as_deref()) {
+            if expected != recorded {
+                return Err(format!(
+                    "{agent} is an agentcloud session viewed in pane {recorded}, not {expected}; \
+                     leave out --pane, or name the recorded pane"
+                ));
+            }
+        }
+        let agent_status = status["agent_status"].as_str().unwrap_or("unknown");
+        return match agent_status {
+            "working" | "idle" | "starting" | "waiting" => Ok(recorded_pane),
+            other => Err(format!(
+                "agentcloud agent {agent} is {other}{}",
+                status["probe_error"]
+                    .as_str()
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default()
+            )),
+        };
+    }
     let headless = manager
         .is_headless(agent)
         .map_err(|error| format!("{agent} is not a usable registered agent: {error}"))?;
@@ -163,12 +192,17 @@ pub(super) fn apply_pending<A: ManagedApi + ?Sized>(
     let Some(request) = state.pending_repoint()? else {
         return Ok(None);
     };
-    // Whether the new agent is headless, learned while validating it, so the retargeted state
-    // does not depend on a second registry read after the outcome is recorded.
+    // Whether the new agent is headless or agentcloud, learned while validating it, so the
+    // retargeted state does not depend on a second registry read after the outcome is recorded.
+    // A headless target replies only by command and is receipted when its wrapper starts a
+    // prompt; a cloud target prints reply markers in its session output (which the bridge
+    // reads) and is receipted when its prompt is journaled, so it is not command-only.
     let headless = std::cell::Cell::new(false);
+    let cloud = std::cell::Cell::new(false);
     let validate = |agent: &str, pane: Option<&str>| {
+        cloud.set(manager.is_cloud(agent).unwrap_or(false));
         let pane_id = validate_target(manager, agent, pane)?;
-        headless.set(pane_id.is_none());
+        headless.set(pane_id.is_none() && !cloud.get());
         Ok(pane_id)
     };
     let previous = PreviousQueue {
@@ -191,10 +225,11 @@ pub(super) fn apply_pending<A: ManagedApi + ?Sized>(
         return Ok(Some((outcome, None)));
     }
     let headless = headless.get();
+    let cloud = cloud.get();
     let next = state
         .retargeted(&outcome.agent_name)
         .with_command_only_replies(headless)
-        .with_receipt_when_started(headless);
+        .with_receipt_when_started(headless || cloud);
     Ok(Some((outcome, Some(next))))
 }
 
