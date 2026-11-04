@@ -1222,10 +1222,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 .find(|pane| pane.pane_id == pane_id)
         });
         let Some(pane) = pane else {
-            return Err(fail(format!(
-                "refusing agent {agent_name:?}: its terminal tab is gone, so its placement in the project workspace {expected:?} cannot be confirmed; inspect it with `{}` or retire it with `{stop}`",
-                self.agentctl_command(&["status", agent_name])
-            )));
+            // No terminal tab: nothing can be typed into the wrong
+            // workspace, because cloud input travels through the
+            // orchestrator, not the tab. A closed `agentterm` tab must
+            // never block a send (the tab is only a viewer); operations
+            // that truly read the tab refuse on their own.
+            return Ok(());
         };
         let actual = self.client.workspace_label(&pane.workspace_id)?;
         if actual != expected {
@@ -3878,6 +3880,29 @@ exit 0
             "DONE\n"
         );
         manager().stop("sub-worker").unwrap();
+    }
+
+    #[test]
+    fn cloud_send_needs_no_terminal_tab() {
+        // Input travels through the orchestrator, not the tab: with the
+        // agentterm tab closed, a send still journals, while a terminal
+        // read (which does read the tab) keeps refusing.
+        let fixture = Fixture::new();
+        fixture.list_row(false);
+        let manager = || fixture.manager().with_project_workspace(Some("subagents"));
+        manager()
+            .start("sub-worker", &fixture.root, fixture.options(None))
+            .unwrap();
+        fixture.herdr.panes.lock().unwrap().clear();
+        manager()
+            .send_cloud("sub-worker", "no tab needed", Some("w-9"))
+            .unwrap();
+        assert!(fixture.verbs().contains(&"send".to_owned()));
+        let message = manager()
+            .read_cloud("sub-worker", 10, "tail")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("no live terminal tab"), "{message}");
     }
 
     #[test]
