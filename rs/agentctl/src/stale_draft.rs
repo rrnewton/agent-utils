@@ -264,6 +264,11 @@ fn paste_length(text: &str) -> usize {
     text.chars().count() - text.matches("\r\n").count()
 }
 
+/// Line count a placeholder label shows, for `submission`'s stranded check.
+pub(crate) fn pasted_line_count_pub(label: &str) -> Option<usize> {
+    pasted_line_count(label)
+}
+
 /// Line count a `[Pasted text #K +M lines]` label shows (M = lines - 1).
 fn pasted_line_count(label: &str) -> Option<usize> {
     let compacted = compact(label);

@@ -767,6 +767,30 @@ pub(crate) fn static_tail_holds(screen: &str, text: &str) -> bool {
     }
 }
 
+/// Whether `view`'s composer holds this exact prompt (text, fragment, or
+/// a placeholder of its size), for the stranded-flush check.
+fn composer_is_this_text(view: &ComposerView, text: &str) -> bool {
+    let solid = squash(&view.composer_solid);
+    let wanted = squash(text);
+    if !solid.is_empty() && (solid == wanted || (solid.len() >= 16 && wanted.contains(&solid))) {
+        return true;
+    }
+    // Placeholder forms: line count or char count of this text.
+    let region = &view.composer;
+    if let Some(start) = region.find("[Pasted text #") {
+        if let Some(end) = region[start..].find(']') {
+            let label = &region[start..=start + end];
+            if let Some(m) = crate::stale_draft::pasted_line_count_pub(label) {
+                return text.lines().count().saturating_sub(1) == m;
+            }
+        }
+    }
+    if paste_placeholders(region) > 0 {
+        return region.contains(&format!("[Pasted Content {} chars]", text.chars().count()));
+    }
+    false
+}
+
 /// Whether `view`'s composer holds only our paste (no human interleave).
 fn composer_holds_only_ours(view: &ComposerView, text: &str, placeholders_before: usize) -> bool {
     let solid = squash(&view.composer_solid);
@@ -1058,6 +1082,56 @@ pub fn submit_verified(
             }
         }
         if let Some(before) = composer_view(harness, &screen) {
+            // Stranded own paste for THIS prompt (a pending retry): press
+            // Enter only, never re-type. Bare Enter on our text submits it
+            // once; on an empty composer it would be harmless.
+            if composer_draft(&before).is_some()
+                && composer_is_this_text(&before, text)
+                && !blocked(harness, &screen)
+            {
+                let key = submit_key(harness, &before, runtime);
+                terminal.send_keys(pane_id, key)?;
+                let pressed_at = runtime.monotonic();
+                let mut presses: u32 = 1;
+                let mut next_press = pressed_at.saturating_add(FIRST_RETRY);
+                let mut wait = FIRST_RETRY;
+                loop {
+                    runtime.sleep(POLL);
+                    if runtime.cancelled() {
+                        return Err(AdapterError::unavailable(format!(
+                            "pane {pane_id}: delivery cancelled during stranded flush"
+                        )));
+                    }
+                    let now = runtime.monotonic();
+                    let current_screen = terminal.read_screen(pane_id)?;
+                    let Some(current) = composer_view(harness, &current_screen) else {
+                        break;
+                    };
+                    if composer_draft(&current).is_none() {
+                        return Ok(Submission::Verified(SubmissionReceipt {
+                            key,
+                            key_presses: presses,
+                            elapsed: now.saturating_sub(pressed_at),
+                            evidence: "stranded prompt flushed with Enter".to_owned(),
+                            printed: true,
+                            settled: true,
+                        }));
+                    }
+                    if now.saturating_sub(pressed_at) >= DRAFT_SUBMIT_TIMEOUT {
+                        break;
+                    }
+                    if presses < DRAFT_PRESSES && now >= next_press {
+                        terminal.send_keys(pane_id, key)?;
+                        presses += 1;
+                        wait = (wait * 2).min(MAX_RETRY);
+                        next_press = now.saturating_add(wait);
+                    }
+                }
+                return refuse(format!(
+                    "stranded_prompt: pane {pane_id}: stranded prompt is still staged; \
+                     no new text was typed"
+                ));
+            }
             // A draft agentctl typed that the harness left unsent is submitted first, and the
             // composer looked at again (#720 agentctl-muse-stale-draft).
             if composer_draft(&before).is_some() && recovered < MAX_DRAFT_RECOVERIES {
@@ -1278,7 +1352,11 @@ pub fn submit_verified(
                     );
                 }
                 if now >= submit_deadline {
-                    return Err(AdapterError::unavailable(format!(
+                    // Stranded, not possibly-submitted: the text is visibly
+                    // still in the composer, so the drain keeps the item
+                    // pending (never the multi-hour wedge state) and a later
+                    // pass/ladder flushes it with bare Enter only.
+                    return Ok(Submission::NotStaged(format!(
                         "stranded_prompt: pane {pane_id}: prompt is still staged in the {harness} composer after \
                          {presses} {key} key press(es) over {:.1}s; it was NOT submitted and is \
                          left visible so it is never typed twice",
@@ -2303,7 +2381,8 @@ mod tests {
                 ..SubmitTimeouts::default()
             },
         );
-        let message = outcome.unwrap_err().to_string();
+        let message = refusal(outcome);
+        assert!(message.contains("stranded_prompt:"), "{message}");
         assert!(message.contains("still staged"), "{message}");
         assert!(message.contains("NOT submitted"), "{message}");
         let state = screen.state();
@@ -3547,10 +3626,9 @@ mod tests {
             &clock,
         );
         match outcome {
-            Err(error) => assert!(
-                error.to_string().contains("it was NOT submitted"),
-                "{error}"
-            ),
+            Ok(Submission::NotStaged(reason)) => {
+                assert!(reason.contains("it was NOT submitted"), "{reason}")
+            }
             other => panic!("expected the prompt to be reported as not submitted, got {other:?}"),
         }
         assert!(frames.keys.lock().unwrap().len() > 1);
@@ -3670,10 +3748,9 @@ mod tests {
             &clock,
         );
         match outcome {
-            Err(error) => assert!(
-                error.to_string().contains("it was NOT submitted"),
-                "{error}"
-            ),
+            Ok(Submission::NotStaged(reason)) => {
+                assert!(reason.contains("it was NOT submitted"), "{reason}")
+            }
             other => panic!("expected the prompt to be reported as not submitted, got {other:?}"),
         }
         assert!(frames.keys.lock().unwrap().len() > 2);
@@ -3710,10 +3787,9 @@ mod tests {
             &clock,
         );
         match outcome {
-            Err(error) => assert!(
-                error.to_string().contains("it was NOT submitted"),
-                "{error}"
-            ),
+            Ok(Submission::NotStaged(reason)) => {
+                assert!(reason.contains("it was NOT submitted"), "{reason}")
+            }
             other => panic!("expected the prompt to be reported as not submitted, got {other:?}"),
         }
     }
@@ -3925,13 +4001,12 @@ mod tests {
             },
             &Clock::default(),
         );
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("it was NOT submitted"),
-            "a transient redraw with an old queue hint must not confirm a dropped key"
-        );
+        match result {
+            Ok(Submission::NotStaged(reason)) => {
+                assert!(reason.contains("it was NOT submitted"), "{reason}")
+            }
+            other => panic!("a transient redraw must not confirm a dropped key: {other:?}"),
+        }
         assert!(frames.keys.lock().unwrap().len() > 1);
     }
 
@@ -4302,8 +4377,9 @@ mod tests {
     fn a_prompt_never_accepted_is_left_staged_without_the_withdrawal_request() {
         let screen = FakeScreen::new("claude", true);
         screen.state().drop_keys = u32::MAX;
-        let error = submit(&screen, "check the build").unwrap_err();
-        assert!(error.to_string().contains("still staged"), "{error}");
+        let reason = refusal(submit(&screen, "check the build"));
+        assert!(reason.contains("stranded_prompt:"), "{reason}");
+        assert!(reason.contains("still staged"), "{reason}");
         assert_eq!(screen.state().composer, "check the build");
         assert!(!screen.state().keys.iter().any(|key| key == "ctrl+u"));
     }

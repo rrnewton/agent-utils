@@ -5404,10 +5404,11 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("NOT submitted"), "{error}");
-        let failed = json_paths(&directory.path().join("failed")).expect("failed records");
-        assert_eq!(failed.len(), 1);
-        let record = load_message(&failed[0]).unwrap();
-        assert_eq!(record["paste_label"], "[Pastedtext#1+4lines]");
+        assert!(error.to_string().contains("stranded_prompt:"), "{error}");
+        // Stranded, not possibly-submitted: it stays pending, never failed.
+        assert!(json_paths(&directory.path().join("failed"))
+            .expect("failed records")
+            .is_empty());
         assert!(screen().composer.contains("four"), "left in the composer");
 
         screen().drop_submit_keys = false;
@@ -5415,7 +5416,7 @@ mod tests {
         let owner = "[from Ada via slack #team · sent: 2026.11.01:06:21 EST · reply: <r3>]\nhi";
         // The paste is submitted and starts a turn; this drain did not opt in to typing into a
         // working Claude Code, so the owner's prompt waits, untyped.
-        let error = send_with_runtime(
+        let result = send_with_runtime(
             &fake,
             &target,
             directory.path(),
@@ -5423,25 +5424,13 @@ mod tests {
             DrainOptions::default(),
             &runtime,
         )
-        .unwrap_err();
-        assert!(matches!(error, AgentError::Pending(_)), "{error}");
-        assert!(error.to_string().contains("it started a turn"), "{error}");
-        assert_eq!(screen().keys, ["Enter"]);
-        assert_eq!(screen().submitted, [lane]);
-        let record = load_message(&failed[0]).unwrap();
-        assert!(record["draft_recovered_at"].is_number(), "{record:?}");
-        // Once the turn is over, the next drain types it.
-        screen().busy = false;
-        let result = drain_with_runtime(
-            &fake,
-            &target,
-            directory.path(),
-            DrainOptions::default(),
-            &runtime,
-        )
         .unwrap();
-        assert_eq!(result.delivered.len(), 1);
-        assert_eq!(screen().submitted, [lane, owner]);
+        // The stranded lane paste is flushed with one Enter, and the
+        // owner's prompt is typed behind the turn it started.
+        assert_eq!(result.delivered.len(), 2);
+        assert_eq!(screen().keys, ["Enter", "Enter"]);
+        assert_eq!(screen().submitted, [lane]);
+        assert_eq!(screen().queued, [owner]);
     }
 
     /// #804 live finding (coordinator pane): a drain that opted in to
@@ -5647,7 +5636,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_quarantines_a_prompt_left_staged() {
+    fn queue_keeps_a_prompt_left_staged_pending_not_possibly_submitted() {
         let directory = TestDirectory::new("left-staged");
         let screen = crate::submission::fake::FakeScreen::new("codex", false);
         screen.state().drop_keys = u32::MAX;
@@ -5662,11 +5651,9 @@ mod tests {
             &runtime,
         )
         .unwrap_err();
-        assert_eq!(error.exit_code(), 76, "{error}");
+        assert_eq!(error.exit_code(), 75, "{error}");
         assert!(error.to_string().contains("NOT submitted"), "{error}");
-        let artifact = &error.undelivered().expect("ambiguous details").artifact;
-        let document = read_json(artifact).unwrap();
-        assert_eq!(document["possibly_submitted"], true);
+        assert!(error.to_string().contains("stranded_prompt:"), "{error}");
         let screen = fake.screen.as_ref().unwrap().state();
         assert_eq!(screen.pastes.len(), 1, "never typed twice");
         assert_eq!(screen.composer, "stuck in the composer");
@@ -7474,7 +7461,7 @@ mod tests {
             Some("request-1"),
         )
         .unwrap_err();
-        assert_eq!(error.exit_code(), 76, "{error}");
+        assert_eq!(error.exit_code(), 75, "{error}");
         assert!(error.to_string().contains("NOT submitted"), "{error}");
         assert_eq!(
             fake.screen.as_ref().unwrap().state().composer,
