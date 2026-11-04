@@ -526,6 +526,24 @@ pub fn make_plan(
             );
             continue;
         }
+        if item.is_flaky_held_at(&at) {
+            hold(
+                &mut held,
+                Held {
+                    pr: item.pr,
+                    kind: "held-green-flaky".into(),
+                    reason: format!(
+                        "validation was GREEN_FLAKY ({} passed only after a retry); held for a ruling until {}; `merge-queue retry {}` returns it to the queue",
+                        item.flaky_nodes.join(", "),
+                        item.flaky_hold_until,
+                        item.pr
+                    ),
+                    with: vec![],
+                    paths: vec![],
+                },
+            );
+            continue;
+        }
         if item.is_deferred_at(&at) {
             hold(
                 &mut held,
@@ -928,6 +946,8 @@ mod unit {
             validation_refusals: 0,
             next_retry_at: String::new(),
             last_refusal: String::new(),
+            flaky_nodes: Vec::new(),
+            flaky_hold_until: String::new(),
             escalated: String::new(),
             deciding_report: String::new(),
             deciding_failed: vec![],

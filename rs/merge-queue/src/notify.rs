@@ -92,6 +92,14 @@ pub fn desired_transition(item: &Item) -> Option<Transition> {
             ),
             verdict: "withdrawn",
         }),
+        ItemStatus::Queued if !item.flaky_hold_until.is_empty() => Some(Transition {
+            key: format!(
+                "held-green-flaky:{}:{}",
+                item.head,
+                history_count(item, "held-green-flaky")
+            ),
+            verdict: "held-green-flaky",
+        }),
         ItemStatus::Queued if !item.escalated.is_empty() => Some(Transition {
             key: format!(
                 "escalated:{}:{}",
@@ -320,6 +328,13 @@ pub fn render_report(state: &State, item: &Item, transition: &Transition) -> Str
             text.push_str(&format!("refusal: {}\n", item.last_refusal));
             text.push_str(&format!("retry_after: {}\n", item.next_retry_at));
             text.push_str(&format!("refusals: {}\n", item.validation_refusals));
+        }
+        "held-green-flaky" => {
+            text.push_str(&format!("flaky_tests: {}\n", item.flaky_nodes.join(", ")));
+            text.push_str(&format!("hold_until: {}\n", item.flaky_hold_until));
+            text.push_str(
+                "remedy: rule on the flaky pass, then `merge-queue retry <pr>` returns it to the queue; the hold expires and re-queues it at hold_until either way\n",
+            );
         }
         _ => {}
     }
@@ -571,6 +586,8 @@ mod unit {
             validation_refusals: 0,
             next_retry_at: String::new(),
             last_refusal: String::new(),
+            flaky_nodes: Vec::new(),
+            flaky_hold_until: String::new(),
             escalated: String::new(),
             deciding_report: String::new(),
             deciding_failed: vec![],

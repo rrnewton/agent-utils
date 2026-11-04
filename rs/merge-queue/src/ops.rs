@@ -258,6 +258,20 @@ fn submit_resolved(
         } else {
             String::new()
         },
+        flaky_nodes: if same_head {
+            existing
+                .as_ref()
+                .map_or_else(Vec::new, |old| old.flaky_nodes.clone())
+        } else {
+            Vec::new()
+        },
+        flaky_hold_until: if same_head {
+            existing
+                .as_ref()
+                .map_or_else(String::new, |old| old.flaky_hold_until.clone())
+        } else {
+            String::new()
+        },
         deciding_report: existing
             .as_ref()
             .map_or_else(String::new, |old| old.deciding_report.clone()),
@@ -306,12 +320,20 @@ pub fn retry(state: &State, pr: i64) -> Result<Item, String> {
     if item.status != ItemStatus::Queued {
         return Err(format!("#{pr} is {}, not queued", item.status.as_str()));
     }
-    let was = if item.escalated.is_empty() {
+    let was = if !item.flaky_hold_until.is_empty() {
+        format!(
+            "GREEN_FLAKY hold ({}; until {})",
+            item.flaky_nodes.join(", "),
+            item.flaky_hold_until
+        )
+    } else if item.escalated.is_empty() {
         format!("{} refusal(s)", item.validation_refusals)
     } else {
         format!("escalated: {}", item.escalated)
     };
     item.escalated.clear();
+    item.flaky_nodes.clear();
+    item.flaky_hold_until.clear();
     item.validation_refusals = 0;
     item.next_retry_at.clear();
     item.last_refusal.clear();

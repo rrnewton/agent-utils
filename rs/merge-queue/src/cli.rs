@@ -476,6 +476,10 @@ enum Command {
         /// at 60). 0 = no delay.
         #[arg(long, default_value_t = crate::state::DEFAULT_REFUSAL_BACKOFF_SECS)]
         refusal_backoff_secs: u64,
+        /// Seconds a GREEN_FLAKY batch (green only because some tests passed after a
+        /// retry inside the run) is held for a ruling before it is re-queued.
+        #[arg(long, default_value_t = crate::state::DEFAULT_GREEN_FLAKY_HOLD_SECS)]
+        green_flaky_hold_secs: u64,
         /// Times a change may be deferred because validation did not run (refusals, a
         /// validator that cannot execute, a probe or donors that could not run) before it is
         /// escalated to its owner and held until `merge-queue retry`.
@@ -1056,6 +1060,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             timeout,
             refusal_max_retries,
             refusal_backoff_secs,
+            green_flaky_hold_secs,
             max_deferrals,
             red_without_probe,
             offload,
@@ -1149,6 +1154,13 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     clean_ignored,
                     refusal_max_retries,
                     refusal_backoff_secs,
+                    green_flaky_hold_secs: if green_flaky_hold_secs
+                        == crate::state::DEFAULT_GREEN_FLAKY_HOLD_SECS
+                    {
+                        0
+                    } else {
+                        green_flaky_hold_secs
+                    },
                     max_deferrals: if max_deferrals == crate::state::DEFAULT_RETRY_BOUND {
                         0
                     } else {

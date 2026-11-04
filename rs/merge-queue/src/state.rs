@@ -80,6 +80,12 @@ pub struct ValidatorConfig {
     /// 0 means no delay between retries (used by tests).
     #[serde(default = "default_refusal_backoff_secs")]
     pub refusal_backoff_secs: u64,
+    /// Seconds a GREEN_FLAKY batch (green only because some tests passed after a
+    /// retry inside the run) is held for a ruling before the hold expires and the
+    /// change is ejected with the flaky tests named. 0 in a stored config means
+    /// the default bound.
+    #[serde(default = "default_green_flaky_hold_secs")]
+    pub green_flaky_hold_secs: u64,
     /// Where validations run: empty or `off` (in this process, the default), `compare` (in
     /// this process, which decides, and also published to donors so their receipts are
     /// compared with the local verdict), or `decide` (published to donors only; an accepted
@@ -311,6 +317,10 @@ fn default_refusal_backoff_secs() -> u64 {
     DEFAULT_REFUSAL_BACKOFF_SECS
 }
 
+fn default_green_flaky_hold_secs() -> u64 {
+    DEFAULT_GREEN_FLAKY_HOLD_SECS
+}
+
 impl ValidatorConfig {
     /// Resolved refusal retries (stored verbatim; missing in an old config means default).
     pub fn refusal_retries(&self) -> usize {
@@ -335,12 +345,23 @@ impl ValidatorConfig {
     pub fn hold_red_without_probe(&self) -> bool {
         self.red_without_probe == "hold"
     }
+
+    /// Resolved GREEN_FLAKY hold bound in seconds.
+    pub fn green_flaky_hold(&self) -> u64 {
+        if self.green_flaky_hold_secs == 0 {
+            DEFAULT_GREEN_FLAKY_HOLD_SECS
+        } else {
+            self.green_flaky_hold_secs
+        }
+    }
 }
 
 /// Default extra refusal retries within one run when the config does not set one.
 pub const DEFAULT_REFUSAL_MAX_RETRIES: usize = 3;
 /// Default base refusal backoff in seconds for a newly initialised queue.
 pub const DEFAULT_REFUSAL_BACKOFF_SECS: u64 = 2;
+/// Default GREEN_FLAKY hold bound in seconds (two hours for a ruling).
+pub const DEFAULT_GREEN_FLAKY_HOLD_SECS: u64 = 7200;
 
 /// How a validated candidate reaches the base branch.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

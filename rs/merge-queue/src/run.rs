@@ -896,6 +896,93 @@ impl<'a> Runner<'a> {
         Ok((retry_after, refusals))
     }
 
+    /// Hold a GREEN_FLAKY batch for a ruling: every change stays queued with the
+    /// retried-pass tests named and a bounded expiry. The hold notifies through the
+    /// item's recorded notify target (the `held-green-flaky` transition); on expiry
+    /// the change is re-queued, never landed unruled and never held silently.
+    fn hold_green_flaky(&self, candidate: &Candidate, ran: &Ran) -> Result<String, String> {
+        let nodes: Vec<String> = ran.flaky_passes.iter().map(ToString::to_string).collect();
+        let until = retry_after_time(Duration::from_secs(
+            self.config.validator.green_flaky_hold(),
+        ));
+        if !self.simulating() {
+            let mut items = lock(&self.items);
+            for pr in &candidate.prs {
+                if let Some(item) = items.get_mut(pr) {
+                    item.flaky_nodes = nodes.clone();
+                    item.flaky_hold_until = until.clone();
+                    item.deciding_report = self.run_dir.join("report.md").display().to_string();
+                    item.deciding_failed.clear();
+                    item.log(
+                        "held-green-flaky",
+                        format!(
+                            "GREEN_FLAKY: {} passed only after a retry; held for a ruling until {until}",
+                            nodes.join(", ")
+                        ),
+                    );
+                    self.state.save_item(item)?;
+                }
+            }
+        }
+        self.event(
+            "held-green-flaky",
+            &format!(
+                "{} held: GREEN_FLAKY ({}) until {until}; not landed",
+                list(&candidate.prs),
+                nodes.join(", ")
+            ),
+        );
+        Ok(until)
+    }
+
+    /// Release GREEN_FLAKY holds whose bounded wait expired: the changes are
+    /// re-queued (their hold fields cleared), so a ruling that never arrives
+    /// cannot stall the queue silently. A fresh GREEN_FLAKY result re-holds.
+    fn release_expired_flaky_holds(&self) -> Result<(), String> {
+        if self.simulating() {
+            return Ok(());
+        }
+        let at = now();
+        let expired: Vec<i64> = {
+            let items = lock(&self.items);
+            items
+                .values()
+                .filter(|item| {
+                    item.status == ItemStatus::Queued
+                        && !item.flaky_hold_until.is_empty()
+                        && item.flaky_hold_until.as_str() <= at.as_str()
+                })
+                .map(|item| item.pr)
+                .collect()
+        };
+        if expired.is_empty() {
+            return Ok(());
+        }
+        let mut items = lock(&self.items);
+        for pr in &expired {
+            if let Some(item) = items.get_mut(pr) {
+                let nodes = item.flaky_nodes.join(", ");
+                item.flaky_nodes.clear();
+                item.flaky_hold_until.clear();
+                item.log(
+                    "green-flaky-hold-expired",
+                    format!(
+                        "GREEN_FLAKY hold expired without a ruling ({nodes}); re-queued for validation"
+                    ),
+                );
+                self.state.save_item(item)?;
+            }
+        }
+        self.event(
+            "green-flaky-hold-expired",
+            &format!(
+                "{} re-queued after the GREEN_FLAKY hold bound",
+                list(&expired)
+            ),
+        );
+        Ok(())
+    }
+
     /// Retry a refused batch validation with backoff. Returns the final `(id, ran)`.
     /// Each attempt is its own validation record (refused attempts are visible, never
     /// counted as green or red).
@@ -1847,6 +1934,7 @@ impl<'a> Runner<'a> {
             interrupted,
             handle: None,
             refused: false,
+            flaky_passes: Vec::new(),
             cannot_execute: None,
             effective_selection: None,
             cpu: None,
@@ -1938,6 +2026,12 @@ impl<'a> Runner<'a> {
 
     /// Execute the run. Errors after the run started stop it and are recorded in the report.
     pub fn run(self) -> Result<RunReport, String> {
+        if let Err(error) = self.release_expired_flaky_holds() {
+            self.event(
+                "green-flaky-hold-expired",
+                &format!("could not release expired GREEN_FLAKY holds: {error}"),
+            );
+        }
         if self.options.with_peers {
             if let Err(error) = self.run_peers() {
                 self.event("peers", &format!("could not drain peers: {error}"));
@@ -2333,6 +2427,19 @@ impl<'a> Runner<'a> {
                                 format!(
                                     "validation refused for {} ({detail}); stays queued, retry after {retry_after}",
                                     list(&head.candidate.prs)
+                                ),
+                                head.candidate.prs.clone(),
+                            )
+                        } else if ran.green() && !ran.flaky_passes.is_empty() {
+                            // Green only because some tests passed after a retry
+                            // inside the run (GREEN_FLAKY): hold for a ruling,
+                            // never land on the plain pass.
+                            let until = self.hold_green_flaky(&head.candidate, &ran)?;
+                            BatchOutcome::Deferred(
+                                format!(
+                                    "validation GREEN_FLAKY for {} ({} passed only after a retry); held for a ruling until {until}, not landed",
+                                    list(&head.candidate.prs),
+                                    ids(&ran.flaky_passes.clone())
                                 ),
                                 head.candidate.prs.clone(),
                             )
@@ -3312,6 +3419,7 @@ fn receipt_ran(receipt: &crate::donor::Receipt, dir: &std::path::Path) -> Result
         interrupted: None,
         handle: None,
         refused: receipt.refused,
+        flaky_passes: Vec::new(),
         cannot_execute: None,
         effective_selection: receipt.effective_selection.clone(),
         cpu: receipt.cpu_ms.map(Duration::from_millis),

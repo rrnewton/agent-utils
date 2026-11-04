@@ -148,6 +148,15 @@ pub struct Item {
     /// Detail of the most recent refusal (exit status and marker), for the operator.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last_refusal: String,
+    /// Tests that passed only after a retry in the run that validated this change
+    /// (a GREEN_FLAKY run). Non-empty while the change is held for a ruling.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flaky_nodes: Vec<String>,
+    /// RFC 3339 UTC time the GREEN_FLAKY hold expires (empty when not held). On
+    /// expiry the change is ejected with the flaky nodes named, never landed
+    /// unruled and never held silently forever.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub flaky_hold_until: String,
     /// Why the change was escalated to its owner, when validation did not run the bounded
     /// number of times (or a red run's probe could not run under `red_without_probe: hold`).
     /// The change stays `queued` but is held until `merge-queue retry` clears this.
@@ -178,6 +187,13 @@ fn is_zero_u32(value: &u32) -> bool {
 }
 
 impl Item {
+    /// Whether this queued change is inside its GREEN_FLAKY hold at `at`.
+    pub fn is_flaky_held_at(&self, at: &str) -> bool {
+        self.status == ItemStatus::Queued
+            && !self.flaky_hold_until.is_empty()
+            && self.flaky_hold_until.as_str() > at
+    }
+
     /// Whether this queued change is deferred until `at` (RFC 3339, second precision, so a
     /// lexicographic comparison is a time comparison) after a validation refusal.
     pub fn is_deferred_at(&self, at: &str) -> bool {

@@ -110,6 +110,87 @@ fn status(fx: &Fixture, pr: i64) -> String {
 }
 
 #[test]
+fn green_flaky_batch_is_held_for_a_ruling_not_landed() {
+    // Green only because a test passed after a retry inside the run: the
+    // validator says so with the GREEN_FLAKY marker. The batch must be held,
+    // never landed on the plain pass and never ejected as red.
+    let fx = setup_validator("run-green-flaky", "echo \"GREEN_FLAKY: a\"; exit 0", &[]);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let before = fx.remote_main();
+    let out = fx.mq(&["run", "--json"]);
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    assert!(r["landed"].as_array().unwrap().is_empty(), "{r}");
+    assert!(r["ejected"].as_array().unwrap().is_empty(), "{r}");
+    assert!(
+        r["stopped"].as_str().unwrap().contains("GREEN_FLAKY"),
+        "{}",
+        r["stopped"]
+    );
+    assert_eq!(fx.remote_main(), before);
+    assert_eq!(status(&fx, 1), "queued");
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    let item = &items.as_array().unwrap()[0];
+    assert_eq!(item["flaky_nodes"], serde_json::json!(["a"]), "{item}");
+    assert!(
+        !item["flaky_hold_until"].as_str().unwrap().is_empty(),
+        "{item}"
+    );
+    let history_kinds: Vec<&str> = item["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert!(
+        history_kinds.contains(&"held-green-flaky"),
+        "{history_kinds:?}"
+    );
+}
+
+#[test]
+fn green_flaky_hold_expires_and_requeues() {
+    // The bounded hold: once it expires the change is re-queued for a fresh
+    // validation (which re-holds if it is GREEN_FLAKY again), never landed
+    // unruled and never stuck silently.
+    let fx = setup_validator(
+        "run-green-flaky-expiry",
+        "echo \"GREEN_FLAKY: a\"; exit 0",
+        &["--green-flaky-hold-secs", "1"],
+    );
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let before = fx.remote_main();
+    fx.mq(&["run", "--json"]);
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let out = fx.mq(&["run", "--json"]);
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    assert!(r["landed"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(fx.remote_main(), before);
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    let item = &items.as_array().unwrap()[0];
+    let history_kinds: Vec<&str> = item["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert!(
+        history_kinds.contains(&"green-flaky-hold-expired"),
+        "{history_kinds:?}"
+    );
+    // Re-validated after release (and held again by the fresh GREEN_FLAKY).
+    assert_eq!(
+        history_kinds
+            .iter()
+            .filter(|k| **k == "held-green-flaky")
+            .count(),
+        2,
+        "{history_kinds:?}"
+    );
+}
+
+#[test]
 fn refusal_exit75_keeps_change_queued_and_is_neither_red_nor_pass() {
     // Admission refuses every validation: exit 75 with the COULD_NOT_RUN marker.
     // No within-run retries, long cross-run backoff, so the deferral is observable.

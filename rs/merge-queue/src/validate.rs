@@ -37,6 +37,35 @@ pub const CANNOT_EXECUTE: &str = "the validator could not execute";
 /// Marker printed by an admission wrapper when it refuses to run validation at all.
 pub const REFUSAL_MARKER: &str = "COULD_NOT_RUN";
 
+/// Marker line a validator prints when the run is green only because some tests passed
+/// after a retry inside the run (`GREEN_FLAKY: id1,id2`). The queue holds such a batch
+/// for a ruling instead of landing it; see [`Ran::flaky_passes`].
+pub const FLAKY_MARKER: &str = "GREEN_FLAKY";
+
+/// Tests a green run names as passed only after a retry, read from its `GREEN_FLAKY:`
+/// marker line. Only a zero exit can be green-flaky: a red run's marker text (a test
+/// printing it, say) means nothing.
+pub fn flaky_passes(exit: Option<i32>, log_text: &str) -> Vec<TestId> {
+    if exit != Some(0) {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for line in log_text.lines() {
+        let Some(rest) = line.trim().strip_prefix(FLAKY_MARKER) else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix(':') else {
+            continue;
+        };
+        for raw in rest.split([',', ' ']) {
+            if let Ok(id) = TestId::parse(raw.trim()) {
+                found.push(id);
+            }
+        }
+    }
+    found
+}
+
 /// Whether an exit status and combined runner output describe an admission refusal rather
 /// than a validation result. A refusal means validation did not run: it must not be treated
 /// as green, must not be treated as red, and must not attribute any test failure.
@@ -82,6 +111,10 @@ pub struct Ran {
     /// Admission refused to run validation at all (exit 75 or `COULD_NOT_RUN`), or the
     /// validator could not execute: validation did not run, so this is neither green nor red.
     pub refused: bool,
+    /// Tests that passed only after a retry inside this run (the validator's
+    /// `GREEN_FLAKY:` marker). A green run with any of these is held for a ruling
+    /// instead of landing.
+    pub flaky_passes: Vec<TestId>,
     /// Why the validator could not execute (it could not start, or exited 126 or 127 without
     /// reporting a failed test), naming the command and `PATH`. Always also `refused`.
     pub cannot_execute: Option<String>,
@@ -654,6 +687,11 @@ impl Validator for CommandValidator {
             interrupted,
             handle: read_handle(out),
             refused,
+            flaky_passes: if refused {
+                Vec::new()
+            } else {
+                flaky_passes(exit, &log_text)
+            },
             cannot_execute,
             effective_selection: None,
             cpu: finished.cpu,
@@ -825,6 +863,7 @@ impl Validator for DagrunValidator {
                     interrupted: None,
                     handle: None,
                     refused: false,
+                    flaky_passes: Vec::new(),
                     cannot_execute: None,
                     effective_selection: Some(Selection::default()),
                     cpu: None,
@@ -876,6 +915,11 @@ impl Validator for DagrunValidator {
             interrupted,
             handle: read_handle(out),
             refused,
+            flaky_passes: if refused {
+                Vec::new()
+            } else {
+                flaky_passes(exit, &log_text)
+            },
             cannot_execute,
             effective_selection: whole_steps,
             cpu: finished.cpu,
@@ -1122,6 +1166,21 @@ dagrun: PASS - 1 passed";
     }
 
     #[test]
+    fn flaky_marker_only_counts_on_a_zero_exit() {
+        let log = "noise\nGREEN_FLAKY: test.a,test.b::case\nmore\n";
+        assert_eq!(
+            flaky_passes(Some(0), log),
+            vec![
+                TestId::step("test.a"),
+                TestId::parse("test.b::case").unwrap()
+            ]
+        );
+        assert!(flaky_passes(Some(1), log).is_empty());
+        assert!(flaky_passes(None, log).is_empty());
+        assert!(flaky_passes(Some(0), "GREEN_FLAKY no colon\n").is_empty());
+    }
+
+    #[test]
     fn missing_and_skip_only_probes_are_unknown_not_pass() {
         for outcome in [Outcome::Missing, Outcome::Skip] {
             let mut results = TestResults::default();
@@ -1140,6 +1199,7 @@ dagrun: PASS - 1 passed";
                 interrupted: None,
                 handle: None,
                 refused: false,
+                flaky_passes: Vec::new(),
                 cannot_execute: None,
                 effective_selection: None,
                 cpu: None,
