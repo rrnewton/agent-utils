@@ -73,6 +73,7 @@ pub fn timeouts() -> SubmitTimeouts {
         stage: STAGE_TIMEOUT,
         submit: SUBMIT_TIMEOUT,
         composer: Duration::ZERO,
+        ..SubmitTimeouts::default()
     }
 }
 

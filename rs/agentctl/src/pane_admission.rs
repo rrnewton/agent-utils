@@ -209,6 +209,60 @@ mod tests {
     }
 
     #[test]
+    fn no_new_path_types_into_a_pane_outside_the_admission_funnel() {
+        // Every prompt typed into a TUI must reach `admit` (or the
+        // PaneAdmission lock in tui_prompts::answer). Direct terminal
+        // input is allowed only in the transport and in the admitted
+        // strategy bodies; a new call site anywhere else fails here.
+        const ALLOWED: &[&str] = &[
+            "client.rs",          // Herdr transport primitives
+            "term.rs",            // term-backend transport
+            "submission.rs",      // verified strategy (admitted closure)
+            "unknown_harness.rs", // unknown strategy (admitted closure)
+            "subagents.rs",       // GuardedInput transport + admitted callers
+            "tui_prompts.rs",     // answer() holds PaneAdmission
+            "stale_composer.rs",  // deterministic sweep keys, not prompts
+            "pane_admission.rs",
+        ];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if ALLOWED.contains(&name.as_str()) || name.contains("test") {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path).expect("read rs");
+                // Tests and fakes type into fake panes, never real ones.
+                let body = body.split("#[cfg(test)]").next().unwrap_or("");
+                for needle in [
+                    ".send_text(",
+                    ".send_keys(",
+                    ".native_prompt(",
+                    ".agent_prompt(",
+                ] {
+                    if body.contains(needle) {
+                        offenders.push(format!("{}: {needle}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "direct pane input outside admission: {offenders:?}"
+        );
+    }
+
+    #[test]
     fn pace_interval_has_a_half_second_floor() {
         assert!(
             pace_interval() >= MIN_PACE || std::env::var("AGENTCTL_PANE_PACE_SECONDS").is_err()

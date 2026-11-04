@@ -4679,13 +4679,15 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     ) -> crate::error::Result<Submission> {
         if self.generic_pane(pane_id) {
             let guarded = self.guarded(runtime)?;
-            return crate::unknown_harness::submit(
-                &GuardedPrompt(&guarded),
-                pane_id,
-                text,
-                crate::unknown_harness::timeouts(),
-                runtime,
-            );
+            return crate::pane_admission::admit(pane_id, "subagents", "", "unknown", || {
+                crate::unknown_harness::submit(
+                    &GuardedPrompt(&guarded),
+                    pane_id,
+                    text,
+                    crate::unknown_harness::timeouts(),
+                    runtime,
+                )
+            });
         }
         // A `/goal` command typed raw, as a chat request that is one asks for, is proved by the
         // harness's answer to it. A Codex goal that `agentctl goal` registered keeps its own

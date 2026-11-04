@@ -72,7 +72,8 @@ impl Ladder {
 /// Whether a delivery error marks a stranded prompt for the ladder:
 /// our still-staged errors and the generic `stranded_prompt:` marker.
 pub fn is_stranded_prompt(detail: &str) -> bool {
-    detail.contains("stranded_prompt:")
+    // One stranded representation: the queue's stranded marker (#850).
+    crate::unknown_harness::is_stranded_prompt(detail)
         || detail.contains("still staged in the")
         || detail.contains("composer already holds unsubmitted text")
 }

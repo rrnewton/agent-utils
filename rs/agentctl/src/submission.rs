@@ -740,6 +740,11 @@ fn squash(text: &str) -> String {
 /// True only as a "still sitting" signal; callers also require the tail to
 /// be unchanged across polls before pressing Enter on it.
 pub(crate) fn static_tail_holds(screen: &str, text: &str) -> bool {
+    // Shared harness-neutral heuristics first (screen_heuristics), then
+    // the wider bottom-region shingle check below.
+    if crate::screen_heuristics::stranded(screen, text) {
+        return true;
+    }
     let tail = squash(&bottom_region(screen));
     if tail.is_empty() {
         return false;
