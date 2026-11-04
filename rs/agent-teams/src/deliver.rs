@@ -303,6 +303,13 @@ impl AgentctlQueueDeliverer {
     }
 }
 
+impl AgentctlQueueDeliverer {
+    /// The target's agentcloud facts, when it is an agentcloud agent.
+    fn cloud_info(&self) -> Option<crate::proof::CloudInfo> {
+        crate::proof::cloud_info(&self.registry, &self.agent)
+    }
+}
+
 impl Deliverer for AgentctlQueueDeliverer {
     fn kind(&self) -> &str {
         "agentctl-queue"
@@ -315,6 +322,19 @@ impl Deliverer for AgentctlQueueDeliverer {
         }
     }
     fn handover(&self, id: &str, envelope: &Value, rendered: &str) -> Handover {
+        // An agentcloud target has no queue a drain could type into: the
+        // queue+drain hop assumes a Herdr pane, so an accepted message
+        // would park in inbox.v2 forever (2026-11-04: 7 accepted messages
+        // stranded while every auto-drain refused the coordinator as not
+        // Herdr-hosted). Inject it into the session at handover instead,
+        // through the orchestrator, never a terminal tab.
+        if let Some(info) = self.cloud_info() {
+            return match crate::proof::inject_cloud_input(&info, id, rendered) {
+                crate::proof::CloudInject::Injected => Handover::Accepted,
+                crate::proof::CloudInject::Refused(reason) => Handover::Refused(reason),
+                crate::proof::CloudInject::Uncertain(reason) => Handover::PossiblySubmitted(reason),
+            };
+        }
         let outcome = self.enqueue(id, envelope, rendered);
         if outcome == Handover::Accepted {
             self.start_drain(id);
@@ -322,9 +342,19 @@ impl Deliverer for AgentctlQueueDeliverer {
         outcome
     }
     fn contains(&self, id: &str) -> Option<bool> {
+        if self.cloud_info().is_some() {
+            // Injection leaves no local copy to find; unprovable, so
+            // recovery settles the ID as possibly submitted, and the
+            // idempotency key keeps a deliberate re-send singular.
+            return None;
+        }
         self.queue_contains(id)
     }
     fn nudge(&self, id: &str) {
+        if self.cloud_info().is_some() {
+            // Injected at handover; nothing waits to be drained.
+            return;
+        }
         // Only a queued, not-yet-processed item needs a drain; the helper
         // re-checks under its lock before typing anything.
         if self.queue_contains(id) == Some(true) {
@@ -762,11 +792,12 @@ pub fn deliverer_for(
 mod tests {
     use super::*;
 
-    /// The agentctl-queue deliverer hands over to an agentcloud
-    /// coordinator exactly as to a Herdr one: the item lands in its queue
-    /// (agentctl's drainers journal it into the session from there, the
-    /// same path `agentctl send` takes), and the target is deliverable —
-    /// its record carries no pinned process identity to refuse on.
+    /// The agentctl-queue deliverer injects into an agentcloud
+    /// coordinator's session at handover (see
+    /// `cloud_coordinator_handover_injects_instead_of_parking`): the
+    /// hand-over is accepted, the target is deliverable — its record
+    /// carries no pinned process identity to refuse on — and containment
+    /// is unprovable, so recovery never re-injects blind.
     #[test]
     fn queue_deliverer_delivers_to_an_agentcloud_coordinator() {
         let dir =
@@ -801,11 +832,101 @@ mod tests {
         };
         let envelope = json!({"id": "m-1", "body_sha256": "abc"});
         assert_eq!(deliverer.undeliverable_reason(), None);
-        assert_eq!(
-            deliverer.handover("m-1", &envelope, "hello coordinator"),
-            Handover::Accepted
+        let _guard = CLOUD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (script, log) = fake_cloudctl(&dir);
+        // SAFETY: serialised by CLOUD_ENV_LOCK; no other test reads this var.
+        unsafe { std::env::set_var("AGENT_TEAMS_AGENTCLOUDCTL", &script) };
+        let outcome = deliverer.handover("m-1", &envelope, "hello coordinator");
+        unsafe { std::env::remove_var("AGENT_TEAMS_AGENTCLOUDCTL") };
+        drop(_guard);
+        assert_eq!(outcome, Handover::Accepted);
+        assert!(std::fs::read_to_string(&log)
+            .expect("injection recorded")
+            .contains("hello coordinator"));
+        assert_eq!(deliverer.contains("m-1"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Serialises the tests that point `$AGENT_TEAMS_AGENTCLOUDCTL` at a fake.
+    static CLOUD_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn fake_cloudctl(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("agentcloudctl");
+        let log = dir.join("calls.log");
+        let body = format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n", log.display());
+        let mut file = std::fs::File::create(&script).expect("script");
+        file.write_all(body.as_bytes()).expect("script body");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("script mode");
+        (script, log)
+    }
+
+    fn cloud_registry(dir: &Path) {
+        let agent_dir = dir.join("agents").join("coord7");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let record = json!({
+            "name": "coord7", "harness": "agentcloud", "adapter": "agentcloud",
+            "harness_identity": null,
+            "session_value": "2bed1f68-4b34-4880-b933-4913caecf0e6",
+            "agentcloud": {"endpoint": "wss://orchestrator.example/ws"},
+            "managed_by": {"agent": "coord6"},
+        });
+        std::fs::write(
+            agent_dir.join("agent.json"),
+            serde_json::to_string(&record).expect("record json"),
+        )
+        .expect("record file");
+        std::fs::write(dir.join("coordinator.json"), "{\"name\": \"coord7\"}")
+            .expect("designation");
+    }
+
+    /// A message accepted for a cloud coordinator must end up injected
+    /// into its session, never parked in its file queue: the queue+drain
+    /// hop types into a Herdr pane, which a cloud session does not have
+    /// (the 2026-11-04 stranding: 7 accepted messages sat in inbox.v2
+    /// while every auto-drain refused the agent as not Herdr-hosted).
+    #[test]
+    fn cloud_coordinator_handover_injects_instead_of_parking() {
+        let _guard = CLOUD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("agent-teams-inject-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("registry");
+        cloud_registry(&dir);
+        let (script, log) = fake_cloudctl(&dir);
+        // SAFETY: serialised by CLOUD_ENV_LOCK; no other test reads this var.
+        unsafe { std::env::set_var("AGENT_TEAMS_AGENTCLOUDCTL", &script) };
+        let agent_dir = dir.join("agents").join("coord7");
+        let deliverer = AgentctlQueueDeliverer {
+            team: "tools".to_string(),
+            queue_dir: agent_dir.join("queue"),
+            ledger_path: dir.join("ledger.json"),
+            registry: dir.clone(),
+            agent: "coord7".to_string(),
+            auto_drain: AutoDrain {
+                enabled: false,
+                ready_timeout_seconds: 120,
+            },
+            drain_state_dir: None,
+        };
+        let envelope = json!({"id": "m-9", "body_sha256": "abc"});
+        let outcome = deliverer.handover("m-9", &envelope, "hello coordinator");
+        unsafe { std::env::remove_var("AGENT_TEAMS_AGENTCLOUDCTL") };
+        assert_eq!(outcome, Handover::Accepted);
+        let calls = std::fs::read_to_string(&log).expect("injection was recorded");
+        assert!(
+            calls.contains("send")
+                && calls.contains("2bed1f68-4b34-4880-b933-4913caecf0e6")
+                && calls.contains("hello coordinator")
+                && calls.contains("m-9"),
+            "calls: {calls}"
         );
-        assert_eq!(deliverer.contains("m-1"), Some(true));
+        let parked = agent_dir.join("queue/inbox.v2/m-9.json");
+        assert!(
+            !parked.exists(),
+            "the message was parked in inbox.v2 instead of injected"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

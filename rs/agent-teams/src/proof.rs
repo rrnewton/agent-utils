@@ -344,6 +344,47 @@ pub fn parse_cloud_liveness(listing: &Value, session_id: &str) -> CloudLiveness 
     }
 }
 
+/// The outcome of injecting one input into an agentcloud session.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CloudInject {
+    /// The orchestrator journaled the input.
+    Injected,
+    /// The orchestrator refused it before journaling; a retry is safe.
+    Refused(String),
+    /// The input may have been journaled; never retry it blind.
+    Uncertain(String),
+}
+
+/// Inject one input into an agentcloud session:
+/// `agentcloudctl send --session S --text TEXT --idempotency-key ID
+/// --end-of-turn` on the session's recorded endpoint, bounded like a
+/// liveness probe. The idempotency key makes a retry after `Refused`
+/// journal nothing twice.
+pub fn inject_cloud_input(info: &CloudInfo, id: &str, text: &str) -> CloudInject {
+    let mut command = std::process::Command::new(agentcloudctl_binary());
+    command.arg("send");
+    if let Some(endpoint) = &info.endpoint {
+        command.args(["--ws-url", endpoint]);
+    }
+    command.args([
+        "--session",
+        &info.session_id,
+        "--text",
+        text,
+        "--idempotency-key",
+        id,
+        "--end-of-turn",
+    ]);
+    match run_bounded(command, CLOUD_PROBE_TIMEOUT * 2) {
+        Ok((true, _)) => CloudInject::Injected,
+        Ok((false, _)) => CloudInject::Refused(
+            "agentcloudctl send exited non-zero; the session refused or could not take the input"
+                .to_string(),
+        ),
+        Err(reason) => CloudInject::Uncertain(reason),
+    }
+}
+
 /// The `agentcloudctl` binary used for session probes:
 /// `$AGENT_TEAMS_AGENTCLOUDCTL`, else `agentcloudctl` on PATH.
 fn agentcloudctl_binary() -> PathBuf {
