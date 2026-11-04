@@ -1044,7 +1044,7 @@ pub enum BlockKind {
     Quote,
     /// A code block, `pre`: said as a short description of it.
     Code,
-    /// A table: said as a short description of it.
+    /// A table: said a row at a time, each cell labelled with its column's header (`#847`).
     Table,
 }
 
@@ -1247,7 +1247,8 @@ fn item_source(text: &str) -> String {
 //   `sentencesOf`) into BALANCED pieces of whole sentences (`balance_sentences`, below);
 // - only a single sentence longer than that is cut inside, into equal runs of words.
 //
-// A code block and a table are said as a short description and are never cut.
+// A code block is said as a short description and is never cut. A table is read a piece per row under its
+// header (`#847 read-aloud-table-rows`, `speakable::table_row_sources`).
 //
 // `read-chunk-balance`. The owner, 2026-10-27, of a single paragraph of four sentences read as one
 // huge piece and one tiny one (its last sentence): the cut had packed sentences greedily, as many as

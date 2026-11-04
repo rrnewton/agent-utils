@@ -1492,3 +1492,65 @@ async fn a_paragraph_of_typed_bullets_is_prepared_and_played_piece_by_piece() {
         ]
     );
 }
+
+/// `#847 read-aloud-table-rows`. A table is prepared a piece for each row under its header, the pieces
+/// naming the one drawn table, and each row plays left to right, every cell labelled with its header.
+#[tokio::test]
+async fn a_table_is_prepared_and_played_a_row_at_a_time() {
+    let (mut state, chat, _elevenlabs) =
+        testing::state_from_toml(&testing::config_toml_without_elevenlabs());
+    state.speech = Arc::new(IndependentSpeech);
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let tabled = chat.seed(
+        &channel,
+        "Reader",
+        "Where the lanes are:\n\n| Lane | Status | Owner |\n|---|---|---|\n| one | open | alice |\n| two | closed | bob |",
+    );
+    let app = router(state);
+    let (status, bytes) = call(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{READ_CHANNEL}/speech/prepare"),
+        Some(json!({"ids": [tabled.0]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let prepared: Value = serde_json::from_slice(&bytes).expect("prepared");
+    let pieces: Vec<Value> = prepared["prepared"][0]["blocks"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .map(|block| {
+            json!([
+                block["kind"],
+                block["element"],
+                block["piece"],
+                block["pieces"]
+            ])
+        })
+        .collect();
+    assert_eq!(
+        Value::Array(pieces),
+        json!([
+            ["paragraph", 0, 0, 1],
+            ["table", 1, 0, 2],
+            ["table", 1, 1, 2]
+        ]),
+        "{prepared}"
+    );
+    let url = prepared["prepared"][0]["url"].as_str().expect("ticket");
+    let mut heard = Vec::new();
+    for block in 0..3 {
+        let (status, bytes) = call(&app, "GET", &format!("{url}?block={block}"), None).await;
+        assert_eq!(status, StatusCode::OK, "block {block}");
+        heard.push(String::from_utf8(bytes).expect("test audio"));
+    }
+    assert_eq!(
+        heard,
+        [
+            "Where the lanes are:",
+            "Lane: one. Status: open. Owner: alice.",
+            "Lane: two. Status: closed. Owner: bob.",
+        ]
+    );
+}

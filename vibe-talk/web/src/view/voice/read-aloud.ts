@@ -1615,10 +1615,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   //
   // The owner listens to long messages in the car. A message of paragraphs and bullets used to be read
   // as one stretch, with no way to see or change where in it the voice was. Now each message is read
-  // in the BLOCKS it is drawn as — a paragraph, a heading, a list item, a block quote; a code block or a
-  // table as a short description — one request per block, so the block being read can be lit, counted
-  // ("2 of 5") and moved between: a tap on another block of the message being read, Previous and Next,
-  // and the media keys a steering wheel or a headset sends.
+  // in the BLOCKS it is drawn as — a paragraph, a heading, a list item, a block quote; a code block as a
+  // short description, a table a row at a time (`#847`) — one request per block, so the block being read
+  // can be lit, counted ("2 of 5") and moved between: a tap on another block of the message being read,
+  // Previous and Next, and the media keys a steering wheel or a headset sends.
   //
   // THE SERVER DECIDES WHAT EACH BLOCK SAYS, from the message itself, and lists the blocks' kinds in
   // drawing order (`source_blocks` in src/render.rs). The page finds the same blocks in the body it
@@ -1884,6 +1884,50 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     return pieces.length === block.pieces ? pieces[block.piece] || null : null;
   }
 
+  /**
+   * `#847 read-aloud-table-rows`. A table is read a row at a time, each cell a sentence of its own labelled
+   * with its column's header (src/speakable.rs `say_table`, a piece per row: `table_row_sources`): piece k is
+   * the k-th row under the header, or the header itself in a table of nothing else. Its sentences are that
+   * row's cells, in order, each as long as what is said of it ("Status: open."), so the light steps cell by
+   * cell with the voice, never ahead of it and skipping none. Null for any other block, or where the rows
+   * drawn are not as many as the pieces read.
+   */
+  function tableRowCells(block: DrawnBlock): Sentence[] | null {
+    if (block.kind !== "table") return null;
+    const tagOf = (node: Element) => String(node.tagName || "").toLowerCase();
+    const rows: Element[] = [];
+    const walk = (node: Element) => {
+      for (const kid of node.children || []) {
+        const tag = tagOf(kid);
+        if (tag === "tr") rows.push(kid);
+        else if (tag === "thead" || tag === "tbody" || tag === "tfoot") walk(kid);
+      }
+    };
+    walk(block.element);
+    const header = rows[0];
+    if (!header) return null;
+    const body = rows.slice(1);
+    const read = body.length > 0 ? body : [header];
+    if (read.length !== block.pieces) return null;
+    const row = read[block.piece];
+    if (!row) return null;
+    const cellsOf = (tr: Element) => [...(tr.children || [])].filter((cell) => ["td", "th"].includes(tagOf(cell)));
+    const labels = body.length > 0 ? cellsOf(header).map((cell) => wordsOf(shownTextOf(cell).text)) : [];
+    const found: Sentence[] = [];
+    cellsOf(row).forEach((cell, at) => {
+      const { text, place } = shownTextOf(cell);
+      let start = 0;
+      while (start < text.length && /\s/.test(text[start]!)) start += 1;
+      let end = text.length;
+      while (end > start && /\s/.test(text[end - 1]!)) end -= 1;
+      // An empty cell is not said, and not lit.
+      if (end <= start) return;
+      const label = labels[at] || "";
+      found.push({ from: place(start), to: place(end), length: (label ? label.length + 2 : 0) + end - start + 1 });
+    });
+    return found;
+  }
+
   /** Take the sentence light off, and stop looking for the next one. */
   function clearReadingSentence() {
     if (sentenceTimer !== null) clearTimeout(sentenceTimer);
@@ -1916,14 +1960,17 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       const drawn = preparedBlocksOf(row, segment.part);
       const block = drawn ? drawn[segment.block!]! : null;
       // `#486 read-aloud-pieces`. A piece of the block lights its own sentences, or itself whole when it
-      // is one; where the page cuts the block otherwise, every sentence of the block.
-      const piece = block ? readPieceOf(block) : null;
-      return block ? { piece, sentences: sentencesOf(block.element, piece) } : null;
+      // is one; where the page cuts the block otherwise, every sentence of the block. `#847
+      // read-aloud-table-rows`: a table's piece is a row, whose sentences are its cells.
+      const cells = block ? tableRowCells(block) : null;
+      const piece = block && !cells ? readPieceOf(block) : null;
+      return block ? { piece, row: cells !== null, sentences: cells || sentencesOf(block.element, piece) } : null;
     }).filter((one) => one !== null && one!.sentences.length > 0) : [];
     const timeline = player && typeof player.timeline === "function" ? player.timeline() : null;
     const piece = lit.length > 0 ? lit[0]!.piece : null;
+    const row = lit.length > 0 && lit[0]!.row;
     const sentences = lit.length > 0 ? lit[0]!.sentences : [];
-    if ((sentences.length < 2 && !piece) || sentences.length < 1 || !timeline || timeline.startsAt === null ||
+    if ((sentences.length < 2 && !piece && !row) || sentences.length < 1 || !timeline || timeline.startsAt === null ||
         readAloudContext === null) {
       if (litSentence !== "") CSS.highlights.delete(SENTENCE_HIGHLIGHT);
       litSentence = "";

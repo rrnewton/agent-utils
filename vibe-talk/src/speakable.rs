@@ -72,12 +72,6 @@ const RELATIVE_LIMIT_DAYS: i64 = 365;
 /// punctuation, and what the listener actually wants to know is that it is there and how big.
 const CODE_SPOKEN_MAX_LINES: usize = 3;
 
-/// How many first-column keys a table announcement will read out before it stops.
-///
-/// The keys are the useful part of a table when you cannot see it — they say what the table is
-/// ABOUT. All of them would be the same wall of text the placeholder exists to remove.
-const TABLE_KEYS_SPOKEN: usize = 4;
-
 /// How many distinct hashes will be given a letter before the table stops growing.
 ///
 /// This is a memory bound on a table that otherwise lives as long as the server, not a claim about
@@ -217,15 +211,7 @@ fn strip_markdown(content: &str) -> String {
     out
 }
 
-/// Replace a pipe table with a sentence about it.
-///
-/// A table of results is excellent to LOOK at and unbearable to hear: every cell arrives with no
-/// structure around it, and by the third row the listener has lost the header. So it is announced —
-/// its shape, and the first column's keys when those look like words somebody would recognise,
-/// because the keys are what the table is ABOUT.
-///
-/// The keys are only offered when they read as English. A first column of hashes or numbers says
-/// nothing when spoken, and a placeholder that recites them is the wall of text this removes.
+/// Replace a pipe table with its rows, said a row at a time ([`say_table`]).
 fn describe_tables(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut out: Vec<String> = Vec::new();
@@ -282,51 +268,79 @@ fn is_table_rule(line: &str) -> bool {
         .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' '))
 }
 
+/// A pipe table, said a row at a time, left to right: each cell a sentence of its own, labelled with
+/// its column's header ("Status: open."), so the listener never has to hold the header in mind.
+/// `#847 read-aloud-table-rows`. The owner, of a table read aloud: "I expected it to read a row at
+/// a time from left to right". (It used to be announced by its shape and its first column's keys,
+/// which read as the voice jumping down the first column while the page lit every cell in turn.)
+///
+/// The header row is the labels, not a row of data, where a rule under it says so; a table of only
+/// a header says its header's cells. A table with no rule has no labels, and its cells are said
+/// bare. An empty cell is passed over; a cell that already ends a sentence keeps its own stop.
 fn say_table(rows: &[&str]) -> String {
-    let data: Vec<&str> = rows.iter().copied().filter(|r| !is_table_rule(r)).collect();
-    let columns = data.first().map_or(0, |r| table_cells(r).len());
-    // The header is not a row of data, when there was a rule under it saying so.
-    let had_header = rows.iter().any(|r| is_table_rule(r));
-    let body: &[&str] = if had_header && !data.is_empty() {
-        &data[1..]
-    } else {
-        &data
-    };
-    let row_count = body.len();
-    let col_plural = if columns == 1 { "" } else { "s" };
-    let row_plural = if row_count == 1 { "" } else { "s" };
-    let shape =
-        format!("a table with {columns} column{col_plural} and {row_count} row{row_plural}");
-
-    let keys: Vec<String> = body
+    let data: Vec<Vec<String>> = rows
         .iter()
-        .filter_map(|r| table_cells(r).into_iter().next())
-        .filter(|k| looks_like_a_word(k))
-        .take(TABLE_KEYS_SPOKEN)
+        .filter(|r| !is_table_rule(r))
+        .map(|r| table_cells(r))
         .collect();
-    if keys.len() < 2 || keys.len() < row_count.min(2) {
-        return format!(" {shape}. ");
-    }
-    let more = if row_count > keys.len() {
-        ", and others"
-    } else {
-        ""
+    let had_header = rows.iter().any(|r| is_table_rule(r));
+    let (labels, body): (&[String], &[Vec<String>]) = match data.split_first() {
+        Some((header, rest)) if had_header && !rest.is_empty() => (header.as_slice(), rest),
+        _ => (&[], data.as_slice()),
     };
-    format!(" {shape}, with keys {}{more}. ", keys.join(", "))
+    let mut said = Vec::new();
+    for row in body {
+        for (at, cell) in row.iter().enumerate() {
+            if cell.is_empty() {
+                continue;
+            }
+            let stop = if cell.ends_with(['.', '!', '?']) {
+                ""
+            } else {
+                "."
+            };
+            match labels.get(at).filter(|label| !label.is_empty()) {
+                Some(label) => said.push(format!("{label}: {cell}{stop}")),
+                None => said.push(format!("{cell}{stop}")),
+            }
+        }
+    }
+    format!(" {} ", said.join(" "))
 }
 
-/// Does this cell read as something a person would recognise, rather than as an identifier?
-fn looks_like_a_word(cell: &str) -> bool {
-    let stripped: String = cell
-        .chars()
-        .filter(|c| !matches!(c, '*' | '`' | '_' | '~'))
+/// `#847 read-aloud-table-rows`. The pieces a table block is read in: one for each row under its
+/// header, each the header, its rule and that row, so it is said as that row alone, labelled
+/// ([`say_table`]). A table of only a header, or one written without a rule, is one piece, itself.
+///
+/// The page lights the cells of the row being read (`tableRowCells` in
+/// web/src/view/voice/read-aloud.ts), counting the rows it drew under the header.
+#[must_use]
+pub fn table_row_sources(source: &str) -> Vec<String> {
+    // A row may be written without its outer pipes; said, every row has them.
+    let piped = |line: &str| {
+        let mut row = String::new();
+        if !line.starts_with('|') {
+            row.push_str("| ");
+        }
+        row.push_str(line);
+        if !line.ends_with('|') || line.ends_with("\\|") {
+            row.push_str(" |");
+        }
+        row
+    };
+    let lines: Vec<String> = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(piped)
         .collect();
-    let stripped = stripped.trim();
-    !stripped.is_empty()
-        && stripped.chars().any(|c| c.is_ascii_alphabetic())
-        && !is_hashlike(stripped)
-        && !is_big_number(stripped)
-        && stripped.chars().filter(char::is_ascii_alphabetic).count() * 2 >= stripped.len()
+    match lines.as_slice() {
+        [header, rule, body @ ..] if is_table_rule(rule) && !body.is_empty() => body
+            .iter()
+            .map(|row| format!("{header}\n{rule}\n{row}"))
+            .collect(),
+        _ => vec![source.to_owned()],
+    }
 }
 
 /// Replace fenced blocks with a description, or keep the short ones.
@@ -1544,29 +1558,71 @@ mod tests {
     }
 
     #[test]
-    fn a_table_becomes_a_sentence_about_the_table() {
+    fn a_table_is_read_a_row_at_a_time_each_cell_with_its_header() {
+        // `#847 read-aloud-table-rows`: left to right, a row at a time, never down a column.
         let table = "\
 | step | result |
 |---|---|
 | build | ok |
 | test | ok |
 | package | failed |";
-        // Keys read, because they are what the table is ABOUT.
         assert_eq!(
             say(table),
-            "a table with 2 columns and 3 rows, with keys build, test, package."
+            "step: build. result: ok. step: test. result: ok. step: package. result: failed."
         );
     }
 
     #[test]
-    fn a_table_of_identifiers_says_its_shape_and_stops() {
-        // Reciting a first column of hashes is the wall of text the placeholder exists to remove.
+    fn a_table_of_identifiers_is_read_with_their_short_names() {
+        // A hash is a short name in a cell as anywhere else.
         let table = "\
 | commit | status |
 |---|---|
 | a1b2c3d4e5f6a7 | ok |
 | f6e5d4c3b2a1f0 | ok |";
-        assert_eq!(say(table), "a table with 2 columns and 2 rows.");
+        assert_eq!(
+            say(table),
+            "commit: hash code A. status: ok. commit: hash code B. status: ok."
+        );
+    }
+
+    #[test]
+    fn a_table_passes_over_empty_cells_keeps_a_cells_own_stop_and_says_a_bare_header() {
+        let table = "\
+| what | note |
+|---|---|
+| build |  |
+| test | Flaky! |";
+        assert_eq!(say(table), "what: build. what: test. note: Flaky!");
+        // Only a header: its cells, bare.
+        assert_eq!(say("| a | b |\n|---|---|"), "a. b.");
+        // No rule, no header: every row's cells, bare.
+        assert_eq!(say("| x | y |\n| z | w |"), "x. y. z. w.");
+    }
+
+    #[test]
+    fn a_table_block_is_read_in_one_piece_per_row_under_its_header() {
+        let source = "| Lane | Status |\n|---|---|\n| one | open |\nTwo | closed";
+        assert_eq!(
+            table_row_sources(source),
+            [
+                "| Lane | Status |\n|---|---|\n| one | open |",
+                "| Lane | Status |\n|---|---|\n| Two | closed |",
+            ]
+        );
+        assert_eq!(
+            say(&table_row_sources(source)[1]),
+            "Lane: Two. Status: closed."
+        );
+        // Only a header, or no rule: one piece, the table itself.
+        assert_eq!(
+            table_row_sources("| a | b |\n|---|---|"),
+            ["| a | b |\n|---|---|"]
+        );
+        assert_eq!(
+            table_row_sources("| x | y |\n| z | w |"),
+            ["| x | y |\n| z | w |"]
+        );
     }
 
     #[test]

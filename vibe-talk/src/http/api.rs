@@ -5871,8 +5871,9 @@ struct SpokenBlock {
 /// blocks (see [`crate::render::source_blocks`]); empty when it is one block.
 ///
 /// `#486 read-aloud-pieces`. Each drawn block in the pieces [`crate::render::read_pieces`] cuts it
-/// into, but a code block or a table, which is said as a short description of it, whole. Empty when
-/// the whole message is one piece.
+/// into, but a code block, which is said as a short description of it, whole, and a table, a piece
+/// for each row under its header (`#847 read-aloud-table-rows`,
+/// [`crate::speakable::table_row_sources`]). Empty when the whole message is one piece.
 ///
 /// Every block through the same speech rules as the whole message, sharing one set of short names
 /// so a hash is "hash code A" in whichever block it is said.
@@ -5886,21 +5887,25 @@ fn spoken_blocks(
     let blocks = crate::render::source_blocks(&message.content, markup, &message.mentions);
     // `read-chunk-balance`: a message that is one block is cut finer than a block of a longer one.
     let alone = blocks.len() == 1;
-    let cut: Vec<(BlockKind, Vec<&str>)> = blocks
+    let cut: Vec<(BlockKind, Vec<String>)> = blocks
         .iter()
         .map(|block| {
-            // A code block or a table is said as a description of it, and a block whose source still
-            // holds a fence (the whole text, when the tree and the HTML disagree) is never cut
-            // through its code: each whole.
+            // A code block is said as a description of it, and a block whose source still holds a
+            // fence (the whole text, when the tree and the HTML disagree) is never cut through its
+            // code: each whole. A table is read a row at a time (`#847 read-aloud-table-rows`).
             let fenced = block.source.contains("```") || block.source.contains("~~~");
-            let pieces = match block.kind {
-                BlockKind::Code | BlockKind::Table => vec![block.source.as_str()],
-                _ if fenced => vec![block.source.as_str()],
-                _ => crate::render::read_pieces(&block.source, alone),
+            let pieces: Vec<String> = match block.kind {
+                BlockKind::Table => crate::speakable::table_row_sources(&block.source),
+                BlockKind::Code => vec![block.source.clone()],
+                _ if fenced => vec![block.source.clone()],
+                _ => crate::render::read_pieces(&block.source, alone)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
             };
             // A block of nothing a piece can hold is still a block the page draws: kept whole.
             let pieces = if pieces.is_empty() {
-                vec![block.source.as_str()]
+                vec![block.source.clone()]
             } else {
                 pieces
             };
@@ -5917,7 +5922,7 @@ fn spoken_blocks(
         for (piece, source) in pieces.into_iter().enumerate() {
             let said = crate::speakable::for_speech_with(
                 &crate::speakable::with_mention_names(
-                    crate::render::piece_source(source),
+                    crate::render::piece_source(&source),
                     &message.mentions,
                 ),
                 now,

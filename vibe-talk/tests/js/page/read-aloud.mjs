@@ -4740,3 +4740,71 @@ test("the Mark-read automatically group explains itself in Help, where its ? lea
   assert.match(help, /Not noise/, "Help does not say how to rescue a message a rule caught");
   assert.match(help, /voice\s+agent\s+cannot\s+change/, "Help does not say who may change the rules");
 });
+
+// --- `#847 read-aloud-table-rows`: a table read a row at a time, its cells lit in step -----------------
+
+const TABLE_HTML = "<table>\n<thead>\n<tr>\n<th>Lane</th>\n<th>Status</th>\n<th>Owner</th>\n</tr>\n</thead>\n" +
+  "<tbody>\n<tr>\n<td>one</td>\n<td>open</td>\n<td>alice</td>\n</tr>\n<tr>\n<td>two</td>\n<td></td>\n<td>bob</td>\n</tr>\n" +
+  "</tbody>\n</table>\n";
+
+test("`#847 read-aloud-table-rows`: a table is read a row at a time, its cells lit left to right in step with the voice, none skipped and never ahead", async () => {
+  // The owner: "after reading the upper left cell, it jumped down to the cell directly below it ... skipped ...
+  // highlights proceeded faster than they should. I expected it to read a row at a time from left to right".
+  const page = newPage();
+  page.enableStreamedAudio();
+  page.enableAbort();
+  const highlights = page.enableHighlights();
+  // What the server says of each row: "Lane: one. Status: open. Owner: alice." and "Lane: two. Owner: bob."
+  const row = (at, chars) => ({ kind: "table", spoken: true, chars, element: 0, piece: at, pieces: 2 });
+  page.speechBlocks[BLOCKED_ID] = [row(0, 38), row(1, 21)];
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: BLOCKED_ID,
+    content: "| Lane | Status | Owner |\n|---|---|---|\n| one | open | alice |\n| two |  | bob |",
+    content_html: TABLE_HTML })]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "1 of 2", "the table is not read a row at a time");
+  assert.equal(blockOf(page.audioStreams[0].url), "0");
+  // A third of a second has arrived: however far the clock runs on, the light waits on the voice.
+  const first = page.audioStreams[0];
+  first.controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(300).fill(0x2000))));
+  await page.settle();
+  const started = page.audio.sources.at(-1).startedAt;
+  page.audio.currentTime = started + 2.5;
+  page.expireTimers(150);
+  await page.settle();
+  assert.equal(litSentence(highlights), "one", "the light ran ahead of the audio");
+  // All of the row arrives, 2.6 s, with no stall before it (the clock back where the audio is): the light
+  // walks its cells left to right, each in turn, none skipped.
+  page.audio.currentTime = started + 0.2;
+  first.controller.bytes(pcm(...new Array(2300).fill(0x2000)));
+  first.controller.drop();
+  await page.settle();
+  const walked = [];
+  for (let at = 0.05; at < 2.6; at += 0.1) {
+    page.audio.currentTime = started + at;
+    page.expireTimers(150);
+    await page.settle();
+    const lit = litSentence(highlights);
+    if (lit !== walked.at(-1)) walked.push(lit);
+  }
+  assert.deepStrictEqual(walked, ["one", "open", "alice"], "the row's cells were not lit in turn, left to right");
+  // The next row: its own cells, an empty one passed over as the voice passes over it.
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 2");
+  const second = page.audioStreams.at(-1);
+  second.controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(1500).fill(0x2000))));
+  second.controller.drop();
+  await page.settle();
+  const next = page.audio.sources.at(-1).startedAt;
+  const again = [];
+  for (let at = 0.05; at < 1.5; at += 0.1) {
+    page.audio.currentTime = next + at;
+    page.expireTimers(150);
+    await page.settle();
+    const lit = litSentence(highlights);
+    if (lit !== again.at(-1)) again.push(lit);
+  }
+  assert.deepStrictEqual(again, ["two", "bob"], "the second row's cells were not lit in turn");
+});
