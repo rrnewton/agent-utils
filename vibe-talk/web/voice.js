@@ -998,7 +998,7 @@ function channelLevels() {
     if (selection().origin === "list" && threadListOffered()) levels.push(...underThreadList(), "list");
     levels.push("thread");
   }
-  if (replyDocked) levels.push("reply");
+  if (replyState.docked) levels.push("reply");
   return levels;
 }
 
@@ -2748,7 +2748,7 @@ const packSlider = createPackSlides({
   list: () => leftEl("side-list"),
   area: () => leftEl("side-scroll"),
   motionMs: (name) => screenMotionMs(name),
-  replyDocked: () => replyDocked,
+  replyDocked: () => replyState.docked,
   hidden: () => document.hidden,
 });
 const { finishPackSlide, slideKey, itemAfterBlock, slideIntoPlace } = packSlider;
@@ -4205,7 +4205,7 @@ function applySearch() {
   if (!columnWork.active().searchWalk) setTextIfChanged(el("search-empty"), empty ? SEARCH_EMPTY_LOADED : searchEmptySentence(loaded));
   el("search-empty").hidden = empty;
   // `#410 inline-reply-editor`. A reply open in the stream: under its row while the search shows it.
-  if (replyDocked) placeInlineReply();
+  if (replyState.docked) placeInlineReply();
   // `#467 inline-send-in-place`. And a reply's row where its box was, while the search shows that row.
   else placeRowsInPlaceAgain();
 }
@@ -6480,7 +6480,7 @@ function paneFor(node) {
   }
   // `#410 inline-reply-editor`. A reply open in the stream is its list's: Escape out of its box goes to
   // that list, and the page keys there move it.
-  if (replyDocked && node && nodeWithin(leftEl("reply-compose"), node)) return replyPane();
+  if (replyState.docked && node && nodeWithin(leftEl("reply-compose"), node)) return replyPane();
   if (lastPane.list() !== null) return lastPane;
   return KEY_PANES.find((pane) => pane.list() !== null) || null;
 }
@@ -8294,7 +8294,7 @@ function keysFromKeyboard() {
  * c and Ctrl+S write in it, and Back puts it down — before it leaves a thread.
  */
 function replyOnScreen() {
-  return replyDocked && screens.screen() === "main";
+  return replyState.docked && screens.screen() === "main";
 }
 
 /**
@@ -12358,7 +12358,7 @@ async function readBehindSwitch() {
 async function changeChannelView(view, threadId = null, summary = null, origin = null, before = null) {
   noteDeepLinkReaderMove();
   // `#277 reply-in-column`. The list a reply open in this column answers a message of is going.
-  if (replyDocked && columnWork.active() === replyColumn) putDockedReplyAway();
+  if (replyState.docked && columnWork.active() === replyState.column) putDockedReplyAway();
   // Before the view goes: where the reader is, and how current what they are reading is — what a
   // view drawn from held rows is as current as. Where a change of layout brings the switch, where the
   // reader of the left column was before it (`before`, `leftColumnPlace`).
@@ -15836,7 +15836,7 @@ function placeOutgoingInPlace(rows) {
         }
       }
     }
-    if (!found || found.anchor === inlineAnchor || found.anchor.hasAttribute("data-inline-reply")) {
+    if (!found || found.anchor === replyState.anchor || found.anchor.hasAttribute("data-inline-reply")) {
       foot.push(row);
       continue;
     }
@@ -18145,8 +18145,8 @@ function renderChannelRows() {
   if (!columnWork.side() && mainRowsOnScreen()) renderSideCards();
   // `#410 inline-reply-editor`. A reply open in the stream, under its row as the rows now stand; and
   // one waiting for its message, opened again once the message is drawn.
-  if (replyDocked) placeInlineReply();
-  else if (pendingReply) reopenPendingReply();
+  if (replyState.docked) placeInlineReply();
+  else if (replyState.pending) reopenPendingReply();
 }
 
 /**
@@ -25453,37 +25453,16 @@ const serverCacheBox = mountServerCache({
 /** The reply drafts, by message id. */
 const replyDrafts = createReplyDrafts({ storage: deviceStorageOnUse(), makeRoom: () => dropMessageCache() });
 
-let replyTarget = null;
-let replyChannelId = null;
 /**
- * Where the reply on screen goes, as `replyRoute` decided when it opened — or since, when a read
- * placed a message the stream had left unplaced, or a reply arrived in the thread it offered to
- * start. See `followReplyStore`.
- */
-let replyRouting = { thread: null, branch: null, into: null, unknown: false, removed: false, note: "" };
-// Which kept drafts were left with "Start a new thread" ticked is the reply drafts' (`startsThread`).
-/** The column the reply was opened from, whose list that place is in. `#229 desktop-two-column`. */
-let replyColumn = columns.main;
-/**
- * Whether a reply is open: its box in the stream of the list Reply was pressed in (`#410
- * inline-reply-editor`; see `dockReply`). There is no other place for it to be open.
- */
-let replyDocked = false;
-/**
- * A reply put away because the list it was open in went — two columns becoming one — to be opened
- * again in the stream, its words as they were, as soon as its message is drawn (`reopenPendingReply`).
- * `typing`: the box had the focus, and gets it back if that is at once. `ready`: the layout that
- * followed is drawn, so a list on screen is one to open it in. Null when none waits.
+ * The reply open in the stream and what it was opened with — its message, channel and route, its column and
+ * list, whether it is docked, one put away to reopen, the focus a column took from it, its quote, the
+ * replies it gathered and the row it is drawn under: one record in web/src/view/channel/replystate.ts
+ * (`#624 voice-page-modularity`), which says what each is.
  *
- * @type {{id: string, typing: boolean, ready: boolean} | null}
+ * @type {import("./src/view/channel/index.ts").ReplyState<ColumnFields, any>}
  */
-let pendingReply = null;
-/**
- * Whether the browser took the focus off the box of a reply open in a column because it stopped drawing
- * that column, so that the reader was typing in it as far as the page is concerned. `#314
- * reply-focus-flake`; see `noteReplyFocusLeaving`.
- */
-let replyFocusTaken = false;
+const replyState = createReplyState(columns.main);
+// Which kept drafts were left with "Start a new thread" ticked is the reply drafts' (`startsThread`).
 
 const REPLY_DRAFT_REFUSED =
   "This browser refused to store the draft, so it will be lost if you reload (private " +
@@ -25495,15 +25474,15 @@ const REPLY_DRAFT_REFUSED =
  * `#185 reply-new-thread`.
  */
 function replyBoundForThread() {
-  return Boolean(replyRouting.into) || Boolean(replyRouting.branch && el("reply-branch").checked);
+  return Boolean(replyState.routing.into) || Boolean(replyState.routing.branch && el("reply-branch").checked);
 }
 
 function rememberDraft() {
-  if (!replyTarget) {
+  if (!replyState.target) {
     return;
   }
   // By the id as a string, the key a reload reads them back under and `draftMarker` asks by.
-  const id = String(replyTarget.id);
+  const id = String(replyState.target.id);
   const had = replyDrafts.has(id);
   const before = replyDrafts.get(id) || "";
   const text = el("reply-text").value;
@@ -25514,7 +25493,7 @@ function rememberDraft() {
   }
   replyDrafts.setStartsThread(id, Boolean(text.trim()) && replyBoundForThread());
   // `#819 voice-page-quoted-reply-and-draft-chip`. Found again by the Draft chip; no newer for being unchanged.
-  if ((replyDrafts.get(id) || "") !== before) noteDraft("reply", id, String(replyChannelId || selectedChannelId() || ""), replyDrafts.has(id));
+  if ((replyDrafts.get(id) || "") !== before) noteDraft("reply", id, String(replyState.channelId || selectedChannelId() || ""), replyDrafts.has(id));
   // `#193 compose-draft-loss`. The row's Draft comes and goes with the draft.
   if (replyDrafts.has(id) !== had) renderDraftMarkers();
   // ...and SAY SO when the browser refuses. The read-back was here from the start and its answer
@@ -25721,7 +25700,7 @@ async function openDraft(draft) {
       column = shows();
     }
     // The box at the foot stands aside while a reply is open in the stream: that reply put down, its draft kept.
-    if (column && replyDocked) closeReply({ restore: false, refocus: false });
+    if (column && replyState.docked) closeReply({ restore: false, refocus: false });
     if (column) inColumn(column, () => focusAtEnd(el("channel-compose-text")));
     return;
   }
@@ -25855,13 +25834,6 @@ function quickReplyToStream(row, message, text) {
   inColumn(column, () => openReply(drawn ? rowMessages(drawn) : [message], drawn, "", false));
 }
 
-/**
- * What the reply box was opened with when it was opened with a quote, and the draft that was there
- * before it, so that Cancel on a quote left untouched keeps only that draft. Null otherwise.
- *
- * @type {{opened: string, draft: string} | null}
- */
-let replyQuote = null;
 
 /**
  * Open Reply on one specific row: its box in the stream of the column Reply was pressed in, under the
@@ -25891,11 +25863,11 @@ function openReply(messages, from = null, quote = "", focus = true) {
   }
   // Only on the channel's lists, where every Reply is: with none on screen the draft waits for its row.
   if (screens.screen() !== "main" || screens.view() !== "discord") return;
-  pendingReply = null;
+  replyState.pending = null;
   // `#410 inline-reply-editor`. A reply already open in the stream is put down first, its words kept as
   // Cancel keeps them and what it gathered put back, and the box moves to this message: the row pressed
   // stays where it was on the screen while the first box leaves from above it.
-  if (replyDocked) {
+  if (replyState.docked) {
     const list = from && from.parentNode ? /** @type {HTMLElement} */ (from.parentNode) : null;
     const id = from ? idsOf(from)[0] : undefined;
     const top = list && from && shownNode(from) ? from.getBoundingClientRect().top : NaN;
@@ -25906,8 +25878,8 @@ function openReply(messages, from = null, quote = "", focus = true) {
     }
   }
   const message = messages[0];
-  replyTarget = message;
-  replyChannelId = selectedChannelId();
+  replyState.target = message;
+  replyState.channelId = selectedChannelId();
   // `#185 reply-new-thread`. Offered only where a new thread is possible, and never carried over
   // from the last reply: the default is to answer where the message is. Only this message's own kept
   // draft brings its tick back (`replyDrafts.startsThread`) — or, where its thread has been answered since,
@@ -25916,10 +25888,10 @@ function openReply(messages, from = null, quote = "", focus = true) {
   // make it a thread: bound for its new thread where the service starts one on the reply's say-so.
   const starts = Boolean(from && from.hasAttribute("data-main-row"));
   const bound = (replyDrafts.has(String(message.id)) && replyDrafts.startsThread(String(message.id))) || starts;
-  replyRouting = replyRoute(message, bound);
-  el("reply-branch").checked = Boolean(replyRouting.branch) && bound;
-  el("reply-branch-row").hidden = !replyRouting.branch;
-  replyColumn = columnWork.active();
+  replyState.routing = replyRoute(message, bound);
+  el("reply-branch").checked = Boolean(replyState.routing.branch) && bound;
+  el("reply-branch-row").hidden = !replyState.routing.branch;
+  replyState.column = columnWork.active();
   el("reply-target-meta").textContent = `to ${
     message.author_is_bot ? `${message.author} (bot)` : String(message.author)
   } · id ${message.id}`;
@@ -25928,7 +25900,7 @@ function openReply(messages, from = null, quote = "", focus = true) {
   const block = quote ? quoteBlock(quote) : "";
   const opened = block && !draft.startsWith(block) ? `${block}${draft}` : draft;
   el("reply-text").value = opened;
-  replyQuote = block ? { opened, draft } : null;
+  replyState.quote = block ? { opened, draft } : null;
   el("reply-state").textContent = "";
   // Where it posts is said first: the line it takes is part of the box's height, and the room left
   // over the box is what the row answered is kept in view in.
@@ -25950,11 +25922,11 @@ function openReply(messages, from = null, quote = "", focus = true) {
  */
 function renderReplyDestination() {
   const note = el("reply-destination");
-  note.textContent = replyRouting.branch
+  note.textContent = replyState.routing.branch
     ? el("reply-branch").checked
       ? "Posts in a new thread on this message, as its first reply."
       : "Posts in the main channel as a reply to this message."
-    : replyRouting.note;
+    : replyState.routing.note;
   note.hidden = note.textContent === "";
 }
 
@@ -25972,29 +25944,29 @@ function closeReply(how = {}) {
   const { restore = true, refocus = true } = how;
   // `#267 quote-reply`. A quote put in the box and left as it was is not a reply begun: the draft
   // that was there before it is what is kept.
-  if (replyQuote && el("reply-text").value === replyQuote.opened) el("reply-text").value = replyQuote.draft;
-  replyQuote = null;
+  if (replyState.quote && el("reply-text").value === replyState.quote.opened) el("reply-text").value = replyState.quote.draft;
+  replyState.quote = null;
   rememberDraft();
-  const id = replyTarget ? String(replyTarget.id) : null;
-  replyTarget = null;
-  if (replyDocked && id !== null) leaveDockedReply(id, { restore, refocus });
+  const id = replyState.target ? String(replyState.target.id) : null;
+  replyState.target = null;
+  if (replyState.docked && id !== null) leaveDockedReply(id, { restore, refocus });
 }
 
 /** Hand the captured target and text to the same durable outbox as the normal composer. */
 async function sendReply() {
-  if (!replyTarget) return;
+  if (!replyState.target) return;
   const text = el("reply-text").value;
   if (!text.trim()) {
     el("reply-state").textContent = "Nothing to send yet — write something first.";
     return;
   }
-  const channel = replyChannelId;
-  const target = replyTarget;
+  const channel = replyState.channelId;
+  const target = replyState.target;
   if (knownChannel(channel)?.writable === false) {
     el("reply-state").textContent = "This channel is read-only.";
     return;
   }
-  const route = replyRouting;
+  const route = replyState.routing;
   // `#315 removed-reply-target`. A reply to a message removed upstream goes nowhere: the words stay in
   // the box, and nothing is queued to hold up what the reader writes next in the channel.
   if (route.removed) {
@@ -26007,33 +25979,33 @@ async function sendReply() {
     channel, threadId: branch || route.into || route.thread, replyTo: String(target.id), text,
     // `#467 inline-send-in-place`. Sent from the box in the stream: its row is drawn where that box was,
     // under the message it answers, until the reply itself is drawn (`placeOutgoingInPlace`).
-    ...(replyDocked ? { inPlace: String(target.id) } : {}),
+    ...(replyState.docked ? { inPlace: String(target.id) } : {}),
     // `#500 sent-receipts-pile-up`. And in which list: the Threads view's cards, where Main may draw the
     // same message on the left.
-    ...(replyDocked && replyList === leftEl("side-cards") ? { inCards: true } : {}),
+    ...(replyState.docked && replyState.list === leftEl("side-cards") ? { inCards: true } : {}),
     // `#300 reply-marks-read`. A targeted reply marks the message it answers, wherever it goes, unless
     // its quote covers too little of it (`#728 vt-quote-read-threshold`).
     marksRead: replyMarksRead(target, text),
     // Not where to post yet: the send reads the channel first. See `placeReplyTarget`.
     ...(route.unknown ? { placement: "unknown" } : {}),
-  }, replyDocked ? replyColumn : null);
+  }, replyState.docked ? replyState.column : null);
   replyDrafts.delete(String(target.id));
   replyDrafts.setStartsThread(String(target.id), false);
   if (outbox.storageOkay()) replyDrafts.save();
-  noteDraft("reply", String(target.id), String(replyChannelId || ""), false);
+  noteDraft("reply", String(target.id), String(replyState.channelId || ""), false);
   renderDraftMarkers();
-  replyQuote = null;
+  replyState.quote = null;
   el("reply-text").value = "";
   el("reply-state").textContent = "";
   // Do not call closeReply: its draft save would overwrite the fallback retained after a storage
   // failure. The captured request owns its text now; a newer reply draft must never be touched by
   // its eventual completion.
-  replyTarget = null;
+  replyState.target = null;
   // `#410 inline-reply-editor`. Sent from the stream, nothing moves but the box, which goes: the message
   // answered turns Done where it stands (`markAnsweredDone`), which says the reply went, and the reply
   // joins what Reply gathered under it as it lands. A reply that does not go says so where the reader
   // is, the outbox row that offers Retry being down at the column's foot (`reportColumnReply`).
-  if (replyDocked) {
+  if (replyState.docked) {
     leaveDockedReply(String(target.id), { sent: true });
     // `#467 inline-send-in-place`. Its row takes the place the box has just left.
     renderOutgoingEverywhere();
@@ -26096,14 +26068,6 @@ async function sendReply() {
 /** The keys' list of `column`: the left column's, or the right one's. */
 const columnPane = (column) => (column === columns.side ? sidePane : channelPane);
 
-/** The list the reply open in the stream was opened on, in `replyColumn`; null while none is open. */
-let replyList = /** @type {HTMLElement | null} */ (null);
-
-/** Whether opening that reply gathered its message's replies, which putting it down puts back. */
-let replyGathered = false;
-
-/** The row the box is drawn under, while it is drawn under one: see `placeInlineReply`. */
-let inlineAnchor = /** @type {HTMLElement | null} */ (null);
 
 /** The lists Reply opens its box in, by their ids. */
 const REPLY_LISTS = ["discord-log", "side-log", "pinned-log", "side-pinned-log", "side-cards"];
@@ -26134,7 +26098,7 @@ const ANCHORS = Boolean(window.CSS && typeof window.CSS.supports === "function" 
  * cards (`#407 unpack-row-parity`: its reply is the left column's, drawn in the right one's list).
  */
 function replyKeysHere() {
-  return columnWork.active() === replyColumn || (replyDocked && columnWork.active() === paneColumn(replyPane()));
+  return columnWork.active() === replyState.column || (replyState.docked && columnWork.active() === paneColumn(replyPane()));
 }
 
 /** The list Reply was pressed on: the row's, where it is on one of the channel's lists; else the column's. */
@@ -26176,19 +26140,19 @@ function headsAnsweredThread(message) {
  * @param {HTMLElement} list
  */
 function gatherForReply(list) {
-  if (!replyTarget) return false;
-  const id = String(replyTarget.id);
+  if (!replyState.target) return false;
+  const id = String(replyState.target.id);
   // What a sent reply left gathered is put back by the next Reply, as N replies on another message puts
   // the first back: one gathering at a time.
   if (gatherState().gathered && gatherState().gathered.byReply && gatherState().gathered.parent !== id) inColumn(gatherState().gathered.column || columnWork.active(), putRepliesBack);
   if (list !== el("discord-log") || rowsChosen()) return false;
   if (gatheredParent() === id) return false;
-  if (rootOfOpenThread(replyTarget)) return false;
+  if (rootOfOpenThread(replyState.target)) return false;
   // Not where the right column shows that thread already: it would be drawn twice side by side, as N
   // replies on a root in two columns declines to (`toggleGathered`).
   const shownRight = layoutShown.columns() && !columnWork.side() && columns.side.mode === "thread"
     ? inColumn(columns.side, () => String(selection().threadId || "")) : "";
-  const own = selection().view === "main" && headsAnsweredThread(replyTarget) ? threadOf(replyTarget) : null;
+  const own = selection().view === "main" && headsAnsweredThread(replyState.target) ? threadOf(replyState.target) : null;
   const thread = own !== null && own !== shownRight ? own : null;
   if (thread === null && gatherReport(id).gathered === 0) return false;
   gatherState().gathered = { parent: id, context: channelContextKey(), byReply: true, thread, column: columnWork.active() };
@@ -26206,7 +26170,7 @@ function gatherForReply(list) {
  * @param {HTMLElement} list
  */
 function inlineReplyAnchor(list) {
-  return replyTarget ? anchorUnder(list, String(replyTarget.id), replyTarget) : null;
+  return replyState.target ? anchorUnder(list, String(replyState.target.id), replyState.target) : null;
 }
 
 /**
@@ -26251,13 +26215,13 @@ function anchorUnder(list, id, message = null) {
  * rebuild or move the rows; the room again whenever the box changes height (`fitInlineRoom`).
  */
 function placeInlineReply() {
-  const list = replyDocked && replyList && replyList.parentNode ? replyList : null;
-  const anchor = list ? inColumn(replyColumn, () => inlineReplyAnchor(list)) : null;
-  if (inlineAnchor !== anchor && inlineAnchor !== null) {
-    inlineAnchor.removeAttribute("data-inline-reply");
-    inlineAnchor.style.removeProperty("--inline-reply-room");
+  const list = replyState.docked && replyState.list && replyState.list.parentNode ? replyState.list : null;
+  const anchor = list ? inColumn(replyState.column, () => inlineReplyAnchor(list)) : null;
+  if (replyState.anchor !== anchor && replyState.anchor !== null) {
+    replyState.anchor.removeAttribute("data-inline-reply");
+    replyState.anchor.style.removeProperty("--inline-reply-room");
   }
-  inlineAnchor = anchor;
+  replyState.anchor = anchor;
   if (list === null) return;
   const mount = replyMountFor(list);
   if (anchor !== null && !anchor.hasAttribute("data-inline-reply")) anchor.setAttribute("data-inline-reply", "");
@@ -26279,13 +26243,13 @@ function placeRowsInPlaceAgain() {
 
 /** The room under the anchor row: the height of the box drawn there, in px. */
 function fitInlineRoom() {
-  if (inlineAnchor === null || !replyList) return;
-  const room = `${Math.ceil(replyMountFor(replyList).getBoundingClientRect().height || 0)}px`;
-  if (inlineAnchor.style.getPropertyValue("--inline-reply-room") !== room) inlineAnchor.style.setProperty("--inline-reply-room", room);
+  if (replyState.anchor === null || !replyState.list) return;
+  const room = `${Math.ceil(replyMountFor(replyState.list).getBoundingClientRect().height || 0)}px`;
+  if (replyState.anchor.style.getPropertyValue("--inline-reply-room") !== room) replyState.anchor.style.setProperty("--inline-reply-room", room);
 }
 
 /**
- * Open the reply's box in the stream of the column being worked on (`replyColumn`), on the list `from`
+ * Open the reply's box in the stream of the column being worked on (`replyState.column`), on the list `from`
  * is a row of: the message's replies gathered under it, the box under them, the column's own box hidden,
  * and the message where it was on the screen. See the section note.
  *
@@ -26293,11 +26257,11 @@ function fitInlineRoom() {
  */
 function dockReply(from) {
   const list = replyListOf(from);
-  const id = String(replyTarget.id);
+  const id = String(replyState.target.id);
   const top = from && from.parentNode && shownNode(from) ? from.getBoundingClientRect().top : NaN;
-  replyList = list;
-  replyDocked = true;
-  replyGathered = gatherForReply(list);
+  replyState.list = list;
+  replyState.docked = true;
+  replyState.gathered = gatherForReply(list);
   // The message where it was, whatever the gathering moved round it.
   holdRowAt(listPane(list), list, id, top);
   const mount = replyMountFor(list);
@@ -26315,7 +26279,7 @@ function dockReply(from) {
   // being what the reader is about to write in. A message, or its replies, taller than the column leaves
   // above it is the one case where the row's top goes up under the head, a scroll up to read. Only for a
   // box drawn under its row: one at the list's foot is not a reason to take the reader there.
-  if (!ANCHORS || inlineAnchor === null) return;
+  if (!ANCHORS || replyState.anchor === null) return;
   const pane = replyPane();
   const over = mount.getBoundingClientRect().bottom - pane.foot();
   if (over > 0) pane.scroller().scrollTop += over;
@@ -26332,11 +26296,11 @@ function holdRowAt(pane, list, id, top) {
  * the message it answered is no longer edged.
  */
 function undockReply() {
-  if (!replyDocked) return;
+  if (!replyState.docked) return;
   // Not open in the stream from here on, before the box moves: Chromium takes the focus off a box as it
   // leaves the column, and that is not the column going (`noteReplyFocusLeaving`).
-  replyDocked = false;
-  replyFocusTaken = false;
+  replyState.docked = false;
+  replyState.focusTaken = false;
   for (const id of ["column-reply", "side-reply"]) leftEl(id).hidden = true;
   // Home, out of sight: the left column's place, hidden.
   leftEl("column-reply").append(leftEl("reply-compose"));
@@ -26344,7 +26308,7 @@ function undockReply() {
   leftEl("side-pane").append(leftEl("side-reply"));
   for (const id of ["channel-composer", "side-composer"]) leftEl(id).hidden = false;
   placeInlineReply();
-  replyList = null;
+  replyState.list = null;
   renderReplyingMarks();
   voiceTranscript().markCardBesideReply();
   scheduleBackSync();
@@ -26368,8 +26332,8 @@ function leaveDockedReply(id, how = {}) {
   const held = document.activeElement;
   const inside = Boolean(held) && nodeWithin(box, held);
   const pane = replyPane();
-  const column = replyColumn;
-  const list = replyList;
+  const column = replyState.column;
+  const list = replyState.list;
   const area = pane.scroller();
   // Sent from the foot of the list, the reader stays at its foot, where the reply lands; put down, the
   // message stays where it is, which leaves the reader where they are.
@@ -26378,8 +26342,8 @@ function leaveDockedReply(id, how = {}) {
   const rect = row && shownNode(row) ? row.getBoundingClientRect() : null;
   const top = rect && rect.bottom > pane.head() && rect.top < pane.foot() ? rect.top : NaN;
   const mark = restore && !footed && !Number.isFinite(top) && pane === columnPane(column) ? inColumn(column, captureScroll) : null;
-  const scatter = replyGathered && !sent;
-  replyGathered = false;
+  const scatter = replyState.gathered && !sent;
+  replyState.gathered = false;
   undockReply();
   inColumn(column, () => {
     if (scatter && gatherState().gathered && gatherState().gathered.byReply && gatherState().gathered.parent === id) {
@@ -26397,7 +26361,7 @@ function leaveDockedReply(id, how = {}) {
 }
 
 /**
- * Open again the reply put away when its list went (`pendingReply`), as soon as its message is drawn on a
+ * Open again the reply put away when its list went (`replyState.pending`), as soon as its message is drawn on a
  * list on screen: the left column's, or the right one's where it is up. In the stream as Reply opens it,
  * words, quote and route and all being the message's draft. The focus goes back into the box only where
  * it was there when the list went and this follows at once; a reply reopened later, its message drawn
@@ -26405,11 +26369,11 @@ function leaveDockedReply(id, how = {}) {
  * redraw of a list while one waits, and by the layout two columns went to once it is drawn.
  */
 function reopenPendingReply() {
-  if (pendingReply === null || !pendingReply.ready || replyDocked || screens.screen() !== "main" || screens.view() !== "discord") return;
+  if (replyState.pending === null || !replyState.pending.ready || replyState.docked || screens.screen() !== "main" || screens.view() !== "discord") return;
   // Not under a reader writing in a box: the box would go from under their hands. A later redraw asks again.
   const held = document.activeElement;
   if (isComposer(held) && held !== leftEl("reply-text")) return;
-  const { id, typing } = pendingReply;
+  const { id, typing } = replyState.pending;
   /** @type {Array<{column: any, list: () => HTMLElement}>} */
   const lists = [{ column: columns.main, list: () => el(pinsView().only ? "pinned-log" : "discord-log") }];
   if (sideColumnUp()) lists.push({ column: columns.side, list: () => leftEl(columns.side.mode === "thread" ? "side-log" : "side-cards") });
@@ -26419,7 +26383,7 @@ function reopenPendingReply() {
       return shown && shownNode(shown) ? rowIn(shown, id) : null;
     });
     if (!row || !shownNode(row)) continue;
-    pendingReply = null;
+    replyState.pending = null;
     inColumn(column, () => openReply(rowMessages(row), row, "", typing));
     return;
   }
@@ -26445,7 +26409,7 @@ function reopenPendingReply() {
  */
 function noteReplyFocusLeaving(event) {
   const box = el("reply-compose");
-  replyFocusTaken = replyDocked && !(event && event.relatedTarget) &&
+  replyState.focusTaken = replyState.docked && !(event && event.relatedTarget) &&
     typeof box.getClientRects === "function" && box.getClientRects().length === 0;
 }
 
@@ -26454,7 +26418,7 @@ function noteReplyFocusLeaving(event) {
  * draft. Nothing is restored, and the keys are left where they are: the reader is going elsewhere.
  */
 function putDockedReplyAway() {
-  if (replyDocked) closeReply({ restore: false, refocus: false });
+  if (replyState.docked) closeReply({ restore: false, refocus: false });
 }
 
 /**
@@ -26478,8 +26442,8 @@ function renderReplyingMarks() {
 
 /** Whether `message` is the one a reply open in the column being worked on answers. */
 function replyingTo(message) {
-  return replyDocked && replyTarget !== null && columnWork.active() === replyColumn &&
-    String(/** @type {any} */ (message).id) === String(/** @type {any} */ (replyTarget).id);
+  return replyState.docked && replyState.target !== null && columnWork.active() === replyState.column &&
+    String(/** @type {any} */ (message).id) === String(/** @type {any} */ (replyState.target).id);
 }
 
 /** Edge `row` as the message being answered, or not. */
@@ -26614,7 +26578,7 @@ function unseenColumnReply() {
  * @returns {{column: ColumnFields, row: HTMLElement} | null}
  */
 function answeredRow(id) {
-  for (const column of [replyColumn, columns.main, columns.side]) {
+  for (const column of [replyState.column, columns.main, columns.side]) {
     if (column === columns.side && !sideShowing()) continue;
     const row = inColumn(column, () => rowHolding(id) ||
       [...el("pinned-log").children].find((one) => idsOf(one).includes(id)) || null);
@@ -26865,28 +26829,28 @@ async function markSentRead(entry) {
  * as it was going to. The words, and where they go, stay with the draft.
  */
 function followReplyStore() {
-  if (!replyDocked || !replyTarget) return;
+  if (!replyState.docked || !replyState.target) return;
   let moved = false;
   // `#315 removed-reply-target`. Removed upstream since Reply was opened, wherever it was going: Send
   // refuses it now, and the note says so.
-  if (!replyRouting.removed && removedUpstream(replyTarget.id)) {
-    replyRouting = replyRoute(replyTarget);
+  if (!replyState.routing.removed && removedUpstream(replyState.target.id)) {
+    replyState.routing = replyRoute(replyState.target);
     el("reply-branch").checked = false;
     el("reply-branch-row").hidden = true;
     moved = true;
-  } else if (replyRouting.unknown) {
-    const settled = replyRoute(replyTarget);
-    if (!settled.unknown || settled.removed !== replyRouting.removed) {
-      replyRouting = settled;
+  } else if (replyState.routing.unknown) {
+    const settled = replyRoute(replyState.target);
+    if (!settled.unknown || settled.removed !== replyState.routing.removed) {
+      replyState.routing = settled;
       el("reply-branch").checked = false;
       el("reply-branch-row").hidden = !settled.branch;
     }
-  } else if (replyRouting.branch || replyRouting.into) {
+  } else if (replyState.routing.branch || replyState.routing.into) {
     // Asked in the column Reply was opened from, as `openReply` asked it: the route reads the view.
     const bound = replyBoundForThread();
-    const settled = inColumn(replyColumn, () => replyRoute(replyTarget, bound));
-    if (settled.branch !== replyRouting.branch || settled.into !== replyRouting.into) {
-      replyRouting = settled;
+    const settled = inColumn(replyState.column, () => replyRoute(replyState.target, bound));
+    if (settled.branch !== replyState.routing.branch || settled.into !== replyState.routing.into) {
+      replyState.routing = settled;
       el("reply-branch").checked = Boolean(settled.branch) && bound;
       el("reply-branch-row").hidden = !settled.branch;
       moved = true;
@@ -27446,7 +27410,7 @@ function chooseView(which) {
   // kept as a draft, by any view but two columns, which keep the column it is in: the others take that
   // column away, or show the right one's cards. Not opened again by itself, as two columns going by the
   // layout button or a narrowed window open it (`leaveColumns`): the reader chose a view to read.
-  if (replyDocked && which !== "columns") closeReply();
+  if (replyState.docked && which !== "columns") closeReply();
   if (which === "threads") {
     setLayout("list");
     return;
@@ -27594,12 +27558,12 @@ function leaveColumns(next = "one", left = null) {
   // change under it, and opened again in the stream once the layout that follows is drawn, where its
   // message is drawn (`reopenPendingReply`): what this returns, which `moveLayout` runs then — over one
   // column, or over the thread list (`#281 view-keys`). Where its message is not drawn, it waits for it.
-  const replying = replyDocked;
+  const replying = replyState.docked;
   // `#314 reply-focus-flake`. Or had it until the browser took it, the column no longer drawn.
-  const typing = replying && (nodeWithin(el("reply-compose"), document.activeElement) || (replyFocusTaken && focusLost()));
-  const waiting = replying && replyTarget ? { id: String(replyTarget.id), typing, ready: false } : null;
+  const typing = replying && (nodeWithin(el("reply-compose"), document.activeElement) || (replyState.focusTaken && focusLost()));
+  const waiting = replying && replyState.target ? { id: String(replyState.target.id), typing, ready: false } : null;
   if (replying) closeReply({ restore: false, refocus: false });
-  if (waiting) pendingReply = waiting;
+  if (waiting) replyState.pending = waiting;
   // `#262 search-load-older`. The right column's walk for the search ends: its list is put aside, held.
   endSearchWalk(columns.side);
   layoutShown.setColumns(false);
@@ -27619,10 +27583,10 @@ function leaveColumns(next = "one", left = null) {
   // All is offered at once, not at the next keystroke. Back to Main, nothing above searched it again.
   renderSearchInAll();
   return replying ? () => {
-    if (pendingReply) pendingReply.ready = true;
+    if (replyState.pending) replyState.pending.ready = true;
     reopenPendingReply();
     // Still waiting: when it opens later, the keys stay where the reader has them by then.
-    if (pendingReply) pendingReply.typing = false;
+    if (replyState.pending) replyState.pending.typing = false;
   } : null;
 }
 
@@ -28141,8 +28105,8 @@ function renderSideCards() {
   }
   // `#410 inline-reply-editor`. A reply open under a row unpacked here, under it as the rows now stand;
   // one waiting for its message, opened again once the message is drawn here.
-  if (replyDocked) placeInlineReply();
-  else if (pendingReply) reopenPendingReply();
+  if (replyState.docked) placeInlineReply();
+  else if (replyState.pending) reopenPendingReply();
 }
 
 // --- the card the reader was held by, moved -----------------------------------------------------------
@@ -30042,7 +30006,7 @@ function selectSideThread(id, summary = null) {
   if (was === "list") rememberCardPlace();
   // `#410 inline-reply-editor`. A reply open under a row unpacked among the cards goes with them, its
   // words kept as a draft: it is the left column's reply (`openReply`), drawn in a list now hidden.
-  if (replyDocked && replyColumn !== columns.side && replyPane() === sidePane) putDockedReplyAway();
+  if (replyState.docked && replyState.column !== columns.side && replyPane() === sidePane) putDockedReplyAway();
   columns.side.mode = "thread";
   renderSideMode();
   const opened = inColumn(columns.side, () => {
@@ -30061,7 +30025,7 @@ function selectSideThread(id, summary = null) {
 /** The X: the thread goes, and the cards come back. Its rows are held, so selecting it again is instant. */
 function closeSideThread() {
   // `#277 reply-in-column`. A reply open under the thread goes with it, its words kept as a draft.
-  if (replyColumn === columns.side) putDockedReplyAway();
+  if (replyState.column === columns.side) putDockedReplyAway();
   // `#262 search-load-older`. The thread's walk for the search goes with it: nothing else it asks
   // about changes when the cards come back.
   endSearchWalk(columns.side);
@@ -33440,7 +33404,7 @@ el("reply-text").addEventListener("input", rememberDraft);
 // forgotten once anything has the focus again, which is where the reader went.
 el("reply-compose").addEventListener("focusout", noteReplyFocusLeaving);
 document.addEventListener("focusin", () => {
-  replyFocusTaken = false;
+  replyState.focusTaken = false;
 });
 // `#410 inline-reply-editor`. A reply open in the stream changes height without the window changing —
 // the box growing with its words or dragged taller, a failed send's line, the new-thread choice — and the

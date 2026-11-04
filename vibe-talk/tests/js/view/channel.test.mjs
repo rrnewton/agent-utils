@@ -771,3 +771,19 @@ test("`#624 voice-page-modularity`: one row menu open at a time, and only the op
   b.close();
   assert.equal(menus.open(), null);
 });
+
+test("`#624 voice-page-modularity`: the open reply's record starts with no reply open, from its column, and each record is its own", () => {
+  const { createReplyState } = CHANNEL_VIEW;
+  const main = { name: "main" };
+  const state = createReplyState(main);
+  assert.deepStrictEqual(state, {
+    target: null, channelId: null,
+    routing: { thread: null, branch: null, into: null, unknown: false, removed: false, note: "" },
+    column: main, docked: false, pending: null, focusTaken: false, quote: null, list: null, gathered: false, anchor: null,
+  });
+  // The page writes it as the reply opens and moves; a second record shares nothing with the first.
+  state.routing.note = "a new thread";
+  state.docked = true;
+  const other = createReplyState(main);
+  assert.deepStrictEqual([other.routing.note, other.docked], ["", false], "two records share their routing or their state");
+});

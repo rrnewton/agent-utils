@@ -279,6 +279,7 @@ declare const createSeamLines: LegacyImports["createSeamLines"];
 declare const createInputKinds: LegacyImports["createInputKinds"];
 declare const createCardPlaces: LegacyImports["createCardPlaces"];
 declare const createColumnWork: LegacyImports["createColumnWork"];
+declare const createReplyState: LegacyImports["createReplyState"];
 declare const createRowMenus: LegacyImports["createRowMenus"];
 declare const createFilterChanges: LegacyImports["createFilterChanges"];
 declare const createRowDrawing: LegacyImports["createRowDrawing"];

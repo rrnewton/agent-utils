@@ -3759,7 +3759,7 @@ test("`#304 back-gesture-in-app`: A REPLY OPEN AT THE FOOT OF THE RIGHT COLUMN i
   // NEGATIVE CONTROLS. A page that takes no reply open in a column for a level closes the thread under
   // it with the one gesture; one never told a reply opened gives it no entry; one never told it was put
   // down leaves its entry for the next gesture to spend.
-  const unlevelled = await dockedReplyWalk(brokenScript('  if (replyDocked) levels.push("reply");\n', "\n"));
+  const unlevelled = await dockedReplyWalk(brokenScript('  if (replyState.docked) levels.push("reply");\n', "\n"));
   assert.deepStrictEqual(unlevelled.docked.facts, { depth: 1, tag: "side" }, "the control with no reply level pushed an entry for it");
   assert.equal(unlevelled.gesture.cards, true, "the control with no reply level kept the right column's thread on the gesture");
   const untold = await dockedReplyWalk(brokenScript(

@@ -109,3 +109,5 @@ export { createFilterChanges } from "./filterchanges.ts";
 export type { FilterChanges, FilterWalk } from "./filterchanges.ts";
 export { createRowMenus } from "./rowmenu.ts";
 export type { RowMenu, RowMenus } from "./rowmenu.ts";
+export { createReplyState } from "./replystate.ts";
+export type { ReplyRouting, ReplyState } from "./replystate.ts";

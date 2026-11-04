@@ -4834,13 +4834,13 @@ test("`#314 reply-focus-flake`: a window narrowed under a reply open in a column
   // THE CONTROLS: the hand-off deciding from where the focus is alone, as it did; and the browser's taking
   // never forgotten. The walk above sees each.
   const { page: control } = await replyColumnsPage(brokenScript(
-    "(nodeWithin(el(\"reply-compose\"), document.activeElement) || (replyFocusTaken && focusLost()))",
+    "(nodeWithin(el(\"reply-compose\"), document.activeElement) || (replyState.focusTaken && focusLost()))",
     "nodeWithin(el(\"reply-compose\"), document.activeElement)"));
   await replyTypedInColumn(control, "right", REPLY_COLUMNS_ROWS[1][1]);
   await narrowedUnderSlowFrame(control, "right");
   assert.ok(replyInStream(control));
   assert.notEqual(focused(control), control.el("reply-text"), "the control kept the focus in the box, so this test cannot see it lost");
-  assert.equal(await movedOn(brokenScript('document.addEventListener("focusin", () => {\n  replyFocusTaken = false;\n});', "")), true,
+  assert.equal(await movedOn(brokenScript('document.addEventListener("focusin", () => {\n  replyState.focusTaken = false;\n});', "")), true,
     "the control that never forgets gave the list the focus too, so this test cannot see a focus taken back");
 });
 
