@@ -12,6 +12,7 @@ import csv
 import datetime as dt
 import enum
 import fcntl
+import fnmatch
 import hashlib
 import io
 import json
@@ -45,6 +46,8 @@ SSH_OPTIONS = (
     "ServerAliveCountMax=4",
 )
 RSYNC_SSH_OPTIONS = SSH_OPTIONS[1:]
+TRANSPORTS = ("ssh", "agentcloud")
+AGENTCLOUD_EXEC = ("agentcloudctl", "node", "exec")
 
 #: Wall-clock ceilings on every child process this tool starts.
 #:
@@ -79,8 +82,114 @@ SQLITE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
 SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm")
 MAX_CONFIG_BYTES = 1024 * 1024
 IGNORED_REMOTE_MANIFEST_STDERR_LINES = frozenset(
-    {"Meta authorized users only. Usage is subject to monitoring and recording."}
+    {
+        "Meta authorized users only. Usage is subject to monitoring and recording.",
+        # agentcloudctl's banner, the agentcloud transport's analogue of the ssh login banner.
+        "note: --ws-url and AGENTCLOUD_ORCHESTRATOR_URL are both unset or empty; dialing the "
+        "canonical prod endpoint wss://mm.internalmeta.com/ws/chat.",
+    }
 )
+
+
+@dataclass(frozen=True)
+class ExcludeRule:
+    """One path this tool never copies, applied to rsync AND to the source manifest.
+
+    ``pattern`` is a deliberately small subset of rsync's filter syntax, chosen because Python's
+    ``fnmatch`` and rsync's wildmatch agree on it exactly: a basename glob built from
+    ``[A-Za-z0-9._-]`` and ``*``, optionally prefixed with ``/`` (anchored to the root of the
+    transfer, so it matches only a direct child of the source root) and optionally suffixed with
+    ``/`` (matches directories only). A matching directory excludes everything beneath it.
+    ``root_scope`` is ``*`` or one ``archive_name`` from log_roots.tsv.
+    """
+
+    root_scope: str
+    pattern: str
+    reason: str
+
+
+#: Paths never archived from any machine. Credentials must not leave their host, and SQLite
+#: databases are not transcripts: harness state DBs are rewritten in place, so every fetch
+#: re-copies them whole (~/.codex/thread_history_1.sqlite alone is >15 GB). Transcript readers
+#: use the session JSONL files and ~/.claude/history.jsonl, both of which stay archived.
+#: Excluding a path never deletes an archived copy; destination files are only ever added.
+DEFAULT_EXCLUDES: tuple[ExcludeRule, ...] = (
+    ExcludeRule("*", "auth.json", "credential"),
+    ExcludeRule("*", ".credentials.json", "credential"),
+    ExcludeRule("*", "*auth-cache*", "credential cache, e.g. .claude/mcp-needs-auth-cache.json"),
+    ExcludeRule("*", "*.key", "key material, e.g. .claude/sessions/*.key"),
+    ExcludeRule("*", "*.token", "token file"),
+    ExcludeRule("*", "*token*.json", "token store (docs such as tokens.css stay archived)"),
+    ExcludeRule(".claude", "/daemon/", "daemon state including control.key"),
+    ExcludeRule("*", "shell-snapshots/", "captured shell environments"),
+    ExcludeRule("*", "*.sqlite", "SQLite database, not a transcript"),
+    ExcludeRule("*", "*.sqlite-wal", "SQLite write-ahead log"),
+    ExcludeRule("*", "*.sqlite-shm", "SQLite shared-memory index"),
+)
+_EXCLUDE_PATTERN = re.compile(r"^/?[A-Za-z0-9._*-]+/?$")
+
+
+def _validate_exclude_rules(rules: Sequence[ExcludeRule]) -> None:
+    for rule in rules:
+        glob = rule.pattern.strip("/")
+        if (
+            _EXCLUDE_PATTERN.fullmatch(rule.pattern) is None
+            or glob in {"", ".", ".."}
+            or set(glob) == {"*"}
+        ):
+            raise ConfigError(f"unsupported exclude pattern: {rule.pattern!r}")
+
+
+def excludes_for(archive_name: str) -> tuple[ExcludeRule, ...]:
+    """The exclude rules for one log root; the single place a later override would plug in."""
+
+    return tuple(
+        rule for rule in DEFAULT_EXCLUDES if rule.root_scope in {"*", archive_name}
+    )
+
+
+def _exclude_matches(rule: ExcludeRule, name: str, depth: int, is_directory: bool) -> bool:
+    if rule.pattern.startswith("/") and depth != 1:
+        return False
+    if rule.pattern.endswith("/") and not is_directory:
+        return False
+    return fnmatch.fnmatchcase(name, rule.pattern.strip("/"))
+
+
+def is_excluded(path: str, kind: EntryKind, rules: Sequence[ExcludeRule]) -> bool:
+    """Whether rsync, given ``rules`` as ``--exclude`` options, would skip ``path``.
+
+    Every ancestor component is a directory (manifests never follow symlinks), so an excluded
+    directory hides its whole subtree, exactly as rsync never descends into it.
+    """
+
+    if path == "." or not rules:
+        return False
+    parts = PurePosixPath(path).parts
+    for depth, name in enumerate(parts, start=1):
+        is_directory = depth < len(parts) or kind is EntryKind.DIRECTORY
+        if any(_exclude_matches(rule, name, depth, is_directory) for rule in rules):
+            return True
+    return False
+
+
+def apply_excludes(scan: ManifestScan, rules: Sequence[ExcludeRule]) -> ManifestScan:
+    kept: list[ManifestEntry] = []
+    excluded_entries = 0
+    excluded_bytes = 0
+    for entry in scan.entries:
+        if is_excluded(entry.path, entry.kind, rules):
+            excluded_entries += 1
+            if entry.kind is EntryKind.FILE:
+                excluded_bytes += entry.size
+        else:
+            kept.append(entry)
+    return replace(
+        scan,
+        entries=tuple(kept),
+        excluded_entries=scan.excluded_entries + excluded_entries,
+        excluded_bytes=scan.excluded_bytes + excluded_bytes,
+    )
 
 
 USAGE = """Usage: fetch_agent_logs.py [OPTIONS]
@@ -88,6 +197,9 @@ USAGE = """Usage: fetch_agent_logs.py [OPTIONS]
 Fetch every configured log root from every configured machine. The current
 machine is copied locally; other machines are read over SSH. Source files are
 never changed, and destination files absent from a source are never deleted.
+A fixed default exclude list (credentials, keys, shell snapshots, and SQLite
+databases) is passed to rsync and applied to the source manifest; --list
+prints it, and every run log records it.
 
 Options:
   --dry-run                Run rsync with --dry-run; do not change archived logs.
@@ -95,7 +207,8 @@ Options:
   --machine SHORT_NAME     Limit to one machine; repeat to select several.
   --root ARCHIVE_NAME      Limit to one root; repeat to select several.
   --min-free-bytes BYTES   Refuse transfers below this free-space reserve.
-  --list                   Print the selected machine/root matrix and exit.
+  --list                   Print the selected machine/root matrix and the
+                           default exclude list, then exit.
   --history                Print the append-only run history and exit.
   --backfill-history       Idempotently migrate/backfill history, print, and exit.
   -h, --help               Show this help.
@@ -184,6 +297,11 @@ class Machine:
     short_name: str
     host: str
     home: PurePosixPath
+    #: How to reach a remote machine: ``ssh`` (the default), or ``agentcloud`` -- the
+    #: agentcloud node-exec channel, for a host that refuses this machine's SSH keys but runs
+    #: an agentcloud node. ``agentcloudctl node exec`` is ssh-shaped (stdio piped both ways),
+    #: so rsync uses it as its remote shell unchanged.
+    transport: str = "ssh"
 
 
 @dataclass(frozen=True)
@@ -245,6 +363,9 @@ class ManifestEntry:
 class ManifestScan:
     entries: tuple[ManifestEntry, ...]
     notices: tuple[str, ...]
+    #: Source entries dropped by exclude rules, so the manifest matches what rsync copied.
+    excluded_entries: int = 0
+    excluded_bytes: int = 0
 
     @property
     def regular_bytes(self) -> int:
@@ -534,7 +655,9 @@ def _read_config_file(path: Path) -> tuple[bytes, str]:
     return contents, text
 
 
-def _read_rows(path: Path, text: str, columns: int) -> list[tuple[int, list[str]]]:
+def _read_rows(
+    path: Path, text: str, columns: int, optional_columns: int = 0
+) -> list[tuple[int, list[str]]]:
     rows: list[tuple[int, list[str]]] = []
     with io.StringIO(text, newline="") as handle:
         reader = csv.reader(handle, delimiter="\t")
@@ -544,9 +667,13 @@ def _read_rows(path: Path, text: str, columns: int) -> list[tuple[int, list[str]
                     continue
                 if row[0].startswith("#"):
                     continue
-                if len(row) != columns:
+                if not columns <= len(row) <= columns + optional_columns:
+                    expected = (
+                        f"{columns}" if not optional_columns
+                        else f"{columns} to {columns + optional_columns}"
+                    )
                     raise ConfigError(
-                        f"{path}:{line}: expected {columns} tab-separated columns, "
+                        f"{path}:{line}: expected {expected} tab-separated columns, "
                         f"found {len(row)}"
                     )
                 if any(field == "" for field in row):
@@ -565,8 +692,14 @@ def load_configuration(
     machines: list[Machine] = []
     seen_names: set[str] = set()
     seen_endpoints: set[tuple[str, PurePosixPath]] = set()
-    for line, row in _read_rows(machines_file, machines_text, 3):
-        short_name, host, raw_home = row
+    for line, row in _read_rows(machines_file, machines_text, 3, optional_columns=1):
+        short_name, host, raw_home = row[:3]
+        transport = row[3] if len(row) > 3 else "ssh"
+        if transport not in TRANSPORTS:
+            raise ConfigError(
+                f"{machines_file}:{line}: unknown transport {transport!r}; "
+                f"expected one of {', '.join(TRANSPORTS)}"
+            )
         _validate_component("machine short name", short_name)
         if short_name in RESERVED_MACHINE_NAMES:
             raise ConfigError(
@@ -586,7 +719,9 @@ def load_configuration(
             )
         seen_names.add(short_name)
         seen_endpoints.add(endpoint)
-        machines.append(Machine(short_name=short_name, host=host, home=home))
+        machines.append(
+            Machine(short_name=short_name, host=host, home=home, transport=transport)
+        )
     if not machines:
         raise ConfigError(f"{machines_file}: no machine rows")
 
@@ -719,12 +854,16 @@ def print_configuration(
     print("\nFETCH MATRIX")
     print("machine\tarchive_name\tsource\tdestination\trequirement\ttransport")
     for operation in operations:
-        transport = "local" if operation.local else "ssh"
+        transport = "local" if operation.local else operation.machine.transport
         print(
             f"{operation.machine.short_name}\t{operation.root.archive_name}\t"
             f"{operation.machine.host}:{operation.source}\t{operation.destination}\t"
             f"{operation.root.requirement.value}\t{transport}"
         )
+    print("\nDEFAULT EXCLUDES (passed to rsync and applied to the source manifest)")
+    print("root_scope\tpattern\treason")
+    for rule in DEFAULT_EXCLUDES:
+        print(f"{rule.root_scope}\t{rule.pattern}\t{rule.reason}")
 
 
 RESULT_COLUMNS = (
@@ -1711,8 +1850,17 @@ class Receipt:
         os.replace(temporary, latest)
 
 
-def _ssh_command(host: str, remote_command: str) -> list[str]:
-    return ["ssh", *SSH_OPTIONS, "--", host, remote_command]
+def _ssh_command(machine: Machine, remote_command: str) -> list[str]:
+    """The argv that runs one shell command string on a remote machine.
+
+    ssh hands the string to the remote login shell. ``agentcloudctl node exec`` execs its argv
+    directly, so the string is wrapped in ``sh -c`` to get the same semantics. Its stdin is the
+    child's stdin, which ``_run_bounded`` points at /dev/null (ssh's ``-n``).
+    """
+
+    if machine.transport == "agentcloud":
+        return [*AGENTCLOUD_EXEC, "--node", machine.host, "--", "sh", "-c", remote_command]
+    return ["ssh", *SSH_OPTIONS, "--", machine.host, remote_command]
 
 
 def _run_bounded(
@@ -1732,6 +1880,7 @@ def _run_bounded(
     try:
         return subprocess.run(
             list(command),
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             check=False,
@@ -1758,6 +1907,7 @@ def _run_bounded_bytes(
     try:
         return subprocess.run(
             list(command),
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             check=False,
             timeout=timeout_s,
@@ -1884,7 +2034,7 @@ def probe_source(operation: Operation, *, estimate_size: bool) -> ProbeObservati
     else:
         completed = _run_bounded(
             _ssh_command(
-                operation.machine.host,
+                operation.machine,
                 _probe_remote_command(
                     operation.source, operation.machine.home, estimate_size
                 ),
@@ -2094,7 +2244,7 @@ def scan_remote_tree(
 ) -> ManifestScan:
     completed = _run_bounded_bytes(
         _ssh_command(
-            operation.machine.host,
+            operation.machine,
             _remote_manifest_command(resolved_source, operation.machine.home),
         ),
         timeout_s=MANIFEST_TIMEOUT_S,
@@ -2153,8 +2303,10 @@ def scan_remote_tree(
 
 def scan_source_tree(operation: Operation, resolved_source: str) -> ManifestScan:
     if operation.local:
-        return scan_local_tree(Path(resolved_source))
-    return scan_remote_tree(operation, PurePosixPath(resolved_source))
+        scan = scan_local_tree(Path(resolved_source))
+    else:
+        scan = scan_remote_tree(operation, PurePosixPath(resolved_source))
+    return apply_excludes(scan, excludes_for(operation.root.archive_name))
 
 
 def scan_destination_tree(destination: Path) -> ManifestScan:
@@ -2424,8 +2576,15 @@ def build_rsync_command(
         f"--partial-dir={partial_directory}",
         "--stats",
     ]
+    command.extend(
+        f"--exclude={rule.pattern}" for rule in excludes_for(operation.root.archive_name)
+    )
     if not operation.local:
-        remote_shell = shlex.join(("ssh", *RSYNC_SSH_OPTIONS))
+        remote_shell = (
+            shlex.join(AGENTCLOUD_EXEC)
+            if operation.machine.transport == "agentcloud"
+            else shlex.join(("ssh", *RSYNC_SSH_OPTIONS))
+        )
         command.append(f"--rsh={remote_shell}")
     if mode is Mode.DRY_RUN:
         command.extend(("--dry-run", "--info=stats2"))
@@ -2593,16 +2752,17 @@ def preflight_hosts(
     this tool has never treated one bad source as fatal.
     """
 
-    hosts: list[str] = []
+    machines: dict[str, Machine] = {}
     for operation in operations:
-        if not operation.local and operation.machine.host not in hosts:
-            hosts.append(operation.machine.host)
+        if not operation.local and operation.machine.host not in machines:
+            machines[operation.machine.host] = operation.machine
+    hosts = list(machines)
     if not hosts:
         return {}
     failures: dict[str, str] = {}
     for host in hosts:
         completed = _run_bounded(
-            _ssh_command(host, "true"), timeout_s=PREFLIGHT_TIMEOUT_S
+            _ssh_command(machines[host], "true"), timeout_s=PREFLIGHT_TIMEOUT_S
         )
         if completed.returncode == 0:
             continue
@@ -2894,6 +3054,11 @@ def execute_transfer_operation(
     comparison: Comparison | None = None
     details: list[str] = []
     if manifest is not None:
+        receipt.logger.line(
+            f"Source manifest: {len(manifest.entries)} entries kept; "
+            f"{manifest.excluded_entries} entries ({manifest.excluded_bytes} bytes) "
+            "excluded by default rules"
+        )
         for notice in manifest.notices:
             warning = _warning_for_notice(operation, "source_manifest_unstable", notice)
             emit_warning(warning)
@@ -2993,8 +3158,11 @@ def _require_commands(options: Options, operations: Sequence[Operation]) -> None
     required: set[str] = set()
     if options.mode is not Mode.CHECK_SOURCES:
         required.update(("du", "rsync"))
-    if any(not operation.local for operation in operations):
-        required.add("ssh")
+    for operation in operations:
+        if not operation.local:
+            required.add(
+                "agentcloudctl" if operation.machine.transport == "agentcloud" else "ssh"
+            )
     missing = sorted(command for command in required if shutil.which(command) is None)
     if missing:
         raise FetchError("required command(s) not found: " + ", ".join(missing))
@@ -3161,6 +3329,10 @@ def execute_run(
         receipt.logger.line(f"Started: {started_utc}")
         receipt.logger.line(f"Archive: {archive_dir}")
         receipt.logger.line(f"Selected operations: {len(operations)}")
+        receipt.logger.line(
+            "Default excludes: "
+            + " ".join(f"{rule.root_scope}:{rule.pattern}" for rule in DEFAULT_EXCLUDES)
+        )
         unfinished_status = "not_attempted_internal_error"
         unfinished_detail = "run stopped before this operation completed"
         try:
@@ -3323,6 +3495,7 @@ def _main(arguments: Sequence[str]) -> int:
         options = parse_options(arguments)
         if options is None:
             return 0
+        _validate_exclude_rules(DEFAULT_EXCLUDES)
         fetcher_file = Path(__file__).resolve()
         archive_dir = fetcher_file.parent
         if options.history_only:

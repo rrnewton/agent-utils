@@ -191,8 +191,8 @@ def test_local_fetch_records_metrics_manifest_history_and_sqlite_warnings(
     source = home / "logs"
     source.mkdir(parents=True)
     (source / "transcript.jsonl").write_text('{"message":"new"}\n', encoding="utf-8")
-    (source / "state.sqlite").write_bytes(b"new database image")
-    (source / "state.sqlite-wal").write_bytes(b"live wal")
+    (source / "state.db").write_bytes(b"new database image")
+    (source / "state.db-wal").write_bytes(b"live wal")
 
     short_name, machine_row = _local_machine_row(home)
     archive = _install_archive(
@@ -206,16 +206,16 @@ def test_local_fetch_records_metrics_manifest_history_and_sqlite_warnings(
     old_transcript.write_bytes(b"an older and substantially larger transcript\n")
     newer_timestamp = (source / "transcript.jsonl").stat().st_mtime + 60
     os.utime(old_transcript, (newer_timestamp, newer_timestamp))
-    (destination / "stale.sqlite-wal").write_bytes(b"stale wal")
-    (destination / "old.sqlite").write_bytes(b"retained old db")
+    (destination / "stale.db-wal").write_bytes(b"stale wal")
+    (destination / "old.db").write_bytes(b"retained old db")
 
     completed = _run(archive)
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert (destination / "transcript.jsonl").read_text(encoding="utf-8") == (
         '{"message":"new"}\n'
     )
-    assert (destination / "stale.sqlite-wal").read_bytes() == b"stale wal"
-    assert (destination / "old.sqlite").read_bytes() == b"retained old db"
+    assert (destination / "stale.db-wal").read_bytes() == b"stale wal"
+    assert (destination / "old.db").read_bytes() == b"retained old db"
 
     receipt = _latest_receipt(archive)
     assert (receipt / "machines.tsv").read_bytes() == (archive / "machines.tsv").read_bytes()
@@ -238,10 +238,10 @@ def test_local_fetch_records_metrics_manifest_history_and_sqlite_warnings(
         encoding="utf-8"
     )
     assert '"path": "transcript.jsonl"' in manifest_text
-    assert '"path": "state.sqlite"' in manifest_text
-    assert '"path": "state.sqlite-wal"' in manifest_text
-    assert '"path": "stale.sqlite-wal"' not in manifest_text
-    assert '"path": "old.sqlite"' not in manifest_text
+    assert '"path": "state.db"' in manifest_text
+    assert '"path": "state.db-wal"' in manifest_text
+    assert '"path": "stale.db-wal"' not in manifest_text
+    assert '"path": "old.db"' not in manifest_text
     codes = _warning_codes(receipt / "warnings.jsonl")
     assert {
         "source_smaller_than_previous_destination",
@@ -1025,6 +1025,7 @@ def test_every_remote_host_is_smoke_tested_once_before_any_source_is_probed(
     class _Machine:
         def __init__(self, host: str) -> None:
             self.host = host
+            self.transport = "ssh"
 
     class _Operation:
         def __init__(self, host: str) -> None:
@@ -1083,3 +1084,241 @@ def test_a_source_on_an_unreachable_host_is_failed_without_being_probed() -> Non
     assert probe.duration_seconds == 0.0
     assert "did not answer preflight" in probe.detail
     assert "Permission denied" in probe.detail
+
+
+# --- default excludes ------------------------------------------------------------------------
+#
+# Credentials must never leave their host, and SQLite databases are not transcripts: a harness
+# rewrites them in place, so every fetch re-copied a >15 GB DB whole. The rsync exclude and the
+# manifest filter must agree exactly, or a real fetch reports "destination is missing
+# source-manifest member" for every excluded file.
+
+_EXCLUDED_SOURCE_PATHS = (
+    "auth.json",
+    ".credentials.json",
+    "mcp-needs-auth-cache.json",
+    "sessions/0123.key",
+    "daemon/control.key",
+    "shell-snapshots/snapshot-bash-1.sh",
+    "nested/shell-snapshots/snapshot-zsh-2.sh",
+    "thread_history_1.sqlite",
+    "thread_history_1.sqlite-wal",
+    "thread_history_1.sqlite-shm",
+    "nested/oauth.token",
+    "nested/refresh_token.json",
+)
+_KEPT_SOURCE_PATHS = (
+    "history.jsonl",
+    "projects/demo/session.jsonl",
+    "projects/demo/daemon/notes.txt",
+    "plugins/theme/tokens.css",
+    "plugins/docs/token-lifecycle.md",
+    "orc/session.db",
+    "muse/session.peer-history.sqlite3",
+)
+
+
+def _populate_exclude_tree(source: Path) -> None:
+    for relative in (*_EXCLUDED_SOURCE_PATHS, *_KEPT_SOURCE_PATHS):
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{relative}\n", encoding="utf-8")
+
+
+def _tree_paths(root: Path) -> set[str]:
+    return {str(path.relative_to(root)) for path in root.rglob("*")}
+
+
+def _assert_excludes_took_effect(archive: Path, destination: Path, manifest: Path) -> None:
+    row = _read_tsv(_latest_receipt(archive) / "results.tsv")[0]
+    assert row["status"] == "fetched", row
+    copied = _tree_paths(destination)
+    manifest_paths = {
+        json.loads(line)["path"]
+        for line in manifest.read_text(encoding="utf-8").splitlines()
+    }
+    manifest_paths.discard(".")
+    # rsync and the manifest agree entry for entry, so nothing is reported missing or retained.
+    assert copied == manifest_paths
+    for relative in _KEPT_SOURCE_PATHS:
+        assert relative in copied
+    for relative in _EXCLUDED_SOURCE_PATHS:
+        assert relative not in copied
+    assert "daemon" not in copied and "shell-snapshots" not in copied
+    log = (_latest_receipt(archive) / "fetch.log").read_text(encoding="utf-8")
+    assert "--exclude=*.sqlite" in log
+    assert "--exclude=/daemon/" in log
+    assert "excluded by default rules" in log
+
+
+def test_default_excludes_apply_to_rsync_and_the_local_manifest(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    source = home / ".claude"
+    _populate_exclude_tree(source)
+    short_name, machine_row = _local_machine_row(home)
+    archive = _install_archive(tmp_path, machine_row, "*\t.claude\t.claude\trequired\n")
+
+    completed = _run(archive)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    _assert_excludes_took_effect(
+        archive,
+        archive / short_name / ".claude",
+        _latest_receipt(archive) / "manifests" / short_name / ".claude.jsonl",
+    )
+
+
+def test_default_excludes_apply_to_rsync_and_the_remote_manifest(tmp_path: Path) -> None:
+    home = tmp_path / "remote-home"
+    source = home / ".claude"
+    _populate_exclude_tree(source)
+    archive = _install_archive(
+        tmp_path,
+        f"remote-test\tremote.invalid\t{home}\n",
+        "*\t.claude\t.claude\trequired\n",
+    )
+
+    completed = _run(archive, env=_fake_ssh_environment(tmp_path))
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    _assert_excludes_took_effect(
+        archive,
+        archive / "remote-test" / ".claude",
+        _latest_receipt(archive) / "manifests" / "remote-test" / ".claude.jsonl",
+    )
+
+
+def test_excluding_a_path_never_deletes_its_archived_copy(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    source = home / ".codex"
+    source.mkdir(parents=True)
+    (source / "thread_history_1.sqlite").write_bytes(b"live database")
+    (source / "session.jsonl").write_text("{}\n", encoding="utf-8")
+    short_name, machine_row = _local_machine_row(home)
+    archive = _install_archive(tmp_path, machine_row, "*\t.codex\t.codex\trequired\n")
+    destination = archive / short_name / ".codex"
+    destination.mkdir(parents=True)
+    (destination / "thread_history_1.sqlite").write_bytes(b"archived copy")
+
+    completed = _run(archive)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert (destination / "thread_history_1.sqlite").read_bytes() == b"archived copy"
+    assert (destination / "session.jsonl").exists()
+    row = _read_tsv(_latest_receipt(archive) / "results.tsv")[0]
+    assert row["status"] == "fetched"
+    assert row["retained_sqlite_databases"] == "1"
+
+
+def test_daemon_exclude_is_anchored_to_the_claude_root_and_directories_only() -> None:
+    module = _fetcher_module()
+    kind = module.EntryKind  # type: ignore[attr-defined]
+    claude = module.excludes_for(".claude")  # type: ignore[attr-defined]
+    codex = module.excludes_for(".codex")  # type: ignore[attr-defined]
+    is_excluded = module.is_excluded  # type: ignore[attr-defined]
+    assert is_excluded("daemon", kind.DIRECTORY, claude)
+    assert is_excluded("daemon/control.key", kind.FILE, claude)
+    assert not is_excluded("daemon", kind.FILE, claude)
+    assert not is_excluded("daemon", kind.SYMLINK, claude)
+    assert not is_excluded("projects/daemon", kind.DIRECTORY, claude)
+    assert not is_excluded("daemon", kind.DIRECTORY, codex)
+    assert not is_excluded("history.jsonl", kind.FILE, claude)
+    assert not is_excluded("tokens.css", kind.FILE, claude)
+    assert not is_excluded(".", kind.DIRECTORY, claude)
+
+
+def test_agentcloud_transport_parses_and_rejects_unknown(tmp_path: Path) -> None:
+    """machines.tsv's optional 4th column selects the transport; ssh stays the default."""
+    module = _fetcher_module()
+    machines = tmp_path / "machines.tsv"
+    roots = tmp_path / "log_roots.tsv"
+    roots.write_text("*\tlogs\tlogs\trequired\n", encoding="utf-8")
+    machines.write_text(
+        "plain\tplain.example\t/home/example\n"
+        "cloud\tcloud.example\t/home/example\tagentcloud\n",
+        encoding="utf-8",
+    )
+    snapshot = module.load_configuration(machines, roots)  # type: ignore[attr-defined]
+    by_name = {machine.short_name: machine for machine in snapshot.configuration.machines}
+    assert by_name["plain"].transport == "ssh"
+    assert by_name["cloud"].transport == "agentcloud"
+
+    machines.write_text(
+        "cloud\tcloud.example\t/home/example\tcarrier-pigeon\n", encoding="utf-8"
+    )
+    with pytest.raises(module.ConfigError, match="unknown transport"):  # type: ignore[attr-defined]
+        module.load_configuration(machines, roots)  # type: ignore[attr-defined]
+
+
+def test_agentcloud_command_shapes() -> None:
+    """agentcloud execs argv, so remote commands are wrapped in sh -c; rsync uses it as rsh."""
+    module = _fetcher_module()
+    machine_type = module.Machine  # type: ignore[attr-defined]
+    from pathlib import PurePosixPath
+
+    cloud = machine_type(
+        short_name="cloud", host="cloud.example",
+        home=PurePosixPath("/home/example"), transport="agentcloud",
+    )
+    plain = machine_type(
+        short_name="plain", host="plain.example", home=PurePosixPath("/home/example")
+    )
+    assert module._ssh_command(cloud, "true") == [  # type: ignore[attr-defined]
+        "agentcloudctl", "node", "exec", "--node", "cloud.example", "--", "sh", "-c", "true",
+    ]
+    assert module._ssh_command(plain, "true")[-2:] == ["plain.example", "true"]  # type: ignore[attr-defined]
+
+
+def test_agentcloud_remote_fetch_copies_like_ssh(tmp_path: Path) -> None:
+    home = tmp_path / "remote-home"
+    source = home / ".claude"
+    source.mkdir(parents=True)
+    (source / "history.jsonl").write_text("{}\n", encoding="utf-8")
+    (source / "auth.json").write_text("{}\n", encoding="utf-8")
+    archive = _install_archive(
+        tmp_path,
+        f"cloud-test\tcloud.invalid\t{home}\tagentcloud\n",
+        "*\t.claude\t.claude\trequired\n",
+    )
+    fake_bin = tmp_path / "agent-bin"
+    fake_bin.mkdir()
+    fake = fake_bin / "agentcloudctl"
+    fake.write_text(
+        """#!/usr/bin/env python3
+import os
+import sys
+
+arguments = sys.argv[1:]
+assert arguments[:2] == ["node", "exec"], arguments
+arguments = arguments[2:]
+if arguments[0] == "--node":
+    arguments = arguments[2:]
+    if arguments and arguments[0] == "--":
+        arguments = arguments[1:]
+else:
+    arguments = arguments[1:]
+if len(arguments) >= 2 and arguments[0] == "sh" and arguments[1] == "-c":
+    os.execl("/bin/sh", "sh", "-c", arguments[2])
+os.execvp(arguments[0], arguments)
+""",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    environment = dict(os.environ)
+    environment.pop("SSH_AUTH_SOCK", None)
+    environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+
+    completed = _run(archive, env=environment)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    destination = archive / "cloud-test" / ".claude"
+    assert (destination / "history.jsonl").exists()
+    assert not (destination / "auth.json").exists()
+
+
+def test_list_prints_the_default_excludes(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    _, machine_row = _local_machine_row(home)
+    archive = _install_archive(tmp_path, machine_row, "*\tlogs\tlogs\trequired\n")
+    listed = _run(archive, "--list")
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    assert "DEFAULT EXCLUDES" in listed.stdout
+    assert "*\t*.sqlite\t" in listed.stdout
+    assert ".claude\t/daemon/\t" in listed.stdout

@@ -26,3 +26,9 @@ A ready patch for the excludes exists (applies to 9dcde0c3; its tests and mypy -
 
 - agent-utils' fetcher tests pass with new tests for the excludes (rsync and manifest) and the agentcloud transport; mypy --strict clean.
 - The archive copy is replaced by (or diffed clean against) the canonical one.
+
+# Notes
+
+## Done (mu-validate, 2026-11-03)
+
+[muse watermelon-full-preview] Applied the ready excludes patch (DEFAULT_EXCLUDES for rsync and the manifest, --list table, per-root excluded counts; 38 tests) and ported the agentcloud transport from the archive copy: optional 4th machines.tsv column (`ssh` default, `agentcloud`), `agentcloudctl node exec --node HOST -- sh -c` for remote commands, agentcloudctl as rsync's `--rsh`, preflight and required-tool checks per transport, and the agentcloudctl banner ignored like the ssh banner. Agent-utils' `_run_bounded`/`_run_bounded_bytes` timeout split is kept (both now also get stdin=/dev/null, matching ssh -n for the exec transport). New tests: transport parsing/validation, command shapes, and a fake-agentcloudctl end-to-end fetch (which also proves auth.json is excluded). 41 fetcher tests pass; mypy --strict clean.
