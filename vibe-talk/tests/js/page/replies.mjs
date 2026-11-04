@@ -1488,7 +1488,7 @@ test("a draft survives leaving without sending, and survives a reload", async ()
 
   page.el("reply-text").value = "half a thought about the first one";
   await page.el("reply-text").dispatch("input");
-  await page.el("reply-cancel").click();
+  await putReplyDown(page);
 
   // Per MESSAGE, not per page: a global draft would hand what you wrote about one message to a
   // reply to a different one, which is the kind of mistake that gets posted.
@@ -1497,7 +1497,7 @@ test("a draft survives leaving without sending, and survives a reload", async ()
   await page.el("reply-cancel").click();
   await openReplyOn(page, messages, 0);
   assert.equal(page.el("reply-text").value, "half a thought about the first one");
-  await page.el("reply-cancel").click();
+  await putReplyDown(page);
 
   // A RELOAD: same storage, brand new execution — back on the channel it was left on.
   const reloaded = reloadWith(store, messages);
@@ -3653,7 +3653,7 @@ test("`#185 reply-new-thread`: a draft put down with the new-thread box ticked c
   await replyButton(rowOf(page, "210")).click();
   await page.el("reply-text").setValue("half an answer");
   await box().setChecked(true);
-  await page.el("reply-cancel").click();
+  await putReplyDown(page);
 
   // Another message: its own empty box, and the choice did not follow the reader there.
   await replyButton(rowOf(page, "212")).click();
@@ -3678,7 +3678,7 @@ test("`#185 reply-new-thread`: a draft put down with the new-thread box ticked c
   // is still one nobody has answered in a thread, and the box is still offered.)
   await page.el("reply-text").setValue("first a ticked draft");
   await box().setChecked(true);
-  await page.el("reply-cancel").click();
+  await putReplyDown(page);
   await replyButton(rowOf(page, "212")).click();
   await page.el("reply-text").setValue("an answer on the main channel");
   await box().setChecked(true);
@@ -5715,4 +5715,39 @@ test("`#846 draft-chip-honest`: Yes to the quick reply's question throws its wor
   assert.equal(page.el("draft-chip").hidden, true, "the chip still counts the discarded draft");
   await quickReplyTo(page, 3);
   assert.equal(page.el("quick-reply-text").value, "", "the discarded words came back for the same words");
+});
+
+test("`#846 draft-chip-honest`: a reply sent brings the box at the foot back on screen, and the chip goes down with it", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "9480", content: "answer me" }), message({ id: "9481", content: "another" })]);
+  await page.el("channel-compose-text").setValue("for the whole channel");
+  await page.el("channel-compose-text").dispatch("input", {});
+  assert.equal(page.el("draft-chip").hidden, true, "fixture: the box on screen is offered");
+  await replyButton(rowOf(page, "9480")).click();
+  assert.equal(page.el("draft-chip").hidden, false, "the box at the foot, stood aside for the reply, is not offered");
+  await page.el("reply-text").setValue("the answer");
+  await page.el("reply-text").dispatch("input", {});
+  distinctReplies(page);
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.ok(!replyInStream(page), "fixture: Send left the reply open");
+  assert.equal(page.el("channel-composer").hidden, false);
+  assert.equal(page.el("draft-chip").hidden, true, "after Send the chip offers the box at the foot, which is on screen");
+});
+
+test("`#846 draft-chip-honest`: Esc on the quick reply's question closes the box, its words kept, and goes no further", async () => {
+  const page = await quickPage();
+  await quickReplyTo(page, 3);
+  await page.el("quick-reply-text").setValue("worth keeping");
+  await page.el("quick-reply-cancel").click();
+  assert.equal(focused(page), page.el("quick-reply-discard-no"));
+  const screen = page.screen();
+  const esc = await press(page, page.el("quick-reply-discard-no"), "Escape");
+  assert.equal(page.el("quick-reply").hidden, true, "Esc on the question left the box up");
+  assert.equal(esc.stopped, true, "Esc on the question went on to the page's own keys");
+  assert.equal(page.screen(), screen);
+  await quickReplyTo(page, 3);
+  assert.equal(page.el("quick-reply-text").value, "worth keeping", "Esc on the question lost the words");
+  assert.equal(page.el("quick-reply-discard").hidden, true, "the question came back with the box");
 });

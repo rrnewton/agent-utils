@@ -3767,8 +3767,8 @@ test("`#304 back-gesture-in-app`: A REPLY OPEN AT THE FOOT OF THE RIGHT COLUMN i
   const untold = await dockedReplyWalk(brokenScript(
     "  // `#304 back-gesture-in-app`. A reply open in the stream is a level of its own.\n  scheduleBackSync();\n", ""));
   assert.deepStrictEqual(untold.docked.facts, { depth: 1, tag: "side" }, "the control never told a reply opened pushed an entry for it");
-  const undocked = await dockedReplyWalk(brokenScript("  renderReplyingMarks();\n  voiceTranscript().markCardBesideReply();\n  scheduleBackSync();\n}",
-    "  renderReplyingMarks();\n  voiceTranscript().markCardBesideReply();\n}"));
+  const undocked = await dockedReplyWalk(brokenScript("  voiceTranscript().markCardBesideReply();\n  scheduleBackSync();\n  // `#846 draft-chip-honest`.",
+    "  voiceTranscript().markCardBesideReply();\n  // `#846 draft-chip-honest`."));
   assert.deepStrictEqual(undocked.cancelled.asked, [], "the control never told the reply was put down went back through its entry");
 });
 

@@ -25690,7 +25690,7 @@ function draftOnScreen(draft) {
   }
   if (draft.kind === "reply") {
     return Boolean(replyState.docked && replyState.target && String(replyState.target.id) === draft.key) &&
-      inSight(el("reply-text"), replyState.column ? inColumn(replyState.column, () => el("scroll-area")) : null);
+      inSight(el("reply-text"), replyPane().scroller());
   }
   return quoteOwner.quickReplyOpenKey() === draft.key;
 }
@@ -25701,10 +25701,17 @@ function draftsOffScreen() {
 }
 
 /**
+ * Whether the reply open in the stream was in sight when the chip was last drawn: a scroll redraws the chip
+ * only when that changes (`draftChipFrame`). Kept by every drawing, so it is never stale.
+ */
+let replyWasInSight = false;
+
+/**
  * The chip: up while the channel on screen holds a draft whose box is off screen, saying how many where
  * there are several (`#846 draft-chip-honest`).
  */
 function renderDraftChip() {
+  replyWasInSight = Boolean(replyState.docked) && inSight(el("reply-text"), replyPane().scroller());
   const chip = leftEl("draft-chip");
   const count = draftsOffScreen().length;
   const hidden = count === 0;
@@ -26068,7 +26075,8 @@ function cancelReply() {
     return;
   }
   setHiddenIfChanged(el("reply-discard"), false);
-  el("reply-discard-no").focus({ preventScroll: true });
+  // Into view as it takes the focus: under the box, it may open below the list's foot.
+  el("reply-discard-no").focus();
 }
 
 /**
@@ -26449,6 +26457,8 @@ function undockReply() {
   renderReplyingMarks();
   voiceTranscript().markCardBesideReply();
   scheduleBackSync();
+  // `#846 draft-chip-honest`. The box at the foot is back on screen, after a Send as after a put-down.
+  renderDraftChip();
 }
 
 /**
@@ -32946,6 +32956,15 @@ leftEl("read-steer-quote").addEventListener("click", pressSelectionChip);
 el("quick-reply-send").addEventListener("click", () => guardQuietly(sendQuickReply)());
 el("quick-reply-cancel").addEventListener("click", () => cancelQuickReply());
 el("quick-reply-discard-yes").addEventListener("click", () => answerQuickReplyDiscard(true));
+// `#846 draft-chip-honest`. Esc on the question is Esc on the box: it closes, its words kept, and goes no further.
+for (const id of ["quick-reply-discard-yes", "quick-reply-discard-no"]) {
+  el(id).addEventListener("keydown", (event) => {
+    if (!event || event.key !== "Escape" || event.isComposing) return;
+    swallow(event);
+    if (typeof event.stopPropagation === "function") event.stopPropagation();
+    closeQuickReply();
+  });
+}
 el("quick-reply-discard-no").addEventListener("click", () => answerQuickReplyDiscard(false));
 el("quick-reply-text").addEventListener("keydown", (event) => {
   if (event && event.key === "Escape") {
@@ -33391,6 +33410,8 @@ const columnsResize = createOncePerFrame(() => {
   renderColumns();
   // `#340 composer-grow-box`. A window widened to a desk's draws a growing box, to be measured.
   fitGrowingBoxes();
+  // `#846 draft-chip-honest`. One column or two shows other boxes.
+  renderDraftChip();
 }, () => (typeof requestAnimationFrame === "function" ? requestAnimationFrame : null));
 if (typeof window.addEventListener === "function") {
   window.addEventListener("resize", () => columnsResize.ask());
@@ -33521,8 +33542,13 @@ el("reply-discard-yes").addEventListener("click", () => answerReplyDiscard(true)
 el("reply-discard-no").addEventListener("click", () => answerReplyDiscard(false));
 // `#846 draft-chip-honest`. A reply open in the stream scrolls on and off screen with its list: the chip
 // follows, once a frame.
-const draftChipFrame = createOncePerFrame(() => renderDraftChip(),
-  () => (typeof requestAnimationFrame === "function" ? requestAnimationFrame : null));
+// Redrawn only when the reply crosses its list's edge (`replyWasInSight`), not on every frame of a scroll.
+const draftChipFrame = createOncePerFrame(() => {
+  const now = replyState.docked && inSight(el("reply-text"), replyPane().scroller());
+  if (now === replyWasInSight) return;
+  replyWasInSight = now;
+  renderDraftChip();
+}, () => (typeof requestAnimationFrame === "function" ? requestAnimationFrame : null));
 for (const id of ["scroll-area", "side-scroll"]) {
   leftEl(id).addEventListener("scroll", () => {
     if (replyState.docked) draftChipFrame.ask();

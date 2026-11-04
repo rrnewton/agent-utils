@@ -491,7 +491,10 @@ const SCROLL_VIEWPORT_PX = 400;
  */
 const FIXTURE_TREE = {
   // `#727 vt-selection-quick-reply`: a tap in the floating box is not a tap outside it.
-  "quick-reply": ["quick-reply-quote", "quick-reply-text", "quick-reply-state", "quick-reply-cancel", "quick-reply-send"],
+  "quick-reply": ["quick-reply-quote", "quick-reply-text", "quick-reply-state", "quick-reply-cancel", "quick-reply-send",
+    "quick-reply-discard"],
+  // `#846 draft-chip-honest`: "Discard this draft?" is in the box it asks about.
+  "quick-reply-discard": ["quick-reply-discard-text", "quick-reply-discard-yes", "quick-reply-discard-no"],
   "scroll-area": ["pane-voice", "pane-discord"],
   // `#241 voice-composer`. The call's message box is the last thing in its pane, inside the
   // scrolling element, as the channel's box is in its own; its height is part of what "the reader is
@@ -577,7 +580,9 @@ const FIXTURE_TREE = {
   // and moved into the stream of a column and back, so what is inside it goes with it: whether the focus
   // is in the reply's box is a question of where that box is.
   "column-reply": ["reply-compose"],
-  "reply-compose": ["reply-target-meta", "reply-text", "reply-branch-row", "reply-destination", "reply-cancel", "reply-send", "reply-grow", "reply-state"],
+  "reply-compose": ["reply-target-meta", "reply-text", "reply-branch-row", "reply-destination", "reply-cancel", "reply-send", "reply-grow",
+    "reply-discard", "reply-state"],
+  "reply-discard": ["reply-discard-text", "reply-discard-yes", "reply-discard-no"],
   "reply-branch-row": ["reply-branch"],
   // `#229 desktop-two-column`. The right column of the desk's two-column layout: its heading, its
   // one scrolling element (the THIRD the model scrolls, see `SCROLLERS`) holding the cards and the

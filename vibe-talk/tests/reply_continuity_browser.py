@@ -1193,6 +1193,21 @@ def drafts_walk(walk: Walk) -> None:
     page.evaluate("() => { const area = document.getElementById('scroll-area'); area.scrollTop = 0; }")
     walk.wait_for("() => document.getElementById('draft-chip-label').textContent === 'Drafts (3)'",
                   f"drafts: the reply scrolled off screen is not offered: {state()}")
+    # Put down while off screen, then opened again by its Reply in sight; scrolled off again, it is offered
+    # again (the scroll's own record of where the reply was is kept by every drawing of the chip).
+    page.focus("#reply-text")
+    page.keyboard.press("Escape")
+    page.keyboard.press("Escape")
+    walk.wait_for(CLOSED, f"drafts: Esc did not put the reply off screen down: {state()}")
+    walk.place(30, page.viewport_size["height"] * 0.3 if page.viewport_size else 200)
+    walk.press(f"#discord-log > li[data-id='{reply_row}'] .reply-button")
+    walk.wait_for(OPEN, "drafts: Reply did not open again")
+    walk.wait_for("() => document.getElementById('draft-chip-label').textContent === 'Drafts (2)'",
+                  f"drafts: the reply opened in sight is offered: {state()}")
+    page.evaluate("() => document.activeElement && document.activeElement.blur()")
+    page.evaluate("() => { const area = document.getElementById('scroll-area'); area.scrollTop = 0; }")
+    walk.wait_for("() => document.getElementById('draft-chip-label').textContent === 'Drafts (3)'",
+                  f"drafts: the reply scrolled off a second time is not offered: {state()}")
     page.evaluate("() => document.getElementById('reply-text').scrollIntoView({block: 'center'})")
     walk.wait_for("() => document.getElementById('draft-chip-label').textContent === 'Drafts (2)'",
                   f"drafts: the reply scrolled back on screen is still offered: {state()}")

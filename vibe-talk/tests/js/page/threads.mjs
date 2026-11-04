@@ -28,7 +28,7 @@ import { PAGE_CODE, brokenModule, BASE_CSS, BIG, BIG_ROOT, CHANNEL, CHARS_PER_LI
   sourceConstant, sseMessage, sseUpdate, stackPlaces, startTalking, statusText, tagOf, tallChannel,
   test, threadBadge, threadButton, threadData, threadOptions, threadPage, threadedService,
   timelineAnswer, twoColumnServer, twoColumns, unpackData, unpackPage, unpackRows, unpackedRow,
-  untilDeepLink, upstreamReadButton, viewOf, wideCard } from "./fixture.mjs";
+  putReplyDown, untilDeepLink, upstreamReadButton, viewOf, wideCard } from "./fixture.mjs";
 
 // --- `#489 card-root-lines`: a card showing its first message keeps its lines ----------------------
 
@@ -2190,7 +2190,7 @@ test("`#281 view-keys` x `#277 reply-in-column`: Ctrl+1 to Ctrl+3 in a reply ope
   await replyButton(rowWithId(page, "200")).click();
   assert.ok(replyInStream(page), "the premise is the reply in one column");
   assert.equal(page.el("reply-text").value, "left words", "Reply did not open with the words kept");
-  await page.el("reply-cancel").click();
+  await putReplyDown(page);
 
   // On the right: Ctrl+4, two columns already, changes nothing, the box keeping the focus and the words.
   await press(page, page.el("scroll-area"), "4", { ctrlKey: true });
@@ -2213,7 +2213,7 @@ test("`#281 view-keys` x `#277 reply-in-column`: Ctrl+1 to Ctrl+3 in a reply ope
   assert.deepStrictEqual(sideIds(page), ["201", "202"]);
   await replyButton(sideRow(page, "202")).click();
   assert.equal(page.el("reply-text").value, "right words", "the words put down by Ctrl+3 were not kept");
-  await page.el("reply-cancel").click();
+  await putReplyDown(page);
 
   // Two columns chosen from the thread list: their button goes back to it, and hands a reply open in
   // a column to the reply screen, words and all, over the list; Cancel is the list again.
@@ -2227,7 +2227,9 @@ test("`#281 view-keys` x `#277 reply-in-column`: Ctrl+1 to Ctrl+3 in a reply ope
   assert.ok(replyInStream(page), "the layout button lost a reply open in a column");
   assert.equal(page.el("reply-text").value, "handed over", "the words did not go with the reply");
   assert.equal(layout(), "list", "the layout button did not go back to the thread list under the reply");
+  // `#846 draft-chip-honest`: Cancel on words asks first; Yes puts the reply down.
   await page.el("reply-cancel").click();
+  await page.el("reply-discard-yes").click();
   assert.equal(page.screen(), "main");
   assert.equal(layout(), "list", "Cancel did not come back to the thread list");
   assert.ok(page.el("side-column").getClientRects().length > 0, "the thread list is not on screen after Cancel");
