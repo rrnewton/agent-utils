@@ -95,6 +95,7 @@ impl PaneAdmission {
             .map_err(|e| AdapterError::unavailable(format!("pane admission dir: {e}")))?;
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .open(dir.join("admission.lock"))
             .map_err(|e| AdapterError::unavailable(format!("pane admission lock: {e}")))?;
