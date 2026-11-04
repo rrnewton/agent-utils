@@ -6565,10 +6565,6 @@ fn run_refresh(args: &[String], kind: RefreshKind) -> u8 {
             }
         },
     };
-    if backend == "muse" {
-        eprintln!("wrkviz: {MUSE_NOT_PORTED}");
-        return 2;
-    }
     let mut rollup_kinds: Vec<String> = all("--rollup-kind");
     for kind_name in &rollup_kinds {
         if !matches!(
@@ -6734,7 +6730,11 @@ fn run_refresh(args: &[String], kind: RefreshKind) -> u8 {
                             false,
                         ));
                     }
-                    default_model.clone()
+                    if backend == "muse" {
+                        crate::muse_backend::DEFAULT_MUSE_MODEL.to_string()
+                    } else {
+                        default_model.clone()
+                    }
                 }
                 Some(raw) => {
                     let model = crate::summarize_core::py_trim(&raw).to_string();
@@ -6744,8 +6744,13 @@ fn run_refresh(args: &[String], kind: RefreshKind) -> u8 {
                     model
                 }
             };
-            check_rollup_model(get("--rollup-model").as_deref(), &model)
-                .map_err(|error| (error, false))?;
+            let rollup_model = resolve_rollup_model(
+                &backend,
+                get("--model").is_none(),
+                get("--rollup-model").as_deref(),
+                &model,
+            )
+            .map_err(|error| (error, false))?;
             if backend_timeout.is_nan() || backend_timeout <= 0.0 {
                 return Err((
                     "--backend-timeout must be a positive number of seconds".to_string(),
@@ -6789,7 +6794,11 @@ fn run_refresh(args: &[String], kind: RefreshKind) -> u8 {
                     crate::summary_budget::Prices::parse(&raw).map_err(|error| (error, false))?,
                 ),
             };
-            if budget_usd.is_some() && prices.is_none() && backend != "heuristic" {
+            if budget_usd.is_some()
+                && prices.is_none()
+                && backend != "heuristic"
+                && !crate::summary_budget::ZERO_RATED_BACKENDS.contains(&backend.as_str())
+            {
                 return Err((
                     "--budget-usd needs --price to turn token estimates into dollars".to_string(),
                     false,
@@ -6806,6 +6815,8 @@ fn run_refresh(args: &[String], kind: RefreshKind) -> u8 {
                 claude_command: vec![
                     get("--claude-command").unwrap_or_else(|| "claude".to_string())
                 ],
+                muse_command: vec![get("--muse-command").unwrap_or_else(|| "muse".to_string())],
+                rollup_model: Some(rollup_model.clone()),
                 reasoning_effort: reasoning_effort.clone(),
                 service_tier: service_tier.clone(),
                 summary_window,
@@ -7931,25 +7942,27 @@ fn run_build(args: &[String]) -> u8 {
 /// One backend call's time limit when `--backend-timeout` is omitted, as in the Python edition.
 const DEFAULT_BACKEND_TIMEOUT_SECONDS: f64 = 900.0;
 
-/// The one-line refusal for `--backend muse` (also the default backend) in this edition.
-const MUSE_NOT_PORTED: &str = "the muse backend is not yet in the Rust edition \
-(#842 wrkviz-muse-backend-rust); use the Python engine or --backend claude|codex";
-
-/// Accept `--rollup-model` only where this edition can honour it: naming the phase model.
-fn check_rollup_model(raw: Option<&str>, model: &str) -> Result<(), String> {
-    let Some(raw) = raw else {
-        return Ok(());
-    };
-    let rollup_model = crate::summarize_core::py_trim(raw);
-    if rollup_model.is_empty() {
-        return Err("--rollup-model must not be empty".to_string());
+/// The calendar-rollup model: `--rollup-model`, else the muse rollup default when muse runs
+/// without `--model`, else the run's model.
+fn resolve_rollup_model(
+    backend: &str,
+    model_omitted: bool,
+    raw: Option<&str>,
+    model: &str,
+) -> Result<String, String> {
+    match raw {
+        None if backend == "muse" && model_omitted => {
+            Ok(crate::muse_backend::DEFAULT_MUSE_ROLLUP_MODEL.to_string())
+        }
+        None => Ok(model.to_string()),
+        Some(raw) => {
+            let rollup_model = crate::summarize_core::py_trim(raw);
+            if rollup_model.is_empty() {
+                return Err("--rollup-model must not be empty".to_string());
+            }
+            Ok(rollup_model.to_string())
+        }
     }
-    if rollup_model != model {
-        return Err("a separate --rollup-model is not yet in the Rust edition \
-(#842 wrkviz-muse-backend-rust); omit it or use the Python engine"
-            .to_string());
-    }
-    Ok(())
 }
 
 fn run_summarize(args: &[String]) -> u8 {
@@ -8174,10 +8187,6 @@ fn run_summarize(args: &[String]) -> u8 {
             }
         },
     };
-    if backend == "muse" {
-        eprintln!("wrkviz: {MUSE_NOT_PORTED}");
-        return 2;
-    }
     let mut rollup_kinds: Vec<String> = values.get("--rollup-kind").cloned().unwrap_or_default();
     for kind in &rollup_kinds {
         if !matches!(
@@ -8224,7 +8233,11 @@ fn run_summarize(args: &[String]) -> u8 {
                             false,
                         ));
                     }
-                    default_model.clone()
+                    if backend == "muse" {
+                        crate::muse_backend::DEFAULT_MUSE_MODEL.to_string()
+                    } else {
+                        default_model.clone()
+                    }
                 }
                 Some(raw) => {
                     let model = crate::summarize_core::py_trim(&raw).to_string();
@@ -8234,8 +8247,13 @@ fn run_summarize(args: &[String]) -> u8 {
                     model
                 }
             };
-            check_rollup_model(get("--rollup-model").as_deref(), &model)
-                .map_err(|error| (error, false))?;
+            let rollup_model = resolve_rollup_model(
+                &backend,
+                get("--model").is_none(),
+                get("--rollup-model").as_deref(),
+                &model,
+            )
+            .map_err(|error| (error, false))?;
             if backend_timeout.is_nan() || backend_timeout <= 0.0 {
                 return Err((
                     "--backend-timeout must be a positive number of seconds".to_string(),
@@ -8279,7 +8297,11 @@ fn run_summarize(args: &[String]) -> u8 {
                     crate::summary_budget::Prices::parse(&raw).map_err(|error| (error, false))?,
                 ),
             };
-            if budget_usd.is_some() && prices.is_none() && backend != "heuristic" {
+            if budget_usd.is_some()
+                && prices.is_none()
+                && backend != "heuristic"
+                && !crate::summary_budget::ZERO_RATED_BACKENDS.contains(&backend.as_str())
+            {
                 return Err((
                     "--budget-usd needs --price to turn token estimates into dollars".to_string(),
                     false,
@@ -8296,6 +8318,8 @@ fn run_summarize(args: &[String]) -> u8 {
                 claude_command: vec![
                     get("--claude-command").unwrap_or_else(|| "claude".to_string())
                 ],
+                muse_command: vec![get("--muse-command").unwrap_or_else(|| "muse".to_string())],
+                rollup_model: Some(rollup_model.clone()),
                 reasoning_effort: reasoning_effort.clone(),
                 service_tier: service_tier.clone(),
                 summary_window,

@@ -899,14 +899,76 @@ pub fn build_summary_prompt(jobs: &[SummaryJob]) -> Result<String, String> {
         _ => "",
     };
     Ok(format!(
-        "{common}{audience}Prompt version: {}\nBEGIN_JOBS_JSON\n{}END_JOBS_JSON\n",
+        "{common}{audience}{}Prompt version: {}\nBEGIN_JOBS_JSON\n{}END_JOBS_JSON\n",
+        time_windows(jobs, &style),
         prompt_version(&jobs[0])?,
         dump_canonical(&payload)
     ))
 }
 
-/// The backend output JSON schema.
-pub fn output_schema() -> Value {
+fn utc_label(ms: i64) -> String {
+    use chrono::TimeZone as _;
+    match chrono::Utc.timestamp_millis_opt(ms).single() {
+        Some(at) => at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        None => format!("{ms} ms"),
+    }
+}
+
+/// Each job's time window in words, for styles whose bullets carry `at_ms`.
+///
+/// Models misplace events near a phase boundary, and a bullet outside its window is dropped
+/// (a phase that loses every bullet falls back to a transcript-only heuristic), so the window
+/// is restated as clock times beside the raw milliseconds. The text is not part of any cache
+/// identity: the job JSON and the prompt version are unchanged, so cached summaries stay valid.
+fn time_windows(jobs: &[SummaryJob], style: &str) -> String {
+    if matches!(style, PROJECT_OVERVIEW_STYLE | GLOSSARY_DEFINITION_STYLE) {
+        return String::new();
+    }
+    let mut out = String::from(
+        "Time windows: every work_summary at_ms for a key must lie inside its window, from \
+start_ms (inclusive) up to end_ms. A bullet outside its window is discarded. Events in \
+prior_context or just before a window's start belong to an earlier window, not this one.\n",
+    );
+    for job in jobs {
+        out.push_str(&format!(
+            "- {}: {} to {} (start_ms {}, end_ms {})\n",
+            job.key,
+            utc_label(job.start_ms),
+            utc_label(job.end_ms),
+            job.start_ms,
+            job.end_ms
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// An array-of-`item` answer schema, holding exactly `keys.len()` items when `keys` is set.
+pub(crate) fn answer_array_schema(item: Value, keys: Option<&[String]>) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("type".into(), Value::String("array".into()));
+    map.insert("items".into(), item);
+    if let Some(keys) = keys {
+        map.insert("minItems".into(), (keys.len() as i64).into());
+        map.insert("maxItems".into(), (keys.len() as i64).into());
+    }
+    Value::Object(map)
+}
+
+/// The answer's `key` property: any non-empty string, or one of `keys`.
+pub(crate) fn answer_key_schema(keys: Option<&[String]>) -> Value {
+    match keys {
+        None => serde_json::json!({"type": "string", "minLength": 1}),
+        Some(keys) => serde_json::json!({"type": "string", "enum": keys}),
+    }
+}
+
+/// The backend output JSON schema; with `keys`, exactly one summary per key.
+///
+/// The muse backend's models answer multi-job batches under keys they made up, leave jobs out,
+/// or add placeholder entries; naming the batch's keys and count in the schema the CLI enforces
+/// removes that freedom. The strict parser still checks every answer.
+pub fn output_schema(keys: Option<&[String]>) -> Value {
     let bullet = {
         let mut props = serde_json::Map::new();
         props.insert("at_ms".into(), serde_json::json!({"type": "integer"}));
@@ -929,10 +991,7 @@ pub fn output_schema() -> Value {
     };
     let summary = {
         let mut props = serde_json::Map::new();
-        props.insert(
-            "key".into(),
-            serde_json::json!({"type": "string", "minLength": 1}),
-        );
+        props.insert("key".into(), answer_key_schema(keys));
         props.insert(
             "phrase".into(),
             serde_json::json!({"type": "string", "minLength": 1, "maxLength": PHRASE_LIMIT}),
@@ -966,15 +1025,7 @@ pub fn output_schema() -> Value {
         Value::Object(item)
     };
     let mut props = serde_json::Map::new();
-    props.insert(
-        "summaries".into(),
-        Value::Object({
-            let mut map = serde_json::Map::new();
-            map.insert("type".into(), Value::String("array".into()));
-            map.insert("items".into(), summary);
-            map
-        }),
-    );
+    props.insert("summaries".into(), answer_array_schema(summary, keys));
     let mut root = serde_json::Map::new();
     root.insert(
         "$schema".into(),
@@ -2087,7 +2138,7 @@ fn codex_batch(
     })?;
     let schema_path = work_dir.join("output-schema.json");
     let output_path = work_dir.join("last-message.json");
-    std::fs::write(&schema_path, dump_canonical(&output_schema()))
+    std::fs::write(&schema_path, dump_canonical(&output_schema(None)))
         .map_err(|error| BatchFailure::plain(crate::json::os_error(&error, &schema_path)))?;
     let mut command: Vec<String> = codex_command.to_vec();
     command.push("exec".into());
@@ -2318,23 +2369,40 @@ pub(crate) fn run_claude_json(
     })
 }
 
+/// Run one batch through the Claude CLI, or through `muse exec` for the muse backend.
+///
+/// Both take the same prompt and schema (narrowed to the batch's keys for muse) and return one
+/// structured result.
 fn claude_batch(
     pending: &[PendingJob],
     model: &str,
     reasoning_effort: Option<&str>,
     claude_command: &[String],
+    backend: &str,
 ) -> Result<CodexOutcome, BatchFailure> {
     let temp = TempDir::new("wrkviz-summary-").map_err(BatchFailure::plain)?;
     let jobs: Vec<SummaryJob> = pending.iter().map(|item| item.job.clone()).collect();
     let prompt = build_summary_prompt(&jobs).map_err(BatchFailure::plain)?;
-    let result = run_claude_json(
-        claude_command,
-        &prompt,
-        &output_schema(),
-        model,
-        reasoning_effort,
-        &temp.path,
-    )?;
+    let result = if backend == "muse" {
+        let keys: Vec<String> = jobs.iter().map(|job| job.key.clone()).collect();
+        crate::muse_backend::run_muse_json(
+            claude_command,
+            &prompt,
+            &output_schema(Some(&keys)),
+            model,
+            reasoning_effort,
+            &temp.path,
+        )?
+    } else {
+        run_claude_json(
+            claude_command,
+            &prompt,
+            &output_schema(None),
+            model,
+            reasoning_effort,
+            &temp.path,
+        )?
+    };
     // Claude transport errors retain usage but no backend output audit.
     match parse_backend_output_with_repairs(&result.output, pending, model, &utc_now_iso()) {
         Ok(parsed) => Ok(CodexOutcome {
@@ -2475,7 +2543,7 @@ fn run_backend_batch(
                 Some(outcome.raw_output),
             ))
         } else {
-            let outcome = claude_batch(batch, model, reasoning_effort, claude_command)?;
+            let outcome = claude_batch(batch, model, reasoning_effort, claude_command, backend)?;
             Ok((
                 outcome.parsed.results,
                 outcome.usage,
@@ -2622,7 +2690,7 @@ pub fn summarize_jobs(
     guard: Option<&SpendGuard>,
 ) -> Result<(HashMap<String, SummaryResult>, SummaryRunStats), String> {
     let run_started_at = utc_now_iso();
-    if !matches!(backend, "claude" | "codex" | "heuristic") {
+    if !matches!(backend, "claude" | "codex" | "heuristic" | "muse") {
         return Err(format!(
             "unsupported summary backend {}",
             py_repr_str(backend)
@@ -3021,8 +3089,8 @@ print(json.dumps({
     fn claude_backend_receives_each_callers_own_schema() {
         use std::os::unix::fs::PermissionsExt as _;
         for (schema, expected) in [
-            (output_schema(), "summaries"),
-            (crate::naming::output_schema(), "names"),
+            (output_schema(None), "summaries"),
+            (crate::naming::output_schema(None), "names"),
         ] {
             let temp = TempDir::new("wrkviz-schema-test-").unwrap();
             let script = temp.path.join("fake-claude");

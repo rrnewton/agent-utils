@@ -1,11 +1,12 @@
 ---
 title: 'wrkviz-muse-backend-rust: the muse summary backend in the Rust edition'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: cl-start
 created_at: 2026-11-04T18:13:01.570188000+00:00
-updated_at: 2026-11-04T18:13:01.570188000+00:00
+updated_at: 2026-11-04T18:51:03.184661000+00:00
+closed_at: 2026-11-04T18:51:03.184661000+00:00
 ---
 
 # Description
@@ -32,3 +33,20 @@ Port the Python edition's behaviour (py/wrkviz, #839) to rs/wrkviz:
 # Notes
 
 Filed by cl-start on coordinator direction, 2026-11-04.
+
+## Resolution
+
+[opus 5.5] cl-start, 2026-11-04. The Rust edition now has the muse backend at parity with Python, and the #839 refusals are gone.
+
+- `rs/wrkviz/src/muse_backend.rs` holds the runner: the same `muse exec` arguments, event parsing and error messages as `py/wrkviz/muse_backend.py`. It plugs into the Claude-shaped batch path of summaries and names, and `SummarizeOptions::agent_command` hands it `--muse-command`.
+- Muse batches get the narrowed answer schema (`output_schema(Some(keys))`, the key enum plus an exact item count). The phase prompt carries the time-window lines.
+- `rollup_model` is used for rollup lookup, carry-forward, generation, calibration, and the run request (recorded only when it differs from the model).
+- The plan: `ZERO_RATED_BACKENDS`, per-kind call times from receipts or built-in figures, `estimated_seconds`, and the wall-time line, all for zero-rated backends only. A budget needs no `--price` for muse and starts no spend guard.
+- CLI: muse is the default, with Spark for phases and Watermelon Full for rollups when `--model` is omitted, and `--muse-command` / `--rollup-model` are honoured.
+- Tests: the refusal tests are replaced by differential tests with a fake `muse`. They cover the default run (identical prompt and schema digests for every call, plus the archive tree, stdout and stderr), `--plan` and a budget under muse, a failed run, a split `--rollup-model`, and a bad `--backend-timeout`.
+
+Validation on the #839 scratch reflink copy, never the archive:
+- The Rust plan sees every Python muse entry for 2026-10-25 and 2026-10-26 as cached, and its 10-26 plan matches Python's line for line.
+- A Rust run of 2026-10-24 (54 phases, 16 names, 2 daily rollups) finished in 13 batches with no retries, in 524 s and at $0.
+- Python then plans that day as fully cached.
+

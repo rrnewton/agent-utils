@@ -368,9 +368,9 @@ pub fn build_name_prompt(jobs: &[AgentNameJob]) -> String {
     build_agent_name_prompt(jobs)
 }
 
-/// The naming output schema.
-pub fn output_schema() -> Value {
-    serde_json::json!({
+/// The naming output schema; with `keys`, exactly one name per key (see the summary schema).
+pub fn output_schema(keys: Option<&[String]>) -> Value {
+    let mut schema = serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "additionalProperties": false,
@@ -401,7 +401,14 @@ pub fn output_schema() -> Value {
                 }
             }
         }
-    })
+    });
+    if keys.is_some() {
+        let names = &mut schema["properties"]["names"];
+        let mut item = names["items"].take();
+        item["properties"]["key"] = crate::summarize_core::answer_key_schema(keys);
+        *names = crate::summarize_core::answer_array_schema(item, keys);
+    }
+    schema
 }
 
 fn require_keys(
@@ -1123,7 +1130,7 @@ fn codex_batch(
     })?;
     let schema_path = work_dir.join("output-schema.json");
     let output_path = work_dir.join("last-message.json");
-    std::fs::write(&schema_path, dump_canonical(&output_schema()))
+    std::fs::write(&schema_path, dump_canonical(&output_schema(None)))
         .map_err(|error| BatchFailure::plain(crate::json::os_error(&error, &schema_path)))?;
     let mut command: Vec<String> = codex_command.to_vec();
     command.push("exec".into());
@@ -1202,23 +1209,37 @@ fn codex_batch(
     }
 }
 
+/// Run one batch through the Claude CLI, or through `muse exec` for the muse backend.
 fn claude_batch(
     pending: &[PendingName],
     model: &str,
     reasoning_effort: Option<&str>,
     claude_command: &[String],
+    backend: &str,
 ) -> Result<NameOutcome, BatchFailure> {
     let temp = TempDir::new("wrkviz-name-").map_err(BatchFailure::plain)?;
     let jobs: Vec<AgentNameJob> = pending.iter().map(|item| item.job.clone()).collect();
     let prompt = build_agent_name_prompt(&jobs);
-    let result = crate::summarize_core::run_claude_json(
-        claude_command,
-        &prompt,
-        &output_schema(),
-        model,
-        reasoning_effort,
-        &temp.path,
-    )
+    let result = if backend == "muse" {
+        let keys: Vec<String> = jobs.iter().map(|job| job.key.clone()).collect();
+        crate::muse_backend::run_muse_json(
+            claude_command,
+            &prompt,
+            &output_schema(Some(&keys)),
+            model,
+            reasoning_effort,
+            &temp.path,
+        )
+    } else {
+        crate::summarize_core::run_claude_json(
+            claude_command,
+            &prompt,
+            &output_schema(None),
+            model,
+            reasoning_effort,
+            &temp.path,
+        )
+    }
     .map_err(|error| BatchFailure {
         message: error.message,
         usage: error.usage,
@@ -1328,7 +1349,7 @@ fn run_backend_batch(
                 Some(outcome.raw_output),
             ))
         } else {
-            let outcome = claude_batch(batch, model, reasoning_effort, claude_command)?;
+            let outcome = claude_batch(batch, model, reasoning_effort, claude_command, backend)?;
             Ok((
                 outcome.parsed.results,
                 outcome.usage,
@@ -1463,7 +1484,7 @@ pub fn name_agents(
     guard: Option<&SpendGuard>,
 ) -> Result<(HashMap<String, AgentNameResult>, SummaryRunStats), String> {
     let run_started_at = utc_now_iso();
-    if !matches!(backend, "claude" | "codex" | "heuristic") {
+    if !matches!(backend, "claude" | "codex" | "heuristic" | "muse") {
         return Err(format!(
             "unsupported agent naming backend {}",
             py_repr_str(backend)

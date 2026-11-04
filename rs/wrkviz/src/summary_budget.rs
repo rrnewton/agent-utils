@@ -192,13 +192,54 @@ fn default_job_usage(kind: &str) -> JobUsage {
     }
 }
 
+/// Backends whose calls are not billed to the run. Their plans report $0 model spend.
+pub const ZERO_RATED_BACKENDS: &[&str] = &["muse"];
+
+/// Seconds one backend call takes when a cache has no timed receipts for a kind yet, by model.
+/// Measured on real team-days in November 2026: a Muse Spark 1.3 call of up to six phases took
+/// 15-76 s (about 50 s for six), and a Watermelon Full rollup call 40-480 s (about 190 s on
+/// average). Any other model is assumed to take a minute.
+const DEFAULT_CALL_SECONDS: &[(&str, f64)] = &[
+    ("muse-spark-1.3-internal", 50.0),
+    ("watermelon-full-preview", 190.0),
+];
+const FALLBACK_CALL_SECONDS: f64 = 60.0;
+
+fn default_call_seconds(model: &str) -> f64 {
+    DEFAULT_CALL_SECONDS
+        .iter()
+        .find(|(name, _)| *name == model)
+        .map_or(FALLBACK_CALL_SECONDS, |(_, seconds)| *seconds)
+}
+
+/// Rollup kinds, which run one job per call, one call at a time, under the rollup model.
+fn is_rollup_kind(kind: &str) -> bool {
+    matches!(kind, TECHNICAL_ROLLUP_KIND | PLAIN_ROLLUP_KIND)
+}
+
+/// Mean seconds of one backend call of a kind, and how many calls that mean is drawn from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CallTime {
+    /// Mean seconds per call.
+    pub seconds: f64,
+    /// Timed calls behind the mean (0 for a built-in figure).
+    pub samples: i64,
+}
+
 /// Mean usage per job kind for one backend and model.
+///
+/// `zero_rated` backends still have token estimates, but cost $0. `per_call` holds the mean
+/// duration of one backend call per kind, for the wall-time estimate.
 #[derive(Clone, Debug)]
 pub struct CostModel {
     /// Per-kind means.
     pub per_job: BTreeMap<String, JobUsage>,
     /// Free (heuristic) backend.
     pub free: bool,
+    /// Zero-rated backend: tokens are estimated, spend is $0.
+    pub zero_rated: bool,
+    /// Mean call duration per kind.
+    pub per_call: BTreeMap<String, CallTime>,
 }
 
 impl CostModel {
@@ -217,7 +258,7 @@ impl CostModel {
 
     /// Estimated USD of `jobs` jobs of `kind`.
     pub fn usd(&self, kind: &str, jobs: i64, prices: &Prices) -> f64 {
-        if self.free || jobs <= 0 {
+        if self.free || self.zero_rated || jobs <= 0 {
             return 0.0;
         }
         let mean = self
@@ -243,6 +284,27 @@ impl CostModel {
             _ => "built-in".to_string(),
         }
     }
+
+    /// Mean duration of one backend call of `kind`.
+    pub fn call_time(&self, kind: &str) -> CallTime {
+        if self.free {
+            return CallTime {
+                seconds: 0.0,
+                samples: 0,
+            };
+        }
+        self.per_call.get(kind).copied().unwrap_or(CallTime {
+            seconds: FALLBACK_CALL_SECONDS,
+            samples: 0,
+        })
+    }
+}
+
+fn receipt_seconds(started_at: &str, completed_at: &str) -> Option<f64> {
+    let started = chrono::DateTime::parse_from_rfc3339(started_at).ok()?;
+    let completed = chrono::DateTime::parse_from_rfc3339(completed_at).ok()?;
+    let seconds = (completed - started).num_microseconds()? as f64 / 1_000_000.0;
+    (seconds >= 0.0).then_some(seconds)
 }
 
 fn receipt_kind(cache_dir: &Path, first_hash: &str, name_cache: bool) -> Option<String> {
@@ -266,20 +328,29 @@ fn receipt_kind(cache_dir: &Path, first_hash: &str, name_cache: bool) -> Option<
 }
 
 /// Mean usage per job kind from completed receipts.
+///
+/// Calendar rollups are calibrated from the receipts of `rollup_model` (default: `model`), the
+/// model that writes them. Each kind also gets its mean call duration, or the built-in figure
+/// for its model when no receipt of that kind is timed.
 pub fn calibrate(
     summary_cache: &Path,
     name_cache: &Path,
     backend: &str,
     model: &str,
     reasoning_effort: Option<&str>,
+    rollup_model: Option<&str>,
 ) -> CostModel {
     if backend == "heuristic" {
         return CostModel {
             per_job: BTreeMap::new(),
             free: true,
+            zero_rated: false,
+            per_call: BTreeMap::new(),
         };
     }
+    let rollup_model = rollup_model.unwrap_or(model);
     let mut totals: BTreeMap<String, [f64; 5]> = BTreeMap::new();
+    let mut durations: BTreeMap<String, [f64; 2]> = BTreeMap::new();
     for (cache_dir, is_names) in [(summary_cache, false), (name_cache, true)] {
         let receipts = cache_dir.join("_usage").join("receipts");
         if !receipts.is_dir() {
@@ -305,7 +376,7 @@ pub fn calibrate(
                 || receipt.usage.is_none()
                 || receipt.input_hashes.is_empty()
                 || receipt.backend != backend
-                || receipt.model != model
+                || (receipt.model != model && receipt.model != rollup_model)
                 || receipt.reasoning_effort.as_deref() != reasoning_effort
             {
                 continue;
@@ -313,6 +384,19 @@ pub fn calibrate(
             let Some(kind) = receipt_kind(cache_dir, &receipt.input_hashes[0], is_names) else {
                 continue;
             };
+            let kind_model = if is_rollup_kind(&kind) {
+                rollup_model
+            } else {
+                model
+            };
+            if receipt.model != kind_model {
+                continue;
+            }
+            if let Some(seconds) = receipt_seconds(&receipt.started_at, &receipt.completed_at) {
+                let timing = durations.entry(kind.clone()).or_default();
+                timing[0] += 1.0;
+                timing[1] += seconds;
+            }
             let usage = receipt.usage.unwrap();
             let item = totals.entry(kind).or_default();
             item[0] += receipt.input_hashes.len() as f64;
@@ -338,9 +422,35 @@ pub fn calibrate(
             )
         })
         .collect();
+    let mut per_call = BTreeMap::new();
+    for kind in [
+        PHASE_KIND,
+        AGENT_NAME_KIND,
+        OVERVIEW_KIND,
+        PLAIN_ROLLUP_KIND,
+        TECHNICAL_ROLLUP_KIND,
+    ] {
+        let time = match durations.get(kind) {
+            Some(timing) if timing[0] > 0.0 => CallTime {
+                seconds: timing[1] / timing[0],
+                samples: timing[0] as i64,
+            },
+            _ => CallTime {
+                seconds: default_call_seconds(if is_rollup_kind(kind) {
+                    rollup_model
+                } else {
+                    model
+                }),
+                samples: 0,
+            },
+        };
+        per_call.insert(kind.to_string(), time);
+    }
     CostModel {
         per_job,
         free: false,
+        zero_rated: ZERO_RATED_BACKENDS.contains(&backend),
+        per_call,
     }
 }
 
@@ -378,6 +488,12 @@ pub struct SummaryPlan {
     pub previous_state: Option<Value>,
     /// Recorded request.
     pub request: Option<Value>,
+    /// Phase jobs per backend call, for the wall-time estimate.
+    pub batch_size: usize,
+    /// Agent-name jobs per backend call, for the wall-time estimate.
+    pub name_batch_size: usize,
+    /// Concurrent backend calls, for the wall-time estimate.
+    pub workers: usize,
 }
 
 fn rounded(value: Option<f64>) -> Value {
@@ -420,12 +536,41 @@ impl SummaryPlan {
 
     /// Estimated USD of one stage.
     pub fn stage_usd(&self, stage: &StageCount) -> Option<f64> {
+        if self.costs.zero_rated {
+            return Some(0.0);
+        }
         self.prices
             .map(|prices| self.costs.usd(&stage.kind, stage.to_generate, &prices))
     }
 
+    /// Estimated wall time of one stage's new model work.
+    ///
+    /// Phase summaries and agent names run in batches on `workers` threads; the overview and
+    /// each calendar rollup is one call, and rollups run one after another.
+    pub fn stage_seconds(&self, stage: &StageCount) -> f64 {
+        if stage.to_generate <= 0 {
+            return 0.0;
+        }
+        let call = self.costs.call_time(&stage.kind).seconds;
+        let per_call_jobs = match stage.kind.as_str() {
+            PHASE_KIND => self.batch_size,
+            AGENT_NAME_KIND => self.name_batch_size,
+            _ => return stage.to_generate as f64 * call,
+        };
+        let calls = (stage.to_generate as usize).div_ceil(per_call_jobs.max(1));
+        calls.div_ceil(self.workers.max(1)) as f64 * call
+    }
+
+    /// Estimated wall time of the whole tree.
+    pub fn estimated_seconds(&self) -> f64 {
+        crate::responsiveness::py_sum(self.stages.iter().map(|stage| self.stage_seconds(stage)))
+    }
+
     /// Estimated USD of the whole tree.
     pub fn estimated_usd(&self) -> Option<f64> {
+        if self.costs.zero_rated {
+            return Some(0.0);
+        }
         self.prices.map(|prices| {
             // CPython `sum(...)` is Neumaier-compensated; a
             // plain fold can land one cent away when the
@@ -495,8 +640,17 @@ impl SummaryPlan {
             comma(usage.input_tokens),
             comma(usage.output_tokens)
         );
-        if let Some(estimate) = self.estimated_usd() {
+        if self.costs.zero_rated {
+            total.push_str(", $0.00 model spend (zero-rated backend)");
+        } else if let Some(estimate) = self.estimated_usd() {
             total.push_str(&format!(", ~${estimate:.2}"));
+        }
+        if self.to_generate() != 0 && self.costs.zero_rated {
+            // Time, not money, is what a zero-rated run spends.
+            total.push_str(&format!(
+                "; expected wall time ~{}",
+                duration_text(self.estimated_seconds())
+            ));
         }
         if let Some(budget) = self.budget_usd {
             total.push_str(&format!("; budget ${budget:.2}"));
@@ -538,7 +692,27 @@ impl SummaryPlan {
                 serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)
             }),
         );
+        if self.costs.zero_rated {
+            let seconds = crate::responsiveness::py_round(self.estimated_seconds(), 1);
+            out.insert(
+                "estimated_seconds".into(),
+                serde_json::Number::from_f64(seconds).map_or(Value::Null, Value::Number),
+            );
+        }
         Value::Object(out)
+    }
+}
+
+/// `seconds` as a short human duration: `45 s`, `12 min` or `2 h 5 min`.
+fn duration_text(seconds: f64) -> String {
+    if seconds < 90.0 {
+        return format!("{seconds:.0} s");
+    }
+    let minutes = (seconds / 60.0).ceil() as i64;
+    if minutes < 120 {
+        format!("{minutes} min")
+    } else {
+        format!("{} h {} min", minutes / 60, minutes % 60)
     }
 }
 

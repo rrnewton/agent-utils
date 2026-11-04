@@ -1676,6 +1676,10 @@ pub struct SummarizeOptions {
     pub codex_command: Vec<String>,
     /// Claude command.
     pub claude_command: Vec<String>,
+    /// Muse command.
+    pub muse_command: Vec<String>,
+    /// The model for calendar rollups; `None` means the run's model.
+    pub rollup_model: Option<String>,
     /// Reasoning effort.
     pub reasoning_effort: Option<String>,
     /// Service tier.
@@ -1688,6 +1692,22 @@ pub struct SummarizeOptions {
     pub budget_usd: Option<f64>,
     /// Prices.
     pub prices: Option<Prices>,
+}
+
+impl SummarizeOptions {
+    /// The command the Claude-shaped batch path runs for `backend`: muse or claude.
+    fn agent_command(&self, backend: &str) -> &[String] {
+        if backend == "muse" {
+            &self.muse_command
+        } else {
+            &self.claude_command
+        }
+    }
+
+    /// The model calendar rollups use.
+    fn rollup_model<'a>(&'a self, model: &'a str) -> &'a str {
+        self.rollup_model.as_deref().unwrap_or(model)
+    }
 }
 
 fn summary_tree(
@@ -1741,6 +1761,7 @@ fn request_json(
     reasoning_effort: Option<&str>,
     service_tier: Option<&str>,
     rollup_kinds: &[String],
+    rollup_model: &str,
 ) -> Value {
     let opt = |value: Option<&str>| value.map_or(Value::Null, |text| Value::String(text.into()));
     let opt_num = |value: Option<i64>| value.map_or(Value::Null, Into::into);
@@ -1760,6 +1781,10 @@ fn request_json(
                 .collect(),
         ),
     );
+    // Recorded only when calendar rollups use a different model.
+    if rollup_model != model {
+        out.insert("rollup_model".into(), Value::String(rollup_model.into()));
+    }
     Value::Object(out)
 }
 
@@ -1788,6 +1813,8 @@ fn plan_tree(
     let index = rollup_index(&tree.summary_root);
     let reasoning_effort = options.reasoning_effort.as_deref();
     let service_tier = options.service_tier.as_deref();
+    // Calendar rollups are looked up under the model that would write them.
+    let rollup_model = options.rollup_model(model);
     let mut stages: Vec<StageCount> = Vec::new();
     let add_stage = |name: &str, kind: &str, stages: &mut Vec<StageCount>| {
         stages.push(StageCount {
@@ -1898,7 +1925,14 @@ fn plan_tree(
         let stage_index = rollup_stage_index[&(kind, job.summary_style.clone())];
         stages[stage_index].total += 1;
         if own_known && prior_known {
-            let hit = cached_summary(job, &cache, backend, model, reasoning_effort, service_tier)?;
+            let hit = cached_summary(
+                job,
+                &cache,
+                backend,
+                rollup_model,
+                reasoning_effort,
+                service_tier,
+            )?;
             if let Some(hit) = hit {
                 stages[stage_index].cached += 1;
                 return Ok(Some(hit));
@@ -1910,7 +1944,7 @@ fn plan_tree(
                 &index,
                 &cache,
                 backend,
-                model,
+                rollup_model,
                 reasoning_effort,
                 service_tier,
             )?;
@@ -1942,7 +1976,14 @@ fn plan_tree(
     Ok(SummaryPlan {
         team_slug: tree.team.team_slug.clone(),
         stages,
-        costs: calibrate(&cache, &name_cache, backend, model, reasoning_effort),
+        costs: calibrate(
+            &cache,
+            &name_cache,
+            backend,
+            model,
+            reasoning_effort,
+            Some(rollup_model),
+        ),
         prices: options.prices,
         budget_usd: options.budget_usd,
         previous_state: unfinished_state(&tree.summary_root),
@@ -1953,7 +1994,11 @@ fn plan_tree(
             reasoning_effort,
             service_tier,
             &options.rollup_kinds,
+            rollup_model,
         )),
+        batch_size: options.batch_size,
+        name_batch_size: options.name_batch_size,
+        workers: options.max_workers,
     })
 }
 
@@ -2050,6 +2095,7 @@ fn run_summary_tree(
     }
     let cache = summary_root.join("cache");
     let index = rollup_index(summary_root);
+    let rollup_model = options.rollup_model(model);
     *progress.borrow_mut() = "phase summaries".to_string();
     let (phase_results, phase_stats) = summarize_jobs(
         &tree.phase_jobs,
@@ -2061,7 +2107,7 @@ fn run_summary_tree(
         &options.codex_command,
         reasoning_effort,
         service_tier,
-        &options.claude_command,
+        options.agent_command(backend),
         guard,
     )?;
     changed += write_phase_data(archive, team_slug, &tree.phases, &phase_results)?;
@@ -2077,7 +2123,7 @@ fn run_summary_tree(
         &options.codex_command,
         reasoning_effort,
         service_tier,
-        &options.claude_command,
+        options.agent_command(backend),
         guard,
     )?;
     changed += write_agent_name_data(archive, team_slug, &name_jobs_list, &agent_names)?;
@@ -2092,7 +2138,7 @@ fn run_summary_tree(
         &options.codex_command,
         reasoning_effort,
         service_tier,
-        &options.claude_command,
+        options.agent_command(backend),
         guard,
     )?;
     let project_overview = overview_results[&tree.overview_job.key].clone();
@@ -2112,13 +2158,23 @@ fn run_summary_tree(
             job.key.split(':').nth(1).unwrap_or_default(),
             job.key
         );
-        if cached_summary(job, &cache, backend, model, reasoning_effort, service_tier)?.is_none() {
+        if cached_summary(
+            job,
+            &cache,
+            backend,
+            rollup_model,
+            reasoning_effort,
+            service_tier,
+        )?
+        .is_none()
+        {
+            // Only the prior same-level context changed: keep the paid summary.
             let carried = carried_forward_summary(
                 job,
                 &index,
                 &cache,
                 backend,
-                model,
+                rollup_model,
                 reasoning_effort,
                 service_tier,
             )?;
@@ -2131,13 +2187,13 @@ fn run_summary_tree(
             std::slice::from_ref(job),
             &cache,
             backend,
-            model,
+            rollup_model,
             options.max_workers,
             options.batch_size,
             &options.codex_command,
             reasoning_effort,
             service_tier,
-            &options.claude_command,
+            options.agent_command(backend),
             guard,
         )?;
         backend_stats.push(stats);
@@ -2315,7 +2371,11 @@ fn summarize_archive_locked(
     let mut options = options.clone();
     options.service_tier = effective.clone();
     let options = &options;
-    if options.budget_usd.is_some() && options.prices.is_none() && backend != "heuristic" {
+    if options.budget_usd.is_some()
+        && options.prices.is_none()
+        && backend != "heuristic"
+        && !crate::summary_budget::ZERO_RATED_BACKENDS.contains(&backend)
+    {
         return Err(SummarizeFailure::Message(
             "a summary budget needs model prices (--price)".to_string(),
         ));
@@ -2331,7 +2391,7 @@ fn summarize_archive_locked(
         )));
     }
     let guard = match (options.budget_usd, options.prices) {
-        (Some(budget), Some(prices)) => Some(
+        (Some(budget), Some(prices)) if !plan.costs.zero_rated => Some(
             SpendGuard::new(budget, prices, plan.costs.clone())
                 .map_err(SummarizeFailure::Message)?,
         ),
@@ -2346,6 +2406,7 @@ fn summarize_archive_locked(
             options.reasoning_effort.as_deref(),
             effective.as_deref(),
             &options.rollup_kinds,
+            options.rollup_model(model),
         ),
         &plan,
         load_state(&summary_root).as_ref(),

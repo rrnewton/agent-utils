@@ -61,6 +61,8 @@ pub mod losslessness;
 pub mod multi_team;
 /// Muse session lineage ingestion.
 pub mod muse;
+/// The headless Muse CLI as a summary backend.
+pub mod muse_backend;
 /// Hindsight agent naming.
 pub mod naming;
 /// Orc SQLite session lineage ingestion (staged port).

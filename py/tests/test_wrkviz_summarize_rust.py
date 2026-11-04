@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -546,54 +547,133 @@ def test_summarize_retryable_split_is_fatal(
     ], expect=2)
 
 
-MUSE_REFUSAL = (
-    "wrkviz: the muse backend is not yet in the Rust edition "
-    "(#842 wrkviz-muse-backend-rust); use the Python engine or --backend claude|codex\n"
-)
+
+FAKE_MUSE = """#!/usr/bin/env python3
+import hashlib, json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+assert args[:2] == ["exec", "--json"], args
+prompt = Path(args[args.index("--prompt-file") + 1]).read_text()
+schema_text = Path(args[args.index("--output-schema") + 1]).read_text()
+schema = json.loads(schema_text)
+log = os.environ.get("FAKE_MUSE_LOG")
+if log:
+    with open(log, "a") as handle:
+        handle.write(json.dumps({
+            "model": args[args.index("--model") + 1],
+            "effort": args[args.index("--reasoning-effort") + 1],
+            "flags": args[args.index("--reasoning-effort") + 2:],
+            "prompt": hashlib.sha256(prompt.encode()).hexdigest(),
+            "schema": hashlib.sha256(schema_text.encode()).hexdigest(),
+            "windows": prompt.count("Time windows:"),
+        }) + "\\n")
+if os.environ.get("FAKE_MUSE_MODE") == "failed":
+    print(json.dumps({"payload": {"kind": "run_usage", "models": [{"input_tokens": 9}]}}))
+    print(json.dumps({"payload": {"kind": "run_terminal", "terminal": "failed",
+                                  "reason": "model unavailable"}}))
+    sys.exit(0)
+if "BEGIN_AGENT_NAME_JOBS_JSON" in prompt:
+    jobs = json.loads(prompt.split("BEGIN_AGENT_NAME_JOBS_JSON\\n", 1)[1].split(
+        "END_AGENT_NAME_JOBS_JSON", 1)[0])
+    answers = schema["properties"]["names"]
+    structured = {"names": [{
+        "key": job["key"], "thread_id": job["thread_id"],
+        "short_name": "Coordinator" if job["official_path"] == "/root" else "Widget Worker",
+        "rationale": "Fake wrapper name.",
+        "lifetime_summary": "Built the widget parser and verified it.",
+    } for job in jobs]}
+else:
+    jobs = json.loads(prompt.split("BEGIN_JOBS_JSON\\n", 1)[1].split("END_JOBS_JSON", 1)[0])
+    answers = schema["properties"]["summaries"]
+    structured = {"summaries": [{
+        "key": job["key"], "phrase": "Project overview supported",
+        "paragraph": "The widget project builds a parser for widget files.",
+        "work_summary": []}
+        if job.get("summary_style") == "project-overview" else {
+        "key": job["key"], "phrase": "Built the widget parser",
+        "paragraph": "The widget parser was implemented and verified with tests.",
+        "work_summary": [{"at_ms": job["start_ms"], "text": "Implemented the widget parser"}]}
+        for job in jobs]}
+keys = [job["key"] for job in jobs]
+assert answers["minItems"] == answers["maxItems"] == len(keys), answers
+assert answers["items"]["properties"]["key"]["enum"] == keys, answers
+print("banner that is not JSON")
+print(json.dumps({"payload": {"kind": "run_usage", "models": [{
+    "input_tokens": 90, "cached_tokens": 30, "output_tokens": 12, "reasoning_tokens": 4}]}}))
+print(json.dumps({"payload": {"kind": "run_terminal", "terminal": "completed",
+                              "reason": "done", "text": json.dumps(structured)}}))
+"""
 
 
-@pytest.mark.parametrize("backend_args", [[], ["--backend", "muse"]])
-def test_rust_refuses_the_muse_backend_before_any_work(
-    tmp_path: Path, rust_wrkviz: Path, backend_args: list[str]
-) -> None:
-    """#839 made muse the default; this edition refuses it in one line and touches nothing."""
+def _both_with_env(
+    tmp_path: Path,
+    rust_wrkviz: Path,
+    args: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    expect: int = 0,
+) -> dict[str, list[dict[str, object]]]:
+    """Run `summarize ARGS` in both editions with per-edition FAKE_MUSE_LOG files."""
 
     archives = _ingest(tmp_path, rust_wrkviz)
-    before = _tree(archives["rs"])
-    result = _run([str(rust_wrkviz)], [
-        "summarize", "--output", str(archives["rs"]), "--team", "widget", *backend_args,
+    outcomes = {}
+    calls: dict[str, list[dict[str, object]]] = {}
+    for label, command in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
+                           ("rs", [str(rust_wrkviz)])):
+        log = tmp_path / f"{label}-muse-calls.jsonl"
+        outcomes[label] = subprocess.run(
+            command + ["summarize", "--output", str(archives[label]), "--team", "widget",
+                       *args],
+            cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=300,
+            env={**os.environ, **(env or {}), "FAKE_MUSE_LOG": str(log)},
+        )
+        calls[label] = sorted(
+            (json.loads(line) for line in log.read_text().splitlines()) if log.exists() else [],
+            key=lambda call: json.dumps(call, sort_keys=True),
+        )
+    oracle, result = outcomes["py"], outcomes["rs"]
+    assert oracle.returncode == expect, oracle.stderr
+    assert result.returncode == oracle.returncode, result.stderr
+    assert _normalize(result.stdout, archives["rs"]) == _normalize(oracle.stdout, archives["py"])
+    assert _normalize(result.stderr, archives["rs"]) == _normalize(oracle.stderr, archives["py"])
+    assert _tree(archives["rs"]) == _tree(archives["py"])
+    return calls
+
+
+def test_summarize_muse_default_matches_python(tmp_path: Path, rust_wrkviz: Path) -> None:
+    """#842: the default muse backend, its per-kind models, prompts and narrowed schemas."""
+
+    fake = _write_executable(tmp_path / "fake-muse", FAKE_MUSE)
+    calls = _both_with_env(tmp_path, rust_wrkviz, ["--muse-command", str(fake)])
+    assert calls["rs"] == calls["py"]
+    models = {str(call["model"]) for call in calls["py"]}
+    assert models == {"muse-spark-1.3-internal", "watermelon-full-preview"}
+    assert any(call["windows"] == 1 for call in calls["py"])
+    assert all(call["effort"] == "medium" for call in calls["py"])
+
+
+def test_summarize_muse_plan_and_budget_match_python(tmp_path: Path, rust_wrkviz: Path) -> None:
+    fake = _write_executable(tmp_path / "fake-muse", FAKE_MUSE)
+    _both_with_env(tmp_path / "plan", rust_wrkviz, [
+        "--muse-command", str(fake), "--plan", "--price", "input=2,output=10",
     ])
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert result.stderr == MUSE_REFUSAL
-    assert _tree(archives["rs"]) == before
-
-    sessions = _sessions(tmp_path / "refresh")
-    fresh = tmp_path / "refresh-out"
-    refreshed = _run([str(rust_wrkviz)], [
-        "refresh", "--sessions-root", str(sessions), "--root-session", CODEX_ROOT,
-        "--team", "widget", "--output", str(fresh), *backend_args,
-    ])
-    assert (refreshed.returncode, refreshed.stderr) == (2, MUSE_REFUSAL)
-    assert not fresh.exists()
-
-
-def test_rust_accepts_the_new_summary_flags_where_it_can_honour_them(
-    tmp_path: Path, rust_wrkviz: Path
-) -> None:
-    _compare(tmp_path / "same", rust_wrkviz, [
-        "--backend", "heuristic", "--model", "offline", "--rollup-model", "offline",
-        "--backend-timeout", "30", "--muse-command", "/nonexistent/muse",
+    _both_with_env(tmp_path / "budget", rust_wrkviz, [
+        "--muse-command", str(fake), "--budget-usd", "0", "--model", "spark-x",
         "--rollup-kind", "daily",
+    ])
+
+
+def test_summarize_muse_failure_matches_python(tmp_path: Path, rust_wrkviz: Path) -> None:
+    fake = _write_executable(tmp_path / "fake-muse", FAKE_MUSE)
+    _both_with_env(tmp_path, rust_wrkviz, ["--muse-command", str(fake)],
+                   env={"FAKE_MUSE_MODE": "failed"}, expect=2)
+
+
+def test_summarize_rollup_model_matches_python(tmp_path: Path, rust_wrkviz: Path) -> None:
+    _compare(tmp_path, rust_wrkviz, [
+        "--backend", "heuristic", "--model", "offline", "--rollup-model", "bigger",
+        "--backend-timeout", "30", "--rollup-kind", "daily",
     ])
     _compare(tmp_path / "bad-timeout", rust_wrkviz, [
         "--backend", "heuristic", "--backend-timeout", "soon",
     ], expect=2)
-    archives = _ingest(tmp_path / "split", rust_wrkviz)
-    split = _run([str(rust_wrkviz)], [
-        "summarize", "--output", str(archives["rs"]), "--team", "widget",
-        "--backend", "heuristic", "--model", "offline", "--rollup-model", "bigger",
-    ])
-    assert split.returncode == 2
-    assert "a separate --rollup-model is not yet in the Rust edition" in split.stderr
-    assert "#842 wrkviz-muse-backend-rust" in split.stderr
