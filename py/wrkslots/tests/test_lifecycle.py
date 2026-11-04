@@ -20674,6 +20674,50 @@ def test_clean_agent_remove_with_recursive_submodules_preserves_peers_and_config
     } == {"already-published"}
 
 
+def test_agent_remove_with_absolute_core_worktree_nested_submodules(
+    tmp_path: Path,
+) -> None:
+    # Older submodule layouts pin each nested repository's core.worktree
+    # to the absolute slot path, and hand-edited .gitmodules files may
+    # indent an option line with spaces under a tab-indented sibling.
+    # The removal fence renames the slot, so those pins name a path that
+    # no longer exists; removal must still complete
+    # (https://github.com/rrnewton/agent-utils/issues/298).
+    project, repository, _remote = make_project(tmp_path)
+    component_head, _leaf_head = add_recursive_submodules(tmp_path, project, repository)
+    component_source = tmp_path / "component-source"
+    modules_file = component_source / ".gitmodules"
+    text = modules_file.read_text(encoding="utf-8")
+    rewritten = text.replace("\turl = ", "        url = ")
+    assert rewritten != text
+    modules_file.write_text(rewritten, encoding="utf-8")
+    git(component_source, "add", ".gitmodules")
+    git(component_source, "commit", "-m", "reindent gitmodules url")
+    git(component_source, "push", "origin", "main")
+    component_head = git(component_source, "rev-parse", "HEAD").stdout.strip()
+    git(repository / "component", "fetch", "-q", "origin")
+    git(repository / "component", "checkout", "-q", component_head)
+    git(repository, "add", "component")
+    git(repository, "commit", "-m", "bump component")
+    git(repository, "push", "origin", "main")
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    target = checkout(project)
+    assert git(target / "component", "rev-parse", "HEAD").stdout.strip() == component_head
+    for sub in (target / "component", target / "component" / "leaf"):
+        git(sub, "config", "core.worktree", str(sub))
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    assert not target.exists()
+    assert not any(target.parent.glob(".slot01.fenced.*"))
+
+
 def test_validate_slot_removes_checkout_with_unfinished_git_operation(
     tmp_path: Path,
 ) -> None:

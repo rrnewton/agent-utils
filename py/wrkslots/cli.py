@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import configparser
 import contextlib
 import contextvars
 import ctypes
@@ -36689,16 +36688,59 @@ def _declared_initialized_submodules(checkout: Path) -> tuple[Path, ...]:
             return
         if modules.is_symlink() or not modules.is_file():
             raise Refusal(f"nested repository has an unsafe .gitmodules file: {modules}")
-        parser = configparser.RawConfigParser(interpolation=None, strict=True)
+        # Parse the declarations with Git's own reader: .gitmodules is a
+        # Git config file, whose lines are independent. A generic INI
+        # parser instead treats an option line indented further than its
+        # sibling (a space-indented url under a tab-indented path, as
+        # hand-edited files carry) as that sibling's continuation, so the
+        # submodule silently vanishes from this enumeration and its
+        # core.worktree is never repaired after a fence rename
+        # (https://github.com/rrnewton/agent-utils/issues/298).
+        declared: dict[str, str] = {}
         try:
-            with modules.open("r", encoding="utf-8") as handle:
-                parser.read_file(handle)
-        except (OSError, UnicodeError, configparser.Error) as exc:
-            raise Refusal(f"cannot read nested repository declarations {modules}: {exc}") from exc
-        for section in parser.sections():
-            if not section.startswith('submodule "') or not parser.has_option(section, "path"):
+            completed = subprocess.run(
+                [
+                    "git",
+                    "--no-replace-objects",
+                    "config",
+                    "--file",
+                    str(modules),
+                    "-z",
+                    "--list",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env={
+                    key: value
+                    for key, value in os.environ.items()
+                    if not key.startswith("GIT_")
+                }
+                | {
+                    "LC_ALL": "C",
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": "/dev/null",
+                    "GIT_CONFIG_SYSTEM": "/dev/null",
+                    "GIT_NO_REPLACE_OBJECTS": "1",
+                },
+            )
+        except OSError as exc:
+            raise Refusal(
+                f"cannot read nested repository declarations {modules}: {exc}"
+            ) from exc
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or f"git exit {completed.returncode}"
+            raise Refusal(
+                f"cannot read nested repository declarations {modules}: {detail}"
+            )
+        for entry in completed.stdout.split("\0"):
+            key, separator, value = entry.partition("\n")
+            if not separator or not key.startswith("submodule."):
                 continue
-            raw = parser.get(section, "path")
+            name, _dot, option = key[len("submodule.") :].rpartition(".")
+            if name and option == "path":
+                declared[name] = value
+        for raw in declared.values():
             relative = Path(raw)
             if relative.is_absolute() or not relative.parts or ".." in relative.parts:
                 raise Refusal(f"unsafe submodule path {raw!r} in {modules}")

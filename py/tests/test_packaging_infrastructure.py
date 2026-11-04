@@ -988,9 +988,12 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # https://github.com/rrnewton/agent-utils/issues/297 (a stranded replay
     # past a refusing census, a clean-caches dry run, and clean-caches
     # beside a stranded batch) are mapped.
-    assert len(all_tests) == 2129
+    # The agent-remove case whose nested .gitmodules indents an option
+    # line with spaces under a tab-indented sibling is mapped
+    # (https://github.com/rrnewton/agent-utils/issues/298).
+    assert len(all_tests) == 2130
     assert len(ordinary) == 339
-    assert len(mapped) == 1790
+    assert len(mapped) == 1791
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
