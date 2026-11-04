@@ -218,7 +218,7 @@ mod tests {
             outbound_enabled: false,
             ack_reaction: Default::default(),
             receipt_reaction: Default::default(),
-            delivery_latency_reaction: false,
+            delivery_latency_reaction: Some(false),
             delivery_latency_test_override: false,
             reject_reaction: Default::default(),
             backend_configuration: None,

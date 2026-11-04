@@ -668,6 +668,10 @@ fn selected_slack_format(
     Ok(Some(slack_format_env_override()?.unwrap_or(base)))
 }
 
+/// Whether a bridge whose saved configuration leaves `delivery_latency_reaction` absent shows
+/// the delivery latency in its receipt reaction (#848 chat-latency-default-on).
+pub const DEFAULT_DELIVERY_LATENCY_REACTION: bool = true;
+
 /// Authority and routing configuration retained for one bridge state directory.
 ///
 /// An unknown top-level key (one a newer agentctl added) is kept, warned about once, and
@@ -705,9 +709,13 @@ pub struct BridgeConfiguration {
     /// Show the ack-to-delivered minutes in the receipt reaction (#802
     /// chat-delivery-latency-emoji): under 30 s it stays the receipt emoji,
     /// then :one: .. :keycap_ten: by rounded minutes, and
-    /// :hourglass_flowing_sand: from 10.5 minutes. Off by default.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub delivery_latency_reaction: bool,
+    /// :hourglass_flowing_sand: from 10.5 minutes. Absent follows
+    /// [`DEFAULT_DELIVERY_LATENCY_REACTION`] (on since #848
+    /// chat-latency-default-on) and stays absent in the saved state, so a
+    /// later default reaches the bridge; `Some(false)` turns it off. Read it
+    /// through [`Self::delivery_latency_on`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_latency_reaction: Option<bool>,
     /// Allow the `[latency-test N]` per-message override (#802); off by
     /// default and only meaningful with `delivery_latency_reaction`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -932,12 +940,20 @@ impl BridgeConfiguration {
         selected_slack_format(&self.slack_format_by_channel, self.slack_format, channel_id)
     }
 
+    /// Whether the receipt shows the delivery latency: the saved
+    /// `delivery_latency_reaction`, else [`DEFAULT_DELIVERY_LATENCY_REACTION`].
+    #[must_use]
+    pub fn delivery_latency_on(&self) -> bool {
+        self.delivery_latency_reaction
+            .unwrap_or(DEFAULT_DELIVERY_LATENCY_REACTION)
+    }
+
     /// The receipt emoji for one request under `delivery_latency_reaction`
     /// (#802): `default` under 30 s, a keycap digit for the rounded
     /// minutes 1-10, and the flowing hourglass from 10.5 minutes up.
     #[must_use]
     pub fn delivery_latency_emoji(&self, seconds: u64, default: &str) -> String {
-        if seconds < 30 || !self.delivery_latency_reaction {
+        if seconds < 30 || !self.delivery_latency_on() {
             return default.to_owned();
         }
         const KEYCAPS: [&str; 10] = [
@@ -9199,7 +9215,7 @@ impl BridgeState {
             // #802: with delivery_latency_reaction on, the receipt shows
             // the ack-to-delivered minutes; a `[latency-test N]` marker in
             // the message (N seconds) overrides the measured duration.
-            let emoji = if self.config.delivery_latency_reaction {
+            let emoji = if self.config.delivery_latency_on() {
                 let measured = request
                     .delivered_at_millis
                     .unwrap_or_else(unix_millis)
@@ -9544,7 +9560,7 @@ impl BridgeState {
                         let detail = bounded_detail(&detail, MAX_RECEIPT_REACTION_ERROR_BYTES);
                         // #802: a refused latency reaction falls back to
                         // the ordinary receipt under a fresh operation ID.
-                        if refused && self.config.delivery_latency_reaction {
+                        if refused && self.config.delivery_latency_on() {
                             if let Some(default) = self.config.receipt_emoji_in_use() {
                                 if snapshot.emoji != default {
                                     record.emoji = default.to_owned();
@@ -9676,7 +9692,7 @@ impl BridgeState {
         let refused = self.refused_receipt_reactions_locked()?;
         Ok(json!({
             "reaction": self.config.receipt_emoji_in_use(),
-            "delivery_latency_reaction": self.config.delivery_latency_reaction,
+            "delivery_latency_reaction": self.config.delivery_latency_on(),
             "waiting": keys.len(),
             "failing": failing,
             "lost": lost.count,
@@ -20044,6 +20060,10 @@ pub(crate) mod tests {
         let mut configuration = config();
         configuration.ack_reaction = ReactionSetting::Inherit;
         configuration.slack_format = None;
+        // #848 chat-latency-default-on: the delivery latency reaction is on while its key is
+        // absent, and only an explicit `false` turns it off, so absent is what keeps the file
+        // in its original shape.
+        configuration.delivery_latency_reaction = None;
         let root = temporary("default-off-bridge");
         BridgeState::initialize(&root, configuration).expect("initialize");
         let stored: Value = serde_json::from_str(
@@ -20129,7 +20149,7 @@ pub(crate) mod tests {
             outbound_enabled: true,
             ack_reaction: ReactionSetting::Emoji("🤖".to_owned()),
             receipt_reaction: ReactionSetting::Inherit,
-            delivery_latency_reaction: false,
+            delivery_latency_reaction: Some(false),
             delivery_latency_test_override: false,
             reject_reaction: ReactionSetting::Inherit,
             backend_configuration: None,
@@ -35394,15 +35414,43 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
     #[test]
     fn delivery_latency_emoji_maps_each_boundary() {
         // #802 chat-delivery-latency-emoji boundary table.
-        let mut config: BridgeConfiguration =
-            serde_json::from_value(config_document_with(&json!({}))).expect("decode");
-        assert!(!config.delivery_latency_reaction);
+        // #848 chat-latency-default-on: absent is on, explicit false is off, explicit true is on.
+        let mut document = config_document_with(&json!({}));
+        document
+            .as_object_mut()
+            .expect("object")
+            .remove("delivery_latency_reaction");
+        let mut config: BridgeConfiguration = serde_json::from_value(document).expect("decode");
+        assert_eq!(config.delivery_latency_reaction, None);
+        assert!(config.delivery_latency_on());
         assert_eq!(
             config.delivery_latency_emoji(600, "✅"),
-            "✅",
-            "off by default"
+            "\u{1f51f}",
+            "on by default"
         );
-        config.delivery_latency_reaction = true;
+        let saved = serde_json::to_value(&config).expect("encode");
+        assert!(
+            saved.get("delivery_latency_reaction").is_none(),
+            "an absent key stays absent, so a later default reaches it: {saved}"
+        );
+        let off: BridgeConfiguration = serde_json::from_value(config_document_with(
+            &json!({"delivery_latency_reaction": false}),
+        ))
+        .expect("decode");
+        assert!(!off.delivery_latency_on());
+        assert_eq!(
+            off.delivery_latency_emoji(600, "✅"),
+            "✅",
+            "an explicit false is off"
+        );
+        let saved = serde_json::to_value(&off).expect("encode");
+        assert_eq!(saved["delivery_latency_reaction"], false, "{saved}");
+        let on: BridgeConfiguration = serde_json::from_value(config_document_with(
+            &json!({"delivery_latency_reaction": true}),
+        ))
+        .expect("decode");
+        assert!(on.delivery_latency_on());
+        config.delivery_latency_reaction = Some(true);
         let cases = [
             (29, "✅"),
             (30, "1\u{fe0f}\u{20e3}"),

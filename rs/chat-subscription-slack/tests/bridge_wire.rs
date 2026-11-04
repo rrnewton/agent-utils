@@ -484,7 +484,7 @@ fn a_bridge_configuration_for_slack_is_accepted_by_the_plugin() {
         outbound_enabled: true,
         ack_reaction: ReactionSetting::Emoji("🤖".to_owned()),
         receipt_reaction: ReactionSetting::Inherit,
-        delivery_latency_reaction: false,
+        delivery_latency_reaction: Some(false),
         delivery_latency_test_override: false,
         reject_reaction: ReactionSetting::Inherit,
         backend_configuration: Some(BackendConfigurationDocument {

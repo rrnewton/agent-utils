@@ -255,9 +255,11 @@ bundled Slack provider: 👀 for acknowledgement (Slack `eyes`), ✅ for receipt
 | `receipt_reaction` | inherit ✅ | use this emoji | no receipt |
 | `reject_reaction` | inherit ❌ | use this emoji | no rejection feedback |
 
-`delivery_latency_reaction` (default `false`, #802 chat-delivery-latency-emoji):
-when `true`, the receipt reaction shows how long delivery took
-(admission to delivered, rounded to the nearest minute). Under
+`delivery_latency_reaction` (default `true`, #802 chat-delivery-latency-emoji,
+#848 chat-latency-default-on): when on, the receipt reaction shows how long
+delivery took (admission to delivered, rounded to the nearest minute). A saved
+configuration without the key follows the agentctl default; an explicit
+`false` turns it off and stays off. Under
 30 s it is the ordinary receipt emoji; then :one: :two: :three: :four:
 :five: :six: :seven: :eight: :nine: :keycap_ten: for 1-10 minutes, and
 :hourglass_flowing_sand: from 10.5 minutes. For testing, one message can

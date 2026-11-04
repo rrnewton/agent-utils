@@ -659,7 +659,7 @@ mod tests {
                 outbound_enabled: true,
                 ack_reaction: ReactionSetting::Disabled,
                 receipt_reaction: ReactionSetting::Inherit,
-                delivery_latency_reaction: false,
+                delivery_latency_reaction: Some(false),
                 delivery_latency_test_override: false,
                 reject_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
