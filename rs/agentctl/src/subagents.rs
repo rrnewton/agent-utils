@@ -3239,11 +3239,9 @@ impl<'a, A: ManagedApi + ?Sized> WorkspaceClient<'a, A> {
         }
         if let Some(identity) = record.harness_anchor() {
             if !self.client.verify_harness_identity(pane_id, identity)? {
-                return Err(AdapterError::recipient_changed(format!(
-                    "refusing input to agent '{}': the anchored {} process (pid {}) is no longer \
-                     a foreground process of pane {pane_id}; run `agentctl doctor`",
-                    record.name, record.harness, identity.pid
-                )));
+                return Err(AdapterError::recipient_changed(
+                    self.anchor_refusal(pane_id, identity),
+                ));
             }
             return Ok(());
         }
@@ -3261,6 +3259,64 @@ impl<'a, A: ManagedApi + ?Sized> WorkspaceClient<'a, A> {
              {pane_id} runs the intended agent, then run `agentctl anchor {}`",
             record.name, record.name
         )))
+    }
+
+    /// Why the anchored harness no longer proves the recipient, and what fixes it (#831
+    /// chat-dead-pin-reanchor). The common case is a restart: the anchored process has exited
+    /// and the pane now runs another process of the same harness, which only an operator may
+    /// confirm is the same agent, with `agentctl anchor NAME --replace`. The refusal names
+    /// both processes and that command, and says when the new process resumes the record's
+    /// native session, the strongest sign it is the same agent; anything else keeps the
+    /// general advice. Typing stays refused either way.
+    fn anchor_refusal(&self, pane_id: &str, identity: &CustomProcessIdentity) -> String {
+        let record = self.record;
+        let name = &record.name;
+        let harness = &record.harness;
+        let gone = self.client.process_liveness(identity) == ProcessLiveness::Dead;
+        let current = self
+            .client
+            .harness_identity(pane_id, harness)
+            .ok()
+            .flatten()
+            .filter(|current| current != identity);
+        let Some(current) = current else {
+            return format!(
+                "refusing input to agent '{name}': the anchored {harness} process (pid {}) is no \
+                 longer a foreground process of pane {pane_id}; run `agentctl doctor`",
+                identity.pid
+            );
+        };
+        let session = record.session_value.clone().or_else(|| {
+            record
+                .launch_spec
+                .as_ref()
+                .and_then(|spec| spec["native_session"]["value"].as_str())
+                .map(str::to_owned)
+        });
+        let resumes = session.as_deref().filter(|session| {
+            self.client
+                .process_command_line(&current)
+                .is_some_and(|argv| argv.iter().any(|argument| argument == session))
+        });
+        let was = if gone {
+            "has exited"
+        } else {
+            "is no longer the pane's foreground process"
+        };
+        let likely = match resumes {
+            Some(session) => format!(
+                ", which resumes {name}'s recorded session {session}, so it is most likely {name} \
+                 restarted"
+            ),
+            None => String::new(),
+        };
+        format!(
+            "refusing input to agent '{name}': the anchored {harness} process (pid {}) {was}, and \
+             pane {pane_id} now runs another {harness} process (pid {}){likely}; if it is {name}, \
+             run `agentctl anchor {name} --replace` to pin it (look at the pane first: \
+             `agentctl attach {name}`), and delivery resumes",
+            identity.pid, current.pid
+        )
     }
 
     /// Pane and terminal claims of every other active record, read conservatively.

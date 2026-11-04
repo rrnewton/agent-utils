@@ -204,13 +204,72 @@ fn a_harness_replaced_before_send_types_nothing_and_stays_pending() {
         Some(agent::QueueOutcome::Pending),
         "{error}"
     );
+    // #831: the refusal names the process now in the pane and the command that re-pins it.
+    assert!(error.to_string().contains("now runs another"), "{error}");
+    assert!(error.to_string().contains("(pid 999)"), "{error}");
     assert!(
-        error.to_string().contains("no longer a foreground process"),
+        error
+            .to_string()
+            .contains("`agentctl anchor worker --replace`"),
         "{error}"
     );
     assert!(!runs(&fixture).contains(&"for the original agent".to_owned()));
     assert!(fixture.client.expected_terminals.lock().unwrap().is_empty());
     assert!(failed_documents(&fixture, "worker").is_empty());
+}
+
+#[test]
+fn a_restart_resuming_the_recorded_session_is_named_as_likely_the_same_agent() {
+    // #831 chat-dead-pin-reanchor: a dead pin with a live same-kind harness in the pane never
+    // loops silently. The refusal says what changed and the exact fix; after the operator
+    // re-pins, delivery resumes.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    // The session Herdr reports for the agent, which the record keeps.
+    let session = fixture
+        .manager()
+        .read_record("worker")
+        .unwrap()
+        .session_value
+        .expect("the fixture reports a native session");
+    let session = session.as_str();
+    fixture
+        .client
+        .harness_pids
+        .lock()
+        .unwrap()
+        .insert("owned".to_owned(), 999);
+    fixture.client.command_lines.lock().unwrap().insert(
+        999,
+        vec![
+            "claude".to_owned(),
+            "--resume".to_owned(),
+            session.to_owned(),
+        ],
+    );
+    let error = send(&fixture, "worker", "after the restart").expect_err("refused");
+    assert_eq!(
+        error.outcome(),
+        Some(agent::QueueOutcome::Pending),
+        "{error}"
+    );
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!(
+            "which resumes worker's recorded session {session}, so it is most likely worker \
+             restarted"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("run `agentctl anchor worker --replace`"),
+        "{text}"
+    );
+    assert!(text.contains("nothing was typed"), "{text}");
+    assert!(!runs(&fixture).contains(&"after the restart".to_owned()));
+    fixture.manager().anchor("worker", true, None).unwrap();
+    send(&fixture, "worker", "after the re-anchor").unwrap();
+    assert!(runs(&fixture).contains(&"after the re-anchor".to_owned()));
 }
 
 fn misroutes(fixture: &Fixture, agent_name: &str) -> Vec<Value> {

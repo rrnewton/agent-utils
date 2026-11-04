@@ -224,6 +224,13 @@ fn hint(agent: &str, reason: &str) -> String {
             "A message agentctl typed is stuck unsent in {agent}'s input box; press Enter there, \
              and delivery resumes. "
         )
+    } else if reason.contains("refusing input") && reason.contains("--replace") {
+        // #831 chat-dead-pin-reanchor: the harness was restarted in the same pane.
+        format!(
+            "{agent}'s pane runs a new process that agentctl will not type into until someone \
+             confirms it is {agent}: look at the pane, then run `agentctl anchor {agent} \
+             --replace`, and delivery resumes. "
+        )
     } else {
         String::new()
     }
@@ -440,6 +447,34 @@ mod tests {
             alarm.root_posted("C1/messages/1.5", "C1/threads/1.5".to_owned());
         }
         notices
+    }
+
+    #[test]
+    fn a_restarted_harness_warning_names_the_anchor_command() {
+        // #831 chat-dead-pin-reanchor: a dead pin with a live same-kind harness is never a
+        // silent "not reached it"; the warning says why and what to run.
+        let refused = "request remains pending: refusing input to agent 'coord5': the anchored \
+                       claude process (pid 641842) has exited, and pane w16:pD now runs another \
+                       claude process (pid 999); if it is coord5, run `agentctl anchor coord5 \
+                       --replace` to pin it (look at the pane first: `agentctl attach coord5`), \
+                       and delivery resumes; nothing was typed";
+        let mut alarm = OwnerAlarm::new(DEFAULT_AFTER);
+        let entries = vec![entry("a", RequestPhase::Pending, 100, refused)];
+        let notices = due(&mut alarm, &entries, minute(105));
+        assert_eq!(notices.len(), 1);
+        let text = &notices[0].text;
+        assert!(
+            text.contains("now runs another claude process (pid 999)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "coord5's pane runs a new process that agentctl will not type into until someone \
+                 confirms it is coord5: look at the pane, then run `agentctl anchor coord5 \
+                 --replace`, and delivery resumes."
+            ),
+            "{text}"
+        );
     }
 
     #[test]

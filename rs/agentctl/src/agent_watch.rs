@@ -3143,6 +3143,11 @@ fn held_hint(agent: &str, kind: &str, reason: &str) -> String {
              drawing (a redraw key did not help in the case seen): restart it on the same \
              session in that pane, then run `agentctl anchor {agent} --replace`. "
         ),
+        "input-refused" if reason.contains("--replace") => format!(
+            "{agent}'s pane runs a new process that agentctl will not type into until someone \
+             confirms it is {agent}: look at the pane, then run `agentctl anchor {agent} \
+             --replace`. "
+        ),
         "input-refused" => format!(
             "agentctl cannot prove that the pane still runs {agent}; the reason names the check \
              that failed and what to run. "
