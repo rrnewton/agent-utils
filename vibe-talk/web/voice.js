@@ -6461,8 +6461,13 @@ const KEY_PANES = [channelPane, sidePane];
 /** The column a pane's list is in, which a key acting on one of its rows works on. `#229`. */
 const paneColumn = (pane) => (pane === sidePane ? columns.side : columns.main);
 
-/** The pane the keys moved last, which keys from outside every pane go to while it takes them. */
-let lastPane = channelPane;
+/**
+ * The pane the keys moved last, which keys from outside every pane go to while it takes them (web/src/view/
+ * channel `createLastPane`).
+ *
+ * @type {import("./src/view/channel/index.ts").LastPane<typeof channelPane>}
+ */
+const lastPane = createLastPane(channelPane);
 
 /**
  * The pane `node` is in; or else the one the keys moved last, while it takes row keys; or else the
@@ -6481,7 +6486,7 @@ function paneFor(node) {
   // `#410 inline-reply-editor`. A reply open in the stream is its list's: Escape out of its box goes to
   // that list, and the page keys there move it.
   if (replyState.docked && node && nodeWithin(leftEl("reply-compose"), node)) return replyPane();
-  if (lastPane.list() !== null) return lastPane;
+  if (lastPane.current().list() !== null) return lastPane.current();
   return KEY_PANES.find((pane) => pane.list() !== null) || null;
 }
 
@@ -6561,7 +6566,7 @@ function markRow(pane, row, drawn) {
   // Another message chosen — by the keys, the mouse, a tap, the focus or a jump — is the reader acting
   // in the list. `#243 filter-keeps-selection`. A redraw keeping the same one (`keepSelection`) is not.
   if (!markNames(was, row)) inColumn(paneColumn(pane), readerActed);
-  lastPane = pane;
+  lastPane.take(pane);
   drawSelection();
 }
 
@@ -6574,7 +6579,7 @@ function releaseRow(pane, row = null) {
 
 /** The pane in use: the one moved last, by a key, the mouse or the focus, while it shows a list. */
 function activePane() {
-  if (lastPane.list() !== null) return lastPane;
+  if (lastPane.current().list() !== null) return lastPane.current();
   return KEY_PANES.find((pane) => pane.list() !== null) || null;
 }
 
@@ -6816,7 +6821,7 @@ function pointRow(pane, row) {
   // Lit is drawn selected (`drawSelection` lights only that), so a move within the row already lit
   // asks no more: not the pane's kept selection, which in the right column switches to that column
   // and back on every move to read.
-  if (!(lastPane === pane && pane.lit === row && (holding || !focusFollowsSelection()))) {
+  if (!(lastPane.current() === pane && pane.lit === row && (holding || !focusFollowsSelection()))) {
     takeRow(pane, row, !holding && focusFollowsSelection());
   }
   dwellColumnGlide(pane, row);
@@ -6870,7 +6875,7 @@ function noteClickedRow(pane, node) {
   if (!row) return;
   const mark = markOf(pane);
   const drawn = drawnBy();
-  if (mark && markNames(mark, row) && (mark.drawn || !drawn) && lastPane === pane) return;
+  if (mark && markNames(mark, row) && (mark.drawn || !drawn) && lastPane.current() === pane) return;
   if (!drawn) {
     noteRow(pane, row);
     return;
@@ -6892,8 +6897,8 @@ function onPaneFocus(pane, event) {
   } else if (row && !(same && mark && mark.drawn && pane.row === row)) {
     takeRow(pane, row, false);
   }
-  if (lastPane !== pane && pane.list() !== null) {
-    lastPane = pane;
+  if (lastPane.current() !== pane && pane.list() !== null) {
+    lastPane.take(pane);
     drawSelection();
   }
 }
@@ -6961,8 +6966,8 @@ function focusList(pane) {
     rowTimeTabStop(row, true);
   }
   // The pane handed the keys is the one in use, and its selection the one lit.
-  if (pane && pane.list() !== null && lastPane !== pane) {
-    lastPane = pane;
+  if (pane && pane.list() !== null && lastPane.current() !== pane) {
+    lastPane.take(pane);
     drawSelection();
   }
   // The pane's own list when one is named: in two columns the keys can be handed to either column.
@@ -22177,7 +22182,7 @@ function olderControlPressed() {
 function searchOlderFromField() {
   if (sideCardsShown()) {
     const left = layoutShown.columns() && inColumn(columns.main, () => searchOffered() && columns.main.searchWalk === null);
-    const cards = !left || lastPane === sidePane;
+    const cards = !left || lastPane.current() === sidePane;
     // The cards' walk under way is not the left column's to end.
     if (cards && repliesWalks.current() !== null) return false;
     if (cards && repliesSearchOffered()) {
@@ -22186,7 +22191,7 @@ function searchOlderFromField() {
     }
     if (!left) return false;
   }
-  const column = sideShowing() && lastPane === sidePane ? columns.side : columns.main;
+  const column = sideShowing() && lastPane.current() === sidePane ? columns.side : columns.main;
   if (!inColumn(column, () => searchOffered() && column.searchWalk === null)) return false;
   guardQuietly(() => inColumn(column, searchOlder))();
   return true;

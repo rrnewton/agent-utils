@@ -787,3 +787,14 @@ test("`#624 voice-page-modularity`: the open reply's record starts with no reply
   const other = createReplyState(main);
   assert.deepStrictEqual([other.routing.note, other.docked], ["", false], "two records share their routing or their state");
 });
+
+test("`#624 voice-page-modularity`: the pane the keys moved last starts as the first, and is the one they moved since", () => {
+  const { createLastPane } = CHANNEL_VIEW;
+  const [main, side] = [{ name: "main" }, { name: "side" }];
+  const last = createLastPane(main);
+  assert.equal(last.current(), main);
+  last.take(side);
+  assert.equal(last.current(), side);
+  last.take(main);
+  assert.equal(last.current(), main);
+});
