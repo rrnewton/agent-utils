@@ -10603,8 +10603,8 @@ function loadState() {
 // Kept per column: `loadState().refreshing` (`freshLoadState`, `#624 voice-page-modularity`).
 // Whether `/client-config` has answered in this page, as opposed to the saved shell standing in, is the server
 // facts' (`ServerFacts.configApplied`).
-/** The fingerprint of the token the channel rows on screen were read or drawn for. */
-let screenIdentity = tokenFingerprint(token());
+/** The fingerprint of the token the channel rows on screen were read or drawn for (web/src/core/sync `createScreenIdentity`). */
+const screenIdentity = createScreenIdentity(tokenFingerprint(token()));
 
 /** A stable 64-bit label for a token. Not a secret and not a check: only "is it the same one". */
 function tokenFingerprint(value) {
@@ -11354,7 +11354,7 @@ function clearChannelScreen() {
   renderOlderControl();
   loadState().freshAt = 0;
   setChannelFreshness("fresh");
-  screenIdentity = tokenFingerprint(token());
+  screenIdentity.claim(tokenFingerprint(token()));
   // `#229 desktop-two-column`. What the right column read goes with the rest, and the threads selected
   // there, which this credential read.
   sideThreads.clear();
@@ -11367,7 +11367,7 @@ function clearChannelScreen() {
  * identity nor merged into its first read.
  */
 function screenBelongsToToken() {
-  if (screenIdentity === tokenFingerprint(token())) return true;
+  if (screenIdentity.belongsTo(tokenFingerprint(token()))) return true;
   clearChannelScreen();
   forgetBookmarks();
   // Reading the envelope deletes it when it, too, belongs to the previous token.

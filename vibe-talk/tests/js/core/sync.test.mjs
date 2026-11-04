@@ -511,3 +511,14 @@ test("`#624 voice-page-modularity`: a reopen owes one read, taken once, and kept
   reopen.keep(owed);
   assert.deepStrictEqual(reopen.take(), { after: 5 }, "a newer debt is not replaced by the old one");
 });
+
+test("`#624 voice-page-modularity`: the rows on screen belong to the credential they were last claimed for", () => {
+  const { createScreenIdentity } = SYNC;
+  const identity = createScreenIdentity("aaaa");
+  assert.equal(identity.belongsTo("aaaa"), true);
+  assert.equal(identity.belongsTo("bbbb"), false, "rows read for one token belong to another");
+  identity.claim("bbbb");
+  assert.deepStrictEqual([identity.belongsTo("aaaa"), identity.belongsTo("bbbb")], [false, true]);
+  // No token at all is a credential of its own: rows drawn signed out are not a token's.
+  assert.equal(createScreenIdentity("").belongsTo("aaaa"), false);
+});
