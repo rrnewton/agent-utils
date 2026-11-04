@@ -1964,6 +1964,11 @@ mod unit {
         FileExt::lock_exclusive(&held).unwrap();
         assert_eq!(slot_occupancy(&state), (2, 1));
         drop(held);
+        // A child another test forks at this instant shares the lock until it execs.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slot_occupancy(&state) != (2, 0) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(slot_occupancy(&state), (2, 0));
         let _ = std::fs::remove_dir_all(&state.root);
     }
