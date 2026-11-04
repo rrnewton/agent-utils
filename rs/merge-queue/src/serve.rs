@@ -720,6 +720,8 @@ pub struct ServeOptions {
     pub max_batch: Option<usize>,
     /// Override the configured agentctl command for push notifications.
     pub agentctl: Option<Vec<String>>,
+    /// Override the configured agentctl registry for push notifications.
+    pub agentctl_registry: Option<std::path::PathBuf>,
     /// Deadline for one notification send; a send still running then has
     /// its process group killed and counts as a failed attempt.
     pub notify_timeout: Duration,
@@ -742,6 +744,7 @@ impl Default for ServeOptions {
             depth: None,
             max_batch: None,
             agentctl: None,
+            agentctl_registry: None,
             notify_timeout: notify::DEFAULT_SEND_TIMEOUT,
             sync_label: None,
             sync_every: Duration::from_secs(DEFAULT_SYNC_EVERY_SECS),
@@ -1130,8 +1133,12 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
             ""
         }
     );
-    let notifier = notify::Notifier::resolve(options.agentctl.as_deref(), &config)
-        .with_timeout(options.notify_timeout);
+    let notifier = notify::Notifier::resolve(
+        options.agentctl.as_deref(),
+        options.agentctl_registry.as_deref(),
+        &config,
+    )
+    .with_timeout(options.notify_timeout);
 
     let mut last_fingerprint = String::new();
     let mut last_base: Option<String> = None;

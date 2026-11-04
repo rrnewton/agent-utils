@@ -313,3 +313,82 @@ fn notify_help_is_documented_on_every_changed_surface() {
         }
     }
 }
+
+#[test]
+fn sends_address_the_configured_registry_unless_env_or_flag_override_it() {
+    // The daemon's working directory need not hold the registry (a daemon started in a bare
+    // queue repository has none there): the configured one is passed as a global option.
+    let (fx, log) = setup(
+        "notify-registry",
+        "exit 0",
+        &["--agentctl-registry", "team/.agentctl"],
+    );
+    let config: Value = serde_json::from_str(
+        &std::fs::read_to_string(fx.queue().join(".git/merge-queue/config.json")).unwrap(),
+    )
+    .unwrap();
+    // A relative path is stored absolute, against the directory `init` ran in.
+    let configured = fx.queue().join("team/.agentctl").display().to_string();
+    assert_eq!(
+        config["notify"]["registry"],
+        configured.as_str(),
+        "{config}"
+    );
+    let log_text = log.to_string_lossy().into_owned();
+    let withdraw_and_serve = |pr: &str, extra: &[&str], env: &[(&str, &str)]| {
+        let branch = format!("r{pr}");
+        fx.branch(&branch, &[(&format!("tests/{branch}"), "ok\n")]);
+        fx.mq_ok(&[
+            "submit",
+            pr,
+            "--head",
+            &branch,
+            "--notify",
+            "lane-fictional",
+        ]);
+        fx.mq_ok(&["withdraw", pr]);
+        let mut args = vec!["serve", "--once"];
+        args.extend_from_slice(extra);
+        let mut vars = vec![("FAKE_LOG", log_text.as_str())];
+        vars.extend_from_slice(env);
+        let out = fx.mq_env(&args, &vars);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    withdraw_and_serve("1", &[], &[]);
+    withdraw_and_serve(
+        "2",
+        &[],
+        &[("MERGE_QUEUE_AGENTCTL_REGISTRY", "/env/.agentctl")],
+    );
+    withdraw_and_serve(
+        "3",
+        &["--agentctl-registry", "/flag/.agentctl"],
+        &[("MERGE_QUEUE_AGENTCTL_REGISTRY", "/env/.agentctl")],
+    );
+    let registries: Vec<String> = sent_lines(&log)
+        .iter()
+        .map(|line| {
+            let rest = line
+                .strip_prefix("--registry ")
+                .unwrap_or_else(|| panic!("no leading --registry: {line}"));
+            let (registry, send) = rest.split_once(" send ").unwrap();
+            assert!(
+                send.starts_with("--deliver-while-working --file "),
+                "{line}"
+            );
+            registry.to_owned()
+        })
+        .collect();
+    assert_eq!(
+        registries,
+        vec![
+            configured,
+            "/env/.agentctl".to_owned(),
+            "/flag/.agentctl".to_owned()
+        ]
+    );
+}

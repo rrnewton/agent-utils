@@ -380,7 +380,7 @@ pub fn sync(
             let notifier = match notifier {
                 Some(notifier) => notifier,
                 None => {
-                    configured = crate::notify::Notifier::resolve(None, config);
+                    configured = crate::notify::Notifier::resolve(None, None, config);
                     &configured
                 }
             };

@@ -520,6 +520,12 @@ enum Command {
         /// The daemon runs `<command> send <name> --deliver-while-working --file <report>`.
         #[arg(long, value_name = "WORD", allow_hyphen_values = true)]
         agentctl: Vec<String>,
+        /// agentctl registry the notifications address: the daemon runs
+        /// `<command> --registry PATH send ...`. Stored as an absolute path. Default: none,
+        /// leaving agentctl's own `.agentctl` in the daemon's working directory, which for a
+        /// daemon started in a bare queue repository is no registry.
+        #[arg(long, value_name = "PATH")]
+        agentctl_registry: Option<PathBuf>,
         /// Overwrite an existing config.json (items and history are kept).
         #[arg(long)]
         force: bool,
@@ -690,6 +696,12 @@ enum Command {
         /// nor the configured command is set.
         #[arg(long, value_name = "WORD", allow_hyphen_values = true)]
         agentctl: Vec<String>,
+        /// agentctl registry the notifications address, instead of the configured one
+        /// (`notify.registry`): sends run `<command> --registry PATH send ...`. Supplement:
+        /// MERGE_QUEUE_AGENTCTL_REGISTRY when this flag is not given. With none of the
+        /// three, agentctl looks for `.agentctl` in the daemon's working directory.
+        #[arg(long, value_name = "PATH")]
+        agentctl_registry: Option<PathBuf>,
         /// Seconds one notification send may run; then its whole process group is
         /// killed and the send counts as a failed attempt (retried on a later
         /// cycle, at most 3 attempts per transition). Minimum 1.
@@ -1071,6 +1083,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             land_command,
             allow_batches,
             agentctl,
+            agentctl_registry,
             force,
         } => {
             if state.exists() && !force {
@@ -1195,7 +1208,21 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     allow_batches,
                     close_prs,
                 },
-                notify: NotifyConfig { agentctl },
+                notify: NotifyConfig {
+                    agentctl,
+                    registry: match agentctl_registry {
+                        Some(path) => std::path::absolute(&path)
+                            .map_err(|error| {
+                                format!(
+                                    "cannot resolve --agentctl-registry {}: {error}",
+                                    path.display()
+                                )
+                            })?
+                            .to_string_lossy()
+                            .into_owned(),
+                        None => String::new(),
+                    },
+                },
                 ..Config::default()
             };
             state.init(&config)?;
@@ -1433,6 +1460,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             depth,
             max_batch,
             agentctl,
+            agentctl_registry,
             notify_timeout_secs,
             sync_label,
             sync_every,
@@ -1451,6 +1479,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 } else {
                     Some(agentctl)
                 },
+                agentctl_registry,
                 notify_timeout: std::time::Duration::from_secs(notify_timeout_secs.max(1)),
                 sync_label,
                 sync_every: std::time::Duration::from_secs(sync_every.max(10)),

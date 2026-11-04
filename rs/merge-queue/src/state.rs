@@ -526,6 +526,13 @@ pub struct NotifyConfig {
     /// test fake or a wrapper. Empty means `agentctl` on `PATH`. The daemon
     /// runs `<command> send <name> --deliver-while-working --file <report>`.
     pub agentctl: Vec<String>,
+    /// agentctl registry the sends address, passed as `--registry PATH`
+    /// before `send`. Empty leaves agentctl's own default, `.agentctl` in the
+    /// daemon's working directory (the queue repository when the daemon was
+    /// started there). Omitted from config.json when empty, so a config that
+    /// does not set it still loads on builds that predate it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub registry: String,
 }
 
 /// Identity for commits the queue creates.
@@ -989,6 +996,19 @@ mod unit {
         let plain: Config =
             serde_json::from_str(r#"{"schema": "merge-queue-config/v1"}"#).expect("plain");
         assert!(plain.unknown_fields.is_empty());
+    }
+
+    #[test]
+    fn an_unset_notify_registry_is_left_out_of_config_json() {
+        // Older builds refuse unknown `notify` fields, so a config that does not set the
+        // registry must not mention it.
+        let written = serde_json::to_value(Config::default()).expect("serialize");
+        assert_eq!(written["notify"], serde_json::json!({"agentctl": []}));
+        let mut config = Config::default();
+        config.notify.registry = "/team/.agentctl".to_owned();
+        let written = serde_json::to_string(&config).expect("serialize");
+        let reread: Config = serde_json::from_str(&written).expect("reread");
+        assert_eq!(reread.notify.registry, "/team/.agentctl");
     }
 
     #[test]

@@ -35,7 +35,13 @@
 //! `config.notify.agentctl`) is primary, `serve --agentctl WORD...`
 //! overrides it for one daemon, and the `MERGE_QUEUE_AGENTCTL` environment
 //! variable (shell-style words) is a documented supplement between the two.
-//! Tests inject a fake command through any of these seams.
+//! Tests inject a fake command through any of these seams. The registry the
+//! sends address resolves the same way: `serve --agentctl-registry PATH`,
+//! then `MERGE_QUEUE_AGENTCTL_REGISTRY`, then `config.notify.registry`
+//! (`init --agentctl-registry PATH`); when one is set, sends run
+//! `<command> --registry PATH send ...`. Without one, agentctl looks for
+//! `.agentctl` in the daemon's working directory, which for a daemon started
+//! in a bare queue repository is no registry at all.
 
 use std::io::Read;
 use std::os::unix::process::CommandExt;
@@ -54,6 +60,9 @@ pub const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Environment supplement naming the agentctl command (shell-style words).
 pub const AGENTCTL_ENV: &str = "MERGE_QUEUE_AGENTCTL";
+
+/// Environment supplement naming the agentctl registry the sends address.
+pub const AGENTCTL_REGISTRY_ENV: &str = "MERGE_QUEUE_AGENTCTL_REGISTRY";
 
 /// One owed transition: a stable dedup key plus its verdict word.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,11 +154,31 @@ pub fn resolve_agentctl(
     vec!["agentctl".to_owned()]
 }
 
+/// Resolve the agentctl registry: a non-empty flag override wins, then the
+/// `MERGE_QUEUE_AGENTCTL_REGISTRY` supplement, then the configured registry;
+/// `None` leaves agentctl's own default.
+pub fn resolve_registry(
+    flag: Option<&std::path::Path>,
+    env: Option<&str>,
+    config: &Config,
+) -> Option<PathBuf> {
+    if let Some(path) = flag.filter(|path| !path.as_os_str().is_empty()) {
+        return Some(path.to_path_buf());
+    }
+    if let Some(env) = env.map(str::trim).filter(|env| !env.is_empty()) {
+        return Some(PathBuf::from(env));
+    }
+    let configured = config.notify.registry.trim();
+    (!configured.is_empty()).then(|| PathBuf::from(configured))
+}
+
 /// The configured agentctl-compatible sender.
 #[derive(Clone, Debug)]
 pub struct Notifier {
     /// Command words; the first is the program.
     pub command: Vec<String>,
+    /// Registry passed as `--registry PATH` before `send`; `None` passes none.
+    pub registry: Option<PathBuf>,
     /// Deadline for one send; on expiry the send's process group is killed
     /// and the send is a failed attempt.
     pub timeout: Duration,
@@ -171,18 +200,37 @@ fn kill_group(child: &mut std::process::Child) {
 }
 
 impl Notifier {
-    /// A sender running `command` with the default deadline.
+    /// A sender running `command` with agentctl's default registry and the
+    /// default deadline.
     pub fn new(command: Vec<String>) -> Self {
         Self {
             command,
+            registry: None,
             timeout: DEFAULT_SEND_TIMEOUT,
         }
     }
 
-    /// Build from the flag override, the environment supplement, and config.
-    pub fn resolve(flag: Option<&[String]>, config: &Config) -> Self {
+    /// Build from the flag overrides (command words, registry), the
+    /// environment supplements, and config.
+    pub fn resolve(
+        flag: Option<&[String]>,
+        registry_flag: Option<&std::path::Path>,
+        config: &Config,
+    ) -> Self {
         let env = std::env::var(AGENTCTL_ENV).ok();
-        Self::new(resolve_agentctl(flag, env.as_deref(), config))
+        let registry_env = std::env::var(AGENTCTL_REGISTRY_ENV).ok();
+        Self::new(resolve_agentctl(flag, env.as_deref(), config)).with_registry(resolve_registry(
+            registry_flag,
+            registry_env.as_deref(),
+            config,
+        ))
+    }
+
+    /// The same sender addressing `registry` (`None`: agentctl's default).
+    #[must_use]
+    pub fn with_registry(mut self, registry: Option<PathBuf>) -> Self {
+        self.registry = registry;
+        self
     }
 
     /// The same sender with a different per-send deadline.
@@ -198,8 +246,11 @@ impl Notifier {
     /// process group is killed) is a failed send, never a success.
     pub fn send(&self, name: &str, report: &std::path::Path) -> Result<(), String> {
         let mut command = Command::new(&self.command[0]);
+        command.args(&self.command[1..]);
+        if let Some(registry) = &self.registry {
+            command.arg("--registry").arg(registry);
+        }
         command
-            .args(&self.command[1..])
             .arg("send")
             .arg("--deliver-while-working")
             .arg("--file")
@@ -671,6 +722,67 @@ mod unit {
             resolve_agentctl(None, Some("  "), &Config::default()),
             vec!["agentctl".to_owned()]
         );
+    }
+
+    #[test]
+    fn registry_resolution_prefers_flag_then_env_then_config() {
+        use std::path::Path;
+        let mut config = Config::default();
+        config.notify.registry = "/team/.agentctl".to_owned();
+        assert_eq!(
+            resolve_registry(Some(Path::new("/flag/.agentctl")), Some("/env"), &config),
+            Some(PathBuf::from("/flag/.agentctl"))
+        );
+        assert_eq!(
+            resolve_registry(None, Some(" /env/.agentctl "), &config),
+            Some(PathBuf::from("/env/.agentctl"))
+        );
+        assert_eq!(
+            resolve_registry(Some(Path::new("")), Some("  "), &config),
+            Some(PathBuf::from("/team/.agentctl"))
+        );
+        // Nothing set: no --registry, so agentctl keeps its own default.
+        assert_eq!(resolve_registry(None, None, &Config::default()), None);
+    }
+
+    #[test]
+    fn a_registry_goes_before_send_as_a_global_option() {
+        let dir = std::env::temp_dir().join(format!(
+            "merge-queue-notify-registry-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("r.md");
+        std::fs::write(&report, "x\n").unwrap();
+        let log = dir.join("argv");
+        let recorder = Notifier::new(vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!("printf '%s\\n' \"$@\" > {}", log.display()),
+            "sh".to_owned(),
+        ])
+        .with_registry(Some(PathBuf::from("/work/team/.agentctl")));
+        recorder.send("lane", &report).unwrap();
+        let argv: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let report_arg = report.display().to_string();
+        assert_eq!(
+            argv,
+            vec![
+                "--registry",
+                "/work/team/.agentctl",
+                "send",
+                "--deliver-while-working",
+                "--file",
+                report_arg.as_str(),
+                "--",
+                "lane"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
