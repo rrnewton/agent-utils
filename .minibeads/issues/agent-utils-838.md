@@ -1,13 +1,14 @@
 ---
 title: 'archive-fetcher-upstream: excludes and agentcloud transport into the canonical log fetcher'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 assignee: mu-validate@devbig030
 labels:
 - archive
 created_at: 2026-11-03T23:44:56.003421017+00:00
-updated_at: 2026-11-03T23:44:56.003421017+00:00
+updated_at: 2026-11-04T01:16:18.889683867+00:00
+closed_at: 2026-11-04T01:16:18.889683727+00:00
 ---
 
 # Description
