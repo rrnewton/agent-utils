@@ -27,6 +27,7 @@ declare const createShellNotices: LegacyImports["createShellNotices"];
 declare const createUndoStamps: LegacyImports["createUndoStamps"];
 declare const copyText: LegacyImports["copyText"];
 declare const createPendingCopy: LegacyImports["createPendingCopy"];
+declare const createOncePerFrame: LegacyImports["createOncePerFrame"];
 declare const shownNode: LegacyImports["shownNode"];
 declare const elementIn: LegacyImports["elementIn"];
 declare const focusMinimally: LegacyImports["focusMinimally"];

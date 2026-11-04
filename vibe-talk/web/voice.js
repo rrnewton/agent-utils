@@ -33247,21 +33247,14 @@ inColumn(columns.side, () => {
   }));
 });
 // The window's width decides one column or two, through the stylesheet: asked again once per frame of
-// a resize, never per scroll.
-let columnsResizeDue = false;
+// a resize, never per scroll (web/src/view/dom `createOncePerFrame`).
+const columnsResize = createOncePerFrame(() => {
+  renderColumns();
+  // `#340 composer-grow-box`. A window widened to a desk's draws a growing box, to be measured.
+  fitGrowingBoxes();
+}, () => (typeof requestAnimationFrame === "function" ? requestAnimationFrame : null));
 if (typeof window.addEventListener === "function") {
-  window.addEventListener("resize", () => {
-    if (columnsResizeDue) return;
-    columnsResizeDue = true;
-    const decide = () => {
-      columnsResizeDue = false;
-      renderColumns();
-      // `#340 composer-grow-box`. A window widened to a desk's draws a growing box, to be measured.
-      fitGrowingBoxes();
-    };
-    if (typeof requestAnimationFrame === "function") requestAnimationFrame(decide);
-    else decide();
-  });
+  window.addEventListener("resize", () => columnsResize.ask());
 }
 // --- the on-screen keyboard ------------------------------------------------------------------------
 //

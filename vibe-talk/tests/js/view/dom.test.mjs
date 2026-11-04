@@ -278,3 +278,25 @@ test("`#624 voice-page-modularity`: the copy noted for the `copy` event is forgo
   pending.release(second);
   assert.equal(pending.held(), null);
 });
+
+test("`#624 voice-page-modularity`: work asked for many times before a frame is done once in it, and at once with no frames", () => {
+  const { createOncePerFrame } = VIEW_DOM;
+  let runs = 0;
+  const frames = [];
+  let scheduler = (fn) => frames.push(fn);
+  const work = createOncePerFrame(() => { runs += 1; }, () => scheduler);
+  work.ask();
+  work.ask();
+  work.ask();
+  assert.deepStrictEqual([runs, frames.length, work.due()], [0, 1, true], "three asks before a frame asked for more than one");
+  frames.shift()();
+  assert.deepStrictEqual([runs, work.due()], [1, false]);
+  work.ask();
+  assert.equal(frames.length, 1, "an ask after the frame did not ask for the next");
+  // A page with no frames does the work at once, every time.
+  scheduler = null;
+  frames.shift()();
+  work.ask();
+  work.ask();
+  assert.equal(runs, 4);
+});

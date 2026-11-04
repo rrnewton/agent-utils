@@ -8,4 +8,6 @@ export { classWords, setClassWord } from "./classes.ts";
 export { sayingNodes, setAttributeIfChanged, setClassNameIfChanged, setHiddenIfChanged, setTextIfChanged, tagNameOf } from "./changes.ts";
 export { UNTYPED_INPUTS, answersEnter, isLink, isTextField, keepsOwnKeys, pressedBySpace, scrollsItself } from "./targets.ts";
 export { copyText, copyThroughTextarea, createPendingCopy } from "./clipboard.ts";
+export { createOncePerFrame } from "./frames.ts";
+export type { FrameScheduler, OncePerFrame } from "./frames.ts";
 export type { PendingCopy, TextClipboard } from "./clipboard.ts";
