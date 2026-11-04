@@ -704,6 +704,51 @@ fn compare_mode_publishes_only_the_candidate_and_cancels_its_lease_when_it_is_ej
 }
 
 #[test]
+fn a_claim_offers_a_job_under_the_tools_the_queue_host_has_now() {
+    // The validator's own tooling moved after the job was published (a fix landed in it).
+    // A claim re-stamps the queued job with the queue host's current answer, so donors that
+    // already have the new tooling take it instead of declining it forever.
+    let fx = Fixture::new("donor-restamp");
+    let tool = fx.root.join("tooling-revision");
+    std::fs::write(&tool, "old\n").unwrap();
+    let identity = format!("tooling=cat {}", tool.display());
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "sleep 3",
+        "--offload",
+        "compare",
+        "--tool-identity",
+        &identity,
+    ]);
+    two_changes(&fx);
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    assert_eq!(jobs(&fx)[0]["tool"]["tools"]["tooling"], "old");
+    std::fs::write(&tool, "new\n").unwrap();
+    let claimed: Value = serde_json::from_str(&fx.mq_ok(&[
+        "donor", "claim", "--donor", "fresh", "--host", "h", "--jobs", "1",
+    ]))
+    .unwrap();
+    assert_eq!(
+        claimed["job"]["tool"]["tools"]["tooling"], "new",
+        "{claimed}"
+    );
+    assert!(
+        claimed["job"]["history"].to_string().contains(
+            "re-stamped with the queue host's current tools (tooling=old -> tooling=new)"
+        ),
+        "{claimed}"
+    );
+    let (code, _, stderr) = finish(run);
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+#[test]
 fn an_unleased_job_whose_candidate_landed_is_cancelled() {
     let fx = Fixture::new("donor-unleased");
     fx.mq_ok(&[

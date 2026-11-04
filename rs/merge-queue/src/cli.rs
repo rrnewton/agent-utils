@@ -196,6 +196,17 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
         DonorCommand::Claim { donor, host, jobs } => {
             let cap = config.donors.max_jobs_per_donor;
             let jobs = if cap > 0 { jobs.min(cap) } else { jobs };
+            // Answer the tool identity now, so a job published before a tool moved is offered
+            // under the tools this host would validate with (see `Store::current_tools`).
+            let mut store = store;
+            match crate::donor::tool_answers(&config.validator, &config.repo) {
+                Ok(answers) => store.current_tools = Some(answers),
+                Err(error) => {
+                    eprintln!(
+                        "merge-queue donor claim: jobs keep their published tool stamps: {error}"
+                    )
+                }
+            }
             let job = store.claim(&donor, &host, jobs)?;
             let text = serde_json::to_string(&crate::donor::Claimed { job })
                 .map_err(|error| error.to_string())?;

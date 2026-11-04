@@ -350,6 +350,9 @@ pub struct Store {
     /// Could-not-run receipts one job may collect before it is cancelled, and one donor may
     /// return for it before it is left out (`donors.max_could_not_run`).
     pub could_not_run_limit: usize,
+    /// The queue host's `validator.tool_identity` answers now, when known. [`Store::claim`]
+    /// re-stamps a queued job published under older answers with these first.
+    pub current_tools: Option<BTreeMap<String, String>>,
 }
 
 /// The store's lock, held only for one short operation.
@@ -533,6 +536,7 @@ impl Store {
             dir: state_root.join("donor"),
             lease_secs: DEFAULT_LEASE_SECS,
             could_not_run_limit: crate::state::DEFAULT_RETRY_BOUND as usize,
+            current_tools: None,
         }
     }
 
@@ -720,7 +724,9 @@ impl Store {
     }
 
     /// Lease the oldest queued job to `donor`, unless it already holds `max_jobs` leases.
-    /// The returned job carries the lease token; nothing else ever returns it.
+    /// The returned job carries the lease token; nothing else ever returns it. With
+    /// [`Store::current_tools`] set, queued jobs are re-stamped first
+    /// ([`Store::restamp_queued`]).
     pub fn claim(&self, donor: &str, host: &str, max_jobs: usize) -> Result<Option<Job>, String> {
         if donor.trim().is_empty() {
             return Err("a donor needs a name".to_owned());
@@ -728,6 +734,7 @@ impl Store {
         let _lock = self.lock()?;
         let at = unix_now();
         self.expire(at)?;
+        self.restamp_queued()?;
         let jobs = self.jobs()?;
         let held = jobs
             .iter()
@@ -757,6 +764,47 @@ impl Store {
             .push(format!("{}: leased to {donor} on {host}", now()));
         self.write(&job)?;
         Ok(Some(job))
+    }
+
+    /// Give every queued job published under tool answers other than
+    /// [`Store::current_tools`] the current ones. A tool repository that moved after the job
+    /// was published (a fix landed in the validator's own tooling) leaves it stamped with
+    /// answers no up-to-date donor has: each such donor declines it and is never offered it
+    /// again, so it would sit queued until it is pruned. The queue host validates with its
+    /// current tools, so the job takes them too, and the donors that declined the old stamp
+    /// may claim it again. Leased and finished jobs keep the stamp they ran under. The
+    /// caller holds the store lock.
+    fn restamp_queued(&self) -> Result<(), String> {
+        let Some(current) = &self.current_tools else {
+            return Ok(());
+        };
+        for mut job in self.jobs()? {
+            if job.state != JobState::Queued || job.tool.tools == *current {
+                continue;
+            }
+            let describe = |tools: &BTreeMap<String, String>| {
+                tools
+                    .iter()
+                    .map(|(name, answer)| format!("{name}={answer}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let declined = std::mem::take(&mut job.declined_by);
+            job.history.push(format!(
+                "{}: re-stamped with the queue host's current tools ({} -> {}){}",
+                now(),
+                describe(&job.tool.tools),
+                describe(current),
+                if declined.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {} may claim it again", declined.join(", "))
+                }
+            ));
+            job.tool.tools = current.clone();
+            self.write(&job)?;
+        }
+        Ok(())
     }
 
     /// The job, if `token` is its live lease's.
@@ -1868,6 +1916,40 @@ mod unit {
             exit: Some(0),
             ..Receipt::default()
         }
+    }
+
+    #[test]
+    fn a_job_published_before_a_tool_moved_is_re_stamped_and_offered_again() {
+        let mut store = Store::new(&temp("restamp"));
+        let stale = publish(&store, "c1");
+        assert!(stale.tool.tools.is_empty());
+        // A donor whose tools already moved declines the stale stamp, and is never offered
+        // the job again while the stamp stays.
+        let first = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = first.lease.as_ref().unwrap().token.clone();
+        store
+            .release(&first.id, &token, "this donor's tools differ", true)
+            .unwrap();
+        assert!(store.claim("d1", "h1", 1).unwrap().is_none());
+        // The queue host's tools moved too: the next claim re-stamps the queued job, and the
+        // donor that declined it gets it.
+        let moved: BTreeMap<String, String> = [("tooling".to_owned(), "v2".to_owned())].into();
+        store.current_tools = Some(moved.clone());
+        let again = store.claim("d1", "h1", 1).unwrap().expect("re-stamped job");
+        assert_eq!(again.id, first.id);
+        assert_eq!(again.tool.tools, moved);
+        assert!(again.declined_by.is_empty(), "{:?}", again.declined_by);
+        let text = again.history.join("\n");
+        assert!(
+            text.contains("re-stamped with the queue host's current tools"),
+            "{text}"
+        );
+        assert!(text.contains("d1 may claim it again"), "{text}");
+        // A leased job keeps the stamp it runs under, and matching answers change nothing.
+        store.current_tools = Some([("tooling".to_owned(), "v3".to_owned())].into());
+        assert!(store.claim("d2", "h2", 1).unwrap().is_none());
+        let job = store.read(&first.id).unwrap();
+        assert_eq!(job.tool.tools, moved, "a leased job is not re-stamped");
     }
 
     #[test]
