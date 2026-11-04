@@ -415,6 +415,17 @@ fn probe_options_for(state: &State, config: &Config, git: &Git) -> ProbeOptions 
         config.combine.as_str(),
         config.recount_pins
     );
+    // Pin sites settle like regenerated files; a queue without pins keeps its cache keys.
+    let config_material = if config.pins.is_empty() {
+        config_material
+    } else {
+        let sites: Vec<_> = config
+            .pins
+            .iter()
+            .map(|pin| (&pin.gitlink, &pin.files))
+            .collect();
+        format!("{config_material};pins={sites:?}")
+    };
     // Merge answers also depend on attributes and merge configuration outside the queue's own
     // settings, and on the Git version; a change to any of them must not reuse old answers.
     let config_material = format!(
@@ -440,11 +451,16 @@ pub fn plan(state: &State, config: &Config, max_batch: usize) -> Result<Plan, St
     let (base_sha, current) = refresh(&git, config, &heads)?;
     let regenerate = config.regenerate.clone();
     let recount = config.recount_pins;
+    let pins = config.pins.clone();
     let mut probe = probe_with_options(
         &git,
         &base_sha,
         &current,
-        &|path| regenerate.covers(path) || (recount && path == crate::recount::PIN_PATH),
+        &|path| {
+            regenerate.covers(path)
+                || (recount && path == crate::recount::PIN_PATH)
+                || pins.iter().any(|pin| pin.covers(path))
+        },
         probe_options_for(state, config, &git),
     )?;
     probe.external = peer_holds(config, &items)?;
@@ -475,6 +491,7 @@ pub struct PlanContinuation {
     heads: BTreeMap<i64, Option<String>>,
     regenerate: RegenerateConfig,
     recount: bool,
+    pins: Vec<crate::state::PinConfig>,
     probe_options: ProbeOptions,
     max_batch: usize,
     priority: PriorityConfig,
@@ -499,11 +516,16 @@ impl PlanContinuation {
     pub fn finish(self) -> Result<Plan, String> {
         let regenerate = self.regenerate.clone();
         let recount = self.recount;
+        let pins = self.pins.clone();
         let mut probe = probe_with_options(
             &self.git,
             &self.base_sha,
             &self.heads,
-            &|path| regenerate.covers(path) || (recount && path == crate::recount::PIN_PATH),
+            &|path| {
+                regenerate.covers(path)
+                    || (recount && path == crate::recount::PIN_PATH)
+                    || pins.iter().any(|pin| pin.covers(path))
+            },
             self.probe_options.clone(),
         )?;
         probe.external = self.external.clone();
@@ -547,12 +569,17 @@ pub fn plan_staged(
     let (base_sha, current) = refresh(&git, config, &heads)?;
     let regenerate = config.regenerate.clone();
     let recount = config.recount_pins;
+    let pins = config.pins.clone();
     let probe_options = probe_options_for(state, config, &git);
     let mut probe = probe_first_stage(
         &git,
         &base_sha,
         &current,
-        &|path| regenerate.covers(path) || (recount && path == crate::recount::PIN_PATH),
+        &|path| {
+            regenerate.covers(path)
+                || (recount && path == crate::recount::PIN_PATH)
+                || pins.iter().any(|pin| pin.covers(path))
+        },
         probe_options.clone(),
     )?;
     let external = peer_holds(config, &items)?;
@@ -575,6 +602,7 @@ pub fn plan_staged(
         heads: current,
         regenerate,
         recount,
+        pins,
         probe_options,
         max_batch,
         priority: config.priority.clone(),

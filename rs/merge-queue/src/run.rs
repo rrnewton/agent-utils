@@ -304,6 +304,9 @@ pub struct RunReport {
     /// Pin decreases changes declared and their batches accepted.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pin_decreases: Vec<PinDecrease>,
+    /// Pinned commits of other repositories resolved to the descendant (`pins`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pin_resolutions: Vec<crate::pins::Resolution>,
     /// Generated files regenerated on candidates.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub regenerated: Vec<Regeneration>,
@@ -1338,15 +1341,47 @@ impl<'a> Runner<'a> {
                 &item.head,
                 &exclude,
                 &message,
-                &|path| regen.covers(path) || (recount && path == crate::recount::PIN_PATH),
+                &|path| {
+                    regen.covers(path)
+                        || (recount && path == crate::recount::PIN_PATH)
+                        || self.config.pin_site(path)
+                },
             )?;
-            let (next, conflicted) = match combined {
+            let (next, mut conflicted) = match combined {
                 Combined::Clean(next) => (next, Vec::new()),
                 Combined::NeedsRegen(next, paths) => (next, paths),
                 Combined::Conflict(paths) => {
                     skipped.insert(*pr);
                     conflicts.push((*pr, "conflict", paths.join(", ")));
                     continue;
+                }
+            };
+            // A pinned commit of another repository the change moves: the descendant of the
+            // target's pin and the change's goes to every site (see `crate::pins`). Exact
+            // changes keep their own commits and are never rewritten.
+            let next = if self.config.pins.is_empty() || item.exact {
+                next
+            } else {
+                match crate::pins::resolve(
+                    &self.git,
+                    &self.config.pins,
+                    &tip,
+                    &item.head,
+                    &next,
+                    &conflicted,
+                    *pr,
+                )? {
+                    crate::pins::Outcome::Resolved(next, decided) => {
+                        // Pinned files the combination settled are resolved now, not stale.
+                        conflicted.retain(|path| !self.config.pin_site(path));
+                        self.record_pin_resolutions(decided)?;
+                        next
+                    }
+                    crate::pins::Outcome::Refused(kind, why) => {
+                        skipped.insert(*pr);
+                        conflicts.push((*pr, kind, why));
+                        continue;
+                    }
                 }
             };
             // Recount this prefix first: base plus the deltas of the changes kept so far and
@@ -1650,6 +1685,27 @@ impl<'a> Runner<'a> {
         result
     }
 
+    /// Record pin resolutions in the run report, the run's events and each change's history,
+    /// once per run (a batch rebuilt during a culprit search resolves the same pins again).
+    fn record_pin_resolutions(&self, decided: Vec<crate::pins::Resolution>) -> Result<(), String> {
+        for resolution in decided {
+            if lock(&self.report).pin_resolutions.contains(&resolution) {
+                continue;
+            }
+            let detail = resolution.describe();
+            self.event("pin-resolved", &detail);
+            if !self.simulating() {
+                let mut items = lock(&self.items);
+                if let Some(item) = items.get_mut(&resolution.pr) {
+                    item.log("pin-resolved", detail);
+                    self.state.save_item(item)?;
+                }
+            }
+            lock(&self.report).pin_resolutions.push(resolution);
+        }
+        Ok(())
+    }
+
     /// Record the pin decreases change `pr` declared and its batch accepted: in the run report,
     /// the run's events and the change's history.
     fn record_pin_decreases(
@@ -1858,6 +1914,10 @@ impl<'a> Runner<'a> {
             let reason = match kind {
                 "conflict" => format!(
                     "does not combine onto {}{context}: conflicts on {detail}; rebase and resubmit",
+                    short(parent)
+                ),
+                "pin" => format!(
+                    "cannot combine onto {}{context}: {detail}; update the change's pin and resubmit",
                     short(parent)
                 ),
                 "not-fast-forward" => format!(
@@ -3898,6 +3958,16 @@ pub fn render_report(report: &RunReport) -> String {
             out.push_str(&format!(
                 "- #{}: `{}` (occurrence {}) down {}: {}\n",
                 decrease.pr, decrease.pin, decrease.occurrence, decrease.amount, decrease.reason
+            ));
+        }
+    }
+    if !report.pin_resolutions.is_empty() {
+        out.push_str("\n## Pin resolutions\n\n");
+        for resolution in &report.pin_resolutions {
+            out.push_str(&format!(
+                "- #{}: {}\n",
+                resolution.pr,
+                resolution.describe()
             ));
         }
     }

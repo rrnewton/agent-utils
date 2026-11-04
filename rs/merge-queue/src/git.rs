@@ -195,6 +195,172 @@ impl Git {
         }
     }
 
+    /// The bytes of the file `path` at `commit`, or `None` when no file is there.
+    pub fn file_bytes(&self, commit: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
+        let spec = format!("{commit}:{path}");
+        let output = self.output(
+            self.command(&["cat-file", "blob", &spec]),
+            "git cat-file blob",
+            &[0, 128],
+        )?;
+        Ok(output.status.success().then_some(output.stdout))
+    }
+
+    /// The commit the gitlink (submodule entry) `path` in `commit` records, if there is one.
+    pub fn gitlink(&self, commit: &str, path: &str) -> Result<Option<String>, String> {
+        let out = self.run(&["ls-tree", commit, "--", path])?;
+        Ok(out.lines().find_map(|line| {
+            let (meta, name) = line.split_once('\t')?;
+            let mut fields = meta.split(' ');
+            match (fields.next(), fields.next(), fields.next()) {
+                (Some("160000"), Some("commit"), Some(id)) if name == path => Some(id.to_owned()),
+                _ => None,
+            }
+        }))
+    }
+
+    /// Every path in `commit`'s tree (files and gitlinks).
+    pub fn paths_in(&self, commit: &str) -> Result<Vec<String>, String> {
+        let output = self.output(
+            self.command(&["ls-tree", "-r", "-z", "--name-only", commit]),
+            "git ls-tree",
+            &[0],
+        )?;
+        Ok(output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect())
+    }
+
+    /// Whether `commit` is a commit present in the repository.
+    pub fn has_commit(&self, commit: &str) -> bool {
+        self.run(&["cat-file", "-e", &format!("{commit}^{{commit}}")])
+            .is_ok()
+    }
+
+    /// Store `bytes` as a blob and return its id.
+    pub fn write_blob(&self, bytes: &[u8]) -> Result<String, String> {
+        let mut command = self.command(&["hash-object", "-w", "--stdin"]);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("could not run git hash-object: {error}"))?;
+        let fed = child
+            .stdin
+            .take()
+            .map_or(Ok(()), |mut stdin| stdin.write_all(bytes));
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("could not run git hash-object: {error}"))?;
+        fed.map_err(|error| format!("could not feed git hash-object: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git hash-object failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    /// A three-way merge of file contents (`git merge-file`): the merged bytes, or `None` when
+    /// they conflict.
+    pub fn merge_texts(
+        &self,
+        ours: &[u8],
+        base: &[u8],
+        theirs: &[u8],
+    ) -> Result<Option<Vec<u8>>, String> {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let git_dir = PathBuf::from(self.run(&["rev-parse", "--absolute-git-dir"])?);
+        let stem = git_dir.join(format!(
+            "merge-queue-merge-file-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let paths: Vec<PathBuf> = ["ours", "base", "theirs"]
+            .iter()
+            .map(|side| PathBuf::from(format!("{}.{side}", stem.display())))
+            .collect();
+        let result = (|| {
+            for (path, bytes) in paths.iter().zip([ours, base, theirs]) {
+                std::fs::write(path, bytes)
+                    .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+            }
+            let mut command = Command::new("git");
+            command
+                .arg("merge-file")
+                .arg("-p")
+                .args(&paths)
+                .stdin(Stdio::null());
+            let output = command
+                .output()
+                .map_err(|error| format!("could not run git merge-file: {error}"))?;
+            match output.status.code() {
+                Some(0) => Ok(Some(output.stdout)),
+                Some(1..=127) => Ok(None),
+                code => Err(format!(
+                    "git merge-file failed ({}): {}",
+                    code.unwrap_or(-1),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+            }
+        })();
+        for path in &paths {
+            let _ = std::fs::remove_file(path);
+        }
+        result
+    }
+
+    /// `tree` with each `(mode, id, path)` entry set (added, or replacing what is there; mode
+    /// `0` removes the path), built in a throwaway index file like [`Git::replace_paths`].
+    pub fn tree_with(
+        &self,
+        tree: &str,
+        entries: &[(String, String, String)],
+    ) -> Result<String, String> {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let git_dir = PathBuf::from(self.run(&["rev-parse", "--absolute-git-dir"])?);
+        let index = git_dir.join(format!(
+            "merge-queue-index-set-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let indexed = |args: &[&str]| {
+            let mut command = self.command(args);
+            command
+                .env("GIT_INDEX_FILE", &index)
+                .env("GIT_LITERAL_PATHSPECS", "1");
+            command
+        };
+        let result = (|| {
+            self.output(indexed(&["read-tree", tree]), "git read-tree", &[0])?;
+            let mut input = Vec::new();
+            for (mode, id, path) in entries {
+                input.extend_from_slice(format!("{mode} {id}\t{path}\0").as_bytes());
+            }
+            self.feed(
+                indexed(&["update-index", "-z", "--index-info"]),
+                &input,
+                "git update-index --index-info",
+            )?;
+            let output = self.output(indexed(&["write-tree"]), "git write-tree", &[0])?;
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        })();
+        let _ = std::fs::remove_file(&index);
+        let _ = std::fs::remove_file(format!("{}.lock", index.display()));
+        result
+    }
+
+    /// A commit of `tree` on `parent`, by the queue's identity.
+    pub fn commit_on(&self, tree: &str, parent: &str, message: &str) -> Result<String, String> {
+        self.commit_tree(tree, &[parent], message, None)
+    }
+
     /// Best common ancestor of two commits.
     pub fn merge_base(&self, left: &str, right: &str) -> Result<String, String> {
         self.run(&["merge-base", left, right])

@@ -438,6 +438,49 @@ impl RegenerateConfig {
     }
 }
 
+/// A commit of another repository that this one pins in several places at once: a submodule
+/// gitlink, and files that repeat the gitlink's commit hash (dependency manifests, lock files,
+/// build files). When a change moves the pin and the target it is combined onto pins another
+/// commit, the queue takes the descendant at every site (see `crate::pins`).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PinConfig {
+    /// Name, for reports.
+    pub name: String,
+    /// Path of the gitlink whose commit is the pin.
+    pub gitlink: String,
+    /// Files that repeat the pin's hash, as `regenerate.paths` names them: an exact path, a
+    /// directory, or a pattern with `*` wildcards. Every full 40-hex occurrence of a pin hash
+    /// in them is a pin site.
+    pub files: Vec<String>,
+    /// URL of the pinned repository. Its `branch` is fetched (into
+    /// `refs/merge-queue/pins/<name>`) only when a commit needed to order two pins is missing.
+    pub url: String,
+    /// The branch a pin a change introduces must be on (default `main`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub branch: String,
+}
+
+impl PinConfig {
+    /// Whether `path` is one of this pin's sites: the gitlink or a declared file.
+    pub fn covers(&self, path: &str) -> bool {
+        (!self.gitlink.is_empty() && path == self.gitlink)
+            || self
+                .files
+                .iter()
+                .any(|pattern| pattern_covers(pattern, path))
+    }
+
+    /// The branch both pins are ordered on.
+    pub fn branch(&self) -> &str {
+        if self.branch.is_empty() {
+            "main"
+        } else {
+            &self.branch
+        }
+    }
+}
+
 /// [`path_matches`], where a pattern without wildcards also covers everything under it as a
 /// directory (`dir` as well as `dir/`).
 fn pattern_covers(pattern: &str, path: &str) -> bool {
@@ -654,6 +697,10 @@ pub struct Config {
     /// treating their conflicts as real: see `recount`. Off by default.
     #[serde(default)]
     pub recount_pins: bool,
+    /// Commits of other repositories this one pins, resolved monotonically when changes are
+    /// combined (see [`PinConfig`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pins: Vec<PinConfig>,
     /// Identity for commits the queue creates.
     pub identity: IdentityConfig,
     /// Failure classes: failed tests matching a rule's pattern are labelled with its class in
@@ -708,6 +755,7 @@ impl Default for Config {
             trust_base: false,
             require_approval_at_head: false,
             recount_pins: false,
+            pins: Vec::new(),
             identity: IdentityConfig::default(),
             classify: Vec::new(),
             github: GitHubConfig::default(),
@@ -725,6 +773,11 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Whether `path` is a site of a configured pin.
+    pub fn pin_site(&self, path: &str) -> bool {
+        self.pins.iter().any(|pin| pin.covers(path))
+    }
+
     /// Resolved planning-probe concurrency (a configured 0 means the default).
     pub fn probe_parallelism(&self) -> usize {
         if self.probe_parallelism == 0 {

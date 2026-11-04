@@ -20,6 +20,7 @@ pub mod interrupt;
 pub mod model;
 pub mod notify;
 pub mod ops;
+pub mod pins;
 pub mod plan;
 pub mod probe_cache;
 pub mod recount;

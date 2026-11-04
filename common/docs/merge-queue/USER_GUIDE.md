@@ -693,6 +693,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `trust_base` | `false` | Skip probing the base in culprit searches. |
 | `require_approval_at_head` | `false` | Approval-at-head rule for GitHub ready sources; see `--require-approval-at-head`. |
 | `recount_pins` | `false` | Recount the generated count pins after merging each batch (base plus each change's own delta); see `--recount-pins`. A change whose pins cannot be recounted is skipped from its batch and stays queued. |
+| `pins` | `[]` | `[{name, gitlink, files, url, branch}]` commits of other repositories this one pins, resolved to the descendant when changes are combined; see "Pinned commits of other repositories". |
 | `classify` | `[]` | `[{pattern, class, evidence}]` failure classes (`evidence` left out of the file while empty); see `--classify`. |
 | `peers` | `{}` | Peer queue name to state directory. |
 | `identity` | empty | `{name, email}` for commits the queue creates. |
@@ -1371,6 +1372,57 @@ In rebase mode, a change whose head already sits on the base with linear history
 own commits, exactly as `git rebase` would leave it. So a change rebased onto the current base
 by its author lands with its own commit ID.
 
+## Pinned commits of other repositories
+
+A repository can pin one commit of another in several places at once. The pin is a submodule
+gitlink, and files repeat its hash: dependency manifests, lock files, build files. Two changes
+that each move such a pin conflict at every one of those sites. A change based on an older pin
+can also move it backwards. `pins` makes this deterministic: pins only move forward, and a change
+is refused only when its pin cannot be put in order.
+
+```json
+"pins": [{
+  "name": "dep",
+  "gitlink": "third-party/dep",
+  "files": ["*Cargo.toml", "*Cargo.lock", "tools/BUILD"],
+  "url": "https://example.com/dep",
+  "branch": "main"
+}]
+```
+
+- `gitlink` is the submodule path whose commit is the pin.
+- `files` names the files that repeat it, as `regenerate.paths` does: exact paths, directories,
+  or `*` patterns. Every full 40-hex occurrence of a pin hash in them is a site. A declared file
+  that carries no pin hash has no site, so a pattern may cover more files than carry the pin.
+- `url` and `branch` (default `main`) name where pins are ordered. The branch is fetched into
+  `refs/merge-queue/pins/<name>` only when a commit needed for that is missing.
+
+When a change touches any site, by moving the gitlink or by editing a declared file, the queue
+checks it after combining it onto the target:
+
+- **Consistency.** Every declared file in the change that carries a known pin (the target's,
+  the change's, or their merge base's) must carry the change's own gitlink commit and no other
+  known pin. A file left at an older pin, holding two, or moved to a hash the gitlink does not
+  name is a **partial update**: the change is ejected with kind `pin`, and the reason names
+  each such file.
+- **Order.** If the change moved the pin and the target pins a different commit, the
+  descendant wins at every site. When the change's pin wins, it must be on `branch`. Pins where
+  neither is an ancestor of the other (**diverged**), a pin missing from `url`, and a winning
+  pin that is not on `branch` eject the change with kind `pin`. A change that keeps the pin its
+  base had leaves the target's pin as it is, whatever it is.
+- **Sites.** Conflicts in sites settle on the target's side while combining (planning treats them
+  the same way, so two pin moves can share a batch). Each declared file that carries a pin, or
+  whose conflict was settled, is then merged again: a three-way merge of the target's, the merge
+  base's and the change's versions, with every known pin hash set to the winner. Pin hashes
+  never conflict there, and no other edit of either side is lost. A conflict outside the pin
+  remains a conflict and ejects the change. The gitlink is set to the winner. When anything
+  changes, it goes in one commit on the candidate: `Pin <name> at <commit>`.
+
+Each decision where the change moved the pin away from the target's is recorded in the run
+report (`pin_resolutions`: `{pr, pin, target, change, chosen, sites}`), in the run's events,
+and in the change's history (`pin-resolved`). A change that touches no site is never checked,
+and nothing is fetched for it.
+
 ## Union merges
 
 `union_paths` (`init --union-path`) names files merged with Git's built-in `union` driver, which
@@ -1388,7 +1440,8 @@ edits, which is why union is never on by default.
 `report.md` and `report.json` give the `mode` (`run`, `shadow`, `dry-run` or `widen`), the base
 before and after, what landed (changes, commit, the claim it was validated with, flaky tests, and a
 `note` for a partly landed batch), what was ejected and why, changes returned to the queue, new
-obligations, the batches a dry run `would_validate`, and a table of every validation: purpose
+obligations, the pins resolved to the descendant (`pin_resolutions`; see "Pinned commits of other
+repositories"), the batches a dry run `would_validate`, and a table of every validation: purpose
 (`batch`, `probe`, `remainder`, `widen`), changes, commit, selection and policy, result (green,
 red with the failed tests, or `cancelled`), `start_ms` (since the run began) and `elapsed_ms`,
 and when known `parent` (the commit the changes were combined onto), `speculation`, `cpu_ms`
