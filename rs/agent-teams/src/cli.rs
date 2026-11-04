@@ -8,8 +8,8 @@ use crate::model::{
     load_declaration, load_routes, load_teams, route_dirs, Declaration, RoutesFile, TeamsFile,
 };
 use crate::proof::{
-    ancestry_has_agent, coordinator_identity, identity_alive, identity_of, inside_unit,
-    load_declarations, sender_standing, SenderStanding,
+    ancestry_has_agent, coordinator_liveness, identity_of, inside_unit, load_declarations,
+    sender_standing, CoordinatorLiveness, SenderStanding,
 };
 use crate::route::{banner, read_frame, route_for, AttemptOutcome, Route};
 use crate::sender::{
@@ -610,16 +610,22 @@ fn cmd_check(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                             .get("registry")
                             .and_then(Value::as_str)
                             .map(crate::jsonfile::expand_home);
-                        let live =
-                            coordinator_identity(&declaration.designation, registry.as_deref())
-                                .is_some_and(|id| identity_alive(&id));
-                        if !live {
-                            problems.push(format!(
-                                "team {name}@{}: designated coordinator is not live",
-                                entry.host
-                            ));
-                        } else {
-                            lines.push(json!({"kind": "ok", "detail": format!("team {name}@{}: declaration live ({})", entry.host, declaration.deliverer_kind)}));
+                        match coordinator_liveness(&declaration.designation, registry.as_deref()) {
+                            CoordinatorLiveness::Live => {
+                                lines.push(json!({"kind": "ok", "detail": format!("team {name}@{}: declaration live ({})", entry.host, declaration.deliverer_kind)}));
+                            }
+                            CoordinatorLiveness::NotLive => {
+                                problems.push(format!(
+                                    "team {name}@{}: designated coordinator is not live",
+                                    entry.host
+                                ));
+                            }
+                            CoordinatorLiveness::Unreachable(reason) => {
+                                problems.push(format!(
+                                    "team {name}@{}: designated coordinator liveness unverified (agentcloud orchestrator unreachable: {reason})",
+                                    entry.host
+                                ));
+                            }
                         }
                     }
                     None => problems.push(format!(

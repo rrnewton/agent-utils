@@ -8,9 +8,19 @@
 //! declaration's delivery target against the registry's own control tree
 //! (the designated coordinator, and `managed_by` up to its root) so `check`,
 //! `accept` and `send` can refuse loudly instead.
+//!
+//! Designation re-roots the tree: once an agent is the designated
+//! coordinator it answers to nobody for these checks, whatever `managed_by`
+//! its record still shows (the edge stays as audit history; `coordinator
+//! set` does not rewrite another agent's record). Only a non-designated
+//! delivery target can be a child here. An agentcloud coordinator has no
+//! pinned process identity, so its liveness comes from the orchestrator
+//! (see `proof::CloudLiveness`), never from a local pid.
 
 use crate::model::{Declaration, Designation};
-use crate::proof::{agent_record, identity_alive, managed_by_chain, registry_coordinator_name};
+use crate::proof::{
+    agent_record, identity_alive, managed_by_chain, registry_coordinator_name, CloudLiveness,
+};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -193,9 +203,11 @@ pub fn managed_by_of(registry: &Path, agent: &str) -> Option<String> {
 
 fn flag(kind: &'static str, detail: String, fix: String) -> Flag {
     let severity = match kind {
-        "target-missing" | "target-archived" | "target-not-live" | "designation-not-live" => {
-            "error"
-        }
+        "target-missing"
+        | "target-archived"
+        | "target-not-live"
+        | "target-cloud-unreachable"
+        | "designation-not-live" => "error",
         _ => "warning",
     };
     Flag {
@@ -216,6 +228,15 @@ fn pinned_designation_live(declaration: &Declaration, registry: Option<&Path>) -
 /// control tree. Non-queue deliverers have no agent target; only a pinned
 /// designation's liveness is checked for them.
 pub fn evaluate(declaration: &Declaration) -> TargetHealth {
+    evaluate_with_cloud_probe(declaration, &crate::proof::cloud_liveness)
+}
+
+/// [`evaluate`] with the agentcloud liveness probe injected, so tests can
+/// answer for the orchestrator without one.
+pub fn evaluate_with_cloud_probe(
+    declaration: &Declaration,
+    cloud_probe: &dyn Fn(&Path, &str) -> Option<CloudLiveness>,
+) -> TargetHealth {
     let mut flags = Vec::new();
     let team = &declaration.team;
     if declaration.deliverer_kind != "agentctl-queue" {
@@ -339,40 +360,51 @@ pub fn evaluate(declaration: &Declaration) -> TargetHealth {
                         format!("revive {target_name} (`agentctl revive {target_name}`) or designate its successor: `agentctl coordinator set NEW`"),
                     ));
                 }
+            } else if let Some(liveness) = cloud_probe(&registry, &target_name) {
+                // No pinned process identity: an agentcloud target's
+                // liveness is the orchestrator's word, not a local pid.
+                match liveness {
+                    CloudLiveness::Live => {}
+                    CloudLiveness::NotLive => flags.push(flag(
+                        "target-not-live",
+                        format!("team {team}: delivery target {target_name:?} is not live (its agentcloud session is not active or attached, as the orchestrator reports it)"),
+                        format!("revive {target_name} (`agentctl revive {target_name}`) or designate its successor: `agentctl coordinator set NEW`"),
+                    )),
+                    CloudLiveness::Unreachable(reason) => flags.push(flag(
+                        "target-cloud-unreachable",
+                        format!("team {team}: delivery target {target_name:?} is an agentcloud session whose liveness is unverified ({reason}); delivery is still attempted"),
+                        "check the agentcloud orchestrator is reachable (`agentcloudctl list`), then `agent-teams check`".to_string(),
+                    )),
+                }
             }
         }
     }
-    // Control-tree shape: the target must be the root, and the tree's root
-    // must be the designated coordinator.
-    if let Some(parent) = managed_by_of(&registry, &target_name) {
-        flags.push(flag(
-            "target-is-child",
-            format!("team {team}: delivery target {target_name:?} is managed by {parent:?}; it is a child tab, not the root coordinator"),
-            format!("designate the root instead: `agentctl coordinator set {}` and re-run `agent-teams init {team} --registry {}`", managed_by_chain(&registry, &target_name).last().cloned().unwrap_or_default(), registry.display()),
-        ));
-    }
-    let chain = managed_by_chain(&registry, &target_name);
-    if let Some(root) = chain.last() {
-        if designated.as_deref() != Some(root.as_str()) {
-            let root_live = agent_record(&registry, root)
-                .is_some_and(|(identity, _)| identity_alive(&identity));
-            if root_live {
-                flags.push(flag(
-                    "tree-root-mismatch",
-                    format!("team {team}: the root of {target_name:?}'s managed-by tree is {root:?}, a live agent that is not the designated coordinator"),
-                    format!("run `agentctl coordinator set {root}` if that root should coordinate, or re-point the declaration: `agent-teams init {team} --registry {}`", registry.display()),
-                ));
-            }
+    // Control-tree shape: a non-designated target must be the root, and the
+    // tree's root must be the designated coordinator. The designated
+    // coordinator itself is the root by designation (see the module docs):
+    // its recorded `managed_by` edge names whoever started it, which stops
+    // counting the moment it is designated, so neither `target-is-child`
+    // nor a root mismatch can fire for it.
+    if designated.as_deref() != Some(target_name.as_str()) {
+        if let Some(parent) = managed_by_of(&registry, &target_name) {
+            flags.push(flag(
+                "target-is-child",
+                format!("team {team}: delivery target {target_name:?} is managed by {parent:?}; it is a child tab, not the root coordinator"),
+                format!("designate the root instead: `agentctl coordinator set {}` and re-run `agent-teams init {team} --registry {}`", managed_by_chain(&registry, &target_name).last().cloned().unwrap_or_default(), registry.display()),
+            ));
         }
-    }
-    if let Some(root) = &designated {
-        if target_name != *root || pinned.is_none() {
-            if let Some(parent) = managed_by_of(&registry, root) {
-                flags.push(flag(
-                    "designated-not-root",
-                    format!("team {team}: designated coordinator {root:?} is managed by {parent:?}; a coordinator must be the root of its control tree"),
-                    format!("run `agentctl manage {root} --clear` so it answers to nobody, or designate its root: `agentctl coordinator set {parent}`"),
-                ));
+        let chain = managed_by_chain(&registry, &target_name);
+        if let Some(root) = chain.last() {
+            if designated.as_deref() != Some(root.as_str()) {
+                let root_live = agent_record(&registry, root)
+                    .is_some_and(|(identity, _)| identity_alive(&identity));
+                if root_live {
+                    flags.push(flag(
+                        "tree-root-mismatch",
+                        format!("team {team}: the root of {target_name:?}'s managed-by tree is {root:?}, a live agent that is not the designated coordinator"),
+                        format!("run `agentctl coordinator set {root}` if that root should coordinate, or re-point the declaration: `agent-teams init {team} --registry {}`", registry.display()),
+                    ));
+                }
             }
         }
     }
@@ -507,32 +539,124 @@ mod tests {
     }
 
     #[test]
-    fn child_target_and_designated_not_root_flag() {
+    fn designated_child_is_the_root() {
+        // Designation re-roots: a designated coordinator managed by its
+        // starter is the root, so no child or not-root flag fires for it.
         let dir = fixture(
             &[("root", None, true), ("child", Some("root"), true)],
             Some("child"),
         );
         let health = evaluate(&declaration(&dir, None));
+        assert!(health.flags.is_empty(), "flags: {:?}", health.flags);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_designated_child_target_still_flags() {
+        let dir = fixture(
+            &[
+                ("coord", None, true),
+                ("root", None, true),
+                ("child", Some("root"), true),
+            ],
+            Some("coord"),
+        );
+        let health = evaluate(&declaration(&dir, Some("child")));
         let found = kinds(&health);
         assert!(found.contains(&"target-is-child"), "{found:?}");
-        assert!(found.contains(&"designated-not-root"), "{found:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn tree_root_mismatch_flags_live_other_root() {
-        // Designated coord is a child of live root; target resolves to coord.
+        // A non-designated target whose tree roots at a live agent that is
+        // not the designated coordinator.
         let dir = fixture(
-            &[("root", None, true), ("coord", Some("root"), true)],
+            &[
+                ("coord", None, true),
+                ("root", None, true),
+                ("coord2", Some("root"), true),
+            ],
             Some("coord"),
         );
-        let health = evaluate(&declaration(&dir, None));
+        let health = evaluate(&declaration(&dir, Some("coord2")));
         let found = kinds(&health);
         assert!(
             found.contains(&"tree-root-mismatch"),
             "{found:?} {:?}",
             health.flags
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Registry holding one agentcloud coordinator (`coord7`, started by
+    /// `coord6`) with no pinned process identity, as agentctl records it.
+    fn cloud_fixture() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10_000);
+        let dir = std::env::temp_dir().join(format!(
+            "agent-teams-health-cloud-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let agent_dir = dir.join("agents").join("coord7");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let record = json!({
+            "name": "coord7", "harness": "agentcloud", "adapter": "agentcloud",
+            "harness_identity": null,
+            "session_value": "2bed1f68-4b34-4880-b933-4913caecf0e6",
+            "agentcloud": {"endpoint": "wss://orchestrator.example/ws"},
+            "managed_by": {"agent": "coord6", "registry": dir.to_string_lossy(), "token": "t"},
+        });
+        std::fs::write(
+            agent_dir.join("agent.json"),
+            serde_json::to_string(&record).expect("record json"),
+        )
+        .expect("record file");
+        std::fs::write(dir.join("coordinator.json"), "{\"name\": \"coord7\"}")
+            .expect("designation");
+        dir
+    }
+
+    #[test]
+    fn live_agentcloud_coordinator_is_healthy_and_root() {
+        let dir = cloud_fixture();
+        let health =
+            evaluate_with_cloud_probe(&declaration(&dir, None), &|_, _| Some(CloudLiveness::Live));
+        assert_eq!(health.target.as_deref(), Some("coord7"));
+        assert!(health.flags.is_empty(), "flags: {:?}", health.flags);
+        assert!(health.undeliverable().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inactive_agentcloud_coordinator_is_not_live() {
+        let dir = cloud_fixture();
+        let health = evaluate_with_cloud_probe(&declaration(&dir, None), &|_, _| {
+            Some(CloudLiveness::NotLive)
+        });
+        let flag = health
+            .flags
+            .iter()
+            .find(|flag| flag.kind == "target-not-live")
+            .expect("not-live flagged");
+        assert!(flag.is_error());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreachable_orchestrator_is_distinct_and_still_deliverable() {
+        let dir = cloud_fixture();
+        let health = evaluate_with_cloud_probe(&declaration(&dir, None), &|_, _| {
+            Some(CloudLiveness::Unreachable("probe timed out".to_string()))
+        });
+        let flag = health
+            .flags
+            .iter()
+            .find(|flag| flag.kind == "target-cloud-unreachable")
+            .expect("unreachable flagged distinctly");
+        assert!(flag.is_error());
+        assert!(flag.detail.contains("unverified"), "{}", flag.detail);
+        assert!(health.undeliverable().is_none(), "{:?}", health.flags);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

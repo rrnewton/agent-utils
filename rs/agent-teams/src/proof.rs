@@ -255,6 +255,227 @@ pub fn coordinator_identity(
     }
 }
 
+/// Agentcloud facts recorded for one agent: its session and the
+/// orchestrator endpoint every probe of that session must use.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CloudInfo {
+    /// The agentcloud session ID (`session_value` in the record).
+    pub session_id: String,
+    /// Recorded orchestrator endpoint (`agentcloud.endpoint`), when present.
+    pub endpoint: Option<String>,
+}
+
+/// The agentcloud facts recorded for `agent`, when it is an agentcloud
+/// session. Unlike [`agent_record`], this needs no pinned process identity:
+/// an agentcloud record carries `harness_identity: null` and
+/// `harness_pid: null` by design, because the orchestrator spawns a fresh
+/// harness process per turn, so no local pid can name the session.
+pub fn cloud_info(registry: &Path, agent: &str) -> Option<CloudInfo> {
+    let directory = agent_queue::registry::directory(registry, agent).ok()?;
+    let text = std::fs::read_to_string(directory.join("agent.json")).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let cloud = value.get("agentcloud").cloned().unwrap_or(Value::Null);
+    if value.get("harness").and_then(Value::as_str) != Some("agentcloud")
+        && value.get("adapter").and_then(Value::as_str) != Some("agentcloud")
+        && cloud.is_null()
+    {
+        return None;
+    }
+    let session_id = value
+        .get("session_value")
+        .and_then(Value::as_str)
+        .filter(|session| !session.is_empty())?
+        .to_string();
+    let endpoint = cloud
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(str::to_string);
+    Some(CloudInfo {
+        session_id,
+        endpoint,
+    })
+}
+
+/// Whether an agentcloud session can receive work, as its orchestrator
+/// reports it. `Unreachable` is deliberately distinct from `NotLive`: the
+/// probe itself failed (binary missing, timeout, non-zero exit, unparsable
+/// output), so liveness is unverified rather than disproved, and callers
+/// must say so instead of silently passing or failing the coordinator.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CloudLiveness {
+    /// The session is active: running, attached, or waiting for input.
+    Live,
+    /// The orchestrator answered and the session is absent or inactive.
+    NotLive,
+    /// The orchestrator could not be asked; liveness is unverified.
+    Unreachable(String),
+}
+
+/// Judge one session from an `agentcloudctl list` document (a JSON array
+/// of fleet rows). A session counts as live when the orchestrator reports
+/// it active: a run in flight, a node attached (its `agentterm` viewer),
+/// or an activity other than `idle` (for example `waiting` on a queued
+/// first prompt). A merely on-disk row (`running: false`, `activity:
+/// "idle"`, nothing attached) is a finished session, not a coordinator.
+pub fn parse_cloud_liveness(listing: &Value, session_id: &str) -> CloudLiveness {
+    let Some(rows) = listing.as_array() else {
+        return CloudLiveness::Unreachable("agentcloudctl list printed no JSON array".to_string());
+    };
+    let Some(row) = rows
+        .iter()
+        .find(|row| row.get("session_id").and_then(Value::as_str) == Some(session_id))
+    else {
+        return CloudLiveness::NotLive;
+    };
+    let running = row.get("running").and_then(Value::as_bool) == Some(true);
+    let attached = row
+        .get("attached_nodes")
+        .and_then(Value::as_array)
+        .is_some_and(|nodes| !nodes.is_empty());
+    let active = row
+        .get("activity")
+        .and_then(Value::as_str)
+        .is_some_and(|activity| !activity.is_empty() && activity != "idle");
+    if running || attached || active {
+        CloudLiveness::Live
+    } else {
+        CloudLiveness::NotLive
+    }
+}
+
+/// The `agentcloudctl` binary used for session probes:
+/// `$AGENT_TEAMS_AGENTCLOUDCTL`, else `agentcloudctl` on PATH.
+fn agentcloudctl_binary() -> PathBuf {
+    if let Some(chosen) = std::env::var_os("AGENT_TEAMS_AGENTCLOUDCTL") {
+        return PathBuf::from(chosen);
+    }
+    PathBuf::from("agentcloudctl")
+}
+
+/// How long one agentcloud liveness probe may run. The orchestrator is a
+/// network service; an unbounded probe would hang `check` exactly when it
+/// is down, which is when the answer matters most.
+const CLOUD_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Run `command` to completion under `timeout`, returning its success and
+/// stdout. The child's stdout is drained on its own thread so a verbose
+/// listing can never fill the pipe and stall the probe past its bound.
+fn run_bounded(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<(bool, String), String> {
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot run probe: {error}"))?;
+    let reader = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+            text
+        })
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("probe timed out after {}s", timeout.as_secs()));
+            }
+            Err(error) => return Err(format!("probe wait failed: {error}")),
+        }
+    };
+    let stdout = reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    Ok((status.success(), stdout))
+}
+
+/// Probe one agentcloud session's liveness through `agentcloudctl list`,
+/// bounded by [`CLOUD_PROBE_TIMEOUT`]. The recorded endpoint is passed
+/// explicitly so the probe reaches the orchestrator the session lives on.
+pub fn probe_cloud_liveness(info: &CloudInfo) -> CloudLiveness {
+    probe_cloud_liveness_with(&agentcloudctl_binary(), info, CLOUD_PROBE_TIMEOUT)
+}
+
+fn probe_cloud_liveness_with(
+    ctl: &Path,
+    info: &CloudInfo,
+    timeout: std::time::Duration,
+) -> CloudLiveness {
+    let mut command = std::process::Command::new(ctl);
+    command.arg("list");
+    if let Some(endpoint) = &info.endpoint {
+        command.args(["--ws-url", endpoint]);
+    }
+    match run_bounded(command, timeout) {
+        Ok((true, stdout)) => match serde_json::from_str::<Value>(&stdout) {
+            Ok(listing) => parse_cloud_liveness(&listing, &info.session_id),
+            Err(error) => CloudLiveness::Unreachable(format!(
+                "agentcloudctl list printed invalid JSON: {error}"
+            )),
+        },
+        Ok((false, _)) => CloudLiveness::Unreachable(
+            "agentcloudctl list exited non-zero; orchestrator unreachable or refused the probe"
+                .to_string(),
+        ),
+        Err(reason) => CloudLiveness::Unreachable(reason),
+    }
+}
+
+/// Liveness of one registered agent's agentcloud session, when it is one.
+pub fn cloud_liveness(registry: &Path, agent: &str) -> Option<CloudLiveness> {
+    let info = cloud_info(registry, agent)?;
+    Some(probe_cloud_liveness(&info))
+}
+
+/// Whether a designation's coordinator can receive work, however it is
+/// hosted: a pinned or Herdr-hosted coordinator by its process identity,
+/// an agentcloud coordinator by its orchestrator-reported session state.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CoordinatorLiveness {
+    /// The coordinator can receive work now.
+    Live,
+    /// The coordinator is verifiably gone or inactive.
+    NotLive,
+    /// Liveness could not be verified (the orchestrator is unreachable);
+    /// distinct from both answers above, never a silent pass.
+    Unreachable(String),
+}
+
+/// Liveness of the coordinator a designation names.
+pub fn coordinator_liveness(
+    designation: &Designation,
+    registry: Option<&Path>,
+) -> CoordinatorLiveness {
+    if let Designation::Registry = designation {
+        if let Some(registry) = registry {
+            if let Some(name) = registry_coordinator_name(registry) {
+                if let Some(liveness) = cloud_liveness(registry, &name) {
+                    return match liveness {
+                        CloudLiveness::Live => CoordinatorLiveness::Live,
+                        CloudLiveness::NotLive => CoordinatorLiveness::NotLive,
+                        CloudLiveness::Unreachable(reason) => {
+                            CoordinatorLiveness::Unreachable(reason)
+                        }
+                    };
+                }
+            }
+        }
+    }
+    match coordinator_identity(designation, registry) {
+        Some(identity) if identity_alive(&identity) => CoordinatorLiveness::Live,
+        _ => CoordinatorLiveness::NotLive,
+    }
+}
+
 /// Walk `managed_by` from `agent` up to the tree root; returns the chain
 /// (agent first, root last). Cycles stop the walk.
 pub fn managed_by_chain(registry: &Path, agent: &str) -> Vec<String> {
@@ -290,6 +511,20 @@ pub enum SenderStanding {
 
 /// Prove the caller's standing for one declaration on this host.
 pub fn sender_standing(designation: &Designation, registry: Option<&Path>) -> SenderStanding {
+    // An agentcloud coordinator has no local harness process to find in
+    // the ancestry: the caller proves it is the coordinator by running
+    // inside the designated session itself (`$AGENTCLOUD_SESSION_ID`,
+    // stamped into every execution the session drives).
+    if let (Designation::Registry, Some(registry)) = (designation, registry) {
+        if let Some(name) = registry_coordinator_name(registry) {
+            if let Some(info) = cloud_info(registry, &name) {
+                let caller = std::env::var("AGENTCLOUD_SESSION_ID").unwrap_or_default();
+                if !caller.is_empty() && caller == info.session_id {
+                    return SenderStanding::Coordinator;
+                }
+            }
+        }
+    }
     let Some(coordinator) = coordinator_identity(designation, registry) else {
         return SenderStanding::Unknown;
     };
@@ -513,6 +748,136 @@ mod record_tests {
         assert_eq!(dirs[1], PathBuf::from("/home/someone/bin"));
         assert_eq!(dirs[2], PathBuf::from("/usr/bin"));
         assert!(augmented_path(None, None).is_none());
+    }
+
+    const CLOUD_SESSION: &str = "2bed1f68-4b34-4880-b933-4913caecf0e6";
+
+    fn cloud_registry(session: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-teams-cloud-test-{}-{}",
+            std::process::id(),
+            session.len()
+        ));
+        let agent_dir = dir.join("agents").join("coord7");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let record = serde_json::json!({
+            "name": "coord7", "harness": "agentcloud", "adapter": "agentcloud",
+            "harness_identity": null, "session_value": session,
+            "agentcloud": {"endpoint": "wss://orchestrator.example/ws"},
+            "managed_by": {"agent": "coord6"},
+        });
+        std::fs::write(
+            agent_dir.join("agent.json"),
+            serde_json::to_string(&record).expect("record json"),
+        )
+        .expect("record file");
+        std::fs::write(dir.join("coordinator.json"), "{\"name\": \"coord7\"}")
+            .expect("designation file");
+        dir
+    }
+
+    #[test]
+    fn cloud_info_reads_session_without_a_process_identity() {
+        let dir = cloud_registry(CLOUD_SESSION);
+        let info = cloud_info(&dir, "coord7").expect("cloud info");
+        assert_eq!(info.session_id, CLOUD_SESSION);
+        assert_eq!(
+            info.endpoint.as_deref(),
+            Some("wss://orchestrator.example/ws")
+        );
+        // The same record yields no pinned process identity: that absence
+        // is exactly why liveness must come from the orchestrator.
+        assert!(agent_record(&dir, "coord7").is_none());
+        assert!(coordinator_identity(&Designation::Registry, Some(&dir)).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cloud_liveness_judges_orchestrator_rows() {
+        let live_running = serde_json::json!([
+            {"session_id": CLOUD_SESSION, "running": true, "activity": "working", "attached_nodes": []}
+        ]);
+        assert_eq!(
+            parse_cloud_liveness(&live_running, CLOUD_SESSION),
+            CloudLiveness::Live
+        );
+        let live_attached = serde_json::json!([
+            {"session_id": CLOUD_SESSION, "running": false, "activity": "idle", "attached_nodes": ["node-a"]}
+        ]);
+        assert_eq!(
+            parse_cloud_liveness(&live_attached, CLOUD_SESSION),
+            CloudLiveness::Live
+        );
+        let live_waiting = serde_json::json!([
+            {"session_id": CLOUD_SESSION, "running": false, "activity": "waiting", "attached_nodes": []}
+        ]);
+        assert_eq!(
+            parse_cloud_liveness(&live_waiting, CLOUD_SESSION),
+            CloudLiveness::Live
+        );
+        let on_disk = serde_json::json!([
+            {"session_id": CLOUD_SESSION, "running": false, "activity": "idle", "attached_nodes": []}
+        ]);
+        assert_eq!(
+            parse_cloud_liveness(&on_disk, CLOUD_SESSION),
+            CloudLiveness::NotLive
+        );
+        let absent = serde_json::json!([{"session_id": "someone-else", "running": true}]);
+        assert_eq!(
+            parse_cloud_liveness(&absent, CLOUD_SESSION),
+            CloudLiveness::NotLive
+        );
+        assert!(matches!(
+            parse_cloud_liveness(&serde_json::json!({"rows": []}), CLOUD_SESSION),
+            CloudLiveness::Unreachable(_)
+        ));
+    }
+
+    #[test]
+    fn cloud_probe_distinguishes_down_orchestrator_from_dead_session() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("agent-teams-cloud-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let info = CloudInfo {
+            session_id: CLOUD_SESSION.to_string(),
+            endpoint: None,
+        };
+        let write_ctl = |name: &str, body: &str| {
+            let script = dir.join(name);
+            let mut file = std::fs::File::create(&script).expect("script");
+            file.write_all(body.as_bytes()).expect("script body");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("script mode");
+            script
+        };
+        let live = write_ctl(
+            "ctl-live",
+            &format!(
+                "#!/bin/sh\necho '[{{\"session_id\": \"{CLOUD_SESSION}\", \"running\": false, \"activity\": \"idle\", \"attached_nodes\": [\"node-a\"]}}]'\n"
+            ),
+        );
+        assert_eq!(
+            probe_cloud_liveness_with(&live, &info, std::time::Duration::from_secs(10)),
+            CloudLiveness::Live
+        );
+        let down = write_ctl("ctl-down", "#!/bin/sh\nexit 1\n");
+        assert!(matches!(
+            probe_cloud_liveness_with(&down, &info, std::time::Duration::from_secs(10)),
+            CloudLiveness::Unreachable(_)
+        ));
+        let garbage = write_ctl("ctl-garbage", "#!/bin/sh\necho 'not json'\n");
+        assert!(matches!(
+            probe_cloud_liveness_with(&garbage, &info, std::time::Duration::from_secs(10)),
+            CloudLiveness::Unreachable(_)
+        ));
+        let slow = write_ctl("ctl-slow", "#!/bin/sh\nsleep 5\n");
+        assert!(matches!(
+            probe_cloud_liveness_with(&slow, &info, std::time::Duration::from_millis(200)),
+            CloudLiveness::Unreachable(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -757,3 +757,55 @@ pub fn deliverer_for(
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The agentctl-queue deliverer hands over to an agentcloud
+    /// coordinator exactly as to a Herdr one: the item lands in its queue
+    /// (agentctl's drainers journal it into the session from there, the
+    /// same path `agentctl send` takes), and the target is deliverable —
+    /// its record carries no pinned process identity to refuse on.
+    #[test]
+    fn queue_deliverer_delivers_to_an_agentcloud_coordinator() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-teams-deliver-cloud-{}", std::process::id()));
+        let agent_dir = dir.join("agents").join("coord7");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let record = json!({
+            "name": "coord7", "harness": "agentcloud", "adapter": "agentcloud",
+            "harness_identity": null,
+            "session_value": "2bed1f68-4b34-4880-b933-4913caecf0e6",
+            "agentcloud": {"endpoint": "wss://orchestrator.example/ws"},
+            "managed_by": {"agent": "coord6"},
+        });
+        std::fs::write(
+            agent_dir.join("agent.json"),
+            serde_json::to_string(&record).expect("record json"),
+        )
+        .expect("record file");
+        std::fs::write(dir.join("coordinator.json"), "{\"name\": \"coord7\"}")
+            .expect("designation");
+        let deliverer = AgentctlQueueDeliverer {
+            team: "tools".to_string(),
+            queue_dir: agent_dir.join("queue"),
+            ledger_path: dir.join("ledger.json"),
+            registry: dir.clone(),
+            agent: "coord7".to_string(),
+            auto_drain: AutoDrain {
+                enabled: false,
+                ready_timeout_seconds: 120,
+            },
+            drain_state_dir: None,
+        };
+        let envelope = json!({"id": "m-1", "body_sha256": "abc"});
+        assert_eq!(deliverer.undeliverable_reason(), None);
+        assert_eq!(
+            deliverer.handover("m-1", &envelope, "hello coordinator"),
+            Handover::Accepted
+        );
+        assert_eq!(deliverer.contains("m-1"), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

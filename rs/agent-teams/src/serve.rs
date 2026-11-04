@@ -5,7 +5,7 @@
 use crate::deliver::deliverer_for;
 use crate::jsonfile::DataResult;
 use crate::ledger::{accept, fence, receipt, AcceptContext};
-use crate::proof::{coordinator_identity, identity_alive, load_declarations};
+use crate::proof::{coordinator_liveness, load_declarations, CoordinatorLiveness};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -101,15 +101,23 @@ pub fn probe(state: &Path, this_host: &str) -> Value {
                     .get("registry")
                     .and_then(Value::as_str)
                     .map(crate::jsonfile::expand_home);
-                let coordinator =
-                    coordinator_identity(&declaration.designation, registry.as_deref());
-                let live = coordinator.as_ref().is_some_and(identity_alive);
-                if !live {
-                    findings.push(json!({
-                        "kind": "coordinator-not-live",
-                        "team": team,
-                        "detail": "the designated coordinator process is not live with its recorded identity",
-                    }));
+                let liveness = coordinator_liveness(&declaration.designation, registry.as_deref());
+                match &liveness {
+                    CoordinatorLiveness::Live => {}
+                    CoordinatorLiveness::NotLive => {
+                        findings.push(json!({
+                            "kind": "coordinator-not-live",
+                            "team": team,
+                            "detail": "the designated coordinator is not live (no live harness process with its recorded identity, and no active agentcloud session)",
+                        }));
+                    }
+                    CoordinatorLiveness::Unreachable(reason) => {
+                        findings.push(json!({
+                            "kind": "coordinator-liveness-unverified",
+                            "team": team,
+                            "detail": format!("the designated coordinator's liveness is unverified: the agentcloud orchestrator is unreachable ({reason})"),
+                        }));
+                    }
                 }
                 let mut relay_peers = serde_json::Map::new();
                 let mut relay_channels = Vec::new();
@@ -122,6 +130,10 @@ pub fn probe(state: &Path, this_host: &str) -> Value {
                         "fleet": entry.fleet, "peers": entry.peers,
                     }));
                 }
+                let coordinator = crate::proof::coordinator_identity(
+                    &declaration.designation,
+                    registry.as_deref(),
+                );
                 teams.push(json!({
                     "team": team,
                     "declaration": path.to_string_lossy(),
@@ -129,7 +141,12 @@ pub fn probe(state: &Path, this_host: &str) -> Value {
                     "relay_peers": relay_peers,
                     "relay_pubkey": crate::relay::own_public_key(state, team, this_host),
                     "relay_channels": relay_channels,
-                    "coordinator_live": live,
+                    "coordinator_live": liveness == CoordinatorLiveness::Live,
+                    "coordinator_liveness": match &liveness {
+                        CoordinatorLiveness::Live => "live",
+                        CoordinatorLiveness::NotLive => "not-live",
+                        CoordinatorLiveness::Unreachable(_) => "unverified",
+                    },
                     "coordinator": coordinator.map(|c| json!({
                         "boot_id": c.boot_id, "pid": c.pid, "starttime_ticks": c.starttime_ticks,
                     })),
