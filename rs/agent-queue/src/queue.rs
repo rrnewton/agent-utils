@@ -619,10 +619,28 @@ fn repend_never_typed(directories: &QueueDirectories, path: &Path) -> Result<boo
     let Ok(mut document) = load_message(path) else {
         return Ok(false);
     };
-    if document.get("paste_tracking") != Some(&Value::Bool(true))
-        || document.contains_key("paste_started_at")
+    // A never-typed item (no delivery attempt recorded) whose error is a
+    // pre-typing refusal is also provably untyped, even if a stale paste
+    // stamp survived: it must be retried, never "possibly submitted".
+    let never_typed_error = document
+        .get("delivery_attempts")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        == 0
+        && document
+            .get("delivery_error")
+            .and_then(Value::as_str)
+            .is_some_and(|e| {
+                e.contains("nothing was typed") || e.contains("does not show a recognisable")
+            });
+    if !never_typed_error
+        && (document.get("paste_tracking") != Some(&Value::Bool(true))
+            || document.contains_key("paste_started_at"))
     {
         return Ok(false);
+    }
+    if never_typed_error {
+        document.remove("paste_started_at");
     }
     let lane = match document.get("inflight_from").and_then(Value::as_str) {
         Some("inbox") => &directories.inbox,

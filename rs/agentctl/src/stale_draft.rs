@@ -264,13 +264,33 @@ fn paste_length(text: &str) -> usize {
     text.chars().count() - text.matches("\r\n").count()
 }
 
+/// Line count a `[Pasted text #K +M lines]` label shows (M = lines - 1).
+fn pasted_line_count(label: &str) -> Option<usize> {
+    let compacted = compact(label);
+    let after = compacted.rsplit_once('+')?.1;
+    after.strip_suffix("lines]")?.parse().ok()
+}
+
 /// Whether a placeholder draft is the paste of `text` that `document` records.
 fn placeholder_matches(draft: &Draft, text: &str, document: &Map<String, Value>) -> bool {
+    placeholder_matches_q(draft, text, document, false)
+}
+
+fn placeholder_matches_q(
+    draft: &Draft,
+    text: &str,
+    document: &Map<String, Value>,
+    quarantined: bool,
+) -> bool {
     match draft {
         Draft::Text(_) => false,
         Draft::Placeholder(length) => paste_length(text) == *length,
         Draft::PastedLines(label) => {
             document.get("paste_label").and_then(Value::as_str) == Some(label.as_str())
+                || (quarantined
+                    && document.get("paste_label").is_none()
+                    && pasted_line_count(label)
+                        .is_some_and(|m| text.lines().count().saturating_sub(1) == m))
         }
     }
 }
@@ -375,7 +395,7 @@ pub(crate) fn find(
                 // number), so it attributes the draft however the delivery
                 // was recorded (#808). A character-count placeholder carries
                 // no such proof and keeps the rule above.
-                Draft::PastedLines(_) => placeholder_matches(draft, text, document),
+                Draft::PastedLines(_) => placeholder_matches_q(draft, text, document, quarantined),
                 _ => {
                     placeholder_matches(draft, text, document)
                         && (vouching == Vouching::Recent || quarantined)
@@ -524,11 +544,13 @@ fn composite_match(records: &[Record], rows: &str, vouching: Vouching) -> Option
                     return false;
                 }
                 match segment {
-                    Segment::Paste(label) => record
-                        .2
-                        .get("paste_label")
-                        .and_then(Value::as_str)
-                        .is_some_and(|held| held == label),
+                    Segment::Paste(label) => {
+                        record.2.get("paste_label").and_then(Value::as_str) == Some(label.as_str())
+                            || (quarantined
+                                && record.2.get("paste_label").is_none()
+                                && pasted_line_count(label)
+                                    .is_some_and(|m| text.lines().count().saturating_sub(1) == m))
+                    }
                     Segment::Chars(length) => {
                         paste_length(text) == *length
                             && (vouching == Vouching::Recent || quarantined)
@@ -1046,6 +1068,37 @@ message number {index:02}"
         assert_eq!(found.id, "second");
         assert_eq!(found.others.len(), 1);
         assert_eq!(found.others[0].0, "first");
+    }
+
+    #[test]
+    fn composite_placeholders_without_labels_match_failed_by_line_count() {
+        // Regression 184e410b: stranded pastes that timed out at the stage
+        // window have no recorded paste_label; their failed records still
+        // reconcile by line count so the composite is not refused forever.
+        let directory = Scratch::new("composite-no-label");
+        let queue = directory.0.as_path();
+        let first = format!("{HEADER}\n{}", "x\n".repeat(21) + "x");
+        let second = format!("{HEADER}\n{}", "y\n".repeat(14) + "y");
+        record(
+            queue,
+            "failed",
+            "first",
+            &json!({"text": first, "inflight_at": 1.0}),
+        );
+        record(
+            queue,
+            "failed",
+            "second",
+            &json!({"text": second, "inflight_at": 2.0}),
+        );
+        let found = find(
+            queue,
+            &Draft::from_composer("[Pasted text #580 +22 lines][Pasted text #613 +15 lines]"),
+            Vouching::Unproven,
+            SystemTime::now(),
+        )
+        .expect("composite of failed pastes reconciles by line count");
+        assert_eq!(found.others.len(), 1);
     }
 
     #[test]

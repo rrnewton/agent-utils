@@ -1684,18 +1684,22 @@ impl ManagedApi for HerdrClient {
                 }
             };
         if crate::submission::verifies(&harness, text) {
-            return crate::submission::submit_verified(
-                &GuardedPrompt(terminal),
-                pane,
-                &harness,
-                text,
-                SubmitTimeouts::default(),
-                runtime,
-            );
+            return crate::pane_admission::admit(pane, "subagents", "", "verified", || {
+                crate::submission::submit_verified(
+                    &GuardedPrompt(terminal),
+                    pane,
+                    &harness,
+                    text,
+                    SubmitTimeouts::default(),
+                    runtime,
+                )
+            });
         }
-        terminal
-            .native_prompt(pane, text)
-            .map(|()| Submission::Unconfirmed)
+        crate::pane_admission::admit(pane, "subagents", "", "unconfirmed", || {
+            terminal
+                .native_prompt(pane, text)
+                .map(|()| Submission::Unconfirmed)
+        })
     }
     fn submit_guarded(
         &self,

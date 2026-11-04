@@ -492,18 +492,22 @@ impl AgentApi for HerdrClient {
                 client: self,
                 runtime,
             };
-            return crate::submission::submit_verified(
-                &terminal,
-                pane_id,
-                &harness,
-                text,
-                SubmitTimeouts::default(),
-                runtime,
-            );
+            return crate::pane_admission::admit(pane_id, "agentctl", "", "verified", || {
+                crate::submission::submit_verified(
+                    &terminal,
+                    pane_id,
+                    &harness,
+                    text,
+                    SubmitTimeouts::default(),
+                    runtime,
+                )
+            });
         }
         runtime.input_started();
-        HerdrClient::prompt_agent_with_cancellation(self, pane_id, text, &cancelled)
-            .map(|()| Submission::Unconfirmed)
+        crate::pane_admission::admit(pane_id, "agentctl", "", "unconfirmed", || {
+            HerdrClient::prompt_agent_with_cancellation(self, pane_id, text, &cancelled)
+                .map(|()| Submission::Unconfirmed)
+        })
     }
 
     fn wait_agent_status_with_runtime(

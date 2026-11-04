@@ -38,6 +38,12 @@ pub const SCREEN_LINES: usize = 200;
 /// pane wait too, and any new paste placeholder drawn in that time, even another
 /// sender's, counts as this paste.
 pub const STAGE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Extra bounded wait, after [`STAGE_TIMEOUT`], for a paste drawn late on a
+/// busy pane (poll slows to [`STAGE_POLL_SLOW`]). Total stage bound is
+/// STAGE_TIMEOUT + STAGE_GRACE (5 min). Never strands our own paste early.
+pub const STAGE_GRACE: Duration = Duration::from_secs(240);
+/// Poll interval during the late-paste grace.
+pub const STAGE_POLL_SLOW: Duration = Duration::from_secs(2);
 /// Maximum time spent retrying the submission key and waiting for corroboration.
 pub const SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Maximum time spent waiting, before typing anything, for a recognisable composer.
@@ -280,6 +286,8 @@ impl PromptTerminal for GuardedPrompt<'_> {
 pub struct SubmitTimeouts {
     /// Wait for the pasted text to become visible.
     pub stage: Duration,
+    /// Extra late-paste grace after `stage` (see [`STAGE_GRACE`]).
+    pub stage_grace: Duration,
     /// Wait for the submission to be proven.
     pub submit: Duration,
     /// Wait, before typing, for a recognisable composer.
@@ -290,6 +298,7 @@ impl Default for SubmitTimeouts {
     fn default() -> Self {
         Self {
             stage: STAGE_TIMEOUT,
+            stage_grace: STAGE_GRACE,
             submit: SUBMIT_TIMEOUT,
             composer: COMPOSER_WAIT,
         }
@@ -713,6 +722,63 @@ fn staged(view: &ComposerView, text: &str, placeholders_before: usize) -> bool {
         || paste_placeholders(&view.composer) > placeholders_before
 }
 
+/// Bottom `K` non-blank rows of a screen, for harness-agnostic tail checks.
+pub(crate) fn bottom_region(screen: &str) -> String {
+    let rows: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+    rows[rows.len().saturating_sub(30)..].join("\n")
+}
+
+fn squash(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// Harness-agnostic static-tail detector (fallback for every harness):
+/// our text fuzzy-matches the bottom region (word shingles / placeholder).
+/// True only as a "still sitting" signal; callers also require the tail to
+/// be unchanged across polls before pressing Enter on it.
+pub(crate) fn static_tail_holds(screen: &str, text: &str) -> bool {
+    let tail = squash(&bottom_region(screen));
+    if tail.is_empty() {
+        return false;
+    }
+    if paste_placeholders(&bottom_region(screen)) > 0 && !squash(text).is_empty() {
+        // A placeholder in the tail whose line/char size could be ours is a
+        // clog signal; exact attribution stays with stale_draft.
+        return true;
+    }
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.chars().count() >= 3)
+        .collect();
+    if words.len() >= 3 {
+        let shingles = words.windows(3).map(|w| w.join(""));
+        if shingles.clone().count() > 0 && shingles.into_iter().any(|s| tail.contains(&s)) {
+            return true;
+        }
+    }
+    let wanted: Vec<char> = squash(text).chars().collect();
+    wanted.len() >= 16 && {
+        let suffix: String = wanted[wanted.len().saturating_sub(80)..].iter().collect();
+        tail.contains(&suffix)
+    }
+}
+
+/// Whether `view`'s composer holds only our paste (no human interleave).
+fn composer_holds_only_ours(view: &ComposerView, text: &str, placeholders_before: usize) -> bool {
+    let solid = squash(&view.composer_solid);
+    if solid.is_empty() {
+        return true; // empty or faint placeholder only
+    }
+    let wanted = squash(text);
+    solid == wanted
+        || wanted.contains(&solid)
+        || paste_placeholders(&view.composer) > placeholders_before
+}
+
 fn transcript_count(view: &ComposerView, text: &str) -> usize {
     compact(&view.transcript).matches(&suffix(text, 40)).count()
 }
@@ -1100,6 +1166,8 @@ pub fn submit_verified(
     };
     let started = runtime.monotonic();
     let stage_deadline = started.saturating_add(timeouts.stage);
+    let grace_deadline = stage_deadline.saturating_add(timeouts.stage_grace);
+    let mut prev_tail: Option<String> = None;
     let view = loop {
         if runtime.cancelled() {
             return cancelled_after_typing();
@@ -1114,16 +1182,62 @@ pub fn submit_verified(
                 }
                 break view;
             }
+            // Fallback for every harness: bottom tail unchanged across
+            // polls and fuzzy-matching our paste means it is sitting there.
+            let tail = bottom_region(&screen);
+            if prev_tail.as_deref() == Some(tail.as_str()) && static_tail_holds(&screen, text) {
+                break view;
+            }
+            prev_tail = Some(tail);
+        } else if static_tail_holds(&screen, text) {
+            // No composer model on this read (mid-redraw): keep waiting in
+            // grace rather than stranding the paste; Enter needs a view.
+            prev_tail = Some(bottom_region(&screen));
         }
-        if runtime.monotonic() >= stage_deadline {
+        let now = runtime.monotonic();
+        if now >= grace_deadline {
             return Err(AdapterError::unavailable(format!(
                 "pane {pane_id}: pasted prompt was not observed in the {harness} composer within \
                  {:.1}s; no submission key was sent",
-                timeouts.stage.as_secs_f64()
+                (timeouts.stage + timeouts.stage_grace).as_secs_f64()
             )));
         }
-        runtime.sleep(POLL);
+        runtime.sleep(if now >= stage_deadline {
+            STAGE_POLL_SLOW
+        } else {
+            POLL
+        });
     };
+    // Human-race guard: re-read immediately before Enter. Anything beyond
+    // our exact paste means a person typed into the composer; never submit
+    // merged text. Leave everything untouched and defer (no Enter).
+    {
+        let screen = terminal.read_screen(pane_id)?;
+        if let Some(current) = composer_view(harness, &screen) {
+            if !blocked(harness, &screen)
+                && staged(&current, text, placeholders_before)
+                && !composer_holds_only_ours(&current, text, placeholders_before)
+            {
+                return Err(AdapterError::unavailable(format!(
+                    "pane {pane_id}: composer changed after our paste (possible human typing); \
+                     no submission key was sent; delivery deferred"
+                )));
+            }
+            if !staged(&current, text, placeholders_before)
+                && transcript_count(&current, text) > transcript_count(&before, text)
+            {
+                // Consumed before our Enter (echoed above): no key needed.
+                return Ok(Submission::Verified(SubmissionReceipt {
+                    key: "Enter",
+                    key_presses: 0,
+                    elapsed: runtime.monotonic().saturating_sub(started),
+                    evidence: "prompt text appeared above the composer".to_owned(),
+                    printed: true,
+                    settled: true,
+                }));
+            }
+        }
+    }
 
     let mut key = submit_key(harness, &view, runtime);
     terminal.send_keys(pane_id, key)?;
@@ -1165,7 +1279,7 @@ pub fn submit_verified(
                 }
                 if now >= submit_deadline {
                     return Err(AdapterError::unavailable(format!(
-                        "pane {pane_id}: prompt is still staged in the {harness} composer after \
+                        "stranded_prompt: pane {pane_id}: prompt is still staged in the {harness} composer after \
                          {presses} {key} key press(es) over {:.1}s; it was NOT submitted and is \
                          left visible so it is never typed twice",
                         now.saturating_sub(started).as_secs_f64()
@@ -1486,6 +1600,8 @@ pub(crate) mod fake {
         pub screen_override: Option<String>,
         /// Herdr facts `composer_probe` reports for this pane.
         pub probe: Option<super::ComposerProbe>,
+        /// Human keystrokes landing in the composer right after our paste.
+        pub human_after_paste: Option<String>,
     }
 
     /// A terminal agent composer with a controllable key drop and redraw lag.
@@ -1671,6 +1787,9 @@ pub(crate) mod fake {
             let mut state = self.state();
             state.pastes.push(body.to_owned());
             stage(&mut state, body);
+            if let Some(human) = state.human_after_paste.take() {
+                state.composer.push_str(&human);
+            }
             Ok(())
         }
 
@@ -3065,15 +3184,66 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            message.contains("within 60.0s; no submission key was sent"),
+            message.contains("within 300.0s; no submission key was sent"),
             "{message}"
         );
         assert_eq!(
             clock.monotonic() - Duration::from_millis(1_000_000),
-            STAGE_TIMEOUT
+            STAGE_TIMEOUT + STAGE_GRACE
         );
         assert_eq!(replay.pastes.lock().unwrap().len(), 1);
         assert!(replay.keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn paste_drawn_70s_late_is_delivered_with_one_enter() {
+        let screen = FakeScreen::new("claude", true);
+        // 700 reads at 100 ms = 70 s before the paste is drawn.
+        screen.state().paste_visible_after_reads = 700;
+        let receipt = receipt(submit(&screen, "flush the stranded paste please"));
+        assert_eq!(receipt.key_presses, 1);
+        let state = screen.state();
+        assert_eq!(state.keys, ["Enter"]);
+        assert_eq!(state.submitted.len() + state.queued.len(), 1);
+    }
+
+    #[test]
+    fn paste_drawn_late_as_placeholder_is_delivered_with_one_enter() {
+        let screen = FakeScreen::new("claude", true);
+        screen.state().paste_visible_after_reads = 700;
+        let text = "line one of the stranded paste\nline two\nline three\nline four";
+        let receipt = receipt(submit(&screen, text));
+        assert_eq!(receipt.key_presses, 1);
+        assert_eq!(screen.state().keys, ["Enter"]);
+    }
+
+    #[test]
+    fn human_keystrokes_after_our_paste_block_the_enter() {
+        let screen = FakeScreen::new("claude", false);
+        screen.state().human_after_paste = Some(" human words".to_owned());
+        let outcome = submit(&screen, "our delivery text here");
+        assert!(outcome.is_err(), "{outcome:?}");
+        let state = screen.state();
+        assert!(
+            state.keys.is_empty(),
+            "no Enter may be sent: {:?}",
+            state.keys
+        );
+        assert!(
+            state.composer.contains("human words"),
+            "human text untouched"
+        );
+        assert!(state.submitted.is_empty());
+    }
+
+    #[test]
+    fn static_tail_detector_matches_our_words_in_the_bottom_rows() {
+        let screen = "old output\nour stranded prompt words here\nmore tail\n";
+        assert!(static_tail_holds(screen, "our stranded prompt words here"));
+        assert!(!static_tail_holds(
+            screen,
+            "completely different request text"
+        ));
     }
 
     /// A clock whose stop request arrives once `stop_after` has passed.

@@ -158,6 +158,9 @@ pub fn answer(
     verify: &dyn Fn(&str) -> crate::error::Result<()>,
     runtime: &dyn AgentRuntime,
 ) -> AgentResult<Value> {
+    // Same per-pane admission point as prompt delivery: locked and paced.
+    let _admission =
+        crate::pane_admission::PaneAdmission::acquire(pane).map_err(|e| fail(e.to_string()))?;
     let mut answering = Answering {
         terminal,
         pane,

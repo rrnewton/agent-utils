@@ -9941,9 +9941,13 @@ and running this, once per reply: {command}"
                 ),
             );
         } else {
+            // No angle-bracket tag on the header line: the screen scanner
+            // reads an inline `<CHAT_REPLY_N>` there as a malformed reply
+            // block and posts false "Chat reply not sent" notices. The
+            // marker lines themselves are named in the footer below.
             fields.push(match &short_command {
-                Some(short) => format!("reply: <CHAT_REPLY_{reply_id}> or {short}"),
-                None => format!("reply: <CHAT_REPLY_{reply_id}>"),
+                Some(short) => format!("reply: CHAT_REPLY_{reply_id} or {short}"),
+                None => format!("reply: CHAT_REPLY_{reply_id}"),
             });
             footer.insert(
                 0,
@@ -32756,7 +32760,7 @@ recent or unresolved reply reservations (limit 8 per 60 s)"
             prompt.lines().next(),
             Some(
                 "[from users/owner via fixture spaces/example · sent: 2026.09.21:08:00 EDT · \
-reply: <CHAT_REPLY_001>]"
+reply: CHAT_REPLY_001]"
             ),
             "{prompt}"
         );
@@ -32767,7 +32771,7 @@ reply: <CHAT_REPLY_001>]"
             prompt.lines().next(),
             Some(
                 "[from users/owner via fixture spaces/example · sent: 2026.09.21:08:00 EDT, \
-delivered 1 h 12 min later · reply: <CHAT_REPLY_001>]"
+delivered 1 h 12 min later · reply: CHAT_REPLY_001]"
             ),
             "{prompt}"
         );
@@ -32942,8 +32946,7 @@ bridge: nothing you write reaches the chat, so write no reply markers."
         // The count is of the provider's text, before the escape and CRLF are replaced.
         let characters = quoted_text.chars().count();
         let context = format!(
-            "[from users/owner via fixture spaces/example · sent: 2026.09.29:14:00 EDT · reply: \
-<CHAT_REPLY_001>]\n\
+            "[from users/owner via fixture spaces/example · sent: 2026.09.29:14:00 EDT · reply: CHAT_REPLY_001]\n\
 \n\
 Quoted message: spaces/example/messages/parent ({characters} characters; the middle is elided)\n\
 > line 1\n> line 2\n> line 3\n> line 4\n> line 5\n> line 6\n> line 7\n> line 8\n> line 9\n\
@@ -39579,7 +39582,7 @@ If you have trouble, run: agentctl chat help 001"
         let key = admitted(&state, 1).remove(0);
         let prompt = prompted(&state, &key);
         assert!(
-            prompt.contains(" · reply: <CHAT_REPLY_001> or agentctl chat reply 001]\n"),
+            prompt.contains(" · reply: CHAT_REPLY_001 or agentctl chat reply 001]\n"),
             "{prompt}"
         );
         assert!(
