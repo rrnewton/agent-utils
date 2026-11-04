@@ -420,7 +420,7 @@ test("hang up comes before talk in the markup, so talk lands under the right thu
   assert.ok(pane.indexOf('id="clear-view"') < hangUp);
 });
 
-test("the view control is ONE button carrying the word for the view you are in, pressed on the channel's", async () => {
+test("the view control is ONE button carrying the word for the view you are in, pressed on the call's", async () => {
   // What this replaces: two text labels, one outlined and one plain, which read as one item having
   // been disabled rather than as the unselected half of a pair.
   assert.equal(PAGE_IDS.has("tab-voice"), false, "the two-label pseudo-tabs are gone");
@@ -430,22 +430,23 @@ test("the view control is ONE button carrying the word for the view you are in, 
   await signIn(page);
   const label = page.el("view-switch-label");
   assert.equal(label.textContent, "Voice", "the switch must name the view you are IN");
-  // `#820 voice-page-action-menu`. A real button, pressed on the channel's view.
-  assert.equal(page.el("view-switch").getAttribute("aria-pressed"), "false");
+  // `#820 voice-page-action-menu`. A real button; `#845 voice-toggle-colours`, pressed (lit) on the call's view.
+  assert.equal(page.el("view-switch").getAttribute("aria-pressed"), "true");
 
   await page.el("view-switch").click();
   await page.settle();
 
   assert.equal(page.tab(), "discord");
   assert.equal(label.textContent, "Channel", "the word did not follow the switch");
-  assert.equal(page.el("view-switch").getAttribute("aria-pressed"), "true");
+  assert.equal(page.el("view-switch").getAttribute("aria-pressed"), "false", "the channel's view is the darker, unpressed one");
 
   await page.el("view-switch").click();
   assert.equal(page.tab(), "voice");
   assert.equal(label.textContent, "Voice");
+  assert.equal(page.el("view-switch").getAttribute("aria-pressed"), "true");
 });
 
-test("the view control is a real button: pressed on the channel's view, filled in the accent", () => {
+test("the view control is a real button: pressed on the call's view, filled in the accent", () => {
   // Two signals for one state — the word and the fill — so it survives being read quickly, at arm's
   // length, by somebody who is not looking for it. `#820 voice-page-action-menu`, the owner: the
   // voice/channel toggle becomes "a smaller real button with a pressed visual style", its label the
@@ -455,9 +456,14 @@ test("the view control is a real button: pressed on the channel's view, filled i
   // return an empty string — a test that passes by having nothing to look at.
   const html = barSlice(HTML.indexOf('id="view-switch"'));
   assert.match(html, /<button\s[^>]*id="view-switch"|id="view-switch"[^>]*>/);
-  assert.match(html, /aria-pressed="false"/, "the button does not say whether it is pressed");
+  // `#845 voice-toggle-colours`: the page opens on the call's view, which is the pressed, lit one.
+  assert.match(html, /aria-pressed="true"/, "the button does not say whether it is pressed");
+  assert.match(html, /aria-label="Voice view"/);
   assert.doesNotMatch(html, /role="switch"|switch-track|switch-knob/, "the knob and track are still drawn");
   assert.match(cssBlock('.switch[aria-pressed="true"]'), /background:\s*var\(--accent\)/, "pressed is not filled in the accent");
+  // The channel's view is the darker one: the quiet page ground, never the accent.
+  assert.match(cssBlock(".switch"), /background:\s*var\(--bg\)/, "unpressed is not the quiet, darker ground");
+  assert.doesNotMatch(cssBlock(".switch"), /var\(--accent\)/);
 });
 
 test("settings is a gear, not the word Settings", () => {

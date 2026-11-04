@@ -490,7 +490,7 @@ def main() -> int:
             mac_cdp.send("Emulation.setUserAgentOverride", {"userAgent": agent, "platform": "MacIntel"})
             mac_page.goto(url, wait_until="load")
             mac_page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-            if mac_page.evaluate("() => document.getElementById('view-switch').getAttribute('aria-pressed')") != "true":
+            if mac_page.evaluate("() => document.getElementById('view-switch').getAttribute('aria-pressed')") != "false":
                 mac_page.click("#view-switch")
             mac_page.wait_for_selector(FIRST_ROW, state="visible", timeout=10_000)
             check(mac_page.evaluate("() => navigator.platform") == "MacIntel", "the Mac's platform was not emulated")

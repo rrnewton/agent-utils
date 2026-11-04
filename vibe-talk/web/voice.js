@@ -2434,7 +2434,8 @@ function showView(name) {
   // there BEFORE the place in that list is restored, which counts it.
   voiceTranscript().placePostCard();
   const discord = name === "discord";
-  el("view-switch").setAttribute("aria-pressed", discord ? "true" : "false");
+  // `#845 voice-toggle-colours`. Pressed, lit in the accent, is the call's view; the channel's is the darker one.
+  el("view-switch").setAttribute("aria-pressed", discord ? "false" : "true");
   el("view-switch-label").textContent = discord ? "Channel" : "Voice";
   el("view-switch").title = discord ? "Showing the channel. Press to show the call." : "Showing the call. Press to show the channel.";
   // Both panes share ONE scroll container, so a switch swaps the content out from under a

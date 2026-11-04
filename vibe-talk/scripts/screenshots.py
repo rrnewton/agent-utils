@@ -4450,8 +4450,8 @@ SCENES: tuple[Scene, ...] = (
                 "window.__text('view-switch-label') === 'Channel'",
             ),
             (
-                "the switch reads as thrown",
-                "document.getElementById('view-switch').getAttribute('aria-pressed') === 'true'",
+                "the switch is not pressed: pressed is the call's view (#845 voice-toggle-colours)",
+                "document.getElementById('view-switch').getAttribute('aria-pressed') === 'false'",
             ),
             (
                 "there are several real messages rendered",

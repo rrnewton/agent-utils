@@ -3465,7 +3465,7 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 until("() => document.getElementById('view-switch').getAttribute('aria-pressed') === "
                       f"{json.dumps(checked)}", why)
 
-            flick("true", "a click where the switch stood on the call view did not open the channel")
+            flick("false", "a click where the switch stood on the call view did not open the channel")
             page.wait_for_selector("#discord-log > li[data-id]", timeout=10_000)
             check(page.evaluate("() => document.getElementById('discord-channel').selectedOptions[0].textContent")
                   == LONG_CHANNEL["label"] and len(str(LONG_CHANNEL["label"])) >= 30,
@@ -3499,9 +3499,9 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 page.mouse.click(pace_x, pace_y)
                 until("() => document.getElementById('speed-popover').hidden", "Pace did not close its popover")
                 # The same spot again is the switch again: back to the call, and back to the channel.
-                flick("false", "a second click in the same spot did not switch back to the call")
+                flick("true", "a second click in the same spot did not switch back to the call")
                 until("() => !document.getElementById('talk').hidden", "the call view's Talk did not come back")
-                flick("true", "a third click in the same spot did not open the channel again")
+                flick("false", "a third click in the same spot did not open the channel again")
                 until("() => document.getElementById('read-aloud').hidden === false",
                       "the channel's Read did not come back")
             # A thread open in the view picker beside the long name: one row still, the channel's

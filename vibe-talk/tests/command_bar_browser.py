@@ -30,7 +30,7 @@ wrap onto a second row.
 are long: the hamburger, just left of the channel picker, opens the action menu over the list; Expand all
 in it opens every message and shuts the menu, Collapse all is then offered and folds them again, and
 Summaries is offered; none of the three floats in the chip row any more; Escape shuts the menu and gives
-the focus back to the hamburger. The view button says the view on screen and is pressed on the channel's,
+the focus back to the hamburger. The view button says the view on screen and is pressed on the call's (#845),
 by a tap and by Enter and Space from the keys. It reuses keyboard_browser's fixture: its fake API and asset server. --web-root DIR runs it
 against another copy of the page; --screenshots DIR keeps a PNG of each step; --port N serves the
 fixture on that port (default: one the system picks).
@@ -222,7 +222,7 @@ def large_font_after_call(browser: Browser, url: str, width: int, height: int, n
     bar's floor the pane wraps its own buttons, as a last resort, and nothing is drawn over anything."""
     page = open_page(browser, url, width, height)
     page.click("#view-switch")
-    page.wait_for_function("() => document.getElementById('view-switch').getAttribute('aria-pressed') !== 'true'",
+    page.wait_for_function("() => document.getElementById('view-switch').getAttribute('aria-pressed') !== 'false'",
                            timeout=10_000)
     page.evaluate("() => { document.documentElement.style.fontSize = '24px'; }")
     page.evaluate(AFTER_CALL_JS)
@@ -285,7 +285,7 @@ def action_menu(browser: Browser, url: str, width: int, height: int, touch: bool
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.wait_for_timeout(300)
     now = menu_state(page)
-    check(now["pressed"] == "true" and now["word"] == "Channel", f"{where}: the view button on the channel says {now}")
+    check(now["pressed"] == "false" and now["word"] == "Channel", f"{where}: the view button on the channel says {now}")
     check(now["open"] is False and now["expanded"] == "false", f"{where}: the menu is open before it is asked for: {now}")
     check(now["floating"] == [], f"{where}: {now['floating']} still float in the chip row")
     check(now["hamburger"]["right"] <= now["picker"]["left"] + 0.5,  # type: ignore[index]
@@ -322,27 +322,27 @@ def action_menu(browser: Browser, url: str, width: int, height: int, touch: bool
     press(page, "#view-switch", touch)
     page.wait_for_timeout(300)
     now = menu_state(page)
-    check(now["pressed"] == "false" and now["word"] == "Voice", f"{where}: a press on the view button left {now}")
+    check(now["pressed"] == "true" and now["word"] == "Voice", f"{where}: a press on the view button left {now}")
     page.focus("#view-switch")
     page.keyboard.press("Enter")
     page.wait_for_timeout(300)
     now = menu_state(page)
-    check(now["pressed"] == "true" and now["word"] == "Channel", f"{where}: Enter on the view button left {now}")
+    check(now["pressed"] == "false" and now["word"] == "Channel", f"{where}: Enter on the view button left {now}")
     # Coming to the channel puts the keys in its list, as it always has: back on the button for Space.
     page.focus("#view-switch")
     page.keyboard.press(" ")
     page.wait_for_timeout(300)
     now = menu_state(page)
-    check(now["pressed"] == "false" and now["word"] == "Voice", f"{where}: Space on the view button left {now}")
+    check(now["pressed"] == "true" and now["word"] == "Voice", f"{where}: Space on the view button left {now}")
     # The call's transcript folds too: the menu is on the call's view as well.
     check(page.is_visible("#action-menu-open"), f"{where}: no action menu on the call's view")
-    check(page.get_attribute("#view-switch", "aria-label") == "Channel view",
+    check(page.get_attribute("#view-switch", "aria-label") == "Voice view",
           f"{where}: the view button's name changed with it: {page.get_attribute('#view-switch', 'aria-label')!r}")
     check(not errors, f"{where}: the page threw: {errors}")
     page.context.close()
     notes.append(f"{where}: the hamburger left of the picker opened the menu, Expand all opened {folded} folded "
                  "messages and shut it, Collapse all folded them again, Summaries offered, none of them in the chip "
-                 "row, Escape shut it onto the hamburger; the view button pressed on the channel, by a tap, Enter and Space")
+                 "row, Escape shut it onto the hamburger; the view button pressed on the call's view and not on the channel's, by a tap, Enter and Space")
 
 
 def phone_boxes(browser: Browser, url: str, shots: Path | None, tag: str) -> dict[str, list[dict[str, float | str]]]:

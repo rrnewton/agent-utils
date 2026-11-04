@@ -215,8 +215,9 @@ a.search-hit-link {
   -webkit-user-select: none;
 }
 
-/* `#820 voice-page-action-menu`. Pressed means the channel's view: filled in the accent, and the word
-   says Channel. Both say the same thing, so the state survives being read quickly. */
+/* `#820 voice-page-action-menu`, `#845 voice-toggle-colours`. Pressed means the call's view: lit, filled in
+   the accent, and the word says Voice; the channel's view is the darker, quiet one, and says Channel.
+   Both say the same thing, so the state survives being read quickly. */
 .switch[aria-pressed="true"] {
   background: var(--accent);
   border-color: var(--accent);

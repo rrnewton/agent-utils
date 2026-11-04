@@ -4048,16 +4048,18 @@
           </div>
 
           <!-- ONE button, not two labels. `#820 voice-page-action-menu`: a smaller real button where a
-               switch with a sliding knob was, its word the view you are in (Voice or Channel), and
-               pressed, in the accent, on the channel's; a press shows the other view. Its name for a
-               screen reader stays "Channel view", pressed or not, as a toggle's name must: a name
-               that changed with it would hear "Voice, not pressed" as the voice being off. -->
+               switch with a sliding knob was, its word the view you are in (Voice or Channel); a press
+               shows the other view. `#845 voice-toggle-colours`: pressed, lit in the accent, on the
+               call's view, and the darker quiet one on the channel's; the owner: "I want the channel
+               view to be the darker one. And the voice view to be the lit up blue one". Its name for a
+               screen reader stays "Voice view", pressed or not, as a toggle's name must: a name that
+               changed with it would hear "Channel, not pressed" as the channel being off. -->
           <button
             id="view-switch"
             class="switch"
             type="button"
-            aria-pressed="false"
-            aria-label="Channel view"
+            aria-pressed="true"
+            aria-label="Voice view"
             title="Showing the call. Press to show the channel."
           >
             <span id="view-switch-label" class="switch-word">Voice</span>
