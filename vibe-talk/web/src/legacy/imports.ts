@@ -25,7 +25,7 @@ export { createApi, createServerFacts, isSlowFailure, readableFailure } from "..
 
 export { allReachesThread, answerUnplaced, answeredThread, coverViewOf, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createPlainReach, createProviderFacts, createRemovals, createSummaries, createTodoView, createUnpackReads, emptyTally, exactReplyCount, foldDeltaIn, foldLiveIn, foldPageIn, heldAsSent, heldNow, inTimeOrder, inViewOf, markDoneIn, namedRecord, newerPage, newerPageSpeaksFor, noteReplyGapsIn, pageFoldIn, placeFromPageIn, projectionOf, refreshFailed, replyTallyOf, restoreCanon, savedTimelineOf, settleDoneIn, summaryKey, tallyRecord, threadOf, timeOf, unplacedToAsk, unseenRepliesIn, upsertThreadSummary, viewOfKey } from "../core/channels/index.ts";
 export { anchorOfMessage, createBookmarkUndo, createBookmarkWrites, createBookmarks, createLegacyMarker, createPins, createReadLedger, isBookmarkState, sameAnchor } from "../core/annotations/index.ts";
-export { REOPENED_VIEWS, UI_STATE_CHARS, UI_STATE_KEY, UI_STATE_VERSION, createBackStack, createDeepLinks, createLayoutChoice, createLinkJumps, createNavigation, createUiState, createVisits, deepLinkQuery, visitKey } from "../core/navigation/index.ts";
+export { REOPENED_VIEWS, UI_STATE_CHARS, UI_STATE_KEY, UI_STATE_VERSION, createBackStack, createDeepLinks, createLayoutChoice, createLinkJumps, createNavigation, createUiState, createViewPlaces, createVisits, deepLinkQuery, visitKey } from "../core/navigation/index.ts";
 export {
   DISCORD_POLL_MS,
   LIVE_RETRY_MS,

@@ -55,6 +55,7 @@ declare const createLayoutChoice: LegacyImports["createLayoutChoice"];
 declare const createBackStack: LegacyImports["createBackStack"];
 declare const createLinkJumps: LegacyImports["createLinkJumps"];
 declare const createVisits: LegacyImports["createVisits"];
+declare const createViewPlaces: LegacyImports["createViewPlaces"];
 declare const deepLinkQuery: LegacyImports["deepLinkQuery"];
 declare const visitKey: LegacyImports["visitKey"];
 declare const STALE_AS_OF_MS: LegacyImports["STALE_AS_OF_MS"];

@@ -347,3 +347,16 @@ test("`#624 voice-page-modularity`: the UI-state record read back, checked, brou
   assert.equal(signedOut.settled(), true);
   assert.equal(kept.kept.has(UI_STATE_KEY), false);
 });
+
+test("`#624 voice-page-modularity`: a view entered again goes back to its offset unless it was left at the newest, and says whether it did", () => {
+  const { createViewPlaces } = NAVIGATION;
+  const places = createViewPlaces();
+  // A first entry goes to the newest.
+  assert.deepStrictEqual([places.enter("discord"), places.restored()], [null, false]);
+  places.leave("discord", { top: 840, atNewest: false });
+  places.leave("voice", { top: 1200, atNewest: true });
+  assert.deepStrictEqual([places.enter("voice"), places.restored()], [null, false], "a view left at the newest was not taken to it");
+  assert.deepStrictEqual([places.enter("discord"), places.restored()], [840, true], "a view left in its backlog was not put back");
+  places.leave("discord", { top: 900, atNewest: true });
+  assert.deepStrictEqual([places.enter("discord"), places.restored()], [null, false]);
+});

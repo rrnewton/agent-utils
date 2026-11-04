@@ -1838,7 +1838,7 @@ async function jumpToSentMessage(ref) {
     uiState.settle();
     showView("discord");
     // A channel the jump changes to is read as it is chosen; the one already chosen is read here.
-    if (String(selectedChannelId()) === ref.channel) await readEnteredChannel(viewRestored);
+    if (String(selectedChannelId()) === ref.channel) await readEnteredChannel(viewScroll.restored());
   } : null;
   return inColumn(columns.main, () => jumpFromSpot(ref, spot, { view: storedOpenInView(), center: true, enter }));
 }
@@ -2201,12 +2201,12 @@ const helpFolds = mountHelpFolds({
  * reader lands where the bottom used to be, several turns above the end, with nothing saying so —
  * which is losing their place, not keeping it. This is the same rule the channel's own re-read
  * settles by (`settleAfterRead`): follow the newest for a reader who was on it, restore the offset
- * for a reader who was not.
+ * for a reader who was not. Kept by web/src/core/navigation `createViewPlaces`, with whether the last entry
+ * was a return (`restored`), which the read that follows needs.
  *
- * @type {{voice: null | {top: number, atNewest: boolean},
- *         discord: null | {top: number, atNewest: boolean}}}
+ * @type {import("./src/core/navigation/index.ts").ViewPlaces<string>}
  */
-const viewScroll = { voice: null, discord: null };
+const viewScroll = createViewPlaces();
 
 /**
  * What the selected channel's chat service can do — threads, its own read cursor, how its live updates are
@@ -2409,9 +2409,6 @@ function nextUndoAt() {
  */
 const sendUndo = createSendUndo({ clock: clockOnUse(), ended: () => renderSendUndo() });
 
-/** Whether the last `showView` put the reader back rather than taking them to the newest. */
-let viewRestored = false;
-
 function showView(name) {
   // `#277 reply-in-column`. The call's view is one list, with no column for a reply to be open in.
   if (name !== "discord") putDockedReplyAway();
@@ -2420,7 +2417,7 @@ function showView(name) {
   const leaving = screens.view();
   if (leaving && leaving !== name) {
     const area = el("scroll-area");
-    viewScroll[leaving] = { top: area.scrollTop, atNewest: atBottom(area) };
+    viewScroll.leave(leaving, { top: area.scrollTop, atNewest: atBottom(area) });
     // ...and, leaving the channel, the message the reader was on, for a reopen. `#189 restore-ui-state`.
     if (leaving === "discord") holdChannelPlace();
   }
@@ -2446,10 +2443,10 @@ function showView(name) {
   // offset: turns can land in the transcript while the reader is over on the channel, and putting
   // them back at the number the bottom used to be is the same "your place moved" defect wearing the
   // fix's clothes. See `viewScroll`.
-  const held = viewScroll[name];
-  const returning = held !== null && !held.atNewest;
+  const top = viewScroll.enter(name);
+  const returning = top !== null;
   if (returning) {
-    el("scroll-area").scrollTop = held.top;
+    el("scroll-area").scrollTop = top;
   } else {
     scrollToNewest();
   }
@@ -2458,10 +2455,9 @@ function showView(name) {
   if (!returning) {
     jumpNewestWanted[name] = false;
   }
-  // Told to the caller, because restoring the position here is only half of it: entering the
-  // channel also RE-READS it, and a read that does not know it is a return settles to the newest
-  // message and undoes this immediately. See the view-switch handler.
-  viewRestored = returning;
+  // Told to the caller (`viewScroll.restored()`, kept by `enter` above), because restoring the position
+  // here is only half of it: entering the channel also RE-READS it, and a read that does not know it is a
+  // return settles to the newest message and undoes this immediately. See the view-switch handler.
   // The chips belong to the list you are looking at, and you are now looking at a different one.
   renderScrollTools();
   renderChannelFreshness();
@@ -33431,7 +33427,7 @@ function pressViewSwitch() {
   // KEEP THE POSITION when this entry was a return. `loadDiscord` with no options settles to the
   // newest message, which would undo the restore `showView` just performed — the two halves have
   // to agree or the fix is invisible.
-  readEnteredChannel(viewRestored);
+  readEnteredChannel(viewScroll.restored());
 }
 
 /** Read the channel just entered, and keep reading it while it stays on screen. */
