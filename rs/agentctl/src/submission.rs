@@ -1254,18 +1254,18 @@ pub fn submit_verified(
         let screen = terminal.read_screen(pane_id)?;
         let view = composer_view(harness, &screen);
         shown.note(&screen, view.as_ref());
-        if let Some(view) = view {
-            if staged(&view, text, placeholders_before) {
+        if let Some(view) = &view {
+            if staged(view, text, placeholders_before) {
                 if let [(label, _)] = shown.labels.as_slice() {
                     runtime.paste_drawn_as(label);
                 }
-                break view;
+                break view.clone();
             }
             // Fallback for every harness: bottom tail unchanged across
             // polls and fuzzy-matching our paste means it is sitting there.
             let tail = bottom_region(&screen);
             if prev_tail.as_deref() == Some(tail.as_str()) && static_tail_holds(&screen, text) {
-                break view;
+                break view.clone();
             }
             prev_tail = Some(tail);
         } else if static_tail_holds(&screen, text) {
@@ -1273,8 +1273,32 @@ pub fn submit_verified(
             // grace rather than stranding the paste; Enter needs a view.
             prev_tail = Some(bottom_region(&screen));
         }
+        // A lost paste on an idle pane with a visibly empty composer
+        // will not render late: end the grace at the first stage window.
+        if runtime.monotonic() >= stage_deadline {
+            if let Some(view) = &view {
+                if composer_draft(view).is_none()
+                    && running_turn(&screen) == Some(false)
+                    && !static_tail_holds(&screen, text)
+                {
+                    return Err(AdapterError::unavailable(format!(
+                        "pane {pane_id}: pasted prompt was not observed in the {harness} composer within \
+                         {:.1}s and the composer is empty; no submission key was sent",
+                        timeouts.stage.as_secs_f64()
+                    )));
+                }
+            }
+        }
         let now = runtime.monotonic();
         if now >= grace_deadline {
+            if timeouts.stage_grace.is_zero() {
+                // The caller polls for the late render outside every lock
+                // and re-admits to press Enter; nothing is stranded here.
+                return Ok(Submission::NotStaged(format!(
+                    "late_paste: pane {pane_id}: pasted prompt was not observed in the                      {harness} composer within {:.1}s; no submission key was sent",
+                    timeouts.stage.as_secs_f64()
+                )));
+            }
             return Err(AdapterError::unavailable(format!(
                 "pane {pane_id}: pasted prompt was not observed in the {harness} composer within \
                  {:.1}s; no submission key was sent",
@@ -3299,6 +3323,27 @@ mod tests {
         let receipt = receipt(submit(&screen, text));
         assert_eq!(receipt.key_presses, 1);
         assert_eq!(screen.state().keys, ["Enter"]);
+    }
+
+    #[test]
+    fn lost_paste_with_no_grace_releases_the_caller_at_the_stage_window() {
+        // P0: a paste that never renders must not hold the admission (or
+        // any) lock for the whole grace: with no grace the caller gets a
+        // retryable late_paste refusal at the stage window, no Enter sent.
+        let screen = FakeScreen::new("claude", true);
+        screen.state().paste_visible_after_reads = u32::MAX;
+        let timeouts = SubmitTimeouts {
+            stage_grace: Duration::ZERO,
+            ..SubmitTimeouts::default()
+        };
+        let (outcome, elapsed) = submit_with(&screen, "lost paste never drawn", timeouts);
+        let reason = refusal(outcome);
+        assert!(reason.starts_with("late_paste:"), "{reason}");
+        assert!(
+            elapsed <= STAGE_TIMEOUT + Duration::from_secs(1),
+            "{elapsed:?}"
+        );
+        assert!(screen.state().keys.is_empty());
     }
 
     #[test]

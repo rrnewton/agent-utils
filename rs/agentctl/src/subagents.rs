@@ -1684,22 +1684,34 @@ impl ManagedApi for HerdrClient {
                 }
             };
         if crate::submission::verifies(&harness, text) {
-            return crate::pane_admission::admit(pane, "subagents", "", "verified", || {
-                crate::submission::submit_verified(
-                    &GuardedPrompt(terminal),
-                    pane,
-                    &harness,
-                    text,
-                    SubmitTimeouts::default(),
-                    runtime,
-                )
-            });
+            return crate::pane_admission::admit(
+                pane,
+                "subagents",
+                &runtime.audit_id(),
+                "verified",
+                || {
+                    crate::submission::submit_verified(
+                        &GuardedPrompt(terminal),
+                        pane,
+                        &harness,
+                        text,
+                        SubmitTimeouts::default(),
+                        runtime,
+                    )
+                },
+            );
         }
-        crate::pane_admission::admit(pane, "subagents", "", "unconfirmed", || {
-            terminal
-                .native_prompt(pane, text)
-                .map(|()| Submission::Unconfirmed)
-        })
+        crate::pane_admission::admit(
+            pane,
+            "subagents",
+            &runtime.audit_id(),
+            "unconfirmed",
+            || {
+                terminal
+                    .native_prompt(pane, text)
+                    .map(|()| Submission::Unconfirmed)
+            },
+        )
     }
     fn submit_guarded(
         &self,
@@ -4679,15 +4691,21 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     ) -> crate::error::Result<Submission> {
         if self.generic_pane(pane_id) {
             let guarded = self.guarded(runtime)?;
-            return crate::pane_admission::admit(pane_id, "subagents", "", "unknown", || {
-                crate::unknown_harness::submit(
-                    &GuardedPrompt(&guarded),
-                    pane_id,
-                    text,
-                    crate::unknown_harness::timeouts(),
-                    runtime,
-                )
-            });
+            return crate::pane_admission::admit(
+                pane_id,
+                "subagents",
+                &runtime.audit_id(),
+                "unknown",
+                || {
+                    crate::unknown_harness::submit(
+                        &GuardedPrompt(&guarded),
+                        pane_id,
+                        text,
+                        crate::unknown_harness::timeouts(),
+                        runtime,
+                    )
+                },
+            );
         }
         // A `/goal` command typed raw, as a chat request that is one asks for, is proved by the
         // harness's answer to it. A Codex goal that `agentctl goal` registered keeps its own
@@ -10778,6 +10796,136 @@ its drain would also type, so it was not queued",
                 "agent {agent_name}'s unsent draft could not be flushed: {error}"
             ))),
         }
+    }
+
+    /// Force a redraw of `agent_name`'s TUI (recovery ladder step 2):
+    /// SIGWINCH to the pinned harness process makes every harness here
+    /// repaint; the screen is re-read and returned as evidence.
+    pub fn redraw_pane(&self, agent_name: &str) -> Result<String> {
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        let pane_id = record
+            .pane_id
+            .clone()
+            .ok_or_else(|| fail(format!("agent {agent_name} has no pane")))?;
+        let identity = record.harness_anchor().ok_or_else(|| {
+            fail(format!(
+                "agent {agent_name} has no pinned harness process to redraw"
+            ))
+        })?;
+        // SAFETY: kill(2) with SIGWINCH has no memory-safety preconditions;
+        // the pid is the record's pinned harness process.
+        if unsafe { libc::kill(identity.pid as i32, libc::SIGWINCH) } != 0 {
+            return Err(fail(format!(
+                "agent {agent_name}: SIGWINCH to harness pid {} failed",
+                identity.pid
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let screen = self.turn_screen(&record)?;
+        Ok(format!(
+            "sent SIGWINCH to {agent_name}'s harness (pid {}) in pane {pane_id}; screen now {} bytes",
+            identity.pid,
+            screen.len()
+        ))
+    }
+
+    /// Child-first restart with `--resume` (recovery ladder step 4, at most
+    /// once per agent per hour; the caller enforces the budget): TERM the
+    /// pinned harness child, wait for it to exit, relaunch in the same pane
+    /// resuming the recorded session (a new session only when none is
+    /// recorded), then `anchor --replace` in this registry and every other
+    /// registry under the same parent that pins this pane.
+    pub fn restart_with_resume(&self, agent_name: &str) -> Result<String> {
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        let pane_id = record
+            .pane_id
+            .clone()
+            .ok_or_else(|| fail(format!("agent {agent_name} has no pane")))?;
+        let identity = record.harness_anchor().ok_or_else(|| {
+            fail(format!(
+                "agent {agent_name} has no pinned harness process to restart"
+            ))
+        })?;
+        let session = record
+            .session_value
+            .clone()
+            .or_else(|| record.resume.clone())
+            .or_else(|| record.observed_session_value().map(str::to_owned));
+        // SAFETY: kill(2) with SIGTERM; pid is the pinned harness child.
+        if unsafe { libc::kill(identity.pid as i32, libc::SIGTERM) } != 0 {
+            return Err(fail(format!(
+                "agent {agent_name}: SIGTERM to harness pid {} failed",
+                identity.pid
+            )));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            // SAFETY: signal 0 probes existence only.
+            if unsafe { libc::kill(identity.pid as i32, 0) } != 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(fail(format!(
+                    "agent {agent_name}: harness pid {} did not exit within 15s of SIGTERM; no relaunch",
+                    identity.pid
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let adapter = crate::harness::adapter(&record.harness).ok_or_else(|| {
+            fail(format!(
+                "agent {agent_name}: no launch adapter for harness {:?}",
+                record.harness
+            ))
+        })?;
+        let (before, after) = adapter.launch_arguments(record.model.as_deref(), session.as_deref());
+        let mut arguments = before;
+        arguments.extend(record.arguments.iter().cloned());
+        arguments.extend(after);
+        let mut pinned: Option<crate::client::CustomProcessIdentity> = None;
+        self.client.start_pane_agent(
+            agent_name,
+            &record.harness,
+            &pane_id,
+            &arguments,
+            Duration::from_secs(60),
+            &mut |identity| {
+                pinned = Some(identity);
+                Ok(())
+            },
+        )?;
+        let _ = pinned;
+        // Re-anchor here, then in every sibling registry pinning this pane.
+        let mut anchored = vec![self.registry.display().to_string()];
+        self.anchor(agent_name, true, session.as_deref())?;
+        if let Some(parent) = self.registry.parent() {
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let other = entry.path();
+                    if other == self.registry || !other.is_dir() {
+                        continue;
+                    }
+                    let Ok(agents) = ManagedAgents::new(self.client, &other) else {
+                        continue;
+                    };
+                    if agents
+                        .load(agent_name)
+                        .is_ok_and(|r| r.pane_id.as_deref() == Some(pane_id.as_str()))
+                        && agents.anchor(agent_name, true, session.as_deref()).is_ok()
+                    {
+                        anchored.push(other.display().to_string());
+                    }
+                }
+            }
+        }
+        Ok(format!(
+            "restarted {agent_name}'s {} child-first in pane {pane_id} with --resume {}; re-anchored in {} registr(ies)",
+            record.harness,
+            session.as_deref().unwrap_or("(new session)"),
+            anchored.len()
+        ))
     }
 
     /// Interrupt a stuck turn and deliver everything queued for the agent (the watcher's

@@ -492,16 +492,61 @@ impl AgentApi for HerdrClient {
                 client: self,
                 runtime,
             };
-            return crate::pane_admission::admit(pane_id, "agentctl", "", "verified", || {
-                crate::submission::submit_verified(
-                    &terminal,
-                    pane_id,
-                    &harness,
-                    text,
-                    SubmitTimeouts::default(),
-                    runtime,
-                )
-            });
+            let timeouts = SubmitTimeouts {
+                stage_grace: Duration::ZERO,
+                ..SubmitTimeouts::default()
+            };
+            let outcome = crate::pane_admission::admit(
+                pane_id,
+                "agentctl",
+                &runtime.audit_id(),
+                "verified",
+                || {
+                    crate::submission::submit_verified(
+                        &terminal, pane_id, &harness, text, timeouts, runtime,
+                    )
+                },
+            )?;
+            // Late paste: the admission lock is released. Poll for the
+            // late render outside every lock, then re-admit; the retry
+            // finds its own stranded paste and presses Enter only.
+            if let Submission::NotStaged(reason) = &outcome {
+                if reason.starts_with("late_paste:") && !runtime.cancelled() {
+                    let deadline = runtime
+                        .monotonic()
+                        .saturating_add(crate::submission::STAGE_GRACE);
+                    loop {
+                        runtime.sleep(crate::submission::STAGE_POLL_SLOW);
+                        if runtime.cancelled() || runtime.monotonic() >= deadline {
+                            return Ok(outcome);
+                        }
+                        let Ok(screen) = terminal.read_screen(pane_id) else {
+                            continue;
+                        };
+                        let appeared = crate::submission::composer_view(&harness, &screen)
+                            .is_some_and(|view| crate::submission::composer_draft(&view).is_some());
+                        if appeared {
+                            return crate::pane_admission::admit(
+                                pane_id,
+                                "agentctl",
+                                &runtime.audit_id(),
+                                "verified-late",
+                                || {
+                                    crate::submission::submit_verified(
+                                        &terminal,
+                                        pane_id,
+                                        &harness,
+                                        text,
+                                        SubmitTimeouts::default(),
+                                        runtime,
+                                    )
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            return Ok(outcome);
         }
         runtime.input_started();
         crate::pane_admission::admit(pane_id, "agentctl", "", "unconfirmed", || {
@@ -689,6 +734,10 @@ pub trait AgentRuntime {
     fn prompt_printed(&self, message_id: &str) {
         let _ = message_id;
     }
+    /// Queue message ID this delivery serves, for the admission audit log.
+    fn audit_id(&self) -> String {
+        String::new()
+    }
     /// Note that a submission is about to make its first terminal input
     /// (its paste). A queue drain uses this to stamp `paste_started_at` on
     /// the inflight item: an inflight item stamped `paste_tracking` at the
@@ -768,6 +817,10 @@ impl AgentRuntime for QueueRuntime<'_> {
     fn delivery_wait_chunk(&self) -> Option<Duration> {
         self.inner.delivery_wait_chunk()
     }
+    fn audit_id(&self) -> String {
+        self.inner.audit_id()
+    }
+
     fn prompt_printed(&self, message_id: &str) {
         self.inner.prompt_printed(message_id);
     }
@@ -831,6 +884,10 @@ impl AgentRuntime for WithdrawUnacceptedRuntime<'_> {
         self.inner.delivery_wait_chunk()
     }
 
+    fn audit_id(&self) -> String {
+        self.inner.audit_id()
+    }
+
     fn prompt_printed(&self, message_id: &str) {
         self.inner.prompt_printed(message_id);
     }
@@ -875,6 +932,10 @@ impl AgentRuntime for WithdrawingRuntime<'_> {
 
     fn delivery_wait_chunk(&self) -> Option<Duration> {
         self.inner.delivery_wait_chunk()
+    }
+
+    fn audit_id(&self) -> String {
+        self.inner.audit_id()
     }
 
     fn prompt_printed(&self, message_id: &str) {
@@ -940,6 +1001,10 @@ impl AgentRuntime for PasteTrackingRuntime<'_> {
         self.inner.delivery_wait_chunk()
     }
 
+    fn audit_id(&self) -> String {
+        self.inner.audit_id()
+    }
+
     fn prompt_printed(&self, message_id: &str) {
         self.inner.prompt_printed(message_id);
     }
@@ -993,6 +1058,10 @@ impl AgentRuntime for BatchTrackingRuntime<'_> {
     fn delivery_wait_chunk(&self) -> Option<Duration> {
         self.inner.delivery_wait_chunk()
     }
+    fn audit_id(&self) -> String {
+        self.inner.audit_id()
+    }
+
     fn prompt_printed(&self, message_id: &str) {
         self.inner.prompt_printed(message_id);
     }

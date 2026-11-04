@@ -47,13 +47,21 @@ pub fn pane_dir(pane_id: &str) -> PathBuf {
     if let Some(dir) = std::env::var_os("AGENTCTL_PANE_ADMISSION_DIR") {
         return PathBuf::from(dir).join(sanitised(pane_id));
     }
-    let state = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
-    state
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("agentctl/panes")
-        .join(sanitised(pane_id))
+    // Tests must never write the real per-user state directory.
+    #[cfg(test)]
+    return std::env::temp_dir()
+        .join(format!("agentctl-test-panes-{}", std::process::id()))
+        .join(sanitised(pane_id));
+    #[cfg(not(test))]
+    {
+        let state = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
+        state
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("agentctl/panes")
+            .join(sanitised(pane_id))
+    }
 }
 
 /// Pacing interval from `AGENTCTL_PANE_PACE_SECONDS` (default 1.0, floor 0.5).
