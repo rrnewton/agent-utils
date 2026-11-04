@@ -133,6 +133,31 @@ fn conflicts_only_in_generated_files_are_regenerated_not_held() {
 }
 
 #[test]
+fn a_generator_built_from_its_own_output_never_sees_conflict_markers() {
+    // The generated file is also source the generator is built from (a generated table compiled
+    // into the generator), so conflict markers in it would fail the generator before it rewrote
+    // anything. A conflicted generated file is taken from the base side, then rewritten.
+    let regen = [
+        "--regen-path",
+        "gen/",
+        "--regen-command",
+        "if grep -q '<<<<<<<' gen/all.txt; then echo marked; exit 101; fi; mkdir -p gen && cat $(ls src/* | sort) > gen/all.txt",
+        "--identity-name",
+        "queue-bot",
+        "--identity-email",
+        "bot@example.com",
+    ];
+    let fx = setup("regen-own-source", &regen);
+    source_change(&fx, "b");
+    source_change(&fx, "c");
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1, 2]], "{r}");
+    assert_eq!(git(&fx.remote(), &["show", "main:gen/all.txt"]), "a\nb\nc");
+}
+
+#[test]
 fn without_regeneration_the_same_changes_conflict() {
     let fx = setup("regen-off", &[]);
     source_change(&fx, "b");
