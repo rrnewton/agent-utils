@@ -862,7 +862,8 @@ if that fails, reads it by the authenticated route instead of playing a URL the 
 accepts.
 
 A long message is read **block by block** (`#376 read-aloud-blocks`): each paragraph, heading, list
-item and block quote it is drawn as, and a code block or a table as a short description of it. The
+item and block quote it is drawn as, a code block as a short description of it, and a table a row at a
+time, each cell labelled with its column's header (`#847 read-aloud-table-rows`). The
 block being read is lit, the row says `reading 2 of 5`, and a strip over the list offers Previous
 and Next. A tap on another block of the message being read jumps there; a tap on the block being
 read stops it. The Media Session's previous, next, pause and play (a steering wheel's or a

@@ -72,6 +72,11 @@ const RELATIVE_LIMIT_DAYS: i64 = 365;
 /// punctuation, and what the listener actually wants to know is that it is there and how big.
 const CODE_SPOKEN_MAX_LINES: usize = 3;
 
+/// `#847 read-aloud-table-rows`. The most rows of one table a message's whole speech says, a row at a
+/// time; the rest are counted. A table of results longer than this is minutes of speech in one
+/// request, and read aloud on the page each row is its own piece anyway.
+const TABLE_ROWS_SPOKEN: usize = 25;
+
 /// How many distinct hashes will be given a letter before the table stops growing.
 ///
 /// This is a memory bound on a table that otherwise lives as long as the server, not a claim about
@@ -253,12 +258,32 @@ fn is_table_row(line: &str) -> bool {
     trimmed.starts_with('|') && trimmed.matches('|').count() >= 2
 }
 
+/// A row's cells as GFM reads them: split at every pipe but an escaped one (`\|`), which is a pipe in
+/// the cell's words (`#847 read-aloud-table-rows`: split there, a cell's value went under the next
+/// column's header), the outer pipes dropped.
 fn table_cells(line: &str) -> Vec<String> {
-    line.trim()
-        .trim_matches('|')
-        .split('|')
-        .map(|c| c.trim().to_owned())
-        .collect()
+    let line = line.trim();
+    let line = line.strip_prefix('|').unwrap_or(line);
+    let line = match line.strip_suffix('|') {
+        Some(inner) if !inner.ends_with('\\') => inner,
+        _ => line,
+    };
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && chars.peek() == Some(&'|') {
+            cell.push('|');
+            chars.next();
+        } else if ch == '|' {
+            cells.push(cell.trim().to_owned());
+            cell.clear();
+        } else {
+            cell.push(ch);
+        }
+    }
+    cells.push(cell.trim().to_owned());
+    cells
 }
 
 /// Is this row the `|---|---|` separator rather than data?
@@ -274,23 +299,48 @@ fn is_table_rule(line: &str) -> bool {
 /// a time from left to right". (It used to be announced by its shape and its first column's keys,
 /// which read as the voice jumping down the first column while the page lit every cell in turn.)
 ///
-/// The header row is the labels, not a row of data, where a rule under it says so; a table of only
-/// a header says its header's cells. A table with no rule has no labels, and its cells are said
-/// bare. An empty cell is passed over; a cell that already ends a sentence keeps its own stop.
+/// As the page draws it: the table begins at the first rule, the row over it is the header and the
+/// labels, and a row of dashes further down is a row saying "none". Lines of pipes before the header
+/// are not the table (the page draws them as text) and are said bare, before it. A table of only a
+/// header says its header's cells; one with no rule has no labels, and its cells are said bare. A
+/// row says no more cells than its header has: the page draws no more. An empty cell is passed over;
+/// a cell that already ends a sentence keeps its own stop. Past
+/// [`TABLE_ROWS_SPOKEN`] rows, how many more there are is said instead: read aloud on the page, a
+/// table is a piece per row ([`table_row_sources`]), and each piece is one row of its own.
 fn say_table(rows: &[&str]) -> String {
-    let data: Vec<Vec<String>> = rows
-        .iter()
-        .filter(|r| !is_table_rule(r))
-        .map(|r| table_cells(r))
-        .collect();
-    let had_header = rows.iter().any(|r| is_table_rule(r));
-    let (labels, body): (&[String], &[Vec<String>]) = match data.split_first() {
-        Some((header, rest)) if had_header && !rest.is_empty() => (header.as_slice(), rest),
-        _ => (&[], data.as_slice()),
+    let cells = |lines: &[&str]| lines.iter().map(|r| table_cells(r)).collect::<Vec<_>>();
+    let rule = rows.iter().position(|r| is_table_rule(r));
+    let (before, labels, body) = match rule {
+        // A header and its rule: the table. Under a header alone, its own cells are the row said.
+        Some(at) if at >= 1 && at + 1 < rows.len() => (
+            cells(&rows[..at - 1]),
+            table_cells(rows[at - 1]),
+            cells(&rows[at + 1..]),
+        ),
+        Some(at) if at >= 1 => (cells(&rows[..at - 1]), Vec::new(), cells(&rows[at - 1..at])),
+        // A rule with nothing over it heads nothing.
+        Some(at) => (Vec::new(), Vec::new(), cells(&rows[at + 1..])),
+        None => (Vec::new(), Vec::new(), cells(rows)),
     };
+    let more = body.len().saturating_sub(TABLE_ROWS_SPOKEN);
     let mut said = Vec::new();
-    for row in body {
-        for (at, cell) in row.iter().enumerate() {
+    for row in &before {
+        for cell in row.iter().filter(|cell| !cell.is_empty()) {
+            let stop = if cell.ends_with(['.', '!', '?']) {
+                ""
+            } else {
+                "."
+            };
+            said.push(format!("{cell}{stop}"));
+        }
+    }
+    for row in body.iter().take(TABLE_ROWS_SPOKEN) {
+        let width = if labels.is_empty() {
+            row.len()
+        } else {
+            labels.len()
+        };
+        for (at, cell) in row.iter().enumerate().take(width) {
             if cell.is_empty() {
                 continue;
             }
@@ -304,6 +354,10 @@ fn say_table(rows: &[&str]) -> String {
                 None => said.push(format!("{cell}{stop}")),
             }
         }
+    }
+    if more > 0 {
+        let rows = if more == 1 { "row" } else { "rows" };
+        said.push(format!("And {more} more {rows}."));
     }
     format!(" {} ", said.join(" "))
 }
@@ -1623,6 +1677,58 @@ mod tests {
             table_row_sources("| x | y |\n| z | w |"),
             ["| x | y |\n| z | w |"]
         );
+    }
+
+    #[test]
+    fn a_tables_escaped_pipe_stays_in_its_cell_and_a_row_of_dashes_is_a_row() {
+        // An escaped pipe is a pipe in the cell's words, never a column's edge.
+        assert_eq!(
+            say("| cmd | note |\n|---|---|\n| a \\| b | pipes |"),
+            "cmd: a | b. note: pipes."
+        );
+        // Only the second line is the rule: a row of dashes further down is a row, said.
+        let dashes = table_row_sources("| Lane | Owner |\n|---|---|\n| one | - |");
+        assert_eq!(dashes.len(), 1);
+        assert!(
+            say(&dashes[0]).starts_with("Lane: one."),
+            "{}",
+            say(&dashes[0])
+        );
+        assert!(!say("| a |\n|---|\n| - |").is_empty());
+        assert_ne!(
+            say("| a |\n|---|\n| - |"),
+            "a.",
+            "the row of dashes was taken for a rule"
+        );
+    }
+
+    #[test]
+    fn a_table_says_what_the_page_draws_of_it() {
+        // No more cells than the header has: a pipe in backticks splits the row, and the page drops
+        // the cell past the header's width.
+        assert_eq!(say("| a | b |\n|---|---|\n| x | y | z |"), "a: x. b: y.");
+        // A line of pipes over the header is text the page draws above the table, said bare, and
+        // the rule is never said.
+        assert_eq!(
+            say("| note | first |\n| a | b |\n|---|---|\n| x | y |"),
+            "note. first. a: x. b: y."
+        );
+        // A run that starts with a rule: the rule heads nothing.
+        assert_eq!(say("|---|---|\n| x | y |"), "x. y.");
+    }
+
+    #[test]
+    fn a_long_tables_whole_speech_says_its_first_rows_and_counts_the_rest() {
+        let mut table = String::from("| n |\n|---|");
+        for at in 1..=27 {
+            table.push_str(&format!("\n| r{at} |"));
+        }
+        let said = say(&table);
+        assert!(said.starts_with("n: r1. n: r2."), "{said}");
+        assert!(said.contains("n: r25.") && !said.contains("r26"), "{said}");
+        assert!(said.ends_with("And 2 more rows."), "{said}");
+        // Read aloud a row at a time, every row is a piece.
+        assert_eq!(table_row_sources(&table).len(), 27);
     }
 
     #[test]

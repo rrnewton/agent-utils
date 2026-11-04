@@ -1893,6 +1893,35 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * drawn are not as many as the pieces read.
    */
   function tableRowCells(block: DrawnBlock): Sentence[] | null {
+    const read = tableReadRow(block);
+    if (!read) return null;
+    const { row, heads: labels } = read;
+    const found: Sentence[] = [];
+    tableCellsOf(row).forEach((cell, at) => {
+      const { text, place } = shownTextOf(cell);
+      let start = 0;
+      while (start < text.length && /\s/.test(text[start]!)) start += 1;
+      let end = text.length;
+      while (end > start && /\s/.test(text[end - 1]!)) end -= 1;
+      // An empty cell is not said, and not lit.
+      if (end <= start) return;
+      const label = labels[at] || "";
+      found.push({ from: place(start), to: place(end), length: (label ? label.length + 2 : 0) + end - start + 1 });
+    });
+    return found;
+  }
+
+  /** A table row's cells, `td` and `th`, in order. */
+  function tableCellsOf(tr: Element) {
+    return [...(tr.children || [])].filter((cell) => ["td", "th"].includes(String(cell.tagName || "").toLowerCase()));
+  }
+
+  /**
+   * The drawn row a table's piece reads (`tableRowCells`), with its column headers' words as the labels (none
+   * where the table is only its header); null for any other block, or where the rows drawn are not as many as
+   * the pieces read.
+   */
+  function tableReadRow(block: DrawnBlock): { row: Element; heads: string[] } | null {
     if (block.kind !== "table") return null;
     const tagOf = (node: Element) => String(node.tagName || "").toLowerCase();
     const rows: Element[] = [];
@@ -1911,21 +1940,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     if (read.length !== block.pieces) return null;
     const row = read[block.piece];
     if (!row) return null;
-    const cellsOf = (tr: Element) => [...(tr.children || [])].filter((cell) => ["td", "th"].includes(tagOf(cell)));
-    const labels = body.length > 0 ? cellsOf(header).map((cell) => wordsOf(shownTextOf(cell).text)) : [];
-    const found: Sentence[] = [];
-    cellsOf(row).forEach((cell, at) => {
-      const { text, place } = shownTextOf(cell);
-      let start = 0;
-      while (start < text.length && /\s/.test(text[start]!)) start += 1;
-      let end = text.length;
-      while (end > start && /\s/.test(text[end - 1]!)) end -= 1;
-      // An empty cell is not said, and not lit.
-      if (end <= start) return;
-      const label = labels[at] || "";
-      found.push({ from: place(start), to: place(end), length: (label ? label.length + 2 : 0) + end - start + 1 });
-    });
-    return found;
+    const heads = body.length > 0 ? tableCellsOf(header).map((cell) => wordsOf(shownTextOf(cell).text)) : [];
+    return { row, heads };
   }
 
   /** Take the sentence light off, and stop looking for the next one. */
@@ -1963,8 +1979,12 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       // is one; where the page cuts the block otherwise, every sentence of the block. `#847
       // read-aloud-table-rows`: a table's piece is a row, whose sentences are its cells.
       const cells = block ? tableRowCells(block) : null;
-      const piece = block && !cells ? readPieceOf(block) : null;
-      return block ? { piece, row: cells !== null, sentences: cells || sentencesOf(block.element, piece) } : null;
+      // A table whose rows the page cannot match lights nothing inside it: no run of its words cut as prose,
+      // and not its sentences, which run across every row while the voice says one.
+      const table = block !== null && block !== undefined && block.kind === "table";
+      const piece = block && !table ? readPieceOf(block) : null;
+      const sentences = cells || (table ? [] : block ? sentencesOf(block.element, piece) : []);
+      return block ? { piece, row: cells !== null, sentences } : null;
     }).filter((one) => one !== null && one!.sentences.length > 0) : [];
     const timeline = player && typeof player.timeline === "function" ? player.timeline() : null;
     const piece = lit.length > 0 ? lit[0]!.piece : null;
@@ -2049,7 +2069,16 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     const drawn = segment && segment.block !== null ? preparedBlocksOf(row, segment.part) : null;
     const block = drawn && segment ? drawn[segment.block!] : null;
     if (block) {
-      const piece = readPieceOf(block);
+      // `#847 read-aloud-table-rows`. A table's piece is its row, its cells with their headers as said.
+      const read = tableReadRow(block);
+      if (read) {
+        const text = tableCellsOf(read.row).map((cell, at) => {
+          const words = wordsOf(shownTextOf(cell).text);
+          return words === "" ? "" : read.heads[at] ? `${read.heads[at]}: ${words}` : words;
+        }).filter((said) => said !== "").join(", ");
+        if (text !== "") return holding(text, read.row);
+      }
+      const piece = block.kind === "table" ? null : readPieceOf(block);
       const shown = shownTextOf(block.element).text;
       const text = wordsOf(piece ? shown.slice(piece.start, piece.end) : shown);
       if (text !== "") return holding(text, block.element);

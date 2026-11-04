@@ -4808,3 +4808,33 @@ test("`#847 read-aloud-table-rows`: a table is read a row at a time, its cells l
   }
   assert.deepStrictEqual(again, ["two", "bob"], "the second row's cells were not lit in turn");
 });
+
+test("`#847 read-aloud-table-rows`: a table whose drawn rows are not as many as the pieces read still reads, lighting nothing inside it", async () => {
+  const page = newPage();
+  page.enableStreamedAudio();
+  page.enableAbort();
+  const highlights = page.enableHighlights();
+  // The server reads three rows; the page drew two.
+  const row = (at) => ({ kind: "table", spoken: true, chars: 20, element: 0, piece: at, pieces: 3 });
+  page.speechBlocks[BLOCKED_ID] = [row(0), row(1), row(2)];
+  await signIn(page);
+  // Cells that end sentences: the table's own sentences run across every row, and must not be lit either.
+  const rows = await inReadingMode(page, [message({ id: BLOCKED_ID,
+    content: "| Lane | Status |\n|---|---|\n| one | Done. Shipped. |\n| two | Open. Waiting. |",
+    content_html: "<table>\n<thead>\n<tr>\n<th>Lane</th>\n<th>Status</th>\n</tr>\n</thead>\n<tbody>\n" +
+      "<tr>\n<td>one</td>\n<td>Done. Shipped.</td>\n</tr>\n<tr>\n<td>two</td>\n<td>Open. Waiting.</td>\n</tr>\n</tbody>\n</table>\n" })]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "1 of 3", "the read did not go on in the server's pieces");
+  const stream = page.audioStreams[0];
+  stream.controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(1500).fill(0x2000))));
+  stream.controller.drop();
+  await page.settle();
+  page.audio.currentTime = page.audio.sources.at(-1).startedAt + 0.7;
+  page.expireTimers(150);
+  await page.settle();
+  assert.equal(litSentence(highlights), "", "something inside a table whose rows do not match was lit as if it were the row");
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3");
+});
