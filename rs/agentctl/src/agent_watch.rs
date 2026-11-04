@@ -852,10 +852,188 @@ struct WatchState {
     /// agentctl-paste-tail-flush), by agent.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     draft_sweeps: BTreeMap<String, DraftSweep>,
+    /// Recovery-ladder episodes (phase 2), by agent: persisted so the
+    /// bounded escalation survives watcher restarts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    ladders: BTreeMap<String, LadderEntry>,
     /// Composer drafts agentctl cannot attribute (#808): left untouched,
     /// tracked so their blocking age can be reported.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     unattributed_drafts: BTreeMap<String, DraftSweep>,
+}
+
+/// One agent's recovery-ladder episode: when blockage was first seen,
+/// failed sweep/redraw cycles, restart times (for the 1/hour cap), and
+/// which steps were already notified.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct LadderEntry {
+    since: f64,
+    /// Consecutive passes that found the pane blocked.
+    #[serde(default)]
+    passes: u32,
+    cycles: u32,
+    #[serde(default)]
+    restarts: Vec<f64>,
+    #[serde(default)]
+    notified: Vec<String>,
+}
+
+/// The deterministic recovery ladder (phase 2): for any agent whose pane
+/// is blocked (stranded draft, blank/unreadable screen) whatever sender
+/// is waiting, escalate sweep -> redraw -> blank check -> bounded
+/// child-first restart, one notice per step via `tell_about` (never into
+/// the stuck pane, #844). Receipt-persisted in `state.ladders`; total
+/// escalation bounded by recovery_ladder's constants.
+fn recent_restarts(state: &WatchState, now: f64) -> usize {
+    state
+        .ladders
+        .values()
+        .flat_map(|e| e.restarts.iter())
+        .filter(|at| now - **at < 3600.0)
+        .count()
+}
+
+fn run_recovery_ladder(
+    _probe: &mut dyn Probe,
+    notifier: &mut dyn Notifier,
+    state: &mut WatchState,
+    observations: &[Observation],
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Vec<Value> {
+    use crate::recovery_ladder::{Ladder, LadderStep};
+    let mut rows = Vec::new();
+    let no_jams = BTreeSet::new();
+    let mut blocked: Vec<String> = Vec::new();
+    let mut restarted_this_pass = false;
+    for row in observations {
+        let Some(screen) = row.screen.as_deref() else {
+            continue;
+        };
+        let blank = crate::submission::is_ansi_blank(screen);
+        let drafted = row
+            .harness
+            .as_deref()
+            .and_then(|h| {
+                crate::submission::composer_view(h, screen)
+                    .and_then(|v| crate::submission::composer_draft(&v))
+            })
+            .is_some();
+        if blank || drafted {
+            blocked.push(row.name.clone());
+        }
+    }
+    // Recovered agents leave the ladder.
+    state.ladders.retain(|agent, _| blocked.contains(agent));
+    if options.check_only {
+        for agent in &blocked {
+            rows.push(json!({"agent": agent, "ladder": "blocked", "due": true}));
+        }
+        return rows;
+    }
+    for agent in blocked {
+        let host_restarts = recent_restarts(state, now);
+        let entry = state
+            .ladders
+            .entry(agent.clone())
+            .or_insert_with(|| LadderEntry {
+                since: now,
+                passes: 0,
+                cycles: 0,
+                restarts: Vec::new(),
+                notified: Vec::new(),
+            });
+        let recent = entry
+            .restarts
+            .iter()
+            .filter(|at| now - *at < 3600.0)
+            .count() as u32;
+        let ladder = Ladder {
+            failed_cycles: entry.cycles,
+            restarts_last_hour: recent,
+            unrecoverable_for: Duration::from_secs_f64((now - entry.since).max(0.0)),
+        };
+        let step = ladder.next_step();
+        // Restart guards: provably stuck across several passes, no visibly
+        // running turn/tool, one restart per pass globally, dry-run unless
+        // AGENTCTL_LADDER_RESTART=1, and a host-wide cap of 3/hour.
+        let screen_text = observations
+            .iter()
+            .find(|r| r.name == agent)
+            .and_then(|r| r.screen.clone())
+            .unwrap_or_default();
+        let running = screen_text.contains("esc to interrupt") || screen_text.contains("Working");
+        let step = if step == LadderStep::Restart
+            && (entry.passes < 3 || running || host_restarts >= 3 || restarted_this_pass)
+        {
+            LadderStep::Redraw
+        } else {
+            step
+        };
+        let step_name = format!("{step:?}").to_lowercase();
+        if step == LadderStep::Restart
+            && std::env::var("AGENTCTL_LADDER_RESTART").as_deref() != Ok("1")
+        {
+            let pane = _probe.agent_pane(&agent).unwrap_or_else(|| "?".to_owned());
+            let why = format!(
+                "agent {agent} pane {pane}: blocked for {:.0}s across {} passes with {} failed sweep/redraw cycle(s);                  would TERM the pinned harness child, relaunch in pane {pane} with --resume, and anchor --replace                  in every registry pinning {pane} (AGENTCTL_LADDER_RESTART is not set)",
+                (now - entry.since).max(0.0), entry.passes, entry.cycles
+            );
+            rows.push(
+                json!({"agent": agent, "pane": pane, "ladder": "restart", "action": "dry-run",
+                             "passes": entry.passes, "cycles": entry.cycles, "detail": why}),
+            );
+            let _ = tell_about(notifier, &agent, &no_jams,
+                &format!("agentctl watch recovery ladder dry-run: {why}; set AGENTCTL_LADDER_RESTART=1 to enable restarts"),
+                &format!("ladder:{agent}:restart:dry-run"), options);
+            continue;
+        }
+        let outcome = match step {
+            LadderStep::Sweep => notifier.ladder_sweep(&agent),
+            LadderStep::Redraw => notifier.ladder_redraw(&agent),
+            LadderStep::Restart => notifier.ladder_restart(&agent),
+            LadderStep::OperatorRequired => {
+                Err(fail("restart budget exhausted (1/hour); operator required"))
+            }
+        };
+        let mut remove_entry = false;
+        match outcome {
+            Ok(detail) => {
+                if step == LadderStep::Restart {
+                    restarted_this_pass = true;
+                    entry.restarts.push(now);
+                    entry.cycles = 0;
+                    entry.since = now;
+                } else {
+                    remove_entry = true;
+                }
+                rows.push(json!({"agent": agent, "ladder": step_name, "action": "done", "detail": detail}));
+            }
+            Err(error) => {
+                entry.cycles = entry.cycles.saturating_add(1);
+                rows.push(json!({"agent": agent, "ladder": step_name, "action": "failed", "detail": error.to_string()}));
+            }
+        }
+        let notice_key = format!("{step_name}:{}", entry.cycles);
+        if !entry.notified.contains(&notice_key) {
+            entry.notified.push(notice_key);
+            let _ = tell_about(
+                notifier,
+                &agent,
+                &no_jams,
+                &format!(
+                    "agentctl watch recovery ladder: {agent}: step {step_name} (cycle {})",
+                    entry.cycles
+                ),
+                &format!("ladder:{agent}:{step_name}:{}", entry.cycles),
+                options,
+            );
+        }
+        if remove_entry {
+            state.ladders.remove(&agent);
+        }
+    }
+    rows
 }
 
 /// One agent's unsent draft of ours under the idle sweep (#731
@@ -947,6 +1125,10 @@ pub trait Probe {
     fn agent_queue(&self, _agent: &str) -> Option<PathBuf> {
         None
     }
+    /// The pane one agent runs in, for ladder reports.
+    fn agent_pane(&self, _agent: &str) -> Option<String> {
+        None
+    }
     /// The harness one agent runs, for parsing its editor screen.
     fn agent_harness(&self, _agent: &str) -> Option<String> {
         None
@@ -1024,6 +1206,20 @@ pub trait Notifier {
     fn flush_draft(&mut self, agent: &str) -> Result<String> {
         let _ = agent;
         Err(fail("this notifier cannot flush editor drafts"))
+    }
+    /// Recovery ladder step 1: submit a stranded draft of ours (bare Enter).
+    fn ladder_sweep(&mut self, agent: &str) -> Result<String> {
+        self.flush_draft(agent)
+    }
+    /// Recovery ladder step 2: force the TUI to redraw and re-read it.
+    fn ladder_redraw(&mut self, agent: &str) -> Result<String> {
+        let _ = agent;
+        Err(fail("this notifier cannot redraw panes"))
+    }
+    /// Recovery ladder step 4: child-first restart with --resume.
+    fn ladder_restart(&mut self, agent: &str) -> Result<String> {
+        let _ = agent;
+        Err(fail("this notifier cannot restart agents"))
     }
     /// Refresh an observed session within a positively pinned native process lifetime.
     fn follow_observed_session(&mut self, _agent: &str) -> Result<bool> {
@@ -2894,6 +3090,7 @@ fn watch_agents_once(
         now,
         options,
     );
+    let ladder = run_recovery_ladder(probe, notifier, state, &observations, now, options);
     // Agent-teams health (#721): declaration red flags, undeliverable notices, and the
     // outbox pump. A failed probe pass says nothing about declarations, so their state is
     // left as it was.
@@ -2961,6 +3158,7 @@ fn watch_agents_once(
         "owner_waits": owner_waits,
         "quarantines": quarantines,
         "draft_sweeps": draft_sweeps,
+        "ladder": ladder,
         "team_declarations": team_flags,
         "team_declarations_notice": team_flags_notice,
         "team_notices": team_notices,
@@ -4724,6 +4922,14 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
             .find_map(|(name, queue)| (name == agent).then_some(queue))
     }
 
+    fn agent_pane(&self, agent: &str) -> Option<String> {
+        ManagedAgents::new(self.client, &self.registry)
+            .ok()?
+            .pane_info(agent)
+            .ok()
+            .map(|info| info.pane_id)
+    }
+
     fn agent_harness(&self, agent: &str) -> Option<String> {
         ManagedAgents::new(self.client, &self.registry)
             .ok()?
@@ -5111,6 +5317,14 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
 
     fn flush_draft(&mut self, agent: &str) -> Result<String> {
         ManagedAgents::new(self.client, &self.registry)?.flush_stale_draft(agent)
+    }
+
+    fn ladder_redraw(&mut self, agent: &str) -> Result<String> {
+        ManagedAgents::new(self.client, &self.registry)?.redraw_pane(agent)
+    }
+
+    fn ladder_restart(&mut self, agent: &str) -> Result<String> {
+        ManagedAgents::new(self.client, &self.registry)?.restart_with_resume(agent)
     }
 
     fn acknowledge_team_notice(&mut self, path: &Path) -> std::result::Result<(), String> {
@@ -6073,6 +6287,85 @@ mod tests {
     }
 
     #[test]
+    fn ladder_escalates_sweep_redraw_then_restart_and_caps_it() {
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier {
+            ladder_fails: true,
+            flush_fails: true,
+            ..RecordingNotifier::default()
+        };
+        let mut probe = DeliveryProbe::default();
+        let mut blank = observation("lane", "working", Some("   \n\n  "));
+        blank.has_pending = true;
+        blank.harness = Some("claude".to_owned());
+        // Pass 1 sweep fails, pass 2 redraw fails, then age past the ladder
+        // window with 3 cycles: restart; a second restart is capped.
+        run_recovery_ladder(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            std::slice::from_ref(&blank),
+            1000.0,
+            &options,
+        );
+        run_recovery_ladder(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            std::slice::from_ref(&blank),
+            1001.0,
+            &options,
+        );
+        assert_eq!(state.ladders["lane"].cycles, 2);
+        state.ladders.get_mut("lane").unwrap().cycles = 3;
+        state.ladders.get_mut("lane").unwrap().passes = 3;
+        // Dry-run by default on first deploy: no restart is executed.
+        let dry = run_recovery_ladder(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            std::slice::from_ref(&blank),
+            1650.0,
+            &options,
+        );
+        assert!(dry.iter().any(|r| r["action"] == "dry-run"), "{dry:?}");
+        assert!(notifier.ladder_steps.iter().all(|(s, _)| s != "restart"));
+        std::env::set_var("AGENTCTL_LADDER_RESTART", "1");
+        let _rows = run_recovery_ladder(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            std::slice::from_ref(&blank),
+            1700.0,
+            &options,
+        );
+        assert!(
+            notifier.ladder_steps.iter().any(|(s, _)| s == "restart"),
+            "{:?}",
+            notifier.ladder_steps
+        );
+        assert_eq!(state.ladders["lane"].restarts.len(), 1);
+        state.ladders.get_mut("lane").unwrap().cycles = 3;
+        let rows = run_recovery_ladder(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            std::slice::from_ref(&blank),
+            2400.0,
+            &options,
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r["detail"].as_str().is_some_and(|d| d.contains("operator"))),
+            "{rows:?}"
+        );
+        // Notices went to the coordinator, never the stuck pane itself.
+        assert!(notifier.sent.iter().all(|(to, _, _)| to != "lane"));
+        let _ = rows;
+    }
+
+    #[test]
     fn notice_routes_skip_the_subject_and_jammed_agents() {
         let mut options = options();
         options.notice_fallback = vec!["second".to_owned(), "third".to_owned()];
@@ -6170,6 +6463,10 @@ mod tests {
         alarms: Vec<(String, String)>,
         /// Whether raising an owner alarm fails, as with no route configured (#844).
         alarm_fails: bool,
+        /// Ladder steps attempted, as (step, agent).
+        ladder_steps: Vec<(String, String)>,
+        /// Whether ladder sweep/redraw fail (restart succeeds).
+        ladder_fails: bool,
     }
 
     impl RecordingNotifier {
@@ -6217,6 +6514,22 @@ mod tests {
             } else {
                 Ok("submitted the draft agentctl typed".to_owned())
             }
+        }
+
+        fn ladder_redraw(&mut self, agent: &str) -> Result<String> {
+            self.ladder_steps
+                .push(("redraw".to_owned(), agent.to_owned()));
+            if self.ladder_fails {
+                Err(fail("redraw did not help"))
+            } else {
+                Ok("redrew".to_owned())
+            }
+        }
+
+        fn ladder_restart(&mut self, agent: &str) -> Result<String> {
+            self.ladder_steps
+                .push(("restart".to_owned(), agent.to_owned()));
+            Ok("restarted with --resume".to_owned())
         }
 
         fn interrupt_and_deliver(&mut self, agent: &str, _expected: u64) -> Result<Interrupt> {
