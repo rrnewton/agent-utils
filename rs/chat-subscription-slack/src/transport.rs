@@ -176,6 +176,9 @@ pub struct PostMessage<'a> {
     /// Block Kit blocks as a JSON array, drawn in place of `text`, which is then the
     /// notification fallback (`#551 headings-real-headings`); `None` posts `text` alone.
     pub blocks: Option<&'a str>,
+    /// Slack message metadata as a JSON object `{"event_type": …, "event_payload": {…}}`, which
+    /// marks the post for machines (#832 chat-trace-format-tagging); `None` posts none.
+    pub metadata: Option<&'a str>,
 }
 
 /// One message from a history or thread listing.

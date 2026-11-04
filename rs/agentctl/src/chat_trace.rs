@@ -6,8 +6,13 @@
 //! `--trace-thread`, this collector reads that text from the agent's
 //! transcript (the #710 reader), removes every complete fenced block
 //! (already posted, so never double-posted), and emits the remainder for
-//! posting to one trace thread. Each post is labelled with the prompt(s)
-//! that started the turn; the label is provenance, not routing.
+//! posting to one trace thread. Each post names the prompt(s) that started
+//! the turn as its trigger; the trigger is provenance, not routing, and
+//! travels only in the post's metadata (#832 chat-trace-format-tagging,
+//! owner 2026-11-03): the text itself carries no label, so it reads (and
+//! is read aloud) as the agent wrote it. Every post is also marked for
+//! machines with [`trace_metadata`], and its text is escaped by
+//! [`escape_for_chat`] so file names and relative links survive the chat.
 //!
 //! Filtering is deliberately minimal: drop fenced blocks and empty
 //! remainders, coalesce within a window or to the turn's end, cap the
@@ -18,11 +23,186 @@ use std::collections::BTreeMap;
 
 use agent_harness::{replies::OutsideBlocks, Event};
 
-/// One trace post to make (already labelled).
+/// One trace post to make.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TracePost {
-    /// The post's text, label line first.
+    /// The post's text, escaped for chat, with no label.
     pub text: String,
+    /// The prompt(s) that started the turn (`owner message`, `reply CHAT_REPLY_007`,
+    /// `agent lane-a`, ...), for the post's metadata.
+    pub trigger: String,
+}
+
+/// The Slack metadata `event_type` of every trace post (#832).
+pub const TRACE_EVENT_TYPE: &str = "agentctl_trace";
+
+/// One trace post's metadata (#832 chat-trace-format-tagging): event type
+/// [`TRACE_EVENT_TYPE`] and payload `{v: 1, kind, agent, team, session, day, seq, trigger}`.
+/// `kind` is `root` for the day's thread root and `entry` for a post in it; `day` is the ET
+/// date; `seq` counts the day's posts from 0 at the root; `team` and `session` are null when
+/// unknown, and the root's `trigger` is null.
+#[must_use]
+pub fn trace_metadata(
+    kind: &str,
+    agent: &str,
+    team: Option<&str>,
+    session: Option<&str>,
+    day: &str,
+    seq: u64,
+    trigger: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event_type": TRACE_EVENT_TYPE,
+        "event_payload": {
+            "v": 1, "kind": kind, "agent": agent, "team": team, "session": session,
+            "day": day, "seq": seq, "trigger": trigger,
+        },
+    })
+}
+
+/// File extensions after which Slack's auto-linker takes a bare name for a web address (many
+/// are also country or generic top-level domains, such as `.rs`, `.py`, `.md`, `.sh`, `.io`).
+const LINKED_EXTENSIONS: &[&str] = &[
+    "ai", "app", "c", "cc", "cfg", "cpp", "css", "csv", "dev", "go", "h", "html", "ini", "io",
+    "java", "js", "json", "jsonl", "kt", "lock", "log", "md", "me", "mjs", "pl", "py", "rb", "rs",
+    "sh", "so", "sql", "to", "toml", "ts", "txt", "xml", "yaml", "yml",
+];
+
+/// Escape trace text for chat, the way the reply path's #794 work protects names
+/// (#832 chat-trace-format-tagging). Outside code fences and inline code:
+///
+/// * a bare file name such as `preemptions.rs` or `src/cli.rs` is put in inline
+///   code, so Slack does not turn it into a link to a web site of that name;
+/// * a Markdown link to a relative path, `[the note](ai_docs/x.md)`, becomes
+///   ``the note (`ai_docs/x.md`)``, since a relative target can only show as raw link markup.
+///
+/// Links with a scheme (`https:`, `mailto:`) and anchors (`#…`) are left as they are, and so is
+/// text inside code.
+#[must_use]
+pub fn escape_for_chat(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for line in text.split('\n') {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            out.push(line.to_owned());
+            continue;
+        }
+        if in_fence {
+            out.push(line.to_owned());
+            continue;
+        }
+        // Even pieces lie outside inline code; odd ones inside. An unmatched backtick leaves
+        // the rest of the line as it is.
+        let pieces: Vec<&str> = line.split('`').collect();
+        let closed = pieces.len() % 2 == 1;
+        let mut escaped = String::with_capacity(line.len());
+        for (index, piece) in pieces.iter().enumerate() {
+            if index > 0 {
+                escaped.push('`');
+            }
+            if index % 2 == 0 && (closed || index + 1 < pieces.len()) {
+                escaped.push_str(&escape_links(piece));
+            } else {
+                escaped.push_str(piece);
+            }
+        }
+        out.push(escaped);
+    }
+    out.join("\n")
+}
+
+/// [`escape_for_chat`] for one piece of text outside code: relative Markdown links first, then
+/// bare names in what is left.
+fn escape_links(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let Some((label, target, consumed)) = markdown_link(&rest[open..]) else {
+            out.push_str(&escape_names(&rest[..=open]));
+            rest = &rest[open + 1..];
+            continue;
+        };
+        out.push_str(&escape_names(&rest[..open]));
+        let absolute = target.contains(':') || target.starts_with('#');
+        if absolute {
+            out.push('[');
+            out.push_str(&escape_names(label));
+            out.push_str("](");
+            out.push_str(target);
+            out.push(')');
+        } else {
+            out.push_str(&escape_names(label));
+            out.push_str(" (`");
+            out.push_str(target);
+            out.push_str("`)");
+        }
+        rest = &rest[open + consumed..];
+    }
+    out.push_str(&escape_names(rest));
+    out
+}
+
+/// A Markdown link `[label](target)` at the start of `text`, with no space in the target, as
+/// (label, target, bytes consumed).
+fn markdown_link(text: &str) -> Option<(&str, &str, usize)> {
+    let close = text.find("](")?;
+    let label = &text[1..close];
+    if label.contains('[') || label.contains(']') {
+        return None;
+    }
+    let after = &text[close + 2..];
+    let end = after.find(')')?;
+    let target = &after[..end];
+    if target.is_empty() || target.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((label, target, close + 2 + end + 1))
+}
+
+/// Put each bare file name in `text` in inline code (see [`LINKED_EXTENSIONS`]).
+fn escape_names(text: &str) -> String {
+    let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+    let mut previous: Option<char> = None;
+    while let Some((start, c)) = chars.next() {
+        if !name_char(c) {
+            out.push(c);
+            previous = Some(c);
+            continue;
+        }
+        let mut end = start + c.len_utf8();
+        while let Some(&(at, next)) = chars.peek() {
+            if !name_char(next) {
+                break;
+            }
+            end = at + next.len_utf8();
+            chars.next();
+        }
+        let token = &text[start..end];
+        // A sentence's closing dots stay outside the name.
+        let name = token.trim_end_matches('.');
+        let trailing = &token[name.len()..];
+        // Part of an address (`https://…`, `a@b.io`) or a path that begins `//`: not a name.
+        let in_address = matches!(previous, Some(':' | '@')) || name.starts_with("//");
+        let linked = name.rsplit_once('.').is_some_and(|(stem, extension)| {
+            stem.chars()
+                .last()
+                .is_some_and(|last| last.is_ascii_alphanumeric() || last == '_')
+                && LINKED_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        });
+        if linked && !in_address {
+            out.push('`');
+            out.push_str(name);
+            out.push('`');
+            out.push_str(trailing);
+        } else {
+            out.push_str(token);
+        }
+        previous = token.chars().last();
+    }
+    out
 }
 
 /// Per-turn counters for the trial.
@@ -307,14 +487,14 @@ impl Collector {
             body.push_str(&format!("\n\n[{omitted} bytes omitted]"));
             *self.metrics.drops.entry("overflow".to_owned()).or_default() += 1;
         }
-        let label = if self.labels.is_empty() {
-            "— after: prompt".to_owned()
+        let trigger = if self.labels.is_empty() {
+            "prompt".to_owned()
         } else {
-            format!("— after: {}", self.labels.join(", "))
+            self.labels.join(", ")
         };
-        let budget = self.max_bytes.saturating_sub(label.len() + 1).max(200);
+        let body = escape_for_chat(&body);
         let mut posts = Vec::new();
-        for part in split_long(&body, budget) {
+        for part in split_long(&body, self.max_bytes) {
             if self.metrics.posts == 0 {
                 if let (Some(start), true) = (self.turn_started, now > 0.0) {
                     self.metrics.first_post_latency_secs = Some((now - start).max(0.0) as u64);
@@ -323,7 +503,8 @@ impl Collector {
             self.metrics.posts += 1;
             self.metrics.bytes += part.len();
             posts.push(TracePost {
-                text: format!("{label}\n{part}"),
+                text: part,
+                trigger: trigger.clone(),
             });
         }
         posts
@@ -478,11 +659,10 @@ mod tests {
         c.feed(&text(2.0, "Side note the owner never saw in chat."));
         let posts = c.feed(&Event::TurnEnd { at: Some(3.0) });
         assert_eq!(posts.len(), 1);
-        assert!(
-            posts[0].text.starts_with("— after: reply CHAT_REPLY_007\n"),
-            "{}",
-            posts[0].text
-        );
+        // #832: no label in the text; the trigger travels in the metadata only.
+        assert_eq!(posts[0].text, "Side note the owner never saw in chat.");
+        assert_eq!(posts[0].trigger, "reply CHAT_REPLY_007");
+        assert!(!posts[0].text.contains("after:"));
         assert!(posts[0].text.contains("Side note"));
         assert!(!posts[0].text.contains("posted answer"));
     }
@@ -519,13 +699,11 @@ mod tests {
         c.feed(&text(3.0, "Working notes from a batched turn."));
         let posts = c.feed(&Event::TurnEnd { at: Some(4.0) });
         assert_eq!(posts.len(), 1);
-        assert!(
-            posts[0]
-                .text
-                .contains("reply CHAT_REPLY_007, agent lane-a, agent agent-b"),
-            "{}",
-            posts[0].text
+        assert_eq!(
+            posts[0].trigger,
+            "reply CHAT_REPLY_007, agent lane-a, agent agent-b"
         );
+        assert_eq!(posts[0].text, "Working notes from a batched turn.");
     }
 
     #[test]
@@ -554,11 +732,85 @@ mod tests {
         let mut held: Vec<TracePost> = (0..5)
             .map(|i| TracePost {
                 text: format!("p{i}"),
+                trigger: "prompt".to_owned(),
             })
             .collect();
         assert_eq!(cap_held(&mut held, 3), 2);
         assert_eq!(held[0].text, "p2");
         assert_eq!(cap_held(&mut held, 3), 0);
+    }
+
+    #[test]
+    fn bare_names_and_relative_links_are_escaped_outside_code() {
+        assert_eq!(
+            escape_for_chat("Fixed preemptions.rs and rs/agentctl/src/cli.rs."),
+            "Fixed `preemptions.rs` and `rs/agentctl/src/cli.rs`."
+        );
+        assert_eq!(
+            escape_for_chat("See [the note](ai_docs/2026-11-03-x.md) for more."),
+            "See the note (`ai_docs/2026-11-03-x.md`) for more."
+        );
+        // Absolute links, anchors, addresses, code and ordinary words are left alone.
+        for kept in [
+            "Read [the PR](https://github.com/o/r/pull/1) and [above](#top).",
+            "Mail a@b.io or open https://example.io/x.rs today.",
+            "Already `cli.rs` in code, e.g. here, version 1.5, done.",
+        ] {
+            assert_eq!(escape_for_chat(kept), kept);
+        }
+        assert_eq!(
+            escape_for_chat("[cli.rs](https://x.example/cli.rs)"),
+            "[`cli.rs`](https://x.example/cli.rs)"
+        );
+        let fenced = "```\nlet p = \"preemptions.rs\";\n```\nthen notes.md";
+        assert_eq!(
+            escape_for_chat(fenced),
+            "```\nlet p = \"preemptions.rs\";\n```\nthen `notes.md`"
+        );
+        // The collector posts the escaped text.
+        let mut c = Collector::new(Duration::from_secs(45));
+        c.feed(&prompt(0.0, REAL_HEADER));
+        c.feed(&text(
+            1.0,
+            "Edited chat_trace.rs per [the issue](.minibeads/issues/x.md).",
+        ));
+        let posts = c.feed(&Event::TurnEnd { at: Some(2.0) });
+        assert_eq!(
+            posts[0].text,
+            "Edited `chat_trace.rs` per the issue (`.minibeads/issues/x.md`)."
+        );
+    }
+
+    #[test]
+    fn trace_metadata_marks_roots_and_entries() {
+        let root = trace_metadata(
+            "root",
+            "coordinator",
+            Some("agent-utils"),
+            Some("s-1"),
+            "2026-11-03",
+            0,
+            None,
+        );
+        assert_eq!(
+            root,
+            serde_json::json!({"event_type": "agentctl_trace", "event_payload": {
+                "v": 1, "kind": "root", "agent": "coordinator", "team": "agent-utils",
+                "session": "s-1", "day": "2026-11-03", "seq": 0, "trigger": null}})
+        );
+        let entry = trace_metadata(
+            "entry",
+            "coordinator",
+            None,
+            None,
+            "2026-11-03",
+            7,
+            Some("owner message"),
+        );
+        assert_eq!(entry["event_payload"]["kind"], "entry");
+        assert_eq!(entry["event_payload"]["seq"], 7);
+        assert_eq!(entry["event_payload"]["trigger"], "owner message");
+        assert!(entry["event_payload"]["team"].is_null());
     }
 
     #[test]

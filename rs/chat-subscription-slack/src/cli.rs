@@ -5,7 +5,7 @@
 //! | Operation | Command |
 //! | --- | --- |
 //! | inbound stream | `slack.conversation tail --channel-id=C… --event-types=message.created --include-iris-seq-id --output=json --heartbeats --catchup=…` |
-//! | post | `slack.message send --channel-id=C… --markdown=file://- [--thread-ts=…] [--as=A…] --output=json` |
+//! | post | `slack.message send --channel-id=C… --markdown=file://- [--blocks=file://…] [--metadata=file://…] [--thread-ts=…] [--as=A…] --output=json` |
 //! | reaction | `slack.reaction add --channel-id=C… --message-ts=… --name=… [--as=A…] --output=json` |
 //! | listing | `slack.message list --channel-id=C… [--thread-ts=…] --oldest=… [--as=A…] --output=json` |
 //! | rescan listing | `slack.message list --channel-id=C… [--thread-ts=…] --oldest=… [--page-token=…] --limit=20 --columns=… --content-format=mrkdwn --output=json` |
@@ -1244,6 +1244,7 @@ pub(crate) fn post_arguments(
     thread_ts: Option<&str>,
     format: TextFormat,
     blocks_file: Option<&Path>,
+    metadata_file: Option<&Path>,
 ) -> Vec<String> {
     let body_flag = match format {
         TextFormat::Markdown => "--markdown=file://-",
@@ -1258,6 +1259,9 @@ pub(crate) fn post_arguments(
     ];
     if let Some(path) = blocks_file {
         arguments.push(format!("--blocks=file://{}", path.display()));
+    }
+    if let Some(path) = metadata_file {
+        arguments.push(format!("--metadata=file://{}", path.display()));
     }
     if let Some(thread_ts) = thread_ts {
         arguments.push(format!("--thread-ts={thread_ts}"));
@@ -1291,14 +1295,15 @@ pub(crate) fn post_outcome(completed: &Completed) -> Result<String, TransportErr
         })
 }
 
-/// A post's Block Kit blocks in a new owner-only file under the temporary directory, for the
-/// client's `--blocks=file://…`, deleted when dropped.
+/// A post's Block Kit blocks or metadata in a new owner-only file under the temporary
+/// directory, for the client's `--blocks=file://…` or `--metadata=file://…`, deleted when
+/// dropped.
 struct BlocksFile {
     path: PathBuf,
 }
 
 impl BlocksFile {
-    fn create(blocks: &str) -> io::Result<Self> {
+    fn create(kind: &str, content: &str) -> io::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -1306,7 +1311,7 @@ impl BlocksFile {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.subsec_nanos());
         let path = std::env::temp_dir().join(format!(
-            "agentctl-slack-blocks-{}-{nanos}-{}.json",
+            "agentctl-slack-{kind}-{}-{nanos}-{}.json",
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
@@ -1316,7 +1321,7 @@ impl BlocksFile {
             .mode(0o600)
             .open(&path)?;
         let written = Self { path };
-        file.write_all(blocks.as_bytes())?;
+        file.write_all(content.as_bytes())?;
         file.sync_all()?;
         Ok(written)
     }
@@ -1388,12 +1393,23 @@ impl SlackTransport for CliTransport {
         // removed when the run ends. Neither is ever an argument a process listing shows.
         let blocks_file = post
             .blocks
-            .map(BlocksFile::create)
+            .map(|blocks| BlocksFile::create("blocks", blocks))
             .transpose()
             .map_err(|error| {
                 TransportError::not_applied(
                     "blocks_file_failed",
                     format!("the post's blocks could not be written for the client: {error}"),
+                    true,
+                )
+            })?;
+        let metadata_file = post
+            .metadata
+            .map(|metadata| BlocksFile::create("metadata", metadata))
+            .transpose()
+            .map_err(|error| {
+                TransportError::not_applied(
+                    "metadata_file_failed",
+                    format!("the post's metadata could not be written for the client: {error}"),
                     true,
                 )
             })?;
@@ -1403,6 +1419,7 @@ impl SlackTransport for CliTransport {
             post.thread_ts,
             post.format,
             blocks_file.as_ref().map(|file| file.path.as_path()),
+            metadata_file.as_ref().map(|file| file.path.as_path()),
         );
         let converted;
         let body: &[u8] = if post.format == TextFormat::Converted {

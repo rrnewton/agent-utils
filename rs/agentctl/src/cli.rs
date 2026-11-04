@@ -2059,7 +2059,7 @@ struct ChatRun {
     /// Print an `agentctl chat reply` command in each request prompt that gives the two reply marker lines, as a way to send a reply at once (default: off). A prompt leaves the command out when no file is left at this executable's path or a word of the command cannot be printed safely. With or without this option, a service with outbound replies enabled listens for that command's wakes on the state directory's .wake.sock, unless the socket's absolute path exceeds 107 bytes. The agent must be able to run this executable and write the state directory; applies only to this run.
     #[arg(long)]
     offer_reply_command: bool,
-    /// Post the agent's non-reply transcript text to one trace thread (#714 chat-transcript-primary): one root per day in the bridge channel, trace text as replies in it (default: off). Fenced replies are unchanged.
+    /// Post the agent's non-reply transcript text to one trace thread (#714 chat-transcript-primary): one root per day in the bridge channel, titled "<agent> main session trace, <date> ET", and trace text as replies in it (default: off). Fenced replies are unchanged. Each post carries Slack message metadata of event type agentctl_trace with payload {v, kind (root or entry), agent, team, session, day (ET date), seq, trigger}; the prompt that started the turn is in the trigger only, never in the text (#832). Bare file names are put in inline code and relative links become "label (`path`)", so neither turns into a stray link
     #[arg(long, requires = "trace_channel")]
     trace_thread: bool,
     /// Channel for the --trace-thread root post. Required with --trace-thread; a relay channel is refused.

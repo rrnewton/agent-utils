@@ -698,6 +698,27 @@ pub fn publish(
     body: &str,
     slack_format: Option<SlackFormat>,
 ) -> Result<Value, ChatServiceError> {
+    publish_tagged(
+        state_root,
+        channel_id,
+        thread_id,
+        request_id,
+        body,
+        slack_format,
+        None,
+    )
+}
+
+/// [`publish`] with Slack message metadata on the post (#832 chat-trace-format-tagging).
+pub fn publish_tagged(
+    state_root: &Path,
+    channel_id: &str,
+    thread_id: Option<&str>,
+    request_id: &str,
+    body: &str,
+    slack_format: Option<SlackFormat>,
+    metadata: Option<Value>,
+) -> Result<Value, ChatServiceError> {
     let state = BridgeState::inspect(state_root)?;
     let configuration = state.config();
     if !configuration.outbound_enabled {
@@ -750,6 +771,7 @@ pub fn publish(
         )
     })?;
     transport.set_slack_format_override(slack_format);
+    transport.set_post_metadata(metadata);
     let message_id = match reply {
         Some(reply) => transport.send(reply)?,
         None => transport.publish_root(root)?,
@@ -770,7 +792,12 @@ pub fn publish(
 /// The trace driver (#714 chat-transcript-primary): read the agent's
 /// transcript, and post its non-reply text to one trace thread per ET day.
 /// The root's thread id lives in `<state>/trace/trace-thread.json`, and
-/// per-turn metrics in `<state>/trace/metrics.jsonl`. Text is held (never
+/// per-turn metrics in `<state>/trace/metrics.jsonl`. Every post carries
+/// `agentctl_trace` metadata (#832 chat-trace-format-tagging): kind, agent,
+/// team, session, ET day, the day's sequence number (also kept in
+/// `trace-thread.json`) and, for entries, the trigger. A helper too old for
+/// metadata refuses it as `request_invalid`; the driver then posts without
+/// metadata for the rest of its run. Text is held (never
 /// spilled to the channel) while no trace thread exists, posts are rate
 /// capped, and only events newer than the persisted high-water mark and
 /// the process start are posted, so a restart never replays old text.
@@ -798,6 +825,11 @@ fn spawn_trace_driver(
             .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
             .and_then(|v| v["high_water"].as_f64())
             .unwrap_or(0.0);
+        // #832: what the metadata says about the agent, read once.
+        let team = crate::subagents::declared_team_for_registry(&registry.display().to_string());
+        let session = agent_native_session(&registry, &agent);
+        let mut seq: u64 = 0;
+        let mut metadata_ok = true;
         let mut source = crate::chat_transcript::CoordinatorTranscript::for_agent_trace(
             registry,
             agent.clone(),
@@ -864,6 +896,7 @@ fn spawn_trace_driver(
                             (
                                 crate::chat_trace::TracePost {
                                     text: format!("[{dropped} trace posts omitted]"),
+                                    trigger: "omission".to_owned(),
                                 },
                                 None,
                             ),
@@ -875,17 +908,19 @@ fn spawn_trace_driver(
             if thread_date != today {
                 thread = None;
                 thread_date = today.clone();
+                seq = 0;
                 if let Ok(raw) = std::fs::read(dir.join("trace-thread.json")) {
                     if let Ok(saved) = serde_json::from_slice::<serde_json::Value>(&raw) {
                         if saved["date"].as_str() == Some(today.as_str()) {
                             thread = saved["thread_id"].as_str().map(str::to_owned);
+                            seq = saved["seq"].as_u64().unwrap_or(0);
                         }
                     }
                 }
             }
-            let write_state = |dir: &Path, today: &str, tid: &str, high_water: f64| {
-                let saved =
-                    serde_json::json!({"date": today, "thread_id": tid, "high_water": high_water});
+            let write_state = |dir: &Path, today: &str, tid: &str, high_water: f64, seq: u64| {
+                let saved = serde_json::json!({"date": today, "thread_id": tid,
+                                               "high_water": high_water, "seq": seq});
                 let tmp = dir.join("trace-thread.json.tmp");
                 std::fs::write(&tmp, saved.to_string())
                     .and_then(|()| std::fs::rename(&tmp, dir.join("trace-thread.json")))
@@ -926,13 +961,23 @@ fn spawn_trace_driver(
             if root_allowed {
                 let uuid = crate::chat_runtime::random_operation_uuid()
                     .unwrap_or_else(|_| "trace-root".to_owned());
-                match publish(
+                let metadata = crate::chat_trace::trace_metadata(
+                    "root",
+                    &agent,
+                    team.as_deref(),
+                    session.as_deref(),
+                    &today,
+                    0,
+                    None,
+                );
+                match publish_trace(
                     &root_dir,
                     &channel,
                     None,
                     &uuid,
                     &format!("{agent} main session trace, {today} ET"),
-                    None,
+                    metadata,
+                    &mut metadata_ok,
                 ) {
                     Ok(receipt) => {
                         let mid = receipt["receipt"]["message_id"]
@@ -940,7 +985,8 @@ fn spawn_trace_driver(
                             .unwrap_or_default()
                             .to_owned();
                         let tid = crate::chat_trace::trace_thread_id(&channel, &mid);
-                        match write_state(&dir, &today, &tid, high_water) {
+                        seq = 0;
+                        match write_state(&dir, &today, &tid, high_water, seq) {
                             Ok(()) => {
                                 thread = Some(tid);
                                 replacement_root = false;
@@ -973,17 +1019,29 @@ fn spawn_trace_driver(
                         crate::chat_runtime::random_operation_uuid()
                             .unwrap_or_else(|_| "trace-post".to_owned())
                     });
-                    match publish(
+                    let metadata = crate::chat_trace::trace_metadata(
+                        "entry",
+                        &agent,
+                        team.as_deref(),
+                        session.as_deref(),
+                        &thread_date,
+                        seq + 1,
+                        Some(&post.trigger),
+                    );
+                    match publish_trace(
                         &root_dir,
                         &channel,
                         thread.as_deref(),
                         &uuid,
                         &post.text,
-                        None,
+                        metadata,
+                        &mut metadata_ok,
                     ) {
                         Ok(_) => {
+                            seq += 1;
                             if let Some(tid) = thread.as_deref() {
-                                let _ = write_state(&dir, &thread_date.clone(), tid, high_water);
+                                let _ =
+                                    write_state(&dir, &thread_date.clone(), tid, high_water, seq);
                             }
                         }
                         Err(e) => {
@@ -1047,6 +1105,58 @@ fn spawn_trace_driver(
             std::thread::sleep(Duration::from_secs(2));
         }
     });
+}
+
+/// Post one trace message with its `agentctl_trace` metadata (#832 chat-trace-format-tagging)
+/// while `metadata_ok` holds. A helper older than metadata refuses the request as
+/// `request_invalid` before it posts anything; then `metadata_ok` is cleared, so this and every
+/// later post of the run go without it, and the trace keeps flowing.
+fn publish_trace(
+    state_root: &Path,
+    channel: &str,
+    thread: Option<&str>,
+    request_id: &str,
+    body: &str,
+    metadata: Value,
+    metadata_ok: &mut bool,
+) -> Result<Value, ChatServiceError> {
+    if *metadata_ok {
+        match publish_tagged(
+            state_root,
+            channel,
+            thread,
+            request_id,
+            body,
+            None,
+            Some(metadata),
+        ) {
+            Err(ChatServiceError::Outbound(failure))
+                if failure.code == "request_invalid"
+                    && failure.outcome == crate::chat_runtime::OutboundOutcome::NotApplied =>
+            {
+                service_log(format!(
+                    "agentctl: the outbound helper refused trace metadata ({}); posting the trace \
+                     without it",
+                    failure.detail
+                ));
+                *metadata_ok = false;
+            }
+            other => return other,
+        }
+    }
+    publish(state_root, channel, thread, request_id, body, None)
+}
+
+/// The agent's native session id from its registry record, for trace metadata (#832), or
+/// `None` when the record names none.
+fn agent_native_session(registry: &Path, agent: &str) -> Option<String> {
+    let directory = agent_queue::registry::directory(registry, agent).ok()?;
+    let record: Value =
+        serde_json::from_str(&std::fs::read_to_string(directory.join("agent.json")).ok()?).ok()?;
+    record["native_session"]["value"]
+        .as_str()
+        .or_else(|| record["session_value"].as_str())
+        .map(str::to_owned)
 }
 
 /// Close capture for one exact request and durably retire it when terminal and replay-safe.

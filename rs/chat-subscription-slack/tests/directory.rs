@@ -785,6 +785,7 @@ fn a_post_with_blocks_hands_them_over_in_a_private_file_removed_afterwards() {
             text: "*Report*",
             format: TextFormat::SlackMrkdwn,
             blocks: Some(blocks),
+            metadata: None,
         })
         .expect("posted");
     assert_eq!(ts, "1792000900.000100");
@@ -819,6 +820,7 @@ fn a_post_with_blocks_hands_them_over_in_a_private_file_removed_afterwards() {
             text: "plain",
             format: TextFormat::SlackMrkdwn,
             blocks: None,
+            metadata: None,
         })
         .expect("posted");
     assert!(!root.join("blocks.path").exists());

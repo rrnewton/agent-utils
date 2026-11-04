@@ -52,8 +52,8 @@ pub(crate) use cloud::{
 };
 pub use cloud::{CloudLaunch, CloudTools};
 pub(crate) use control::{
-    acknowledge_team_notice, agent_teams_state_dir, controller_of, team_declaration_flags,
-    team_undeliverable_notices, tree_order,
+    acknowledge_team_notice, agent_teams_state_dir, controller_of, declared_team_for_registry,
+    team_declaration_flags, team_undeliverable_notices, tree_order,
 };
 pub use control::{render_tree, ManageAction};
 pub use headless::{HeadlessApprovals, HeadlessStart, TakeoverOptions, TurnoverOptions};

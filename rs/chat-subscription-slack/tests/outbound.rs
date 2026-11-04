@@ -171,6 +171,52 @@ fn rejection(sender_id: &str) -> Value {
 }
 
 #[test]
+fn a_send_carries_its_metadata_to_every_post_and_bad_metadata_is_refused() {
+    // #832 chat-trace-format-tagging: trace posts are marked for machines.
+    let ledger = ledger("metadata");
+    let config = config(&ledger, Some(APP));
+    let fake = FakeTransport::new();
+    let metadata = json!({"event_type": "agentctl_trace",
+                          "event_payload": {"v": 1, "kind": "entry", "agent": "coordinator"}});
+    let mut request = send(ID, Some("1792000801.000100"), "traced text");
+    request["metadata"] = metadata.clone();
+    let response = run(&config, &fake, &request, 1_000);
+    assert_eq!(response["ok"], json!(true), "{response}");
+    let state = fake.state();
+    assert_eq!(state.posts.len(), 1);
+    let posted: Value = serde_json::from_str(state.posts[0].metadata.as_deref().unwrap()).unwrap();
+    assert_eq!(posted, metadata);
+    drop(state);
+    // A send without metadata posts none.
+    let plain = run(
+        &config,
+        &fake,
+        &send("2b7e4f6a-1c2d-4e5f-8a9b-0c1d2e3f4a5b", None, "plain"),
+        1_000,
+    );
+    assert_eq!(plain["ok"], json!(true), "{plain}");
+    assert_eq!(fake.state().posts[1].metadata, None);
+    for bad in [
+        json!("agentctl_trace"),
+        json!({"event_type": "agentctl_trace"}),
+        json!({"event_type": "Has Spaces", "event_payload": {}}),
+        json!({"event_type": "agentctl_trace", "event_payload": []}),
+        json!({"event_type": "agentctl_trace", "event_payload": {}, "extra": 1}),
+    ] {
+        let mut request = send("3b7e4f6a-1c2d-4e5f-8a9b-0c1d2e3f4a5b", None, "x");
+        request["metadata"] = bad.clone();
+        let response = run(&config, &fake, &request, 1_000);
+        assert_eq!(response["ok"], json!(false), "{bad}: {response}");
+        assert_eq!(
+            response["error"]["code"],
+            json!("request_invalid"),
+            "{response}"
+        );
+    }
+    assert_eq!(fake.state().posts.len(), 2, "a refused send posts nothing");
+}
+
+#[test]
 fn reply_goes_into_the_request_thread_as_the_app() {
     let ledger = ledger("thread");
     let config = config(&ledger, Some(APP));

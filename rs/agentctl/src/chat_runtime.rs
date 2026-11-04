@@ -3933,6 +3933,8 @@ pub struct CommandOutboundTransport {
     slack_format_override: Option<SlackFormat>,
     // `#708 vt-live-push`: the sinks told of every post and reaction this transport makes.
     event_sink: Option<Arc<crate::chat_event_sink::EventSink>>,
+    // #832 chat-trace-format-tagging: metadata for the next sends and root posts.
+    post_metadata: Option<serde_json::Value>,
 }
 
 /// Read-only provider directory operations used by the operator's grant command.
@@ -4014,6 +4016,7 @@ impl CommandOutboundTransport {
             slack_format_by_channel: self.slack_format_by_channel.clone(),
             slack_format_override: self.slack_format_override,
             event_sink: self.event_sink.clone(),
+            post_metadata: self.post_metadata.clone(),
         })
     }
 
@@ -4125,6 +4128,7 @@ impl CommandOutboundTransport {
             slack_format_by_channel: BTreeMap::new(),
             slack_format_override: None,
             event_sink: None,
+            post_metadata: None,
         })
     }
 
@@ -4144,6 +4148,12 @@ impl CommandOutboundTransport {
     /// `agentctl chat publish --slack-format` does.
     pub fn set_slack_format_override(&mut self, format: Option<SlackFormat>) {
         self.slack_format_override = format;
+    }
+
+    /// Attach Slack message metadata (`{"event_type", "event_payload"}`) to the next sends and
+    /// root posts, as the trace driver does (#832 chat-trace-format-tagging); `None` for none.
+    pub fn set_post_metadata(&mut self, metadata: Option<serde_json::Value>) {
+        self.post_metadata = metadata;
     }
 
     /// The format to name on the wire for `channel_id`, or `None` to name
@@ -4303,7 +4313,8 @@ impl ReplyTransport for CommandOutboundTransport {
         submission: ReplySubmission<'_>,
     ) -> std::result::Result<String, OutboundFailure> {
         let format = self.slack_format_for(submission.channel_id);
-        let request = encode_send_request_with_format(&submission, format)?;
+        let request =
+            encode_send_request_with_metadata(&submission, format, self.post_metadata.as_ref())?;
         let response = self.exchange(&request)?;
         let message_id = decode_send_response(&response, &submission)?;
         self.note_posted(
@@ -4326,7 +4337,8 @@ impl ReplyTransport for CommandOutboundTransport {
             body: submission.body,
             request_id: submission.request_id,
         };
-        let request = encode_root_message_request_with_format(&root, format)?;
+        let request =
+            encode_root_message_request_with_metadata(&root, format, self.post_metadata.as_ref())?;
         let response = self.exchange(&request)?;
         let message_id = decode_send_response(&response, &submission)?;
         self.note_posted(
@@ -4346,7 +4358,11 @@ impl RootMessageTransport for CommandOutboundTransport {
         submission: RootMessageSubmission<'_>,
     ) -> std::result::Result<String, OutboundFailure> {
         let format = self.slack_format_for(submission.channel_id);
-        let request = encode_root_message_request_with_format(&submission, format)?;
+        let request = encode_root_message_request_with_metadata(
+            &submission,
+            format,
+            self.post_metadata.as_ref(),
+        )?;
         let response = self.exchange(&request)?;
         let message_id = decode_root_message_response(&response, &submission)?;
         self.note_posted(
@@ -4493,6 +4509,10 @@ struct SendWireRequest<'a> {
     text: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     slack_format: Option<&'a str>,
+    /// Message metadata (#832 chat-trace-format-tagging), only when set: a request without it
+    /// encodes exactly as before, so an older helper still accepts it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<&'a serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -4588,6 +4608,15 @@ pub fn encode_send_request_with_format(
     submission: &ReplySubmission<'_>,
     format: Option<SlackFormat>,
 ) -> std::result::Result<Vec<u8>, OutboundFailure> {
+    encode_send_request_with_metadata(submission, format, None)
+}
+
+/// Encode one v1 send request that may also carry message metadata (#832).
+pub fn encode_send_request_with_metadata(
+    submission: &ReplySubmission<'_>,
+    format: Option<SlackFormat>,
+    metadata: Option<&serde_json::Value>,
+) -> std::result::Result<Vec<u8>, OutboundFailure> {
     validate_outbound_send(submission)?;
     encode_wire_request(&SendWireRequest {
         version: 1,
@@ -4597,6 +4626,7 @@ pub fn encode_send_request_with_format(
         thread_id: Some(submission.thread_id),
         text: submission.body,
         slack_format: format.map(SlackFormat::name),
+        metadata,
     })
 }
 
@@ -4612,6 +4642,15 @@ pub fn encode_root_message_request_with_format(
     submission: &RootMessageSubmission<'_>,
     format: Option<SlackFormat>,
 ) -> std::result::Result<Vec<u8>, OutboundFailure> {
+    encode_root_message_request_with_metadata(submission, format, None)
+}
+
+/// Encode one v1 root-message request that may also carry message metadata (#832).
+pub fn encode_root_message_request_with_metadata(
+    submission: &RootMessageSubmission<'_>,
+    format: Option<SlackFormat>,
+    metadata: Option<&serde_json::Value>,
+) -> std::result::Result<Vec<u8>, OutboundFailure> {
     validate_root_message_submission(submission)?;
     encode_wire_request(&SendWireRequest {
         version: 1,
@@ -4621,6 +4660,7 @@ pub fn encode_root_message_request_with_format(
         thread_id: None,
         text: submission.body,
         slack_format: format.map(SlackFormat::name),
+        metadata,
     })
 }
 
@@ -36505,6 +36545,57 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 format!("[coord] {sentence}")
             );
         }
+    }
+
+    #[test]
+    fn trace_metadata_rides_on_the_wire_only_when_set() {
+        // #832 chat-trace-format-tagging: roots and replies carry the metadata; a request
+        // without it keeps the v1 shape an older helper accepts.
+        let send = ReplySubmission {
+            channel_id: "spaces/example",
+            thread_id: "spaces/example/threads/one",
+            body: "hello",
+            request_id: "123e4567-e89b-42d3-a456-426614174000",
+        };
+        let root = RootMessageSubmission {
+            channel_id: "spaces/example",
+            body: "coordinator main session trace, 2026-11-03 ET",
+            request_id: "123e4567-e89b-42d3-a456-426614174001",
+        };
+        let metadata = crate::chat_trace::trace_metadata(
+            "entry",
+            "coordinator",
+            Some("agent-utils"),
+            None,
+            "2026-11-03",
+            3,
+            Some("owner message"),
+        );
+        let plain: Value =
+            serde_json::from_slice(&encode_send_request(&send).expect("encode")).expect("json");
+        assert!(plain.get("metadata").is_none(), "{plain}");
+        let reply: Value = serde_json::from_slice(
+            &encode_send_request_with_metadata(&send, None, Some(&metadata)).expect("encode"),
+        )
+        .expect("json");
+        assert_eq!(reply["metadata"], metadata);
+        assert_eq!(reply["thread_id"], json!("spaces/example/threads/one"));
+        let root_metadata = crate::chat_trace::trace_metadata(
+            "root",
+            "coordinator",
+            None,
+            None,
+            "2026-11-03",
+            0,
+            None,
+        );
+        let root: Value = serde_json::from_slice(
+            &encode_root_message_request_with_metadata(&root, None, Some(&root_metadata))
+                .expect("encode"),
+        )
+        .expect("json");
+        assert_eq!(root["metadata"]["event_payload"]["kind"], json!("root"));
+        assert_eq!(root["thread_id"], Value::Null);
     }
 
     #[test]

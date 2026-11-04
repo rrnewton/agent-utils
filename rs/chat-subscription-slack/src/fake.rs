@@ -52,6 +52,8 @@ pub struct FakePost {
     pub format: TextFormat,
     /// Block Kit blocks posted with the body, if any.
     pub blocks: Option<String>,
+    /// Message metadata posted with the body, if any, as compact JSON.
+    pub metadata: Option<String>,
     /// Assigned message ts.
     pub ts: String,
 }
@@ -351,6 +353,7 @@ impl SlackTransport for FakeTransport {
             text: post.text.to_owned(),
             format: post.format,
             blocks: post.blocks.map(str::to_owned),
+            metadata: post.metadata.map(str::to_owned),
             ts: ts.clone(),
         });
         if failure == Some(FakePostFailure::PostedButLost) {

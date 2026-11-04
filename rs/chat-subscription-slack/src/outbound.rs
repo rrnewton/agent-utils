@@ -11,6 +11,11 @@
 //! {"version":1,"id":"<uuid>","action":"list_members","channel_id":"C…"}
 //! ```
 //!
+//! A send may also carry `"slack_format"` (`markdown` or `converted`) and `"metadata"`, Slack
+//! message metadata `{"event_type":"…","event_payload":{…}}` that every post of the send carries
+//! (#832 chat-trace-format-tagging). A helper older than either key refuses the request as
+//! `request_invalid`.
+//!
 //! A success names the posted message (`C…/messages/<ts>`) or reaction
 //! (`C…/messages/<ts>/reactions/<name>`), or returns `sender_id` / `sender_ids` for a read-only
 //! directory request. Membership is always enumerated explicitly, never as a wildcard. A failure
@@ -541,6 +546,8 @@ enum Request {
         thread_ts: Option<String>,
         text: String,
         slack_format: Option<TextFormat>,
+        /// Message metadata, compact JSON (#832 chat-trace-format-tagging).
+        metadata: Option<String>,
     },
     Reaction {
         channel_id: String,
@@ -562,6 +569,44 @@ enum Request {
     },
 }
 
+/// The keys a send request may carry beyond the required ones.
+const SEND_OPTIONAL: [&str; 2] = ["slack_format", "metadata"];
+
+/// The most bytes of compact metadata JSON a send accepts.
+pub const MAX_METADATA_BYTES: usize = 4_096;
+
+/// Check a send's `metadata`, Slack's message metadata: exactly `event_type`, a name of
+/// lowercase letters, digits, `_` and `.` up to 255 characters, and `event_payload`, an object;
+/// at most [`MAX_METADATA_BYTES`] as compact JSON. Returns that compact JSON.
+fn validate_metadata(value: &Value) -> Result<String, String> {
+    let Value::Object(metadata) = value else {
+        return Err("metadata must be an object".to_owned());
+    };
+    if !exact_keys(metadata, &["event_type", "event_payload"]) {
+        return Err("metadata has exactly event_type and event_payload".to_owned());
+    }
+    let valid_type = metadata["event_type"].as_str().is_some_and(|name| {
+        !name.is_empty()
+            && name.len() <= 255
+            && name.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.')
+            })
+    });
+    if !valid_type {
+        return Err(
+            "metadata event_type must be 1 to 255 lowercase letters, digits, _ or .".to_owned(),
+        );
+    }
+    if !metadata["event_payload"].is_object() {
+        return Err("metadata event_payload must be an object".to_owned());
+    }
+    let compact = value.to_string();
+    if compact.len() > MAX_METADATA_BYTES {
+        return Err(format!("metadata is over {MAX_METADATA_BYTES} bytes"));
+    }
+    Ok(compact)
+}
+
 fn exact_keys(object: &Map<String, Value>, keys: &[&str]) -> bool {
     object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key))
 }
@@ -571,23 +616,18 @@ fn parse_request(object: &Map<String, Value>, action: &str) -> Result<Request, R
     let invalid = |detail: &str| Refusal::not_applied("request_invalid", detail, false);
     match action {
         "send" => {
-            if !exact_keys(
-                object,
-                &["version", "id", "action", "channel_id", "thread_id", "text"],
-            ) && !exact_keys(
-                object,
-                &[
-                    "version",
-                    "id",
-                    "action",
-                    "channel_id",
-                    "thread_id",
-                    "text",
-                    "slack_format",
-                ],
-            ) {
-                return Err(invalid("a send request has exactly version, id, action, channel_id, thread_id and text, plus an optional slack_format"));
+            let required = ["version", "id", "action", "channel_id", "thread_id", "text"];
+            if !required.iter().all(|key| object.contains_key(*key))
+                || !object
+                    .keys()
+                    .all(|key| required.contains(&key.as_str()) || SEND_OPTIONAL.contains(&key.as_str()))
+            {
+                return Err(invalid("a send request has exactly version, id, action, channel_id, thread_id and text, plus an optional slack_format and metadata"));
             }
+            let metadata = match object.get("metadata") {
+                None => None,
+                Some(value) => Some(validate_metadata(value).map_err(|detail| invalid(&detail))?),
+            };
             let slack_format = match object.get("slack_format") {
                 None => None,
                 Some(Value::String(value)) => Some(parse_slack_format(value).ok_or_else(|| {
@@ -618,6 +658,7 @@ fn parse_request(object: &Map<String, Value>, action: &str) -> Result<Request, R
                 thread_ts,
                 text: body,
                 slack_format,
+                metadata,
             })
         }
         "ensure_reaction" => {
@@ -851,6 +892,7 @@ pub fn handle_request(
             thread_ts,
             text,
             slack_format,
+            metadata,
         } => send(
             config,
             app_id,
@@ -860,6 +902,7 @@ pub fn handle_request(
             thread_ts.as_deref(),
             &text,
             slack_format,
+            metadata.as_deref(),
             now_millis,
             &diagnostics,
         )
@@ -1158,6 +1201,7 @@ fn send(
     thread_ts: Option<&str>,
     text: &str,
     slack_format: Option<TextFormat>,
+    metadata: Option<&str>,
     now_millis: &dyn Fn() -> u64,
     diagnostics: &Diagnostics,
 ) -> Result<String, Refusal> {
@@ -1307,6 +1351,7 @@ fn send(
             text: chunk,
             format: post_format,
             blocks,
+            metadata,
         });
         // Blocks Slack refuses (a limit it counts differently, say) were not posted, and the
         // text alone always is a valid post: say the chunk as text rather than lose it.
@@ -1323,6 +1368,7 @@ fn send(
                 text: chunk,
                 format: post_format,
                 blocks: None,
+                metadata,
             });
         }
         match posted {

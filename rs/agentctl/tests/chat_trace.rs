@@ -72,5 +72,7 @@ fn muse_replay_traces_assistant_text() {
     .join("\n");
     let posts = replay("muse", &bytes);
     assert_eq!(posts.len(), 1, "{posts:?}");
-    assert!(posts[0].text.contains("agent lane-a"), "{}", posts[0].text);
+    // #832: the trigger is metadata only; the text is the agent's words.
+    assert_eq!(posts[0].trigger, "agent lane-a");
+    assert_eq!(posts[0].text, "Trace-worthy working notes.");
 }

@@ -211,6 +211,10 @@ impl WarmClient {
             // A spare already holds its body flag; blocks need a new client run.
             return WarmPost::NoSpare("a post with blocks has no spares".to_owned());
         }
+        if post.metadata.is_some() {
+            // Likewise metadata, which is a flag of the client run.
+            return WarmPost::NoSpare("a post with metadata has no spares".to_owned());
+        }
         let Some(thread_ts) = post.thread_ts else {
             return WarmPost::NoSpare("only thread replies have spares".to_owned());
         };
@@ -952,6 +956,7 @@ impl Worker {
             Some(&key.thread_ts),
             self.format,
             None,
+            None,
         );
         let mut command = self.transport.client_command(&arguments);
         command
@@ -1350,6 +1355,7 @@ mod tests {
             text: "hello",
             format: TextFormat::Markdown,
             blocks: None,
+            metadata: None,
         }
     }
 
@@ -1499,6 +1505,7 @@ mod tests {
             text: "hello",
             format: TextFormat::Markdown,
             blocks: None,
+            metadata: None,
         };
         assert!(matches!(client.post(&post), WarmPost::NoSpare(_)));
         let other = AppId::new("A0OTHERAPP1").expect("app");
