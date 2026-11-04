@@ -2538,7 +2538,7 @@ const REFUSAL_KEEPS_SERVER = ["      else if (write.server === done) stands.add(
 const REFUSAL_KEEPS_LATER = ["      if (write.writes > 0) stands.add(id);\n      else if", "      if"];
 
 /** The lines that bring the Undo chip up to date as a Done is saved whatever it offers since, for a negative control. */
-const CHIP_FOLLOWS_ANY = ["  if (offered()) {\n    const still = new Set(lastDismissal.messages);\n", "  {\n    const still = new Set(requested);\n"];
+const CHIP_FOLLOWS_ANY = ["  if (offered()) {\n    const still = new Set(lastDismissal.current().messages);\n", "  {\n    const still = new Set(requested);\n"];
 
 /**
  * Root 201 of `threadData`, Main and All held, the chat service's marker supported, marked Done in Main
@@ -2910,7 +2910,7 @@ test("`#326 refused-undo-restores-done`: a put back from its row that the server
   assert.equal(doneDrawn(page, "201"), "true");
   // THE CONTROL: the refusal bringing the chip back to what it offered before the put back, whatever it
   // offers since: it offers 201 again, and the Done on 203 has no Undo.
-  const control = await run(brokenScript("    if (lastDismissal === offer) {", "    if (true) {"));
+  const control = await run(brokenScript("    if (lastDismissal.current() === offer) {", "    if (true) {"));
   assert.deepStrictEqual(control.restoreCalls.at(-1), { messages: ["201"] },
     "without the chip's own check the Undo put back 203, so this test cannot see it");
 });

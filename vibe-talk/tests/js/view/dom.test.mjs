@@ -318,3 +318,14 @@ test("`#624 voice-page-modularity`: a row button says the keys the hints last sa
   shortcuts.say(done, "done-button");
   assert.equal(done.attributes.get("aria-keyshortcuts"), "e Shift+E");
 });
+
+test("`#624 voice-page-modularity`: the Undo offer for the last Done stands until replaced or cleared, the same object", () => {
+  const { createUndoOffer } = VIEW_SHELL;
+  const offer = createUndoOffer();
+  assert.equal(offer.current(), null);
+  const done = { channel: "c", messages: ["1", "2"], at: 3 };
+  offer.set(done);
+  assert.equal(offer.current(), done, "the offer is not the object set: an undo compares it by identity");
+  offer.set(null);
+  assert.equal(offer.current(), null);
+});

@@ -5,8 +5,8 @@ export { BANNER_DISMISS_MS, STATUS_DISMISS_MS, createShellNotices } from "./noti
 export type { ShellNotices, ShellNoticesDependencies } from "./notices.ts";
 export { CHIPS_PILL_REM, createChipsOverComposer } from "./chips.ts";
 export type { ChipsOverComposer, ChipsOverComposerDependencies } from "./chips.ts";
-export { createUndoStamps } from "./undo.ts";
-export type { UndoStamps } from "./undo.ts";
+export { createUndoOffer, createUndoStamps } from "./undo.ts";
+export type { UndoOffer, UndoStamps } from "./undo.ts";
 export { SCREENS, createScreens } from "./screens.ts";
 export type { Screens } from "./screens.ts";
 export { ACTION_MENU_ITEMS, createActionMenu } from "./actionmenu.ts";

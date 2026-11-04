@@ -26,6 +26,7 @@ declare const createRowShortcuts: LegacyImports["createRowShortcuts"];
 declare const createChannelPick: LegacyImports["createChannelPick"];
 declare const createShellNotices: LegacyImports["createShellNotices"];
 declare const createUndoStamps: LegacyImports["createUndoStamps"];
+declare const createUndoOffer: LegacyImports["createUndoOffer"];
 declare const copyText: LegacyImports["copyText"];
 declare const createPendingCopy: LegacyImports["createPendingCopy"];
 declare const createOncePerFrame: LegacyImports["createOncePerFrame"];

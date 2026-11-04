@@ -8025,8 +8025,8 @@ function filterFromKeyboard(which) {
 function liveUndos() {
   /** @type {Array<{at: number, run: () => void}>} */
   const held = [];
-  if (lastDismissal !== null) {
-    held.push({ at: lastDismissal.at || 0, run: () => guardQuietly(undoDismissal)() });
+  if (lastDismissal.current() !== null) {
+    held.push({ at: lastDismissal.current().at || 0, run: () => guardQuietly(undoDismissal)() });
   }
   const sendOffer = sendUndo.current();
   if (sendOffer && dismissedSends.find(sendOffer.id)) {
@@ -23822,9 +23822,12 @@ function noteArchived(payload, replace) {
  * The exact set the last dismissal cleared, so the undo restores that and nothing else.
  *
  * Not a count and not "the last N": by the time the reader presses undo, N may name a different
- * set. Held as the server reported it, which is also what makes undoing a BULK clear exact.
+ * set. Held as the server reported it, which is also what makes undoing a BULK clear exact (web/src/view/
+ * shell `createUndoOffer`).
+ *
+ * @type {import("./src/view/shell/index.ts").UndoOffer<any>}
  */
-let lastDismissal = null;
+const lastDismissal = createUndoOffer();
 
 /**
  * The name a dismissal of `ids` gives its Undo: the message's opening words when the ids are ONE
@@ -23885,8 +23888,8 @@ function renderTodoControls() {
     ? `Clear ${listState().backlog}?`
     : `Clear the backlog (${listState().backlog})`;
   clear.className = backlogIsArmed() ? "chip armed" : "chip";
-  el("undo-dismiss").hidden = lastDismissal === null;
-  drawUndoLabel(lastDismissal);
+  el("undo-dismiss").hidden = lastDismissal.current() === null;
+  drawUndoLabel(lastDismissal.current());
 }
 
 // Bulk and destructive, so it asks twice — the same armed idiom the Clear control on the dock
@@ -24585,7 +24588,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   // Exactly what this changes, to put back if the write fails: never a copy of the whole set, which
   // would undo what reads folded meanwhile (`#222 unread-replies`).
   const added = requested.filter((id) => !doneState().archived.has(id));
-  const previousDismissal = lastDismissal;
+  const previousDismissal = lastDismissal.current();
   // `#245 done-feedback`. Named now, while the row is still drawn; see `dismissalName`.
   const name = dismissalName(requested);
   // This Done's own offer of Undo, marked as its own (`act`), which a put back of some of its messages
@@ -24594,8 +24597,8 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   // Done, while it was being saved, when it came back offering to put back a message already back.
   const act = Symbol("done");
   const at = nextUndoAt();
-  lastDismissal = { channel, messages: requested, bump, name, act, at };
-  const offered = () => lastDismissal !== null && lastDismissal.act === act;
+  lastDismissal.set({ channel, messages: requested, bump, name, act, at });
+  const offered = () => lastDismissal.current() !== null && lastDismissal.current().act === act;
   // Before anything here changes, so that what the server holds is known if it refuses (`#326`).
   noteInboxWrite(requested);
   for (const id of requested) {
@@ -24675,7 +24678,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     // A move staged before a slip that came ahead of the write: taken back as a refused Done's is.
     const unsent = sent ? null : move;
     if (unsent) guardQuietly(() => sendBookmark(unsent, { conditional: true, after: Promise.resolve(false) }))();
-    if (offered()) lastDismissal = landed.length > 0 ? { channel, messages: landed.slice(), bump: null, at } : previousDismissal;
+    if (offered()) lastDismissal.set(landed.length > 0 ? { channel, messages: landed.slice(), bump: null, at } : previousDismissal);
     // Taken back in the column it was made in, and in the other. `#229 desktop-two-column`.
     inColumn(column, () => {
       for (const id of added) if (back.has(id)) doneState().archived.delete(id);
@@ -24704,8 +24707,8 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   const stored = (payload.messages || requested).map(String);
   // What the server stored, less what was put back from its row meanwhile.
   if (offered()) {
-    const still = new Set(lastDismissal.messages);
-    lastDismissal = { channel, messages: stored.filter((id) => still.has(id) || !requested.includes(id)), bump, name, act, at };
+    const still = new Set(lastDismissal.current().messages);
+    lastDismissal.set({ channel, messages: stored.filter((id) => still.has(id) || !requested.includes(id)), bump, name, act, at });
   }
   const count = stored.length;
   setStatus(
@@ -24744,7 +24747,7 @@ async function restoreMessages(ids) {
   const channel = selectedChannelId();
   const restored = ids.map(String);
   const removed = restored.filter((id) => doneState().archived.has(id));
-  const previousDismissal = lastDismissal;
+  const previousDismissal = lastDismissal.current();
   // Before anything here changes, so that what the server holds is known if it refuses (`#326
   // refused-undo-restores-done`).
   noteInboxWrite(restored);
@@ -24766,7 +24769,7 @@ async function restoreMessages(ids) {
   // The Undo chip's offer once this has taken its messages out of it. `#326 refused-undo-restores-done`:
   // a refusal changes the chip back only while it still offers that — not once a Done made while this
   // was on its way offers its own, which it used to take away, offering this one's again.
-  let offer = lastDismissal;
+  let offer = lastDismissal.current();
   /** Whether the write was queued: a slip before it takes back exactly what this changed. */
   let sent = false;
   let settled = false;
@@ -24780,11 +24783,11 @@ async function restoreMessages(ids) {
     mirrored = mirrorArchived(restored, false);
     // ...and every view held out of sight, and the cards on screen. `#306 done-stale-across-views`.
     followDoneEverywhere(restored, column);
-    if (lastDismissal !== null) {
-      const left = lastDismissal.messages.filter((id) => !restored.includes(id));
-      lastDismissal = left.length === 0 ? null : { ...lastDismissal, messages: left };
+    if (lastDismissal.current() !== null) {
+      const left = lastDismissal.current().messages.filter((id) => !restored.includes(id));
+      lastDismissal.set(left.length === 0 ? null : { ...lastDismissal.current(), messages: left });
     }
-    offer = lastDismissal;
+    offer = lastDismissal.current();
     await refreshAfterInboxChange();
     renderTodoControls();
     setStatus(`Restoring ${restored.length} message${restored.length === 1 ? "" : "s"}…`);
@@ -24818,9 +24821,9 @@ async function restoreMessages(ids) {
       settleHeldDone(standing.length > 0 ? heldDonePart(held, [...back]) : held, false);
     }
     // Unless the chip has changed since: a Done made meanwhile offers its own Undo, which stands.
-    if (lastDismissal === offer) {
+    if (lastDismissal.current() === offer) {
       const left = previousDismissal === null ? [] : previousDismissal.messages.filter((id) => !kept.has(id));
-      lastDismissal = previousDismissal === null || left.length === 0 ? null : { ...previousDismissal, messages: left };
+      lastDismissal.set(previousDismissal === null || left.length === 0 ? null : { ...previousDismissal, messages: left });
     }
     inColumn(column, () => {
       for (const id of removed) if (back.has(id)) doneState().archived.add(id);
@@ -24995,11 +24998,11 @@ function rowsMissDone() {
 
 /** Put back exactly what the last dismissal cleared, and the bookmark where that moved it from. */
 async function undoDismissal() {
-  if (lastDismissal === null) {
+  if (lastDismissal.current() === null) {
     return;
   }
-  const undoing = lastDismissal;
-  lastDismissal = null;
+  const undoing = lastDismissal.current();
+  lastDismissal.set(null);
   renderTodoControls();
   const restoring = restoreMessages(undoing.messages);
   // `#240 reading-bookmark`. Back where it was, unless something moved it since.
@@ -25065,7 +25068,7 @@ function setReadMode(mode) {
     // An undo belongs to the act it undoes, and leaving the view is the reader moving on. Keeping
     // it would offer to restore messages into a list they are no longer looking at. Showing or
     // collapsing what is read leaves every message in the list, so the undo stays between those two.
-    if (readModes.hiding() !== wasHiding) lastDismissal = null;
+    if (readModes.hiding() !== wasHiding) lastDismissal.set(null);
     if (!readModes.hiding()) {
       listState().backlog = 0;
     }
