@@ -1,6 +1,6 @@
 ---
 title: 'voice-page-dictation-polish: hide the keyboard while dictation listens and show a mic badge'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: cl-refactor@devbig030
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-828: blocks
 created_at: 2026-11-03T22:00:33.289746695+00:00
-updated_at: 2026-11-03T22:00:33.318825003+00:00
+updated_at: 2026-11-04T00:13:26.437418813+00:00
+closed_at: 2026-11-04T00:13:26.437418612+00:00
 ---
 
 # Description
