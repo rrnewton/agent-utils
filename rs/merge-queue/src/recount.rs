@@ -29,7 +29,10 @@
 //! only the decreases it makes itself. A change whose head is contained in an earlier change of
 //! the batch adds nothing. A change stacked on one that already landed as a rebased copy is
 //! measured from that change's head instead of its merge base, which predates the copy while the
-//! base already counts its edits.
+//! base already counts its edits; so is a change stacked on one in a batch beneath it in the
+//! window, whose candidate (carrying a copy of that change) its batch is built on. A trailer
+//! never changes a count: the counts come from the pin values in the commits, and a trailer on a
+//! stacked change for a decrease the other change makes matches nothing and is ignored.
 
 use std::collections::BTreeMap;
 

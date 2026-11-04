@@ -519,3 +519,73 @@ fn a_change_stacked_on_one_that_landed_counts_only_its_own_pin_edits() {
     assert!(landed_pin.contains("(\"test.alpha\", 9)"), "{landed_pin}");
     assert!(r.get("pin_decreases").is_none(), "{r}");
 }
+
+/// #1 moves two alpha tests away and declares it; #2 is stacked on #1, changes no pin, and
+/// carries a copy of #1's trailer (as a lane might, after seeing #2 refused for #1's decrease).
+/// The base moves on first, so #1 lands as a rebased copy.
+fn stacked_with_copied_trailer(tag: &str) -> Fixture {
+    let fx = setup(tag, true);
+    branch_with_message(
+        &fx,
+        "b",
+        &[(PIN, &pin_text(8)), ("tests/b", "ok\n")],
+        "Move two alpha tests\n\nCount-Pin-Decrease: test.alpha 2 two tests move\n",
+    );
+    stacked_branch(
+        &fx,
+        "c",
+        "b",
+        &[("tests/c", "ok\n")],
+        "Add a beta test\n\nCount-Pin-Decrease: test.alpha 2 two tests move\n",
+    );
+    fx.write("other", "other\n");
+    fx.commit_all("an unrelated change");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    fx
+}
+
+/// The pin landed, the decreases the run recorded, and how many times #1's commit landed.
+fn landed_outcome(fx: &Fixture, r: &Value) -> (String, Vec<i64>, usize) {
+    let landed_pin = git(&fx.remote(), &["show", &format!("main:{PIN}")]);
+    let decreases = r["pin_decreases"]
+        .as_array()
+        .map(|all| all.iter().map(|d| d["pr"].as_i64().unwrap()).collect())
+        .unwrap_or_default();
+    let subjects = git(&fx.remote(), &["log", "--format=%s", "main"]);
+    (
+        landed_pin,
+        decreases,
+        subjects.matches("Move two alpha tests").count(),
+    )
+}
+
+#[test]
+fn a_trailer_copied_onto_a_change_stacked_in_the_same_batch_counts_nothing() {
+    let fx = stacked_with_copied_trailer("recount-stacked-trailer");
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1, 2]], "{r}");
+    let (pin, decreases, copies) = landed_outcome(&fx, &r);
+    // 10 (base) - 2 (#1, declared); #2 changes no pin, so its trailer matches nothing.
+    assert!(pin.contains("(\"test.alpha\", 8)"), "{pin}");
+    assert_eq!(decreases, vec![1], "{r}");
+    assert_eq!(copies, 1);
+}
+
+#[test]
+fn a_change_stacked_on_one_in_the_batch_beneath_counts_only_its_own_pin_edits() {
+    // One change per batch, two batches in flight: #2's batch is built on #1's candidate, which
+    // carries a rebased copy of #1 before it lands. Measured from its merge base, #2 would carry
+    // #1's -2 again and its copied trailer would accept it, counting the -2 twice; measured from
+    // #1's head, as once #1 has landed, it changes nothing.
+    let fx = stacked_with_copied_trailer("recount-stacked-window");
+    let r = report(&fx.mq_ok(&["run", "--json", "--max-batch", "1", "--depth", "2"]));
+    assert_eq!(landed(&r), vec![vec![1], vec![2]], "{r}");
+    assert_eq!(r["windows"], serde_json::json!([2, 2]), "{r}");
+    let (pin, decreases, copies) = landed_outcome(&fx, &r);
+    assert!(pin.contains("(\"test.alpha\", 8)"), "{pin}");
+    assert_eq!(decreases, vec![1], "{r}");
+    // #1's own commit is not replayed on top of its copy.
+    assert_eq!(copies, 1);
+}

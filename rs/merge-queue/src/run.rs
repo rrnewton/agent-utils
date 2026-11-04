@@ -690,6 +690,10 @@ pub struct Runner<'a> {
     excluded: Mutex<BTreeSet<i64>>,
     /// Heads of changes landed (or simulated as landed) in this run.
     landed_heads: Mutex<Vec<String>>,
+    /// Changes whose rebased copies a candidate built in this run carries, by the candidate's
+    /// commit and each of its prefixes, the batches beneath it in the window included. A batch
+    /// built on one of these commits treats those changes as landed.
+    carried: Mutex<BTreeMap<String, Vec<i64>>>,
     /// Simulated base for shadow and dry runs.
     simulated: Mutex<Option<String>>,
     base: Mutex<String>,
@@ -824,6 +828,7 @@ impl<'a> Runner<'a> {
             deps: Mutex::new(BTreeMap::new()),
             excluded: Mutex::new(held),
             landed_heads: Mutex::new(Vec::new()),
+            carried: Mutex::new(BTreeMap::new()),
             simulated: Mutex::new(None),
             base: Mutex::new(String::new()),
             next_validation: Mutex::new(0),
@@ -1204,6 +1209,16 @@ impl<'a> Runner<'a> {
             .map(|item| item.head.clone())
             .collect();
         exclude_heads.extend(lock(&self.landed_heads).iter().cloned());
+        // A batch built on the candidate of the batch beneath it in the window carries rebased
+        // copies of that batch's changes (and of the batches below it) before they land. As
+        // with landed changes, their commits are not replayed again, and a change stacked on one
+        // of them is recounted from its head.
+        let beneath: Vec<i64> = lock(&self.carried).get(parent).cloned().unwrap_or_default();
+        let beneath_heads: Vec<(i64, String)> = beneath
+            .iter()
+            .filter_map(|pr| items.get(pr).map(|item| (*pr, item.head.clone())))
+            .collect();
+        exclude_heads.extend(beneath_heads.iter().map(|(_, head)| head.clone()));
         let mut tip = parent.to_owned();
         let mut kept: Vec<i64> = Vec::new();
         let mut prefixes = Vec::new();
@@ -1258,6 +1273,15 @@ impl<'a> Runner<'a> {
                     landed.push((head.clone(), short(head).to_owned()));
                 }
             }
+            // Those the batches beneath carry and that have not landed yet.
+            let mut landing: Vec<&str> = Vec::new();
+            for (pr, head) in &beneath_heads {
+                if !landed.iter().any(|(seen, _)| seen == head) {
+                    landed.push((head.clone(), format!("#{pr}")));
+                    landing.push(head);
+                }
+            }
+            let carried_below = |head: &str| landing.contains(&head);
             for pr in prs {
                 if skipped.contains(pr) {
                     continue;
@@ -1311,6 +1335,10 @@ impl<'a> Runner<'a> {
                     }
                     let (reference, label) = match nearest.as_slice() {
                         [] => (mergebase, "the merge base".to_owned()),
+                        [(landed_head, name)] if carried_below(landed_head) => (
+                            landed_head.clone(),
+                            format!("the head of {name}, which the batch beneath carries"),
+                        ),
                         [(landed_head, name)] => (
                             landed_head.clone(),
                             format!("the head of {name}, which landed"),
@@ -1318,8 +1346,13 @@ impl<'a> Runner<'a> {
                         several => {
                             let names: Vec<&str> =
                                 several.iter().map(|(_, name)| name.as_str()).collect();
+                            let how = if several.iter().any(|(head, _)| carried_below(head)) {
+                                "landed or are landing"
+                            } else {
+                                "landed"
+                            };
                             return Err(format!(
-                                "its head contains {}, which landed separately; rebase it onto the base",
+                                "its head contains {}, which {how} separately; rebase it onto the base",
                                 names.join(" and ")
                             ));
                         }
@@ -1687,6 +1720,14 @@ impl<'a> Runner<'a> {
                 short(&tip),
                 history_markers.join("; ")
             ));
+        }
+        {
+            let mut carried = lock(&self.carried);
+            let mut so_far = beneath;
+            for (pr, prefix) in kept.iter().zip(&prefixes) {
+                so_far.push(*pr);
+                carried.insert(prefix.clone(), so_far.clone());
+            }
         }
         Ok((
             Candidate {
