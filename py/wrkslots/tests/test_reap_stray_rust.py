@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from wrkslots.tests.test_create_text_rust import _fixture
 
 
 AU_ROOT = Path(__file__).resolve().parents[3]
+_HEX40 = re.compile(r"\b[0-9a-f]{40}\b")
 
 
 def _rust(root: Path, upstream: Path, *, apply: bool, fmt: str) -> subprocess.CompletedProcess[str]:
@@ -25,7 +27,9 @@ def _rust(root: Path, upstream: Path, *, apply: bool, fmt: str) -> subprocess.Co
 
 
 def _norm(text: str, root: Path) -> str:
-    return text.replace(str(root), "ROOT").replace(str(root.parent), "BASE")
+    # The two fixture repositories are committed a moment apart, so their HEAD
+    # hashes differ whenever creation crosses a second boundary (#827).
+    return _HEX40.sub("HEAD", text.replace(str(root), "ROOT").replace(str(root.parent), "BASE"))
 
 
 def test_reap_stray_rust_plan_matches_python(tmp_path: Path) -> None:
