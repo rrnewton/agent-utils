@@ -1,11 +1,12 @@
 ---
 title: 'draft-chip-honest: ignore empty drafts, really discard on confirm, show only when the composer is off screen'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-refactor
 created_at: 2026-11-04T19:00:42.756365822+00:00
-updated_at: 2026-11-04T19:00:42.756365822+00:00
+updated_at: 2026-11-04T20:27:31.547954157+00:00
+closed_at: 2026-11-04T20:27:31.547954017+00:00
 ---
 
 # Description
