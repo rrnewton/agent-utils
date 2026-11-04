@@ -86,6 +86,7 @@ export {
   childByClass,
   classWords,
   copyText,
+  createPendingCopy,
   elementIn,
   focusMinimally,
   isLink,

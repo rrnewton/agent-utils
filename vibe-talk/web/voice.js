@@ -7726,12 +7726,12 @@ const COPY_REFUSED = "This browser would not copy to the clipboard.";
  */
 
 /**
- * The copy a key in the page has noted, while the `copy` event it expects may still come: from the key
- * to the end of its task, after the browser's default for it has run. Null otherwise.
+ * The copy a key in the page has noted, while the `copy` event it expects may still come (web/src/view/dom
+ * `createPendingCopy`).
  *
- * @type {MessageCopy | null}
+ * @type {import("./src/view/dom/index.ts").PendingCopy<MessageCopy>}
  */
-let pendingCopy = null;
+const pendingCopy = createPendingCopy();
 
 /** Whether a copy is the browser's own: a text field holding the focus, or text selected on the page. */
 const browserCopies = () => isTextField(document.activeElement) || selectedText() !== "";
@@ -7805,7 +7805,7 @@ function messageCopy() {
  */
 function onPageCopy(event) {
   if (!event || !event.clipboardData || browserCopies()) return;
-  const copy = pendingCopy || messageCopy();
+  const copy = pendingCopy.held() || messageCopy();
   if (!copy) return;
   event.clipboardData.setData("text/plain", copy.text);
   event.clipboardData.setData("text/html", copy.html);
@@ -7821,7 +7821,7 @@ function onPageCopy(event) {
  * @param {Event} event
  */
 function onPageBeforeCopy(event) {
-  if (event && !browserCopies() && (pendingCopy || messageCopy())) event.preventDefault();
+  if (event && !browserCopies() && (pendingCopy.held() || messageCopy())) event.preventDefault();
 }
 
 /**
@@ -7833,9 +7833,9 @@ function onPageBeforeCopy(event) {
 function copyChordFromKeyboard() {
   const copy = messageCopy();
   if (!copy) return false;
-  pendingCopy = copy;
+  pendingCopy.hold(copy);
   setTimeout(() => {
-    if (pendingCopy === copy) pendingCopy = null;
+    pendingCopy.release(copy);
     if (!copy.served) guardQuietly(() => copyNow(copy))();
   }, 0);
   return false;
@@ -7894,13 +7894,13 @@ async function copySelectionNow(selection) {
  * @param {MessageCopy} copy
  */
 async function copyNow(copy) {
-  pendingCopy = copy;
+  pendingCopy.hold(copy);
   try {
     if (typeof document.execCommand === "function") document.execCommand("copy");
   } catch (_error) {
     // Refused: the ways below are tried.
   } finally {
-    if (pendingCopy === copy) pendingCopy = null;
+    pendingCopy.release(copy);
   }
   if (copy.served) return true;
   const copied = await writeClipboardText(copy.text);

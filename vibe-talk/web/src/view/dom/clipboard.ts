@@ -63,4 +63,33 @@ function copyThroughTextarea(value: string): boolean {
   return copied;
 }
 
-export { copyText, copyThroughTextarea };
+/**
+ * The copy a key in the page has noted while the `copy` event it expects may still come (`#296
+ * copy-highlighted-message`; `#624 voice-page-modularity`, moved from the legacy script): from the key to
+ * the end of its task, after the browser's default for it has run. What a copy holds, and answering the
+ * event with it, are the page's (`onPageCopy`, `copyChordFromKeyboard`, `copyNow`).
+ */
+export interface PendingCopy<Copy> {
+  /** The copy noted, or null. */
+  held(): Copy | null;
+  /** Note `copy` for the `copy` event to come. */
+  hold(copy: Copy): void;
+  /** The wait for `copy` is over: forget it, unless another was noted since. */
+  release(copy: Copy): void;
+}
+
+/** Nothing noted. */
+function createPendingCopy<Copy>(): PendingCopy<Copy> {
+  let pendingCopy: Copy | null = null;
+  return {
+    held: () => pendingCopy,
+    hold(copy) {
+      pendingCopy = copy;
+    },
+    release(copy) {
+      if (pendingCopy === copy) pendingCopy = null;
+    },
+  };
+}
+
+export { copyText, copyThroughTextarea, createPendingCopy };

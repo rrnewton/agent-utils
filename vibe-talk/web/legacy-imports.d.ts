@@ -26,6 +26,7 @@ declare const createChannelPick: LegacyImports["createChannelPick"];
 declare const createShellNotices: LegacyImports["createShellNotices"];
 declare const createUndoStamps: LegacyImports["createUndoStamps"];
 declare const copyText: LegacyImports["copyText"];
+declare const createPendingCopy: LegacyImports["createPendingCopy"];
 declare const shownNode: LegacyImports["shownNode"];
 declare const elementIn: LegacyImports["elementIn"];
 declare const focusMinimally: LegacyImports["focusMinimally"];

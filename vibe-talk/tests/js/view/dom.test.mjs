@@ -264,3 +264,17 @@ test("`#624 voice-page-modularity`: the channel picker opened by Ctrl+K is remem
   pick.forget();
   assert.equal(pick.byKey(), false);
 });
+
+test("`#624 voice-page-modularity`: the copy noted for the `copy` event is forgotten only by the wait it was noted for", () => {
+  const { createPendingCopy } = VIEW_DOM;
+  const pending = createPendingCopy();
+  const [first, second] = [{ text: "first" }, { text: "second" }];
+  assert.equal(pending.held(), null);
+  pending.hold(first);
+  assert.equal(pending.held(), first);
+  pending.hold(second);
+  pending.release(first);
+  assert.equal(pending.held(), second, "the end of an older wait forgot the copy noted since");
+  pending.release(second);
+  assert.equal(pending.held(), null);
+});
