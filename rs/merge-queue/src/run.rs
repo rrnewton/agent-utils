@@ -569,11 +569,33 @@ impl Obs {
     }
 }
 
+/// The verdict a hold for a ruling waits on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Hold {
+    /// Tests passed only after a retry.
+    GreenFlaky,
+    /// The host refused every measurement of tests on a run and on its rerun.
+    InfraBlocked,
+}
+
+impl Hold {
+    fn label(self) -> &'static str {
+        match self {
+            Hold::GreenFlaky => crate::validate::FLAKY_MARKER,
+            Hold::InfraBlocked => crate::validate::INFRA_BLOCKED_MARKER,
+        }
+    }
+}
+
 enum Culprit {
     /// The bare parent fails the focus, twice.
     BaseRed(BTreeSet<TestId>),
     /// The full candidate passed the focus on rerun.
     Flaky(BTreeSet<TestId>),
+    /// The validator holds the full candidate's rerun for a ruling: it passed only because of
+    /// the rerun (GREEN_FLAKY), or the host refused to measure these tests on both runs
+    /// (INFRA-BLOCKED). Neither lands nor ejects.
+    Held(Hold, Vec<TestId>),
     /// A probe was refused by admission: no culprit can be named; defer the batch.
     Refused(String),
     /// A probe observed nothing conclusive (`Missing`/`Skip`-only): no
@@ -925,27 +947,48 @@ impl<'a> Runner<'a> {
         Ok((retry_after, refusals))
     }
 
-    /// Hold a GREEN_FLAKY batch for a ruling: every change stays queued with the
-    /// retried-pass tests named and a bounded expiry. The hold notifies through the
-    /// item's recorded notify target (the `held-green-flaky` transition); on expiry
-    /// the change is re-queued, never landed unruled and never held silently.
-    fn hold_green_flaky(&self, candidate: &Candidate, ran: &Ran) -> Result<String, String> {
-        let nodes: Vec<String> = ran.flaky_passes.iter().map(ToString::to_string).collect();
+    /// Hold a batch for a ruling: every change stays queued with the held tests named and a
+    /// bounded expiry. A GREEN_FLAKY hold names tests that passed only after a retry; an
+    /// INFRA-BLOCKED hold names tests the host refused to measure on a run and its rerun. The
+    /// hold notifies through the item's recorded notify target (the `held-green-flaky` or
+    /// `held-infra-blocked` transition); on expiry the change is re-queued, never landed
+    /// unruled and never held silently.
+    fn hold_for_ruling(
+        &self,
+        candidate: &Candidate,
+        hold: Hold,
+        tests: &[TestId],
+    ) -> Result<String, String> {
+        let nodes: Vec<String> = tests.iter().map(ToString::to_string).collect();
         let until = retry_after_time(Duration::from_secs(
             self.config.validator.green_flaky_hold(),
         ));
+        let (verdict, kind, why) = match hold {
+            Hold::GreenFlaky => (
+                String::new(),
+                "held-green-flaky",
+                "passed only after a retry",
+            ),
+            Hold::InfraBlocked => (
+                crate::validate::INFRA_BLOCKED_MARKER.to_owned(),
+                "held-infra-blocked",
+                "the host refused every measurement of them on a run and on its rerun",
+            ),
+        };
+        let label = hold.label();
         if !self.simulating() {
             let mut items = lock(&self.items);
             for pr in &candidate.prs {
                 if let Some(item) = items.get_mut(pr) {
                     item.flaky_nodes = nodes.clone();
                     item.flaky_hold_until = until.clone();
+                    item.hold_verdict = verdict.clone();
                     item.deciding_report = self.run_dir.join("report.md").display().to_string();
                     item.deciding_failed.clear();
                     item.log(
-                        "held-green-flaky",
+                        kind,
                         format!(
-                            "GREEN_FLAKY: {} passed only after a retry; held for a ruling until {until}",
+                            "{label}: {} {why}; held for a ruling until {until}",
                             nodes.join(", ")
                         ),
                     );
@@ -954,9 +997,9 @@ impl<'a> Runner<'a> {
             }
         }
         self.event(
-            "held-green-flaky",
+            kind,
             &format!(
-                "{} held: GREEN_FLAKY ({}) until {until}; not landed",
+                "{} held: {label} ({}) until {until}; not landed",
                 list(&candidate.prs),
                 nodes.join(", ")
             ),
@@ -991,12 +1034,19 @@ impl<'a> Runner<'a> {
         for pr in &expired {
             if let Some(item) = items.get_mut(pr) {
                 let nodes = item.flaky_nodes.join(", ");
+                let label = item.hold_label().to_owned();
+                let kind = if item.hold_verdict.is_empty() {
+                    "green-flaky-hold-expired"
+                } else {
+                    "infra-blocked-hold-expired"
+                };
                 item.flaky_nodes.clear();
                 item.flaky_hold_until.clear();
+                item.hold_verdict.clear();
                 item.log(
-                    "green-flaky-hold-expired",
+                    kind,
                     format!(
-                        "GREEN_FLAKY hold expired without a ruling ({nodes}); re-queued for validation"
+                        "{label} hold expired without a ruling ({nodes}); re-queued for validation"
                     ),
                 );
                 self.state.save_item(item)?;
@@ -1005,7 +1055,7 @@ impl<'a> Runner<'a> {
         self.event(
             "green-flaky-hold-expired",
             &format!(
-                "{} re-queued after the GREEN_FLAKY hold bound",
+                "{} re-queued after the hold-for-a-ruling bound",
                 list(&expired)
             ),
         );
@@ -1997,6 +2047,7 @@ impl<'a> Runner<'a> {
             handle: None,
             refused: false,
             flaky_passes: Vec::new(),
+            infra_blocked: Vec::new(),
             cannot_execute: None,
             effective_selection: None,
             cpu: None,
@@ -2492,11 +2543,36 @@ impl<'a> Runner<'a> {
                                 ),
                                 head.candidate.prs.clone(),
                             )
+                        } else if !ran.infra_blocked.is_empty() {
+                            // The host refused every measurement of some tests on the
+                            // run and its rerun (INFRA-BLOCKED): no result, so neither
+                            // land nor eject; hold for a ruling. Batches behind it were
+                            // built on its tree.
+                            discard(&mut flights, &rx, pending);
+                            let until = self.hold_for_ruling(
+                                &head.candidate,
+                                Hold::InfraBlocked,
+                                &ran.infra_blocked,
+                            )?;
+                            BatchOutcome::Deferred(
+                                format!(
+                                    "validation INFRA-BLOCKED for {} ({} refused on the run and its rerun); held for a ruling until {until}, not landed",
+                                    list(&head.candidate.prs),
+                                    ids(&ran.infra_blocked.clone())
+                                ),
+                                head.candidate.prs.clone(),
+                            )
                         } else if ran.green() && !ran.flaky_passes.is_empty() {
                             // Green only because some tests passed after a retry
                             // inside the run (GREEN_FLAKY): hold for a ruling,
-                            // never land on the plain pass.
-                            let until = self.hold_green_flaky(&head.candidate, &ran)?;
+                            // never land on the plain pass. Batches behind it were
+                            // built on its tree.
+                            discard(&mut flights, &rx, pending);
+                            let until = self.hold_for_ruling(
+                                &head.candidate,
+                                Hold::GreenFlaky,
+                                &ran.flaky_passes,
+                            )?;
                             BatchOutcome::Deferred(
                                 format!(
                                     "validation GREEN_FLAKY for {} ({} passed only after a retry); held for a ruling until {until}, not landed",
@@ -2994,6 +3070,18 @@ impl<'a> Runner<'a> {
                         current.prs.clone(),
                     ));
                 }
+                Culprit::Held(hold, tests) => {
+                    let until = self.hold_for_ruling(&current, hold, &tests)?;
+                    return Ok(BatchOutcome::Deferred(
+                        format!(
+                            "{} rerun of {} on the same tree ({}); held for a ruling until {until}, not landed",
+                            hold.label(),
+                            list(&current.prs),
+                            ids(&tests)
+                        ),
+                        current.prs.clone(),
+                    ));
+                }
                 Culprit::Flaky(tests) => {
                     self.event(
                         "flaky",
@@ -3337,6 +3425,23 @@ impl<'a> Runner<'a> {
                 if ran.refused() {
                     return Ok(Culprit::Refused(refusal_detail(&ran)));
                 }
+                // A rerun of the whole candidate the validator holds for a ruling: no verdict on
+                // the change either way. Only a validator that prints the markers gets here.
+                if *i == n && !ran.cancelled {
+                    if !ran.infra_blocked.is_empty() {
+                        return Ok(Culprit::Held(Hold::InfraBlocked, ran.infra_blocked.clone()));
+                    }
+                    if ran.green() && !ran.flaky_passes.is_empty() {
+                        return Ok(Culprit::Held(Hold::GreenFlaky, ran.flaky_passes.clone()));
+                    }
+                }
+                if !ran.infra_blocked.is_empty() {
+                    return Ok(Culprit::Inconclusive(format!(
+                        "probe at prefix {i} of {} was INFRA-BLOCKED ({}): the host refused to measure it",
+                        candidate.prs.len(),
+                        ids(&ran.infra_blocked.clone())
+                    )));
+                }
                 let entry = obs.entry(*i).or_default();
                 match ran.probe_observation() {
                     ProbeObservation::Fail => {
@@ -3504,7 +3609,17 @@ fn receipt_ran(receipt: &crate::donor::Receipt, dir: &std::path::Path) -> Result
         interrupted: None,
         handle: None,
         refused: receipt.refused,
-        flaky_passes: Vec::new(),
+        // The validator prints its markers last, so the receipt's log tail carries them.
+        flaky_passes: if receipt.refused {
+            Vec::new()
+        } else {
+            crate::validate::flaky_passes(receipt.exit, &receipt.log_tail)
+        },
+        infra_blocked: if receipt.refused {
+            Vec::new()
+        } else {
+            crate::validate::infra_blocked(receipt.exit, &receipt.log_tail)
+        },
         cannot_execute: None,
         effective_selection: receipt.effective_selection.clone(),
         cpu: receipt.cpu_ms.map(Duration::from_millis),

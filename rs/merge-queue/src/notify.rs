@@ -103,11 +103,12 @@ pub fn desired_transition(item: &Item) -> Option<Transition> {
         }),
         ItemStatus::Queued if !item.flaky_hold_until.is_empty() => Some(Transition {
             key: format!(
-                "held-green-flaky:{}:{}",
+                "{}:{}:{}",
+                item.hold_kind(),
                 item.head,
-                history_count(item, "held-green-flaky")
+                history_count(item, item.hold_kind())
             ),
-            verdict: "held-green-flaky",
+            verdict: item.hold_kind(),
         }),
         ItemStatus::Queued if !item.escalated.is_empty() => Some(Transition {
             key: format!(
@@ -387,6 +388,13 @@ pub fn render_report(state: &State, item: &Item, transition: &Transition) -> Str
                 "remedy: rule on the flaky pass, then `merge-queue retry <pr>` returns it to the queue; the hold expires and re-queues it at hold_until either way\n",
             );
         }
+        "held-infra-blocked" => {
+            text.push_str(&format!("blocked_tests: {}\n", item.flaky_nodes.join(", ")));
+            text.push_str(&format!("hold_until: {}\n", item.flaky_hold_until));
+            text.push_str(
+                "remedy: the host refused every measurement of these tests on a run and on its rerun, so the change has no result for them; rule on it, then `merge-queue retry <pr>` returns it to the queue; the hold expires and re-queues it at hold_until either way\n",
+            );
+        }
         _ => {}
     }
     if !item.deciding_failed.is_empty() {
@@ -639,6 +647,7 @@ mod unit {
             last_refusal: String::new(),
             flaky_nodes: Vec::new(),
             flaky_hold_until: String::new(),
+            hold_verdict: String::new(),
             escalated: String::new(),
             deciding_report: String::new(),
             deciding_failed: vec![],

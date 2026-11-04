@@ -492,7 +492,8 @@ enum Command {
         #[arg(long, default_value_t = crate::state::DEFAULT_REFUSAL_BACKOFF_SECS)]
         refusal_backoff_secs: u64,
         /// Seconds a GREEN_FLAKY batch (green only because some tests passed after a
-        /// retry inside the run) is held for a ruling before it is re-queued.
+        /// retry) or an INFRA-BLOCKED one (the host refused to measure some tests on a run and
+        /// its rerun) is held for a ruling before it is re-queued.
         #[arg(long, default_value_t = crate::state::DEFAULT_GREEN_FLAKY_HOLD_SECS)]
         green_flaky_hold_secs: u64,
         /// Times a change may be deferred because validation did not run (refusals, a

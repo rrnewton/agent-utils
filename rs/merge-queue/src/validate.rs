@@ -42,6 +42,16 @@ pub const REFUSAL_MARKER: &str = "COULD_NOT_RUN";
 /// for a ruling instead of landing it; see [`Ran::flaky_passes`].
 pub const FLAKY_MARKER: &str = "GREEN_FLAKY";
 
+/// Marker line a validator prints, with [`INFRA_BLOCKED_EXIT`], when the host refused every
+/// measurement of some tests on a run and on its rerun of the same commit
+/// (`INFRA-BLOCKED: id1,id2`): the commit has no result for them, so it is neither green nor
+/// red. The queue holds such a change for a ruling, as for GREEN_FLAKY; see
+/// [`Ran::infra_blocked`].
+pub const INFRA_BLOCKED_MARKER: &str = "INFRA-BLOCKED";
+
+/// Exit status that goes with [`INFRA_BLOCKED_MARKER`].
+pub const INFRA_BLOCKED_EXIT: i32 = 6;
+
 /// Tests a green run names as passed only after a retry, read from its `GREEN_FLAKY:`
 /// marker line. Only a zero exit can be green-flaky: a red run's marker text (a test
 /// printing it, say) means nothing.
@@ -49,9 +59,23 @@ pub fn flaky_passes(exit: Option<i32>, log_text: &str) -> Vec<TestId> {
     if exit != Some(0) {
         return Vec::new();
     }
+    marker_ids(log_text, FLAKY_MARKER)
+}
+
+/// Tests a run names as INFRA-BLOCKED, read from its `INFRA-BLOCKED:` marker line. Only
+/// [`INFRA_BLOCKED_EXIT`] can be INFRA-BLOCKED: the marker text in any other run means nothing.
+pub fn infra_blocked(exit: Option<i32>, log_text: &str) -> Vec<TestId> {
+    if exit != Some(INFRA_BLOCKED_EXIT) {
+        return Vec::new();
+    }
+    marker_ids(log_text, INFRA_BLOCKED_MARKER)
+}
+
+/// The test IDs on every `MARKER: id1,id2` line of `log_text`.
+fn marker_ids(log_text: &str, marker: &str) -> Vec<TestId> {
     let mut found = Vec::new();
     for line in log_text.lines() {
-        let Some(rest) = line.trim().strip_prefix(FLAKY_MARKER) else {
+        let Some(rest) = line.trim().strip_prefix(marker) else {
             continue;
         };
         let Some(rest) = rest.trim_start().strip_prefix(':') else {
@@ -115,6 +139,10 @@ pub struct Ran {
     /// `GREEN_FLAKY:` marker). A green run with any of these is held for a ruling
     /// instead of landing.
     pub flaky_passes: Vec<TestId>,
+    /// Tests the host refused to measure on this run and on its rerun of the same commit (the
+    /// validator's `INFRA-BLOCKED:` marker, exit 6). A run with any of these is neither green
+    /// nor red: its change is held for a ruling.
+    pub infra_blocked: Vec<TestId>,
     /// Why the validator could not execute (it could not start, or exited 126 or 127 without
     /// reporting a failed test), naming the command and `PATH`. Always also `refused`.
     pub cannot_execute: Option<String>,
@@ -692,6 +720,11 @@ impl Validator for CommandValidator {
             } else {
                 flaky_passes(exit, &log_text)
             },
+            infra_blocked: if refused {
+                Vec::new()
+            } else {
+                infra_blocked(exit, &log_text)
+            },
             cannot_execute,
             effective_selection: None,
             cpu: finished.cpu,
@@ -864,6 +897,7 @@ impl Validator for DagrunValidator {
                     handle: None,
                     refused: false,
                     flaky_passes: Vec::new(),
+                    infra_blocked: Vec::new(),
                     cannot_execute: None,
                     effective_selection: Some(Selection::default()),
                     cpu: None,
@@ -919,6 +953,11 @@ impl Validator for DagrunValidator {
                 Vec::new()
             } else {
                 flaky_passes(exit, &log_text)
+            },
+            infra_blocked: if refused {
+                Vec::new()
+            } else {
+                infra_blocked(exit, &log_text)
             },
             cannot_execute,
             effective_selection: whole_steps,
@@ -1181,6 +1220,22 @@ dagrun: PASS - 1 passed";
     }
 
     #[test]
+    fn infra_blocked_marker_only_counts_with_its_exit() {
+        let log = "noise\nINFRA-BLOCKED: e2e.manifest_c_programs_buck\nmore\n";
+        assert_eq!(
+            infra_blocked(Some(INFRA_BLOCKED_EXIT), log),
+            vec![TestId::step("e2e.manifest_c_programs_buck")]
+        );
+        // A red or green run that prints the text is not INFRA-BLOCKED.
+        assert!(infra_blocked(Some(1), log).is_empty());
+        assert!(infra_blocked(Some(0), log).is_empty());
+        assert!(infra_blocked(None, log).is_empty());
+        // Nor is a GREEN_FLAKY line, nor the marker without its colon.
+        assert!(infra_blocked(Some(INFRA_BLOCKED_EXIT), "GREEN_FLAKY: a\n").is_empty());
+        assert!(infra_blocked(Some(INFRA_BLOCKED_EXIT), "INFRA-BLOCKED a\n").is_empty());
+    }
+
+    #[test]
     fn missing_and_skip_only_probes_are_unknown_not_pass() {
         for outcome in [Outcome::Missing, Outcome::Skip] {
             let mut results = TestResults::default();
@@ -1200,6 +1255,7 @@ dagrun: PASS - 1 passed";
                 handle: None,
                 refused: false,
                 flaky_passes: Vec::new(),
+                infra_blocked: Vec::new(),
                 cannot_execute: None,
                 effective_selection: None,
                 cpu: None,

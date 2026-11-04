@@ -149,14 +149,20 @@ pub struct Item {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last_refusal: String,
     /// Tests that passed only after a retry in the run that validated this change
-    /// (a GREEN_FLAKY run). Non-empty while the change is held for a ruling.
+    /// (a GREEN_FLAKY run), or that the host refused to measure (an INFRA-BLOCKED run; see
+    /// `hold_verdict`). Non-empty while the change is held for a ruling.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flaky_nodes: Vec<String>,
-    /// RFC 3339 UTC time the GREEN_FLAKY hold expires (empty when not held). On
-    /// expiry the change is ejected with the flaky nodes named, never landed
-    /// unruled and never held silently forever.
+    /// RFC 3339 UTC time the hold for a ruling expires (empty when not held). On
+    /// expiry the change is re-queued for validation with the held nodes named, never
+    /// landed unruled and never held silently forever.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub flaky_hold_until: String,
+    /// The verdict the hold waits on a ruling for: empty for GREEN_FLAKY (the held tests
+    /// passed only after a retry), or `INFRA-BLOCKED` (the host refused every measurement of
+    /// them on a run and on its rerun of the same commit). Left out of the record while empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hold_verdict: String,
     /// Why the change was escalated to its owner, when validation did not run the bounded
     /// number of times (or a red run's probe could not run under `red_without_probe: hold`).
     /// The change stays `queued` but is held until `merge-queue retry` clears this.
@@ -187,7 +193,26 @@ fn is_zero_u32(value: &u32) -> bool {
 }
 
 impl Item {
-    /// Whether this queued change is inside its GREEN_FLAKY hold at `at`.
+    /// The verdict this change's hold waits on a ruling for: `GREEN_FLAKY` or `INFRA-BLOCKED`.
+    pub fn hold_label(&self) -> &str {
+        if self.hold_verdict.is_empty() {
+            crate::validate::FLAKY_MARKER
+        } else {
+            &self.hold_verdict
+        }
+    }
+
+    /// The transition and history event of this change's hold: `held-green-flaky`, or
+    /// `held-infra-blocked` for an INFRA-BLOCKED hold.
+    pub fn hold_kind(&self) -> &'static str {
+        if self.hold_verdict == crate::validate::INFRA_BLOCKED_MARKER {
+            "held-infra-blocked"
+        } else {
+            "held-green-flaky"
+        }
+    }
+
+    /// Whether this queued change is inside its hold for a ruling at `at`.
     pub fn is_flaky_held_at(&self, at: &str) -> bool {
         self.status == ItemStatus::Queued
             && !self.flaky_hold_until.is_empty()

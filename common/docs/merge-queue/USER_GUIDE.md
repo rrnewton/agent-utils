@@ -127,6 +127,7 @@ This command creates the state directory and writes `config.json`.
 | `--refusal-max-retries N` | `3` | Extra attempts after an admission refusal (exit `75`, or a non-zero exit whose first output line starts with `COULD_NOT_RUN` and that attributed no failed test) within one `run`, each after a backoff delay. A refusal is never a pass and never red: the change stays queued. |
 | `--refusal-backoff-secs SECS` | `2` | Base backoff between refusal retries, doubled per attempt and capped at 60 seconds. `0` means no delay. The same backoff sets the deferred change's next retry time. |
 | `--max-deferrals N` | `3` | How many times a change may be deferred because validation did not run (an admission refusal, a validator that cannot execute, a probe or donors that could not run) before it is escalated to its owner and held until `merge-queue retry` (see "Bounded retry"). |
+| `--green-flaky-hold-secs SECS` | `7200` | How long a change is held for a ruling after a GREEN_FLAKY or INFRA-BLOCKED result (see "Held for a ruling") before it is re-queued for a fresh validation. |
 | `--red-without-probe MODE` | `eject` | What a red validation that names failed tests does when its follow-up probe cannot run: `eject` the change (the red run is the verdict) or `hold` it for its owner. |
 | `--offload MODE` | `off` | Where validations run: `off` (in this process, as always), `compare` (in this process, which decides, and also on donors, whose receipts are only compared) or `decide` (on donors only; an accepted receipt is the verdict). See "Donor validators". |
 | `--tool-identity NAME=COMMAND` | none | A tool the validation depends on (repeatable): the command prints its identity, for example a tool repository's commit or a toolchain version, never a hash of a binary (builds are not byte-identical across hosts). Donors whose answer differs decline the job. merge-queue's own revision is always compared. |
@@ -220,7 +221,8 @@ is recorded in the change's history. Submitting the change again puts it back in
 This command returns changes that were escalated to their owner (see "Bounded retry") to the
 queue: it clears the escalation, the refusal count and the backoff, in the item records and in
 the shadow ledger. Run it once whatever kept validation from running is fixed. A change that is
-only deferred is returned at once too, without waiting for its backoff.
+only deferred is returned at once too, without waiting for its backoff. It is also the ruling
+that ends a hold (see "Held for a ruling"): the change is validated again.
 
 ### `merge-queue list`
 
@@ -628,6 +630,9 @@ An **item record** (`items/<pr>.json`) has these fields:
 - `landed_as`: the base commit that contains the change, once it has landed.
 - `validation_refusals`, `next_retry_at`, `last_refusal`: present only after a validation
   refusal. The status stays `queued`; `next_retry_at` is when validation may be retried.
+- `flaky_nodes`, `flaky_hold_until`, `hold_verdict`: present only while the change is held for a
+  ruling (see "Held for a ruling"). `hold_verdict` is `INFRA-BLOCKED` for that hold and absent
+  for a GREEN_FLAKY one.
 - `history`: a list of `{at, kind, detail}` events. A refusal adds a `validation-refused` event.
 
 ## Configuration (`config.json`)
@@ -818,6 +823,24 @@ else my-runner --target "$(git rev-parse HEAD)" full; fi | tee /dev/stderr |
 A runner that can only run everything at a new commit still works. Culprit-search probes at other
 commits then cost full runs, so keep batches small (`--max-batch 1` or `2`). With `--trust-base`,
 a red single-change batch costs exactly one targeted rerun.
+
+**Held for a ruling.** Two marker lines let a runner say that its run is neither a plain pass nor
+a product failure; each names the tests it concerns:
+
+- `GREEN_FLAKY: id1,id2` with exit `0`: the run is green only because those tests passed after a
+  retry, inside the run or because the run was itself a same-commit rerun of a failure.
+- `INFRA-BLOCKED: id1,id2` with exit `6`: the host refused every measurement of those tests, on a
+  run and on its rerun of the same commit, so the commit has no result for them.
+
+The queue holds such a change instead of landing or ejecting it: the batch run that printed the
+marker, or a culprit search whose rerun of the whole candidate printed it. A marker with another
+exit status means nothing. Each change of the batch stays `queued` with the tests in
+`flaky_nodes`, the hold's end in `flaky_hold_until` (`--green-flaky-hold-secs`, two hours by
+default) and, for INFRA-BLOCKED, `hold_verdict: INFRA-BLOCKED`. `plan` holds it as
+`held-green-flaky` or `held-infra-blocked`, its `--notify` recipient gets that notification, and
+batches built on top of it are discarded. `merge-queue retry PR` is the ruling that returns it to
+the queue; when the hold ends without one, the change is re-queued for a fresh validation (which
+holds it again if the result is the same). A donor's receipt carries the markers in its log tail.
 
 **`dagrun`.** Test IDs are DAG step names. A selection becomes `dagrun run --dag DAG --keep-going
 --selected a,b`, which also runs each selected step's dependencies; `all` omits `--selected`. The
@@ -1044,7 +1067,9 @@ The base moves only to a commit whose exact tree passed validation (the bors rul
    suspected failing prefix in the same round, so a single-change batch costs one round of two
    concurrent runs (the base and a rerun). A prefix that fails and then passes is flaky: its tests
    are recorded and the search continues. If the full candidate passes on rerun, the batch lands
-   with the tests recorded under `flaky` in the report. Flaky results are never hidden.
+   with the tests recorded under `flaky` in the report, unless the runner marks that rerun
+   `GREEN_FLAKY` or `INFRA-BLOCKED`, which holds the batch for a ruling instead (see "Held for a
+   ruling"). Flaky results are never hidden.
 6. **Ejection.** The culprit is marked `ejected`, with a report in `runs/<id>/ejections/<pr>.md`
    naming the failed tests. Changes that depend on an ejected change (ejected for failed tests or
    for a conflict) are set aside for the rest of the run and stay `queued`; they never land in that

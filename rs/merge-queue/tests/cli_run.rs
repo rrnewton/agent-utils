@@ -1053,3 +1053,43 @@ fn decision_features_use_the_shared_classifier_policy_at_the_plan_base() {
     );
     assert_eq!(conflicting["classification"]["unknown"], 1, "{conflicting}");
 }
+
+#[test]
+fn infra_blocked_batch_is_held_for_a_ruling_neither_landed_nor_ejected() {
+    // The validator says the host refused every measurement of `a` on a run and its rerun
+    // (INFRA-BLOCKED, exit 6): no result, so the batch is held, never landed and never
+    // ejected as red.
+    let fx = setup_validator(
+        "run-infra-blocked",
+        "echo \"INFRA-BLOCKED: a\"; exit 6",
+        &[],
+    );
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let before = fx.remote_main();
+    let out = fx.mq(&["run", "--json"]);
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    assert!(r["landed"].as_array().unwrap().is_empty(), "{r}");
+    assert!(r["ejected"].as_array().unwrap().is_empty(), "{r}");
+    assert!(
+        r["stopped"].as_str().unwrap().contains("INFRA-BLOCKED"),
+        "{}",
+        r["stopped"]
+    );
+    assert_eq!(fx.remote_main(), before);
+    assert_eq!(status(&fx, 1), "queued");
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    let item = &items.as_array().unwrap()[0];
+    assert_eq!(item["flaky_nodes"], serde_json::json!(["a"]), "{item}");
+    assert_eq!(item["hold_verdict"], "INFRA-BLOCKED", "{item}");
+    let history_kinds: Vec<&str> = item["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert!(
+        history_kinds.contains(&"held-infra-blocked"),
+        "{history_kinds:?}"
+    );
+}

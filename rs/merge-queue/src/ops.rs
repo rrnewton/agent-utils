@@ -272,6 +272,13 @@ fn submit_resolved(
         } else {
             String::new()
         },
+        hold_verdict: if same_head {
+            existing
+                .as_ref()
+                .map_or_else(String::new, |old| old.hold_verdict.clone())
+        } else {
+            String::new()
+        },
         deciding_report: existing
             .as_ref()
             .map_or_else(String::new, |old| old.deciding_report.clone()),
@@ -322,7 +329,8 @@ pub fn retry(state: &State, pr: i64) -> Result<Item, String> {
     }
     let was = if !item.flaky_hold_until.is_empty() {
         format!(
-            "GREEN_FLAKY hold ({}; until {})",
+            "{} hold ({}; until {})",
+            item.hold_label(),
             item.flaky_nodes.join(", "),
             item.flaky_hold_until
         )
@@ -334,6 +342,7 @@ pub fn retry(state: &State, pr: i64) -> Result<Item, String> {
     item.escalated.clear();
     item.flaky_nodes.clear();
     item.flaky_hold_until.clear();
+    item.hold_verdict.clear();
     item.validation_refusals = 0;
     item.next_retry_at.clear();
     item.last_refusal.clear();

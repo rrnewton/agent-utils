@@ -527,13 +527,19 @@ pub fn make_plan(
             continue;
         }
         if item.is_flaky_held_at(&at) {
+            let why = if item.hold_verdict == crate::validate::INFRA_BLOCKED_MARKER {
+                "the host refused every measurement of them on a run and on its rerun"
+            } else {
+                "passed only after a retry"
+            };
             hold(
                 &mut held,
                 Held {
                     pr: item.pr,
-                    kind: "held-green-flaky".into(),
+                    kind: item.hold_kind().into(),
                     reason: format!(
-                        "validation was GREEN_FLAKY ({} passed only after a retry); held for a ruling until {}; `merge-queue retry {}` returns it to the queue",
+                        "validation was {} ({}: {why}); held for a ruling until {}; `merge-queue retry {}` returns it to the queue",
+                        item.hold_label(),
                         item.flaky_nodes.join(", "),
                         item.flaky_hold_until,
                         item.pr
@@ -948,6 +954,7 @@ mod unit {
             last_refusal: String::new(),
             flaky_nodes: Vec::new(),
             flaky_hold_until: String::new(),
+            hold_verdict: String::new(),
             escalated: String::new(),
             deciding_report: String::new(),
             deciding_failed: vec![],
