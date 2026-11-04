@@ -7,6 +7,9 @@ API; the Documents page is not built. The server side (`documents-index-server`)
 authorised to start before the client; the client (`documents-view-client`) waits for
 `#624 voice-page-modularity`. `#544 documents-view-design`.
 
+Amended 2026-11-04 (coordinator, owner request): private documents served from the vibe-talk
+server itself, with a CLI and a skill (`#855 vibe-talk-private-docs`); see "Private documents".
+
 ## The ask
 
 The owner, 2026-10-26 (condensed). Agents often answer with a report committed to GitHub, or posted
@@ -823,6 +826,66 @@ reader crosses a section boundary.
   sees exactly today's single row. A combined row of several messages treats each message as a
   unit above its blocks.
 
+## Private documents: served from the vibe-talk server itself (owner 2026-11-04)
+
+The owner, 2026-11-04 17:54 ET: "Sometimes I don't WANT to publish a doc to [a paste
+service] or github. But I want to read it on the go." The Documents view should also serve
+documents that live only on the vibe-talk server. An agent should be able to "publish a
+private document to vibe-talk" by calling a vibe-talk CLI. (`#855 vibe-talk-private-docs`)
+
+"Private" here means **not published anywhere else**. It is not a new access tier: the
+2026-10-28 decision (no per-document privacy gating in the MVP) still holds. A private
+document is read with the server's existing token, like everything else on it.
+
+**Storage.** A `documents/` directory beside the server's durable state, the directory that
+holds `[storage] path` and `documents-index.json`. It can be overridden by a new
+`[documents] private_dir` setting, which must be an absolute path and is created 0700. Each
+document is one file, stored under a slug name chosen from its title or file name, plus a
+small sidecar (`NAME.meta.json`: title, added_at, source path, sha256, size). Markdown,
+plain text and HTML are accepted in the first cut. Other types are refused with a clear
+error.
+
+**CLI.** Run where the server runs, with the server's `--config`:
+
+- `vibe-talk docs add FILE [--name NAME] [--title TITLE]` copies FILE into `documents/` and
+  prints the document's private URL (`https://HOST/documents/private/NAME`, the page route
+  that opens it in the reader) and its document key. Re-adding the same NAME replaces the
+  content and bumps a version, so the page's "New version available" chip applies.
+- `vibe-talk docs path NAME` prints the absolute file path an agent may write to directly,
+  for generated documents, plus the URL it will have. The server picks the file up on the next
+  list, or immediately through a file watch.
+- `vibe-talk docs list` and `vibe-talk docs rm NAME` (with confirmation) manage them.
+- `--json` on each command, for agents.
+
+**Serving and listing.** Private documents are a new document kind, `private`, with the key
+`private/NAME`. They enter the same index as linked documents, as a source alongside the
+message fold rather than a mention of one. They list in the Documents view with their own
+type icon, sort by added_at in "mention order", and open in the same reader with the chunk
+navigator and read-aloud. Fetch is a local file read: no network, no fetch cache.
+
+**The skill.** Ship `skills/vibe-talk-private-docs/SKILL.md` together with the CLI, never
+before it, so no skill describes an interface that does not exist. Sketch:
+
+```markdown
+---
+name: vibe-talk-private-docs
+description: Publish a document privately to the owner's vibe-talk server so they can read
+  it on the go, without posting it to GitHub or a paste service. Use when asked to "publish a
+  private document to vibe-talk", "put this in vibe-talk documents", or to share a report
+  only through vibe-talk.
+---
+# vibe-talk-private-docs
+Run where the vibe-talk server runs, with its --config.
+- Existing file: `vibe-talk docs add REPORT.md --title "..." --json` → share the printed URL.
+- Writing fresh: `vibe-talk docs path NAME --json` → write the file at the printed path, then
+  share the printed URL.
+Never paste the server token. Markdown, text or HTML only.
+```
+
+**Page part.** The `private` kind's icon, list rows and reader entry follow the `#624
+voice-page-modularity` rule: new page state gets one owner in a module, never new top-level
+state in the legacy script.
+
 ## The challenging issues
 
 1. **A confused deputy with the owner's credentials.** Anyone who can post in a watched channel
@@ -1064,3 +1127,4 @@ I'll take your recommendation on."
   documents-view-design` was already closed on 2026-10-26; this final design is the
   record it pointed at. Implementation is staged as `documents-index-server` (now)
   and `documents-view-client` (blocked by `#624 voice-page-modularity`).
+- **2026-11-04 17:54 ET**: owner TODO (reply 147, via the lead): serve **private documents** from the vibe-talk server itself, plus a CLI and a skill so an agent can "publish a private document to vibe-talk". Added the "Private documents" section; `#855 vibe-talk-private-docs`. "Private" means unpublished elsewhere, not a new access tier; the 2026-10-28 no-gating decision stands.
