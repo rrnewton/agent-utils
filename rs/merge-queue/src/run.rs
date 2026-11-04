@@ -301,6 +301,9 @@ pub struct RunReport {
     /// Changes skipped at batch construction (still queued), with the named reason.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recount_skips: Vec<RecountSkip>,
+    /// Pin decreases changes declared and their batches accepted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pin_decreases: Vec<PinDecrease>,
     /// Generated files regenerated on candidates.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub regenerated: Vec<Regeneration>,
@@ -327,6 +330,22 @@ pub struct RunReport {
     pub windows: Vec<usize>,
     /// Changes landed per hour of wall time.
     pub prs_per_hour: f64,
+}
+
+/// A pin decrease a change declared and its batch accepted (see
+/// [`crate::recount::DECREASE_TRAILER`]).
+#[derive(Clone, Debug, Serialize)]
+pub struct PinDecrease {
+    /// Change that declared it.
+    pub pr: i64,
+    /// Pin name.
+    pub pin: String,
+    /// Occurrence index of the pin in file order.
+    pub occurrence: usize,
+    /// How much the pin went down.
+    pub amount: u64,
+    /// Why, as the trailer says.
+    pub reason: String,
 }
 
 /// One change skipped at batch construction (still queued).
@@ -1197,11 +1216,13 @@ impl<'a> Runner<'a> {
                     continue;
                 }
                 let head = items[pr].head.clone();
-                // The change's deltas, and its merge-base and head pin values for the refusal.
+                // The change's deltas, its merge-base and head pin values, and (when it lowers a
+                // pin) its head commit's message, which may declare the decrease.
                 type Versions = (
                     BTreeMap<(String, usize), i64>,
                     BTreeMap<(String, usize), u64>,
                     BTreeMap<(String, usize), u64>,
+                    String,
                 );
                 let delta = (|| -> Result<Versions, String> {
                     let mergebase = self
@@ -1215,42 +1236,49 @@ impl<'a> Runner<'a> {
                         mb_text.as_deref(),
                         head_text.as_deref(),
                     )?;
+                    let message = if delta.values().any(|d| *d < 0) {
+                        self.git.message(&head)?
+                    } else {
+                        String::new()
+                    };
                     Ok((
                         delta,
                         crate::recount::values(mb_text.as_deref()),
                         crate::recount::values(head_text.as_deref()),
+                        message,
                     ))
                 })();
                 match delta {
                     Err(detail) => {
                         skips.push((*pr, format!("recount-pins refused: {detail}")));
                     }
-                    Ok((delta, mb_values, head_values)) => {
-                        if let Some((name, index, next, base_value)) =
-                            crate::recount::below_base(&base_map, &running, &delta)
-                        {
-                            // Name both of the change's own values: a lane must tell a test
-                            // the change removes from a head pin stale against its merge base.
-                            let key = (name.clone(), index);
-                            let at = |values: &BTreeMap<(String, usize), u64>| {
-                                values
-                                    .get(&key)
-                                    .map_or_else(|| "absent".to_owned(), u64::to_string)
-                            };
-                            skips.push((
-                                *pr,
-                                format!(
-                                    "recount-pins refused: pin {name:?} (occurrence {index}) is {} at the merge base and {} at the head ({:+}), so on the base's {base_value} it resolves to {next}, below the base; a decrease is refused (tests the change removes, or a head pin stale against its merge base)",
-                                    at(&mb_values),
-                                    at(&head_values),
-                                    delta.get(&key).copied().unwrap_or(0)
-                                ),
-                            ));
-                        } else {
-                            for (key, d) in &delta {
-                                *running.entry(key.clone()).or_insert(0) += d;
+                    Ok((delta, mb_values, head_values, message)) => {
+                        // A decrease lands only as the head commit declares it.
+                        let (declared, unreadable) = crate::recount::declared_decreases(&message);
+                        match crate::recount::check_decreases(
+                            &delta,
+                            &base_map,
+                            &running,
+                            &mb_values,
+                            &head_values,
+                            &declared,
+                            &unreadable,
+                        ) {
+                            Err(detail) => {
+                                skips.push((*pr, format!("recount-pins refused: {detail}")));
                             }
-                            accepted.insert(*pr, delta);
+                            Ok(honoured) => {
+                                for (key, d) in &delta {
+                                    *running.entry(key.clone()).or_insert(0) += d;
+                                }
+                                accepted.insert(*pr, delta);
+                                self.record_pin_decreases(
+                                    *pr,
+                                    &honoured,
+                                    &mb_values,
+                                    &head_values,
+                                )?;
+                            }
                         }
                     }
                 }
@@ -1620,6 +1648,50 @@ impl<'a> Runner<'a> {
         })();
         self.slots.give(slot);
         result
+    }
+
+    /// Record the pin decreases change `pr` declared and its batch accepted: in the run report,
+    /// the run's events and the change's history.
+    fn record_pin_decreases(
+        &self,
+        pr: i64,
+        honoured: &[crate::recount::Decrease],
+        mb_values: &BTreeMap<(String, usize), u64>,
+        head_values: &BTreeMap<(String, usize), u64>,
+    ) -> Result<(), String> {
+        for decrease in honoured {
+            let key = (decrease.name.clone(), decrease.occurrence);
+            let shown = |values: &BTreeMap<(String, usize), u64>| {
+                values
+                    .get(&key)
+                    .map_or_else(|| "absent".to_owned(), u64::to_string)
+            };
+            let detail = format!(
+                "declared decrease of pin {:?} (occurrence {}) by {} accepted ({} at the merge base, {} at the head): {}",
+                decrease.name,
+                decrease.occurrence,
+                decrease.amount,
+                shown(mb_values),
+                shown(head_values),
+                decrease.reason
+            );
+            self.event("count-pin-decrease", &format!("#{pr}: {detail}"));
+            lock(&self.report).pin_decreases.push(PinDecrease {
+                pr,
+                pin: decrease.name.clone(),
+                occurrence: decrease.occurrence,
+                amount: decrease.amount,
+                reason: decrease.reason.clone(),
+            });
+            if !self.simulating() {
+                let mut items = lock(&self.items);
+                if let Some(item) = items.get_mut(&pr) {
+                    item.log("count-pin-decrease", detail);
+                    self.state.save_item(item)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Rewrite the pin counts on `tip` to `values` and commit the result;
@@ -3805,6 +3877,15 @@ pub fn render_report(report: &RunReport) -> String {
         out.push_str("\n## Skipped at construction (still queued)\n\n");
         for skip in &report.recount_skips {
             out.push_str(&format!("- #{}: {}\n", skip.pr, skip.reason));
+        }
+    }
+    if !report.pin_decreases.is_empty() {
+        out.push_str("\n## Declared pin decreases\n\n");
+        for decrease in &report.pin_decreases {
+            out.push_str(&format!(
+                "- #{}: `{}` (occurrence {}) down {}: {}\n",
+                decrease.pr, decrease.pin, decrease.occurrence, decrease.amount, decrease.reason
+            ));
         }
     }
     if !report.would_validate.is_empty() {

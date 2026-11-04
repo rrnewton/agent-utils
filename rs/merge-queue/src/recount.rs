@@ -17,6 +17,11 @@
 //! versions, or a resolved value below the base) is skipped from the batch at
 //! construction and stays queued; the refusal is recorded, never silent, and
 //! never fails the batch.
+//!
+//! A decrease (a head value below the merge base's) is refused unless the change's head commit
+//! declares exactly that decrease for exactly that pin with a [`DECREASE_TRAILER`] trailer,
+//! because a lower count is as likely a head pin stale against its merge base as tests the
+//! change means to drop.
 
 use std::collections::BTreeMap;
 
@@ -206,21 +211,130 @@ pub fn change_deltas(
     Ok(deltas)
 }
 
-/// Whether applying `delta` to `running` would push any pin below its base
-/// value; names the first such pin.
-pub fn below_base(
-    base: &BTreeMap<(String, usize), u64>,
-    running: &BTreeMap<(String, usize), i64>,
-    delta: &BTreeMap<(String, usize), i64>,
-) -> Option<(String, usize, i64, u64)> {
-    for (key, d) in delta {
-        let base_value = base.get(key).copied().unwrap_or(0);
-        let next = running.get(key).copied().unwrap_or(base_value as i64) + d;
-        if next < base_value as i64 {
-            return Some((key.0.clone(), key.1, next, base_value));
+/// Trailer a change's head commit carries to declare an intended pin decrease:
+/// `Count-Pin-Decrease: <pin> <amount> <reason>`. `<pin>` is a pin name, for its first
+/// occurrence, or `name:N` for occurrence `N`; `<amount>` is how much it goes down (written `2`
+/// or `-2`). One trailer per pin.
+pub const DECREASE_TRAILER: &str = "Count-Pin-Decrease";
+
+/// One declared pin decrease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Decrease {
+    /// Pin name.
+    pub name: String,
+    /// Occurrence index of the pin in file order.
+    pub occurrence: usize,
+    /// How much the pin goes down.
+    pub amount: u64,
+    /// Why, as the trailer says.
+    pub reason: String,
+}
+
+/// The decreases `message` declares, and every [`DECREASE_TRAILER`] line it could not read.
+pub fn declared_decreases(message: &str) -> (Vec<Decrease>, Vec<String>) {
+    let mut declared = Vec::new();
+    let mut unreadable = Vec::new();
+    for line in message.lines().map(str::trim) {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case(DECREASE_TRAILER) {
+            continue;
+        }
+        let mut parts = value.trim().splitn(3, char::is_whitespace);
+        let parsed = match (parts.next(), parts.next(), parts.next()) {
+            (Some(pin), Some(amount), Some(reason)) if !reason.trim().is_empty() => {
+                let (name, occurrence) = match pin.rsplit_once(':') {
+                    Some((name, index)) => (name, index.parse::<usize>().ok()),
+                    None => (pin, Some(0)),
+                };
+                match (occurrence, amount.parse::<i64>()) {
+                    (Some(occurrence), Ok(amount)) if amount != 0 && !name.is_empty() => {
+                        Some(Decrease {
+                            name: name.to_owned(),
+                            occurrence,
+                            amount: amount.unsigned_abs(),
+                            reason: reason.trim().to_owned(),
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match parsed {
+            Some(decrease) => declared.push(decrease),
+            None => unreadable.push(line.to_owned()),
         }
     }
-    None
+    (declared, unreadable)
+}
+
+/// Check every decrease in a change's `delta` against the decreases its head commit declares:
+/// each needs a declaration of exactly its amount for exactly its pin. Returns the declarations
+/// the change honours, or why it is refused, naming the change's merge-base and head values
+/// (`mb_values`, `head_values`) and the value the pin would resolve to on the batch so far
+/// (`running`, defaulting to `base`).
+#[allow(clippy::too_many_arguments)]
+pub fn check_decreases(
+    delta: &BTreeMap<(String, usize), i64>,
+    base: &BTreeMap<(String, usize), u64>,
+    running: &BTreeMap<(String, usize), i64>,
+    mb_values: &BTreeMap<(String, usize), u64>,
+    head_values: &BTreeMap<(String, usize), u64>,
+    declared: &[Decrease],
+    unreadable: &[String],
+) -> Result<Vec<Decrease>, String> {
+    let mut honoured = Vec::new();
+    for ((name, index), d) in delta {
+        if *d >= 0 {
+            continue;
+        }
+        let key = (name.clone(), *index);
+        let shown = |values: &BTreeMap<(String, usize), u64>| {
+            values
+                .get(&key)
+                .map_or_else(|| "absent".to_owned(), u64::to_string)
+        };
+        let base_value = base.get(&key).copied().unwrap_or(0);
+        let resolved = running.get(&key).copied().unwrap_or(base_value as i64) + d;
+        let pin = if *index == 0 {
+            name.clone()
+        } else {
+            format!("{name}:{index}")
+        };
+        let values = format!(
+            "pin {name:?} (occurrence {index}) is {} at the merge base and {} at the head ({d:+}), so on the base's {base_value} it resolves to {resolved}",
+            shown(mb_values),
+            shown(head_values)
+        );
+        match declared
+            .iter()
+            .find(|decrease| decrease.name == *name && decrease.occurrence == *index)
+        {
+            Some(decrease) if decrease.amount == d.unsigned_abs() => {
+                honoured.push(decrease.clone())
+            }
+            Some(decrease) => {
+                return Err(format!(
+                    "{values}, but the head commit declares a decrease of {} ({DECREASE_TRAILER}: {pin} {} {}); a decrease must match its declaration exactly",
+                    decrease.amount, decrease.amount, decrease.reason
+                ));
+            }
+            None => {
+                let unread = if unreadable.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (unreadable trailer(s): {})", unreadable.join(" | "))
+                };
+                return Err(format!(
+                    "{values}, below the base; an undeclared decrease is refused{unread}: declare an intended one with a `{DECREASE_TRAILER}: {pin} {} <reason>` trailer on the head commit, or rebase a head whose pin is stale against its merge base",
+                    d.unsigned_abs()
+                ));
+            }
+        }
+    }
+    Ok(honoured)
 }
 
 /// Batch values: `base + sum(deltas)` per key.
@@ -358,6 +472,75 @@ mod unit {
         assert!(change_deltas(Some(base), Some(mb), Some(head))
             .unwrap_err()
             .contains("occurrence-count mismatch for pin \"twin\": base 1, merge base 0, head 1"));
+    }
+
+    #[test]
+    fn a_decrease_needs_a_declaration_of_exactly_its_amount() {
+        let base = values(Some("(\"p\", 10),\n(\"q\", 4),\n"));
+        let mb = values(Some("(\"p\", 10),\n(\"q\", 4),\n"));
+        let head = values(Some("(\"p\", 8),\n(\"q\", 5),\n"));
+        let delta = change_deltas(
+            Some("(\"p\", 10),\n(\"q\", 4),\n"),
+            Some("(\"p\", 10),\n(\"q\", 4),\n"),
+            Some("(\"p\", 8),\n(\"q\", 5),\n"),
+        )
+        .unwrap();
+        let running = BTreeMap::new();
+        let check = |message: &str| {
+            let (declared, unreadable) = declared_decreases(message);
+            check_decreases(&delta, &base, &running, &mb, &head, &declared, &unreadable)
+        };
+        // Declared exactly (either sign): honoured, and only for the decreasing pin.
+        for message in [
+            "Move two tests\n\nCount-Pin-Decrease: p 2 two tests move to the privileged node\n",
+            "x\n\ncount-pin-decrease: p -2 same, lower-case key\n",
+        ] {
+            let honoured = check(message).unwrap();
+            assert_eq!(honoured.len(), 1, "{honoured:?}");
+            assert_eq!(honoured[0].name, "p");
+            assert_eq!(honoured[0].amount, 2);
+        }
+        // Undeclared: refused, naming both of the change's values and the trailer to add.
+        let refused = check("No trailer\n").unwrap_err();
+        assert!(
+            refused.contains(
+                "pin \"p\" (occurrence 0) is 10 at the merge base and 8 at the head (-2)"
+            ),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("Count-Pin-Decrease: p 2 <reason>"),
+            "{refused}"
+        );
+        // Larger than declared, or smaller: refused.
+        let refused = check("x\n\nCount-Pin-Decrease: p 1 one test only\n").unwrap_err();
+        assert!(refused.contains("declares a decrease of 1"), "{refused}");
+        let refused = check("x\n\nCount-Pin-Decrease: p 3 three tests\n").unwrap_err();
+        assert!(refused.contains("declares a decrease of 3"), "{refused}");
+        // A declaration for another pin, or another occurrence, does not cover it.
+        assert!(check("x\n\nCount-Pin-Decrease: q 2 wrong pin\n").is_err());
+        assert!(check("x\n\nCount-Pin-Decrease: p:1 2 wrong occurrence\n").is_err());
+        // An unreadable trailer is named in the refusal.
+        let refused = check("x\n\nCount-Pin-Decrease: p two\n").unwrap_err();
+        assert!(refused.contains("unreadable trailer(s)"), "{refused}");
+    }
+
+    #[test]
+    fn decrease_trailers_parse_pin_occurrence_amount_and_reason() {
+        let (declared, unreadable) = declared_decreases(
+            "Subject\n\nBody text: not a trailer\nCount-Pin-Decrease: test.cli:1 -3 moved to #[ignore]\nCount-Pin-Decrease: test.cli 2\nCount-Pin-Decrease: test.x 0 nothing\n",
+        );
+        assert_eq!(
+            declared,
+            vec![Decrease {
+                name: "test.cli".into(),
+                occurrence: 1,
+                amount: 3,
+                reason: "moved to #[ignore]".into(),
+            }]
+        );
+        // No reason, or a zero amount, cannot be read.
+        assert_eq!(unreadable.len(), 2, "{unreadable:?}");
     }
 
     #[test]

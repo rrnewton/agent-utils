@@ -444,7 +444,8 @@ enum Command {
         /// Recount the generated count pins after merging each batch
         /// (base plus each change's own delta) instead of treating their
         /// conflicts as real. A pin a change introduces takes its head's value;
-        /// a decrease below the base is refused. Off by default.
+        /// a decrease lands only as the change's head commit declares it
+        /// (`Count-Pin-Decrease: <pin> <amount> <reason>`). Off by default.
         #[arg(long)]
         recount_pins: bool,
         /// After landing, close each landed pull request with a pointer to the landed commit

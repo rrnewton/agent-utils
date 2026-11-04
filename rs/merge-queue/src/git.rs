@@ -426,6 +426,11 @@ impl Git {
             .collect())
     }
 
+    /// A commit's full message.
+    pub fn message(&self, commit: &str) -> Result<String, String> {
+        self.run(&["log", "-1", "--format=%B", commit])
+    }
+
     /// Author and message metadata for replaying a commit.
     fn commit_meta(&self, commit: &str) -> Result<(String, String, String, String), String> {
         let raw = self.run(&["log", "-1", "--format=%an%x00%ae%x00%aI%x00%B", commit])?;

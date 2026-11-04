@@ -340,4 +340,101 @@ fn a_decrease_is_refused_naming_the_merge_base_and_head_values() {
         reason.contains("it resolves to 8, below the base"),
         "{reason}"
     );
+    assert!(
+        reason.contains("an undeclared decrease is refused"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("`Count-Pin-Decrease: test.alpha 2 <reason>`"),
+        "{reason}"
+    );
+}
+
+/// Push a branch from `main` with one commit writing `files` under `message`.
+fn branch_with_message(fx: &Fixture, name: &str, files: &[(&str, &str)], message: &str) {
+    git(&fx.dev(), &["checkout", "-q", "-B", name, "main"]);
+    for (path, text) in files {
+        fx.write(path, text);
+    }
+    fx.commit_all(message);
+    git(
+        &fx.dev(),
+        &["push", "-q", "-f", "origin", &format!("HEAD:{name}")],
+    );
+    git(&fx.dev(), &["checkout", "-q", "main"]);
+}
+
+#[test]
+fn a_declared_decrease_lands_and_is_recorded() {
+    let fx = setup("recount-declared", true);
+    // #1 moves two alpha tests away and says so; #2 adds one alpha test in the same batch.
+    branch_with_message(
+        &fx,
+        "b",
+        &[(PIN, &pin_text(8)), ("tests/b", "ok\n")],
+        "Move two alpha tests to the privileged node\n\nCount-Pin-Decrease: test.alpha 2 two tests run on the privileged node instead\n",
+    );
+    fx.branch("c", &[(PIN, &pin_text(11)), ("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1, 2]], "{r}");
+    // 10 (base) - 2 (#1, declared) + 1 (#2).
+    let landed_pin = git(&fx.remote(), &["show", &format!("main:{PIN}")]);
+    assert!(landed_pin.contains("(\"test.alpha\", 9)"), "{landed_pin}");
+    // Recorded in the run report and in the change's history.
+    assert_eq!(
+        r["pin_decreases"],
+        serde_json::json!([{
+            "pr": 1,
+            "pin": "test.alpha",
+            "occurrence": 0,
+            "amount": 2,
+            "reason": "two tests run on the privileged node instead"
+        }]),
+        "{r}"
+    );
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    let item = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["pr"] == 1)
+        .unwrap();
+    let recorded = item["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "count-pin-decrease")
+        .unwrap_or_else(|| panic!("{item}"));
+    assert!(
+        recorded["detail"].as_str().unwrap().contains(
+            "declared decrease of pin \"test.alpha\" (occurrence 0) by 2 accepted (10 at the merge base, 8 at the head)"
+        ),
+        "{recorded}"
+    );
+}
+
+#[test]
+fn a_decrease_larger_than_declared_is_refused() {
+    let fx = setup("recount-over-declared", true);
+    branch_with_message(
+        &fx,
+        "b",
+        &[(PIN, &pin_text(7)), ("tests/b", "ok\n")],
+        "Move alpha tests\n\nCount-Pin-Decrease: test.alpha 2 two tests move\n",
+    );
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert!(landed(&r).is_empty(), "{r}");
+    let reason = r["recount_skips"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("is 10 at the merge base and 7 at the head (-3)"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("but the head commit declares a decrease of 2"),
+        "{reason}"
+    );
+    assert!(r.get("pin_decreases").is_none(), "{r}");
 }
