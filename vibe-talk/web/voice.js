@@ -9153,14 +9153,15 @@ function controlShortcuts(field) {
   return out;
 }
 
-/** The `aria-keyshortcuts` of each row button as `renderKeyHints` last said them, by class, for the rows drawn after it. */
-let rowShortcuts = new Map();
+/**
+ * The `aria-keyshortcuts` of each row button as `renderKeyHints` last said them, by class, for the rows drawn
+ * after it (web/src/view/shell `createRowShortcuts`).
+ */
+const rowShortcuts = createRowShortcuts();
 
 /** Give a row button its `aria-keyshortcuts`, or take them away when its key is turned off. */
 function sayRowShortcut(button, className) {
-  const said = (rowShortcuts.get(className) || []).join(" ");
-  if (said) button.setAttribute("aria-keyshortcuts", said);
-  else button.removeAttribute("aria-keyshortcuts");
+  rowShortcuts.say(button, className);
 }
 
 /**
@@ -9179,10 +9180,10 @@ function renderKeyHints() {
     if (said.length) el(id).setAttribute("aria-keyshortcuts", said.join(" "));
     else el(id).removeAttribute("aria-keyshortcuts");
   }
-  rowShortcuts = controlShortcuts("rowControls");
+  rowShortcuts.set(controlShortcuts("rowControls"));
   for (const list of ["discord-log", "pinned-log"]) {
     for (const row of /** @type {HTMLElement[]} */ ([...el(list).children])) {
-      for (const className of rowShortcuts.keys()) {
+      for (const className of rowShortcuts.classes()) {
         const button = childByClass(row, className);
         if (button) sayRowShortcut(button, className);
       }

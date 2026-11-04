@@ -300,3 +300,21 @@ test("`#624 voice-page-modularity`: work asked for many times before a frame is 
   work.ask();
   assert.equal(runs, 4);
 });
+
+test("`#624 voice-page-modularity`: a row button says the keys the hints last said for its class, or none", () => {
+  const { createRowShortcuts } = VIEW_SHELL;
+  const button = () => {
+    const attributes = new Map();
+    return { attributes, setAttribute: (name, value) => attributes.set(name, value), removeAttribute: (name) => attributes.delete(name) };
+  };
+  const shortcuts = createRowShortcuts();
+  assert.deepStrictEqual([...shortcuts.classes()], []);
+  const done = button();
+  done.setAttribute("aria-keyshortcuts", "stale");
+  shortcuts.say(done, "done-button");
+  assert.equal(done.attributes.has("aria-keyshortcuts"), false, "a button no key presses kept its shortcuts");
+  shortcuts.set(new Map([["done-button", ["e", "Shift+E"]], ["reply-button", ["r"]]]));
+  assert.deepStrictEqual([...shortcuts.classes()], ["done-button", "reply-button"]);
+  shortcuts.say(done, "done-button");
+  assert.equal(done.attributes.get("aria-keyshortcuts"), "e Shift+E");
+});
