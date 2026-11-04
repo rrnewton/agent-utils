@@ -110,6 +110,8 @@ export type { FilterChanges, FilterWalk } from "./filterchanges.ts";
 export { createRowMenus } from "./rowmenu.ts";
 export type { RowMenu, RowMenus } from "./rowmenu.ts";
 export { createReplyState } from "./replystate.ts";
+export { createSummaryWatch } from "./summarywatch.ts";
+export type { SummaryWatch, SummaryWatchDependencies } from "./summarywatch.ts";
 export { createLastPane } from "./lastpane.ts";
 export type { LastPane } from "./lastpane.ts";
 export type { ReplyRouting, ReplyState } from "./replystate.ts";

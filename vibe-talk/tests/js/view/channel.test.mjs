@@ -798,3 +798,25 @@ test("`#624 voice-page-modularity`: the pane the keys moved last starts as the f
   last.take(main);
   assert.equal(last.current(), main);
 });
+
+test("`#624 voice-page-modularity`: one summary timer for the soonest moment any source's cards are owed, armed again only when it moves", () => {
+  const { createSummaryWatch } = CHANNEL_VIEW;
+  const timers = [];
+  let fired = 0;
+  const watch = createSummaryWatch({
+    setTimer: (run, ms) => { const timer = { run, ms, cleared: false }; timers.push(timer); return timer; },
+    clearTimer: (timer) => { timer.cleared = true; },
+    fired: () => { fired += 1; },
+  });
+  watch.owe("cards", 5000, 1000);
+  assert.deepStrictEqual([timers.length, timers[0].ms, watch.at()], [1, 4000, 5000]);
+  watch.owe("thread-card", 9000, 1000);
+  assert.equal(timers.length, 1, "a later moment armed another timer");
+  watch.owe("thread-card", 3000, 1000);
+  assert.deepStrictEqual([timers.length, timers[0].cleared, timers[1].ms], [2, true, 2000], "a sooner moment did not move the timer");
+  timers[1].run();
+  assert.deepStrictEqual([fired, watch.at()], [1, Infinity]);
+  // Fired, every source is forgotten: the next one told arms the timer alone.
+  watch.owe("cards", Infinity, 2000);
+  assert.equal(timers.length, 2, "nothing owed armed a timer");
+});

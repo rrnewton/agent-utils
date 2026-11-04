@@ -10393,11 +10393,15 @@ function cardSplit(choice) {
   return view.mode === "split" ? view.cut : null;
 }
 
-/** The next moment a summary on its way is owed something — a read, or the end of its wait — and its timer. */
-let summaryWatch = { at: Infinity, timer: /** @type {any} */ (null) };
-
-/** By who draws cards — the cards, the card at the top of a thread — the next moment its cards are owed. */
-const summaryWatchNeeds = new Map();
+/**
+ * The one timer for the next moment a summary on its way is owed something — a read, or the end of its
+ * wait — over every source that draws cards (web/src/view/channel `createSummaryWatch`).
+ */
+const summaryWatch = createSummaryWatch({
+  setTimer: (run, ms) => setTimeout(run, ms),
+  clearTimer: (timer) => clearTimeout(/** @type {any} */ (timer)),
+  fired: () => guardQuietly(summaryWatchFired)(),
+});
 
 /**
  * Arm one timer for the next moment any card waiting for a summary (`cardPending`) is owed something:
@@ -10416,17 +10420,7 @@ function watchPendingSummaries(choices, source) {
     const step = SUMMARY_READ_STEPS_MS.map((ms) => choice.at + ms).find((at) => at > now);
     owed = Math.min(owed, step === undefined ? choice.at + SUMMARY_WAIT_MS : step);
   }
-  summaryWatchNeeds.set(source, owed);
-  const next = Math.min(...summaryWatchNeeds.values());
-  if (next === summaryWatch.at) return;
-  if (summaryWatch.timer !== null) clearTimeout(summaryWatch.timer);
-  summaryWatch = { at: next, timer: null };
-  if (next === Infinity) return;
-  summaryWatch.timer = setTimeout(() => {
-    summaryWatch = { at: Infinity, timer: null };
-    summaryWatchNeeds.clear();
-    guardQuietly(summaryWatchFired)();
-  }, Math.max(0, next - now));
+  summaryWatch.owe(source, owed, now);
 }
 
 /** A summary on its way is owed a read: the Threads list read now, past its spacing, and the cards drawn again. */
