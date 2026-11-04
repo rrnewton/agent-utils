@@ -19,11 +19,14 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-agentctl]
     timeout: 14400
     cpu_timeout: 1800
-    hint: &python_test_hint
+    hint:
       est_duration_s: 150
       classification: latency-bound
       preferred_inner_jobs: 2
-      rss_baseline_bytes: 1610612736
+      # #851: measured peak 2,123,538,432 bytes (1.978 GiB, the largest of 111 recorded runs
+      # across the slots' dagrun profiles); a 2 GiB baseline x mem_cap_factor 1.25 caps it at
+      # 2.5 GiB, above peak + max(25%, 512 MiB) (#818's rule) = 2.49 GiB.
+      rss_baseline_bytes: 2147483648
 
   - group: agentctl
     job: shard-1
@@ -33,7 +36,13 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-agentctl]
     timeout: 14400
     cpu_timeout: 1800
-    hint: *python_test_hint
+    hint:
+      est_duration_s: 150
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      # #851: measured peak 1,972,359,168 bytes (1.837 GiB, the largest of 109 recorded runs);
+      # peak + 512 MiB = 2.35 GiB, under this 2.5 GiB cap.
+      rss_baseline_bytes: 2147483648
 
   - group: dagrun
     job: shard-0
@@ -75,7 +84,11 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, component-experiment-runner]
     timeout: 7200
     cpu_timeout: 900
-    hint: *python_test_hint
+    hint: &python_test_hint
+      est_duration_s: 150
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1610612736
 
   - group: experiment-runner
     job: cli-smoke
@@ -393,7 +406,15 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
-    hint: *wrkslots_test_hint
+    hint:
+      resources: {lifecycle-io: 1}
+      est_duration_s: 300
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      # #851: a test here runs Cargo, so a cold build peaks at 4.1 GiB (16 GiB probe cap,
+      # 166 passed) and a warm one at 3,188,764,672 bytes (2.97 GiB); it was OOM-killed at
+      # ~1.9 GiB. 4.25 GiB x mem_cap_factor 1.25 caps it at 5.31 GiB, above 4.1 GiB + 25%.
+      rss_baseline_bytes: 4563402752
 
   - group: wrkviz
     job: shard-0

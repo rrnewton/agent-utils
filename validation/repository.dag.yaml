@@ -151,7 +151,10 @@ steps:
       resources: {cargo-target: 1}
       est_duration_s: 60
       classification: cpu-bound
-      rss_baseline_bytes: 1073741824
+      # #851: `cargo run --example` rebuilds the wrkviz crate in debug whenever it changed, and
+      # rustc then peaks at about 1.7 GiB (1,733,116 KiB measured on main, 1,771,140 KiB with
+      # #842); 2 GiB x mem_cap_factor 1.25 caps it at 2.5 GiB, above peak + 512 MiB.
+      rss_baseline_bytes: 2147483648
 
   - group: hygiene
     job: case-timings
