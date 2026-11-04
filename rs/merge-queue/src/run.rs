@@ -1197,31 +1197,53 @@ impl<'a> Runner<'a> {
                     continue;
                 }
                 let head = items[pr].head.clone();
-                let delta = (|| -> Result<BTreeMap<(String, usize), i64>, String> {
+                // The change's deltas, and its merge-base and head pin values for the refusal.
+                type Versions = (
+                    BTreeMap<(String, usize), i64>,
+                    BTreeMap<(String, usize), u64>,
+                    BTreeMap<(String, usize), u64>,
+                );
+                let delta = (|| -> Result<Versions, String> {
                     let mergebase = self
                         .git
                         .merge_base(parent, &head)
                         .map_err(|error| format!("no merge base with the batch base: {error}"))?;
                     let mb_text = self.git.show_file(&mergebase, crate::recount::PIN_PATH)?;
                     let head_text = self.git.show_file(&head, crate::recount::PIN_PATH)?;
-                    crate::recount::change_deltas(
+                    let delta = crate::recount::change_deltas(
                         base_text.as_deref(),
                         mb_text.as_deref(),
                         head_text.as_deref(),
-                    )
+                    )?;
+                    Ok((
+                        delta,
+                        crate::recount::values(mb_text.as_deref()),
+                        crate::recount::values(head_text.as_deref()),
+                    ))
                 })();
                 match delta {
                     Err(detail) => {
                         skips.push((*pr, format!("recount-pins refused: {detail}")));
                     }
-                    Ok(delta) => {
+                    Ok((delta, mb_values, head_values)) => {
                         if let Some((name, index, next, base_value)) =
                             crate::recount::below_base(&base_map, &running, &delta)
                         {
+                            // Name both of the change's own values: a lane must tell a test
+                            // the change removes from a head pin stale against its merge base.
+                            let key = (name.clone(), index);
+                            let at = |values: &BTreeMap<(String, usize), u64>| {
+                                values
+                                    .get(&key)
+                                    .map_or_else(|| "absent".to_owned(), u64::to_string)
+                            };
                             skips.push((
                                 *pr,
                                 format!(
-                                    "recount-pins refused: resolved value {next} for pin {name:?} (occurrence {index}) is below base {base_value}"
+                                    "recount-pins refused: pin {name:?} (occurrence {index}) is {} at the merge base and {} at the head ({:+}), so on the base's {base_value} it resolves to {next}, below the base; a decrease is refused (tests the change removes, or a head pin stale against its merge base)",
+                                    at(&mb_values),
+                                    at(&head_values),
+                                    delta.get(&key).copied().unwrap_or(0)
                                 ),
                             ));
                         } else {
@@ -1320,6 +1342,34 @@ impl<'a> Runner<'a> {
             } else {
                 next
             };
+            // A pin the change introduces must survive the combination: a pin-file conflict
+            // settled on the target's side drops the change's lines in that hunk, its new entry
+            // included, and recounting cannot rewrite an entry that is not there.
+            if recount && !item.exact {
+                if let Some(delta) = accepted.get(pr) {
+                    let base_values = crate::recount::values(base_text.as_deref());
+                    let combined = crate::recount::values(
+                        self.git
+                            .show_file(&next, crate::recount::PIN_PATH)?
+                            .as_deref(),
+                    );
+                    if let Some((name, index)) = delta
+                        .keys()
+                        .find(|key| !base_values.contains_key(*key) && !combined.contains_key(*key))
+                    {
+                        skipped.insert(*pr);
+                        conflicts.push((
+                            *pr,
+                            "conflict",
+                            format!(
+                                "{} (the pin {name:?} (occurrence {index}) it introduces was lost settling that file's conflict)",
+                                crate::recount::PIN_PATH
+                            ),
+                        ));
+                        continue;
+                    }
+                }
+            }
             // Regenerate right after this change whenever the combined tree may hold stale
             // generated files: the change conflicted in one (settled on the target's side), its
             // combination changed one (a textual merge of generated files need not be the

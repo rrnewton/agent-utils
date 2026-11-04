@@ -235,3 +235,109 @@ fn a_pin_conflict_in_a_file_the_generator_compiles_is_settled_recounted_then_reg
         assert!(!text.contains("<<<<<<<"), "{commit}: {text}");
     }
 }
+
+/// The pin file with `alpha`, then `beta` at 5, and `gamma` either absent or right after
+/// `beta` (`gamma_after_beta`) or right after `alpha`.
+fn pins_with(alpha: u64, gamma: Option<(u64, bool)>) -> String {
+    let gamma_line = |value: u64| format!("    (\"test.gamma\", {value}),\n");
+    let mut text = "pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[\n".to_owned();
+    text.push_str(&format!("    (\"test.alpha\", {alpha}),\n"));
+    if let Some((value, false)) = gamma {
+        text.push_str(&gamma_line(value));
+    }
+    text.push_str("    (\"test.beta\", 5),\n");
+    if let Some((value, true)) = gamma {
+        text.push_str(&gamma_line(value));
+    }
+    text.push_str("];\n");
+    text
+}
+
+#[test]
+fn a_pin_occurrence_the_head_introduces_lands_with_the_head_value() {
+    let fx = setup("recount-new-pin", true);
+    // #1 bumps alpha; #2 bumps alpha too and introduces gamma, away from the alpha conflict.
+    fx.branch("b", &[(PIN, &pin_text(12)), ("tests/b", "ok\n")]);
+    fx.branch(
+        "c",
+        &[(PIN, &pins_with(11, Some((4, true)))), ("tests/c", "ok\n")],
+    );
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1, 2]], "{r}");
+    // No refusal: the report leaves out an empty `recount_skips`.
+    assert!(r.get("recount_skips").is_none(), "{r}");
+    // 10 (base) + 2 (#1) + 1 (#2); gamma is #2's own value.
+    let landed_pin = git(&fx.remote(), &["show", &format!("main:{PIN}")]);
+    assert!(landed_pin.contains("(\"test.alpha\", 13)"), "{landed_pin}");
+    assert!(landed_pin.contains("(\"test.gamma\", 4)"), "{landed_pin}");
+    assert!(landed_pin.contains("(\"test.beta\", 5)"), "{landed_pin}");
+}
+
+#[test]
+fn a_pin_the_base_added_since_does_not_refuse_a_change_that_leaves_it() {
+    let fx = setup("recount-base-new-pin", true);
+    // The change branches from the seed, before the base gains gamma.
+    fx.branch("c", &[(PIN, &pin_text(11)), ("tests/c", "ok\n")]);
+    git(&fx.dev(), &["checkout", "-q", "main"]);
+    fx.write(PIN, &pins_with(10, Some((4, true))));
+    fx.commit_all("the base gains gamma");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&["submit", "1", "--head", "c"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    // No refusal: the report leaves out an empty `recount_skips`.
+    assert!(r.get("recount_skips").is_none(), "{r}");
+    assert_eq!(landed(&r), vec![vec![1]], "{r}");
+    let landed_pin = git(&fx.remote(), &["show", &format!("main:{PIN}")]);
+    assert!(landed_pin.contains("(\"test.alpha\", 11)"), "{landed_pin}");
+    assert!(landed_pin.contains("(\"test.gamma\", 4)"), "{landed_pin}");
+}
+
+#[test]
+fn a_new_pin_lost_settling_a_conflict_ejects_the_change_naming_it() {
+    let fx = setup("recount-new-pin-lost", true);
+    // #2 adds gamma right next to the alpha line #1 also bumps: the settled conflict hunk takes
+    // #1's side and drops gamma, so #2 cannot be recounted into the batch.
+    fx.branch("b", &[(PIN, &pin_text(12)), ("tests/b", "ok\n")]);
+    fx.branch(
+        "c",
+        &[(PIN, &pins_with(11, Some((4, false)))), ("tests/c", "ok\n")],
+    );
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1]], "{r}");
+    let ejected = r["ejected"].as_array().unwrap();
+    assert_eq!(ejected[0]["pr"], 2, "{r}");
+    let reason = ejected[0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("the pin \"test.gamma\" (occurrence 0) it introduces was lost"),
+        "{reason}"
+    );
+    assert!(reason.contains("rebase and resubmit"), "{reason}");
+    // The landed pin file holds no half-recounted gamma.
+    let landed_pin = git(&fx.remote(), &["show", &format!("main:{PIN}")]);
+    assert!(!landed_pin.contains("test.gamma"), "{landed_pin}");
+}
+
+#[test]
+fn a_decrease_is_refused_naming_the_merge_base_and_head_values() {
+    let fx = setup("recount-decrease", true);
+    fx.branch("c", &[(PIN, &pin_text(8)), ("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "c"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert!(landed(&r).is_empty(), "{r}");
+    let skips = r["recount_skips"].as_array().unwrap();
+    let reason = skips[0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(
+            "pin \"test.alpha\" (occurrence 0) is 10 at the merge base and 8 at the head (-2)"
+        ),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("it resolves to 8, below the base"),
+        "{reason}"
+    );
+}

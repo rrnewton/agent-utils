@@ -443,7 +443,8 @@ enum Command {
         require_approval_at_head: bool,
         /// Recount the generated count pins after merging each batch
         /// (base plus each change's own delta) instead of treating their
-        /// conflicts as real. Off by default.
+        /// conflicts as real. A pin a change introduces takes its head's value;
+        /// a decrease below the base is refused. Off by default.
         #[arg(long)]
         recount_pins: bool,
         /// After landing, close each landed pull request with a pointer to the landed commit
