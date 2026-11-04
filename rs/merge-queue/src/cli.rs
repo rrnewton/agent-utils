@@ -401,7 +401,11 @@ enum Command {
         regen_path: Vec<String>,
         /// Shell command, run as `sh -c` at the root of the candidate checkout, that
         /// rewrites every generated file deterministically. Runs with `MQ_PR`,
-        /// `MQ_REGEN_PATHS` and `MQ_CONFLICTED` set.
+        /// `MQ_REGEN_PATHS`, `MQ_CONFLICTED`, `MQ_HEAD` (the change's head), `MQ_PARENT` (the
+        /// commit it was combined onto) and `MQ_CHANGE_BASE` (where the change's own edits
+        /// start, past any change it is stacked on) set. A stdout line `merge-queue-note: TEXT`
+        /// is recorded in the run's events and the change's history; on failure, its
+        /// `merge-queue-conflict: TEXT` lines eject the change as a conflict.
         #[arg(long, default_value = "")]
         regen_command: String,
         /// Optional command run before --regen-command, such as building the generator; its

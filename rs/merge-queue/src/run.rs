@@ -378,6 +378,17 @@ pub struct Regeneration {
     pub rewritten: Vec<String>,
     /// The regeneration commit, or the unchanged tip when nothing was rewritten.
     pub commit: String,
+    /// What the command said it did (its `merge-queue-note:` lines).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// The change a regeneration follows: the commit it was combined onto, its head, and the
+/// commit its own edits start from (see `Runner::change_base`).
+struct RegenChange {
+    parent: String,
+    head: String,
+    base: String,
 }
 
 /// A batch a dry run would validate.
@@ -1551,6 +1562,7 @@ impl<'a> Runner<'a> {
             }
             let mut exclude: Vec<&str> = kept.iter().map(|p| items[p].head.as_str()).collect();
             exclude.extend(exclude_heads.iter().map(String::as_str));
+            let carried: Vec<String> = exclude.iter().map(|head| (*head).to_owned()).collect();
             let message = format!("Merge #{pr} ({})", item.head_ref);
             let combined = self.git.combine_with(
                 self.config.combine,
@@ -1666,14 +1678,19 @@ impl<'a> Runner<'a> {
                         .iter()
                         .any(|path| regen.covers(path)));
             let next = if touched {
-                match self.regenerate(&next, *pr, &conflicted)? {
+                let change = RegenChange {
+                    parent: tip.clone(),
+                    head: item.head.clone(),
+                    base: self.change_base(&tip, &item.head, &carried)?,
+                };
+                match self.regenerate(&next, *pr, &conflicted, Some(&change))? {
                     Ok(done) => done,
                     Err((kind, why)) => {
                         // Before blaming this change, check that the generator works on the
                         // tree just before it: if that fails too, the base or the generator's
                         // environment is broken, and every change would be ejected in turn.
                         if !generator_ok.contains(&tip) {
-                            match self.regenerate(&tip, *pr, &[])? {
+                            match self.regenerate(&tip, *pr, &[], None)? {
                                 Ok(_) => {
                                     generator_ok.insert(tip.clone());
                                 }
@@ -1740,20 +1757,63 @@ impl<'a> Runner<'a> {
         ))
     }
 
+    /// The commit change `head`'s own edits start from, as combined onto `parent`: the head of
+    /// the nearest change in `carried` (landed, carried by a batch beneath, or earlier in this
+    /// batch) that `head` is stacked on, or else the merge base of `parent` and `head` (empty for
+    /// unrelated histories).
+    fn change_base(&self, parent: &str, head: &str, carried: &[String]) -> Result<String, String> {
+        let merge_base = self.git.merge_base(parent, head).unwrap_or_default();
+        let added: BTreeSet<String> = self
+            .git
+            .run(&["rev-list", &format!("{parent}..{head}")])?
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let under: Vec<&String> = carried.iter().filter(|h| added.contains(*h)).collect();
+        let mut nearest: Vec<&String> = Vec::new();
+        for candidate in &under {
+            let mut covered = false;
+            for other in &under {
+                if other != candidate && self.git.is_ancestor(candidate, other)? {
+                    covered = true;
+                    break;
+                }
+            }
+            if !covered && !nearest.contains(candidate) {
+                nearest.push(candidate);
+            }
+        }
+        Ok(match nearest.as_slice() {
+            [one] => (*one).clone(),
+            _ => merge_base,
+        })
+    }
+
     /// Rewrite the generated files on `tip` (which just combined `pr`) with the configured
     /// command and commit the result. `Ok(Err((kind, why)))` means this change cannot be
     /// regenerated: `regen-build-failed` (the optional build step failed: the combined tree
-    /// cannot build the generator), `regen-failed` (the generator command failed),
-    /// `regen-touched-other` or `regen-left-conflict`. `Err` (including a failure to start a
-    /// process) means the run itself cannot continue.
+    /// cannot build the generator), `regen-failed` (the generator command failed), `conflict`
+    /// (it failed reporting a real conflict), `regen-touched-other` or `regen-left-conflict`.
+    /// `Err` (including a failure to start a process) means the run itself cannot continue.
+    /// `change` is the change `tip` combined onto its parent; `None` when `tip` holds no change
+    /// of its own, as when checking the generator on the tree before a change.
     #[allow(clippy::type_complexity)]
     fn regenerate(
         &self,
         tip: &str,
         pr: i64,
         conflicted: &[String],
+        change: Option<&RegenChange>,
     ) -> Result<Result<String, (&'static str, String)>, String> {
         let regen = &self.config.regenerate;
+        let (parent, head, base) = match change {
+            Some(change) => (
+                change.parent.as_str(),
+                change.head.as_str(),
+                change.base.as_str(),
+            ),
+            None => ("", "", ""),
+        };
         if !regen.enabled() {
             return Ok(Err((
                 "regen-failed",
@@ -1773,6 +1833,9 @@ impl<'a> Runner<'a> {
                     .env("MQ_PR", pr.to_string())
                     .env("MQ_REGEN_PATHS", regen.paths.join(" "))
                     .env("MQ_CONFLICTED", conflicted.join(" "))
+                    .env("MQ_HEAD", head)
+                    .env("MQ_PARENT", parent)
+                    .env("MQ_CHANGE_BASE", base)
                     .stdin(std::process::Stdio::null())
                     .output()
                     .map_err(|error| format!("cannot run {what}: {error}"))?;
@@ -1799,6 +1862,12 @@ impl<'a> Runner<'a> {
             }
             let output = run_script(&regen.command, "regenerate.command")?;
             if !output.status.success() {
+                // The command found a real conflict (in a partly hand-written generated file):
+                // the change needs a rebase, and nothing is wrong with the generator.
+                let conflicts = prefixed_lines(&output.stdout, "merge-queue-conflict:");
+                if !conflicts.is_empty() {
+                    return Ok(Err(("conflict", conflicts.join("; "))));
+                }
                 return Ok(Err((
                     "regen-failed",
                     format!(
@@ -1881,10 +1950,11 @@ impl<'a> Runner<'a> {
                 }
                 wt.rev_parse("HEAD")?
             };
+            let notes = prefixed_lines(&output.stdout, "merge-queue-note:");
             self.event(
                 "regenerate",
                 &format!(
-                    "#{pr}: {} at {}{}",
+                    "#{pr}: {} at {}{}{}",
                     if changed.is_empty() {
                         "generated files already current".to_owned()
                     } else {
@@ -1895,19 +1965,48 @@ impl<'a> Runner<'a> {
                         String::new()
                     } else {
                         format!(" (conflicted: {})", conflicted.join(", "))
+                    },
+                    if notes.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; {}", notes.join("; "))
                     }
                 ),
             );
+            self.record_regenerate_notes(pr, &notes)?;
             lock(&self.report).regenerated.push(Regeneration {
                 pr,
                 conflicted: conflicted.to_vec(),
                 rewritten: changed,
                 commit: commit.clone(),
+                notes,
             });
             Ok(Ok(commit))
         })();
         self.slots.give(slot);
         result
+    }
+
+    /// Record what a regeneration after change `pr` said it did in the change's history, once
+    /// per run (a batch rebuilt during a culprit search regenerates the same change again).
+    fn record_regenerate_notes(&self, pr: i64, notes: &[String]) -> Result<(), String> {
+        if notes.is_empty() || self.simulating() {
+            return Ok(());
+        }
+        let seen: Vec<String> = lock(&self.report)
+            .regenerated
+            .iter()
+            .filter(|regeneration| regeneration.pr == pr)
+            .flat_map(|regeneration| regeneration.notes.clone())
+            .collect();
+        let mut items = lock(&self.items);
+        if let Some(item) = items.get_mut(&pr) {
+            for note in notes.iter().filter(|note| !seen.contains(note)) {
+                item.log("regenerate-note", note.clone());
+            }
+            self.state.save_item(item)?;
+        }
+        Ok(())
     }
 
     /// Record pin resolutions in the run report, the run's events and each change's history,
@@ -4097,6 +4196,17 @@ fn sleep_unless_stopped(delay: Duration) {
         }
         std::thread::sleep(left.min(Duration::from_millis(100)));
     }
+}
+
+/// The text after `prefix` on each line of `stdout` that starts with it, trimmed, empty ones
+/// dropped.
+fn prefixed_lines(stdout: &[u8], prefix: &str) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix(prefix))
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .collect()
 }
 
 /// The last `lines` non-empty lines of a command's combined output, joined for a one-line reason.

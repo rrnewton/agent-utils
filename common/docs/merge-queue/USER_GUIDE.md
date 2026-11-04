@@ -97,7 +97,7 @@ This command creates the state directory and writes `config.json`.
 | `--classifier-policy PATH` | none | A test-footprint policy in the repository (version 2, such as `ci/test-footprints.json`), read at each plan's base commit. Decision-log features then take their components and a verdict from it, through the shared change classifier (`change-classify userguide`). |
 | `--ci-path PATTERN` | none | A CI or validation-infrastructure path (exact path, directory with or without a trailing slash, or `*` wildcards). `plan` suggests the priority label for a change that touches only these paths; the queue never applies the label itself. Repeatable. |
 | `--regen-path PATTERN` | none | A generated file (exact path, directory with or without a trailing slash, or `*` wildcards) whose conflicts the queue settles on the target's side and then regenerates, instead of holding the change. Repeatable. See "Generated files". |
-| `--regen-command CMD` | empty | Shell command, run as `sh -c` at the root of the candidate checkout, that rewrites every generated file from its sources deterministically. Runs with `MQ_PR` (change number), `MQ_REGEN_PATHS` (space-separated generated patterns) and `MQ_CONFLICTED` (space-separated conflicted paths, empty for a non-conflict refresh) set. Required with `--regen-path`. |
+| `--regen-command CMD` | empty | Shell command, run as `sh -c` at the root of the candidate checkout, that rewrites every generated file from its sources deterministically. Runs with `MQ_PR` (change number), `MQ_REGEN_PATHS` (space-separated generated patterns), `MQ_CONFLICTED` (space-separated conflicted paths, empty for a non-conflict refresh), `MQ_HEAD`, `MQ_PARENT` and `MQ_CHANGE_BASE` set (see [Generated files](#generated-files)). Required with `--regen-path`. |
 | `--regen-when WHEN` | `conflict` | `conflict`: regenerate after a change whose combination conflicted in, or changed, a generated file (a textual merge of generated files need not be the regenerated output). `always`: regenerate after every change. Either way regeneration happens per change, so every prefix is a self-consistent tree. |
 | `--regen-build CMD` | empty | Command run before `--regen-command`, such as building the generator. When it fails, the change is ejected as `regen-build-failed` with the error tail. |
 | `--exact-sha` | off | Exact-commit rule: never carry a validation result to another commit. See "The exact-commit rule". |
@@ -1387,21 +1387,40 @@ list them with `--regen-path` and give the command that rebuilds them with `--re
 - **The regenerate contract (`--regen-command`).** The queue runs the command as `sh -c` with
   the working directory at the root of a scratch checkout of the candidate tip (the exact tree
   being combined), stdin closed, and these variables set: `MQ_PR` (the change being combined),
-  `MQ_REGEN_PATHS` (the configured generated patterns, space-separated) and `MQ_CONFLICTED` (the
+  `MQ_REGEN_PATHS` (the configured generated patterns, space-separated), `MQ_CONFLICTED` (the
   generated paths that conflicted and were settled on the target's side, space-separated; empty
-  when nothing conflicted). The
+  when nothing conflicted), `MQ_HEAD` (the change's head), `MQ_PARENT` (the commit the change was
+  combined onto) and `MQ_CHANGE_BASE` (the commit the change's own edits start from). For a change
+  stacked on another change whose copy `MQ_PARENT` already holds (landed, in the batch beneath,
+  or earlier in this batch), `MQ_CHANGE_BASE` is that change's head; otherwise it is the merge
+  base of `MQ_PARENT` and `MQ_HEAD`. All three are empty when the command runs on a tree with no
+  change of its own, as when the queue checks the generator on the tree before a change. The
   command must rewrite every generated file deterministically from the checkout's sources and
   touch nothing else: for the same sources it must produce byte-identical output on every run,
   and the queue refuses any run that changes a file outside the generated set. A minimal correct
   example that rebuilds `gen/all.txt` from its sources is `mkdir -p gen && cat $(ls src/* | sort) > gen/all.txt`; a full example with paths and sources of your own follows the same shape — run in
   the candidate checkout, read `MQ_CONFLICTED` if you need to scope work, and never write outside
-  the generated paths.
+  the generated paths. A stdout line `merge-queue-note: TEXT` records what the command did (for
+  example "renumbered #12's revision 40 to 41"): the queue adds it to the `regenerate` event, to
+  the regeneration in the run report and, once per run, to the change's history as
+  `regenerate-note`.
+- **Partly hand-written files.** A file that holds a table the command keeps in step, beside
+  text people write, such as a list of numbered revisions with comments, can be a generated path
+  too. Two changes that each append the next row then combine instead of being held. The queue
+  settles the file's conflicts on the target's side, as for any generated file, so such a command
+  must merge the file itself from the versions at `MQ_CHANGE_BASE`, `MQ_PARENT` and `MQ_HEAD`
+  (`git show "$MQ_HEAD:path"`), rewrite the parts it owns, and treat a conflict anywhere else as
+  real. To report one, it prints `merge-queue-conflict: TEXT` naming the file and the lines, and
+  exits nonzero. The change is then ejected as `conflict` ("rebase and resubmit") instead of as
+  a generator failure. A command that ignored those conflicts would silently drop the change's
+  side of them.
 - **Refusals.** A change that cannot be regenerated is ejected with a kind that says why:
 
   | Kind | Meaning |
   |---|---|
   | `regen-build-failed` | `--regen-build` failed: the combined tree cannot even build the generator (stale against the base, or the combination broke the generator's sources). The reason carries the build error's last lines. |
   | `regen-failed` | The regeneration command itself failed (a wrong argument, a generator crash). |
+  | `conflict` | The command failed and printed `merge-queue-conflict:` lines: a real conflict in a partly hand-written file. The reason carries those lines. |
   | `regen-touched-other` | The command changed a file that is not generated. |
   | `regen-left-conflict` | Conflict markers remain in a generated file afterwards. |
 
@@ -1413,7 +1432,7 @@ list them with `--regen-path` and give the command that rebuilds them with `--re
   daemon sends.
 
 This is deterministic, not repair. The command must give the same output for the same sources.
-The run report lists every regeneration under `regenerated`.
+The run report lists every regeneration under `regenerated`, with the command's notes.
 
 ## The exact-commit rule
 

@@ -398,8 +398,17 @@ pub struct RegenerateConfig {
     pub paths: Vec<String>,
     /// Shell command, run as `sh -c` at the root of a scratch checkout of the candidate
     /// tip, that rewrites every generated file from its sources. It must be deterministic
-    /// (byte-identical output for the same sources) and touch nothing else. The queue runs
-    /// it with `MQ_PR`, `MQ_REGEN_PATHS` and `MQ_CONFLICTED` set.
+    /// (byte-identical output for the same sources) and touch nothing else. The queue runs it
+    /// with `MQ_PR`, `MQ_REGEN_PATHS` and `MQ_CONFLICTED` set, and with `MQ_HEAD` (the change's
+    /// head), `MQ_PARENT` (the commit the change was combined onto) and `MQ_CHANGE_BASE` (the
+    /// commit the change's own edits start from: the head of a change it is stacked on whose
+    /// copy `MQ_PARENT` already holds, or else the merge base of the two), all empty when it
+    /// runs on a tree without a change of its own. A generated path that is partly hand-written
+    /// is the command's to merge from those three commits: the combination settled its
+    /// conflicts on the parent's side. A stdout line `merge-queue-note: TEXT` is recorded with
+    /// the regeneration, in the run's events and the change's history; when the command fails,
+    /// its `merge-queue-conflict: TEXT` lines make the ejection a conflict (rebase and
+    /// resubmit) instead of a generator failure.
     pub command: String,
     /// Optional shell command run before `command`, such as building the generator. When it
     /// fails, the combined tree cannot even build the generator (stale against the base, or the

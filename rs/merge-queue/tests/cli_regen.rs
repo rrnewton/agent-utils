@@ -809,3 +809,393 @@ fn clean_generated_merge_still_regenerates_the_tip_in_merge_mode() {
         "{r}"
     );
 }
+
+/// A numbered table of revisions under `rev/`, each naming the digest of the definitions under
+/// `wire/`: `rev/table.txt` is a hand-written header line, then one `N DIGEST` row per revision,
+/// and `rev/current.txt` names the newest. Each file under `tests/` is a test as in RUNNER;
+/// `rev` fails unless the newest row is the current revision with the definitions' digest and
+/// the rows count up by one.
+const ROWS_RUNNER: &str = r#"if [ "$MQ_SELECTION" = all ]; then set -- $(ls tests) rev; else set -- $MQ_TESTS; fi
+rc=0
+for t in "$@"; do
+  o=pass
+  if [ "$t" = rev ]; then
+    d=$(cat $(ls wire/* | sort) | cksum | cut -d' ' -f1)
+    [ "$(grep '^[0-9]' rev/table.txt | tail -n 1)" = "$(cat rev/current.txt) $d" ] || o=fail
+    grep '^[0-9]' rev/table.txt | awk 'NR > 1 && $1 != p + 1 { bad = 1 } { p = $1 } END { exit bad }' || o=fail
+  elif [ -f "tests/$t" ] && grep -q FAIL "tests/$t"; then o=fail; fi
+  [ $o = fail ] && rc=1
+  printf '{"id":"%s","outcome":"%s"}\n' "$t" "$o" >> "$MQ_RESULTS"
+done
+exit $rc"#;
+
+/// Keeps the table above in step, as a project's own command would: the header is merged three
+/// ways from where the change's own edits start (both sides changing it is a real conflict),
+/// the rows are the parent's, and a change that added a row of its own gets one new row after
+/// the parent's newest, measured on the combined tree.
+const ROWS_REGEN: &str = r#"set -e
+[ -n "$MQ_HEAD" ] || exit 0
+t=$(mktemp -d)
+trap 'rm -rf "${t:?}"' EXIT
+for side in base:$MQ_CHANGE_BASE parent:$MQ_PARENT head:$MQ_HEAD; do
+  git show "${side#*:}:rev/table.txt" > "$t/${side%%:*}"
+  grep -v '^[0-9]' "$t/${side%%:*}" > "$t/${side%%:*}.header" || true
+done
+if ! git merge-file -p "$t/parent.header" "$t/base.header" "$t/head.header" > "$t/header"; then
+  echo "merge-queue-conflict: rev/table.txt: both sides changed its header"
+  exit 1
+fi
+grep '^[0-9]' "$t/parent" > "$t/rows"
+mine=$(grep '^[0-9]' "$t/head" | grep -vxF -f "$t/base" | tail -n 1 | cut -d' ' -f1)
+digest=$(cat $(ls wire/* | sort) | cksum | cut -d' ' -f1)
+last=$(tail -n 1 "$t/rows")
+if [ -n "$mine" ] && [ "${last#* }" != "$digest" ]; then
+  n=$((${last%% *} + 1))
+  echo "$n $digest" >> "$t/rows"
+  [ "$mine" = "$n" ] || echo "merge-queue-note: renumbered #$MQ_PR's revision $mine to $n"
+fi
+cat "$t/header" "$t/rows" > rev/table.txt
+tail -n 1 "$t/rows" | cut -d' ' -f1 > rev/current.txt"#;
+
+/// The digest ROWS_RUNNER and ROWS_REGEN compute for definitions concatenated to `text`.
+fn digest(text: &str) -> String {
+    let output = std::process::Command::new("sh")
+        .args(["-c", "printf %s \"$1\" | cksum | cut -d' ' -f1", "sh", text])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+/// A fixture at revision 1 (definition `wire/0`), regenerating `rev/` with `regen`.
+fn rows_setup(tag: &str, regen: &str) -> Fixture {
+    let fx = Fixture::new(tag);
+    fx.write("wire/0", "0\n");
+    fx.write("tests/t0", "ok\n");
+    fx.write(
+        "rev/table.txt",
+        &format!("# revisions\n1 {}\n", digest("0\n")),
+    );
+    fx.write("rev/current.txt", "1\n");
+    fx.commit_all("seed");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        ROWS_RUNNER,
+        "--max-batch",
+        "4",
+        "--regen-path",
+        "rev/",
+        "--regen-command",
+        regen,
+    ]);
+    fx
+}
+
+/// Push branch `name` from `from` adding definition `wire/<name>` and the row its author
+/// measured: revision `row` with the digest of the definitions on the branch, optionally
+/// replacing the table's header. Returns the head.
+fn wire_change(fx: &Fixture, name: &str, from: &str, row: u32, header: Option<&str>) -> String {
+    git(&fx.dev(), &["checkout", "-q", "-B", name, from]);
+    fx.write(&format!("wire/{name}"), &format!("{name}\n"));
+    fx.write(&format!("tests/{name}"), "ok\n");
+    let definitions = git(&fx.dev(), &["ls-files", "wire"])
+        .lines()
+        .map(|path| std::fs::read_to_string(fx.dev().join(path)).unwrap())
+        .collect::<String>();
+    let table = std::fs::read_to_string(fx.dev().join("rev/table.txt")).unwrap();
+    let table = match header {
+        Some(header) => format!("{header}\n{}", table.split_once('\n').unwrap().1),
+        None => table,
+    };
+    fx.write(
+        "rev/table.txt",
+        &format!("{table}{row} {}\n", digest(&definitions)),
+    );
+    fx.write("rev/current.txt", &format!("{row}\n"));
+    fx.commit_all(&format!("{name}: add a definition and revision {row}"));
+    git(
+        &fx.dev(),
+        &["push", "-q", "-f", "origin", &format!("HEAD:{name}")],
+    );
+    let head = git(&fx.dev(), &["rev-parse", "HEAD"]);
+    git(&fx.dev(), &["checkout", "-q", "main"]);
+    head
+}
+
+/// The landed table, as `(revision, digest)` rows after the header, and the current revision.
+fn landed_rows(fx: &Fixture) -> (Vec<(u32, String)>, String) {
+    let table = git(&fx.remote(), &["show", "main:rev/table.txt"]);
+    let rows = table
+        .lines()
+        .skip(1)
+        .map(|line| {
+            let (n, d) = line.split_once(' ').unwrap();
+            (n.parse().unwrap(), d.to_owned())
+        })
+        .collect();
+    (rows, git(&fx.remote(), &["show", "main:rev/current.txt"]))
+}
+
+/// The notes each change's regeneration recorded in the run report, by change.
+fn regenerate_notes(r: &Value) -> Vec<(i64, Vec<String>)> {
+    r["regenerated"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|regeneration| {
+            let notes = regeneration["notes"]
+                .as_array()
+                .map(|notes| {
+                    notes
+                        .iter()
+                        .map(|n| n.as_str().unwrap().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            (regeneration["pr"].as_i64().unwrap(), notes)
+        })
+        .collect()
+}
+
+/// The `(kind, detail)` entries of change `pr`'s history.
+fn history(fx: &Fixture, pr: i64) -> Vec<(String, String)> {
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    let item = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["pr"] == pr)
+        .unwrap_or_else(|| panic!("no item #{pr} in {items}"));
+    item["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["kind"].as_str().unwrap().to_owned(),
+                e["detail"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// The details of the run's events of kind `kind`.
+fn run_events(fx: &Fixture, r: &Value, kind: &str) -> Vec<String> {
+    let path = fx
+        .queue()
+        .join(".git/merge-queue/runs")
+        .join(r["run"].as_str().unwrap())
+        .join("events.jsonl");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["kind"] == kind)
+        .map(|event| event["detail"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn rows_two_changes_append_to_a_numbered_table_are_renumbered_in_either_landing_order() {
+    // Both changes were written against revision 1 and claim revision 2. Whichever lands first
+    // keeps it; the other is renumbered to 3, with the digest measured on the combined tree.
+    for (first, second) in [("b", "c"), ("c", "b")] {
+        let fx = rows_setup(&format!("rows-order-{first}"), ROWS_REGEN);
+        wire_change(&fx, first, "main", 2, None);
+        wire_change(&fx, second, "main", 2, None);
+        fx.mq_ok(&["submit", "1", "--head", first]);
+        fx.mq_ok(&["submit", "2", "--head", second]);
+        let r = report(&fx.mq_ok(&["run", "--json"]));
+        assert_eq!(landed(&r), vec![vec![1, 2]], "{r}");
+        let (rows, current) = landed_rows(&fx);
+        assert_eq!(
+            rows,
+            vec![
+                (1, digest("0\n")),
+                (2, digest(&format!("0\n{first}\n"))),
+                (3, digest("0\nb\nc\n")),
+            ],
+            "{first} first"
+        );
+        assert_eq!(current, "3");
+        let note = "renumbered #2's revision 2 to 3".to_owned();
+        assert_eq!(
+            regenerate_notes(&r),
+            vec![(1, vec![]), (2, vec![note.clone()])],
+            "{r}"
+        );
+        let events = run_events(&fx, &r, "regenerate");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.starts_with("#2: ") && e.ends_with(&format!("; {note}"))),
+            "{events:?}"
+        );
+        assert!(
+            history(&fx, 2).contains(&("regenerate-note".to_owned(), note)),
+            "{:?}",
+            history(&fx, 2)
+        );
+        assert!(!history(&fx, 1)
+            .iter()
+            .any(|(kind, _)| kind == "regenerate-note"));
+    }
+}
+
+#[test]
+fn rows_a_change_written_before_another_landed_is_renumbered_in_a_later_run() {
+    let fx = rows_setup("rows-later-run", ROWS_REGEN);
+    wire_change(&fx, "c", "main", 2, None);
+    wire_change(&fx, "b", "main", 2, None);
+    fx.mq_ok(&["submit", "1", "--head", "c"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1]], "{r}");
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![2]], "{r}");
+    let (rows, current) = landed_rows(&fx);
+    assert_eq!(
+        rows,
+        vec![
+            (1, digest("0\n")),
+            (2, digest("0\nc\n")),
+            (3, digest("0\nb\nc\n")),
+        ]
+    );
+    assert_eq!(current, "3");
+    assert_eq!(
+        regenerate_notes(&r),
+        vec![(2, vec!["renumbered #2's revision 2 to 3".to_owned()])],
+        "{r}"
+    );
+}
+
+#[test]
+fn rows_a_stacked_change_gets_one_row_after_the_change_beneath_it() {
+    // #3 is stacked on #2 and claims revision 3 after #2's 2; #1 lands first with its own 2, so
+    // #2 becomes 3 and #3 becomes 4.
+    let fx = rows_setup("rows-stacked", ROWS_REGEN);
+    wire_change(&fx, "c", "main", 2, None);
+    wire_change(&fx, "b", "main", 2, None);
+    wire_change(&fx, "d", "b", 3, None);
+    fx.mq_ok(&["submit", "1", "--head", "c"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.mq_ok(&["submit", "3", "--head", "d"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1, 2, 3]], "{r}");
+    let (rows, current) = landed_rows(&fx);
+    assert_eq!(
+        rows,
+        vec![
+            (1, digest("0\n")),
+            (2, digest("0\nc\n")),
+            (3, digest("0\nb\nc\n")),
+            (4, digest("0\nb\nc\nd\n")),
+        ]
+    );
+    assert_eq!(current, "4");
+    assert_eq!(
+        regenerate_notes(&r),
+        vec![
+            (1, vec![]),
+            (2, vec!["renumbered #2's revision 2 to 3".to_owned()]),
+            (3, vec!["renumbered #3's revision 3 to 4".to_owned()]),
+        ],
+        "{r}"
+    );
+}
+
+/// Run the stacked scenario with the regenerate command logging what it was told, and check
+/// it against the commits: `extra` are the run's own arguments. Returns the run report.
+fn rows_environment_follows_the_change(tag: &str, extra: &[&str]) -> Value {
+    let probe =
+        std::env::temp_dir().join(format!("merge-queue-it-{tag}-{}.log", std::process::id()));
+    let command = format!(
+        "printf '%s %s %s %s\\n' \"$MQ_PR\" \"$MQ_HEAD\" \"$MQ_PARENT\" \"$MQ_CHANGE_BASE\" >> '{}'\n{ROWS_REGEN}",
+        probe.display()
+    );
+    let fx = rows_setup(tag, &command);
+    let main = fx.remote_main();
+    let c = wire_change(&fx, "c", "main", 2, None);
+    let b = wire_change(&fx, "b", "main", 2, None);
+    let d = wire_change(&fx, "d", "b", 3, None);
+    fx.mq_ok(&["submit", "1", "--head", "c"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.mq_ok(&["submit", "3", "--head", "d"]);
+    let mut args = vec!["run", "--json"];
+    args.extend_from_slice(extra);
+    let r = report(&fx.mq_ok(&args));
+    let log = std::fs::read_to_string(&probe).unwrap();
+    let _ = std::fs::remove_file(&probe);
+    assert_eq!(
+        landed(&r).concat(),
+        vec![1, 2, 3],
+        "{r}\nregenerate saw:\n{log}"
+    );
+    let seen: Vec<Vec<&str>> = log.lines().map(|l| l.split(' ').collect()).collect();
+    assert_eq!(seen.len(), 3, "{log}");
+    // Unstacked changes start where they branched from the base.
+    assert_eq!(seen[0], vec!["1", c.as_str(), main.as_str(), main.as_str()]);
+    assert_eq!(&seen[1][..2], &["2", b.as_str()]);
+    assert_eq!(seen[1][3], main);
+    // #2 was combined onto #1's tip, and #3 onto #2's copy, not onto #2's own head.
+    let tree_has = |commit: &str, path: &str| {
+        git(&fx.remote(), &["ls-tree", "--name-only", "-r", commit])
+            .lines()
+            .any(|p| p == path)
+    };
+    assert!(tree_has(seen[1][2], "wire/c"), "{log}");
+    assert_eq!(&seen[2][..2], &["3", d.as_str()]);
+    assert!(tree_has(seen[2][2], "wire/b") && seen[2][2] != b, "{log}");
+    // A change stacked on a change the parent holds a copy of starts at that change's head.
+    assert_eq!(seen[2][3], b, "{log}");
+    r
+}
+
+#[test]
+fn rows_the_command_learns_where_each_change_starts() {
+    let r = rows_environment_follows_the_change("rows-env", &[]);
+    assert_eq!(landed(&r), vec![vec![1, 2, 3]], "{r}");
+}
+
+#[test]
+fn rows_the_command_learns_where_a_change_stacked_on_the_batch_beneath_starts() {
+    // One change per batch and two batches in flight: #3's batch is built on #2's candidate
+    // before #2 lands.
+    let r = rows_environment_follows_the_change(
+        "rows-env-window",
+        &["--max-batch", "1", "--depth", "2"],
+    );
+    assert_eq!(landed(&r), vec![vec![1], vec![2], vec![3]], "{r}");
+    assert_eq!(r["windows"], serde_json::json!([2, 2, 2]), "{r}");
+}
+
+#[test]
+fn rows_a_real_conflict_the_command_reports_ejects_the_change_as_a_conflict() {
+    let fx = rows_setup("rows-conflict", ROWS_REGEN);
+    wire_change(&fx, "b", "main", 2, Some("# revisions after b"));
+    wire_change(&fx, "c", "main", 2, Some("# revisions after c"));
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1]], "{r}");
+    assert_eq!(r["ejected"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["ejected"][0]["pr"], 2);
+    assert_eq!(r["ejected"][0]["kind"], "conflict");
+    let reason = r["ejected"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(
+            "conflicts on rev/table.txt: both sides changed its header; rebase and resubmit"
+        ),
+        "{reason}"
+    );
+    let (rows, current) = landed_rows(&fx);
+    assert_eq!(rows, vec![(1, digest("0\n")), (2, digest("0\nb\n"))]);
+    assert_eq!(current, "2");
+}
