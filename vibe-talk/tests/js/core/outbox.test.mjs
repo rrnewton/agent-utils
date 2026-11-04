@@ -491,11 +491,12 @@ test("unconfirmed sends: every id in the outbox asked once per load, a later cal
     ids: () => ids.values(),
     settle: (id) => {
       asked.push(id);
-      ids.delete(id);
+      // An id that turns up during the walk is not part of it: the walk is over the ids as they were.
+      if (id === "a") ids.add("a2");
     },
   });
   sends.settleOnce();
-  assert.deepStrictEqual(asked, ["a", "b"], "a copy of the ids is walked, so an ask that drops its entry skips none");
+  assert.deepStrictEqual(asked, ["a", "b"], "a copy of the ids is walked, so an entry added by an ask is not asked about");
   ids.add("c");
   sends.settleOnce();
   assert.deepStrictEqual(asked, ["a", "b"], "once per load");
