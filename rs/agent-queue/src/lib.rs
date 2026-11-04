@@ -81,7 +81,9 @@
 //! or a prompt whose opening was retimed), `paste_label` (the numbered placeholder the harness
 //! drew for the paste, such as `[Pastedtext#3+12lines]`, without its blanks), `draft_recovered_at`
 //! and `draft_recovered_evidence` (when and how a prompt found left unsent in the editor was
-//! submitted again). A sender may add fields of its own, such as the
+//! submitted again), and `stranded_at` and `stranded_passes` (a pending prompt left at the bottom
+//! of a TUI's screen after its Enter presses, whose `typed_as` holds the text left there; later
+//! drains only press Enter and never type it again). A sender may add fields of its own, such as the
 //! original send time of a chat request (`sent_at`, `opening`). Readers ignore fields they do not
 //! know, so a field cannot make an older reader refuse an item.
 //!

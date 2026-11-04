@@ -1317,6 +1317,13 @@ fn classify(
     if let Some((kind, detail)) = blocked_finding(screen) {
         return Some(Finding::new(kind, detail));
     }
+    if observation
+        .harness
+        .as_deref()
+        .is_some_and(crate::unknown_harness::is_unknown)
+    {
+        return classify_generic(observation, options, memory, now, screen);
+    }
     let turn = crate::turn_state::read_screen(screen);
     // A turn past --turn-minutes with input queued behind it: a harness that submits queued
     // input only when the turn ends will not read it until then.
@@ -1404,6 +1411,39 @@ fn classify(
         return working_finding(observation, options, memory, now, screen, &turn);
     }
     None
+}
+
+/// What is wrong with an agent whose harness no adapter reads (`--harness unknown`), judged from
+/// its screen alone: no Herdr status, turn marker or transcript. A menu or dialog at the bottom is
+/// an approval episode. Once it was delivered a prompt and holds no more, a screen that stood
+/// still since the last pass is idle, timed from its last change: a finish with a `DONE:` or
+/// `BLOCKED:` line, else idle without a verdict. A screen that keeps changing is working.
+fn classify_generic(
+    observation: &Observation,
+    options: &WatchAgentsOptions,
+    memory: &AgentMemory,
+    now: f64,
+    screen: &str,
+) -> Option<Finding> {
+    if let Some(line) = crate::screen_heuristics::menu_open(screen, None) {
+        return Some(Finding::new(
+            EpisodeKind::ApprovalPrompt,
+            line.chars().take(QUOTED_LINE_CHARS).collect::<String>(),
+        ));
+    }
+    let still = now - memory.screen_changed_at >= crate::unknown_harness::QUIET.as_secs_f64();
+    if !observation.has_delivered || observation.has_pending || !still {
+        return None;
+    }
+    if let Some(verdict) = verdict_line(screen, &options.markers) {
+        return Some(Finding::new(EpisodeKind::ChildDone, verdict));
+    }
+    Some(Finding::timed(
+        EpisodeKind::IdleNoVerdict,
+        "screen unchanged with no verdict marker (unknown harness)",
+        memory.screen_changed_at,
+        None,
+    ))
 }
 
 /// What is wrong with a headless agent, judged from its event log and queue instead of a screen
@@ -6768,6 +6808,80 @@ mod tests {
         let idle = pass(&mut probe, &mut notifier, &mut state, 3900.0, &options);
         assert_eq!(idle["episodes"][0]["kind"], "idle-no-verdict", "{idle}");
         assert_eq!(notifier.sent.len(), 2);
+    }
+
+    fn generic(name: &str, screen: &str) -> Observation {
+        Observation {
+            harness: Some(crate::unknown_harness::HARNESS.to_owned()),
+            ..observation(name, "unknown", Some(screen))
+        }
+    }
+
+    #[test]
+    fn an_unknown_harness_is_idle_once_its_screen_stops_changing() {
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        // A screen that changes every pass is working, whatever Herdr's status says.
+        for (index, screen) in ["out 1\n> ", "out 2\n> ", "out 3\n> "].iter().enumerate() {
+            let mut probe = ScriptedProbe(vec![vec![generic("orc", screen)]]);
+            let report = pass(
+                &mut probe,
+                &mut notifier,
+                &mut state,
+                60.0 * index as f64,
+                &options,
+            );
+            assert!(
+                report["episodes"].as_array().unwrap().is_empty(),
+                "{report}"
+            );
+        }
+        // Then it holds still: idle, timed from its last change, reported at the threshold.
+        let mut probe = ScriptedProbe(vec![vec![generic("orc", "out 3\n> ")]]);
+        let report = pass(&mut probe, &mut notifier, &mut state, 180.0, &options);
+        assert_eq!(report["episodes"][0]["kind"], "idle-no-verdict", "{report}");
+        assert_eq!(report["episodes"][0]["since"], 120.0, "{report}");
+        assert!(notifier.sent.is_empty());
+        let mut probe = ScriptedProbe(vec![vec![generic("orc", "out 3\n> ")]]);
+        pass(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            120.0 + 900.0,
+            &options,
+        );
+        assert_eq!(notifier.sent.len(), 1, "{:?}", notifier.sent);
+    }
+
+    #[test]
+    fn an_unknown_harness_finishes_with_a_verdict_line_on_a_still_screen() {
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let screen = "working on it\nDONE: the gate is green at abc1234\n> ";
+        let mut probe = ScriptedProbe(vec![
+            vec![generic("orc", screen)],
+            vec![generic("orc", screen)],
+        ]);
+        // First seen this pass: not yet known to be still.
+        let first = pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        assert!(first["episodes"].as_array().unwrap().is_empty(), "{first}");
+        let second = pass(&mut probe, &mut notifier, &mut state, 60.0, &options);
+        assert_eq!(second["episodes"][0]["kind"], "child-done", "{second}");
+    }
+
+    #[test]
+    fn an_unknown_harness_at_a_menu_is_at_a_prompt() {
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let mut probe = ScriptedProbe(vec![vec![generic(
+            "orc",
+            "Run rm -rf build?\n❯ 1. Allow once\n  2. Deny\n",
+        )]]);
+        let report = pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        assert_eq!(report["episodes"][0]["kind"], "approval-prompt", "{report}");
     }
 
     #[test]

@@ -11,7 +11,8 @@
 //! * [`claude`], Claude Code;
 //! * [`codex`], Codex;
 //! * [`muse`], Muse;
-//! * [`agentcloud`], remote agentcloud sessions, which have no local screen at all.
+//! * [`agentcloud`], remote agentcloud sessions, which have no local screen at all;
+//! * [`unknown`], any other TUI, driven by harness-neutral rules (`--harness unknown`).
 //!
 //! Logic that holds for every harness (verified submission, the watcher's episode rules, queue
 //! delivery) stays where it was and asks the adapter. Where a cross-harness reader must work on a
@@ -31,6 +32,7 @@ pub mod claude;
 pub mod codex;
 pub mod muse;
 pub mod transcript;
+pub mod unknown;
 
 use crate::submission::ComposerView;
 
@@ -213,6 +215,9 @@ pub fn all() -> [&'static dyn HarnessAdapter; 4] {
 /// The adapter for a record's `harness` (Herdr's agent kind), when agentctl knows it.
 #[must_use]
 pub fn adapter(harness: &str) -> Option<&'static dyn HarnessAdapter> {
+    if crate::unknown_harness::is_unknown(harness) {
+        return Some(&unknown::Unknown);
+    }
     all().into_iter().find(|adapter| adapter.name() == harness)
 }
 

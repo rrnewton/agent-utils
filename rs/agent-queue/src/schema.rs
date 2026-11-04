@@ -115,6 +115,13 @@ pub struct QueueItem {
     /// The numbered placeholder the harness drew for the paste, without its blanks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paste_label: Option<String>,
+    /// Unix seconds when the prompt was first left stranded at the bottom of a TUI's screen
+    /// after its Enter presses; it stays pending, and later passes only press Enter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stranded_at: Option<f64>,
+    /// Drain passes that found the prompt still stranded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stranded_passes: Option<u64>,
     /// Unix seconds when an unsent draft was recovered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub draft_recovered_at: Option<f64>,
@@ -172,6 +179,8 @@ impl QueueItem {
             probable_misroute: None,
             typed_as: None,
             paste_label: None,
+            stranded_at: None,
+            stranded_passes: None,
             draft_recovered_at: None,
             draft_recovered_evidence: None,
             not_after: None,

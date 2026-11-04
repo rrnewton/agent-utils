@@ -2162,6 +2162,12 @@ impl AgentRecord {
         Ok(())
     }
 
+    /// The agent kind Herdr must report for the record's pane: its harness, except for a harness
+    /// driven by the generic rules, whose pane Herdr reports as no kind or any kind it guesses.
+    fn expected_agent(&self) -> Option<String> {
+        (!crate::unknown_harness::is_unknown(&self.harness)).then(|| self.harness.clone())
+    }
+
     fn target(&self) -> Result<Target> {
         self.supported()?;
         if self.pane_id.as_deref().is_none_or(str::is_empty) {
@@ -2175,7 +2181,7 @@ impl AgentRecord {
             pane_id: self.pane_id.clone(),
             session_agent,
             session_value,
-            expected_agent: Some(self.harness.clone()),
+            expected_agent: self.expected_agent(),
             expected_cwd: Some(PathBuf::from(&self.cwd)),
             expected_workspace: None,
         })
@@ -2239,7 +2245,32 @@ struct WorkspaceClient<'a, A: ManagedApi + ?Sized> {
     readback: Option<Duration>,
 }
 
+/// The status of a pane whose harness no adapter reads (`--harness unknown`): Herdr's agent kind
+/// and lifecycle say nothing about it, so the record's harness stands for the kind and the
+/// status comes from the screen alone ([`crate::unknown_harness::status`]).
+fn generic_status(info: &mut AgentPaneInfo, harness: &str, screen: &str, now: Duration) {
+    info.agent = Some(harness.to_owned());
+    let quiet = crate::unknown_harness::observe_pane(&info.pane_id, screen, now);
+    let status = crate::unknown_harness::status(screen, quiet).to_owned();
+    if status != info.status {
+        info.reported_status = Some(std::mem::replace(&mut info.status, status));
+    }
+}
+
+/// A process-wide monotonic clock for screen reads made without a caller runtime.
+fn generic_clock() -> Duration {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed()
+}
+
 impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
+    /// Whether `pane_id` is this record's pane and its harness is driven by the generic rules.
+    fn generic_pane(&self, pane_id: &str) -> bool {
+        Some(pane_id) == self.record.pane_id.as_deref()
+            && crate::unknown_harness::is_unknown(&self.record.harness)
+            && self.record.adapter != "herdr-relay"
+    }
+
     fn uses_muse_composer(&self) -> bool {
         self.record.harness == "muse"
             && matches!(
@@ -4642,6 +4673,16 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         text: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<Submission> {
+        if self.generic_pane(pane_id) {
+            let guarded = self.guarded(runtime)?;
+            return crate::unknown_harness::submit(
+                &GuardedPrompt(&guarded),
+                pane_id,
+                text,
+                crate::unknown_harness::timeouts(),
+                runtime,
+            );
+        }
         // A `/goal` command typed raw, as a chat request that is one asks for, is proved by the
         // harness's answer to it. A Codex goal that `agentctl goal` registered keeps its own
         // path, which confirms a replacement through the working state.
@@ -5010,6 +5051,13 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             )));
         }
         self.validate_workspace_policy(&info)?;
+        if self.generic_pane(pane_id) {
+            let screen = self
+                .client
+                .read(pane_id, "visible", Some(TURN_SCREEN_LINES))?;
+            generic_status(&mut info, &self.record.harness, &screen, generic_clock());
+            return Ok(info);
+        }
         if Some(pane_id) == self.record.pane_id.as_deref()
             && info.agent.as_deref() != Some(self.record.harness.as_str())
             && self.pinned_harness_owns(pane_id)?
@@ -5207,6 +5255,18 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             )));
         }
         self.validate_workspace_policy(&info)?;
+        if self.generic_pane(pane_id) {
+            let screen = self.client.read_with_runtime(
+                pane_id,
+                "visible",
+                Some(TURN_SCREEN_LINES),
+                runtime,
+            )?;
+            // Each readiness probe may bring a fresh runtime whose clock starts over, so
+            // stillness is timed on one clock for the whole process.
+            generic_status(&mut info, &self.record.harness, &screen, generic_clock());
+            return Ok(info);
+        }
         if Some(pane_id) == self.record.pane_id.as_deref()
             && info.agent.as_deref() != Some(self.record.harness.as_str())
             && self.pinned_harness_owns(pane_id)?
@@ -8317,6 +8377,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         reasoning_effort: Option<&str>,
     ) -> Result<Value> {
         name(agent_name)?;
+        if crate::unknown_harness::is_unknown(&options.harness) {
+            // An owned launch is judged alive by the kind Herdr reports, which such a harness
+            // never has.
+            return Err(fail(
+                "start does not launch --harness unknown: run the program in a Herdr tab, then \
+                 agentctl adopt NAME --pane ID --harness unknown",
+            ));
+        }
         let cwd = fs::canonicalize(cwd)
             .map_err(|_| fail(format!("cwd is not a directory: {}", cwd.display())))?;
         if !cwd.is_dir() {
@@ -8759,6 +8827,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         }
         harness_arguments(&options.harness, None, None, &[])?;
+        let generic = crate::unknown_harness::is_unknown(&options.harness);
+        // A harness driven by the generic rules has no kind Herdr reports; its pinned foreground
+        // process is its identity instead.
+        let expected_agent = (!generic).then(|| options.harness.clone());
         let cwd = fs::canonicalize(&options.cwd)
             .map_err(|_| fail(format!("cwd is not a directory: {}", options.cwd.display())))?;
         if !cwd.is_dir() {
@@ -8777,7 +8849,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             pane_id: Some(options.pane_id.clone()),
             session_agent: options.session.as_ref().map(|_| options.harness.clone()),
             session_value: options.session.clone(),
-            expected_agent: Some(options.harness.clone()),
+            expected_agent: expected_agent.clone(),
             expected_workspace: Some(options.expected_workspace.clone()),
             expected_cwd: Some(cwd.clone()),
         };
@@ -8793,9 +8865,29 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         // register two panes that report the same native session.
         let _identity_lock = self.identity_lock()?;
         self.refuse_pending_rename(&[agent_name])?;
-        let (_target_lock, info) = agent::lock_resolved_target(self.client, &target)?;
+        let (_target_lock, info) = match agent::lock_resolved_target(self.client, &target) {
+            Ok(locked) => locked,
+            Err(error)
+                if crate::harness::adapter(&options.harness).is_none()
+                    && error.to_string().contains("agent is None") =>
+            {
+                return Err(fail(format!(
+                    "{error}; Herdr recognises no agent in this pane and agentctl has no adapter \
+                     for {:?}: adopt it with --harness unknown to drive it by generic screen rules",
+                    options.harness
+                )));
+            }
+            Err(error) => return Err(error),
+        };
         match (&info.session_agent, &info.session_value) {
             (None, None) => {}
+            (Some(kind), Some(_)) if generic => {
+                return Err(fail(format!(
+                    "refusing pane {}: Herdr recognises a {kind:?} session in it; adopt it with \
+                     --harness {kind}",
+                    options.pane_id
+                )));
+            }
             (Some(kind), Some(value))
                 if !kind.is_empty()
                     && !value.is_empty()
@@ -8860,7 +8952,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     pane_id: Some(info.pane_id.clone()),
                     session_agent: info.session_agent.clone(),
                     session_value: info.session_value.clone(),
-                    expected_agent: Some(options.harness.clone()),
+                    expected_agent: expected_agent.clone(),
                     expected_workspace: None,
                     expected_cwd: Some(cwd.clone()),
                 },
@@ -8929,7 +9021,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 pane_id: Some(info.pane_id.clone()),
                 session_agent: info.session_agent.clone(),
                 session_value: info.session_value.clone(),
-                expected_agent: Some(options.harness.clone()),
+                expected_agent: expected_agent.clone(),
                 expected_workspace: None,
                 expected_cwd: Some(cwd.clone()),
             },
@@ -8972,6 +9064,17 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             self.client
                 .harness_identity(&confirmed.pane_id, &options.harness)?
         };
+        if generic
+            && harness_identity
+                .as_ref()
+                .is_none_or(|identity| !identity.valid())
+        {
+            return Err(fail(format!(
+                "refusing pane {}: adopting an unknown harness needs one program leading the \
+                 pane's foreground process group, to pin as its identity",
+                options.pane_id
+            )));
+        }
         if confirmed.terminal_id != info.terminal_id {
             return Err(fail(format!(
                 "refusing pane {}: terminal changed before adoption",
@@ -9537,7 +9640,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "refusing to unregister adopted agent {agent_name:?}: recorded pane shell generation changed"
             )));
         }
-        if info.agent.is_none() {
+        // Herdr never reports a kind for a harness driven by the generic rules: it is present
+        // while its pinned foreground process still is.
+        let generic_present = crate::unknown_harness::is_unknown(&record.harness)
+            && match record.harness_anchor() {
+                Some(anchor) => self.client.verify_harness_identity(&info.pane_id, anchor)?,
+                None => false,
+            };
+        if info.agent.is_none() && !generic_present {
             // A live agent is pinned by its harness and, when one was
             // reported, native session. A returned shell has no such process
             // identity, so its recorded tab remains part of the fallback
@@ -9705,7 +9815,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 pane_id: Some(named_pane.clone()),
                 session_agent: record.session_agent.clone(),
                 session_value: record.session_value.clone(),
-                expected_agent: Some(record.harness.clone()),
+                expected_agent: record.expected_agent(),
                 expected_workspace: Some(expected_workspace.clone()),
                 expected_cwd: Some(PathBuf::from(&record.cwd)),
             };
@@ -9844,7 +9954,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                         pane_id: Some(source.pane_id),
                         session_agent: record.session_agent.clone(),
                         session_value: record.session_value.clone(),
-                        expected_agent: Some(record.harness.clone()),
+                        expected_agent: record.expected_agent(),
                         expected_workspace: None,
                         expected_cwd: Some(PathBuf::from(&record.cwd)),
                     };
@@ -9876,7 +9986,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     pane_id: Some(moved.pane_id.clone()),
                     session_agent: record.session_agent.clone(),
                     session_value: record.session_value.clone(),
-                    expected_agent: Some(record.harness.clone()),
+                    expected_agent: record.expected_agent(),
                     expected_workspace: Some(expected_workspace.clone()),
                     expected_cwd: Some(PathBuf::from(&record.cwd)),
                 };
@@ -13736,6 +13846,7 @@ pub(crate) mod tests {
                     custom_dies_after_report: AtomicBool::new(false),
                     custom_fails_after_identity: AtomicBool::new(false),
                     custom_at_idle_shell: AtomicBool::new(true),
+                    no_agent_kind: AtomicBool::new(false),
                     foreign_shell_identity: Mutex::new(Fake::foreign_shell_identity()),
                     foreign_shell_path: Mutex::new(PathBuf::from("/bin/bash")),
                     replacement_shell_on_read: Mutex::new(None),
@@ -14179,6 +14290,8 @@ pub(crate) mod tests {
         custom_dies_after_report: AtomicBool,
         custom_fails_after_identity: AtomicBool,
         custom_at_idle_shell: AtomicBool,
+        /// Herdr reports no agent kind for any pane, as for a TUI it has no manifest for.
+        no_agent_kind: AtomicBool,
         foreign_shell_identity: Mutex<CustomProcessIdentity>,
         foreign_shell_path: Mutex<PathBuf>,
         replacement_shell_on_read: Mutex<Option<PaneShellProof>>,
@@ -14537,7 +14650,8 @@ pub(crate) mod tests {
                 } else {
                     self.root.display().to_string()
                 },
-                agent: (stale_report || (self.started.load(Ordering::Relaxed) && !dead))
+                agent: (!self.no_agent_kind.load(Ordering::Relaxed)
+                    && (stale_report || (self.started.load(Ordering::Relaxed) && !dead)))
                     .then(|| kind.to_owned()),
                 status: self
                     .status
@@ -16901,6 +17015,109 @@ fi
                 .last()
                 .map(String::as_str),
             Some("adopted in place")
+        );
+    }
+
+    #[test]
+    fn an_unknown_harness_is_adopted_by_its_pinned_process_and_read_from_its_screen() {
+        let fixture = Fixture::new();
+        fixture.prepare_foreign();
+        // No native session: Herdr has no manifest for this TUI.
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let mut options = fixture.adopt_options();
+        options.harness = crate::unknown_harness::HARNESS.to_owned();
+        fixture.manager().adopt("foreign", options).unwrap();
+        let record = fixture.manager().load("foreign").unwrap();
+        assert_eq!(record.harness, "unknown");
+        assert!(record.harness_identity.is_some());
+        assert_eq!(record.target().unwrap().expected_agent, None);
+        // Herdr's kind and lifecycle are replaced by what the screen shows.
+        *fixture.client.status.lock().unwrap() = Some("unknown".to_owned());
+        *fixture.client.screen.lock().unwrap() = Some("orc minimal\n> ".to_owned());
+        let info = fixture.manager().pane_info("foreign").unwrap();
+        assert_eq!(info.agent.as_deref(), Some("unknown"));
+        assert_eq!(info.status, "working", "a first read is not yet still");
+        *fixture.client.screen.lock().unwrap() =
+            Some("Run it?\n❯ 1. Allow\n  2. Deny\n".to_owned());
+        assert_eq!(
+            fixture.manager().pane_info("foreign").unwrap().status,
+            "blocked"
+        );
+    }
+
+    #[test]
+    fn an_adopted_unknown_harness_stops_while_its_program_runs() {
+        let fixture = Fixture::new();
+        fixture.prepare_foreign();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let mut options = fixture.adopt_options();
+        options.harness = crate::unknown_harness::HARNESS.to_owned();
+        fixture.manager().adopt("foreign", options).unwrap();
+        // Herdr reports no kind for such a TUI, and the pane is not back at its idle shell:
+        // the pinned program still running is what keeps it present.
+        fixture.client.no_agent_kind.store(true, Ordering::Relaxed);
+        fixture
+            .client
+            .custom_at_idle_shell
+            .store(false, Ordering::Relaxed);
+        fixture.manager().stop("foreign").unwrap();
+        assert!(fixture.manager().load("foreign").is_err());
+    }
+
+    #[test]
+    fn start_refuses_the_unknown_harness_and_points_at_adopt() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: crate::unknown_harness::HARNESS.to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("adopt"), "{error}");
+    }
+
+    #[test]
+    fn adopting_an_unrecognised_tui_under_its_own_name_points_at_the_unknown_harness() {
+        let fixture = Fixture::new();
+        fixture.prepare_foreign();
+        // Herdr recognises no agent in the pane.
+        fixture.client.started.store(false, Ordering::Relaxed);
+        let mut options = fixture.adopt_options();
+        options.harness = "orc".to_owned();
+        let error = fixture.manager().adopt("foreign", options).unwrap_err();
+        assert!(error.to_string().contains("--harness unknown"), "{error}");
+    }
+
+    #[test]
+    fn adopting_an_unknown_harness_needs_a_program_to_pin() {
+        let fixture = Fixture::new();
+        fixture.prepare_foreign();
+        // No native session: Herdr has no manifest for this TUI.
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .missing_harness_identity
+            .store(true, Ordering::Relaxed);
+        let mut options = fixture.adopt_options();
+        options.harness = crate::unknown_harness::HARNESS.to_owned();
+        let error = fixture.manager().adopt("foreign", options).unwrap_err();
+        assert!(
+            error.to_string().contains("foreground process group"),
+            "{error}"
         );
     }
 

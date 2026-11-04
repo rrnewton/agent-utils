@@ -729,6 +729,13 @@ pub trait AgentRuntime {
     fn paste_drawn_as(&self, label: &str) {
         let _ = label;
     }
+    /// Whether the prompt a queue drain is delivering was left stranded at the bottom of a TUI's
+    /// screen by an earlier pass (its record carries `stranded_at`): the submission must not type
+    /// it again, only press Enter until it leaves (#850 unknown-harness-mode). The default is
+    /// `false`.
+    fn stranded_retry(&self) -> bool {
+        false
+    }
 }
 
 /// A runtime that behaves as `inner` and names the queue a drain delivers from: see
@@ -739,6 +746,9 @@ struct QueueRuntime<'a> {
 }
 
 impl AgentRuntime for QueueRuntime<'_> {
+    fn stranded_retry(&self) -> bool {
+        self.inner.stranded_retry()
+    }
     fn paste_drawn_as(&self, label: &str) {
         self.inner.paste_drawn_as(label);
     }
@@ -789,6 +799,9 @@ pub(crate) struct WithdrawUnacceptedRuntime<'a> {
 }
 
 impl AgentRuntime for WithdrawUnacceptedRuntime<'_> {
+    fn stranded_retry(&self) -> bool {
+        self.inner.stranded_retry()
+    }
     fn paste_drawn_as(&self, label: &str) {
         self.inner.paste_drawn_as(label);
     }
@@ -832,6 +845,9 @@ impl AgentRuntime for WithdrawUnacceptedRuntime<'_> {
 }
 
 impl AgentRuntime for WithdrawingRuntime<'_> {
+    fn stranded_retry(&self) -> bool {
+        self.inner.stranded_retry()
+    }
     fn paste_drawn_as(&self, label: &str) {
         self.inner.paste_drawn_as(label);
     }
@@ -887,9 +903,14 @@ struct PasteTrackingRuntime<'a> {
     document: std::cell::RefCell<Map<String, Value>>,
     /// The placeholder the harness drew for the paste: see [`AgentRuntime::paste_drawn_as`].
     paste_label: std::cell::RefCell<Option<String>>,
+    /// The item was left stranded by an earlier pass: see [`AgentRuntime::stranded_retry`].
+    stranded: bool,
 }
 
 impl AgentRuntime for PasteTrackingRuntime<'_> {
+    fn stranded_retry(&self) -> bool {
+        self.stranded || self.inner.stranded_retry()
+    }
     fn paste_drawn_as(&self, label: &str) {
         *self.paste_label.borrow_mut() = Some(label.to_owned());
     }
@@ -988,6 +1009,28 @@ impl AgentRuntime for BatchTrackingRuntime<'_> {
             }
         }
     }
+}
+
+/// Record on a pending item that its prompt was left stranded at the bottom of a TUI's screen
+/// (#850 unknown-harness-mode): when that was first seen, how many passes found it so, and the
+/// text left there, which later passes flush with Enter and never type again. Logged on every
+/// pass, with a one-time notice the first time.
+fn note_stranded(document: &mut Map<String, Value>, identifier: &str, typed: &str, detail: &str) {
+    if !document.contains_key("stranded_at") {
+        document.insert("stranded_at".to_owned(), json!(unix_seconds()));
+        eprintln!(
+            "agentctl: notice: prompt {identifier} is stranded at the bottom of the screen; it \
+             stays pending and later drains press Enter (never type it again) until it leaves"
+        );
+    }
+    let passes = document
+        .get("stranded_passes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(1);
+    document.insert("stranded_passes".to_owned(), json!(passes));
+    document.insert("typed_as".to_owned(), json!(typed));
+    eprintln!("agentctl: prompt {identifier} stranded (pass {passes}): {detail}");
 }
 
 /// Remove the paste-tracking stamps before an item reaches a terminal
@@ -1623,6 +1666,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             // drain with an explicit --max-items, and an urgent priority drain, never batch.
             if options.batch_working_backlog
                 && info.status == "working"
+                && !document.contains_key("stranded_at")
                 && !owner_prompt(&identifier, &document)
                 && priority_only.is_none()
                 && options.max_items.is_none()
@@ -1657,6 +1701,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             .and_then(Value::as_str)
                             .map_or(candidate_filename.clone(), str::to_owned);
                         if candidate_attempts >= options.max_attempts
+                            || candidate_document.contains_key("stranded_at")
                             || owner_prompt(&candidate_id, &candidate_document)
                             || set_aside_reason(
                                 &directories,
@@ -1783,7 +1828,9 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             for (index, (member, inflight)) in active.iter().enumerate() {
                                 let document = &mut documents[index];
                                 document.remove("possibly_submitted");
-                                document.remove("typed_as");
+                                if !document.contains_key("stranded_at") {
+                                    document.remove("typed_as");
+                                }
                                 document.remove("inflight_at");
                                 document.remove("paste_tracking");
                                 document.remove("inflight_from");
@@ -1844,6 +1891,18 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                                 }
                             }
                             Ok(Delivered::NotStaged(detail)) => {
+                                // A stranded combined prompt: every member keeps it as the text
+                                // the next passes flush, one member at a time.
+                                if crate::unknown_harness::is_stranded_prompt(&detail) {
+                                    for (index, (member, _)) in active.iter().enumerate() {
+                                        note_stranded(
+                                            &mut documents[index],
+                                            &member.3,
+                                            &combined,
+                                            &detail,
+                                        );
+                                    }
+                                }
                                 revert(&active, &mut documents, &detail, &mut delivered)?;
                                 blocked = Some(detail);
                                 // As a single prompt that never reached the composer:
@@ -2010,11 +2069,24 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             // What is typed, when that is not the queued text (a chat prompt's opening is
             // retimed as it is typed), so a draft Muse leaves unsent can be told for agentctl's
             // own (#720 agentctl-muse-stale-draft).
-            let typed = typed_text(&document)?;
-            if document.get("text").and_then(Value::as_str) == Some(typed.as_str()) {
-                document.remove("typed_as");
-            } else {
-                document.insert("typed_as".to_owned(), json!(typed));
+            // A prompt an earlier pass left stranded at the bottom of a TUI's screen is flushed
+            // with Enter, never typed again; what it was typed as stays its text (#850
+            // unknown-harness-mode).
+            let stranded = document.contains_key("stranded_at");
+            let typed = match document
+                .get("typed_as")
+                .and_then(Value::as_str)
+                .filter(|_| stranded)
+            {
+                Some(text) => text.to_owned(),
+                None => typed_text(&document)?,
+            };
+            if !stranded {
+                if document.get("text").and_then(Value::as_str) == Some(typed.as_str()) {
+                    document.remove("typed_as");
+                } else {
+                    document.insert("typed_as".to_owned(), json!(typed));
+                }
             }
             atomic_json(&inflight_path, &Value::Object(document.clone()))?;
 
@@ -2046,6 +2118,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 inflight_path: inflight_path.clone(),
                 document: std::cell::RefCell::new(document.clone()),
                 paste_label: std::cell::RefCell::new(None),
+                stranded,
             };
             let delivery_runtime: &dyn AgentRuntime = &tracking;
             let outcome = deliver_one(
@@ -2068,8 +2141,14 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 Ok(Delivered::NotStaged(detail)) => {
                     // Nothing reached the composer: undo the at-most-once barrier so the
                     // prompt stays pending. A crash before the rename still quarantines it.
+                    // A stranded prompt also stays pending, keeping the text it was typed as
+                    // for the next pass to flush.
                     document.remove("possibly_submitted");
-                    document.remove("typed_as");
+                    if crate::unknown_harness::is_stranded_prompt(&detail) {
+                        note_stranded(&mut document, &identifier, &typed, &detail);
+                    } else if !stranded {
+                        document.remove("typed_as");
+                    }
                     document.remove("inflight_at");
                     document.remove("paste_tracking");
                     document.remove("inflight_from");
@@ -4625,6 +4704,148 @@ mod tests {
         }
     }
 
+    /// An agent whose prompts go through the generic rules into a fake minimal TUI (#850
+    /// unknown-harness-mode).
+    struct GenericTuiAgent {
+        inner: FakeAgent,
+        tui: crate::unknown_harness::fake::FakeTui,
+    }
+
+    impl AgentApi for GenericTuiAgent {
+        fn panes(&self) -> crate::error::Result<Vec<Pane>> {
+            self.inner.panes()
+        }
+        fn pane_info(&self, pane_id: &str) -> crate::error::Result<AgentPaneInfo> {
+            self.inner.pane_info(pane_id)
+        }
+        fn workspace_label(&self, workspace_id: &str) -> crate::error::Result<String> {
+            self.inner.workspace_label(workspace_id)
+        }
+        fn run(&self, pane_id: &str, text: &str) -> crate::error::Result<()> {
+            self.inner.run(pane_id, text)
+        }
+        fn wait_agent_status(
+            &self,
+            pane_id: &str,
+            status: &str,
+            timeout_ms: u64,
+        ) -> crate::error::Result<()> {
+            self.inner.wait_agent_status(pane_id, status, timeout_ms)
+        }
+        fn read(
+            &self,
+            pane_id: &str,
+            source: &str,
+            lines: Option<usize>,
+        ) -> crate::error::Result<String> {
+            self.inner.read(pane_id, source, lines)
+        }
+        fn submit_with_runtime(
+            &self,
+            pane_id: &str,
+            text: &str,
+            runtime: &dyn AgentRuntime,
+        ) -> crate::error::Result<Submission> {
+            crate::unknown_harness::submit(
+                &self.tui,
+                pane_id,
+                text,
+                crate::unknown_harness::timeouts(),
+                runtime,
+            )
+        }
+    }
+
+    #[test]
+    fn a_stranded_prompt_stays_pending_and_is_flushed_on_the_next_pass_without_retyping() {
+        let directory = TestDirectory::new("stranded-pending");
+        let agent = GenericTuiAgent {
+            inner: FakeAgent::new(&["idle"]),
+            tui: crate::unknown_harness::fake::FakeTui::new(),
+        };
+        let first = "please run the gate and report the commit back to me";
+        let second = "and then write the handoff file for the coordinator";
+        enqueue(directory.path(), first, Some("first")).unwrap();
+        enqueue(directory.path(), second, Some("second")).unwrap();
+        let options = || DrainOptions {
+            ready_timeout: Duration::ZERO,
+            ..DrainOptions::default()
+        };
+        // Pass 1: the TUI drops every Enter. The prompt is stranded, never quarantined.
+        agent.tui.state().drop_enters = 100;
+        let result = drain_with_runtime(
+            &agent,
+            &target(),
+            directory.path(),
+            options(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Pending, "{result:?}");
+        assert!(
+            result.quarantined.is_empty(),
+            "never possibly_submitted: {result:?}"
+        );
+        assert!(result.delivered.is_empty());
+        let blocked = result.blocked.expect("a blocked reason");
+        assert!(
+            crate::unknown_harness::is_stranded_prompt(&blocked),
+            "{blocked}"
+        );
+        let document = read_private_json(&directory.path().join("inbox/first.json")).unwrap();
+        assert_eq!(document["delivery_state"], "pending");
+        assert!(document["stranded_at"].is_f64(), "{document}");
+        assert_eq!(document["stranded_passes"], 1);
+        assert_eq!(document["typed_as"], first);
+        assert!(document.get("possibly_submitted").is_none(), "{document}");
+        // The queue behind it waits rather than typing on top of it.
+        let typed: Vec<String> = agent.tui.state().inputs.clone();
+        assert_eq!(
+            typed.iter().filter(|i| i.starts_with("paste:")).count(),
+            1,
+            "{typed:?}"
+        );
+
+        // Pass 2: still dropping Enters. Still pending, still never re-typed.
+        let result = drain_with_runtime(
+            &agent,
+            &target(),
+            directory.path(),
+            options(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Pending, "{result:?}");
+        let document = read_private_json(&directory.path().join("inbox/first.json")).unwrap();
+        assert_eq!(document["stranded_passes"], 2);
+
+        // Pass 3: the TUI takes Enter again. The stranded prompt leaves with Enter alone, and the
+        // queue head moves on to the next prompt.
+        agent.tui.state().drop_enters = 0;
+        let result = drain_with_runtime(
+            &agent,
+            &target(),
+            directory.path(),
+            options(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.delivered, ["first", "second"], "{result:?}");
+        assert!(result.quarantined.is_empty());
+        let state = agent.tui.state();
+        assert_eq!(state.submitted, vec![first.to_owned(), second.to_owned()]);
+        let pastes: Vec<&String> = state
+            .inputs
+            .iter()
+            .filter(|i| i.starts_with("paste:"))
+            .collect();
+        assert_eq!(
+            pastes.len(),
+            2,
+            "the stranded prompt was never typed again: {pastes:?}"
+        );
+    }
+
     #[test]
     fn composer_unreadable_stays_pending_with_its_reason_recorded() {
         let directory = TestDirectory::new("unreadable-pending");
@@ -6687,6 +6908,7 @@ mod tests {
             inflight_path: path.clone(),
             document: std::cell::RefCell::new(document),
             paste_label: std::cell::RefCell::new(None),
+            stranded: false,
         };
         tracking.input_started();
         let stamped = load_message(&path).unwrap();

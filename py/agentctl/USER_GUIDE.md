@@ -1748,6 +1748,70 @@ boot/process/image identity. It is not a package-signature or trusted-binary
 attestation; another executable installed under one of those basenames is
 outside this same-user cleanup boundary.
 
+### Adopt a TUI agentctl does not know: `--harness unknown` (Rust edition, #850 unknown-harness-mode)
+
+Herdr reports a terminal program it has no manifest for (an ORC minimal TUI, a
+readline loop, a new coding agent) as no agent kind with status `unknown`, so
+`adopt --harness orc` is refused: no agent kind is reported, and agentctl has no adapter
+for `orc`. Adopt it in best-effort mode instead:
+
+```sh
+agentctl adopt orc-lead --pane w1:p7 --workspace project \
+  --cwd /work/project --harness unknown
+```
+
+The program leading the pane's foreground process group is pinned as the
+harness identity (adoption refuses a pane that runs only its shell), and every
+keystroke is still guarded by the pane, terminal, cwd and shell-generation
+checks above. A pane in which Herdr does recognise a native session is refused
+with the kind to use instead. `stop` treats the agent as present while that
+pinned program is still in front. `agentctl start` does not launch
+`--harness unknown`: run the program in a Herdr tab yourself, then adopt it.
+
+Nothing in this mode reads harness-specific text. It works from the screen
+alone, with these rules:
+
+- **Ready**: no menu or dialog at the bottom of the screen, and the screen has
+  not changed for 2 s (clock digits and spinner glyphs are ignored). `status`
+  shows `idle`, `working` or `blocked` from those rules. Herdr's own status is
+  ignored.
+- **Delivery**: a bracketed paste, then a poll until the text shows at the
+  bottom of the screen (matching only its letters and digits, so wrapping,
+  box borders and prompt glyphs do not matter) or the screen changes and
+  settles, then Enter.
+- **Confirmation**: the prompt counts as submitted once the text no longer
+  sits at the bottom *as it did when staged*: the rows after it changed (a new
+  prompt line, output, a redrawn input box) or it left the bottom. A
+  line-oriented TUI keeps the submitted line on screen above its next prompt.
+  The new rows after that line are the proof.
+- **Enter under uncertainty**: a leftover that is still identical gets another
+  bare Enter, 1 s apart and then doubling up to 4 s, at most 5 presses. Text is
+  never pasted twice. If the paste never showed and one Enter changed nothing,
+  the prompt stays pending (safe to retry). If our text already sits in the
+  last rows when a delivery starts, the delivery presses Enter instead of
+  pasting again. A prompt still at the bottom after the fifth press is
+  `stranded_prompt`: it stays **pending** (never quarantined as possibly
+  submitted), its queue record gains `stranded_at`, `stranded_passes` and the
+  text left there (`typed_as`), the drain logs it (a notice the first time),
+  and every later drain presses Enter only, never typing it again, until it
+  leaves the bottom. Prompts behind it wait rather than being typed on top of it.
+- **Never into a menu**: no key is sent while the bottom of the screen shows
+  numbered options `1.`, `2.` … with a cursor glyph or highlight on one of them,
+  a `(y/n)`-style prompt, or any known harness's approval phrase. Our own
+  numbered list sitting in the input does not count.
+- **watch-agents**: a menu or dialog is an `approval-prompt`. Once the agent
+  has been sent a prompt and none is waiting, a screen that stood still since
+  the last pass is idle, timed from its last change: with a `DONE:` or
+  `BLOCKED:` line it is a `child-done`, otherwise `idle-no-verdict`. A screen that
+  keeps changing counts as working. There is no stall, turn or transcript
+  analysis.
+
+Limits: the TUI must accept a bracketed paste (or ignore the paste markers);
+one that drops it shows nothing and the prompt stays pending. If an identical
+earlier prompt is still in the last three rows, the new one is taken for it
+and submitted with Enter instead of being pasted. A TUI whose screen never
+stands still (a clock with letters, an animation) never counts as ready.
+
 ### Retire a dead adopted record after a restart
 
 After a Herdr restart, an adopted record can refer to a shell generation that

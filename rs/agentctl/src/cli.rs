@@ -1258,7 +1258,7 @@ struct Adopt {
     /// Expected live agent working directory; compared canonically (required)
     #[arg(long, value_name = "DIR")]
     cwd: PathBuf,
-    /// Expected live harness kind, such as codex, claude, or muse (required)
+    /// Expected live harness kind, such as codex, claude, or muse; `unknown` adopts any other TUI in best-effort mode, driven by generic screen rules (required)
     #[arg(long, value_name = "KIND")]
     harness: String,
     /// Stable native conversation ID already reported by this exact pane

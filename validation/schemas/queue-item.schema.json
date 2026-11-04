@@ -251,6 +251,23 @@
     "sent_at": {
       "description": "Original send time recorded by a sender, in its own units."
     },
+    "stranded_at": {
+      "description": "Unix seconds when the prompt was first left stranded at the bottom of a TUI's screen\nafter its Enter presses; it stays pending, and later passes only press Enter.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "stranded_passes": {
+      "description": "Drain passes that found the prompt still stranded.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
     "text": {
       "description": "The prompt text; never empty.",
       "minLength": 1,
