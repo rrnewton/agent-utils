@@ -255,6 +255,13 @@ recorded.
 - A request that cannot be applied when its turn comes (its change landed meanwhile, its head
   no longer resolves) is moved to `intake/refused/` with the reason, noted in the change's
   history (`intake-refused`), and shown by `status` for a week.
+- A recorded request is not in any item record until it is applied, so `list` and `status` show
+  it on its own line, for example `#4885 pending-intake: submit pr-4885 at 1a2b3c4d5e since
+  2026-11-04T20:51:03Z` (`list --json`: a row with `"status": "pending-intake"`).
+- Asking again is harmless. A request identical to the last one waiting for the same change is
+  not recorded again: the command prints `already recorded #N at <time>` and exits 0. Identical
+  requests recorded one after another anyway (two submitters at the same moment) are applied
+  once, and the log line says how many were folded into it.
 
 ### `merge-queue list`
 
@@ -266,7 +273,11 @@ priority change.
 | Option | Default | Meaning |
 |---|---|---|
 | `--all` | off | Include landed, ejected and withdrawn changes. |
-| `--json` | off | Print the full item records as a JSON array. |
+| `--json` | off | Print the full item records as a JSON array, followed by one row per request recorded while a run held the queue (`pr`, `"status": "pending-intake"`, `op`, `head_ref`, `head`, `recorded_at`, `last_recorded_at`, `requests`). |
+
+Requests recorded while a run held the writer lock (see "Intake while a run holds the queue") are
+listed after the table as `#N pending-intake: <op> ... since <time>` until they are applied, with
+the number of identical requests when a submitter asked more than once.
 
 ### `merge-queue plan`
 
@@ -405,7 +416,8 @@ none when no daemon is running (a `run` started by hand reports its own progress
 checkouts; one is in use only while a validation holds its `scratch/slot-<n>.lock`, since every
 slot keeps its checkout between validations. A failed attempt to take the writer lock shows as
 the daemon's last error until the daemon gets the lock or has nothing queued. Requests recorded
-while a run held the lock show as `intake: N request(s) ...` until they are applied. Requests
+while a run held the lock show as `intake: N request(s) ...` until they are applied, one
+`#N pending-intake: ...` line per change and request (JSON `intake.requests`). Requests
 refused when applied show as `intake refused: ...`, and the newest three are named (JSON `intake`).
 A pending drain request shows as `drain: requested at ...` (JSON `drain`; see **Upgrading the
 daemon** below).

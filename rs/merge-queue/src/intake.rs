@@ -6,6 +6,11 @@
 //! that finds the lock free. A request that cannot be applied then (its change landed meanwhile,
 //! its head no longer resolves) is kept under `intake/refused/` with the reason, and `status`
 //! shows it.
+//!
+//! `list` and `status` show the waiting requests as `pending-intake`, so a submitter can see its
+//! request was taken. A request identical to the last one waiting for the same change is not
+//! recorded again (the command says it is already recorded), and identical requests recorded
+//! one after another (by two submitters at once, say) are applied once.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -79,6 +84,10 @@ pub struct Entry {
     /// Why the writer lock could not be taken then.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub busy: String,
+    /// For a submission, the commit its head ref resolved to when it was recorded (shown while
+    /// it waits; the submission itself still takes the ref's head when it is applied).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub seen_head: String,
     /// The request.
     pub request: Request,
     /// RFC 3339 UTC time it was refused, once it was.
@@ -116,6 +125,59 @@ impl Applied {
     }
 }
 
+/// [`Pending::status`]: how `list` shows a change that has only a waiting request.
+pub const PENDING_INTAKE: &str = "pending-intake";
+
+/// A waiting request, as `list` and `status` show it. Identical requests for the same change
+/// recorded one after another (a submitter repeating itself) count as one, with their number.
+#[derive(Clone, Debug, Serialize)]
+pub struct Pending {
+    /// Change number.
+    pub pr: i64,
+    /// Always [`PENDING_INTAKE`], so a `list --json` reader tells these from item records.
+    pub status: &'static str,
+    /// `submit`, `withdraw` or `retry`.
+    pub op: String,
+    /// For a submission, its head ref.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub head_ref: String,
+    /// For a submission, the head it names, or else the commit its ref resolved to when it was
+    /// recorded (the submission takes the ref's head at the time it is applied).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub head: String,
+    /// When the first of these requests was recorded.
+    pub recorded_at: String,
+    /// When the last of them was recorded.
+    pub last_recorded_at: String,
+    /// How many identical requests were recorded in a row.
+    pub requests: usize,
+}
+
+impl Pending {
+    /// `#N pending-intake: submit REF at abc1234567 since T`, for a text listing.
+    pub fn line(&self) -> String {
+        let mut what = self.op.clone();
+        if !self.head_ref.is_empty() {
+            what = format!("{what} {}", self.head_ref);
+        }
+        if !self.head.is_empty() {
+            what = format!("{what} at {}", short(&self.head));
+        }
+        let repeats = if self.requests > 1 {
+            format!(
+                " ({} identical requests, the last at {})",
+                self.requests, self.last_recorded_at
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "#{} {PENDING_INTAKE}: {what} since {}{repeats}",
+            self.pr, self.recorded_at
+        )
+    }
+}
+
 /// Requests waiting for the lock and recent refusals, for `status`.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Summary {
@@ -124,6 +186,9 @@ pub struct Summary {
     /// When the oldest of them was recorded.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub oldest_pending: String,
+    /// The waiting requests by change, in recording order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub requests: Vec<Pending>,
     /// Refused requests kept (the last week).
     pub refused: usize,
     /// The newest refused requests, newest first.
@@ -161,9 +226,38 @@ fn read(path: &Path) -> Result<Entry, String> {
     serde_json::from_str(&text).map_err(|error| format!("unreadable {}: {error}", path.display()))
 }
 
+/// Whether two requests ask for the same thing (the recording time is not part of a request).
+fn same(a: &Request, b: &Request) -> bool {
+    serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+}
+
+/// The waiting entries in recording order (unreadable ones left out).
+fn pending_entries(state: &State) -> Vec<Entry> {
+    files(&pending_dir(state))
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|path| read(path).ok())
+        .collect()
+}
+
 /// Record `request` for the next holder of the writer lock; `busy` says why it could not be
-/// taken now.
-pub fn record(state: &State, request: Request, busy: &str) -> Result<Entry, String> {
+/// taken now, and `seen_head` is what a submission's ref resolved to. Returns the entry and
+/// whether it is new: when the last waiting request for the same change is identical, nothing
+/// is recorded again and that request is returned instead.
+pub fn record(
+    state: &State,
+    request: Request,
+    busy: &str,
+    seen_head: &str,
+) -> Result<(Entry, bool), String> {
+    if let Some(last) = pending_entries(state)
+        .into_iter()
+        .rfind(|entry| entry.request.pr() == request.pr())
+    {
+        if same(&last.request, &request) {
+            return Ok((last, false));
+        }
+    }
     // Microseconds, then the process and a per-process count: unique, and in recording order.
     static COUNT: AtomicU32 = AtomicU32::new(0);
     let id = format!(
@@ -177,12 +271,13 @@ pub fn record(state: &State, request: Request, busy: &str) -> Result<Entry, Stri
         id: id.clone(),
         recorded_at: now(),
         busy: busy.to_owned(),
+        seen_head: seen_head.to_owned(),
         request,
         refused_at: String::new(),
         error: String::new(),
     };
     write_json(&pending_dir(state).join(format!("{id}.json")), &entry)?;
-    Ok(entry)
+    Ok((entry, true))
 }
 
 /// Whether any request is waiting (a directory listing; no lock).
@@ -208,7 +303,11 @@ pub fn pending_withdrawals(state: &State) -> BTreeSet<i64> {
 /// that cannot be applied is moved to `intake/refused/` with the reason (and noted in its
 /// change's history); the rest still apply. Errs only when the requests cannot be listed.
 pub fn apply(state: &State, config: &Config, _lock: &Lock) -> Result<Vec<Applied>, String> {
-    let mut applied = Vec::new();
+    let mut applied: Vec<Applied> = Vec::new();
+    // For each change, the last request applied, its line in `applied`, and how many identical
+    // requests recorded right after it were folded into it rather than applied again.
+    let mut last: std::collections::BTreeMap<i64, (Request, usize, usize)> =
+        std::collections::BTreeMap::new();
     for path in files(&pending_dir(state))? {
         let entry = match read(&path) {
             Ok(entry) => entry,
@@ -227,12 +326,28 @@ pub fn apply(state: &State, config: &Config, _lock: &Lock) -> Result<Vec<Applied
                 continue;
             }
         };
+        let pr = entry.request.pr();
+        if let Some((previous, line, repeats)) = last.get_mut(&pr) {
+            if same(previous, &entry.request) {
+                std::fs::remove_file(&path)
+                    .map_err(|error| format!("cannot remove {}: {error}", path.display()))?;
+                *repeats += 1;
+                applied[*line].request = format!(
+                    "{} (and {} identical request(s) recorded after it, the last at {})",
+                    previous.describe(),
+                    repeats,
+                    entry.recorded_at
+                );
+                continue;
+            }
+        }
         let outcome = perform(state, config, &entry);
         if let Err(error) = &outcome {
             refuse(state, &entry, error)?;
         }
         std::fs::remove_file(&path)
             .map_err(|error| format!("cannot remove {}: {error}", path.display()))?;
+        last.insert(pr, (entry.request.clone(), applied.len(), 0));
         applied.push(Applied {
             request: entry.request.describe(),
             recorded_at: entry.recorded_at.clone(),
@@ -315,17 +430,63 @@ fn prune_refused(state: &State) {
     }
 }
 
+/// The waiting requests in recording order, a request identical to the one recorded just before
+/// it for the same change counted as a repeat of that one (no lock).
+pub fn pending(state: &State) -> Vec<Pending> {
+    let mut out: Vec<(Request, Pending)> = Vec::new();
+    for entry in pending_entries(state) {
+        let pr = entry.request.pr();
+        if let Some((request, pending)) =
+            out.iter_mut().rev().find(|(request, _)| request.pr() == pr)
+        {
+            if same(request, &entry.request) {
+                pending.requests += 1;
+                pending.last_recorded_at.clone_from(&entry.recorded_at);
+                continue;
+            }
+        }
+        let (op, head_ref, head) = match &entry.request {
+            Request::Submit(submission) => (
+                "submit",
+                submission.head_ref.clone(),
+                if submission.head.is_empty() {
+                    entry.seen_head.clone()
+                } else {
+                    submission.head.clone()
+                },
+            ),
+            Request::Withdraw { .. } => ("withdraw", String::new(), String::new()),
+            Request::Retry { .. } => ("retry", String::new(), String::new()),
+        };
+        out.push((
+            entry.request.clone(),
+            Pending {
+                pr,
+                status: PENDING_INTAKE,
+                op: op.to_owned(),
+                head_ref,
+                head,
+                recorded_at: entry.recorded_at.clone(),
+                last_recorded_at: entry.recorded_at.clone(),
+                requests: 1,
+            },
+        ));
+    }
+    out.into_iter().map(|(_, pending)| pending).collect()
+}
+
 /// Waiting and refused requests, for `status` (no lock).
 pub fn summary(state: &State) -> Summary {
-    let pending = files(&pending_dir(state)).unwrap_or_default();
+    let pending_files = files(&pending_dir(state)).unwrap_or_default();
     let refused = files(&refused_dir(state)).unwrap_or_default();
     Summary {
-        pending: pending.len(),
-        oldest_pending: pending
+        pending: pending_files.len(),
+        oldest_pending: pending_files
             .first()
             .and_then(|path| read(path).ok())
             .map(|entry| entry.recorded_at)
             .unwrap_or_default(),
+        requests: pending(state),
         refused: refused.len(),
         recent_refusals: refused
             .iter()

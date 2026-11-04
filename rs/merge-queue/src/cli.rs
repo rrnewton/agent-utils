@@ -663,12 +663,14 @@ enum Command {
         #[arg(required = true)]
         prs: Vec<i64>,
     },
-    /// List changes and their status.
+    /// List changes and their status, then the requests recorded while a run held the queue
+    /// (`#N pending-intake: ...`) until they are applied.
     List {
         /// Include landed, ejected and withdrawn changes.
         #[arg(long)]
         all: bool,
-        /// Print JSON records instead of a table.
+        /// Print JSON records instead of a table: the item records, then one row per recorded
+        /// request, with `"status": "pending-intake"`.
         #[arg(long)]
         json: bool,
     },
@@ -1370,12 +1372,24 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                             submission.head_ref, submission.head
                         ));
                     }
-                    intake::record(&state, intake::Request::Submit(Box::new(submission)), &busy)?;
-                    println!(
-                        "recorded #{pr} (head now {}) for the next cycle: {busy}; it is applied \
-                         as soon as the writer lock is free",
-                        short(&current)
-                    );
+                    let request = intake::Request::Submit(Box::new(submission));
+                    let (entry, new) = intake::record(&state, request, &busy, &current)?;
+                    if new {
+                        println!(
+                            "recorded #{pr} (head now {}) for the next cycle: {busy}; it is \
+                             applied as soon as the writer lock is free",
+                            short(&current)
+                        );
+                    } else {
+                        println!(
+                            "already recorded #{pr} at {} (head now {}), not recorded again: \
+                             {busy}; it is applied as soon as the writer lock is free, and \
+                             `merge-queue list` shows it as {} until then",
+                            entry.recorded_at,
+                            short(&current),
+                            intake::PENDING_INTAKE
+                        );
+                    }
                     return Ok(0);
                 }
             };
@@ -1479,12 +1493,22 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     if item.status == ItemStatus::Landed {
                         return Err(format!("#{pr} has already landed"));
                     }
-                    intake::record(&state, intake::Request::Withdraw { pr, reason }, &busy)?;
-                    println!(
-                        "recorded the withdrawal of #{pr} for the next cycle: {busy}; the run \
-                         does not land a batch holding #{pr}, and the withdrawal is applied as \
-                         soon as the writer lock is free"
-                    );
+                    let request = intake::Request::Withdraw { pr, reason };
+                    let (entry, new) = intake::record(&state, request, &busy, "")?;
+                    if new {
+                        println!(
+                            "recorded the withdrawal of #{pr} for the next cycle: {busy}; the \
+                             run does not land a batch holding #{pr}, and the withdrawal is \
+                             applied as soon as the writer lock is free"
+                        );
+                    } else {
+                        println!(
+                            "already recorded the withdrawal of #{pr} at {}, not recorded \
+                             again: {busy}; the run does not land a batch holding #{pr}, and the \
+                             withdrawal is applied as soon as the writer lock is free",
+                            entry.recorded_at
+                        );
+                    }
                     return Ok(0);
                 }
             };
@@ -1510,11 +1534,20 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                         }
                     }
                     for pr in prs {
-                        intake::record(&state, intake::Request::Retry { pr }, &busy)?;
-                        println!(
-                            "recorded the retry of #{pr} for the next cycle: {busy}; it is \
-                             applied as soon as the writer lock is free"
-                        );
+                        let (entry, new) =
+                            intake::record(&state, intake::Request::Retry { pr }, &busy, "")?;
+                        if new {
+                            println!(
+                                "recorded the retry of #{pr} for the next cycle: {busy}; it is \
+                                 applied as soon as the writer lock is free"
+                            );
+                        } else {
+                            println!(
+                                "already recorded the retry of #{pr} at {}, not recorded again: \
+                                 {busy}; it is applied as soon as the writer lock is free",
+                                entry.recorded_at
+                            );
+                        }
                     }
                     return Ok(0);
                 }
@@ -1532,11 +1565,23 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 .into_iter()
                 .filter(|item| all || item.status == ItemStatus::Queued)
                 .collect();
+            // Requests recorded while a run held the writer lock are not in any item record yet.
+            let pending = intake::pending(&state);
             if json {
-                let text = serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?;
+                let mut rows = serde_json::to_value(&items).map_err(|e| e.to_string())?;
+                if let Some(rows) = rows.as_array_mut() {
+                    for request in &pending {
+                        rows.push(serde_json::to_value(request).map_err(|e| e.to_string())?);
+                    }
+                }
+                let text = serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?;
                 println!("{text}");
             } else if items.is_empty() {
-                println!("queue is empty");
+                if pending.is_empty() {
+                    println!("queue is empty");
+                } else {
+                    println!("no queued item records");
+                }
             } else {
                 println!(
                     "{:<8} {:<10} {:<8} {:<10} {:<10} TITLE",
@@ -1560,6 +1605,15 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                         tested,
                         item.title
                     );
+                }
+            }
+            if !json && !pending.is_empty() {
+                println!(
+                    "recorded while a run held the queue, applied as soon as the writer lock is \
+                     free:"
+                );
+                for request in &pending {
+                    println!("{}", request.line());
                 }
             }
             Ok(0)

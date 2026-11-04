@@ -1799,6 +1799,9 @@ pub fn render_status(report: &StatusReport) -> String {
              (oldest {})\n",
             intake.pending, intake.oldest_pending
         ));
+        for request in &intake.requests {
+            out.push_str(&format!("  {}\n", request.line()));
+        }
     }
     if intake.refused > 0 {
         out.push_str(&format!(

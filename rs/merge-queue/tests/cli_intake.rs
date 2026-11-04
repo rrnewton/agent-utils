@@ -97,14 +97,15 @@ fn wait_for(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-/// The change's item record, or `null` when it has none.
+/// The change's item record, or `null` when it has none (`list --json` shows waiting requests
+/// too, after the item records, as `pending-intake` rows).
 fn item(fx: &Fixture, pr: i64) -> Value {
     let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
     items
         .as_array()
         .unwrap()
         .iter()
-        .find(|i| i["pr"] == pr)
+        .find(|i| i["pr"] == pr && i["status"] != "pending-intake")
         .cloned()
         .unwrap_or(Value::Null)
 }
@@ -161,6 +162,9 @@ fn a_submission_while_a_run_validates_is_recorded_and_lands_after_it() {
     let out = fx.mq_ok(&["submit", "2", "--head", "b", "--prioritized"]);
     assert!(out.contains("recorded #2"), "{out}");
     assert_eq!(item(&fx, 2), Value::Null);
+    let rows = pending_rows(&fx);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["pr"], 2, "{rows:?}");
     let report = status_json(&fx);
     assert_eq!(report["intake"]["pending"], 1, "{report}");
     let text = fx.mq_ok(&["status"]);
@@ -307,4 +311,108 @@ fn a_recorded_request_that_cannot_be_applied_is_kept_with_its_reason() {
         text.contains("intake refused: 1 in the last week") && text.contains("submit #3"),
         "{text}"
     );
+}
+
+/// The waiting requests `list --json` shows after the item records.
+fn pending_rows(fx: &Fixture) -> Vec<Value> {
+    let rows: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    rows.as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["status"] == "pending-intake")
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_repeated_request_is_recorded_once_and_listed_as_pending_intake() {
+    let fx = queue("intake-repeat");
+    let head = fx.branch("a", &[("tests/a", "ok\n")]);
+    let lock = hold_writer_lock(&fx);
+    let out = fx.mq_ok(&["submit", "1", "--head", "a"]);
+    assert!(out.contains("recorded #1"), "{out}");
+    // The submitter cannot see the change in any item record yet, and asks again.
+    let out = fx.mq_ok(&["submit", "1", "--head", "a"]);
+    assert!(out.contains("already recorded #1 at"), "{out}");
+    assert_eq!(status_json(&fx)["intake"]["pending"], 1);
+    // `list` shows the waiting request, with the head the ref resolved to.
+    let text = fx.mq_ok(&["list"]);
+    assert!(
+        text.contains(&format!(
+            "#1 pending-intake: submit a at {} since",
+            &head[..10]
+        )),
+        "{text}"
+    );
+    let rows = pending_rows(&fx);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["pr"], 1, "{rows:?}");
+    assert_eq!(rows[0]["op"], "submit", "{rows:?}");
+    assert_eq!(rows[0]["head"], head.as_str(), "{rows:?}");
+    assert_eq!(rows[0]["requests"], 1, "{rows:?}");
+    let text = String::from_utf8_lossy(&fx.mq(&["status"]).stdout).into_owned();
+    assert!(text.contains("  #1 pending-intake: submit a at"), "{text}");
+    // A different request is recorded, and only the last one waiting counts as a repeat.
+    let out = fx.mq_ok(&["submit", "1", "--head", "a", "--priority", "5"]);
+    assert!(
+        out.contains("recorded #1") && !out.contains("already"),
+        "{out}"
+    );
+    let out = fx.mq_ok(&["submit", "1", "--head", "a", "--priority", "5"]);
+    assert!(out.contains("already recorded #1 at"), "{out}");
+    assert_eq!(status_json(&fx)["intake"]["pending"], 2);
+    drop(lock);
+    let out = fx.mq(&["run"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(status(&fx, 1), "landed");
+    assert_eq!(item(&fx, 1)["priority"], 5);
+    assert!(pending_rows(&fx).is_empty());
+}
+
+#[test]
+fn identical_requests_recorded_one_after_another_are_applied_once() {
+    let fx = queue("intake-fold");
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    let lock = hold_writer_lock(&fx);
+    let out = fx.mq_ok(&["submit", "1", "--head", "a"]);
+    assert!(out.contains("recorded #1"), "{out}");
+    // Two more copies, as two submitters recording at once (or an older version) leave them.
+    let pending = state_dir(&fx).join("intake").join("pending");
+    let first = std::fs::read_dir(&pending)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    for copy in ["zz-1.json", "zz-2.json"] {
+        std::fs::copy(&first, pending.join(copy)).unwrap();
+    }
+    assert_eq!(status_json(&fx)["intake"]["pending"], 3);
+    let rows = pending_rows(&fx);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["requests"], 3, "{rows:?}");
+    let text = fx.mq_ok(&["list"]);
+    assert!(
+        text.contains("(3 identical requests, the last at"),
+        "{text}"
+    );
+    drop(lock);
+    let out = fx.mq(&["run"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("applied submit #1 (and 2 identical request(s) recorded after it"),
+        "{stderr}"
+    );
+    assert_eq!(status(&fx, 1), "landed");
+    let submitted = history(&item(&fx, 1))
+        .into_iter()
+        .filter(|(kind, _)| kind == "submitted")
+        .count();
+    assert_eq!(submitted, 1);
+    assert_eq!(status_json(&fx)["intake"]["pending"], 0);
 }
