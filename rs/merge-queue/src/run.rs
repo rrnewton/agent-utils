@@ -67,6 +67,10 @@ pub struct RunOptions {
     /// The `serve` daemon running this run: once a drain of it is requested, the run finishes
     /// the validations in flight and starts no new one (see [`crate::drain`]).
     pub drain_pid: Option<u32>,
+    /// Where the run keeps the batches it is validating or deciding now, in order (the serve
+    /// heartbeat's window): what the run built, not the plan, which still names changes the
+    /// run skips.
+    pub window: Option<Arc<Mutex<Vec<Vec<i64>>>>>,
 }
 
 /// Donor validators for this run (offload `compare` or `decide`).
@@ -843,6 +847,13 @@ impl<'a> Runner<'a> {
 
     fn simulating(&self) -> bool {
         self.options.shadow || self.options.dry_run
+    }
+
+    /// Publish the batches being validated or decided now (see [`RunOptions::window`]).
+    fn publish_window(&self, batches: Vec<Vec<i64>>) {
+        if let Some(window) = &self.options.window {
+            *lock(window) = batches;
+        }
     }
 
     /// Whether the daemon running this run has been asked to drain (see [`crate::drain`]).
@@ -2781,6 +2792,12 @@ impl<'a> Runner<'a> {
             let mut full_loaded = false;
             let result = (|| -> Result<String, String> {
                 loop {
+                    self.publish_window(
+                        flights
+                            .iter()
+                            .map(|flight| flight.candidate.prs.clone())
+                            .collect(),
+                    );
                     // Need the completed plan before a later batch can be
                     // built. Joining here is where planning overlaps
                     // execution: any batch already in flight keeps
@@ -2852,6 +2869,12 @@ impl<'a> Runner<'a> {
                         });
                         started += 1;
                         lock(&self.report).windows.push(window);
+                        self.publish_window(
+                            flights
+                                .iter()
+                                .map(|flight| flight.candidate.prs.clone())
+                                .collect(),
+                        );
                     }
                     // The window still has room but only the first batch
                     // was at hand: finish the plan now (the batches in
@@ -2898,6 +2921,12 @@ impl<'a> Runner<'a> {
                         let Some(head) = flights.pop_front() else {
                             break;
                         };
+                        // The batch being decided stays in the window until it is decided.
+                        self.publish_window(
+                            std::iter::once(head.candidate.prs.clone())
+                                .chain(flights.iter().map(|flight| flight.candidate.prs.clone()))
+                                .collect(),
+                        );
                         let (vid, ran) = head
                             .result
                             .unwrap_or_else(|| Err("missing result".to_owned()))?;

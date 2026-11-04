@@ -28,7 +28,7 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
@@ -844,16 +844,26 @@ fn lock_heartbeat(shared: &Mutex<Heartbeat>) -> std::sync::MutexGuard<'_, Heartb
 /// Keep the heartbeat fresh until `done`. Writes happen under the mutex, so
 /// they never interleave with the work cycle's own heartbeat writes (which
 /// share one temporary file name per process).
-fn refresh_heartbeat(state: &State, shared: &Mutex<Heartbeat>, done: &AtomicBool) {
+fn refresh_heartbeat(
+    state: &State,
+    shared: &Mutex<Heartbeat>,
+    done: &AtomicBool,
+    window: &Mutex<Vec<Vec<i64>>>,
+) {
     let mut last = Instant::now();
     while !done.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(50));
         if last.elapsed() >= HEARTBEAT_REFRESH && !done.load(Ordering::SeqCst) {
             last = Instant::now();
             let (total, in_use) = slot_occupancy(state);
+            let batches = window
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
             let mut heartbeat = lock_heartbeat(shared);
             heartbeat.slots_total = total;
             heartbeat.slots_in_use = in_use;
+            heartbeat.active_batches = batches;
             heartbeat.touch();
             let _ = write_heartbeat(state, &heartbeat);
         }
@@ -864,18 +874,12 @@ fn refresh_heartbeat(state: &State, shared: &Mutex<Heartbeat>, done: &AtomicBool
 /// was clean; a failure is recorded in the heartbeat's `last_error`.
 fn run_cycle(
     state: &State,
-    config: &Config,
     options: &ServeOptions,
     shared: &Mutex<Heartbeat>,
+    window: &Arc<Mutex<Vec<Vec<i64>>>>,
 ) -> bool {
-    // Show the planned window in the heartbeat; the Runner replans
-    // internally, this is a status peek only.
-    if let Ok(plan) = ops::plan(state, config, options.max_batch.unwrap_or(config.max_batch)) {
-        let mut heartbeat = lock_heartbeat(shared);
-        heartbeat.active_batches = plan.batches.iter().map(|b| b.prs.clone()).collect();
-        heartbeat.touch();
-        let _ = write_heartbeat(state, &heartbeat);
-    }
+    // The heartbeat's window is what the run publishes as it builds and decides batches (see
+    // `refresh_heartbeat`), never the plan: a change the run skips at construction is not in it.
     let run_options = RunOptions {
         shadow: options.shadow,
         depth: options.depth,
@@ -883,6 +887,7 @@ fn run_cycle(
         quiet: true,
         offload: options.offload.clone(),
         drain_pid: Some(std::process::id()),
+        window: Some(Arc::clone(window)),
         ..RunOptions::default()
     };
     let outcome = Runner::new(state, run_options)
@@ -979,12 +984,7 @@ fn clear_busy_error(heartbeat: &mut Heartbeat, busy_error: &mut String) {
 }
 
 /// Run one work cycle with the heartbeat kept fresh by a helper thread.
-fn work_cycle(
-    state: &State,
-    config: &Config,
-    options: &ServeOptions,
-    heartbeat: &mut Heartbeat,
-) -> bool {
+fn work_cycle(state: &State, options: &ServeOptions, heartbeat: &mut Heartbeat) -> bool {
     heartbeat.state = "working".to_owned();
     heartbeat.working_since = now();
     heartbeat.working_since_unix = unix_now();
@@ -992,10 +992,11 @@ fn work_cycle(
     let _ = write_heartbeat(state, heartbeat);
     let shared = Mutex::new(heartbeat.clone());
     let done = AtomicBool::new(false);
+    let window = Arc::new(Mutex::new(Vec::new()));
     let clean = std::thread::scope(|scope| {
-        scope.spawn(|| refresh_heartbeat(state, &shared, &done));
+        scope.spawn(|| refresh_heartbeat(state, &shared, &done, &window));
         let _stop = SetOnDrop(&done);
-        run_cycle(state, config, options, &shared)
+        run_cycle(state, options, &shared, &window)
     });
     *heartbeat = shared.into_inner().unwrap_or_else(PoisonError::into_inner);
     heartbeat.state = "idle".to_owned();
@@ -1330,7 +1331,7 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
                                         retry_seen.clone_from(due);
                                     }
                                 }
-                                if work_cycle(state, &config, options, &mut heartbeat) {
+                                if work_cycle(state, options, &mut heartbeat) {
                                     heartbeat.failed_cycles = 0;
                                     failure_retry = None;
                                 } else {

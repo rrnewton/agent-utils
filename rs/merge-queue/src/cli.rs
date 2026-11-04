@@ -1614,6 +1614,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     offload,
                     // A drain is for the serve daemon; a one-shot run never drains.
                     drain_pid: None,
+                    // A one-shot run reports its own progress; no heartbeat shows a window.
+                    window: None,
                 },
             )?;
             let report = runner.run()?;

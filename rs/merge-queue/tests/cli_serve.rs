@@ -847,3 +847,52 @@ fn status_counts_a_slot_and_a_batch_only_while_a_validation_runs() {
     );
     daemon.stop();
 }
+
+#[test]
+fn status_names_only_the_batches_the_run_builds() {
+    // #1's pins cannot be recounted, so the run skips it while building the batch: the window
+    // shows #2 alone, not the plan's #1 and #2.
+    let fx = Fixture::new("status-built-window");
+    let pin = "ci/manifest-plan/src/validation_dag_static.rs";
+    let pins = |alpha: u64| {
+        format!("pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[\n    (\"test.alpha\", {alpha}),\n];\n")
+    };
+    fx.write(pin, &pins(10));
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    let gate = fx.root.join("gate");
+    let validator = format!(
+        "i=0; while [ ! -e '{gate}' ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; [ -e '{gate}' ]",
+        gate = gate.display()
+    );
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        &validator,
+        "--recount-pins",
+    ]);
+    // A second occurrence of the pin: no (name, occurrence) match, so it cannot be recounted.
+    let doubled = "pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[\n    (\"test.alpha\", 11),\n    (\"test.alpha\", 1),\n];\n";
+    fx.branch("bad", &[(pin, doubled), ("tests/bad", "ok\n")]);
+    fx.branch("good", &[("tests/good", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "bad"]);
+    fx.mq_ok(&["submit", "2", "--head", "good"]);
+    let daemon = Daemon::start(&fx);
+    wait_for("a validation in a slot", Duration::from_secs(30), || {
+        status_json(&fx)["slots_in_use"] == 1
+    });
+    wait_for("the window the run built", Duration::from_secs(5), || {
+        status_json(&fx)["active_batches"] == serde_json::json!([[2]])
+    });
+    std::fs::write(&gate, "").unwrap();
+    wait_for("landing", Duration::from_secs(30), || {
+        item_status(&fx, 2) == "landed"
+    });
+    assert_eq!(item_status(&fx, 1), "queued");
+    daemon.stop();
+}

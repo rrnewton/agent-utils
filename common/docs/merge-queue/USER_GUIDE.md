@@ -399,8 +399,9 @@ unreadable). A daemon in a work cycle is reported as `working for N s` (JSON `wo
 separately from liveness; with a fresh heartbeat it is `running` and no kill is advised. An
 unreadable item record makes `status` unhealthy (JSON `items_error`, exit 1) instead of
 counting zero queued changes. Every unhealthy verdict names its remedy. The window is the
-batches a live daemon's heartbeat names: none while it idles, and none when no daemon is
-running (a `run` started by hand reports its own progress). Slots count the `scratch/slot-*`
+batches a live daemon's heartbeat names: the batches its run built and is validating or deciding
+(a change the run skipped while building a batch is not among them), none while it idles, and
+none when no daemon is running (a `run` started by hand reports its own progress). Slots count the `scratch/slot-*`
 checkouts; one is in use only while a validation holds its `scratch/slot-<n>.lock`, since every
 slot keeps its checkout between validations. A failed attempt to take the writer lock shows as
 the daemon's last error until the daemon gets the lock or has nothing queued. Requests recorded
