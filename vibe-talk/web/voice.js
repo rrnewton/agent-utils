@@ -12190,7 +12190,8 @@ function rememberChannelDraft() {
   if (!composerState().key) return;
   const text = el("channel-compose-text").value;
   const before = channelDrafts.get(composerState().key) || "";
-  if (text) channelDrafts.set(composerState().key, text);
+  // `#846 draft-chip-honest`. Blank words are no draft, and are not kept.
+  if (text.trim()) channelDrafts.set(composerState().key, text);
   else channelDrafts.delete(composerState().key);
   if (!saveChannelDrafts()) {
     el("channel-compose-state").textContent = CHANNEL_DRAFT_REFUSED;
@@ -25659,10 +25660,53 @@ function draftsHere() {
   return [...known, ...more];
 }
 
-/** The chip: up while the channel on screen holds a draft, saying how many where there are several. */
+/**
+ * Whether `node` is shown, drawn, and — given the list `area` it scrolls in — has any of itself inside what
+ * that list shows. Where the page cannot measure, shown is on screen.
+ *
+ * @param {HTMLElement} node
+ * @param {HTMLElement | null} area
+ */
+function inSight(node, area) {
+  if (!shownNode(node)) return false;
+  if (typeof node.getClientRects === "function" && node.getClientRects().length === 0) return false;
+  if (!area || typeof node.getBoundingClientRect !== "function" || typeof area.getBoundingClientRect !== "function") return true;
+  const box = node.getBoundingClientRect();
+  const frame = area.getBoundingClientRect();
+  return box.bottom > frame.top && box.top < frame.bottom;
+}
+
+/**
+ * `#846 draft-chip-honest`. Whether `draft`'s own box is on screen: the box at a column's foot that holds it,
+ * its reply open in the stream and scrolled into view, or its quick reply open. The owner: "Our draft button
+ * pops up even when the composer is on the screen. It should just be for jumping to it when off screen".
+ *
+ * @param {import("./src/core/outbox/index.ts").DraftEntry} draft
+ */
+function draftOnScreen(draft) {
+  if (draft.kind === "composer") {
+    return [columns.main, ...(sideShowing() ? [columns.side] : [])].some((column) => column.composer.key === draft.key &&
+      inColumn(column, () => inSight(el("channel-compose-text"), null)));
+  }
+  if (draft.kind === "reply") {
+    return Boolean(replyState.docked && replyState.target && String(replyState.target.id) === draft.key) &&
+      inSight(el("reply-text"), replyState.column ? inColumn(replyState.column, () => el("scroll-area")) : null);
+  }
+  return quoteOwner.quickReplyOpenKey() === draft.key;
+}
+
+/** The channel on screen's drafts whose box is not on screen, newest first: what the chip jumps to. */
+function draftsOffScreen() {
+  return draftsHere().filter((draft) => !draftOnScreen(draft));
+}
+
+/**
+ * The chip: up while the channel on screen holds a draft whose box is off screen, saying how many where
+ * there are several (`#846 draft-chip-honest`).
+ */
 function renderDraftChip() {
   const chip = leftEl("draft-chip");
-  const count = draftsHere().length;
+  const count = draftsOffScreen().length;
   const hidden = count === 0;
   if (chip.hidden !== hidden) chip.hidden = hidden;
   setTextIfChanged(leftEl("draft-chip-label"), count > 1 ? `Drafts (${count})` : "Draft");
@@ -25787,13 +25831,14 @@ async function pressDraftChip() {
   // A quick reply open is put away, its words kept as its draft (not put down into the stream as a tap
   // elsewhere would): the chip goes on from it to the next.
   if (quoteOwner.quickReplyOpen()) closeQuickReply();
-  const drafts = draftsHere();
-  if (drafts.length === 0) {
+  // `#846 draft-chip-honest`. Only the drafts off screen, in their round among them all: the one just opened,
+  // on screen now, is passed over, and the next tap goes on from it rather than back to the newest.
+  const next = draftRound.next(draftsHere(), String(selectedChannelId() || ""), (draft) => !draftOnScreen(draft));
+  if (!next) {
     renderDraftChip();
     return;
   }
-  const next = draftRound.next(drafts, String(selectedChannelId() || ""));
-  if (next) await openDraft(next);
+  await openDraft(next);
 }
 
 // --- quoting part of a message in the reply to it ------------------------------------------------
@@ -25817,8 +25862,46 @@ const quoteOwner = createQuoting({
   noteDraft: (key, channel, written) => noteDraft("quick", key, channel, written),
   // `#821 voice-page-read-aloud-react`. The microphone stops whenever the box closes: Send, Cancel, Esc, a tap
   // elsewhere, another reply.
-  closed: () => dictation.stop(),
+  closed: () => {
+    dictation.stop();
+    // `#846 draft-chip-honest`. A question left unanswered goes with the box, and its draft is off screen now.
+    setHiddenIfChanged(leftEl("quick-reply-discard"), true);
+    renderDraftChip();
+  },
+  opened: () => {
+    setHiddenIfChanged(leftEl("quick-reply-discard"), true);
+    renderDraftChip();
+  },
 });
+
+/**
+ * `#846 draft-chip-honest`. Cancel on the quick reply: with words in it, "Discard this draft?" first; with
+ * none, it closes at once. Esc and a tap elsewhere keep the words, as before.
+ */
+function cancelQuickReply() {
+  if (!el("quick-reply-text").value.trim()) {
+    closeQuickReply();
+    return;
+  }
+  setHiddenIfChanged(leftEl("quick-reply-discard"), false);
+  leftEl("quick-reply-discard-no").focus({ preventScroll: true });
+}
+
+/**
+ * The quick reply's answer to "Discard this draft?": Yes empties it and closes it, its draft gone from the
+ * device and the Draft chip; No leaves it open, focused.
+ *
+ * @param {boolean} discard
+ */
+function answerQuickReplyDiscard(discard) {
+  setHiddenIfChanged(leftEl("quick-reply-discard"), true);
+  if (!discard) {
+    if (quoteOwner.quickReplyOpen()) leftEl("quick-reply-text").focus({ preventScroll: true });
+    return;
+  }
+  el("quick-reply-text").value = "";
+  closeQuickReply();
+}
 const {
   noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip, quickReplyHolds,
   quickReplyListMoved, placeQuickReply, closeQuickReply, putDownQuickReply, sendQuickReply,
@@ -25918,8 +26001,11 @@ function openReply(messages, from = null, quote = "", focus = true) {
   // Where it posts is said first: the line it takes is part of the box's height, and the room left
   // over the box is what the row answered is kept in view in.
   renderReplyDestination();
+  setHiddenIfChanged(el("reply-discard"), true);
   dockReply(from);
   fitGrowingBox(el("reply-text"));
+  // `#846 draft-chip-honest`. Its draft is on screen now, and the box at the foot stands aside for it.
+  renderDraftChip();
   if (!focus) return;
   // The box came up to be written in: it takes the focus, the caret under a quote or after a draft.
   // Without moving either list, which has rules of its own about where the reader is.
@@ -25962,7 +26048,45 @@ function closeReply(how = {}) {
   rememberDraft();
   const id = replyState.target ? String(replyState.target.id) : null;
   replyState.target = null;
+  setHiddenIfChanged(el("reply-discard"), true);
   if (replyState.docked && id !== null) leaveDockedReply(id, { restore, refocus });
+  // `#846 draft-chip-honest`. The draft is off screen now, and the box at the foot back.
+  renderDraftChip();
+}
+
+/**
+ * `#846 draft-chip-honest`. Cancel: put the reply away. With words it would keep as a draft, it asks first,
+ * "Discard this draft?", under the box (`answerReplyDiscard`); with none, it goes at once. Esc and Back keep
+ * the words (`closeReply`). The owner: Cancel asks, "and Yes really deletes it".
+ */
+function cancelReply() {
+  const text = el("reply-text").value;
+  // What putting it away would keep: a quote put in and left as it was keeps the draft from before it.
+  const kept = replyState.quote && text === replyState.quote.opened ? replyState.quote.draft : text;
+  if (!replyState.target || !kept.trim()) {
+    closeReply();
+    return;
+  }
+  setHiddenIfChanged(el("reply-discard"), false);
+  el("reply-discard-no").focus({ preventScroll: true });
+}
+
+/**
+ * The answer to "Discard this draft?": Yes empties the box and puts the reply away, so the draft is gone from
+ * the page and the device (`rememberDraft`), its row's Draft mark and the Draft chip's count with it; No
+ * leaves the box open as it was, focused.
+ *
+ * @param {boolean} discard
+ */
+function answerReplyDiscard(discard) {
+  setHiddenIfChanged(el("reply-discard"), true);
+  if (!discard) {
+    if (replyState.target) el("reply-text").focus({ preventScroll: true });
+    return;
+  }
+  replyState.quote = null;
+  el("reply-text").value = "";
+  closeReply();
 }
 
 /** Hand the captured target and text to the same durable outbox as the normal composer. */
@@ -32820,7 +32944,9 @@ leftEl("read-steer-quote").addEventListener("click", pressSelectionChip);
 // `#727 vt-selection-quick-reply`. The floating box: its keys, Send and Cancel, a tap outside (which puts
 // what was written back under its message: `putDownQuickReply`), and the list the reader moves letting it go.
 el("quick-reply-send").addEventListener("click", () => guardQuietly(sendQuickReply)());
-el("quick-reply-cancel").addEventListener("click", () => closeQuickReply());
+el("quick-reply-cancel").addEventListener("click", () => cancelQuickReply());
+el("quick-reply-discard-yes").addEventListener("click", () => answerQuickReplyDiscard(true));
+el("quick-reply-discard-no").addEventListener("click", () => answerQuickReplyDiscard(false));
 el("quick-reply-text").addEventListener("keydown", (event) => {
   if (event && event.key === "Escape") {
     event.preventDefault();
@@ -33390,7 +33516,18 @@ whoIsWho.load();
 identityList.render();
 renderChannelRows();
 for (const [key, box] of NEWLINE_KEYS) wireNewlineKey(leftEl(key), leftEl(box));
-el("reply-cancel").addEventListener("click", () => closeReply());
+el("reply-cancel").addEventListener("click", () => cancelReply());
+el("reply-discard-yes").addEventListener("click", () => answerReplyDiscard(true));
+el("reply-discard-no").addEventListener("click", () => answerReplyDiscard(false));
+// `#846 draft-chip-honest`. A reply open in the stream scrolls on and off screen with its list: the chip
+// follows, once a frame.
+const draftChipFrame = createOncePerFrame(() => renderDraftChip(),
+  () => (typeof requestAnimationFrame === "function" ? requestAnimationFrame : null));
+for (const id of ["scroll-area", "side-scroll"]) {
+  leftEl(id).addEventListener("scroll", () => {
+    if (replyState.docked) draftChipFrame.ask();
+  }, { passive: true });
+}
 el("reply-send").addEventListener("click", guardQuietly(sendReply));
 // `#225 enter-to-send`. The box that had no Enter handler at all, so the one the owner had to reach
 // for the mouse in.

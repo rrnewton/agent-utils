@@ -371,6 +371,9 @@ def phone_walk(desk: Desk) -> None:
     desk.notes.append(f"the message being answered at {number(before, 'top'):.1f}px, {number(up, 'top'):.1f}px with the "
                       f"keyboard up (its reply's box whole above the keys), {number(down, 'top'):.1f}px after")
     page.click("#reply-cancel")
+    # `#846 draft-chip-honest`: Cancel on words asks first; Esc on the question puts the reply down, words kept.
+    if page.is_visible("#reply-discard"):
+        page.keyboard.press("Escape")
     desk.wait_for("() => document.getElementById('column-reply').hidden", "Cancel did not put the reply away")
 
     # Read on, then the keyboard: one slim row holding Stop, and nothing else of either bar.

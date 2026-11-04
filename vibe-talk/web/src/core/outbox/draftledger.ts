@@ -112,20 +112,26 @@ export interface DraftRound {
   /**
    * The draft a tap goes to among `drafts` (newest first) in channel `channel`: the one after the last it went
    * to there, round to the newest again; the newest where it last went elsewhere, or to a draft gone since.
+   * `offers` (`#846 draft-chip-honest`) passes over the drafts the chip does not offer — those on screen —
+   * without losing the round's place among them all; null when it offers none.
    */
-  next<Entry extends { readonly kind: DraftKind; readonly key: string }>(drafts: readonly Entry[], channel: string): Entry | null;
+  next<Entry extends { readonly kind: DraftKind; readonly key: string }>(
+    drafts: readonly Entry[], channel: string, offers?: (draft: Entry) => boolean): Entry | null;
 }
 
 /** Gone nowhere yet. */
 export function createDraftRound(): DraftRound {
   let last = { channel: "", draft: "" };
   return {
-    next(drafts, channel) {
-      if (drafts.length === 0) return null;
+    next(drafts, channel, offers = () => true) {
       const at = last.channel === channel ? drafts.findIndex((draft) => draftIdentity(draft) === last.draft) : -1;
-      const next = drafts[(at + 1) % drafts.length]!;
-      last = { channel, draft: draftIdentity(next) };
-      return next;
+      for (let step = 1; step <= drafts.length; step += 1) {
+        const next = drafts[(at + step) % drafts.length]!;
+        if (!offers(next)) continue;
+        last = { channel, draft: draftIdentity(next) };
+        return next;
+      }
+      return null;
     },
   };
 }

@@ -27,7 +27,7 @@ import { ALICE, BASE_CSS, CHANNEL, CODER, CSS, CSS_CODE, DESKTOP_QUERY, DISCORD_
   sourceString, splitPost, sseDelete, sseMessage, stackPlaces, startTalking, statusText, storedPin,
   tagOf, takesASide, tallColumns, tapArrow, test, threadBadge, threadButton, threadData,
   threadOptions, threadPage, timelineReads, tokenValues, turnSummariesOn, turnTodoOn,
-  twoColumnServer, twoColumns, unpackedRow, withLiveChannel, wordsIn } from "./fixture.mjs";
+  putReplyDown, twoColumnServer, twoColumns, unpackedRow, withLiveChannel, wordsIn } from "./fixture.mjs";
 
 const REPLY_LANDED_MS = sourceConstant("REPLY_LANDED_MS");
 
@@ -2521,7 +2521,7 @@ test("`#193 compose-draft-loss`: Edit on a failed reply opens Reply on the messa
   // A second thought on the same question, left as a draft.
   await openReplyOn(page, messages);
   await page.el("reply-text").setValue("and a second thought");
-  await page.el("reply-cancel").click();
+  await putReplyDown(page);
 
   await outgoingEdit(outgoingRows(page)[0]).click();
   await page.settle();
@@ -4304,14 +4304,14 @@ test("`#727 vt-selection-quick-reply`: a tap outside puts what was written back 
     assert.equal(page.el("quick-reply-text").value, "", `${where}: the draft was kept in the box as well`);
     await page.el("quick-reply-cancel").click();
     // Put down, the reply keeps it as the message's draft, and Reply brings it back.
-    await page.el("reply-cancel").click();
+    await putReplyDown(page);
     await page.settle();
     assert.equal(page.el("column-reply").hidden, true);
     await page.documentEvent("pointerdown", { target: rowWithId(page, "1000000000000000002") });
     await replyButton(rowWithId(page, QUICK_LONG)).click();
     await page.settle();
     assert.equal(page.el("reply-text").value, `> ${QUICK_SENTENCES[3]}\n\nhalf a thought`, `${where}: the draft was not kept`);
-    await page.el("reply-cancel").click();
+    await putReplyDown(page);
     // A draft the message had already stays, after the one put down.
     await quickReplyTo(page, 5);
     await page.el("quick-reply-text").setValue("and another");
@@ -4337,7 +4337,7 @@ test("`#727 vt-selection-quick-reply`: replies to several sentences in a row, ea
   assert.equal(page.repliesPosted.length, 3);
 });
 
-test("`#727 vt-selection-quick-reply`: Esc or Cancel closes the box, keeping what was written for the same words", async () => {
+test("`#727 vt-selection-quick-reply`: Esc closes the box, keeping what was written for the same words; Cancel on words asks first (#846 draft-chip-honest)", async () => {
   const page = await quickPage();
   const area = page.el("scroll-area");
   const top = area.scrollTop;
@@ -4350,13 +4350,26 @@ test("`#727 vt-selection-quick-reply`: Esc or Cancel closes the box, keeping wha
   // The same words again: the draft is back. Other words: an empty box.
   await quickReplyTo(page, 3);
   assert.equal(page.el("quick-reply-text").value, "half a thought", "the draft for the same words was lost");
+  // `#846 draft-chip-honest`. Cancel on words asks; No leaves the box as it was, its words in it.
   await page.el("quick-reply-cancel").click();
-  assert.equal(page.el("quick-reply").hidden, true, "Cancel did not close the box");
+  assert.equal(page.el("quick-reply").hidden, false, "Cancel on words closed the box without asking");
+  assert.equal(page.el("quick-reply-discard").hidden, false, "Cancel on words did not ask");
+  assert.equal(page.el("quick-reply-discard-text").textContent, "Discard this draft?");
+  assert.equal(focused(page), page.el("quick-reply-discard-no"), "the question did not take the focus on No");
+  await page.el("quick-reply-discard-no").click();
+  assert.equal(page.el("quick-reply-discard").hidden, true, "No left the question up");
+  assert.equal(page.el("quick-reply").hidden, false, "No closed the box");
+  assert.equal(page.el("quick-reply-text").value, "half a thought", "No touched the words");
+  assert.equal(focused(page), page.el("quick-reply-text"), "No did not give the box back the focus");
+  await press(page, page.el("quick-reply-text"), "Escape");
+  // Nothing written: Cancel closes at once.
   await quickReplyTo(page, 9);
   assert.equal(page.el("quick-reply-text").value, "", "another sentence's box opened with a draft");
   await page.el("quick-reply-cancel").click();
+  assert.equal(page.el("quick-reply").hidden, true, "Cancel on an empty box did not close it");
+  assert.equal(page.el("quick-reply-discard").hidden, true, "Cancel on an empty box asked");
   await quickReplyTo(page, 3);
-  assert.equal(page.el("quick-reply-text").value, "half a thought", "Cancel lost the draft");
+  assert.equal(page.el("quick-reply-text").value, "half a thought", "No, or Esc after it, lost the draft");
   // A tap inside the box is not outside.
   await page.documentEvent("pointerdown", { target: page.el("quick-reply-text") });
   assert.equal(page.el("quick-reply").hidden, false, "a tap in the box closed it");
@@ -4956,7 +4969,7 @@ test("`#277 reply-in-column`: Escape on the other column's list does what it doe
 /** A page that opens the reply's box in the stream and leaves the column's own box drawn beside it. */
 const TWO_BOXES = ['  for (const id of ["channel-composer", "side-composer"]) leftEl(id).hidden = true;\n', ""];
 
-test("`#410 inline-reply-editor`: in one column Reply opens the box in the list under the message, the channel's box hidden; Cancel brings that box back, each draft kept where it was", async () => {
+test("`#410 inline-reply-editor`: in one column Reply opens the box in the list under the message, the channel's box hidden; putting it down brings that box back, each draft kept where it was", async () => {
   const page = await scatteredPage();
   await page.el("channel-compose-text").setValue("for the whole channel");
   await page.el("channel-compose-text").dispatch("input", {});
@@ -4978,11 +4991,12 @@ test("`#410 inline-reply-editor`: in one column Reply opens the box in the list 
   assert.equal(focused(page), page.el("reply-text"), `the box did not take the focus; ${focusName(page)} has it`);
   await page.el("reply-text").setValue("half a thought");
   await page.el("reply-text").dispatch("input", {});
-  await page.el("reply-cancel").click();
-  assert.equal(replyBoxAt(page), "closed", "Cancel left the box in the list");
+  // `#846 draft-chip-honest`: put down as Esc puts it, keeping the words (Cancel on words asks to discard them).
+  await putReplyDown(page);
+  assert.equal(replyBoxAt(page), "closed", "putting the reply down left the box in the list");
   assert.equal(page.el("column-reply").hidden, true);
-  assert.equal(page.el("channel-composer").hidden, false, "Cancel did not bring the channel's box back");
-  assert.deepStrictEqual(inlineAnchors(page), [], "Cancel left a row keeping room for a box");
+  assert.equal(page.el("channel-composer").hidden, false, "putting the reply down did not bring the channel's box back");
+  assert.deepStrictEqual(inlineAnchors(page), [], "putting the reply down left a row keeping room for a box");
   assert.equal(draftMarkerOf(rowWithId(page, "600")).hidden, false, "the reply's words were not kept as its draft");
   assert.equal(page.el("channel-compose-text").value, "for the whole channel", "the channel's draft was touched");
   assert.equal(area.scrollTop, before, "putting the reply down moved the list");
@@ -5600,4 +5614,105 @@ test("`#467 inline-send-in-place`: the row is drawn straight after the list, and
   await page.el("pinned-filter").click();
   await page.settle();
   assert.equal(inPlaceRows(page).length, 1, "the reply's row did not come back with the list");
+});
+
+test("`#846 draft-chip-honest`: blank words are no draft, and the Draft chip stays down while the box holding a draft is on screen", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "9460", content: "a message" }), message({ id: "9461", content: "another" })]);
+  const box = page.el("channel-compose-text");
+  const kept = () => Object.values(JSON.parse(page.storage.get("vibe-talk.channel-drafts") || "{}"));
+  await box.setValue("   \n ");
+  await box.dispatch("input", {});
+  assert.deepStrictEqual(kept(), [], "blank words were kept as a draft");
+  assert.equal(page.el("draft-chip").hidden, true, "blank words raised the chip");
+  await box.setValue("a real draft");
+  await box.dispatch("input", {});
+  assert.deepStrictEqual(kept(), ["a real draft"]);
+  // The owner: "Our draft button pops up even when the composer is on the screen."
+  assert.equal(page.el("draft-chip").hidden, true, "the chip is up while the box holding the draft is on screen");
+  // A reply opened in the stream: the box at the foot stands aside, its draft off screen, and the chip offers it.
+  await replyButton(rowOf(page, "9460")).click();
+  assert.equal(page.el("channel-composer").hidden, true, "fixture: the box at the foot is still drawn");
+  assert.equal(page.el("draft-chip").hidden, false, "the chip is down with the box's draft off screen");
+  assert.equal(page.el("draft-chip-label").textContent, "Draft");
+  // The reply's own words, in the box on screen, are not offered while it is.
+  await page.el("reply-text").setValue("an answer");
+  await page.el("reply-text").dispatch("input", {});
+  assert.equal(page.el("draft-chip-label").textContent, "Draft", "the reply on screen was counted");
+  // Put down, the reply's draft is off screen and offered, and the box at the foot is back on screen.
+  await putReplyDown(page);
+  assert.equal(page.el("channel-composer").hidden, false);
+  assert.equal(page.el("draft-chip").hidden, false, "the reply's draft, put down, is not offered");
+  assert.equal(page.el("draft-chip-label").textContent, "Draft", "the box on screen was counted again");
+  // The chip goes to the reply, which is on screen then, and the box's draft, still on screen, is not counted.
+  await page.el("draft-chip").click();
+  await page.settle();
+  assert.ok(replyInStream(page), "the chip did not open the reply's draft");
+  assert.equal(page.el("draft-chip-label").textContent, "Draft", "the chip counts the reply it just opened");
+});
+
+test("`#846 draft-chip-honest`: Cancel on a reply's words asks \"Discard this draft?\"; No keeps it, Yes deletes it from the page and the device", async () => {
+  const page = newPage();
+  await signIn(page);
+  const messages = [message({ id: "9470", content: "answer me" }), message({ id: "9471", content: "or me" })];
+  await showDiscord(page, messages);
+  await replyButton(rowOf(page, "9470")).click();
+  await page.el("reply-text").setValue("words to lose");
+  await page.el("reply-text").dispatch("input", {});
+  await page.el("reply-cancel").click();
+  assert.ok(replyInStream(page), "Cancel on words put the reply down without asking");
+  assert.equal(page.el("reply-discard").hidden, false, "Cancel on words did not ask");
+  assert.equal(page.el("reply-discard-text").textContent, "Discard this draft?");
+  assert.equal(focused(page), page.el("reply-discard-no"), "the question did not take the focus on No");
+  await page.el("reply-discard-no").click();
+  assert.equal(page.el("reply-discard").hidden, true, "No left the question up");
+  assert.ok(replyInStream(page), "No put the reply down");
+  assert.equal(page.el("reply-text").value, "words to lose", "No touched the words");
+  assert.equal(focused(page), page.el("reply-text"), "No did not give the box back the focus");
+  // Put down as Esc puts it, the words are a draft: on the device, on the row, and offered by the chip.
+  await putReplyDown(page);
+  assert.equal(JSON.parse(page.storage.get("vibe-talk.voice.drafts"))["9470"], "words to lose");
+  assert.equal(draftMarkerOf(rowOf(page, "9470")).hidden, false);
+  assert.equal(page.el("draft-chip").hidden, false);
+  // Cancel, then Yes: gone from all three, at once.
+  await draftMarkerOf(rowOf(page, "9470")).click();
+  assert.equal(page.el("reply-text").value, "words to lose");
+  await page.el("reply-cancel").click();
+  await page.el("reply-discard-yes").click();
+  assert.ok(!replyInStream(page), "Yes left the reply open");
+  assert.equal(page.el("reply-discard").hidden, true);
+  assert.equal(JSON.parse(page.storage.get("vibe-talk.voice.drafts") || "{}")["9470"], undefined, "the device kept the discarded draft");
+  assert.equal(draftMarkerOf(rowOf(page, "9470")).hidden, true, "the row still says Draft");
+  assert.equal(page.el("draft-chip").hidden, true, "the chip still counts the discarded draft");
+  // A reload finds nothing, and Cancel on an empty box puts it down at once.
+  const reloaded = reloadWith(new Map(page.storage), messages);
+  await signIn(reloaded);
+  await reopenedChannel(reloaded);
+  assert.equal(draftMarkerOf(rowOf(reloaded, "9470")).hidden, true, "the discarded draft's mark came back after a reload");
+  await replyButton(rowOf(reloaded, "9470")).click();
+  assert.equal(reloaded.el("reply-text").value, "", "the discarded draft came back after a reload");
+  await reloaded.el("reply-cancel").click();
+  assert.ok(!replyInStream(reloaded), "Cancel on an empty box did not put it down");
+  assert.equal(reloaded.el("reply-discard").hidden, true, "Cancel on an empty box asked");
+});
+
+test("`#846 draft-chip-honest`: Yes to the quick reply's question throws its words away, from the device too", async () => {
+  const page = await quickPage();
+  await quickReplyTo(page, 3);
+  await page.el("quick-reply-text").setValue("not worth keeping");
+  await press(page, page.el("quick-reply-text"), "Escape");
+  const kept = () => Object.values(JSON.parse(page.storage.get("vibe-talk.quick-reply-drafts") || "{}"));
+  assert.deepStrictEqual(kept(), ["not worth keeping"], "fixture: Esc did not keep the quick reply's words");
+  assert.equal(page.el("draft-chip").hidden, false, "the closed quick reply's draft is not offered");
+  await quickReplyTo(page, 3);
+  assert.equal(page.el("draft-chip").hidden, true, "the open quick reply's own draft is offered");
+  await page.el("quick-reply-cancel").click();
+  await page.el("quick-reply-discard-yes").click();
+  assert.equal(page.el("quick-reply").hidden, true, "Yes left the box open");
+  assert.equal(page.el("quick-reply-discard").hidden, true);
+  assert.deepStrictEqual(kept(), [], "the device kept the discarded words");
+  assert.equal(page.el("draft-chip").hidden, true, "the chip still counts the discarded draft");
+  await quickReplyTo(page, 3);
+  assert.equal(page.el("quick-reply-text").value, "", "the discarded words came back for the same words");
 });

@@ -669,6 +669,9 @@ def held_send_key(walk: Walk, api: FakeApi) -> None:
     check(walk.page.evaluate("() => !document.getElementById('column-reply').hidden"), "a held Ctrl+Enter put the reply away")
     walk.shot("held-ctrl-enter-on-reply")
     walk.page.click("#reply-cancel")
+    # `#846 draft-chip-honest`: Cancel on words asks first; Esc on the question puts the reply down, words kept.
+    if walk.page.is_visible("#reply-discard"):
+        walk.page.keyboard.press("Escape")
     walk.page.wait_for_function("() => document.getElementById('column-reply').hidden")
     walk.notes.append("a held Ctrl+Enter (one press, three auto-repeats) went to the box from the list and from "
                       "Reply, and sent neither draft")

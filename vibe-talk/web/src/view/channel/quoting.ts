@@ -199,6 +199,8 @@ export interface QuotingDependencies {
   noteDraft(key: string, channel: string, written: boolean): void;
   /** `#821 voice-page-read-aloud-react`. The box has closed, however it did: whatever listens into it stops. */
   closed(): void;
+  /** `#846 draft-chip-honest`. The box has opened on a message's words, its draft on screen. */
+  opened?(): void;
 }
 
 /** The quoting owner's commands. */
@@ -221,6 +223,8 @@ export interface Quoting {
   quickReplyListMoved(target: unknown): void;
   /** Whether a quick reply is open. */
   quickReplyOpen(): boolean;
+  /** `#846 draft-chip-honest`. The key the open quick reply's draft is kept under, or null with none open. */
+  quickReplyOpenKey(): string | null;
   /** Place the open box under the words it quotes, inside what the window shows. */
   placeQuickReply(): void;
   /** Close the quick reply, keeping what was written for the same words. */
@@ -513,6 +517,7 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     text.focus({ preventScroll: true });
     const end = text.value.length;
     if (typeof text.setSelectionRange === "function") text.setSelectionRange(end, end);
+    deps.opened?.();
   }
 
   /** The chip's own box, where a touch let the selection go before the press: the box opens under it. */
@@ -633,7 +638,8 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
 
   return {
     held: () => quoteHeld, holdQuote, noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip,
-    quickReplyHolds, quickReplyListMoved, quickReplyOpen: () => quickReply !== null, placeQuickReply,
+    quickReplyHolds, quickReplyListMoved, quickReplyOpen: () => quickReply !== null,
+    quickReplyOpenKey: () => (quickReply ? quickReply.key : null), placeQuickReply,
     closeQuickReply, putDownQuickReply, sendQuickReply, noteQuickReplyInput, openQuickDraft, openSentenceReply,
     quickDraftLive: (key) => Boolean((quickReplyDrafts.get(key) || "").trim()),
     quickDraftMessage: (key) => keyParts(key).id,

@@ -693,6 +693,14 @@
                       <input id="reply-grow" type="checkbox" /> Grow
                     </label>
                   </div>
+                  <!-- `#846 draft-chip-honest`. Cancel on words asks first: Yes empties the box and puts it
+                       away, the draft gone from the page and the device; No leaves the box as it was. Esc and
+                       Back still put the reply down with its words kept as a draft. -->
+                  <div id="reply-discard" class="draft-discard" role="group" aria-labelledby="reply-discard-text" hidden>
+                    <p id="reply-discard-text">Discard this draft?</p>
+                    <button id="reply-discard-yes" type="button">Yes</button>
+                    <button id="reply-discard-no" class="secondary" type="button">No</button>
+                  </div>
                   <!-- A send that failed says so HERE, next to the text it did not send, and the text
                        stays in the box. -->
                   <p id="reply-state" class="hint" aria-live="polite"></p>
@@ -2807,8 +2815,9 @@
                 <strong>Grow</strong> and its <strong>Send</strong>, and that box is hidden while the
                 reply is open, so there is only ever one. <strong>Send reply</strong>, or
                 <kbd>Enter</kbd> if Enter sends, posts it and the reply joins the others under the
-                message; <strong>Cancel</strong> or <kbd>Esc</kbd> keeps what you wrote as a draft on
-                that message and puts the replies back in time order. Reply on another message moves the
+                message; <kbd>Esc</kbd> keeps what you wrote as a draft on that message and puts the replies
+                back in time order, and <strong>Cancel</strong> asks <q>Discard this draft?</q> first:
+                <strong>Yes</strong> throws the words away. Reply on another message moves the
                 box there. <kbd>r</kbd> replies to the selected message, and <kbd>m</kbd> or
                 <kbd>Ctrl</kbd>+<kbd>S</kbd> (<kbd>⌘</kbd>+<kbd>S</kbd> on a Mac) go back to the box.
               </p>
@@ -3046,7 +3055,7 @@
                 <kbd>]</kbd> move the keys between them. <strong>Reply</strong> and <strong>Quote
                 reply</strong> open the reply box in the list you pressed them in, as they do in one
                 column (see Replying, below); both columns stay on screen. Ctrl+1 to Ctrl+3 pressed in that box
-                put the reply down, its words kept as a draft, as <strong>Cancel</strong> does, and show
+                put the reply down, its words kept as a draft, as <kbd>Esc</kbd> does, and show
                 the view you chose. A reply that does not go says so on
                 the status line, and that column's <strong>Newest</strong> reads <strong>Reply not
                 sent</strong> until you go down to it and its <strong>Retry</strong>. A narrower window
@@ -3752,6 +3761,12 @@
         <p id="quick-reply-state" class="hint" aria-live="polite"></p>
         <button id="quick-reply-cancel" class="secondary" type="button">Cancel</button>
         <button id="quick-reply-send" type="button">Send</button>
+      </div>
+      <!-- `#846 draft-chip-honest`. Cancel on words asks first, as the reply's does (#reply-discard). -->
+      <div id="quick-reply-discard" class="draft-discard" role="group" aria-labelledby="quick-reply-discard-text" hidden>
+        <p id="quick-reply-discard-text">Discard this draft?</p>
+        <button id="quick-reply-discard-yes" type="button">Yes</button>
+        <button id="quick-reply-discard-no" class="secondary" type="button">No</button>
       </div>
       <!-- `#829 voice-page-dictation-polish`. Listening: a round microphone badge hanging off the box's lower-left
            corner, while the recognition runs and no longer. A tap on it stops listening. -->

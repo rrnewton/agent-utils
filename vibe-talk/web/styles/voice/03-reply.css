@@ -324,3 +324,22 @@
   flex: 1;
   margin: 0;
 }
+
+/* `#846 draft-chip-honest`. "Discard this draft?" under the box Cancel was pressed in, its Yes and No at the
+   row's end as the box's own buttons are. */
+.draft-discard {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.4rem;
+}
+
+.draft-discard[hidden] {
+  display: none;
+}
+
+.draft-discard p {
+  flex: 1;
+  margin: 0;
+  font-weight: 600;
+}

@@ -72,7 +72,8 @@ export function createChannelDrafts(deps: ChannelDraftsDependencies): ChannelDra
       try {
         const saved: unknown = JSON.parse(deps.storage.getItem(storageKey) || "{}");
         for (const [key, value] of Object.entries((saved || {}) as object)) {
-          if (typeof value === "string") channelDrafts.set(key, value);
+          // `#846 draft-chip-honest`. Blank words are no draft: one kept before the page stopped keeping them is let go.
+          if (typeof value === "string" && value.trim()) channelDrafts.set(key, value);
         }
       } catch (_error) {
         // Storage may be absent or contain an interrupted write; composing still works in this page.

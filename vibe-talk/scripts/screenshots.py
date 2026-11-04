@@ -3268,6 +3268,9 @@ def _act_failed_send_and_draft(driver: Driver) -> None:
     driver.page.wait_for_function("() => window.__visible('column-reply')", timeout=5_000)
     driver.page.fill("#reply-text", DRAFT_REPLY_TEXT)
     driver.click("reply-cancel")
+    # `#846 draft-chip-honest`: Cancel on words asks first; Esc on the question puts the reply down, words kept.
+    if driver.page.is_visible("#reply-discard"):
+        driver.page.keyboard.press("Escape")
     driver.page.wait_for_function("() => !window.__visible('column-reply')", timeout=5_000)
     driver.js(
         "(() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; "

@@ -84,7 +84,8 @@ export function createReplyDrafts(deps: ReplyDraftsDependencies): ReplyDrafts {
         return;
       }
       for (const [id, text] of Object.entries(stored as object)) {
-        if (typeof text === "string" && text) {
+        // `#846 draft-chip-honest`. Blank words are no draft.
+        if (typeof text === "string" && text.trim()) {
           drafts.set(id, text);
         }
       }

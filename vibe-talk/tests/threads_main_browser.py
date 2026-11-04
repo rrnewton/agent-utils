@@ -196,6 +196,9 @@ def threads_walk(desk: Desk) -> None:
     desk.check(listed["boxes"] == ["reply-text"], f"more than one message box on screen: {listed['boxes']}")
     desk.shot("3-reply-under-main-message")
     page.click("#reply-cancel")
+    # `#846 draft-chip-honest`: Cancel on words asks first; Esc on the question puts the reply down, words kept.
+    if page.is_visible("#reply-discard"):
+        page.keyboard.press("Escape")
     desk.wait_for("() => document.getElementById('side-reply').hidden", "Cancel did not put the reply away")
     listed = page.evaluate(LIST_JS)
     assert isinstance(listed, dict)

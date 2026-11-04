@@ -314,6 +314,9 @@ def compose_walk(desk: Desk) -> None:
     desk.check(found["layout"] == "list" and found["focus"] == "reply-text", f"Cmd+S with a reply open: {found}")
     desk.shot("2-cmd-s-reply")
     page.click("#reply-cancel")
+    # `#846 draft-chip-honest`: Cancel on words asks first; Esc on the question puts the reply down, words kept.
+    if page.is_visible("#reply-discard"):
+        page.keyboard.press("Escape")
     desk.wait_for("() => document.getElementById('side-reply').hidden", "Cancel did not put the reply away")
     # Negative control: Main channel off, no box in the Threads view: back to the view it was chosen from (All).
     set_chip(desk, "side-main", False)

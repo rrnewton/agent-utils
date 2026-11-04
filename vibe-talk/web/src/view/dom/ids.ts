@@ -368,6 +368,10 @@ export interface ElementById {
   "pull-refresh": HTMLDivElement;
   "quick-reply": HTMLDivElement;
   "quick-reply-cancel": HTMLButtonElement;
+  "quick-reply-discard": HTMLDivElement;
+  "quick-reply-discard-no": HTMLButtonElement;
+  "quick-reply-discard-text": HTMLParagraphElement;
+  "quick-reply-discard-yes": HTMLButtonElement;
   "quick-reply-mic": HTMLButtonElement;
   "quick-reply-quote": HTMLElement;
   "quick-reply-send": HTMLButtonElement;
@@ -416,6 +420,10 @@ export interface ElementById {
   "reply-cancel": HTMLButtonElement;
   "reply-compose": HTMLDivElement;
   "reply-destination": HTMLParagraphElement;
+  "reply-discard": HTMLDivElement;
+  "reply-discard-no": HTMLButtonElement;
+  "reply-discard-text": HTMLParagraphElement;
+  "reply-discard-yes": HTMLButtonElement;
   "reply-grow": HTMLInputElement;
   "reply-newline": HTMLButtonElement;
   "reply-send": HTMLButtonElement;

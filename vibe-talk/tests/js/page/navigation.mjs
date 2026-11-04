@@ -3725,7 +3725,9 @@ async function dockedReplyWalk(script = SCRIPT) {
   await replyButton(sideRow(page, "202")).click();
   await page.settle();
   const again = { facts: backFacts(page), at: replyBoxAt(page), text: page.el("reply-text").value };
+  // `#846 draft-chip-honest`: Cancel on words asks first; Yes puts the reply down, its words thrown away.
   await page.el("reply-cancel").click();
+  await page.el("reply-discard-yes").click();
   await page.settle();
   const cancelled = { at: replyBoxAt(page), asked: [...page.history.asked] };
   await page.traverse();

@@ -9550,6 +9550,15 @@ const replyBoxAt = (page) => {
   return parent ? `#${parent.id}` : "nowhere";
 };
 
+/**
+ * `#846 draft-chip-honest`. Put the reply down with its words kept as its draft, as Esc does: with words in
+ * the box the first Esc leaves it for the list and the next goes Back. (Cancel on words asks to discard them.)
+ */
+async function putReplyDown(page) {
+  await press(page, page.el("reply-text"), "Escape");
+  if (replyBoxAt(page) !== "closed") await press(page, focused(page), "Escape");
+}
+
 /** Two columns, the first thread selected on the right: Main on the left, 201 and 202 on the right. */
 async function replyColumnsPage(script = SCRIPT) {
   const { page, data } = await twoColumnServer(null, script);
@@ -10101,7 +10110,7 @@ export { ACKNOWLEDGED, ALIAS_NOTICE, ALICE, BASE_CSS, BIG, BIG_ROOT, BOTTOM_SLAC
   outgoingRows, outgoingSpinner, pagedChannel, pagedThreads, pagedTimeline, parityData, parityPage,
   parkMidway, parseSanitizedHtml, passTime, passing, pcm, pickThread, pickerChoices, pinChip,
   pinItem, pinnedIds, pinnedPlacePage, placeChannel, placeRow, pollOnce, presentTime, posted, postedWhere, press,
-  pressCopy, pressHere, pressOn, promptsSent, proposal, proposedDuringACall, providerDown, pullDown,
+  pressCopy, pressHere, pressOn, promptsSent, putReplyDown, proposal, proposedDuringACall, providerDown, pullDown,
   putBackOf, questionFarAbove, quotePage, reReadChannel, reactionStripOf, readAloudMessages,
   readBackDuringACall, readButton, readChannel, readKinds, readModeSaid, readModeTo, readRunLineOf,
   readThroughButton, readViewsSince, readerOn, readsSince, recordingCall, refreshDiscord, relayed,

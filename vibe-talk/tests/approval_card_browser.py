@@ -1465,6 +1465,9 @@ def columns_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, screensho
         check(after["replyIn"] == "column-reply" and after["replyText"] == "still writing",
               f"{where}: sending the draft took the reply away ({after['replyIn']}, {after['replyText']!r})")
         page.click("#reply-cancel")
+        # `#846 draft-chip-honest`: Cancel on words asks first; Esc on the question puts the reply down, words kept.
+        if page.is_visible("#reply-discard"):
+            page.keyboard.press("Escape")
         page.wait_for_function("() => document.getElementById('column-reply').hidden", timeout=5000)
 
         # The right column: a reply open in the thread there outlines the card's Send as well.
@@ -1485,6 +1488,9 @@ def columns_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, screensho
             page.screenshot(path=str(screenshots / f"card-beside-side-reply-{width}x{height}.png"),
                             animations="disabled")
         page.click("#reply-cancel")
+        # `#846 draft-chip-honest`: Cancel on words asks first; Esc on the question puts the reply down, words kept.
+        if page.is_visible("#reply-discard"):
+            page.keyboard.press("Escape")
         page.wait_for_function("() => document.getElementById('side-reply').hidden", timeout=5000)
         cleared = columns_measure(page)
         check(cleared["beside"] is False and cleared["sendBackground"] not in TRANSPARENT,

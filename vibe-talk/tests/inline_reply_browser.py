@@ -545,6 +545,9 @@ def columns_walk(desk: Desk, api: ReplyColumnsApi) -> None:
 
     # Cancel: the thread's box back, the row where it was, its words a Draft on the row.
     page.click("#reply-cancel")
+    # `#846 draft-chip-honest`: Cancel on words asks first; Esc on the question puts the reply down, words kept.
+    if page.is_visible("#reply-discard"):
+        page.keyboard.press("Escape")
     desk.wait_for("() => document.getElementById('side-reply').hidden", "Cancel did not put the box away")
     desk.settled()
     back = measure(desk, "side-log", "208")
@@ -660,6 +663,9 @@ def phone_walk(desk: Desk, api: ReplyColumnsApi) -> None:
         desk.check(not crosses, f"phone newest: something floating over the foot covers Send: {over} over {send}")
     desk.shot("3-phone-newest")
     page.click("#reply-cancel")
+    # `#846 draft-chip-honest`: Cancel on words asks first; Esc on the question puts the reply down, words kept.
+    if page.is_visible("#reply-discard"):
+        page.keyboard.press("Escape")
     desk.notes.append(f"phone newest {newest}: the box under it at the foot, Send clear of the chips and the pill")
 
 

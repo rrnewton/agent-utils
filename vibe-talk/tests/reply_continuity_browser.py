@@ -1106,9 +1106,10 @@ DRAFT_JS = """() => {
 
 def drafts_walk(walk: Walk) -> None:
     """`#819 voice-page-quoted-reply-and-draft-chip`. A draft in each place a reply is written: the box at the
-    channel's foot, a reply under its message, a quick reply closed by Esc. The Draft chip is up from the
-    first and counts them; after a reload it still does; and each tap opens the next, newest first, focused,
-    with its words: the reply, the quick reply, the box, and round to the reply again."""
+    channel's foot, a reply under its message, a quick reply closed by Esc. The Draft chip counts the ones whose
+    box is off screen (`#846 draft-chip-honest`: never the box at the foot while it is drawn); after a reload it
+    still does; and each tap opens the next, newest first, focused, with its words: the reply, the quick reply,
+    the box (off screen while the reply stands in its place), and round to the reply again."""
     page = walk.page
 
     def state() -> Json:
@@ -1131,8 +1132,8 @@ def drafts_walk(walk: Walk) -> None:
     # The box at the channel's foot.
     page.click("#channel-compose-text")
     page.keyboard.type("composer draft")
-    walk.wait_for("() => !document.getElementById('draft-chip').hidden", "drafts: no chip for the box's draft")
-    walk.check(state()["chip"] == "Draft", f"drafts: the chip says {state()['chip']!r} for one draft")
+    walk.page.wait_for_timeout(200)
+    walk.check(state()["chip"] is None, f"drafts: a chip for the draft in the box on screen: {state()}")
     page.evaluate("() => document.activeElement && document.activeElement.blur()")
     # A quick reply, closed by Esc with words in it.
     quick_row = message_id(COUNT - 2)
@@ -1145,23 +1146,26 @@ def drafts_walk(walk: Walk) -> None:
     page.keyboard.type("quick draft")
     page.keyboard.press("Escape")
     walk.wait_for("() => document.getElementById('quick-reply').hidden", "drafts: Esc left the quick reply up")
-    walk.wait_for("() => document.getElementById('draft-chip-label').textContent === 'Drafts (2)'",
-                  "drafts: the chip did not count the quick reply's draft")
-    # A reply under its message, put away with Cancel.
+    walk.wait_for("() => !document.getElementById('draft-chip').hidden"
+                  " && document.getElementById('draft-chip-label').textContent === 'Draft'",
+                  "drafts: the chip did not count the quick reply's draft alone")
+    # A reply under its message, put away: Cancel asks to discard it, and Esc on the question keeps it.
     reply_row = message_id(30)
     walk.place(30, page.viewport_size["height"] * 0.3 if page.viewport_size else 200)
     walk.press(f"#discord-log > li[data-id='{reply_row}'] .reply-button")
     walk.wait_for(OPEN, "drafts: Reply did not open")
     page.keyboard.type("reply draft")
     walk.press("#reply-cancel")
-    walk.wait_for(CLOSED, "drafts: Cancel did not put the reply away")
-    walk.wait_for("() => document.getElementById('draft-chip-label').textContent === 'Drafts (3)'",
+    walk.wait_for("() => !document.getElementById('reply-discard').hidden", "drafts: Cancel on words did not ask")
+    page.keyboard.press("Escape")
+    walk.wait_for(CLOSED, "drafts: Esc on the question did not put the reply away")
+    walk.wait_for("() => document.getElementById('draft-chip-label').textContent === 'Drafts (2)'",
                   "drafts: the chip did not count the reply's draft")
     walk.shot("drafts-chip")
     # A reload: every draft is still found.
     page.reload(wait_until="load")
     open_channel()
-    walk.wait_for("() => document.getElementById('draft-chip-label').textContent === 'Drafts (3)'"
+    walk.wait_for("() => document.getElementById('draft-chip-label').textContent === 'Drafts (2)'"
                   " && !document.getElementById('draft-chip').hidden",
                   f"drafts: after a reload the chip says {state()['chip']!r}")
     # Each tap: the next draft, newest first, opened and focused with its words.
@@ -1182,10 +1186,20 @@ def drafts_walk(walk: Walk) -> None:
             walk.check(now["reply"] is True, f"drafts, tap {turn + 1}: the reply is not open: {now}")
         else:
             page.evaluate("() => document.activeElement && document.activeElement.blur()")
-    walk.check(state()["chip"] == "Drafts (3)", f"drafts: after the round the chip says {state()['chip']!r}")
-    walk.notes.append("a draft in the box, a quick reply and a reply each raised and counted the Draft chip, which "
-                      "still counted all three after a reload and opened each in turn, newest first, focused with "
-                      "its words (the quick reply left open put away by the next tap, kept), then the newest again")
+    # The reply open, the quick reply's draft and the box's, which the reply stands in place of, are off screen.
+    walk.check(state()["chip"] == "Drafts (2)", f"drafts: after the round the chip says {state()['chip']!r}")
+    # Scrolled off screen, the open reply's draft is offered too; scrolled back, it is not.
+    page.evaluate("() => document.activeElement && document.activeElement.blur()")
+    page.evaluate("() => { const area = document.getElementById('scroll-area'); area.scrollTop = 0; }")
+    walk.wait_for("() => document.getElementById('draft-chip-label').textContent === 'Drafts (3)'",
+                  f"drafts: the reply scrolled off screen is not offered: {state()}")
+    page.evaluate("() => document.getElementById('reply-text').scrollIntoView({block: 'center'})")
+    walk.wait_for("() => document.getElementById('draft-chip-label').textContent === 'Drafts (2)'",
+                  f"drafts: the reply scrolled back on screen is still offered: {state()}")
+    walk.notes.append("a draft in the box (not counted while the box is drawn), a quick reply and a reply raised the "
+                      "Draft chip, which still counted the two off screen after a reload and opened each draft in "
+                      "turn, newest first, focused with its words (the quick reply left open put away by the next "
+                      "tap, kept; the box's while the reply stood in its place), then the newest again")
 
 
 def triple_click_case(walk: Walk, list_box: dict[str, float]) -> None:

@@ -196,11 +196,12 @@ test("`#624 voice-page-modularity`: the message boxes' drafts, saved and taken b
   drafts.set('["d",null]', "lost");
   assert.equal(drafts.save(), false);
   assert.equal(roomMade, 2);
-  // Another page takes back what the device kept; anything not a string is not a draft.
-  saved.set("vibe-talk.channel-drafts", JSON.stringify({ a: "kept", b: 3, c: "" }));
+  // Another page takes back what the device kept; anything not a string is not a draft, and nor are blank
+  // words (`#846 draft-chip-honest`).
+  saved.set("vibe-talk.channel-drafts", JSON.stringify({ a: "kept", b: 3, c: "", d: " \n\t " }));
   const again = make();
   again.load();
-  assert.deepStrictEqual([again.get("a"), again.get("b"), again.get("c")], ["kept", undefined, ""]);
+  assert.deepStrictEqual([again.get("a"), again.get("b"), again.get("c"), again.get("d")], ["kept", undefined, undefined, undefined]);
   saved.set("vibe-talk.channel-drafts", "{not json");
   const damaged = make();
   damaged.load();
@@ -299,7 +300,7 @@ test("`#624 voice-page-modularity`: the outbox's entries, order, changes and sav
 test("`#624 voice-page-modularity`: the reply drafts are kept by message id, and a new thread's tick only for this session", () => {
   const { createReplyDrafts, DRAFTS_KEY } = OUTBOX;
   assert.equal(DRAFTS_KEY, "vibe-talk.voice.drafts");
-  const kept = new Map([[DRAFTS_KEY, JSON.stringify({ 101: "half a thought", 102: "", 103: 7 })]]);
+  const kept = new Map([[DRAFTS_KEY, JSON.stringify({ 101: "half a thought", 102: "", 103: 7, 105: "  \n " })]]);
   let full = false;
   let roomMade = 0;
   const storage = {
@@ -309,8 +310,8 @@ test("`#624 voice-page-modularity`: the reply drafts are kept by message id, and
   };
   const drafts = createReplyDrafts({ storage, makeRoom: () => { roomMade += 1; full = false; } });
   drafts.load();
-  assert.deepStrictEqual([drafts.has("101"), drafts.get("101"), drafts.has("102"), drafts.has("103")],
-    [true, "half a thought", false, false], "an empty or non-text draft was taken back");
+  assert.deepStrictEqual([drafts.has("101"), drafts.get("101"), drafts.has("102"), drafts.has("103"), drafts.has("105")],
+    [true, "half a thought", false, false, false], "an empty, blank (#846 draft-chip-honest) or non-text draft was taken back");
   drafts.set("104", "another");
   drafts.delete("101");
   assert.equal(drafts.save(), true);
@@ -448,6 +449,18 @@ test("`#819 voice-page-quoted-reply-and-draft-chip`: the Draft chip's round goes
   assert.deepStrictEqual([0, 1, 2, 3].map(() => round.next(drafts, "c1").key), ["m2", "c1\nm1\nq", '["c1",null]', "m2"]);
   assert.equal(round.next(drafts, "c2").key, "m2", "another channel starts at its newest");
   assert.equal(round.next(drafts.slice(1), "c2").key, "c1\nm1\nq", "the last one gone, the round starts at the newest");
+  // `#846 draft-chip-honest`. The drafts on screen are passed over, and the round keeps its place among them all:
+  // the one just opened is on screen, and the next tap goes on from it, not back to the newest.
+  const offered = createDraftRound();
+  let onScreen = new Set(['["c1",null]']);
+  const offers = (draft) => !onScreen.has(draft.key);
+  assert.equal(offered.next(drafts, "c1", offers).key, "m2");
+  onScreen = new Set(["m2"]);
+  assert.equal(offered.next(drafts, "c1", offers).key, "c1\nm1\nq", "the round went back to the newest");
+  onScreen = new Set(["m2", "c1\nm1\nq"]);
+  assert.equal(offered.next(drafts, "c1", offers).key, '["c1",null]', "a draft off screen again was not offered");
+  onScreen = new Set(drafts.map((draft) => draft.key));
+  assert.equal(offered.next(drafts, "c1", offers), null, "with every draft on screen there is nothing to offer");
 });
 
 test("`#624 voice-page-modularity`: the outbox pump runs one pass at a time, going round again for a pass asked during one", () => {
