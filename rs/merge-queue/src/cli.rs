@@ -1,5 +1,6 @@
 //! Command-line interface.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -7,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 use crate::git::{CombineMode, Git};
 use crate::intake;
-use crate::model::ItemStatus;
+use crate::model::{waiting_on, Item, ItemStatus, Waiting};
 use crate::ops::{self, Submission};
 use crate::plan::{render, short};
 use crate::run::{self, RunOptions, RunReport, Runner};
@@ -588,7 +589,11 @@ enum Command {
         /// Lower lands first.
         #[arg(long, default_value_t = DEFAULT_PRIORITY)]
         priority: i64,
-        /// Change number that must land first (repeatable).
+        /// Change number that must land first (repeatable). While one of them (or one that it
+        /// must land after) is ejected, withdrawn or not in the queue, this change is held: it
+        /// stays queued, is never validated or landed without it, and `list` and `status` show
+        /// `held: waiting on #N (ejected)`. It is planned again once #N is queued and lands
+        /// first; resubmit this change without that `--after` to drop the dependency.
         #[arg(long, value_name = "PR")]
         after: Vec<i64>,
         /// Validate and land this change in a batch of its own.
@@ -979,6 +984,31 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> i32 {
             1
         }
     }
+}
+
+/// The item records by change number.
+fn records_by_pr(state: &State) -> Result<BTreeMap<i64, Item>, String> {
+    Ok(state
+        .items()?
+        .into_iter()
+        .map(|item| (item.pr, item))
+        .collect())
+}
+
+/// What `submit` says about a change held for a change it must land after.
+fn held_note(pr: i64, waiting: &Waiting) -> String {
+    let again = if waiting.status == "not in the queue" {
+        ""
+    } else {
+        " again"
+    };
+    format!(
+        "#{pr} is held, {}: it is not validated or landed until #{} is queued{again} and lands; \
+         resubmit #{pr} without --after {} to drop the dependency",
+        waiting.describe(),
+        waiting.pr,
+        waiting.named()
+    )
 }
 
 fn dispatch(cli: Cli) -> Result<i32, String> {
@@ -1372,6 +1402,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                             submission.head_ref, submission.head
                         ));
                     }
+                    let after = submission.after.clone();
                     let request = intake::Request::Submit(Box::new(submission));
                     let (entry, new) = intake::record(&state, request, &busy, &current)?;
                     if new {
@@ -1389,6 +1420,9 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                             short(&current),
                             intake::PENDING_INTAKE
                         );
+                    }
+                    for waiting in waiting_on(pr, &after, &records_by_pr(&state)?) {
+                        println!("{}", held_note(pr, &waiting));
                     }
                     return Ok(0);
                 }
@@ -1414,6 +1448,9 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     ""
                 }
             );
+            for waiting in waiting_on(item.pr, &item.after, &records_by_pr(&state)?) {
+                println!("{}", held_note(item.pr, &waiting));
+            }
             Ok(0)
         }
         Command::Sync {
@@ -1560,16 +1597,31 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             Ok(0)
         }
         Command::List { all, json } => {
-            let items: Vec<_> = state
-                .items()?
-                .into_iter()
+            let by_pr = records_by_pr(&state)?;
+            let items: Vec<&Item> = by_pr
+                .values()
                 .filter(|item| all || item.status == ItemStatus::Queued)
                 .collect();
+            // A queued change held for a change it must land after (`--after`).
+            let held = |item: &Item| {
+                if item.status == ItemStatus::Queued {
+                    waiting_on(item.pr, &item.after, &by_pr)
+                } else {
+                    Vec::new()
+                }
+            };
             // Requests recorded while a run held the writer lock are not in any item record yet.
             let pending = intake::pending(&state);
             if json {
                 let mut rows = serde_json::to_value(&items).map_err(|e| e.to_string())?;
                 if let Some(rows) = rows.as_array_mut() {
+                    for (row, item) in rows.iter_mut().zip(&items) {
+                        let waiting = held(item);
+                        if !waiting.is_empty() {
+                            row["waiting_on"] =
+                                serde_json::to_value(&waiting).map_err(|e| e.to_string())?;
+                        }
+                    }
                     for request in &pending {
                         rows.push(serde_json::to_value(request).map_err(|e| e.to_string())?);
                     }
@@ -1587,7 +1639,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     "{:<8} {:<10} {:<8} {:<10} {:<10} TITLE",
                     "PR", "STATUS", "PRIO", "HEAD", "TESTED"
                 );
-                for item in items {
+                for item in &items {
                     let tested = item
                         .claim
                         .as_ref()
@@ -1605,6 +1657,9 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                         tested,
                         item.title
                     );
+                    for waiting in held(item) {
+                        println!("{:<8} held: {}", "", waiting.describe());
+                    }
                 }
             }
             if !json && !pending.is_empty() {

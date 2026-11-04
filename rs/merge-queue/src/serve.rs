@@ -1519,6 +1519,10 @@ pub struct StatusReport {
     /// A drain request on file (`merge-queue drain-for-upgrade`), whichever daemon it names.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drain: Option<crate::drain::Request>,
+    /// Queued changes held because a change they must land after (`--after`) is ejected,
+    /// withdrawn or not in the queue (see [`crate::model::Waiting`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub waiting: Vec<crate::model::WaitingChange>,
     /// Why the item records cannot be read, when they cannot. The queue is
     /// then unhealthy whatever the daemon's liveness: nothing can be planned.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -1649,6 +1653,7 @@ pub fn collect_status(state: &State, stale_after_secs: u64) -> Result<StatusRepo
         working_secs,
         intake: crate::intake::summary(state),
         drain: crate::drain::read(state),
+        waiting: crate::model::waiting_changes(&items),
         items_error,
         remedy,
     })
@@ -1763,6 +1768,11 @@ pub fn render_status(report: &StatusReport) -> String {
             "queue: {} queued, {} landed, {} ejected, {} withdrawn\n",
             report.queued, report.landed, report.ejected, report.withdrawn
         ));
+        for change in &report.waiting {
+            for waiting in &change.waiting_on {
+                out.push_str(&format!("  #{} held: {}\n", change.pr, waiting.describe()));
+            }
+        }
     } else {
         out.push_str(&format!(
             "queue: UNREADABLE ({}); counts unknown\n",

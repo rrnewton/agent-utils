@@ -1,5 +1,7 @@
 //! Queue vocabulary: submitted changes, plans, and widening obligations.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
 use serde::{Deserialize, Serialize};
 
 use crate::tests::{TestResult, TestResults, ValidationClaim};
@@ -397,6 +399,97 @@ pub struct Plan {
     /// suggestion to add the priority label, which the queue never applies itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suggest_priority: Vec<i64>,
+}
+
+/// A change that a queued change must land after (`--after`, itself or through other queued
+/// changes) and that is neither queued nor landed: ejected, withdrawn, or not in the queue. The
+/// queued change is held, never validated or landed without it, until that change is queued
+/// again and lands, or until the dependency is dropped by resubmitting without that `--after`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Waiting {
+    /// The change waited on.
+    pub pr: i64,
+    /// Its status (`ejected` or `withdrawn`), or `not in the queue`.
+    pub status: String,
+    /// The queued changes in between, nearest first; empty when the change names it itself.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub through: Vec<i64>,
+}
+
+impl Waiting {
+    /// `waiting on #5138 (ejected)`, or `waiting on #5139, which waits on #5138 (ejected)`.
+    pub fn describe(&self) -> String {
+        let mut text = "waiting on ".to_owned();
+        for pr in &self.through {
+            text.push_str(&format!("#{pr}, which waits on "));
+        }
+        text.push_str(&format!("#{} ({})", self.pr, self.status));
+        text
+    }
+
+    /// The change named in `--after` that this wait comes through.
+    pub fn named(&self) -> i64 {
+        self.through.first().copied().unwrap_or(self.pr)
+    }
+}
+
+/// What change `pr`, which must land after `after`, waits on (see [`Waiting`]), nearest first,
+/// each change once.
+pub fn waiting_on(pr: i64, after: &[i64], items: &BTreeMap<i64, Item>) -> Vec<Waiting> {
+    let mut out: Vec<Waiting> = Vec::new();
+    let mut seen = BTreeSet::from([pr]);
+    let mut queue = VecDeque::from([(after.to_vec(), Vec::new())]);
+    while let Some((deps, through)) = queue.pop_front() {
+        for dep in deps {
+            match items.get(&dep) {
+                Some(item) if item.status == ItemStatus::Landed => {}
+                Some(item) if item.status == ItemStatus::Queued => {
+                    if seen.insert(dep) {
+                        let mut next: Vec<i64> = through.clone();
+                        next.push(dep);
+                        queue.push_back((item.after.clone(), next));
+                    }
+                }
+                other => {
+                    if !out.iter().any(|waiting| waiting.pr == dep) {
+                        out.push(Waiting {
+                            pr: dep,
+                            status: other
+                                .map_or("not in the queue", |item| item.status.as_str())
+                                .to_owned(),
+                            through: through.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A queued change and what it waits on (see [`Waiting`]).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WaitingChange {
+    /// The queued change.
+    pub pr: i64,
+    /// What it waits on.
+    pub waiting_on: Vec<Waiting>,
+}
+
+/// Every queued change that waits on a change it must land after, by change number.
+pub fn waiting_changes(items: &[Item]) -> Vec<WaitingChange> {
+    let by_pr: BTreeMap<i64, Item> = items.iter().map(|item| (item.pr, item.clone())).collect();
+    by_pr
+        .values()
+        .filter(|item| item.status == ItemStatus::Queued)
+        .filter_map(|item| {
+            let waiting_on = waiting_on(item.pr, &item.after, &by_pr);
+            (!waiting_on.is_empty()).then_some(WaitingChange {
+                pr: item.pr,
+                waiting_on,
+            })
+        })
+        .collect()
 }
 
 /// Plan schema identifier.

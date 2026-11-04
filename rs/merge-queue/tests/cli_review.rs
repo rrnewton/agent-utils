@@ -91,6 +91,106 @@ fn dependent_of_conflict_ejected_change_is_requeued_not_landed() {
     assert_eq!(r["requeued"], serde_json::json!([3]));
 }
 
+/// The item rows `list --json` prints, by change number.
+fn rows(fx: &Fixture) -> Vec<Value> {
+    let rows: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    rows.as_array().unwrap().clone()
+}
+
+fn row(fx: &Fixture, pr: i64) -> Value {
+    rows(fx).into_iter().find(|r| r["pr"] == pr).unwrap()
+}
+
+#[test]
+fn a_change_waiting_on_an_ejected_change_is_held_and_says_so() {
+    let fx = conflict_fixture("rv-dep-held");
+    fx.mq(&["run", "--json"]);
+    assert_eq!(status(&fx, 2), "ejected");
+    // #3 stays queued and says what it waits for, in list and status.
+    let text = fx.mq_ok(&["list"]);
+    assert!(text.contains("held: waiting on #2 (ejected)"), "{text}");
+    assert_eq!(
+        row(&fx, 3)["waiting_on"],
+        serde_json::json!([{"pr": 2, "status": "ejected"}])
+    );
+    assert!(row(&fx, 1).get("waiting_on").is_none());
+    let text = String::from_utf8_lossy(&fx.mq(&["status"]).stdout).into_owned();
+    assert!(text.contains("#3 held: waiting on #2 (ejected)"), "{text}");
+    // Another run neither validates nor lands it without #2.
+    let r = report(&String::from_utf8_lossy(&fx.mq(&["run", "--json"]).stdout));
+    assert!(r["validations"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(status(&fx, 3), "queued");
+    // Resubmitted without the dependency, it lands.
+    let out = fx.mq_ok(&["submit", "3", "--head", "y"]);
+    assert!(!out.contains("held"), "{out}");
+    fx.mq_ok(&["run", "--json"]);
+    assert_eq!(status(&fx, 3), "landed");
+}
+
+#[test]
+fn a_change_submitted_after_a_withdrawn_change_is_held_until_it_lands() {
+    let fx = setup("rv-after-withdrawn", &[]);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["withdraw", "1"]);
+    let out = fx.mq_ok(&["submit", "2", "--head", "b", "--after", "1"]);
+    assert!(
+        out.contains(
+            "#2 is held, waiting on #1 (withdrawn): it is not validated or landed until #1 is queued again and lands; resubmit #2 without --after 1 to drop the dependency"
+        ),
+        "{out}"
+    );
+    // Through a queued change, and on one never submitted.
+    let out = fx.mq_ok(&["submit", "3", "--head", "c", "--after", "2", "--after", "9"]);
+    assert!(
+        out.contains("#3 is held, waiting on #2, which waits on #1 (withdrawn)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("#3 is held, waiting on #9 (not in the queue): it is not validated or landed until #9 is queued and lands"),
+        "{out}"
+    );
+    let text = fx.mq_ok(&["list"]);
+    assert!(text.contains("held: waiting on #1 (withdrawn)"), "{text}");
+    assert!(
+        text.contains("held: waiting on #2, which waits on #1 (withdrawn)"),
+        "{text}"
+    );
+    assert_eq!(
+        row(&fx, 3)["waiting_on"],
+        serde_json::json!([
+            {"pr": 9, "status": "not in the queue"},
+            {"pr": 1, "status": "withdrawn", "through": [2]}
+        ])
+    );
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert!(r["landed"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(status(&fx, 2), "queued");
+    // Once #1 is queued again, #2 lands after it; #3 still waits on #9.
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    let landed: Vec<i64> = r["landed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|l| {
+            l["prs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_i64().unwrap())
+        })
+        .collect();
+    assert_eq!(landed, vec![1, 2], "{r}");
+    assert_eq!(status(&fx, 3), "queued");
+    assert_eq!(
+        row(&fx, 3)["waiting_on"],
+        serde_json::json!([{"pr": 9, "status": "not in the queue"}])
+    );
+}
+
 #[test]
 fn dry_run_changes_no_item() {
     let fx = conflict_fixture("rv-dry");

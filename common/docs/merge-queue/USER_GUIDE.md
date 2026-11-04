@@ -154,7 +154,7 @@ recorded instead and applied when the lock frees (see "Intake while a run holds 
 | `--head REF` | required | The head branch on the remote, or a full ref such as `refs/pull/42/head`. |
 | `--sha SHA` | empty | The exact head commit (or a prefix of it) that you mean. Submission is refused if the branch points elsewhere. |
 | `--priority N` | `100` | Lower values land first. |
-| `--after PR` | none | A change that must land first. Repeatable. |
+| `--after PR` | none | A change that must land first. Repeatable. While it (or a change it must land after) is ejected, withdrawn or not in the queue, this change is held: it stays queued, is never validated or landed without it, and `submit`, `list` and `status` say `held: waiting on #PR (ejected)`. It is planned again once #PR is queued and lands first (resubmit an ejected or withdrawn #PR with `submit`); resubmitting this change without that `--after` drops the dependency. Held, never rejected: the dependency can be ejected after this change was accepted, and a dependent may be submitted before its dependency. |
 | `--solo` | off | Validate and land this change in a batch of its own. Use it for risky changes. |
 | `--prioritized` | off | A priority change, as the priority label makes one under `sync`: planned ahead of all other work and validated in a batch of its own. It still lands only on its own exact green. See "Priority changes". |
 | `--by NAME` | empty | Who is submitting (an agent or a person). |
@@ -268,7 +268,9 @@ recorded.
 This command prints the queued changes as a table with the columns `PR`, `STATUS`, `PRIO`, `HEAD`,
 `TESTED` and `TITLE`. `TESTED` shows the scope of the submitter's claim (`complete`, `focused`,
 or `-` when there is none), so focused submissions are visible at a glance. `PRIO` ends in `!` for a
-priority change.
+priority change. A queued change held for a change it must land after (`--after`) has a
+`held: waiting on #N (ejected)` line under its row (`list --json`: `waiting_on`, with `through`
+naming the queued changes in between).
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -420,11 +422,12 @@ while a run held the lock show as `intake: N request(s) ...` until they are appl
 `#N pending-intake: ...` line per change and request (JSON `intake.requests`). Requests
 refused when applied show as `intake refused: ...`, and the newest three are named (JSON `intake`).
 A pending drain request shows as `drain: requested at ...` (JSON `drain`; see **Upgrading the
-daemon** below).
+daemon** below). A queued change held for a change it must land after shows under the queue
+counts as `#N held: waiting on #M (ejected)` (JSON `waiting`; see `--after` under `submit`).
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--json` | off | Print the status report as JSON (`daemon`, `pid`, `heartbeat`, queue counts, `active_batches`, slots, `intake`, `drain`, `remedy`). |
+| `--json` | off | Print the status report as JSON (`daemon`, `pid`, `heartbeat`, queue counts, `active_batches`, slots, `intake`, `drain`, `waiting`, `remedy`). |
 | `--stale-after-secs N` | `10` | Heartbeat age in seconds after which a live daemon counts as stale. |
 
 ### Running `serve` as a service
@@ -603,7 +606,11 @@ on which files two changes share.
 3. **Dependencies.** A change whose head contains another queued head (a stacked change) must land
    after it. Explicit `--after` dependencies count too. A dependency that has landed is satisfied.
    A dependency that is neither queued nor landed holds the dependent as `waiting-on-dependency`.
-   A dependent of a held change is held as `waiting-on-dependency` as well.
+   A dependent of a held change is held as `waiting-on-dependency` as well. A run that ejects a
+   change sets its dependents aside (`requeued` in the run report); they are never validated
+   without it. `list` and `status` show such a change as `held: waiting on #N (ejected)`, or
+   `held: waiting on #M, which waits on #N (withdrawn)` through a queued change (`list --json`:
+   `waiting_on`; `status --json`: `waiting`).
 4. **Pairwise conflicts.** Pairs of queued heads are merged with `git merge-tree`. Two kinds of
    pair are skipped because they cannot conflict: stacked pairs, found from one
    `git rev-list BASE..HEAD` per head rather than a check per pair, and pairs that share no file
