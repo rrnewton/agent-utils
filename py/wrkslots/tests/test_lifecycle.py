@@ -30658,6 +30658,76 @@ def test_clean_caches_reports_then_cleans_only_explicit_or_all_slots(
     assert empty_rows["slot02"]["cache_bytes"] == 0
 
 
+def test_clean_caches_dry_run_reports_without_deleting(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path, cache_globs=("target",)
+    )
+    assert create(project, slot="slot01", agent="codex-1", branch="codex/one").returncode == 0
+    tree = checkout(project, "slot01")
+    (tree / "target" / "debug").mkdir(parents=True)
+    (tree / "target" / "debug" / "artifact").write_bytes(b"a" * 1024)
+
+    report = command(
+        project, "clean-caches", "--only", "slot01", "--dry-run", "--format", "json"
+    )
+    assert report.returncode == 0, report.stderr
+    rows = {row["slot"]: row for row in json.loads(report.stdout)["slots"]}
+    assert rows["slot01"]["action"] == "REPORT"
+    assert rows["slot01"]["cache_bytes"] >= 1024
+    assert (tree / "target").is_dir()
+
+
+def test_clean_caches_not_blocked_by_stranded_absent_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One slot's active-and-archived split (an interrupted
+    recover-absent-validate-rows batch) must not refuse cache cleanup
+    for every other slot
+    (https://github.com/rrnewton/agent-utils/issues/297)."""
+    project, repository, _remote = make_project(
+        tmp_path, cache_globs=("target",)
+    )
+    assert create(project, slot="slot01", agent="codex-1", branch="codex/one").returncode == 0
+    tree = checkout(project, "slot01")
+    (tree / "target" / "debug").mkdir(parents=True)
+    (tree / "target" / "debug" / "artifact").write_bytes(b"a" * 1024)
+    made = create(
+        project, slot="stranded", agent="validate-a", branch=None, slot_type="validate"
+    )
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    record = mark_recorded_owner_dead(project, "stranded")
+    make_validate_row_absent(project, repository, record)
+    input_path = write_absent_validate_input(project, [record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-absent-validate-row":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_validate_recovery(project, input_path, apply=True)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+
+    cleaned = command(
+        project, "clean-caches", "--only", "slot01", "--format", "json"
+    )
+    assert cleaned.returncode == 0, cleaned.stderr
+    rows = {row["slot"]: row for row in json.loads(cleaned.stdout)["slots"]}
+    assert rows["slot01"]["action"] == "REMOVED"
+    assert not (tree / "target").exists()
+
+    named = command(
+        project, "clean-caches", "--only", "stranded", "--format", "json"
+    )
+    assert named.returncode != 0
+    assert "replay it with 'wrkslots recover' first" in (named.stdout + named.stderr)
+
+
 def test_agent_removal_and_clean_caches_refuse_nested_git_metadata(
     tmp_path: Path,
 ) -> None:
@@ -45434,6 +45504,70 @@ def test_recover_absent_validate_rows_handles_terminal_and_recordless_rows(
     ]
 
 
+def test_recover_absent_validate_rows_replays_past_a_refusing_census(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A half-done recovery (archives durable, ACTIVE rows still present)
+    must finish even when the host-wide process census refuses, as it
+    does when its output budget overflows on a busy host
+    (https://github.com/rrnewton/agent-utils/issues/297). The census ran
+    before the archive append; storage absence and dead owners are
+    re-proven locally on replay."""
+    project, repository, _remote = make_project(tmp_path)
+    made = create(
+        project, slot="stranded", agent="validate-a", branch=None, slot_type="validate"
+    )
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    record = mark_recorded_owner_dead(project, "stranded")
+    make_validate_row_absent(project, repository, record)
+    input_path = write_absent_validate_input(project, [record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-absent-validate-row":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_validate_recovery(project, input_path, apply=True)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    # Stranded: archived AND still active, journal present.
+    assert [r.slot for r in wrkslots._load_active(config).slots] == ["stranded"]
+    assert [str(r["slot"]) for r in wrkslots._load_archive(config).records] == ["stranded"]
+    assert (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+    def refusing_census(_rows: object) -> object:
+        raise wrkslots.Refusal("read-only census refused for this test")
+
+    monkeypatch.setattr(
+        wrkslots, "_assert_absent_validate_processes_unrelated", refusing_census
+    )
+    resumed = wrkslots.main(
+        ["--project-root", str(project), "recover", "--coordinator-pid", str(os.getpid())]
+    )
+    assert resumed == 0
+    assert list(wrkslots._load_active(config).slots) == []
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+    # A fresh recovery still refuses while the census refuses, and
+    # appends nothing: the census gates the archive append, not only the
+    # replay.
+    fresh = create(
+        project, slot="fresh", agent="validate-b", branch=None, slot_type="validate"
+    )
+    assert fresh.returncode == 0, fresh.stderr
+    fresh_record = mark_recorded_owner_dead(project, "fresh")
+    make_validate_row_absent(project, repository, fresh_record)
+    fresh_input = write_absent_validate_input(project, [fresh_record])
+    assert run_absent_validate_recovery(project, fresh_input, apply=True) != 0
+    assert [r.slot for r in wrkslots._load_active(config).slots] == ["fresh"]
+    assert "fresh" not in [str(r["slot"]) for r in wrkslots._load_archive(config).records]
+
+
 def test_audit_row_round_trips_as_absent_validate_input(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -46102,7 +46236,10 @@ def _absent_batch_refused_after_its_archives(
     real_safe = wrkslots._assert_absent_validate_rows_safe
 
     def refuse_once_archived(
-        config_arg: wrkslots.Config, rows: Sequence[wrkslots.ActiveRecord]
+        config_arg: wrkslots.Config,
+        rows: Sequence[wrkslots.ActiveRecord],
+        *,
+        host_process_census: bool = True,
     ) -> None:
         archived = {
             entry.get("slot") for entry in wrkslots._load_archive(config_arg).records
@@ -46112,7 +46249,7 @@ def _absent_batch_refused_after_its_archives(
                 "user-systemd unit population, identity, state, or jobs changed during "
                 "three bounded enumeration attempts"
             )
-        real_safe(config_arg, rows)
+        real_safe(config_arg, rows, host_process_census=host_process_census)
 
     monkeypatch.setattr(wrkslots, "_assert_absent_validate_rows_safe", refuse_once_archived)
     assert run_absent_validate_recovery(project, input_path, apply=True) == 3
@@ -46181,7 +46318,10 @@ def test_a_lockless_reader_waits_out_an_absent_batch_between_its_archive_and_act
     real_safe = wrkslots._assert_absent_validate_rows_safe
 
     def read_inside_the_gap(
-        config_arg: wrkslots.Config, rows: Sequence[wrkslots.ActiveRecord]
+        config_arg: wrkslots.Config,
+        rows: Sequence[wrkslots.ActiveRecord],
+        *,
+        host_process_census: bool = True,
     ) -> None:
         archived = {entry.get("slot") for entry in wrkslots._load_archive(config_arg).records}
         if any(row.slot in archived for row in rows) and reader.ident is None:
@@ -46194,7 +46334,7 @@ def test_a_lockless_reader_waits_out_an_absent_batch_between_its_archive_and_act
                 time.sleep(0.01)
             time.sleep(0.2)
             assert result == {}, "the reader finished while the batch held the lock"
-        real_safe(config_arg, rows)
+        real_safe(config_arg, rows, host_process_census=host_process_census)
 
     monkeypatch.setattr(wrkslots, "_assert_absent_validate_rows_safe", read_inside_the_gap)
     assert run_absent_validate_recovery(project, input_path, apply=True) == 0

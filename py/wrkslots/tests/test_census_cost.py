@@ -1968,3 +1968,30 @@ def test_lsof_census_walks_each_distinct_mount_table_once(
     )
     with pytest.raises(cli.Refusal, match=rf"live process {user} uses slot"):
         cli._assert_slot_unused(slot, proc_root=proc_root)
+
+
+def test_census_output_refusal_names_the_overflowing_stream() -> None:
+    budget = cli._ReadOnlyCommandBudget.start(
+        timeout_seconds=60, stdout_limit=4, stderr_limit=4
+    )
+    with pytest.raises(cli.Refusal, match="stdout over by 3 bytes"):
+        budget.consume_output(b"1234567", b"")
+    budget = cli._ReadOnlyCommandBudget.start(
+        timeout_seconds=60, stdout_limit=4, stderr_limit=4
+    )
+    with pytest.raises(cli.Refusal, match="stderr over by 2 bytes"):
+        budget.consume_output(b"", b"123456")
+
+
+def test_absent_census_stderr_budget_scales_with_process_count() -> None:
+    assert cli._absent_census_stderr_bytes(10) == 64 * 1024
+    assert cli._absent_census_stderr_bytes(4600) == 4600 * 256
+
+
+def test_user_systemd_stdout_budget_scales_with_process_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "_host_process_count", lambda: 10)
+    assert cli._user_systemd_stdout_bytes() == 1024 * 1024
+    monkeypatch.setattr(cli, "_host_process_count", lambda: 4600)
+    assert cli._user_systemd_stdout_bytes() == 4600 * 512

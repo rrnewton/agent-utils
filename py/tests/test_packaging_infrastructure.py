@@ -984,9 +984,13 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # whose gitdir still names the pre-rename worktree) is mapped.
     # The two later-schema frozen COULD_NOT_RUN cases of 47aa56e7 (service-result
     # schemas 6 and 7) are ordinary.
-    assert len(all_tests) == 2126
+    # The three absent-validate-row recovery cases for
+    # https://github.com/rrnewton/agent-utils/issues/297 (a stranded replay
+    # past a refusing census, a clean-caches dry run, and clean-caches
+    # beside a stranded batch) are mapped.
+    assert len(all_tests) == 2129
     assert len(ordinary) == 339
-    assert len(mapped) == 1787
+    assert len(mapped) == 1790
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

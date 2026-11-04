@@ -764,6 +764,48 @@ _AT_SYMLINK_FOLLOW = 0x400
 # distinct-content bound.
 _MOUNTINFO_CENSUS_BYTES_LIMIT = 256 * 1024 * 1024
 _ABSENT_PROCESS_CENSUS_SECONDS = 60.0
+# Per-process stderr allowance for the all-process census: privileged
+# helpers run per observed process and each may note a line (for example a
+# PID-namespace teardown), so a fixed 64 KiB budget overflows on busy
+# hosts (https://github.com/rrnewton/agent-utils/issues/297). The floor
+# keeps small hosts at the historical bound.
+_ABSENT_CENSUS_STDERR_FLOOR_BYTES = 64 * 1024
+_ABSENT_CENSUS_STDERR_PER_PROCESS_BYTES = 256
+
+
+def _absent_census_stderr_bytes(process_count: int) -> int:
+    """Stderr budget for one all-process census, scaled to the host."""
+
+    return max(
+        _ABSENT_CENSUS_STDERR_FLOOR_BYTES,
+        process_count * _ABSENT_CENSUS_STDERR_PER_PROCESS_BYTES,
+    )
+
+
+def _host_process_count() -> int:
+    """Live process count, the scale factor for host-wide census output."""
+
+    try:
+        return sum(1 for name in os.listdir("/proc") if name.isdigit())
+    except OSError:
+        return 0
+
+
+# Per-process stdout allowance for the user-systemd snapshot: the unit
+# listing and per-unit property replies grow with the number of units,
+# which grows with the host's process count, so a fixed 1 MiB budget
+# overflows on busy hosts the same way the stderr budget did.
+_USER_SYSTEMD_STDOUT_FLOOR_BYTES = 1024 * 1024
+_USER_SYSTEMD_STDOUT_PER_PROCESS_BYTES = 512
+
+
+def _user_systemd_stdout_bytes() -> int:
+    """Stdout budget for one user-systemd snapshot, scaled to the host."""
+
+    return max(
+        _USER_SYSTEMD_STDOUT_FLOOR_BYTES,
+        _host_process_count() * _USER_SYSTEMD_STDOUT_PER_PROCESS_BYTES,
+    )
 _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
 # One operation-wide deadline covers the shared privileged census and every
 # per-item same-UID census of a validation batch.  Phase A selects and seals the
@@ -30437,6 +30479,31 @@ def _journal_cache_slot(
     return _cache_slot_for_validated_journal(config, journal)
 
 
+def _journal_kind_is_absent_batch(config: Config, path: Path) -> bool:
+    """Whether an outstanding journal is an absent-row recovery batch.
+
+    Those journals are replayed by `wrkslots recover`, not by cache
+    cleanup; they must not refuse cleanup of unrelated slots
+    (https://github.com/rrnewton/agent-utils/issues/297). Kind only: the
+    batch's provenance is validated by its own replay path.
+    """
+
+    try:
+        if path.exists() or path.is_symlink():
+            contents, _identity = _read_regular_file_identity(
+                path, "cache recovery journal", _JOURNAL_BYTES_LIMIT
+            )
+            raw = _strict_json_object(contents, "cache recovery journal")
+        else:
+            pending = _pending_journal_for_path(config, path)
+            if pending is None:
+                return False
+            raw = pending
+    except (StateError, Refusal):
+        return False
+    return raw.get("kind") in {"remove-validate-batch", "recover-absent-validate-rows"}
+
+
 def _all_journal_cache_slots(
     config: Config,
     requested: AbstractSet[str] | None = None,
@@ -30445,6 +30512,7 @@ def _all_journal_cache_slots(
     journals = tuple(
         _validated_cache_journal(config, path, states)
         for path in _outstanding_journals(config)
+        if not _journal_kind_is_absent_batch(config, path)
     )
     seen: dict[str, str] = {}
     for journal in journals:
@@ -34732,13 +34800,23 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
     with contextlib.ExitStack() as locks:
         locks.enter_context(_mutation_locks(config, args.wait_lock))
         _refuse_partial_state(config)
-        states, _archives = _validate_global_state(config)
+        # An interrupted absent-row recovery leaves its rows active and
+        # archived until replayed; that split must not block cache
+        # reclamation for every other slot
+        # (https://github.com/rrnewton/agent-utils/issues/297). The batch's
+        # own slots are refused by name below.
+        states, _archives, _batch_journals, absent_slots = (
+            _validate_global_state_beside_absent_batch(config)
+        )
         requested = set(only)
+        for slot in sorted(requested & set(absent_slots)):
+            _assert_not_in_absent_batch(slot, absent_slots)
         cache_slots = {
             record.slot: CacheSlot(record.slot, record.machine, record.checkouts)
             for state in states
             for record in state.slots
-            if not requested or record.slot in requested
+            if record.slot not in absent_slots
+            and (not requested or record.slot in requested)
         }
         registered_slots = {
             record.slot for candidate in states for record in candidate.slots
@@ -34786,6 +34864,10 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
         if unknown:
             raise Refusal(f"unknown slot(s) for cache cleanup: {', '.join(unknown)}")
         selected = set(cache_slots) if args.yes else set(only)
+        if getattr(args, "dry_run", False):
+            # Report exactly what the selected run would remove, deleting
+            # nothing (https://github.com/rrnewton/agent-utils/issues/297).
+            selected = set()
         rows: list[dict[str, object]] = [
             {
                 "slot": slot,
@@ -55841,8 +55923,16 @@ class _ReadOnlyCommandBudget:
     def consume_output(self, stdout: bytes, stderr: bytes) -> None:
         self.stdout_remaining -= len(stdout)
         self.stderr_remaining -= len(stderr)
-        if self.stdout_remaining < 0 or self.stderr_remaining < 0:
-            raise Refusal("read-only census exceeded its operation-wide output bound")
+        if self.stdout_remaining < 0:
+            raise Refusal(
+                "read-only census exceeded its operation-wide output bound: "
+                f"stdout over by {-self.stdout_remaining} bytes"
+            )
+        if self.stderr_remaining < 0:
+            raise Refusal(
+                "read-only census exceeded its operation-wide output bound: "
+                f"stderr over by {-self.stderr_remaining} bytes"
+            )
 
     def consume_observation(self) -> None:
         if self.observations_remaining <= 0:
@@ -56021,7 +56111,11 @@ def _run_root_owned_command(
     stdout_limit = selected_budget.stdout_remaining
     stderr_limit = selected_budget.stderr_remaining
     if stdout_limit <= 0 or stderr_limit <= 0:
-        raise Refusal("read-only census exhausted its operation-wide output bound")
+        stream = "stdout" if stdout_limit <= 0 else "stderr"
+        raise Refusal(
+            "read-only census exhausted its operation-wide output bound: "
+            f"{stream} budget already spent"
+        )
     result = _run_bounded_read_only_command(
         command,
         timeout_seconds=selected_budget.remaining_seconds(),
@@ -56052,7 +56146,11 @@ def _run_same_uid_command(
     stdout_limit = budget.stdout_remaining
     stderr_limit = budget.stderr_remaining
     if stdout_limit <= 0 or stderr_limit <= 0:
-        raise Refusal("same-UID census exhausted its operation-wide output bound")
+        stream = "stdout" if stdout_limit <= 0 else "stderr"
+        raise Refusal(
+            "same-UID census exhausted its operation-wide output bound: "
+            f"{stream} budget already spent"
+        )
     result = _run_bounded_read_only_command(
         command,
         timeout_seconds=budget.remaining_seconds(),
@@ -58253,15 +58351,15 @@ def _assert_absent_validate_processes_unrelated(
     rows: Sequence[tuple[ActiveRecord, tuple[Path, ...]]],
 ) -> tuple[_AbsentProcessObservation, ...]:
     targets = {path: record.slot for record, row_paths in rows for path in row_paths}
-    budget = _ReadOnlyCommandBudget.start(
-        timeout_seconds=_ABSENT_PROCESS_CENSUS_SECONDS,
-        stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
-        stderr_limit=64 * 1024,
-        input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
-    )
     for attempt in range(3):
         try:
             processes = _absent_validate_process_snapshot()
+            budget = _ReadOnlyCommandBudget.start(
+                timeout_seconds=_ABSENT_PROCESS_CENSUS_SECONDS,
+                stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
+                stderr_limit=_absent_census_stderr_bytes(len(processes)),
+                input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+            )
             match = _absent_validate_mount_match(processes, targets, budget)
             if match is not None:
                 pid, slot, kind, detail = match
@@ -58356,7 +58454,11 @@ def _run_user_busctl(
     )
     stderr_limit = budget.stderr_remaining
     if stdout_limit <= 0 or stderr_limit <= 0:
-        raise Refusal("user-systemd census exhausted its operation-wide output bound")
+        stream = "stdout" if stdout_limit <= 0 else "stderr"
+        raise Refusal(
+            "user-systemd census exhausted its operation-wide output bound: "
+            f"{stream} budget already spent"
+        )
     returncode, stdout, stderr = _run_bounded_read_only_command(
         command,
         timeout_seconds=budget.remaining_seconds(),
@@ -58799,7 +58901,7 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
 
     budget = _ReadOnlyCommandBudget.start(
         timeout_seconds=30,
-        stdout_limit=1024 * 1024,
+        stdout_limit=_user_systemd_stdout_bytes(),
         stderr_limit=64 * 1024,
         input_limit=(
             _USER_SYSTEMD_LISTING_BYTES_LIMIT * _USER_SYSTEMD_SNAPSHOT_LISTING_READS
@@ -59796,7 +59898,12 @@ def _assert_absent_validate_owners_dead(records: Sequence[ActiveRecord]) -> None
         )
 
 
-def _assert_absent_validate_rows_safe(config: Config, records: Sequence[ActiveRecord]) -> None:
+def _assert_absent_validate_rows_safe(
+    config: Config,
+    records: Sequence[ActiveRecord],
+    *,
+    host_process_census: bool = True,
+) -> None:
     if not records:
         return
     _assert_absent_validate_rows_not_held(config, records)
@@ -59804,6 +59911,15 @@ def _assert_absent_validate_rows_safe(config: Config, records: Sequence[ActiveRe
     _assert_absent_validate_owners_dead(records)
     bindings = _retained_handles_for_absent_rows(config, rows)
     _assert_retained_handle_processes_dead(bindings)
+    if not host_process_census:
+        # Replay of a transaction whose archive entries are already
+        # durable: the host-wide process census ran (and passed) before
+        # those entries were appended, and the checks above re-prove
+        # storage absence and dead owners locally. Re-running the census
+        # here can only strand the rows active-and-archived when the
+        # census itself refuses under load
+        # (https://github.com/rrnewton/agent-utils/issues/297).
+        return
     evidence = _run_evidence(
         config,
         rows,
@@ -60279,7 +60395,11 @@ def _recover_absent_validate_rows(
         if (record := active_by_slot.get(item.slot)) is not None
     ]
     if remaining:
-        _assert_absent_validate_rows_safe(config, remaining)
+        _assert_absent_validate_rows_safe(
+            config,
+            remaining,
+            host_process_census=archived_prefix < len(items),
+        )
         active_state = _write_active_rows_removed(
             config,
             active_state,
@@ -63182,6 +63302,14 @@ usage or audit gate unknown, 3 fail-closed refusal.
         choices=("human", "json"),
         default="human",
         help="report format (default: human)",
+    )
+    clean_caches.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "with --only or --yes, report what would be removed for the selected "
+            "slots without deleting anything"
+        ),
     )
     clean_caches.set_defaults(handler=_cmd_clean_caches)
 
