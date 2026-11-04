@@ -200,9 +200,13 @@ The site can be built before any summaries exist. Agent activity, graph edges, c
 transcripts, and statistics remain available; sparse phase, lifetime, and calendar records are
 explicitly marked unavailable, and only genuine cached summaries receive Markdown files and links.
 
-The default summary configuration is `gpt-5.5` with `--reasoning-effort medium`. A provider or
-model failure aborts the summary run and retains its failure receipt; the pipeline never silently
-substitutes another model or the heuristic backend.
+The default summary backend is the zero-rated headless `muse` CLI, with every tool disabled:
+`muse-spark-1.3-internal` writes phase summaries, agent names and the project overview, and
+`watermelon-full-preview` writes calendar rollups (`--model` and `--rollup-model` override them),
+at `--reasoning-effort medium`. `--backend codex` (default model `gpt-5.5`) and `--backend claude`
+remain available. Each backend call is stopped after `--backend-timeout` seconds (default 900). A
+provider or model failure aborts the summary run and retains its failure receipt; the pipeline
+never silently substitutes another model or backend.
 
 To use the installed Claude Code CLI as the summary backend, select it explicitly, including the
 intended Claude model:
@@ -223,7 +227,7 @@ truncating durable normalized data:
 wrkviz summarize --output ./timelines/example-team --team example-team \
   --summary-start-time 2026-08-07T02:00:00Z \
   --summary-end-time 2026-08-07T03:00:00Z \
-  --rollup-kind hourly --model gpt-5.5 --reasoning-effort medium
+  --rollup-kind hourly --reasoning-effort medium
 ```
 
 After those cache entries exist, export the same zero-token website slice elsewhere with

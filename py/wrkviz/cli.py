@@ -54,12 +54,14 @@ from wrkviz.pipeline import (
     utc_now,
 )
 from wrkviz.budget import (
+    ZERO_RATED_BACKENDS,
     BudgetError,
     Prices,
     SummaryPlan,
     load_state,
     partial_warning,
 )
+from wrkviz.muse_backend import DEFAULT_MUSE_MODEL, DEFAULT_MUSE_ROLLUP_MODEL
 from wrkviz.project_config import (
     ProjectIngestConfig,
     ingest_project,
@@ -102,6 +104,9 @@ DEFAULT_MODEL = os.environ.get("WRKVIZ_MODEL", "gpt-5.5")
 DEFAULT_REASONING_EFFORT = os.environ.get(
     "WRKVIZ_REASONING_EFFORT", "medium"
 )
+#: One backend call's time limit. Healthy calls finish in seconds to a few minutes; a stalled
+#: call is stopped well before it can hold a run for the 20 minutes stalls have been seen to last.
+DEFAULT_BACKEND_TIMEOUT_SECONDS = 900.0
 
 
 def _load_userguide() -> str:
@@ -118,7 +123,10 @@ Build a version-controllable, multi-resolution website from an agent team's appe
    {PROG} refresh \\
      --root-session SESSION_UUID --team example-team \\
      --output ./timelines/example-team \\
-     --timezone America/New_York --model {DEFAULT_MODEL}
+     --timezone America/New_York
+
+   Summaries come from the zero-rated headless muse CLI by default; --backend codex or
+   --backend claude (with --model) uses those CLIs instead.
 
 2. Open it locally:
 
@@ -405,16 +413,30 @@ def _add_orc_ingest(parser: argparse.ArgumentParser) -> None:
 def _add_summary(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--backend",
-        choices=("codex", "claude", "heuristic"),
-        default="codex",
-        help="summary backend (heuristic is deterministic/offline)",
+        choices=("muse", "codex", "claude", "heuristic"),
+        default="muse",
+        help=(
+            "summary backend (default: %(default)s). muse runs the headless 'muse exec' with "
+            "every tool disabled and is zero-rated (no model spend); codex and claude run "
+            "those CLIs; heuristic is deterministic and offline"
+        ),
     )
     parser.add_argument(
         "--model",
         default=None,
         help=(
-            "backend model name; required for Claude, otherwise defaults to "
-            f"{DEFAULT_MODEL!r} (or WRKVIZ_MODEL)"
+            "backend model for phase summaries, agent names and the project overview. "
+            f"Defaults: muse {DEFAULT_MUSE_MODEL!r}; codex {DEFAULT_MODEL!r} (or WRKVIZ_MODEL); "
+            "required for claude"
+        ),
+    )
+    parser.add_argument(
+        "--rollup-model",
+        default=None,
+        help=(
+            "backend model for calendar rollups (default: --model, except that muse without "
+            f"--model uses {DEFAULT_MUSE_ROLLUP_MODEL!r}, which writes better rollups). Rollups "
+            "are cached under the model that wrote them"
         ),
     )
     parser.add_argument(
@@ -452,6 +474,22 @@ def _add_summary(parser: argparse.ArgumentParser) -> None:
         "--claude-command",
         default="claude",
         help="Claude executable (primarily for testing/wrappers)",
+    )
+    parser.add_argument(
+        "--muse-command",
+        default="muse",
+        help="Muse executable (primarily for testing/wrappers)",
+    )
+    parser.add_argument(
+        "--backend-timeout",
+        type=float,
+        default=DEFAULT_BACKEND_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "stop one backend call (its whole process group) after this many seconds and fail "
+            "its batch, so a stalled call cannot hold the run (default: %(default)s); finished "
+            "batches stay cached and a rerun retries only the failed ones"
+        ),
     )
     summary_start = parser.add_mutually_exclusive_group()
     summary_start.add_argument(
@@ -1293,17 +1331,34 @@ def _print_plan(plan: SummaryPlan) -> None:
         print(line, flush=True)
 
 
-def _summary_call(ns: argparse.Namespace) -> SummarizeReport | None:
-    backend = str(ns.backend)
-    raw_model: object = ns.model
+def _summary_models(backend: str, raw_model: object, raw_rollup: object) -> tuple[str, str]:
+    """Return the (phase, rollup) models for *backend* from ``--model`` and ``--rollup-model``."""
+
     if raw_model is None:
         if backend == "claude":
             raise ValueError("--model is required when --backend=claude")
-        model = DEFAULT_MODEL
+        model = DEFAULT_MUSE_MODEL if backend == "muse" else DEFAULT_MODEL
     else:
         model = str(raw_model).strip()
         if not model:
             raise ValueError("--model must not be empty")
+    if raw_rollup is None:
+        rollup_model = (
+            DEFAULT_MUSE_ROLLUP_MODEL if backend == "muse" and raw_model is None else model
+        )
+    else:
+        rollup_model = str(raw_rollup).strip()
+        if not rollup_model:
+            raise ValueError("--rollup-model must not be empty")
+    return model, rollup_model
+
+
+def _summary_call(ns: argparse.Namespace) -> SummarizeReport | None:
+    backend = str(ns.backend)
+    model, rollup_model = _summary_models(backend, ns.model, ns.rollup_model)
+    backend_timeout = float(ns.backend_timeout)
+    if not backend_timeout > 0:
+        raise ValueError("--backend-timeout must be a positive number of seconds")
     raw_service_tier: object = ns.service_tier
     service_tier = (
         None if raw_service_tier is None else str(raw_service_tier)
@@ -1355,7 +1410,11 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport | None:
     if budget_usd is not None and not budget_usd >= 0:
         raise ValueError("--budget-usd must be a non-negative number")
     prices = None if ns.price is None else Prices.parse(str(ns.price))
-    if budget_usd is not None and prices is None and backend != "heuristic":
+    if (
+        budget_usd is not None
+        and prices is None
+        and backend not in ("heuristic", *ZERO_RATED_BACKENDS)
+    ):
         raise ValueError("--budget-usd needs --price to turn token estimates into dollars")
     if bool(getattr(ns, "plan", False)):
         plan = plan_summaries(
@@ -1372,6 +1431,10 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport | None:
             rollup_kinds=rollup_kinds,
             budget_usd=budget_usd,
             prices=prices,
+            rollup_model=rollup_model,
+            max_workers=int(ns.summary_workers),
+            batch_size=int(ns.summary_batch_size),
+            name_batch_size=int(ns.name_batch_size),
         )
         _print_plan(plan)
         if plan.over_budget:
@@ -1393,6 +1456,9 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport | None:
         transcript_chars=int(ns.transcript_chars),
         codex_command=(str(ns.codex_command),),
         claude_command=(str(ns.claude_command),),
+        muse_command=(str(ns.muse_command),),
+        backend_timeout_seconds=backend_timeout,
+        rollup_model=rollup_model,
         reasoning_effort=str(ns.reasoning_effort),
         service_tier=service_tier,
         summary_window=summary_window,

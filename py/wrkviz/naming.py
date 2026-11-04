@@ -40,8 +40,9 @@ from wrkviz.claude_backend import (
     ClaudeBackendError,
     run_claude_json,
 )
+from wrkviz.muse_backend import MuseBackendError, run_muse_json
 from wrkviz.budget import AGENT_NAME_KIND, BudgetStop, SpendGuard
-from wrkviz.summarize import SummaryRunStats, clean_summary_prose
+from wrkviz.summarize import SummaryRunStats, answer_array_schema, clean_summary_prose
 from wrkviz.summary_artifacts import (
     ARTIFACT_ENVELOPE_FORMAT,
     ARTIFACT_ENVELOPE_VERSION,
@@ -356,7 +357,9 @@ def build_name_prompt(jobs: Sequence[AgentNameJob]) -> str:
     return build_agent_name_prompt(jobs)
 
 
-def _output_schema() -> dict[str, JsonValue]:
+def _output_schema(keys: Sequence[str] | None = None) -> dict[str, JsonValue]:
+    """Return the agent-name answer schema; with *keys*, exactly one name per key (#839)."""
+
     item: dict[str, JsonValue] = {
         "type": "object",
         "additionalProperties": False,
@@ -368,7 +371,11 @@ def _output_schema() -> dict[str, JsonValue]:
             "lifetime_summary",
         ],
         "properties": {
-            "key": {"type": "string", "minLength": 1},
+            "key": (
+                {"type": "string", "minLength": 1}
+                if keys is None
+                else {"type": "string", "enum": list(keys)}
+            ),
             "thread_id": {"type": "string", "minLength": 1},
             "short_name": {
                 "type": "string",
@@ -392,7 +399,7 @@ def _output_schema() -> dict[str, JsonValue]:
         "type": "object",
         "additionalProperties": False,
         "required": ["names"],
-        "properties": {"names": {"type": "array", "items": item}},
+        "properties": {"names": answer_array_schema(item, keys)},
     }
 
 
@@ -970,21 +977,31 @@ def _claude_batch(
     reasoning_effort: str | None,
     claude_command: Sequence[str],
     processes: BackendProcesses,
+    *,
+    backend: str = "claude",
 ) -> _NameBatchOutcome:
+    """Run one batch through the Claude CLI, or through ``muse exec`` for the muse backend.
+
+    Both take the same prompt and schema and return one structured result (#839).
+    """
+
+    run_json = run_muse_json if backend == "muse" else run_claude_json
     with tempfile.TemporaryDirectory(
         prefix="wrkviz-name-", ignore_cleanup_errors=True
     ) as raw_dir:
         try:
-            result = run_claude_json(
+            result = run_json(
                 claude_command,
                 prompt=build_agent_name_prompt([item.job for item in pending]),
-                schema=_output_schema(),
+                schema=_output_schema(
+                    [item.job.key for item in pending] if backend == "muse" else None
+                ),
                 model=model,
                 reasoning_effort=reasoning_effort,
                 cwd=Path(raw_dir),
                 processes=processes,
             )
-        except ClaudeBackendError as error:
+        except (ClaudeBackendError, MuseBackendError) as error:
             raise _ClaudeNameBatchError(str(error), error.usage) from error
         try:
             parsed = _parse_backend_output_with_repairs(
@@ -1062,6 +1079,7 @@ def _run_backend_batch(
     codex_command: Sequence[str],
     claude_command: Sequence[str],
     processes: BackendProcesses,
+    muse_command: Sequence[str] = ("muse",),
 ) -> _GeneratedNameBatch:
     started_at = _utc_now()
     input_hashes = tuple(item.input_hash for item in batch)
@@ -1090,7 +1108,12 @@ def _run_backend_batch(
             raw_output = outcome.raw_output
         else:
             outcome = _claude_batch(
-                batch, model, reasoning_effort, claude_command, processes
+                batch,
+                model,
+                reasoning_effort,
+                muse_command if backend == "muse" else claude_command,
+                processes,
+                backend=backend,
             )
             results = outcome.parsed.results
             repairs = outcome.parsed.repairs
@@ -1223,6 +1246,8 @@ def name_agents(
     service_tier: str | None = None,
     claude_command: Sequence[str] = ("claude",),
     guard: SpendGuard | None = None,
+    muse_command: Sequence[str] = ("muse",),
+    backend_timeout_seconds: float | None = None,
 ) -> tuple[dict[str, AgentNameResult], SummaryRunStats]:
     """Name agents after their summary pass, reusing immutable validated cache entries.
 
@@ -1231,7 +1256,7 @@ def name_agents(
 
     run_started_at = _utc_now()
 
-    if backend not in {"claude", "codex", "heuristic"}:
+    if backend not in {"claude", "codex", "heuristic", "muse"}:
         raise AgentNameError(f"unsupported agent naming backend {backend!r}")
     if not model.strip():
         raise AgentNameError("agent naming model must not be empty")
@@ -1274,7 +1299,7 @@ def name_agents(
     generated: dict[str, AgentNameResult] = {}
     generated_receipt_by_key: dict[str, str] = {}
     new_receipts: list[BatchUsageReceipt] = []
-    processes = BackendProcesses()
+    processes = BackendProcesses(backend_timeout_seconds)
 
     def publish_batch(
         batch: Sequence[_PendingName], batch_result: _GeneratedNameBatch
@@ -1328,6 +1353,7 @@ def name_agents(
                 codex_command=tuple(codex_command),
                 claude_command=tuple(claude_command),
                 processes=processes,
+                muse_command=tuple(muse_command),
             )
             usage = outcome.receipt.usage
             return outcome

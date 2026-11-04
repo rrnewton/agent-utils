@@ -12,11 +12,15 @@ without the rollups above them, so the budget is checked twice:
   ``summarize_state.json`` records the stop so the next run reports it and resumes.
 
 Estimates use the mean recorded usage per job of each kind from this cache's own batch receipts
-(same backend and model), falling back to built-in figures when there is no history.
+(same backend and model), falling back to built-in figures when there is no history. The muse
+backend is zero-rated: its plan still estimates tokens, but its model spend is $0 whatever
+``--price`` says, so a budget never stops it, and the plan reports the run's expected wall time
+instead, from the receipts' recorded call durations (#839 wrkviz-muse-backend).
 """
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 from collections.abc import Mapping
@@ -172,13 +176,43 @@ DEFAULT_JOB_USAGE: Mapping[str, JobUsage] = {
 
 _ZERO = JobUsage(0, 0, 0, 0)
 
+#: Backends whose calls are not billed to the run. Their plans report $0 model spend.
+ZERO_RATED_BACKENDS = frozenset({"muse"})
+
+#: Seconds one backend call takes when a cache has no timed receipts for a kind yet, by model.
+#: Measured on real team-days in November 2026: a Muse Spark 1.3 call of up to six phases took
+#: 15-76 s (about 50 s for six), and a Watermelon Full rollup call 40-480 s (about 190 s on
+#: average). Any other model is assumed to take a minute.
+DEFAULT_CALL_SECONDS: Mapping[str, float] = {
+    "muse-spark-1.3-internal": 50.0,
+    "watermelon-full-preview": 190.0,
+}
+FALLBACK_CALL_SECONDS = 60.0
+
+#: Rollup kinds, which run one job per call, one call at a time, under the rollup model.
+_ROLLUP_JOB_KINDS = frozenset({TECHNICAL_ROLLUP_KIND, PLAIN_ROLLUP_KIND})
+
+
+@dataclass(frozen=True)
+class CallTime:
+    """Mean seconds of one backend call of a kind, and how many calls that mean is drawn from."""
+
+    seconds: float
+    samples: int = 0
+
 
 @dataclass(frozen=True)
 class CostModel:
-    """Mean usage per job kind for one backend and model."""
+    """Mean usage per job kind for one backend and model.
+
+    ``zero_rated`` backends still have token estimates, but cost $0. ``per_call`` holds the mean
+    duration of one backend call per kind, for the wall-time estimate.
+    """
 
     per_job: Mapping[str, JobUsage]
     free: bool = False
+    zero_rated: bool = False
+    per_call: Mapping[str, CallTime] | None = None
 
     def usage(self, kind: str, jobs: int) -> TokenUsage:
         """Return the estimated usage of *jobs* jobs of *kind*."""
@@ -195,7 +229,7 @@ class CostModel:
         reservations add up to exactly the plan's per-stage estimate.
         """
 
-        if self.free or jobs <= 0:
+        if self.free or self.zero_rated or jobs <= 0:
             return 0.0
         default = DEFAULT_JOB_USAGE.get(kind, DEFAULT_JOB_USAGE[TECHNICAL_ROLLUP_KIND])
         mean = self.per_job.get(kind, default)
@@ -215,6 +249,14 @@ class CostModel:
         if item is None or item.samples == 0:
             return "built-in"
         return f"mean of {item.samples} recorded"
+
+    def call_time(self, kind: str) -> CallTime:
+        """Return the mean duration of one backend call of *kind*."""
+
+        if self.free:
+            return CallTime(0.0)
+        item = (self.per_call or {}).get(kind)
+        return item if item is not None else CallTime(FALLBACK_CALL_SECONDS)
 
 
 def _receipt_kind(cache_dir: Path, first_hash: str, name_cache: bool) -> str | None:
@@ -238,18 +280,36 @@ def _receipt_kind(cache_dir: Path, first_hash: str, name_cache: bool) -> str | N
     return PHASE_KIND
 
 
+def _receipt_seconds(started_at: str, completed_at: str) -> float | None:
+    try:
+        seconds = (
+            datetime.fromisoformat(completed_at) - datetime.fromisoformat(started_at)
+        ).total_seconds()
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
 def calibrate(
     summary_cache: Path,
     name_cache: Path,
     backend: str,
     model: str,
     reasoning_effort: str | None,
+    rollup_model: str | None = None,
 ) -> CostModel:
-    """Return mean usage per job kind from completed receipts of this backend/model/effort."""
+    """Return mean usage per job kind from completed receipts of this backend/model/effort.
+
+    Calendar rollups are calibrated from the receipts of *rollup_model* (default: *model*), the
+    model that writes them. Each kind also gets its mean call duration, or the built-in figure
+    for its model when no receipt of that kind is timed.
+    """
 
     if backend == "heuristic":
         return CostModel(per_job={}, free=True)
+    rollup_model = rollup_model or model
     totals: dict[str, list[float]] = {}
+    durations: dict[str, list[float]] = {}
     for cache_dir, is_names in ((summary_cache, False), (name_cache, True)):
         receipts = cache_dir / "_usage" / "receipts"
         if not receipts.is_dir():
@@ -262,13 +322,21 @@ def calibrate(
                 or receipt.usage is None
                 or not receipt.input_hashes
                 or receipt.backend != backend
-                or receipt.model != model
+                or receipt.model not in (model, rollup_model)
                 or receipt.reasoning_effort != reasoning_effort
             ):
                 continue
             kind = _receipt_kind(cache_dir, receipt.input_hashes[0], is_names)
             if kind is None:
                 continue
+            kind_model = rollup_model if kind in _ROLLUP_JOB_KINDS else model
+            if receipt.model != kind_model:
+                continue
+            seconds = _receipt_seconds(receipt.started_at, receipt.completed_at)
+            if seconds is not None:
+                timing = durations.setdefault(kind, [0.0, 0.0])
+                timing[0] += 1
+                timing[1] += seconds
             item = totals.setdefault(kind, [0.0, 0.0, 0.0, 0.0, 0.0])
             item[0] += len(receipt.input_hashes)
             item[1] += receipt.usage.input_tokens
@@ -286,7 +354,21 @@ def calibrate(
         for kind, values in totals.items()
         if values[0] > 0
     }
-    return CostModel(per_job=per_job)
+    per_call: dict[str, CallTime] = {}
+    for kind in (PHASE_KIND, AGENT_NAME_KIND, OVERVIEW_KIND, *sorted(_ROLLUP_JOB_KINDS)):
+        measured = durations.get(kind)
+        if measured is not None and measured[0] > 0:
+            per_call[kind] = CallTime(measured[1] / measured[0], int(measured[0]))
+        else:
+            kind_model = rollup_model if kind in _ROLLUP_JOB_KINDS else model
+            per_call[kind] = CallTime(
+                DEFAULT_CALL_SECONDS.get(kind_model, FALLBACK_CALL_SECONDS)
+            )
+    return CostModel(
+        per_job=per_job,
+        zero_rated=backend in ZERO_RATED_BACKENDS,
+        per_call=per_call,
+    )
 
 
 @dataclass
@@ -312,6 +394,9 @@ class SummaryPlan:
     budget_usd: float | None
     previous_state: Mapping[str, JsonValue] | None = None
     request: Mapping[str, JsonValue] | None = None
+    batch_size: int = 6
+    name_batch_size: int = 12
+    workers: int = 3
 
     def stage_usage(self, stage: StageCount) -> TokenUsage:
         """Return the estimated usage of one stage's new model work."""
@@ -328,16 +413,44 @@ class SummaryPlan:
         return total
 
     def stage_usd(self, stage: StageCount) -> float | None:
-        """Return the estimated cost of one stage, if prices are known."""
+        """Return the estimated cost of one stage, if prices are known (always $0 if free)."""
 
+        if self.costs.zero_rated:
+            return 0.0
         if self.prices is None:
             return None
         return self.costs.usd(stage.kind, stage.to_generate, self.prices)
+
+    def stage_seconds(self, stage: StageCount) -> float:
+        """Return the estimated wall time of one stage's new model work.
+
+        Phase summaries and agent names run in batches on ``workers`` threads; the overview and
+        each calendar rollup is one call, and rollups run one after another.
+        """
+
+        if stage.to_generate <= 0:
+            return 0.0
+        call = self.costs.call_time(stage.kind).seconds
+        if stage.kind == PHASE_KIND:
+            calls = math.ceil(stage.to_generate / max(1, self.batch_size))
+        elif stage.kind == AGENT_NAME_KIND:
+            calls = math.ceil(stage.to_generate / max(1, self.name_batch_size))
+        else:
+            return stage.to_generate * call
+        return math.ceil(calls / max(1, self.workers)) * call
+
+    @property
+    def estimated_seconds(self) -> float:
+        """Return the estimated wall time of the whole remaining tree."""
+
+        return sum(self.stage_seconds(stage) for stage in self.stages)
 
     @property
     def estimated_usd(self) -> float | None:
         """Return the estimated cost of the whole remaining tree, if prices are known."""
 
+        if self.costs.zero_rated:
+            return 0.0
         if self.prices is None:
             return None
         return sum(
@@ -388,8 +501,13 @@ class SummaryPlan:
             f"{usage.output_tokens:,} out tokens"
         )
         estimate = self.estimated_usd
-        if estimate is not None:
+        if self.costs.zero_rated:
+            total += ", $0.00 model spend (zero-rated backend)"
+        elif estimate is not None:
             total += f", ~${estimate:.2f}"
+        if self.to_generate and self.costs.zero_rated:
+            # Time, not money, is what a zero-rated run spends.
+            total += f"; expected wall time ~{_duration(self.estimated_seconds)}"
         if self.budget_usd is not None:
             total += f"; budget ${self.budget_usd:.2f}"
             if estimate is not None:
@@ -413,17 +531,31 @@ class SummaryPlan:
             }
             for stage in self.stages
         ]
-        return {
+        plan: dict[str, JsonValue] = {
             "stages": stages,
             "to_generate": self.to_generate,
             "estimated_usage": self.usage.to_json(),
             "estimated_usd": _rounded(self.estimated_usd),
             "budget_usd": self.budget_usd,
         }
+        if self.costs.zero_rated:
+            plan["estimated_seconds"] = round(self.estimated_seconds, 1)
+        return plan
 
 
 def _rounded(value: float | None) -> JsonValue:
     return None if value is None else round(value, 4)
+
+
+def _duration(seconds: float) -> str:
+    """Return *seconds* as a short human duration: ``45 s``, ``12 min`` or ``2 h 5 min``."""
+
+    if seconds < 90:
+        return f"{seconds:.0f} s"
+    minutes = math.ceil(seconds / 60)
+    if minutes < 120:
+        return f"{minutes} min"
+    return f"{minutes // 60} h {minutes % 60} min"
 
 
 class SpendGuard:

@@ -99,6 +99,8 @@ def test_reasoning_effort_and_service_tier_reach_pipeline(
             str(tmp_path),
             "--team",
             "test-team",
+            "--backend",
+            "codex",
             "--model",
             "model-under-test",
             "--reasoning-effort",
@@ -136,14 +138,89 @@ def test_default_summary_model_is_supported_configuration(
         ["summarize", "--output", "unused", "--team", "test-team"]
     )
 
-    assert ns.backend == "codex"
+    assert ns.backend == "muse"
     # The parser keeps omission visible so Claude can require an explicit model;
-    # `_summary_call` resolves the Codex omission to DEFAULT_MODEL.
+    # `_summary_call` resolves the omission per backend.
     assert ns.model is None
+    assert ns.rollup_model is None
     assert ns.reasoning_effort == "medium"
+    assert ns.muse_command == "muse"
+    assert ns.backend_timeout == timeline_cli.DEFAULT_BACKEND_TIMEOUT_SECONDS
 
     with pytest.raises(SystemExit) as raised:
         timeline_cli.main(["summarize", "--help"])
     assert raised.value.code == 0
     help_text = " ".join(capsys.readouterr().out.split())
     assert "instead of selecting another model or backend" in help_text
+    # argparse may wrap a model name at its hyphens.
+    help_text = help_text.replace("- ", "-")
+    assert "muse-spark-1.3-internal" in help_text
+    assert "watermelon-full-preview" in help_text
+    assert "zero-rated" in help_text
+
+
+@pytest.mark.parametrize(
+    ("backend", "model", "rollup", "expected"),
+    [
+        ("muse", None, None, ("muse-spark-1.3-internal", "watermelon-full-preview")),
+        ("muse", "spark-x", None, ("spark-x", "spark-x")),
+        ("muse", None, "big-y", ("muse-spark-1.3-internal", "big-y")),
+        ("codex", None, None, (timeline_cli.DEFAULT_MODEL, timeline_cli.DEFAULT_MODEL)),
+        ("codex", "gpt-z", "gpt-r", ("gpt-z", "gpt-r")),
+        ("claude", "claude-q", None, ("claude-q", "claude-q")),
+        ("heuristic", None, None, (timeline_cli.DEFAULT_MODEL, timeline_cli.DEFAULT_MODEL)),
+    ],
+)
+def test_summary_models_follow_backend_defaults(
+    backend: str, model: str | None, rollup: str | None, expected: tuple[str, str]
+) -> None:
+    assert timeline_cli._summary_models(backend, model, rollup) == expected
+
+
+def test_summary_models_reject_missing_claude_model_and_blank_names() -> None:
+    with pytest.raises(ValueError, match="--model is required"):
+        timeline_cli._summary_models("claude", None, None)
+    with pytest.raises(ValueError, match="--rollup-model must not be empty"):
+        timeline_cli._summary_models("muse", None, " ")
+
+
+def test_muse_backend_options_reach_pipeline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_summarize_archive(
+        archive: Path, team_slug: str, backend: str, model: str, **kwargs: object
+    ) -> SummarizeReport:
+        seen.update(backend=backend, model=model, **kwargs)
+        return _report()
+
+    monkeypatch.setattr(timeline_cli, "summarize_archive", fake_summarize_archive)
+    ns = timeline_cli._parser().parse_args(
+        [
+            "summarize",
+            "--output",
+            str(tmp_path),
+            "--team",
+            "test-team",
+            "--muse-command",
+            "/opt/muse-wrapper",
+            "--backend-timeout",
+            "120",
+        ]
+    )
+    timeline_cli._summary_call(ns)
+    assert seen["backend"] == "muse"
+    assert seen["model"] == "muse-spark-1.3-internal"
+    assert seen["rollup_model"] == "watermelon-full-preview"
+    assert seen["muse_command"] == ("/opt/muse-wrapper",)
+    assert seen["backend_timeout_seconds"] == 120.0
+    assert seen["service_tier"] is None
+
+
+def test_backend_timeout_must_be_positive(tmp_path: Path) -> None:
+    ns = timeline_cli._parser().parse_args(
+        ["summarize", "--output", str(tmp_path), "--team", "t", "--backend-timeout", "0"]
+    )
+    with pytest.raises(ValueError, match="--backend-timeout"):
+        timeline_cli._summary_call(ns)

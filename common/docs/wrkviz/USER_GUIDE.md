@@ -72,8 +72,9 @@ usable when copied offline.
 python3 -m pip install wrkviz
 ```
 
-Python 3.10+ is required. Summarization uses an installed `codex` CLI by default; ingestion,
-formatting, serving, and the deterministic `heuristic` backend use only the Python standard library.
+Python 3.10+ is required. Summarization uses an installed `muse` CLI by default (`--backend codex`
+and `--backend claude` use those CLIs instead); ingestion, formatting, serving, and the
+deterministic `heuristic` backend use only the Python standard library.
 
 ## Find the coordinator session
 
@@ -628,19 +629,47 @@ covers is refused, because that is a decision rather than a fault.
 ### 3. Summarize — the only token-spending stage
 
 ```bash
+wrkviz summarize --team example-team --output ./timelines/example-team
+```
+
+The default backend is `muse`: each batch is one headless `muse exec --json` call with an
+`--output-schema`, the `empty` preset, and the shell, file writes, web tools, reminders, questions
+back, the session log, personal context and Muse's own rules all turned off, so a call is a pure
+prompt-to-JSON transformation. Muse calls are zero-rated: they spend no model budget. Phase
+summaries, agent names and the project overview use `muse-spark-1.3-internal`; calendar rollups,
+which gain most from a larger model, use `watermelon-full-preview`. `--model` sets the first model
+(and, when given alone, the rollup model too), and `--rollup-model` sets the rollup model on its
+own. Each rollup is cached under the model that wrote it, so changing `--rollup-model` regenerates
+rollups and leaves phase summaries cached. The reasoning effort defaults to `medium` for every
+backend. `--muse-command` selects a wrapper or alternate executable; it does not change the cache
+identity.
+
+Each muse call is handed a schema narrowed to its own batch: the answer's `key` must be one of
+the batch's keys, and it must hold exactly one entry per job. Spark, left to the open schema,
+answered multi-job batches with one entry, with keys it made up, or with an extra placeholder
+entry; the narrowed schema removed those failures, and the strict parser still checks every
+answer.
+
+To summarize through the Codex CLI instead:
+
+```bash
 wrkviz summarize \
   --team example-team --output ./timelines/example-team \
   --backend codex --model gpt-5.5 --reasoning-effort medium \
   --service-tier priority
 ```
 
-The CLI defaults to `gpt-5.5` at `medium` reasoning effort. A provider or model failure stops the
-run and leaves its failure receipt; it never silently changes models or switches to the heuristic
-backend. Use `--model` or the
-`WRKVIZ_MODEL` environment variable only when intentionally overriding that policy.
+With `--backend codex` the model defaults to `gpt-5.5` (or the `WRKVIZ_MODEL` environment
+variable). A provider or model failure stops the run and leaves its failure receipt; it never
+silently changes models or switches backends.
+
+Every backend call has a time limit, `--backend-timeout` (default 900 seconds). A call still
+running at the limit is stopped, its whole process group with it, and its batch fails like any
+other provider failure; batches that already finished stay cached, so the next run asks only for
+the rest. This bounds the rare call that stalls for many minutes while its siblings finish.
 
 The summary provider is independent of the transcript source provider. To summarize any normalized
-team through the installed Claude Code CLI, run:
+team through the installed Claude Code CLI, which needs an explicit `--model`, run:
 
 ```bash
 wrkviz summarize \
@@ -717,7 +746,11 @@ any model call, `summarize` walks that whole tree against the cache and prints a
 how many jobs are cached, carried forward (below), or need a model call, with estimated tokens
 and, given `--price`, dollars. Estimates are the mean recorded usage per job of each kind from
 this team's own receipts for the same backend, model and effort; a team with no history uses
-built-in figures that err high. `--plan` prints the plan and exits without spending:
+built-in figures that err high. With the zero-rated `muse` backend the plan reports `$0.00 model
+spend` whatever `--price` says, a budget never stops the run, and the plan gives the run's
+expected wall time instead, from the mean duration of the receipts' calls (or built-in per-model
+figures), the batch sizes and `--summary-workers`. `--plan` prints the plan and exits without
+spending:
 
 ```bash
 wrkviz summarize --team example-team --output ./timelines/example-team \
@@ -758,7 +791,9 @@ the strict JSON schema; a failed batch cannot corrupt existing cache data, while
 batches remain reusable.
 
 Phase work bullets use half-open time bounds: the start timestamp is valid and the end timestamp is
-not. A model response that is otherwise completely valid may contain out-of-range phase bullets;
+not. The phase prompt states each job's window in UTC and in milliseconds, and says that events in
+prior context belong to an earlier window. A model response that is otherwise completely valid may
+contain out-of-range phase bullets;
 the pipeline drops those bullets without shifting or inventing timestamps. It then derives the
 phrase and paragraph only from remaining valid bullet text, or uses the existing transcript-only
 fallback when every bullet was rejected. A genuinely empty model bullet list keeps the model's
@@ -803,7 +838,7 @@ wrkviz summarize \
   --team example-team --output ./timelines/example-team \
   --summary-start-time 2026-08-07T02:00:00Z \
   --summary-end-time 2026-08-07T03:00:00Z \
-  --rollup-kind hourly --model gpt-5.5 --reasoning-effort medium
+  --rollup-kind hourly --reasoning-effort medium
 ```
 
 Repeat `--rollup-kind` to request several levels. Omitting it retains the daily, weekly, monthly,

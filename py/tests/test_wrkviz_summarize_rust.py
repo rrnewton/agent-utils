@@ -544,3 +544,56 @@ def test_summarize_retryable_split_is_fatal(
         "--backend", "codex", "--model", "fake-model",
         "--codex-command", str(fake), "--summary-batch-size", "2",
     ], expect=2)
+
+
+MUSE_REFUSAL = (
+    "wrkviz: the muse backend is not yet in the Rust edition "
+    "(#842 wrkviz-muse-backend-rust); use the Python engine or --backend claude|codex\n"
+)
+
+
+@pytest.mark.parametrize("backend_args", [[], ["--backend", "muse"]])
+def test_rust_refuses_the_muse_backend_before_any_work(
+    tmp_path: Path, rust_wrkviz: Path, backend_args: list[str]
+) -> None:
+    """#839 made muse the default; this edition refuses it in one line and touches nothing."""
+
+    archives = _ingest(tmp_path, rust_wrkviz)
+    before = _tree(archives["rs"])
+    result = _run([str(rust_wrkviz)], [
+        "summarize", "--output", str(archives["rs"]), "--team", "widget", *backend_args,
+    ])
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == MUSE_REFUSAL
+    assert _tree(archives["rs"]) == before
+
+    sessions = _sessions(tmp_path / "refresh")
+    fresh = tmp_path / "refresh-out"
+    refreshed = _run([str(rust_wrkviz)], [
+        "refresh", "--sessions-root", str(sessions), "--root-session", CODEX_ROOT,
+        "--team", "widget", "--output", str(fresh), *backend_args,
+    ])
+    assert (refreshed.returncode, refreshed.stderr) == (2, MUSE_REFUSAL)
+    assert not fresh.exists()
+
+
+def test_rust_accepts_the_new_summary_flags_where_it_can_honour_them(
+    tmp_path: Path, rust_wrkviz: Path
+) -> None:
+    _compare(tmp_path / "same", rust_wrkviz, [
+        "--backend", "heuristic", "--model", "offline", "--rollup-model", "offline",
+        "--backend-timeout", "30", "--muse-command", "/nonexistent/muse",
+        "--rollup-kind", "daily",
+    ])
+    _compare(tmp_path / "bad-timeout", rust_wrkviz, [
+        "--backend", "heuristic", "--backend-timeout", "soon",
+    ], expect=2)
+    archives = _ingest(tmp_path / "split", rust_wrkviz)
+    split = _run([str(rust_wrkviz)], [
+        "summarize", "--output", str(archives["rs"]), "--team", "widget",
+        "--backend", "heuristic", "--model", "offline", "--rollup-model", "bigger",
+    ])
+    assert split.returncode == 2
+    assert "a separate --rollup-model is not yet in the Rust edition" in split.stderr
+    assert "#842 wrkviz-muse-backend-rust" in split.stderr

@@ -97,6 +97,7 @@ from wrkviz.budget import (
     Prices,
     SpendGuard,
     StageCount,
+    ZERO_RATED_BACKENDS,
     SummaryPlan,
     calibrate,
     load_state,
@@ -4161,10 +4162,14 @@ def _request_json(
     reasoning_effort: str | None,
     service_tier: str | None,
     rollup_kinds: tuple[str, ...],
+    rollup_model: str | None = None,
 ) -> dict[str, JsonValue]:
-    """What a summarize run was asked for, as recorded in its run state."""
+    """What a summarize run was asked for, as recorded in its run state.
 
-    return {
+    ``rollup_model`` appears only when calendar rollups use a different model (#839).
+    """
+
+    request: dict[str, JsonValue] = {
         "backend": backend,
         "model": model,
         "reasoning_effort": reasoning_effort,
@@ -4173,6 +4178,9 @@ def _request_json(
         "window_end_ms": tree.team.window_end_ms,
         "rollup_kinds": list(rollup_kinds),
     }
+    if rollup_model is not None and rollup_model != model:
+        request["rollup_model"] = rollup_model
+    return request
 
 
 def _rollup_index(summary_root: Path) -> Path:
@@ -4192,9 +4200,18 @@ def _plan_tree(
     rollup_kinds: tuple[str, ...],
     prices: Prices | None,
     budget_usd: float | None,
+    rollup_model: str | None = None,
+    batch_size: int = 6,
+    name_batch_size: int = 12,
+    max_workers: int = 3,
 ) -> SummaryPlan:
-    """Count what is cached, carried forward, or needs a model call, level by level."""
+    """Count what is cached, carried forward, or needs a model call, level by level.
 
+    Calendar rollups are looked up under *rollup_model* (default: *model*), the model that
+    would write them (#839).
+    """
+
+    rollup_model = rollup_model or model
     cache = tree.summary_root / "cache"
     name_cache = tree.summary_root / "name_cache"
     index = _rollup_index(tree.summary_root)
@@ -4258,13 +4275,15 @@ def _plan_tree(
         item = rollup_stages[(job.key.split(":")[1], job.summary_style)]
         item.total += 1
         if own_known and prior_known:
-            hit = cached_summary(job, cache, backend, model, reasoning_effort, service_tier)
+            hit = cached_summary(
+                job, cache, backend, rollup_model, reasoning_effort, service_tier
+            )
             if hit is not None:
                 item.cached += 1
                 return hit
         if own_known:
             carried = carried_forward_summary(
-                job, index, cache, backend, model, reasoning_effort, service_tier
+                job, index, cache, backend, rollup_model, reasoning_effort, service_tier
             )
             if carried is not None:
                 item.carried_forward += 1
@@ -4290,13 +4309,16 @@ def _plan_tree(
     return SummaryPlan(
         team_slug=tree.team.team_slug,
         stages=stages,
-        costs=calibrate(cache, name_cache, backend, model, reasoning_effort),
+        costs=calibrate(cache, name_cache, backend, model, reasoning_effort, rollup_model),
         prices=prices,
         budget_usd=budget_usd,
         previous_state=_unfinished_state(tree.summary_root),
         request=_request_json(
-            tree, backend, model, reasoning_effort, service_tier, rollup_kinds
+            tree, backend, model, reasoning_effort, service_tier, rollup_kinds, rollup_model
         ),
+        batch_size=batch_size,
+        name_batch_size=name_batch_size,
+        workers=max_workers,
     )
 
 
@@ -4328,6 +4350,9 @@ def _summarize_archive_locked(
     budget_usd: float | None = None,
     prices: Prices | None = None,
     on_plan: Callable[[SummaryPlan], None] | None = None,
+    muse_command: Sequence[str] = ("muse",),
+    backend_timeout_seconds: float | None = None,
+    rollup_model: str | None = None,
 ) -> SummarizeReport:
     """Fill only missing/changed structured summaries; never format the website.
 
@@ -4339,7 +4364,13 @@ def _summarize_archive_locked(
     """
 
     service_tier = resolve_service_tier(backend, service_tier)
-    if budget_usd is not None and prices is None and backend != "heuristic":
+    rollup_model = rollup_model or model
+    if (
+        budget_usd is not None
+        and prices is None
+        and backend != "heuristic"
+        and backend not in ZERO_RATED_BACKENDS
+    ):
         raise ValueError("a summary budget needs model prices (--price)")
     tree = _summary_tree(
         archive,
@@ -4360,6 +4391,10 @@ def _summarize_archive_locked(
         rollup_kinds=rollup_kinds,
         prices=prices,
         budget_usd=budget_usd,
+        rollup_model=rollup_model,
+        batch_size=batch_size,
+        name_batch_size=name_batch_size,
+        max_workers=max_workers,
     )
     if on_plan is not None:
         on_plan(plan)
@@ -4367,13 +4402,13 @@ def _summarize_archive_locked(
         raise BudgetExceeded(plan)
     guard = (
         SpendGuard(budget_usd, prices, plan.costs)
-        if budget_usd is not None and prices is not None
+        if budget_usd is not None and prices is not None and not plan.costs.zero_rated
         else None
     )
     summary_root = tree.summary_root
     state = running_state(
         request=_request_json(
-            tree, backend, model, reasoning_effort, service_tier, rollup_kinds
+            tree, backend, model, reasoning_effort, service_tier, rollup_kinds, rollup_model
         ),
         plan=plan,
         previous=load_state(summary_root),
@@ -4397,6 +4432,9 @@ def _summarize_archive_locked(
             reasoning_effort=reasoning_effort,
             service_tier=service_tier,
             rollup_kinds=rollup_kinds,
+            muse_command=muse_command,
+            backend_timeout_seconds=backend_timeout_seconds,
+            rollup_model=rollup_model,
         )
     except BaseException as error:
         reason = (
@@ -4445,7 +4483,11 @@ def _run_summary_tree(
     reasoning_effort: str | None,
     service_tier: str | None,
     rollup_kinds: tuple[str, ...],
+    muse_command: Sequence[str] = ("muse",),
+    backend_timeout_seconds: float | None = None,
+    rollup_model: str | None = None,
 ) -> SummarizeReport:
+    rollup_model = rollup_model or model
     team = tree.team
     team_slug = team.team_slug
     summary_root = tree.summary_root
@@ -4472,6 +4514,8 @@ def _run_summary_tree(
         reasoning_effort=reasoning_effort,
         service_tier=service_tier,
         guard=guard,
+        muse_command=muse_command,
+        backend_timeout_seconds=backend_timeout_seconds,
     )
     changed += _write_phase_data(archive, team_slug, phases, phase_results)
     progress["stage"] = "agent names"
@@ -4488,6 +4532,8 @@ def _run_summary_tree(
         reasoning_effort=reasoning_effort,
         service_tier=service_tier,
         guard=guard,
+        muse_command=muse_command,
+        backend_timeout_seconds=backend_timeout_seconds,
     )
     changed += _write_agent_name_data(
         archive, team_slug, name_jobs, agent_names
@@ -4506,6 +4552,8 @@ def _run_summary_tree(
         reasoning_effort=reasoning_effort,
         service_tier=service_tier,
         guard=guard,
+        muse_command=muse_command,
+        backend_timeout_seconds=backend_timeout_seconds,
     )
     project_overview = overview_results[overview_job.key]
     _validate_project_overview(project_overview, "generated project overview")
@@ -4525,11 +4573,14 @@ def _run_summary_tree(
     def resolve(job: SummaryJob, own_known: bool, prior_known: bool) -> SummaryResult:
         nonlocal carried_forward, changed
         progress["stage"] = f"{job.key.split(':')[1]} rollups ({job.key})"
-        if cached_summary(job, cache, backend, model, reasoning_effort, service_tier) is None:
+        if (
+            cached_summary(job, cache, backend, rollup_model, reasoning_effort, service_tier)
+            is None
+        ):
             # Only the prior same-level context changed: the rollup summarizes exactly what
             # its paid summary already covers, so keep that instead of paying again.
             carried = carried_forward_summary(
-                job, index, cache, backend, model, reasoning_effort, service_tier
+                job, index, cache, backend, rollup_model, reasoning_effort, service_tier
             )
             if carried is not None:
                 carried_forward += 1
@@ -4538,7 +4589,7 @@ def _run_summary_tree(
             (job,),
             cache,
             backend,
-            model,
+            rollup_model,
             max_workers=max_workers,
             batch_size=batch_size,
             codex_command=codex_command,
@@ -4546,6 +4597,8 @@ def _run_summary_tree(
             reasoning_effort=reasoning_effort,
             service_tier=service_tier,
             guard=guard,
+            muse_command=muse_command,
+            backend_timeout_seconds=backend_timeout_seconds,
         )
         backend_stats.append(stats)
         result = results[job.key]
@@ -4664,8 +4717,15 @@ def plan_summaries(
     rollup_kinds: tuple[str, ...] = DEFAULT_ROLLUP_KINDS,
     budget_usd: float | None = None,
     prices: Prices | None = None,
+    rollup_model: str | None = None,
+    max_workers: int = 3,
+    batch_size: int = 6,
+    name_batch_size: int = 12,
 ) -> SummaryPlan:
-    """Return what :func:`summarize_archive` would do and cost, without any model call."""
+    """Return what :func:`summarize_archive` would do and cost, without any model call.
+
+    *max_workers*, *batch_size* and *name_batch_size* only shape the wall-time estimate.
+    """
 
     service_tier = resolve_service_tier(backend, service_tier)
     with archive_writer_lock(archive):
@@ -4688,6 +4748,10 @@ def plan_summaries(
             rollup_kinds=rollup_kinds,
             prices=prices,
             budget_usd=budget_usd,
+            rollup_model=rollup_model,
+            batch_size=batch_size,
+            name_batch_size=name_batch_size,
+            max_workers=max_workers,
         )
 
 
@@ -4712,6 +4776,9 @@ def summarize_archive(
     budget_usd: float | None = None,
     prices: Prices | None = None,
     on_plan: Callable[[SummaryPlan], None] | None = None,
+    muse_command: Sequence[str] = ("muse",),
+    backend_timeout_seconds: float | None = None,
+    rollup_model: str | None = None,
 ) -> SummarizeReport:
     """Fill structured summaries/names while serializing token-spending cache misses.
 
@@ -4741,6 +4808,9 @@ def summarize_archive(
             budget_usd=budget_usd,
             prices=prices,
             on_plan=on_plan,
+            muse_command=muse_command,
+            backend_timeout_seconds=backend_timeout_seconds,
+            rollup_model=rollup_model,
         )
 
 

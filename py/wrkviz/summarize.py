@@ -38,6 +38,7 @@ from wrkviz.claude_backend import (
     ClaudeBackendError,
     run_claude_json,
 )
+from wrkviz.muse_backend import MuseBackendError, run_muse_json
 from wrkviz.summary_registry import (
     ContextCoverage,
     GLOSSARY_DEFINITION_STYLE,
@@ -737,6 +738,7 @@ def build_summary_prompt(jobs: Sequence[SummaryJob]) -> str:
     return (
         common
         + audience
+        + _time_windows(jobs, style)
         + f"Prompt version: {_prompt_version(jobs[0])}\n"
         "BEGIN_JOBS_JSON\n"
         + canonical_json(payload)
@@ -744,7 +746,43 @@ def build_summary_prompt(jobs: Sequence[SummaryJob]) -> str:
     )
 
 
-def _output_schema() -> dict[str, JsonValue]:
+def _utc_label(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _time_windows(jobs: Sequence[SummaryJob], style: str) -> str:
+    """Each job's time window in words, for styles whose bullets carry ``at_ms`` (#839).
+
+    Models misplace events near a phase boundary, and a bullet outside its window is dropped
+    (a phase that loses every bullet falls back to a transcript-only heuristic), so the window
+    is restated as clock times beside the raw milliseconds. The text is not part of any cache
+    identity: the job JSON and the prompt version are unchanged, so cached summaries stay valid.
+    """
+
+    if style in (PROJECT_OVERVIEW_STYLE, GLOSSARY_DEFINITION_STYLE):
+        return ""
+    lines = [
+        "Time windows: every work_summary at_ms for a key must lie inside its window, from "
+        "start_ms (inclusive) up to end_ms. A bullet outside its window is discarded. Events in "
+        "prior_context or just before a window's start belong to an earlier window, not this "
+        "one.\n"
+    ]
+    for job in jobs:
+        lines.append(
+            f"- {job.key}: {_utc_label(job.start_ms)} to {_utc_label(job.end_ms)} "
+            f"(start_ms {job.start_ms}, end_ms {job.end_ms})\n"
+        )
+    return "".join(lines) + "\n"
+
+
+def _output_schema(keys: Sequence[str] | None = None) -> dict[str, JsonValue]:
+    """Return the summary answer schema; with *keys*, exactly one summary per key.
+
+    The muse backend's models answer multi-job batches under keys they made up, leave jobs out,
+    or add placeholder entries; naming the batch's keys and count in the schema the CLI enforces
+    removes that freedom (#839). The strict parser still checks every answer.
+    """
+
     bullet: dict[str, JsonValue] = {
         "type": "object",
         "additionalProperties": False,
@@ -759,7 +797,11 @@ def _output_schema() -> dict[str, JsonValue]:
         "additionalProperties": False,
         "required": ["key", "phrase", "paragraph", "work_summary"],
         "properties": {
-            "key": {"type": "string", "minLength": 1},
+            "key": (
+                {"type": "string", "minLength": 1}
+                if keys is None
+                else {"type": "string", "enum": list(keys)}
+            ),
             "phrase": {
                 "type": "string",
                 "minLength": 1,
@@ -774,8 +816,19 @@ def _output_schema() -> dict[str, JsonValue]:
         "type": "object",
         "additionalProperties": False,
         "required": ["summaries"],
-        "properties": {"summaries": {"type": "array", "items": summary}},
+        "properties": {"summaries": answer_array_schema(summary, keys)},
     }
+
+
+def answer_array_schema(
+    item: dict[str, JsonValue], keys: Sequence[str] | None
+) -> dict[str, JsonValue]:
+    """Return an array-of-*item* schema, holding exactly ``len(keys)`` items when *keys* is set."""
+
+    array: dict[str, JsonValue] = {"type": "array", "items": item}
+    if keys is not None:
+        array.update(minItems=len(keys), maxItems=len(keys))
+    return array
 
 
 def _object(value: JsonValue, where: str) -> dict[str, JsonValue]:
@@ -1497,21 +1550,31 @@ def _claude_batch(
     reasoning_effort: str | None,
     claude_command: Sequence[str],
     processes: BackendProcesses,
+    *,
+    backend: str = "claude",
 ) -> _CodexBatchOutcome:
+    """Run one batch through the Claude CLI, or through ``muse exec`` for the muse backend.
+
+    Both take the same prompt and schema and return one structured result (#839).
+    """
+
+    run_json = run_muse_json if backend == "muse" else run_claude_json
     with tempfile.TemporaryDirectory(
         prefix="wrkviz-summary-", ignore_cleanup_errors=True
     ) as raw_dir:
         try:
-            result = run_claude_json(
+            result = run_json(
                 claude_command,
                 prompt=build_summary_prompt([item.job for item in pending]),
-                schema=_output_schema(),
+                schema=_output_schema(
+                    [item.job.key for item in pending] if backend == "muse" else None
+                ),
                 model=model,
                 reasoning_effort=reasoning_effort,
                 cwd=Path(raw_dir),
                 processes=processes,
             )
-        except ClaudeBackendError as error:
+        except (ClaudeBackendError, MuseBackendError) as error:
             # The Claude result envelope is CLI transport, not a validated final
             # message. Keep its concise error and usage in the receipt without
             # persisting captured stdout as a backend-output audit artifact.
@@ -1609,6 +1672,7 @@ def _run_backend_batch(
     codex_command: Sequence[str],
     claude_command: Sequence[str],
     processes: BackendProcesses,
+    muse_command: Sequence[str] = ("muse",),
 ) -> _GeneratedBatch:
     """Run one batch and persist a receipt even when the backend call fails."""
 
@@ -1639,7 +1703,12 @@ def _run_backend_batch(
             raw_output = outcome.raw_output
         else:
             outcome = _claude_batch(
-                batch, model, reasoning_effort, claude_command, processes
+                batch,
+                model,
+                reasoning_effort,
+                muse_command if backend == "muse" else claude_command,
+                processes,
+                backend=backend,
             )
             results = outcome.parsed.results
             usage = outcome.usage
@@ -1775,6 +1844,8 @@ def summarize_jobs(
     service_tier: str | None = None,
     claude_command: Sequence[str] = ("claude",),
     guard: SpendGuard | None = None,
+    muse_command: Sequence[str] = ("muse",),
+    backend_timeout_seconds: float | None = None,
 ) -> tuple[dict[str, SummaryResult], SummaryRunStats]:
     """Return summaries, consulting immutable content-addressed cache entries first.
 
@@ -1785,7 +1856,7 @@ def summarize_jobs(
 
     run_started_at = _utc_now()
 
-    if backend not in {"claude", "codex", "heuristic"}:
+    if backend not in {"claude", "codex", "heuristic", "muse"}:
         raise SummaryError(f"unsupported summary backend {backend!r}")
     if not model.strip():
         raise SummaryError("summary model must not be empty")
@@ -1824,7 +1895,7 @@ def summarize_jobs(
     generated: dict[str, SummaryResult] = {}
     generated_receipt_by_key: dict[str, str] = {}
     new_receipts: list[BatchUsageReceipt] = []
-    processes = BackendProcesses()
+    processes = BackendProcesses(backend_timeout_seconds)
 
     def publish_batch(
         batch: Sequence[_PendingJob], batch_result: _GeneratedBatch
@@ -1881,6 +1952,7 @@ def summarize_jobs(
                 codex_command=tuple(codex_command),
                 claude_command=tuple(claude_command),
                 processes=processes,
+                muse_command=tuple(muse_command),
             )
             usage = outcome.receipt.usage
             return outcome
@@ -2050,15 +2122,16 @@ __all__ = [
     "GLOSSARY_DEFINITION_PROMPT_VERSION",
     "GLOSSARY_DEFINITION_STYLE",
     "PLAIN_LANGUAGE_ROLLUP_STYLE",
-    "PROMPT_VERSION",
     "PROJECT_OVERVIEW_PROMPT_VERSION",
     "PROJECT_OVERVIEW_STYLE",
+    "PROMPT_VERSION",
     "SummaryError",
     "SummaryJob",
     "SummaryResult",
     "SummaryRunStats",
     "TECHNICAL_ROLLUP_STYLE",
     "WorkBullet",
+    "answer_array_schema",
     "build_summary_prompt",
     "cached_summary",
     "carried_forward_matches",

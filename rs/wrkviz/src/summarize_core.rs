@@ -1825,6 +1825,74 @@ pub fn install_interrupt_handler() {
     });
 }
 
+/// One backend call's time limit in milliseconds; 0 means none (`--backend-timeout`, #839).
+static BACKEND_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The exit status reported for a backend call stopped at its time limit, as `timeout(1)` does.
+pub(crate) const TIMED_OUT_EXIT: i32 = 124;
+
+/// Set the time limit every later backend call runs under (`None` removes it).
+pub fn set_backend_timeout(seconds: Option<f64>) {
+    let millis = seconds.map_or(0, |value| (value * 1000.0).round().max(1.0) as u64);
+    BACKEND_TIMEOUT_MS.store(millis, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn signal_group(group: i32, signal: &str) {
+    let _ = std::process::Command::new("kill")
+        .args([signal, &format!("-{group}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Stop one call's process group at its deadline: SIGTERM, then SIGKILL after a 2 s grace.
+///
+/// Returns the watcher's join handle and a flag saying whether it fired; setting `finished`
+/// tells it the call ended on its own.
+fn watch_deadline(
+    group: i32,
+    millis: u64,
+    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> (
+    std::thread::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fired_in_thread = fired.clone();
+    let handle = std::thread::spawn(move || {
+        let wait_until = |deadline: std::time::Instant| -> bool {
+            while std::time::Instant::now() < deadline {
+                if finished.load(SeqCst) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            finished.load(SeqCst)
+        };
+        let start = std::time::Instant::now();
+        if wait_until(start + std::time::Duration::from_millis(millis)) {
+            return;
+        }
+        fired_in_thread.store(true, SeqCst);
+        signal_group(group, "-TERM");
+        if wait_until(std::time::Instant::now() + std::time::Duration::from_secs(2)) {
+            return;
+        }
+        signal_group(group, "-KILL");
+    });
+    (handle, fired)
+}
+
+fn seconds_label(millis: u64) -> String {
+    let seconds = millis as f64 / 1000.0;
+    if seconds.fract() == 0.0 {
+        format!("{}", seconds as u64)
+    } else {
+        format!("{seconds}")
+    }
+}
+
 pub(crate) fn run_process(
     command: &[String],
     input_text: &str,
@@ -1844,18 +1912,46 @@ pub(crate) fn run_process(
     if let Ok(mut set) = BACKEND_GROUPS.lock() {
         set.insert(group);
     }
+    let millis = BACKEND_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst);
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = (millis > 0).then(|| watch_deadline(group, millis, finished.clone()));
     if let Some(stdin) = child.stdin.as_mut() {
         let _ = stdin.write_all(input_text.as_bytes());
     }
     let output = child.wait_with_output();
+    finished.store(true, std::sync::atomic::Ordering::SeqCst);
+    let timed_out = match watcher {
+        Some((handle, fired)) => {
+            let _ = handle.join();
+            fired.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        None => false,
+    };
     if let Ok(mut set) = BACKEND_GROUPS.lock() {
         set.remove(&group);
     }
     let output = output?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if timed_out {
+        let note = format!(
+            "wrkviz stopped the backend call after {} s (--backend-timeout)",
+            seconds_label(millis)
+        );
+        return Ok(CompletedProcess {
+            returncode: TIMED_OUT_EXIT,
+            stdout,
+            stderr: if stderr.is_empty() {
+                note
+            } else {
+                format!("{stderr}\n{note}")
+            },
+        });
+    }
     Ok(CompletedProcess {
         returncode: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stdout,
+        stderr,
     })
 }
 

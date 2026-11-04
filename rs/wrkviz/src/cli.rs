@@ -605,9 +605,8 @@ fn run_quickstart(args: &[String]) -> u8 {
         );
         return 2;
     }
-    let model = std::env::var("WRKVIZ_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
     print!(
-        "wrkviz v0.1.0\n\nBuild a version-controllable, multi-resolution website from an agent team's append-only logs.\n\n1. Ingest, summarize only cache misses, and build the site:\n\n   wrkviz refresh \\\n     --root-session SESSION_UUID --team example-team \\\n     --output ./timelines/example-team \\\n     --timezone America/New_York --model {model}\n\n2. Open it locally:\n\n   cd ./timelines/example-team\n   make serve\n   # http://127.0.0.1:8765/\n\n3. Rerun the same refresh later. New log records are normalized; content-addressed summaries are\n   reused; only changed time windows and calendar rollups spend model tokens.\n\n4. See what a summarize run would spend before it spends anything, and cap it:\n\n   wrkviz summarize --team example-team --output ./timelines/example-team      --price input=2,output=10 --plan\n   wrkviz summarize --team example-team --output ./timelines/example-team      --price input=2,output=10 --budget-usd 20\n\n   A run estimated over the budget refuses to start; one that reaches it anyway stops, marks\n   summary_data/summarize_state.json partial, and the next run resumes from the cache.\n\nThe stages are separate on purpose: `ingest`, `summarize`, and `build`. The `build` command never\ncalls a model, so formatting and UI changes can be regenerated for free.\n"
+        "wrkviz v0.1.0\n\nBuild a version-controllable, multi-resolution website from an agent team's append-only logs.\n\n1. Ingest, summarize only cache misses, and build the site:\n\n   wrkviz refresh \\\n     --root-session SESSION_UUID --team example-team \\\n     --output ./timelines/example-team \\\n     --timezone America/New_York\n\n   Summaries come from the zero-rated headless muse CLI by default; --backend codex or\n   --backend claude (with --model) uses those CLIs instead.\n\n2. Open it locally:\n\n   cd ./timelines/example-team\n   make serve\n   # http://127.0.0.1:8765/\n\n3. Rerun the same refresh later. New log records are normalized; content-addressed summaries are\n   reused; only changed time windows and calendar rollups spend model tokens.\n\n4. See what a summarize run would spend before it spends anything, and cap it:\n\n   wrkviz summarize --team example-team --output ./timelines/example-team      --price input=2,output=10 --plan\n   wrkviz summarize --team example-team --output ./timelines/example-team      --price input=2,output=10 --budget-usd 20\n\n   A run estimated over the budget refuses to start; one that reaches it anyway stops, marks\n   summary_data/summarize_state.json partial, and the next run resumes from the cache.\n\nThe stages are separate on purpose: `ingest`, `summarize`, and `build`. The `build` command never\ncalls a model, so formatting and UI changes can be regenerated for free.\n"
     );
     println!();
     0
@@ -3488,7 +3487,8 @@ fn is_option_token(arg: &str, names: &[&str]) -> bool {
 
 /// The Python edition's summarize help, verbatim.
 pub const SUMMARIZE_HELP: &str = r##"usage: wrkviz summarize [-h] --output OUTPUT --team TEAM
-                        [--backend {codex,claude,heuristic}] [--model MODEL]
+                        [--backend {muse,codex,claude,heuristic}]
+                        [--model MODEL] [--rollup-model ROLLUP_MODEL]
                         [--reasoning-effort REASONING_EFFORT]
                         [--service-tier SERVICE_TIER]
                         [--summary-workers SUMMARY_WORKERS]
@@ -3499,6 +3499,8 @@ pub const SUMMARIZE_HELP: &str = r##"usage: wrkviz summarize [-h] --output OUTPU
                         [--transcript-chars TRANSCRIPT_CHARS]
                         [--codex-command CODEX_COMMAND]
                         [--claude-command CLAUDE_COMMAND]
+                        [--muse-command MUSE_COMMAND]
+                        [--backend-timeout SECONDS]
                         [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]
                         [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]
                         [--summary-timezone SUMMARY_TIMEZONE]
@@ -3511,10 +3513,20 @@ options:
   -h, --help            show this help message and exit
   --output OUTPUT       version-controllable archive directory
   --team TEAM           stable team slug, for example example-team
-  --backend {codex,claude,heuristic}
-                        summary backend (heuristic is deterministic/offline)
-  --model MODEL         backend model name; required for Claude, otherwise
-                        defaults to 'gpt-5.5' (or WRKVIZ_MODEL)
+  --backend {muse,codex,claude,heuristic}
+                        summary backend (default: muse). muse runs the
+                        headless 'muse exec' with every tool disabled and is
+                        zero-rated (no model spend); codex and claude run
+                        those CLIs; heuristic is deterministic and offline
+  --model MODEL         backend model for phase summaries, agent names and the
+                        project overview. Defaults: muse 'muse-
+                        spark-1.3-internal'; codex 'gpt-5.5' (or
+                        WRKVIZ_MODEL); required for claude
+  --rollup-model ROLLUP_MODEL
+                        backend model for calendar rollups (default: --model,
+                        except that muse without --model uses 'watermelon-
+                        full-preview', which writes better rollups). Rollups
+                        are cached under the model that wrote them
   --reasoning-effort REASONING_EFFORT
                         backend reasoning effort, recorded in cache provenance
                         (default: medium). A model/provider failure aborts
@@ -3534,6 +3546,14 @@ options:
                         Codex executable (primarily for testing/wrappers)
   --claude-command CLAUDE_COMMAND
                         Claude executable (primarily for testing/wrappers)
+  --muse-command MUSE_COMMAND
+                        Muse executable (primarily for testing/wrappers)
+  --backend-timeout SECONDS
+                        stop one backend call (its whole process group) after
+                        this many seconds and fail its batch, so a stalled
+                        call cannot hold the run (default: 900.0); finished
+                        batches stay cached and a rerun retries only the
+                        failed ones
   --summary-start-date SUMMARY_START_DATE
                         first local date to summarize without truncating
                         archived data
@@ -4780,7 +4800,7 @@ fn run_inspect(args: &[String]) -> u8 {
     }
 }
 
-const SUMMARIZE_USAGE: &str = "usage: wrkviz summarize [-h] --output OUTPUT --team TEAM\n                        [--backend {codex,claude,heuristic}] [--model MODEL]\n                        [--reasoning-effort REASONING_EFFORT]\n                        [--service-tier SERVICE_TIER]\n                        [--summary-workers SUMMARY_WORKERS]\n                        [--summary-batch-size SUMMARY_BATCH_SIZE]\n                        [--name-batch-size NAME_BATCH_SIZE]\n                        [--phase-minutes PHASE_MINUTES]\n                        [--context-chars CONTEXT_CHARS]\n                        [--transcript-chars TRANSCRIPT_CHARS]\n                        [--codex-command CODEX_COMMAND]\n                        [--claude-command CLAUDE_COMMAND]\n                        [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                        [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                        [--summary-timezone SUMMARY_TIMEZONE]\n                        [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                        [--budget-usd USD] [--price RATES] [--plan]";
+const SUMMARIZE_USAGE: &str = "usage: wrkviz summarize [-h] --output OUTPUT --team TEAM\n                        [--backend {muse,codex,claude,heuristic}]\n                        [--model MODEL] [--rollup-model ROLLUP_MODEL]\n                        [--reasoning-effort REASONING_EFFORT]\n                        [--service-tier SERVICE_TIER]\n                        [--summary-workers SUMMARY_WORKERS]\n                        [--summary-batch-size SUMMARY_BATCH_SIZE]\n                        [--name-batch-size NAME_BATCH_SIZE]\n                        [--phase-minutes PHASE_MINUTES]\n                        [--context-chars CONTEXT_CHARS]\n                        [--transcript-chars TRANSCRIPT_CHARS]\n                        [--codex-command CODEX_COMMAND]\n                        [--claude-command CLAUDE_COMMAND]\n                        [--muse-command MUSE_COMMAND]\n                        [--backend-timeout SECONDS]\n                        [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                        [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                        [--summary-timezone SUMMARY_TIMEZONE]\n                        [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                        [--budget-usd USD] [--price RATES] [--plan]";
 
 /// Verbatim `wrkviz build --help` text.
 pub const BUILD_HELP: &str = r##"usage: wrkviz build [-h] --output OUTPUT --team TEAM
@@ -4938,7 +4958,8 @@ const REFRESH_HELP: &str = r##"usage: wrkviz refresh [-h] --output OUTPUT --team
                       [--end-date END_DATE | --end-time END_TIME]
                       [--project LABEL=REPOSITORY_URL]
                       [--source-host HOSTNAME]
-                      [--backend {codex,claude,heuristic}] [--model MODEL]
+                      [--backend {muse,codex,claude,heuristic}]
+                      [--model MODEL] [--rollup-model ROLLUP_MODEL]
                       [--reasoning-effort REASONING_EFFORT]
                       [--service-tier SERVICE_TIER]
                       [--summary-workers SUMMARY_WORKERS]
@@ -4949,6 +4970,8 @@ const REFRESH_HELP: &str = r##"usage: wrkviz refresh [-h] --output OUTPUT --team
                       [--transcript-chars TRANSCRIPT_CHARS]
                       [--codex-command CODEX_COMMAND]
                       [--claude-command CLAUDE_COMMAND]
+                      [--muse-command MUSE_COMMAND]
+                      [--backend-timeout SECONDS]
                       [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]
                       [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]
                       [--summary-timezone SUMMARY_TIMEZONE]
@@ -4994,10 +5017,20 @@ options:
   --source-host HOSTNAME
                         execution hostname captured by the source data; repeat
                         for multi-host work
-  --backend {codex,claude,heuristic}
-                        summary backend (heuristic is deterministic/offline)
-  --model MODEL         backend model name; required for Claude, otherwise
-                        defaults to 'gpt-5.5' (or WRKVIZ_MODEL)
+  --backend {muse,codex,claude,heuristic}
+                        summary backend (default: muse). muse runs the
+                        headless 'muse exec' with every tool disabled and is
+                        zero-rated (no model spend); codex and claude run
+                        those CLIs; heuristic is deterministic and offline
+  --model MODEL         backend model for phase summaries, agent names and the
+                        project overview. Defaults: muse 'muse-
+                        spark-1.3-internal'; codex 'gpt-5.5' (or
+                        WRKVIZ_MODEL); required for claude
+  --rollup-model ROLLUP_MODEL
+                        backend model for calendar rollups (default: --model,
+                        except that muse without --model uses 'watermelon-
+                        full-preview', which writes better rollups). Rollups
+                        are cached under the model that wrote them
   --reasoning-effort REASONING_EFFORT
                         backend reasoning effort, recorded in cache provenance
                         (default: medium). A model/provider failure aborts
@@ -5017,6 +5050,14 @@ options:
                         Codex executable (primarily for testing/wrappers)
   --claude-command CLAUDE_COMMAND
                         Claude executable (primarily for testing/wrappers)
+  --muse-command MUSE_COMMAND
+                        Muse executable (primarily for testing/wrappers)
+  --backend-timeout SECONDS
+                        stop one backend call (its whole process group) after
+                        this many seconds and fail its batch, so a stalled
+                        call cannot hold the run (default: 900.0); finished
+                        batches stay cached and a rerun retries only the
+                        failed ones
   --summary-start-date SUMMARY_START_DATE
                         first local date to summarize without truncating
                         archived data
@@ -5063,8 +5104,8 @@ const REFRESH_CLAUDE_HELP: &str = r##"usage: wrkviz refresh-claude [-h] --output
                              [--end-date END_DATE | --end-time END_TIME]
                              [--project LABEL=REPOSITORY_URL]
                              [--source-host HOSTNAME]
-                             [--backend {codex,claude,heuristic}]
-                             [--model MODEL]
+                             [--backend {muse,codex,claude,heuristic}]
+                             [--model MODEL] [--rollup-model ROLLUP_MODEL]
                              [--reasoning-effort REASONING_EFFORT]
                              [--service-tier SERVICE_TIER]
                              [--summary-workers SUMMARY_WORKERS]
@@ -5075,6 +5116,8 @@ const REFRESH_CLAUDE_HELP: &str = r##"usage: wrkviz refresh-claude [-h] --output
                              [--transcript-chars TRANSCRIPT_CHARS]
                              [--codex-command CODEX_COMMAND]
                              [--claude-command CLAUDE_COMMAND]
+                             [--muse-command MUSE_COMMAND]
+                             [--backend-timeout SECONDS]
                              [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]
                              [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]
                              [--summary-timezone SUMMARY_TIMEZONE]
@@ -5117,10 +5160,20 @@ options:
   --source-host HOSTNAME
                         execution hostname captured by the source data; repeat
                         for multi-host work
-  --backend {codex,claude,heuristic}
-                        summary backend (heuristic is deterministic/offline)
-  --model MODEL         backend model name; required for Claude, otherwise
-                        defaults to 'gpt-5.5' (or WRKVIZ_MODEL)
+  --backend {muse,codex,claude,heuristic}
+                        summary backend (default: muse). muse runs the
+                        headless 'muse exec' with every tool disabled and is
+                        zero-rated (no model spend); codex and claude run
+                        those CLIs; heuristic is deterministic and offline
+  --model MODEL         backend model for phase summaries, agent names and the
+                        project overview. Defaults: muse 'muse-
+                        spark-1.3-internal'; codex 'gpt-5.5' (or
+                        WRKVIZ_MODEL); required for claude
+  --rollup-model ROLLUP_MODEL
+                        backend model for calendar rollups (default: --model,
+                        except that muse without --model uses 'watermelon-
+                        full-preview', which writes better rollups). Rollups
+                        are cached under the model that wrote them
   --reasoning-effort REASONING_EFFORT
                         backend reasoning effort, recorded in cache provenance
                         (default: medium). A model/provider failure aborts
@@ -5140,6 +5193,14 @@ options:
                         Codex executable (primarily for testing/wrappers)
   --claude-command CLAUDE_COMMAND
                         Claude executable (primarily for testing/wrappers)
+  --muse-command MUSE_COMMAND
+                        Muse executable (primarily for testing/wrappers)
+  --backend-timeout SECONDS
+                        stop one backend call (its whole process group) after
+                        this many seconds and fail its batch, so a stalled
+                        call cannot hold the run (default: 900.0); finished
+                        batches stay cached and a rerun retries only the
+                        failed ones
   --summary-start-date SUMMARY_START_DATE
                         first local date to summarize without truncating
                         archived data
@@ -5189,7 +5250,8 @@ const REFRESH_ORC_HELP: &str = r##"usage: wrkviz refresh-orc [-h] --output OUTPU
                           [--end-date END_DATE | --end-time END_TIME]
                           [--project LABEL=REPOSITORY_URL]
                           [--source-host HOSTNAME]
-                          [--backend {codex,claude,heuristic}] [--model MODEL]
+                          [--backend {muse,codex,claude,heuristic}]
+                          [--model MODEL] [--rollup-model ROLLUP_MODEL]
                           [--reasoning-effort REASONING_EFFORT]
                           [--service-tier SERVICE_TIER]
                           [--summary-workers SUMMARY_WORKERS]
@@ -5200,6 +5262,8 @@ const REFRESH_ORC_HELP: &str = r##"usage: wrkviz refresh-orc [-h] --output OUTPU
                           [--transcript-chars TRANSCRIPT_CHARS]
                           [--codex-command CODEX_COMMAND]
                           [--claude-command CLAUDE_COMMAND]
+                          [--muse-command MUSE_COMMAND]
+                          [--backend-timeout SECONDS]
                           [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]
                           [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]
                           [--summary-timezone SUMMARY_TIMEZONE]
@@ -5258,10 +5322,20 @@ options:
   --source-host HOSTNAME
                         execution hostname captured by the source data; repeat
                         for multi-host work
-  --backend {codex,claude,heuristic}
-                        summary backend (heuristic is deterministic/offline)
-  --model MODEL         backend model name; required for Claude, otherwise
-                        defaults to 'gpt-5.5' (or WRKVIZ_MODEL)
+  --backend {muse,codex,claude,heuristic}
+                        summary backend (default: muse). muse runs the
+                        headless 'muse exec' with every tool disabled and is
+                        zero-rated (no model spend); codex and claude run
+                        those CLIs; heuristic is deterministic and offline
+  --model MODEL         backend model for phase summaries, agent names and the
+                        project overview. Defaults: muse 'muse-
+                        spark-1.3-internal'; codex 'gpt-5.5' (or
+                        WRKVIZ_MODEL); required for claude
+  --rollup-model ROLLUP_MODEL
+                        backend model for calendar rollups (default: --model,
+                        except that muse without --model uses 'watermelon-
+                        full-preview', which writes better rollups). Rollups
+                        are cached under the model that wrote them
   --reasoning-effort REASONING_EFFORT
                         backend reasoning effort, recorded in cache provenance
                         (default: medium). A model/provider failure aborts
@@ -5281,6 +5355,14 @@ options:
                         Codex executable (primarily for testing/wrappers)
   --claude-command CLAUDE_COMMAND
                         Claude executable (primarily for testing/wrappers)
+  --muse-command MUSE_COMMAND
+                        Muse executable (primarily for testing/wrappers)
+  --backend-timeout SECONDS
+                        stop one backend call (its whole process group) after
+                        this many seconds and fail its batch, so a stalled
+                        call cannot hold the run (default: 900.0); finished
+                        batches stay cached and a rerun retries only the
+                        failed ones
   --summary-start-date SUMMARY_START_DATE
                         first local date to summarize without truncating
                         archived data
@@ -5320,9 +5402,9 @@ options:
                         15.0)
 "##;
 
-const REFRESH_USAGE: &str = "usage: wrkviz refresh [-h] --output OUTPUT --team TEAM [--snapshot-root DIR]\n                      [--sessions-root SESSIONS_ROOT] --root-session\n                      ROOT_SESSION [--continuation-session UUID]\n                      [--timezone TIMEZONE]\n                      [--start-date START_DATE | --start-time START_TIME]\n                      [--end-date END_DATE | --end-time END_TIME]\n                      [--project LABEL=REPOSITORY_URL]\n                      [--source-host HOSTNAME]\n                      [--backend {codex,claude,heuristic}] [--model MODEL]\n                      [--reasoning-effort REASONING_EFFORT]\n                      [--service-tier SERVICE_TIER]\n                      [--summary-workers SUMMARY_WORKERS]\n                      [--summary-batch-size SUMMARY_BATCH_SIZE]\n                      [--name-batch-size NAME_BATCH_SIZE]\n                      [--phase-minutes PHASE_MINUTES]\n                      [--context-chars CONTEXT_CHARS]\n                      [--transcript-chars TRANSCRIPT_CHARS]\n                      [--codex-command CODEX_COMMAND]\n                      [--claude-command CLAUDE_COMMAND]\n                      [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                      [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                      [--summary-timezone SUMMARY_TIMEZONE]\n                      [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                      [--budget-usd USD] [--price RATES] [--github-metadata]\n                      [--github-timeout GITHUB_TIMEOUT]";
-const REFRESH_CLAUDE_USAGE: &str = "usage: wrkviz refresh-claude [-h] --output OUTPUT --team TEAM\n                             [--snapshot-root DIR] --session-file SESSION_FILE\n                             [--timezone TIMEZONE]\n                             [--start-date START_DATE | --start-time START_TIME]\n                             [--end-date END_DATE | --end-time END_TIME]\n                             [--project LABEL=REPOSITORY_URL]\n                             [--source-host HOSTNAME]\n                             [--backend {codex,claude,heuristic}]\n                             [--model MODEL]\n                             [--reasoning-effort REASONING_EFFORT]\n                             [--service-tier SERVICE_TIER]\n                             [--summary-workers SUMMARY_WORKERS]\n                             [--summary-batch-size SUMMARY_BATCH_SIZE]\n                             [--name-batch-size NAME_BATCH_SIZE]\n                             [--phase-minutes PHASE_MINUTES]\n                             [--context-chars CONTEXT_CHARS]\n                             [--transcript-chars TRANSCRIPT_CHARS]\n                             [--codex-command CODEX_COMMAND]\n                             [--claude-command CLAUDE_COMMAND]\n                             [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                             [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                             [--summary-timezone SUMMARY_TIMEZONE]\n                             [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                             [--budget-usd USD] [--price RATES]\n                             [--github-metadata]\n                             [--github-timeout GITHUB_TIMEOUT]";
-const REFRESH_ORC_USAGE: &str = "usage: wrkviz refresh-orc [-h] --output OUTPUT --team TEAM\n                          [--snapshot-root DIR] --source-root SOURCE_ROOT\n                          --root-session ROOT_SESSION\n                          [--continuation-session SESSION_OR_JSON]\n                          [--accept-orc-prefix-rewrite SESSION]\n                          [--timezone TIMEZONE]\n                          [--start-date START_DATE | --start-time START_TIME]\n                          [--end-date END_DATE | --end-time END_TIME]\n                          [--project LABEL=REPOSITORY_URL]\n                          [--source-host HOSTNAME]\n                          [--backend {codex,claude,heuristic}] [--model MODEL]\n                          [--reasoning-effort REASONING_EFFORT]\n                          [--service-tier SERVICE_TIER]\n                          [--summary-workers SUMMARY_WORKERS]\n                          [--summary-batch-size SUMMARY_BATCH_SIZE]\n                          [--name-batch-size NAME_BATCH_SIZE]\n                          [--phase-minutes PHASE_MINUTES]\n                          [--context-chars CONTEXT_CHARS]\n                          [--transcript-chars TRANSCRIPT_CHARS]\n                          [--codex-command CODEX_COMMAND]\n                          [--claude-command CLAUDE_COMMAND]\n                          [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                          [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                          [--summary-timezone SUMMARY_TIMEZONE]\n                          [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                          [--budget-usd USD] [--price RATES]\n                          [--github-metadata]\n                          [--github-timeout GITHUB_TIMEOUT]";
+const REFRESH_USAGE: &str = "usage: wrkviz refresh [-h] --output OUTPUT --team TEAM [--snapshot-root DIR]\n                      [--sessions-root SESSIONS_ROOT] --root-session\n                      ROOT_SESSION [--continuation-session UUID]\n                      [--timezone TIMEZONE]\n                      [--start-date START_DATE | --start-time START_TIME]\n                      [--end-date END_DATE | --end-time END_TIME]\n                      [--project LABEL=REPOSITORY_URL]\n                      [--source-host HOSTNAME]\n                      [--backend {muse,codex,claude,heuristic}]\n                      [--model MODEL] [--rollup-model ROLLUP_MODEL]\n                      [--reasoning-effort REASONING_EFFORT]\n                      [--service-tier SERVICE_TIER]\n                      [--summary-workers SUMMARY_WORKERS]\n                      [--summary-batch-size SUMMARY_BATCH_SIZE]\n                      [--name-batch-size NAME_BATCH_SIZE]\n                      [--phase-minutes PHASE_MINUTES]\n                      [--context-chars CONTEXT_CHARS]\n                      [--transcript-chars TRANSCRIPT_CHARS]\n                      [--codex-command CODEX_COMMAND]\n                      [--claude-command CLAUDE_COMMAND]\n                      [--muse-command MUSE_COMMAND]\n                      [--backend-timeout SECONDS]\n                      [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                      [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                      [--summary-timezone SUMMARY_TIMEZONE]\n                      [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                      [--budget-usd USD] [--price RATES] [--github-metadata]\n                      [--github-timeout GITHUB_TIMEOUT]";
+const REFRESH_CLAUDE_USAGE: &str = "usage: wrkviz refresh-claude [-h] --output OUTPUT --team TEAM\n                             [--snapshot-root DIR] --session-file SESSION_FILE\n                             [--timezone TIMEZONE]\n                             [--start-date START_DATE | --start-time START_TIME]\n                             [--end-date END_DATE | --end-time END_TIME]\n                             [--project LABEL=REPOSITORY_URL]\n                             [--source-host HOSTNAME]\n                             [--backend {muse,codex,claude,heuristic}]\n                             [--model MODEL] [--rollup-model ROLLUP_MODEL]\n                             [--reasoning-effort REASONING_EFFORT]\n                             [--service-tier SERVICE_TIER]\n                             [--summary-workers SUMMARY_WORKERS]\n                             [--summary-batch-size SUMMARY_BATCH_SIZE]\n                             [--name-batch-size NAME_BATCH_SIZE]\n                             [--phase-minutes PHASE_MINUTES]\n                             [--context-chars CONTEXT_CHARS]\n                             [--transcript-chars TRANSCRIPT_CHARS]\n                             [--codex-command CODEX_COMMAND]\n                             [--claude-command CLAUDE_COMMAND]\n                             [--muse-command MUSE_COMMAND]\n                             [--backend-timeout SECONDS]\n                             [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                             [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                             [--summary-timezone SUMMARY_TIMEZONE]\n                             [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                             [--budget-usd USD] [--price RATES]\n                             [--github-metadata]\n                             [--github-timeout GITHUB_TIMEOUT]";
+const REFRESH_ORC_USAGE: &str = "usage: wrkviz refresh-orc [-h] --output OUTPUT --team TEAM\n                          [--snapshot-root DIR] --source-root SOURCE_ROOT\n                          --root-session ROOT_SESSION\n                          [--continuation-session SESSION_OR_JSON]\n                          [--accept-orc-prefix-rewrite SESSION]\n                          [--timezone TIMEZONE]\n                          [--start-date START_DATE | --start-time START_TIME]\n                          [--end-date END_DATE | --end-time END_TIME]\n                          [--project LABEL=REPOSITORY_URL]\n                          [--source-host HOSTNAME]\n                          [--backend {muse,codex,claude,heuristic}]\n                          [--model MODEL] [--rollup-model ROLLUP_MODEL]\n                          [--reasoning-effort REASONING_EFFORT]\n                          [--service-tier SERVICE_TIER]\n                          [--summary-workers SUMMARY_WORKERS]\n                          [--summary-batch-size SUMMARY_BATCH_SIZE]\n                          [--name-batch-size NAME_BATCH_SIZE]\n                          [--phase-minutes PHASE_MINUTES]\n                          [--context-chars CONTEXT_CHARS]\n                          [--transcript-chars TRANSCRIPT_CHARS]\n                          [--codex-command CODEX_COMMAND]\n                          [--claude-command CLAUDE_COMMAND]\n                          [--muse-command MUSE_COMMAND]\n                          [--backend-timeout SECONDS]\n                          [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                          [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                          [--summary-timezone SUMMARY_TIMEZONE]\n                          [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                          [--budget-usd USD] [--price RATES]\n                          [--github-metadata]\n                          [--github-timeout GITHUB_TIMEOUT]";
 const GITHUB_METADATA_USAGE: &str = "usage: wrkviz github-metadata [-h] --output OUTPUT --team TEAM\n                              [--phase-minutes PHASE_MINUTES]\n                              [--github-timeout GITHUB_TIMEOUT]";
 
 const MIGRATE_SNAPSHOTS_USAGE: &str = "usage: wrkviz migrate-snapshots [-h] --output OUTPUT [--snapshot-root DIR]\n                                [--move] [--copy] [--format {text,json}]";
@@ -6247,6 +6329,7 @@ fn run_refresh(args: &[String], kind: RefreshKind) -> u8 {
         "--source-host",
         "--backend",
         "--model",
+        "--rollup-model",
         "--reasoning-effort",
         "--service-tier",
         "--summary-workers",
@@ -6257,6 +6340,8 @@ fn run_refresh(args: &[String], kind: RefreshKind) -> u8 {
         "--transcript-chars",
         "--codex-command",
         "--claude-command",
+        "--muse-command",
+        "--backend-timeout",
         "--summary-start-date",
         "--summary-start-time",
         "--summary-end-date",
@@ -6319,7 +6404,12 @@ fn run_refresh(args: &[String], kind: RefreshKind) -> u8 {
                 ),
             );
         }
-        let Some(name) = value_candidates.first().cloned() else {
+        // An exact name wins over longer names it prefixes (--backend vs --backend-timeout).
+        let exact = value_candidates
+            .iter()
+            .find(|name| name.as_str() == head)
+            .cloned();
+        let Some(name) = exact.or_else(|| value_candidates.first().cloned()) else {
             return argparse_error(usage, prog, &format!("unrecognized arguments: {arg}"));
         };
         let value = match explicit {
@@ -6448,16 +6538,36 @@ fn run_refresh(args: &[String], kind: RefreshKind) -> u8 {
             }
         },
     };
-    let backend = get("--backend").unwrap_or_else(|| "codex".to_string());
-    if !matches!(backend.as_str(), "codex" | "claude" | "heuristic") {
+    let backend = get("--backend").unwrap_or_else(|| "muse".to_string());
+    if !matches!(backend.as_str(), "muse" | "codex" | "claude" | "heuristic") {
         return argparse_error(
             usage,
             prog,
             &format!(
-                "argument --backend: invalid choice: {} (choose from 'codex', 'claude', 'heuristic')",
+                "argument --backend: invalid choice: {} (choose from 'muse', 'codex', 'claude', 'heuristic')",
                 crate::json::py_repr_str(&backend)
             ),
         );
+    }
+    let backend_timeout: f64 = match get("--backend-timeout") {
+        None => DEFAULT_BACKEND_TIMEOUT_SECONDS,
+        Some(raw) => match raw.parse::<f64>() {
+            Ok(value) => value,
+            Err(_) => {
+                return argparse_error(
+                    usage,
+                    prog,
+                    &format!(
+                        "argument --backend-timeout: invalid float value: {}",
+                        crate::json::py_repr_str(&raw)
+                    ),
+                )
+            }
+        },
+    };
+    if backend == "muse" {
+        eprintln!("wrkviz: {MUSE_NOT_PORTED}");
+        return 2;
     }
     let mut rollup_kinds: Vec<String> = all("--rollup-kind");
     for kind_name in &rollup_kinds {
@@ -6634,6 +6744,15 @@ fn run_refresh(args: &[String], kind: RefreshKind) -> u8 {
                     model
                 }
             };
+            check_rollup_model(get("--rollup-model").as_deref(), &model)
+                .map_err(|error| (error, false))?;
+            if backend_timeout.is_nan() || backend_timeout <= 0.0 {
+                return Err((
+                    "--backend-timeout must be a positive number of seconds".to_string(),
+                    false,
+                ));
+            }
+            crate::summarize_core::set_backend_timeout(Some(backend_timeout));
             let has_date_bound =
                 get("--summary-start-date").is_some() || get("--summary-end-date").is_some();
             let summary_timezone = match get("--summary-timezone") {
@@ -7809,6 +7928,30 @@ fn run_build(args: &[String]) -> u8 {
     }
 }
 
+/// One backend call's time limit when `--backend-timeout` is omitted, as in the Python edition.
+const DEFAULT_BACKEND_TIMEOUT_SECONDS: f64 = 900.0;
+
+/// The one-line refusal for `--backend muse` (also the default backend) in this edition.
+const MUSE_NOT_PORTED: &str = "the muse backend is not yet in the Rust edition \
+(#842 wrkviz-muse-backend-rust); use the Python engine or --backend claude|codex";
+
+/// Accept `--rollup-model` only where this edition can honour it: naming the phase model.
+fn check_rollup_model(raw: Option<&str>, model: &str) -> Result<(), String> {
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    let rollup_model = crate::summarize_core::py_trim(raw);
+    if rollup_model.is_empty() {
+        return Err("--rollup-model must not be empty".to_string());
+    }
+    if rollup_model != model {
+        return Err("a separate --rollup-model is not yet in the Rust edition \
+(#842 wrkviz-muse-backend-rust); omit it or use the Python engine"
+            .to_string());
+    }
+    Ok(())
+}
+
 fn run_summarize(args: &[String]) -> u8 {
     crate::summarize_core::install_interrupt_handler();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -7820,6 +7963,7 @@ fn run_summarize(args: &[String]) -> u8 {
         "--team",
         "--backend",
         "--model",
+        "--rollup-model",
         "--reasoning-effort",
         "--service-tier",
         "--summary-workers",
@@ -7830,6 +7974,8 @@ fn run_summarize(args: &[String]) -> u8 {
         "--transcript-chars",
         "--codex-command",
         "--claude-command",
+        "--muse-command",
+        "--backend-timeout",
         "--summary-start-date",
         "--summary-start-time",
         "--summary-end-date",
@@ -7889,7 +8035,9 @@ fn run_summarize(args: &[String]) -> u8 {
             .into_iter()
             .filter(|name| *name != "--plan")
             .collect();
-        let Some(name) = matched.first() else {
+        // An exact name wins over longer names it prefixes (--backend vs --backend-timeout).
+        let exact = matched.iter().find(|name| **name == head);
+        let Some(name) = exact.or_else(|| matched.first()) else {
             return argparse_error(
                 SUMMARIZE_USAGE,
                 "wrkviz summarize",
@@ -7999,16 +8147,36 @@ fn run_summarize(args: &[String]) -> u8 {
             }
         },
     };
-    let backend = get("--backend").unwrap_or_else(|| "codex".to_string());
-    if !matches!(backend.as_str(), "codex" | "claude" | "heuristic") {
+    let backend = get("--backend").unwrap_or_else(|| "muse".to_string());
+    if !matches!(backend.as_str(), "muse" | "codex" | "claude" | "heuristic") {
         return argparse_error(
             SUMMARIZE_USAGE,
             "wrkviz summarize",
             &format!(
-                "argument --backend: invalid choice: {} (choose from 'codex', 'claude', 'heuristic')",
+                "argument --backend: invalid choice: {} (choose from 'muse', 'codex', 'claude', 'heuristic')",
                 crate::json::py_repr_str(&backend)
             ),
         );
+    }
+    let backend_timeout: f64 = match get("--backend-timeout") {
+        None => DEFAULT_BACKEND_TIMEOUT_SECONDS,
+        Some(raw) => match raw.parse::<f64>() {
+            Ok(value) => value,
+            Err(_) => {
+                return argparse_error(
+                    SUMMARIZE_USAGE,
+                    "wrkviz summarize",
+                    &format!(
+                        "argument --backend-timeout: invalid float value: {}",
+                        crate::json::py_repr_str(&raw)
+                    ),
+                )
+            }
+        },
+    };
+    if backend == "muse" {
+        eprintln!("wrkviz: {MUSE_NOT_PORTED}");
+        return 2;
     }
     let mut rollup_kinds: Vec<String> = values.get("--rollup-kind").cloned().unwrap_or_default();
     for kind in &rollup_kinds {
@@ -8066,6 +8234,15 @@ fn run_summarize(args: &[String]) -> u8 {
                     model
                 }
             };
+            check_rollup_model(get("--rollup-model").as_deref(), &model)
+                .map_err(|error| (error, false))?;
+            if backend_timeout.is_nan() || backend_timeout <= 0.0 {
+                return Err((
+                    "--backend-timeout must be a positive number of seconds".to_string(),
+                    false,
+                ));
+            }
+            crate::summarize_core::set_backend_timeout(Some(backend_timeout));
             let has_date_bound =
                 get("--summary-start-date").is_some() || get("--summary-end-date").is_some();
             let summary_timezone = match get("--summary-timezone") {
