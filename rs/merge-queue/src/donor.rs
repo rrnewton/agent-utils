@@ -27,6 +27,11 @@ use crate::tests::{Selection, TestResults};
 pub const JOB_SCHEMA: &str = "merge-queue-donor-job/v1";
 /// Schema of a receipt.
 pub const RECEIPT_SCHEMA: &str = "merge-queue-receipt/v1";
+
+/// Why a compare-mode job outlives its run: its candidate landed, and the donor holding the
+/// lease may still report a receipt worth comparing (see [`Job::candidate_gone`]). A candidate
+/// that did not land gets its job cancelled instead.
+pub const CANDIDATE_LANDED: &str = "its candidate landed";
 /// A repository URL reduced to what names the repository, so the forms of one repository
 /// compare equal: the scheme (`https`, `http`, `ssh`, `git`, `git+ssh`, or scp-like
 /// `user@host:path`), the user, the port, a trailing `/` and a `.git` suffix are dropped, and
@@ -1022,21 +1027,24 @@ impl Store {
         Ok(true)
     }
 
-    /// Retire every queued or leased job with `reason` (compare mode); returns their ids.
-    pub fn retire_all_live(&self, reason: &str) -> Result<Vec<String>, String> {
+    /// [`Store::cancel_all_live`] for compare mode: a leased job kept for the late
+    /// comparison of a candidate that landed ([`CANDIDATE_LANDED`]) is left to its donor;
+    /// every other queued or leased job is cancelled. Returns the cancelled ids.
+    pub fn cancel_all_live_but_landed(&self, reason: &str) -> Result<Vec<String>, String> {
         let live: Vec<String> = self
             .jobs()?
             .into_iter()
             .filter(|job| matches!(job.state, JobState::Queued | JobState::Leased))
+            .filter(|job| job.candidate_gone.as_deref() != Some(CANDIDATE_LANDED))
             .map(|job| job.id)
             .collect();
-        let mut retired = Vec::new();
+        let mut cancelled = Vec::new();
         for id in live {
-            if self.retire(&id, reason)? {
-                retired.push(id);
+            if self.cancel_live(&id, reason)? {
+                cancelled.push(id);
             }
         }
-        Ok(retired)
+        Ok(cancelled)
     }
 
     /// Cancel every queued or leased job with `reason`; returns their ids. A run calls this

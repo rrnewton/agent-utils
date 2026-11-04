@@ -642,18 +642,13 @@ impl<'a> Runner<'a> {
                 Ok(tool) => {
                     let reason = "superseded: the run that published it ended without settling it";
                     let swept = if offload == crate::state::Offload::Compare {
-                        store.retire_all_live(reason)
+                        store.cancel_all_live_but_landed(reason)
                     } else {
                         store.cancel_all_live(reason)
                     };
                     match swept {
                         Ok(swept) if !swept.is_empty() => eprintln!(
-                            "merge-queue: {} {} donor job(s) an earlier run left live",
-                            if offload == crate::state::Offload::Compare {
-                                "retired"
-                            } else {
-                                "cancelled"
-                            },
+                            "merge-queue: cancelled {} donor job(s) an earlier run left live",
                             swept.len()
                         ),
                         Ok(_) => {}
@@ -1746,17 +1741,21 @@ impl<'a> Runner<'a> {
             _ => {
                 // Compare mode: donors validate the same commit too, but only the local
                 // verdict decides; a donor that cannot publish never affects it.
-                let compared = self.donors.as_ref().and_then(|donors| {
-                    self.publish(donors, &job)
-                        .map_err(|error| {
-                            self.event(
-                                "donor",
-                                &format!("v{id}: not published for comparison: {error}"),
-                            )
-                        })
-                        .ok()
-                        .map(|published| (donors, published))
-                });
+                let compared = self
+                    .donors
+                    .as_ref()
+                    .filter(|donors| self.compares(donors, &job))
+                    .and_then(|donors| {
+                        self.publish(donors, &job)
+                            .map_err(|error| {
+                                self.event(
+                                    "donor",
+                                    &format!("v{id}: not published for comparison: {error}"),
+                                )
+                            })
+                            .ok()
+                            .map(|published| (donors, published))
+                    });
                 let slot = self.slots.take();
                 let result = self.slots.checkout(slot, &job.commit).and_then(|checkout| {
                     self.validator
@@ -1765,6 +1764,12 @@ impl<'a> Runner<'a> {
                 self.slots.give(slot);
                 if let Some((donors, published)) = compared {
                     let recorded = match &result {
+                        // A local validation that never ran leaves nothing to compare, and
+                        // the donor would spend a full validation on it.
+                        Ok(ran) if ran.refused() => donors.store.cancel(
+                            &published,
+                            "the local validation could not run, so there is nothing to compare",
+                        ),
                         Ok(ran) if !ran.cancelled && ran.interrupted.is_none() => {
                             donors.store.record_local(&published, local_verdict(ran))
                         }
@@ -1874,6 +1879,18 @@ impl<'a> Runner<'a> {
         Ok(published.id)
     }
 
+    /// Whether compare mode publishes `job` for donors too: only a new candidate (a batch or
+    /// a remainder), and only once per commit in a run. A culprit probe or a flaky check
+    /// repeats a candidate already published (a flaky check reruns the very same commit), and
+    /// widening revalidates a landed one; each would cost a donor a full validation that
+    /// compares nothing new.
+    fn compares(&self, donors: &Donors, job: &Job) -> bool {
+        matches!(job.purpose, "batch" | "remainder")
+            && !lock(&donors.published)
+                .iter()
+                .any(|(_, commit)| *commit == job.commit)
+    }
+
     /// Cancel this run's donor jobs the queue no longer wants. A job whose candidate is now in
     /// the base landed; once the run has `ended`, every job still live was superseded (the
     /// next run plans and publishes its candidates afresh). The donor of a cancelled job stops
@@ -1888,15 +1905,16 @@ impl<'a> Runner<'a> {
             let landed = !base.is_empty()
                 && (*commit == base || self.git.is_ancestor(commit, &base).unwrap_or(false));
             let reason = if landed {
-                "its candidate landed"
+                crate::donor::CANDIDATE_LANDED
             } else if ended {
                 "superseded: the run that published it ended without landing its candidate"
             } else {
                 return true;
             };
-            // In compare mode a leased job's receipt can still be compared (it cannot affect
-            // landing), so only an unleased job is cancelled.
-            let retired = if donors.mode == crate::state::Offload::Compare {
+            // In compare mode the receipt for a landed candidate can still be compared (it
+            // cannot affect landing), so a leased job is kept for its donor. A candidate that
+            // did not land (ejected, or left to the next run) is not worth a donor's time.
+            let retired = if donors.mode == crate::state::Offload::Compare && landed {
                 donors.store.retire(id, reason)
             } else {
                 donors.store.cancel_live(id, reason)

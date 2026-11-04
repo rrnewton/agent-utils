@@ -646,6 +646,64 @@ fn compare_mode_keeps_a_leased_job_after_landing_and_compares_its_late_receipt()
 }
 
 #[test]
+fn compare_mode_publishes_only_the_candidate_and_cancels_its_lease_when_it_is_ejected() {
+    // A red batch's culprit search reruns the failed test on the very same candidate (the
+    // flaky check) and on the base. None of that is published for donors: the candidate was
+    // already published once. And once the candidate is ejected, the donor holding its lease
+    // is told to stop instead of finishing a validation nobody will use.
+    let fx = Fixture::new("donor-ejected");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        r#"sleep 3; rc=0; for t in $(ls tests 2>/dev/null); do o=pass; if grep -q FAIL "tests/$t"; then o=fail; rc=1; fi; printf '{"id":"%s","outcome":"%s"}\n' "$t" "$o" >> "$MQ_RESULTS"; done; exit $rc"#,
+        "--offload",
+        "compare",
+    ]);
+    fx.branch("a", &[("tests/a", "FAIL\n")]);
+    fx.branch("b", &[("b.txt", "b\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let claimed: Value = serde_json::from_str(&fx.mq_ok(&[
+        "donor", "claim", "--donor", "slow", "--host", "h", "--jobs", "1",
+    ]))
+    .unwrap();
+    let id = claimed["job"]["id"].as_str().unwrap().to_owned();
+    let token = claimed["job"]["lease"]["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (code, report, stderr) = finish(run);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(item_status(&fx, 1), "ejected", "{report}");
+    assert_eq!(item_status(&fx, 2), "landed", "{report}");
+    let probes = report["validations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v["purpose"] == "probe")
+        .count();
+    assert!(probes > 0, "the search must have probed: {report}");
+    // One job for the first candidate and one for the remainder, which is a new
+    // candidate once #1 is out; none for any probe.
+    let all = jobs(&fx);
+    let commits: Vec<&str> = all.iter().map(|j| j["commit"].as_str().unwrap()).collect();
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert_ne!(commits[0], commits[1], "{all:?}");
+    let job = all.iter().find(|j| j["id"] == id.as_str()).unwrap();
+    assert_eq!(job["state"], "cancelled", "{job}");
+    let (ok, out, err) = donor_call(&fx, "renew", &id, &token);
+    assert!(ok, "{err}");
+    let renewal: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(renewal["renewal"], "stop", "{renewal}");
+}
+
+#[test]
 fn an_unleased_job_whose_candidate_landed_is_cancelled() {
     let fx = Fixture::new("donor-unleased");
     fx.mq_ok(&[
