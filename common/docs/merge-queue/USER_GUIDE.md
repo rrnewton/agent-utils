@@ -96,7 +96,7 @@ This command creates the state directory and writes `config.json`.
 | `--priority-label LABEL` | `mq-priority` | The label that makes a pull request a priority change when `sync` reads it from the hosting service, compared without regard to case. `-` turns it off. See "Priority changes". |
 | `--classifier-policy PATH` | none | A test-footprint policy in the repository (version 2, such as `ci/test-footprints.json`), read at each plan's base commit. Decision-log features then take their components and a verdict from it, through the shared change classifier (`change-classify userguide`). |
 | `--ci-path PATTERN` | none | A CI or validation-infrastructure path (exact path, directory with or without a trailing slash, or `*` wildcards). `plan` suggests the priority label for a change that touches only these paths; the queue never applies the label itself. Repeatable. |
-| `--regen-path PATTERN` | none | A generated file (exact path, directory with or without a trailing slash, or `*` wildcards) whose conflicts the queue resolves by regenerating it instead of holding the change. Repeatable. See "Generated files". |
+| `--regen-path PATTERN` | none | A generated file (exact path, directory with or without a trailing slash, or `*` wildcards) whose conflicts the queue settles on the target's side and then regenerates, instead of holding the change. Repeatable. See "Generated files". |
 | `--regen-command CMD` | empty | Shell command, run as `sh -c` at the root of the candidate checkout, that rewrites every generated file from its sources deterministically. Runs with `MQ_PR` (change number), `MQ_REGEN_PATHS` (space-separated generated patterns) and `MQ_CONFLICTED` (space-separated conflicted paths, empty for a non-conflict refresh) set. Required with `--regen-path`. |
 | `--regen-when WHEN` | `conflict` | `conflict`: regenerate after a change whose combination conflicted in, or changed, a generated file (a textual merge of generated files need not be the regenerated output). `always`: regenerate after every change. Either way regeneration happens per change, so every prefix is a self-consistent tree. |
 | `--regen-build CMD` | empty | Command run before `--regen-command`, such as building the generator. When it fails, the change is ejected as `regen-build-failed` with the error tail. |
@@ -1213,10 +1213,16 @@ list them with `--regen-path` and give the command that rebuilds them with `--re
 
 - **Planning.** A conflict confined to generated files is not a conflict. The plan batches those
   changes together instead of holding all but one.
-- **Building.** When combining a change leaves conflicts only in generated files, the queue checks
-  the combination out in a scratch worktree, runs the command there, and commits the rewritten
-  files on top as `merge-queue: regenerate <paths> after #<pr>`, under `identity`. It does this
-  right after that change. It also regenerates after any change whose combination changed a
+- **Building.** When combining a change leaves conflicts only in generated files, the queue first
+  settles them on the target's side: where both sides edited the same lines the target's lines
+  win, the change's other edits to the file are kept, and a conflict that is not about lines (one
+  side deleted the file) takes the target's whole file, or its absence. No commit carries conflict
+  markers, so a generator that compiles one of these files still builds. With `--recount-pins`,
+  the pin file is recounted next, so generated files that embed the pins are made from the
+  recounted values. The queue then checks the combination out in a scratch worktree, runs the
+  command there, and commits the rewritten files on top as
+  `merge-queue: regenerate <paths> after #<pr>`, under `identity`. It does this right after that
+  change. It also regenerates after any change whose combination changed a
   generated file (a textual merge of generated files need not be the regenerated output) and,
   with `--regen-when always`, after every change; a regeneration commits only when a generated
   file actually changed. Because this happens per change, every prefix the culprit search might
@@ -1228,7 +1234,8 @@ list them with `--regen-path` and give the command that rebuilds them with `--re
   the working directory at the root of a scratch checkout of the candidate tip (the exact tree
   being combined), stdin closed, and these variables set: `MQ_PR` (the change being combined),
   `MQ_REGEN_PATHS` (the configured generated patterns, space-separated) and `MQ_CONFLICTED` (the
-  generated paths that conflicted, space-separated; empty when nothing conflicted). The
+  generated paths that conflicted and were settled on the target's side, space-separated; empty
+  when nothing conflicted). The
   command must rewrite every generated file deterministically from the checkout's sources and
   touch nothing else: for the same sources it must produce byte-identical output on every run,
   and the queue refuses any run that changes a file outside the generated set. A minimal correct

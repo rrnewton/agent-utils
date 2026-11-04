@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// How a change is combined onto the candidate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -38,8 +39,9 @@ pub enum Combined {
     Clean(String),
     /// Textual conflict on these paths.
     Conflict(Vec<String>),
-    /// Combined, but these regenerable paths still hold conflict markers: the tip must be
-    /// regenerated before anything validates it.
+    /// Combined, but these regenerable paths conflicted and were settled on the target's side
+    /// (see [`Git::resolve_to_target`]): the tip must be regenerated before anything validates
+    /// it.
     NeedsRegen(String, Vec<String>),
 }
 
@@ -225,8 +227,24 @@ impl Git {
         right: &str,
         merge_base: Option<&str>,
     ) -> Result<Result<String, (String, Vec<String>)>, String> {
+        self.merge_tree_favoring(left, right, merge_base, false)
+    }
+
+    /// [`Git::merge_tree`]; with `favor_left`, conflicting hunks of a text merge take `left`'s
+    /// lines (`-X ours`), so only conflicts that are not text conflicts remain.
+    #[allow(clippy::type_complexity)]
+    fn merge_tree_favoring(
+        &self,
+        left: &str,
+        right: &str,
+        merge_base: Option<&str>,
+        favor_left: bool,
+    ) -> Result<Result<String, (String, Vec<String>)>, String> {
         let base_arg = merge_base.map(|base| format!("--merge-base={base}"));
         let mut args = vec!["merge-tree", "--write-tree", "--name-only", "--no-messages"];
+        if favor_left {
+            args.extend(["-X", "ours"]);
+        }
         if let Some(arg) = &base_arg {
             args.push(arg);
         }
@@ -443,13 +461,111 @@ impl Git {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 
+    /// Run `command` with `input` on its standard input; any exit but 0 is an error.
+    fn feed(&self, mut command: Command, input: &[u8], what: &str) -> Result<(), String> {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("could not run {what}: {error}"))?;
+        let fed = child
+            .stdin
+            .take()
+            .map_or(Ok(()), |mut stdin| stdin.write_all(input));
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("could not run {what}: {error}"))?;
+        if output.status.success() {
+            fed.map_err(|error| format!("could not feed {what}: {error}"))
+        } else {
+            Err(format!(
+                "{what} failed ({}): {}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+
+    /// Merge `other` into `onto` (as [`Git::merge_tree`]) with every conflict settled on `onto`'s
+    /// side, and return the tree. Conflicting hunks take `onto`'s lines (`-X ours`) while hunks
+    /// that merge cleanly keep both sides' edits; a conflict that is not a text conflict
+    /// (modify/delete, file/directory) takes `onto`'s whole entry, or its absence. `conflicted`
+    /// is what the plain merge reported, every path of it regenerable. Settling them before
+    /// anything runs keeps conflict markers out of every commit, so a generator that compiles one
+    /// of these files still builds; the regeneration that follows rewrites the generated ones.
+    fn resolve_to_target(
+        &self,
+        onto: &str,
+        other: &str,
+        merge_base: Option<&str>,
+        conflicted: &[String],
+    ) -> Result<String, String> {
+        match self.merge_tree_favoring(onto, other, merge_base, true)? {
+            Ok(tree) => Ok(tree),
+            Err((tree, left)) => {
+                if let Some(path) = left.iter().find(|path| !conflicted.contains(path)) {
+                    return Err(format!(
+                        "git merge-tree -X ours reported a conflict in {path} that the plain merge did not"
+                    ));
+                }
+                self.replace_paths(&tree, onto, &left)
+            }
+        }
+    }
+
+    /// `tree` with each of `paths` replaced by its entry in commit `source`, or removed where
+    /// `source` has none. Built in a throwaway index file in the Git directory, so no working
+    /// tree and not the repository's own index is involved (the repository may be bare).
+    fn replace_paths(&self, tree: &str, source: &str, paths: &[String]) -> Result<String, String> {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let git_dir = PathBuf::from(self.run(&["rev-parse", "--absolute-git-dir"])?);
+        let index = git_dir.join(format!(
+            "merge-queue-index-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let indexed = |args: &[&str]| {
+            let mut command = self.command(args);
+            command
+                .env("GIT_INDEX_FILE", &index)
+                .env("GIT_LITERAL_PATHSPECS", "1");
+            command
+        };
+        let result = (|| {
+            self.output(indexed(&["read-tree", tree]), "git read-tree", &[0])?;
+            let mut list = vec!["ls-tree", "-r", "-z", "--full-tree", source, "--"];
+            list.extend(paths.iter().map(String::as_str));
+            let entries = self.output(indexed(&list), "git ls-tree", &[0])?.stdout;
+            // Remove every path first (mode 0), then add `source`'s entries, which
+            // `--index-info` reads in ls-tree's own format.
+            let zero = "0".repeat(tree.len());
+            let mut input = Vec::new();
+            for path in paths {
+                input.extend_from_slice(format!("0 {zero}\t{path}\0").as_bytes());
+            }
+            input.extend_from_slice(&entries);
+            self.feed(
+                indexed(&["update-index", "-z", "--index-info"]),
+                &input,
+                "git update-index --index-info",
+            )?;
+            let output = self.output(indexed(&["write-tree"]), "git write-tree", &[0])?;
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        })();
+        let _ = std::fs::remove_file(&index);
+        let _ = std::fs::remove_file(format!("{}.lock", index.display()));
+        result
+    }
+
     /// Replay `commit` onto `onto` without a working tree (a plumbing cherry-pick).
     pub fn cherry_pick(&self, onto: &str, commit: &str) -> Result<Combined, String> {
         self.cherry_pick_with(onto, commit, &nothing_regenerable)
     }
 
-    /// Replay `commit` onto `onto`; conflicts confined to regenerable paths are committed with
-    /// their markers and reported as [`Combined::NeedsRegen`].
+    /// Replay `commit` onto `onto`; conflicts confined to regenerable paths are settled on
+    /// `onto`'s side ([`Git::resolve_to_target`]) and reported as [`Combined::NeedsRegen`].
     pub fn cherry_pick_with(
         &self,
         onto: &str,
@@ -457,30 +573,27 @@ impl Git {
         regenerable: Regenerable<'_>,
     ) -> Result<Combined, String> {
         let parent = format!("{commit}^");
-        match self.merge_tree(onto, commit, Some(&parent))? {
-            Err((tree, paths)) if paths.iter().all(|path| regenerable(path)) => {
-                let (name, email, date, message) = self.commit_meta(commit)?;
-                let new = self.commit_tree(
-                    &tree,
-                    &[onto],
-                    message.trim_end(),
-                    Some((&name, &email, &date)),
-                )?;
-                Ok(Combined::NeedsRegen(new, paths))
-            }
-            Err((_, paths)) => Ok(Combined::Conflict(paths)),
-            Ok(tree) => {
-                // Like `git rebase`, drop a commit whose change the target already has.
-                if tree == self.tree_of(onto)? {
-                    return Ok(Combined::Clean(onto.to_owned()));
-                }
-                let (name, email, date, message) = self.commit_meta(commit)?;
-                let message = message.trim_end();
-                let new =
-                    self.commit_tree(&tree, &[onto], message, Some((&name, &email, &date)))?;
-                Ok(Combined::Clean(new))
-            }
-        }
+        let (tree, settled) = match self.merge_tree(onto, commit, Some(&parent))? {
+            Err((_, paths)) if paths.iter().all(|path| regenerable(path)) => (
+                self.resolve_to_target(onto, commit, Some(&parent), &paths)?,
+                paths,
+            ),
+            Err((_, paths)) => return Ok(Combined::Conflict(paths)),
+            Ok(tree) => (tree, Vec::new()),
+        };
+        // Like `git rebase`, drop a commit whose change the target already has.
+        let new = if tree == self.tree_of(onto)? {
+            onto.to_owned()
+        } else {
+            let (name, email, date, message) = self.commit_meta(commit)?;
+            let message = message.trim_end();
+            self.commit_tree(&tree, &[onto], message, Some((&name, &email, &date)))?
+        };
+        Ok(if settled.is_empty() {
+            Combined::Clean(new)
+        } else {
+            Combined::NeedsRegen(new, settled)
+        })
     }
 
     /// Combine one change (`head`, excluding commits reachable from `exclude`) onto `onto`.
@@ -525,21 +638,21 @@ impl Git {
         regenerable: Regenerable<'_>,
     ) -> Result<Combined, String> {
         match mode {
-            CombineMode::Merge => match self.merge_tree(onto, head, None)? {
-                Err((tree, paths)) if paths.iter().all(|path| regenerable(path)) => {
-                    Ok(Combined::NeedsRegen(
-                        self.commit_tree(&tree, &[onto, head], merge_message, None)?,
-                        paths,
-                    ))
-                }
-                Err((_, paths)) => Ok(Combined::Conflict(paths)),
-                Ok(tree) => Ok(Combined::Clean(self.commit_tree(
-                    &tree,
-                    &[onto, head],
-                    merge_message,
-                    None,
-                )?)),
-            },
+            CombineMode::Merge => {
+                let (tree, settled) = match self.merge_tree(onto, head, None)? {
+                    Err((_, paths)) if paths.iter().all(|path| regenerable(path)) => {
+                        (self.resolve_to_target(onto, head, None, &paths)?, paths)
+                    }
+                    Err((_, paths)) => return Ok(Combined::Conflict(paths)),
+                    Ok(tree) => (tree, Vec::new()),
+                };
+                let new = self.commit_tree(&tree, &[onto, head], merge_message, None)?;
+                Ok(if settled.is_empty() {
+                    Combined::Clean(new)
+                } else {
+                    Combined::NeedsRegen(new, settled)
+                })
+            }
             CombineMode::Rebase => {
                 if self.fast_forwards(onto, head)? {
                     return Ok(Combined::Clean(head.to_owned()));
@@ -900,7 +1013,7 @@ mod unit {
     }
 
     #[test]
-    fn conflicts_in_regenerable_paths_pass_through_with_markers() {
+    fn conflicts_in_regenerable_paths_settle_on_the_target_side() {
         let tmp = TempDir::new("git-regen");
         let git = init(&tmp.0);
         write(&tmp.0, "gen.json", "v0\n");
@@ -918,21 +1031,166 @@ mod unit {
             &[("gen.json", "vb\n"), ("b.src", "b\n")],
         );
         let regen = |path: &str| path == "gen.json";
-        let Combined::NeedsRegen(tip, paths) = git
-            .combine_with(CombineMode::Rebase, &a, &b, &[], "", &regen)
-            .unwrap()
-        else {
-            panic!("conflict confined to gen.json should pass through");
-        };
-        assert_eq!(paths, vec!["gen.json".to_owned()]);
-        let text = git.run(&["show", &format!("{tip}:gen.json")]).unwrap();
-        assert!(text.contains("<<<<<<<"), "{text}");
-        assert!(git.run(&["show", &format!("{tip}:b.src")]).is_ok());
+        for mode in [CombineMode::Rebase, CombineMode::Merge] {
+            let Combined::NeedsRegen(tip, paths) =
+                git.combine_with(mode, &a, &b, &[], "", &regen).unwrap()
+            else {
+                panic!("{mode:?}: a conflict confined to gen.json should pass through");
+            };
+            assert_eq!(paths, vec!["gen.json".to_owned()], "{mode:?}");
+            // The target's version, with no conflict markers for anything to trip on.
+            assert_eq!(
+                git.run(&["show", &format!("{tip}:gen.json")]).unwrap(),
+                "va",
+                "{mode:?}"
+            );
+            assert!(
+                git.conflict_markers(&a, &tip).unwrap().is_empty(),
+                "{mode:?}"
+            );
+            assert_eq!(git.run(&["show", &format!("{tip}:b.src")]).unwrap(), "b");
+            assert_eq!(git.run(&["show", &format!("{tip}:a.src")]).unwrap(), "a");
+        }
         // Without the regenerable list it is an ordinary conflict.
         assert_eq!(
             git.combine(CombineMode::Rebase, &a, &b, &[], "").unwrap(),
             Combined::Conflict(vec!["gen.json".to_owned()])
         );
+    }
+
+    #[test]
+    fn only_the_conflicting_hunks_of_a_regenerable_path_take_the_target_side() {
+        // A file the generator reads as well as writes (a static table compiled into it) must
+        // stay well formed: the target's lines win where both sides edited the same lines, and
+        // the change's edits elsewhere in the file survive.
+        let tmp = TempDir::new("git-regen-hunks");
+        let git = init(&tmp.0);
+        write(
+            &tmp.0,
+            "table.rs",
+            "(\"alpha\", 10),\n2\n3\n4\n(\"beta\", 5),\n",
+        );
+        git_add_commit(&tmp.0);
+        let target = branch(
+            &tmp.0,
+            "target",
+            "main",
+            &[("table.rs", "(\"alpha\", 11),\n2\n3\n4\n(\"beta\", 5),\n")],
+        );
+        let change = branch(
+            &tmp.0,
+            "change",
+            "main",
+            &[
+                (
+                    "table.rs",
+                    "// alpha grows by 3\n(\"alpha\", 13),\n2\n3\n4\n(\"beta\", 6),\n",
+                ),
+                ("src.rs", "uses beta\n"),
+            ],
+        );
+        let regen = |path: &str| path == "table.rs";
+        let Combined::NeedsRegen(tip, paths) = git
+            .combine_with(CombineMode::Rebase, &target, &change, &[], "", &regen)
+            .unwrap()
+        else {
+            panic!("a conflict confined to table.rs should pass through");
+        };
+        assert_eq!(paths, vec!["table.rs".to_owned()]);
+        assert_eq!(
+            git.run(&["show", &format!("{tip}:table.rs")]).unwrap(),
+            "(\"alpha\", 11),\n2\n3\n4\n(\"beta\", 6),"
+        );
+        assert_eq!(
+            git.run(&["show", &format!("{tip}:src.rs")]).unwrap(),
+            "uses beta"
+        );
+    }
+
+    #[test]
+    fn a_modify_delete_conflict_in_a_regenerable_path_takes_the_target_side() {
+        let tmp = TempDir::new("git-regen-delete");
+        let git = init(&tmp.0);
+        let cmd = |args: &[&str]| super::testrepo::git(&tmp.0, args);
+        write(&tmp.0, "gen/old.json", "v0\n");
+        write(&tmp.0, "gen/kept.json", "k0\n");
+        git_add_commit(&tmp.0);
+        // The target stopped generating old.json and rewrote kept.json; the change edited old.json
+        // and deleted kept.json.
+        cmd(&["checkout", "-q", "-b", "target", "main"]);
+        cmd(&["rm", "-q", "gen/old.json"]);
+        write(&tmp.0, "gen/kept.json", "k1\n");
+        git_add_commit(&tmp.0);
+        let target = git.rev_parse("HEAD").unwrap();
+        cmd(&["checkout", "-q", "-b", "change", "main"]);
+        write(&tmp.0, "gen/old.json", "v1\n");
+        cmd(&["rm", "-q", "gen/kept.json"]);
+        write(&tmp.0, "src.txt", "s\n");
+        git_add_commit(&tmp.0);
+        let change = git.rev_parse("HEAD").unwrap();
+        cmd(&["checkout", "-q", "main"]);
+        let regen = |path: &str| path.starts_with("gen/");
+        let Combined::NeedsRegen(tip, paths) = git
+            .combine_with(CombineMode::Rebase, &target, &change, &[], "", &regen)
+            .unwrap()
+        else {
+            panic!("modify/delete conflicts confined to gen/ should pass through");
+        };
+        assert_eq!(
+            paths,
+            vec!["gen/kept.json".to_owned(), "gen/old.json".to_owned()]
+        );
+        assert_eq!(
+            git.show_file(&tip, "gen/old.json").unwrap(),
+            None,
+            "deleted on the target, so deleted"
+        );
+        assert_eq!(
+            git.show_file(&tip, "gen/kept.json").unwrap().as_deref(),
+            Some("k1")
+        );
+        assert_eq!(
+            git.show_file(&tip, "src.txt").unwrap().as_deref(),
+            Some("s")
+        );
+    }
+
+    #[test]
+    fn a_conflict_outside_regenerable_paths_is_still_a_conflict() {
+        let tmp = TempDir::new("git-regen-real");
+        let git = init(&tmp.0);
+        write(&tmp.0, "gen.json", "v0\n");
+        write(&tmp.0, "real.txt", "r0\n");
+        git_add_commit(&tmp.0);
+        let target = branch(
+            &tmp.0,
+            "target",
+            "main",
+            &[("gen.json", "vt\n"), ("real.txt", "rt\n")],
+        );
+        let both = branch(
+            &tmp.0,
+            "both",
+            "main",
+            &[("gen.json", "vc\n"), ("real.txt", "rc\n")],
+        );
+        let real = branch(&tmp.0, "real", "main", &[("real.txt", "rc\n")]);
+        let regen = |path: &str| path == "gen.json";
+        for mode in [CombineMode::Rebase, CombineMode::Merge] {
+            // Mixed with a generated-file conflict, the real conflict still wins, naming both.
+            assert_eq!(
+                git.combine_with(mode, &target, &both, &[], "", &regen)
+                    .unwrap(),
+                Combined::Conflict(vec!["gen.json".to_owned(), "real.txt".to_owned()]),
+                "{mode:?}"
+            );
+            assert_eq!(
+                git.combine_with(mode, &target, &real, &[], "", &regen)
+                    .unwrap(),
+                Combined::Conflict(vec!["real.txt".to_owned()]),
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]

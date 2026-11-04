@@ -364,7 +364,8 @@ enum Command {
         classifier_policy: String,
         /// Generated-file path pattern the queue regenerates instead of treating its conflicts
         /// as real (exact path, directory with or without a trailing slash, or `*` wildcards).
-        /// Repeatable.
+        /// A conflict in one is settled on the target's side before the command runs (the
+        /// target's lines win where both sides edited the same lines). Repeatable.
         #[arg(long, value_name = "PATTERN")]
         regen_path: Vec<String>,
         /// Shell command, run as `sh -c` at the root of the candidate checkout, that

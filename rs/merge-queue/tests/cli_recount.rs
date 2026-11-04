@@ -138,3 +138,100 @@ fn without_the_flag_the_same_changes_conflict() {
     let plan: Value = serde_json::from_str(&fx.mq_ok(&["plan", "--json"])).unwrap();
     assert_eq!(plan["held"][0]["kind"], "conflicts-with-queued", "{plan}");
 }
+
+/// A generator that compiles the pin file (refusing conflict markers, as a compiler would) and
+/// writes the pins it read into `gen/dag.txt`, a generated file that embeds them.
+const PIN_GENERATOR: &str = r#"if grep -q '^<<<<<<< ' ci/manifest-plan/src/validation_dag_static.rs; then
+  echo 'error: expected type, found `<<<<<<<`' >&2; exit 101
+fi
+mkdir -p gen && grep -o '("test[.][a-z]*", [0-9]*)' ci/manifest-plan/src/validation_dag_static.rs > gen/dag.txt"#;
+
+/// Like `RUNNER`, plus a `fresh` test that fails when `gen/dag.txt` is not what the generator
+/// makes of the pin file (the generated file's own freshness check).
+const RUNNER_FRESH: &str = r#"if [ "$MQ_SELECTION" = all ]; then set -- $(ls tests) fresh; else set -- $MQ_TESTS; fi
+rc=0
+for t in "$@"; do
+  o=pass
+  if [ "$t" = fresh ]; then
+    grep -o '("test[.][a-z]*", [0-9]*)' ci/manifest-plan/src/validation_dag_static.rs | cmp -s - gen/dag.txt || o=fail
+  elif grep -q FAIL "tests/$t"; then o=fail; fi
+  [ $o = fail ] && rc=1
+  printf '{"id":"%s","outcome":"%s"}\n' "$t" "$o" >> "$MQ_RESULTS"
+done
+exit $rc"#;
+
+fn dag_text(alpha: u64) -> String {
+    format!("(\"test.alpha\", {alpha})\n(\"test.beta\", 5)\n")
+}
+
+#[test]
+fn a_pin_conflict_in_a_file_the_generator_compiles_is_settled_recounted_then_regenerated() {
+    // The pin file is listed as regenerable and is compiled into the generator. A change and
+    // the base each bumped the same pin, so combining them conflicts there and in the generated
+    // file. The conflict must be settled before the generator runs (markers would stop it from
+    // compiling, and the change would be ejected as `regen-failed`), the pins recounted next,
+    // and only then the generated file rewritten, so that it embeds the recounted pins.
+    let fx = Fixture::new("recount-regen");
+    fx.write(PIN, &pin_text(10));
+    fx.write("gen/dag.txt", &dag_text(10));
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        RUNNER_FRESH,
+        "--recount-pins",
+        "--regen-path",
+        "gen/",
+        "--regen-path",
+        PIN,
+        "--regen-command",
+        PIN_GENERATOR,
+    ]);
+    // The change adds three tests: 10 -> 13, regenerated as its author saw it.
+    fx.branch(
+        "b",
+        &[
+            (PIN, &pin_text(13)),
+            ("gen/dag.txt", &dag_text(13)),
+            ("tests/b", "ok\n"),
+        ],
+    );
+    // Meanwhile the base added one: 10 -> 11, regenerated likewise.
+    fx.write(PIN, &pin_text(11));
+    fx.write("gen/dag.txt", &dag_text(11));
+    fx.commit_all("advance main");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    let base = fx.remote_main();
+
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1]], "{r}");
+    assert!(r["ejected"].as_array().unwrap().is_empty(), "{r}");
+    // 11 (base) + 3 (the change), in the pin file and in the file generated from it.
+    let landed_pin = git(&fx.remote(), &["show", &format!("main:{PIN}")]);
+    assert!(landed_pin.contains("(\"test.alpha\", 14)"), "{landed_pin}");
+    assert!(!landed_pin.contains("<<<<<<<"), "{landed_pin}");
+    assert_eq!(
+        git(&fx.remote(), &["show", "main:gen/dag.txt"]),
+        dag_text(14).trim_end(),
+        "{r}"
+    );
+    let regenerated = r["regenerated"].as_array().unwrap();
+    assert_eq!(regenerated.len(), 1, "{r}");
+    assert_eq!(
+        regenerated[0]["conflicted"],
+        serde_json::json!([PIN, "gen/dag.txt"]),
+        "{r}"
+    );
+    // No commit on the landed range holds a conflict marker.
+    for commit in git(&fx.remote(), &["rev-list", &format!("{base}..main")]).lines() {
+        let text = git(&fx.remote(), &["show", &format!("{commit}:{PIN}")]);
+        assert!(!text.contains("<<<<<<<"), "{commit}: {text}");
+    }
+}

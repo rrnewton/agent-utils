@@ -1220,10 +1220,31 @@ impl<'a> Runner<'a> {
                     continue;
                 }
             };
-            // Regenerate right after this change whenever the combined tree may hold stale or
-            // conflict-marked generated files: the change conflicted in one, its combination
-            // changed one (a textual merge of generated files need not be the generator's
-            // output), or `when = always`. Doing it per change keeps every prefix a
+            // Recount this prefix first: base plus the deltas of the changes kept so far and
+            // this one's. It runs before regeneration because generated files can embed the
+            // pins, and a pin file whose conflict was settled on the target's side holds the
+            // target's numbers until it is recounted. Exact changes keep their own commits and
+            // are never rewritten. The running totals take this change's delta only once the
+            // change is kept.
+            let mut counted = applied.clone();
+            let next = if recount && !item.exact {
+                if let Some(delta) = accepted.get(pr) {
+                    for (key, d) in delta {
+                        *counted.entry(key.clone()).or_insert(0) += d;
+                    }
+                }
+                let values: BTreeMap<(String, usize), u64> = counted
+                    .iter()
+                    .map(|(key, value)| (key.clone(), (*value).max(0) as u64))
+                    .collect();
+                self.recount_apply(&next, *pr, &values, base_text.as_deref())?
+            } else {
+                next
+            };
+            // Regenerate right after this change whenever the combined tree may hold stale
+            // generated files: the change conflicted in one (settled on the target's side), its
+            // combination changed one (a textual merge of generated files need not be the
+            // generator's output), or `when = always`. Doing it per change keeps every prefix a
             // self-consistent tree for culprit probes, and the next change builds on the
             // regenerated prefix, so the prefixes form a fast-forward chain for per-change
             // landing drivers.
@@ -1263,23 +1284,7 @@ impl<'a> Runner<'a> {
             } else {
                 next
             };
-            // Recount this prefix: base plus the deltas of the changes kept
-            // so far, regardless of what regeneration produced. Exact
-            // changes keep their own commits and are never rewritten.
-            let next = if recount && !item.exact {
-                if let Some(delta) = accepted.get(pr).cloned() {
-                    for (key, d) in &delta {
-                        *applied.entry(key.clone()).or_insert(0) += d;
-                    }
-                }
-                let values: BTreeMap<(String, usize), u64> = applied
-                    .iter()
-                    .map(|(key, value)| (key.clone(), (*value).max(0) as u64))
-                    .collect();
-                self.recount_apply(&next, *pr, &values, base_text.as_deref())?
-            } else {
-                next
-            };
+            applied = counted;
             tip = next;
             kept.push(*pr);
             prefixes.push(tip.clone());
