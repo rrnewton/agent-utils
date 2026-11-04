@@ -67,9 +67,15 @@ const SHARD = (() => {
  * own that watches it, since the main thread may be stuck in one synchronous call when it happens (a
  * failing assertion's diff once grew a file's process by gigabytes a minute, past every heap limit,
  * until the host's out-of-memory killer took down the sandbox it ran in). The suite's files peak under
- * 600 MiB. `VIBE_TALK_PAGE_RSS_LIMIT_MB` sets another limit; 0 turns the watch off.
+ * 600 MiB with the launchers' heap cap; without it a slice has been measured at 2.7 GiB and the
+ * whole suite in one process at 3.7 GiB (tests.dag.yaml), so the default leaves room above both. `VIBE_TALK_PAGE_RSS_LIMIT_MB` sets another
+ * limit, 0 turns the watch off, and anything that is not a number is the default.
  */
-const PAGE_RSS_LIMIT_MB = Number(process.env.VIBE_TALK_PAGE_RSS_LIMIT_MB ?? 2048);
+const PAGE_RSS_LIMIT_DEFAULT_MB = 6144;
+const PAGE_RSS_LIMIT_MB = (() => {
+  const given = Number(process.env.VIBE_TALK_PAGE_RSS_LIMIT_MB ?? PAGE_RSS_LIMIT_DEFAULT_MB);
+  return Number.isFinite(given) && given >= 0 ? given : PAGE_RSS_LIMIT_DEFAULT_MB;
+})();
 if (PAGE_RSS_LIMIT_MB > 0) {
   new Worker(`
     const { workerData } = require("node:worker_threads");
