@@ -438,3 +438,84 @@ fn a_decrease_larger_than_declared_is_refused() {
     );
     assert!(r.get("pin_decreases").is_none(), "{r}");
 }
+
+/// Push `name` from `from` with one commit writing `files` under `message`.
+fn stacked_branch(fx: &Fixture, name: &str, from: &str, files: &[(&str, &str)], message: &str) {
+    git(&fx.dev(), &["checkout", "-q", "-B", name, from]);
+    for (path, text) in files {
+        fx.write(path, text);
+    }
+    fx.commit_all(message);
+    git(
+        &fx.dev(),
+        &["push", "-q", "-f", "origin", &format!("HEAD:{name}")],
+    );
+    git(&fx.dev(), &["checkout", "-q", "main"]);
+}
+
+#[test]
+fn a_change_stacked_on_another_in_the_batch_counts_only_its_own_pin_edits() {
+    // #1 moves two alpha tests away and declares it; #2 is stacked on #1 and adds one alpha
+    // test. Measured from its merge base #2 would carry #1's -2 as an undeclared -1 of its own;
+    // measured from #1's head it adds +1, and the batch counts #1's decrease once.
+    let fx = setup("recount-stacked", true);
+    branch_with_message(
+        &fx,
+        "b",
+        &[(PIN, &pin_text(8)), ("tests/b", "ok\n")],
+        "Move two alpha tests\n\nCount-Pin-Decrease: test.alpha 2 two tests move\n",
+    );
+    stacked_branch(
+        &fx,
+        "c",
+        "b",
+        &[(PIN, &pin_text(9)), ("tests/c", "ok\n")],
+        "Add an alpha test",
+    );
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1, 2]], "{r}");
+    // 10 (base) - 2 (#1, declared) + 1 (#2).
+    let landed_pin = git(&fx.remote(), &["show", &format!("main:{PIN}")]);
+    assert!(landed_pin.contains("(\"test.alpha\", 9)"), "{landed_pin}");
+    assert_eq!(r["pin_decreases"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["pin_decreases"][0]["pr"], 1, "{r}");
+}
+
+#[test]
+fn a_change_stacked_on_one_that_landed_counts_only_its_own_pin_edits() {
+    // #1 lands first (as a rebased copy, so #2's merge base with the new base still predates
+    // it). #2 is measured from #1's head, which the base already counts.
+    let fx = setup("recount-stacked-landed", true);
+    branch_with_message(
+        &fx,
+        "b",
+        &[(PIN, &pin_text(8)), ("tests/b", "ok\n")],
+        "Move two alpha tests\n\nCount-Pin-Decrease: test.alpha 2 two tests move\n",
+    );
+    // The base moves on, so #1 lands as a rebased copy rather than as its own commit.
+    fx.write("other", "other\n");
+    fx.commit_all("an unrelated change");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1]], "{r}");
+    let landed_b = git(&fx.remote(), &["rev-parse", "main"]);
+    let original_b = git(&fx.remote(), &["rev-parse", "b"]);
+    assert_ne!(landed_b, original_b, "#1 must land as a copy for this test");
+    stacked_branch(
+        &fx,
+        "c",
+        "b",
+        &[(PIN, &pin_text(9)), ("tests/c", "ok\n")],
+        "Add an alpha test",
+    );
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![2]], "{r}");
+    // 8 (base, with #1) + 1 (#2).
+    let landed_pin = git(&fx.remote(), &["show", &format!("main:{PIN}")]);
+    assert!(landed_pin.contains("(\"test.alpha\", 9)"), "{landed_pin}");
+    assert!(r.get("pin_decreases").is_none(), "{r}");
+}

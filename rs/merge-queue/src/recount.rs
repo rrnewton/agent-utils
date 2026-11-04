@@ -22,6 +22,14 @@
 //! declares exactly that decrease for exactly that pin with a [`DECREASE_TRAILER`] trailer,
 //! because a lower count is as likely a head pin stale against its merge base as tests the
 //! change means to drop.
+//!
+//! A change stacked on another in the same batch (the other's head is an ancestor of its head)
+//! carries the other's pin changes too, so its delta is its own minus the other's
+//! ([`subtract`]): the batch counts the shared changes once, and the stacked change declares
+//! only the decreases it makes itself. A change whose head is contained in an earlier change of
+//! the batch adds nothing. A change stacked on one that already landed as a rebased copy is
+//! measured from that change's head instead of its merge base, which predates the copy while the
+//! base already counts its edits.
 
 use std::collections::BTreeMap;
 
@@ -270,17 +278,33 @@ pub fn declared_decreases(message: &str) -> (Vec<Decrease>, Vec<String>) {
     (declared, unreadable)
 }
 
+/// `delta` less `earlier`, per key, without the keys that come to zero: the delta of a change
+/// stacked on one whose own delta is `earlier`.
+pub fn subtract(
+    delta: &BTreeMap<(String, usize), i64>,
+    earlier: &BTreeMap<(String, usize), i64>,
+) -> BTreeMap<(String, usize), i64> {
+    let mut out = delta.clone();
+    for (key, d) in earlier {
+        *out.entry(key.clone()).or_insert(0) -= d;
+    }
+    out.retain(|_, d| *d != 0);
+    out
+}
+
 /// Check every decrease in a change's `delta` against the decreases its head commit declares:
 /// each needs a declaration of exactly its amount for exactly its pin. Returns the declarations
-/// the change honours, or why it is refused, naming the change's merge-base and head values
-/// (`mb_values`, `head_values`) and the value the pin would resolve to on the batch so far
-/// (`running`, defaulting to `base`).
+/// the change honours, or why it is refused, naming the values the delta is measured from and
+/// to (`mb_values` at `reference`, "the merge base" or the head of the change it is stacked on,
+/// and `head_values`) and the value the pin would resolve to on the batch so far (`running`,
+/// defaulting to `base`).
 #[allow(clippy::too_many_arguments)]
 pub fn check_decreases(
     delta: &BTreeMap<(String, usize), i64>,
     base: &BTreeMap<(String, usize), u64>,
     running: &BTreeMap<(String, usize), i64>,
     mb_values: &BTreeMap<(String, usize), u64>,
+    reference: &str,
     head_values: &BTreeMap<(String, usize), u64>,
     declared: &[Decrease],
     unreadable: &[String],
@@ -304,7 +328,7 @@ pub fn check_decreases(
             format!("{name}:{index}")
         };
         let values = format!(
-            "pin {name:?} (occurrence {index}) is {} at the merge base and {} at the head ({d:+}), so on the base's {base_value} it resolves to {resolved}",
+            "pin {name:?} (occurrence {index}) is {} at {reference} and {} at the head ({d:+}), so on the base's {base_value} it resolves to {resolved}",
             shown(mb_values),
             shown(head_values)
         );
@@ -488,7 +512,16 @@ mod unit {
         let running = BTreeMap::new();
         let check = |message: &str| {
             let (declared, unreadable) = declared_decreases(message);
-            check_decreases(&delta, &base, &running, &mb, &head, &declared, &unreadable)
+            check_decreases(
+                &delta,
+                &base,
+                &running,
+                &mb,
+                "the merge base",
+                &head,
+                &declared,
+                &unreadable,
+            )
         };
         // Declared exactly (either sign): honoured, and only for the decreasing pin.
         for message in [
@@ -523,6 +556,26 @@ mod unit {
         // An unreadable trailer is named in the refusal.
         let refused = check("x\n\nCount-Pin-Decrease: p two\n").unwrap_err();
         assert!(refused.contains("unreadable trailer(s)"), "{refused}");
+    }
+
+    #[test]
+    fn a_stacked_change_counts_only_its_own_delta() {
+        // #1 adds pin "new" and lowers p by 2; #2, stacked on #1, adds 1 to p and bumps "new".
+        let base = "(\"p\", 10),\n";
+        let first = change_deltas(Some(base), Some(base), Some("(\"p\", 8),\n(\"new\", 3),\n"));
+        let second = change_deltas(Some(base), Some(base), Some("(\"p\", 9),\n(\"new\", 4),\n"));
+        let (first, second) = (first.unwrap(), second.unwrap());
+        let own = subtract(&second, &first);
+        assert_eq!(
+            own,
+            BTreeMap::from([(("new".to_owned(), 0), 1), (("p".to_owned(), 0), 1)])
+        );
+        // Base plus both is the stacked head's own values: the shared changes count once.
+        let values = candidate_values(&parse_pins(base).pins, &[&first, &own]);
+        assert_eq!(values[&("p".to_owned(), 0)], 9);
+        assert_eq!(values[&("new".to_owned(), 0)], 4);
+        // A change that adds nothing to the one it is stacked on has no delta.
+        assert!(subtract(&first, &first).is_empty());
     }
 
     #[test]

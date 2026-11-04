@@ -1208,6 +1208,9 @@ impl<'a> Runner<'a> {
         let mut base_text: Option<String> = None;
         let mut accepted: BTreeMap<i64, BTreeMap<(String, usize), i64>> = BTreeMap::new();
         let mut applied: BTreeMap<(String, usize), i64> = BTreeMap::new();
+        // Changes recounted against an earlier change of this batch (stacked on it, or contained
+        // in it), by that change: they cannot land without it.
+        let mut stacked_on: BTreeMap<i64, i64> = BTreeMap::new();
         if recount {
             base_text = self.git.show_file(parent, crate::recount::PIN_PATH)?;
             let base_pins = base_text
@@ -1224,75 +1227,229 @@ impl<'a> Runner<'a> {
                 .collect();
             applied = running.clone();
             let mut skips: Vec<(i64, String)> = Vec::new();
+            // Accepted changes in batch order, with their deltas, their head values and the
+            // commit the deltas are measured from, for the changes stacked on them.
+            type Accepted = (
+                i64,
+                BTreeMap<(String, usize), i64>,
+                BTreeMap<(String, usize), u64>,
+                String,
+            );
+            let mut earlier: Vec<Accepted> = Vec::new();
+            // Heads of changes that already landed, and how to name them.
+            let mut landed: Vec<(String, String)> = items
+                .values()
+                .filter(|item| item.status == ItemStatus::Landed)
+                .map(|item| (item.head.clone(), format!("#{}", item.pr)))
+                .collect();
+            for head in lock(&self.landed_heads).iter() {
+                if !landed.iter().any(|(seen, _)| seen == head) {
+                    landed.push((head.clone(), short(head).to_owned()));
+                }
+            }
             for pr in prs {
                 if skipped.contains(pr) {
                     continue;
                 }
                 let head = items[pr].head.clone();
-                // The change's deltas, its merge-base and head pin values, and (when it lowers a
-                // pin) its head commit's message, which may declare the decrease.
+                // The change's deltas, measured from its merge base with the batch base, or
+                // from the head of a change that already landed and that this head is stacked
+                // on: a rebase lands a copy of that change, so the merge base predates it while
+                // the base already counts its pin edits. Also the values there and at the head,
+                // that commit, and how to name it.
                 type Versions = (
                     BTreeMap<(String, usize), i64>,
                     BTreeMap<(String, usize), u64>,
                     BTreeMap<(String, usize), u64>,
                     String,
+                    String,
                 );
-                let delta = (|| -> Result<Versions, String> {
+                let versions = (|| -> Result<Versions, String> {
                     let mergebase = self
                         .git
                         .merge_base(parent, &head)
                         .map_err(|error| format!("no merge base with the batch base: {error}"))?;
-                    let mb_text = self.git.show_file(&mergebase, crate::recount::PIN_PATH)?;
+                    let added: BTreeSet<String> = self
+                        .git
+                        .run(&["rev-list", &format!("{parent}..{head}")])?
+                        .lines()
+                        .map(str::to_owned)
+                        .collect();
+                    let mut under: Vec<&(String, String)> = Vec::new();
+                    for candidate in &landed {
+                        if added.contains(&candidate.0)
+                            && self.git.is_ancestor(&mergebase, &candidate.0)?
+                        {
+                            under.push(candidate);
+                        }
+                    }
+                    let mut nearest: Vec<&(String, String)> = Vec::new();
+                    for candidate in &under {
+                        let mut covered = false;
+                        for other in &under {
+                            if other.0 != candidate.0
+                                && self.git.is_ancestor(&candidate.0, &other.0)?
+                            {
+                                covered = true;
+                                break;
+                            }
+                        }
+                        if !covered {
+                            nearest.push(candidate);
+                        }
+                    }
+                    let (reference, label) = match nearest.as_slice() {
+                        [] => (mergebase, "the merge base".to_owned()),
+                        [(landed_head, name)] => (
+                            landed_head.clone(),
+                            format!("the head of {name}, which landed"),
+                        ),
+                        several => {
+                            let names: Vec<&str> =
+                                several.iter().map(|(_, name)| name.as_str()).collect();
+                            return Err(format!(
+                                "its head contains {}, which landed separately; rebase it onto the base",
+                                names.join(" and ")
+                            ));
+                        }
+                    };
+                    let from_text = self.git.show_file(&reference, crate::recount::PIN_PATH)?;
                     let head_text = self.git.show_file(&head, crate::recount::PIN_PATH)?;
                     let delta = crate::recount::change_deltas(
                         base_text.as_deref(),
-                        mb_text.as_deref(),
+                        from_text.as_deref(),
                         head_text.as_deref(),
                     )?;
-                    let message = if delta.values().any(|d| *d < 0) {
-                        self.git.message(&head)?
-                    } else {
-                        String::new()
-                    };
                     Ok((
                         delta,
-                        crate::recount::values(mb_text.as_deref()),
+                        crate::recount::values(from_text.as_deref()),
                         crate::recount::values(head_text.as_deref()),
-                        message,
+                        reference,
+                        label,
                     ))
                 })();
-                match delta {
+                let (full, from_values, head_values, from, from_label) = match versions {
+                    Ok(versions) => versions,
+                    Err(detail) => {
+                        skips.push((*pr, format!("recount-pins refused: {detail}")));
+                        continue;
+                    }
+                };
+                // A head that contains an earlier accepted change's head carries that change's
+                // pin edits too, so it is measured against the nearest such head; a head that an
+                // earlier change already contains adds nothing. Several nearest heads, none
+                // stacked on another, cannot be told apart: that change waits for them to land.
+                let mut container = None;
+                let mut beneath: Vec<&Accepted> = Vec::new();
+                for accepted_change in &earlier {
+                    let other = &items[&accepted_change.0].head;
+                    if self.git.is_ancestor(&head, other)? {
+                        container.get_or_insert(accepted_change.0);
+                    } else if self.git.is_ancestor(other, &head)?
+                        && !beneath.iter().any(|seen| items[&seen.0].head == *other)
+                    {
+                        beneath.push(accepted_change);
+                    }
+                }
+                let mut nearest: Vec<&Accepted> = Vec::new();
+                for candidate in &beneath {
+                    let mut covered = false;
+                    for other in &beneath {
+                        if other.0 != candidate.0
+                            && self
+                                .git
+                                .is_ancestor(&items[&candidate.0].head, &items[&other.0].head)?
+                        {
+                            covered = true;
+                            break;
+                        }
+                    }
+                    if !covered {
+                        nearest.push(candidate);
+                    }
+                }
+                let (delta, reference, from_values, on) = match (container, nearest.as_slice()) {
+                    (Some(on), _) => (
+                        BTreeMap::new(),
+                        format!("#{on}'s head"),
+                        head_values.clone(),
+                        Some(on),
+                    ),
+                    (None, []) => (full.clone(), from_label, from_values, None),
+                    // Both deltas count from the same commit, so the difference is this
+                    // change's own.
+                    (None, [(on, on_full, on_values, on_from)]) if *on_from == from => (
+                        crate::recount::subtract(&full, on_full),
+                        format!("#{on}'s head"),
+                        on_values.clone(),
+                        Some(*on),
+                    ),
+                    (None, [(on, _, _, _)]) => {
+                        skips.push((
+                            *pr,
+                            format!(
+                                "recount-pins refused: it is stacked on #{on} from this batch, but their pins are counted from different commits; it is recounted once #{on} lands"
+                            ),
+                        ));
+                        continue;
+                    }
+                    (None, several) => {
+                        let names: Vec<String> = several
+                            .iter()
+                            .map(|(on, _, _, _)| format!("#{on}"))
+                            .collect();
+                        skips.push((
+                            *pr,
+                            format!(
+                                "recount-pins refused: its head contains {} from this batch, and neither is stacked on the other; it is recounted once they land",
+                                names.join(" and ")
+                            ),
+                        ));
+                        continue;
+                    }
+                };
+                // A decrease lands only as the head commit declares it.
+                let message = if delta.values().any(|d| *d < 0) {
+                    match self.git.message(&head) {
+                        Ok(message) => message,
+                        Err(detail) => {
+                            skips.push((*pr, format!("recount-pins refused: {detail}")));
+                            continue;
+                        }
+                    }
+                } else {
+                    String::new()
+                };
+                let (declared, unreadable) = crate::recount::declared_decreases(&message);
+                match crate::recount::check_decreases(
+                    &delta,
+                    &base_map,
+                    &running,
+                    &from_values,
+                    &reference,
+                    &head_values,
+                    &declared,
+                    &unreadable,
+                ) {
                     Err(detail) => {
                         skips.push((*pr, format!("recount-pins refused: {detail}")));
                     }
-                    Ok((delta, mb_values, head_values, message)) => {
-                        // A decrease lands only as the head commit declares it.
-                        let (declared, unreadable) = crate::recount::declared_decreases(&message);
-                        match crate::recount::check_decreases(
-                            &delta,
-                            &base_map,
-                            &running,
-                            &mb_values,
-                            &head_values,
-                            &declared,
-                            &unreadable,
-                        ) {
-                            Err(detail) => {
-                                skips.push((*pr, format!("recount-pins refused: {detail}")));
-                            }
-                            Ok(honoured) => {
-                                for (key, d) in &delta {
-                                    *running.entry(key.clone()).or_insert(0) += d;
-                                }
-                                accepted.insert(*pr, delta);
-                                self.record_pin_decreases(
-                                    *pr,
-                                    &honoured,
-                                    &mb_values,
-                                    &head_values,
-                                )?;
-                            }
+                    Ok(honoured) => {
+                        for (key, d) in &delta {
+                            *running.entry(key.clone()).or_insert(0) += d;
                         }
+                        if let Some(on) = on {
+                            stacked_on.insert(*pr, on);
+                        }
+                        self.record_pin_decreases(
+                            *pr,
+                            &honoured,
+                            &from_values,
+                            &reference,
+                            &head_values,
+                        )?;
+                        accepted.insert(*pr, delta);
+                        earlier.push((*pr, full, head_values, from));
                     }
                 }
             }
@@ -1332,6 +1489,12 @@ impl<'a> Runner<'a> {
                 .get(pr)
                 .is_some_and(|befores| !befores.is_disjoint(&skipped))
             {
+                skipped.insert(*pr);
+                held.push(*pr);
+                continue;
+            }
+            // A change recounted against an earlier change's head cannot land without it.
+            if stacked_on.get(pr).is_some_and(|on| !kept.contains(on)) {
                 skipped.insert(*pr);
                 held.push(*pr);
                 continue;
@@ -1723,6 +1886,7 @@ impl<'a> Runner<'a> {
         pr: i64,
         honoured: &[crate::recount::Decrease],
         mb_values: &BTreeMap<(String, usize), u64>,
+        reference: &str,
         head_values: &BTreeMap<(String, usize), u64>,
     ) -> Result<(), String> {
         for decrease in honoured {
@@ -1733,7 +1897,7 @@ impl<'a> Runner<'a> {
                     .map_or_else(|| "absent".to_owned(), u64::to_string)
             };
             let detail = format!(
-                "declared decrease of pin {:?} (occurrence {}) by {} accepted ({} at the merge base, {} at the head): {}",
+                "declared decrease of pin {:?} (occurrence {}) by {} accepted ({} at {reference}, {} at the head): {}",
                 decrease.name,
                 decrease.occurrence,
                 decrease.amount,
