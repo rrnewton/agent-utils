@@ -225,7 +225,11 @@ impl BridgeHello {
 /// sent, so neither is ever asked about.
 #[must_use]
 pub fn needed(config: &Config) -> bool {
-    config.replay.enabled && config.conversation.backend == ConversationBackend::WebSocket
+    config.replay.enabled
+        && matches!(
+            config.conversation.backend,
+            ConversationBackend::WebSocket | ConversationBackend::S2s
+        )
 }
 
 /// The address this server dials the bridge at: `read_aloud.websocket_url`, then
@@ -391,6 +395,11 @@ mod tests {
         assert!(needed(&config(&format!(
             "{websocket}[replay]\nenabled = true\n"
         ))));
+        let s2s = "[conversation]\nbackend = \"s2s\"\nwebsocket_url = \"/ws\"\n";
+        assert!(
+            needed(&config(&format!("{s2s}[replay]\nenabled = true\n"))),
+            "the s2s backend is a vibe-talk-v1 bridge too"
+        );
         assert!(
             !needed(&config(websocket)),
             "replay off sends nothing, so asks nothing"

@@ -756,7 +756,7 @@ async fn main() -> anyhow::Result<()> {
         // `#512 voice-recap-private-stack`.
         tracing::info!(
             asking = voice_bridge.url().is_some(),
-            "replay.enabled is true with conversation.backend = \"websocket\" and \
+            "replay.enabled is true with a vibe-talk-v1 bridge backend (websocket/s2s) and \
              replay.bridge_fetches_profile: a new call's recap rides in the voice-agent profile the \
              bridge fetches, unless the bridge lists replay in its session_started, which this server \
              asks it (one session, ended with quit, nothing said)"
@@ -764,7 +764,7 @@ async fn main() -> anyhow::Result<()> {
     } else if vibe_talk::voice_bridge::needed(&config) {
         tracing::info!(
             asking = voice_bridge.url().is_some(),
-            "replay.enabled is true with conversation.backend = \"websocket\": Resuming is offered \
+            "replay.enabled is true with a vibe-talk-v1 bridge backend (websocket/s2s): Resuming is offered \
              only once the voice bridge lists replay in its session_started, so this server asks it \
              (one session, ended with quit, nothing said) and reports Resuming off until it answers"
         );

@@ -1381,6 +1381,14 @@ pub enum ConversationBackend {
     ElevenLabs,
     /// Connect the browser to a deployment-managed `vibe-talk-v1` WebSocket.
     WebSocket,
+    /// Connect the browser to a deployment-managed `vibe-talk-v1` WebSocket whose
+    /// server side is a native speech-to-speech (S2S) stack instead of a cascaded
+    /// ASR/LLM/TTS one. The wire protocol to the page is identical to
+    /// [`ConversationBackend::WebSocket`]; only the deployment behind the socket
+    /// differs (an Allentown S2S backend behind the Cosmos shim, in place of a
+    /// kepler cascade), plus the S2S session identity and tier the deployment
+    /// presents to Cosmos (see `s2s_client_id` / `s2s_tier`).
+    S2s,
 }
 
 /// Provider-neutral live conversation configuration.
@@ -1401,6 +1409,24 @@ pub struct ConversationConfig {
     /// then stay off the network. Unset: the page opens `websocket_url` itself, as before.
     #[serde(default)]
     pub relay_upstream: Option<String>,
+    /// Cosmos `client_id` the S2S deployment presents when it opens sessions
+    /// ([`ConversationBackend::S2s`] only). Cosmos checks this against
+    /// `realtimeai/cosmos/client_registry` (per-client rate limits; rejection
+    /// when the registry's enforcement JK is on for the client). A deployment
+    /// must use its OWN registered id (for the devbig014 prototype:
+    /// `vibe-talk-devbig014`); never borrow another service's. Registration is
+    /// an RTAI-owned configerator change and is NOT done by this codebase.
+    /// Unset: the deployment's bridge uses its own default identity.
+    #[serde(default)]
+    pub s2s_client_id: Option<String>,
+    /// ServiceRouter tier serving the S2S checkpoint the deployment opens
+    /// sessions against ([`ConversationBackend::S2s`] only), e.g. an
+    /// `realtimeai.llm.<checkpoint>_v2` tier. Which tier a devserver tool may
+    /// use in production is an open question for the S2S owners; the prototype
+    /// was validated against a test checkpoint tier only. Unset: the
+    /// deployment's backend uses its own default tier.
+    #[serde(default)]
+    pub s2s_tier: Option<String>,
     /// Human-readable label shown in connection details.
     #[serde(default = "default_conversation_label")]
     pub label: String,
@@ -1474,6 +1500,8 @@ impl Default for ConversationConfig {
             backend: ConversationBackend::ElevenLabs,
             websocket_url: None,
             relay_upstream: None,
+            s2s_client_id: None,
+            s2s_tier: None,
             label: default_conversation_label(),
             ask_before_send: default_ask_before_send(),
             explicit_send_only: default_explicit_send_only(),
@@ -6061,6 +6089,25 @@ provider = "slack"
             Some("key-from-env")
         );
         assert_eq!(cfg.elevenlabs.api_base, "https://proxy.test/v1");
+    }
+
+    #[test]
+    fn an_s2s_conversation_backend_carries_its_own_identity_and_tier() {
+        let text = format!(
+            "{FULL}\n[conversation]\nbackend = \"s2s\"\nwebsocket_url = \
+             \"ws://127.0.0.1:9000/ws\"\ns2s_client_id = \"vibe-talk-devbig014\"\n\
+             s2s_tier = \"realtimeai.llm.test_v2\"\n"
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.conversation.backend, ConversationBackend::S2s);
+        assert_eq!(
+            cfg.conversation.s2s_client_id.as_deref(),
+            Some("vibe-talk-devbig014")
+        );
+        assert_eq!(
+            cfg.conversation.s2s_tier.as_deref(),
+            Some("realtimeai.llm.test_v2")
+        );
     }
 
     #[test]

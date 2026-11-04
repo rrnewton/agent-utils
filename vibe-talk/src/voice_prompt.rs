@@ -105,7 +105,7 @@ pub async fn current(state: &AppState) -> OwnerPrompt {
 pub fn delivery(state: &AppState) -> PromptDelivery {
     match state.config.conversation.backend {
         ConversationBackend::ElevenLabs => PromptDelivery::Page,
-        ConversationBackend::WebSocket => PromptDelivery::Profile,
+        ConversationBackend::WebSocket | ConversationBackend::S2s => PromptDelivery::Profile,
     }
 }
 

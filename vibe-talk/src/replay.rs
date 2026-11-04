@@ -466,7 +466,8 @@ pub fn offered(
     replay.enabled
         && match conversation.backend {
             crate::config::ConversationBackend::ElevenLabs => true,
-            crate::config::ConversationBackend::WebSocket => {
+            crate::config::ConversationBackend::WebSocket
+            | crate::config::ConversationBackend::S2s => {
                 bridge == crate::voice_bridge::ReplaySupport::Accepted
                     || replay.bridge_fetches_profile
             }
@@ -487,7 +488,10 @@ pub fn via_profile(
 ) -> bool {
     replay.enabled
         && replay.bridge_fetches_profile
-        && conversation.backend == crate::config::ConversationBackend::WebSocket
+        && matches!(
+            conversation.backend,
+            crate::config::ConversationBackend::WebSocket | crate::config::ConversationBackend::S2s
+        )
         && bridge != crate::voice_bridge::ReplaySupport::Accepted
 }
 

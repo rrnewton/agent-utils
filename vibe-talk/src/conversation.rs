@@ -189,6 +189,65 @@ impl ConversationalVoiceProvider for WebSocketConversationProvider {
     }
 }
 
+/// Provider for a deployment-managed WebSocket speaking `vibe-talk-v1` whose server
+/// side is a native speech-to-speech stack (Allentown S2S behind the Cosmos shim)
+/// instead of a cascaded ASR/LLM/TTS one. The page-facing wire is identical to
+/// [`WebSocketConversationProvider`]; the S2S session identity and checkpoint tier
+/// are deployment configuration the bridge presents to Cosmos, carried here so
+/// one config file describes the whole deployment.
+pub struct S2sConversationProvider {
+    url: Option<String>,
+    label: String,
+    /// Cosmos `client_id` the deployment presents (its own, registered) identity.
+    pub client_id: Option<String>,
+    /// ServiceRouter tier serving the S2S checkpoint.
+    pub tier: Option<String>,
+}
+
+impl S2sConversationProvider {
+    /// Build a provider from deployment configuration.
+    #[must_use]
+    pub fn new(config: &ConversationConfig) -> Self {
+        Self {
+            url: config.websocket_url.clone(),
+            label: config.label.clone(),
+            client_id: config.s2s_client_id.clone(),
+            tier: config.s2s_tier.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl ConversationalVoiceProvider for S2sConversationProvider {
+    fn describe(&self) -> VoiceDescription {
+        VoiceDescription {
+            name: self.label.clone(),
+            settings_url: None,
+            instance_id: None,
+        }
+    }
+
+    async fn open_session(&self) -> Result<VoiceSession, VoiceSessionError> {
+        let url = self
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .ok_or(VoiceSessionError::NotConfigured(
+                "conversation.websocket_url",
+            ))?;
+        Ok(VoiceSession {
+            websocket_url: url.to_owned(),
+            protocol: "vibe-talk-v1",
+            provider: self.describe().name,
+            valid_for_seconds: None,
+            input_sample_rate: 24_000,
+            output_sample_rate: 24_000,
+            agent_prompt: None,
+        })
+    }
+}
+
 /// What to warn about when the browser's voice socket names a host other than this server's own
 /// public one, or `None`. `#209 voice-socket-open`.
 ///
@@ -203,7 +262,10 @@ pub fn foreign_socket_host(
     conversation: &ConversationConfig,
     public_base_url: Option<&str>,
 ) -> Option<String> {
-    if conversation.backend != ConversationBackend::WebSocket {
+    if !matches!(
+        conversation.backend,
+        ConversationBackend::WebSocket | ConversationBackend::S2s
+    ) {
         return None;
     }
     let socket = conversation.websocket_url.as_deref()?.trim();
@@ -240,12 +302,16 @@ pub fn provider(
             elevenlabs_config,
         )),
         ConversationBackend::WebSocket => Arc::new(WebSocketConversationProvider::new(config)),
+        ConversationBackend::S2s => Arc::new(S2sConversationProvider::new(config)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::{TranscriptRole, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame};
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message;
 
     fn websocket(url: &str) -> ConversationConfig {
         ConversationConfig {
@@ -291,5 +357,194 @@ mod tests {
             None,
             "the hosted provider does not use this URL"
         );
+    }
+
+    fn s2s(url: &str) -> ConversationConfig {
+        ConversationConfig {
+            backend: ConversationBackend::S2s,
+            websocket_url: Some(url.to_owned()),
+            label: "voice (S2S)".to_owned(),
+            s2s_client_id: Some("vibe-talk-devbig014".to_owned()),
+            s2s_tier: Some("realtimeai.llm.test_v2".to_owned()),
+            ask_before_send: true,
+            explicit_send_only: true,
+            ..ConversationConfig::default()
+        }
+    }
+
+    /// A fake S2S bridge: speaks `vibe-talk-v1`, and for each closed audio
+    /// segment answers with one transcript, one binary PCM frame and one
+    /// `turn_complete` — the shape an Allentown S2S backend behind the Cosmos
+    /// shim presents to the page. No real S2S tier is touched.
+    async fn fake_s2s_bridge(listener: tokio::net::TcpListener) {
+        while let Ok((stream, _)) = listener.accept().await {
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("fake bridge handshake");
+            let started = serde_json::to_string(&VibeTalkV1ServerFrame::SessionStarted {
+                greeting: Some(false),
+                session_id: Some("fake-s2s".to_owned()),
+                capabilities: vec!["replay".to_owned()],
+            })
+            .unwrap();
+            socket.send(Message::Text(started.into())).await.unwrap();
+            let mut heard_audio = 0usize;
+            while let Some(Ok(frame)) = socket.next().await {
+                match frame {
+                    Message::Binary(bytes) => heard_audio += bytes.len(),
+                    Message::Text(raw) => {
+                        let client: VibeTalkV1ClientFrame =
+                            serde_json::from_str(raw.as_ref()).expect("client frame");
+                        match client {
+                            VibeTalkV1ClientFrame::AudioEnd => {
+                                assert!(heard_audio > 0, "a turn with no audio");
+                                let text =
+                                    serde_json::to_string(&VibeTalkV1ServerFrame::Transcript {
+                                        role: TranscriptRole::Assistant,
+                                        text: "fake s2s reply".to_owned(),
+                                        turn: Some(1),
+                                        is_final: Some(true),
+                                    })
+                                    .unwrap();
+                                socket.send(Message::Text(text.into())).await.unwrap();
+                                socket
+                                    .send(Message::Binary(vec![0u8; 960].into()))
+                                    .await
+                                    .unwrap();
+                                let done =
+                                    serde_json::to_string(&VibeTalkV1ServerFrame::TurnComplete {
+                                        turn: Some(1),
+                                        interrupted: None,
+                                    })
+                                    .unwrap();
+                                socket.send(Message::Text(done.into())).await.unwrap();
+                            }
+                            VibeTalkV1ClientFrame::Quit => break,
+                            _ => {}
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// The S2S backend hands the page the same `vibe-talk-v1` session shape as
+    /// the websocket backend, and one audio turn flows through a fake S2S
+    /// bridge and back: PCM in, transcript + PCM + `turn_complete` out.
+    #[tokio::test]
+    async fn an_s2s_turn_flows_through_a_fake_bridge_and_back() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake bridge");
+        let addr = listener.local_addr().unwrap();
+        let bridge = tokio::spawn(fake_s2s_bridge(listener));
+        let url = format!("ws://{addr}/ws");
+
+        // The bridge hello the server asks at startup sees the fake bridge's
+        // capabilities, exactly as with the websocket backend.
+        let capabilities =
+            crate::voice_bridge::hello(&url, &crate::bridge_dial::Credentials::default())
+                .await
+                .expect("fake bridge answers the hello");
+        assert_eq!(capabilities, vec!["replay".to_owned()]);
+
+        let config = s2s(&url);
+        let provider = S2sConversationProvider::new(&config);
+        assert_eq!(
+            provider.client_id.as_deref(),
+            Some("vibe-talk-devbig014"),
+            "the deployment's own Cosmos client_id"
+        );
+        let session = provider.open_session().await.expect("s2s session");
+        assert_eq!(session.protocol, "vibe-talk-v1");
+        assert_eq!(session.websocket_url, url);
+        assert_eq!(session.input_sample_rate, 24_000);
+        assert_eq!(session.output_sample_rate, 24_000);
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(session.websocket_url.as_str())
+            .await
+            .expect("connect fake bridge");
+        let first = socket.next().await.unwrap().unwrap();
+        let started: VibeTalkV1ServerFrame =
+            serde_json::from_str(first.into_text().unwrap().as_ref()).expect("session_started");
+        assert_eq!(
+            started,
+            VibeTalkV1ServerFrame::SessionStarted {
+                greeting: Some(false),
+                session_id: Some("fake-s2s".to_owned()),
+                capabilities: vec!["replay".to_owned()],
+            }
+        );
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&VibeTalkV1ClientFrame::AudioStart)
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        socket
+            .send(Message::Binary(vec![0u8; 1920].into()))
+            .await
+            .unwrap();
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&VibeTalkV1ClientFrame::AudioEnd)
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        let mut transcript = None;
+        let mut audio_bytes = 0usize;
+        let mut completed = false;
+        while let Some(Ok(frame)) = socket.next().await {
+            match frame {
+                Message::Binary(bytes) => audio_bytes += bytes.len(),
+                Message::Text(raw) => {
+                    let server: VibeTalkV1ServerFrame =
+                        serde_json::from_str(raw.as_ref()).expect("server frame");
+                    match server {
+                        VibeTalkV1ServerFrame::Transcript { text, .. } => transcript = Some(text),
+                        VibeTalkV1ServerFrame::TurnComplete { .. } => {
+                            completed = true;
+                            break;
+                        }
+                        other => panic!("unexpected server frame: {other:?}"),
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(transcript.as_deref(), Some("fake s2s reply"));
+        assert_eq!(audio_bytes, 960, "the fake bridge's PCM reply");
+        assert!(completed, "the turn ends with turn_complete");
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&VibeTalkV1ClientFrame::Quit)
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        bridge.abort();
+    }
+
+    /// An S2S deployment with no socket URL is refused the same way the
+    /// websocket backend refuses one, naming the missing setting.
+    #[tokio::test]
+    async fn an_s2s_backend_without_a_url_is_not_configured() {
+        let config = ConversationConfig {
+            backend: ConversationBackend::S2s,
+            ..ConversationConfig::default()
+        };
+        let error = S2sConversationProvider::new(&config)
+            .open_session()
+            .await
+            .expect_err("no URL, no session");
+        assert_eq!(error.code(), "conversation_not_configured");
     }
 }
