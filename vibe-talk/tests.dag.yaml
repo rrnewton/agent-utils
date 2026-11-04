@@ -533,6 +533,7 @@ steps:
     jobs_flag: ""
     deps: [setup.contract-tools]
     timeout: 480
+    cpu_timeout: 60
     hint:
       resources: {browser: 1}
       est_duration_s: 55
@@ -1638,6 +1639,7 @@ steps:
     jobs_flag: ""
     deps: [setup.contract-tools]
     timeout: 880
+    cpu_timeout: 110
     hint:
       resources: {browser: 1}
       est_duration_s: 50
