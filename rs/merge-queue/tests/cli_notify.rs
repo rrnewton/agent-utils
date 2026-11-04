@@ -202,6 +202,35 @@ fn withdrawn_sends_exactly_once() {
 }
 
 #[test]
+fn a_name_agentctl_cannot_accept_is_skipped_once_and_never_sent() {
+    // A hosting login is not an agentctl name: agentctl refuses it every time, so the daemon
+    // records one skip with the reason instead of three failed sends.
+    let (fx, log) = setup("notify-unaddressable", "exit 0", &[]);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a", "--notify", "SomeUser"]);
+    fx.mq_ok(&["withdraw", "1"]);
+    serve_once(&fx, &log, "0");
+    serve_once(&fx, &log, "0");
+    assert!(sent_lines(&log).is_empty(), "{:?}", sent_lines(&log));
+    let withdrawn = item(&fx, 1);
+    let skipped: Vec<&Value> = withdrawn["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "notify-skipped")
+        .collect();
+    assert_eq!(skipped.len(), 1, "{withdrawn}");
+    assert!(
+        skipped[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("withdrawn not sent to SomeUser: it is not an agentctl agent name"),
+        "{withdrawn}"
+    );
+    assert_eq!(withdrawn["notify_delivery"]["attempts"], 3, "{withdrawn}");
+}
+
+#[test]
 fn refusal_deferred_sends_exactly_once_per_refusal() {
     let (fx, log) = setup(
         "notify-refused",

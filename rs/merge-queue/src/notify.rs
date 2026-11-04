@@ -471,6 +471,18 @@ fn owed(item: &Item) -> Option<(Transition, u32)> {
     Some((transition, attempts))
 }
 
+/// Why no send to `name` can ever succeed, if none can: agentctl names start with a lowercase
+/// letter and hold 1-32 lowercase letters, digits or hyphens.
+fn unaddressable(name: &str) -> Option<String> {
+    let mut chars = name.chars();
+    let valid = name.len() <= 32
+        && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    (!valid).then(|| {
+        "it is not an agentctl agent name (a lowercase letter, then up to 31 lowercase letters, digits or hyphens)".to_owned()
+    })
+}
+
 /// How many items owe a send attempt now. A lock-free read, so the daemon
 /// can skip taking the writer lock when there is nothing to send.
 pub fn pending(state: &State) -> Result<usize, String> {
@@ -545,6 +557,27 @@ pub fn sweep_locked(
         let Some((transition, attempts)) = owed(&item) else {
             continue;
         };
+        // A name agentctl can never accept (a hosting login such as `SomeUser`, say) is not
+        // retried: one record says why, and the transition counts as given up.
+        if let Some(why) = unaddressable(&item.notify) {
+            let _ = update_delivery(state, pr, &transition, |fresh| {
+                fresh.notify_delivery = NotifyDelivery {
+                    key: transition.key.clone(),
+                    attempts: MAX_ATTEMPTS,
+                    delivered: false,
+                    last_error: why.clone(),
+                };
+                fresh.log(
+                    "notify-skipped",
+                    format!("{} not sent to {}: {why}", transition.verdict, item.notify),
+                );
+            });
+            eprintln!(
+                "merge-queue notify: #{pr} {} not sent to {}: {why}",
+                transition.verdict, item.notify
+            );
+            continue;
+        }
         // Persist the attempt before sending: a daemon crash mid-send can
         // then only lose the delivery mark, never the retry bound.
         let recorded = update_delivery(state, pr, &transition, |fresh| {
