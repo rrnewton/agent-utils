@@ -1,11 +1,12 @@
 ---
 title: 'read-aloud-table-rows: read tables row by row with header labels, highlight in step'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-refactor
 created_at: 2026-11-04T19:00:42.856066401+00:00
-updated_at: 2026-11-04T19:00:42.856066401+00:00
+updated_at: 2026-11-04T21:19:45.734409777+00:00
+closed_at: 2026-11-04T21:19:45.734409496+00:00
 ---
 
 # Description
