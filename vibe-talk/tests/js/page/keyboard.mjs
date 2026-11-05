@@ -3876,7 +3876,8 @@ test("`#344 search-shortcut`: THE SEARCH CHORD IS HEARD FIRST, at the window in 
   assert.ok(searchReady(page), `with the key stopped at the box, Ctrl+/ left the focus on ${focusName(page)}`);
   // NEGATIVE CONTROL: without the window's listener the table's own walk still searches on Ctrl+/ (the
   // same binding, from the document), until something on the way stops the key.
-  const deafScript = brokenScript('window.addEventListener("keydown", keyDispatch.onEverywhereKey, { capture: true });', "");
+  const deafScript = await brokenModule([{ file: "src/view/shell/keylisteners.ts",
+    find: '  listen<KeyboardEvent>(window, "keydown", (event) => deps.onEverywhereKey(event), { capture: true });\n', replace: "" }]);
   const deaf = await keyboardPageOn(deafScript);
   await press(deaf, deaf.el("channel-compose-text"), "/", { ctrlKey: true });
   assert.ok(searchReady(deaf), "without the window's listener Ctrl+/ did not search from the document either");

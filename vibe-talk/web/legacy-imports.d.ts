@@ -41,6 +41,7 @@ declare const createPointerSelection: LegacyImports["createPointerSelection"];
 declare const createKeySelection: LegacyImports["createKeySelection"];
 declare const createKeymap: LegacyImports["createKeymap"];
 declare const createReadCollapse: LegacyImports["createReadCollapse"];
+declare const mountKeyListeners: LegacyImports["mountKeyListeners"];
 declare const KEYS_MESSAGE: LegacyImports["KEYS_MESSAGE"];
 declare const KEYS_MOVING: LegacyImports["KEYS_MOVING"];
 declare const KEYS_PAGE: LegacyImports["KEYS_PAGE"];

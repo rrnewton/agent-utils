@@ -30440,27 +30440,27 @@ el("width-grip").addEventListener("keydown", (event) => readingWidthControl.grip
 // something is broken.
 document.addEventListener("visibilitychange", onVisibility);
 document.addEventListener("pointerdown", closeRowMenuOutside);
-// `#224 keyboard-shortcuts`. Every key the page answers, in one place: see `keyDispatch.onPageKey`. The switch
-// for the single-key shortcuts is restored first, so the keys are said as they will act.
-document.addEventListener("keydown", keyDispatch.onPageKey);
-// `#344 search-shortcut`. ...but for the chords that act whatever holds the focus, heard before any
-// other listener of the page: see `keyDispatch.onEverywhereKey`.
-window.addEventListener("keydown", keyDispatch.onEverywhereKey, { capture: true });
-// `#296 copy-highlighted-message`. A copy with nothing selected copies the highlighted message.
-document.addEventListener("beforecopy", highlightCopy.onPageBeforeCopy);
-document.addEventListener("copy", highlightCopy.onPageCopy);
-singleKeys.restore();
-keyHints.render();
-el("single-keys").addEventListener("change", () => singleKeys.apply(el("single-keys").checked));
-// A click in a list selects its row, so that the next key starts there; the focus arriving in a list
-// makes it the one in use, and a row it lands in the selection. `#239 single-selection`: a real mouse
-// move over a row selects it, and a pointer's kind says whether its click or tap is drawn.
-for (const pane of KEY_PANES) {
-  pane.scroller().addEventListener("click", (event) => noteClickedRow(pane, event && event.target));
-  pane.scroller().addEventListener("focusin", (event) => onPaneFocus(pane, event));
-}
-document.addEventListener("pointermove", onPointerMove);
-document.addEventListener("pointerdown", onPointerDown);
+// The keys' and the selection's listeners (`#224 keyboard-shortcuts`, `#344 search-shortcut`, `#296
+// copy-highlighted-message`, `#239 single-selection`): every key heard in one place, the chords that act whatever
+// holds the focus heard first, a copy with nothing selected, the single-key switch (restored first, so the keys are
+// said as they will act), and the clicks, the focus and the pointer that move the one selection. One owner in
+// web/src/view/shell/keylisteners.ts (`#624 voice-page-modularity`), mounted here, in the page's order; the page
+// never takes them down, and its `unmount` waits for the ordered boot to have a teardown.
+mountKeyListeners({
+  onPageKey: (event) => keyDispatch.onPageKey(event),
+  onEverywhereKey: (event) => keyDispatch.onEverywhereKey(event),
+  onPageBeforeCopy: (event) => highlightCopy.onPageBeforeCopy(event),
+  onPageCopy: (event) => highlightCopy.onPageCopy(event),
+  restoreSingleKeys: () => singleKeys.restore(),
+  renderKeyHints: () => keyHints.render(),
+  applySingleKeys: (on) => singleKeys.apply(on),
+  singleKeysBox: () => /** @type {HTMLInputElement} */ (el("single-keys")),
+  keyPanes: () => KEY_PANES,
+  noteClickedRow: (pane, node) => noteClickedRow(pane, node),
+  onPaneFocus: (pane, event) => onPaneFocus(pane, event),
+  onPointerMove: (event) => onPointerMove(event),
+  onPointerDown: (event) => onPointerDown(event),
+});
 // `#280 scroll-stability`. The mouse leaving the window drops the wait before a glide between the columns.
 document.documentElement.addEventListener("pointerleave", onPointerLeavePage);
 // `#267 quote-reply`. Words selected in one message make its Reply a Quote reply.

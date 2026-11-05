@@ -2031,3 +2031,67 @@ test("`#624 voice-page-modularity`: Shift+E folds first, marks Done only what is
   await shiftE.readAndCollapse(pane, row, ["9"]);
   assert.deepStrictEqual(log, ["channel?", "fold channel row", "done 9 row", "saved? 9", "service c1 9", "channel?", "say marked read 9"]);
 });
+
+test("`#624 voice-page-modularity`: the keys' and the selection's listeners mount in the page's order, the switch restored before the keys are said, and unmount every one", () => {
+  const { mountKeyListeners } = VIEW_SHELL;
+  const log = [];
+  const target = (name) => {
+    const listeners = [];
+    return { name, listeners, checked: false,
+      addEventListener: (type, listener, options) => { listeners.push({ type, listener, options }); log.push(`listen ${name} ${type}${options && options.capture ? " capture" : ""}`); },
+      removeEventListener: (type, listener, options) => {
+        const at = listeners.findIndex((one) => one.type === type && one.listener === listener && Boolean(one.options && one.options.capture) === Boolean(options && options.capture));
+        if (at >= 0) listeners.splice(at, 1);
+      } };
+  };
+  const doc = target("document");
+  const win = target("window");
+  const box = target("single-keys");
+  const panes = [{ name: "channel", area: target("channel-scroll") }, { name: "side", area: target("side-scroll") }].map((pane) => ({ ...pane, scroller: () => pane.area }));
+  const fire = (on, type, event = {}, capture = false) => {
+    for (const one of on.listeners.filter((each) => each.type === type && Boolean(each.options && each.options.capture) === capture)) one.listener(event);
+  };
+  const was = [globalThis.document, globalThis.window];
+  globalThis.document = doc;
+  globalThis.window = win;
+  try {
+    const mounted = mountKeyListeners({
+      onPageKey: (event) => log.push(`page key ${event.key}`),
+      onEverywhereKey: (event) => log.push(`everywhere key ${event.key}`),
+      onPageBeforeCopy: () => log.push("before copy"),
+      onPageCopy: () => log.push("copy"),
+      restoreSingleKeys: () => log.push("restore single keys"),
+      renderKeyHints: () => log.push("say the keys"),
+      applySingleKeys: (on) => log.push(`single keys ${on}`),
+      singleKeysBox: () => box,
+      keyPanes: () => panes,
+      noteClickedRow: (pane, node) => log.push(`click ${pane.name} ${node}`),
+      onPaneFocus: (pane, event) => log.push(`focus ${pane.name} ${event.target}`),
+      onPointerMove: () => log.push("pointer move"),
+      onPointerDown: () => log.push("pointer down"),
+    });
+    assert.deepStrictEqual(log, ["listen document keydown", "listen window keydown capture", "listen document beforecopy", "listen document copy",
+      "restore single keys", "say the keys", "listen single-keys change", "listen channel-scroll click", "listen channel-scroll focusin",
+      "listen side-scroll click", "listen side-scroll focusin", "listen document pointermove", "listen document pointerdown"],
+      "the listeners were not mounted in the page's order, or the keys were said before the switch was restored");
+    log.length = 0;
+    fire(doc, "keydown", { key: "j" });
+    fire(win, "keydown", { key: "/" }, true);
+    fire(doc, "beforecopy");
+    fire(doc, "copy");
+    box.checked = true;
+    fire(box, "change");
+    fire(panes[1].area, "click", { target: "row" });
+    fire(panes[0].area, "focusin", { target: "button" });
+    fire(panes[0].area, "click", null);
+    fire(doc, "pointermove");
+    fire(doc, "pointerdown");
+    assert.deepStrictEqual(log, ["page key j", "everywhere key /", "before copy", "copy", "single keys true", "click side row", "focus channel button",
+      "click channel null", "pointer move", "pointer down"]);
+    mounted.unmount();
+    assert.deepStrictEqual([doc, win, box, panes[0].area, panes[1].area].map((one) => one.listeners.length), [0, 0, 0, 0, 0], "a listener was left mounted");
+    mounted.unmount();
+  } finally {
+    [globalThis.document, globalThis.window] = was;
+  }
+});
