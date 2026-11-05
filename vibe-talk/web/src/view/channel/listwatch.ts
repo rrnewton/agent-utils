@@ -132,14 +132,16 @@ export function mountListWatch(deps: ListWatchDependencies): ListWatch {
         if (deps.sideShowing()) deps.renderSideJumpNewest();
         deps.scheduleColumnLinks();
       });
-    }) as SizeWatcher;
-    watchers.push(sideGeometry);
+    });
     // Not the room past the foot itself, which only this page sizes: a size it is given while an observer
     // of its neighbours is being told of theirs is one the browser could not report in the same frame. Nor
     // the room held for a card (`#459 pack-keeps-card-still`), for the same reason.
-    const side = deps.leftById("side-scroll");
-    for (const box of [side, ...Array.from(side.children)]) {
-      if (box !== deps.leftById("side-overscroll") && box !== deps.leftById("side-overextend")) sideGeometry.observe(box);
+    if (sideGeometry) {
+      watchers.push(sideGeometry);
+      const side = deps.leftById("side-scroll");
+      for (const box of [side, ...Array.from(side.children)]) {
+        if (box !== deps.leftById("side-overscroll") && box !== deps.leftById("side-overextend")) sideGeometry.observe(box);
+      }
     }
   }
   return {

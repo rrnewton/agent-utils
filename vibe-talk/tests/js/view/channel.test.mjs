@@ -909,14 +909,18 @@ test("`#624 voice-page-modularity`: watching the lists answers a scroll at once,
   const overscroll = element("side-overscroll");
   const overextend = element("side-overextend");
   const side = element("side-scroll", [element("side-log"), overscroll, overextend, element("side-cards")]);
-  const ids = { "scroll-area": area, "side-scroll": side, "side-overscroll": overscroll, "side-overextend": overextend };
+  // The right column's elements are found only through leftById, as the page finds them in either column.
+  const ids = { "scroll-area": area };
+  const leftIds = { "side-scroll": side, "side-overscroll": overscroll, "side-overextend": overextend };
   const watchers = [];
+  const asked = [];
   const tasks = [];
   const state = { resize: true, back: false, returnRow: null, onScreen: false, sideShowing: false };
   const deps = {
     byId: (id) => ids[id],
-    leftById: (id) => ids[id],
+    leftById: (id) => leftIds[id],
     sizeWatcher: (report) => {
+      asked.push("size watcher");
       if (!state.resize) return null;
       const watcher = { report, watched: [], stopped: false, observe(box) { this.watched.push(box.id); }, disconnect() { this.stopped = true; } };
       watchers.push(watcher);
@@ -965,7 +969,9 @@ test("`#624 voice-page-modularity`: watching the lists answers a scroll at once,
   assert.deepStrictEqual([area.listeners.length, watchers.map((one) => one.stopped)], [0, [true, true]], "the scroll listener or a size watcher outlived unmount");
   state.resize = false;
   watchers.length = 0;
+  asked.length = 0;
   const bare = mountListWatch(deps);
-  assert.deepStrictEqual([watchers.length, area.listeners.length], [0, 1], "a browser with no ResizeObserver lost the scroll listener, or watched sizes anyway");
+  assert.deepStrictEqual([asked, area.listeners.length], [["size watcher"], 1],
+    "a browser with no ResizeObserver lost the scroll listener, or a second watcher was asked for after the first was refused");
   bare.unmount();
 });

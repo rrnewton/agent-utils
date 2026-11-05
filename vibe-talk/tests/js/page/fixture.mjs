@@ -4620,6 +4620,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       observe(target) {
         this.targets.push(target);
       }
+
+      disconnect() {
+        this.targets = [];
+      }
     };
   };
   /**
