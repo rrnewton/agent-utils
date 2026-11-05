@@ -19,7 +19,7 @@ Search result (step 1, reported to the coordinator before this doc): **no
 earlier written plan for this whole-worktrees image exists** in agent-utils
 `ai_docs/`, `.minibeads/`, git history (`--grep`/`-S` for btrfs/sparse/loop),
 the harness repo (`ai_docs/`, `hosts/*`, ops logs), `~/agent_scratch`, or
-dev-hermit's `ai_docs`. What exists is the different, per-slot design the
+a consumer project's `ai_docs`. What exists is the different, per-slot design the
 owner said is *not* this: `ai_docs/transient/2026-09-28-slot-images/README.md`
 — one sparse **ext4** image **per slot** (`py/wrkslots/slotimage.py`,
 `imagecmd.py`; landed as `cc931d32 wrkslots: disk-image slots and slot
