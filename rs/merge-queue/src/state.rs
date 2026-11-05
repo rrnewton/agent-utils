@@ -121,6 +121,12 @@ pub struct ValidatorConfig {
     /// them. Off by default.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub fail_fast: bool,
+    /// Turn off the early-red watch: by default the queue sets `$MQ_EARLY_RED=1`, watches the
+    /// verdicts a runner streams, and stops the run at its first deterministic failure (a
+    /// reported failure in a step already declared `RERUN-EXEMPT:`), releasing the slot and
+    /// its dependents at once. A runner that streams nothing keeps the post-run behaviour.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub disable_early_red: bool,
     /// Confirm a red by validating the same commit again before blaming a change (the
     /// same-commit rerun, which gets `$MQ_RERUN_FROM`), and search a red batch for its culprit
     /// with probes of its prefixes. Off by default: retries belong in the validator, so the
@@ -449,6 +455,12 @@ impl ValidatorConfig {
         } else {
             self.max_deferrals
         }
+    }
+
+    /// Whether the queue watches streamed verdicts and stops a run at its first
+    /// deterministic failure (on unless `disable_early_red` is set).
+    pub fn early_red_enabled(&self) -> bool {
+        !self.disable_early_red
     }
 
     /// Whether a red run whose probe cannot run holds the change instead of ejecting it.

@@ -252,6 +252,10 @@ pub struct ValidationRecord {
     /// The donor that ran it (`NAME@HOST`); absent when it ran here.
     #[serde(default)]
     pub donor: Option<String>,
+    /// The queue stopped it early at a streamed deterministic failure (absent in records
+    /// from older builds).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub early_red: bool,
 }
 
 impl ValidationRecord {
@@ -321,6 +325,9 @@ impl Serialize for ValidationRecord {
         }
         if let Some(donor) = &self.donor {
             state.serialize_field("donor", donor)?;
+        }
+        if self.early_red {
+            state.serialize_field("early_red", &self.early_red)?;
         }
         state.end()
     }
@@ -3025,7 +3032,7 @@ impl<'a> Runner<'a> {
         // A test asked for beyond the suite that the runner never reported is missing, so a
         // runner that ignores the request is never green.
         let mut ran = ran;
-        if !ran.cancelled && ran.interrupted.is_none() && !ran.refused() {
+        if !ran.cancelled && !ran.early_red && ran.interrupted.is_none() && !ran.refused() {
             ran.results
                 .require(&Selection::of(job.extra.iter().cloned()));
         }
@@ -3064,12 +3071,13 @@ impl<'a> Runner<'a> {
             speculation: job.speculation,
             cpu_ms: ran.cpu.map(|cpu| cpu.as_millis() as u64),
             donor: ran.donor.clone(),
+            early_red: ran.early_red,
         };
         write_json(&dir.join("record.json"), &record)?;
         self.event(
             "result",
             &format!(
-                "v{id} {} in {:.1}s{}{}",
+                "v{id} {} in {:.1}s{}{}{}",
                 if ran.interrupted.is_some() {
                     "interrupted"
                 } else if record.cancelled {
@@ -3091,6 +3099,11 @@ impl<'a> Runner<'a> {
                     String::new()
                 } else {
                     format!(", failed: {}", ids(&record.failed()))
+                },
+                if record.early_red {
+                    " (early red: stopped at the first deterministic failure)"
+                } else {
+                    ""
                 }
             ),
         );
@@ -3217,6 +3230,7 @@ impl<'a> Runner<'a> {
             effective_selection: None,
             cpu: None,
             donor: None,
+            early_red: false,
         };
         loop {
             if let Err(why) = crate::interrupt::check("a donor receipt arrived") {
@@ -5850,6 +5864,7 @@ fn receipt_ran(receipt: &crate::donor::Receipt, dir: &std::path::Path) -> Result
         effective_selection: receipt.effective_selection.clone(),
         cpu: receipt.cpu_ms.map(Duration::from_millis),
         donor: Some(format!("{}@{}", receipt.donor.name, receipt.donor.host)),
+        early_red: false,
     })
 }
 
@@ -6296,6 +6311,7 @@ mod unit {
             speculation: None,
             cpu_ms: None,
             donor: None,
+            early_red: false,
         }
     }
 

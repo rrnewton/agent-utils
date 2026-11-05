@@ -72,6 +72,22 @@ pub const RERUN_EXEMPT_MARKER: &str = "RERUN-EXEMPT";
 /// the runner may stop at the first red step and report the steps it skipped as `skip`.
 pub const FAIL_FAST_ENV: &str = "MQ_FAIL_FAST";
 
+/// Environment variable set to `1` when the queue watches the run's streamed verdicts and
+/// stops it at the first deterministic failure (see [`Ran::early_red`]): the runner opts in
+/// by appending each verdict as it happens and declaring its deterministic steps early
+/// with a `RERUN-EXEMPT:` line. A runner that does neither keeps the post-run behaviour.
+pub const EARLY_RED_ENV: &str = "MQ_EARLY_RED";
+
+/// The attributed failures of `results` that belong to a step named in `exempt`: the
+/// failures a rerun of the same commit cannot change.
+pub fn deterministic_failures(results: &TestResults, exempt: &[TestId]) -> BTreeSet<TestId> {
+    results
+        .attributed_failures()
+        .into_iter()
+        .filter(|test| exempt.iter().any(|step| step.step == test.step))
+        .collect()
+}
+
 /// Tests a green run names as passed only after a retry, read from its `GREEN_FLAKY:`
 /// marker line. Only a zero exit can be green-flaky: a red run's marker text (a test
 /// printing it, say) means nothing.
@@ -221,6 +237,10 @@ pub struct Ran {
     pub cpu: Option<Duration>,
     /// The donor that ran it (`NAME@HOST`); `None` for a validation run here.
     pub donor: Option<String>,
+    /// The queue stopped this run early at its first deterministic failure, streamed by the
+    /// runner before it exited (see [`EARLY_RED_ENV`]). Its results are the verdicts seen
+    /// so far; unreported tests carry no outcome. Never also `cancelled`.
+    pub early_red: bool,
 }
 
 /// What one culprit-search probe actually observed.
@@ -273,10 +293,7 @@ impl Ran {
             return false;
         }
         let failed = self.reproduced();
-        !failed.is_empty()
-            && failed
-                .iter()
-                .all(|test| self.rerun_exempt.iter().any(|step| step.step == test.step))
+        !failed.is_empty() && deterministic_failures(&self.results, &self.rerun_exempt) == failed
     }
 
     /// The failed tests, when this red run attributed its failures and every one is suspect (a
@@ -471,12 +488,69 @@ fn shared_select(
     })
 }
 
+/// Files a running validation streams its verdicts into, watched for an early deterministic
+/// failure. A runner that never writes them until it exits is never stopped early.
+struct EarlyRedFiles {
+    /// `$MQ_RESULTS` of a `command` runner, when it has one.
+    results: Option<PathBuf>,
+    /// The dagrun journal of a `dagrun` runner, when it has one.
+    journal: Option<PathBuf>,
+    /// Combined runner output (verdict lines and the `RERUN-EXEMPT:` declaration).
+    log: PathBuf,
+}
+
+impl EarlyRedFiles {
+    /// The deterministic failures streamed so far, if any: a reported failure in a step the
+    /// runner has already declared `RERUN-EXEMPT:`.
+    fn streamed_failures(&self) -> BTreeSet<TestId> {
+        let log_text = std::fs::read_to_string(&self.log).unwrap_or_default();
+        let exempt = marker_ids(&log_text, RERUN_EXEMPT_MARKER);
+        if exempt.is_empty() {
+            return BTreeSet::new();
+        }
+        let mut results = TestResults::default();
+        if let Some(path) = &self.results {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                    // A line still being written does not parse; the next poll reads it whole.
+                    let Ok(parsed) = serde_json::from_str::<ResultLine>(line) else {
+                        continue;
+                    };
+                    let (Ok(id), Some(outcome)) =
+                        (TestId::parse(&parsed.id), Outcome::parse(&parsed.outcome))
+                    else {
+                        continue;
+                    };
+                    results.record(TestResult {
+                        id,
+                        outcome,
+                        duration_ms: parsed.duration_ms,
+                        log: parsed.log,
+                    });
+                }
+            }
+        }
+        if let Some(path) = &self.journal {
+            let journal = std::fs::read_to_string(path).unwrap_or_default();
+            for (id, outcome) in parse_journal(&journal).results {
+                results.results.insert(id, outcome);
+            }
+        }
+        for (id, outcome) in parse_step_lines(&log_text).results {
+            results.results.entry(id).or_insert(outcome);
+        }
+        deterministic_failures(&results, &exempt)
+    }
+}
+
 /// How a runner process ended.
 struct Finished {
     exit: Option<i32>,
     elapsed: Duration,
     /// The queue cancelled it, or it was interrupted.
     cancelled: bool,
+    /// The queue stopped it early at a streamed deterministic failure.
+    early_red: bool,
     /// Set when a stop request or an outside kill signal ended it (see [`Ran::interrupted`]).
     interrupted: Option<String>,
     /// The runner could not be started at all (no such file, not executable).
@@ -567,6 +641,30 @@ fn cannot_execute(
 /// A stop request cancels the runner like a discarded candidate does; a runner that died of
 /// an outside kill signal, or that finished while a stop was under way, is interrupted rather
 /// than red.
+/// Stop a runner's whole process group and note why in its log.
+fn stop_group(child: &mut std::process::Child, log: &Path, why: &str) {
+    // Quiet: `kill(1)`'s complaints would land in the queue's own log, not the run's.
+    let _ = Command::new("kill")
+        .args(["-TERM", "--", &format!("-{}", child.id())])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let grace = Instant::now();
+    while grace.elapsed() < Duration::from_secs(2) {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The group is usually gone by now; whatever is left of it is killed without a
+    // "No such process" line when nothing is.
+    crate::bounded::kill_group(child);
+    if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(log) {
+        let _ = writeln!(log, "merge-queue: validation {why}");
+    }
+}
+
 fn run_logged(
     config: &ValidatorConfig,
     argv: &[String],
@@ -574,6 +672,7 @@ fn run_logged(
     env: &[(&str, String)],
     log: &Path,
     cancel: &AtomicBool,
+    early: Option<&EarlyRedFiles>,
 ) -> Result<Finished, String> {
     let file = std::fs::File::create(log)
         .map_err(|error| format!("cannot create {}: {error}", log.display()))?;
@@ -608,6 +707,7 @@ fn run_logged(
                 exit: None,
                 elapsed: started.elapsed(),
                 cancelled: false,
+                early_red: false,
                 interrupted: None,
                 spawn_error: Some(error),
                 cpu: None,
@@ -629,6 +729,7 @@ fn run_logged(
                 exit: status.code(),
                 elapsed: started.elapsed(),
                 cancelled: interrupted.is_some(),
+                early_red: false,
                 interrupted,
                 spawn_error: None,
                 cpu,
@@ -637,38 +738,45 @@ fn run_logged(
         let stopping = crate::interrupt::requested();
         let cancelled = cancel.load(Ordering::Relaxed) || stopping;
         let timed_out = limit.is_some_and(|limit| started.elapsed() > limit);
-        if cancelled || timed_out {
-            // Quiet: `kill(1)`'s complaints would land in the queue's own log, not the run's.
-            let _ = Command::new("kill")
-                .args(["-TERM", "--", &format!("-{}", child.id())])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            let grace = Instant::now();
-            while grace.elapsed() < Duration::from_secs(2) {
-                if matches!(child.try_wait(), Ok(Some(_))) {
-                    break;
+        if !cancelled && !timed_out {
+            if let Some(files) = early {
+                let failures = files.streamed_failures();
+                if !failures.is_empty() {
+                    let names: Vec<String> = failures.iter().map(ToString::to_string).collect();
+                    stop_group(
+                        &mut child,
+                        log,
+                        &format!(
+                            "stopped early: deterministic failure streamed for {}",
+                            names.join(", ")
+                        ),
+                    );
+                    return Ok(Finished {
+                        exit: None,
+                        elapsed: started.elapsed(),
+                        cancelled: false,
+                        early_red: true,
+                        interrupted: None,
+                        spawn_error: None,
+                        cpu: None,
+                    });
                 }
-                std::thread::sleep(Duration::from_millis(50));
             }
-            // The group is usually gone by now; whatever is left of it is killed without a
-            // "No such process" line when nothing is.
-            crate::bounded::kill_group(&mut child);
-            if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(log) {
-                let why = if stopping {
-                    "cancelled: the queue is stopping".to_owned()
-                } else if cancelled {
-                    "cancelled by the queue".to_owned()
-                } else {
-                    format!("killed after {}s", config.timeout_secs)
-                };
-                let _ = writeln!(log, "merge-queue: validation {why}");
-            }
+        }
+        if cancelled || timed_out {
+            let why = if stopping {
+                "cancelled: the queue is stopping".to_owned()
+            } else if cancelled {
+                "cancelled by the queue".to_owned()
+            } else {
+                format!("killed after {}s", config.timeout_secs)
+            };
+            stop_group(&mut child, log, &why);
             return Ok(Finished {
                 exit: None,
                 elapsed: started.elapsed(),
                 cancelled,
+                early_red: false,
                 interrupted: stopping
                     .then(|| crate::interrupt::check("this validation finished").unwrap_err()),
                 spawn_error: None,
@@ -759,9 +867,25 @@ impl Validator for CommandValidator {
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.clone())),
         );
+        if self.0.early_red_enabled() {
+            env.push((EARLY_RED_ENV, "1".to_owned()));
+        }
         let log = out.join("run.log");
         let argv = vec!["sh".to_owned(), "-c".to_owned(), self.0.run.clone()];
-        let finished = run_logged(&self.0, &argv, checkout, &env, &log, cancel)?;
+        let early_files = self.0.early_red_enabled().then(|| EarlyRedFiles {
+            results: Some(results_path.clone()),
+            journal: None,
+            log: log.clone(),
+        });
+        let finished = run_logged(
+            &self.0,
+            &argv,
+            checkout,
+            &env,
+            &log,
+            cancel,
+            early_files.as_ref(),
+        )?;
         let mut results = TestResults::default();
         let mut suspect: BTreeSet<TestId> = BTreeSet::new();
         if let Ok(text) = std::fs::read_to_string(&results_path) {
@@ -805,7 +929,32 @@ impl Validator for CommandValidator {
             cancelled,
             ..
         } = finished;
+        let early_red = finished.early_red;
         let interrupted = finished.interrupted.clone();
+        if early_red {
+            // Stopped at the first streamed deterministic failure: the verdicts seen so far
+            // are the result; unreported tests carry no outcome and are not required.
+            let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+            return Ok(Ran {
+                results,
+                exit: None,
+                elapsed,
+                log: log.clone(),
+                cancelled: false,
+                interrupted: None,
+                handle: read_handle(out),
+                refused: false,
+                flaky_passes: Vec::new(),
+                infra_blocked: Vec::new(),
+                rerun_exempt: marker_ids(&log_text, RERUN_EXEMPT_MARKER),
+                suspect: suspect.into_iter().collect(),
+                cannot_execute: None,
+                effective_selection: None,
+                cpu: None,
+                donor: None,
+                early_red: true,
+            });
+        }
         if results.results.is_empty() {
             results.unattributed = true;
             let outcome = if exit == Some(0) {
@@ -871,6 +1020,7 @@ impl Validator for CommandValidator {
             effective_selection: None,
             cpu: finished.cpu,
             donor: None,
+            early_red: false,
         })
     }
 }
@@ -1062,20 +1212,45 @@ impl Validator for DagrunValidator {
                     effective_selection: Some(Selection::default()),
                     cpu: None,
                     donor: None,
+                    early_red: false,
                 });
             }
             argv.push("--selected".to_owned());
             argv.push(steps.into_iter().collect::<Vec<_>>().join(","));
         }
-        let env = [("DAGRUN_LOG_DIR", journal_dir.display().to_string())];
+        let env = [
+            ("DAGRUN_LOG_DIR", journal_dir.display().to_string()),
+            (
+                EARLY_RED_ENV,
+                if self.0.early_red_enabled() {
+                    "1".to_owned()
+                } else {
+                    "0".to_owned()
+                },
+            ),
+        ];
         let log = out.join("run.log");
-        let finished = run_logged(&self.0, &argv, checkout, &env, &log, cancel)?;
+        let early_files = self.0.early_red_enabled().then(|| EarlyRedFiles {
+            results: None,
+            journal: Some(journal_dir.join("journal.jsonl")),
+            log: log.clone(),
+        });
+        let finished = run_logged(
+            &self.0,
+            &argv,
+            checkout,
+            &env,
+            &log,
+            cancel,
+            early_files.as_ref(),
+        )?;
         let Finished {
             exit,
             elapsed,
             cancelled,
             ..
         } = finished;
+        let early_red = finished.early_red;
         let interrupted = finished.interrupted.clone();
         let journal =
             std::fs::read_to_string(journal_dir.join("journal.jsonl")).unwrap_or_default();
@@ -1091,6 +1266,28 @@ impl Validator for DagrunValidator {
             .tests()
             .map(|tests| Selection::of(tests.iter().map(TestId::whole_step)));
         let reported_failures = !results.attributed_failures().is_empty();
+        if early_red {
+            let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+            return Ok(Ran {
+                results,
+                exit: None,
+                elapsed,
+                log: log.clone(),
+                cancelled: false,
+                interrupted: None,
+                handle: read_handle(out),
+                refused: false,
+                flaky_passes: Vec::new(),
+                infra_blocked: Vec::new(),
+                rerun_exempt: marker_ids(&log_text, RERUN_EXEMPT_MARKER),
+                suspect: Vec::new(),
+                cannot_execute: None,
+                effective_selection: whole_steps,
+                cpu: None,
+                donor: None,
+                early_red: true,
+            });
+        }
         results.require(whole_steps.as_ref().unwrap_or(selection));
         let log_text = std::fs::read_to_string(&log).unwrap_or_default();
         let cannot_execute =
@@ -1129,6 +1326,7 @@ impl Validator for DagrunValidator {
             effective_selection: whole_steps,
             cpu: finished.cpu,
             donor: None,
+            early_red: false,
         })
     }
 }
@@ -1301,6 +1499,134 @@ mod unit {
         assert!(ran.cancelled);
         assert!(!ran.green());
         assert!(ran.elapsed < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_streamed_deterministic_failure_stops_the_run_early() {
+        let tmp = TempDir::new("validate-early-red");
+        let v = from_config(&config(
+            r#"echo 'RERUN-EXEMPT: check.unit'; echo '{"id":"check.unit::a","outcome":"fail"}' >> "$MQ_RESULTS"; sleep 30"#,
+        ))
+        .unwrap();
+        let ran = v
+            .run(
+                &tmp.0,
+                &Selection::of([TestId::step("check.unit"), TestId::step("slow")]),
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(ran.early_red, "{ran:?}");
+        assert!(!ran.cancelled && !ran.green() && !ran.refused());
+        assert!(ran.deterministic_red(), "{ran:?}");
+        assert_eq!(
+            ran.failed(),
+            [TestId::parse("check.unit::a").unwrap()].into()
+        );
+        assert!(ran.elapsed < Duration::from_secs(10), "{ran:?}");
+    }
+
+    #[test]
+    fn early_red_and_fail_fast_together_stop_the_run_early() {
+        let tmp = TempDir::new("validate-early-red-fail-fast");
+        let v = from_config(&config(
+            r#"echo "ff=$MQ_FAIL_FAST er=$MQ_EARLY_RED" > env-seen.txt; echo 'RERUN-EXEMPT: check.unit'; echo '{"id":"check.unit::a","outcome":"fail"}' >> "$MQ_RESULTS"; sleep 30"#,
+        ))
+        .unwrap();
+        let ran = v
+            .run_with(
+                &tmp.0,
+                &Selection::of([TestId::step("check.unit")]),
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+                &[(FAIL_FAST_ENV.to_owned(), "1".to_owned())],
+            )
+            .unwrap();
+        assert!(ran.early_red && ran.deterministic_red(), "{ran:?}");
+        assert!(ran.elapsed < Duration::from_secs(10), "{ran:?}");
+        let seen = std::fs::read_to_string(tmp.0.join("env-seen.txt")).unwrap();
+        assert_eq!(seen.trim(), "ff=1 er=1", "{seen}");
+    }
+
+    #[test]
+    fn a_streamed_failure_outside_the_declared_steps_never_stops_the_run() {
+        let tmp = TempDir::new("validate-early-red-nonexempt");
+        let v = from_config(&config(
+            r#"echo 'RERUN-EXEMPT: check.unit'; echo '{"id":"flaky::a","outcome":"fail"}' >> "$MQ_RESULTS"; sleep 2; exit 1"#,
+        ))
+        .unwrap();
+        let ran = v
+            .run(
+                &tmp.0,
+                &Selection::of([TestId::step("check.unit"), TestId::step("flaky")]),
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(!ran.early_red, "{ran:?}");
+        assert!(!ran.deterministic_red(), "{ran:?}");
+        assert!(ran.elapsed >= Duration::from_secs(2), "{ran:?}");
+        assert!(
+            ran.failed().contains(&TestId::parse("flaky::a").unwrap()),
+            "{ran:?}"
+        );
+    }
+
+    #[test]
+    fn a_streamed_pass_never_stops_the_run() {
+        let tmp = TempDir::new("validate-early-red-pass");
+        let mut cfg = config(
+            r#"echo 'RERUN-EXEMPT: check.unit'; echo '{"id":"check.unit::a","outcome":"pass"}' >> "$MQ_RESULTS"; sleep 30"#,
+        );
+        cfg.timeout_secs = 1;
+        let v = from_config(&cfg).unwrap();
+        let ran = v
+            .run(
+                &tmp.0,
+                &Selection::of([TestId::step("check.unit")]),
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(!ran.early_red && !ran.deterministic_red(), "{ran:?}");
+    }
+
+    #[test]
+    fn a_dagrun_journal_deterministic_failure_stops_the_run_early() {
+        let tmp = TempDir::new("validate-early-red-dagrun");
+        let script = tmp.0.join("fake-dagrun");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             echo '{\"event\":\"step_end\",\"step\":\"check.unit\",\"ok\":false}' >> \"$DAGRUN_LOG_DIR/journal.jsonl\"\n\
+             echo 'RERUN-EXEMPT: check.unit'\n\
+             sleep 30\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cfg = ValidatorConfig {
+            kind: "dagrun".into(),
+            dagrun: script.display().to_string(),
+            dag: "validation.dag.yaml".into(),
+            ..ValidatorConfig::default()
+        };
+        let v = from_config(&cfg).unwrap();
+        let ran = v
+            .run(
+                &tmp.0,
+                &Selection::of([TestId::step("check.unit"), TestId::step("slow")]),
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(ran.early_red, "{ran:?}");
+        assert!(ran.deterministic_red(), "{ran:?}");
+        assert_eq!(ran.failed(), [TestId::step("check.unit")].into());
+        assert!(ran.elapsed < Duration::from_secs(10), "{ran:?}");
     }
 
     #[test]
@@ -1559,6 +1885,7 @@ dagrun: PASS - 1 passed";
             effective_selection: None,
             cpu: None,
             donor: None,
+            early_red: false,
         }
     }
 
@@ -1623,6 +1950,7 @@ dagrun: PASS - 1 passed";
                 effective_selection: None,
                 cpu: None,
                 donor: None,
+                early_red: false,
             };
             assert_eq!(ran.probe_observation(), ProbeObservation::Unknown);
             assert_ne!(ran.probe_observation(), ProbeObservation::Pass);

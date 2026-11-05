@@ -1451,6 +1451,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                         red_without_probe
                     },
                     fail_fast,
+                    disable_early_red: false,
                     confirm_reruns,
                     split_red_batches,
                     suspect_flake_reruns,

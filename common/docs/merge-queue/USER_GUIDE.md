@@ -914,6 +914,12 @@ An **item record** (`items/<pr>.json`) has these fields:
   (the default) ejects it.
 - `fail_fast`: `true` sets `$MQ_FAIL_FAST=1` for candidate validations (see "Fail-fast runs");
   absent (the default) means off. A binary older than this field refuses a config that has it.
+- `disable_early_red`: `true` turns off the early-red watch (see "Early red (streamed
+  verdicts)"); absent (the default) means the watch is on. A binary older than this field
+  refuses a config that has it.
+- `disable_early_red`: `true` turns off the early-red watch (see "Early red (streamed
+  verdicts)"); absent (the default) means the watch is on. A binary older than this field
+  refuses a config that has it.
 - `confirm_reruns`: `true` turns same-commit confirmation on: red batches are searched and a
   blamed failure must be seen twice (see "Keeping the base green"). Absent (the default) means
   off: the first red is the verdict. A binary older than this field refuses a config that has it.
@@ -1104,6 +1110,66 @@ receipt carries it in its log tail.
 step and reports each step it skipped as `skip`, never `pass`: a skipped test was not seen to
 pass, so a remainder after an ejection reruns it. A runner that ignores the variable is still
 correct, only slower to report red.
+
+
+**Early red (streamed verdicts).** By default the queue watches a running validation and stops
+it at its first deterministic failure, so a red candidate releases its slot and the batches built
+on it at once instead of holding them until the runner exits. `validator.disable_early_red: true`
+turns the watch off. The adapter contract is:
+
+- The queue sets `$MQ_EARLY_RED=1` in the runner's environment when the watch is on (for a
+  `dagrun` runner, in dagrun's environment). A runner that ignores the variable is unchanged.
+- To opt in, a `command` runner appends each verdict to `$MQ_RESULTS` as the test finishes and
+  flushes the file (a line written whole; a partial line is read on the next poll). A `dagrun`
+  runner opts in through dagrun itself: each `step_end` it appends to `journal.jsonl`, and its
+  verdict lines (`[step] ✗ FAIL ...`) in the combined output count too.
+- Deterministic steps are declared with the same `RERUN-EXEMPT: step1,step2` line as above,
+  printed (and flushed) before or with the first failure it covers, not only at exit. An adapter
+  may also print `MQ_EARLY_RED: step1` at the first deterministic red; the queue needs only the
+  declaration and the failure.
+- A failure counts as deterministic when it is a completed `fail`/`error` verdict whose step is
+  already declared. A timeout or no-verdict failure never stops a run early, and neither does a
+  failure in any other step.
+- When one lands, the queue stops the runner's whole process group (TERM, then kill after a
+  short grace, as for a cancel), records the run as red with `early_red: true`, and decides the
+  batch on the verdicts seen so far; tests never reported carry no outcome. An adapter that
+  exits 1 by itself at the first deterministic red, with `$MQ_RESULTS` and the declaration
+  already written, gets the same decision without being stopped. Publication and other post-run
+  work still happen after the verdict, off the slot.
+- The watch composes with fail-fast: with both on, `$MQ_FAIL_FAST=1` asks the runner to stop
+  inside its own step while the watch stops the whole run; whichever acts first reports red.
+- With `validator.offload: decide`, receipts arrive whole, so there is no early red from donors;
+  the watch applies to validations this host runs.
+
+
+**Early red (streamed verdicts).** By default the queue watches a running validation and stops
+it at its first deterministic failure, so a red candidate releases its slot and the batches built
+on it at once instead of holding them until the runner exits. `validator.disable_early_red: true`
+turns the watch off. The adapter contract is:
+
+- The queue sets `$MQ_EARLY_RED=1` in the runner's environment when the watch is on (for a
+  `dagrun` runner, in dagrun's environment). A runner that ignores the variable is unchanged.
+- To opt in, a `command` runner appends each verdict to `$MQ_RESULTS` as the test finishes and
+  flushes the file (a line written whole; a partial line is read on the next poll). A `dagrun`
+  runner opts in through dagrun itself: each `step_end` it appends to `journal.jsonl`, and its
+  verdict lines (`[step] ✗ FAIL ...`) in the combined output count too.
+- Deterministic steps are declared with the same `RERUN-EXEMPT: step1,step2` line as above,
+  printed (and flushed) before or with the first failure it covers, not only at exit. An adapter
+  may also print `MQ_EARLY_RED: step1` at the first deterministic red; the queue needs only the
+  declaration and the failure.
+- A failure counts as deterministic when it is a completed `fail`/`error` verdict whose step is
+  already declared. A timeout or no-verdict failure never stops a run early, and neither does a
+  failure in any other step.
+- When one lands, the queue stops the runner's whole process group (TERM, then kill after a
+  short grace, as for a cancel), records the run as red with `early_red: true`, and decides the
+  batch on the verdicts seen so far; tests never reported carry no outcome. An adapter that
+  exits 1 by itself at the first deterministic red, with `$MQ_RESULTS` and the declaration
+  already written, gets the same decision without being stopped. Publication and other post-run
+  work still happen after the verdict, off the slot.
+- The watch composes with fail-fast: with both on, `$MQ_FAIL_FAST=1` asks the runner to stop
+  inside its own step while the watch stops the whole run; whichever acts first reports red.
+- With `validator.offload: decide`, receipts arrive whole, so there is no early red from donors;
+  the watch applies to validations this host runs.
 
 **Held for a ruling.** Two marker lines let a runner say that its run is neither a plain pass nor
 a product failure; each names the tests it concerns:
