@@ -31,6 +31,17 @@ case "$(uname -s)-$(uname -m)" in
 esac
 
 name="node-v$NODE_VERSION-linux-$arch"
+
+# What this host offers on its own, named in every failure below so a red setup step explains
+# itself (e.g. "host node v16.20.2; Node 22 download failed: ...").
+host_node() {
+  if command -v node >/dev/null 2>&1; then
+    node --version 2>/dev/null || printf 'unknown'
+  else
+    printf 'none'
+  fi
+}
+
 cache="${XDG_CACHE_HOME:-${HOME:?}/.cache}/agent-utils/node"
 install="$cache/$name"
 archive="$cache/$name.tar.xz"
@@ -65,7 +76,7 @@ if [ ! -f "$archive" ]; then
   echo "provision-node22: downloading $url" >&2
   if ! curl -fsSL --connect-timeout 30 --max-time 900 --retry 3 -o "$archive.part" -- "$url"; then
     rm -f -- "$archive.part"
-    echo "provision-node22: download failed: $url" >&2
+    echo "provision-node22: host node $(host_node); Node $NODE_VERSION download failed: $url" >&2
     exit 1
   fi
   mv -f -- "$archive.part" "$archive"
@@ -74,7 +85,7 @@ fi
 got="$(sha256sum -- "$archive" | cut -d' ' -f1)"
 if [ "$got" != "$want" ]; then
   rm -f -- "$archive"
-  echo "provision-node22: SHA256 MISMATCH for $name.tar.xz: got $got, want $want." >&2
+  echo "provision-node22: host node $(host_node); SHA256 MISMATCH for $name.tar.xz: got $got, want $want." >&2
   echo "provision-node22: the archive was deleted and nothing was installed." >&2
   exit 1
 fi
@@ -85,7 +96,7 @@ tar -xJf "$archive" -C "$install.part" --strip-components=1
 printf '%s\n' "$want" >"$install.part/.verified-sha256"
 mv -- "$install.part" "$install"
 if ! verified_install; then
-  echo "provision-node22: $install/bin/node does not report v$NODE_VERSION after install" >&2
+  echo "provision-node22: host node $(host_node); $install/bin/node does not report v$NODE_VERSION after install" >&2
   exit 1
 fi
 echo "provision-node22: installed $name (sha256 ${want:0:12})" >&2

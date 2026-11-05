@@ -72,7 +72,7 @@ steps:
     job: clippy
     desc: clippy over every target, warnings denied
     labels: [validation-vibe-talk]
-    cmd: cd vibe-talk && cargo clippy --all-targets --locked -- -D warnings
+    cmd: cd vibe-talk && ../scripts/with-node22 cargo clippy --all-targets --locked -- -D warnings
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     deps: [setup.contract-tools]
@@ -106,11 +106,29 @@ steps:
   # whoever last ran `npm ci` in this checkout. A repeat run with the same lockfile does nothing.
   # The page build uses them too (`#624 voice-page-modularity`): every cargo step, through build.rs,
   # and every browser walk, which serves a page build of its own (tests/page_sources.py).
+  # The pinned Node 22 the page and contract steps run under (#865): on a host whose system
+  # node is v16 there is no --test-reporter and esbuild refuses, so these steps provision
+  # their own toolchain exactly as the timeline browser checks do. The provisioner is
+  # idempotent and flock-guarded, so this step and timeline's can both run.
+  - group: setup
+    job: node22
+    desc: install the pinned Node 22 release, verified against its published sha256
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: scripts/provision-node22
+    jobs_flag: ""
+    timeout: 2400
+    cpu_timeout: 300
+    hint:
+      est_duration_s: 2
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+
   - group: setup
     job: contract-tools
-    desc: install the contract generator's lockfile-pinned tools
+    desc: install the contract generator's lockfile-pinned tools (under the provisioned Node 22, #865)
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: scripts/provision-node-packages vibe-talk/contract
+    cmd: scripts/with-node22 scripts/provision-node-packages vibe-talk/contract
+    deps: [setup.node22]
     jobs_flag: ""
     timeout: 2400
     cpu_timeout: 300
@@ -123,7 +141,7 @@ steps:
     job: contract
     desc: generated browser contract is current; tsc --checkJs over voice.js, and the page's modules strict and portable
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && make contract-check typecheck
+    cmd: cd vibe-talk && ../scripts/with-node22 make contract-check typecheck
     jobs_flag: ""
     deps: [setup.contract-tools]
     timeout: 960
@@ -2110,7 +2128,7 @@ steps:
     job: release
     desc: the release binary the server-shaped suites run against
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && cargo build --release --locked
+    cmd: cd vibe-talk && ../scripts/with-node22 cargo build --release --locked
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     deps: [setup.contract-tools]
@@ -2147,7 +2165,7 @@ steps:
     job: tests
     desc: the release test binaries the Rust and page suites run
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && cargo test --release --locked --no-run
+    cmd: cd vibe-talk && ../scripts/with-node22 cargo test --release --locked --no-run
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     deps: [build.release]
@@ -2179,7 +2197,7 @@ steps:
     job: unit
     desc: the Rust suites, and the contract's page suite through its harness
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 ../scripts/case_timings.py run-cargo -- cargo test --release --locked --no-fail-fast -- --skip the_voice_page_suite_passes --exact
+    cmd: cd vibe-talk && ../scripts/with-node22 python3 ../scripts/case_timings.py run-cargo -- cargo test --release --locked --no-fail-fast -- --skip the_voice_page_suite_passes --exact
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     deps: [build.tests, setup.contract-tools]
@@ -2219,9 +2237,10 @@ steps:
     job: page-0
     desc: the app page's suite, slice 0 of four, node over web/voice.js
     labels: [validation-vibe-talk, validation-vibe-talk-page]
+    deps: [setup.node22]
     cmd: >-
       cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
-      VOICE_PAGE_SHARD=0/4 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
+      VOICE_PAGE_SHARD=0/4 ../scripts/with-node22 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
       --test-reporter=tap
       --test-reporter-destination="${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}/node-${DAGRUN_OUTER_RUN:-vibe-talk.test.page-0}.tap"
       tests/js/voice_page.test.mjs
@@ -2239,9 +2258,10 @@ steps:
     job: page-1
     desc: the app page's suite, slice 1 of four, node over web/voice.js
     labels: [validation-vibe-talk, validation-vibe-talk-page]
+    deps: [setup.node22]
     cmd: >-
       cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
-      VOICE_PAGE_SHARD=1/4 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
+      VOICE_PAGE_SHARD=1/4 ../scripts/with-node22 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
       --test-reporter=tap
       --test-reporter-destination="${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}/node-${DAGRUN_OUTER_RUN:-vibe-talk.test.page-1}.tap"
       tests/js/voice_page.test.mjs
@@ -2259,9 +2279,10 @@ steps:
     job: page-2
     desc: the app page's suite, slice 2 of four, node over web/voice.js
     labels: [validation-vibe-talk, validation-vibe-talk-page]
+    deps: [setup.node22]
     cmd: >-
       cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
-      VOICE_PAGE_SHARD=2/4 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
+      VOICE_PAGE_SHARD=2/4 ../scripts/with-node22 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
       --test-reporter=tap
       --test-reporter-destination="${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}/node-${DAGRUN_OUTER_RUN:-vibe-talk.test.page-2}.tap"
       tests/js/voice_page.test.mjs
@@ -2279,9 +2300,10 @@ steps:
     job: page-3
     desc: the app page's suite, slice 3 of four, node over web/voice.js
     labels: [validation-vibe-talk, validation-vibe-talk-page]
+    deps: [setup.node22]
     cmd: >-
       cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
-      VOICE_PAGE_SHARD=3/4 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
+      VOICE_PAGE_SHARD=3/4 ../scripts/with-node22 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
       --test-reporter=tap
       --test-reporter-destination="${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}/node-${DAGRUN_OUTER_RUN:-vibe-talk.test.page-3}.tap"
       tests/js/voice_page.test.mjs
