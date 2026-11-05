@@ -7253,92 +7253,42 @@ async function readAndCollapse(pane, row, ids) {
 }
 
 /**
- * Fold `row` for Shift+E with what the reader is looking at left where it was (`#280
- * scroll-stability`), and answer whether it is folded now. A short message has no fold, and a row
- * showing its links in place of its text is not folded out of sight (`actOnRow`).
+ * Folding a message from the keyboard: Shift+O folds the selected message away into a line of read messages
+ * and steps above it, and Shift+E's fold (`readAndCollapse`) keeps what the reader is looking at where it was.
+ * One owner in web/src/view/shell/foldkeys.ts (`#624 voice-page-modularity`); the page destructures its two
+ * under their old names.
  *
- * With its head on screen it is the fold control's own act: held by `preservingScroll`, the rows above
- * stay and the rows below close up under it. With its head scrolled off the top that would carry the
- * folded row off the screen and lift the rows below up past the place being read, so there its foot
- * holds when the foot is on screen, and the rows below stay where they are; a row taller than the
- * screen, read part way through, brings its head to the top of the list, the rows after it below.
- * A reader on the newest line stays on it, as `preservingScroll` keeps them.
+ * @type {import("./src/view/shell/index.ts").FoldKeys<KeyPane>}
  */
-function foldForRead(pane, row) {
-  const entry = row.foldEntry;
-  if (!entry || showingLinks(row)) return Boolean(entry && isFolded(entry));
-  if (isFolded(entry)) return true;
-  const area = pane.scroller();
-  const head = pane.head();
-  const was = row.getBoundingClientRect();
-  if (was.top >= head - 1 || atBottom(area)) {
-    preservingScroll(() => setFolded(entry, true));
-  } else {
-    setFolded(entry, true);
-    const now = row.getBoundingClientRect();
-    area.scrollTop += was.bottom <= pane.foot() ? now.bottom - was.bottom : now.top - head;
-  }
-  renderScrollTools();
-  return true;
-}
-
-/**
- * Shift+O: fold the selected message away into a "… read messages …" line, and step to the
- * message above (`#480 fold-one-message-key`). The owner's way through one thread at a time:
- * press, press, press, closing up what is dealt with, until the thread's first message — which
- * stays, and the key does nothing there. Adjacent folded messages are one line with a count, by
- * the same plan as Fold read's runs (`readRunPlan`), in any read mode; Enter or a tap on the
- * line opens it again (`openReadRun` takes its ids back out of `foldedOnes`).
- *
- * Folding a message away marks it Done when it was not already, as `e` marks it: the line says
- * "read messages", and a message the reader has closed up as dealt with is read. A message
- * already Done is not marked again. On a run's own line the key steps above it and folds that
- * message, so spamming it keeps going up. A card is packed by its own control, not folded here.
- */
-function foldOneFromKeyboard(target) {
-  const { pane, row, took } = rowForAct(target);
-  if (!pane || !row) return took;
-  if (row.hasAttribute("data-card")) return false;
-  let at = row;
-  // On a folded line already: the message to fold is the one above it.
-  while (at && at.getAttribute("data-read-run")) {
-    const rows = paneRows(pane);
-    at = rows[rows.indexOf(at) - 1] || null;
-    if (at && at.getAttribute("data-read-run") === "member") at = shownRowFor(at);
-  }
-  if (!at || at.hasAttribute("data-card")) return true;
-  const unpack = at.getAttribute("data-unpack-thread");
-  const root = unpack !== null
-    ? rowMessages(at).some((message) => Boolean(message.thread && message.thread.is_root))
-    : isOpenThreadRoot(at, openThreadRootId());
-  if (root) {
-    setStatus("The thread's first message stays.");
-    return true;
-  }
-  const ids = idsOf(at);
-  if (ids.length === 0) return false;
-  const key = unpack !== null ? viewKey("thread", unpack) : inColumn(pane === sidePane ? columns.side : columns.main, () => viewKey());
-  const folded = foldedOnes.get(key) || new Set();
-  for (const id of ids) folded.add(id);
-  foldedOnes.set(key, folded);
-  readRuns.close(key, ids);
-  if (!ids.every((id) => doneState().archived.has(id))) guardQuietly(() => markRowDone(ids, at))();
-  if (unpack !== null) {
-    renderSideColumn();
-  } else {
-    inColumn(pane === sidePane ? columns.side : columns.main, () => {
-      applyReadRuns();
-      renderScrollTools();
-    });
-  }
-  // Above the line it folded into, or on the line itself when there is nothing above.
-  const landed = paneRowFor(pane, ids[0], false);
-  const rows = paneRows(pane);
-  const above = landed ? rows[rows.indexOf(landed) - 1] : null;
-  selectRow(pane, above || landed || at);
-  setStatus("Folded away.");
-  return true;
-}
+const foldKeys = createFoldKeys({
+  showingLinks: (row) => showingLinks(row),
+  isFolded: (entry) => isFolded(entry),
+  setFolded: (entry, folded) => setFolded(entry, folded),
+  atBottom: (area) => atBottom(area),
+  preservingScroll: (act) => preservingScroll(act),
+  renderScrollTools: () => renderScrollTools(),
+  rowForAct: (target) => rowForAct(target),
+  paneRows: (pane) => paneRows(pane),
+  shownRowFor: (row) => shownRowFor(row),
+  rowMessages: (row) => rowMessages(row),
+  isThreadRoot: (message) => Boolean(message.thread && message.thread.is_root),
+  isOpenThreadRoot: (row) => isOpenThreadRoot(row, openThreadRootId()),
+  setStatus: (text) => setStatus(text),
+  idsOf: (row) => idsOf(row),
+  threadViewKey: (id) => viewKey("thread", id),
+  columnViewKey: (column) => inColumn(column, () => viewKey()),
+  paneColumn: (pane) => paneColumn(pane),
+  inColumn: (column, act) => inColumn(column, act),
+  foldedOnes: () => foldedOnes,
+  closeReadRun: (key, ids) => readRuns.close(key, ids),
+  isDone: (id) => doneState().archived.has(id),
+  markDone: (ids, row) => guardQuietly(() => markRowDone(ids, row))(),
+  renderSideColumn: () => renderSideColumn(),
+  applyReadRuns: () => applyReadRuns(),
+  paneRowFor: (pane, id, card) => paneRowFor(pane, id, card),
+  selectRow: (pane, row) => selectRow(pane, row),
+});
+const { foldForRead, foldOneFromKeyboard } = foldKeys;
 
 /**
  * The keys that act on the selected row: Enter and o, → and ←, [ and ], r, ".", s, i and l, and pressing one

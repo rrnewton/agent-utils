@@ -36,6 +36,7 @@ declare const createViewKeys: LegacyImports["createViewKeys"];
 declare const createChannelKeys: LegacyImports["createChannelKeys"];
 declare const createRowKeys: LegacyImports["createRowKeys"];
 declare const createDoneKeys: LegacyImports["createDoneKeys"];
+declare const createFoldKeys: LegacyImports["createFoldKeys"];
 declare const pageStep: LegacyImports["pageStep"];
 declare const createRowShortcuts: LegacyImports["createRowShortcuts"];
 declare const createShellNotices: LegacyImports["createShellNotices"];

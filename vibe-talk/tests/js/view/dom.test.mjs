@@ -1279,3 +1279,92 @@ test("`#624 voice-page-modularity`: n goes to the next unread row below the sele
   rows = [];
   assert.deepStrictEqual(run(() => keys.nextUnreadFromKeyboard({})), [false]);
 });
+
+test("`#624 voice-page-modularity`: Shift+E's fold keeps the reader's place, and Shift+O folds a message away, marks it Done and steps above it", () => {
+  const { createFoldKeys } = VIEW_SHELL;
+  const log = [];
+  const folds = new Map();
+  const rowOf = (id, attributes = {}, extra = {}) => ({ id, attributes, foldEntry: { id }, getAttribute(name) { return this.attributes[name] ?? null; },
+    hasAttribute(name) { return name in this.attributes; }, ...extra });
+  const area = { scrollTop: 500 };
+  const pane = { scroller: () => area, head: () => 100, foot: () => 700 };
+  let rows = [rowOf("1"), rowOf("2"), rowOf("3")];
+  const state = { acted: { pane, row: rows[2], took: true }, links: false, bottom: false, done: new Set(["1"]), root: false, unpackRoot: false };
+  const folded = new Map();
+  const keys = createFoldKeys({
+    showingLinks: () => state.links,
+    isFolded: (entry) => folds.get(entry.id) === true,
+    setFolded: (entry, on) => { log.push(`fold ${entry.id} ${on}`); folds.set(entry.id, on); state.rect = state.after; },
+    atBottom: () => state.bottom,
+    preservingScroll: (act) => { log.push("hold"); act(); },
+    renderScrollTools: () => log.push("tools"),
+    rowForAct: (...args) => { if (args.length !== 1) log.push(`rowForAct ${args.length} args`); return state.acted; },
+    paneRows: () => rows,
+    shownRowFor: (row) => rows.find((one) => one.id === row.attributes.shownAs) || null,
+    rowMessages: () => [{ thread: { is_root: state.unpackRoot } }],
+    isThreadRoot: (message) => Boolean(message.thread && message.thread.is_root),
+    isOpenThreadRoot: () => state.root,
+    setStatus: (text) => log.push(`say ${text}`),
+    idsOf: (row) => [row.id],
+    threadViewKey: (id) => `thread:${id}`,
+    columnViewKey: (column) => `${column}:view`,
+    paneColumn: () => "main",
+    inColumn: (column, act) => { log.push(`in ${column}`); act(); },
+    foldedOnes: () => folded,
+    closeReadRun: (key, ids) => log.push(`close run ${key} ${ids}`),
+    isDone: (id) => state.done.has(id),
+    markDone: (ids) => log.push(`done ${ids}`),
+    renderSideColumn: () => log.push("side drawn"),
+    applyReadRuns: () => log.push("runs"),
+    paneRowFor: (_pane, id) => rows.find((one) => one.id === id) || null,
+    selectRow: (...args) => log.push(`select ${args[1].id}${args.length > 2 ? " +" : ""}`),
+  });
+  const run = (act) => { log.length = 0; return [act(), ...log]; };
+  const tall = rows[1];
+  tall.getBoundingClientRect = () => state.rect;
+  state.rect = { top: 150, bottom: 400 };
+  state.after = { top: 150, bottom: 180 };
+  assert.deepStrictEqual(run(() => keys.foldForRead(pane, tall)), [true, "hold", "fold 2 true", "tools"], "a fold with its head on screen was not the fold control's own held act");
+  assert.deepStrictEqual(run(() => keys.foldForRead(pane, tall)), [true], "a folded row was folded again");
+  folds.clear();
+  state.rect = { top: 40, bottom: 400 };
+  state.after = { top: 40, bottom: 60 };
+  assert.deepStrictEqual([run(() => keys.foldForRead(pane, tall)), area.scrollTop], [[true, "fold 2 true", "tools"], 160], "with its head off the top, its foot on screen did not hold");
+  folds.clear();
+  area.scrollTop = 500;
+  state.rect = { top: 40, bottom: 900 };
+  state.after = { top: 40, bottom: 60 };
+  assert.deepStrictEqual([run(() => keys.foldForRead(pane, tall)), area.scrollTop], [[true, "fold 2 true", "tools"], 440], "a row taller than the screen did not bring its head to the top");
+  folds.clear();
+  state.bottom = true;
+  assert.deepStrictEqual(run(() => keys.foldForRead(pane, tall)), [true, "hold", "fold 2 true", "tools"], "a reader on the newest line was not kept there");
+  folds.clear();
+  state.links = true;
+  assert.deepStrictEqual(run(() => keys.foldForRead(pane, tall)), [false], "a row showing its links was folded out of sight");
+  state.links = false;
+  assert.deepStrictEqual(run(() => keys.foldForRead(pane, { foldEntry: null })), [false]);
+  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [true, "close run main:view 3", "done 3", "in main", "runs", "tools", "select 2", "say Folded away."],
+    "Shift+O did not fold the message away, mark it Done and step above it");
+  assert.deepStrictEqual(folded.get("main:view"), new Set(["3"]));
+  state.acted = { pane, row: rows[0], took: true };
+  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [true, "close run main:view 1", "in main", "runs", "tools", "select 1", "say Folded away."],
+    "a message already Done was marked again, or with nothing above the key did not stay on it");
+  const line = rowOf("line", { "data-read-run": "head" });
+  rows = [rowOf("1"), rowOf("2"), line];
+  state.acted = { pane, row: line, took: true };
+  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})).slice(0, 2), [true, "close run main:view 2"], "Shift+O on a run's line did not fold the message above it");
+  state.root = true;
+  state.acted = { pane, row: rows[0], took: true };
+  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [true, "say The thread's first message stays."]);
+  state.root = false;
+  const unpacked = rowOf("u1", { "data-unpack-thread": "t9" });
+  rows = [rowOf("u0"), unpacked];
+  state.acted = { pane, row: unpacked, took: true };
+  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [true, "close run thread:t9 u1", "done u1", "side drawn", "select u0", "say Folded away."], "an unpacked thread's message was not folded in its thread's view");
+  state.unpackRoot = true;
+  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [true, "say The thread's first message stays."], "an unpacked thread's first message was folded");
+  state.acted = { pane, row: rowOf("card", { "data-card": "" }), took: true };
+  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [false], "a card was folded");
+  state.acted = { pane: null, row: null, took: true };
+  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [true]);
+});
