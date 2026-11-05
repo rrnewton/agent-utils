@@ -313,7 +313,7 @@ fn a_change_already_on_the_base_lands_with_its_own_commit() {
 
 #[test]
 fn exact_commit_rule_reruns_the_whole_selection_after_an_ejection() {
-    let fx = setup("exact", &["--exact-sha"]);
+    let fx = setup("exact", &["--exact-sha", "--confirm-reruns"]);
     fx.branch("a1", &[("tests/a1", "ok\n")]);
     fx.branch("b1", &[("tests/b1", "FAIL\n")]);
     fx.branch("c1", &[("tests/c1", "ok\n")]);
@@ -463,6 +463,7 @@ fn culprit_search_regenerates_the_prefix_it_probes() {
         &command,
         "--regen-when",
         "always",
+        "--confirm-reruns",
     ]);
     fx.branch("b", &[("src/b", "b\n"), ("tests/b", "ok\n")]);
     fx.branch("c", &[("src/c", "c\n"), ("tests/c", "FAIL\n")]);

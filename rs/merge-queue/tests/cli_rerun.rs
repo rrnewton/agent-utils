@@ -1,5 +1,6 @@
 //! Same-commit reruns of failed tests through a runner handle (`MQ_HANDLE_FILE` /
 //! `MQ_RERUN_FROM`), mapped onto flaky passes, with a trusted base and the exact-commit rule.
+//! Same-commit confirmation is opt-in (`init --confirm-reruns`); every queue here turns it on.
 
 mod support;
 
@@ -35,6 +36,7 @@ fn a_failure_that_passes_on_a_same_commit_rerun_lands_as_flaky() {
         "--trust-base",
         "--max-batch",
         "1",
+        "--confirm-reruns",
     ]);
     fx.branch("a", &[("a", "a\n")]);
     fx.mq_ok(&["submit", "1", "--head", "a"]);
@@ -105,6 +107,7 @@ fn run_with_rerun_verdict(tag: &str, says: &str) -> (Fixture, Value, Value) {
         "--trust-base",
         "--max-batch",
         "1",
+        "--confirm-reruns",
     ]);
     fx.branch("a", &[("a", "a\n")]);
     fx.mq_ok(&["submit", "1", "--head", "a"]);

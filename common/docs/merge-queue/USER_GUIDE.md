@@ -47,13 +47,16 @@ individual tests, and the queue tracks exactly which of them ran.
 - **Widening obligations.** When a batch lands on a focused validation, the queue records
   an obligation to run the complete suite on that commit or a later one. Obligations live in
   `obligations/`, the queue reports them, and a later complete run discharges them.
-- **Failed-test culprit search.** When a batch fails, the queue searches the batch's prefixes for
-  the first change that makes the failure appear, and every probe runs **only the failed tests**
-  (plus whatever the runner says those tests depend on). It never reruns the whole suite to look
-  at a subset. A change is blamed only when its failure was seen twice, or once when the runner
-  names every failure of that run a deterministic check (see "Deterministic checks"). The culprit
-  is ejected with a report, and the queue continues with the rest. There is no automatic repair. See "Keeping the
-  base green".
+- **Failed-test culprit search.** When a batch fails, the queue finds the change that makes the
+  failure appear, and every probe runs **only the failed tests** (plus whatever the runner says
+  those tests depend on). It never reruns the whole suite to look at a subset. By default the
+  first red is the verdict: a red change on its own is ejected on that one sighting, and a red
+  batch of several changes is not searched, because each of its changes goes back as a batch of its own. With
+  same-commit confirmation on (`--confirm-reruns`), the queue searches the batch's prefixes, and a
+  change is blamed only when its failure was seen twice, or once when the runner names every
+  failure of that run a deterministic check (see "Deterministic checks"). The culprit is ejected
+  with a report, and the queue continues with the rest. There is no automatic repair. See
+  "Keeping the base green".
 - **Silence is not success.** A test that was selected but never reported has outcome `missing`,
   and it blocks landing. In a culprit search, though, only tests that actually failed or errored
   (or a non-zero exit) count as reproducing the failure. A test that a change adds does not exist
@@ -132,6 +135,7 @@ This command creates the state directory and writes `config.json`.
 | `--green-flaky-hold-secs SECS` | `7200` | How long a change is held for a ruling after a GREEN_FLAKY or INFRA-BLOCKED result (see "Held for a ruling") before it is re-queued for a fresh validation. |
 | `--red-without-probe MODE` | `eject` | What a red validation that names failed tests does when its follow-up probe cannot run: `eject` the change (the red run is the verdict) or `hold` it for its owner. |
 | `--fail-fast` | off | Ask the runner to stop each candidate validation at its first red step: `$MQ_FAIL_FAST` is `1` for every validation except the complete run on the base (see "Fail-fast runs"). |
+| `--confirm-reruns` | off | Confirm a red before blaming a change: search a red batch's prefixes, and rerun a failure at the same commit (`$MQ_RERUN_FROM`), so that a failure is blamed only when seen twice. Off, the first red is the verdict: a red change on its own is ejected on that sighting, and each change of a red batch goes back as a batch of its own (see "Keeping the base green"). |
 | `--offload MODE` | `off` | Where validations run: `off` (in this process, as always), `compare` (in this process, which decides, and also on donors, whose receipts are only compared) or `decide` (on donors only; an accepted receipt is the verdict). See "Donor validators". |
 | `--tool-identity NAME=COMMAND` | none | A tool the validation depends on (repeatable): the command prints its identity, for example a tool repository's commit or a toolchain version, never a hash of a binary (builds are not byte-identical across hosts). A donor whose answer differs does not run the job (see "Tool identity and receipts"). merge-queue's own revision is always compared. |
 | `--tool-refresh NAME=COMMAND` | none | How a donor brings the tool `NAME` (one of `--tool-identity`) up to date, for example a fetch of the tool repository (repeatable). A donor whose answer differs runs it once and asks again: an older donor then takes the job, and one that still differs declines it. |
@@ -513,8 +517,9 @@ service units, say), the cancelled one may even keep running to its end with nob
 verdict. A drain avoids both. The running daemon finishes the validations already in flight and
 acts on their verdicts (a green batch lands), starts no new validation (no new batch, no
 culprit-search probe, no rerun), and exits 0 once no run is in progress. The changes it did not
-decide stay queued, and nothing is ejected for the drain. A red batch whose culprit search the
-drain prevented is validated again by the next daemon.
+decide stay queued, and nothing is ejected for the drain. A red batch whose culprit search, or
+whose changes split off one by one, the drain left undecided is planned and validated again by
+the next daemon.
 
 ```bash
 install -m 755 merge-queue.new /path/to/merge-queue   # the running daemon keeps its own copy
@@ -825,6 +830,9 @@ An **item record** (`items/<pr>.json`) has these fields:
   (the default) ejects it.
 - `fail_fast`: `true` sets `$MQ_FAIL_FAST=1` for candidate validations (see "Fail-fast runs");
   absent (the default) means off. A binary older than this field refuses a config that has it.
+- `confirm_reruns`: `true` turns same-commit confirmation on: red batches are searched and a
+  blamed failure must be seen twice (see "Keeping the base green"). Absent (the default) means
+  off: the first red is the verdict. A binary older than this field refuses a config that has it.
 
 **`donors`** fields (only read when `validator.offload` is not off; absent means the defaults):
 
@@ -942,7 +950,9 @@ itself is never validated again.
 lines (`[step] ✓ PASS ...`, `[step] ✗ FAIL ...`, `[step] SKIPPED ...`) is still attributed per
 step from its output.
 
-**Same-commit reruns.** A runner may write an opaque handle for its run (a run ID, a log path)
+**Same-commit reruns.** Only with same-commit confirmation on (`validator.confirm_reruns`): off,
+the queue never validates a commit again to rerun its failures and never sets `$MQ_RERUN_FROM`.
+A runner may write an opaque handle for its run (a run ID, a log path)
 to `$MQ_HANDLE_FILE`. When the queue later validates the same commit again, to rerun failed tests
 in a culprit search, it passes the latest handle as `$MQ_RERUN_FROM` and that run's directory
 as `$MQ_RERUN_OF`. A runner that can rerun only the failed parts of an earlier run at the same
@@ -958,7 +968,7 @@ else my-runner --target "$(git rev-parse HEAD)" full; fi | tee /dev/stderr |
 
 A runner that can only run everything at a new commit still works. Culprit-search probes at other
 commits then cost full runs, so keep batches small (`--max-batch 1` or `2`). With `--trust-base`,
-a red single-change batch costs exactly one targeted rerun.
+a red single-change batch costs exactly one targeted rerun (none with confirmation off).
 
 **Deterministic checks.** Some checks depend only on the tree: a lint, a path audit, a grep. A
 rerun of the same commit cannot change their answer, so a confirming rerun only costs time. A
@@ -971,8 +981,9 @@ When every failure the run attributed belongs to a named step, the queue counts 
 confirmed on this one sighting. A red single-change batch is ejected without a rerun; in a larger
 batch, a probe that fails this way confirms its prefix at once. The ejection reason says `seen
 once: a deterministic check, which a rerun of the same tree cannot change`, where it otherwise
-says `seen twice`. A run with any failure outside the named steps, or with no attributed failure,
-still needs its failure seen twice. The marker with another exit status means nothing. A donor's
+says `seen twice`. With same-commit confirmation on, a run with any failure outside the named
+steps, or with no attributed failure, still needs its failure seen twice; off, every red counts on
+its first sighting anyway. The marker with another exit status means nothing. A donor's
 receipt carries it in its log tail.
 
 **Fail-fast runs.** With `validator.fail_fast` (`init --fail-fast`), the queue sets
@@ -1226,17 +1237,28 @@ The base moves only to a commit whose exact tree passed validation (the bors rul
    at once. Green batches land in order, as soon as every batch ahead of them has landed, and the
    next batch starts at once on top of the last one in flight.
 2. **AIMD.** The window starts at `depth`, grows by one per landed batch up to `max_depth`, and
-   halves per red batch, never below one. With `max_depth` 0 it stays at `depth`. The report's
+   halves per red batch it searches or decides alone, never below one; a red batch that is split
+   (below) leaves it as it is. With `max_depth` 0 it stays at `depth`. The report's
    `windows` field records the window each time a batch started.
 3. **A red head** cancels everything behind it: those candidates were built on its tree. Their
    validations are killed, reported as `cancelled` (never as red), and their batches go back to the
    front of the queue, to be rebuilt once the red batch is resolved.
-4. **Culprit search.** The queue searches the red batch's prefixes (`parent + first i changes`) for
+4. **Split, or culprit search.** With same-commit confirmation off (the default), a red batch of
+   several changes is split instead of searched: each change goes back, in order, to the front of
+   the queue as a batch of its own, and stays alone in every later plan of the run, including the
+   plans made for requests taken in during the run. Each is then decided by its own validation,
+   built on the one before it. A split ejects nothing, halves nothing and starts no probe, so the
+   singles validate side by side and the run keeps taking in requests while they do. With
+   confirmation on, the queue searches the red batch's prefixes (`parent + first i changes`) for
    the first one that fails, running **only the failed tests**. Each round probes up to `depth`
    prefixes at once, evenly spaced (a W-ary search, not halves). The bare parent is probed until it
    is known green. A prefix search respects stacked changes and also catches a change that fails
    only in combination with the ones before it.
-5. **Seen twice.** Every blaming conclusion needs its failure observed twice: a culprit's prefix
+5. **Seen twice, or once.** With confirmation off, one sighting confirms. A red change on its own
+   is ejected after its own red validation and, unless `trust_base`, one probe of the bare parent
+   on the failed tests; a parent that fails them stops the queue (exit `3`) instead. The reason
+   says `seen once: same-commit confirmation is off (validator.confirm_reruns)`. With confirmation
+   on, every blaming conclusion needs its failure observed twice: a culprit's prefix
    must fail twice (with the prefix before it passing), and a base that fails the tests twice stops
    the queue (exit `3`) instead of ejecting an innocent change. Spare probe slots rerun the
    suspected failing prefix in the same round, so a single-change batch costs one round of two

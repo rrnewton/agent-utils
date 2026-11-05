@@ -121,6 +121,14 @@ pub struct ValidatorConfig {
     /// them. Off by default.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub fail_fast: bool,
+    /// Confirm a red by validating the same commit again before blaming a change (the
+    /// same-commit rerun, which gets `$MQ_RERUN_FROM`), and search a red batch for its culprit
+    /// with probes of its prefixes. Off by default: retries belong in the validator, so the
+    /// first red is the verdict. A red single-change batch is ejected on that one sighting,
+    /// and a red batch of several changes goes back as single-change batches, each decided by
+    /// its own validation.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub confirm_reruns: bool,
 }
 
 fn is_zero_u32(value: &u32) -> bool {

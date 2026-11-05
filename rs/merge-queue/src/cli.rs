@@ -536,6 +536,11 @@ enum Command {
         /// reported as `skip`.
         #[arg(long)]
         fail_fast: bool,
+        /// Confirm each red by validating the same commit again (`$MQ_RERUN_FROM`) and search a
+        /// red batch with prefix probes. Off by default: the first red is the verdict, and a red
+        /// batch of several changes goes back as single-change batches.
+        #[arg(long)]
+        confirm_reruns: bool,
         /// Where validations run: `off` (in this process; the default), `compare` (in this
         /// process, which decides, and also on donors, whose receipts are only compared), or
         /// `decide` (on donors only; an accepted receipt is the verdict).
@@ -1193,6 +1198,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             max_deferrals,
             red_without_probe,
             fail_fast,
+            confirm_reruns,
             offload,
             tool_identity,
             tool_refresh,
@@ -1322,6 +1328,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                         red_without_probe
                     },
                     fail_fast,
+                    confirm_reruns,
                     offload: if offload == "off" {
                         String::new()
                     } else {

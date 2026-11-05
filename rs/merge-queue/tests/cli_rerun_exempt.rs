@@ -1,7 +1,8 @@
 //! A red run whose every failure the validator names a deterministic check (`RERUN-EXEMPT:`) is
 //! confirmed on that one sighting: a rerun of the same tree cannot change its answer, so the
-//! queue ejects without one. Any other failure still needs its second sighting. `validator.
-//! fail_fast` hands candidate validations `MQ_FAIL_FAST=1`.
+//! queue ejects without one. With same-commit confirmation on (`--confirm-reruns`), any other
+//! failure still needs its second sighting. `validator.fail_fast` hands candidate validations
+//! `MQ_FAIL_FAST=1`.
 
 mod support;
 
@@ -109,7 +110,7 @@ fn a_deterministic_check_red_once_is_ejected_without_a_rerun() {
 
 #[test]
 fn a_failure_outside_the_named_checks_still_needs_its_second_sighting() {
-    let fx = setup("exempt-mixed", &["--max-batch", "1"]);
+    let fx = setup("exempt-mixed", &["--max-batch", "1", "--confirm-reruns"]);
     fx.branch(
         "a",
         &[("tests/check.paths", "FAIL\n"), ("tests/unit_a", "FAIL\n")],
@@ -129,7 +130,7 @@ fn a_failure_outside_the_named_checks_still_needs_its_second_sighting() {
 
 #[test]
 fn a_deterministic_culprit_in_a_batch_needs_no_confirming_probe() {
-    let fx = setup("exempt-batch", &["--max-batch", "3"]);
+    let fx = setup("exempt-batch", &["--max-batch", "3", "--confirm-reruns"]);
     fx.branch("a", &[("tests/unit_a", "ok\n")]);
     fx.branch("b", &[("tests/check.paths", "FAIL\n")]);
     fx.branch("c", &[("tests/unit_c", "ok\n")]);

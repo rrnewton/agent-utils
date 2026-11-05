@@ -767,6 +767,7 @@ fn compare_mode_publishes_only_the_candidate_and_cancels_its_lease_when_it_is_ej
         r#"sleep 3; rc=0; for t in $(ls tests 2>/dev/null); do o=pass; if grep -q FAIL "tests/$t"; then o=fail; rc=1; fi; printf '{"id":"%s","outcome":"%s"}\n' "$t" "$o" >> "$MQ_RESULTS"; done; exit $rc"#,
         "--offload",
         "compare",
+        "--confirm-reruns",
     ]);
     fx.branch("a", &[("tests/a", "FAIL\n")]);
     fx.branch("b", &[("b.txt", "b\n")]);

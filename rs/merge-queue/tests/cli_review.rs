@@ -201,7 +201,10 @@ fn dry_run_changes_no_item() {
 
 #[test]
 fn flake_during_the_search_does_not_eject_an_innocent_change() {
-    let fx = setup("rv-flake", &["--max-batch", "4", "--depth", "2"]);
+    let fx = setup(
+        "rv-flake",
+        &["--max-batch", "4", "--depth", "2", "--confirm-reruns"],
+    );
     fx.branch("a", &[("tests/a", "ok\n")]);
     fx.branch("b", &[("tests/b", "ok\n")]);
     fx.branch("c", &[("tests/c", "FAIL\n")]);

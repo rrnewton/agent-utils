@@ -37,6 +37,10 @@ fn state_dir(fx: &Fixture) -> PathBuf {
 /// A queue whose validations each append a line to `started`, wait (at most 30 s) for `gate`,
 /// and then fail exactly when a test file says FAIL.
 fn setup(tag: &str) -> (Fixture, PathBuf, PathBuf) {
+    setup_with(tag, &[])
+}
+
+fn setup_with(tag: &str, extra: &[&str]) -> (Fixture, PathBuf, PathBuf) {
     let fx = Fixture::new(tag);
     fx.write("tests/t0", "ok\n");
     fx.commit_all("seed tests");
@@ -54,7 +58,7 @@ exit $rc"#,
         started = started.display(),
         gate = gate.display()
     );
-    fx.mq_ok(&[
+    let mut args = vec![
         "init",
         "--remote",
         "origin",
@@ -62,7 +66,9 @@ exit $rc"#,
         "command",
         "--validator-run",
         &validator,
-    ]);
+    ];
+    args.extend_from_slice(extra);
+    fx.mq_ok(&args);
     (fx, started, gate)
 }
 
@@ -196,31 +202,38 @@ fn a_drain_lands_the_validation_in_flight_starts_no_other_and_exits() {
 
 #[test]
 fn a_drain_starts_no_culprit_search_and_ejects_nothing() {
-    // A red batch would be searched: a drain lets the batch's validation finish, but starts no
-    // probe, so both changes stay queued for the next daemon and nothing is ejected.
-    let (fx, started, gate) = setup("drain-red-batch");
-    // Both queued before the daemon starts, so its first run plans both.
-    fx.branch("a", &[("tests/a", "ok\n")]);
-    fx.branch("b", &[("tests/b", "FAIL\n")]);
-    fx.mq_ok(&["submit", "1", "--head", "a"]);
-    fx.mq_ok(&["submit", "2", "--head", "b"]);
-    let mut daemon = Daemon::start(&fx, "2");
-    wait_for("the batch's validation", Duration::from_secs(30), || {
-        lines(&started) == 1
-    });
-    fx.mq_ok(&["drain-for-upgrade"]);
-    std::fs::write(&gate, "").unwrap();
-    assert_eq!(daemon.exit_code(Duration::from_secs(60)), Some(0));
-    assert_eq!(item_status(&fx, 1), "queued");
-    assert_eq!(item_status(&fx, 2), "queued");
-    assert_eq!(lines(&started), 1, "no probe started");
-    let report = newest_report(&fx);
-    assert!(report["ejected"].as_array().unwrap().is_empty(), "{report}");
-    let stopped = report["stopped"].as_str().unwrap();
-    assert!(
-        stopped.starts_with("drained for upgrade") && stopped.contains("the changes stay queued"),
-        "{stopped}"
-    );
+    // A red batch is split into batches of one change each (the default), or searched when
+    // same-commit confirmation is on. Either way a drain lets the batch's validation finish
+    // but starts no further validation, so both changes stay queued for the next daemon and
+    // nothing is ejected.
+    for (tag, extra) in [
+        ("drain-red-batch", &[][..]),
+        ("drain-red-search", &["--confirm-reruns"][..]),
+    ] {
+        let (fx, started, gate) = setup_with(tag, extra);
+        // Both queued before the daemon starts, so its first run plans both.
+        fx.branch("a", &[("tests/a", "ok\n")]);
+        fx.branch("b", &[("tests/b", "FAIL\n")]);
+        fx.mq_ok(&["submit", "1", "--head", "a"]);
+        fx.mq_ok(&["submit", "2", "--head", "b"]);
+        let mut daemon = Daemon::start(&fx, "2");
+        wait_for("the batch's validation", Duration::from_secs(30), || {
+            lines(&started) == 1
+        });
+        fx.mq_ok(&["drain-for-upgrade"]);
+        std::fs::write(&gate, "").unwrap();
+        assert_eq!(daemon.exit_code(Duration::from_secs(60)), Some(0), "{tag}");
+        assert_eq!(item_status(&fx, 1), "queued", "{tag}");
+        assert_eq!(item_status(&fx, 2), "queued", "{tag}");
+        assert_eq!(lines(&started), 1, "{tag}: no further validation started");
+        let report = newest_report(&fx);
+        assert!(report["ejected"].as_array().unwrap().is_empty(), "{report}");
+        let stopped = report["stopped"].as_str().unwrap();
+        assert!(
+            stopped.starts_with("drained for upgrade") && stopped.contains("changes stay queued"),
+            "{tag}: {stopped}"
+        );
+    }
 }
 
 #[test]

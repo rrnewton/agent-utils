@@ -12,17 +12,21 @@
 //!   remainder of a batch reruns the failed tests, the tests the batch run did not see pass
 //!   (skipped or unreported), and the tests the selection policy says the removed change
 //!   affected, within the batch's own selection.
-//! * A conclusion that blames a change or the base needs the failure seen twice; a failure that
-//!   does not reproduce is recorded as flaky, never blamed. The one exception is a red run whose
-//!   every failure the validator names a deterministic check (`RERUN-EXEMPT:`): a rerun of the
-//!   same tree cannot change that answer, so one sighting confirms it.
+//! * With same-commit confirmation on (`validator.confirm_reruns`), a conclusion that blames a
+//!   change or the base needs the failure seen twice, and a failure that does not reproduce is
+//!   recorded as flaky, never blamed. The one exception is a red run whose every failure the
+//!   validator names a deterministic check (`RERUN-EXEMPT:`): a rerun of the same tree cannot
+//!   change that answer, so one sighting confirms it. With it off (the default), every first
+//!   red is the verdict: retries belong in the validator, not in an outer loop here. A red batch
+//!   of several changes is then split instead of searched: each change goes back as a batch of
+//!   its own and stays alone in every later plan of the run.
 //! * Every landing records its selection, policy and scope; a focused landing leaves an
 //!   obligation that only a green complete run discharges.
 //!
 //! The window is rolling (a dependent pipeline): up to `window` batches validate at once, each
 //! on top of the one before; when the head lands, the next batch starts at once. A red head
 //! cancels everything behind it. The window grows by one per landed batch up to `max_depth` and
-//! halves per red batch (AIMD), never below one.
+//! halves per red batch searched or decided alone (AIMD), never below one; a split leaves it.
 //!
 //! A run holds the writer lock for its whole length, so `submit`, `withdraw` and `retry` record
 //! their requests instead (see [`crate::intake`]). While a batch is in flight the run takes in
@@ -606,10 +610,18 @@ struct Obs {
     /// counted separately so they never read as a pass.
     unknowns: usize,
     failed: BTreeSet<TestId>,
-    /// A failure seen here was a deterministic check (the validator's `RERUN-EXEMPT:` marker):
-    /// a rerun of the same tree cannot change it, so one sighting confirms it.
-    deterministic: bool,
+    /// Why one sighting of a failure here confirms it, if it does: a deterministic check (the
+    /// validator's `RERUN-EXEMPT:` marker), or same-commit confirmation being off.
+    once: Option<&'static str>,
 }
+
+/// [`Obs::once`] for a deterministic check.
+const DETERMINISTIC_ONCE: &str =
+    "seen once: a deterministic check, which a rerun of the same tree cannot change";
+
+/// [`Obs::once`] when same-commit confirmation is off.
+const UNCONFIRMED_ONCE: &str =
+    "seen once: same-commit confirmation is off (validator.confirm_reruns)";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Seen {
@@ -630,15 +642,14 @@ impl Obs {
     }
 
     fn confirmed_fail(&self) -> bool {
-        self.passes == 0 && (self.fails >= 2 || (self.fails == 1 && self.deterministic))
+        self.passes == 0 && (self.fails >= 2 || (self.fails == 1 && self.once.is_some()))
     }
 
     /// How a confirmed failure was confirmed, for the reason that names it.
     fn confirmation(&self) -> &'static str {
-        if self.fails >= 2 {
-            "seen twice"
-        } else {
-            "seen once: a deterministic check, which a rerun of the same tree cannot change"
+        match self.once {
+            Some(once) if self.fails < 2 => once,
+            _ => "seen twice",
         }
     }
 }
@@ -743,6 +754,10 @@ pub struct Runner<'a> {
     /// commit and each of its prefixes, the batches beneath it in the window included. A batch
     /// built on one of these commits treats those changes as landed.
     carried: Mutex<BTreeMap<String, Vec<i64>>>,
+    /// Changes this run split off a red batch (see [`Self::split_red`] and
+    /// [`Self::red_without_probe`]): every later plan in the run gives each a batch of its own,
+    /// so taking in a request does not batch them together again.
+    solo: Mutex<BTreeSet<i64>>,
     /// Simulated base for shadow and dry runs.
     simulated: Mutex<Option<String>>,
     base: Mutex<String>,
@@ -880,6 +895,7 @@ impl<'a> Runner<'a> {
             excluded: Mutex::new(held),
             landed_heads: Mutex::new(Vec::new()),
             carried: Mutex::new(BTreeMap::new()),
+            solo: Mutex::new(BTreeSet::new()),
             simulated: Mutex::new(None),
             base: Mutex::new(String::new()),
             next_validation: Mutex::new(0),
@@ -2370,9 +2386,11 @@ impl<'a> Runner<'a> {
             ),
         );
         // A rerun at a commit already validated gets that run's handle, so a runner that can
-        // rerun only the failed parts of an earlier run (at the same commit) can do so.
+        // rerun only the failed parts of an earlier run (at the same commit) can do so. Only
+        // with same-commit confirmation on: off, the queue asks for no rerun.
         let mut extra: Vec<(String, String)> = lock(&self.handles)
             .get(&job.commit)
+            .filter(|_| self.config.validator.confirm_reruns)
             .map(|(handle, previous)| {
                 vec![
                     ("MQ_RERUN_FROM".to_owned(), handle.clone()),
@@ -3008,23 +3026,48 @@ impl<'a> Runner<'a> {
                 deps.entry(*after).or_default().insert(*before);
             }
         }
+        let batches = self.isolate_solo(plan.batches.iter().map(|batch| batch.prs.clone()));
         self.event(
             "plan-intake",
             &format!(
                 "{} batch(es) on top of {} (carrying {}): {}; {} held",
-                plan.batches.len(),
+                batches.len(),
                 short(tip),
                 list(&carried.iter().copied().collect::<Vec<_>>()),
-                plan.batches
+                batches
                     .iter()
-                    .map(|batch| list(&batch.prs))
+                    .map(|prs| list(prs))
                     .collect::<Vec<_>>()
                     .join(" then "),
                 plan.held.len()
             ),
         );
-        *pending = plan.batches.iter().map(|batch| batch.prs.clone()).collect();
+        *pending = batches;
         Ok(())
+    }
+
+    /// `batches` with each change split off a red batch in this run (see [`Self::split_red`])
+    /// in a batch of its own; the changes between two of them stay together, in order.
+    fn isolate_solo(&self, batches: impl IntoIterator<Item = Vec<i64>>) -> VecDeque<Vec<i64>> {
+        let solo = lock(&self.solo);
+        let mut out = VecDeque::new();
+        for batch in batches {
+            let mut together: Vec<i64> = Vec::new();
+            for pr in batch {
+                if solo.contains(&pr) {
+                    if !together.is_empty() {
+                        out.push_back(std::mem::take(&mut together));
+                    }
+                    out.push_back(vec![pr]);
+                } else {
+                    together.push(pr);
+                }
+            }
+            if !together.is_empty() {
+                out.push_back(together);
+            }
+        }
+        out
     }
 
     /// Record that each change `plan` batches depends on the changes in `carried` (in flight
@@ -3354,6 +3397,19 @@ impl<'a> Runner<'a> {
                                 window = (window + 1).min(self.max_window);
                             }
                             outcome
+                        } else if !self.config.validator.confirm_reruns
+                            && head.candidate.prs.len() > 1
+                        {
+                            // Same-commit confirmation is off: the red is the verdict, and a
+                            // batch of several changes is not searched here (the probes and the
+                            // remainder would hold this loop for their whole length, with no
+                            // request taken and no free slot filled). Each change goes back, in
+                            // order, as a batch of its own: built on the one before, each is a
+                            // prefix of the red batch, decided by its own validation. The
+                            // window is not halved, so they validate side by side.
+                            discard(&mut flights, &rx, pending);
+                            self.split_red(&head.candidate, &ran, vid, pending);
+                            BatchOutcome::Done
                         } else {
                             // Everything behind a red batch was built on its tree.
                             discard(&mut flights, &rx, pending);
@@ -3786,6 +3842,38 @@ impl<'a> Runner<'a> {
         Ok(BatchOutcome::Done)
     }
 
+    /// A red batch of several changes with same-commit confirmation off: each change goes back
+    /// at the front of `pending`, in order, as a batch of its own, and stays alone in every
+    /// later plan of this run.
+    fn split_red(
+        &self,
+        candidate: &Candidate,
+        ran: &Ran,
+        vid: usize,
+        pending: &mut VecDeque<Vec<i64>>,
+    ) {
+        let failed: Vec<TestId> = ran.failed().into_iter().collect();
+        self.event(
+            "split",
+            &format!(
+                "v{vid} {} red ({}); each change goes back as a batch of its own, in order",
+                list(&candidate.prs),
+                if failed.is_empty() {
+                    format!(
+                        "exit {}",
+                        ran.exit.map_or("none".to_owned(), |code| code.to_string())
+                    )
+                } else {
+                    ids(&failed)
+                }
+            ),
+        );
+        lock(&self.solo).extend(candidate.prs.iter().copied());
+        for pr in candidate.prs.iter().rev() {
+            pending.push_front(vec![*pr]);
+        }
+    }
+
     /// A red batch: find culprits with failed-test-only probes, eject them, and land the rest.
     fn handle_red(
         &self,
@@ -4055,6 +4143,7 @@ impl<'a> Runner<'a> {
                 list(&current.prs)
             ),
         );
+        lock(&self.solo).extend(current.prs.iter().copied());
         for pr in current.prs.iter().rev() {
             pending.push_front(vec![*pr]);
         }
@@ -4111,7 +4200,7 @@ impl<'a> Runner<'a> {
     /// broken base never ejects an innocent change; spare probe slots re-run the suspected
     /// failing prefix, and every blaming conclusion needs its failure seen twice, or once when
     /// the run that saw it named it a deterministic check (`first_deterministic` for the red
-    /// run that started the search).
+    /// run that started the search) or same-commit confirmation is off.
     fn find_culprit(
         &self,
         candidate: &Candidate,
@@ -4120,6 +4209,8 @@ impl<'a> Runner<'a> {
         first_deterministic: bool,
     ) -> Result<Culprit, String> {
         let n = candidate.prs.len();
+        // Off, one sighting of any failure confirms it.
+        let unconfirmed = (!self.config.validator.confirm_reruns).then_some(UNCONFIRMED_ONCE);
         let mut obs: BTreeMap<usize, Obs> = BTreeMap::new();
         obs.insert(
             n,
@@ -4128,7 +4219,11 @@ impl<'a> Runner<'a> {
                 passes: 0,
                 unknowns: 0,
                 failed: first_failed.clone(),
-                deterministic: first_deterministic,
+                once: if first_deterministic {
+                    Some(DETERMINISTIC_ONCE)
+                } else {
+                    unconfirmed
+                },
             },
         );
         if self.config.trust_base && n > 0 {
@@ -4233,7 +4328,11 @@ impl<'a> Runner<'a> {
                     ProbeObservation::Fail => {
                         entry.fails += 1;
                         entry.failed.extend(ran.reproduced());
-                        entry.deterministic |= ran.deterministic_red();
+                        if ran.deterministic_red() {
+                            entry.once = Some(DETERMINISTIC_ONCE);
+                        } else if entry.once.is_none() {
+                            entry.once = unconfirmed;
+                        }
                     }
                     ProbeObservation::Pass => entry.passes += 1,
                     ProbeObservation::Unknown => {

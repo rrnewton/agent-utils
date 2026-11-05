@@ -574,7 +574,7 @@ fn green_batches_land_in_order_with_speculation() {
 
 #[test]
 fn culprit_is_found_with_failed_tests_only_and_the_rest_lands() {
-    let fx = setup("run-culprit", &["--max-batch", "4"]);
+    let fx = setup("run-culprit", &["--max-batch", "4", "--confirm-reruns"]);
     fx.branch("a", &[("tests/a", "ok\n")]);
     fx.branch("b", &[("tests/b", "FAIL\n")]);
     fx.branch("c", &[("tests/c", "ok\n")]);
@@ -667,7 +667,7 @@ fn broken_base_stops_without_ejecting() {
 
 #[test]
 fn flaky_failure_is_detected_and_reported_not_blamed() {
-    let fx = setup("run-flaky", &[]);
+    let fx = setup("run-flaky", &["--confirm-reruns"]);
     fx.branch("a", &[("tests/a", "FLAKY\n")]);
     fx.mq_ok(&["submit", "1", "--head", "a"]);
     let marker = fx.root.join("flaky-marker");
@@ -862,7 +862,10 @@ fn decision_records(fx: &Fixture) -> Vec<Value> {
 
 #[test]
 fn every_validation_leaves_one_decision_record_and_stats_summarise_them() {
-    let fx = setup("run-decisions", &["--max-batch", "4", "--depth", "1"]);
+    let fx = setup(
+        "run-decisions",
+        &["--max-batch", "4", "--depth", "1", "--confirm-reruns"],
+    );
     fx.branch("a", &[("tests/a", "ok\n")]);
     fx.branch("b", &[("tests/b", "FAIL\n")]);
     fx.branch("c", &[("tests/c", "ok\n")]);
