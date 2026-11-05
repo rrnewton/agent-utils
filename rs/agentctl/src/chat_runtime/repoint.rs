@@ -289,7 +289,16 @@ impl BridgeState {
 
     /// When the bridge last changed its target, if it ever did: a request typed before then went
     /// to the previous agent, and the bridge no longer reads that agent's screen.
+    #[cfg(test)]
     pub(crate) fn retargeted_at_millis(&self) -> Option<u64> {
+        self.last_retarget().map(|(at, _)| at)
+    }
+
+    /// When the bridge last changed its target, with the requests that change left to the
+    /// previous agent: those whose prompts that agent's queue had typed, answered or awaiting
+    /// an answer. A prompt typed in the same millisecond as the change can be either agent's by
+    /// its time alone, so these are named (#869 agentctl-test-fsync-churn).
+    pub(crate) fn last_retarget(&self) -> Option<(u64, BTreeSet<String>)> {
         if fs::symlink_metadata(self.target_path()).is_err() {
             return None;
         }
@@ -300,7 +309,15 @@ impl BridgeState {
             .iter()
             .rev()
             .find(|outcome| outcome.changed_target())
-            .map(|outcome| outcome.applied_at_millis)
+            .map(|outcome| {
+                let left = outcome
+                    .delivered_to_previous
+                    .iter()
+                    .chain(&outcome.awaiting_reply_from_previous)
+                    .cloned()
+                    .collect();
+                (outcome.applied_at_millis, left)
+            })
     }
 
     /// This state, serving `agent_name` instead of the agent it was opened with. Process-local
@@ -1072,13 +1089,25 @@ mod tests {
             .expect("apply");
         assert_eq!(
             outcome.awaiting_reply_from_previous,
-            vec![answered_elsewhere]
+            vec![answered_elsewhere.clone()]
         );
         assert!(outcome
             .summary()
             .contains("1 delivered to old-agent still unanswered"));
-        assert!(state.retargeted_at_millis().is_some());
-        // The new agent is never reminded of a request it did not receive.
+        let retargeted_at = state.retargeted_at_millis().expect("retargeted");
+        // The new agent is never reminded of a request it did not receive, also when its prompt
+        // was typed in the millisecond the bridge changed target, which time alone cannot place
+        // (#869 agentctl-test-fsync-churn: on a fast scratch disk it often was).
+        let mut record = state.read_request(&answered_elsewhere).expect("request");
+        record.delivery_started_at_millis = Some(retargeted_at);
+        record.delivered_at_millis = Some(retargeted_at);
+        let mut checkpoint = state.read_checkpoint().expect("checkpoint");
+        state
+            .write_request_accounted(&record, &mut checkpoint)
+            .expect("write request");
+        state
+            .persist_checkpoint(&mut checkpoint)
+            .expect("persist checkpoint");
         assert!(state
             .reply_reminder_candidates()
             .expect("candidates")

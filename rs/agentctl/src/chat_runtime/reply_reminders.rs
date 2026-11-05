@@ -313,7 +313,7 @@ then start again from that time",
     pub(crate) fn reply_reminder_candidates(&self) -> Result<ReminderCandidates> {
         // A prompt typed before the bridge was repointed went to the previous agent, which the
         // current one cannot answer for (#677 chat-bridge-repoint).
-        let retargeted_at = self.retargeted_at_millis().unwrap_or(0);
+        let (retargeted_at, left_to_previous) = self.last_retarget().unwrap_or_default();
         let (records, alias_record) = {
             let _snapshot = self.lock_state_snapshot()?;
             (self.request_records()?, self.read_reply_aliases().ok())
@@ -328,6 +328,7 @@ then start again from that time",
             if record.reply_closed
                 || record.reply_count > 0
                 || record.phase != RequestPhase::Delivered
+                || left_to_previous.contains(&record.key)
             {
                 continue;
             }
