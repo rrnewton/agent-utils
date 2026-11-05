@@ -1,11 +1,11 @@
 ---
 title: 'chat-notsent-after-posted: never tell an agent a reply was not sent once the bridge posted it'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-start
 created_at: 2026-11-05T15:27:40.515166915+00:00
-updated_at: 2026-11-05T15:27:40.515166915+00:00
+updated_at: 2026-11-05T16:06:58.000000000+00:00
 ---
 
 # Description
@@ -32,3 +32,36 @@ Seen twice on 2026-11-05 on a consumer host's bridge, agentctl d8447c04:
 # Notes
 
 Reported by the lead on 2026-11-05 at 10:26 AM ET, from a consumer team (P1; the owner noticed duplicate replies). Assigned to cl-start.
+
+## Resolution
+
+[opus 5.5] cl-start, 2026-11-05.
+
+**Sequence** (the consumer host's bridge log and its coordinator queue, read-only), the same all three times:
+
+| Reply ID | Transcript captured and sent reply 1 | Not-sent notice queued (`queued_at`) |
+|---|---|---|
+| 5826 | 12:43:18Z | 12:45:23Z |
+| 5829 | 15:10:09Z | 15:14:00Z |
+| 5835 | 15:23:22Z | 15:26:40Z |
+
+- **What happened:** minutes after each send, a recovery scan of the pane read that block's opening line and first rows, without its closing line, as a block with no closing line.
+- **Why the existing check missed it:** the check that silences the start of a stored reply compared the pane's text with the stored text, ignoring only whitespace and box drawing.
+  - The stored text is in its own formatting: `*bold*`, `•`/`◦` bullets, `[label](url)` links.
+  - The pane draws it rendered, so the two never matched.
+- **Not a race:** each notice was queued after its reply was stored.
+
+**Fix:**
+- **One capture settles the block for every path.** A block seen only in part (no closing line, or unopened) under a reply ID whose reply is already stored is never reported:
+  - under a short alias, which names the request, once the request has any stored reply;
+  - under a long `<nonce>_<ordinal>` ID, which names one reply, once that reply is.
+- **The race is closed too.** A not-sent notice still waiting in the coordinator's queue is taken back out, untyped, once every partial block it reports is under such an ID (`withdraw_answered_feedback`, checked each pass). Its entries are recorded as reported. The service logs the withdrawal.
+- **Blocks with a misplaced or miswritten tag** are still weighed against the stored replies' text, as before.
+- **Trade-off:** a genuinely cut-off second block under a short ID whose request already has a reply is no longer reported. The userguide says so and points at `chat reply`.
+
+**Tests:**
+- `a_reply_sent_from_the_transcript_is_never_reported_unsent_from_its_cut_off_rendering` covers both the transcript path and `chat reply`, with markup the pane renders.
+- `an_unsent_unclosed_block_is_still_reported_and_its_notice_withdrawn_once_it_is_sent` checks two things:
+  - a genuinely unsent block is still reported;
+  - its queued notice is withdrawn once the reply is stored, and the block is not reported again.
+- Four existing tests changed where they expected a report or log for a partial block under an already-answered ID.

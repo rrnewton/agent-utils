@@ -3490,6 +3490,17 @@ with other text, so the oldest were not read",
     if let Some(line) = already_reported_log_line(&capture.suppressed_ids) {
         control.log(line);
     }
+    // A not-sent notice still queued for a block whose reply has since been stored must not
+    // reach the coordinator (#891 chat-notsent-after-posted).
+    match chat_runtime::withdraw_answered_feedback(state, manager) {
+        Ok(true) => control.log(
+            "agentctl: chat reply fence feedback withdrawn from the coordinator's queue: every \
+             block it reported has since been sent"
+                .to_owned(),
+        ),
+        Ok(false) => {}
+        Err(error) => report.error("reply-fence-feedback", "coordinator", error),
+    }
     if !capture.unknown_ids.is_empty() || !capture.covered_ids.is_empty() {
         let notes = TypingNotes::default();
         let result = deliver_feedback(

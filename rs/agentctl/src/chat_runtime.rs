@@ -12922,6 +12922,13 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
     /// nothing if that partial block's text is part of a stored reply, as the start of one: that
     /// partial block is silent anyway, and its entry, from its first characters alone, would
     /// also be the entry of a later block that starts the same way and was never sent.
+    ///
+    /// A block seen only in part under a reply ID whose reply this request already stored is
+    /// silent, whatever its visible text (#891 chat-notsent-after-posted): that reply went out,
+    /// through the transcript or `chat reply`, and the screen shows a rendering of it, with the
+    /// formatting and line breaks the stored text does not have, cut off by the edge of the pane.
+    /// Telling the coordinator it was not sent made it send the reply again. A block with a
+    /// misplaced or miswritten tag is still weighed against the stored replies' text.
     fn unmatched_partials_locked(
         &self,
         key: &str,
@@ -12930,7 +12937,19 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let mut stored: Option<Vec<(String, String)>> = None;
         let mut compared = BTreeSet::new();
         let mut entries = PartialEntries::default();
+        let mut next_reply_ordinal = None;
         for block in partial {
+            let next = match next_reply_ordinal {
+                Some(next) => next,
+                None => *next_reply_ordinal.insert(self.read_request(key)?.next_reply_ordinal),
+            };
+            if matches!(
+                block,
+                PartialBlock::Unclosed { .. } | PartialBlock::Unopened { .. }
+            ) && reply_id_answered(block.identifier(), next)
+            {
+                continue;
+            }
             if let PartialBlock::Mangled { identifier, text } = block {
                 // A stored reply that quotes the row, such as one that explains the mistake,
                 // holds its text.
@@ -14681,6 +14700,60 @@ fn lists_unmatched_id<'a>(mut entries: impl Iterator<Item = &'a String>) -> bool
     })
 }
 
+/// The coordinator queue's message ID for the fence feedback prompt about `unavailable`.
+fn fence_feedback_message_id(unavailable: &[String]) -> Result<String> {
+    let identity = serde_json::to_vec(&serde_json::json!({ "unavailable": unavailable }))?;
+    Ok(format!("chat-feedback-{:x}", Sha256::digest(identity)))
+}
+
+/// Take a queued fence feedback prompt back out of the coordinator's queue, untyped, once every
+/// block it reports is under a reply ID whose reply has since been stored (#891
+/// chat-notsent-after-posted): a block seen while the coordinator was still writing it is
+/// reported as not sent, the notice waits in the queue while the coordinator works, and the
+/// transcript or `chat reply` then stores and sends that very reply. Typed after that, the
+/// notice made the coordinator send it again. A withdrawn prompt's entries are recorded as
+/// reported, so the blocks are not reported again. `Ok(true)` when it was withdrawn; a prompt
+/// that names any other block (one with a misplaced or miswritten tag, or under an ID that
+/// matches no request), or that the queue has begun to type, is left alone.
+///
+/// # Errors
+///
+/// The fence feedback record or a request record cannot be read or written.
+pub(crate) fn withdraw_answered_feedback(
+    state: &BridgeState,
+    delivery: &dyn CoordinatorDelivery,
+) -> Result<bool> {
+    let Some(pending) = state.read_fence_feedback()?.pending else {
+        return Ok(false);
+    };
+    for entry in &pending.unavailable {
+        // Only blocks seen in part, as `unmatched_partials_locked` silences them.
+        let FeedbackEntry::HeldBack {
+            identifier,
+            kind: HeldBackKind::Unclosed | HeldBackKind::Unopened | HeldBackKind::Remnant,
+        } = FeedbackEntry::parse(entry)
+        else {
+            return Ok(false);
+        };
+        let Some(key) = state.request_for_reply_id(identifier)? else {
+            return Ok(false);
+        };
+        let next = state.read_request(&key)?.next_reply_ordinal;
+        if !reply_id_answered(identifier, next) {
+            return Ok(false);
+        }
+    }
+    let message_id = fence_feedback_message_id(&pending.unavailable)?;
+    if !matches!(
+        delivery.withdraw(&state.config.agent_name, &message_id),
+        Ok(true)
+    ) {
+        return Ok(false);
+    }
+    state.record_fence_feedback(&pending.unavailable, &pending.prompt, false, &[])?;
+    Ok(true)
+}
+
 /// Submit or settle one fence feedback prompt. Its queue identity is the unavailable markers
 /// alone: the available IDs advance with every captured reply, so keying on them too made each
 /// rescan of one stale marker a new prompt, a new reply and a new post.
@@ -14691,8 +14764,7 @@ fn drive_fence_feedback(
     prompt: &str,
     options: DrainOptions,
 ) -> Result<CoordinatorDeliveryResult> {
-    let identity = serde_json::to_vec(&serde_json::json!({ "unavailable": unavailable }))?;
-    let message_id = format!("chat-feedback-{:x}", Sha256::digest(identity));
+    let message_id = fence_feedback_message_id(unavailable)?;
     let agent_name = &state.config.agent_name;
     let initial = delivery
         .message_state(agent_name, &message_id)
@@ -15977,6 +16049,20 @@ impl PartialBlock {
 /// Whether `text`, with the plain view `view`, of a block seen only in part is part of a reply
 /// in `stored`, as `stored_reply_views_locked` returns them: the start of one for the start of a
 /// block, if `unclosed`, and otherwise the end of one, in either the plain or the column view.
+/// Whether a reply block under `identifier` belongs to a reply its request already stored, when
+/// the request's next reply takes ordinal `next_reply_ordinal`: under a short alias, which names
+/// the request, once any reply is stored; under a long `<nonce>_<ordinal>` ID, which names one
+/// reply, once that reply is (#891 chat-notsent-after-posted).
+fn reply_id_answered(identifier: &str, next_reply_ordinal: u32) -> bool {
+    if parse_reply_alias(identifier).is_some() {
+        return next_reply_ordinal > 1;
+    }
+    identifier
+        .rsplit_once('_')
+        .and_then(|(_, ordinal)| ordinal.parse::<u32>().ok())
+        .is_some_and(|ordinal| ordinal < next_reply_ordinal)
+}
+
 fn part_of_stored(stored: &[(String, String)], unclosed: bool, text: &str, view: &str) -> bool {
     let columns = ColumnView::of(text).text;
     stored.iter().any(|(plain, by_column)| {
@@ -19398,6 +19484,21 @@ pub(crate) mod tests {
             _options: DrainOptions,
         ) -> std::result::Result<(), String> {
             self.drain_queue()
+        }
+
+        fn withdraw(
+            &self,
+            _agent_name: &str,
+            message_id: &str,
+        ) -> std::result::Result<bool, String> {
+            let mut states = self.states.lock().expect("queue lock");
+            match states.get_mut(message_id) {
+                Some(state) if *state == QueueMessageState::Pending => {
+                    *state = QueueMessageState::Cancelled;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
         }
 
         fn screen(&self, _agent_name: &str) -> std::result::Result<String, String> {
@@ -26649,15 +26750,6 @@ lines\n"
             assert!(capture.replies.is_empty(), "{screen}{capture:?}");
             assert_eq!(capture.unknown_ids, std::slice::from_ref(entry), "{screen}");
         }
-        // A closing tag on such a row closes the block that a marker opened (#852
-        // unknown-tui-bridge), as it does on any row of text.
-        let capture = state
-            .capture_snapshot(&claude(&format!(
-                "⏺ {opening}\n  Fixed in parse_marker().{closing}\n"
-            )))
-            .expect("scan of a block closed on a row of text");
-        assert_eq!(capture.replies, [(key.clone(), vec![1])], "{capture:?}");
-        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
         let pair = format!("{opening}Done.{closing}");
         for screen in [
             codex(&format!(
@@ -26806,6 +26898,17 @@ EOF)\n  ⎿  (No content)\n"
                 "{screen}"
             );
         }
+        // A closing tag on such a row closes the block that a marker opened (#852
+        // unknown-tui-bridge), as it does on any row of text. After the blocks seen in part
+        // above, since every such block under an ID whose reply is stored is silent (#891
+        // chat-notsent-after-posted).
+        let capture = state
+            .capture_snapshot(&claude(&format!(
+                "⏺ {opening}\n  Fixed in parse_marker().{closing}\n"
+            )))
+            .expect("scan of a block closed on a row of text");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])], "{capture:?}");
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
         // An output row after it changes nothing: the closing tag closed the block, which went
         // out above, so it is neither sent again nor reported.
         let screen = claude(&format!(
@@ -30571,9 +30674,14 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
             .expect("scan of the block sent again");
         assert_eq!(capture.replies, [(key.clone(), vec![2])]);
         assert!(capture.unknown_ids.is_empty());
-        // The fragment is still on screen and still matches no stored reply, but it was
-        // reported once, so it is only logged.
-        assert_eq!(capture.suppressed_ids, [second]);
+        // The fragment is still on screen and still matches no stored reply, but the reply under
+        // its ID is now stored, so it is silent, not even logged as reported before (#891
+        // chat-notsent-after-posted).
+        assert!(
+            capture.suppressed_ids.is_empty(),
+            "{:?}",
+            capture.suppressed_ids
+        );
 
         assert_eq!(coordinator.prompts(), [unclosed_notice, unopened_notice]);
         while state
@@ -31115,10 +31223,9 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
         );
         let capture = state.capture_snapshot(&nested).expect("nested capture");
         assert_eq!(capture.replies, [(key.clone(), vec![1])]);
-        assert_eq!(
-            capture.unknown_ids,
-            [held_back(&format!("{nonce}_1"), "unclosed", "outerstart")]
-        );
+        // The outer block is seen in part under the ID of a reply now stored, so it is silent
+        // (#891 chat-notsent-after-posted).
+        assert!(capture.unknown_ids.is_empty(), "{:?}", capture.unknown_ids);
         assert_eq!(
             state.read_reply(&key, 1).expect("reply").body,
             "inner answer"
@@ -31603,6 +31710,7 @@ k │\n\
     fn a_block_seen_in_part_is_silent_when_it_matches_a_stored_reply() {
         let (state, key, nonce, root) = open_request("partial-block-match");
         let id = format!("{nonce}_1");
+        let next = format!("{nonce}_2");
         let capture = state
             .capture_snapshot(&reply_block(&id, "This is the end of the answer"))
             .expect("store");
@@ -31618,25 +31726,127 @@ k │\n\
             // Nothing of it is visible.
             (format!("</CHAT_REPLY_{id}>\n"), None),
             (format!("<CHAT_REPLY_{id}>\n"), None),
-            // What is visible matches no stored reply. The first is cut by the top of the capture
-            // and shows fewer than HELD_BACK_DIGEST_CHARS identity characters.
+            // What is visible matches no stored reply, but the reply under its ID was stored, so
+            // the block is a rendering of that reply, not a reply that did not go out (#891
+            // chat-notsent-after-posted).
+            (format!("another ending\n</CHAT_REPLY_{id}>\n"), None),
+            (format!("<CHAT_REPLY_{id}>\nThat is\n"), None),
+            // Under the next reply's ID, nothing is stored. The first is cut by the top of the
+            // capture and shows fewer than HELD_BACK_DIGEST_CHARS identity characters.
             (
-                format!("another ending\n</CHAT_REPLY_{id}>\n"),
+                format!("another ending\n</CHAT_REPLY_{next}>\n"),
                 Some(("remnant", "anotherending")),
             ),
             (
-                format!("<CHAT_REPLY_{id}>\nThat is\n"),
+                format!("<CHAT_REPLY_{next}>\nThat is\n"),
                 Some(("unclosed", "Thatis")),
             ),
         ] {
             let capture = state.capture_snapshot(&seen).expect("partial capture");
             assert!(capture.replies.is_empty(), "{seen:?}");
             let expected = reported
-                .map(|(kind, covered)| held_back(&id, kind, covered))
+                .map(|(kind, covered)| held_back(&next, kind, covered))
                 .into_iter()
                 .collect::<Vec<_>>();
             assert_eq!(capture.unknown_ids, expected, "{seen:?}");
         }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reply_sent_from_the_transcript_is_never_reported_unsent_from_its_cut_off_rendering() {
+        // #891 chat-notsent-after-posted: the transcript path stored and sent reply 001; minutes
+        // later the pane showed that block's opening line and its first rows, drawn with the
+        // formatting rendered and a link shown by its label, but not its closing line. The bridge
+        // told the coordinator the block was not sent, and the coordinator sent it again.
+        let root = temporary("notsent-after-transcript");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = admitted(&state, 2);
+        prompted(&state, &keys[0]);
+        prompted(&state, &keys[1]);
+        let later = Some(unix_millis() + 1_000);
+        let reader = with_transcript(&state, vec![transcript_block("001", WRITTEN, later)]);
+        let capture = reader
+            .capture_snapshot(&reply_block("001", DRAWN))
+            .expect("capture from the transcript");
+        assert_eq!(capture.replies, [(keys[0].clone(), vec![1])]);
+        // The block scrolls on: its opening line and first rows show, its closing line does not.
+        let cut = "<CHAT_REPLY_001>\nMitigated; please reload. The cause was rate\nlimiting, see the status page.\n";
+        for capture in [
+            reader.capture_snapshot(cut).expect("cut-off capture"),
+            state
+                .capture_snapshot(cut)
+                .expect("cut-off capture, screen only"),
+        ] {
+            assert!(capture.unknown_ids.is_empty(), "{:?}", capture.unknown_ids);
+        }
+        // A reply stored by `chat reply` silences its rendering the same way.
+        state
+            .submit_reply(&keys[1], "002", "Done: the *gate* passed on main.")
+            .expect("chat reply");
+        let capture = state
+            .capture_snapshot("<CHAT_REPLY_002>\nDone: the gate passed\n")
+            .expect("cut-off capture of a chat reply");
+        assert!(capture.unknown_ids.is_empty(), "{:?}", capture.unknown_ids);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_unsent_unclosed_block_is_still_reported_and_its_notice_withdrawn_once_it_is_sent() {
+        // #891 chat-notsent-after-posted. A block of a request with no stored reply, seen with no
+        // closing line, is reported; the notice waits while the coordinator works. When the reply
+        // is then stored, the notice is taken back out of the queue untyped, and the block is not
+        // reported again.
+        let root = temporary("notsent-withdrawn");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = admitted(&state, 1);
+        prompted(&state, &keys[0]);
+        let cut = "<CHAT_REPLY_001>\nThe first half of an answer that is still being written\n";
+        let capture = state.capture_snapshot(cut).expect("cut-off capture");
+        assert_eq!(capture.unknown_ids.len(), 1, "{:?}", capture.unknown_ids);
+        assert!(capture.unknown_ids[0].starts_with("001 unclosed "));
+        let coordinator = QueueDelivery::default();
+        *coordinator.busy_drains.lock().expect("busy lock") = 1;
+        let result = deliver_fence_feedback_with(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback");
+        assert!(
+            matches!(result, CoordinatorDeliveryResult::Pending(_)),
+            "{result:?}"
+        );
+        assert!(coordinator.prompts()[0].contains("no closing line for the reply block marked 001"));
+        // Nothing is withdrawn while the block's reply is not stored.
+        assert!(!withdraw_answered_feedback(&state, &coordinator).expect("withdraw"));
+        let complete = reply_block(
+            "001",
+            "The first half of an answer that is still being written, and the rest.",
+        );
+        assert_eq!(
+            state.capture_snapshot(&complete).expect("capture").replies,
+            [(keys[0].clone(), vec![1])]
+        );
+        assert!(withdraw_answered_feedback(&state, &coordinator).expect("withdraw"));
+        let states = coordinator.states.lock().expect("queue lock").clone();
+        assert_eq!(
+            states.values().copied().collect::<Vec<_>>(),
+            [QueueMessageState::Cancelled],
+            "the notice was taken back out untyped"
+        );
+        assert!(state
+            .read_fence_feedback()
+            .expect("feedback")
+            .pending
+            .is_none());
+        assert!(!withdraw_answered_feedback(&state, &coordinator).expect("nothing left"));
+        assert!(state
+            .capture_snapshot(cut)
+            .expect("capture again")
+            .unknown_ids
+            .is_empty());
         fs::remove_dir_all(root).expect("cleanup");
     }
 

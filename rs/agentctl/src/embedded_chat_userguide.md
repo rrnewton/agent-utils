@@ -1607,7 +1607,17 @@ closing marker in a message that shows no opening one before it or whose first
 row is out of view. It does not report a part that holds no text or is the start
 or the end of a reply already stored for that request, read in row order or
 column by column. A part cut inside a table row that wrapped at another width
-than the stored reply's is still reported, once. The prompt says what the
+than the stored reply's is still reported, once. Nor does it report any partial
+block under a reply ID whose reply is already stored, whatever its visible text:
+under a short ID such as `001`, which names the request, once the request has any
+stored reply; under a long `<nonce>_<ordinal>` ID, which names one reply, once
+that reply is stored. A reply taken from the transcript or sent with `chat reply`
+is stored in its own formatting, which the pane draws differently, so its cut-off
+rendering matched no stored text and was reported as not sent, and the agent sent
+it again. In exchange, a second block under a short ID whose request already has
+a reply is not reported when it is cut off; send it with `chat reply` to be sure.
+A notice still waiting in the agent's queue is taken back out, untyped, once every
+partial block it reports is under such an ID. The prompt says what the
 capture was missing: the start of the message that holds the block or an opening
 line for the block, or the block's closing line. A block that a prompt or a tool
 call interrupts reads as both: the rows before the new item as a block with no
