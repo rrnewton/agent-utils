@@ -12,11 +12,13 @@ state formats are refused, never converted.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Generator
 from pathlib import Path
@@ -179,6 +181,23 @@ class Fixture:
         env = self.env()
         if extra_env:
             env.update(extra_env)
+        parent_pid = os.getpid()
+
+        def die_with_parent() -> None:
+            # The launcher must not outlive this test process: if the outer
+            # pytest is killed (SIGKILL included), the kernel delivers
+            # SIGKILL to the launcher, whose own launch-gate children carry
+            # the same parent-death lifeline onward to the bridge and the
+            # harness (#857). Without this, a killed gate step left a
+            # `chat run` reparented to init for 34 hours.
+            libc = ctypes.CDLL(None, use_errno=True)
+            if os.getppid() != parent_pid:
+                os.kill(os.getpid(), signal.SIGKILL)
+            if libc.prctl(1, int(signal.SIGKILL), 0, 0, 0) != 0:
+                os.kill(os.getpid(), signal.SIGKILL)
+            if os.getppid() != parent_pid:
+                os.kill(os.getpid(), signal.SIGKILL)
+
         return subprocess.Popen(
             [
                 str(self.agentctl),
@@ -194,6 +213,8 @@ class Fixture:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            start_new_session=True,
+            preexec_fn=die_with_parent,
         )
 
     def processes_with(self, needle: str) -> list[int]:
@@ -230,6 +251,15 @@ class Fixture:
     def close(self) -> None:
         self.shell.kill()
         self.shell.wait()
+        # Finally-net (#857): nothing the fixture started may outlive the
+        # test, even when a test failed before its launcher exited. The
+        # launcher normally stops its children itself; kill any straggler
+        # that still carries this fixture's state path.
+        for pid in self.processes_with(str(self.state)):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
 
 
 @pytest.fixture()
@@ -364,3 +394,85 @@ def test_launch_bridge_killed_first_is_an_error_and_stops_coordinator(
     assert process.returncode == 1
     assert "chat bridge exited" in stderr
     assert _wait_for(lambda: not Path(f"/proc/{harness_pid}").exists(), 15)
+
+
+_OUTER_KILL_HELPER = '''
+import importlib.util
+import json
+import os
+import time
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location(
+    "chat_launch_rust_module", os.environ["CHAT_LAUNCH_MODULE"]
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+def test_outer_fixture_sleeps(tmp_path):
+    made = module.Fixture(tmp_path)
+    process = made.launch()
+    assert module._wait_for(lambda: (made.control / "harness.pid").exists(), 60)
+    bridges = []
+
+    def find_bridge():
+        bridges.clear()
+        bridges.extend(
+            pid for pid in made.bridge_processes() if pid != process.pid
+        )
+        return bool(bridges)
+
+    assert module._wait_for(find_bridge, 60)
+    Path(os.environ["CHAT_LAUNCH_MARKER"]).write_text(
+        json.dumps(
+            {
+                "state": str(made.state),
+                "launcher_pid": process.pid,
+                "bridge_pid": bridges[0],
+                "harness_pid": int((made.control / "harness.pid").read_text()),
+            }
+        )
+    )
+    time.sleep(600)
+'''
+
+
+def test_killing_outer_pytest_leaves_no_chat_run(tmp_path: Path) -> None:
+    """SIGKILL of the outer pytest must take the whole fixture tree down (#857)."""
+    helper = tmp_path / "test_outer_kill_helper.py"
+    helper.write_text(_OUTER_KILL_HELPER)
+    marker = tmp_path / "marker.json"
+    env = dict(os.environ)
+    env["CHAT_LAUNCH_MODULE"] = str(Path(__file__).resolve())
+    env["CHAT_LAUNCH_MARKER"] = str(marker)
+    env["PYTHONPATH"] = str(AU_ROOT / "py") + os.pathsep + env.get("PYTHONPATH", "")
+    outer = subprocess.Popen(
+        [sys.executable, "-m", "pytest", str(helper), "-x", "-q", "-p", "no:cacheprovider"],
+        cwd=tmp_path,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        assert _wait_for(lambda: marker.exists(), 300), "outer pytest never launched its fixture"
+        record = json.loads(marker.read_text())
+        outer.kill()  # SIGKILL to the pytest process only, as a killed gate step does.
+        outer.wait(timeout=30)
+
+        def gone() -> bool:
+            if Path(f"/proc/{record['bridge_pid']}").exists():
+                return False
+            if Path(f"/proc/{record['harness_pid']}").exists():
+                return False
+            if Path(f"/proc/{record['launcher_pid']}").exists():
+                return False
+            return True
+
+        assert _wait_for(gone, 30), f"fixture children survived the outer kill: {record}"
+    finally:
+        if outer.poll() is None:
+            outer.kill()
+            outer.wait(timeout=30)
