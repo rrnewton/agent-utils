@@ -27,7 +27,15 @@ P1. `wrkslots remove --coordinator-authorized --expected-generation 1 --no-lock-
 - Test: while a large fenced slot directory is being deleted, another process acquires and releases the run-population lock promptly, within seconds, not after the deletion.
 - Test: two queued removals plus a waiting admission. The admission gets the lock between the removals.
 - A removal of a multi-GB slot holds the lock for seconds, as measured in the test or a timed run.
+- The pre-deletion salvage and inventory work (`git ls-tree -r`, `git rev-parse --git-common-dir`, remote checks) runs OUTSIDE the lock. Under the lock, only a cheap re-validation runs, for example HEAD, ref and mtime fingerprints; if they changed, redo the work outside the lock. Alternatively the inventory becomes cheaper than a full `ls-tree`. Either way, a plain `wrkslots remove` (without --no-lock-budget) of a cleaned multi-GB slot under load no longer trips the 60 s pre-deletion budget.
+- A remote check that needs a GitHub credential while the credential-pacing bucket is full WAITS, bounded, for a credential slot instead of refusing. If the wait times out, it refuses with a clear "retry later: credential pacing" message. A test covers both a wait that succeeds and one that times out.
 
 # Notes
 
 Reported by the lead on 2026-11-05 at 10:46 AM ET, from a consumer team (P1; it starves validation admissions). Assigned to mu-validate after #879.
+
+More data from the same consumer team, via the lead on 2026-11-05 at 11:39 AM ET:
+- A plain `wrkslots remove` refused a cleaned 6.5 GB slot twice on the 60 s pre-deletion budget under load. The first time the budget ran out on `git rev-parse --git-common-dir` in the shared repo; the second time on `git ls-tree -r --name-only` in the slot's checkout.
+- Another slot refused because the pre-salvage remote check needed a GitHub credential while the git_credential pacing bucket was full ("credential helper ... told us to quit").
+
+The last two acceptance items were added for these.
