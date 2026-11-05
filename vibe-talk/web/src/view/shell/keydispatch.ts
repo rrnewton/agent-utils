@@ -1,8 +1,8 @@
 // The page's keyboard dispatch (`#224 keyboard-shortcuts`, `#344 search-shortcut`, `#403 composer-key-global`;
 // `#624 voice-page-modularity`, moved from the legacy script into view/shell for the plan's step 17): the two
 // keydown listeners that walk the keymap, which binding a key runs, whether a chord may fire where the focus is,
-// and the column it runs in. The keymap itself, what each binding does, and registering the listeners are the
-// page's.
+// the Ctrl keys a text field keeps on a Mac, and the column it runs in. The keymap itself, what each binding
+// does, and registering the listeners are the page's.
 
 import { MAC_FIELD_EDIT_LETTERS, appleKeyboard, chordMatches, swallow, typesCharacter } from "./chords.ts";
 import type { KeyChord, KeyEvent } from "./chords.ts";

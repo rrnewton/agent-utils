@@ -6313,7 +6313,7 @@ function watchBoxInsertions(box) {
 //     reaches the table. A chord takes Ctrl or Cmd on every platform (the owner asked for Ctrl+S on
 //     his Mac, then for the search and now for the message box), except in a text field on a Mac, where Ctrl and a letter macOS edits text with
 //     (Ctrl+K, Ctrl+A, Ctrl+E and the rest) is the field's: there the page's chord is Cmd only
-//     (`macFieldEditKey`).
+//     (`keyDispatch.macFieldEditKey`).
 //   * Those character keys can all be turned off in Settings, "Single-key shortcuts", on by default:
 //     what WCAG 2.1.4 asks of them. The arrows, Escape, Enter and the chords stay.
 //   * THE SELECTED MESSAGE IS REAL FOCUS ON ITS ROW, so a screen reader announces the row and its
@@ -8175,7 +8175,7 @@ function isBarPicker(node) {
 /**
  * @typedef {object} KeyChord
  * @property {string} key `KeyboardEvent.key`: a letter in lower case, a character, or a named key.
- * @property {boolean} [mod] Ctrl, or Cmd: either works on every platform, but for `macFieldEditKey`.
+ * @property {boolean} [mod] Ctrl, or Cmd: either works on every platform, but for `keyDispatch.macFieldEditKey`.
  * @property {boolean} [alt] Alt (Option on a Mac). Only ever with an arrow: Option and a letter types
  *   a character on a Mac.
  * @property {boolean} [shift] For a letter or a named key. A character such as "?" or ":" is matched
@@ -8397,7 +8397,7 @@ const KEYMAP = [
     // repeats are taken too, each being the browser's own Ctrl+E (Cmd+E) as well; a repeat marks nothing.
     // Not `everywhere`, as the search's chord is (`keyDispatch.onEverywhereKey`): that listener refuses the chord's
     // default before anything is done, and this one is the browser's while there is no message to mark;
-    // and it is heard here, after `macFieldEditKey`, so Ctrl+E in a field on a Mac stays the field's.
+    // and it is heard here, after `keyDispatch.macFieldEditKey`, so Ctrl+E in a field on a Mac stays the field's.
     group: KEYS_MESSAGE, chords: [{ key: "e" }, { key: "e", mod: true }], repeats: true,
     does: () => `Done, or not Done. Marked Done, on to the next unread below. ${modKeyName()}+E does it from a ` +
       "message box or the search too, where e is typed, with single keys on or off; the box keeps what you are typing",
@@ -8700,8 +8700,9 @@ const singleKeys = createSingleKeys({
 
 /**
  * The page's keyboard dispatch: the keydown listeners `onPageKey`, at the document, and `onEverywhereKey`, at
- * the window in the capture phase, which walk `KEYMAP`, and `chordAllowed`, the rules at the top of this
- * section. One owner in web/src/view/shell/keydispatch.ts (`#624 voice-page-modularity`).
+ * the window in the capture phase, which walk `KEYMAP`; `chordAllowed`, the rules at the top of this
+ * section; and `macFieldEditKey`, the Ctrl keys a text field keeps on a Mac. One owner in
+ * web/src/view/shell/keydispatch.ts (`#624 voice-page-modularity`).
  *
  * @type {import("./src/view/shell/index.ts").KeyDispatch<HTMLElement>}
  */
