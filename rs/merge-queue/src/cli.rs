@@ -781,6 +781,23 @@ enum Command {
         /// (0, the default, always starts one when it fits).
         #[arg(long, default_value_t = 0)]
         disjoint_root_min_red_percent: u32,
+        /// How many base-rooted batches may validate at once, each disjoint
+        /// from everything in flight (default 1: today's behaviour).
+        #[arg(long, default_value_t = 1)]
+        roots: usize,
+        /// Keep a rooted batch whose base moved instead of cancelling it:
+        /// a green one is requeued at the front for a rebuild, a red one is
+        /// decided as usual.
+        #[arg(long)]
+        keep_stale_roots: bool,
+        /// Build on the stack top only when the recent pass rate is at
+        /// least this percent (0, the default, always stacks).
+        #[arg(long, default_value_t = 0)]
+        stack_min_pass_percent: u32,
+        /// Build batches wider than one only when the recent pass rate is
+        /// at least this percent (0, the default, always allows width).
+        #[arg(long, default_value_t = 0)]
+        batch_min_pass_percent: u32,
         /// Confirm each red by validating the same commit again (`$MQ_RERUN_FROM`) and search a
         /// red batch with prefix probes. Off by default: the first red is the verdict, and a red
         /// batch of several changes goes back as single-change batches.
@@ -1505,6 +1522,10 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             refusal_backoff_secs,
             green_flaky_hold_secs,
             green_flaky,
+            roots,
+            keep_stale_roots,
+            stack_min_pass_percent,
+            batch_min_pass_percent,
             max_deferrals,
             red_without_probe,
             fail_fast,
@@ -1677,6 +1698,10 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 },
                 value_ordering,
                 disjoint_root_min_red_percent,
+                roots,
+                keep_stale_roots,
+                stack_min_pass_percent,
+                batch_min_pass_percent,
                 conflict_prior: crate::state::ConflictPriorConfig {
                     footprints: conflict_footprints,
                 },

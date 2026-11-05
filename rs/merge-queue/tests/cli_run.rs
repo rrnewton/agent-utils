@@ -1219,3 +1219,219 @@ fn infra_blocked_batch_is_held_for_a_ruling_neither_landed_nor_ejected() {
         "{history_kinds:?}"
     );
 }
+
+/// Set top-level config fields in the queue's config.json.
+fn set_config(fx: &Fixture, fields: &[(&str, Value)]) {
+    let path = state_dir(fx).join("config.json");
+    let mut config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for (key, value) in fields {
+        config[key] = value.clone();
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+}
+
+fn item_of(fx: &Fixture, pr: i64) -> Value {
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["pr"] == pr)
+        .cloned()
+        .unwrap()
+}
+
+#[test]
+fn roots_three_disjoint_changes_validate_on_the_base_at_once() {
+    // (A) roots=3, window 3: three disjoint single changes are three
+    // flights, every one built on the base itself.
+    let fx = setup("roots-three", &["--max-batch", "1"]);
+    set_config(
+        &fx,
+        &[
+            ("depth", serde_json::json!(3)),
+            ("roots", serde_json::json!(3)),
+        ],
+    );
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    let base = fx.remote_main();
+    let out = fx.mq_ok(&["run", "--json"]);
+    let r = report(&out);
+    // The first three validations are the three roots (later ones are
+    // the default stale-root rebuilds after the first landing).
+    let mut first: Vec<&Value> = r["validations"].as_array().unwrap().iter().collect();
+    first.sort_by_key(|v| v["start_ms"].as_u64().unwrap_or(0));
+    assert!(first.len() >= 3, "{r}");
+    for validation in &first[..3] {
+        assert_eq!(validation["parent"], base, "every flight is a root: {r}");
+        assert_eq!(validation["prs"].as_array().unwrap().len(), 1);
+    }
+    assert_eq!(landed_prs(&r).len(), 3, "all three land in one run: {r}");
+}
+
+#[test]
+fn keep_stale_roots_requeues_a_green_stale_root_and_ejects_a_red_one() {
+    // (B) A lands and moves the base; B (red, old base) is ejected as a
+    // red single change; C (green, old base) is requeued at the front
+    // with "green at <base>" in its history, rebuilt on the new base.
+    let fx = setup("roots-keep-stale", &["--max-batch", "1"]);
+    set_config(
+        &fx,
+        &[
+            ("depth", serde_json::json!(3)),
+            ("roots", serde_json::json!(3)),
+            ("keep_stale_roots", serde_json::json!(true)),
+        ],
+    );
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/b", "FAIL\n")]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    let base = fx.remote_main();
+    let out = fx.mq_ok(&["run", "--json"]);
+    let r = report(&out);
+    assert_eq!(status(&fx, 1), "landed", "{r}");
+    assert_eq!(status(&fx, 2), "ejected", "{r}");
+    assert_eq!(status(&fx, 3), "landed", "{r}");
+    // C's history names the base it was green at, and C was validated
+    // again on the new base (its second validation's parent is A's tip).
+    let c = item_of(&fx, 3);
+    let details: Vec<String> = c["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["detail"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert!(
+        details.iter().any(|d| d.contains("green at")),
+        "{details:?}"
+    );
+    let c_validations: Vec<&Value> = r["validations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v["prs"] == serde_json::json!([3]))
+        .collect();
+    assert_eq!(c_validations.len(), 2, "C validated on both bases: {r}");
+    assert_eq!(c_validations[0]["parent"], base);
+    assert_ne!(c_validations[1]["parent"], base);
+}
+
+/// Seed the decision history with `green` passes and `red` failures, then
+/// return the fixture ready for a gated run.
+fn seeded_rate(tag: &str, green: usize, red: usize) -> Fixture {
+    let fx = setup(tag, &["--max-batch", "1"]);
+    let mut pr = 100;
+    for _ in 0..green {
+        pr += 1;
+        let name = format!("g{pr}");
+        fx.branch(&name, &[(&format!("tests/{name}"), "ok\n")]);
+        fx.mq_ok(&["submit", &pr.to_string(), "--head", &name]);
+    }
+    for _ in 0..red {
+        pr += 1;
+        let name = format!("r{pr}");
+        fx.branch(&name, &[(&format!("tests/{name}"), "FAIL\n")]);
+        fx.mq_ok(&["submit", &pr.to_string(), "--head", &name]);
+    }
+    fx.mq_ok(&["run", "--json"]);
+    fx
+}
+
+#[test]
+fn stack_gate_below_the_rate_builds_a_root_at_the_rate_stacks() {
+    // (C) stack_min_pass_percent=80 at a 50% pass rate: the second batch
+    // is a root on the base, not stacked on the first batch's tip.
+    let fx = seeded_rate("roots-stack-gate-low", 1, 1);
+    set_config(
+        &fx,
+        &[
+            ("depth", serde_json::json!(3)),
+            ("roots", serde_json::json!(3)),
+            ("stack_min_pass_percent", serde_json::json!(80)),
+        ],
+    );
+    fx.branch("x", &[("tests/x", "ok\n")]);
+    fx.branch("y", &[("tests/y", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "x"]);
+    fx.mq_ok(&["submit", "2", "--head", "y"]);
+    let base = fx.remote_main();
+    let out = fx.mq_ok(&["run", "--json"]);
+    let r = report(&out);
+    let second = r["validations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["prs"] == serde_json::json!([2]))
+        .expect("second change validated");
+    assert_eq!(second["parent"], base, "root, not stacked: {r}");
+
+    // At a 90% pass rate the same setup stacks as today.
+    let fx = seeded_rate("roots-stack-gate-high", 9, 1);
+    set_config(
+        &fx,
+        &[
+            ("depth", serde_json::json!(3)),
+            ("roots", serde_json::json!(3)),
+            ("stack_min_pass_percent", serde_json::json!(80)),
+        ],
+    );
+    fx.branch("x", &[("tests/x", "ok\n")]);
+    fx.branch("y", &[("tests/y", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "x"]);
+    fx.mq_ok(&["submit", "2", "--head", "y"]);
+    let out = fx.mq_ok(&["run", "--json"]);
+    let r = report(&out);
+    let first = r["validations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["prs"] == serde_json::json!([1]))
+        .expect("first change validated");
+    // The validation that landed the second change (a root built before
+    // the first landed may precede it, cancelled).
+    let second = r["validations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v["prs"] == serde_json::json!([2]) && v["green"] == true)
+        .max_by_key(|v| v["start_ms"].as_u64().unwrap_or(0))
+        .expect("second change validated green");
+    assert_eq!(
+        second["parent"], first["commit"],
+        "stacked on the first batch's tip: {r}"
+    );
+}
+
+#[test]
+fn batch_gate_below_the_rate_forces_width_one() {
+    // (C) batch_min_pass_percent=80 at a 50% pass rate: batches are one
+    // change wide despite max_batch 4.
+    let fx = seeded_rate("roots-batch-gate", 1, 1);
+    set_config(&fx, &[("batch_min_pass_percent", serde_json::json!(80))]);
+    // max_batch is the init default (wide); three disjoint changes would
+    // plan as one batch without the gate.
+    fx.branch("x", &[("tests/x", "ok\n")]);
+    fx.branch("y", &[("tests/y", "ok\n")]);
+    fx.branch("z", &[("tests/z", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "x"]);
+    fx.mq_ok(&["submit", "2", "--head", "y"]);
+    fx.mq_ok(&["submit", "3", "--head", "z"]);
+    let out = fx.mq_ok(&["run", "--json"]);
+    let r = report(&out);
+    for validation in r["validations"].as_array().unwrap() {
+        assert_eq!(
+            validation["prs"].as_array().unwrap().len(),
+            1,
+            "width one under the gate: {r}"
+        );
+    }
+    assert_eq!(landed_prs(&r).len(), 3, "{r}");
+}

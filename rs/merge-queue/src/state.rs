@@ -166,6 +166,14 @@ pub struct ValidatorConfig {
 /// Default wall limit of a suspect-flake rerun.
 pub const DEFAULT_SUSPECT_FLAKE_TIMEOUT_SECS: u64 = 1800;
 
+fn default_roots() -> usize {
+    1
+}
+
+fn is_default_roots(value: &usize) -> bool {
+    *value == 1
+}
+
 fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
@@ -967,6 +975,29 @@ pub struct Config {
     /// likely. The default 0 turns the gate off: a root starts whenever one fits.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub disjoint_root_min_red_percent: u32,
+    /// How many base-rooted batches may validate at once, each disjoint
+    /// from everything in flight (1, the default: today's single disjoint
+    /// root in the window's last slot). At least the window means every
+    /// slot may be a root: k independent single-change validations on the
+    /// current base, the first green landing and the rest going stale.
+    #[serde(default = "default_roots", skip_serializing_if = "is_default_roots")]
+    pub roots: usize,
+    /// Keep a rooted batch whose base moved instead of cancelling it: a
+    /// green one is requeued at the front to be rebuilt on the new base, a
+    /// red one is decided as usual. Off (the default) cancels it at once.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_stale_roots: bool,
+    /// Build a batch on the stack top only when the recent pass rate (the
+    /// green share of the last 20 decided validations) is at least this
+    /// percent; below it, build a root on the base instead when `roots`
+    /// allows. 0 (the default) always stacks.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub stack_min_pass_percent: u32,
+    /// Build batches wider than one change only when the recent pass rate
+    /// is at least this percent; below it, batches are one change wide
+    /// whatever `max_batch` says. 0 (the default) always allows width.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub batch_min_pass_percent: u32,
     /// Concurrent git probes while planning (base and pairwise conflict checks, each a git
     /// subprocess). 0 means [`DEFAULT_PROBE_PARALLELISM`]. Probe results are cached across
     /// runs in `probe-cache.json`, so this bounds only cache misses.
@@ -1061,6 +1092,10 @@ impl Default for Config {
             value_ordering: false,
             disable_disjoint_root: false,
             disjoint_root_min_red_percent: 0,
+            roots: 1,
+            keep_stale_roots: false,
+            stack_min_pass_percent: 0,
+            batch_min_pass_percent: 0,
             probe_parallelism: 0,
             union_paths: Vec::new(),
             regenerate: RegenerateConfig::default(),

@@ -3710,6 +3710,12 @@ impl<'a> Runner<'a> {
         rx: &mpsc::Receiver<(u64, JobResult)>,
         pending: &mut VecDeque<Vec<i64>>,
     ) {
+        // Kept stale roots finish and are decided (green: requeued at the
+        // front for a rebuild; red: decided as usual) instead of being
+        // cancelled the moment the base moves.
+        if self.config.keep_stale_roots {
+            return;
+        }
         let base = lock(&self.base).clone();
         if flights
             .iter()
@@ -4604,6 +4610,24 @@ impl<'a> Runner<'a> {
             } else {
                 None
             };
+            // Recent pass rate for the stack/batch gates (see
+            // `Config::stack_min_pass_percent`): the green share of the
+            // same last-20 window. No decided history is no evidence the
+            // rate clears a gate, so it does not.
+            let recent_pass_percent = if self.config.stack_min_pass_percent > 0
+                || self.config.batch_min_pass_percent > 0
+            {
+                crate::decisions::recent_red_rate(&self.state.root, 20)
+                    .map(|red| (1.0 - red) * 100.0)
+            } else {
+                None
+            };
+            let stack_allowed = self.config.stack_min_pass_percent == 0
+                || recent_pass_percent
+                    .is_some_and(|pass| pass >= self.config.stack_min_pass_percent as f64);
+            let wide_allowed = self.config.batch_min_pass_percent == 0
+                || recent_pass_percent
+                    .is_some_and(|pass| pass >= self.config.batch_min_pass_percent as f64);
             let result = (|| -> Result<String, String> {
                 loop {
                     // A landing since the last iteration (a head decided below,
@@ -4769,27 +4793,58 @@ impl<'a> Runner<'a> {
                         && !self.draining()
                     {
                         crate::interrupt::check("building the next batch")?;
+                        // Below the stack pass-rate gate, with every root
+                        // slot taken, a new batch waits for a flight to
+                        // finish instead of building on the stack top.
+                        if !stack_allowed
+                            && !flights.is_empty()
+                            && flights
+                                .iter()
+                                .filter(|flight| flight.rooted && !flight.stacked)
+                                .count()
+                                >= self.config.roots.max(1)
+                        {
+                            break;
+                        }
                         // The disjoint root takes the window's last slot (window of
                         // at least 3): the front batch, when it is disjoint from
                         // everything in flight, validates on the base itself instead
                         // of on the deepest stacked candidate.
+                        let max_roots = self.config.roots.max(1);
+                        let roots_in_flight = flights
+                            .iter()
+                            .filter(|flight| flight.rooted && !flight.stacked)
+                            .count();
+                        let front_disjoint = pending.front().is_some_and(|prs| {
+                            let in_flight: Vec<i64> = flights
+                                .iter()
+                                .flat_map(|flight| flight.candidate.prs.iter().copied())
+                                .collect();
+                            self.batch_disjoint(prs, &in_flight)
+                        });
+                        // Below the stack pass-rate gate a batch is built
+                        // on the base (a root) instead of on the stack top,
+                        // whenever a root slot is free; with the default
+                        // roots=1 that is today's last-slot root exactly.
                         let rooted = !self.config.disable_disjoint_root
                             && (self.config.disjoint_root_min_red_percent == 0
                                 || recent_red_rate.is_some_and(|rate| {
                                     rate * 100.0 >= self.config.disjoint_root_min_red_percent as f64
                                 }))
-                            && window >= 3
-                            && occupied(&flights) + 1 >= window
                             && !flights.is_empty()
-                            && !flights.iter().any(|flight| flight.rooted)
-                            && pending.front().is_some_and(|prs| {
-                                let in_flight: Vec<i64> = flights
-                                    .iter()
-                                    .flat_map(|flight| flight.candidate.prs.iter().copied())
-                                    .collect();
-                                self.batch_disjoint(prs, &in_flight)
-                            });
-                        let prs = pending.pop_front().unwrap_or_default();
+                            && roots_in_flight < max_roots
+                            && front_disjoint
+                            && (max_roots > 1 || (window >= 3 && occupied(&flights) + 1 >= window));
+                        let mut prs = pending.pop_front().unwrap_or_default();
+                        // Below the batch pass-rate gate, batches are one
+                        // change wide whatever the plan made of them: the
+                        // rest go back to the front as singles, in order.
+                        if !wide_allowed && prs.len() > 1 {
+                            let rest: Vec<i64> = prs.split_off(1);
+                            for pr in rest.into_iter().rev() {
+                                pending.push_front(vec![pr]);
+                            }
+                        }
                         let parent = if rooted {
                             let base = self.current_base()?;
                             *lock(&self.base) = base.clone();
@@ -5009,13 +5064,62 @@ impl<'a> Runner<'a> {
                                 .front()
                                 .is_some_and(|flight| flight.candidate.parent != base)
                             {
-                                self.cancel_rooted(
-                                    &mut flights,
-                                    &rx,
-                                    pending,
-                                    "the base moved from the commit it was built on",
-                                );
-                                break;
+                                if self.config.keep_stale_roots
+                                    && flights.front().is_some_and(|flight| {
+                                        flight.result.as_ref().is_some_and(|result| {
+                                            result.as_ref().is_ok_and(|(_, ran)| ran.green())
+                                        })
+                                    })
+                                {
+                                    // A stale root that came back green
+                                    // cannot land as built: its changes go
+                                    // back to the FRONT of pending (ahead of
+                                    // never-validated ones) to be rebuilt
+                                    // on the current base, with the green
+                                    // result in their history. A red stale
+                                    // root falls through and is decided as
+                                    // usual (a red single change ejects).
+                                    let stale = flights.pop_front().expect("front flight");
+                                    let parent = stale.candidate.parent.clone();
+                                    {
+                                        let mut items = lock(&self.items);
+                                        for pr in &stale.candidate.prs {
+                                            if let Some(item) = items.get_mut(pr) {
+                                                item.log(
+                                                    "green-stale-root",
+                                                    format!(
+                                                        "green at {} (the base it was built on); \
+                                                         requeued at the front to be rebuilt on {}",
+                                                        short(&parent),
+                                                        short(&base)
+                                                    ),
+                                                );
+                                                let _ = self.state.save_item(item);
+                                            }
+                                        }
+                                    }
+                                    self.event(
+                                        "stale-root-green",
+                                        &format!(
+                                            "{} was green at {} after the base moved; \
+                                             requeued at the front to be rebuilt on {}",
+                                            list(&stale.candidate.prs),
+                                            short(&parent),
+                                            short(&base)
+                                        ),
+                                    );
+                                    pending.push_front(stale.candidate.prs.clone());
+                                    continue;
+                                }
+                                if !self.config.keep_stale_roots {
+                                    self.cancel_rooted(
+                                        &mut flights,
+                                        &rx,
+                                        pending,
+                                        "the base moved from the commit it was built on",
+                                    );
+                                    break;
+                                }
                             }
                         }
                         let base_before = lock(&self.base).clone();
@@ -5287,7 +5391,9 @@ impl<'a> Runner<'a> {
                         // off a rooted batch's parent: cancel the root at
                         // once, before any other head is decided, so its
                         // validation is cut short and its slot freed.
-                        if lock(&self.base).as_str() != base_before.as_str() {
+                        if !self.config.keep_stale_roots
+                            && lock(&self.base).as_str() != base_before.as_str()
+                        {
                             self.cancel_rooted(
                                 &mut flights,
                                 &rx,

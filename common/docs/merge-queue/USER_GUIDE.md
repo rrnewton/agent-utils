@@ -879,6 +879,10 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `value_ordering` | `false` | Value-ordered scheduling: a waiting batch whose historical green rate (per change, from the decision log) beats the deepest in-flight batch's aborts it for its slot; the aborted batch is replanned later in the run (a `value-abort` event). |
 | `disable_disjoint_root` | `false` | Turn off the disjoint second root: with a window of at least 2, one slot validates a batch built on the base itself, disjoint (no textual conflict, no dependency) from every batch in flight, so a red stack cannot take the whole window down. |
 | `disjoint_root_min_red_percent` | `0` | Only start a disjoint second root when the red share of the last 20 decided validations in the decision records is at least this percent; `0` (the default) always starts one when it fits. Set it with `init --disjoint-root-min-red-percent`. |
+| `roots` | `1` | How many base-rooted batches may validate at once, each disjoint from everything in flight. `1` is today's behaviour (one disjoint root in the window's last slot); at least the window (`depth`) means every slot may be a root. Set it with `init --roots`. |
+| `keep_stale_roots` | `false` | Keep a rooted batch whose base moved instead of cancelling it: a green one is requeued at the front to be rebuilt on the new base (its history says `green at <base>`), a red one is decided as usual. Set it with `init --keep-stale-roots`. |
+| `stack_min_pass_percent` | `0` | Build on the stack top only when the recent pass rate (green share of the last 20 decided validations) is at least this percent; below it, build a root on the base when `roots` allows. `0` always stacks. Set it with `init --stack-min-pass-percent`. |
+| `batch_min_pass_percent` | `0` | Build batches wider than one change only when the recent pass rate is at least this percent; below it, batches are one change wide whatever `max_batch` says. `0` always allows width. Set it with `init --batch-min-pass-percent`. |
 | `union_paths` | `[]` | Attribute patterns merged with Git's union driver (see "Union merges"). |
 | `priority` | absent | `{label, ci_paths}`: the priority label (absent or empty: `mq-priority`; `-`: off) and the CI path patterns for label suggestions. Left out of the file while both are defaults. See "Priority changes". |
 | `regenerate` | empty | `{paths, command, when}`; see "Generated files". |
@@ -1596,6 +1600,28 @@ The base moves only to a commit whose exact tree passed validation (the bors rul
    ejections) and everything behind it is rebuilt on the new base and validated again.
 9. **Obligations.** Every focused landing leaves an obligation until a green complete run
    (`widen`, or `run --widen`) covers that commit or a later one. A red complete run leaves it open.
+
+## The k-wide baseline
+
+The default speculation is a stack: each batch builds on the previous one, so one red batch
+cancels everything built on it. When most batches are red, that wastes the window. The k-wide
+baseline turns the window into `k` independent single-change validations on the current base:
+the first green lands, the rest go stale and are rebuilt on the new base. Stacking and wide
+batches come back only when the recent pass rate earns them:
+
+```json
+"max_batch": 4, "depth": 6, "max_depth": 6,
+"roots": 6, "keep_stale_roots": true,
+"stack_min_pass_percent": 80, "batch_min_pass_percent": 80
+```
+
+With `roots` at least the window, every slot may hold a base-rooted batch, each disjoint from
+everything in flight. `keep_stale_roots` lets a stale root finish instead of cancelling it: a
+green one is requeued at the front of the queue (ahead of never-validated changes, which have
+no pass prediction) with `green at <base>` in its history, and a red single change is ejected
+as the culprit it is, since the base it ran on was green. Below an 80% recent pass rate nothing
+stacks and every batch is one change wide; at or above it, batches widen to `max_batch` and
+build on the stack top as usual. Every field absent is today's behaviour exactly.
 
 ## The precheck
 
