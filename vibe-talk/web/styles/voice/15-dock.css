@@ -208,12 +208,42 @@
 #read-steer-balance {
   display: flex;
   align-items: center;
+  gap: 0.2rem;
   flex: 0 0 var(--read-react-width);
   align-self: stretch;
+  /* `#886 voice-page-autoplay`. At the row's LEFT EDGE, as React is at its right: the two auto margins share the
+     room left over, so the arrows and the count stay together at the exact middle between them. */
+  margin-inline-end: auto;
+}
+
+/* `#886 voice-page-autoplay`. Autoplay: a small toggle filling the box at the row's left, its state pressed or
+   not, lit in the strip's orange while on. Quieter than React, which is solid. */
+.read-steer-toggle {
+  pointer-events: auto;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 2.75rem;
+  padding: 0 0.15rem;
+  border-radius: 0.6rem;
+  border: 1px solid var(--warn);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.read-steer-toggle[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--warn) 45%, var(--panel));
+  font-weight: 700;
 }
 
 #read-react {
   flex: 0 0 var(--read-react-width);
+  /* `#886 voice-page-autoplay`. At the row's RIGHT EDGE, right-justified, as before `#828` drew it beside the arrows. */
+  margin-inline-start: auto;
   min-width: 0;
   padding: 0 0.25rem;
   /* `#828`: a rounded rectangle in the strip's own orange, not a pill in the accent. */
@@ -233,8 +263,10 @@
   opacity: 0.45;
 }
 
-/* `#821`. A read of one block draws its strip for React alone: no arrows, count, blocks, or balance for them. */
-#read-steer[data-react-only] #read-steer-row > :not(#read-react),
+/* `#821`. A read of one block draws its strip for React alone: no arrows, count or blocks. `#886 voice-page-autoplay`:
+   and Autoplay at the left, in its box, without the grip. */
+#read-steer[data-react-only] #read-steer-row > :not(#read-react):not(#read-steer-balance),
+#read-steer[data-react-only] #read-steer-grip,
 #read-steer[data-react-only] #read-timeline {
   display: none;
 }
@@ -428,6 +460,11 @@
   #read-react {
     min-height: 3.25rem;
     font-size: 0.8rem;
+  }
+
+  /* `#886 voice-page-autoplay`. Autoplay as tall as React, a thumb's target. */
+  .read-steer-toggle {
+    min-height: 3.25rem;
   }
 
   #read-steer {

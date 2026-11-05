@@ -110,6 +110,7 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["linksRaw", "vibe-talk.voice.link-raw-urls", false, [[true, "on"], [false, null]], false],
     onOff("composerGrow", "vibe-talk.voice.composer-grow", false, false),
     onOff("readerHidden", "vibe-talk.voice.reader-hidden", false, false),
+    onOff("autoplay", "vibe-talk.voice.autoplay", false, false),
     onOff("enterSends", "vibe-talk.voice.enter-sends", true, THROWN),
     onOff("singleKeys", "vibe-talk.voice.single-keys", true, true),
     onOff("richHeaders", "vibe-talk.voice.rich-headers", true, true),

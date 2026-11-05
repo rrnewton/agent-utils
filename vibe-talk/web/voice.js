@@ -723,6 +723,8 @@ function readAloudOwner() {
     get eachColumn() { return eachColumn; },
     get renderChannelRows() { return renderChannelRows; },
     get dismissMessages() { return dismissMessages; },
+    // `#886 voice-page-autoplay`. What reads after a read heard to its end.
+    nextAfterRead: (parts) => autoplay.nextAfter(parts),
     get currentView() { return screens.view(); },
     get selectedChannelId() { return selectedChannelId; },
     get shownChannelList() { return /** @type {() => HTMLOListElement} */ (shownChannelList); },
@@ -7094,6 +7096,25 @@ const readerRow = createReaderRow({
   keep: (hidden) => deviceSettings().keep(DEVICE_SETTINGS.readerHidden, hidden),
 });
 
+/**
+ * `#886 voice-page-autoplay`. On, a read heard to its end goes on to the next unread message below it, in the view
+ * it was read in (the pane the keys moved last first): web/src/view/voice `createAutoplay`, kept on this device.
+ */
+const autoplay = createAutoplay({
+  byId: (id) => /** @type {any} */ (el(id)),
+  stored: () => deviceSettings().get(DEVICE_SETTINGS.autoplay),
+  keep: (on) => deviceSettings().keep(DEVICE_SETTINGS.autoplay, on),
+  panes: () => [...new Set([activePane(), ...KEY_PANES].filter(Boolean))],
+  paneRows: (pane) => paneRows(pane),
+  idsOf: (row) => idsOf(row),
+  rowIsRead: (row) => rowIsRead(row),
+  paneRowFor: (pane, id, card) => paneRowFor(pane, id, card),
+  read: (row) => (row.hasAttribute("data-card")
+    ? guardQuietly(() => readAloudOwner().readCardAloud(row))()
+    : guardQuietly(() => readAloudOwner().readAloud(idsOf(row)))()),
+  setStatus: (text) => setStatus(text),
+});
+
 // --- the server ------------------------------------------------------------------------------
 
 /**
@@ -7591,6 +7612,7 @@ function renderControlBar() {
   // (`#880 voice-page-menu-placement`).
   el("action-menu-open").hidden = !main;
   el("reader-toggle").hidden = screens.view() !== "discord";
+  el("autoplay-toggle").hidden = screens.view() !== "discord";
   if (actionMenu.open()) actionMenu.render();
   el("open-settings").hidden = Object.prototype.hasOwnProperty.call(SCREEN_TITLES, screens.screen());
   // The pack, by the same rule and as a LOOP rather than by name: `#60 canned-prompt-buttons` adds
@@ -30639,6 +30661,8 @@ el("read-steer-grip").addEventListener("pointercancel", readAloudOwner().onReadG
 el("read-steer-grip").addEventListener("lostpointercapture", readAloudOwner().onReadGripUp);
 el("read-steer-grip").addEventListener("keydown", readAloudOwner().onReadGripKey);
 el("read-steer-grip").addEventListener("dblclick", () => { readAloudOwner().moveReadSteer(null); });
+// `#886 voice-page-autoplay`. The strip's Autoplay toggle.
+el("read-autoplay").addEventListener("click", () => autoplay.setOn(!autoplay.on()));
 if (typeof window.addEventListener === "function") window.addEventListener("resize", readAloudOwner().placeReadSteer);
 
 el("read-aloud").addEventListener("click", () => {
@@ -30676,6 +30700,8 @@ function leaveReadingMode() {
   }
 }
 el("read-aloud-stop").addEventListener("click", leaveReadingMode);
+// `#886 voice-page-autoplay`. Stop forgets a Hang up's halt, as nothing it stopped will end and go on.
+el("read-aloud-stop").addEventListener("click", () => autoplay.halt(null));
 
 /** Turn reading mode on or off. The one path in and out of it, whichever control asked. */
 function setReadingMode(on) {
@@ -30714,6 +30740,9 @@ function setReadingMode(on) {
   renderChannelRows();
 }
 el("hang-up").addEventListener("click", voiceCall().stop);
+// `#886 voice-page-autoplay`. Hang up ends the going on: a read in progress, heard to its end, reads nothing after it.
+el("hang-up").addEventListener("click", () =>
+  autoplay.halt(readAloudOwner().nowPlaying !== null ? readAloudOwner().nowPlaying.id : readAloudOwner().pendingRead));
 el("clear-view").addEventListener("click", voiceTranscript().onClear);
 // `guardQuietly`, not `guard`: erasing a stored record must never be able to hang up a live call.
 el("forget-conversations").addEventListener("click", guardQuietly(voiceTranscript().forgetConversations));
@@ -30771,6 +30800,8 @@ el("action-menu-open").addEventListener("click", () => setActionMenuOpen(!action
 setActionMenuOpen(false);
 // `#880 voice-page-menu-placement`. The reader's row as this device keeps it, before the first frame.
 readerRow.render();
+// `#886 voice-page-autoplay`. Autoplay as this device keeps it, on the strip's toggle and the menu's item.
+autoplay.render();
 // ...and stated once at load, rather than left to the first tap. The markup ships shut, but shut is
 // a state the opener has to be ASSERTING for a screen reader to hear it — an `aria-expanded` that
 // only appears after somebody has already opened the tray is no use to the reader who needs it.
@@ -31332,6 +31363,8 @@ mountListControls({
   toggleSummaries: () => applySummarizeCollapsed(!storedSummarizeCollapsed()),
   readerHidden: () => readerRow.hidden(),
   setReaderHidden: (hidden) => readerRow.setHidden(hidden),
+  autoplayOn: () => autoplay.on(),
+  setAutoplay: (on) => autoplay.setOn(on),
   closeSpeedPopover: () => closeSpeedPopover(),
   focusInActionMenu: () => nodeWithin(el("action-menu"), document.activeElement),
   closeActionMenu: () => setActionMenuOpen(false),

@@ -184,8 +184,10 @@ STRIP_LAYOUT = """() => {
 
 # `#537 scrub-bar-no-play-pause`: no Pause or Stop on the strip; the bar under the list has both.
 # `#627 scrubber-thumb-arrows`: the fat section arrows, the count, the thin block arrows.
-# `#828 voice-page-read-nav-center`: React after them, there while the read plays.
-STRIP_ORDER = ["read-section-prev", "read-section-next", "read-steer-count", "read-prev", "read-next", "read-react"]
+# `#828 voice-page-read-nav-center`: React after them, there while the read plays. `#886 voice-page-autoplay`:
+# Autoplay before them all, at the row's left (after the desk's grip).
+STRIP_ORDER = ["read-autoplay", "read-section-prev", "read-section-next", "read-steer-count", "read-prev", "read-next",
+               "read-react"]
 
 # `#627 scrubber-thumb-arrows`. The arrows' boxes; `#828 voice-page-read-nav-center`, and the row's and the
 # count's, whose centres are one.

@@ -445,7 +445,7 @@ STRIP_JS = """() => {
   const box = (id) => { const n = document.getElementById(id); if (!n || n.hidden || !n.getClientRects().length) return null;
     const r = n.getBoundingClientRect(); return {left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height}; };
   return {strip: box('read-steer'), row: box('read-steer-row'), balance: box('read-steer-balance'),
-          react: box('read-react'), count: box('read-steer-count'),
+          react: box('read-react'), count: box('read-steer-count'), autoplay: box('read-autoplay'),
           arrows: ['read-section-prev', 'read-section-next', 'read-prev', 'read-next'].map(box), timeline: box('read-timeline'),
           width: document.documentElement.clientWidth};
 }"""
@@ -542,9 +542,19 @@ def check_nav_row(desk: Desk, where: str, touch: bool) -> None:
                f"{where}: React is not at the right of the arrows and the count: {layout}")
     desk.check(arrows[0]["left"] - layout["strip"]["left"] >= react["width"],
                f"{where}: the first arrow stands too near the row's left edge: {layout}")
+    # `#886 voice-page-autoplay`: React at the row's RIGHT EDGE, right-justified, and the balance at its left edge
+    # holding Autoplay, both apart from the arrows and the count in the middle.
+    desk.check(row["right"] - react["right"] <= 1, f"{where}: React is not at the row's right edge: {layout}")
+    desk.check(balance["left"] - row["left"] <= 1, f"{where}: the balance is not at the row's left edge: {layout}")
+    # ...the room left over shared between its two sides: none on a narrow phone, the same on each side on a desk.
+    sides = (arrows[0]["left"] - balance["right"], react["left"] - arrows[3]["right"])
+    desk.check(abs(sides[0] - sides[1]) <= 2, f"{where}: the room beside the arrows is not shared {sides}: {layout}")
+    auto = layout["autoplay"]
+    desk.check(isinstance(auto, dict) and auto["left"] >= balance["left"] - 0.5 and auto["right"] <= balance["right"] + 0.5,
+               f"{where}: Autoplay is not drawn in the balance at the row's left: {layout}")
     desk.check(layout["strip"]["right"] <= layout["width"] + 0.5, f"{where}: the strip runs past the screen: {layout}")
     if touch:
-        small = [one for one in [*arrows, react] if one["height"] < 48 or (one in arrows and one["width"] < 44)]
+        small = [one for one in [*arrows, react, auto] if one["height"] < 48 or (one in arrows and one["width"] < 44)]
         desk.check(not small, f"{where}: a phone's arrow or React is under its size: {small}")
 
 
@@ -596,6 +606,10 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
     if voice == "device":
         # A read of one block draws no arrows: its strip stands for React alone.
         desk.check(not arrows, f"react, device: a one-block read's strip draws arrows: {layout}")
+        # `#886 voice-page-autoplay`: Autoplay stays at its left, React at its right edge.
+        desk.check(isinstance(layout["autoplay"], dict) and isinstance(layout["row"], dict)
+                   and layout["row"]["right"] - react["right"] <= 1 and layout["autoplay"]["left"] - layout["row"]["left"] <= 1,
+                   f"react, device: a one-block read's strip lost Autoplay at its left or React at its right edge: {layout}")
     if voice == "agent":
         check_nav_row(desk, "react, paused", touch)
         check_jump_to_reading(desk, "jump, paused", touch, row)

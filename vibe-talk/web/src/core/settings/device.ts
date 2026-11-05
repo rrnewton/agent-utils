@@ -84,6 +84,9 @@ export const DEVICE_SETTINGS = Object.freeze({
   /** `#880 voice-page-menu-placement`. Whether the channel's row of big reader buttons is hidden: a screen-layout
    * choice, kept on this device as `composerGrow` is. A refused read shows it. */
   readerHidden: offUnlessOn("vibe-talk.voice.reader-hidden", false),
+  /** `#886 voice-page-autoplay`. Whether a read heard to its end goes on to the next unread message below it: kept on
+   * this device, as the reader's row is. A refused read is off. */
+  autoplay: offUnlessOn("vibe-talk.voice.autoplay", false),
   /** Whether Enter in the reply box sends. */
   enterSends: onUnlessOff("vibe-talk.voice.enter-sends"),
   /** `#224 keyboard-shortcuts`. Whether single keys are shortcuts. */

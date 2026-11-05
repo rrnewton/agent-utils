@@ -29,6 +29,8 @@ export interface ElementById {
   "author-filter": HTMLButtonElement;
   "author-filter-chip": HTMLSpanElement;
   "author-filter-tip": HTMLSpanElement;
+  "autoplay-toggle": HTMLButtonElement;
+  "autoplay-toggle-label": HTMLSpanElement;
   "back-to-reply": HTMLButtonElement;
   "bar-pack": HTMLDivElement;
   "bar-placement": HTMLSelectElement;
@@ -384,6 +386,7 @@ export interface ElementById {
   "read-aloud": HTMLButtonElement;
   "read-aloud-label": HTMLSpanElement;
   "read-aloud-stop": HTMLButtonElement;
+  "read-autoplay": HTMLButtonElement;
   "read-new": HTMLButtonElement;
   "read-new-label": HTMLSpanElement;
   "read-next": HTMLButtonElement;

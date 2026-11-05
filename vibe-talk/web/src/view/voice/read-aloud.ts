@@ -107,6 +107,11 @@ export interface ReadAloudDependencies<Column = unknown> {
   eachColumn(fn: () => unknown): void;
   renderChannelRows(): void;
   dismissMessages(body: { messages: string[] }): Promise<void>;
+  /**
+   * `#886 voice-page-autoplay`. A read of `parts` heard to its end, before its messages are archived (which can
+   * redraw the list without them): what reads next, or null.
+   */
+  nextAfterRead?(parts: string[]): ((archived: Promise<unknown>) => boolean) | null;
   readonly currentView: string;
   selectedChannelId(): string;
   shownChannelList(): HTMLOListElement;
@@ -664,9 +669,11 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         if (index + 1 < chunks.length) {
           speakPart(index + 1);
         } else {
-          stopReading();
+          // `#886 voice-page-autoplay`: what reads next is found before the archive can redraw the list.
+          const next = deps.nextAfterRead ? deps.nextAfterRead(parts) : null;
+          endReadGoingOn(next !== null);
           setReadState("ready");
-          deps.guardQuietly(() => deps.dismissMessages({ messages: parts }))();
+          goOnAfterRead(next, deps.guardQuietly(() => deps.dismissMessages({ messages: parts }))());
         }
       };
       nowPlaying!.utterance = utterance;
@@ -2383,6 +2390,39 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
 
   /** True while `jumpReading` stops the read it is about to start again elsewhere. */
   let readJumping = false;
+
+  /**
+   * `#886 voice-page-autoplay`. A read heard to its end, stopped: where autoplay may go on (`goingOn`), as a jump
+   * does, keeping the media keys and the audio output, which the next read, started from no gesture (a locked
+   * phone, a steering wheel), could not take back.
+   */
+  function endReadGoingOn(goingOn: boolean) {
+    readJumping = goingOn;
+    try {
+      stopReading();
+    } finally {
+      readJumping = false;
+    }
+  }
+
+  /**
+   * `#886 voice-page-autoplay`. After a read heard to its end and its archive (`archived`): autoplay's next read,
+   * or, where none started, the media keys and the audio output given back as an ordinary stop gives them.
+   */
+  function goOnAfterRead(next: ((archived: Promise<unknown>) => boolean) | null, archived: Promise<unknown>) {
+    if (next === null) return;
+    readJumping = true;
+    try {
+      next(archived);
+    } finally {
+      readJumping = false;
+    }
+    // Nothing started (none left below, or the row gone): a read starts by marking itself pending, at once.
+    if (nowPlaying === null && pendingRead === null) {
+      releaseMediaSession();
+      quietReadAloudContext();
+    }
+  }
   /**
    * `#442 read-strip-order`. True from a jump until the block jumped to plays or fails: the bar keeps
    * Pause and Stop where they were through the wait, rather than giving the thumb's place to a Stop
@@ -3117,10 +3157,12 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
           startNext(at + 1);
           return;
         }
-        stopReading();
+        // `#886 voice-page-autoplay`: what reads next is found before the archive can redraw the list.
+        const next = deps.nextAfterRead ? deps.nextAfterRead(parts) : null;
+        endReadGoingOn(next !== null);
         // EVERY constituent. A row read to the end is a row the reader has heard all of, and
         // archiving only the first would leave its own tail in the queue.
-        deps.guardQuietly(() => deps.dismissMessages({ messages: parts }))();
+        goOnAfterRead(next, deps.guardQuietly(() => deps.dismissMessages({ messages: parts }))());
       });
       audio.addEventListener("error", (why: unknown, detail?: unknown) => {
         if (ticket !== readingTicket) {

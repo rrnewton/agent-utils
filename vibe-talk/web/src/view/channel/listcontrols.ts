@@ -1,6 +1,6 @@
 // The list's tools (`#65 scrollback-paging`, `#262 search-load-older`, `#605`-`#608 server-side-search`, `#48
 // transcript-storage`, `#301 semicolon-expand-cycle`, `#221 read-modes`, `#564 message-summary-toggle`, `#820
-// voice-page-action-menu`, `#880 voice-page-menu-placement`; `#624 voice-page-modularity`, moved from the legacy
+// voice-page-action-menu`, `#880 voice-page-menu-placement`, `#886 voice-page-autoplay`; `#624 voice-page-modularity`, moved from the legacy
 // script's wiring into view/channel for the plan's step 17): the ways further back, the search's ways wider, the
 // action menu's items, and the chips over the list. What each does is the page's; mounted once, in the page's
 // order, and taken down again.
@@ -36,6 +36,9 @@ export interface ListControlsDependencies {
   readerHidden(): boolean;
   setReaderHidden(hidden: boolean): void;
   closeSpeedPopover(): void;
+  /** `#886 voice-page-autoplay`. Whether autoplay is on, and turning it on or off. */
+  autoplayOn(): boolean;
+  setAutoplay(on: boolean): void;
   /** `#820 voice-page-action-menu`. Whether the focus is in the action menu, and closing it. */
   focusInActionMenu(): boolean;
   closeActionMenu(): void;
@@ -75,9 +78,11 @@ export function mountListControls(deps: ListControlsDependencies): ListControls 
     deps.setReaderHidden(!deps.readerHidden());
     if (deps.readerHidden()) deps.closeSpeedPopover();
   });
+  // `#886 voice-page-autoplay`. Autoplay on or off, as the read strip's toggle.
+  listen(el("autoplay-toggle"), "click", () => deps.setAutoplay(!deps.autoplayOn()));
   // `#820 voice-page-action-menu`. Those are the action menu's items: choosing one closes it, after the
   // item's own act (registered just above), and gives the keys back to its opener rather than to nothing.
-  for (const id of ["expand-all", "collapse-all", "summarise", "reader-toggle"]) {
+  for (const id of ["expand-all", "collapse-all", "summarise", "reader-toggle", "autoplay-toggle"]) {
     listen(el(id), "click", () => {
       const inside = deps.focusInActionMenu();
       deps.closeActionMenu();

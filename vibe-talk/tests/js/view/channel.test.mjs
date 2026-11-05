@@ -1212,6 +1212,7 @@ test("`#624 voice-page-modularity`: the list's tools reach the act each names, i
   const press = (id, type = "click") => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener({}));
   let hidden = false;
   let inside = true;
+  let autoplaying = false;
   const controls = mountListControls({
     byId: (id) => target(id),
     leftById: (id) => target(`left ${id}`),
@@ -1229,6 +1230,8 @@ test("`#624 voice-page-modularity`: the list's tools reach the act each names, i
     readerHidden: () => hidden,
     setReaderHidden: (wanted) => { hidden = wanted; log.push(`reader hidden ${wanted}`); },
     closeSpeedPopover: () => log.push("pace closed"),
+    autoplayOn: () => autoplaying,
+    setAutoplay: (wanted) => { autoplaying = wanted; log.push(`autoplay ${wanted}`); },
     focusInActionMenu: () => inside,
     closeActionMenu: () => log.push("menu closed"),
     jumpToNewest: () => log.push("newest"),
@@ -1236,8 +1239,8 @@ test("`#624 voice-page-modularity`: the list's tools reach the act each names, i
   assert.deepStrictEqual(log, ["listen load-older click", "listen left search-in-all click", "listen server-more click",
     "listen search-all-channels change", "listen search-further click", "listen load-older-turns click", "listen collapse-all click",
     "listen expand-all click", "listen todo-filter click", "listen clear-backlog click", "listen undo-dismiss click", "listen summarise click",
-    "listen reader-toggle click", "listen expand-all click", "listen collapse-all click", "listen summarise click", "listen reader-toggle click",
-    "listen jump-newest click"], "a listener was added out of the page's order");
+    "listen reader-toggle click", "listen autoplay-toggle click", "listen expand-all click", "listen collapse-all click", "listen summarise click",
+    "listen reader-toggle click", "listen autoplay-toggle click", "listen jump-newest click"], "a listener was added out of the page's order");
   log.length = 0;
   assert.deepStrictEqual(press("load-older"), ["older asked"], "the control did not answer what it started, which the page suite waits for");
   press("left search-in-all");
@@ -1264,6 +1267,12 @@ test("`#624 voice-page-modularity`: the list's tools reach the act each names, i
   assert.deepStrictEqual(log, ["folded false", "menu closed", "focus action-menu-open true", "folded true", "menu closed", "summaries", "menu closed",
     "reader hidden true", "pace closed", "menu closed", "focus action-menu-open true", "reader hidden false", "menu closed", "focus action-menu-open true"],
     "an item's act came after the menu closed, Hide reader left the pace popover open, or Show reader closed it again");
+  log.length = 0;
+  // `#886 voice-page-autoplay`. Autoplay on, then off, each closing the menu after it.
+  press("autoplay-toggle");
+  press("autoplay-toggle");
+  assert.deepStrictEqual(log, ["autoplay true", "menu closed", "focus action-menu-open true", "autoplay false", "menu closed",
+    "focus action-menu-open true"], "the menu's Autoplay did not flip it before closing the menu");
   controls.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });

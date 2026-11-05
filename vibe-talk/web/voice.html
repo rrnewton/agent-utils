@@ -1068,8 +1068,10 @@
           <div id="read-steer" role="group" aria-label="Reading position" hidden>
             <!-- `#828 voice-page-read-nav-center`. ONE LINE, THE COUNT AT ITS CENTRE. The owner, 2026-11-03: "I want it
                  in the same row. I don't want to add another row." The arrows stand two a side of "k of n", React
-                 after them at the right, and at the left an invisible spacer as wide as React, always kept, so
-                 the count is the row's exact middle. The desk's grip stands inside the spacer. -->
+                 at the right, and at the left a box as wide as React, always kept, so the count is the row's exact
+                 middle. The desk's grip stands inside it. `#886 voice-page-autoplay`: React at the row's RIGHT EDGE,
+                 the box at its left edge holding the Autoplay toggle; the owner, 2026-11-05, "I wanted to leave it on
+                 the edge right justified. Please put it back. Also add a little toggle on the left side". -->
             <div id="read-steer-row">
               <span id="read-steer-balance">
                 <button id="read-steer-grip" type="button" aria-label="Move the reading controls"
@@ -1080,6 +1082,10 @@
                     <circle cx="2" cy="13" r="1.2" /><circle cx="6" cy="13" r="1.2" />
                   </svg>
                 </button>
+                <!-- `#886 voice-page-autoplay`. On, a read heard to its end goes on to the next unread message
+                     below it in this view. Its state is `aria-pressed`, its name fixed; the action menu says it too. -->
+                <button id="read-autoplay" class="read-steer-toggle" type="button" aria-pressed="false"
+                  aria-label="Autoplay" title="Autoplay: when a message ends, read the next unread one below it">Auto</button>
               </span>
               <button id="read-section-prev" class="read-steer-button read-steer-arrow" type="button" data-weight="fat"
                 aria-label="Previous section" title="Previous section">
@@ -4022,6 +4028,11 @@
             -->
             <button id="reader-toggle" class="tray-button" type="button" hidden>
               <span id="reader-toggle-label" class="tray-label">Hide reader</span>
+            </button>
+            <!-- `#886 voice-page-autoplay`. The read strip's Autoplay, here too, so it can be turned on before a read and
+                 with the reader's row hidden. On the channel's view only, as reading is. -->
+            <button id="autoplay-toggle" class="tray-button" type="button" hidden>
+              <span id="autoplay-toggle-label" class="tray-label">Autoplay: off</span>
             </button>
             <p id="action-menu-empty" class="hint" hidden>Nothing to expand, collapse or summarize here.</p>
           </div>

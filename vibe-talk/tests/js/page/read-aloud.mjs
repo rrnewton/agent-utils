@@ -517,6 +517,92 @@ test("the message archives itself when the audio FINISHES, and not before", asyn
   assert.equal(rowState(page, 0).reading, "false", "the row is still marked as speaking");
 });
 
+test("`#886 voice-page-autoplay`: on, a read heard to its end goes on to the next unread message below it, and stops at the end, on Stop, and for a read the reader starts", async () => {
+  const page = newPage();
+  await signIn(page);
+  const ids = ["1000000000000000001", "1000000000000000002", "1000000000000000003", "1000000000000000004"];
+  const rows = await inReadingMode(page, ids.map((id, at) => message({ id, content: `message ${at + 1}`,
+    timestamp: `2026-08-19T05:3${at}:00.000Z` })));
+  const heard = async () => { await page.players.at(-1).end(); await page.settle(); };
+  // Off by default: a read heard to its end reads nothing after it. Message 2 is read now.
+  assert.equal(page.el("read-autoplay").getAttribute("aria-pressed"), "false", "Autoplay is on by default");
+  assert.equal(page.el("autoplay-toggle-label").text(), "Autoplay: off");
+  await rows[1].dispatch("click", {});
+  await page.settle();
+  await heard();
+  assert.deepEqual(readAloudMessages(page), [ids[1]], "off, a read went on");
+  // On, from the action menu, and kept.
+  await page.el("action-menu-open").click();
+  await page.el("autoplay-toggle").click();
+  await page.settle();
+  assert.equal(page.el("action-menu").hidden, true, "choosing Autoplay left the menu open");
+  assert.equal(page.el("read-autoplay").getAttribute("aria-pressed"), "true", "the strip's toggle does not say Autoplay is on");
+  assert.equal(page.el("autoplay-toggle-label").text(), "Autoplay: on");
+  assert.equal(page.storage.get("vibe-talk.voice.autoplay"), "1", "Autoplay on is not kept");
+  // 1 goes on past the read 2 to 3, and 3 to 4; after 4 nothing is unread below, and nothing more is read.
+  await page.el("discord-log").children[0].dispatch("click", {});
+  await page.settle();
+  await heard();
+  assert.deepEqual(readAloudMessages(page).slice(1), [ids[0], ids[2]], "1 did not go on to 3, past the read 2");
+  await heard();
+  assert.deepEqual(readAloudMessages(page).slice(1), [ids[0], ids[2], ids[3]], "3 did not go on to 4");
+  await heard();
+  assert.equal(readAloudMessages(page).length, 4, "past the last unread message a read went on");
+  assert.deepEqual(page.dismissCalls.map((call) => call.messages[0]), [ids[1], ids[0], ids[2], ids[3]],
+    "a read gone on to was not marked read as a read heard to its end is");
+  // Kept across a reload, the strip's toggle and the menu's word with it.
+  const again = newPage(page.storage);
+  await signIn(again);
+  assert.equal(again.el("read-autoplay").getAttribute("aria-pressed"), "true", "a reload forgot Autoplay");
+  assert.equal(again.el("autoplay-toggle-label").text(), "Autoplay: on");
+  // Off from the strip's own toggle.
+  await again.el("read-autoplay").click();
+  assert.equal(again.storage.get("vibe-talk.voice.autoplay"), "0");
+  assert.equal(again.el("autoplay-toggle-label").text(), "Autoplay: off");
+});
+
+test("`#886 voice-page-autoplay`: Stop ends the going on, and a read the reader starts goes on from where it is", async () => {
+  const page = newPage(new Map([["vibe-talk.voice.autoplay", "1"]]));
+  await signIn(page);
+  const ids = ["1000000000000000001", "1000000000000000002", "1000000000000000003", "1000000000000000004"];
+  const rows = await inReadingMode(page, ids.map((id, at) => message({ id, content: `message ${at + 1}`,
+    timestamp: `2026-08-19T05:3${at}:00.000Z` })));
+  assert.equal(page.el("read-autoplay").getAttribute("aria-pressed"), "true", "the kept Autoplay is not on at load");
+  // Stop: the read never ends, so nothing goes on.
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await page.el("read-aloud-stop").click();
+  await page.settle();
+  assert.deepEqual(readAloudMessages(page), [ids[0]]);
+  assert.deepEqual(page.dismissCalls, [], "a stopped read was marked read");
+  // A read the reader starts in place of another: the first never ends, and the new one goes on from itself.
+  await page.el("read-aloud").click();
+  await page.settle();
+  await page.el("discord-log").children[0].dispatch("click", {});
+  await page.settle();
+  await page.el("discord-log").children[2].dispatch("click", {});
+  await page.settle();
+  await page.players.at(-1).end();
+  await page.settle();
+  assert.deepEqual(readAloudMessages(page).slice(1), [ids[0], ids[2], ids[3]], "the read started went on from somewhere else");
+});
+
+test("`#886 voice-page-autoplay`: the device voice goes on too", async () => {
+  const page = devicePage(undefined, new Map([["vibe-talk.voice.autoplay", "1"]]));
+  await signIn(page);
+  const ids = ["1000000000000000001", "1000000000000000002"];
+  const rows = await inReadingMode(page, ids.map((id, at) => message({ id, content: `Message number ${at + 1} is here.`,
+    timestamp: `2026-08-19T05:3${at}:00.000Z` })));
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  page.deviceSpeech.utterances.at(-1).end();
+  await page.settle();
+  assert.match(String(page.deviceSpeech.utterances.at(-1).text), /Message number 2/, "the device voice did not go on to 2");
+  page.deviceSpeech.utterances.at(-1).end();
+  await page.settle();
+  assert.deepEqual(page.dismissCalls.map((call) => call.messages[0]), ids, "a read gone on to by the device voice was not marked read");
+});
+
 test("audio that FAILS archives nothing — the archive is how the reader knows what is left", async () => {
   const page = newPage();
   await signIn(page);
@@ -1444,9 +1530,10 @@ test("`#442 read-strip-order`: the strip reads its arrows and k of n in the mark
   // `#819 voice-page-quoted-reply-and-draft-chip`: and Quote reply, a line of its own over the blocks.
   // `#821 voice-page-read-aloud-react`: React, at the right of the arrows' row, before it. `#828
   // voice-page-read-nav-center`: the row a box of its own, opening on the balance that holds the grip.
-  assert.deepEqual(ids, ["read-steer", "read-steer-row", "read-steer-balance", "read-steer-grip", "read-section-prev",
+  // `#886 voice-page-autoplay`: and Autoplay in the balance at the row's left, after the grip.
+  assert.deepEqual(ids, ["read-steer", "read-steer-row", "read-steer-balance", "read-steer-grip", "read-autoplay", "read-section-prev",
     "read-section-next", "read-steer-count", "read-prev", "read-next", "read-react", "read-steer-quote"],
-    "the strip's controls are not the grip, the section arrows, the count, the block arrows, React and Quote reply alone");
+    "the strip's controls are not the grip, Autoplay, the section arrows, the count, the block arrows, React and Quote reply alone");
   assert.ok(!PAGE_ELEMENTS.has("read-pause") && !PAGE_ELEMENTS.has("read-stop"), "the strip still has a Pause or a Stop of its own");
   // The bar under the list keeps both: Read (the Pause of a read playing) and Stop beside it.
   assert.ok(PAGE_ELEMENTS.has("read-aloud") && PAGE_ELEMENTS.has("read-aloud-stop"), "the bar lost its Pause or its Stop");
@@ -1989,6 +2076,33 @@ test("the blocks of a message heard to its end archive it once, after the last b
   await page.settle();
   assert.deepEqual(page.dismissCalls, [{ messages: [BLOCKED_ID] }]);
   assert.equal(page.el("read-steer").hidden, true);
+});
+
+test("`#886 voice-page-autoplay`: going on from a read in blocks keeps the media keys and the audio output to the next read", async () => {
+  // A phone locked in a pocket, listening by ear: the next read starts from no gesture, which could not take either
+  // back once given up; so going on gives them up no more than a jump does (`readJumping`).
+  const { page, rows } = await blockedRead({ store: new Map([["vibe-talk.voice.autoplay", "1"]]), mediaSession: true });
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const tenFrames = () => joined(wavHeader(1000, 1), pcm(...new Array(10).fill(0x2000)));
+  for (let at = 0; at < 3; at += 1) {
+    page.audioStreams[at].controller.bytes(tenFrames());
+    await page.settle();
+    page.audioStreams[at].controller.drop();
+    await page.settle();
+  }
+  assert.equal(typeof page.mediaSession.handlers.nexttrack, "function", "the premise: a read in blocks holds the media keys");
+  let suspends = 0;
+  const suspend = page.audio.suspend;
+  page.audio.suspend = async () => { suspends += 1; return suspend(); };
+  const states = page.mediaSession.states.length;
+  for (const source of page.audio.sources) source.onended();
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [{ messages: [BLOCKED_ID] }]);
+  assert.match(page.audioStreams.at(-1).url, /ticket-for-1000000000000000002/, "the read in blocks did not go on to the next message");
+  assert.equal(suspends, 0, "the audio output was given up between the reads");
+  // The next read, of one block, lets the keys go as such a read always has; the end of the read before it did not.
+  assert.deepEqual(page.mediaSession.states.slice(states), ["none"], "the media keys were let go at the end of the read as well");
 });
 
 // --- `#379 read-aloud-sentences`: the sentence being said, inside the block being read ------------
