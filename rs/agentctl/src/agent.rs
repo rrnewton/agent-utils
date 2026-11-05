@@ -138,6 +138,10 @@ pub struct QueueStatus {
     pub inflight: Vec<String>,
     /// Prompt identifiers retained after malformed or ambiguous delivery.
     pub failed: Vec<String>,
+    /// Failed entries with sender, first line and arrival label, newest
+    /// first (#903 queue-failed-digest). Empty for every other session.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed_entries: Vec<crate::failed_digest::FailedEntry>,
 }
 
 /// One pending prompt held by an unreadable composer.
@@ -3047,6 +3051,7 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
         composer_unreadable,
         inflight: identifiers_if_directory(&directories.inflight)?,
         failed: identifiers_if_directory(&directories.failed)?,
+        failed_entries: crate::failed_digest::failed_entries(root),
     })
 }
 
@@ -6371,6 +6376,70 @@ mod tests {
         assert_eq!(
             fake.runs(),
             ["owner request", "bridge reminder", "older agent note"]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_before_typing_delivery_surfaces_as_a_digest_at_the_next_idle_drain() {
+        // #903 queue-failed-digest (end to end): a delivery cancelled before
+        // typing was parked in failed/ as possibly_submitted, silently. The
+        // next idle drain types only the digest naming it — never the
+        // original message again — and a second digest is not queued.
+        let directory = TestDirectory::new("failed-digest-e2e");
+        let root = directory.path();
+        enqueue(root, "seed", Some("seed")).unwrap();
+        // Simulate the cancelled delivery's durable record.
+        let failed = root.join("failed");
+        fs::create_dir_all(&failed).unwrap();
+        fs::write(
+            failed.join("lead-1.json"),
+            serde_json::json!({
+                "id": "lead-1",
+                "text": "[from coordb via agentctl · reply: agentctl send coordb]\nland the parser fix today\nwith this second line",
+                "queued_at": 100.0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            failed.join("lead-1.json.error"),
+            serde_json::json!({
+                "artifact": "lead-1.json",
+                "outcome": "possibly_submitted",
+                "error": "control command was cancelled",
+                "failed_at": 200.0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::remove_file(root.join("inbox/seed.json")).unwrap();
+
+        let queued = crate::failed_digest::queue_digest(root)
+            .unwrap()
+            .expect("digest queued");
+        let fake = FakeAgent::new(&["idle"]);
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            root,
+            DrainOptions::default(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.delivered, [queued.as_str()], "{result:?}");
+        let runs = fake.runs();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert!(
+            runs[0].contains("may not have reached you: lead-1 coordb land the parser fix today"),
+            "{runs:?}"
+        );
+        assert!(
+            !runs[0].contains("with this second line"),
+            "the original message is never re-delivered: {runs:?}"
+        );
+        assert!(
+            crate::failed_digest::queue_digest(root).unwrap().is_none(),
+            "once per entry"
         );
     }
 

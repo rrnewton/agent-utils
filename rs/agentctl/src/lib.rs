@@ -22,6 +22,7 @@ pub mod client;
 pub mod codex_goal;
 pub(crate) mod credentials;
 pub mod error;
+pub mod failed_digest;
 pub mod forward_compat;
 pub mod goal_command;
 pub mod harness;

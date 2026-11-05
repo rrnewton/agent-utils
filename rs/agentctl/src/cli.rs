@@ -4472,7 +4472,37 @@ fn waiting_requests(registry: &Path, name: &str) -> Option<(Value, String)> {
 
 /// `agentctl requests`: print the open status-file requests, skipping the designated
 /// `coordinator`'s own status file.
+/// Every agent's failed-queue entries (#903 queue-failed-digest), as
+/// `failed_queue` rows for `agentctl requests`: agent, id, sender, first
+/// line and arrival label, newest first per agent.
+fn failed_queue_rows(registry: &Path) -> Vec<Value> {
+    let mut rows = Vec::new();
+    let Ok(names) = agent_queue::registry::names(registry) else {
+        return rows;
+    };
+    for agent in names {
+        let Ok(directory) = agent_queue::registry::directory(registry, &agent) else {
+            continue;
+        };
+        for entry in crate::failed_digest::failed_entries(&directory.join("queue")) {
+            rows.push(json!({
+                "agent": agent,
+                "id": entry.id,
+                "sender": entry.sender,
+                "first_line": entry.first_line,
+                "label": entry.label,
+                "error": entry.error,
+            }));
+        }
+    }
+    rows
+}
+
 fn run_requests(registry: &Path, coordinator: Option<&str>, as_json: bool) -> Result<i32, Failure> {
+    // Failed-queue entries are listed whether or not status-file requests
+    // are configured (#903): a parked possibly_submitted message must not
+    // stay invisible because a team never turned status files on.
+    let failed = failed_queue_rows(registry);
     let config = match crate::status_requests::StatusConfig::load(registry) {
         Ok(Some(config)) => config,
         Ok(None) => {
@@ -4480,6 +4510,20 @@ fn run_requests(registry: &Path, coordinator: Option<&str>, as_json: bool) -> Re
                 "agentctl requests: status requests are not configured: {} is missing",
                 registry.join(crate::status_requests::CONFIG_FILE).display()
             );
+            if as_json {
+                write_json(&json!({"failed_queue": failed})).map_err(Failure::Output)?;
+            } else {
+                for row in &failed {
+                    println!(
+                        "{} {}: {} {} {}",
+                        row["agent"].as_str().unwrap_or("?"),
+                        row["label"].as_str().unwrap_or("?"),
+                        row["id"].as_str().unwrap_or("?"),
+                        row["sender"].as_str().unwrap_or("?"),
+                        row["first_line"].as_str().unwrap_or("")
+                    );
+                }
+            }
             return Ok(1);
         }
         Err(error) => {
@@ -4492,7 +4536,8 @@ fn run_requests(registry: &Path, coordinator: Option<&str>, as_json: bool) -> Re
     let open = crate::status_requests::scan(registry, &config, &skip, std::time::SystemTime::now());
     let line = crate::status_requests::waiting_line(&open, false);
     if as_json {
-        write_json(&json!({"waiting": line, "requests": open})).map_err(Failure::Output)?;
+        write_json(&json!({"waiting": line, "requests": open, "failed_queue": failed}))
+            .map_err(Failure::Output)?;
         return Ok(0);
     }
     let mut text = format!("{line}\n");
@@ -4504,6 +4549,16 @@ fn run_requests(registry: &Path, coordinator: Option<&str>, as_json: bool) -> Re
             request.path.display(),
             request.line,
             request.heading
+        ));
+    }
+    for row in &failed {
+        text.push_str(&format!(
+            "{} {}: {} {} {}\n",
+            row["agent"].as_str().unwrap_or("?"),
+            row["label"].as_str().unwrap_or("?"),
+            row["id"].as_str().unwrap_or("?"),
+            row["sender"].as_str().unwrap_or("?"),
+            row["first_line"].as_str().unwrap_or("")
         ));
     }
     print!("{text}");

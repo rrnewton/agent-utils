@@ -10422,6 +10422,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             if row["mode"].as_str() == Some("headless") {
                 continue;
             }
+            // #903 queue-failed-digest: an agent with nothing pending but
+            // failed entries it was never told about gets one digest prompt
+            // queued, so this pass delivers it when the agent is next idle.
+            // The digest never re-delivers the failed message itself.
+            if !check_only {
+                if let Ok(queue) = self.queue(name) {
+                    let _ = crate::failed_digest::queue_digest(&queue);
+                }
+            }
             let Ok(pending) = self.pending_prompts(name) else {
                 continue;
             };
