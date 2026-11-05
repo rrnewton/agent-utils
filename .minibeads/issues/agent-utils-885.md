@@ -1,0 +1,41 @@
+---
+title: 'wrkslots-orphaned-create-journal: an orphaned create can be aborted and never blocks unrelated creates'
+status: open
+priority: 0
+issue_type: bug
+assignee: mu-salvage
+created_at: 2026-11-05T11:42:03.624088077+00:00
+updated_at: 2026-11-05T11:42:03.624088077+00:00
+---
+
+# Description
+
+P0. One orphaned `wrkslots create` blocks every later create in a consumer project, including the creation of its merge queue's validate checkouts. It also cannot be aborted through any supported command.
+
+**State (2026-11-05, consumer host):**
+- A `CREATE.<n>.<host>.<seq>.<slot>.journal` records owner null, hook_progress 1, and a coordinator_lease naming the project coordinator's own live process.
+- The create was orphaned when its parent shell received SIGTERM. It had been refused mid-way ("coordinator PID … is not in the invoking process ancestry"), leaving a partial slot directory and a Git worktree registration.
+
+**Effect:**
+- Every later create refuses with "process state is indeterminate: owner=indeterminate (no owner process generation is recorded); coordinator=live". `_cmd_create` runs `_classify_create_journals`, which refuses on any indeterminate journal (py/wrkslots/cli.py ~9928-9933), before `_assert_interrupted_creates_unrelated` can say the journal concerns a different slot.
+- `recover --slot … --coordinator-pid <coordinator>` and `--abort-create` refuse with the same text.
+
+# Design
+
+1. **Supported abort.** For an owner-less create journal whose coordinator_lease is the invoking coordinator itself (live, and proven to be the caller), when no create is running (the journal lock is free, or held by no live process): roll the partial slot back according to the journal's recorded phase.
+   - Fence the partial directory, prune the Git worktree registration, and leave no registry row.
+   - Record it with an event kind the pinned consumer wrkslots already understands.
+2. **Unrelated creates proceed.** A create of a different slot runs the unrelatedness check first. An indeterminate create journal for another slot, with disjoint paths, does not block it. Keep refusing when the requested slot or paths overlap the journal's.
+3. Both editions.
+4. **Compatibility.** The post-abort state is readable by the consumer's pinned wrkslots (agent-utils f79789533dc0), and that version's create-journal classification passes on it.
+
+# Acceptance Criteria
+
+- Test: SIGTERM a create's parent mid-create, leaving an owner-less create journal; then a create of an unrelated slot succeeds.
+- Test: the coordinator's `recover --abort-create` rolls the partial slot back cleanly (directory fenced, registration pruned, no row), and is refused while a create still holds the journal lock.
+- Test: the pinned f79789533dc0 code classifies the post-abort state cleanly.
+- Landed alone, with the SHA sent to the lead at once.
+
+# Notes
+
+Reported by the lead on 2026-11-05 at 06:41 AM ET (P0; it blocks a consumer's merge queue). Assigned to mu-salvage, which pauses #881 for it.
