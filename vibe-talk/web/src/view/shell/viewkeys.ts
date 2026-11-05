@@ -8,7 +8,7 @@ import type { Screens } from "./screens.ts";
 /** The four views Ctrl+1 to Ctrl+4 choose, in the picker's order. */
 export type ViewChoice = "main" | "flat" | "threads" | "columns";
 
-/** An undo on offer, as far as the key reads it: when it was made, and what it is of. */
+/** An undo on offer, as far as the key reads it: when it was made. */
 export interface UndoOfferStamp {
   /** Its undo stamp; an offer from before the stamps has none, and counts oldest. */
   readonly at?: number;

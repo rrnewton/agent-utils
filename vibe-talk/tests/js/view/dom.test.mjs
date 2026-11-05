@@ -958,7 +958,7 @@ test("`#624 voice-page-modularity`: the view, filter and undo keys choose from t
     doneOffer: () => state.done,
     undoDone: () => log.push("undo done"),
     sendOffer: () => state.send,
-    sendHeld: () => state.sendHeld,
+    sendHeld: (id) => state.sendHeld && id === state.send.id,
     putBackSend: (id) => log.push(`put back ${id}`),
     bookmarkOffer: () => state.bookmark,
     currentChannelId: () => state.current,
@@ -983,6 +983,12 @@ test("`#624 voice-page-modularity`: the view, filter and undo keys choose from t
   assert.deepStrictEqual(run(() => keys.viewFromKeyboard("main", false)), [false], "a view was chosen with no channel");
   assert.deepStrictEqual(run(() => keys.voiceFromKeyboard(false)), [true, "switch"], "Ctrl+0 needed a channel, or did not go to the call's view");
   assert.deepStrictEqual(run(() => keys.voiceFromKeyboard(false)), [true], "Ctrl+0 on the call's view left it");
+  state.view = "discord";
+  assert.deepStrictEqual(run(() => keys.voiceFromKeyboard(true)), [true], "a held Ctrl+0's repeat switched the view");
+  state.side = true;
+  state.screen = "help";
+  assert.deepStrictEqual(run(() => keys.voiceFromKeyboard(false)), [true, "in main", "close settings", "switch"], "Ctrl+0 from Help in the right column did not leave Help for the call's view, in the left column");
+  state.side = false;
   state.screen = "signin";
   assert.deepStrictEqual(run(() => keys.voiceFromKeyboard(false)), [false]);
   state.screen = "main";
@@ -1005,6 +1011,8 @@ test("`#624 voice-page-modularity`: the view, filter and undo keys choose from t
   state.send = { id: "s1", at: 5 };
   state.bookmark = { channel: "c1", at: 3 };
   assert.deepStrictEqual(run(() => keys.undoFromKeyboard()), [true, "put back s1"], "the newest offer was not taken back first");
+  state.send = { id: "s1", at: 3 };
+  assert.deepStrictEqual(run(() => keys.undoFromKeyboard()), [true, "put back s1"], "of two offers made at once, the one listed first was not taken back first");
   state.send = null;
   assert.deepStrictEqual(run(() => keys.undoFromKeyboard()), [true, "bookmark back"]);
   state.bookmark = { channel: "c2", at: 9 };
