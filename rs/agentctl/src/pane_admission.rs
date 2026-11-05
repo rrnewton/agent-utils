@@ -47,12 +47,17 @@ pub fn pane_dir(pane_id: &str) -> PathBuf {
     if let Some(dir) = std::env::var_os("AGENTCTL_PANE_ADMISSION_DIR") {
         return PathBuf::from(dir).join(sanitised(pane_id));
     }
-    // Tests must never write the real per-user state directory.
-    #[cfg(test)]
-    return std::env::temp_dir()
-        .join(format!("agentctl-test-panes-{}", std::process::id()))
-        .join(sanitised(pane_id));
-    #[cfg(not(test))]
+    // Tests must never write the real per-user state directory: test
+    // binaries (unit and integration) live under a `deps` directory.
+    if std::env::current_exe().is_ok_and(|exe| exe.to_string_lossy().contains("/deps/")) {
+        return std::env::temp_dir()
+            .join(format!(
+                "agentctl-test-panes-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+            .join(sanitised(pane_id));
+    }
     {
         let state = std::env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
@@ -107,8 +112,33 @@ impl PaneAdmission {
             .write(true)
             .open(dir.join("admission.lock"))
             .map_err(|e| AdapterError::unavailable(format!("pane admission lock: {e}")))?;
-        lock.lock_exclusive()
-            .map_err(|e| AdapterError::unavailable(format!("pane admission flock: {e}")))?;
+        // Bounded wait: an unbounded flock here made `chat run` hang on
+        // shutdown until systemd's stop timeout when another sender held
+        // the pane. Try-lock in short naps up to the deadline instead.
+        let lock_timeout = std::env::var("AGENTCTL_PANE_LOCK_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(10));
+        let lock_deadline = std::time::Instant::now() + lock_timeout;
+        loop {
+            match lock.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= lock_deadline {
+                        return Err(AdapterError::unavailable(format!(
+                            "pane admission flock timed out after {lock_timeout:?}: {e}"
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(AdapterError::unavailable(format!(
+                        "pane admission flock: {e}"
+                    )))
+                }
+            }
+        }
         // Pace while holding the lock so starts are serialised at >= interval.
         let stamp = dir.join("last-admission");
         let last = std::fs::read_to_string(&stamp)
@@ -268,6 +298,22 @@ mod tests {
             offenders.is_empty(),
             "direct pane input outside admission: {offenders:?}"
         );
+    }
+
+    #[test]
+    fn a_held_admission_lock_times_out_instead_of_hanging() {
+        std::env::set_var("AGENTCTL_PANE_LOCK_TIMEOUT_MS", "300");
+        let held = PaneAdmission::acquire("w9:p9").expect("first acquire");
+        let started = std::time::Instant::now();
+        let outcome = PaneAdmission::acquire("w9:p9");
+        assert!(outcome.is_err(), "second acquire must time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(held);
+        std::env::remove_var("AGENTCTL_PANE_LOCK_TIMEOUT_MS");
     }
 
     #[test]

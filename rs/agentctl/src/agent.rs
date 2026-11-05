@@ -498,7 +498,7 @@ impl AgentApi for HerdrClient {
             };
             let outcome = crate::pane_admission::admit(
                 pane_id,
-                "agentctl",
+                &sender_or(runtime, "agentctl"),
                 &runtime.audit_id(),
                 "verified",
                 || {
@@ -528,7 +528,7 @@ impl AgentApi for HerdrClient {
                         if appeared {
                             return crate::pane_admission::admit(
                                 pane_id,
-                                "agentctl",
+                                &sender_or(runtime, "agentctl"),
                                 &runtime.audit_id(),
                                 "verified-late",
                                 || {
@@ -549,10 +549,16 @@ impl AgentApi for HerdrClient {
             return Ok(outcome);
         }
         runtime.input_started();
-        crate::pane_admission::admit(pane_id, "agentctl", "", "unconfirmed", || {
-            HerdrClient::prompt_agent_with_cancellation(self, pane_id, text, &cancelled)
-                .map(|()| Submission::Unconfirmed)
-        })
+        crate::pane_admission::admit(
+            pane_id,
+            &sender_or(runtime, "agentctl"),
+            &runtime.audit_id(),
+            "unconfirmed",
+            || {
+                HerdrClient::prompt_agent_with_cancellation(self, pane_id, text, &cancelled)
+                    .map(|()| Submission::Unconfirmed)
+            },
+        )
     }
 
     fn wait_agent_status_with_runtime(
@@ -736,6 +742,10 @@ pub trait AgentRuntime {
     }
     /// Queue message ID this delivery serves, for the admission audit log.
     fn audit_id(&self) -> String {
+        String::new()
+    }
+    /// Real sender of this delivery (from its sender header), for the audit.
+    fn audit_sender(&self) -> String {
         String::new()
     }
     /// Note that a submission is about to make its first terminal input
@@ -1002,7 +1012,20 @@ impl AgentRuntime for PasteTrackingRuntime<'_> {
     }
 
     fn audit_id(&self) -> String {
-        self.inner.audit_id()
+        self.inflight_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    fn audit_sender(&self) -> String {
+        let document = self.document.borrow();
+        document
+            .get("text")
+            .and_then(Value::as_str)
+            .and_then(|text| crate::sender_header::parse(text.lines().next()?))
+            .map(|header| header.sender)
+            .unwrap_or_default()
     }
 
     fn prompt_printed(&self, message_id: &str) {
@@ -1037,6 +1060,28 @@ struct BatchTrackingRuntime<'a> {
 }
 
 impl AgentRuntime for BatchTrackingRuntime<'_> {
+    fn audit_id(&self) -> String {
+        self.inflight_paths
+            .first()
+            .and_then(|path| path.file_stem())
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    fn audit_sender(&self) -> String {
+        self.inflight_paths
+            .first()
+            .and_then(|path| load_message(path).ok())
+            .and_then(|document| {
+                document
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .and_then(|text| crate::sender_header::parse(text.lines().next()?))
+                    .map(|header| header.sender)
+            })
+            .unwrap_or_default()
+    }
+
     fn paste_drawn_as(&self, label: &str) {
         *self.paste_label.borrow_mut() = Some(label.to_owned());
     }
@@ -1057,9 +1102,6 @@ impl AgentRuntime for BatchTrackingRuntime<'_> {
     }
     fn delivery_wait_chunk(&self) -> Option<Duration> {
         self.inner.delivery_wait_chunk()
-    }
-    fn audit_id(&self) -> String {
-        self.inner.audit_id()
     }
 
     fn prompt_printed(&self, message_id: &str) {
@@ -1160,6 +1202,16 @@ impl SystemRuntime {
     pub fn note_terminated(&self) {
         self.terminated
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The audit sender for a delivery: its real sender when known, else `fallback`.
+pub(crate) fn sender_or(runtime: &dyn AgentRuntime, fallback: &str) -> String {
+    let sender = runtime.audit_sender();
+    if sender.is_empty() {
+        fallback.to_owned()
+    } else {
+        sender
     }
 }
 

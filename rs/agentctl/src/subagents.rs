@@ -1686,7 +1686,7 @@ impl ManagedApi for HerdrClient {
         if crate::submission::verifies(&harness, text) {
             return crate::pane_admission::admit(
                 pane,
-                "subagents",
+                &agent::sender_or(runtime, "subagents"),
                 &runtime.audit_id(),
                 "verified",
                 || {
@@ -1703,7 +1703,7 @@ impl ManagedApi for HerdrClient {
         }
         crate::pane_admission::admit(
             pane,
-            "subagents",
+            &agent::sender_or(runtime, "subagents"),
             &runtime.audit_id(),
             "unconfirmed",
             || {
@@ -4693,7 +4693,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             let guarded = self.guarded(runtime)?;
             return crate::pane_admission::admit(
                 pane_id,
-                "subagents",
+                &agent::sender_or(runtime, "subagents"),
                 &runtime.audit_id(),
                 "unknown",
                 || {

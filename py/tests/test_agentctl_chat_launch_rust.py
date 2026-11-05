@@ -304,6 +304,19 @@ def test_launch_sigterm_stops_both_children(fixture: Fixture) -> None:
     assert _wait_for(lambda: not fixture.processes_with(str(fixture.state)), 15)
 
 
+def test_launch_sigterm_exits_within_a_few_seconds(fixture: Fixture) -> None:
+    # Regression: admission work (pane flock / late-paste polling) must
+    # never keep `chat run` alive until systemd's stop timeout.
+    process = fixture.launch()
+    assert _wait_for(lambda: (fixture.control / "harness.pid").exists(), 60)
+    assert _wait_for(lambda: bool(fixture.processes_with(str(fixture.state))), 60)
+    started = time.monotonic()
+    process.send_signal(signal.SIGTERM)
+    _stdout, _stderr = process.communicate(timeout=10)
+    assert time.monotonic() - started < 10
+    assert process.returncode == 0
+
+
 def test_launch_agent_label_override_is_persisted(fixture: Fixture) -> None:
     process = fixture.launch(
         extra_env={"FAKE_HARNESS_EXIT": "0"}, args=["--agent-label", "custom-label"]
