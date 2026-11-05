@@ -5,7 +5,7 @@ priority: 1
 issue_type: feature
 assignee: cl-start
 created_at: 2026-11-04T22:42:10.018251750+00:00
-updated_at: 2026-11-05T01:30:00.000000000+00:00
+updated_at: 2026-11-05T14:36:49.000000000+00:00
 ---
 
 # Description
@@ -50,3 +50,10 @@ P1, owner via the lead (2026-11-04 17:36-17:41 ET). Assigned to cl-start after #
 - On every harness, the bridge's own prompt rows (the `reply: <CHAT_REPLY_N>` header field and the `Reply between a line ...` instruction) are never read as tags. Every routing notice ends with `agentctl chat reply ID --file FILE`.
 - P0b (cl-start, 2026-11-04): lenient tags on every harness and in an agentcloud session's history text, which goes through the same scan. To keep prose quotes from being read as tags, an opening tag counts only at the start of a message, a paragraph or a row after a finished sentence, or after a lead that ends with a colon, and not inside an open block. A closing tag counts where it closes the open block of its ID, or ends a finished sentence at the end of its row when no block is open. Tags elsewhere (mid-sentence, code spans, fences, tool calls) keep the inline-tag report. Tags of an open request written with a character missing or extra (`<CHAT_REPLY_N` with no `>`, `< CHAT_REPLY_N >`, `&lt;...&gt;`, `[CHAT_REPLY_N]`, a lowercase name) are reported once as `mangled`, with a notice naming `agentctl chat reply ID --file FILE`. Known gap: `CHAT_REPLY_N>` is not reported, because that is how the bridge's own `‹` quotation reads once a pane drops the `‹`. The 34 inline-policy tests were rewritten: tags at a message start now send, and the inline-report tests use a prose lead.
 - Remaining: agentterm recognition and transcript harvesting (C); the auto-fallback to unknown (B); an agentcloud record through its agentterm view (D).
+- C (cl-start, 2026-11-05): an agentterm pane driven as `--harness unknown` is read by its input frame (`crate::harness::agentterm`).
+  - `╭ idle ─…` is idle, and a spinner with `working M:SS` is working. Before, a long silent turn looked idle after 2 s, and the ticking idle clock looked busy. Any other label reads `unknown`.
+  - A delivery is refused during a turn (Enter would steer it) and under another label.
+  - A composer draft that is not a placeholder is refused with the shared `composer already holds unsubmitted text` wording, so the bridge's alarm and draft reporting see it. An earlier pass's own stranded paste still gets Enter.
+  - Tested with screens laid out like the recorded idle and working agentterm screens (names replaced), and through the fake TUI.
+  - Not done: the stale-composer clear for an agentterm draft (agentterm's clearing keys are unverified), and transcript harvesting. Replies are captured from the screen, as done in P0, or with `chat reply --file`.
+- Remaining: B and D.

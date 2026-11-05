@@ -116,9 +116,20 @@ pub fn observe_pane(pane_id: &str, screen: &str, now: Duration) -> Duration {
 /// The Herdr-style status of a generic pane: `blocked` with a menu or dialog open, `idle` once
 /// the screen stood still for [`QUIET`], else `working`.
 #[must_use]
+///
+/// A screen that ends with agentterm's input frame ([`crate::harness::agentterm`]) is read by
+/// that frame instead of by stillness: `idle` or `working` as it says, and `unknown` under any
+/// other label.
 pub fn status(screen: &str, quiet_for: Duration) -> &'static str {
+    use crate::harness::agentterm::{self, FrameState};
     if screen::menu_open(screen, None).is_some() {
         "blocked"
+    } else if let Some(frame) = agentterm::frame(screen) {
+        match frame.state {
+            FrameState::Idle => "idle",
+            FrameState::Working => "working",
+            FrameState::Other(_) => "unknown",
+        }
     } else if quiet_for >= QUIET {
         "idle"
     } else {
@@ -180,6 +191,9 @@ pub fn submit(
         return refuse(format!(
             "pane {pane_id} shows a menu or dialog ({line:?}); nothing was typed"
         ));
+    }
+    if let Some(reason) = agentterm_refusal(pane_id, &before, text, runtime) {
+        return refuse(reason);
     }
     let started = runtime.monotonic();
     let receipt = |presses: u32, evidence: String, printed: bool, settled: bool| {
@@ -304,6 +318,49 @@ pub fn submit(
             next_press = now.saturating_add(wait);
         }
     }
+}
+
+/// Why nothing may be typed into an agentterm pane showing `screen` ([`crate::harness::agentterm`]):
+/// a running turn, which Enter would steer; a frame label that is neither idle nor working; or a
+/// composer draft that is not this prompt left by an earlier pass. `None` for any other screen.
+fn agentterm_refusal(
+    pane_id: &str,
+    screen: &str,
+    text: &str,
+    runtime: &dyn AgentRuntime,
+) -> Option<String> {
+    use crate::harness::agentterm::{self, FrameState};
+    let frame = agentterm::frame(screen)?;
+    match frame.state {
+        FrameState::Working => {
+            return Some(format!(
+                "pane {pane_id}: agentterm shows a running turn, and Enter would steer it; \
+                 nothing was typed"
+            ))
+        }
+        FrameState::Other(label) => {
+            return Some(format!(
+                "pane {pane_id}: agentterm's input frame reads {label:?}, neither idle nor \
+                 working; nothing was typed"
+            ))
+        }
+        FrameState::Idle => {}
+    }
+    let draft = frame.draft?;
+    if runtime.stranded_retry() || screen::stranded(screen, text) {
+        return None;
+    }
+    let preview: String = draft
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(120)
+        .collect();
+    Some(format!(
+        "pane {pane_id} composer already holds unsubmitted text {preview:?}; refusing to append \
+         to it; nothing was typed"
+    ))
 }
 
 /// Poll after the paste until it shows, was consumed, or the stage deadline passes.
@@ -446,6 +503,9 @@ pub(crate) mod fake {
         pub menu: Option<String>,
         /// Status rows drawn under everything else.
         pub footer: Vec<String>,
+        /// Draw the input in agentterm's input frame under this label (`idle`, `⠹ working
+        /// 0:12`, ...), instead of a bare line.
+        pub agentterm: Option<String>,
         /// Every prompt the TUI took, in order.
         pub submitted: Vec<String>,
         /// Every key and paste received.
@@ -503,7 +563,16 @@ pub(crate) mod fake {
                 .enumerate()
                 .map(|(index, row)| format!("{}{row}", if index == 0 { "> " } else { "  " }))
                 .collect();
-            if state.boxed {
+            if let Some(label) = &state.agentterm {
+                rows.push(format!("╭ {label} ──────────────────────────────[ lock ]╮"));
+                if input.is_empty() {
+                    rows.push("│> send a message to the session".to_owned());
+                } else {
+                    rows.extend(lines.iter().map(|row| format!("│{row}")));
+                }
+                rows.push("╰ ● host-a ─ model-x ─ ctx ███░ 37% ─────────────╯".to_owned());
+                rows.push(" ⏎ send · / commands · ^X b sessions · ^D quit".to_owned());
+            } else if state.boxed {
                 rows.push("┌ Input ─────────────────────────┐".to_owned());
                 rows.extend(lines.iter().map(|row| format!("│ {row}")));
                 rows.push("└────────────────────────────────┘".to_owned());
@@ -607,6 +676,62 @@ mod tests {
         assert!(receipt.printed, "{receipt:?}");
         assert_eq!(tui.state().submitted, vec![PROMPT.to_owned()]);
         assert_eq!(enters(&tui), 1);
+    }
+
+    #[test]
+    fn delivers_into_an_idle_agentterm_frame() {
+        // #852 unknown-tui-bridge.
+        let tui = FakeTui::new();
+        tui.state().agentterm = Some("idle".to_owned());
+        let outcome = run(&tui).unwrap();
+        assert!(matches!(outcome, Submission::Verified(_)), "{outcome:?}");
+        assert_eq!(tui.state().submitted, vec![PROMPT.to_owned()]);
+        assert_eq!(pastes(&tui), 1);
+    }
+
+    #[test]
+    fn agentterm_is_never_typed_into_during_a_turn_or_under_another_label() {
+        let tui = FakeTui::new();
+        tui.state().agentterm = Some("⠹ working 3:50".to_owned());
+        let Submission::NotStaged(reason) = run(&tui).unwrap() else {
+            panic!("expected a refusal");
+        };
+        assert!(reason.contains("running turn"), "{reason}");
+        tui.state().agentterm = Some("reconnecting".to_owned());
+        let Submission::NotStaged(reason) = run(&tui).unwrap() else {
+            panic!("expected a refusal");
+        };
+        assert!(reason.contains("\"reconnecting\""), "{reason}");
+        assert!(tui.state().inputs.is_empty(), "nothing was typed");
+    }
+
+    #[test]
+    fn an_agentterm_draft_is_refused_but_our_own_stranded_paste_is_sent() {
+        let tui = FakeTui::new();
+        tui.state().agentterm = Some("idle".to_owned());
+        tui.state().input = "half a sentence the owner typed".to_owned();
+        let Submission::NotStaged(reason) = run(&tui).unwrap() else {
+            panic!("expected a refusal");
+        };
+        assert!(
+            reason.contains("composer already holds unsubmitted text \"half a sentence"),
+            "{reason}"
+        );
+        assert!(tui.state().inputs.is_empty(), "nothing was typed");
+        // A paste of this very prompt left by an earlier pass gets Enter, never a second paste.
+        tui.state().input = PROMPT.to_owned();
+        assert!(matches!(run(&tui).unwrap(), Submission::Verified(_)));
+        assert_eq!(tui.state().submitted, vec![PROMPT.to_owned()]);
+        assert_eq!(pastes(&tui), 0);
+    }
+
+    #[test]
+    fn an_agentterm_pane_reads_idle_or_working_from_its_frame_not_its_stillness() {
+        use crate::harness::agentterm::tests::{IDLE, WORKING};
+        assert_eq!(status(IDLE, Duration::ZERO), "idle");
+        assert_eq!(status(WORKING, Duration::from_secs(600)), "working");
+        let other = IDLE.replace("╭ idle ─", "╭ reconnecting ─");
+        assert_eq!(status(&other, Duration::from_secs(600)), "unknown");
     }
 
     #[test]

@@ -1907,6 +1907,16 @@ alone, with these rules:
   text left there (`typed_as`), the drain logs it (a notice the first time),
   and every later drain presses Enter only, never typing it again, until it
   leaves the bottom. Prompts behind it wait rather than being typed on top of it.
+- **agentterm**: a pane showing agentterm's view of a remote session is read by
+  agentterm's input frame at the bottom of the screen, not by stillness:
+  `╭ idle ─…` is `idle`, and a spinner with `working M:SS` is `working`. Any
+  other label is `unknown`, and nothing is typed under it. A running turn is
+  never typed into, because Enter there steers the turn. A composer row after
+  `│>` that is neither `send a message to …` nor `write here to steer during
+  this turn` is a draft. A delivery is refused with the same wording as any
+  other harness (`composer already holds unsubmitted text`), unless the draft is
+  this very prompt left by an earlier pass, which gets Enter. The chat bridge's
+  `--stale-composer-clear-after` does not clear an agentterm draft yet.
 - **Never into a menu**: no key is sent while the bottom of the screen shows
   numbered options `1.`, `2.` … with a cursor glyph or highlight on one of them,
   a `(y/n)`-style prompt, or any known harness's approval phrase. Our own

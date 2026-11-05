@@ -12,6 +12,8 @@
 //! * [`codex`], Codex;
 //! * [`muse`], Muse;
 //! * [`agentcloud`], remote agentcloud sessions, which have no local screen at all;
+//! * [`agentterm`], not an adapter: the input frame of agentterm's view of such a session, which
+//!   the generic rules read;
 //! * [`unknown`], any other TUI, driven by harness-neutral rules (`--harness unknown`).
 //!
 //! Logic that holds for every harness (verified submission, the watcher's episode rules, queue
@@ -28,6 +30,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 pub mod agentcloud;
+pub mod agentterm;
 pub mod claude;
 pub mod codex;
 pub mod muse;
