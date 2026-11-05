@@ -1,13 +1,14 @@
 ---
 title: 'voice-page-autoplay: React returns to the right edge, and an Autoplay toggle reads the next unread message'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: cl-refactor
 labels:
 - vibe-talk
 created_at: 2026-11-05T13:48:07.667621857+00:00
-updated_at: 2026-11-05T13:48:07.667621857+00:00
+updated_at: 2026-11-05T14:48:57.687176055+00:00
+closed_at: 2026-11-05T14:48:57.687175885+00:00
 ---
 
 # Description
@@ -38,3 +39,14 @@ It follows #880 voice-page-menu-placement (Hide reader). It is an owner-approved
 # Notes
 
 Relayed by the lead on 2026-11-05 (owner reply 158). Assigned to cl-refactor, ahead of #624 batch 64.
+
+## Resolution
+
+[opus 5.5 cl-refactor] Landed as e7709ea8 on github/main (gate 131/131, adversarial review recorded). React keeps its
+orange and stands at the read strip's right edge again, right-justified, the arrows and "k of n" still centred; a small
+Auto toggle stands at the strip's left end, and the action menu carries "Autoplay: on/off" on the channel's view. On, a
+read heard to its end goes on to the next unread message below it in the view it was read in (thread cards by their
+root message), each marked read as a manual read is; it says so when nothing unread is left, ends on Stop, goes on
+from a read the reader starts, and Hang up halts the read in progress. The media keys and the audio output are kept
+from one read to the next, so a locked phone keeps going. Kept on the device (`vibe-talk.voice.autoplay`), default off;
+no key. Unverified: the owner's phone after the deploy, including the locked-screen chain.
