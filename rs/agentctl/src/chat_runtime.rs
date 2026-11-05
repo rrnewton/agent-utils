@@ -19814,7 +19814,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn temporary(name: &str) -> PathBuf {
+    pub(crate) fn temporary(name: &str) -> PathBuf {
         // Keep a dedicated scratch root available for journal-heavy recovery tests on slow hosts.
         // This changes only the temporary filesystem; all write boundaries and assertions remain.
         let root = std::env::var_os("AGENTCTL_CHAT_TEST_TMPDIR")
@@ -19919,7 +19919,7 @@ pub(crate) mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
-    fn config() -> BridgeConfiguration {
+    pub(crate) fn config() -> BridgeConfiguration {
         BridgeConfiguration {
             unknown: Default::default(),
             subscription_plugin: "fixture".to_owned(),
@@ -31898,7 +31898,7 @@ k │\n\
         fs::remove_dir_all(root).expect("cleanup");
     }
 
-    fn same_thread_reply_requests(state: &BridgeState, count: u64) -> Vec<String> {
+    pub(crate) fn same_thread_reply_requests(state: &BridgeState, count: u64) -> Vec<String> {
         let messages = (1..=count)
             .map(|index| {
                 CommittableEvent::message_created(

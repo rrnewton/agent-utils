@@ -1310,12 +1310,13 @@ impl ReplyWakeListener {
     fn start(
         root: &Path,
         wakes: mpsc::SyncSender<String>,
+        sends: Option<mpsc::SyncSender<String>>,
         output_wake: SharedWake,
         overflowed: Arc<AtomicBool>,
         repoint: Arc<AtomicBool>,
     ) -> Option<Self> {
         match reply_wake_socket(root)
-            .and_then(|path| Self::bind(path, wakes, output_wake, overflowed, repoint))
+            .and_then(|path| Self::bind(path, wakes, sends, output_wake, overflowed, repoint))
         {
             Ok(listener) => Some(listener),
             Err(error) => {
@@ -1331,6 +1332,7 @@ impl ReplyWakeListener {
     fn bind(
         path: PathBuf,
         wakes: mpsc::SyncSender<String>,
+        sends: Option<mpsc::SyncSender<String>>,
         output_wake: SharedWake,
         overflowed: Arc<AtomicBool>,
         repoint: Arc<AtomicBool>,
@@ -1373,6 +1375,7 @@ impl ReplyWakeListener {
                         &receiver,
                         &stopping,
                         &wakes,
+                        sends.as_ref(),
                         &output_wake,
                         &overflowed,
                         &repoint,
@@ -1417,14 +1420,18 @@ fn listens_for_reply_wakes(config: &BridgeConfiguration) -> bool {
     config.outbound_enabled
 }
 
-/// The wake socket's thread: hand each well-formed request key to the owner loop and end its
-/// wait, until `stopping` is set. A queue that is full asks the loop for a recovery pass instead,
-/// which finds every request with a reply to send. A repoint wake sets `repoint`, which ends the
-/// owner loop's pass so that it applies the waiting request (#677 chat-bridge-repoint).
+/// The wake socket's thread: hand each well-formed request key to the reply sender, through
+/// `sends`, and to the owner loop, and end the loop's wait, until `stopping` is set. The reply
+/// sender sends the reply at once, even while the loop is in the middle of a pass (#858
+/// chat-reply-wake-latency); the loop sends whatever the sender did not. A queue that is full asks
+/// the loop for a recovery pass instead, which finds every request with a reply to send. A
+/// repoint wake sets `repoint`, which ends the owner loop's pass so that it applies the waiting
+/// request (#677 chat-bridge-repoint).
 fn receive_reply_wakes(
     socket: &UnixDatagram,
     stopping: &AtomicBool,
     wakes: &mpsc::SyncSender<String>,
+    sends: Option<&mpsc::SyncSender<String>>,
     output_wake: &SharedWake,
     overflowed: &AtomicBool,
     repoint: &AtomicBool,
@@ -1442,6 +1449,10 @@ fn receive_reply_wakes(
                 let Some(key) = reply_wake_key(&buffer[..length]) else {
                     continue;
                 };
+                // A sender that is busy or gone leaves the reply to the owner loop.
+                if let Some(sends) = sends {
+                    let _ = sends.try_send(key.clone());
+                }
                 match wakes.try_send(key) {
                     Ok(()) => {}
                     Err(mpsc::TrySendError::Full(_)) => overflowed.store(true, Ordering::SeqCst),
@@ -2081,11 +2092,58 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         }
     };
     let (reply_wake_sender, reply_wakes) = mpsc::sync_channel(REPLY_WAKE_CAPACITY);
+    // The reply sender sends each reply `chat reply` announces at once, with a transport of its
+    // own, so that a reply never waits behind the owner loop typing a prompt (#858
+    // chat-reply-wake-latency). Without it, the loop sends the reply at its next pass.
+    let reply_sender = if listens_for_reply_wakes(state.config()) {
+        match outbound
+            .as_ref()
+            .map(CommandOutboundTransport::try_clone_generation)
+            .transpose()
+        {
+            Ok(Some(transport)) => {
+                let (sends, keys) = mpsc::sync_channel(REPLY_WAKE_CAPACITY);
+                match spawn_reply_sender(
+                    state.clone(),
+                    keys,
+                    transport,
+                    Arc::clone(&stop),
+                    |line| {
+                        service_log(line);
+                    },
+                ) {
+                    Ok(worker) => Some((sends, worker)),
+                    Err(error) => {
+                        service_log(format_args!(
+                            "agentctl: the chat reply sender could not start; replies that chat \
+                             reply stores are sent by the owner loop's next pass: {error}"
+                        ));
+                        None
+                    }
+                }
+            }
+            Ok(None) => None,
+            Err(error) => {
+                service_log(format_args!(
+                    "agentctl: the chat reply sender has no transport; replies that chat reply \
+                     stores are sent by the owner loop's next pass: {error}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (reply_sends, reply_sender) = match reply_sender {
+        Some((sends, worker)) => (Some(sends), Some(worker)),
+        None => (None, None),
+    };
     // Bound before the owner loop's first recovery pass, which sends any reply stored earlier.
     let reply_wake = if listens_for_reply_wakes(state.config()) {
         ReplyWakeListener::start(
             state_root,
             reply_wake_sender,
+            reply_sends,
             Arc::clone(&output_wake),
             Arc::clone(&overflowed),
             Arc::clone(&stop.repoint),
@@ -2175,6 +2233,11 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     }
     if let Some(listener) = reply_wake {
         if let Err(error) = listener.stop(shutdown_deadline) {
+            stop.record_cleanup_error(error.to_string());
+        }
+    }
+    if let Some(worker) = reply_sender {
+        if let Err(error) = join_worker_until(worker, "chat reply sender", shutdown_deadline) {
             stop.record_cleanup_error(error.to_string());
         }
     }
@@ -2620,6 +2683,109 @@ struct AckWorkers {
 /// passes `service_log`. If the second cannot start, the error comes with the first worker, which
 /// the caller joins once it has stopped the service.
 #[allow(clippy::too_many_arguments)]
+/// How long one owner-loop step may take before the service log names it (#858
+/// chat-reply-wake-latency): a pass that holds the loop this long holds every other kind of work
+/// with it.
+const SLOW_STEP: Duration = Duration::from_secs(10);
+
+/// One owner-loop step, timed from its creation to its drop, which logs the step's name and
+/// duration when it took [`SLOW_STEP`] or longer.
+struct SlowStep {
+    name: &'static str,
+    started: Instant,
+}
+
+impl SlowStep {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for SlowStep {
+    fn drop(&mut self) {
+        let took = self.started.elapsed();
+        if took >= SLOW_STEP {
+            service_log(format_args!(
+                "agentctl: slow owner-loop step: {} took {:.1}s; the loop did nothing else \
+                 meanwhile (replies that chat reply stores still go out through the reply sender)",
+                self.name,
+                took.as_secs_f64()
+            ));
+        }
+    }
+}
+
+/// How long the reply sender waits for a key before it looks at `stop` again.
+const REPLY_SENDER_POLL: Duration = Duration::from_millis(250);
+
+/// Start the reply sender (#858 chat-reply-wake-latency): a thread that sends, through
+/// `transport`, the replies of each request key `keys` gives, as the owner loop's passes send
+/// them, holding `stop`'s publish lock while it does. It only publishes: it types nothing, reads
+/// no pane, and takes no pane or queue lock, and the reply breaker and held replies apply as on
+/// the loop's sends. A send that fails is logged and left to the loop, which retries it. It ends
+/// once `stop` is stopped or `keys` is disconnected.
+fn spawn_reply_sender(
+    state: BridgeState,
+    keys: mpsc::Receiver<String>,
+    mut transport: impl chat_runtime::ReplyTransport + Send + 'static,
+    stop: Arc<StopState>,
+    log: impl Fn(fmt::Arguments<'_>) + Send + 'static,
+) -> io::Result<ServiceWorker> {
+    let (done_sender, done) = mpsc::sync_channel(1);
+    let handle = thread::Builder::new()
+        .name("agentctl-chat-reply-send".to_owned())
+        .spawn(move || {
+            while !stop.is_stopped() {
+                match keys.recv_timeout(REPLY_SENDER_POLL) {
+                    Ok(key) => send_announced_replies(&state, &key, &mut transport, &stop, &log),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            let _ = done_sender.send(());
+        })?;
+    Ok(ServiceWorker { handle, done })
+}
+
+/// Send the replies of request `key` that wait, oldest first, at most `MAX_SENDS_PER_PASS` of
+/// them, as one owner-loop pass does, and log what happened as the loop logs its passes.
+fn send_announced_replies(
+    state: &BridgeState,
+    key: &str,
+    transport: &mut dyn chat_runtime::ReplyTransport,
+    stop: &StopState,
+    log: &dyn Fn(fmt::Arguments<'_>),
+) {
+    let _publishing = stop
+        .publish_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !state.has_unsent_reply(key) {
+        return;
+    }
+    log(format_args!(
+        "agentctl: chat reply for request {key} was stored by `agentctl chat reply`; sending it"
+    ));
+    let mut report = CycleReport::default();
+    for _ in 0..MAX_SENDS_PER_PASS {
+        if stop.is_stopped() {
+            break;
+        }
+        match state.publish_one(key, transport) {
+            Ok(Some(receipt)) => report.sent.push(receipt),
+            Ok(None) => break,
+            Err(error) => {
+                report.error("publish", key, error);
+                break;
+            }
+        }
+    }
+    log_report(&report, log);
+}
+
 fn spawn_ack_workers(
     state: &BridgeState,
     queue: &Arc<AckQueue>,
@@ -3063,6 +3229,13 @@ fn process_keys_with_delivery(
     }
     report.prompt_typed = notes.typed.get();
     if let Some(transport) = control.transport.as_mut() {
+        // Only the sends hold the lock, never the delivery above, so the reply sender is never
+        // kept waiting behind a prompt being typed.
+        let _publishing = control.stop.map(|stop| {
+            stop.publish_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
         let mut sends = 0_usize;
         for key in keys.iter().take(MAX_KEYS_PER_PASS) {
             while sends < MAX_SENDS_PER_PASS {
@@ -3853,6 +4026,10 @@ struct StopState {
     // Set when a repoint request waits: it ends the owner loop's pass, not the service, so that
     // `run_owner_loop` applies the request between passes (#677 chat-bridge-repoint).
     repoint: Arc<AtomicBool>,
+    // Held while replies are published, by the owner loop's passes and by the reply sender, so
+    // that one process sends a request's replies one at a time and in order (#858
+    // chat-reply-wake-latency).
+    publish_lock: Mutex<()>,
 }
 
 impl StopState {
@@ -6067,6 +6244,7 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
         health.tick(state);
         if reminder_waiting {
             if let Some(reminders) = reminders.as_mut() {
+                let _step = SlowStep::new("reply reminder settle");
                 reminder_waiting = reminders.settle(state, manager, stop);
             }
         }
@@ -6140,6 +6318,7 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
             // settle the pane has already left, so it saves no snapshot, which would cost a file
             // write and two fsyncs each time, and a failed read is tried again at the next
             // interval. Every other read of the pane still stops the service when it fails.
+            let _step = SlowStep::new("pane read and capture");
             match manager.peek_capture_with_runtime(
                 &state.config().agent_name,
                 SNAPSHOT_LINES,
@@ -6182,12 +6361,14 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
         }
 
         if recover {
+            let _step = SlowStep::new("recovery pass");
             let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
             enqueue_report_backlog(&mut direct_keys, &report, overflowed);
             notes.log(&report);
             turn.report(&report);
         }
         if !direct_keys.is_empty() {
+            let _step = SlowStep::new("delivery and send of queued requests");
             let report = drain_immediate_backlog(
                 state,
                 manager,
@@ -6212,6 +6393,7 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
             // type, and the drain of the next pass would stop at the same point, so the retry
             // stops too. The passes for the requests after one whose drain typed their prompts
             // find them typed and only record that.
+            let _step = SlowStep::new("retry of prompts waiting to be typed");
             let mut report = CycleReport::default();
             for key in &watch.retry_keys {
                 if control.stopped() {
@@ -6239,6 +6421,7 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
             watch.scan(state, &queue_reader, &mut routes);
         }
         if scanned {
+            let _step = SlowStep::new("owner alarm and reply source checks");
             owner_alarm_step(
                 owner_alarm.as_mut(),
                 &watch.entries,
@@ -6255,6 +6438,7 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
             );
         }
         if let Some(run) = stale_composer.as_mut().filter(|_| scanned) {
+            let _step = SlowStep::new("stale composer check");
             if stale_composer_step(
                 run,
                 watch.composer_blocked,
@@ -6288,6 +6472,7 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
         }
 
         if Instant::now() >= next_reconciliation {
+            let _step = SlowStep::new("reconciliation");
             let problem = state.reply_alias_problem();
             if problem != alias_problem {
                 match &problem {
@@ -14337,6 +14522,7 @@ esac
             ReplyWakeListener::bind(
                 root.join(REPLY_WAKE_SOCKET),
                 reply_wake_sender,
+                None,
                 Arc::clone(&output_wake),
                 Arc::clone(&overflowed),
                 Arc::default(),
@@ -18025,6 +18211,7 @@ request. No open chat request has been sent to you."]
         let listener = ReplyWakeListener::bind(
             root.join(REPLY_WAKE_SOCKET),
             sender,
+            None,
             Arc::default(),
             Arc::clone(&overflowed),
             Arc::default(),
@@ -18039,6 +18226,7 @@ request. No open chat request has been sent to you."]
         match ReplyWakeListener::bind(
             root.join(REPLY_WAKE_SOCKET),
             sender,
+            None,
             Arc::default(),
             Arc::new(AtomicBool::new(false)),
             Arc::default(),
@@ -18204,15 +18392,22 @@ request. No open chat request has been sent to you."]
         assert!(ReplyWakeListener::start(
             &too_long,
             sender.clone(),
+            None,
             Arc::default(),
             Arc::clone(&overflowed),
             Arc::default(),
         )
         .is_none());
         assert!(!wake_service(&too_long, &key));
-        let listener =
-            ReplyWakeListener::start(&fits, sender, Arc::default(), overflowed, Arc::default())
-                .expect("listen in a directory of 96 bytes");
+        let listener = ReplyWakeListener::start(
+            &fits,
+            sender,
+            None,
+            Arc::default(),
+            overflowed,
+            Arc::default(),
+        )
+        .expect("listen in a directory of 96 bytes");
         assert!(wake_service(&fits, &key));
         assert_eq!(wakes.recv_timeout(Duration::from_secs(5)), Ok(key));
         listener
@@ -18278,6 +18473,7 @@ request. No open chat request has been sent to you."]
         let listener = ReplyWakeListener::start(
             &spelled("/./."),
             sender,
+            None,
             Arc::default(),
             Arc::new(AtomicBool::new(false)),
             Arc::default(),
@@ -18513,6 +18709,7 @@ request. No open chat request has been sent to you."]
         let listener = ReplyWakeListener::start(
             &root,
             sender,
+            None,
             Arc::default(),
             Arc::new(AtomicBool::new(false)),
             Arc::default(),
@@ -18716,6 +18913,291 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
                 "[worker] third answer"
             ]
         );
+    }
+
+    /// An outbound helper under `root` that appends each send request it gets to `sends`, then
+    /// answers it as posted when `posts`, or fails without an answer when not.
+    fn recording_send_helper(root: &Path, sends: &Path, posts: bool) -> CommandOutboundTransport {
+        let helper = root.join("recording-send-helper");
+        if !helper.exists() {
+            fs::copy(
+                fs::canonicalize("/bin/sh").expect("canonical shell"),
+                &helper,
+            )
+            .expect("copy outbound helper");
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("helper mode");
+        }
+        let answer = if posts {
+            r#"id=${request#*\"id\":\"}
+id=${id%%\"*}
+printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id":"spaces/example/messages/reply"}}\n' "$id""#
+        } else {
+            "exit 1"
+        };
+        let script = format!(
+            r#"
+IFS= read -r request || exit 2
+case "$request" in
+  *'"action":"send"'*) ;;
+  *) exit 3 ;;
+esac
+printf '%s\n' "$request" >> "$1" || exit 4
+{answer}
+"#
+        );
+        CommandOutboundTransport::new(
+            helper,
+            vec![
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from(script),
+                std::ffi::OsString::from("agentctl-chat-reply-sender-helper"),
+                sends.as_os_str().to_owned(),
+            ],
+            &[],
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        )
+        .expect("pin outbound helper")
+    }
+
+    /// A delivery whose typing of a prompt holds until the test releases it, or 30 seconds pass:
+    /// a pass of the owner loop stuck inside `deliver_request_with`, with whatever it holds there.
+    #[derive(Default)]
+    struct HeldTyping {
+        states: Mutex<BTreeMap<String, QueueMessageState>>,
+        typing: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl HeldTyping {
+        /// Wait up to `limit` for a prompt to be typed; whether one is.
+        fn wait_typing(&self, limit: Duration) -> bool {
+            let guard = self.typing.lock().expect("typing");
+            let (guard, _) = self
+                .changed
+                .wait_timeout_while(guard, limit, |(typing, _)| !*typing)
+                .expect("typing wait");
+            guard.0
+        }
+
+        /// Whether a prompt is being typed and not released yet.
+        fn still_typing(&self) -> bool {
+            let guard = self.typing.lock().expect("typing");
+            guard.0 && !guard.1
+        }
+
+        fn release(&self) {
+            self.typing.lock().expect("typing").1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    impl chat_runtime::CoordinatorDelivery for HeldTyping {
+        fn message_state(
+            &self,
+            _agent_name: &str,
+            message_id: &str,
+        ) -> std::result::Result<Option<QueueMessageState>, String> {
+            Ok(self.states.lock().expect("states").get(message_id).copied())
+        }
+
+        fn submit(
+            &self,
+            _agent_name: &str,
+            _prompt: &str,
+            message_id: &str,
+            _options: DrainOptions,
+        ) -> std::result::Result<(), String> {
+            let mut guard = self.typing.lock().expect("typing");
+            guard.0 = true;
+            self.changed.notify_all();
+            let (guard, _) = self
+                .changed
+                .wait_timeout_while(guard, Duration::from_secs(30), |(_, released)| !*released)
+                .expect("typing wait");
+            drop(guard);
+            self.states
+                .lock()
+                .expect("states")
+                .insert(message_id.to_owned(), QueueMessageState::Processed);
+            Ok(())
+        }
+
+        fn drain(
+            &self,
+            _agent_name: &str,
+            _options: DrainOptions,
+        ) -> std::result::Result<(), String> {
+            Ok(())
+        }
+
+        fn screen(&self, _agent_name: &str) -> std::result::Result<String, String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn a_reply_stored_while_a_pass_types_a_prompt_reaches_the_helper_within_a_second() {
+        // #858 chat-reply-wake-latency: a pass of the owner loop is stuck typing a request's
+        // prompt, inside `deliver_request_with` with every lock it holds there, as a pass typing
+        // into a busy pane is for a minute or more. A reply `chat reply` stores meanwhile for
+        // another request goes out through the reply sender in under a second, while the pass is
+        // still typing, and the pass then finishes as it would have.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        let (root, state) = worker_bridge_state(&fixture, true);
+        let (answered, _) = delivered_worker_request(&state);
+        let identifier = state
+            .next_reply_route(&answered)
+            .expect("reply route")
+            .expect("open request")
+            .identifier;
+        let waiting = admitted_worker_message(&state, 2, "two");
+        let sends = fixture.root.join("sends");
+        let loop_transport = recording_send_helper(&fixture.root, &sends, true);
+        let sender_transport = loop_transport
+            .try_clone_generation()
+            .expect("the reply sender's transport");
+        let stop = Arc::new(StopState::default());
+        let (send_keys, keys) = mpsc::sync_channel(REPLY_WAKE_CAPACITY);
+        let sender = spawn_reply_sender(
+            state.clone(),
+            keys,
+            sender_transport,
+            Arc::clone(&stop),
+            |_| {},
+        )
+        .expect("start the reply sender");
+        let (wake_sender, _wakes) = mpsc::sync_channel(REPLY_WAKE_CAPACITY);
+        let listener = ReplyWakeListener::bind(
+            root.join(REPLY_WAKE_SOCKET),
+            wake_sender,
+            Some(send_keys),
+            Arc::default(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::default(),
+        )
+        .expect("listen for reply wakes");
+        let typing = HeldTyping::default();
+        let sent_text =
+            |text: &str| fs::read_to_string(&sends).is_ok_and(|sent| sent.contains(text));
+        thread::scope(|scope| {
+            let pass = scope.spawn(|| {
+                let mut transport = Some(loop_transport);
+                let mut control = PassControl {
+                    transport: &mut transport,
+                    stop: Some(&stop),
+                };
+                process_keys_with_delivery(
+                    &state,
+                    &typing,
+                    DrainOptions::default(),
+                    std::slice::from_ref(&waiting),
+                    &mut control,
+                )
+            });
+            assert!(
+                typing.wait_typing(Duration::from_secs(30)),
+                "the pass never typed"
+            );
+            let started = Instant::now();
+            let stored = match reply(&root, &answered, &identifier, "an answer during typing") {
+                Ok(ReplyCommandOutcome::Stored(result)) => result,
+                other => panic!("chat reply did not store: {other:?}"),
+            };
+            assert_eq!(stored["service_woken"], true, "{stored}");
+            let deadline = started + Duration::from_secs(5);
+            while !sent_text("an answer during typing") && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let took = started.elapsed();
+            assert!(
+                sent_text("an answer during typing"),
+                "the reply was not sent"
+            );
+            assert!(
+                took < Duration::from_secs(1),
+                "stored to helper took {took:?} while a pass typed a prompt"
+            );
+            assert!(typing.still_typing(), "the pass stopped typing first");
+            typing.release();
+            let report = pass.join().expect("pass thread").expect("the pass");
+            assert_eq!(report.delivered, std::slice::from_ref(&waiting));
+        });
+        assert!(!state.has_unsent_reply(&answered));
+        stop.stop();
+        listener
+            .stop(Instant::now() + Duration::from_secs(5))
+            .expect("stop the reply wake listener");
+        join_worker_until(
+            sender,
+            "chat reply sender",
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("stop the reply sender");
+    }
+
+    #[test]
+    fn a_reply_sender_whose_helper_fails_trips_the_breaker_as_the_loop_does() {
+        // #858 chat-reply-wake-latency: the reply sender sends through `publish_one`, so a send
+        // whose helper fails is charged to the thread's post-rate breaker exactly as one from the
+        // owner loop is. Nine requests in one thread each have a reply; the helper fails every
+        // send. The first 8 reach the helper and stay charged as unknown outcomes, the ninth is
+        // held by the breaker without reaching it, each failure is logged, and the held reply
+        // stays for the loop to send once the breaker lets it.
+        use crate::chat_runtime::tests as runtime;
+        let root = runtime::temporary("reply-sender-breaker");
+        let state = BridgeState::initialize(&root, runtime::config()).expect("initialize state");
+        let requests = runtime::same_thread_reply_requests(&state, 9);
+        let sends = root.join("failed-sends");
+        let transport = recording_send_helper(&root, &sends, false);
+        let stop = Arc::new(StopState::default());
+        let (send_keys, keys) = mpsc::sync_channel(REPLY_WAKE_CAPACITY);
+        let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sender = spawn_reply_sender(state.clone(), keys, transport, Arc::clone(&stop), {
+            let logs = Arc::clone(&logs);
+            move |line| logs.lock().expect("logs").push(line.to_string())
+        })
+        .expect("start the reply sender");
+        for key in &requests {
+            send_keys.send(key.clone()).expect("announce the reply");
+        }
+        let tripped = |logs: &[String]| {
+            logs.iter()
+                .any(|line| line.contains("post-rate breaker tripped"))
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !tripped(&logs.lock().expect("logs")) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        stop.stop();
+        join_worker_until(
+            sender,
+            "chat reply sender",
+            Instant::now() + Duration::from_secs(10),
+        )
+        .expect("stop the reply sender");
+        let logs = logs.lock().expect("logs").clone();
+        assert!(tripped(&logs), "{logs:#?}");
+        let attempts = fs::read_to_string(&sends)
+            .expect("helper attempts")
+            .lines()
+            .count();
+        assert_eq!(attempts, 8, "{logs:#?}");
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.contains("chat operation: publish"))
+                .count(),
+            9,
+            "{logs:#?}"
+        );
+        assert!(state.has_unsent_reply(&requests[8]));
+        assert_eq!(
+            state.status().expect("status")["reply_breaker"]["held_threads"][0]
+                ["recent_or_unresolved_reservations"],
+            8
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// The options `chat run` gives the passes that type prompts by default: no wait for the agent

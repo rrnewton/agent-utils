@@ -366,6 +366,7 @@ mod tests {
         let listener = ReplyWakeListener::bind(
             root.join(REPLY_WAKE_SOCKET),
             sender,
+            None,
             Arc::default(),
             Arc::new(AtomicBool::new(false)),
             Arc::clone(&repoint),

@@ -984,7 +984,13 @@ chat-reply-no-wake, the Rust edition listened only with that option, so a
 reply stored without it waited for the next reconciliation or a restart; the
 Python edition always listened.) After it stores a reply that is not sent
 yet, `reply` sends the request key to that socket, and the service sends the
-reply at once instead of at its next reconciliation. `service_woken` says
+reply at once instead of at its next reconciliation. A thread of its own sends
+it (#858 chat-reply-wake-latency), so a reply goes out within a second even
+while the owner loop is busy, for example typing a prompt into a pane that is
+slow to take it; replies keep their order and the thread post-rate breaker,
+because both senders take the same publish lock. The log names any step of the
+owner loop that takes 10 seconds or more (`slow owner-loop step: NAME took
+Ns`). `service_woken` says
 whether the key was sent to a socket of the current user at that path; nothing
 confirms that a service received it. Without a listening service, the reply is
 sent at the next reconciliation, when the agent goes idle, or when the service
