@@ -84,7 +84,6 @@ export {
 export { DEFAULT_CARD_MAX_LINES, DEFAULT_COLLAPSED_LINES, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, createCardMaxLines, createCollapsedLines, createCredentials, createDeviceSettings, createEnterSends, createInAppLinks, createKeptSwitch, createQuoteReadPercent, createSettingsSync, createSingleKeys } from "../core/settings/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
 export {
-  answersEnter,
   childByClass,
   classWords,
   copyText,
@@ -105,7 +104,7 @@ export {
   shownNode,
   tagNameOf,
 } from "../view/dom/index.ts";
-export { SCREENS, createActionMenu, createChannelKeys, createChipsOverComposer, createHighlightCopy, createKeyDispatch, createKeyHints, createPromptsTray, createReplySight, createRowShortcuts, createScreenKeys, createScreens, createScrollKeys, createShellNotices, createUndoOffer, createUndoStamps, createViewKeys, createWriteKeys, modHeld, pageStep, swallow, typedKey } from "../view/shell/index.ts";
+export { SCREENS, createActionMenu, createChannelKeys, createChipsOverComposer, createHighlightCopy, createKeyDispatch, createKeyHints, createPromptsTray, createReplySight, createRowKeys, createRowShortcuts, createScreenKeys, createScreens, createScrollKeys, createShellNotices, createUndoOffer, createUndoStamps, createViewKeys, createWriteKeys, modHeld, pageStep, swallow, typedKey } from "../view/shell/index.ts";
 export {
   COMPOSER_FIELDS,
   COMPOSER_GROW_BOXES,

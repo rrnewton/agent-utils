@@ -37,3 +37,5 @@ export { createViewKeys } from "./viewkeys.ts";
 export type { UndoOfferStamp, ViewChoice, ViewKeys, ViewKeysDependencies } from "./viewkeys.ts";
 export { createChannelKeys } from "./channelkeys.ts";
 export type { ChannelKeys, ChannelKeysDependencies, ChannelPicker, SteppedChannel } from "./channelkeys.ts";
+export { createRowKeys } from "./rowkeys.ts";
+export type { ActedRow, OpenRowMenu, RowKeys, RowKeysDependencies } from "./rowkeys.ts";

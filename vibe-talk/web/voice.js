@@ -7385,189 +7385,55 @@ function foldOneFromKeyboard(target) {
 }
 
 /**
- * Enter and o: what a tap on the selected message does (fold or unfold it, or in Read read it aloud:
- * `actOnRow`) and, on the line of a collapsed run of read messages, open the run. Enter on a button
- * or a link inside a row is that control's own press, and is left to it.
+ * The keys that act on the selected row: Enter and o, → and ←, [ and ], r, ".", s, i and l, and pressing one
+ * of the row's own buttons. One owner in web/src/view/shell/rowkeys.ts (`#624 voice-page-modularity`); the
+ * page destructures its keys under their old names.
+ *
+ * @type {import("./src/view/shell/index.ts").RowKeys}
  */
-function openFromKeyboard(event, target) {
-  if (event.key === "Enter" && answersEnter(target)) return false;
-  const { pane, row, took } = rowForAct(target, true);
-  if (!pane || !row) return took;
-  if (row.getAttribute("data-read-run") === "head") {
-    openReadRun(row);
-    // `#407 unpack-row-parity`. In an unpacked block the run's rows are drawn anew: its first row's; and
-    // over the cards, the run's first card or row (`#432 read-mode-unify`).
-    const now = row.parentNode ? row : liveUnpackedRow(row) || liveCardRow(row);
-    if (now) selectRow(pane, now, false);
-    return true;
-  }
-  // A card: a press on it, which highlights it and shows it whole, or puts that out. The keys stay on
-  // it; → goes into its thread. `#277 thread-card-focus`, and `#229 desktop-two-column` before it. The
-  // same in the thread list, whose cards are the right column's (`#281 view-keys`).
-  if (row.hasAttribute("data-card")) {
-    const card = childByClass(row, "side-card");
-    if (card) card.click();
-    // `#440 thread-card-pack-toggle`. In the Threads view the press drew the card anew: the keys stay on it.
-    const now = row.parentNode ? null : liveCardRow(row);
-    if (now) selectRow(sidePane, now, false);
-    else focusList(sidePane);
-    return true;
-  }
-  actOnRow(row, childByClass(row, "fold"));
-  return true;
-}
-
-/** Press one of the selected row's own buttons, found by its class: the act a click there performs. */
-function pressRowButton(target, className) {
-  const { row, took } = rowForAct(target);
-  const button = row ? childByClass(row, className) : null;
-  if (!button) return took ? "took" : null;
-  button.click();
-  return button;
-}
-
-/**
- * →: into the selected message's thread, by its own thread tag (question 3); on the thread cards, into
- * the thread of the highlighted card, or of the card the keys are on, by its replies button (`#277
- * thread-card-focus`).
- */
-function threadFromKeyboard(target) {
-  const card = cardForArrow(target);
-  const opener = card ? childByClass(card, card.hasAttribute("data-card") ? "side-card-open" : "thread-card-open") : null;
-  if (opener) {
-    opener.click();
-    // In two columns the keys go into the thread with it, as from a message's tag; in one column the
-    // rows the focus was on have been replaced by the rows of the thread.
-    if (layoutShown.columns()) focusList(sidePane);
-    else settleFocus();
-    return true;
-  }
-  const { row, took } = rowForAct(target);
-  const badge = row ? childByClass(row, "thread-badge") : null;
-  if (!badge || badge.hidden) return took;
-  const starting = badge.getAttribute("data-thread-state") === "start";
-  badge.click();
-  // `#252 thread-button-state`. A thread nobody has answered opens with the focus in its message box,
-  // for its first reply, and the keys leave it there.
-  if (starting && isComposer(document.activeElement)) return true;
-  // In two columns the thread is selected on the right, and the keys go with it. `#229`.
-  if (layoutShown.columns()) {
-    focusList(sidePane);
-    return true;
-  }
-  // The rows the focus was on have been replaced by the rows of the thread.
-  settleFocus();
-  return true;
-}
-
-/** Back out of a thread to the view it was opened from, the focus on the list. */
-function leaveThread() {
-  // Its drawing is done before its first wait: the focus can be settled on what it drew.
-  guardQuietly(closeThread)();
-  settleFocus();
-}
-
-/** ←: out of a thread. Elsewhere it is nobody's. */
-function threadOutFromKeyboard() {
-  // In two columns, from the right column back to Main on the left; the thread stays where it is.
-  // `#229 desktop-two-column`.
-  if (layoutShown.columns()) {
-    if (!columnWork.side() || screens.screen() !== "main" || screens.view() !== "discord") return false;
-    // `#277 thread-card-focus`. A thread entered from its card goes back out to the cards, as → came
-    // in: the X, and the keys on the card it was entered from.
-    if (columns.side.mode === "thread" && columns.side.fromCards) {
-      const card = cardRowOnRight(inColumn(columns.side, () => String(selection().threadId)));
-      closeSideThread();
-      if (card && card.parentNode && rowShown(card)) selectRow(sidePane, card);
-      else focusList(sidePane);
-      return true;
-    }
-    focusList(channelPane);
-    return true;
-  }
-  // The thread list shows cards, not a thread: there is none on screen to leave. `#281 view-keys`.
-  if (threadListOnScreen()) return false;
-  if (screens.screen() !== "main" || screens.view() !== "discord" || selection().view !== "thread") return false;
-  leaveThread();
-  return true;
-}
-
-/**
- * [ and ]: the keys to the left column or to the right one, in two columns. `#229 desktop-two-column`.
- * F6, the desktop convention for moving between panes, is the browser's own in a window that has an
- * address bar, so it is not taken.
- */
-function columnFromKeyboard(right) {
-  if (!layoutShown.columns() || !channelOnScreen()) return false;
-  focusList(right ? sidePane : channelPane);
-  return true;
-}
-
-/**
- * r: reply to the selected message, its box open in the list and ready to type in. With words of
- * that message selected, its Reply is Quote reply, and r presses that (`#267 quote-reply`).
- */
-function replyFromKeyboard(target) {
-  const pressed = pressRowButton(target, "reply-button");
-  if (pressed === null) return false;
-  if (pressed !== "took" && replyOnScreen()) el("reply-text").focus();
-  return true;
-}
-
-/** .: the ⋯ menu of the selected message, the focus on its first item; ↓ and ↑ move through it. */
-function menuFromKeyboard(target) {
-  const pressed = pressRowButton(target, "row-more-button");
-  if (pressed === null) return false;
-  if (pressed === "took") return true;
-  const [first] = menuItems();
-  if (first) focusMinimally(first);
-  return true;
-}
-
-/** s: read the selected message aloud, or stop it: the act of a tap in Read. */
-function readFromKeyboard(target) {
-  // `#540 read-aloud-desktop`: a card is read as a press on it reads it, by its first message.
-  // Not a card standing as the line of a run of read threads, which Enter opens.
-  const { row: card } = keyContext(target);
-  if (card && card.hasAttribute("data-card") && card.getAttribute("data-read-run") !== "head") {
-    readAloudOwner().readCardAloud(card);
-    return true;
-  }
-  const { row, took } = rowForAct(target);
-  if (!row) return took;
-  guardQuietly(() => readAloudOwner().readAloud(idsOf(row)))();
-  return true;
-}
-
-/** i: the details sheet a press-and-hold opens (author, time and id) on the selected message. */
-function detailsFromKeyboard(target) {
-  const { row, took } = rowForAct(target);
-  if (!row) return took;
-  toggleMessageDetails(row, rowMessages(row));
-  return true;
-}
-
-/**
- * l: copy the selected message's own address in its service — the address its ⋯ menu's
- * "Open in …" link opens (`upstreamUrlOf`, the row's first constituent's, as the link is).
- * `#408 copy-upstream-link`. The menu holds the link and its Copy item (`#409`, `#461`);
- * this key is how a keyboard does the same copy. On a row with no
- * address the key is not acted on, as the menu offers nothing there: left to the browser
- * like any unbound key rather than swallowed in silence.
- */
-function copyLinkFromKeyboard(target) {
-  const { row } = rowForAct(target);
-  if (!row) return false;
-  const message = rowMessages(row)[0];
-  const url = upstreamUrlOf(message);
-  if (url === null) return false;
-  // The act the menu's item did when it was the copy, menu shut included: a copy asked with
-  // this row's menu open leaves the reader with the said status, not the menu over it.
-  const menu = rowMenus.open();
-  if (menu && nodeWithin(row, menu.root)) menu.close();
-  guardQuietly(() => copyUpstreamLink(url, upstreamServiceName(message)))();
-  return true;
-}
+const rowKeys = createRowKeys({
+  rowForAct: (target, runLine) => rowForAct(target, runLine),
+  keyContext: (target) => keyContext(target),
+  openReadRun: (row) => openReadRun(row),
+  liveUnpackedRow: (row) => liveUnpackedRow(row),
+  liveCardRow: (row) => liveCardRow(row),
+  selectRow: (...args) => selectRow(...args),
+  channelPane: () => channelPane,
+  sidePane: () => sidePane,
+  focusList: (pane) => focusList(pane),
+  settleFocus: () => settleFocus(),
+  actOnRow: (row, fold) => actOnRow(row, fold),
+  cardForArrow: (target) => cardForArrow(target),
+  columnsShown: () => layoutShown.columns(),
+  isComposer: (node) => isComposer(node),
+  closeThread: () => guardQuietly(closeThread)(),
+  inSide: () => columnWork.side(),
+  screen: () => screens.screen(),
+  view: () => screens.view(),
+  sideMode: () => columns.side.mode,
+  sideFromCards: () => columns.side.fromCards,
+  sideThreadId: () => inColumn(columns.side, () => String(selection().threadId)),
+  cardRowOnRight: (id) => cardRowOnRight(id),
+  closeSideThread: () => closeSideThread(),
+  rowShown: (row) => rowShown(row),
+  threadListOnScreen: () => threadListOnScreen(),
+  selectionView: () => selection().view,
+  channelOnScreen: () => channelOnScreen(),
+  replyOnScreen: () => replyOnScreen(),
+  byId: (id) => el(id),
+  menuItems: () => menuItems(),
+  readCardAloud: (card) => readAloudOwner().readCardAloud(card),
+  readRowAloud: (row) => guardQuietly(() => readAloudOwner().readAloud(idsOf(row)))(),
+  toggleDetails: (row) => toggleMessageDetails(row, rowMessages(row)),
+  firstMessage: (row) => rowMessages(row)[0],
+  upstreamUrlOf: (message) => upstreamUrlOf(message),
+  openRowMenu: () => rowMenus.open(),
+  copyUpstreamLink: (url, message) => guardQuietly(() => copyUpstreamLink(url, upstreamServiceName(message)))(),
+});
+const {
+  openFromKeyboard, pressRowButton, threadFromKeyboard, leaveThread, threadOutFromKeyboard, columnFromKeyboard,
+  replyFromKeyboard, menuFromKeyboard, readFromKeyboard, detailsFromKeyboard, copyLinkFromKeyboard,
+} = rowKeys;
 
 /** The text the reader has selected on the page, or "". */
 function selectedText() {

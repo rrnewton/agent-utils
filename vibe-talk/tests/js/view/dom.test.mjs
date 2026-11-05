@@ -1079,3 +1079,122 @@ test("`#624 voice-page-modularity`: Alt+↓ and Alt+↑ step through the channel
     globalThis.document = was;
   }
 });
+
+test("`#624 voice-page-modularity`: the row keys open, enter and leave threads, press the row's buttons and act only on the row they may", () => {
+  const { createRowKeys } = VIEW_SHELL;
+  const log = [];
+  const button = (className, extra = {}) => ({ className, nodeType: 1, hidden: false, attributes: {}, getAttribute(name) { return this.attributes[name] ?? null; },
+    click: () => log.push(`click ${className}`), focus: (options) => log.push(`focus ${className}${options && options.preventScroll ? " quietly" : ""}`), scrollIntoView: () => {}, ...extra });
+  const rowOf = (attributes, children, id = "row") => ({ id, attributes, children, parentNode: {}, getAttribute(name) { return this.attributes[name] ?? null; },
+    hasAttribute(name) { return name in this.attributes; } });
+  const fold = button("fold");
+  const badge = button("thread-badge");
+  const row = rowOf({}, [fold, badge, button("reply-button"), button("row-more-button")]);
+  const state = { acted: { pane: "channel pane", row, took: true }, card: null, columns: false, side: false, screen: "main", view: "discord", sideMode: "list",
+    fromCards: false, threadList: false, selectionView: "all", reply: false, menu: null, url: "https://chat/1", composer: false };
+  const keys = createRowKeys({
+    rowForAct: (_target, runLine) => (runLine || state.acted.row?.getAttribute("data-read-run") !== "head" ? state.acted : { pane: "channel pane", row: null, took: true }),
+    keyContext: () => ({ pane: state.acted.pane, row: state.acted.row }),
+    openReadRun: () => log.push("open run"),
+    liveUnpackedRow: () => null,
+    liveCardRow: () => "live card",
+    selectRow: (_pane, selected, ...bring) => log.push(["select", selected.id || selected, ...bring].join(" ")),
+    channelPane: () => "channel pane",
+    sidePane: () => "side pane",
+    focusList: (pane) => log.push(`focus list ${pane}`),
+    settleFocus: () => log.push("settled"),
+    actOnRow: (_row, control) => log.push(`act ${control ? control.className : "none"}`),
+    cardForArrow: () => state.card,
+    columnsShown: () => state.columns,
+    isComposer: () => state.composer,
+    closeThread: () => log.push("thread closed"),
+    inSide: () => state.side,
+    screen: () => state.screen,
+    view: () => state.view,
+    sideMode: () => state.sideMode,
+    sideFromCards: () => state.fromCards,
+    sideThreadId: () => "t1",
+    cardRowOnRight: (id) => (id === "t1" ? rowOf({ "data-card": "" }, [], "t1 card") : null),
+    closeSideThread: () => log.push("side thread closed"),
+    rowShown: () => true,
+    threadListOnScreen: () => state.threadList,
+    selectionView: () => state.selectionView,
+    channelOnScreen: () => true,
+    replyOnScreen: () => state.reply,
+    byId: (id) => button(id),
+    menuItems: () => [button("first item")],
+    readCardAloud: () => log.push("read card"),
+    readRowAloud: () => log.push("read row"),
+    toggleDetails: () => log.push("details"),
+    firstMessage: () => ({ id: "m1" }),
+    upstreamUrlOf: () => state.url,
+    openRowMenu: () => state.menu,
+    copyUpstreamLink: (url, message) => log.push(`copy ${url} ${message.id}`),
+  });
+  const run = (act) => { log.length = 0; return [act(), ...log]; };
+  const was = globalThis.document;
+  globalThis.document = { activeElement: null };
+  try {
+    const enter = { key: "Enter" };
+    assert.deepStrictEqual(run(() => keys.openFromKeyboard(enter, {})), [true, "act fold"]);
+    assert.deepStrictEqual(run(() => keys.openFromKeyboard(enter, { tagName: "BUTTON" })), [false], "Enter on a button in a row was not left to it");
+    row.attributes["data-read-run"] = "head";
+    assert.deepStrictEqual(run(() => keys.openFromKeyboard({ key: "o" }, {})), [true, "open run", "select row false"], "o on the line of a run did not open it and keep the keys on it");
+    delete row.attributes["data-read-run"];
+    const cardRow = rowOf({ "data-card": "" }, [button("side-card")]);
+    state.acted = { pane: "side pane", row: cardRow, took: true };
+    assert.deepStrictEqual(run(() => keys.openFromKeyboard(enter, {})), [true, "click side-card", "focus list side pane"], "Enter on a card did not press it and keep the keys on the cards");
+    cardRow.parentNode = null;
+    assert.deepStrictEqual(run(() => keys.openFromKeyboard(enter, {})), [true, "click side-card", "select live card false"], "a card drawn anew by its press lost the keys");
+    state.acted = { pane: null, row: null, took: true };
+    assert.deepStrictEqual(run(() => keys.openFromKeyboard(enter, {})), [true], "a key taken with no row to act on was not reported taken");
+    assert.deepStrictEqual(run(() => keys.pressRowButton({}, "reply-button")), ["took"]);
+    state.acted = { pane: null, row: null, took: false };
+    assert.deepStrictEqual([run(() => keys.pressRowButton({}, "reply-button")), run(() => keys.replyFromKeyboard({}))], [[null], [false]]);
+    state.acted = { pane: "channel pane", row, took: true };
+    state.reply = true;
+    assert.deepStrictEqual(run(() => keys.replyFromKeyboard({})), [true, "click reply-button", "focus reply-text"], "r did not open the reply and put the keys in its box");
+    assert.deepStrictEqual(run(() => keys.menuFromKeyboard({})), [true, "click row-more-button", "focus first item quietly"]);
+    assert.deepStrictEqual(run(() => keys.threadFromKeyboard({})), [true, "click thread-badge", "settled"]);
+    badge.attributes["data-thread-state"] = "start";
+    state.composer = true;
+    assert.deepStrictEqual(run(() => keys.threadFromKeyboard({})), [true, "click thread-badge"], "a thread with no replies took the focus from its box");
+    state.composer = false;
+    state.columns = true;
+    assert.deepStrictEqual(run(() => keys.threadFromKeyboard({})), [true, "click thread-badge", "focus list side pane"], "in two columns the keys did not go with the thread");
+    badge.hidden = true;
+    assert.deepStrictEqual(run(() => keys.threadFromKeyboard({})), [true], "a hidden thread tag was pressed");
+    badge.hidden = false;
+    state.card = rowOf({}, [button("thread-card-open")]);
+    assert.deepStrictEqual(run(() => keys.threadFromKeyboard({})), [true, "click thread-card-open", "focus list side pane"], "→ on a card did not open its thread");
+    state.card = null;
+    assert.deepStrictEqual(run(() => keys.threadOutFromKeyboard()), [false], "← from the left column in two columns was taken");
+    state.side = true;
+    assert.deepStrictEqual(run(() => keys.threadOutFromKeyboard()), [true, "focus list channel pane"]);
+    state.sideMode = "thread";
+    state.fromCards = true;
+    assert.deepStrictEqual(run(() => keys.threadOutFromKeyboard()), [true, "side thread closed", "select t1 card"],
+      "← from a thread entered from its card did not go back to the cards, with the keys on that card brought into view");
+    state.side = false;
+    state.columns = false;
+    assert.deepStrictEqual(run(() => keys.threadOutFromKeyboard()), [false], "← outside a thread was taken");
+    state.selectionView = "thread";
+    assert.deepStrictEqual(run(() => keys.threadOutFromKeyboard()), [true, "thread closed", "settled"]);
+    state.threadList = true;
+    assert.deepStrictEqual(run(() => keys.threadOutFromKeyboard()), [false], "← over the thread list left a thread not on screen");
+    state.threadList = false;
+    assert.deepStrictEqual([run(() => keys.columnFromKeyboard(true)), (state.columns = true, run(() => keys.columnFromKeyboard(true)))], [[false], [true, "focus list side pane"]]);
+    assert.deepStrictEqual(run(() => keys.readFromKeyboard({})), [true, "read row"]);
+    state.acted = { pane: "side pane", row: rowOf({ "data-card": "" }, []), took: true };
+    assert.deepStrictEqual(run(() => keys.readFromKeyboard({})), [true, "read card"], "s on a card did not read it as a press does");
+    state.acted = { pane: "channel pane", row, took: true };
+    assert.deepStrictEqual(run(() => keys.detailsFromKeyboard({})), [true, "details"]);
+    state.menu = { root: fold, close: () => log.push("menu closed") };
+    fold.parentNode = row;
+    assert.deepStrictEqual(run(() => keys.copyLinkFromKeyboard({})), [true, "menu closed", "copy https://chat/1 m1"], "l left the row's own menu open over the status");
+    state.url = null;
+    assert.deepStrictEqual(run(() => keys.copyLinkFromKeyboard({})), [false], "l on a row with no address was taken");
+  } finally {
+    globalThis.document = was;
+  }
+});
