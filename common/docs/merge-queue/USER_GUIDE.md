@@ -50,8 +50,9 @@ individual tests, and the queue tracks exactly which of them ran.
 - **Failed-test culprit search.** When a batch fails, the queue searches the batch's prefixes for
   the first change that makes the failure appear, and every probe runs **only the failed tests**
   (plus whatever the runner says those tests depend on). It never reruns the whole suite to look
-  at a subset. A change is blamed only when its failure was seen twice. The culprit is ejected with
-  a report, and the queue continues with the rest. There is no automatic repair. See "Keeping the
+  at a subset. A change is blamed only when its failure was seen twice, or once when the runner
+  names every failure of that run a deterministic check (see "Deterministic checks"). The culprit
+  is ejected with a report, and the queue continues with the rest. There is no automatic repair. See "Keeping the
   base green".
 - **Silence is not success.** A test that was selected but never reported has outcome `missing`,
   and it blocks landing. In a culprit search, though, only tests that actually failed or errored
@@ -130,6 +131,7 @@ This command creates the state directory and writes `config.json`.
 | `--max-deferrals N` | `3` | How many times a change may be deferred because validation did not run (an admission refusal, a validator that cannot execute, a probe or donors that could not run) before it is escalated to its owner and held until `merge-queue retry` (see "Bounded retry"). |
 | `--green-flaky-hold-secs SECS` | `7200` | How long a change is held for a ruling after a GREEN_FLAKY or INFRA-BLOCKED result (see "Held for a ruling") before it is re-queued for a fresh validation. |
 | `--red-without-probe MODE` | `eject` | What a red validation that names failed tests does when its follow-up probe cannot run: `eject` the change (the red run is the verdict) or `hold` it for its owner. |
+| `--fail-fast` | off | Ask the runner to stop each candidate validation at its first red step: `$MQ_FAIL_FAST` is `1` for every validation except the complete run on the base (see "Fail-fast runs"). |
 | `--offload MODE` | `off` | Where validations run: `off` (in this process, as always), `compare` (in this process, which decides, and also on donors, whose receipts are only compared) or `decide` (on donors only; an accepted receipt is the verdict). See "Donor validators". |
 | `--tool-identity NAME=COMMAND` | none | A tool the validation depends on (repeatable): the command prints its identity, for example a tool repository's commit or a toolchain version, never a hash of a binary (builds are not byte-identical across hosts). A donor whose answer differs does not run the job (see "Tool identity and receipts"). merge-queue's own revision is always compared. |
 | `--tool-refresh NAME=COMMAND` | none | How a donor brings the tool `NAME` (one of `--tool-identity`) up to date, for example a fetch of the tool repository (repeatable). A donor whose answer differs runs it once and asks again: an older donor then takes the job, and one that still differs declines it. |
@@ -818,6 +820,8 @@ An **item record** (`items/<pr>.json`) has these fields:
 - `max_deferrals`: deferrals before a change is escalated to its owner (absent or `0`: `3`).
 - `red_without_probe`: `hold` holds a red change whose probe cannot run for its owner; absent
   (the default) ejects it.
+- `fail_fast`: `true` sets `$MQ_FAIL_FAST=1` for candidate validations (see "Fail-fast runs");
+  absent (the default) means off. A binary older than this field refuses a config that has it.
 
 **`donors`** fields (only read when `validator.offload` is not off; absent means the defaults):
 
@@ -952,6 +956,28 @@ else my-runner --target "$(git rev-parse HEAD)" full; fi | tee /dev/stderr |
 A runner that can only run everything at a new commit still works. Culprit-search probes at other
 commits then cost full runs, so keep batches small (`--max-batch 1` or `2`). With `--trust-base`,
 a red single-change batch costs exactly one targeted rerun.
+
+**Deterministic checks.** Some checks depend only on the tree: a lint, a path audit, a grep. A
+rerun of the same commit cannot change their answer, so a confirming rerun only costs time. A
+runner says so on a red run with one marker line naming the steps:
+
+- `RERUN-EXEMPT: step1,step2` with a red exit (not `0`, `6` or `75`): those steps are
+  deterministic checks.
+
+When every failure the run attributed belongs to a named step, the queue counts that red as
+confirmed on this one sighting. A red single-change batch is ejected without a rerun; in a larger
+batch, a probe that fails this way confirms its prefix at once. The ejection reason says `seen
+once: a deterministic check, which a rerun of the same tree cannot change`, where it otherwise
+says `seen twice`. A run with any failure outside the named steps, or with no attributed failure,
+still needs its failure seen twice. The marker with another exit status means nothing. A donor's
+receipt carries it in its log tail.
+
+**Fail-fast runs.** With `validator.fail_fast` (`init --fail-fast`), the queue sets
+`$MQ_FAIL_FAST=1` for every validation it runs on this host except the complete run on the base
+(`widen`), whose record should name every failure. A runner that honors it stops at the first red
+step and reports each step it skipped as `skip`, never `pass`: a skipped test was not seen to
+pass, so a remainder after an ejection reruns it. A runner that ignores the variable is still
+correct, only slower to report red.
 
 **Held for a ruling.** Two marker lines let a runner say that its run is neither a plain pass nor
 a product failure; each names the tests it concerns:

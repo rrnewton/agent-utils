@@ -115,6 +115,12 @@ pub struct ValidatorConfig {
     /// change to its owner instead).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub red_without_probe: String,
+    /// Ask the runner to stop a candidate validation at its first red step: `$MQ_FAIL_FAST` is
+    /// `1` for every validation this host runs except the complete run on the base (`widen`).
+    /// The runner reports the steps it skipped as `skip`, never `pass`, so a remainder reruns
+    /// them. Off by default.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fail_fast: bool,
 }
 
 fn is_zero_u32(value: &u32) -> bool {

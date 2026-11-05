@@ -13,7 +13,9 @@
 //!   (skipped or unreported), and the tests the selection policy says the removed change
 //!   affected, within the batch's own selection.
 //! * A conclusion that blames a change or the base needs the failure seen twice; a failure that
-//!   does not reproduce is recorded as flaky, never blamed.
+//!   does not reproduce is recorded as flaky, never blamed. The one exception is a red run whose
+//!   every failure the validator names a deterministic check (`RERUN-EXEMPT:`): a rerun of the
+//!   same tree cannot change that answer, so one sighting confirms it.
 //! * Every landing records its selection, policy and scope; a focused landing leaves an
 //!   obligation that only a green complete run discharges.
 //!
@@ -604,6 +606,9 @@ struct Obs {
     /// counted separately so they never read as a pass.
     unknowns: usize,
     failed: BTreeSet<TestId>,
+    /// A failure seen here was a deterministic check (the validator's `RERUN-EXEMPT:` marker):
+    /// a rerun of the same tree cannot change it, so one sighting confirms it.
+    deterministic: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -625,7 +630,16 @@ impl Obs {
     }
 
     fn confirmed_fail(&self) -> bool {
-        self.passes == 0 && self.fails >= 2
+        self.passes == 0 && (self.fails >= 2 || (self.fails == 1 && self.deterministic))
+    }
+
+    /// How a confirmed failure was confirmed, for the reason that names it.
+    fn confirmation(&self) -> &'static str {
+        if self.fails >= 2 {
+            "seen twice"
+        } else {
+            "seen once: a deterministic check, which a rerun of the same tree cannot change"
+        }
     }
 }
 
@@ -648,8 +662,9 @@ impl Hold {
 }
 
 enum Culprit {
-    /// The bare parent fails the focus, twice.
-    BaseRed(BTreeSet<TestId>),
+    /// The bare parent fails the focus (seen twice, or once for a deterministic check), with
+    /// how that was confirmed.
+    BaseRed(BTreeSet<TestId>, &'static str),
     /// The full candidate passed the focus on rerun.
     Flaky(BTreeSet<TestId>),
     /// The validator holds the full candidate's rerun for a ruling: it passed only because of
@@ -661,11 +676,14 @@ enum Culprit {
     /// A probe observed nothing conclusive (`Missing`/`Skip`-only): no
     /// culprit can be named; the batch stops rather than guessing.
     Inconclusive(String),
-    /// The change at `index` makes the focus fail (seen twice) and the prefix before it passes.
+    /// The change at `index` makes the focus fail (seen twice, or once for a deterministic
+    /// check) and the prefix before it passes.
     Found {
         index: usize,
         failed: BTreeSet<TestId>,
         flaky: BTreeSet<TestId>,
+        /// How the failure was confirmed ([`Obs::confirmation`]).
+        confirmation: &'static str,
     },
 }
 
@@ -2353,7 +2371,7 @@ impl<'a> Runner<'a> {
         );
         // A rerun at a commit already validated gets that run's handle, so a runner that can
         // rerun only the failed parts of an earlier run (at the same commit) can do so.
-        let extra: Vec<(String, String)> = lock(&self.handles)
+        let mut extra: Vec<(String, String)> = lock(&self.handles)
             .get(&job.commit)
             .map(|(handle, previous)| {
                 vec![
@@ -2362,6 +2380,11 @@ impl<'a> Runner<'a> {
                 ]
             })
             .unwrap_or_default();
+        // A candidate validation may stop at its first red step (`validator.fail_fast`). The
+        // complete run on the base (`widen`) never does: its record names every failure.
+        if self.config.validator.fail_fast && job.purpose != "widen" {
+            extra.push((crate::validate::FAIL_FAST_ENV.to_owned(), "1".to_owned()));
+        }
         let start_ms = self.started.elapsed().as_millis() as u64;
         let ran = match &self.donors {
             Some(donors) if donors.mode == crate::state::Offload::Decide => {
@@ -2593,6 +2616,7 @@ impl<'a> Runner<'a> {
             refused: false,
             flaky_passes: Vec::new(),
             infra_blocked: Vec::new(),
+            rerun_exempt: Vec::new(),
             cannot_execute: None,
             effective_selection: None,
             cpu: None,
@@ -3786,8 +3810,10 @@ impl<'a> Runner<'a> {
         let mut carried = false;
         // The red run attributed its failures to named tests (not only an exit status).
         let mut attributed = !ran.results.unattributed && !seen_failed.is_empty();
+        // Every failure of the red run is a deterministic check: seen once, it is confirmed.
+        let mut deterministic = ran.deterministic_red();
         loop {
-            match self.find_culprit(&current, &focus, &seen_failed)? {
+            match self.find_culprit(&current, &focus, &seen_failed, deterministic)? {
                 Culprit::Refused(detail) if attributed => {
                     return self.red_without_probe(&current, &seen_failed, &detail, pending);
                 }
@@ -3810,10 +3836,10 @@ impl<'a> Runner<'a> {
                         current.prs.clone(),
                     ));
                 }
-                Culprit::BaseRed(tests) => {
+                Culprit::BaseRed(tests, confirmation) => {
                     return Ok(BatchOutcome::Stop(
                         format!(
-                            "the base {} itself fails {} (seen twice); fix the base first",
+                            "the base {} itself fails {} ({confirmation}); fix the base first",
                             short(&current.parent),
                             ids(&tests.into_iter().collect::<Vec<_>>())
                         ),
@@ -3856,11 +3882,12 @@ impl<'a> Runner<'a> {
                     index,
                     failed,
                     flaky: flaked,
+                    confirmation,
                 } => {
                     flaky.extend(flaked);
                     let culprit = current.prs[index];
                     let reason = format!(
-                        "{} fail with #{culprit} on top of {} (seen twice) and pass without it",
+                        "{} fail with #{culprit} on top of {} ({confirmation}) and pass without it",
                         ids(&failed.iter().cloned().collect::<Vec<_>>()),
                         if index == 0 {
                             format!("the base {}", short(&current.parent))
@@ -3972,6 +3999,7 @@ impl<'a> Runner<'a> {
                         .collect();
                     seen_failed = rran.failed();
                     attributed = !rran.results.unattributed && !seen_failed.is_empty();
+                    deterministic = rran.deterministic_red();
                     focus = if rran.results.unattributed {
                         delta
                     } else {
@@ -4081,12 +4109,15 @@ impl<'a> Runner<'a> {
     /// Search the candidate's prefixes for the first change that makes `focus` fail, running only
     /// `focus`, with up to `width` probes at once. The bare parent is probed until known, so a
     /// broken base never ejects an innocent change; spare probe slots re-run the suspected
-    /// failing prefix, and every blaming conclusion needs its failure seen twice.
+    /// failing prefix, and every blaming conclusion needs its failure seen twice, or once when
+    /// the run that saw it named it a deterministic check (`first_deterministic` for the red
+    /// run that started the search).
     fn find_culprit(
         &self,
         candidate: &Candidate,
         focus: &Selection,
         first_failed: &BTreeSet<TestId>,
+        first_deterministic: bool,
     ) -> Result<Culprit, String> {
         let n = candidate.prs.len();
         let mut obs: BTreeMap<usize, Obs> = BTreeMap::new();
@@ -4097,6 +4128,7 @@ impl<'a> Runner<'a> {
                 passes: 0,
                 unknowns: 0,
                 failed: first_failed.clone(),
+                deterministic: first_deterministic,
             },
         );
         if self.config.trust_base && n > 0 {
@@ -4122,7 +4154,10 @@ impl<'a> Runner<'a> {
                 return Ok(Culprit::Flaky(flaky));
             }
             if confirmed(&obs, 0) {
-                return Ok(Culprit::BaseRed(obs[&0].failed.clone()));
+                return Ok(Culprit::BaseRed(
+                    obs[&0].failed.clone(),
+                    obs[&0].confirmation(),
+                ));
             }
             let hi = (0..=n).find(|i| seen(&obs, *i) == Seen::Fail).unwrap_or(n);
             let lo = (0..hi).rev().find(|i| seen(&obs, *i) == Seen::Pass);
@@ -4131,6 +4166,7 @@ impl<'a> Runner<'a> {
                     index: hi - 1,
                     failed: obs[&hi].failed.clone(),
                     flaky,
+                    confirmation: obs[&hi].confirmation(),
                 });
             }
             let mut probes: Vec<usize> = Vec::new();
@@ -4197,6 +4233,7 @@ impl<'a> Runner<'a> {
                     ProbeObservation::Fail => {
                         entry.fails += 1;
                         entry.failed.extend(ran.reproduced());
+                        entry.deterministic |= ran.deterministic_red();
                     }
                     ProbeObservation::Pass => entry.passes += 1,
                     ProbeObservation::Unknown => {
@@ -4369,6 +4406,11 @@ fn receipt_ran(receipt: &crate::donor::Receipt, dir: &std::path::Path) -> Result
             Vec::new()
         } else {
             crate::validate::infra_blocked(receipt.exit, &receipt.log_tail)
+        },
+        rerun_exempt: if receipt.refused {
+            Vec::new()
+        } else {
+            crate::validate::rerun_exempt(receipt.exit, &receipt.log_tail)
         },
         cannot_execute: None,
         effective_selection: receipt.effective_selection.clone(),

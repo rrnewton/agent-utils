@@ -531,6 +531,11 @@ enum Command {
         /// the change (the red run is the verdict) or `hold` it for its owner.
         #[arg(long, default_value = "eject", value_parser = ["eject", "hold"])]
         red_without_probe: String,
+        /// Ask the runner to stop each candidate validation at its first red step
+        /// (`$MQ_FAIL_FAST=1`; never for the complete run on the base). Steps it skips must be
+        /// reported as `skip`.
+        #[arg(long)]
+        fail_fast: bool,
         /// Where validations run: `off` (in this process; the default), `compare` (in this
         /// process, which decides, and also on donors, whose receipts are only compared), or
         /// `decide` (on donors only; an accepted receipt is the verdict).
@@ -1186,6 +1191,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             green_flaky_hold_secs,
             max_deferrals,
             red_without_probe,
+            fail_fast,
             offload,
             tool_identity,
             tool_refresh,
@@ -1314,6 +1320,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     } else {
                         red_without_probe
                     },
+                    fail_fast,
                     offload: if offload == "off" {
                         String::new()
                     } else {

@@ -52,6 +52,17 @@ pub const INFRA_BLOCKED_MARKER: &str = "INFRA-BLOCKED";
 /// Exit status that goes with [`INFRA_BLOCKED_MARKER`].
 pub const INFRA_BLOCKED_EXIT: i32 = 6;
 
+/// Marker line a validator prints on a red run to name the failed steps that are deterministic
+/// checks (`RERUN-EXEMPT: step1,step2`): their answer depends only on the tree, so a rerun of the
+/// same commit cannot change it. When every failure of the run is in a named step, the queue
+/// counts the red as confirmed on that one observation instead of spending a rerun on it; see
+/// [`Ran::deterministic_red`].
+pub const RERUN_EXEMPT_MARKER: &str = "RERUN-EXEMPT";
+
+/// Environment variable set to `1` for a candidate validation when `validator.fail_fast` is on:
+/// the runner may stop at the first red step and report the steps it skipped as `skip`.
+pub const FAIL_FAST_ENV: &str = "MQ_FAIL_FAST";
+
 /// Tests a green run names as passed only after a retry, read from its `GREEN_FLAKY:`
 /// marker line. Only a zero exit can be green-flaky: a red run's marker text (a test
 /// printing it, say) means nothing.
@@ -69,6 +80,18 @@ pub fn infra_blocked(exit: Option<i32>, log_text: &str) -> Vec<TestId> {
         return Vec::new();
     }
     marker_ids(log_text, INFRA_BLOCKED_MARKER)
+}
+
+/// Steps a red run names as deterministic checks, read from its `RERUN-EXEMPT:` marker line.
+/// Only a red exit can carry it: in a green run, a refusal (exit 75), an INFRA-BLOCKED run
+/// (exit 6) or a run killed without an exit status, the marker text means nothing.
+pub fn rerun_exempt(exit: Option<i32>, log_text: &str) -> Vec<TestId> {
+    match exit {
+        Some(code) if code != 0 && code != REFUSAL_EXIT && code != INFRA_BLOCKED_EXIT => {
+            marker_ids(log_text, RERUN_EXEMPT_MARKER)
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The test IDs on every `MARKER: id1,id2` line of `log_text`.
@@ -143,6 +166,10 @@ pub struct Ran {
     /// validator's `INFRA-BLOCKED:` marker, exit 6). A run with any of these is neither green
     /// nor red: its change is held for a ruling.
     pub infra_blocked: Vec<TestId>,
+    /// Steps the validator names as deterministic checks on this red run (its `RERUN-EXEMPT:`
+    /// marker): a rerun of the same commit cannot change their answer. See
+    /// [`Ran::deterministic_red`].
+    pub rerun_exempt: Vec<TestId>,
     /// Why the validator could not execute (it could not start, or exited 126 or 127 without
     /// reporting a failed test), naming the command and `PATH`. Always also `refused`.
     pub cannot_execute: Option<String>,
@@ -196,6 +223,21 @@ impl Ran {
     /// synthetic test ID, carries that fact).
     pub fn reproduced(&self) -> BTreeSet<TestId> {
         self.results.attributed_failures()
+    }
+
+    /// Whether this red run is confirmed without a second observation: it attributed its
+    /// failures to named tests, and every one of them belongs to a step the validator named in
+    /// its `RERUN-EXEMPT:` marker. A red run with no attributed failure, or with any failure
+    /// outside those steps, still needs its failure seen twice.
+    pub fn deterministic_red(&self) -> bool {
+        if !self.reproduces() || self.rerun_exempt.is_empty() {
+            return false;
+        }
+        let failed = self.reproduced();
+        !failed.is_empty()
+            && failed
+                .iter()
+                .all(|test| self.rerun_exempt.iter().any(|step| step.step == test.step))
     }
 
     /// Failed tests. A red run with no attributed failure reports none;
@@ -725,6 +767,11 @@ impl Validator for CommandValidator {
             } else {
                 infra_blocked(exit, &log_text)
             },
+            rerun_exempt: if refused {
+                Vec::new()
+            } else {
+                rerun_exempt(exit, &log_text)
+            },
             cannot_execute,
             effective_selection: None,
             cpu: finished.cpu,
@@ -898,6 +945,7 @@ impl Validator for DagrunValidator {
                     refused: false,
                     flaky_passes: Vec::new(),
                     infra_blocked: Vec::new(),
+                    rerun_exempt: Vec::new(),
                     cannot_execute: None,
                     effective_selection: Some(Selection::default()),
                     cpu: None,
@@ -958,6 +1006,11 @@ impl Validator for DagrunValidator {
                 Vec::new()
             } else {
                 infra_blocked(exit, &log_text)
+            },
+            rerun_exempt: if refused {
+                Vec::new()
+            } else {
+                rerun_exempt(exit, &log_text)
             },
             cannot_execute,
             effective_selection: whole_steps,
@@ -1236,6 +1289,86 @@ dagrun: PASS - 1 passed";
     }
 
     #[test]
+    fn rerun_exempt_marker_only_counts_on_a_red_exit() {
+        let log = "noise\nRERUN-EXEMPT: check.paths,check.names\nmore\n";
+        assert_eq!(
+            rerun_exempt(Some(1), log),
+            vec![TestId::step("check.paths"), TestId::step("check.names")]
+        );
+        // A green run, a refusal, an INFRA-BLOCKED run or a killed one says nothing by it.
+        assert!(rerun_exempt(Some(0), log).is_empty());
+        assert!(rerun_exempt(Some(REFUSAL_EXIT), log).is_empty());
+        assert!(rerun_exempt(Some(INFRA_BLOCKED_EXIT), log).is_empty());
+        assert!(rerun_exempt(None, log).is_empty());
+        assert!(rerun_exempt(Some(1), "RERUN-EXEMPT check.paths\n").is_empty());
+    }
+
+    /// A finished run with these outcomes, exit status and `RERUN-EXEMPT:` steps.
+    fn ran_with(outcomes: &[(&str, Outcome)], exit: Option<i32>, exempt: &[&str]) -> Ran {
+        let mut results = TestResults::default();
+        for (id, outcome) in outcomes {
+            results.record(TestResult {
+                id: TestId::parse(id).unwrap(),
+                outcome: *outcome,
+                duration_ms: None,
+                log: None,
+            });
+        }
+        results.unattributed = outcomes.is_empty();
+        Ran {
+            results,
+            exit,
+            elapsed: Duration::ZERO,
+            log: PathBuf::new(),
+            cancelled: false,
+            interrupted: None,
+            handle: None,
+            refused: false,
+            flaky_passes: Vec::new(),
+            infra_blocked: Vec::new(),
+            rerun_exempt: exempt.iter().map(|step| TestId::step(*step)).collect(),
+            cannot_execute: None,
+            effective_selection: None,
+            cpu: None,
+            donor: None,
+        }
+    }
+
+    #[test]
+    fn a_red_is_deterministic_only_when_every_failure_is_in_a_named_step() {
+        let fail = Outcome::Fail;
+        let pass = Outcome::Pass;
+        // Every failure is a named check, whole step or a case inside it.
+        assert!(ran_with(
+            &[("check.paths", fail), ("unit", pass)],
+            Some(1),
+            &["check.paths"]
+        )
+        .deterministic_red());
+        assert!(
+            ran_with(&[("check.paths::a", fail)], Some(1), &["check.paths"]).deterministic_red()
+        );
+        // A failure outside the named steps needs its second sighting.
+        assert!(!ran_with(
+            &[("check.paths", fail), ("unit", fail)],
+            Some(1),
+            &["check.paths"]
+        )
+        .deterministic_red());
+        // No marker, an unattributed red, or a green run: not deterministic.
+        assert!(!ran_with(&[("check.paths", fail)], Some(1), &[]).deterministic_red());
+        assert!(!ran_with(&[], Some(1), &["check.paths"]).deterministic_red());
+        assert!(!ran_with(&[("check.paths", pass)], Some(0), &["check.paths"]).deterministic_red());
+        // A refused or cancelled run reproduces nothing.
+        let mut refused = ran_with(&[("check.paths", fail)], Some(1), &["check.paths"]);
+        refused.refused = true;
+        assert!(!refused.deterministic_red());
+        let mut cancelled = ran_with(&[("check.paths", fail)], Some(1), &["check.paths"]);
+        cancelled.cancelled = true;
+        assert!(!cancelled.deterministic_red());
+    }
+
+    #[test]
     fn missing_and_skip_only_probes_are_unknown_not_pass() {
         for outcome in [Outcome::Missing, Outcome::Skip] {
             let mut results = TestResults::default();
@@ -1256,6 +1389,7 @@ dagrun: PASS - 1 passed";
                 refused: false,
                 flaky_passes: Vec::new(),
                 infra_blocked: Vec::new(),
+                rerun_exempt: Vec::new(),
                 cannot_execute: None,
                 effective_selection: None,
                 cpu: None,
