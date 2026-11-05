@@ -8516,6 +8516,62 @@ def _archive_files(config: Config) -> list[tuple[str, Path]]:
     return result
 
 
+_MACHINE_SHARD_RE = r"(?P<machine>[A-Za-z0-9][A-Za-z0-9._-]{0,63})"
+
+
+def _foreign_shards(config: Config) -> tuple[tuple[Path, str], ...]:
+    """Shards recorded by other machines that are present on disk (#873).
+
+    Read commands stay on the local machine's shard by default; a foreign
+    shard (a stale copy, usually) is reported as present, never read,
+    unless ``--all-machines`` asks for every shard.
+    """
+
+    result: dict[Path, str] = {}
+    for machine, path in (*_state_files(config), *_archive_files(config)):
+        if machine != config.machine:
+            result[path] = machine
+    for pattern in ("ACTIVE.*.journal", "CREATE.*.journal", "FINISH.*.journal"):
+        for path in sorted(config.control.glob(pattern)):
+            journal_machine = _journal_machine(config, path)
+            if journal_machine is not None and journal_machine != config.machine:
+                result[path] = journal_machine
+    events_pattern = re.compile(rf"^EVENTS\.{_MACHINE_SHARD_RE}$")
+    for path in sorted(config.control.glob("EVENTS.*")):
+        match = events_pattern.fullmatch(path.name)
+        if match is not None and match.group("machine") != config.machine:
+            result[path] = match.group("machine")
+    return tuple(sorted(result.items(), key=lambda item: str(item[0])))
+
+
+def _foreign_shard_notes(config: Config) -> list[dict[str, object]]:
+    """NOTE records naming each foreign shard a default read skipped."""
+
+    notes: list[dict[str, object]] = []
+    for path, machine in _foreign_shards(config):
+        try:
+            # Whole seconds: both editions print the same instant for the
+            # same file (sub-second rounding differs per language).
+            modified = dt.datetime.fromtimestamp(
+                int(path.stat().st_mtime), tz=dt.timezone.utc
+            ).isoformat()
+        except OSError:
+            modified = "unknown"
+        notes.append(
+            {"machine": machine, "path": str(path), "modified": modified}
+        )
+    return notes
+
+
+def _print_foreign_shard_notes(notes: Sequence[Mapping[str, object]]) -> None:
+    for note in notes:
+        print(
+            f"NOTE: foreign shard {note['path']} (machine {note['machine']}, "
+            f"modified {note['modified']}) was not read; "
+            "pass --all-machines to include it"
+        )
+
+
 def _state_machines(config: Config) -> tuple[str, ...]:
     active = {machine for machine, _path in _state_files(config)}
     archive = {machine for machine, _path in _archive_files(config)}
@@ -10060,10 +10116,11 @@ def _classify_create_journals(
     requested_slot: str | None = None,
     requested_slot_type: str = "agent",
     skipped_paths: list[Path] | None = None,
+    machines: AbstractSet[str] | None = None,
 ) -> tuple[_CreateJournalClassification, ...]:
     rows = tuple(
         row
-        for path in _outstanding_journals(config)
+        for path in _outstanding_journals(config, machines)
         if path not in excluded_paths
         for row in (
             _classify_create_journal(
@@ -10101,9 +10158,12 @@ def _assert_create_journal_classifications_stable(
     archives: Sequence[ArchiveState],
     *,
     excluded_paths: AbstractSet[Path] = frozenset(),
+    machines: AbstractSet[str] | None = None,
 ) -> None:
     outstanding = tuple(
-        path for path in _outstanding_journals(config) if path not in excluded_paths
+        path
+        for path in _outstanding_journals(config, machines)
+        if path not in excluded_paths
     )
     if tuple(row.path for row in rows) != outstanding:
         raise Refusal("recovery journal set changed while it was classified")
@@ -25381,14 +25441,79 @@ def _refuse_partial_state(
             )
 
 
-def _outstanding_journals(config: Config) -> list[Path]:
-    paths = {path for path in config.control.glob("ACTIVE.*.journal")}
-    paths.update(config.control.glob("CREATE.*.journal"))
-    paths.update(config.control.glob("FINISH.*.journal"))
+def _journal_machine(config: Config, path: Path) -> str | None:
+    """Machine a journal filename names, or None when it names none.
+
+    ``ACTIVE.<machine>.journal`` carries the machine directly; a scoped
+    ``CREATE.``/``FINISH.`` name embeds it length-prefixed
+    (``CREATE.<len>.<machine>.<len>.<slot>.journal``), which parses
+    unambiguously even when the machine itself contains dots.  A legacy
+    unscoped CREATE./FINISH. journal names no machine.
+    """
+
+    del config  # the filename alone decides; kept for caller symmetry
+    active = re.fullmatch(rf"ACTIVE\.{_MACHINE_SHARD_RE}\.journal", path.name)
+    if active is not None:
+        return active.group("machine")
+    for prefix in ("CREATE.", "FINISH."):
+        if not path.name.startswith(prefix):
+            continue
+        rest = path.name[len(prefix) :]
+        digits, separator, rest = rest.partition(".")
+        if not separator or not digits.isdigit():
+            return None
+        length = int(digits)
+        machine, remainder = rest[:length], rest[length:]
+        if len(machine) != length or not remainder.startswith("."):
+            return None
+        slot_digits, separator, slot = remainder[1:].partition(".")
+        if (
+            not separator
+            or not slot_digits.isdigit()
+            or not slot.endswith(".journal")
+            or len(slot[: -len(".journal")]) != int(slot_digits)
+        ):
+            return None
+        return machine
+    return None
+
+
+def _outstanding_journals(
+    config: Config, machines: AbstractSet[str] | None = None
+) -> list[Path]:
+    """Outstanding mutation journals, optionally for named machines only.
+
+    ``machines=None`` reads every shard (mutation and recovery paths must
+    never miss a journal).  A read-only caller scoped to the local shard
+    (#873) passes the local machine; journals that name no machine count
+    as local.
+    """
+
+    paths: set[Path] = set()
+    for path in config.control.glob("ACTIVE.*.journal"):
+        if machines is not None:
+            machine = _journal_machine(config, path)
+            if machine is not None and machine not in machines:
+                continue
+        paths.add(path)
+    for path in config.control.glob("CREATE.*.journal"):
+        if machines is not None:
+            machine = _journal_machine(config, path)
+            if machine is not None and machine not in machines:
+                continue
+        paths.add(path)
+    for path in config.control.glob("FINISH.*.journal"):
+        if machines is not None:
+            machine = _journal_machine(config, path)
+            if machine is not None and machine not in machines:
+                continue
+        paths.add(path)
     for directory in config.control.glob("EVENTS.*"):
         if not directory.is_dir() or directory.is_symlink():
             continue
         machine = directory.name.removeprefix("EVENTS.")
+        if machines is not None and machine not in machines:
+            continue
         paths.update(_pending_operations_from_events(config, machine))
     return sorted(paths)
 
@@ -26830,9 +26955,16 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
         _validate_global_state_beside_absent_batch(config)
     )
     _assert_not_in_absent_batch(slot, absent_slots)
+    # #873: by default only the local machine's journals are classified; a
+    # foreign shard is noted, never allowed to block a local verdict.
+    all_machines = bool(getattr(args, "all_machines", False))
+    machines = None if all_machines else frozenset({config.machine})
+    foreign_notes = [] if all_machines else _foreign_shard_notes(config)
     before_rows = _global_rows(before_states, before_archives)
     before_paths = tuple(
-        path for path in _outstanding_journals(config) if path not in absent_paths
+        path
+        for path in _outstanding_journals(config, machines)
+        if path not in absent_paths
     )
     skipped_paths: list[Path] = []
     rows = _classify_create_journals(
@@ -26843,6 +26975,7 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
         requested_slot=slot,
         requested_slot_type=slot_type,
         skipped_paths=skipped_paths,
+        machines=machines,
     )
     _assert_interrupted_creates_unrelated(
         config, rows, slot=slot, agent=agent, slot_type=slot_type
@@ -26864,9 +26997,11 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
         after_states,
         after_archives,
         excluded_paths=absent_paths | frozenset(skipped_paths),
+        machines=machines,
     )
     payload = {
         "blocking": False,
+        "foreign_shards": foreign_notes,
         "journals": [row.to_obj() for row in rows],
         "requested": {
             "agent": agent,
@@ -26899,6 +27034,7 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
                 f"JOURNAL: state={row.state} machine={row.machine} slot={row.slot} "
                 f"agent={row.agent} dirty_checkouts={dirty} journal={row.path}"
             )
+        _print_foreign_shard_notes(foreign_notes)
     return 0
 
 
@@ -35167,10 +35303,14 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
         requested = set(only)
         for slot in sorted(requested & set(absent_slots)):
             _assert_not_in_absent_batch(slot, absent_slots)
-        # A row recorded by a foreign machine is never cleaned here: its
-        # slot name could select a local directory that is not its cache,
-        # and nothing about it may be written (#876).  Such rows are
-        # reported below, never selected.
+        # A row recorded by a foreign machine is never cleaned here by
+        # default: its slot name could select a local directory that is
+        # not its cache, and nothing about it may be written (#876).
+        # Such rows are reported below, never selected.  --all-machines
+        # (#873) is the explicit opt-in that reports and cleans them as
+        # before; reclaim writes no event, so the foreign log is still
+        # never appended to.
+        all_machines = bool(getattr(args, "all_machines", False))
         foreign_cache_rows = sorted(
             (state.machine, record.slot)
             for state in states
@@ -35178,10 +35318,12 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
             for record in state.slots
             if not requested or record.slot in requested
         )
+        if all_machines:
+            foreign_cache_rows = []
         cache_slots = {
             record.slot: CacheSlot(record.slot, record.machine, record.checkouts)
             for state in states
-            if state.machine == config.machine
+            if all_machines or state.machine == config.machine
             for record in state.slots
             if record.slot not in absent_slots
             and (not requested or record.slot in requested)
@@ -35194,6 +35336,8 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
         )
         registered_slots.update(slot.slot for slot in journal_slots)
         for journal_slot in journal_slots:
+            if not all_machines and journal_slot.machine != config.machine:
+                continue
             if not requested or journal_slot.slot in requested:
                 cache_slots[journal_slot.slot] = journal_slot
         malformed_slots: dict[str, str] = {}
@@ -35728,20 +35872,46 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock):
         registry_started = metrics.start()
         _refuse_partial_state(config, allow_validate_batch_seals=True)
-        states, _archives = _validate_global_state(config)
-        snapshot_revision = _audit_registry_revision(states)
+        all_states, _archives = _validate_global_state(config)
+        # #873: verdicts cover the local machine's shard by default; a
+        # foreign shard is noted, never allowed to skew a local verdict.
+        # Global validation above still runs (a malformed shard refuses),
+        # and the cross-machine identity comparisons below stay global
+        # where they only detect change, never publish a foreign row.
+        all_machines = bool(getattr(args, "all_machines", False))
+        foreign_notes = [] if all_machines else _foreign_shard_notes(config)
+        states = (
+            all_states
+            if all_machines
+            else [state for state in all_states if state.machine == config.machine]
+        )
+        read_machines = (
+            _state_machines(config)
+            if all_machines
+            else tuple(state.machine for state in states)
+        )
+        snapshot_revision = _audit_registry_revision(all_states)
         records = [record for state in states for record in state.slots]
         event_logs = {
             state.machine: _load_events(config, state.machine) for state in states
         }
         seal_targets, seal_errors = _audit_validate_batch_seal_evidence(config)
+        if not all_machines:
+            seal_targets = tuple(
+                target for target in seal_targets if target[0] == config.machine
+            )
+            seal_errors = tuple(
+                error for error in seal_errors if error[0] == config.machine
+            )
         seal_by_slot = {
             (machine, slot): (generation, path)
             for machine, slot, generation, path in seal_targets
         }
         represented_seals: set[tuple[str, str, int]] = set()
         journal_slots = {
-            slot.slot: slot for slot in _all_journal_cache_slots(config, states=states)
+            slot.slot: slot
+            for slot in _all_journal_cache_slots(config, states=all_states)
+            if all_machines or slot.machine == config.machine
         }
         # Per-record snapshot identities for the stale-snapshot
         # revalidation below: a later change invalidates only the row
@@ -35751,8 +35921,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         # files, and an event-replayed record can differ from its
         # file form without any registry change during the audit.
         _file_states = [
-            _load_active_snapshot(config, machine)
-            for machine in _state_machines(config)
+            _load_active_snapshot(config, machine) for machine in read_machines
         ]
         snapshot_records = {
             (record.machine, record.slot, record.generation): _record_sha256(record)
@@ -36211,8 +36380,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         # did not; per-record digests are computed from the parsed
         # records without another event pass.
         current_states = [
-            _load_active_snapshot(config, machine)
-            for machine in _state_machines(config)
+            _load_active_snapshot(config, machine) for machine in read_machines
         ]
         current_record_list = [
             record for state in current_states for record in state.slots
@@ -36220,6 +36388,15 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         current_seal_targets, current_seal_errors = (
             _audit_validate_batch_seal_evidence(config)
         )
+        if not all_machines:
+            current_seal_targets = tuple(
+                target
+                for target in current_seal_targets
+                if target[0] == config.machine
+            )
+            current_seal_errors = tuple(
+                error for error in current_seal_errors if error[0] == config.machine
+            )
     current_records = {
         (record.machine, record.slot, record.generation): _record_sha256(record)
         for record in current_record_list
@@ -36433,6 +36610,8 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         if slot in snapshot_journals or slot in kept_slots:
             continue
         journal_machine, journal_state, _journal_digest = current_journals[slot]
+        if not all_machines and journal_machine != config.machine:
+            continue
         rows.append(
             {
                 "slot": slot,
@@ -36624,6 +36803,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         "remote_refs_refreshed": False,
         "disk": disk,
         "slots": sorted_rows,
+        "foreign_shards": foreign_notes,
         "metrics": metrics.to_obj(),
     }
     if args.format == "json":
@@ -36645,6 +36825,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 release_obj = _as_mapping(release_value, "audit owner_release")
                 detail += f"; {release_obj['summary']}"
             print(f"{row['verdict']}: {row['slot']}: {detail}")
+        _print_foreign_shard_notes(foreign_notes)
         if args.gate:
             print(f"state={gate_state}")
             print(f"summary={summary}")
@@ -63222,6 +63403,14 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     audit.add_argument("--format", choices=("human", "json"), default="human")
     audit.add_argument(
+        "--all-machines",
+        action="store_true",
+        help=(
+            "audit every machine's ACTIVE shard instead of only the local "
+            "machine's (foreign shards are noted, not read, by default)"
+        ),
+    )
+    audit.add_argument(
         "--cache-census-state",
         metavar="PATH",
         help=(
@@ -63434,6 +63623,14 @@ usage or audit gate unknown, 3 fail-closed refusal.
     classify_create.add_argument("slot", help="prospective slot name")
     classify_create.add_argument("--slot-type", choices=SLOT_TYPES, required=True)
     classify_create.add_argument("--agent", required=True, metavar="AGENT")
+    classify_create.add_argument(
+        "--all-machines",
+        action="store_true",
+        help=(
+            "classify every machine's journals instead of only the local "
+            "machine's (foreign shards are noted, not read, by default)"
+        ),
+    )
     classify_create.add_argument(
         "--format", choices=("human", "json"), default="human"
     )
@@ -64117,6 +64314,15 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--yes",
         action="store_true",
         help="remove configured caches from every unheld active or unregistered slot",
+    )
+    clean_caches.add_argument(
+        "--all-machines",
+        action="store_true",
+        help=(
+            "report and clean rows recorded by every machine instead of "
+            "only the local machine's (foreign rows are skipped and "
+            "reported by default)"
+        ),
     )
     clean_caches.add_argument(
         "--format",

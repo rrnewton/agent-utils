@@ -30641,6 +30641,139 @@ def test_foreign_shard_is_never_written_by_retirement_or_cleanup(
     assert _foreign_shard_snapshot(project) == foreign_before
 
 
+def test_foreign_shards_are_ignored_by_default_reads(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path, cache_globs=("target",)
+    )
+    assert create(
+        project, slot="slot01", agent="codex-1", branch="codex/one"
+    ).returncode == 0
+    baseline = command(project, "audit", "--format", "json")
+    assert baseline.returncode == 0, baseline.stderr
+    baseline_rows = {
+        (row["slot"], row["machine"], row["verdict"])
+        for row in json.loads(baseline.stdout)["slots"]
+    }
+    assert baseline_rows == {("slot01", "testhost", "BLOCKED")} or baseline_rows
+
+    # A foreign slot whose storage is absent.  Only the shard files stay
+    # behind (the stale-copy case): the foreign slot's directory is gone,
+    # so storage is absent and no local on-disk row remains either.
+    assert create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/two",
+        machine="otherhost",
+    ).returncode == 0
+    shutil.rmtree(checkout(project, "slot02").parent)
+    git(repository, "worktree", "prune")
+    control = control_directory(project)
+    assert (control / "ACTIVE.otherhost.json").is_file()
+
+    # Default audit: same verdicts as without the foreign shards, plus a
+    # NOTE naming them; --all-machines reports the foreign rows.
+    audited = command(project, "audit", "--format", "json")
+    assert audited.returncode == 0, audited.stderr
+    payload = json.loads(audited.stdout)
+    assert {
+        (row["slot"], row["machine"], row["verdict"]) for row in payload["slots"]
+    } == baseline_rows
+    assert {item["machine"] for item in payload["foreign_shards"]} == {"otherhost"}
+    human = command(project, "audit")
+    assert human.returncode == 0, human.stderr
+    assert "NOTE" in human.stdout and "otherhost" in human.stdout
+
+    audited_all = command(project, "audit", "--all-machines", "--format", "json")
+    assert audited_all.returncode == 0, audited_all.stderr
+    all_rows = {
+        (row["slot"], row["machine"]) for row in json.loads(audited_all.stdout)["slots"]
+    }
+    assert ("slot02", "otherhost") in all_rows
+
+    # clean-caches already skips foreign rows by default (#876); under
+    # --all-machines it reports them again.
+    cleaned = raw_command(project, "clean-caches", "--format", "json")
+    assert cleaned.returncode == 0, cleaned.stderr
+    cleaned_payload = json.loads(cleaned.stdout)
+    assert "slot02" not in {row["slot"] for row in cleaned_payload["slots"]}
+    assert cleaned_payload["skipped_foreign"] == [
+        {"machine": "otherhost", "slot": "slot02"}
+    ]
+    cleaned_all = raw_command(
+        project, "clean-caches", "--all-machines", "--format", "json"
+    )
+    assert cleaned_all.returncode == 0, cleaned_all.stderr
+    cleaned_all_payload = json.loads(cleaned_all.stdout)
+    assert "slot02" in {row["slot"] for row in cleaned_all_payload["slots"]}
+    assert cleaned_all_payload["skipped_foreign"] == []
+
+    # An interrupted foreign create leaves its machine journal behind.
+    interrupted = create(
+        project,
+        slot="slot03",
+        agent="codex-3",
+        branch="codex/three",
+        machine="otherhost",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    assert list(control.glob("*.otherhost.*.journal")) or (
+        control / "ACTIVE.otherhost.journal"
+    ).is_file()
+
+    # Default classify: the foreign journal does not block or appear;
+    # --all-machines classifies it as before.
+    classified = raw_command(
+        project,
+        "classify-create-journals",
+        "slot99",
+        "--slot-type",
+        "agent",
+        "--agent",
+        "codex-99",
+        "--format",
+        "json",
+    )
+    assert classified.returncode == 0, classified.stderr
+    classified_payload = json.loads(classified.stdout)
+    assert classified_payload["journals"] == []
+    assert {item["machine"] for item in classified_payload["foreign_shards"]} == {
+        "otherhost"
+    }
+    classified_human = raw_command(
+        project,
+        "classify-create-journals",
+        "slot99",
+        "--slot-type",
+        "agent",
+        "--agent",
+        "codex-99",
+    )
+    assert classified_human.returncode == 0, classified_human.stderr
+    assert "NOTE" in classified_human.stdout
+
+    classified_all = raw_command(
+        project,
+        "classify-create-journals",
+        "slot99",
+        "--slot-type",
+        "agent",
+        "--agent",
+        "codex-99",
+        "--all-machines",
+        "--format",
+        "json",
+    )
+    assert classified_all.returncode == 0, classified_all.stderr
+    assert {
+        (row["machine"], row["slot"])
+        for row in json.loads(classified_all.stdout)["journals"]
+    } == {("otherhost", "slot03")}
+
+
 def test_audit_associates_recovery_journals_from_other_machine_shards(
     tmp_path: Path,
 ) -> None:
@@ -30651,7 +30784,19 @@ def test_audit_associates_recovery_journals_from_other_machine_shards(
     refused = create(project, machine="otherhost")
     assert refused.returncode == 3
 
-    audit = command(project, "audit", "--format", "json")
+    # #873: another machine's journal is associated only under
+    # --all-machines; the default audit notes it and reports no row.
+    default_audit = command(project, "audit", "--format", "json")
+    assert default_audit.returncode == 0, default_audit.stderr
+    default_payload = json.loads(default_audit.stdout)
+    assert all(
+        row["machine"] != "otherhost" for row in default_payload["slots"]
+    )
+    assert {item["machine"] for item in default_payload["foreign_shards"]} == {
+        "otherhost"
+    }
+
+    audit = command(project, "audit", "--all-machines", "--format", "json")
 
     assert audit.returncode == 0, audit.stderr
     row = json.loads(audit.stdout)["slots"][0]
@@ -30661,7 +30806,9 @@ def test_audit_associates_recovery_journals_from_other_machine_shards(
     assert "wrkslots recover" in row["reasons"][0]
 
     git(repository, "worktree", "remove", "--force", str(checkout(project)))
-    without_directory = command(project, "audit", "--format", "json")
+    without_directory = command(
+        project, "audit", "--all-machines", "--format", "json"
+    )
     assert without_directory.returncode == 0, without_directory.stderr
     missing_row = json.loads(without_directory.stdout)["slots"][0]
     assert missing_row["slot"] == "slot01"
@@ -46788,7 +46935,14 @@ def test_create_and_classification_proceed_beside_an_interrupted_absent_validate
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     # validate-run admission checks this exact field set.
-    assert set(payload) == {"blocking", "journals", "requested", "schema"}
+    assert set(payload) == {
+        "blocking",
+        "foreign_shards",
+        "journals",
+        "requested",
+        "schema",
+    }
+    assert payload["foreign_shards"] == []
     assert payload["blocking"] is False and payload["journals"] == []
     assert "proceeding beside the interrupted absent-validation-row batch" in captured.err
     assert "2 row(s) stay active and archived" in captured.err

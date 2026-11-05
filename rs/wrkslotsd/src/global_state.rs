@@ -393,6 +393,140 @@ pub(crate) fn discover_machines(control: &Path) -> Result<Vec<String>> {
     Ok(machines.into_iter().collect())
 }
 
+/// Machine a journal filename names, or None when it names none
+/// (#873; Python `_journal_machine`).  `ACTIVE.<machine>.journal`
+/// carries the machine directly; a scoped `CREATE.`/`FINISH.` name
+/// embeds it length-prefixed
+/// (`CREATE.<len>.<machine>.<len>.<slot>.journal`), which parses
+/// unambiguously even when the machine itself contains dots.  A legacy
+/// unscoped CREATE./FINISH. journal names no machine.
+pub(crate) fn journal_machine(name: &str) -> Option<String> {
+    if let Some(machine) = strip_affixes(name, "ACTIVE.", ".journal") {
+        return machine_name(machine);
+    }
+    for prefix in ["CREATE.", "FINISH."] {
+        let Some(rest) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        let (digits, rest) = rest.split_once('.')?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let length: usize = digits.parse().ok()?;
+        if rest.len() < length || !rest.is_char_boundary(length) {
+            return None;
+        }
+        let (machine, remainder) = rest.split_at(length);
+        let remainder = remainder.strip_prefix('.')?;
+        let (slot_digits, slot) = remainder.split_once('.')?;
+        if slot_digits.is_empty() || !slot_digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let slot_length: usize = slot_digits.parse().ok()?;
+        let slot_name = slot.strip_suffix(".journal")?;
+        if slot_name.len() != slot_length {
+            return None;
+        }
+        return machine_name(machine);
+    }
+    None
+}
+
+/// Shards recorded by other machines that are present on disk (#873;
+/// Python `_foreign_shards`), sorted by path.
+pub(crate) fn foreign_shards(
+    control: &Path,
+    local: &str,
+) -> Result<Vec<(std::path::PathBuf, String)>> {
+    let mut result: std::collections::BTreeMap<std::path::PathBuf, String> =
+        std::collections::BTreeMap::new();
+    let entries = std::fs::read_dir(control).map_err(|error| {
+        format!(
+            "cannot list control directory {}: {error}",
+            control.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "cannot list control directory {}: {error}",
+                control.display()
+            )
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let machine = if let Some(machine) = strip_affixes(&name, "ACTIVE.", ".json") {
+            machine_name(machine)
+        } else if let Some(machine) = strip_affixes(&name, "ARCHIVED.", ".json") {
+            machine_name(machine)
+        } else if name.ends_with(".journal")
+            && (name.starts_with("ACTIVE.")
+                || name.starts_with("CREATE.")
+                || name.starts_with("FINISH."))
+        {
+            journal_machine(&name)
+        } else if name.starts_with("EVENTS.") {
+            machine_name(strip_affixes(&name, "EVENTS.", "").unwrap_or_default())
+        } else {
+            None
+        };
+        if let Some(machine) = machine {
+            if machine != local {
+                result.insert(path, machine);
+            }
+        }
+    }
+    Ok(result.into_iter().collect())
+}
+
+/// NOTE records naming each foreign shard a default read skipped
+/// (#873; Python `_foreign_shard_notes`).
+pub(crate) fn foreign_shard_notes(control: &Path, local: &str) -> Result<Vec<Value>> {
+    Ok(foreign_shards(control, local)?
+        .into_iter()
+        .map(|(path, machine)| {
+            let modified = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|duration| {
+                    chrono::DateTime::from_timestamp(
+                        duration.as_secs() as i64,
+                        duration.subsec_nanos(),
+                    )
+                })
+                // Whole seconds, as in the Python reader: both editions
+                // print the same instant for the same file.
+                .map(|moment| moment.format("%Y-%m-%dT%H:%M:%S+00:00").to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            json!({
+                "machine": machine,
+                "modified": modified,
+                "path": path.to_string_lossy(),
+            })
+        })
+        .collect())
+}
+
+/// Human NOTE lines for foreign shards a default read skipped.
+pub(crate) fn foreign_shard_note_lines(notes: &[Value]) -> String {
+    let mut out = String::new();
+    for note in notes {
+        out.push_str(&format!(
+            "NOTE: foreign shard {} (machine {}, modified {}) was not read; \
+             pass --all-machines to include it\n",
+            note.get("path").and_then(Value::as_str).unwrap_or_default(),
+            note.get("machine")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            note.get("modified")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ));
+    }
+    out
+}
+
 /// Validate every machine's ACTIVE and ARCHIVED shards as one registry,
 /// printing each machine's normalized pair.
 pub(crate) fn parse_global(root: Option<&Path>) -> Result<Value> {

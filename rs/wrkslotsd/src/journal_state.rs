@@ -2687,6 +2687,7 @@ use crate::handoff_state::{read_regular_file_identity, strict_json_object};
 
 /// One outstanding recovery journal, validated against its
 /// append-only evidence.
+#[derive(Clone)]
 pub(crate) struct ValidatedJournal {
     pub(crate) slot: String,
     pub(crate) machine: String,

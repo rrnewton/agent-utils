@@ -5842,6 +5842,7 @@ pub(crate) fn parse_audit(
     root: Option<&Path>,
     machine_override: Option<&str>,
     census: CensusRequest,
+    all_machines: bool,
 ) -> Result<Value> {
     if census.work_limit < 1 {
         return Err("--cache-work-limit must be positive".to_string());
@@ -5854,7 +5855,26 @@ pub(crate) fn parse_audit(
     refuse_partial_state_allow_seals(&cfg.control)?;
     validate_global(root, &cfg)?;
     let machines = discover_machines(&cfg.control)?;
+    // #873: verdicts cover the local machine's shard by default; a
+    // foreign shard is noted, never allowed to skew a local verdict.
+    // Global validation above still runs (a malformed shard refuses),
+    // and event chains stay global because journal validation is a
+    // control-plane gate, as in the Python reader.
+    let _ = selected;
+    let foreign_notes: Vec<Value> = if all_machines {
+        Vec::new()
+    } else {
+        crate::global_state::foreign_shard_notes(&cfg.control, &cfg.machine)?
+    };
+    let read_machines: Vec<String> = if all_machines {
+        machines.clone()
+    } else if machines.contains(&cfg.machine) {
+        vec![cfg.machine.clone()]
+    } else {
+        Vec::new()
+    };
     let mut records: Vec<Value> = Vec::new();
+    let mut all_records: Vec<Value> = Vec::new();
     let mut shard_revisions: Vec<(String, i64)> = Vec::new();
     let mut events_by_machine: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for machine in &machines {
@@ -5867,7 +5887,10 @@ pub(crate) fn parse_audit(
                 .unwrap_or(0),
         ));
         if let Some(slots) = document.get("slots").and_then(Value::as_array) {
-            records.extend(slots.iter().cloned());
+            all_records.extend(slots.iter().cloned());
+            if read_machines.contains(machine) {
+                records.extend(slots.iter().cloned());
+            }
         }
         let directory = cfg.control.join(format!("EVENTS.{machine}"));
         let events = if directory.is_dir() {
@@ -5877,7 +5900,9 @@ pub(crate) fn parse_audit(
         };
         events_by_machine.insert(machine.clone(), events);
     }
-    let journals = validated_journals(&cfg, &config, &events_by_machine, &records)?;
+    // Journal validation stays global (a control-plane gate, as in the
+    // Python reader); only the row association below is machine-scoped.
+    let journals = validated_journals(&cfg, &config, &events_by_machine, &all_records)?;
     let mut journal_checkouts: BTreeMap<String, Vec<JournalCheckout>> = BTreeMap::new();
     let mut journals_by_path: Vec<&ValidatedJournal> = journals.values().collect();
     journals_by_path.sort_by(|left, right| left.path.cmp(&right.path));
@@ -5888,6 +5913,20 @@ pub(crate) fn parse_audit(
         );
     }
     let (seal_targets, seal_errors) = seal_evidence(&cfg);
+    let (seal_targets, seal_errors) = if all_machines {
+        (seal_targets, seal_errors)
+    } else {
+        (
+            seal_targets
+                .into_iter()
+                .filter(|target| target.machine == cfg.machine)
+                .collect(),
+            seal_errors
+                .into_iter()
+                .filter(|(machine, _name, _error)| machine.as_deref() == Some(cfg.machine.as_str()))
+                .collect(),
+        )
+    };
     // Per-record snapshot identities for the stale-snapshot
     // revalidation below: a later change invalidates only the row
     // whose own identity changed, appeared, or disappeared.
@@ -6066,6 +6105,14 @@ pub(crate) fn parse_audit(
             )
         })
         .collect();
+    // Row association is machine-scoped (#873): a foreign journal never
+    // attaches to a local row or plans a local cache subject.  The
+    // identity maps above keep every journal, as in the Python reader.
+    let row_journals: BTreeMap<String, ValidatedJournal> = journals
+        .iter()
+        .filter(|(_slot, journal)| all_machines || journal.machine == cfg.machine)
+        .map(|(slot, journal)| (slot.clone(), journal.clone()))
+        .collect();
     let snapshot_on_disk: BTreeSet<(String, String)> = on_disk.clone();
     let validation_paths: Vec<PathBuf> = records
         .iter()
@@ -6090,7 +6137,7 @@ pub(crate) fn parse_audit(
         if slot_type != "agent" {
             continue;
         }
-        if journals.contains_key(slot) {
+        if row_journals.contains_key(slot) {
             target_actions.push(TargetAction::Journal(slot.clone()));
         } else {
             target_actions.push(TargetAction::Unregistered(slot_type.clone(), slot.clone()));
@@ -6216,7 +6263,7 @@ pub(crate) fn parse_audit(
             &config,
             record,
             &events,
-            &journals,
+            &row_journals,
             &strays,
             sealed.map(|(generation, _path)| *generation),
             &validation_paths,
@@ -6229,7 +6276,7 @@ pub(crate) fn parse_audit(
         rows.push(row);
     }
     for (slot_type, slot) in on_disk.difference(&registered) {
-        let journal = journals.get(slot);
+        let journal = row_journals.get(slot);
         let sealed = seal_by_slot.get(&(selected.clone(), slot.clone()));
         let (reason, owner_state) = if let Some(journal) = journal {
             (
@@ -6317,7 +6364,7 @@ pub(crate) fn parse_audit(
             represented_seals.insert((selected.clone(), slot.clone(), *generation));
         }
     }
-    for journal in journals.values() {
+    for journal in row_journals.values() {
         let known = registered.iter().any(|(_type, slot)| slot == &journal.slot)
             || on_disk.iter().any(|(_type, slot)| slot == &journal.slot);
         if known {
@@ -6421,15 +6468,33 @@ pub(crate) fn parse_audit(
     };
     let current_machines = discover_machines(&cfg.control)?;
     let mut current_records_list: Vec<Value> = Vec::new();
+    let mut current_all_records: Vec<Value> = Vec::new();
     for machine in &current_machines {
         let document = active_document(root, &cfg, machine)?;
         if let Some(slots) = document.get("slots").and_then(Value::as_array) {
-            current_records_list.extend(slots.iter().cloned());
+            current_all_records.extend(slots.iter().cloned());
+            if read_machines.contains(machine) {
+                current_records_list.extend(slots.iter().cloned());
+            }
         }
     }
     let current_journals_map =
-        validated_journals(&cfg, &config, &events_by_machine, &current_records_list)?;
+        validated_journals(&cfg, &config, &events_by_machine, &current_all_records)?;
     let (current_seal_targets, current_seal_errors) = seal_evidence(&cfg);
+    let (current_seal_targets, current_seal_errors) = if all_machines {
+        (current_seal_targets, current_seal_errors)
+    } else {
+        (
+            current_seal_targets
+                .into_iter()
+                .filter(|target| target.machine == cfg.machine)
+                .collect(),
+            current_seal_errors
+                .into_iter()
+                .filter(|(machine, _name, _error)| machine.as_deref() == Some(cfg.machine.as_str()))
+                .collect(),
+        )
+    };
     let current_records: BTreeMap<(String, String, i64), Value> = current_records_list
         .iter()
         .map(|record| (record_key(record), record.clone()))
@@ -6724,6 +6789,9 @@ pub(crate) fn parse_audit(
         kept_slots.insert(slot);
     }
     for journal in current_journals_map.values() {
+        if !all_machines && journal.machine != cfg.machine {
+            continue;
+        }
         if snapshot_journals.contains_key(&journal.slot) || kept_slots.contains(&journal.slot) {
             continue;
         }
@@ -6929,6 +6997,7 @@ pub(crate) fn parse_audit(
         "remote_refs_refreshed": false,
         "disk": disk,
         "slots": rows,
+        "foreign_shards": foreign_notes,
     }))
 }
 
@@ -6943,8 +7012,9 @@ pub(crate) fn audit_cli(
     census: CensusRequest,
     gate: bool,
     human: bool,
+    all_machines: bool,
 ) -> Result<(String, i32)> {
-    let payload = parse_audit(root, machine_override, census)?;
+    let payload = parse_audit(root, machine_override, census, all_machines)?;
     let text = |key: &str| {
         payload
             .get(key)
@@ -7043,6 +7113,9 @@ pub(crate) fn audit_cli(
                 detail
             ));
         }
+    }
+    if let Some(notes) = payload.get("foreign_shards").and_then(Value::as_array) {
+        out.push_str(&crate::global_state::foreign_shard_note_lines(notes));
     }
     if gate {
         out.push_str(&format!("state={}\n", text("state")));

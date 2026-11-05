@@ -1000,9 +1000,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The #876 foreign-shard case (retirement and cleanup skip a row
     # recorded by another machine, and a direct foreign append is refused)
     # is mapped.
-    assert len(all_tests) == 2136
+    # The #873 default-read case (audit, classify-create-journals and
+    # clean-caches ignore a foreign shard unless --all-machines) is mapped.
+    assert len(all_tests) == 2137
     assert len(ordinary) == 339
-    assert len(mapped) == 1797
+    assert len(mapped) == 1798
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

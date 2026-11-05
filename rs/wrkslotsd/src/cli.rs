@@ -217,6 +217,9 @@ pub(crate) enum Command {
         /// Exit non-zero on attention (1) or unknown (2) slots
         #[arg(long)]
         gate: bool,
+        /// Audit every machine's ACTIVE shard instead of only the local machine's
+        #[arg(long)]
+        all_machines: bool,
         /// Output format: json or human
         #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
         format: String,
@@ -290,6 +293,9 @@ pub(crate) enum Command {
         /// Total cache-glob planning time in seconds across every subject (audit plans outside the state lock after a short-lock snapshot)
         #[arg(long, value_name = "SECONDS", default_value_t = 30.0)]
         cache_plan_total_seconds: f64,
+        /// Audit every machine's ACTIVE shard instead of only the local machine's
+        #[arg(long)]
+        all_machines: bool,
     },
     /// Diagnose unpublished or stale-after-rebase HEADs for every checkout on the selected machine
     Unpushed {
@@ -879,6 +885,9 @@ pub(crate) enum Command {
         /// Output format: human prints the journal lines; json prints the payload
         #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
         format: String,
+        /// Classify every machine's journals instead of only the local machine's
+        #[arg(long)]
+        all_machines: bool,
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
@@ -1418,6 +1427,7 @@ pub fn run() -> u8 {
             cache_wall_seconds,
             cache_plan_total_seconds,
             gate,
+            all_machines,
             format,
         } => match crate::audit_state::audit_cli(
             root.as_deref(),
@@ -1430,6 +1440,7 @@ pub fn run() -> u8 {
             },
             gate,
             format == "human",
+            all_machines,
         ) {
             Ok((text, code)) => {
                 print!("{text}");
@@ -1497,6 +1508,7 @@ pub fn run() -> u8 {
             cache_work_limit,
             cache_wall_seconds,
             cache_plan_total_seconds,
+            all_machines,
         } => {
             match crate::audit_state::parse_audit(
                 root.as_deref(),
@@ -1507,6 +1519,7 @@ pub fn run() -> u8 {
                     wall_seconds: cache_wall_seconds,
                     plan_total_seconds: cache_plan_total_seconds,
                 },
+                all_machines,
             ) {
                 Ok(value) => {
                     println!(
@@ -2379,6 +2392,7 @@ pub fn run() -> u8 {
             agent,
             slot_type,
             format,
+            all_machines,
             root,
             machine,
         } => match crate::classify_journals::classify_create_journals(
@@ -2388,6 +2402,7 @@ pub fn run() -> u8 {
             &slot_type,
             &agent,
             format == "json",
+            all_machines,
         ) {
             Ok(text) => {
                 print!("{text}");

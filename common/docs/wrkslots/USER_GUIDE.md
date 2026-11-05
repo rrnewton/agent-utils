@@ -236,6 +236,15 @@ interrupted, or unregistered slots; exits 2 when an expired slot cannot be class
 evidence is unavailable; and exits 0 only when neither condition exists. The output names the
 affected slots and the next command. It never converts an unknown result into permission to remove.
 
+By default `audit`, like `status` and `doctor`, reads only the local machine's shard. A shard
+recorded by another machine (a stale copy, usually) is named in a NOTE -- with its machine and
+modification time, and in the JSON payload's `foreign_shards` -- but never read, so it cannot skew
+a local verdict; pass `--all-machines` to include every machine's rows as before.
+`classify-create-journals` and `clean-caches` follow the same rule: a foreign journal does not
+block a local classification, a foreign row is skipped and reported under `skipped_foreign`, and
+`--all-machines` opts back into the cross-machine behaviour. Nothing is ever written to another
+machine's event log.
+
 A registered row whose slot directory is absent -- `lstat` reports that nothing exists at the path
 -- is reported as `RECOVERABLE` rather than `BLOCKED` when absence is its only remaining reason
 after the same liveness, owner, heartbeat, handoff, and process/path census checks that make a

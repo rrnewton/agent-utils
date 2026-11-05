@@ -110,7 +110,7 @@ fn pending_ops(control: &Path, machine: &str) -> Result<Vec<(String, Value)>> {
     Ok(pending)
 }
 
-fn outstanding(control: &Path) -> Result<Vec<PathBuf>> {
+fn outstanding(control: &Path, machines: Option<&BTreeSet<String>>) -> Result<Vec<PathBuf>> {
     let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
     if let Ok(entries) = std::fs::read_dir(control) {
         for entry in entries.flatten() {
@@ -120,10 +120,24 @@ fn outstanding(control: &Path) -> Result<Vec<PathBuf>> {
                 || name.starts_with("FINISH."))
                 && name.ends_with(".journal")
             {
+                // #873: a machine-scoped read skips journals that name a
+                // foreign machine; unscoped journals count as local.
+                if let Some(machines) = machines {
+                    if let Some(machine) = crate::global_state::journal_machine(&name) {
+                        if !machines.contains(&machine) {
+                            continue;
+                        }
+                    }
+                }
                 paths.insert(entry.path());
             }
             if name.starts_with("EVENTS.") && entry.path().is_dir() {
                 let machine = name.trim_start_matches("EVENTS.").to_string();
+                if let Some(machines) = machines {
+                    if !machines.contains(&machine) {
+                        continue;
+                    }
+                }
                 for (journal_name, _) in pending_ops(control, &machine)? {
                     paths.insert(control.join(journal_name));
                 }
@@ -750,6 +764,7 @@ pub(crate) fn classify_create_journals(
     slot_type: &str,
     agent: &str,
     format_json: bool,
+    all_machines: bool,
 ) -> Result<String> {
     let (cfg, _selected) = load_cfg(root, machine_override)?;
     let config = load_config(root, machine_override)?;
@@ -788,7 +803,19 @@ pub(crate) fn classify_create_journals(
             }
         }
     }
-    let paths = outstanding(&cfg.control)?;
+    // #873: by default only the local machine's journals are classified;
+    // a foreign shard is noted, never allowed to block a local verdict.
+    let foreign_notes: Vec<Value> = if all_machines {
+        Vec::new()
+    } else {
+        crate::global_state::foreign_shard_notes(&cfg.control, &cfg.machine)?
+    };
+    let machines: Option<BTreeSet<String>> = if all_machines {
+        None
+    } else {
+        Some(BTreeSet::from([cfg.machine.clone()]))
+    };
+    let paths = outstanding(&cfg.control, machines.as_ref())?;
     let mut rows: Vec<Row> = Vec::new();
     for path in &paths {
         // Only create journals are classified; other kinds refuse in
@@ -876,6 +903,7 @@ pub(crate) fn classify_create_journals(
     if format_json {
         let payload = json!({
             "blocking": false,
+            "foreign_shards": foreign_notes,
             "journals": journals,
             "requested": {
                 "agent": agent,
@@ -922,5 +950,8 @@ pub(crate) fn classify_create_journals(
             row.journal.display()
         ));
     }
+    out.push_str(&crate::global_state::foreign_shard_note_lines(
+        &foreign_notes,
+    ));
     Ok(out)
 }
