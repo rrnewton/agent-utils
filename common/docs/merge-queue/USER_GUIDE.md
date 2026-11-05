@@ -932,11 +932,25 @@ policy: `select` runs in a checkout of the candidate with `$MQ_BASE` (the candid
 line `all` selects everything). Without `select`, every validation is complete. Every validation
 runs in the candidate checkout, under the `admission` prefix, with the `timeout_secs` limit.
 
+**Tests beyond the complete suite.** A runner's complete suite need not hold every test: some
+are too slow or too costly to run on every candidate, and only matter when a change touches what
+they test. A `select` that prints `all` and also test IDs asks for the complete suite plus those
+tests. The runner gets `$MQ_SELECTION=all` and the IDs, space separated, in `$MQ_EXTRA_TESTS`
+(set only when there are some). A `dagrun` runner does not run them, so with it they count as
+missing: they are for the `command` kind. A failing one makes the
+validation red like any test, and the culprit search that follows reruns it as a selected test
+(`$MQ_SELECTION=tests`). One the runner never reports counts as missing, never as a pass. The
+`validate` event names them (`all + super.a, super.b`), and so does the validation's
+`record.json` (`extra`). A remainder that runs the complete suite after an ejection runs the
+batch's extra tests too.
+
 **`command`.** `run` is a shell template (`sh -c`) that reads the selection from:
 
 - `$MQ_SELECTION`: `all` or `tests`;
 - `$MQ_TESTS`: the IDs, space separated (empty for `all`);
 - `$MQ_TESTS_FILE`: the IDs, one per line;
+- `$MQ_EXTRA_TESTS`: with `all`, the tests to run beyond the complete suite, space separated
+  (see "Tests beyond the complete suite"; unset when there are none);
 
 and writes one JSON object per line to `$MQ_RESULTS`:
 `{"id": "step::case", "outcome": "pass|fail|skip|error", "duration_ms": 12}`. A worse outcome

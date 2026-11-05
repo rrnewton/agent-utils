@@ -307,7 +307,15 @@ pub struct Chosen {
     pub selection: Selection,
     /// Policy name.
     pub policy: String,
+    /// Tests the policy asks for beyond the complete suite, with [`Selection::All`]: a select
+    /// command that prints `all` and then test IDs. The runner gets them in
+    /// [`EXTRA_TESTS_ENV`]. Empty with any other selection.
+    pub extra: BTreeSet<TestId>,
 }
+
+/// Environment variable naming the tests a validation of the complete suite runs beyond it (see
+/// [`Chosen::extra`]), space separated. Set only when there are some.
+pub const EXTRA_TESTS_ENV: &str = "MQ_EXTRA_TESTS";
 
 /// A configured validator.
 pub trait Validator: Sync {
@@ -370,8 +378,11 @@ pub fn from_config(config: &ValidatorConfig) -> Result<Box<dyn Validator>, Strin
     }
 }
 
-fn parse_ids(text: &str, prefix: &str) -> Result<Selection, String> {
+/// A select command's output: its selection, and with `all` the IDs it names beyond the
+/// complete suite.
+fn parse_ids(text: &str, prefix: &str) -> Result<(Selection, BTreeSet<TestId>), String> {
     let mut tests = BTreeSet::new();
+    let mut all = false;
     for line in text.lines() {
         let line = line.trim();
         let Some(id) = line.strip_prefix(prefix) else {
@@ -382,11 +393,16 @@ fn parse_ids(text: &str, prefix: &str) -> Result<Selection, String> {
             continue;
         }
         if id == "all" {
-            return Ok(Selection::All);
+            all = true;
+            continue;
         }
         tests.insert(TestId::parse(id)?);
     }
-    Ok(Selection::Tests(tests))
+    Ok(if all {
+        (Selection::All, tests)
+    } else {
+        (Selection::Tests(tests), BTreeSet::new())
+    })
 }
 
 fn shared_select(
@@ -399,6 +415,7 @@ fn shared_select(
         return Ok(Chosen {
             selection: Selection::All,
             policy: "all".to_owned(),
+            extra: BTreeSet::new(),
         });
     }
     let output = Command::new("sh")
@@ -417,13 +434,18 @@ fn shared_select(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let selection = parse_ids(&String::from_utf8_lossy(&output.stdout), &config.id_prefix)?;
+    let (selection, extra) =
+        parse_ids(&String::from_utf8_lossy(&output.stdout), &config.id_prefix)?;
     let policy = if config.policy.is_empty() {
         "select-command".to_owned()
     } else {
         config.policy.clone()
     };
-    Ok(Chosen { selection, policy })
+    Ok(Chosen {
+        selection,
+        policy,
+        extra,
+    })
 }
 
 /// How a runner process ended.
@@ -1251,6 +1273,7 @@ mod unit {
             chosen.selection,
             Selection::of([TestId::step("a.b"), TestId::parse("c.d::e").unwrap()])
         );
+        assert!(chosen.extra.is_empty());
         cfg.select.clear();
         assert_eq!(
             from_config(&cfg)
@@ -1260,6 +1283,24 @@ mod unit {
                 .selection,
             Selection::All
         );
+    }
+
+    #[test]
+    fn select_all_with_ids_asks_for_those_tests_beyond_the_suite() {
+        let tmp = TempDir::new("validate-select-extra");
+        let mut cfg = config("true");
+        cfg.select = "echo super.b; echo all; echo super.a".into();
+        let chosen = from_config(&cfg).unwrap().select(&tmp.0, "B", "H").unwrap();
+        assert_eq!(chosen.selection, Selection::All);
+        assert_eq!(
+            chosen.extra,
+            [TestId::step("super.a"), TestId::step("super.b")].into()
+        );
+        // Without `all` the IDs are the selection itself, and nothing is beyond it.
+        cfg.select = "echo super.a".into();
+        let chosen = from_config(&cfg).unwrap().select(&tmp.0, "B", "H").unwrap();
+        assert_eq!(chosen.selection, Selection::of([TestId::step("super.a")]));
+        assert!(chosen.extra.is_empty());
     }
 
     #[test]

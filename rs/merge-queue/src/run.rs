@@ -203,6 +203,9 @@ pub struct ValidationRecord {
     pub selection: Selection,
     /// Policy that chose it.
     pub policy: String,
+    /// Tests run beyond the complete suite (see [`Chosen::extra`]).
+    #[serde(default)]
+    pub extra: BTreeSet<TestId>,
     /// Full sparse per-test results (outcome map, durations, log pointers
     /// and the unattributed flag). This is the stored truth; `green` and
     /// `failed` below are derived from it, never stored.
@@ -270,13 +273,16 @@ impl ValidationRecord {
 impl Serialize for ValidationRecord {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("ValidationRecord", 19)?;
+        let mut state = serializer.serialize_struct("ValidationRecord", 20)?;
         state.serialize_field("id", &self.id)?;
         state.serialize_field("purpose", &self.purpose)?;
         state.serialize_field("prs", &self.prs)?;
         state.serialize_field("commit", &self.commit)?;
         state.serialize_field("selection", &self.selection)?;
         state.serialize_field("policy", &self.policy)?;
+        if !self.extra.is_empty() {
+            state.serialize_field("extra", &self.extra)?;
+        }
         state.serialize_field("results", &self.results)?;
         state.serialize_field("exit", &self.exit)?;
         state.serialize_field("log", &self.log)?;
@@ -584,6 +590,8 @@ struct Job {
     speculation: Option<Speculation>,
     selection: Selection,
     policy: String,
+    /// Tests beyond the complete suite, with [`Selection::All`] (see [`Chosen::extra`]).
+    extra: BTreeSet<TestId>,
 }
 
 /// A batch's place in the speculation window.
@@ -1602,6 +1610,7 @@ impl<'a> Runner<'a> {
                     speculation: None,
                     selection: chosen.selection.clone(),
                     policy: chosen.policy.clone(),
+                    extra: chosen.extra.clone(),
                 }])
                 .pop()
                 .ok_or("no retry result")??;
@@ -2796,11 +2805,16 @@ impl<'a> Runner<'a> {
         self.event(
             "validate",
             &format!(
-                "v{id} {} {} on {}: {} ({})",
+                "v{id} {} {} on {}: {}{} ({})",
                 job.purpose,
                 list(&job.prs),
                 short(&job.commit),
                 job.selection.summary(),
+                if job.extra.is_empty() {
+                    String::new()
+                } else {
+                    format!(" + {}", ids(&job.extra.iter().cloned().collect::<Vec<_>>()))
+                },
                 job.policy
             ),
         );
@@ -2821,6 +2835,16 @@ impl<'a> Runner<'a> {
         // complete run on the base (`widen`) never does: its record names every failure.
         if self.config.validator.fail_fast && job.purpose != "widen" {
             extra.push((crate::validate::FAIL_FAST_ENV.to_owned(), "1".to_owned()));
+        }
+        if !job.extra.is_empty() {
+            extra.push((
+                crate::validate::EXTRA_TESTS_ENV.to_owned(),
+                job.extra
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ));
         }
         let start_ms = self.started.elapsed().as_millis() as u64;
         let ran = match &self.donors {
@@ -2873,6 +2897,13 @@ impl<'a> Runner<'a> {
                 result?
             }
         };
+        // A test asked for beyond the suite that the runner never reported is missing, so a
+        // runner that ignores the request is never green.
+        let mut ran = ran;
+        if !ran.cancelled && ran.interrupted.is_none() && !ran.refused() {
+            ran.results
+                .require(&Selection::of(job.extra.iter().cloned()));
+        }
         if let Some(handle) = &ran.handle {
             lock(&self.handles).insert(job.commit.clone(), (handle.clone(), dir.clone()));
         }
@@ -2894,6 +2925,7 @@ impl<'a> Runner<'a> {
             commit: job.commit,
             selection: ran.effective_selection.clone().unwrap_or(job.selection),
             policy: job.policy,
+            extra: job.extra,
             results: ran.results.clone(),
             exit: ran.exit,
             log: ran.log.clone(),
@@ -2966,6 +2998,7 @@ impl<'a> Runner<'a> {
             &tree,
             &base,
             &job.selection,
+            &job.extra,
             &self.config.validator,
             &donors.tool,
         )?;
@@ -3705,6 +3738,7 @@ impl<'a> Runner<'a> {
                             }),
                             selection: chosen.selection.clone(),
                             policy: chosen.policy.clone(),
+                            extra: chosen.extra.clone(),
                         };
                         let id = next_id;
                         next_id += 1;
@@ -4674,6 +4708,14 @@ impl<'a> Runner<'a> {
                             } else {
                                 format!("delta-after-eject({})", chosen.policy)
                             },
+                            // A remainder that runs the complete suite runs what the batch ran
+                            // beyond it too (the culprit's included: running more never hides
+                            // anything); a focused delta already names the failed ones.
+                            extra: if delta.is_all() {
+                                chosen.extra.clone()
+                            } else {
+                                BTreeSet::new()
+                            },
                         }])
                         .pop()
                         .ok_or("no remainder result")??;
@@ -4934,6 +4976,7 @@ impl<'a> Runner<'a> {
                     speculation: None,
                     selection: focus.clone(),
                     policy: "failed-tests".to_owned(),
+                    extra: BTreeSet::new(),
                 });
             }
             for (i, result) in probes.iter().zip(self.validate_all(jobs)) {
@@ -5006,6 +5049,7 @@ impl<'a> Runner<'a> {
                 speculation: None,
                 selection: Selection::All,
                 policy: "all".to_owned(),
+                extra: BTreeSet::new(),
             }])
             .pop()
             .ok_or("no widen result")??;
@@ -5618,6 +5662,7 @@ mod unit {
             commit: "c".repeat(40),
             selection: Selection::All,
             policy: "all".to_owned(),
+            extra: BTreeSet::new(),
             results,
             exit,
             log: PathBuf::from("validations/0001-batch/run.log"),

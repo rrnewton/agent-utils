@@ -12,7 +12,7 @@
 //! accepted only for the live lease, the job's exact commit and tree, and the tool identity the
 //! queue computed when it published the job; it then stands in for a local validation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,7 +21,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::state::ValidatorConfig;
-use crate::tests::{Selection, TestResults};
+use crate::tests::{Selection, TestId, TestResults};
 
 /// Schema of a job record.
 pub const JOB_SCHEMA: &str = "merge-queue-donor-job/v1";
@@ -178,6 +178,9 @@ pub struct Job {
     pub base: String,
     /// Tests to run.
     pub selection: Selection,
+    /// Tests to run beyond the complete suite, with an `all` selection (`MQ_EXTRA_TESTS`).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub extra: BTreeSet<TestId>,
     /// Validator settings to run them with.
     pub validator: ValidatorConfig,
     /// Identity a donor's tool must match.
@@ -768,6 +771,7 @@ impl Store {
         tree: &str,
         base: &str,
         selection: &Selection,
+        extra: &BTreeSet<TestId>,
         validator: &ValidatorConfig,
         tool: &ToolIdentity,
     ) -> Result<Job, String> {
@@ -786,6 +790,7 @@ impl Store {
             tree: tree.to_owned(),
             base: base.to_owned(),
             selection: selection.clone(),
+            extra: extra.clone(),
             validator: validator.clone(),
             tool: tool.clone(),
             created_at: now(),
@@ -1724,9 +1729,26 @@ impl Worker<'_> {
             let validator =
                 crate::validate::from_config(&job.validator).map_err(Unreported::Declined)?;
             let started_at = now();
-            let ran = validator
-                .run(&checkout, &job.selection, &out, cancel)
+            let env: Vec<(String, String)> = if job.extra.is_empty() {
+                Vec::new()
+            } else {
+                vec![(
+                    crate::validate::EXTRA_TESTS_ENV.to_owned(),
+                    job.extra
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )]
+            };
+            let mut ran = validator
+                .run_with(&checkout, &job.selection, &out, cancel, &env)
                 .map_err(Unreported::Declined)?;
+            // As at the queue: an extra test the runner never reported is missing.
+            if !ran.cancelled && ran.interrupted.is_none() && !ran.refused() {
+                ran.results
+                    .require(&Selection::of(job.extra.iter().cloned()));
+            }
             if let Some(why) = &ran.interrupted {
                 return Err(Unreported::Released(format!("donor stopping: {why}")));
             }
@@ -2025,6 +2047,7 @@ mod unit {
                 "tree0",
                 "base0",
                 &Selection::of([TestId::step("a")]),
+                &BTreeSet::new(),
                 &validator,
                 &tool,
             )
