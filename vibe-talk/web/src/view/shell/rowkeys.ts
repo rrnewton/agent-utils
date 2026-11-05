@@ -1,8 +1,8 @@
 // The keys that act on the selected row (`#224 keyboard-shortcuts`, `#229 desktop-two-column`, `#277
 // thread-card-focus`, `#408 copy-upstream-link`, `#540 read-aloud-desktop`; `#624 voice-page-modularity`, moved
 // from the legacy script into view/shell for the plan's step 17): Enter and o, → and ←, [ and ], r, ".", s, i and
-// l, and pressing one of the row's own buttons. Which row the keys act on, and every act a press on a row or
-// card performs, are the page's.
+// l, and pressing one of the row's own buttons. Which row the keys act on is selectionkeys.ts's (`rowForAct`);
+// every act a press on a row or card performs is the page's.
 
 import { answersEnter, childByClass, focusMinimally, nodeWithin } from "../dom/index.ts";
 

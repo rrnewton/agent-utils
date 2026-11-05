@@ -1439,6 +1439,26 @@ test("`#624 voice-page-modularity`: ↓ and ↑ read on through a tall message, 
     state.inView = new Set(["1"]);
     globalThis.document.activeElement = rows[0];
     assert.deepStrictEqual(run(() => keys.stepFromKeyboard({}, -1)), [true, 800], "↑ on a message above the head did not read back through it, half a room at most");
+    const justPast = rowOf("p", 200, 520);
+    rows.push(justPast);
+    state.current = justPast;
+    state.inView = new Set(["p"]);
+    globalThis.document.activeElement = justPast;
+    assert.deepStrictEqual(run(() => keys.stepFromKeyboard({}, 1)), [true, 1028], "↓ on a message just past the foot did not bring its foot up with the landing gap");
+    const justAbove = rowOf("q", 80, 300);
+    rows.push(justAbove);
+    state.current = justAbove;
+    state.inView = new Set(["q"]);
+    globalThis.document.activeElement = justAbove;
+    assert.deepStrictEqual(run(() => keys.stepFromKeyboard({}, -1)), [true, 972], "↑ on a message just above the head did not bring its head down with the landing gap");
+    rows.splice(4);
+    state.current = null;
+    state.inView = new Set();
+    assert.deepStrictEqual([run(() => keys.stepFromKeyboard({}, 1)), run(() => keys.stepFromKeyboard({}, -1))], [[true, "select 1", 1000], [true, "select 4", 1000]],
+      "with no row in sight the keys did not take the list's first or last row");
+    const empty = rows.splice(0);
+    assert.deepStrictEqual(run(() => keys.stepFromKeyboard({}, 1)), [false, 1000], "↓ in an empty list was taken");
+    rows.push(...empty);
     assert.deepStrictEqual(run(() => keys.stepFromKeyboard({ outside: true }, 1)), [false, 1000], "↓ outside any list was taken");
     const opener = item("opener");
     const items = [item("a"), item("b", "A"), item("c", "BUTTON", { hidden: true }), { tagName: "DIV", hidden: false, children: [item("d")] }, opener];
@@ -1448,6 +1468,12 @@ test("`#624 voice-page-modularity`: ↓ and ↑ read on through a tall message, 
     assert.deepStrictEqual(keys.menuItems().map((one) => one.id), ["a", "b", "d"], "the menu's items are not its shown buttons and links, in order, without its own opener");
     assert.deepStrictEqual(run(() => keys.stepFromKeyboard(items[3].children[0], 1)), [true, "focus a quietly", 1000], "↓ on the last item did not go round to the first");
     assert.deepStrictEqual(run(() => keys.stepFromKeyboard(items[0], -1)), [true, "focus d quietly", 1000], "↑ on the first item did not go round to the last");
+    assert.deepStrictEqual([run(() => keys.stepFromKeyboard(items[3], 1)), run(() => keys.stepFromKeyboard(items[3], -1))], [[true, "focus a quietly", 1000], [true, "focus d quietly", 1000]],
+      "from a part of the menu that is no item, ↓ and ↑ did not take its first and last items");
+    state.current = rows[1];
+    state.inView = new Set(["2"]);
+    globalThis.document.activeElement = rows[1];
+    assert.deepStrictEqual(run(() => keys.stepFromKeyboard({ outside: false }, 1)), [true, "select 3 true 1", 1000], "with a menu open and the focus outside it, ↓ did not move the selection");
     state.menu = null;
     assert.deepStrictEqual(keys.menuItems(), []);
     state.current = rows[1];
