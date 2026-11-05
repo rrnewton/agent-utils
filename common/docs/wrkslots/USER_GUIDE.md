@@ -1080,6 +1080,19 @@ with the number of files in the slot. The JSON report gives the limit in `item_b
 for each removed slot, `seconds_before_deletion`: how long it held the lock before it began
 deleting.
 
+An ordinary `remove` holds the project registry lock only for its state transitions: it validates
+the slot, writes the finish journal and renames the slot directory behind its fence, then releases
+the lock and deletes the fenced tree, however long that takes, and takes the lock once more only
+to record the completion in the registry and the archive. Other commands — admissions included —
+are therefore never kept waiting behind a large slot's deletion, and back-to-back removals each
+release the lock between their transitions. This is true with `--no-lock-budget` too: that flag
+lifts the time limit, not the lock discipline. If a removal dies after the fence was made, its
+journal remains and the next `remove` or `wrkslots recover` finishes the removal from it, exactly
+as for a removal interrupted in the middle of deleting. The pre-deletion salvage and inventory
+work (the per-checkout Git scans and remote checks) runs before the lock is taken; under the lock
+only a cheap re-check of HEAD, the remote URL hash and the recorded row runs, and the outside
+work is redone if any of those changed.
+
 A refused slot is left in place and reported with its reason, and the remaining slots are still
 attempted. A missing row, a changed generation, a validation slot, and a row whose directory is
 absent are refused before any scan; use `recover-absent-agent-rows` for the last. Any other

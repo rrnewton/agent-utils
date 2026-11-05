@@ -1008,6 +1008,10 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # recover-absent-validate-rows share one owner predicate) is mapped.
     # The #879 agreement case (status and audit share one liveness
     # answer per row) is mapped.
+    # The two #894 remove-lock-scope cases (a fenced deletion that holds
+    # no registry lock while it runs, with a second removal fencing
+    # meanwhile, and a remover killed after the fence finished by
+    # recover) are mapped.
     # The three further #885 cases (forward recovery after completed
     # hooks, an abort removing a clean initialized submodule, and an
     # exact create recovering before a validation-batch seal) are mapped.
@@ -1019,9 +1023,9 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The three #910 cases (a nested submodule the primary dropped is
     # remote-verified, bundled when unpublished, and skipped when
     # uninitialised) are mapped.
-    assert len(all_tests) == 2149
+    assert len(all_tests) == 2151
     assert len(ordinary) == 339
-    assert len(mapped) == 1810
+    assert len(mapped) == 1812
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

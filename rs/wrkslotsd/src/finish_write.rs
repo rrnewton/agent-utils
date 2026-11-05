@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -51,6 +52,48 @@ struct GitOutput {
     code: i32,
     stdout: String,
     stderr: String,
+}
+
+// When the GitHub credential helper's pacing bucket is full it tells Git
+// to quit; a network Git command then waits, bounded, for a credential
+// slot instead of refusing at once (#894).  On expiry the refusal says
+// "retry later: credential pacing".
+const CREDENTIAL_PACING_WAIT_SECONDS: u64 = 120;
+const CREDENTIAL_PACING_POLL_SECONDS: u64 = 5;
+
+fn credential_pacing_refused(output: &str) -> bool {
+    let text = output.to_lowercase();
+    text.contains("credential pacing")
+        || (text.contains("credential") && text.contains("quit"))
+}
+
+fn network_operation(args: &[&str]) -> bool {
+    matches!(args.first(), Some(&"fetch") | Some(&"push") | Some(&"ls-remote"))
+}
+
+/// Run one Git command, waiting out credential pacing on network commands.
+fn git_run_paced(repo: &Path, args: &[&str], dev_null_dir: bool) -> Result<GitOutput> {
+    let deadline = Instant::now() + Duration::from_secs(CREDENTIAL_PACING_WAIT_SECONDS);
+    loop {
+        let output = git_run(repo, args, dev_null_dir)?;
+        if output.code == 0
+            || !network_operation(args)
+            || !credential_pacing_refused(&format!("{}\n{}", output.stderr, output.stdout))
+        {
+            return Ok(output);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "retry later: credential pacing: the GitHub credential helper is pacing requests and no credential slot freed within {CREDENTIAL_PACING_WAIT_SECONDS} seconds for git {} in {}",
+                args.join(" "),
+                repo.display()
+            ));
+        }
+        std::thread::sleep(
+            Duration::from_secs(CREDENTIAL_PACING_POLL_SECONDS).min(deadline - now),
+        );
+    }
 }
 
 fn git_run(repo: &Path, args: &[&str], dev_null_dir: bool) -> Result<GitOutput> {
@@ -90,7 +133,7 @@ fn git_run(repo: &Path, args: &[&str], dev_null_dir: bool) -> Result<GitOutput> 
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = git_run(repo, args, false)?;
+    let output = git_run_paced(repo, args, false)?;
     if output.code != 0 {
         let detail = output.stderr.trim();
         return Err(format!(
@@ -738,7 +781,7 @@ pub(crate) fn fetch_remote(
     if !landed_ref.starts_with(&prefix) {
         return Err(format!("landed ref must be under {prefix}: {landed_ref}"));
     }
-    let listed = git_run(
+    let listed = git_run_paced(
         checkout,
         &["ls-remote", "--refs", "--heads", "--", url],
         true,

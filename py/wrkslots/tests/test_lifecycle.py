@@ -59216,3 +59216,118 @@ def test_clean_caches_skips_one_nested_git_cache_and_cleans_the_slot(
     ), row
     assert sentinel.is_file()
     assert not plain.exists()
+
+
+def test_remove_deletes_fenced_tree_without_holding_the_registry_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#894: deletion runs unlocked; an admission gets in between removals.
+
+    The first removal is parked inside the actual fenced-tree deletion.
+    While it is parked, the registry lock must be acquirable at once and
+    a real admission (a create) must complete; neither waits for the
+    deletion.  A second removal then runs after the first completes.
+    Nothing here relies on lock wake-up order: each removal holds the
+    lock only between its own state transitions, so the admission's
+    window is the whole deletion, not a race for a wake-up.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project, slot="slot01", agent="codex-1").returncode == 0
+    assert (
+        create(project, slot="slot02", agent="codex-2", branch="codex/task2").returncode
+        == 0
+    )
+    mark_owner_dead(project, slot="slot01")
+    mark_owner_dead(project, slot="slot02")
+    set_liveness(project, "dead")
+    config = wrkslots._load_config(str(project), "testhost")
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_delete = wrkslots._delete_prepared_deferred_finish
+
+    def parked_delete(
+        config_: wrkslots.Config,
+        prepared: wrkslots._PreparedDeferredFinish,
+        finish: wrkslots._FinishContext,
+    ) -> Mapping[str, object]:
+        # Park at the start of the out-of-lock deletion phase: the fence
+        # and journal are durable and the registry lock is released.
+        if prepared.record.slot == "slot01":
+            entered.set()
+            assert release.wait(timeout=120)
+        return real_delete(config_, prepared, finish)
+
+    monkeypatch.setattr(wrkslots, "_delete_prepared_deferred_finish", parked_delete)
+    results: dict[str, int] = {}
+
+    def run_remove(slot: str) -> None:
+        results[slot] = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove",
+                slot,
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--expected-generation",
+                "1",
+                "--coordinator-authorized",
+            ]
+        )
+
+    first = threading.Thread(target=run_remove, args=("slot01",))
+    first.start()
+    assert entered.wait(timeout=120)
+    started = time.monotonic()
+    with wrkslots._mutation_locks(config, 5.0):
+        pass
+    assert time.monotonic() - started < 5.0
+    # A real admission completes inside the same window, before the
+    # second removal below runs: it is not stuck behind the deletion.
+    admitted = create(project, slot="slot03", agent="codex-3", branch="codex/task3")
+    assert admitted.returncode == 0, admitted.stderr
+    assert first.is_alive()
+    release.set()
+    first.join(timeout=120)
+    assert results["slot01"] == 0
+
+    second = remove(project, slot="slot02")
+    assert second.returncode == 0, second.stderr
+    remaining = {
+        cast(dict[str, object], row)["slot"] for row in active_slots(project)
+    }
+    assert remaining == {"slot03"}
+
+
+def test_remove_killed_after_the_fence_is_finished_by_recover(
+    tmp_path: Path,
+) -> None:
+    """#894: a remover killed after fencing leaves a journal recover finishes."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project, slot="slot01", agent="codex-1").returncode == 0
+    mark_owner_dead(project, slot="slot01")
+    set_liveness(project, "dead")
+    config = wrkslots._load_config(str(project), "testhost")
+    slot_dir = wrkslots._slot_directory(config, "slot01", "agent")
+
+    killed = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-finish-fence"},
+    )
+    assert killed.returncode == 86, killed.stderr
+    assert not slot_dir.exists()
+    assert len(active_slots(project)) == 1
+
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+    assert recovered.returncode == 0, recovered.stderr
+    assert active_slots(project) == []
+    assert not slot_dir.exists()

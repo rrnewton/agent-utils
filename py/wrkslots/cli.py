@@ -926,6 +926,13 @@ _AGENT_REMOVE_BATCH_ITEM_SECONDS = 60.0
 # across that network I/O (see _prefetch_remote_containment).  The local facts
 # (HEAD, status, remote URL) are always re-read under the lock.
 _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS = 300.0
+# When the GitHub credential helper's pacing bucket is full it tells Git to
+# quit; a network Git command then waits, bounded, for a credential slot
+# instead of refusing at once (#894).  The wait is also bounded by any item
+# budget in force; on expiry the refusal says "retry later: credential
+# pacing".
+_CREDENTIAL_PACING_WAIT_SECONDS = 120.0
+_CREDENTIAL_PACING_POLL_SECONDS = 5.0
 # Bounds on the ls-remote and on the commits-only fetch of that check.
 _REMOTE_CONTAINMENT_LIST_SECONDS = 60.0
 _REMOTE_CONTAINMENT_FETCH_SECONDS = 300.0
@@ -13638,6 +13645,30 @@ def _alternate_object_directories(objects: Path, label: str) -> tuple[Path, ...]
     return tuple(found)
 
 
+def _credential_pacing_refused(output: str) -> bool:
+    """Return whether Git failed because the credential helper paced it.
+
+    When GitHub's credential pacing bucket is full, `gh auth git-credential`
+    returns no credential and tells Git to quit, so the network command
+    fails with the helper's quit in its output instead of an auth error.
+    """
+
+    text = output.lower()
+    return "credential pacing" in text or (
+        "credential" in text and "quit" in text
+    )
+
+
+def _credential_pacing_deadline(what: str) -> float:
+    """Return the monotonic deadline for waiting on a credential slot."""
+
+    deadline = time.monotonic() + _CREDENTIAL_PACING_WAIT_SECONDS
+    item_left = _item_seconds_left(what)
+    if item_left is not None:
+        deadline = min(deadline, time.monotonic() + item_left)
+    return deadline
+
+
 class _GitVcs:
     """The small Git boundary used by slot operations."""
 
@@ -13664,30 +13695,51 @@ class _GitVcs:
         command, env, what = _GitVcs._invocation(
             repository, args, env_overrides, config=config
         )
-        seconds, expired = _GitVcs._bound(what, timeout_seconds, timeout_refusal)
-        try:
-            if seconds is None:
-                completed = subprocess.run(
-                    command,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    env=env,
-                    input=input_text,
-                )
-            else:
-                completed = _run_within_item_budget(
-                    command,
-                    seconds=seconds,
-                    what=what,
-                    env=env,
-                    input_text=input_text,
-                    timeout_refusal=expired,
-                )
-        except OSError as exc:
-            raise Refusal(f"cannot execute Git: {exc}") from exc
-        if check and completed.returncode != 0:
+        pacing_deadline: float | None = None
+        while True:
+            seconds, expired = _GitVcs._bound(what, timeout_seconds, timeout_refusal)
+            try:
+                if seconds is None:
+                    completed = subprocess.run(
+                        command,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        env=env,
+                        input=input_text,
+                    )
+                else:
+                    completed = _run_within_item_budget(
+                        command,
+                        seconds=seconds,
+                        what=what,
+                        env=env,
+                        input_text=input_text,
+                        timeout_refusal=expired,
+                    )
+            except OSError as exc:
+                raise Refusal(f"cannot execute Git: {exc}") from exc
+            if not (check and completed.returncode != 0):
+                return completed
             network_operation = _GitVcs._network_operation(args)
+            if network_operation and _credential_pacing_refused(
+                completed.stderr + "\n" + completed.stdout
+            ):
+                # The credential helper's pacing bucket is full: wait,
+                # bounded, for a credential slot and retry the command
+                # instead of refusing at once (#894).
+                if pacing_deadline is None:
+                    pacing_deadline = _credential_pacing_deadline(what)
+                remaining = pacing_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise Refusal(
+                        "retry later: credential pacing: the GitHub credential "
+                        "helper is pacing requests and no credential slot freed "
+                        f"within {_CREDENTIAL_PACING_WAIT_SECONDS:g} seconds "
+                        f"for git {' '.join(args)} in {repository}"
+                    )
+                time.sleep(min(_CREDENTIAL_PACING_POLL_SECONDS, remaining))
+                continue
             detail = (
                 "\n".join(
                     text.strip()
@@ -13705,7 +13757,6 @@ class _GitVcs:
             ):
                 raise _RemoteTransportUnavailable(message)
             raise Refusal(message)
-        return completed
 
     @staticmethod
     def _network_operation(args: Sequence[str]) -> bool:
@@ -39728,8 +39779,12 @@ def _begin_or_resume_path_fence(
             continue
         if path.exists() or path.is_symlink():
             _repair_registration_at_slot(config, record, checkout, fenced, vcs)
-    journal["phase"] = "fenced"
-    _write_journal(config, journal, journal_path=journal_path)
+    # A resumed fence (the deferred deletion of #894, or recovery) has
+    # already journaled this phase; writing it again would append a
+    # duplicate progress event the other edition does not write.
+    if journal.get("phase") != "fenced":
+        journal["phase"] = "fenced"
+        _write_journal(config, journal, journal_path=journal_path)
     if newly_fenced:
         _interrupt_for_test("after-path-fence")
     return journal, fenced
@@ -40417,7 +40472,8 @@ def _begin_finish(
     *,
     journal_path: Path,
     defer_private_census: bool = False,
-) -> _PreparedPrivateFinish | None:
+    defer_deletion: bool = False,
+) -> _PreparedPrivateFinish | _PreparedDeferredFinish | None:
     vcs = _GitVcs()
     _load_archive(config, require_repository=False)
     _assert_not_held(config, record)
@@ -40478,8 +40534,8 @@ def _begin_finish(
     )
     _write_journal(config, journal, journal_path=journal_path)
     _interrupt_for_test("after-finish-journal")
-    if defer_private_census:
-        if finish.private_cleanup is None:
+    if defer_private_census or defer_deletion:
+        if defer_private_census and finish.private_cleanup is None:
             raise StateError("only a private cleanup can defer its fresh census")
         try:
             journal, _fenced_slot = _begin_or_resume_path_fence(
@@ -40504,6 +40560,9 @@ def _begin_finish(
             ):
                 _clear_journal(config, journal, journal_path=journal_path)
             raise
+        if defer_deletion:
+            _interrupt_for_test("after-finish-fence")
+            return _PreparedDeferredFinish(final_record, journal, journal_path)
         return _PreparedPrivateFinish(final_record, journal, journal_path)
     try:
         journal = _finish_remove_paths(
@@ -40669,6 +40728,77 @@ def _complete_prepared_private_finish(
         before,
         _global_rows(after_states, after_archives),
         current.slot,
+    )
+
+
+def _delete_prepared_deferred_finish(
+    config: Config,
+    prepared: _PreparedDeferredFinish,
+    finish: _FinishContext,
+) -> Mapping[str, object]:
+    """Delete one fenced slot tree with no registry lock held (#894).
+
+    The journal on disk must still be the one this removal wrote under the
+    lock; the deletion itself is the ordinary finish path deletion, which
+    resumes the fence, journals each removed checkout, and removes the
+    fenced tree.  A refusal (or a kill) anywhere here leaves the journal
+    behind for the next remove or recovery pass, exactly as an interrupted
+    locked removal does.
+    """
+
+    path, journal = _load_journal(config, selected_path=prepared.journal_path)
+    if path != prepared.journal_path or not _json_equal(journal, prepared.journal):
+        raise Refusal(
+            f"deferred finish journal changed before its out-of-lock deletion: {path}"
+        )
+    return _finish_remove_paths(
+        config,
+        prepared.record,
+        dict(journal),
+        _GitVcs(),
+        finish,
+        journal_path=prepared.journal_path,
+    )
+
+
+def _complete_deferred_finish(
+    config: Config,
+    prepared: _PreparedDeferredFinish,
+    deleted_journal: Mapping[str, object],
+    *,
+    coordinator: ProcessIdentity,
+    runner: ProcessIdentity,
+    handoff_writer: ProcessIdentity | None,
+    proof_fd: int | None,
+) -> None:
+    """Record one out-of-lock deletion's completion under the mutation locks.
+
+    Only this slot's record is compared with the fenced record: other slots
+    may legitimately have been admitted or removed while the lock was
+    released for the deletion, so the global only-this-slot-changed check
+    of the locked path does not apply here.
+    """
+
+    path, journal = _load_journal(config, selected_path=prepared.journal_path)
+    if path != prepared.journal_path or not _json_equal(journal, deleted_journal):
+        raise Refusal(
+            f"deferred finish journal changed during its out-of-lock deletion: {path}"
+        )
+    states, _archives = _validate_global_state_for_finish_recovery(config, journal)
+    state = next(item for item in states if item.machine == config.machine)
+    current = _find_record(state, prepared.record.slot)
+    if _record_to_obj(current) != _record_to_obj(prepared.record):
+        raise Refusal(
+            f"slot {prepared.record.slot} changed during its out-of-lock deletion"
+        )
+    _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
+    _assert_not_held(config, current)
+    _finish_state_update(
+        config,
+        state,
+        current,
+        journal,
+        journal_path=prepared.journal_path,
     )
 
 
@@ -41113,6 +41243,7 @@ def _cmd_remove_in_scope(
         else _mutation_locks(config, args.wait_lock, deadline=wait_deadline)
     )
     prepared_private_finish: _PreparedPrivateFinish | None = None
+    prepared_deferred_finish: _PreparedDeferredFinish | None = None
     finish_context: _FinishContext | None = None
     with lock_scope, _agent_batch_item_deadline(agent_batch):
         _refuse_partial_state(
@@ -41799,7 +41930,16 @@ def _cmd_remove_in_scope(
             agent_batch=agent_batch,
             stale_copy_discard_sequence=stale_copy_discard_sequence,
         )
-        prepared_private_finish = _begin_finish(
+        # An ordinary removal fences and journals under the lock, deletes
+        # the fenced tree with the lock released, and re-takes the lock only
+        # to record completion (#894).  The private-cleanup and scoped
+        # validation finishes keep their own out-of-lock shapes.
+        defer_deletion = (
+            private_cleanup is None
+            and not scoped_validation_finish
+            and validation_removal_proof is None
+        )
+        prepared_finish = _begin_finish(
             config,
             state,
             record,
@@ -41810,20 +41950,34 @@ def _cmd_remove_in_scope(
                 else _journal_path(config)
             ),
             defer_private_census=private_cleanup is not None,
+            defer_deletion=defer_deletion,
         )
-        if prepared_private_finish is None:
+        if isinstance(prepared_finish, _PreparedPrivateFinish):
+            prepared_private_finish = prepared_finish
+        elif isinstance(prepared_finish, _PreparedDeferredFinish):
+            prepared_deferred_finish = prepared_finish
+        if prepared_deferred_finish is not None:
+            # Completion revalidates this slot's record itself; other slots
+            # may change while the deletion runs unlocked.
+            pass
+        elif prepared_private_finish is None:
             after_states, after_archives = _validate_global_state(
                 config, require_repository=False
+            )
+            _assert_only_slot_changed(
+                before,
+                _global_rows(after_states, after_archives),
+                args.slot,
             )
         else:
             after_states, after_archives = _validate_global_state_for_finish_recovery(
                 config, prepared_private_finish.journal
             )
-        _assert_only_slot_changed(
-            before,
-            _global_rows(after_states, after_archives),
-            args.slot,
-        )
+            _assert_only_slot_changed(
+                before,
+                _global_rows(after_states, after_archives),
+                args.slot,
+            )
     if prepared_private_finish is not None:
         assert private_cleanup is not None
         assert finish_context is not None
@@ -41889,6 +42043,31 @@ def _cmd_remove_in_scope(
                         config, prepared_private_finish, exc
                     )
                 raise
+    if prepared_deferred_finish is not None:
+        assert finish_context is not None
+        # The fenced tree is deleted with no registry lock held, so a
+        # waiting admission or another removal's state transition proceeds
+        # meanwhile (#894).  A refusal or kill here leaves the journal for
+        # the next remove or recovery pass.
+        deleted_journal = _delete_prepared_deferred_finish(
+            config, prepared_deferred_finish, finish_context
+        )
+        completion_scope = (
+            _mutation_locks(config, args.wait_lock)
+            if wait_deadline is None
+            else _mutation_locks(config, args.wait_lock, deadline=wait_deadline)
+        )
+        with completion_scope:
+            _refuse_partial_state(config, allow_validate_batch_seals=True)
+            _complete_deferred_finish(
+                config,
+                prepared_deferred_finish,
+                deleted_journal,
+                coordinator=coordinator,
+                runner=runner,
+                handoff_writer=handoff_writer,
+                proof_fd=proof_fd,
+            )
     if agent_batch is not None and finish_context is not None:
         agent_batch.nested_git_evidence[:] = [
             dict(item) for item in finish_context.nested_git_evidence
@@ -43607,11 +43786,13 @@ def _single_remove_agent_batch(
 ) -> _AgentRemoveBatchContext | None:
     """Prepare ordinary remove of one agent slot as a remove-agent-batch of one.
 
-    The registry lock is held for a whole removal, and every client that
-    writes the registry waits for it.  Ordinary remove used to run ``lsof +D``
-    over the slot under that lock four times, and the cost of each run grows
-    with the number of files in the slot: on a 33 GB slot of 68,888 entries,
-    at load average about 260, one run took 9 to 18 seconds.  A batch of one
+    The registry lock is held only for a removal's state transitions
+    (#894), but the checks before the fence still decide who may proceed,
+    and every client that writes the registry waits behind them.  Ordinary
+    remove used to run ``lsof +D`` over the slot under that lock four
+    times, and the cost of each run grows with the number of files in the
+    slot: on a 33 GB slot of 68,888 entries, at load average about 260,
+    one run took 9 to 18 seconds.  A batch of one
     instead runs that single ``lsof +D`` here, before the lock is taken, and
     uses remove-agent-batch's checks under the lock: before the path fence, a
     fresh /proc scan and a check that the slot directory is the one lsof
@@ -60128,6 +60309,23 @@ class _FinishContext:
 @dataclasses.dataclass(frozen=True)
 class _PreparedPrivateFinish:
     """Durable path fence awaiting its final out-of-lock liveness census."""
+
+    record: ActiveRecord
+    journal: Mapping[str, object]
+    journal_path: Path
+
+
+@dataclasses.dataclass(frozen=True)
+class _PreparedDeferredFinish:
+    """Durable path fence whose deletion runs outside the registry lock (#894).
+
+    The journal and the rename fence are written under the mutation locks;
+    the fenced tree is then deleted with no lock held, and the locks are
+    re-taken only to record completion.  An interruption anywhere after the
+    fence leaves the journal behind, and the next remove or recovery pass
+    finishes the removal from it, exactly as for an interrupted locked
+    removal.
+    """
 
     record: ActiveRecord
     journal: Mapping[str, object]

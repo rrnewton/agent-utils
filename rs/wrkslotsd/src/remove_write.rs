@@ -1403,7 +1403,7 @@ pub(crate) fn remove_slot(
     validate_name(slot, "slot")?;
     let coordinator = read_process_identity(coordinator_pid)?;
     assert_caller(&coordinator, "coordinator")?;
-    let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
+    let locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     let journals = parse_journals(root)?;
     if let Some(first) = journals
@@ -1419,16 +1419,9 @@ pub(crate) fn remove_slot(
     }
     validate_global(root, &cfg)?;
     let active = active_document(root, &cfg, &selected)?;
+    // The archive document is (re)read at completion time, after the
+    // out-of-lock deletion (#894); reading it here would go stale.
     let archives_path = cfg.control.join(format!("ARCHIVED.{selected}.json"));
-    let archives_before: Value = if archives_path.exists() {
-        serde_json::from_str(
-            &std::fs::read_to_string(&archives_path)
-                .map_err(|error| format!("cannot read archive state: {error}"))?,
-        )
-        .map_err(|error| format!("cannot read archive state: {error}"))?
-    } else {
-        json!({"schema": 2, "machine": selected, "revision": 0, "records": []})
-    };
     let record = active
         .get("slots")
         .and_then(Value::as_array)
@@ -1893,6 +1886,11 @@ pub(crate) fn remove_slot(
         object.insert("phase".to_string(), json!("fenced"));
     }
     write_journal(&cfg, &selected, &journal)?;
+    // The journal and the fence are durable, so the registry lock is
+    // released before the deletion I/O (#894): the fenced tree is deleted
+    // unlocked, and the lock is re-taken only to record completion.  An
+    // interruption from here on leaves the journal for recovery.
+    drop(locks);
     // Contents re-check at the fenced path.
     {
         let expected: BTreeSet<String> = current
@@ -1985,6 +1983,37 @@ pub(crate) fn remove_slot(
         object.insert("phase".to_string(), json!("removed"));
     }
     write_journal(&cfg, &selected, &journal)?;
+    // Re-take the registry lock only to record completion (#894).  Other
+    // slots may have changed while the deletion ran unlocked; this slot's
+    // record must still be the fenced one.
+    let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
+    let archives_before: Value = if archives_path.exists() {
+        serde_json::from_str(
+            &std::fs::read_to_string(&archives_path)
+                .map_err(|error| format!("cannot read archive state: {error}"))?,
+        )
+        .map_err(|error| format!("cannot read archive state: {error}"))?
+    } else {
+        json!({"schema": 2, "machine": selected, "revision": 0, "records": []})
+    };
+    {
+        let state_now = active_document(root, &cfg, &selected)?;
+        let record_now = state_now
+            .get("slots")
+            .and_then(Value::as_array)
+            .and_then(|slots| {
+                slots
+                    .iter()
+                    .find(|item| item.get("slot").and_then(Value::as_str) == Some(slot))
+            })
+            .cloned()
+            .ok_or_else(|| format!("slot '{slot}' is not active on machine {selected}"))?;
+        if record_now != current {
+            return Err(format!(
+                "slot {slot} changed during its out-of-lock deletion; preserve the journal and run 'wrkslots recover'"
+            ));
+        }
+    }
     // State update: archive first, then delete the active record.
     let handoff = current.get("handoff").cloned().unwrap_or(Value::Null);
     let mut entry = json!({

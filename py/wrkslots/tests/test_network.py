@@ -617,3 +617,49 @@ def test_create_and_remote_round_trip_work_without_installed_wrapper(
     authority = vcs.remote_authority(repository, "origin")
     vcs.push_salvage(repository, "origin", expected, ref, authority)
     assert vcs.verify_ref(remote, ref, "published ref") == expected
+
+
+def test_credential_pacing_wait_retries_until_a_credential_slot_frees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#894: a paced credential helper is waited out, not refused at once."""
+
+    attempts: list[object] = []
+
+    def fake_run(command: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        attempts.append(command)
+        if len(attempts) < 3:
+            return subprocess.CompletedProcess(
+                ["git"], 1, "", "fatal: credential helper 'gh' told us to quit"
+            )
+        return subprocess.CompletedProcess(["git"], 0, "ok", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wrkslots, "_CREDENTIAL_PACING_POLL_SECONDS", 0.01)
+
+    completed = wrkslots._GitVcs._run(
+        tmp_path, ["ls-remote", "https://example.invalid/repo.git"]
+    )
+
+    assert completed.returncode == 0
+    assert len(attempts) == 3
+
+
+def test_credential_pacing_wait_times_out_with_retry_later(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#894: a pacing wait that never frees refuses 'retry later: credential pacing'."""
+
+    def fake_run(command: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            ["git"], 1, "", "fatal: credential helper 'gh' told us to quit"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wrkslots, "_CREDENTIAL_PACING_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(wrkslots, "_CREDENTIAL_PACING_POLL_SECONDS", 0.01)
+
+    with pytest.raises(wrkslots.Refusal, match="retry later: credential pacing"):
+        wrkslots._GitVcs._run(
+            tmp_path, ["ls-remote", "https://example.invalid/repo.git"]
+        )
