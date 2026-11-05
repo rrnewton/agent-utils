@@ -876,7 +876,18 @@ struct LadderEntry {
     restarts: Vec<f64>,
     #[serde(default)]
     notified: Vec<String>,
+    /// A step already succeeded this episode: keep the episode (and its
+    /// notified list) until the pane is genuinely unblocked, so a pane
+    /// that stays blocked never re-notifies or re-acts (#ladder-episode).
+    #[serde(default)]
+    acted: bool,
+    /// Consecutive passes with the pane unblocked.
+    #[serde(default)]
+    clear_streak: u32,
 }
+
+/// Passes genuinely unblocked before a ladder episode closes.
+const LADDER_CLEAR_PASSES: u32 = 3;
 
 /// The deterministic recovery ladder (phase 2): for any agent whose pane
 /// is blocked (stranded draft, blank/unreadable screen) whatever sender
@@ -923,8 +934,19 @@ fn run_recovery_ladder(
             blocked.push(row.name.clone());
         }
     }
-    // Recovered agents leave the ladder.
-    state.ladders.retain(|agent, _| blocked.contains(agent));
+    // (c) An episode ends only after LADDER_CLEAR_PASSES genuinely
+    // unblocked passes; until then its notified list survives, so no
+    // step is ever notified twice in one episode.
+    state.ladders.retain(|agent, entry| {
+        if blocked.contains(agent) {
+            entry.clear_streak = 0;
+            true
+        } else {
+            entry.clear_streak = entry.clear_streak.saturating_add(1);
+            entry.passes = 0;
+            entry.clear_streak < LADDER_CLEAR_PASSES
+        }
+    });
     if options.check_only {
         for agent in &blocked {
             rows.push(json!({"agent": agent, "ladder": "blocked", "due": true}));
@@ -942,7 +964,16 @@ fn run_recovery_ladder(
                 cycles: 0,
                 restarts: Vec::new(),
                 notified: Vec::new(),
+                acted: false,
+                clear_streak: 0,
             });
+        // (b) Every consecutive blocked pass counts toward the restart
+        // guard; an unblocked pass reset it in the retain above.
+        entry.passes = entry.passes.saturating_add(1);
+        if entry.acted {
+            rows.push(json!({"agent": agent, "ladder": "holding", "detail": "step done; episode kept until the pane is unblocked"}));
+            continue;
+        }
         let recent = entry
             .restarts
             .iter()
@@ -996,16 +1027,14 @@ fn run_recovery_ladder(
                 Err(fail("restart budget exhausted (1/hour); operator required"))
             }
         };
-        let mut remove_entry = false;
         match outcome {
             Ok(detail) => {
+                entry.acted = true;
                 if step == LadderStep::Restart {
                     restarted_this_pass = true;
                     entry.restarts.push(now);
                     entry.cycles = 0;
                     entry.since = now;
-                } else {
-                    remove_entry = true;
                 }
                 rows.push(json!({"agent": agent, "ladder": step_name, "action": "done", "detail": detail}));
             }
@@ -1028,9 +1057,6 @@ fn run_recovery_ladder(
                 &format!("ladder:{agent}:{step_name}:{}", entry.cycles),
                 options,
             );
-        }
-        if remove_entry {
-            state.ladders.remove(&agent);
         }
     }
     rows
@@ -6318,8 +6344,9 @@ mod tests {
             &options,
         );
         assert_eq!(state.ladders["lane"].cycles, 2);
+        // (b) Passes counted by the loop itself, no test-only writes.
+        assert_eq!(state.ladders["lane"].passes, 2);
         state.ladders.get_mut("lane").unwrap().cycles = 3;
-        state.ladders.get_mut("lane").unwrap().passes = 3;
         // Dry-run by default on first deploy: no restart is executed.
         let dry = run_recovery_ladder(
             &mut probe,
@@ -6346,7 +6373,10 @@ mod tests {
             notifier.ladder_steps
         );
         assert_eq!(state.ladders["lane"].restarts.len(), 1);
-        state.ladders.get_mut("lane").unwrap().cycles = 3;
+        // A new episode of the same jam (the restarted pane blocks again):
+        let entry = state.ladders.get_mut("lane").unwrap();
+        entry.cycles = 3;
+        entry.acted = false;
         let rows = run_recovery_ladder(
             &mut probe,
             &mut notifier,
@@ -6363,6 +6393,72 @@ mod tests {
         // Notices went to the coordinator, never the stuck pane itself.
         assert!(notifier.sent.iter().all(|(to, _, _)| to != "lane"));
         let _ = rows;
+    }
+
+    #[test]
+    fn ladder_episode_is_kept_until_genuinely_unblocked_and_never_renotifies() {
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default(); // sweep succeeds
+        let mut probe = DeliveryProbe::default();
+        let mut blank = observation("lane", "working", Some("   \n\n  "));
+        blank.has_pending = true;
+        blank.harness = Some("claude".to_owned());
+        let clear = observation("lane", "idle", Some("done"));
+        // One blocked pass acts (sweep) and notifies once.
+        run_recovery_ladder(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            std::slice::from_ref(&blank),
+            1000.0,
+            &options,
+        );
+        let told = notifier.sent.len();
+        assert!(told >= 1);
+        assert!(
+            state.ladders.contains_key("lane"),
+            "episode kept after a successful step"
+        );
+        // Still blocked: no second action, no second notice.
+        run_recovery_ladder(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            std::slice::from_ref(&blank),
+            1001.0,
+            &options,
+        );
+        assert_eq!(
+            notifier.sent.len(),
+            told,
+            "never notify twice in one episode"
+        );
+        assert_eq!(notifier.flushes.len(), 1, "never act twice in one episode");
+        // Two unblocked passes keep it; the third closes it.
+        for now in [1002.0, 1003.0] {
+            run_recovery_ladder(
+                &mut probe,
+                &mut notifier,
+                &mut state,
+                std::slice::from_ref(&clear),
+                now,
+                &options,
+            );
+            assert!(state.ladders.contains_key("lane"));
+        }
+        run_recovery_ladder(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            std::slice::from_ref(&clear),
+            1004.0,
+            &options,
+        );
+        assert!(
+            !state.ladders.contains_key("lane"),
+            "episode closes after 3 unblocked passes"
+        );
     }
 
     #[test]
