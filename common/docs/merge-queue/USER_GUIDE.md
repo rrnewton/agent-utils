@@ -1404,12 +1404,17 @@ How it ends decides what happens:
 A pass or a failure is kept per head and command under `precheck/verdicts/`, so submitting the
 same head again gets the same answer without running the command; a check that could not run is
 tried again the next time. A new head is a new check. `merge-queue submit --skip-precheck`
-queues a head without the check when a refusal is wrong; its history says so.
+queues a head without the check when a refusal is wrong; its history says so, and the skip is
+kept as that head's verdict.
 
-The precheck runs where a submission becomes a queued change: a `submit` that takes the writer
-lock, a recorded submission when it is applied, and each change `sync` submits. Keep it to
-checks that take seconds, or a minute at most on a warm build cache: it runs under the writer
-lock, so a run taking in recorded submissions waits for it.
+The precheck runs where a submission becomes a queued change (a `submit` that takes the writer
+lock, a recorded submission when it is applied, and each change `sync` submits), and again when
+a run builds a batch, for every change in it. The second check answers at once from the kept
+verdict of a head checked at submission. It catches a change queued before the precheck was
+configured: if that change fails, it is ejected as `precheck` and the batch is built without
+it. Keep the command to checks that take seconds, or a minute at most on
+a warm build cache: it runs under the writer lock, so a run taking in recorded submissions or
+building a batch waits for it.
 
 ## The decision log
 

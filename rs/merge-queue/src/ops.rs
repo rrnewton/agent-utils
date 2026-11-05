@@ -358,6 +358,7 @@ fn submit_resolved(
     let mut refusal = None;
     if submission.skip_precheck {
         if !config.precheck.command.trim().is_empty() {
+            crate::precheck::skip(&state.root, config, &current, &item.submitted_by)?;
             detail.push_str("; precheck skipped (--skip-precheck)");
         }
     } else if let Some(verdict) = crate::precheck::check(
@@ -378,6 +379,9 @@ fn submit_resolved(
                 "; precheck could not run, so it was queued without one: {}",
                 verdict.reason
             )),
+            crate::precheck::Outcome::Skipped => {
+                detail.push_str(&format!("; precheck {}", verdict.reason));
+            }
             crate::precheck::Outcome::Failed => {
                 let kept = crate::precheck::verdict_path(&state.root, &current, &verdict.command);
                 refusal = Some((verdict.refusal(item.pr, &kept), kept));

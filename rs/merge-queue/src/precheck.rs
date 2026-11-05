@@ -22,7 +22,12 @@
 //!
 //! A pass or a failure is kept per head and command, so resubmitting a head costs nothing and
 //! gets the same answer; a check that could not run is tried again next time. `submit
-//! --skip-precheck` queues a head without the check, for a refusal that is wrong.
+//! --skip-precheck` queues a head without the check, for a refusal that is wrong, and keeps
+//! that as the head's verdict.
+//!
+//! A run checks every change again before it joins a batch, which answers at once from the kept
+//! verdict for a head checked at submission, and catches a change queued before the precheck
+//! was configured: one that fails is ejected there, before the batch is built.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -57,6 +62,9 @@ pub enum Outcome {
     Failed,
     /// The check could not run (see the module documentation); it says nothing about the change.
     CouldNotRun,
+    /// Not run: the head was submitted with `--skip-precheck`, which is kept like a verdict so a
+    /// later check of the same head (before a batch is built) does not refuse it either.
+    Skipped,
 }
 
 /// The result of one precheck of one head.
@@ -146,6 +154,31 @@ pub fn kept(state_root: &Path, head: &str, command: &str) -> Option<Verdict> {
     let verdict: Verdict = serde_json::from_str(&text).ok()?;
     (verdict.schema == VERDICT_SCHEMA && verdict.head == head && verdict.command == command)
         .then_some(verdict)
+}
+
+/// Keep a [`Outcome::Skipped`] verdict for `head` under the configured command: `submit
+/// --skip-precheck` by `by`. Nothing when no precheck is configured.
+pub fn skip(state_root: &Path, config: &Config, head: &str, by: &str) -> Result<(), String> {
+    let command = config.precheck.command.trim();
+    if command.is_empty() {
+        return Ok(());
+    }
+    let verdict = Verdict {
+        schema: VERDICT_SCHEMA.to_owned(),
+        head: head.to_owned(),
+        command: command.to_owned(),
+        outcome: Outcome::Skipped,
+        exit: None,
+        reason: if by.is_empty() {
+            "skipped at submission (--skip-precheck)".to_owned()
+        } else {
+            format!("skipped at submission by {by} (--skip-precheck)")
+        },
+        output: String::new(),
+        elapsed_ms: 0,
+        checked_at: now(),
+    };
+    write_json(&verdict_path(state_root, head, command), &verdict)
 }
 
 /// Check change `pr` at `head` (a commit in `git`'s repository) with the configured precheck.

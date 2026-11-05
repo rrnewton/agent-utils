@@ -332,3 +332,54 @@ fn a_recorded_submission_is_prechecked_when_it_is_applied() {
     assert!(line.contains(" more line(s) in intake/refused/"), "{line}");
     assert!(!status.contains("Diff in"), "{status}");
 }
+
+/// Set `precheck.command` in the queue's config.json (or clear it with an empty command).
+fn set_precheck(fx: &Fixture, command: &str) {
+    let path = state_dir(fx).join("config.json");
+    let mut config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    if command.is_empty() {
+        config.as_object_mut().unwrap().remove("precheck");
+    } else {
+        config["precheck"] = serde_json::json!({ "command": command });
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+}
+
+#[test]
+fn a_change_queued_before_the_precheck_is_checked_before_it_joins_a_batch() {
+    let (fx, calls, _) = setup("precheck-gate", FORMAT_CHECK, &[]);
+    let precheck = format!("sh '{}'", fx.root.join("precheck.sh").display());
+    // Queued while no precheck was configured.
+    set_precheck(&fx, "");
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/b", "BADFMT\n")]);
+    fx.branch("c", &[("tests/c", "BADFMT\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    assert!(lines(&calls).is_empty());
+    set_precheck(&fx, &precheck);
+    // Skipped by its owner after the precheck came in: the skip is kept for its head.
+    fx.mq_ok(&["submit", "3", "--head", "c", "--skip-precheck"]);
+    let report: Value = serde_json::from_str(&fx.mq_ok(&["run", "--json"])).unwrap();
+    // #2 is ejected before any batch is built on it; #1 and the skipped #3 land.
+    assert_eq!(item(&fx, 2)["status"], "ejected");
+    let ejected = history(&item(&fx, 2))
+        .into_iter()
+        .find(|(kind, _)| kind == "ejected")
+        .unwrap()
+        .1;
+    assert!(
+        ejected.starts_with("precheck: #2: the precheck failed on"),
+        "{ejected}"
+    );
+    assert_eq!(item(&fx, 1)["status"], "landed", "{report}");
+    assert_eq!(item(&fx, 3)["status"], "landed", "{report}");
+    let files = git(&fx.remote(), &["ls-tree", "-r", "--name-only", "main"]);
+    assert!(!files.lines().any(|line| line == "tests/b"), "{files}");
+    // Only the heads with no kept verdict were checked: #1 and #2, once each.
+    let checked: Vec<String> = lines(&calls)
+        .iter()
+        .map(|line| line.split(' ').next().unwrap().to_owned())
+        .collect();
+    assert_eq!(checked, ["1", "2"], "{:?}", lines(&calls));
+}

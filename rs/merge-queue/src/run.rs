@@ -2683,7 +2683,8 @@ impl<'a> Runner<'a> {
         pending: &mut VecDeque<Vec<i64>>,
         context: &str,
     ) -> Result<Candidate, String> {
-        let (candidate, rejected) = self.build(parent, prs)?;
+        let prs = self.prechecked(prs, pending)?;
+        let (candidate, rejected) = self.build(parent, &prs)?;
         // Built on a batch still in flight, not on the base, a change may fail to combine
         // because of a change that never lands: it is set aside, not ejected.
         let in_flight = parent != lock(&self.base).as_str();
@@ -2721,6 +2722,49 @@ impl<'a> Runner<'a> {
             self.drop_dependents(pr, pending);
         }
         Ok(candidate)
+    }
+
+    /// `prs` without the changes whose head fails the precheck, each ejected (with the changes
+    /// that depend on it) before any batch is built on it. A head checked at submission answers
+    /// from its kept verdict at once; this catches a change queued before the precheck was
+    /// configured, or whose verdict has expired.
+    fn prechecked(
+        &self,
+        prs: &[i64],
+        pending: &mut VecDeque<Vec<i64>>,
+    ) -> Result<Vec<i64>, String> {
+        if self.simulating() || self.config.precheck.command.trim().is_empty() {
+            return Ok(prs.to_vec());
+        }
+        let base = lock(&self.base).clone();
+        let mut kept = Vec::new();
+        for &pr in prs {
+            let item = lock(&self.items).get(&pr).cloned();
+            let verdict = item.as_ref().and_then(|item| {
+                crate::precheck::check(
+                    &self.state.root,
+                    &self.config,
+                    &self.git,
+                    pr,
+                    &item.head_ref,
+                    &item.head,
+                    &base,
+                )
+            });
+            match verdict {
+                Some(verdict) if verdict.outcome == crate::precheck::Outcome::Failed => {
+                    let path = crate::precheck::verdict_path(
+                        &self.state.root,
+                        &verdict.head,
+                        &verdict.command,
+                    );
+                    self.eject(pr, "precheck", &verdict.refusal(pr, &path), &[])?;
+                    self.drop_dependents(pr, pending);
+                }
+                _ => kept.push(pr),
+            }
+        }
+        Ok(kept)
     }
 
     /// A change that does not combine onto `parent`, the candidate of a batch still in flight:
