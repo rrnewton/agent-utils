@@ -882,6 +882,12 @@ pub struct Config {
     /// Largest window the adaptive (AIMD) window may grow to: +1 per landed batch, halved per
     /// red batch, never below 1. 0 (the default) means `depth`, a fixed window.
     pub max_depth: usize,
+    /// Value-ordered scheduling: when intake brings a batch whose historical green
+    /// rate beats the deepest in-flight batch's, abort the deepest (it is replanned
+    /// later in the run) and give its slot to the new batch. Off by default: it
+    /// wants decision history worth ordering by.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub value_ordering: bool,
     /// Concurrent git probes while planning (base and pairwise conflict checks, each a git
     /// subprocess). 0 means [`DEFAULT_PROBE_PARALLELISM`]. Probe results are cached across
     /// runs in `probe-cache.json`, so this bounds only cache misses.
@@ -973,6 +979,7 @@ impl Default for Config {
             max_batch: DEFAULT_MAX_BATCH,
             depth: DEFAULT_DEPTH,
             max_depth: 0,
+            value_ordering: false,
             probe_parallelism: 0,
             union_paths: Vec::new(),
             regenerate: RegenerateConfig::default(),

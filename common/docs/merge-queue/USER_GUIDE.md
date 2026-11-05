@@ -873,6 +873,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `max_batch` | `4` | The maximum number of changes per batch. |
 | `depth` | `2` | The initial window and the culprit-search probe width. |
 | `max_depth` | `0` | The largest adaptive window; `0` means fixed at `depth`. |
+| `value_ordering` | `false` | Value-ordered scheduling: a waiting batch whose historical green rate (per change, from the decision log) beats the deepest in-flight batch's aborts it for its slot; the aborted batch is replanned later in the run (a `value-abort` event). |
 | `union_paths` | `[]` | Attribute patterns merged with Git's union driver (see "Union merges"). |
 | `priority` | absent | `{label, ci_paths}`: the priority label (absent or empty: `mq-priority`; `-`: off) and the CI path patterns for label suggestions. Left out of the file while both are defaults. See "Priority changes". |
 | `regenerate` | empty | `{paths, command, when}`; see "Generated files". |

@@ -326,6 +326,56 @@ pub fn prior_rates(state_root: &Path) -> Option<PriorRates> {
     })
 }
 
+/// Per-change historical green rates from the decision records: for each change,
+/// the share of its decided (green/red) validations that were green, plus the
+/// global share. The value-ordering input (see `Config::value_ordering`).
+pub fn change_rates(state_root: &Path) -> Option<(f64, BTreeMap<i64, f64>)> {
+    let dir = state_root.join("decisions");
+    let mut decided = 0usize;
+    let mut green = 0usize;
+    let mut per: BTreeMap<i64, (usize, usize)> = BTreeMap::new();
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.ends_with(".jsonl") || name == "rulings.jsonl" || name == "skips.jsonl" {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Ok(record) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let is_green = match record.get("outcome").and_then(Value::as_str) {
+                Some("green") => true,
+                Some("red") => false,
+                _ => continue,
+            };
+            decided += 1;
+            green += usize::from(is_green);
+            if let Some(changes) = record.get("changes").and_then(Value::as_array) {
+                for change in changes {
+                    if let Some(pr) = change.get("pr").and_then(Value::as_i64) {
+                        let slot = per.entry(pr).or_default();
+                        slot.1 += 1;
+                        slot.0 += usize::from(is_green);
+                    }
+                }
+            }
+        }
+    }
+    if decided == 0 {
+        return None;
+    }
+    Some((
+        green as f64 / decided as f64,
+        per.into_iter()
+            .map(|(pr, (g, n))| (pr, g as f64 / n as f64))
+            .collect(),
+    ))
+}
+
 /// Inputs for turning one run's report into decision records.
 pub struct Sources<'a> {
     /// Item records by change number (for submission times, sources and claims).

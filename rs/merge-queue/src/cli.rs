@@ -732,6 +732,10 @@ enum Command {
         /// the conflict prior. Empty (the default) disables the prior.
         #[arg(long, default_value = "")]
         conflict_footprints: String,
+        /// Value-ordered scheduling: abort the deepest in-flight batch for a waiting
+        /// batch with a better historical green rate.
+        #[arg(long)]
+        value_ordering: bool,
         /// Confirm each red by validating the same commit again (`$MQ_RERUN_FROM`) and search a
         /// red batch with prefix probes. Off by default: the first red is the verdict, and a red
         /// batch of several changes goes back as single-change batches.
@@ -1453,6 +1457,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             peripheral_timeout_secs,
             peripheral_max_batch,
             conflict_footprints,
+            value_ordering,
             confirm_reruns,
             split_red_batches,
             suspect_flake_reruns,
@@ -1607,6 +1612,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     tool_identity,
                     tool_refresh,
                 },
+                value_ordering,
                 conflict_prior: crate::state::ConflictPriorConfig {
                     footprints: conflict_footprints,
                 },

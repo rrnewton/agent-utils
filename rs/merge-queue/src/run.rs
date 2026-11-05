@@ -4180,6 +4180,12 @@ impl<'a> Runner<'a> {
             let mut full_loaded = false;
             let mut deferred_this_run: BTreeSet<i64> = BTreeSet::new();
             let mut refused_stop = String::new();
+            // Historical per-change green rates, for value-ordered aborts.
+            let rates = if self.config.value_ordering {
+                crate::decisions::change_rates(&self.state.root)
+            } else {
+                None
+            };
             let result = (|| -> Result<String, String> {
                 loop {
                     self.publish_window(
@@ -4216,7 +4222,7 @@ impl<'a> Runner<'a> {
                     // not started yet.
                     if full_loaded
                         && want_more
-                        && occupied(&flights) < window
+                        && (occupied(&flights) < window || self.config.value_ordering)
                         && (!flights.is_empty() || !pending.is_empty())
                         && self.takes_intake()
                     {
@@ -4270,6 +4276,55 @@ impl<'a> Runner<'a> {
                                             short(&tip)
                                         ),
                                     );
+                                }
+                            }
+                        }
+                    }
+                    // Value-ordered abort: a waiting batch with a better historical
+                    // green rate than the deepest in-flight batch takes its slot; the
+                    // aborted batch is replanned later in this run.
+                    if let Some((global, per)) = &rates {
+                        if occupied(&flights) >= window && !pending.is_empty() {
+                            let rate = |prs: &[i64]| -> f64 {
+                                prs.iter()
+                                    .map(|pr| per.get(pr).copied().unwrap_or(*global))
+                                    .sum::<f64>()
+                                    / prs.len().max(1) as f64
+                            };
+                            if let Some(index) = flights
+                                .iter()
+                                .rposition(|flight| flight.stacked && flight.result.is_none())
+                            {
+                                let deepest = &flights[index].candidate.prs;
+                                if rate(&pending[0]) > rate(deepest) {
+                                    let flight = flights.remove(index).unwrap();
+                                    flight.cancel.store(true, Ordering::Relaxed);
+                                    let mut waiting = flight.result.is_none();
+                                    while waiting {
+                                        match rx.recv() {
+                                            Ok((id, result)) => {
+                                                if id == flight.id {
+                                                    waiting = false;
+                                                } else if let Some(other) =
+                                                    flights.iter_mut().find(|f| f.id == id)
+                                                {
+                                                    other.result = Some(result);
+                                                }
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    self.event(
+                                        "value-abort",
+                                        &format!(
+                                            "{} aborted (rate {:.2}) for {} (rate {:.2}); replanned later",
+                                            list(&flight.candidate.prs),
+                                            rate(&flight.candidate.prs),
+                                            list(&pending[0]),
+                                            rate(&pending[0])
+                                        ),
+                                    );
+                                    pending.push_back(flight.candidate.prs);
                                 }
                             }
                         }
