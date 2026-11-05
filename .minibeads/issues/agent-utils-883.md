@@ -1,9 +1,9 @@
 ---
 title: 'wrkslots-shard-memory-and-heartbeat: shard-0 stays inside its memory cap and the heartbeat-renewal test survives load'
 status: open
-priority: 2
+priority: 1
 issue_type: bug
-assignee: cl-start
+assignee: mu-salvage
 created_at: 2026-11-05T11:28:43.362021367+00:00
 updated_at: 2026-11-05T11:28:43.362021367+00:00
 ---
@@ -29,14 +29,20 @@ Two repeat offenders appeared in the gate ledger on 2026-11-05 after #875 fixed 
   - in parallel gates it was OOM-killed at the 1.9 GiB cap around 40% of its tests;
   - `test_worktrees_image.py` alone peaks at 48-66 MB.
 
+  - On 2026-11-05 at 11:15 AM ET, shard-2 was OOM-killed even at the 2.5 GiB stopgap cap (5 oom_kill events, 265 s). A shard that can finish in about 0.9 GiB but sometimes grows past 2.5 GiB has a runaway, not a sizing problem.
+
+  Approach (the lead, 11:20 AM ET): sample cgroup memory per test (or run with pytest-xdist off and record RSS per test) across several runs of shard-0 and shard-2, find the test or fixture, fix it, then revert the cap.
+
   Look for a test that occasionally balloons: a spawned process tree counted in the cgroup, a large in-memory log or fixture, a retry loop accumulating output. Sample per-test cgroup memory across several runs of shard-0 and shard-2.
 
 # Acceptance Criteria
 
 - shard-0 has no OOM kill in the next 24 h ledger readout, and its cap stays within the gate host's overall memory budget.
-- Revert the TEMPORARY 2.5 GiB stopgap cap for shards 0 and 2 (validation/python-components.dag.yaml, 2026-11-05) to the shared `wrkslots_test_hint` once the balloon is found.
+- Revert the TEMPORARY stopgap cap (4 GiB since 11:30 AM ET; first 2.5 GiB) for shards 0 and 2 (validation/python-components.dag.yaml, 2026-11-05) to the shared `wrkslots_test_hint` once the balloon is found.
 - The shard-4 test passes under a load test: for example, 4 parallel copies plus a CPU hog for 20 iterations, or the gate's own stress mode.
 
 # Notes
 
 From mu-salvage's look at the gate ledger on 2026-11-05. Assigned to mu-salvage after #881; moved to cl-start on 2026-11-05 at 10:20 AM ET because gate health fell to a 36% first-run pass rate. If #879 changes the same liveness code, coordinate with mu-validate.
+
+Raised to P1 and moved to mu-salvage, NEXT after the #885 (b) part it is in the middle of, on 2026-11-05 at 11:20 AM ET (the lead): at an 18% first-run pass rate, this is the biggest tax on every lane. cl-start keeps #891, #896 and #897.
