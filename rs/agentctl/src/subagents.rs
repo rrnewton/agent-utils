@@ -10568,6 +10568,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if record.is_headless() {
             return self.send_headless_for_chat(lock, &record, text, message_id, &options);
         }
+        if record.is_cloud() {
+            // The chat bridge's path too: journaled by `agentcloudctl send` under the message id
+            // as its idempotency key, never typed (#896 chat-receipt-needs-evidence).
+            return self.cloud_send_journaled(&record, text, message_id);
+        }
         record.input_allowed()?;
         let queue = self.queue(&record.name)?;
         let client = WorkspaceClient {
@@ -10590,6 +10595,28 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             runtime,
             Some(message_id),
         )
+    }
+
+    /// Journal `text` into cloud agent `record`'s session under the idempotency key
+    /// `message_id`, as [`Self::cloud_send_record`] does, reported as delivered: the
+    /// orchestrator holds it once the send exits 0, which `cloud-inputs/` records for
+    /// `message_state`.
+    fn cloud_send_journaled(
+        &self,
+        record: &AgentRecord,
+        text: &str,
+        message_id: &str,
+    ) -> Result<QueueResult> {
+        self.cloud_send_record(record, text, Some(message_id))?;
+        Ok(agent::QueueResult {
+            message_id: message_id.to_owned(),
+            delivered: vec![message_id.to_owned()],
+            quarantined: Vec::new(),
+            pending: Vec::new(),
+            cancelled: Vec::new(),
+            blocked: None,
+            outcome: agent::QueueOutcome::Delivered,
+        })
     }
 
     /// Send a prompt that must never be left waiting, such as a chat bridge's reply reminder:
@@ -11416,16 +11443,7 @@ its drain would also type, so it was not queued",
                     &generated
                 }
             };
-            self.cloud_send_record(record, text, Some(identifier))?;
-            return Ok(agent::QueueResult {
-                message_id: identifier.to_owned(),
-                delivered: vec![identifier.to_owned()],
-                quarantined: Vec::new(),
-                pending: Vec::new(),
-                cancelled: Vec::new(),
-                blocked: None,
-                outcome: agent::QueueOutcome::Delivered,
-            });
+            return self.cloud_send_journaled(record, text, identifier);
         }
         record.input_allowed()?;
         let queue = self.queue(&record.name)?;

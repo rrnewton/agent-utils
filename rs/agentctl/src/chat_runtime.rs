@@ -20618,7 +20618,7 @@ pub(crate) mod tests {
         .expect("delivery")
     }
 
-    fn indexed_delivery(sequence: u64, index: u64) -> DeliveryBatch {
+    pub(crate) fn indexed_delivery(sequence: u64, index: u64) -> DeliveryBatch {
         indexed_delivery_at(
             sequence,
             index,

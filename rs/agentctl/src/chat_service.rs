@@ -4243,6 +4243,20 @@ impl AgentRuntime for StopRuntime<'_> {
     }
 }
 
+/// Run `run` with the delivery `chat run` uses for `manager`, for tests elsewhere in the crate.
+#[cfg(test)]
+pub(crate) fn with_service_delivery<A: ManagedApi + ?Sized, T>(
+    manager: &ManagedAgents<'_, A>,
+    run: impl FnOnce(&dyn chat_runtime::CoordinatorDelivery) -> T,
+) -> T {
+    let stop = StopState::default();
+    let delivery = CancellableDelivery {
+        manager,
+        runtime: StopRuntime::new(&stop),
+    };
+    run(&delivery)
+}
+
 struct CancellableDelivery<'a, A: ManagedApi + ?Sized> {
     manager: &'a ManagedAgents<'a, A>,
     runtime: StopRuntime<'a>,

@@ -4375,6 +4375,144 @@ exit 0
         assert_eq!(durable_seq("ok\n"), None);
     }
 
+    /// A bridge state serving the fixture's cloud agent, holding one admitted request.
+    fn chat_state(name: &str) -> (crate::chat_runtime::BridgeState, String, PathBuf) {
+        use crate::chat_runtime::tests::{config, indexed_delivery, temporary};
+        let root = temporary(name);
+        let mut configuration = config();
+        configuration.agent_name = "sub-worker".to_owned();
+        let state = crate::chat_runtime::BridgeState::initialize(&root, configuration).unwrap();
+        let key = state
+            .admit_batch(&indexed_delivery(1, 1))
+            .unwrap()
+            .new_request_keys
+            .remove(0);
+        (state, key, root)
+    }
+
+    fn phase(state: &crate::chat_runtime::BridgeState, key: &str) -> &'static str {
+        state
+            .request_times()
+            .unwrap()
+            .into_iter()
+            .find(|times| times.key == key)
+            .expect("request")
+            .phase
+    }
+
+    #[test]
+    fn a_chat_request_to_a_cloud_agent_is_journaled_and_receipted_only_after_the_send() {
+        // #896 chat-receipt-needs-evidence, live check: `chat run`'s delivery refused a cloud
+        // target outright ("drives Herdr-hosted harnesses only"), so nothing reached the session.
+        let fixture = Fixture::new();
+        fixture.list_row(true);
+        fixture.start(None).unwrap();
+        let (state, key, root) = chat_state("cloud-chat-delivered");
+        let manager = fixture.manager();
+        let sends = |fixture: &Fixture| fixture.verbs().iter().filter(|v| *v == "send").count();
+        let before = sends(&fixture);
+        let result = crate::chat_service::with_service_delivery(&manager, |delivery| {
+            crate::chat_runtime::deliver_request_with(
+                &state,
+                delivery,
+                &key,
+                DrainOptions::default(),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            result,
+            crate::chat_runtime::CoordinatorDeliveryResult::Delivered
+        );
+        assert_eq!(sends(&fixture), before + 1, "the session got the prompt");
+        let send = fixture
+            .calls()
+            .into_iter()
+            .rfind(|call| call[0] == "send")
+            .unwrap();
+        let message_id = format!("chat-{key}");
+        let at = send
+            .iter()
+            .position(|word| word == "--idempotency-key")
+            .unwrap();
+        assert_eq!(send[at + 1], message_id);
+        let text = &send[send.iter().position(|word| word == "--text").unwrap() + 1];
+        assert!(
+            text.contains("<chat_message>\nrequest 1\n</chat_message>"),
+            "{text}"
+        );
+        assert_eq!(phase(&state, &key), "delivered");
+        let noted: Value = agent::read_private_json(&fixture.root.join(format!(
+            "registry/agents/sub-worker/cloud-inputs/{message_id}.json"
+        )))
+        .unwrap();
+        assert_eq!(
+            (noted["state"].as_str(), noted["seq"].as_u64()),
+            (Some("accepted"), Some(42))
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_failed_cloud_send_leaves_the_chat_request_pending_until_the_history_shows_it() {
+        // #896: a send that fails is no evidence. The request stays pending, so the stall alarm
+        // counts it and the next pass sends again under the same key; once the session history
+        // shows that key, the receipt follows without a second send.
+        let fixture = Fixture::new();
+        fixture.list_row(true);
+        fixture.start(None).unwrap();
+        let (state, key, root) = chat_state("cloud-chat-failed");
+        let manager = fixture.manager();
+        fixture.respond("send", None, Some("orchestrator unavailable\n"), Some(1));
+        fixture.respond("history", Some(""), None, None);
+        let deliver = || {
+            crate::chat_service::with_service_delivery(&manager, |delivery| {
+                crate::chat_runtime::deliver_request_with(
+                    &state,
+                    delivery,
+                    &key,
+                    DrainOptions::default(),
+                )
+            })
+            .unwrap()
+        };
+        let result = deliver();
+        assert!(
+            matches!(result, crate::chat_runtime::CoordinatorDeliveryResult::Pending(ref why) if why.contains("orchestrator unavailable")),
+            "{result:?}"
+        );
+        assert_eq!(phase(&state, &key), "pending");
+        let entries = state.delivery_entries().expect("delivery entries");
+        let entry = entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .expect("entry");
+        assert!(
+            entry.stalled(u64::MAX, crate::chat_runtime::DELIVERY_STALL_AFTER),
+            "the stall alarm counts it"
+        );
+        // The session journaled it after all: the history shows the key.
+        let message_id = format!("chat-{key}");
+        fixture.respond(
+            "history",
+            Some(&format!("{}\n", history_frame(43, &message_id))),
+            None,
+            None,
+        );
+        let sends = fixture.verbs().iter().filter(|v| *v == "send").count();
+        assert_eq!(
+            deliver(),
+            crate::chat_runtime::CoordinatorDeliveryResult::Delivered
+        );
+        assert_eq!(
+            fixture.verbs().iter().filter(|v| *v == "send").count(),
+            sends,
+            "not sent twice"
+        );
+        assert_eq!(phase(&state, &key), "delivered");
+        fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn a_deferred_startup_goal_rechecks_the_workspace_policy() {
         let fixture = Fixture::new();
