@@ -49,3 +49,5 @@ P0. One orphaned `wrkslots create` blocks every later create in a consumer proje
 # Notes
 
 Reported by the lead on 2026-11-05 at 06:41 AM ET (P0). Part (a), 5c4796cc, resolved the consumer's outage at 09:13 AM ET: the create was recovered forward and validations resumed. The remaining items are P0 for recurrence. Assigned to mu-salvage, which pauses #881 for it.
+
+Progress (2026-11-05): (a) classification landed alone as 5c4796cc. The seal/create deadlock, forward recovery and clean-initialized-submodule abort landed as 3aad488b (post-landing gate 54/55, only the #883 shard-2 OOM failing). Still open in this issue: item 6 (a supported terminal path when the journal file is gone but append-only history names it) and item 8 (unscoped recover matching scoped, or naming the --slot to use), each with a test. #883 was taken next at P1; these two remain for mu-salvage after it.
