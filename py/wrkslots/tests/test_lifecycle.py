@@ -46252,6 +46252,127 @@ def test_audit_row_round_trips_as_absent_validate_input(
         wrkslots._read_absent_validate_rows_input(config, str(input_path))
 
 
+def test_absent_validate_legacy_row_without_owner_agrees(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#878: a legacy validate row with no recorded owner generation.
+
+    The row predates recorded owner generations, so it has no exact
+    owner to prove dead.  One shared predicate decides: the storage
+    proofs (absent paths, no fenced sibling, no Git registration,
+    retained-handle and host censuses) run as for any row, and on the
+    owner axis an expired heartbeat stands in for the missing
+    generation.  Audit and recover-absent-validate-rows both follow
+    it, so audit never names a plan recover would refuse.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_validate_row(
+        project, repository, slot="gone", agent="validate-a"
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    current = wrkslots._find_record(state, "gone")
+    expired = (
+        dt.datetime.now(dt.timezone.utc)
+        - dt.timedelta(seconds=current.heartbeat_ttl_seconds + 1)
+    ).isoformat(timespec="seconds")
+    legacy = replace(current, owner=None, heartbeat_at=expired)
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, legacy),
+        action="test-legacy-row",
+        slot="gone",
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    code, out = _audit_json(project, capsys)
+    assert code == 0
+    row = next(item for item in json.loads(out)["slots"] if item["slot"] == "gone")
+    assert row["verdict"] == "RECOVERABLE", row["reasons"]
+
+    input_path = project / "absent-validate-rows.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "rows": [
+                    {
+                        key: row[key]
+                        for key in (
+                            "machine",
+                            "slot",
+                            "generation",
+                            "record_sha256",
+                        )
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert run_absent_validate_recovery(project, input_path, apply=False) == 0
+    capsys.readouterr()
+    assert run_absent_validate_recovery(project, input_path, apply=True) == 0
+    capsys.readouterr()
+    state_after = wrkslots._load_active(config)
+    assert all(item.slot != "gone" for item in state_after.slots)
+
+    # The same row with a live heartbeat: both refuse, with the
+    # heartbeat named -- the expired heartbeat is what stands in for
+    # the missing generation, so a fresh one proves nothing.
+    record = prepare_absent_validate_row(
+        project, repository, slot="gone-2", agent="validate-b"
+    )
+    state = wrkslots._load_active(config)
+    current = wrkslots._find_record(state, "gone-2")
+    fresh = replace(current, owner=None)
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, fresh),
+        action="test-legacy-row-fresh",
+        slot="gone-2",
+    )
+    code, out = _audit_json(project, capsys)
+    assert code == 0
+    row = next(item for item in json.loads(out)["slots"] if item["slot"] == "gone-2")
+    assert row["verdict"] == "BLOCKED", row["reasons"]
+    input_path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "rows": [
+                    {
+                        key: row[key]
+                        for key in (
+                            "machine",
+                            "slot",
+                            "generation",
+                            "record_sha256",
+                        )
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert run_absent_validate_recovery(project, input_path, apply=False) == 3
+    captured = capsys.readouterr()
+    assert "heartbeat" in captured.err
+
+    # Direct predicate agreement for generation rows is unchanged:
+    # an exact owner still has to be dead, and the shared predicate
+    # refuses an ownerless row whose heartbeat has not expired.
+    assert record.owner is not None
+    fresh_stamp = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    with pytest.raises(wrkslots.Refusal, match="heartbeat"):
+        wrkslots._assert_absent_validate_owners_dead(
+            (replace(record, owner=None, heartbeat_at=fresh_stamp),)
+        )
+
+
 def _audit_json(
     project: Path, capsys: pytest.CaptureFixture[str], *extra: str
 ) -> tuple[int, str]:
@@ -47676,8 +47797,17 @@ def test_absent_validate_recovery_binds_stable_host_identity(
     with pytest.raises(wrkslots.Refusal, match="missing or mixed"):
         wrkslots._assert_absent_validate_row_is_local(mixed)
 
-    with pytest.raises(wrkslots.Refusal, match="no exact owner process generation"):
+    # #878: an ownerless row is refused only while its heartbeat is
+    # unexpired; an expired one passes the shared predicate.
+    with pytest.raises(wrkslots.Refusal, match="heartbeat has not expired"):
         wrkslots._assert_absent_validate_owners_dead((replace(record, owner=None),))
+    expired_stamp = (
+        dt.datetime.now(dt.timezone.utc)
+        - dt.timedelta(seconds=record.heartbeat_ttl_seconds + 1)
+    ).isoformat(timespec="seconds")
+    wrkslots._assert_absent_validate_owners_dead(
+        (replace(record, owner=None, heartbeat_at=expired_stamp),)
+    )
 
     live = wrkslots._read_process_identity(os.getpid())
     dead_owner = replace(

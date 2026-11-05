@@ -1004,9 +1004,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # clean-caches ignore a foreign shard unless --all-machines) is mapped.
     # The two #885 cases (an owner-less orphaned create does not block an
     # unrelated create, and the coordinator aborts it) are mapped.
-    assert len(all_tests) == 2139
+    # The #878 legacy-validate agreement case (audit and
+    # recover-absent-validate-rows share one owner predicate) is mapped.
+    assert len(all_tests) == 2140
     assert len(ordinary) == 339
-    assert len(mapped) == 1800
+    assert len(mapped) == 1801
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

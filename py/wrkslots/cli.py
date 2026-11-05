@@ -35973,6 +35973,21 @@ def _audit_record(
             f"recorded owner is {owner_state}: {owner_detail}; the recover-absent "
             "commands require the recorded owner generation to be dead"
         )
+    if slot_absent and record.slot_type == "validate":
+        # #878: the owner axis is decided by the one predicate recover
+        # uses, so a legacy row with no recorded owner generation is
+        # RECOVERABLE exactly when recover would accept it (an expired
+        # heartbeat stands in for the missing generation).
+        try:
+            owner_refusal = _absent_validate_owner_refusal(
+                record,
+                current_host=_host_id(),
+                current_boot=_boot_id(Path("/proc")),
+            )
+        except Refusal as exc:
+            owner_refusal = f"recorded owner evidence is unverifiable: {exc}"
+        if owner_refusal is not None and owner_refusal not in reasons:
+            reasons.append(owner_refusal)
     if (
         release_honoured
         or (
@@ -61107,24 +61122,57 @@ def _assert_absent_validate_systemd_unrelated(
     resolver.check_bound()
 
 
+def _absent_validate_owner_refusal(
+    record: ActiveRecord,
+    *,
+    current_host: str,
+    current_boot: str,
+) -> str | None:
+    """The owner-axis refusal for one absent validate row, or None (#878).
+
+    The one predicate audit and recover-absent-validate-rows share, so
+    audit never names a plan recover would refuse and recover never
+    refuses a row audit called RECOVERABLE.  A recorded owner
+    generation must be exactly dead, as before.  A legacy row predates
+    recorded generations and has no owner to prove dead; for it, an
+    expired heartbeat stands in for the missing generation (a live one
+    proves nothing), and the callers' storage, retained-handle and
+    process censuses still prove no live use of the absent paths.
+    Validate rows hold no authored work, so nothing else is at stake.
+    """
+
+    owner = record.owner
+    if owner is None:
+        _age, expired = _heartbeat_diagnosis(record)
+        if not expired:
+            return (
+                f"validation row {record.slot} has no exact owner process "
+                "generation and its heartbeat has not expired, so the "
+                "missing generation proves nothing"
+            )
+        return None
+    if owner.host_id != current_host:
+        return f"recorded owner host is indeterminate for validation row {record.slot}"
+    if owner.boot_id != current_boot:
+        return None
+    ticks = _process_start_ticks(Path("/proc") / str(owner.pid))
+    if ticks is None or ticks != owner.start_ticks:
+        return None
+    return (
+        f"recorded owner PID {owner.pid} generation is still live for "
+        f"validation row {record.slot}"
+    )
+
+
 def _assert_absent_validate_owners_dead(records: Sequence[ActiveRecord]) -> None:
     current_host = _host_id()
     current_boot = _boot_id(Path("/proc"))
     for record in records:
-        owner = record.owner
-        if owner is None:
-            raise Refusal(f"validation row {record.slot} has no exact owner process generation")
-        if owner.host_id != current_host:
-            raise Refusal(f"recorded owner host is indeterminate for validation row {record.slot}")
-        if owner.boot_id != current_boot:
-            continue
-        ticks = _process_start_ticks(Path("/proc") / str(owner.pid))
-        if ticks is None or ticks != owner.start_ticks:
-            continue
-        raise Refusal(
-            f"recorded owner PID {owner.pid} generation is still live for validation "
-            f"row {record.slot}"
+        refusal = _absent_validate_owner_refusal(
+            record, current_host=current_host, current_boot=current_boot
         )
+        if refusal is not None:
+            raise Refusal(refusal)
 
 
 def _assert_absent_validate_rows_safe(

@@ -256,7 +256,11 @@ audit's classification grants no authority. `RECOVERABLE` rows count as reclaima
 An absent row that fails any other check stays `BLOCKED` and still names the recovery command. An
 owner release does not stand in for the owner's exit here: both recovery commands require the
 recorded owner generation to be dead, so an absent row whose releasing owner still runs stays
-`BLOCKED` and says so. A slot path that is occupied by anything other than a real directory -- a
+`BLOCKED` and says so. A validation row recorded before owner generations were kept has no
+owner to prove dead; for it an expired heartbeat stands in for the missing generation (a live one
+proves nothing), with every storage, Git, and process census unchanged, and audit and
+`recover-absent-validate-rows` decide by that one rule, so the plan audit names is the plan
+recovery runs. A slot path that is occupied by anything other than a real directory -- a
 symlink, even a dangling one, an ordinary file, or a path `lstat` cannot inspect -- is never absent:
 it stays `BLOCKED` or refuses the audit exactly as before.
 
