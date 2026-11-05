@@ -4097,6 +4097,14 @@ def _parse_sandbox_settings(raw: Mapping[str, object]) -> sandbox.SandboxSetting
 #: that anything is using the slot. Every process-level check (working
 #: directory, root, descriptors, mappings, owner cgroup) still runs.
 _OWNED_REPRESENTATION_MOUNTS: frozenset[tuple[Path, str]] = frozenset()
+#: ``(mount point, MAJOR:MINOR, mount root)`` of this project's own
+#: worktrees-image slot binds (#898). The census ignores exactly the recorded
+#: bind's line: its target, its subvolume root and its device must all match,
+#: so a foreign mount at the same path, or any mount under the slot, is still
+#: use. Mount IDs are namespace-local, so identity is target+root+device, as
+#: for the slot-image mounts above; the recorded mount ID is kept in the
+#: bind record for diagnostics.
+_OWNED_WORKTREES_BIND_MOUNTS: frozenset[tuple[Path, str, str]] = frozenset()
 #: ``(mount point, MAJOR:MINOR, /dev/loopN)`` of every second attachment of a
 #: doubly attached image: an independent, stale file system on the same image
 #: file. The census reports such a line as use, naming it, unless this command
@@ -4137,6 +4145,7 @@ def _activate_representation(config: Config) -> None:
         _OWNED_REPRESENTATION_MOUNTS = frozenset()
         _STALE_REPRESENTATION_MOUNTS = frozenset()
         _DISCARDED_STALE_MOUNTS = frozenset()
+        _refresh_worktrees_bind_mounts(config)
         return
     try:
         actions, failures = slotimage.ensure_all_mounted(config.control)
@@ -4162,12 +4171,19 @@ def _mountinfo_line_key(line: str) -> tuple[Path, str, str] | None:
 
 
 def _owned_mount_line(line: str) -> bool:
+    key = _mountinfo_line_key(line)
+    if key is None:
+        return False
+    # A recorded worktrees-image bind is the slot's own mount (#898): target,
+    # device and subvolume root must all match the record, so a foreign mount
+    # at the same path (different root or device) still counts as use.
+    if key in _OWNED_WORKTREES_BIND_MOUNTS:
+        return True
     if not _OWNED_REPRESENTATION_MOUNTS:
         return False
-    key = _mountinfo_line_key(line)
     # A bind of a subdirectory of the image (mount root other than "/") is not
     # the slot's own mount, whatever device it shows.
-    return key is not None and key[2] == "/" and (key[0], key[1]) in _OWNED_REPRESENTATION_MOUNTS
+    return key[2] == "/" and (key[0], key[1]) in _OWNED_REPRESENTATION_MOUNTS
 
 
 def _stale_mount_note(line: str) -> str | None:
@@ -4212,6 +4228,46 @@ def _slot_image_at(config: Config, path: Path) -> slotimage.SlotImage | None:
         raise Refusal(f"cannot read slot image records: {exc}") from exc
 
 
+def _refresh_worktrees_bind_mounts(config: Config) -> None:
+    """Note this project's recorded worktrees-image binds for the census (#898).
+
+    A bind's live identity is its target, device and subvolume root in the
+    current mount table. Canonical slot paths and any fenced sibling of a
+    recorded slot (a removal in flight) are candidate targets; a candidate
+    counts only when the table shows the recorded subvolume bound there.
+    """
+
+    global _OWNED_WORKTREES_BIND_MOUNTS
+    if config.worktrees_image is None:
+        _OWNED_WORKTREES_BIND_MOUNTS = frozenset()
+        return
+    try:
+        records = worktreesimage.load_bind_records(config.control)
+        table = slotimage.mount_table()
+    except (worktreesimage.WorktreesImageError, slotimage.ImageError, Refusal):
+        _OWNED_WORKTREES_BIND_MOUNTS = frozenset()
+        return
+    points: dict[Path, str] = {}
+    for slot, record in records.items():
+        for slot_type in SLOT_TYPES:
+            try:
+                canonical = _slot_directory(config, slot, slot_type)
+            except Refusal:
+                continue
+            points[canonical] = record.subvolume
+            try:
+                for fenced in canonical.parent.glob(f".{slot}.fenced.*"):
+                    points[fenced] = record.subvolume
+            except OSError:
+                continue
+    owned: set[tuple[Path, str, str]] = set()
+    for entry in table:
+        subvolume = points.get(entry.mount_point)
+        if subvolume is not None and entry.root == f"/{subvolume}":
+            owned.add((entry.mount_point, entry.device, entry.root))
+    _OWNED_WORKTREES_BIND_MOUNTS = frozenset(owned)
+
+
 def _refresh_owned_mounts(config: Config) -> None:
     global _OWNED_REPRESENTATION_MOUNTS, _STALE_REPRESENTATION_MOUNTS, _DISCARDED_STALE_MOUNTS
     owned, stale = slotimage.owned_mounts(config.control)
@@ -4237,6 +4293,29 @@ def _refresh_owned_mounts(config: Config) -> None:
     _DISCARDED_STALE_MOUNTS = frozenset(
         item for item in stale if (item[0], item[1]) in discarded
     )
+    _refresh_worktrees_bind_mounts(config)
+
+
+def _worktrees_bind_slot(config: Config, path: Path) -> str | None:
+    """The slot whose recorded worktrees-image bind is at ``path``, or None.
+
+    ``path`` may be the slot's canonical path or its fenced sibling
+    (``.<slot>.fenced.<generation>.<hash>``): a removal relocates the bind to
+    the fenced path and unbinds it from there (#898).
+    """
+
+    if config.worktrees_image is None:
+        return None
+    try:
+        records = worktreesimage.load_bind_records(config.control)
+    except worktreesimage.WorktreesImageError as exc:
+        raise Refusal(f"cannot read worktrees image record: {exc}") from exc
+    if path.name in records:
+        return path.name
+    fenced = re.fullmatch(r"\.(.+)\.fenced\.\d+\.[0-9a-f]{32}", path.name)
+    if fenced is not None and fenced.group(1) in records:
+        return fenced.group(1)
+    return None
 
 
 def _rename_slot_path(config: Config, source: Path, destination: Path) -> None:
@@ -4244,13 +4323,29 @@ def _rename_slot_path(config: Config, source: Path, destination: Path) -> None:
 
     A mount point cannot be renamed. For an image-backed slot the image is
     unmounted, the empty mount point renamed, and the image mounted again at
-    the destination. Failures surface as OSError so every caller's existing
-    rename error handling still applies.
+    the destination. A slot born in the worktrees image gets the same
+    treatment for its recorded bind (#898). Failures surface as OSError so
+    every caller's existing rename error handling still applies.
     """
 
     image = _slot_image_at(config, source)
     if image is None:
-        os.rename(source, destination)
+        bind_slot = _worktrees_bind_slot(config, source)
+        if bind_slot is None:
+            os.rename(source, destination)
+            return
+        try:
+            worktreesimage.relocate_bind(
+                config.control,
+                worktreesimage.image_mount_dir(config.control),
+                bind_slot,
+                source,
+                destination,
+            )
+        except worktreesimage.WorktreesImageError as exc:
+            raise OSError(errno.EBUSY, f"cannot relocate worktrees-image bind: {exc}") from exc
+        finally:
+            _refresh_owned_mounts(config)
         return
     try:
         slotimage.relocate(image, destination)
@@ -4263,20 +4358,28 @@ def _rename_slot_path(config: Config, source: Path, destination: Path) -> None:
 def _remove_slot_directory(config: Config, path: Path) -> None:
     """Remove an emptied slot directory: rmdir, or destroy its image.
 
-    Raises OSError with the same meaning as rmdir when the slot still holds
-    content, so callers keep their refusal wording.
+    A slot born in the worktrees image is unbound and its subvolume deleted
+    here (#898); a failed unmount raises before anything is dropped, so the
+    bind record and subvolume stay for a retry. Raises OSError with the same
+    meaning as rmdir when the slot still holds content, so callers keep their
+    refusal wording.
     """
 
     image = _slot_image_at(config, path)
     if image is None:
-        if config.worktrees_image is not None and path.name in worktreesimage.load_binds(config.control):
+        bind_slot = _worktrees_bind_slot(config, path)
+        if bind_slot is not None:
             try:
-                worktreesimage.unbind_slot(config.control, path.name, path)
+                records = worktreesimage.load_bind_records(config.control)
+                worktreesimage.unbind_slot(config.control, bind_slot, path)
                 worktreesimage.delete_slot_subvolume(
-                    worktreesimage.image_mount_dir(config.control) / path.name
+                    worktreesimage.image_mount_dir(config.control)
+                    / records[bind_slot].subvolume
                 )
             except worktreesimage.WorktreesImageError as exc:
                 raise OSError(errno.ENOTEMPTY, str(exc)) from exc
+            finally:
+                _refresh_owned_mounts(config)
             path.rmdir()
             return
         path.rmdir()

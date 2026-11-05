@@ -128,6 +128,126 @@ def test_bind_record_round_trip(tmp_path: Path) -> None:
     assert worktreesimage.image_mount_dir(tmp_path) == tmp_path / ".slots-image"
 
 
+def test_bind_records_keep_mount_id_and_read_legacy(tmp_path: Path) -> None:
+    worktreesimage.save_binds(tmp_path, {"old": "old"})
+    assert worktreesimage.load_bind_records(tmp_path) == {
+        "old": worktreesimage.BindRecord(subvolume="old")
+    }
+    worktreesimage.save_bind_records(
+        tmp_path, {"s1": worktreesimage.BindRecord(subvolume="s1", mount_id=4242)}
+    )
+    assert worktreesimage.load_bind_records(tmp_path)["s1"].mount_id == 4242
+    assert worktreesimage.load_binds(tmp_path) == {"s1": "s1"}
+
+
+def test_mount_id_at_reads_the_topmost_mount(tmp_path: Path) -> None:
+    table = tmp_path / "mountinfo"
+    table.write_text(
+        "10 1 0:1 / /proj/worktrees/slots/s1 rw - btrfs /dev/loop0 rw\n"
+        "11 1 0:1 /s1 /proj/worktrees/slots/s1 rw - btrfs /dev/loop0 rw\n",
+        encoding="utf-8",
+    )
+    assert worktreesimage.mount_id_at(Path("/proj/worktrees/slots/s1"), table) == 11
+    assert worktreesimage.mount_id_at(Path("/proj/worktrees/slots/s2"), table) is None
+
+
+def test_own_bind_is_not_use_but_a_foreign_mount_is(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The recorded bind (target + device + subvolume root) is the slot's own
+    # mount and is skipped; a foreign mount at the same path, and any mount
+    # under the slot, still count as use (#898).
+    slot = "/p/worktrees/slots/s1"
+    own = f"11 1 0:1 /s1 {slot} rw - btrfs /dev/loop0 rw"
+    foreign_same_path = f"12 1 0:2 /other {slot} rw - btrfs /dev/loop1 rw"
+    foreign_under = f"13 1 0:2 /x {slot}/sub rw - tmpfs tmpfs rw"
+    monkeypatch.setattr(
+        cli,
+        "_OWNED_WORKTREES_BIND_MOUNTS",
+        frozenset({(Path(slot), "0:1", "/s1")}),
+    )
+    parsed = cli._parse_mountinfo_paths(f"{own}\n{foreign_same_path}\n{foreign_under}\n", "test")
+    paths = [str(path) for path, _raw in parsed]
+    assert paths.count(slot) == 1  # only the foreign mount at the same path
+    assert f"{slot}/sub" in paths
+    uses = cli._mountinfo_uses_slot(f"{own}\n{foreign_same_path}\n", Path(slot), "test")
+    assert uses == (f"mount={slot}",)
+
+
+class _FakeMounts:
+    """A worktrees-image host in miniature: commands act on real directories."""
+
+    def __init__(self, fail_umount: bool = False) -> None:
+        self.calls: list[list[str]] = []
+        self.fail_umount = fail_umount
+
+    def run(self, argv: list[str], *, sudo: bool = False) -> object:
+        self.calls.append(list(argv))
+        if argv[:1] == ["mount"]:
+            return None
+        if argv[:1] == ["umount"]:
+            if self.fail_umount:
+                raise worktreesimage.WorktreesImageError("umount: target is busy")
+            return None
+        if argv[:3] == ["btrfs", "subvolume", "delete"]:
+            Path(argv[3]).rmdir()
+            return None
+        raise AssertionError(f"unexpected command: {argv}")
+
+
+def test_bind_fence_and_remove_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    slot_path = config.worktrees / "s1"
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 777)
+
+    worktreesimage.bind_slot(control, mount_dir, "s1", slot_path)
+    assert worktreesimage.load_bind_records(control)["s1"].mount_id == 777
+
+    fenced = config.worktrees / (".s1.fenced.1." + "a" * 32)
+    cli._rename_slot_path(config, slot_path, fenced)
+    assert fenced.is_dir() and not slot_path.exists()
+    assert worktreesimage.load_binds(control) == {"s1": "s1"}
+    assert [call[0] for call in fake.calls] == ["mount", "umount", "mount"]
+
+    cli._remove_slot_directory(config, fenced)
+    assert not fenced.exists()
+    assert not (mount_dir / "s1").exists()
+    assert worktreesimage.load_binds(control) == {}
+
+
+def test_remove_refuses_when_the_bind_unmount_fails_and_a_retry_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    slot_path = config.worktrees / "s1"
+    slot_path.mkdir(parents=True)
+    worktreesimage.save_bind_records(
+        control, {"s1": worktreesimage.BindRecord(subvolume="s1", mount_id=5)}
+    )
+    failing = _FakeMounts(fail_umount=True)
+    monkeypatch.setattr(worktreesimage, "_run", failing.run)
+    with pytest.raises(OSError):
+        cli._remove_slot_directory(config, slot_path)
+    # Nothing was dropped: slot, subvolume and record are all still there.
+    assert slot_path.is_dir() and (mount_dir / "s1").is_dir()
+    assert worktreesimage.load_binds(control) == {"s1": "s1"}
+
+    monkeypatch.setattr(worktreesimage, "_run", _FakeMounts().run)
+    cli._remove_slot_directory(config, slot_path)
+    assert not slot_path.exists() and not (mount_dir / "s1").exists()
+    assert worktreesimage.load_binds(control) == {}
+
+
 def test_listing_signature_and_quota(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
     (tmp_path / "sub").mkdir()

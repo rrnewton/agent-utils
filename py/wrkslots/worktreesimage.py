@@ -399,8 +399,23 @@ def record_path(control: Path) -> Path:
     return control / RECORD_NAME
 
 
-def load_binds(control: Path) -> dict[str, str]:
-    """Recorded binds: slot name to subvolume name inside the image."""
+@dataclasses.dataclass(frozen=True)
+class BindRecord:
+    """One slot's recorded bind: its subvolume and the mount's identity.
+
+    ``mount_id`` is the ID the bind had in the mounting namespace when it
+    was made (field 1 of its mountinfo line). Mount IDs are namespace-local,
+    so callers match a live mount by target path, mount root (the subvolume)
+    and device, exactly as the slot-image census matches its owned mounts;
+    the recorded ID names this exact mount in diagnostics and records.
+    """
+
+    subvolume: str
+    mount_id: int | None = None
+
+
+def load_bind_records(control: Path) -> dict[str, BindRecord]:
+    """Recorded binds with their mount identity (legacy strings included)."""
 
     path = record_path(control)
     if not path.is_file():
@@ -411,7 +426,42 @@ def load_binds(control: Path) -> dict[str, str]:
     binds = value.get("binds") if isinstance(value, dict) else None
     if not isinstance(binds, dict):
         raise WorktreesImageError(f"malformed worktrees image record: {path}")
-    return {str(key): str(item) for key, item in binds.items()}
+    records: dict[str, BindRecord] = {}
+    for slot, item in binds.items():
+        if isinstance(item, str):
+            records[str(slot)] = BindRecord(subvolume=item)
+        elif isinstance(item, dict) and isinstance(item.get("subvolume"), str):
+            mount_id = item.get("mount_id")
+            records[str(slot)] = BindRecord(
+                subvolume=item["subvolume"],
+                mount_id=mount_id if isinstance(mount_id, int) else None,
+            )
+        else:
+            raise WorktreesImageError(f"malformed worktrees image record: {path}")
+    return records
+
+
+def load_binds(control: Path) -> dict[str, str]:
+    """Recorded binds: slot name to subvolume name inside the image."""
+
+    return {slot: record.subvolume for slot, record in load_bind_records(control).items()}
+
+
+def save_bind_records(control: Path, records: dict[str, BindRecord]) -> None:
+    """Persist the bind records atomically beside the registry."""
+
+    import json
+
+    path = record_path(control)
+    temporary = path.with_name(path.name + ".tmp")
+    payload = {
+        "binds": {
+            slot: {"subvolume": record.subvolume, "mount_id": record.mount_id}
+            for slot, record in sorted(records.items())
+        }
+    }
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 def save_binds(control: Path, binds: dict[str, str]) -> None:
@@ -425,6 +475,25 @@ def save_binds(control: Path, binds: dict[str, str]) -> None:
     temporary.replace(path)
 
 
+def mount_id_at(mount_point: Path, mountinfo: Path = Path("/proc/self/mountinfo")) -> int | None:
+    """The mount ID of the topmost mount at ``mount_point``, or None."""
+
+    try:
+        text = mountinfo.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return None
+    found: int | None = None
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 5 or fields[4].replace("\\040", " ") != str(mount_point):
+            continue
+        try:
+            found = int(fields[0])
+        except ValueError:
+            continue
+    return found
+
+
 def bind_slot(control: Path, mount_dir: Path, slot: str, slot_path: Path) -> None:
     """Bind a slot's image subvolume at its original real path; record it."""
 
@@ -433,18 +502,42 @@ def bind_slot(control: Path, mount_dir: Path, slot: str, slot_path: Path) -> Non
         raise WorktreesImageError(f"slot subvolume is missing: {source}")
     slot_path.mkdir(parents=True, exist_ok=True)
     _run(["mount", "--bind", str(source), str(slot_path)], sudo=True)
-    binds = load_binds(control)
-    binds[slot] = slot
-    save_binds(control, binds)
+    records = load_bind_records(control)
+    records[slot] = BindRecord(subvolume=slot, mount_id=mount_id_at(slot_path))
+    save_bind_records(control, records)
+
+
+def relocate_bind(control: Path, mount_dir: Path, slot: str, source: Path, destination: Path) -> None:
+    """Move a slot's bind from ``source`` to ``destination``; record follows.
+
+    A mount point cannot be renamed, so the bind is unmounted, the empty
+    mount point renamed, and the subvolume bound again at the destination.
+    A failed unmount changes nothing: the slot, its mount and its record all
+    stay at ``source``, so the caller refuses and a retry starts clean.
+    """
+
+    records = load_bind_records(control)
+    record = records.get(slot)
+    if record is None:
+        raise WorktreesImageError(f"slot {slot} has no recorded worktrees-image bind")
+    _run(["umount", str(source)], sudo=True)
+    try:
+        source.rename(destination)
+    except OSError:
+        _run(["mount", "--bind", str(mount_dir / record.subvolume), str(source)], sudo=True)
+        raise
+    _run(["mount", "--bind", str(mount_dir / record.subvolume), str(destination)], sudo=True)
+    records[slot] = BindRecord(subvolume=record.subvolume, mount_id=mount_id_at(destination))
+    save_bind_records(control, records)
 
 
 def unbind_slot(control: Path, slot: str, slot_path: Path) -> None:
     """Unmount a slot's bind and drop its record (original stays beneath)."""
 
     _run(["umount", str(slot_path)], sudo=True)
-    binds = load_binds(control)
-    binds.pop(slot, None)
-    save_binds(control, binds)
+    records = load_bind_records(control)
+    records.pop(slot, None)
+    save_bind_records(control, records)
 
 
 def ensure_binds(control: Path, mount_dir: Path, slots_dir: Path) -> list[str]:
