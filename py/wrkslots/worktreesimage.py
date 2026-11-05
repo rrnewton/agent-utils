@@ -58,6 +58,8 @@ class WorktreesImageSettings:
     mount: str = "kernel"
 
     def image_file(self, root: Path) -> Path:
+        """The backing image file for a project rooted at ``root``."""
+
         return root / self.relative_path
 
 
@@ -230,6 +232,8 @@ def mount_image(image_file: Path, mount_point: Path) -> None:
 
 
 def unmount_image(mount_point: Path) -> None:
+    """Unmount the worktrees image from the slots directory."""
+
     _run(["umount", str(mount_point)], sudo=True)
 
 
@@ -257,10 +261,13 @@ def grow_image(image_file: Path, mount_point: Path, new_size_bytes: int) -> None
 
 
 def trim_image(mount_point: Path) -> str:
+    """Return freed guest blocks to the host sparse file via fstrim."""
+
     return _run(["fstrim", "-v", str(mount_point)], sudo=True).stdout.strip()
 
 
 def status_report(root: Path, worktrees: Path, settings: WorktreesImageSettings) -> dict[str, object]:
+    """Mount state, apparent size, and host-allocated bytes of the image."""
     image_file = settings.image_file(root)
     report: dict[str, object] = {
         "image_file": str(image_file),
