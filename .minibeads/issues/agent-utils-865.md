@@ -1,11 +1,12 @@
 ---
 title: 'gate-node-provision: run vibe-talk page and contract steps on a provisioned Node 22'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-validate
 created_at: 2026-11-05T04:10:15.606607960+00:00
-updated_at: 2026-11-05T04:10:15.606607960+00:00
+updated_at: 2026-11-05T05:06:17.231374044+00:00
+closed_at: 2026-11-05T05:06:17.231373773+00:00
 ---
 
 # Description
