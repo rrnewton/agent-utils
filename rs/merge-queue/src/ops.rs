@@ -674,6 +674,8 @@ fn probe_options_for(state: &State, config: &Config, git: &Git) -> ProbeOptions 
         cache_dir: Some(state.root.clone()),
         parallelism: config.probe_parallelism(),
         config_hash: Some(probe_config_hash(git, &config_material)),
+        footprints: (!config.conflict_prior.footprints.is_empty())
+            .then(|| config.conflict_prior.footprints.clone()),
         peripheral: config
             .peripheral
             .enabled()

@@ -955,6 +955,16 @@ An **item record** (`items/<pr>.json`) has these fields:
   claim the duplicates. In `compare` mode every donor already only compares, so the list has
   no effect there.
 
+**`conflict_prior`** fields (absent means off):
+
+- `footprints`: path in the repository of a test-footprints JSON
+  (`{"<test id>": ["<path>", ...]}`, read at the plan's base; `--conflict-footprints`).
+  Two changes sharing an affected test (a test whose footprint touches both changes'
+  files) are marked suspect in the plan's `prior_conflicts` and are merge-tree probed
+  even when their files are disjoint. The prior never decides anything: the probe
+  remains the only conflict verdict, and the planner's mechanism/overlap edges are
+  advisory input of the same kind, not a second verdict.
+
 **`peripheral`** fields (the peripheral lane; absent means off):
 
 - `command`: a shell command run in a checkout of each change head with `$MQ_BASE`,

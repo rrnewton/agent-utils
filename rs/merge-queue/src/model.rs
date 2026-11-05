@@ -479,6 +479,10 @@ pub struct Plan {
     /// suggestion to add the priority label, which the queue never applies itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suggest_priority: Vec<i64>,
+    /// Pairs the footprint prior marks suspect (shared affected tests). A prior only:
+    /// `conflicts` remains the only verdict. Absent in plans from older builds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_conflicts: Vec<(i64, i64)>,
 }
 
 /// A change that a queued change must land after (`--after`, itself or through other queued

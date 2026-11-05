@@ -99,6 +99,9 @@ pub struct Probe {
     /// Peripheral classification per change (absent: binary-touching, the fail-closed
     /// default, including when no hook is configured).
     pub peripheral: BTreeMap<i64, PeripheralMark>,
+    /// Pairs the footprint prior marks as suspect (shared affected tests), whether or
+    /// not the merge-tree probe found a textual conflict. A prior, never a verdict.
+    pub prior: Vec<(i64, i64)>,
 }
 
 /// Knobs for [`probe_with_options`].
@@ -114,6 +117,9 @@ pub struct ProbeOptions {
     pub config_hash: Option<String>,
     /// Peripheral classifier hook; `None` classifies nothing (all binary-touching).
     pub peripheral: Option<PeripheralHook>,
+    /// Path in the repository of the test-footprints JSON (`{test id: [paths]}`),
+    /// read at the base; `None` disables the conflict prior.
+    pub footprints: Option<String>,
 }
 
 impl Default for ProbeOptions {
@@ -123,6 +129,7 @@ impl Default for ProbeOptions {
             parallelism: DEFAULT_PROBE_PARALLELISM,
             config_hash: None,
             peripheral: None,
+            footprints: None,
         }
     }
 }
@@ -136,6 +143,7 @@ impl ProbeOptions {
             parallelism: 1,
             config_hash: None,
             peripheral: None,
+            footprints: None,
         }
     }
 }
@@ -369,7 +377,7 @@ fn probe_impl(
 
     // Phase 2, per pair: ancestry from the ranges (no git), then a merge only when the two
     // changes share a file outside the regenerable paths, a necessary condition for a textual
-    // conflict.
+    // conflict - or when the footprint prior marks them suspect.
     let ranges: BTreeMap<i64, BTreeSet<String>> = entries
         .iter()
         .map(|(pr, entry)| (*pr, entry.range.iter().cloned().collect()))
@@ -378,6 +386,36 @@ fn probe_impl(
         .iter()
         .map(|(pr, entry)| (*pr, entry.files.iter().cloned().collect()))
         .collect();
+    // The footprint prior: tests whose footprint touches a change's files are that
+    // change's affected tests; two changes sharing an affected test are suspect even
+    // when their files are disjoint. The prior only widens and orders probing - the
+    // merge-tree probe below remains the only conflict verdict.
+    if let Some(path) = &options.footprints {
+        if let Ok(text) = git.run(&["show", &format!("{base_sha}:{path}")]) {
+            if let Ok(footprints) = serde_json::from_str::<BTreeMap<String, Vec<String>>>(&text) {
+                let affected: BTreeMap<i64, BTreeSet<&str>> = live
+                    .iter()
+                    .map(|(pr, _)| {
+                        let tests = footprints
+                            .iter()
+                            .filter(|(_, paths)| paths.iter().any(|p| files[pr].contains(p)))
+                            .map(|(test, _)| test.as_str())
+                            .collect();
+                        (*pr, tests)
+                    })
+                    .collect();
+                for (i, (a, _)) in live.iter().enumerate() {
+                    for (b, _) in &live[i + 1..] {
+                        if !affected[a].is_disjoint(&affected[b]) {
+                            probe.prior.push((*a, *b));
+                        }
+                    }
+                }
+                probe.prior.sort_unstable();
+            }
+        }
+    }
+
     let mut to_merge: Vec<(i64, i64, String, String)> = Vec::new();
     let mut cached_conflicts: Vec<(i64, i64, Vec<String>)> = Vec::new();
     for (i, (a, head_a)) in live.iter().enumerate() {
@@ -398,6 +436,7 @@ fn probe_impl(
             if !files[a]
                 .intersection(&files[b])
                 .any(|path| !regenerable(path))
+                && !probe.prior.contains(&(*a, *b))
             {
                 stats.pairs_skipped += 1;
                 continue;
@@ -1033,6 +1072,7 @@ pub fn make_plan(
         conflicts: probe.conflicts.clone(),
         dependencies: dependencies.into_iter().collect(),
         suggest_priority,
+        prior_conflicts: probe.prior.clone(),
     }
 }
 
@@ -1482,6 +1522,7 @@ mod unit {
             parallelism: 1,
             config_hash: None,
             peripheral: Some(hook.clone()),
+            footprints: None,
         };
         let first = probe_with_options(
             &git,
@@ -1522,6 +1563,43 @@ mod unit {
         )
         .unwrap();
         assert!(!failed.peripheral[&1].peripheral);
+    }
+
+    #[test]
+    fn footprint_prior_marks_disjoint_files_sharing_a_test_and_probes_them() {
+        use crate::git::testrepo::*;
+        let tmp = TempDir::new("probe-prior");
+        let git = init(&tmp.0);
+        write(
+            &tmp.0,
+            "ci/test-footprints.json",
+            "{\"suite\": [\"src/a.rs\", \"src/b.rs\"]}\n",
+        );
+        write(&tmp.0, "src/a.rs", "a\n");
+        write(&tmp.0, "src/b.rs", "b\n");
+        git_commit(&tmp.0);
+        let base = git.rev_parse("main").unwrap();
+        let a = branch(&tmp.0, "a", "main", &[("src/a.rs", "a2\n")]);
+        let b = branch(&tmp.0, "b", "main", &[("src/b.rs", "b2\n")]);
+        let heads: BTreeMap<i64, Option<String>> = [(1, Some(a)), (2, Some(b))].into();
+        // No footprints: the file-disjoint pair is never probed and never marked.
+        let plain = probe(&git, &base, &heads, &crate::git::nothing_regenerable).unwrap();
+        assert!(plain.prior.is_empty() && plain.stats.pairs_skipped >= 1);
+        let options = ProbeOptions {
+            footprints: Some("ci/test-footprints.json".to_owned()),
+            ..ProbeOptions::default()
+        };
+        let probed = probe_with_options(
+            &git,
+            &base,
+            &heads,
+            &crate::git::nothing_regenerable,
+            options,
+        )
+        .unwrap();
+        assert_eq!(probed.prior, vec![(1, 2)]);
+        // The prior is not a verdict: disjoint files still do not conflict.
+        assert!(probed.conflicts.is_empty(), "{probed:?}");
     }
 
     fn git_commit(dir: &std::path::Path) {
@@ -1705,6 +1783,7 @@ mod unit {
                 parallelism: 8,
                 config_hash: None,
                 peripheral: None,
+                footprints: None,
             },
         )
         .unwrap();
@@ -1740,6 +1819,7 @@ mod unit {
             parallelism: 8,
             config_hash: None,
             peripheral: None,
+            footprints: None,
         };
         let first = probe_with_options(
             &git,
@@ -1780,6 +1860,7 @@ mod unit {
             parallelism: 4,
             config_hash: Some("cfg-a".to_owned()),
             peripheral: None,
+            footprints: None,
         };
         let first = probe_with_options(
             &git,
@@ -1853,6 +1934,7 @@ mod unit {
                     parallelism: 8,
                     config_hash: None,
                     peripheral: None,
+                    footprints: None,
                 },
             )
             .unwrap();
@@ -1873,6 +1955,7 @@ mod unit {
             parallelism: 8,
             config_hash: None,
             peripheral: None,
+            footprints: None,
         };
         // The first stage leaves no pair unknown: an optimistic first batch could pair two
         // conflicting changes (ejecting one the plan would only hold) or a change stacked on a
@@ -1927,6 +2010,7 @@ mod unit {
             parallelism: 4,
             config_hash: None,
             peripheral: None,
+            footprints: None,
         };
         let warm = probe_with_options(
             &git,
@@ -1994,6 +2078,7 @@ mod unit {
                 parallelism: 32,
                 config_hash: None,
                 peripheral: None,
+                footprints: None,
             },
         )
         .unwrap();
@@ -2009,6 +2094,7 @@ mod unit {
                 parallelism: 32,
                 config_hash: None,
                 peripheral: None,
+                footprints: None,
             },
         )
         .unwrap();
@@ -2075,6 +2161,7 @@ mod unit {
                     parallelism: 32,
                     config_hash: None,
                     peripheral: None,
+                    footprints: None,
                 },
             )
             .unwrap();
@@ -2087,6 +2174,7 @@ mod unit {
                 parallelism: 32,
                 config_hash: None,
                 peripheral: None,
+                footprints: None,
             };
             let cpu0 = cpu_ticks();
             let start = std::time::Instant::now();

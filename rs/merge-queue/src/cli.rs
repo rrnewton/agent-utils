@@ -728,6 +728,10 @@ enum Command {
         /// Largest batch of only peripheral changes (0: twice --max-batch).
         #[arg(long, default_value_t = 0)]
         peripheral_max_batch: usize,
+        /// Path in the repository of the test-footprints JSON (`{test id: [paths]}`) for
+        /// the conflict prior. Empty (the default) disables the prior.
+        #[arg(long, default_value = "")]
+        conflict_footprints: String,
         /// Confirm each red by validating the same commit again (`$MQ_RERUN_FROM`) and search a
         /// red batch with prefix probes. Off by default: the first red is the verdict, and a red
         /// batch of several changes goes back as single-change batches.
@@ -1448,6 +1452,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             peripheral_command,
             peripheral_timeout_secs,
             peripheral_max_batch,
+            conflict_footprints,
             confirm_reruns,
             split_red_batches,
             suspect_flake_reruns,
@@ -1601,6 +1606,9 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     },
                     tool_identity,
                     tool_refresh,
+                },
+                conflict_prior: crate::state::ConflictPriorConfig {
+                    footprints: conflict_footprints,
                 },
                 peripheral: crate::state::PeripheralConfig {
                     command: peripheral_command,

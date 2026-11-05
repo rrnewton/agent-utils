@@ -319,6 +319,20 @@ impl PeripheralConfig {
     }
 }
 
+/// The footprint-fed conflict prior: a test-footprints file in the repository
+/// (`{test id: [paths]}`) whose overlaps mark pairs as suspect before probing.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConflictPriorConfig {
+    /// Path in the repository (read at the plan's base) of the footprints JSON.
+    /// Empty disables the prior.
+    pub footprints: String,
+}
+
+fn is_default_conflict_prior(value: &ConflictPriorConfig) -> bool {
+    value == &ConflictPriorConfig::default()
+}
+
 fn is_default_peripheral(value: &PeripheralConfig) -> bool {
     value == &PeripheralConfig::default()
 }
@@ -929,6 +943,9 @@ pub struct Config {
     /// Peripheral-change classification (an empty command disables the lane).
     #[serde(default, skip_serializing_if = "is_default_peripheral")]
     pub peripheral: PeripheralConfig,
+    /// Footprint-fed conflict prior (an empty path disables it).
+    #[serde(default, skip_serializing_if = "is_default_conflict_prior")]
+    pub conflict_prior: ConflictPriorConfig,
     /// Landing configuration.
     pub land: LandConfig,
     /// The precheck of submitted heads. Omitted from config.json when unset.
@@ -974,6 +991,7 @@ impl Default for Config {
             validator: ValidatorConfig::default(),
             donors: DonorsConfig::default(),
             peripheral: PeripheralConfig::default(),
+            conflict_prior: ConflictPriorConfig::default(),
             land: LandConfig::default(),
             precheck: PrecheckConfig::default(),
             notify: NotifyConfig::default(),
