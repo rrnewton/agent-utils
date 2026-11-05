@@ -1348,6 +1348,119 @@ def test_a_near_miss_of_an_exiting_process_is_still_refused(
         cli._same_uid_process_observations(budget, proc_root)
 
 
+def _live_proc(proc_root: Path, pid: int = 2991804) -> Path:
+    pid_dir = proc_root / str(pid)
+    (pid_dir / "ns").mkdir(parents=True)
+    (pid_dir / "stat").write_bytes(opaque_stat(pid, 1, flags=0, start_ticks=99))
+    uid = os.getuid()
+    (pid_dir / "status").write_text(
+        f"Name:\tlive\nState:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
+        f"NSpid:\t{pid}\nThreads:\t1\n", encoding="ascii")
+    (pid_dir / "cgroup").write_text("0::/fixture\n", encoding="ascii")
+    return pid_dir
+
+
+def _mark_zombie(pid_dir: Path, pid: int = 2991804) -> None:
+    uid = os.getuid()
+    (pid_dir / "status").write_text(
+        f"Name:\tlive\nState:\tZ (zombie)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
+        f"NSpid:\t{pid}\nThreads:\t1\n", encoding="ascii")
+
+
+def _budget() -> cli._ReadOnlyCommandBudget:
+    return cli._ReadOnlyCommandBudget.start(
+        timeout_seconds=30, stdout_limit=1 << 20, stderr_limit=1 << 20)
+
+
+def test_namespace_read_fails_once_then_zombie_census_continues(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #875: a PID past the terminal check but mid-exit has an unreadable
+    # ns/mnt while start_ticks still reads; a moment later it is a zombie.
+    for lane in ("snapshot", "same_uid"):
+        proc_root = tmp_path / lane
+        pid_dir = _live_proc(proc_root)
+        calls = 0
+
+        def flaky(_pid_dir: Path) -> str | None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise cli.Refusal("mount namespace is indeterminate because ns/mnt is unreadable: simulated")
+            _mark_zombie(pid_dir)
+            return None
+
+        monkeypatch.setattr(cli, "_mount_namespace", flaky)
+        if lane == "snapshot":
+            assert cli._absent_validate_process_snapshot(proc_root) == ()
+        else:
+            assert cli._same_uid_process_observations(_budget(), proc_root) == ()
+        assert calls >= 2
+
+
+def test_namespace_absent_then_disappears_census_continues(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #875: ns/mnt reads as absent, then the PID disappears on re-probe.
+    for lane in ("snapshot", "same_uid"):
+        proc_root = tmp_path / lane
+        pid_dir = _live_proc(proc_root)
+        calls = 0
+
+        def vanishing(_pid_dir: Path) -> str | None:
+            nonlocal calls
+            calls += 1
+            if calls >= 2:
+                (pid_dir / "stat").unlink(missing_ok=True)
+            return None
+
+        monkeypatch.setattr(cli, "_mount_namespace", vanishing)
+        if lane == "snapshot":
+            assert cli._absent_validate_process_snapshot(proc_root) == ()
+        else:
+            assert cli._same_uid_process_observations(_budget(), proc_root) == ()
+        assert calls >= 2
+
+
+def test_namespace_absent_then_generation_changes_census_continues(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #875: a changed start time on re-probe means the original PID exited.
+    for lane in ("snapshot", "same_uid"):
+        proc_root = tmp_path / lane
+        pid_dir = _live_proc(proc_root)
+        calls = 0
+
+        def changed(_pid_dir: Path) -> str | None:
+            nonlocal calls
+            calls += 1
+            if calls >= 2:
+                (pid_dir / "stat").write_bytes(opaque_stat(2991804, 1, flags=0, start_ticks=100))
+            return None
+
+        monkeypatch.setattr(cli, "_mount_namespace", changed)
+        if lane == "snapshot":
+            assert cli._absent_validate_process_snapshot(proc_root) == ()
+        else:
+            assert cli._same_uid_process_observations(_budget(), proc_root) == ()
+        assert calls >= 2
+
+
+def test_namespace_stays_live_and_unreadable_is_still_refused(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #875: a genuinely live, unreadable namespace is refused after retries.
+    for lane in ("snapshot", "same_uid"):
+        proc_root = tmp_path / lane
+        _live_proc(proc_root)
+
+        def unreadable(_pid_dir: Path) -> str | None:
+            raise cli.Refusal("mount namespace is indeterminate because ns/mnt is unreadable: simulated")
+
+        monkeypatch.setattr(cli, "_mount_namespace", unreadable)
+        with pytest.raises(cli.Refusal, match="mount namespace is indeterminate"):
+            if lane == "snapshot":
+                cli._absent_validate_process_snapshot(proc_root)
+            else:
+                cli._same_uid_process_observations(_budget(), proc_root)
+
+
 def test_a_link_that_is_unreadable_rather_than_released_is_still_refused(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Only ENOENT means released; a permission error on cwd says nothing.

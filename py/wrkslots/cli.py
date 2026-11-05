@@ -56249,6 +56249,81 @@ def _surviving_thread_entries(
     return [(thread, leader) for thread in threads]
 
 
+_MOUNT_NAMESPACE_REPROBE_ATTEMPTS = 3
+_MOUNT_NAMESPACE_REPROBE_DELAY_SECONDS = 0.05
+
+
+def _proven_exited_thread_entries(
+    pid_dir: Path, generation: _ProcessStat, *, released_context: bool = False,
+) -> list[tuple[Path, tuple[int, int]]] | None:
+    """Surviving-thread entries if ``pid_dir`` is proven exited, else None.
+
+    Proven exited means gone, generation changed, or terminal
+    (zombie/dead).  With ``released_context`` (the namespace link itself
+    read as absent), an exiting namespace init or a process whose context
+    is already released also proves it.  Anything else returns None.
+    """
+
+    try:
+        current = _read_process_stat(pid_dir)
+    except Refusal:
+        return None
+    if current is None or current.start_ticks != generation.start_ticks:
+        return []
+    try:
+        if _process_generation_is_terminal(pid_dir, generation):
+            return _surviving_thread_entries(pid_dir, generation)
+    except _ProcessEvidenceChanged:
+        return []
+    except Refusal:
+        return None
+    if not released_context:
+        return None
+    if _process_is_exiting_namespace_init(pid_dir):
+        return []
+    if _process_context_released(pid_dir, generation):
+        return []
+    return None
+
+
+def _mount_namespace_reprobed(
+    pid_dir: Path, generation: _ProcessStat,
+) -> tuple[str | None, list[tuple[Path, tuple[int, int]]] | None]:
+    """Read a mount namespace, re-probing a PID that may be exiting (#875).
+
+    Returns ``(namespace, None)`` for a live process, or ``(None, threads)``
+    when a re-probe proves the PID exited (gone, generation changed,
+    terminal, or context released); ``threads`` are its surviving-thread
+    entries to walk in its place.  Raises Refusal only when the PID is
+    still live and still indeterminate after the bounded re-probes, so a
+    genuinely live unreadable namespace (permission or a foreign user
+    namespace) is still refused, never accepted.
+    """
+
+    last_refusal: Refusal | None = None
+    for attempt in range(_MOUNT_NAMESPACE_REPROBE_ATTEMPTS + 1):
+        if attempt:
+            time.sleep(_MOUNT_NAMESPACE_REPROBE_DELAY_SECONDS)
+        try:
+            namespace = _mount_namespace(pid_dir)
+        except Refusal as exc:
+            last_refusal = exc
+            exited = _proven_exited_thread_entries(pid_dir, generation)
+            if exited is not None:
+                return None, exited
+            continue
+        if namespace is not None:
+            return namespace, None
+        exited = _proven_exited_thread_entries(pid_dir, generation, released_context=True)
+        if exited is not None:
+            return None, exited
+        last_refusal = Refusal(
+            f"mount namespace is indeterminate for live PID {pid_dir.name}"
+        )
+    assert last_refusal is not None
+    raise last_refusal
+
+
 def _absent_validate_process_snapshot(
     proc_root: Path = Path("/proc"),
     *,
@@ -56279,23 +56354,15 @@ def _absent_validate_process_snapshot(
             if _process_uid(pid_dir) is None:
                 continue
             cgroup = _read_process_cgroup(pid_dir) if include_owner_cgroups else ""
-            mount_namespace = _mount_namespace(pid_dir)
         except Refusal:
             if _process_start_ticks(pid_dir) is None:
                 continue
             raise
+        mount_namespace, exited_threads = _mount_namespace_reprobed(pid_dir, generation)
         if mount_namespace is None:
-            if _process_is_zombie(pid_dir):
-                # It exited after the terminal check above.
-                pending.extend(reversed(_surviving_thread_entries(pid_dir, generation)))
-                continue
-            if _process_start_ticks(pid_dir) is None:
-                continue
-            if _process_is_exiting_namespace_init(pid_dir):
-                continue
-            if _process_context_released(pid_dir, generation):
-                continue
-            raise Refusal(f"mount namespace is indeterminate for live PID {pid_dir.name}")
+            assert exited_threads is not None
+            pending.extend(reversed(exited_threads))
+            continue
         current_generation = _read_process_stat(pid_dir)
         if current_generation is None:
             continue
@@ -57658,27 +57725,14 @@ def _same_uid_process_observations(
         filesystem_uid = _process_filesystem_uid(pid_dir)
         if filesystem_uid is None or filesystem_uid != os.getuid():
             continue
-        try:
-            # Validation-batch final checks pass record=None and need path and
-            # mount evidence, never owner-cgroup membership. Avoid rereading an
-            # unused cgroup file for every same-filesystem-UID PID and target.
-            mount_namespace = _mount_namespace(pid_dir)
-        except Refusal:
-            if _process_start_ticks(pid_dir) is None:
-                continue
-            raise
+        # Validation-batch final checks pass record=None and need path and
+        # mount evidence, never owner-cgroup membership. Avoid rereading an
+        # unused cgroup file for every same-filesystem-UID PID and target.
+        mount_namespace, exited_threads = _mount_namespace_reprobed(pid_dir, generation)
         if mount_namespace is None:
-            if _process_is_zombie(pid_dir):
-                # It exited after the terminal check above.
-                pending.extend(reversed(_surviving_thread_entries(pid_dir, generation)))
-                continue
-            if _process_start_ticks(pid_dir) is None:
-                continue
-            if _process_is_exiting_namespace_init(pid_dir):
-                continue
-            if _process_context_released(pid_dir, generation):
-                continue
-            raise Refusal(f"mount namespace is indeterminate for live PID {pid_dir.name}")
+            assert exited_threads is not None
+            pending.extend(reversed(exited_threads))
+            continue
         current_generation = _read_process_stat(pid_dir)
         if current_generation is None:
             continue
