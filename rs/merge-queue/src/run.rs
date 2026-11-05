@@ -5107,6 +5107,51 @@ impl<'a> Runner<'a> {
                                 self.log_ruling(KNOWN_FLAKY, &accepted, "landed", "");
                             }
                             outcome
+                        } else if ran.green()
+                            && !ran.flaky_passes.is_empty()
+                            && self.config.validator.green_flaky_lands()
+                        {
+                            // GREEN_FLAKY, but the validator's policy is to
+                            // land it: land on this validation like the
+                            // known-flaky path, with the retried tests
+                            // recorded, and no hold. The standing ruling is
+                            // the config itself.
+                            let claim = ValidationClaim::new(
+                                head.chosen.selection.clone(),
+                                head.chosen.policy.clone(),
+                                head.candidate.tip.clone(),
+                            );
+                            let accepted = Accepted {
+                                held: self.held_candidate(&head.candidate, &claim, vid),
+                                ruling: Ruling {
+                                    by: "validator.green_flaky=land".to_owned(),
+                                    reason: format!(
+                                        "passed only after a retry: {}",
+                                        ids(&ran.flaky_passes.clone())
+                                    ),
+                                    at: now(),
+                                },
+                                flaky: ran.flaky_passes.iter().map(ToString::to_string).collect(),
+                            };
+                            self.event(
+                                "green-flaky-landed",
+                                &format!(
+                                    "{} passed only after a retry ({}); landing by policy",
+                                    list(&head.candidate.prs),
+                                    accepted.flaky.join(", ")
+                                ),
+                            );
+                            let outcome = self.land(
+                                &head.candidate,
+                                claim,
+                                vec![vid],
+                                ran.flaky_passes.iter().cloned().collect(),
+                            )?;
+                            if matches!(outcome, BatchOutcome::Done) {
+                                window = (window + 1).min(self.max_window);
+                                self.log_ruling("green-flaky-policy", &accepted, "landed", "");
+                            }
+                            outcome
                         } else if ran.green() && !ran.flaky_passes.is_empty() {
                             // Green only because some tests passed after a retry
                             // inside the run (GREEN_FLAKY): hold for a ruling,
@@ -5420,11 +5465,23 @@ impl<'a> Runner<'a> {
                         item.log(
                             "landed",
                             format!(
-                                "in {} at {tip}; validated with {} ({}, policy {}){suffix}",
+                                "in {} at {tip}; validated with {} ({}, policy {}){suffix}{}",
                                 list(prs),
                                 claim.selection.summary(),
                                 claim.scope.as_str(),
-                                claim.policy
+                                claim.policy,
+                                if flaky.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "; flaky: {}",
+                                        flaky
+                                            .iter()
+                                            .map(ToString::to_string)
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )
+                                }
                             ),
                         );
                         self.state.save_item(item)?;

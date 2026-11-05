@@ -87,6 +87,13 @@ pub struct ValidatorConfig {
     /// the default bound.
     #[serde(default = "default_green_flaky_hold_secs")]
     pub green_flaky_hold_secs: u64,
+    /// What a GREEN_FLAKY result (green only because some tests passed
+    /// after a retry) does when its tests are not all on the known-flaky
+    /// list: `hold` (the default: held for a ruling, below) or `land`
+    /// (land at once, with the retried tests recorded). An older binary
+    /// refuses a config that names this field (unknown fields are refused).
+    #[serde(default = "default_green_flaky_policy")]
+    pub green_flaky: String,
     /// Where validations run: empty or `off` (in this process, the default), `compare` (in
     /// this process, which decides, and also published to donors so their receipts are
     /// compared with the local verdict), or `decide` (published to donors only; an accepted
@@ -529,6 +536,10 @@ fn default_green_flaky_hold_secs() -> u64 {
     DEFAULT_GREEN_FLAKY_HOLD_SECS
 }
 
+fn default_green_flaky_policy() -> String {
+    "hold".to_owned()
+}
+
 impl ValidatorConfig {
     /// Resolved refusal retries (stored verbatim; missing in an old config means default).
     pub fn refusal_retries(&self) -> usize {
@@ -567,6 +578,12 @@ impl ValidatorConfig {
     /// Whether a red run whose probe cannot run holds the change instead of ejecting it.
     pub fn hold_red_without_probe(&self) -> bool {
         self.red_without_probe == "hold"
+    }
+
+    /// Whether GREEN_FLAKY results land by policy (`validator.green_flaky`
+    /// is `land`) instead of being held for a ruling.
+    pub fn green_flaky_lands(&self) -> bool {
+        self.green_flaky == "land"
     }
 
     /// Resolved GREEN_FLAKY hold bound in seconds.

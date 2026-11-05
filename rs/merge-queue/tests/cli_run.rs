@@ -149,6 +149,104 @@ fn green_flaky_batch_is_held_for_a_ruling_not_landed() {
     );
 }
 
+/// The queue's state directory (config, decisions, runs).
+fn state_dir(fx: &Fixture) -> std::path::PathBuf {
+    let common = git(&fx.queue(), &["rev-parse", "--git-common-dir"]);
+    let common = if std::path::Path::new(&common).is_absolute() {
+        std::path::PathBuf::from(common)
+    } else {
+        fx.queue().join(common)
+    };
+    common.join("merge-queue")
+}
+
+/// Set `validator.green_flaky` in the queue's config.json.
+fn set_green_flaky(fx: &Fixture, policy: &str) {
+    let path = state_dir(fx).join("config.json");
+    let mut config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    config["validator"]["green_flaky"] = serde_json::json!(policy);
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+}
+
+#[test]
+fn green_flaky_lands_by_policy_and_records_the_flaky_ids() {
+    // validator.green_flaky=land: a GREEN_FLAKY result lands at once even
+    // when the retried test is not on known-flaky.json, and the flaky ids
+    // are recorded in the item history and the landing record.
+    let fx = setup_validator(
+        "run-green-flaky-land",
+        "echo \"GREEN_FLAKY: x\"; exit 0",
+        &[],
+    );
+    set_green_flaky(&fx, "land");
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let before = fx.remote_main();
+    let out = fx.mq(&["run", "--json"]);
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(landed_prs(&r), vec![vec![1]], "{r}");
+    assert_ne!(fx.remote_main(), before, "landed on the remote");
+    assert_eq!(status(&fx, 1), "landed");
+    // The flaky ids are in the landing record of the report.
+    assert_eq!(r["landed"][0]["flaky"], serde_json::json!(["x"]), "{r}");
+    // ... in the item-history landed entry ...
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    let item = &items.as_array().unwrap()[0];
+    let landed_entries: Vec<&Value> = item["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "landed")
+        .collect();
+    assert_eq!(landed_entries.len(), 1, "{item}");
+    assert!(
+        landed_entries[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("flaky: x"),
+        "{landed_entries:?}"
+    );
+    // ... in the run's report.md ("flaky: x") ...
+    let run_dir = state_dir(&fx).join("runs").join(r["run"].as_str().unwrap());
+    let report_md = std::fs::read_to_string(run_dir.join("report.md")).unwrap();
+    assert!(report_md.contains("flaky: x"), "{report_md}");
+    // ... and in rulings.jsonl as a green-flaky-policy ruling.
+    let rulings = std::fs::read_to_string(state_dir(&fx).join("decisions/rulings.jsonl")).unwrap();
+    assert!(rulings.contains("green-flaky-policy"), "{rulings}");
+    assert!(rulings.contains("validator.green_flaky=land"), "{rulings}");
+}
+
+#[test]
+fn infra_blocked_still_holds_with_the_land_policy() {
+    // INFRA-BLOCKED is a hold whatever the GREEN_FLAKY policy says.
+    let fx = setup_validator(
+        "run-infra-blocked-land-policy",
+        "echo \"INFRA-BLOCKED: x\"; exit 6",
+        &[],
+    );
+    set_green_flaky(&fx, "land");
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let before = fx.remote_main();
+    let out = fx.mq(&["run", "--json"]);
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    assert!(r["landed"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(fx.remote_main(), before);
+    assert_eq!(status(&fx, 1), "queued");
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    let item = &items.as_array().unwrap()[0];
+    let history_kinds: Vec<&str> = item["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert!(
+        history_kinds.contains(&"held-infra-blocked"),
+        "{history_kinds:?}"
+    );
+}
+
 #[test]
 fn green_flaky_hold_expires_and_requeues() {
     // The bounded hold: once it expires the change is re-queued for a fresh

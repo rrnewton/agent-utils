@@ -139,6 +139,7 @@ This command creates the state directory and writes `config.json`.
 | `--refusal-backoff-secs SECS` | `2` | Base backoff between refusal retries, doubled per attempt and capped at 60 seconds. `0` means no delay. The same backoff sets the deferred change's next retry time. |
 | `--max-deferrals N` | `3` | How many times a change may be deferred because validation did not run (an admission refusal, a validator that cannot execute, a probe or donors that could not run) before it is escalated to its owner and held until `merge-queue retry` (see "Bounded retry"). |
 | `--green-flaky-hold-secs SECS` | `7200` | How long a change is held for a ruling after a GREEN_FLAKY or INFRA-BLOCKED result (see "Held for a ruling") before it is re-queued for a fresh validation. |
+| `--green-flaky MODE` | `hold` | What a GREEN_FLAKY result does when its retried tests are not all on the known-flaky list: `hold` it for a ruling, or `land` it at once with the retried tests recorded (`validator.green_flaky` in the config; absent means `hold`, and an older binary refuses a config that names it). INFRA-BLOCKED always holds. |
 | `--red-without-probe MODE` | `eject` | What a red validation that names failed tests does when its follow-up probe cannot run: `eject` the change (the red run is the verdict) or `hold` it for its owner. |
 | `--fail-fast` | off | Ask the runner to stop each candidate validation at its first red step: `$MQ_FAIL_FAST` is `1` for every validation except the complete run on the base (see "Fail-fast runs"). |
 | `--peripheral-command CMD` | off | Consumer hook marking changes peripheral (see the `peripheral` fields). |
@@ -287,7 +288,9 @@ red batch's rerun, or a hold made by an older version); `retry` validates those 
 The known-flaky list holds tests whose flakiness is known and tracked by an issue. It is a
 standing ruling: a GREEN_FLAKY result whose retried tests are all on the list lands at once,
 without a hold, the tests recorded as flaky with the landing, and the ruling goes to the decision
-log as `known-flaky`. A result that retried any test not on the list is held as before.
+log as `known-flaky`. A result that retried any test not on the list is held as before — unless
+`validator.green_flaky` is `land`, in which case it lands by that policy instead (see
+"Held for a ruling").
 
 - `add TEST --issue ISSUE --by WHO [--reason WHY]` adds the test, or replaces its entry. `ISSUE`
   is a link or a tracker ID. An entry covers its test, the test's cells (`TEST[cell]`, as a
@@ -1262,6 +1265,14 @@ is re-queued for a fresh validation (which holds it again if the result is the s
 GREEN_FLAKY result whose retried tests are all on the known-flaky list is never held: the list is
 a standing ruling, and the batch lands (see `merge-queue known-flaky`). A donor's receipt carries
 the markers in its log tail.
+
+With `validator.green_flaky: "land"` (or `--green-flaky land` at `init`), a GREEN_FLAKY result
+whose tests are not all on the list lands the same way, by policy instead of by ruling: no hold,
+no `accept-flaky` needed. The config is the standing ruling — recorded as
+`validator.green_flaky=land` in `rulings.jsonl` (ruling `green-flaky-policy`) — and the retried
+tests are recorded in the landing record, the item-history `landed` entry (`; flaky: <ids>`), the
+run's `report.md` and the `green-flaky-landed` event. A flaky result still never passes silently:
+it lands, and it is recorded. INFRA-BLOCKED holds whatever this setting says.
 
 **`dagrun`.** Test IDs are DAG step names. A selection becomes `dagrun run --dag DAG --keep-going
 --selected a,b`, which also runs each selected step's dependencies; `all` omits `--selected`. The

@@ -737,6 +737,11 @@ enum Command {
         /// its rerun) is held for a ruling before it is re-queued.
         #[arg(long, default_value_t = crate::state::DEFAULT_GREEN_FLAKY_HOLD_SECS)]
         green_flaky_hold_secs: u64,
+        /// What a GREEN_FLAKY result does when its retried tests are not all
+        /// on the known-flaky list: `hold` it for a ruling (the default) or
+        /// `land` it at once with the retried tests recorded.
+        #[arg(long, default_value = "hold", value_parser = ["hold", "land"])]
+        green_flaky: String,
         /// Times a change may be deferred because validation did not run (refusals, a
         /// validator that cannot execute, a probe or donors that could not run) before it is
         /// escalated to its owner and held until `merge-queue retry`.
@@ -1499,6 +1504,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             refusal_max_retries,
             refusal_backoff_secs,
             green_flaky_hold_secs,
+            green_flaky,
             max_deferrals,
             red_without_probe,
             fail_fast,
@@ -1633,6 +1639,11 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     clean_ignored,
                     refusal_max_retries,
                     refusal_backoff_secs,
+                    green_flaky: if green_flaky == "hold" {
+                        String::new()
+                    } else {
+                        green_flaky
+                    },
                     green_flaky_hold_secs: if green_flaky_hold_secs
                         == crate::state::DEFAULT_GREEN_FLAKY_HOLD_SECS
                     {
