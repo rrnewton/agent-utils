@@ -58,6 +58,92 @@ def test_reap_stray_plan_then_apply(tmp_path: Path) -> None:
     assert "stray-" in refs
 
 
+def _archived_record(slot: str, *, generation: int = 1) -> dict[str, object]:
+    """One record in the archive schema `_archive_to_obj` writes (#877)."""
+
+    finished = "2026-10-26T01:00:00Z"
+    return {
+        "archive_id": f"node-a:{slot}:{generation}:{finished}",
+        "slot": slot,
+        "agent": f"agent-{slot}",
+        "task": "do work",
+        "purpose": "testing",
+        "machine": "node-a",
+        "generation": generation,
+        "created_at": "2026-10-26T00:00:00Z",
+        "finished_at": finished,
+        "mode": "remove",
+        "actor": "coordinator",
+        "physical_storage": "removed",
+        "validation": ["clean"],
+        "limitations": [],
+        "continuation": "none",
+        "checkouts": [
+            {
+                "name": "repo",
+                "path": f"worktrees/{slot}/repo",
+                "repository": "../upstream-repo",
+                "branch": "suite/work",
+                "start_point": "a" * 40,
+                "remote": "origin",
+                "remote_url_sha256": "b" * 64,
+                "landed_ref": "refs/remotes/origin/main",
+                "head": "a" * 40,
+                "containing_remote_refs": ["refs/remotes/origin/main"],
+                "vcs": "git",
+            }
+        ],
+    }
+
+
+def test_reap_stray_reports_past_archived_records(tmp_path: Path) -> None:
+    root = _fixture(tmp_path / "case")
+    stray = _stray(tmp_path / "case")
+    control = root / "worktrees"
+    valid = _archived_record("slot-old")
+    malformed = _archived_record("slot-bad")
+    # Not the archive schema's "remove": the record is genuinely
+    # malformed, as an interrupted or hand-edited archive can be.
+    malformed["mode"] = "forget"
+    (control / "ARCHIVED.node-a.json").write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "machine": "node-a",
+                "revision": 4,
+                "records": [valid, malformed],
+            }
+        )
+    )
+    (control / "EVENTS.node-a").mkdir(exist_ok=True)
+    (control / "ACTIVE.node-a.json").write_text(
+        json.dumps({"schema": 2, "machine": "node-a", "revision": 1, "slots": []})
+    )
+
+    rc, out = _run(root, apply=False, fmt="json")
+    assert rc == 0
+    payload = json.loads(out)
+    # The malformed record is named, and the report still covers the
+    # stray; the valid record's repository is among the sources.
+    assert payload["malformed_archives"] == [
+        {
+            "machine": "node-a",
+            "slot": "slot-bad",
+            "reason": "archive state.records[1].mode is invalid: 'forget'",
+        }
+    ]
+    assert [row["path"] for row in payload["stray"]] == [str(stray)]
+    assert payload["stray"][0]["outcome"] == "would-reap"
+
+    # A malformed record does not bear on this removal, so apply works.
+    rc, out = _run(root, apply=True, fmt="json")
+    assert rc == 0
+    payload = json.loads(out)
+    assert payload["stray"][0]["outcome"] == "reaped"
+    assert payload["malformed_archives"][0]["slot"] == "slot-bad"
+    assert not stray.exists()
+
+
 def test_reap_stray_unpushed_is_retained(tmp_path: Path) -> None:
     root = _fixture(tmp_path / "case")
     stray = _stray(tmp_path / "case")

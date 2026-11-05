@@ -272,6 +272,9 @@ pub(crate) fn reap_stray_worktrees(
             "repositories": repositories.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
             "stray": stray,
             "retained": retained,
+            // #877: this reader is already lenient per record, so the
+            // named-malformed list is empty here.
+            "malformed_archives": Vec::<Value>::new(),
         });
         return Ok((
             format!(

@@ -6398,135 +6398,15 @@ def _archive_from_obj(
     for index, item in enumerate(_as_list(raw["records"], "archive state.records")):
         mapping = _as_mapping(item, f"archive state.records[{index}]")
         label = f"archive state.records[{index}]"
-        fields = {
-            "archive_id",
-            "slot",
-            "agent",
-            "task",
-            "purpose",
-            "machine",
-            "generation",
-            "created_at",
-            "finished_at",
-            "mode",
-            "actor",
-            "physical_storage",
-            "validation",
-            "limitations",
-            "continuation",
-            "checkouts",
-        }
-        _exact_keys(
+        _archive_record_from_obj(
+            config,
             mapping,
-            fields,
-            {"slot_type", "salvage", "layout", "import_source"},
+            selected,
             label,
+            label_prefix,
+            archive_ids,
+            archived_slots,
         )
-        archive_id = _as_str(mapping["archive_id"], f"{label}.archive_id")
-        if archive_id in archive_ids:
-            raise StateError(f"duplicate archive_id in {label_prefix}: {archive_id}")
-        archive_ids.add(archive_id)
-        slot = _validate_name(_as_str(mapping["slot"], f"{label}.slot"), "archived slot")
-        if slot in archived_slots:
-            raise StateError(f"duplicate archived slot in {label_prefix}: {slot}")
-        archived_slots.add(slot)
-        agent = _validate_name(
-            _as_str(mapping["agent"], f"{label}.agent"), "archived agent"
-        )
-        if not _as_str(mapping["task"], f"{label}.task") or not _as_str(
-            mapping["purpose"], f"{label}.purpose"
-        ):
-            raise StateError(f"{label} has an empty task or purpose")
-        slot_type = _as_str(mapping.get("slot_type", "agent"), f"{label}.slot_type")
-        if slot_type not in SLOT_TYPES:
-            raise StateError(f"{label}.slot_type must be one of {', '.join(SLOT_TYPES)}")
-        record_layout = (
-            config.layout
-            if "layout" not in mapping
-            else _validate_layout(_as_str(mapping["layout"], f"{label}.layout"))
-        )
-        import_source = _import_source_from_obj(
-            mapping.get("import_source"), f"{label}.import_source"
-        )
-        for salvage_index, salvage in enumerate(
-            _as_list(mapping.get("salvage", []), f"{label}.salvage")
-        ):
-            _as_mapping(salvage, f"{label}.salvage[{salvage_index}]")
-        record_machine = _as_str(mapping["machine"], f"{label}.machine")
-        if record_machine != selected:
-            raise StateError(
-                f"archived slot {slot} says machine {record_machine}, expected {selected}"
-            )
-        generation = _as_int(mapping["generation"], f"{label}.generation", minimum=1)
-        _parse_timestamp(_as_str(mapping["created_at"], f"{label}.created_at"), label)
-        finished_at = _as_str(mapping["finished_at"], f"{label}.finished_at")
-        _parse_timestamp(finished_at, label)
-        expected_archive_id = f"{selected}:{slot}:{generation}:{finished_at}"
-        if archive_id != expected_archive_id:
-            raise StateError(f"{label}.archive_id does not match its record")
-        mode = _as_str(mapping["mode"], f"{label}.mode")
-        if mode != "remove":
-            raise StateError(f"{label}.mode is invalid: {mode!r}")
-        actor = _as_str(mapping["actor"], f"{label}.actor")
-        if actor != "coordinator":
-            raise StateError(f"{label}.actor does not match its operation")
-        if _as_str(mapping["physical_storage"], f"{label}.physical_storage") != "removed":
-            raise StateError(f"{label} does not record removed physical storage")
-        validation = _as_list(mapping["validation"], f"{label}.validation")
-        if not validation:
-            raise StateError(f"{label} has no validation evidence")
-        for evidence_index, evidence in enumerate(validation):
-            _as_str(evidence, f"{label}.validation[{evidence_index}]")
-        for limitation_index, limitation in enumerate(
-            _as_list(mapping["limitations"], f"{label}.limitations")
-        ):
-            _as_str(limitation, f"{label}.limitations[{limitation_index}]")
-        if not _as_str(mapping["continuation"], f"{label}.continuation"):
-            raise StateError(f"{label} has no continuation")
-        checkouts = tuple(
-            _checkout_from_obj(value, f"{label}.checkouts[{checkout_index}]")
-            for checkout_index, value in enumerate(
-                _as_list(mapping["checkouts"], f"{label}.checkouts")
-            )
-        )
-        if len({checkout.name for checkout in checkouts}) != len(checkouts):
-            raise StateError(f"{label} has duplicate checkout names")
-        if not checkouts and (import_source is None or record_layout != "nested"):
-            raise StateError(f"{label} has no checkouts")
-        if record_layout == "flat" and len(checkouts) != 1:
-            raise StateError(f"{label} has multiple checkouts under flat layout")
-        if import_source is not None:
-            source_row = import_source.row
-            source_owner = _as_mapping(
-                source_row.get("owner_sidecar"),
-                f"{label}.import_source.row.owner_sidecar",
-            )
-            source_task, source_purpose = _historical_task_and_purpose(
-                source_row, f"{label}.import_source.row", agent
-            )
-            if (
-                record_layout != "nested"
-                or source_task != mapping["task"]
-                or source_purpose != mapping["purpose"]
-                or source_row.get("allocated") != mapping["created_at"]
-                or source_owner.get("slot") != slot
-                or source_owner.get("agent") != agent
-            ):
-                raise StateError(f"{label} differs from its historical source row")
-        for checkout in checkouts:
-            slot_path = _slot_directory(config, slot, slot_type)
-            destination = (
-                slot_path if record_layout == "flat" else slot_path / checkout.name
-            )
-            expected = destination.relative_to(config.root).as_posix()
-            if checkout.path != expected:
-                raise StateError(
-                    f"{label} checkout {checkout.name} path escaped its archived slot"
-                )
-            if checkout.landed_ref != _landed_ref_for_remote(config, checkout.remote):
-                raise StateError(
-                    f"{label} checkout {checkout.name} differs from configured authority"
-                )
         records.append(dict(mapping))
     return ArchiveState(
         machine=actual_machine,
@@ -6535,6 +6415,153 @@ def _archive_from_obj(
     )
 
 
+def _archive_record_from_obj(
+    config: Config,
+    mapping: Mapping[str, object],
+    selected: str,
+    label: str,
+    label_prefix: str,
+    archive_ids: set[str],
+    archived_slots: set[str],
+) -> None:
+    """Validate one archived record with the archive schema (#877).
+
+    Shared by the strict loader (any failure refuses the whole state)
+    and reap-stray-worktrees' tolerant reader, which names a malformed
+    record and reads past it.  The cross-record sets are the caller's:
+    the strict loader keeps one pair per shard, the tolerant reader one
+    pair per shard as well, so a duplicate still names its record.
+    """
+
+    fields = {
+        "archive_id",
+        "slot",
+        "agent",
+        "task",
+        "purpose",
+        "machine",
+        "generation",
+        "created_at",
+        "finished_at",
+        "mode",
+        "actor",
+        "physical_storage",
+        "validation",
+        "limitations",
+        "continuation",
+        "checkouts",
+    }
+    _exact_keys(
+        mapping,
+        fields,
+        {"slot_type", "salvage", "layout", "import_source"},
+        label,
+    )
+    archive_id = _as_str(mapping["archive_id"], f"{label}.archive_id")
+    if archive_id in archive_ids:
+        raise StateError(f"duplicate archive_id in {label_prefix}: {archive_id}")
+    archive_ids.add(archive_id)
+    slot = _validate_name(_as_str(mapping["slot"], f"{label}.slot"), "archived slot")
+    if slot in archived_slots:
+        raise StateError(f"duplicate archived slot in {label_prefix}: {slot}")
+    archived_slots.add(slot)
+    agent = _validate_name(
+        _as_str(mapping["agent"], f"{label}.agent"), "archived agent"
+    )
+    if not _as_str(mapping["task"], f"{label}.task") or not _as_str(
+        mapping["purpose"], f"{label}.purpose"
+    ):
+        raise StateError(f"{label} has an empty task or purpose")
+    slot_type = _as_str(mapping.get("slot_type", "agent"), f"{label}.slot_type")
+    if slot_type not in SLOT_TYPES:
+        raise StateError(f"{label}.slot_type must be one of {', '.join(SLOT_TYPES)}")
+    record_layout = (
+        config.layout
+        if "layout" not in mapping
+        else _validate_layout(_as_str(mapping["layout"], f"{label}.layout"))
+    )
+    import_source = _import_source_from_obj(
+        mapping.get("import_source"), f"{label}.import_source"
+    )
+    for salvage_index, salvage in enumerate(
+        _as_list(mapping.get("salvage", []), f"{label}.salvage")
+    ):
+        _as_mapping(salvage, f"{label}.salvage[{salvage_index}]")
+    record_machine = _as_str(mapping["machine"], f"{label}.machine")
+    if record_machine != selected:
+        raise StateError(
+            f"archived slot {slot} says machine {record_machine}, expected {selected}"
+        )
+    generation = _as_int(mapping["generation"], f"{label}.generation", minimum=1)
+    _parse_timestamp(_as_str(mapping["created_at"], f"{label}.created_at"), label)
+    finished_at = _as_str(mapping["finished_at"], f"{label}.finished_at")
+    _parse_timestamp(finished_at, label)
+    expected_archive_id = f"{selected}:{slot}:{generation}:{finished_at}"
+    if archive_id != expected_archive_id:
+        raise StateError(f"{label}.archive_id does not match its record")
+    mode = _as_str(mapping["mode"], f"{label}.mode")
+    if mode != "remove":
+        raise StateError(f"{label}.mode is invalid: {mode!r}")
+    actor = _as_str(mapping["actor"], f"{label}.actor")
+    if actor != "coordinator":
+        raise StateError(f"{label}.actor does not match its operation")
+    if _as_str(mapping["physical_storage"], f"{label}.physical_storage") != "removed":
+        raise StateError(f"{label} does not record removed physical storage")
+    validation = _as_list(mapping["validation"], f"{label}.validation")
+    if not validation:
+        raise StateError(f"{label} has no validation evidence")
+    for evidence_index, evidence in enumerate(validation):
+        _as_str(evidence, f"{label}.validation[{evidence_index}]")
+    for limitation_index, limitation in enumerate(
+        _as_list(mapping["limitations"], f"{label}.limitations")
+    ):
+        _as_str(limitation, f"{label}.limitations[{limitation_index}]")
+    if not _as_str(mapping["continuation"], f"{label}.continuation"):
+        raise StateError(f"{label} has no continuation")
+    checkouts = tuple(
+        _checkout_from_obj(value, f"{label}.checkouts[{checkout_index}]")
+        for checkout_index, value in enumerate(
+            _as_list(mapping["checkouts"], f"{label}.checkouts")
+        )
+    )
+    if len({checkout.name for checkout in checkouts}) != len(checkouts):
+        raise StateError(f"{label} has duplicate checkout names")
+    if not checkouts and (import_source is None or record_layout != "nested"):
+        raise StateError(f"{label} has no checkouts")
+    if record_layout == "flat" and len(checkouts) != 1:
+        raise StateError(f"{label} has multiple checkouts under flat layout")
+    if import_source is not None:
+        source_row = import_source.row
+        source_owner = _as_mapping(
+            source_row.get("owner_sidecar"),
+            f"{label}.import_source.row.owner_sidecar",
+        )
+        source_task, source_purpose = _historical_task_and_purpose(
+            source_row, f"{label}.import_source.row", agent
+        )
+        if (
+            record_layout != "nested"
+            or source_task != mapping["task"]
+            or source_purpose != mapping["purpose"]
+            or source_row.get("allocated") != mapping["created_at"]
+            or source_owner.get("slot") != slot
+            or source_owner.get("agent") != agent
+        ):
+            raise StateError(f"{label} differs from its historical source row")
+    for checkout in checkouts:
+        slot_path = _slot_directory(config, slot, slot_type)
+        destination = (
+            slot_path if record_layout == "flat" else slot_path / checkout.name
+        )
+        expected = destination.relative_to(config.root).as_posix()
+        if checkout.path != expected:
+            raise StateError(
+                f"{label} checkout {checkout.name} path escaped its archived slot"
+            )
+        if checkout.landed_ref != _landed_ref_for_remote(config, checkout.remote):
+            raise StateError(
+                f"{label} checkout {checkout.name} differs from configured authority"
+            )
 def _load_archive_snapshot(config: Config, machine: str | None = None) -> ArchiveState:
     selected = machine or config.machine
     path = _archive_path(config, selected)
@@ -8635,6 +8662,74 @@ def _load_all_archives(
                     f"slot {slot!r} is archived in both {previous} and {archive.machine}"
                 )
     return archives
+
+
+def _load_archives_tolerant(
+    config: Config,
+) -> tuple[list[ArchiveState], list[dict[str, object]]]:
+    """Archived records for a report that reads past damage (#877).
+
+    Reads each ARCHIVED file's records directly -- not the strict
+    loader, which refuses the whole shard over one record, and not
+    the event fold, whose records are already schema-valid.  Each
+    record is validated with the archive schema; one that fails is
+    named in the second return value and skipped, and the rest of
+    its shard still reads.  Structural damage above the record level
+    (an unreadable file, a wrong shard shape, a machine mismatch)
+    still refuses: there is no record list to read past.
+    """
+
+    archives: list[ArchiveState] = []
+    malformed: list[dict[str, object]] = []
+    for machine, path in _archive_files(config):
+        raw = _as_mapping(_read_json(path, "archive state"), str(path))
+        _exact_keys(
+            raw, {"schema", "machine", "revision", "records"}, set(), "archive state"
+        )
+        if _as_int(raw["schema"], "archive state.schema") != SCHEMA:
+            raise StateError(f"unsupported archive state schema in {path}")
+        actual_machine = _as_str(raw["machine"], "archive state.machine")
+        if actual_machine != machine:
+            raise StateError(
+                f"archive state machine mismatch: filename says {machine}, "
+                f"content says {actual_machine}"
+            )
+        valid: list[dict[str, object]] = []
+        archive_ids: set[str] = set()
+        archived_slots: set[str] = set()
+        for index, raw_record in enumerate(
+            _as_list(raw["records"], "archive state.records")
+        ):
+            mapping = _as_mapping(raw_record, f"archive state.records[{index}]")
+            try:
+                _archive_record_from_obj(
+                    config,
+                    mapping,
+                    machine,
+                    f"archive state.records[{index}]",
+                    str(path),
+                    archive_ids,
+                    archived_slots,
+                )
+            except StateError as exc:
+                slot = mapping.get("slot")
+                malformed.append(
+                    {
+                        "machine": machine,
+                        "slot": slot if isinstance(slot, str) else None,
+                        "reason": str(exc),
+                    }
+                )
+                continue
+            valid.append(dict(mapping))
+        archives.append(
+            ArchiveState(
+                machine,
+                _as_int(raw["revision"], "archive state.revision"),
+                tuple(valid),
+            )
+        )
+    return archives, malformed
 
 
 class _RegistryOverlap(StateError):
@@ -30380,7 +30475,11 @@ def _cmd_reap_stray_worktrees(args: argparse.Namespace) -> int:
 
     config = _load_config(args.project_root, args.machine)
     states = _load_all_active(config)
-    archives = _load_all_archives(config)
+    # #877: archived records validate with the archive schema, and a
+    # malformed one is named and read past -- never parsed with the
+    # active-row schema, which refuses every project with archive
+    # history.  Only the records' repository paths are needed here.
+    archives, malformed_archives = _load_archives_tolerant(config)
     owned: set[Path] = set()
     repositories: set[Path] = set()
     for state in states:
@@ -30391,9 +30490,13 @@ def _cmd_reap_stray_worktrees(args: argparse.Namespace) -> int:
                 repositories.add(_stored_repository_path(config, checkout.repository)[1])
     for archive in archives:
         for raw_record in archive.records:
-            record = _record_from_obj(raw_record, "archived record")
-            for checkout in record.checkouts:
-                repositories.add(_stored_repository_path(config, checkout.repository)[1])
+            for checkout_value in _as_list(
+                raw_record.get("checkouts", []), "archived record.checkouts"
+            ):
+                checkout = _checkout_from_obj(checkout_value, "archived checkout")
+                repositories.add(
+                    _stored_repository_path(config, checkout.repository)[1]
+                )
     for raw in args.repository or ():
         candidate = Path(raw)
         repositories.add(candidate if candidate.is_absolute() else config.root / candidate)
@@ -30494,6 +30597,7 @@ def _cmd_reap_stray_worktrees(args: argparse.Namespace) -> int:
         "repositories": [str(item) for item in sorted(repositories, key=str)],
         "stray": rows,
         "retained": retained,
+        "malformed_archives": malformed_archives,
     }
     if args.format == "json":
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -30505,6 +30609,11 @@ def _cmd_reap_stray_worktrees(args: argparse.Namespace) -> int:
             print(f"STRAY: {item['path']} head={item['head']}")
         for item in retained:
             print(f"RETAINED: {item['path']} outcome={item['outcome']} reason={item['reason']}")
+        for item in malformed_archives:
+            print(
+                f"MALFORMED-ARCHIVE: machine={item['machine']} "
+                f"slot={item['slot']} reason={item['reason']}"
+            )
     return 1 if args.apply and retained else 0
 
 
