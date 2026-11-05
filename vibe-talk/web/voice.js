@@ -7254,7 +7254,8 @@ async function readAndCollapse(pane, row, ids) {
 
 /**
  * Folding a message from the keyboard: Shift+O folds the selected message away into a line of read messages
- * and steps above it, and Shift+E's fold (`readAndCollapse`) keeps what the reader is looking at where it was.
+ * and steps above it, and Shift+E's fold (`foldForRead`, which `readAndCollapse` calls) keeps what the reader is
+ * looking at where it was.
  * One owner in web/src/view/shell/foldkeys.ts (`#624 voice-page-modularity`); the page destructures its two
  * under their old names.
  *

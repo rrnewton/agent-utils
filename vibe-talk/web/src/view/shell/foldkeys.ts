@@ -38,7 +38,7 @@ export interface FoldKeysDependencies<Pane extends FoldedPane, Entry, Message, C
   rowMessages(row: HTMLElement): Message[];
   /** Whether `message` is its thread's first. */
   isThreadRoot(message: Message): boolean;
-  /** Whether `row` is the first message of the thread open in its column. */
+  /** Whether `row` is the first message of the thread open in the column the code is working in. */
   isOpenThreadRoot(row: HTMLElement): boolean;
   /** Say `text` on the status line. */
   setStatus(text: string): void;

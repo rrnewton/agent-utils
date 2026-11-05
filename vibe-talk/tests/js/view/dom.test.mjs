@@ -1264,6 +1264,7 @@ test("`#624 voice-page-modularity`: n goes to the next unread row below the sele
   state.took = false;
   assert.deepStrictEqual(run(() => keys.doneFromKeyboard({})), [false, "rowForAct false false"]);
   state.row = rows[2];
+  state.took = true;
   state.read = new Set(["1", "2", "3", "5"]);
   delete rows[3].attributes["data-thread-read"];
   state.again = true;
@@ -1303,9 +1304,9 @@ test("`#624 voice-page-modularity`: Shift+E's fold keeps the reader's place, and
     shownRowFor: (row) => rows.find((one) => one.id === row.attributes.shownAs) || null,
     rowMessages: () => [{ thread: { is_root: state.unpackRoot } }],
     isThreadRoot: (message) => Boolean(message.thread && message.thread.is_root),
-    isOpenThreadRoot: () => state.root,
+    isOpenThreadRoot: (row) => state.root && row === state.rootRow,
     setStatus: (text) => log.push(`say ${text}`),
-    idsOf: (row) => [row.id],
+    idsOf: (row) => (row.attributes.empty ? [] : [row.id]),
     threadViewKey: (id) => `thread:${id}`,
     columnViewKey: (column) => `${column}:view`,
     paneColumn: () => "main",
@@ -1313,10 +1314,10 @@ test("`#624 voice-page-modularity`: Shift+E's fold keeps the reader's place, and
     foldedOnes: () => folded,
     closeReadRun: (key, ids) => log.push(`close run ${key} ${ids}`),
     isDone: (id) => state.done.has(id),
-    markDone: (ids) => log.push(`done ${ids}`),
+    markDone: (ids, row) => log.push(`done ${ids} of ${row.id}`),
     renderSideColumn: () => log.push("side drawn"),
     applyReadRuns: () => log.push("runs"),
-    paneRowFor: (_pane, id) => rows.find((one) => one.id === id) || null,
+    paneRowFor: (_pane, id, card) => (card === false ? rows.find((one) => one.id === id) || null : null),
     selectRow: (...args) => log.push(`select ${args[1].id}${args.length > 2 ? " +" : ""}`),
   });
   const run = (act) => { log.length = 0; return [act(), ...log]; };
@@ -1343,7 +1344,12 @@ test("`#624 voice-page-modularity`: Shift+E's fold keeps the reader's place, and
   assert.deepStrictEqual(run(() => keys.foldForRead(pane, tall)), [false], "a row showing its links was folded out of sight");
   state.links = false;
   assert.deepStrictEqual(run(() => keys.foldForRead(pane, { foldEntry: null })), [false]);
-  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [true, "close run main:view 3", "done 3", "in main", "runs", "tools", "select 2", "say Folded away."],
+  folds.set("2", true);
+  state.links = true;
+  assert.deepStrictEqual(run(() => keys.foldForRead(pane, tall)), [true], "a folded row showing its links was not said to be folded");
+  state.links = false;
+  folds.clear();
+  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [true, "close run main:view 3", "done 3 of 3", "in main", "runs", "tools", "select 2", "say Folded away."],
     "Shift+O did not fold the message away, mark it Done and step above it");
   assert.deepStrictEqual(folded.get("main:view"), new Set(["3"]));
   state.acted = { pane, row: rows[0], took: true };
@@ -1353,14 +1359,28 @@ test("`#624 voice-page-modularity`: Shift+E's fold keeps the reader's place, and
   rows = [rowOf("1"), rowOf("2"), line];
   state.acted = { pane, row: line, took: true };
   assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})).slice(0, 2), [true, "close run main:view 2"], "Shift+O on a run's line did not fold the message above it");
+  const member = rowOf("m", { "data-read-run": "member", shownAs: "x" });
+  rows = [rowOf("x"), member, line];
+  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})).slice(0, 3), [true, "close run main:view x", "done x of x"],
+    "a run's line above a folded member did not fold the message that member is shown as");
+  rows = [line];
+  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [true], "a run's line with nothing above it did not take the key, or folded something");
+  rows = [rowOf("card", { "data-card": "" }), line];
+  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [true], "a run's line under a card folded the card");
+  rows = [rowOf("1", { empty: true }), line];
+  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [false], "a row with no messages was folded");
+  rows = [rowOf("1"), rowOf("2"), line];
   state.root = true;
   state.acted = { pane, row: rows[0], took: true };
+  state.rootRow = rows[1];
+  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})).slice(0, 2), [true, "close run main:view 1"], "the thread's first message was asked about another row");
+  state.rootRow = rows[0];
   assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [true, "say The thread's first message stays."]);
   state.root = false;
   const unpacked = rowOf("u1", { "data-unpack-thread": "t9" });
   rows = [rowOf("u0"), unpacked];
   state.acted = { pane, row: unpacked, took: true };
-  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [true, "close run thread:t9 u1", "done u1", "side drawn", "select u0", "say Folded away."], "an unpacked thread's message was not folded in its thread's view");
+  assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [true, "close run thread:t9 u1", "done u1 of u1", "side drawn", "select u0", "say Folded away."], "an unpacked thread's message was not folded in its thread's view");
   state.unpackRoot = true;
   assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [true, "say The thread's first message stays."], "an unpacked thread's first message was folded");
   state.acted = { pane, row: rowOf("card", { "data-card": "" }), took: true };
