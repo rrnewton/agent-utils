@@ -85,3 +85,5 @@ The reply-154 request itself (the lead, 2026-11-05 06:24 AM ET, P1) was lost in 
   - The weaker cases are still taken: "taken before Enter" (new rows under the paste) and a paste never drawn whose Enter changed the screen.
   - Requiring an echo now would break the interim agentterm pane, whose side panel splits the echoed rows. That tightening comes with #852 D, which brings history-based evidence.
 - **The consumer team's verification on its bridge** is pending, through the lead.
+
+**Follow-up (seq label).** The landed change (5c78da37) saved the first number of any successful send's output as its seq. `send-message` prints a message id, and an applied `/goal` prints its echo (it journals no input), so for those the saved seq could be wrong; the `accepted` state was right either way, since both exit only after the server's durable ack. The follow-up records a seq only for `send` whose last output line is a bare number.

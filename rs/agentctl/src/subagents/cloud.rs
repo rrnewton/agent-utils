@@ -436,12 +436,19 @@ impl CloudInputState {
     }
 }
 
-/// The durable seq `agentcloudctl send` prints: the first number in its output.
+/// The durable seq `agentcloudctl send` prints, when its last line is that number alone.
+/// `send-message` prints a message id instead, and an applied `/goal` its echo, which journals
+/// no input: neither has a seq.
 fn durable_seq(stdout: &str) -> Option<u64> {
-    stdout
-        .split(|c: char| !c.is_ascii_digit())
-        .find(|digits| !digits.is_empty())
-        .and_then(|digits| digits.parse().ok())
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?
+        .trim();
+    line.bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| line.parse().ok())
+        .flatten()
 }
 
 /// The seq of the newest `user_input` with idempotency key `key` in `agentcloudctl history
@@ -1582,7 +1589,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         }
         // agentcloudctl exits 0 only once the input is durably journaled, and prints its seq:
         // the input is in the session's history, which is the evidence `message_state` asks for.
-        let seq = durable_seq(&run.stdout);
+        let seq = (verb == "send").then(|| durable_seq(&run.stdout)).flatten();
         self.note_cloud_input(&record.name, &key, CloudInputState::Accepted, seq)?;
         Ok(json!({
             "name": record.name,
@@ -4361,7 +4368,10 @@ exit 0
         .join("\n");
         assert_eq!(history_seq(&raw, "k"), Some(5));
         assert_eq!(history_seq(&raw, "other"), None);
-        assert_eq!(durable_seq("journaled at seq 42\n"), Some(42));
+        assert_eq!(durable_seq("42\n"), Some(42));
+        assert_eq!(durable_seq("journaled at seq 42\n"), None);
+        assert_eq!(durable_seq("applied: goal (active): ship 3 fixes\n"), None);
+        assert_eq!(durable_seq("msg-7f3a\n"), None);
         assert_eq!(durable_seq("ok\n"), None);
     }
 
