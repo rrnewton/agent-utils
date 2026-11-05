@@ -371,7 +371,60 @@ Implemented as step 2 on top of step 1 (landed `194e2814`):
 | (3) fragmentation | Identical 512 MiB + 2,000 random-overwrite churn: backing file with `+C` had **11 extents**, without `+C` **54 extents**. NOCOW measurably contains host fragmentation; the gap grows with churn age. |
 | (4) in-flight migration | Rehearsed end to end: rename, mount at the same path, per-slot subvolume + copy, status CONSISTENT, Git history intact. Two findings: `cp --reflink=always` across host→image fails `EXDEV` (different filesystems) — migration copies are plain, reflink pays only *inside* the image; and a partial copy leaves a broken `.git` gitfile, so verification (full listing + Git) must precede the swap, as `wrkslots migrate` does. In flat layout, mounting at `worktrees/` also moves the control directory inside the image; §6's recommendation (mount at the slots directory, control outside) stands unless the operator accepts the copied-registry cutover. |
 
-## 13. Open questions
+## 13. Lessons from the rolled-back trial D (2026-11-05)
+
+The first live cutover attempt was rolled back by the coordinator
+within minutes. The mechanism, for the record:
+
+- The plan renamed `worktrees/slots` → `worktrees/slots_old` and
+  mounted the image over the original path, with symlinks for live
+  slots. **Agent delivery broke immediately**: agentctl binds each
+  agent's queue to its expected cwd (`worktrees/slots/<slot>`), Herdr
+  reports the *real* cwd (`worktrees/slots_old/<slot>`), and agentctl
+  refused all input to every live agent as unreachable. Symlinked
+  slot paths break delivery, not just storage checks.
+- Renaming a parent of live slots also renamed the cwd of the very
+  session running the cutover, breaking its own tooling.
+- `mount --move` is unsupported under shared mount propagation.
+
+Hard constraints for any revised plan:
+
+1. **Live slots keep their real path.** A slot migrates only when its
+   agent is stopped, or in place without changing the path (copy into
+   the image, then a wrkslots-managed bind mount at the original
+   path).
+2. **Never rename a parent of live slots** — not the slots directory,
+   not any ancestor of a live agent's cwd.
+3. **agentctl's expected-cwd binding is a hard constraint**, equal in
+   force to wrkslots' registry paths and Git's worktree paths. All
+   three name the same absolute path; any design must keep that path
+   a real directory (a bind mount preserves it; a symlink does not).
+4. **The cutover must not rename the cwd of the session running it.**
+   Whoever migrates a slot is never inside the tree being migrated;
+   the operator's own slot migrates last, run by the coordinator.
+
+### Revised in-flight plan (for coordinator approval, not yet run)
+
+- Mount the image permanently at a non-slot path beside the control
+  directory (e.g. `worktrees/.slots-image`). Nothing under `slots/`
+  changes yet; no path any agent uses is touched.
+- Per stopped slot, in any order, one at a time: convert ext4 →
+  worktree if image-backed; `wrkslots migrate <slot>` copies it into
+  an image subvolume, verifies the listing, then bind-mounts the
+  subvolume at the slot's original path and records the bind so every
+  config load re-establishes it (the per-slot image precedent). The
+  original directory stays, hidden under the bind, until the slot is
+  verified (agentctl delivery probe + `git status` + wrkslots
+  CONSISTENT), then is deleted as a separate approved step.
+- New slots: created as image subvolumes and bind-mounted at
+  `slots/<name>` from the start. Their real path never changes.
+- Live slots are never migrated and never have an ancestor renamed.
+  When an agent finishes, its slot migrates in the next quiet moment.
+- Rollback is per slot and instant: unmount the bind; the original
+  directory is still there. No project-wide rollback exists because
+  no project-wide cutover exists.
+
+## 14. Open questions
 
 - Snapshot retention policy (count/age/who approves deletion).
 - Default `size_bytes` and the host-allocated alarm threshold.

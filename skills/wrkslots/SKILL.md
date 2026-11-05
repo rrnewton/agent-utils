@@ -267,6 +267,12 @@ FUSE fallback, so a host without passwordless sudo cannot enable it.
 Absent key means today's behaviour. Design and trial numbers:
 `ai_docs/transient/2026-11-05-wtimg-worktrees-image/DESIGN.md`.
 
+Hard constraints (learned from a rolled-back live cutover, 2026-11-05):
+never rename a parent of live slots; never expose a live slot through a
+symlink (agent delivery binds to the real cwd, so symlinked slots become
+unreachable); migrate only stopped slots, or in place via a bind mount at
+the unchanged path; whoever migrates a slot is never inside its tree.
+
 Procedure (refined from the devbig014 throwaway trial):
 
 1. Quiesce slots (`audit` clean), write the rollback plan first.
