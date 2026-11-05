@@ -14,9 +14,10 @@ from pathlib import Path
 import pytest
 from wrkslots import yamlconfig
 
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
-CARGO = "cargo"
 
 VALID = [
     "schema: 2\nmachine: node-a\n",
@@ -45,9 +46,11 @@ INVALID = [
 def _rust_parse(tmp_path: Path, text: str) -> subprocess.CompletedProcess[str]:
     document = tmp_path / "config.yml"
     document.write_text(text)
+    # Run the session's shared wrkslotsd binary instead of `cargo run`
+    # per case (#883): each Cargo invocation re-checked the release
+    # build inside the test's memory cap.
     return subprocess.run(
-        [CARGO, "run", "--quiet", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkslotsd", "--", "parse-config", "--config", str(document)],
+        [str(rust_wrkslotsd()), "parse-config", "--config", str(document)],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
     )
 

@@ -72,6 +72,20 @@ def test_real_agentctl_writer_records_reanchor() -> None:
     import subprocess
 
     repo = Path(__file__).resolve().parents[3]
+    # Bound the in-test Cargo build (#883): with default job parallelism
+    # its test-binary link peaked at 3.7 GiB inside a shard whose cap is
+    # about 1.9 GiB, OOM-killing whichever shard this test lands in.
+    # Two jobs and line-tables-only debug info keep the writer's real
+    # test while shrinking that build's peak.
+    env = dict(os.environ)
+    env["CARGO_BUILD_JOBS"] = "2"
+    env.update(
+        {
+            "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+            "CARGO_PROFILE_TEST_DEBUG": "line-tables-only",
+            "CARGO_INCREMENTAL": "0",
+        }
+    )
     result = subprocess.run(
         [
             "cargo", "test", "--quiet", "--locked",
@@ -79,7 +93,7 @@ def test_real_agentctl_writer_records_reanchor() -> None:
             "-p", "agentctl", "--lib",
             "anchor_refuses_a_changed_harness_without_replace",
         ],
-        cwd=repo, capture_output=True, text=True, check=False, timeout=900,
+        cwd=repo, capture_output=True, text=True, check=False, timeout=900, env=env,
     )
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
 

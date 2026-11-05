@@ -322,17 +322,12 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
-    # TEMPORARY stopgap (#883 wrkslots-shard-memory-and-heartbeat, 2026-11-05): shards 0 and 2
-    # peak anywhere from ~0.9 GiB to past the 1.9 GiB cap (1.5 GiB x mem_cap_factor 1.25), even
-    # alone, so they were OOM-killed in most gates (once even at a 2.5 GiB cap). A 3.2 GiB
-    # baseline caps them at 4 GiB until #883 finds the ballooning test; revert both to
-    # *wrkslots_test_hint then.
-    hint:
+    hint: &wrkslots_test_hint
       resources: {lifecycle-io: 1}
       est_duration_s: 300
       classification: latency-bound
       preferred_inner_jobs: 2
-      rss_baseline_bytes: 3435973837
+      rss_baseline_bytes: 1610612736
 
   - group: wrkslots
     job: shard-1
@@ -342,12 +337,7 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
-    hint: &wrkslots_test_hint
-      resources: {lifecycle-io: 1}
-      est_duration_s: 300
-      classification: latency-bound
-      preferred_inner_jobs: 2
-      rss_baseline_bytes: 1610612736
+    hint: *wrkslots_test_hint
 
   - group: wrkslots
     job: shard-2
@@ -357,17 +347,7 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
-    # TEMPORARY stopgap, as shard-0 (#883 wrkslots-shard-memory-and-heartbeat, 2026-11-05): shards 0 and 2
-    # peak anywhere from ~0.9 GiB to past the 1.9 GiB cap (1.5 GiB x mem_cap_factor 1.25), even
-    # alone, so they were OOM-killed in most gates (once even at a 2.5 GiB cap). A 3.2 GiB
-    # baseline caps them at 4 GiB until #883 finds the ballooning test; revert both to
-    # *wrkslots_test_hint then.
-    hint:
-      resources: {lifecycle-io: 1}
-      est_duration_s: 300
-      classification: latency-bound
-      preferred_inner_jobs: 2
-      rss_baseline_bytes: 3435973837
+    hint: *wrkslots_test_hint
 
   - group: wrkslots
     job: shard-3
