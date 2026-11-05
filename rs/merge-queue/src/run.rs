@@ -25,8 +25,11 @@
 //!
 //! The window is rolling (a dependent pipeline): up to `window` batches validate at once, each
 //! on top of the one before; when the head lands, the next batch starts at once. A red head
-//! cancels everything behind it. The window grows by one per landed batch up to `max_depth` and
-//! halves per red batch searched or decided alone (AIMD), never below one; a split leaves it.
+//! cancels everything behind it. A red batch behind the head waits for its turn to be decided,
+//! but the batches built on it are cancelled when its result comes, it gives up its place in the
+//! window, and later batches are built beneath it. The window grows by one per landed batch up
+//! to `max_depth` and halves per red batch searched or decided alone (AIMD), never below one; a
+//! split leaves it.
 //!
 //! A run holds the writer lock for its whole length, so `submit`, `withdraw` and `retry` record
 //! their requests instead (see [`crate::intake`]). While a batch is in flight the run takes in
@@ -601,6 +604,10 @@ struct Flight {
     chosen: Chosen,
     cancel: Arc<AtomicBool>,
     result: Option<JobResult>,
+    /// Later batches are built on this one's candidate. Cleared when it is red while batches
+    /// beneath it are still undecided (see [`cut_after`]): it keeps its place, to be decided in
+    /// order, but no longer holds a place in the window, and nothing is built on it.
+    stacked: bool,
 }
 
 /// Observations of one prefix during a culprit search.
@@ -3572,7 +3579,7 @@ impl<'a> Runner<'a> {
                     // not started yet.
                     if full_loaded
                         && want_more
-                        && flights.len() < window
+                        && occupied(&flights) < window
                         && (!flights.is_empty() || !pending.is_empty())
                         && self.takes_intake()
                     {
@@ -3584,7 +3591,7 @@ impl<'a> Runner<'a> {
                             .collect();
                         busy.extend(lock(&self.excluded).iter().copied());
                         if crate::intake::has_pending_except(self.state, &busy) {
-                            let tip = match flights.back() {
+                            let tip = match stack_top(&flights) {
                                 Some(last) => last.candidate.tip.clone(),
                                 None => self.current_base()?,
                             };
@@ -3605,7 +3612,7 @@ impl<'a> Runner<'a> {
                                     .flat_map(|flight| flight.candidate.prs.iter().copied())
                                     .collect();
                                 busy.extend(lock(&self.excluded).iter().copied());
-                                let tip = match flights.back() {
+                                let tip = match stack_top(&flights) {
                                     Some(last) => last.candidate.tip.clone(),
                                     None => self.current_base()?,
                                 };
@@ -3624,14 +3631,15 @@ impl<'a> Runner<'a> {
                             }
                         }
                     }
-                    // Fill the window, each new batch on top of the last one in flight.
-                    while flights.len() < window
+                    // Fill the window, each new batch on top of the last one in flight that is
+                    // not red.
+                    while occupied(&flights) < window
                         && !pending.is_empty()
                         && (self.options.max_batches == 0 || started < self.options.max_batches)
                         && !self.draining()
                     {
                         crate::interrupt::check("building the next batch")?;
-                        let parent = match flights.back() {
+                        let parent = match stack_top(&flights) {
                             Some(flight) => flight.candidate.tip.clone(),
                             None => {
                                 let base = self.current_base()?;
@@ -3653,7 +3661,7 @@ impl<'a> Runner<'a> {
                             commit: candidate.tip.clone(),
                             parent: candidate.parent.clone(),
                             speculation: Some(Speculation {
-                                depth: flights.len() + 1,
+                                depth: occupied(&flights) + 1,
                                 window,
                             }),
                             selection: chosen.selection.clone(),
@@ -3672,6 +3680,7 @@ impl<'a> Runner<'a> {
                             chosen,
                             cancel,
                             result: None,
+                            stacked: true,
                         });
                         started += 1;
                         lock(&self.report).windows.push(window);
@@ -3690,7 +3699,11 @@ impl<'a> Runner<'a> {
                     let want_more = (self.options.max_batches == 0
                         || started < self.options.max_batches)
                         && !self.draining();
-                    if flights.len() < window && pending.is_empty() && !full_loaded && want_more {
+                    if occupied(&flights) < window
+                        && pending.is_empty()
+                        && !full_loaded
+                        && want_more
+                    {
                         let handle = plan_join
                             .take()
                             .ok_or_else(|| "planning thread already joined".to_owned())?;
@@ -3724,6 +3737,43 @@ impl<'a> Runner<'a> {
                     // Only after the result is stored, so `discard` waits for no message
                     // this loop already took.
                     crate::interrupt::check("acting on a finished validation")?;
+                    // A red batch behind the head is decided in order, once the batches
+                    // beneath it are, but the batches built on its tree cannot land whatever
+                    // they are: cancel them now, so their slots take other work at once
+                    // instead of waiting for the head.
+                    if let Some(index) = flights.iter().position(|flight| flight.id == id) {
+                        if index > 0
+                            && flights[index].stacked
+                            && plainly_red(flights[index].result.as_ref())
+                        {
+                            let red = flights[index].candidate.prs.clone();
+                            let cancelled: Vec<i64> = flights
+                                .iter()
+                                .skip(index + 1)
+                                .flat_map(|flight| flight.candidate.prs.iter().copied())
+                                .collect();
+                            flights[index].stacked = false;
+                            cut_after(&mut flights, index, &rx, pending);
+                            self.event(
+                                "red-behind-head",
+                                &format!(
+                                    "{} is red behind the head: {}; it is decided once the \
+                                     batches beneath it are, and later batches are built \
+                                     beneath it",
+                                    list(&red),
+                                    if cancelled.is_empty() {
+                                        "nothing was built on it".to_owned()
+                                    } else {
+                                        format!(
+                                            "cancelled {}, built on its tree, to be built \
+                                             again",
+                                            list(&cancelled)
+                                        )
+                                    }
+                                ),
+                            );
+                        }
+                    }
                     // Land (or search) heads that have finished, in order.
                     while flights
                         .front()
@@ -3865,12 +3915,17 @@ impl<'a> Runner<'a> {
                             // order, as a batch of its own: built on the one before, each is a
                             // prefix of the red batch, decided by its own validation. The
                             // window is not halved, so they validate side by side.
-                            discard(&mut flights, &rx, pending);
+                            if head.stacked {
+                                discard(&mut flights, &rx, pending);
+                            }
                             self.split_red(&head.candidate, &ran, vid, pending);
                             BatchOutcome::Done
                         } else {
-                            // Everything behind a red batch was built on its tree.
-                            discard(&mut flights, &rx, pending);
+                            // Everything behind a red batch was built on its tree, unless it
+                            // was cut out of the stack when its result came (see `cut_after`).
+                            if head.stacked {
+                                discard(&mut flights, &rx, pending);
+                            }
                             window = (window / 2).max(1);
                             self.handle_red(&head.candidate, &head.chosen, &ran, vid, pending)?
                         };
@@ -4969,6 +5024,66 @@ impl<'a> Runner<'a> {
 
 /// Cancel every flight, wait for each to report, and return their batches to the queue front in
 /// their original order.
+/// The batch in flight the next batch is built on: the last one not cut out of the stack.
+fn stack_top(flights: &VecDeque<Flight>) -> Option<&Flight> {
+    flights.iter().rev().find(|flight| flight.stacked)
+}
+
+/// Places taken in the window: every batch in flight but one cut out of the stack, which only
+/// waits for its turn to be decided.
+fn occupied(flights: &VecDeque<Flight>) -> usize {
+    flights.iter().filter(|flight| flight.stacked).count()
+}
+
+/// Whether `result` is a red verdict: a validation that ran to its end and is not green, not
+/// refused, not held as INFRA-BLOCKED and not cancelled.
+fn plainly_red(result: Option<&JobResult>) -> bool {
+    matches!(
+        result,
+        Some(Ok((_, ran)))
+            if !ran.cancelled
+                && ran.interrupted.is_none()
+                && !ran.refused()
+                && ran.infra_blocked.is_empty()
+                && !ran.green()
+    )
+}
+
+/// Cancel the batches after `index`, all built on its tree, and wait for each to stop; their
+/// changes go back to the front of `pending`, in order. A result that arrives meanwhile for a
+/// batch kept is stored on it.
+fn cut_after(
+    flights: &mut VecDeque<Flight>,
+    index: usize,
+    rx: &mpsc::Receiver<(u64, JobResult)>,
+    pending: &mut VecDeque<Vec<i64>>,
+) {
+    let cut: Vec<Flight> = flights.drain(index + 1..).collect();
+    for flight in &cut {
+        flight.cancel.store(true, Ordering::Relaxed);
+    }
+    let mut waiting: BTreeSet<u64> = cut
+        .iter()
+        .filter(|flight| flight.result.is_none())
+        .map(|flight| flight.id)
+        .collect();
+    while !waiting.is_empty() {
+        match rx.recv() {
+            Ok((id, result)) => {
+                if !waiting.remove(&id) {
+                    if let Some(kept) = flights.iter_mut().find(|flight| flight.id == id) {
+                        kept.result = Some(result);
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    for flight in cut.into_iter().rev() {
+        pending.push_front(flight.candidate.prs);
+    }
+}
+
 fn discard(
     flights: &mut VecDeque<Flight>,
     rx: &mpsc::Receiver<(u64, JobResult)>,

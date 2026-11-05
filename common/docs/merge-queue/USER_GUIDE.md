@@ -301,8 +301,11 @@ window has a free slot and the run goes on (a batch is in flight, or batches are
 start), it applies the requests for the changes it is not busy with: every change except those
 in flight and those it ejected or set aside. It then plans every queued change it has not
 started again, on top of the last batch in flight. A new change can then start validating in
-the free slot at once, and a `--prioritized` one goes before batches that have not started. The
-run checks for requests every `--poll-ms` under `serve` and every 15 seconds under `run`.
+the free slot at once, and a `--prioritized` one goes before batches that have not started. A
+batch that came back red behind the head holds no place in the window, and the batches built on
+it are cancelled (see "Keeping the base green"), so those slots take requests at once, built
+beneath the red batch. The run checks for requests every `--poll-ms` under `serve` and every 15
+seconds under `run`.
 
 - The plan is made on the candidate of the last batch in flight, so a change that conflicts
   with work in flight is held for the next run, not ejected. A change stacked on a change in
@@ -1299,7 +1302,13 @@ The base moves only to a commit whose exact tree passed validation (the bors rul
    `windows` field records the window each time a batch started.
 3. **A red head** cancels everything behind it: those candidates were built on its tree. Their
    validations are killed, reported as `cancelled` (never as red), and their batches go back to the
-   front of the queue, to be rebuilt once the red batch is resolved.
+   front of the queue, to be rebuilt once the red batch is resolved. **A red batch behind the
+   head** is decided in order too, once every batch ahead of it is: until then the head's changes
+   could be the cause. But the batches built on its tree cannot land whatever they are, so they
+   are cancelled the moment its result comes (a `red-behind-head` event), and the red batch gives
+   up its place in the window. Their changes, and requests recorded meanwhile, are built beneath
+   it, on the last batch in flight that is not red, and validate in the freed slots at once. When
+   the red batch's turn comes, the batches behind it are kept, since none was built on it.
 4. **Split, or culprit search.** With same-commit confirmation off (the default), a red batch of
    several changes is split instead of searched: each change goes back, in order, to the front of
    the queue as a batch of its own, and stays alone in every later plan of the run, including the
