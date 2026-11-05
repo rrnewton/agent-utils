@@ -445,3 +445,60 @@ test("`#624 voice-page-modularity`: the keyboard dispatch runs the first binding
   assert.deepStrictEqual(press({ key: "/", keyCode: 229 }), ["prevented 0"]);
   assert.equal(keys.chordAllowed(keymap[3], { key: "e" }, {}), true);
 });
+
+test("`#624 voice-page-modularity`: the keys are said from the keymap in the reader's own words, and what the switch turned off is left out", () => {
+  const { createKeyHints, createRowShortcuts, chordWords, chordShortcuts, viewKeysNote } = VIEW_SHELL;
+  assert.deepStrictEqual([chordWords({ key: "s", mod: true }, "Cmd"), chordWords({ key: "ArrowDown", alt: true }, "Cmd"),
+    chordWords({ key: "ArrowDown", alt: true }, "Ctrl"), chordWords({ key: "e", shift: true }, "Ctrl"), chordWords({ key: "j" }, "Ctrl")],
+  ["Cmd+S", "Option+↓", "Alt+↓", "Shift+E", "j"]);
+  assert.deepStrictEqual([chordShortcuts({ key: "s", mod: true }), chordShortcuts({ key: " " }), chordShortcuts({ key: "e", shift: true })],
+    [["Control+S", "Meta+S"], ["Space"], ["Shift+E"]]);
+  assert.match(viewKeysNote("Cmd"), /^Cmd\+0 goes to the voice view, and Cmd\+1 to Cmd\+4/);
+  const node = (tag = "div") => ({
+    tag, attributes: {}, children: [], textContent: "", className: "",
+    setAttribute(name, value) { this.attributes[name] = value; },
+    removeAttribute(name) { delete this.attributes[name]; },
+    append(...more) { this.children.push(...more); },
+    replaceChildren(...more) { this.children = more; },
+  });
+  const done = node("button");
+  const row = { done };
+  const nodes = {};
+  const byId = (id) => (nodes[id] ??= node());
+  byId("discord-log").children = [row];
+  byId("open-settings").attributes["aria-keyshortcuts"] = "stale";
+  const keymap = [
+    { group: "Page", chords: [{ key: "/" }, { key: "/", mod: true }], does: "Search", controls: ["search-toggle"] },
+    { group: "Page", chords: [{ key: "," }], does: () => "Settings, now", controls: ["open-settings"] },
+    { group: "Message", chords: [{ key: "e" }], does: "Done", rowControls: ["done"] },
+    { group: "Views", chords: [{ key: "1", mod: true }, { key: "2", mod: true }, { key: "3", mod: true }], does: "A view" },
+  ];
+  let single = true;
+  const rowShortcuts = createRowShortcuts();
+  const hints = createKeyHints({
+    keymap: () => keymap, singleKeysOn: () => single, modKeyName: () => "Ctrl", byId, rowShortcuts,
+    childByClass: (at, className) => at[className] || null, groups: ["Page", "Message", "Views"], viewGroup: "Views",
+  });
+  const was = globalThis.document;
+  globalThis.document = { createElement: node };
+  try {
+    hints.render();
+    assert.deepStrictEqual([nodes["single-keys"].checked, nodes["search-toggle"].attributes["aria-keyshortcuts"],
+      nodes["open-settings"].attributes["aria-keyshortcuts"], done.attributes["aria-keyshortcuts"], nodes["search-toggle"].attributes.title],
+    [true, "/ Control+/ Meta+/", ",", "E", "Search messages (/ or Ctrl+/)"]);
+    const list = nodes["keyboard-keys"].children;
+    assert.deepStrictEqual(list.map((one) => one.tag), ["h3", "ul", "h3", "ul", "h3", "ul", "p"], "the groups, or the note under the views, are not where they were");
+    assert.deepStrictEqual(list[1].children.map((one) => one.children.map((part) => part.textContent)),
+      [["/ or Ctrl+/", "Search"], [",", "Settings, now"]]);
+    assert.equal(list[5].children[0].children[0].textContent, "Ctrl+1, Ctrl+2, Ctrl+3");
+    single = false;
+    hints.render();
+    assert.deepStrictEqual([nodes["single-keys"].checked, nodes["open-settings"].attributes["aria-keyshortcuts"], done.attributes["aria-keyshortcuts"],
+      nodes["search-toggle"].attributes.title, nodes["open-settings"].attributes.title],
+    [false, undefined, undefined, "Search messages (Ctrl+/)", "Settings ()"], "a key the switch turned off was still said on its button");
+    assert.match(nodes["keyboard-keys"].children[0].textContent, /^Single-key shortcuts are off in Settings: .* the Ctrl and Alt chords act\.$/);
+    assert.equal(hints.bindingWords(keymap[0]), "/ or Ctrl+/", "the full list leaves out keys the switch turned off");
+  } finally {
+    globalThis.document = was;
+  }
+});

@@ -23,3 +23,5 @@ export { createPromptsTray } from "./promptstray.ts";
 export type { PromptsTray, PromptsTrayDependencies } from "./promptstray.ts";
 export { createKeyDispatch } from "./keydispatch.ts";
 export type { DispatchedKey, KeyBinding, KeyDispatch, KeyDispatchDependencies } from "./keydispatch.ts";
+export { KEY_WORDS, chordShortcuts, chordWords, createKeyHints, viewKeysNote } from "./keyhints.ts";
+export type { KeyHints, KeyHintsDependencies, SaidBinding } from "./keyhints.ts";

@@ -1,7 +1,7 @@
 // The keys that press each row button (`#295 key-hints`; `#624 voice-page-modularity`, moved from the legacy
 // script into view/shell): the `aria-keyshortcuts` of every row button, by its class, as the key hints last
-// said them, so a row drawn after says the same as the rows already there. Working them out from the keymap,
-// and when, are the page's (`controlShortcuts`, `renderKeyHints`).
+// said them, so a row drawn after says the same as the rows already there. Working them out from the keymap is
+// keyhints.ts; when, the page's.
 
 /** A row button, as far as its shortcuts are written on it. */
 export interface ShortcutButton {
