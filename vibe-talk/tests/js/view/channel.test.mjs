@@ -820,3 +820,71 @@ test("`#624 voice-page-modularity`: one summary timer for the soonest moment any
   watch.owe("cards", Infinity, 2000);
   assert.equal(timers.length, 2, "nothing owed armed a timer");
 });
+
+test("`#624 voice-page-modularity`: the search's and the filter chips' listeners toggle each filter, type a filter change in place, and Enter and Escape act on the field", async () => {
+  const { mountFilterChips } = CHANNEL_VIEW;
+  const { LINK_KINDS } = await moduleForTests("src/present/rows/index.ts");
+  const log = [];
+  const elements = new Map();
+  const el = (id) => {
+    if (!elements.has(id)) {
+      const listeners = [];
+      elements.set(id, { id, value: "", listeners,
+        addEventListener: (type, listener) => listeners.push({ type, listener }),
+        removeEventListener: (type, listener) => listeners.splice(listeners.findIndex((one) => one.type === type && one.listener === listener), 1) });
+    }
+    return elements.get(id);
+  };
+  const fire = (id, type, event = {}) => { for (const one of el(id).listeners.filter((each) => each.type === type)) one.listener(event); };
+  const state = { open: false, pinned: false, links: false, hidden: new Set(["pr"]), raw: false, query: "", typed: true, side: false, older: false };
+  const chips = mountFilterChips({
+    byId: el,
+    searchOpen: () => state.open,
+    setSearchOpen: (open) => log.push(`search ${open}`),
+    pinnedOnly: () => state.pinned,
+    setPinnedOnly: (...args) => log.push(`pinned ${args.join(" ")}`),
+    linksOnly: () => state.links,
+    setLinksOnly: (on) => log.push(`links ${on}`),
+    cycleAuthorFilter: (...args) => log.push(`author ${args.length}`),
+    linkKindHidden: (kind) => state.hidden.has(kind),
+    setLinkKindShown: (kind, shown) => log.push(`kind ${kind} ${shown}`),
+    linksRaw: () => state.raw,
+    setLinksRaw: (raw) => log.push(`raw ${raw}`),
+    keepingFilterPlace: (change) => { log.push("keep place ("); change(); log.push(")"); },
+    liftingHideRead: (change) => { log.push("lift ("); change(); log.push(")"); },
+    setQuery: (text) => { state.query = text; log.push(`query ${text}`); },
+    query: () => state.query,
+    setMarked: (text) => log.push(`marked ${JSON.stringify(text)}`),
+    searchTyped: () => state.typed,
+    renderEveryColumnsTools: () => log.push("chips"),
+    sideColumnUp: () => state.side,
+    refilterSideCards: () => log.push("side cards"),
+    markSearchSoon: () => log.push("mark soon"),
+    markSearchNow: () => log.push("mark now"),
+    searchOlderFromField: () => { log.push("older"); return state.older; },
+    settleFocus: () => log.push("settle"),
+    swallow: (event) => log.push(`swallow ${event.key}`),
+  });
+  const run = (act) => { log.length = 0; act(); return [...log]; };
+  assert.deepStrictEqual([run(() => fire("search-toggle", "click")), run(() => fire("pinned-filter", "click")), run(() => fire("links-filter", "click")),
+    run(() => fire("author-filter", "click", { type: "click" })), run(() => fire("link-raw", "click"))],
+  [["search true"], ["pinned true"], ["links true"], ["author 0"], ["raw true"]], "a chip did not toggle, or the pin chip passed more than its one argument");
+  assert.deepStrictEqual(LINK_KINDS.map(({ chip }) => run(() => fire(chip, "click"))[0]), LINK_KINDS.map(({ kind }) => `kind ${kind} ${kind === "pr"}`));
+  let into = null;
+  fire("link-kinds", "focusin", { target: { scrollIntoView: (options) => { into = options; } } });
+  fire("link-kinds", "focusin", { target: null });
+  assert.deepStrictEqual(into, { block: "nearest", inline: "nearest" });
+  el("search-field").value = "foo";
+  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["keep place (", "lift (", "query foo", "chips", ")", ")", "mark soon"]);
+  state.typed = false;
+  state.side = true;
+  el("search-field").value = "";
+  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["keep place (", "lift (", "query ", "marked \"\"", "chips", "side cards", ")", ")", "mark soon"],
+    "a cleared search kept its marks, or the right column's cards were not filtered again");
+  assert.deepStrictEqual([run(() => fire("search-field", "keydown", { key: "Enter" })), run(() => { state.older = true; fire("search-field", "keydown", { key: "Enter" }); }),
+    run(() => fire("search-field", "keydown", { key: "Escape" })), run(() => fire("search-field", "keydown", { key: "Escape", isComposing: true })),
+    run(() => fire("search-field", "keydown", { key: "Enter", isComposing: true })), run(() => fire("search-field", "keydown", { key: "a" }))],
+  [["mark now", "older"], ["mark now", "older", "swallow Enter"], ["search false", "settle", "swallow Escape"], [], [], []]);
+  chips.unmount();
+  assert.deepStrictEqual([...elements.values()].filter((one) => one.listeners.length > 0).map((one) => one.id), [], "a listener was left mounted");
+});

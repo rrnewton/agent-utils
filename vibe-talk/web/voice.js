@@ -31337,64 +31337,40 @@ for (const id of ["expand-all", "collapse-all", "summarise"]) {
   });
 }
 el("jump-newest").addEventListener("click", () => scrollKeys.jumpToNewest());
-// `#129 message-search`. The glass is a toggle, and the second tap is the way out: a control that
-// only ever opens leaves the reader looking for a close button that is not on a phone keyboard.
-el("search-toggle").addEventListener("click", () => setSearchOpen(!searchField.open()));
-// `#206 pin-message`. A toggle, like the glass beside it.
-el("pinned-filter").addEventListener("click", () => setPinnedOnly(!pinsView().only));
-// `#211 link-filter`. The same, for links.
-el("links-filter").addEventListener("click", () => setLinksOnly(!searchField.links()));
-// `#251 author-filter`. Everyone, Mine, Theirs, in turn.
-el("author-filter").addEventListener("click", cycleAuthorFilter);
-// `#212 link-filter`. And each kind of link under it, a toggle of its own.
-for (const { kind, chip } of LINK_KINDS) {
-  el(chip).addEventListener("click", () => setLinkKindShown(kind, linkKinds.hidden().has(kind)));
-}
-// `#620 link-url-chip`. URL, first in that row: addresses or names.
-el("link-raw").addEventListener("click", () => setLinksRaw(!linkKinds.raw()));
-// `#266 link-filter-kinds`. The row of six scrolls sideways on a phone, and a browser scrolls it to a
-// button taking the focus only when none of that button shows: one cut off at the row's end stayed cut
-// off under Tab. So the button the focus reaches is brought wholly into the row, by Tab or by a tap.
-el("link-kinds").addEventListener("focusin", (event) => {
-  const target = /** @type {HTMLElement | null} */ (event.target);
-  if (target && typeof target.scrollIntoView === "function") target.scrollIntoView({ block: "nearest", inline: "nearest" });
+// The search's and the filter chips' listeners (`#129 message-search`, `#206 pin-message`, `#211`/`#212
+// link-filter`, `#251 author-filter`, `#266 link-filter-kinds`, `#620 link-url-chip`): the glass and the filters
+// as toggles, each kind of link, and the search field's typing, Enter and Escape. One owner in
+// web/src/view/channel/filterchips.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its
+// `unmount` waits for the ordered boot's teardown.
+mountFilterChips({
+  byId: (id) => el(id),
+  searchOpen: () => searchField.open(),
+  setSearchOpen: (open) => setSearchOpen(open),
+  pinnedOnly: () => pinsView().only,
+  setPinnedOnly: (on) => setPinnedOnly(on),
+  linksOnly: () => searchField.links(),
+  setLinksOnly: (on) => setLinksOnly(on),
+  cycleAuthorFilter: () => cycleAuthorFilter(),
+  linkKindHidden: (kind) => linkKinds.hidden().has(kind),
+  setLinkKindShown: (kind, shown) => setLinkKindShown(kind, shown),
+  linksRaw: () => linkKinds.raw(),
+  setLinksRaw: (raw) => setLinksRaw(raw),
+  keepingFilterPlace: (change) => keepingFilterPlace(change),
+  liftingHideRead: (change) => liftingHideRead(change),
+  setQuery: (text) => searchField.setQuery(text),
+  query: () => searchField.query(),
+  setMarked: (text) => searchField.setMarked(text),
+  searchTyped: (text) => searchTyped(text),
+  renderEveryColumnsTools: () => eachColumn(renderScrollTools),
+  sideColumnUp: () => sideColumnUp(),
+  refilterSideCards: () => refilterSideCards(),
+  markSearchSoon: () => markSearchSoon(),
+  markSearchNow: () => markSearchNow(),
+  searchOlderFromField: () => searchOlderFromField(),
+  settleFocus: () => settleFocus(),
+  swallow: (event) => swallow(event),
 });
-// Typed or cleared — by the keyboard, the field's own clear button, or a paste — the text is a filter
-// change, and the reader's message stays where it is on the screen (`#243 filter-keeps-selection`).
-// `#212 link-filter`, from review: text that matches nothing takes the reader to the sentence saying
-// so, and text that matches again puts back the message they were on before it.
-el("search-field").addEventListener("input", () => {
-  // `#262 search-load-older`. The first term typed, or the last taken away, may make Hide read step
-  // aside or come back (`liftingHideRead`).
-  keepingFilterPlace(() => liftingHideRead(() => {
-    searchField.setQuery(el("search-field").value);
-    // `#249 search-highlight`. Cleared — no word left to find — the marks go with the words, in this
-    // one redraw; otherwise they follow once the typing pauses (`searchField.marked()`).
-    if (!searchTyped(searchField.query())) searchField.setMarked(searchField.query());
-    eachColumn(renderScrollTools);
-    if (sideColumnUp()) refilterSideCards();
-  }));
-  markSearchSoon();
-});
-// Escape closes AND clears, which is the same act — see `setSearchOpen`. It is the gesture a
-// desktop reader reaches for without being told, and the only one a keyboard has. `#224
-// keyboard-shortcuts`: and the reader is put back on the list, rather than on a field that has just
-// gone; handled here, so the page's own listener (`keyDispatch.onPageKey`) leaves it alone. Not while an input
-// method composes, whose Escape is its own.
-el("search-field").addEventListener("keydown", (event) => {
-  // `#249 search-highlight`. Enter — a phone keyboard's Search — is the reader saying the words are
-  // typed: the hits are marked now rather than when the pause would have.
-  if (event.key === "Enter" && !event.isComposing) {
-    markSearchNow();
-    // `#262 search-load-older`. And it searches further back, where the step back offers that.
-    if (searchOlderFromField()) swallow(event);
-  }
-  if (event.key === "Escape" && !event.isComposing) {
-    setSearchOpen(false);
-    settleFocus();
-    swallow(event);
-  }
-});
+
 // The chip is an offer to go somewhere the reader may simply go themselves. Once they are there it
 // has nothing left to say, so it takes itself away rather than waiting to be tapped — and since
 // `#207 scrollback-jump` it is offered the moment they scroll far enough up the history to want it.

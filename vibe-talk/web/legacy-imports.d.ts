@@ -326,6 +326,7 @@ declare const createUnpackWatch: LegacyImports["createUnpackWatch"];
 declare const createCardsDrawn: LegacyImports["createCardsDrawn"];
 declare const createLayoutShown: LegacyImports["createLayoutShown"];
 declare const createArming: LegacyImports["createArming"];
+declare const mountFilterChips: LegacyImports["mountFilterChips"];
 declare const createCardFlight: LegacyImports["createCardFlight"];
 declare const createScrollKeeping: LegacyImports["createScrollKeeping"];
 declare const createPackSlides: LegacyImports["createPackSlides"];
