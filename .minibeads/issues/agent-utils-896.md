@@ -1,6 +1,6 @@
 ---
 title: 'chat-receipt-needs-evidence: no delivered receipt without positive delivery evidence, for any harness'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: cl-start
@@ -89,3 +89,9 @@ The reply-154 request itself (the lead, 2026-11-05 06:24 AM ET, P1) was lost in 
 **Follow-up (seq label).** The landed change (5c78da37) saved the first number of any successful send's output as its seq. `send-message` prints a message id, and an applied `/goal` prints its echo (it journals no input), so for those the saved seq could be wrong; the `accepted` state was right either way, since both exit only after the server's durable ack. The follow-up records a seq only for `send` whose last output line is a bare number.
 
 **Fix-forward (live check failed, 2026-11-05 14:11 ET).** After 5c78da37 was deployed and the consumer's bridge repointed to its agentcloud session, the receipt side was honest (the request stayed pending), but nothing reached the session. The `chat run` delivery (`ManagedAgents::send_identified_with_runtime`, through the service's cancellable delivery) had no agentcloud branch, unlike `send`, `send_once`, `drain`, `withdraw` and `message_state`, so it stopped at the Herdr-only check ("this operation drives Herdr-hosted harnesses only") and retried every pass. Before 5c78da37 that was hidden: the request was recorded delivered without any send. The path now journals through `cloud_send_record` under `chat-<key>`, recording `accepted` and the seq. Tests, through the service's own delivery: `a_chat_request_to_a_cloud_agent_is_journaled_and_receipted_only_after_the_send` and `a_failed_cloud_send_leaves_the_chat_request_pending_until_the_history_shows_it` (pending and counted as stalled after a failed send; delivered without a second send once the history shows the key).
+
+**Live check passed (consumer team, through the lead, 2026-11-05).** After 9d503632 was deployed and the consumer's bridge repointed to its agentcloud session, an owner post reached the session through the bridge. The session history shows it at seq 565630 under key `chat-8ec03bac...`, its `cloud-inputs` record is `accepted`, the request was delivered after the send, and the coordinator's reply was captured and posted.
+
+Two notes from that check:
+- **The seq was not recorded** (`"seq": null`) even with c5eb3efb. The real `agentcloudctl send` prints `delivered: input durable at seq N`, not a bare number. A deduplicated resend prints `delivered: input already durable (idempotency key K)`, which has no seq. The parser now reads the ack line, and the test fixture prints that same line.
+- **The reply was captured from the agentterm pane's screen, not from the cloud session's history.** Capturing replies from history stays in #852 D.

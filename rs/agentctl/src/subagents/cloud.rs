@@ -436,18 +436,23 @@ impl CloudInputState {
     }
 }
 
-/// The durable seq `agentcloudctl send` prints, when its last line is that number alone.
-/// `send-message` prints a message id instead, and an applied `/goal` its echo, which journals
-/// no input: neither has a seq.
+/// The durable seq `agentcloudctl send` prints: its ack line `delivered: input durable at seq N`,
+/// or a bare `N` from builds that printed only the number. A resend that agentcloud deduplicated
+/// prints `delivered: input already durable (idempotency key K)`, `send-message` a message id, and
+/// an applied `/goal` its echo, which journals no input: none of them gives a seq.
 fn durable_seq(stdout: &str) -> Option<u64> {
     let line = stdout
         .lines()
         .rev()
         .find(|line| !line.trim().is_empty())?
         .trim();
-    line.bytes()
+    let number = line
+        .strip_prefix("delivered: input durable at seq ")
+        .unwrap_or(line);
+    number
+        .bytes()
         .all(|byte| byte.is_ascii_digit())
-        .then(|| line.parse().ok())
+        .then(|| number.parse().ok())
         .flatten()
 }
 
@@ -2467,7 +2472,12 @@ exit 0
                 _turn: turn,
             };
             fixture.respond("create", Some(&format!("{SESSION}\n")), None, None);
-            fixture.respond("send", Some("42\n"), None, None);
+            fixture.respond(
+                "send",
+                Some("delivered: input durable at seq 42\n"),
+                None,
+                None,
+            );
             fixture
         }
 
@@ -4369,6 +4379,14 @@ exit 0
         assert_eq!(history_seq(&raw, "k"), Some(5));
         assert_eq!(history_seq(&raw, "other"), None);
         assert_eq!(durable_seq("42\n"), Some(42));
+        assert_eq!(
+            durable_seq("delivered: input durable at seq 565630\n"),
+            Some(565630)
+        );
+        assert_eq!(
+            durable_seq("delivered: input already durable (idempotency key chat-1)\n"),
+            None
+        );
         assert_eq!(durable_seq("journaled at seq 42\n"), None);
         assert_eq!(durable_seq("applied: goal (active): ship 3 fixes\n"), None);
         assert_eq!(durable_seq("msg-7f3a\n"), None);
