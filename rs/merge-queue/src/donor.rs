@@ -220,6 +220,10 @@ pub struct Job {
     /// `donor: detail`, oldest first. None is a verdict: each re-queued the job.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub could_not_run: Vec<String>,
+    /// A duplicate published for compare-only donors (`donors.compare_only`): only they may
+    /// claim it, and its receipt is a comparison, never the verdict.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compare_only: bool,
 }
 
 impl Job {
@@ -356,6 +360,9 @@ pub struct Store {
     /// The queue host's `validator.tool_identity` answers now, when known. [`Store::claim`]
     /// re-stamps a queued job published under older answers with these first.
     pub current_tools: Option<BTreeMap<String, String>>,
+    /// Donor names that only ever compare: they claim only `compare_only` duplicates, and
+    /// deciding donors never claim those.
+    pub compare_only: std::collections::BTreeSet<String>,
 }
 
 /// The store's lock, held only for one short operation.
@@ -621,6 +628,7 @@ impl Store {
             lease_secs: DEFAULT_LEASE_SECS,
             could_not_run_limit: crate::state::DEFAULT_RETRY_BOUND as usize,
             current_tools: None,
+            compare_only: std::collections::BTreeSet::new(),
         }
     }
 
@@ -804,9 +812,62 @@ impl Store {
             comparison: None,
             candidate_gone: None,
             could_not_run: Vec::new(),
+            compare_only: false,
         };
         self.write(&job)?;
         Ok(job)
+    }
+
+    /// Publish the compare-only duplicate of `main`: the same candidate for donors that
+    /// only ever compare. Its receipt never decides the batch.
+    pub fn publish_compare_duplicate(&self, main: &Job) -> Result<Job, String> {
+        let _lock = self.lock()?;
+        let id = format!(
+            "{}-{}-{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%S%3f"),
+            &main.commit[..main.commit.len().min(12)],
+            &token()?[..8]
+        );
+        let mut job = main.clone();
+        job.id = id;
+        job.state = JobState::Queued;
+        job.lease = None;
+        job.receipt = None;
+        job.attempts = 0;
+        job.created_at = now();
+        job.history = vec![format!(
+            "{}: published as the compare-only duplicate of {}",
+            now(),
+            main.id
+        )];
+        job.declined_by = Vec::new();
+        job.local = None;
+        job.comparison = None;
+        job.candidate_gone = None;
+        job.could_not_run = Vec::new();
+        job.compare_only = true;
+        self.write(&job)?;
+        Ok(job)
+    }
+
+    /// Record, on both jobs, how a compare-only duplicate's receipt compares with the
+    /// deciding job's receipt. A duplicate still running records nothing yet.
+    pub fn record_comparison(&self, deciding: &str, compared: &str) -> Result<bool, String> {
+        let _lock = self.lock()?;
+        let deciding_job = self.read(deciding)?;
+        let mut compared_job = self.read(compared)?;
+        let (Some(deciding_receipt), Some(compared_receipt)) =
+            (&deciding_job.receipt, &compared_job.receipt)
+        else {
+            return Ok(false);
+        };
+        let comparison = compare(&deciding_receipt.verdict(), &compared_receipt.verdict());
+        let mut deciding_job = deciding_job;
+        deciding_job.comparison = Some(comparison.clone());
+        self.write(&deciding_job)?;
+        compared_job.comparison = Some(comparison);
+        self.write(&compared_job)?;
+        Ok(true)
     }
 
     /// Lease the oldest queued job to `donor`, unless it already holds `max_jobs` leases.
@@ -832,8 +893,11 @@ impl Store {
         if held >= max_jobs.max(1) {
             return Ok(None);
         }
+        let compare_only_donor = self.compare_only.contains(donor);
         let Some(mut job) = jobs.into_iter().find(|job| {
-            job.state == JobState::Queued && !job.declined_by.iter().any(|name| name == donor)
+            job.state == JobState::Queued
+                && job.compare_only == compare_only_donor
+                && !job.declined_by.iter().any(|name| name == donor)
         }) else {
             return Ok(None);
         };
@@ -1113,7 +1177,9 @@ impl Store {
             now(),
             receipt.donor.name,
             receipt.donor.host,
-            if job.candidate_gone.is_some() {
+            if job.compare_only {
+                " (compare-only: compared, never the verdict)"
+            } else if job.candidate_gone.is_some() {
                 " after the queue had stopped wanting the candidate (compared only)"
             } else {
                 ""
@@ -2069,6 +2135,50 @@ mod unit {
             exit: Some(0),
             ..Receipt::default()
         }
+    }
+
+    #[test]
+    fn compare_only_donors_claim_only_duplicates_and_never_decide() {
+        let mut store = Store::new(&temp("compare-only"));
+        store.compare_only = ["d2".to_owned()].into();
+        let main = publish(&store, "c1");
+        let dup = store.publish_compare_duplicate(&main).unwrap();
+        assert!(dup.compare_only && !main.compare_only);
+        // The compare-only donor gets only the duplicate; a deciding donor never gets it.
+        let claimed_dup = store.claim("d2", "h2", 1).unwrap().expect("a duplicate");
+        assert_eq!(claimed_dup.id, dup.id);
+        assert!(store.claim("d2", "h2", 1).unwrap().is_none());
+        let claimed_main = store
+            .claim("d1", "h1", 1)
+            .unwrap()
+            .expect("the deciding job");
+        assert_eq!(claimed_main.id, main.id);
+        // The duplicate's receipt is accepted as a comparison, never the verdict.
+        let dup_token = claimed_dup.lease.as_ref().unwrap().token.clone();
+        store
+            .report(&dup.id, &dup_token, receipt(&claimed_dup, "d2"))
+            .unwrap();
+        let dup_after = store.read(&dup.id).unwrap();
+        assert_eq!(dup_after.state, JobState::Done);
+        assert!(
+            dup_after.history.join("\n").contains("compare-only"),
+            "{:?}",
+            dup_after.history
+        );
+        // The deciding receipt then records the comparison on both jobs.
+        let main_token = claimed_main.lease.as_ref().unwrap().token.clone();
+        store
+            .report(&main.id, &main_token, receipt(&claimed_main, "d1"))
+            .unwrap();
+        assert!(store.record_comparison(&main.id, &dup.id).unwrap());
+        assert_eq!(
+            store.read(&main.id).unwrap().comparison.as_deref(),
+            Some("match")
+        );
+        assert_eq!(
+            store.read(&dup.id).unwrap().comparison.as_deref(),
+            Some("match")
+        );
     }
 
     #[test]

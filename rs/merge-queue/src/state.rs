@@ -211,6 +211,11 @@ pub struct DonorsConfig {
     /// Receipts saying validation could not run that one job may collect before it is
     /// cancelled, and that one donor may return for it before it is left out (0 = 3).
     pub max_could_not_run: u32,
+    /// Donor names that only ever compare: in `decide` mode each published job gets a
+    /// duplicate that only these donors may claim, whose receipt is recorded as a
+    /// comparison and never decides the batch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compare_only: Vec<String>,
 }
 
 impl DonorsConfig {
@@ -239,6 +244,11 @@ impl DonorsConfig {
         } else {
             self.max_bundle_bytes
         }
+    }
+
+    /// Whether donor `name` only ever compares (see `compare_only`).
+    pub fn is_compare_only(&self, name: &str) -> bool {
+        self.compare_only.iter().any(|only| only == name)
     }
 
     /// Resolved claim timeout.

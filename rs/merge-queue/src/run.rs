@@ -910,6 +910,9 @@ impl<'a> Runner<'a> {
             let mut store = crate::donor::Store::new(&state.root);
             store.lease_secs = config.donors.lease();
             store.could_not_run_limit = config.donors.could_not_run_limit();
+            if offload == crate::state::Offload::Decide {
+                store.compare_only = config.donors.compare_only.iter().cloned().collect();
+            }
             match crate::donor::tool_identity(&config.validator, &config.repo) {
                 Ok(tool) => {
                     let reason = "superseded: the run that published it ended without settling it";
@@ -3209,6 +3212,33 @@ impl<'a> Runner<'a> {
             "donor",
             &format!("v{id}: published as donor job {published}"),
         );
+        // Compare-only donors get a duplicate of the same candidate: their receipts are
+        // recorded as comparisons and never decide this validation.
+        let duplicate = if donors.store.compare_only.is_empty() {
+            None
+        } else {
+            match donors
+                .store
+                .get(&published)
+                .and_then(|main| donors.store.publish_compare_duplicate(&main))
+            {
+                Ok(dup) => {
+                    lock(&donors.published).push((dup.id.clone(), job.commit.clone()));
+                    self.event(
+                        "donor",
+                        &format!("v{id}: published as compare-only duplicate {}", dup.id),
+                    );
+                    Some(dup.id)
+                }
+                Err(error) => {
+                    self.event(
+                        "donor",
+                        &format!("v{id}: compare-only duplicate not published: {error}"),
+                    );
+                    None
+                }
+            }
+        };
         let claim_timeout = Duration::from_secs(self.config.donors.claim_timeout());
         let mut waiting_since = Instant::now();
         let mut could_not_run = 0;
@@ -3266,6 +3296,11 @@ impl<'a> Runner<'a> {
                             receipt.donor.name, receipt.donor.host
                         ),
                     );
+                    if let Some(dup) = &duplicate {
+                        // Best effort: a duplicate still running compares nothing yet;
+                        // its receipt stays on its own job for the operator.
+                        let _ = donors.store.record_comparison(&published, dup);
+                    }
                     return receipt_ran(&receipt, dir);
                 }
                 crate::donor::JobState::Cancelled

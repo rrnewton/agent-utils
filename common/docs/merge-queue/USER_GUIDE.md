@@ -942,6 +942,11 @@ An **item record** (`items/<pr>.json`) has these fields:
   before the run stops with an error (default `900`). Nothing is ejected.
 - `max_could_not_run`: could-not-run receipts one job may collect before it is cancelled, and
   one donor may return for it before it is left out (absent or `0`: `3`).
+- `compare_only`: donor names that only ever compare in `decide` mode. Each published job
+  gets a duplicate only they may claim; its receipt is recorded as a comparison (`comparison`
+  on both jobs, counted by `donor status`) and never decides the batch. Deciding donors never
+  claim the duplicates. In `compare` mode every donor already only compares, so the list has
+  no effect there.
 
 **`land`** fields:
 
@@ -1217,7 +1222,9 @@ exactly the in-process path. The two other modes:
   environment differs subtly shows up as a mismatch and never lands anything. Switch to
   `decide` only after a run of matching verdicts.
 - `decide`: validations run on donors only, and an accepted receipt is the verdict, with the
-  same culprit search, flaky detection and obligations as a local result. The queue host keeps
+  same culprit search, flaky detection and obligations as a local result. A donor named in
+  `donors.compare_only` never gives that verdict: it validates a duplicate of the candidate
+  and its receipt is only compared with the deciding one. The queue host keeps
   validating by running a donor of its own (`donor run --queue 'merge-queue --repo QUEUE'
   --clone QUEUE --name local --jobs 2`), so its local capacity is one donor among several.
   Remote donors add capacity.

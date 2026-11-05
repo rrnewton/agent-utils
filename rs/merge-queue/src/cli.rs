@@ -225,6 +225,11 @@ fn donor_store(state: &State, config: &Config) -> crate::donor::Store {
     let mut store = crate::donor::Store::new(&state.root);
     store.lease_secs = config.donors.lease();
     store.could_not_run_limit = config.donors.could_not_run_limit();
+    if crate::state::Offload::parse(config.validator.offload.as_str())
+        == Ok(crate::state::Offload::Decide)
+    {
+        store.compare_only = config.donors.compare_only.iter().cloned().collect();
+    }
     store
 }
 

@@ -1179,3 +1179,65 @@ fn a_stop_while_waiting_for_a_donor_cancels_the_job_without_a_verdict() {
     assert_eq!(jobs(&fx)[0]["state"], "cancelled");
     assert_eq!(item_status(&fx, 1), "queued");
 }
+
+#[test]
+fn compare_only_donors_compare_in_decide_mode_and_never_decide() {
+    let fx = Fixture::new("donor-compare-only");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "decide",
+    ]);
+    set_config(&fx, |config| {
+        config["donors"]["compare_only"] = serde_json::json!(["d2"]);
+    });
+    two_changes(&fx);
+    let deciding_clone = donor_clone(&fx, "deciding-host");
+    let compare_clone = donor_clone(&fx, "compare-host");
+    let run = spawn_run(&fx, &[]);
+    wait_for(
+        "the deciding job and its duplicate",
+        Duration::from_secs(30),
+        || jobs(&fx).len() >= 2,
+    );
+    // The compare-only donor validates its duplicate; nothing lands on its receipt.
+    let out = donor(&fx, &compare_clone, "d2", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let all = jobs(&fx);
+    let dup = all
+        .iter()
+        .find(|job| job["compare_only"] == true)
+        .unwrap_or_else(|| panic!("no compare-only duplicate: {all:?}"));
+    assert_eq!(dup["state"], "done", "{dup}");
+    assert_eq!(dup["receipt"]["donor"]["name"], "d2", "{dup}");
+    assert_eq!(item_status(&fx, 1), "queued");
+    // The deciding donor's receipt alone lands the batch, and the comparison is recorded.
+    let out = donor(&fx, &deciding_clone, "d1", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (code, report, stderr) = finish(run);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        report["landed"][0]["prs"],
+        serde_json::json!([1, 2]),
+        "{report}"
+    );
+    let all = jobs(&fx);
+    let main = all
+        .iter()
+        .find(|job| job["compare_only"] != true)
+        .unwrap_or_else(|| panic!("no deciding job: {all:?}"));
+    assert_eq!(main["receipt"]["donor"]["name"], "d1", "{main}");
+    assert_eq!(main["comparison"], "match", "{main}");
+}
