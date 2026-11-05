@@ -2695,15 +2695,20 @@ pub const CHAT_STOP_GRACE: Duration = Duration::from_secs(4);
 const SLOW_STEP: Duration = Duration::from_secs(10);
 
 /// One owner-loop step, timed from its creation to its drop, which logs the step's name and
-/// duration when it took [`SLOW_STEP`] or longer.
+/// duration when it took longer than it should: [`SLOW_STEP`], or for a step that waits, twice
+/// the longest wait.
 struct SlowStep {
     name: &'static str,
     started: Instant,
+    slow_after: Duration,
 }
 
-/// The owner-loop step running now, for the termination guard's log line (#870
-/// agentctl-service-slow-stop).
-static OWNER_LOOP_STEP: Mutex<Option<&'static str>> = Mutex::new(None);
+/// The owner-loop step running now and when it began, for the termination guard's log line
+/// (#870 agentctl-service-slow-stop) and the stall watchdog's.
+static OWNER_LOOP_STEP: Mutex<Option<(&'static str, Instant)>> = Mutex::new(None);
+/// The owner-loop step that finished last and when it finished, for the stall watchdog's line
+/// when the loop stalls between steps.
+static LAST_OWNER_LOOP_STEP: Mutex<Option<(&'static str, Instant)>> = Mutex::new(None);
 
 /// What the owner loop was doing, if it was inside a named step: what a stop that took too long
 /// abandoned.
@@ -2712,17 +2717,60 @@ pub fn owner_loop_step() -> Option<String> {
     let step = *OWNER_LOOP_STEP
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    step.map(|name| format!("the owner loop was in its step: {name}"))
+    step.map(|(name, _)| format!("the owner loop was in its step: {name}"))
+}
+
+/// Where the owner loop is, for the stall watchdog's line: the step it is in and for how long,
+/// or, between steps, the step that finished last and how long ago.
+fn owner_loop_position() -> String {
+    let current = *OWNER_LOOP_STEP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let last = *LAST_OWNER_LOOP_STEP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    describe_position(current, last, Instant::now())
+}
+
+fn describe_position(
+    current: Option<(&'static str, Instant)>,
+    last: Option<(&'static str, Instant)>,
+    now: Instant,
+) -> String {
+    if let Some((name, started)) = current {
+        return format!(
+            "it is in its step \"{name}\", begun {}s ago",
+            now.saturating_duration_since(started).as_secs()
+        );
+    }
+    match last {
+        Some((name, finished)) => format!(
+            "it is in no named step; the last, \"{name}\", finished {}s ago",
+            now.saturating_duration_since(finished).as_secs()
+        ),
+        None => "it has finished no named step".to_owned(),
+    }
 }
 
 impl SlowStep {
     fn new(name: &'static str) -> Self {
+        Self::with_bound(name, SLOW_STEP)
+    }
+
+    /// A step that waits, up to [`OWNER_LOOP_WAIT_MAX`] by design: slow only past twice that.
+    fn waiting(name: &'static str) -> Self {
+        Self::with_bound(name, OWNER_LOOP_WAIT_MAX * 2)
+    }
+
+    fn with_bound(name: &'static str, slow_after: Duration) -> Self {
+        let started = Instant::now();
         *OWNER_LOOP_STEP
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(name);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((name, started));
         Self {
             name,
-            started: Instant::now(),
+            started,
+            slow_after,
         }
     }
 }
@@ -2732,8 +2780,11 @@ impl Drop for SlowStep {
         *OWNER_LOOP_STEP
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *LAST_OWNER_LOOP_STEP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((self.name, Instant::now()));
         let took = self.started.elapsed();
-        if took >= SLOW_STEP {
+        if took >= self.slow_after {
             service_log(format_args!(
                 "agentctl: slow owner-loop step: {} took {:.1}s; the loop did nothing else \
                  meanwhile (replies that chat reply stores still go out through the reply sender)",
@@ -2792,9 +2843,6 @@ fn send_announced_replies(
     if !state.has_unsent_reply(key) {
         return;
     }
-    log(format_args!(
-        "agentctl: chat reply for request {key} was stored by `agentctl chat reply`; sending it"
-    ));
     let mut report = CycleReport::default();
     for _ in 0..MAX_SENDS_PER_PASS {
         if stop.is_stopped() {
@@ -2808,6 +2856,14 @@ fn send_announced_replies(
                 break;
             }
         }
+    }
+    // Said only for a reply this thread sent: the owner loop says when it takes the same wake
+    // first, and a second wake for a reply already on its way sends nothing.
+    if !report.sent.is_empty() {
+        log(format_args!(
+            "agentctl: chat reply for request {key}, stored by `agentctl chat reply`, was sent \
+             by the reply sender"
+        ));
     }
     log_report(&report, log);
 }
@@ -5901,10 +5957,11 @@ fn spawn_stall_watchdog(
                     continue;
                 };
                 let detail = format!(
-                    "the chat owner loop made no progress for {}s (bound {}s); stopping chat run so \
-                     that its unit starts it again",
+                    "the chat owner loop made no progress for {}s (bound {}s; {}); stopping chat \
+                     run so that its unit starts it again",
                     age / 1_000,
-                    stall_after.as_secs()
+                    stall_after.as_secs(),
+                    owner_loop_position()
                 );
                 service_log(format_args!("agentctl: {detail}"));
                 if let Err(error) = state.note_owner_loop_down("stalled", &detail) {
@@ -6271,15 +6328,21 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
             }
             return Ok(());
         }
-        health.tick(state);
+        {
+            let _step = SlowStep::new("service health record");
+            health.tick(state);
+        }
         if reminder_waiting {
             if let Some(reminders) = reminders.as_mut() {
                 let _step = SlowStep::new("reply reminder settle");
                 reminder_waiting = reminders.settle(state, manager, stop);
             }
         }
-        take_provider_notices(notices, stop, &mut direct_keys, overflowed)?;
-        take_reply_wakes(state, reply_wakes, &mut direct_keys, overflowed);
+        {
+            let _step = SlowStep::new("provider notices and reply wakes");
+            take_provider_notices(notices, stop, &mut direct_keys, overflowed)?;
+            take_reply_wakes(state, reply_wakes, &mut direct_keys, overflowed);
+        }
         let recover = direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst);
         // A rescan tries every prompt waiting to be typed, so a due scan retries none of its own
         // when one runs. Nor does it while the status the loop last learned from Herdr is other
@@ -6294,6 +6357,7 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
         let mut retry = false;
         let scanned = watch.due();
         if scanned {
+            let _step = SlowStep::new("scan for prompts waiting to be typed");
             watch.scan(state, &queue_reader, &mut routes);
             if !recover && !watch.retry_keys.is_empty() {
                 match manager.pane_info_with_runtime(&state.config().agent_name, &owner_runtime) {
@@ -6561,6 +6625,7 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
             output_retry_delay = Duration::from_secs(1);
         }
         if stream.is_none() && Instant::now() >= output_retry_at {
+            let _step = SlowStep::new("output subscription connect");
             match connect_output(
                 client,
                 manager,
@@ -6617,7 +6682,11 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
             } else {
                 Duration::ZERO
             };
-            let waited = active.wait(timeout);
+            let waited = {
+                let _step = SlowStep::waiting("wait for pane events");
+                active.wait(timeout)
+            };
+            let _step = SlowStep::new("pane event handling");
             // A stop wakes this wait, and every Herdr call made after it fails as cancelled, so
             // the loop leaves here, where a stop seen at the top of a pass leaves it, instead of
             // in the next call (#291 stop-lost-wakeup).
@@ -6811,7 +6880,11 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
             } else {
                 Duration::ZERO
             };
-            match notices.recv_timeout(timeout) {
+            let received = {
+                let _step = SlowStep::waiting("wait for provider notices");
+                notices.recv_timeout(timeout)
+            };
+            match received {
                 Ok(notice) => match notice {
                     ProviderNotice::Batch(keys) => {
                         enqueue_direct_keys(&mut direct_keys, keys, overflowed)
@@ -8481,6 +8554,24 @@ fn already_reported_log_line(suppressed_ids: &[String]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stall_names_the_step_the_owner_loop_is_in_or_finished_last() {
+        let now = Instant::now();
+        let ago = |seconds| now - Duration::from_secs(seconds);
+        assert_eq!(
+            describe_position(Some(("wait for pane events", ago(301))), None, now),
+            "it is in its step \"wait for pane events\", begun 301s ago"
+        );
+        assert_eq!(
+            describe_position(None, Some(("reconciliation", ago(299))), now),
+            "it is in no named step; the last, \"reconciliation\", finished 299s ago"
+        );
+        assert_eq!(
+            describe_position(None, None, now),
+            "it has finished no named step"
+        );
+    }
+
     use super::*;
     use crate::chat_runtime::ReactionSetting;
     use std::cell::Cell;

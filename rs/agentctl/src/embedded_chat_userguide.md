@@ -2532,7 +2532,9 @@ The service log records each reply as it arrives, with the reply ID its
 request is known by: `chat reply N of request KEY (reply ID ID) was captured
 from the coordinator's pane` for a block a capture stored, and ``chat reply for
 request KEY was stored by `agentctl chat reply`; sending it`` for one the reply
-command stored. Together with the reminder lines, the log shows whether a reply
+command stored that the owner loop sends, or ``chat reply for request KEY,
+stored by `agentctl chat reply`, was sent by the reply sender`` for one the
+reply sender sent first. Together with the reminder lines, the log shows whether a reply
 arrived before or after a reminder.
 
 The requests are recorded as reminded in `reply-reminders.json` in the state
@@ -3238,7 +3240,9 @@ before this record is never called stalled. A stalled `chat run` stops itself
 with exit status 70 so that its unit starts it again; every blocking step of
 a round is bounded well below the bound (a delivery waits at most 5 seconds
 for the coordinator's locks and ends `--ready-timeout` plus 30 seconds after
-it starts, leaving the request pending for the next pass).
+it starts, leaving the request pending for the next pass). Its log line says
+where the loop was: in which named step and for how long, or, between steps,
+which step finished last and how long before, so a stall names its cause.
 The target is looked up in the registry the bridge itself runs with: the
 running service's `--registry`, else the registry `chat run` recorded for the
 state in the bridge index, else the command's own `--registry`. A registry that
