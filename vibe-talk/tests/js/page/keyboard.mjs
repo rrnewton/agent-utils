@@ -1059,8 +1059,13 @@ test("e MARKS THE SELECTED MESSAGE DONE and moves on to the next unread below; e
 /** `rowStates` with message `id` left out. */
 const othersOf = (states, id) => Object.fromEntries(Object.entries(states).filter(([key]) => key !== id));
 
-/** The line in `readAndCollapse` that marks Done only a message not Done already. */
-const DONE_UNLESS_DONE = "  if (!wasDone) await markRowDone(ids, row);\n";
+/** The line in `readAndCollapse` that marks Done only a message not Done already (web/src/view/shell/readcollapse.ts). */
+const DONE_UNLESS_DONE = "    if (!wasDone) await deps.markRowDone(ids, row);\n";
+
+/** Shift+E's act as it was before `#295`: Done through here, every message above marked too. */
+const OLD_SHIFT_E = ["  readCollapseFromKeyboard: (target) => readCollapseFromKeyboard(target),\n",
+  "  readCollapseFromKeyboard: (target) => { const { pane, row, took } = rowForAct(target); const ids = row ? idsOf(row) : []; " +
+  "if (!pane || !row || ids.length === 0) return took; guardQuietly(() => markReadThroughHere(row, ids[ids.length - 1]))(); return true; },\n"];
 
 /**
  * A channel of thirty long messages at its top, message 3 selected and opened with Enter, then Shift+E.
@@ -1120,17 +1125,19 @@ test("Shift+E MARKS THE SELECTED MESSAGE DONE AND COLLAPSES IT, and nothing else
 
 test("Shift+E's negative controls: a key that does not fold, one that toggles, and the old Done through here all fail (#295)", async () => {
   // Without the fold: the message stays open.
-  const unfolded = await readCollapseOnThree(brokenScript("const folded = foldForRead(pane, row);", "const folded = false;"));
+  const unfolded = await readCollapseOnThree(await brokenModule([{ file: "src/view/shell/readcollapse.ts",
+    find: "const folded = deps.foldForRead(pane, row);", replace: "const folded = false;" }]));
   assert.equal(channelRow(unfolded.page, "3").getAttribute("data-collapsed"), "false",
     "the negative control folded the message anyway, so the check above proves nothing");
   // As a toggle, the e key's act: a second press puts the message back.
-  const toggled = await readCollapseOnThree(brokenScript(DONE_UNLESS_DONE, "  await toggleArchived(ids, row);\n"));
+  const toggled = await readCollapseOnThree(await brokenModule([{ file: "src/view/shell/readcollapse.ts", find: DONE_UNLESS_DONE,
+    replace: "    await deps.markRowDone(ids, row);\n" }], brokenScript("  markRowDone: (ids, row) => markRowDone(ids, row),\n",
+    "  markRowDone: (ids, row) => toggleArchived(ids, row),\n")));
   await pressHere(toggled.page, "E", { shiftKey: true });
   assert.notDeepStrictEqual(toggled.page.restoreCalls, [],
     "the negative control's toggle put nothing back, so the check above proves nothing");
   // The old act: every message above is marked too.
-  const through = await readCollapseOnThree(brokenScript("guardQuietly(() => readAndCollapse(pane, row, ids))();",
-    "guardQuietly(() => markReadThroughHere(row, ids[ids.length - 1]))();"));
+  const through = await readCollapseOnThree(brokenScript(...OLD_SHIFT_E));
   assert.notDeepStrictEqual(othersOf(rowStates(through.page), "3"), othersOf(through.before.states, "3"),
     "the negative control's Done through here changed no other message, so the check above proves nothing");
 });
@@ -1318,7 +1325,7 @@ const readCollapseMarked = (script = SCRIPT, arrange = null) =>
   readCollapseOnThree(script, (page) => { page.upstreamReadMarkSupported = true; if (arrange) arrange(page); });
 
 /** The line in `readAndCollapse` that asks the chat service, taken out for a negative control. */
-const ASKS_SERVICE = "  const mark = await markReadInService(channel, ids[ids.length - 1]);\n";
+const ASKS_SERVICE = "    const mark = await deps.markReadInService(channel, ids[ids.length - 1] as string);\n";
 
 /**
  * Shift+E on message 3 with the server's floor, then again on it once opened, then e on message 4 and
@@ -1365,8 +1372,8 @@ test("Shift+E MARKS THE MESSAGE READ IN THE CHAT SERVICE where the server can mo
     "  if (!channelMarksUpstream(channel)) return none;\n", ""));
   assert.deepStrictEqual(unmarked.upstreamReadCalls, [{ message_id: "3", after_reply: true }],
     "with the provider's word unchecked nothing was asked, so the first test's check cannot see it");
-  const { page: unasked } = await readCollapseMarked(brokenScript(ASKS_SERVICE,
-    "  const mark = { service: \"Discord\", asked: false, marked: false, already: false, why: \"\" };\n"));
+  const { page: unasked } = await readCollapseMarked(await brokenModule([{ file: "src/view/shell/readcollapse.ts", find: ASKS_SERVICE,
+    replace: "    const mark = { service: \"Discord\", asked: false, marked: false, already: false, why: \"\" };\n" }]));
   assert.deepStrictEqual(unasked.upstreamReadCalls, [], "with the ask taken out it still asked, so this test cannot see it");
 });
 
@@ -1394,11 +1401,13 @@ test("Shift+E ON A MESSAGE ALREADY DONE writes no second Done, and asks the serv
   // THE CONTROLS. Without the already-Done check the second press writes a second Done. Without the
   // service's half for a Done message, the message e marked is never read in the service. Without
   // `after_reply`, the server's floor is not consulted, and the second press asks the service again.
-  const twice = await readCollapseTwice(brokenScript(DONE_UNLESS_DONE, "  await markRowDone(ids, row);\n"));
+  const twice = await readCollapseTwice(await brokenModule([{ file: "src/view/shell/readcollapse.ts", find: DONE_UNLESS_DONE,
+    replace: "    await deps.markRowDone(ids, row);\n" }]));
   assert.equal(twice.again.dismissed, 2,
     "with the already-Done check taken out the second press wrote no second Done, so this test cannot see it");
-  const skipped = await readCollapseTwice(brokenScript(ASKS_SERVICE, "  const mark = wasDone ? { service: \"Discord\", " +
-    "asked: false, marked: false, already: false, why: \"\" } : await markReadInService(channel, ids[ids.length - 1]);\n"));
+  const skipped = await readCollapseTwice(await brokenModule([{ file: "src/view/shell/readcollapse.ts", find: ASKS_SERVICE,
+    replace: "    const mark = wasDone ? { service: \"Discord\", asked: false, marked: false, already: false, why: \"\" } " +
+    ": await deps.markReadInService(channel, ids[ids.length - 1] as string);\n" }]));
   assert.deepStrictEqual(skipped.asked, ["3"],
     "with a Done message asking nothing the message e marked was read in the service, so this test cannot see it");
   const owner = await readCollapseTwice(brokenScript("body: { message_id: String(id), after_reply: true }",
@@ -1421,8 +1430,8 @@ test("Shift+E asks the chat service nothing after a Done that failed, and the fa
   assert.doesNotMatch(page.el("status").textContent, /^Marked read/, "a Done that failed was said as a read");
   // THE CONTROL: with the failure swallowed and no look again after its own Done (`#370
   // shift-e-undo-marker`), the service is asked all the same.
-  const { page: control } = await readCollapseMarked(brokenScript(`${DONE_UNLESS_DONE}  if (!(await doneSaved(ids))) return;\n`,
-    "  if (!wasDone) await markRowDone(ids, row).catch(() => {});\n"), refuse);
+  const { page: control } = await readCollapseMarked(await brokenModule([{ file: "src/view/shell/readcollapse.ts", find: `${DONE_UNLESS_DONE}${WAITS_FOR_SAVE}`,
+    replace: "    if (!wasDone) await deps.markRowDone(ids, row).catch(() => {});\n" }]), refuse);
   await control.settle();
   assert.equal(control.upstreamReadCalls.length, 1,
     "with the failure swallowed nothing was asked, so this test cannot see it");
@@ -1433,7 +1442,7 @@ test("Shift+E asks the chat service nothing after a Done that failed, and the fa
 // take that for a saved Done: the chat service's marker, once moved, cannot be moved back.
 
 /** The line in `readAndCollapse` that waits for a Done still being saved, taken out for a negative control. */
-const WAITS_FOR_SAVE = "  if (!(await doneSaved(ids))) return;\n";
+const WAITS_FOR_SAVE = "    if (!(await deps.doneSaved(ids))) return;\n";
 
 /**
  * Message 3 opened and its Done made by `first`, Shift+E or e, held on its way to the server; Shift+E
@@ -1496,7 +1505,8 @@ test("SHIFT+E PRESSED WHILE A DONE IS STILL BEING SAVED asks the chat service on
   // asks the service at once, so its marker moves for a Done that then fails, and a read is said.
   // Waiting without looking again asks it once the Done has failed.
   for (const first of ["Shift+E", "e"]) {
-    const unwaited = await readCollapseWhileSaving(failing, first, brokenScript(WAITS_FOR_SAVE, ""));
+    const unwaited = await readCollapseWhileSaving(failing, first,
+      await brokenModule([{ file: "src/view/shell/readcollapse.ts", find: WAITS_FOR_SAVE, replace: "" }]));
     assert.deepStrictEqual(unwaited.whileSaving, [{ message_id: "3", after_reply: true }],
       `without the wait Shift+E after ${first} did not ask before the Done was saved, so this test cannot see it`);
     assert.match(unwaited.page.el("status").textContent, /read here/,
@@ -1604,8 +1614,7 @@ test("NO KEY MARKS EVERY MESSAGE ABOVE ONE READ ANY MORE: not Shift+E, nor any k
   };
   assert.deepStrictEqual(await sweep(SCRIPT), [], "a key marked more than the message it was pressed on");
   // The control: Shift+E as it was. The sweep has to see it.
-  const old = brokenScript("guardQuietly(() => readAndCollapse(pane, row, ids))();",
-    "guardQuietly(() => markReadThroughHere(row, ids[ids.length - 1]))();");
+  const old = brokenScript(...OLD_SHIFT_E);
   const caught = await sweep(old, (c) => c.key === "e");
   assert.ok(caught.some(({ chord }) => chord.shiftKey), "the sweep did not catch the old Shift+E, so it proves nothing");
 });

@@ -51,3 +51,5 @@ export { createKeySelection } from "./keyselection.ts";
 export type { KeyPane, KeySelection, KeySelectionDependencies, KeySelectionModel } from "./keyselection.ts";
 export { KEYS_MESSAGE, KEYS_MOVING, KEYS_PAGE, KEYS_VIEW, KEYS_WRITING, createKeymap } from "./keymap.ts";
 export type { KeymapActs, KeymapBinding } from "./keymap.ts";
+export { createReadCollapse } from "./readcollapse.ts";
+export type { CollapsedRow, ReadCollapse, ReadCollapseDependencies } from "./readcollapse.ts";

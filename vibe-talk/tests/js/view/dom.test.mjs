@@ -1979,3 +1979,51 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
   answers.manyChatServices = true;
   assert.ok(keymap.map((binding) => (typeof binding.does === "function" ? binding.does() : "")).join("\n").includes("Copy its link in its chat service:"));
 });
+
+test("`#624 voice-page-modularity`: Shift+E folds first, marks Done only what is not Done, waits for the Done to be saved before asking the service, and says nothing over another channel", async () => {
+  const { createReadCollapse } = VIEW_SHELL;
+  const log = [];
+  const pane = { name: "channel" };
+  const row = { id: "row" };
+  const state = { act: { pane, row, took: false }, ids: ["3", "4"], channel: "c1", done: new Set(), saved: true, folded: true, moveTo: null, fail: null };
+  const quiet = [];
+  const shiftE = createReadCollapse({
+    rowForAct: (target) => { log.push(`row for ${target.id}`); return state.act; },
+    idsOf: () => state.ids,
+    runQuietly: (act) => { quiet.push(act().catch((error) => log.push(`error ${error.message}`))); },
+    channelId: () => state.channel,
+    foldForRead: (_pane, folding) => { log.push(`fold ${folding.id}`); return state.folded; },
+    isDone: (id) => state.done.has(id),
+    markRowDone: async (ids) => { log.push(`done ${ids.join(",")}`); if (state.fail) throw new Error(state.fail); },
+    doneSaved: async (ids) => { log.push(`saved? ${ids.join(",")}`); return state.saved; },
+    markReadInService: async (channel, id) => { log.push(`service ${channel} ${id}`); if (state.moveTo) state.channel = state.moveTo; return { id }; },
+    doneReadWords: (mark, also) => `already Done, read ${mark.id}${also}`,
+    serviceReadWords: (mark, also) => `marked read ${mark.id}${also}`,
+    setStatus: (text) => log.push(`say ${text}`),
+  });
+  const press = async () => { log.length = 0; quiet.length = 0; const took = shiftE.readCollapseFromKeyboard({ id: "t" }); await Promise.all(quiet); return [took, ...log]; };
+  assert.deepStrictEqual(await press(), [true, "row for t", "fold row", "done 3,4", "saved? 3,4", "service c1 4", "say marked read 4, and collapsed"]);
+  state.done = new Set(["3", "4"]);
+  state.folded = false;
+  assert.deepStrictEqual(await press(), [true, "row for t", "fold row", "saved? 3,4", "service c1 4", "say already Done, read 4"],
+    "a message Done already was marked again, or its service half was not asked");
+  state.done = new Set(["3"]);
+  state.saved = false;
+  assert.deepStrictEqual(await press(), [true, "row for t", "fold row", "done 3,4", "saved? 3,4"], "the service was asked for a Done not saved");
+  state.saved = true;
+  state.fail = "refused";
+  assert.deepStrictEqual(await press(), [true, "row for t", "fold row", "done 3,4", "error refused"], "a Done that failed asked the service, or was not said");
+  state.fail = null;
+  state.moveTo = "c2";
+  assert.deepStrictEqual(await press(), [true, "row for t", "fold row", "done 3,4", "saved? 3,4", "service c1 4"], "the status line spoke over another channel");
+  state.moveTo = null;
+  state.channel = "c1";
+  state.ids = [];
+  assert.deepStrictEqual(await press(), [false, "row for t"], "a row of no message was acted on");
+  state.act = { pane: null, row: null, took: true };
+  assert.deepStrictEqual(await press(), [true, "row for t"], "a key taken with no row to act on was given back");
+  log.length = 0;
+  state.ids = ["9"];
+  await shiftE.readAndCollapse(pane, row, ["9"]);
+  assert.deepStrictEqual(log, ["fold row", "done 9", "saved? 9", "service c1 9", "say marked read 9"]);
+});

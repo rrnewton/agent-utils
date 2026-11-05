@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 
 import { CHANNEL, CLEAR_ARMED_MS, CSS, CSS_CODE, DISCORD_POLL_MS, DONE_FLASH_FADE_MS,
   DONE_FLASH_HOLD_MS, GLYPHS, HOLD_MS, INBOX_NOTICE, OTHER_CHANNEL, SCRIPT, SCRIPT_CODE, backlog,
-  brokenScript, brokenScriptEach, channelRow, chooseReadMode, conversation, cssBlock, cssRules,
+  brokenModule, brokenScript, brokenScriptEach, channelRow, chooseReadMode, conversation, cssBlock, cssRules,
   delayedReply, deliver, doneButton, elidedOf, errorResponse, focusName, focused, inboxChannel,
   inboxId, json, jumpSaysArrived, keyboardPageAtTop, listCardSays, longMessage, message, newPage,
   nodeIn, openReplyOn, openThree, outgoingRetry, outgoingRows, pagedTimeline, pickThread, press,
@@ -3478,7 +3478,8 @@ test("`#327 done-races-remaining`: an Undo that slips in the page before its wri
 // Shift+E now looks again once its Done is saved, as a sent reply does since `#327`.
 
 /** The line that looks again after Shift+E's own Done, as first written (only for a Done made before): for negative controls. */
-const SHIFT_E_LOOKS_AGAIN = ["  if (!(await doneSaved(ids))) return;\n", "  if (wasDone && !(await doneSaved(ids))) return;\n"];
+const SHIFT_E_LOOKS_AGAIN = { file: "src/view/shell/readcollapse.ts", find: "    if (!(await deps.doneSaved(ids))) return;\n",
+  replace: "    if (wasDone && !(await deps.doneSaved(ids))) return;\n" };
 
 /**
  * The chat service's marker supported: message 3 selected and opened (`openThree`), Shift+E pressed
@@ -3521,7 +3522,7 @@ test("`#370 shift-e-undo-marker`: an Undo pressed while Shift+E's own Done is on
 
   // THE CONTROL: Shift+E looked again only for a Done made before it, as first written: the Undo
   // saved, the chat service is still asked for the message put back.
-  const control = await shiftEWithHeldDone(true, brokenScript(...SHIFT_E_LOOKS_AGAIN));
+  const control = await shiftEWithHeldDone(true, await brokenModule([SHIFT_E_LOOKS_AGAIN]));
   assert.deepStrictEqual(control.page.restoreCalls, [{ messages: ["3"] }], "the premise is the Undo written");
   assert.equal(control.page.dealtWith.has("3"), false, "the premise is the message put back on the server");
   assert.deepStrictEqual(control.asked, ["3"],
