@@ -1989,7 +1989,11 @@ test("`#624 voice-page-modularity`: Shift+E folds first, marks Done only what is
   const quiet = [];
   const shiftE = createReadCollapse({
     rowForAct: (target) => { log.push(`row for ${target.id}`); return state.act; },
-    idsOf: (of) => { assert.equal(of, state.act.row, "the ids were asked of another row"); return state.ids; },
+    idsOf: (of) => {
+      if (of === null) log.push("ids of nothing");
+      assert.equal(of, state.act.row, "the ids were asked of another row");
+      return state.ids;
+    },
     runQuietly: (act) => { quiet.push(act().catch((error) => log.push(`error ${error.message}`))); },
     channelId: () => { log.push("channel?"); return state.channel; },
     foldForRead: (on, folding) => { log.push(`fold ${on.name} ${folding.id}`); return state.folded; },
