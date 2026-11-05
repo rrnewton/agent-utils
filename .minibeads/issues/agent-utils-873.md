@@ -4,8 +4,10 @@ status: open
 priority: 2
 issue_type: bug
 assignee: mu-validate
+depends_on:
+  agent-utils-876: blocks
 created_at: 2026-11-05T08:36:45.091501022+00:00
-updated_at: 2026-11-05T08:36:45.091501022+00:00
+updated_at: 2026-11-05T09:21:58.524416380+00:00
 ---
 
 # Description
