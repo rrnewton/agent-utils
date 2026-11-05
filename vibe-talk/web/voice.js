@@ -8925,84 +8925,30 @@ const singleKeys = createSingleKeys({
   render: () => renderKeyHints(),
 });
 
-/** Whether `chord` of `binding` may fire with the focus on `target`. See the rules at the top of this section. */
-function chordAllowed(binding, chord, target) {
-  if (typesCharacter(chord) && !singleKeys.current()) return false;
-  if (chord.mod || chord.key === "Escape" || binding.inField) return true;
-  return !isTextField(target) && !keepsOwnKeys(target);
-}
-
 /**
- * The keydown listener of the page, at the document: every key but the few `onEverywhereKey` takes
- * first. See the top of this section.
+ * The page's keyboard dispatch: the keydown listeners `onPageKey`, at the document, and `onEverywhereKey`, at
+ * the window in the capture phase, which walk `KEYMAP`, and `chordAllowed`, the rules at the top of this
+ * section. One owner in web/src/view/shell/keydispatch.ts (`#624 voice-page-modularity`).
  *
- * @param {KeyboardEvent} event
+ * @type {import("./src/view/shell/index.ts").KeyDispatch<HTMLElement>}
  */
-function onPageKey(event) {
-  if (!event || event.isComposing || event.keyCode === 229) return;
-  // `#239 single-selection`. A key moves the one selection from wherever the mouse put it. Said
-  // before a key its own element took (Escape out of the search, Enter in a message box) is left
-  // alone: the keys are in use all the same, and what a still pointer lights stays put away.
-  keysInUse();
-  if (event.defaultPrevented) return;
-  const target = /** @type {HTMLElement} */ (event.target || document.activeElement);
-  if (macFieldEditKey(event, target)) return;
-  // `#229 desktop-two-column`. In the column of the list the key is for: the one the focus is in,
-  // else the one the keys moved last.
-  const pane = screens.screen() === "main" ? paneFor(target) : null;
-  inColumn(pane ? paneColumn(pane) : columns.main, () => dispatchKey(event, target));
-}
-
-/**
- * The chords that act whatever holds the focus: those of the bindings marked `everywhere`, today the
- * search's Ctrl+/ (Cmd+/), `#344 search-shortcut`, and the message box's Ctrl+S (Cmd+S), `#403
- * composer-key-global`.
- *
- * Registered at the WINDOW in the CAPTURE phase, which a keydown reaches first: before the document,
- * before any element's own listener and before `onPageKey`. So nothing the page adds later can keep the
- * chord from it, a listener that stops the key included. Only a window capture listener registered
- * before it could, and the page has none; a browser extension's is out of the page's reach. The chord's
- * default is refused at once, so it is never the browser's, even where it finds nothing to open; a held
- * chord's repeats are refused too, and do nothing more. The key is NOT stopped: `onPageKey` still hears
- * it, notes the keys in use, and leaves it alone as a key already taken (`defaultPrevented`), as does
- * every element's own listener, none of which answers a Ctrl or Cmd chord with "/" or S.
- *
- * Nothing fires while an input method composes. An AltGr chord (Ctrl and Alt together, as Windows sends
- * it) matches no binding, so a "/" typed with AltGr is still a "/".
- *
- * @param {KeyboardEvent} event
- */
-function onEverywhereKey(event) {
-  if (!event || event.isComposing || event.keyCode === 229) return;
-  const binding = KEYMAP.find((one) => one.everywhere && one.run &&
-    one.chords.some((chord) => chord.mod && chordMatches(chord, event)));
-  if (!binding) return;
-  swallow(event);
-  if (event.repeat) return;
-  keysInUse();
-  const target = /** @type {HTMLElement} */ (event.target || document.activeElement);
-  const pane = screens.screen() === "main" ? paneFor(target) : null;
-  inColumn(pane ? paneColumn(pane) : columns.main, () => binding.run(event, target));
-}
-
-/** `onPageKey`, in the column it chose: the first binding that takes the key, else the scroll keys. */
-function dispatchKey(event, target) {
-  for (const binding of KEYMAP) {
-    if (!binding.run) continue;
-    if (!binding.chords.some((chord) => chordMatches(chord, event) && chordAllowed(binding, chord, target))) continue;
-    // A held key repeats only the keys that move: a held e is one Done, not a Done on every row it passes.
-    if (event.repeat && !binding.repeats) continue;
-    // A key that moves through the messages or acts on one is the reader acting in the list, measured
-    // from where they are (`readerActed`). The keys for a filter, the search and Escape are not: they
-    // ARE filter changes, and a filter turned on and off again by them is a round trip. `#243`.
-    if (binding.group === KEYS_MOVING || binding.group === KEYS_MESSAGE) readerActed();
-    if (binding.run(event, target)) {
-      swallow(event);
-      return;
-    }
-  }
-  routeScrollKey(event, target);
-}
+const keyDispatch = createKeyDispatch({
+  keymap: () => KEYMAP,
+  singleKeysOn: () => singleKeys.current(),
+  isTextField: (target) => isTextField(target),
+  keepsOwnKeys: (target) => keepsOwnKeys(target),
+  keysInUse: () => keysInUse(),
+  macFieldEditKey: (event, target) => macFieldEditKey(event, target),
+  activeElement: () => /** @type {HTMLElement} */ (document.activeElement),
+  onMain: () => screens.screen() === "main",
+  paneFor: (target) => paneFor(target),
+  paneColumn: (pane) => paneColumn(pane),
+  mainColumn: () => columns.main,
+  inColumn: (column, act) => inColumn(column, act),
+  listGroups: [KEYS_MOVING, KEYS_MESSAGE],
+  readerActed: () => readerActed(),
+  routeScrollKey: (event, target) => routeScrollKey(event, target),
+});
 
 // --- saying the keys
 
@@ -32539,10 +32485,10 @@ document.addEventListener("visibilitychange", onVisibility);
 document.addEventListener("pointerdown", closeRowMenuOutside);
 // `#224 keyboard-shortcuts`. Every key the page answers, in one place: see `onPageKey`. The switch
 // for the single-key shortcuts is restored first, so the keys are said as they will act.
-document.addEventListener("keydown", onPageKey);
+document.addEventListener("keydown", keyDispatch.onPageKey);
 // `#344 search-shortcut`. ...but for the chords that act whatever holds the focus, heard before any
 // other listener of the page: see `onEverywhereKey`.
-window.addEventListener("keydown", onEverywhereKey, { capture: true });
+window.addEventListener("keydown", keyDispatch.onEverywhereKey, { capture: true });
 // `#296 copy-highlighted-message`. A copy with nothing selected copies the highlighted message.
 document.addEventListener("beforecopy", onPageBeforeCopy);
 document.addEventListener("copy", onPageCopy);

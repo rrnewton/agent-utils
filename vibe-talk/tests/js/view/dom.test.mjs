@@ -385,3 +385,63 @@ test("`#624 voice-page-modularity`: the prompts tray is shut until opened, and s
   tray.setOpen(true);
   assert.equal(other.open(), false, "two trays share their state");
 });
+
+test("`#624 voice-page-modularity`: the keyboard dispatch runs the first binding that takes a key, in its column, by the rules of the focus", () => {
+  const { createKeyDispatch } = VIEW_SHELL;
+  const log = [];
+  let single = true;
+  const field = { field: true };
+  const side = { pane: "side" };
+  const inSide = { in: side };
+  const bind = (name, chords, extra = {}) => ({ chords, run: () => { log.push(name); return extra.takes ?? true; }, ...extra });
+  const keymap = [
+    { chords: [{ key: "?" }] },
+    bind("passes", [{ key: "j" }], { takes: false }),
+    bind("down", [{ key: "j" }], { group: "moving", repeats: true }),
+    bind("done", [{ key: "e" }], { group: "message" }),
+    bind("filter", [{ key: "f" }], { group: "filters" }),
+    bind("escape", [{ key: "Escape" }]),
+    bind("send", [{ key: "s", mod: true }], { everywhere: true }),
+  ];
+  const keys = createKeyDispatch({
+    keymap: () => keymap,
+    singleKeysOn: () => single,
+    isTextField: (target) => Boolean(target && target.field),
+    keepsOwnKeys: () => false,
+    keysInUse: () => log.push("keys"),
+    macFieldEditKey: (event) => event.key === "k" && event.ctrlKey,
+    activeElement: () => field,
+    onMain: () => true,
+    paneFor: (target) => (target && target.in) || null,
+    paneColumn: (pane) => pane.pane,
+    mainColumn: () => "main",
+    inColumn: (column, act) => { log.push(`in ${column}`); act(); },
+    listGroups: ["moving", "message"],
+    readerActed: () => log.push("acted"),
+    routeScrollKey: (event) => log.push(`scroll ${event.key}`),
+  });
+  const press = (fields) => {
+    const event = { key: "", code: "", ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, target: {}, prevented: 0, ...fields };
+    event.preventDefault = () => { event.prevented += 1; event.defaultPrevented = true; };
+    log.length = 0;
+    keys.onEverywhereKey(event);
+    keys.onPageKey(event);
+    return [...log, `prevented ${event.prevented}`];
+  };
+  assert.deepStrictEqual(press({ key: "j" }), ["keys", "in main", "passes", "acted", "down", "prevented 1"],
+    "a binding that did not take the key let the walk go on, or the reader's acting was not noted for each");
+  assert.deepStrictEqual(press({ key: "f", target: inSide }), ["keys", "in side", "filter", "prevented 1"], "the key ran outside its list's column, or a filter key counted as acting in the list");
+  assert.deepStrictEqual(press({ key: "e", repeat: true }), ["keys", "in main", "scroll e", "prevented 0"], "a held e was a Done on every row");
+  assert.deepStrictEqual(press({ key: "j", target: field }), ["keys", "in main", "scroll j", "prevented 0"], "a single key fired in a text field");
+  assert.deepStrictEqual(press({ key: "Escape", target: field }), ["keys", "in main", "escape", "prevented 1"], "Escape did not leave a field");
+  single = false;
+  assert.deepStrictEqual(press({ key: "e" }), ["keys", "in main", "scroll e", "prevented 0"], "a single key fired with the single keys off");
+  single = true;
+  assert.deepStrictEqual(press({ key: "k", ctrlKey: true }), ["keys", "prevented 0"], "a Mac field's own Ctrl edit was taken");
+  assert.deepStrictEqual(press({ key: "s", metaKey: true, target: null }), ["keys", "in main", "send", "keys", "prevented 1"],
+    "Cmd+S was not heard first at the window, or the document's listener ran it again");
+  assert.deepStrictEqual(press({ key: "s", ctrlKey: true, repeat: true }), ["keys", "prevented 1"], "a held chord's repeats were not refused, or ran it");
+  assert.deepStrictEqual(press({ key: "j", isComposing: true }), ["prevented 0"], "a key fired while an input method composed");
+  assert.deepStrictEqual(press({ key: "/", keyCode: 229 }), ["prevented 0"]);
+  assert.equal(keys.chordAllowed(keymap[3], { key: "e" }, {}), true);
+});

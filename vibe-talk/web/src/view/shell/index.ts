@@ -21,3 +21,5 @@ export { createReplySight } from "./draftsight.ts";
 export type { ReplySight } from "./draftsight.ts";
 export { createPromptsTray } from "./promptstray.ts";
 export type { PromptsTray, PromptsTrayDependencies } from "./promptstray.ts";
+export { createKeyDispatch } from "./keydispatch.ts";
+export type { DispatchedKey, KeyBinding, KeyDispatch, KeyDispatchDependencies } from "./keydispatch.ts";
