@@ -639,6 +639,9 @@ struct Flight {
     /// beneath it are still undecided (see [`cut_after`]): it keeps its place, to be decided in
     /// order, but no longer holds a place in the window, and nothing is built on it.
     stacked: bool,
+    /// Built on the base itself, disjoint from every batch in flight (a second root):
+    /// a red or discarded stack does not cancel it, and it counts in the window.
+    rooted: bool,
     /// Where it sat in the window when it started.
     speculation: Option<Speculation>,
     /// Validations of this candidate that admission refused and that were started again (see
@@ -3364,6 +3367,28 @@ impl<'a> Runner<'a> {
     }
 
     /// The policy's selection for `commit` relative to `base`.
+    /// Whether `prs` can validate on the base beside the batches in flight: no shared
+    /// change, no textual conflict, and no dependency in either direction, per the plan.
+    fn batch_disjoint(&self, prs: &[i64], in_flight: &[i64]) -> bool {
+        if prs.is_empty() || in_flight.is_empty() {
+            return false;
+        }
+        let plan = &lock(&self.report).plan;
+        let flying: BTreeSet<i64> = in_flight.iter().copied().collect();
+        if prs.iter().any(|pr| flying.contains(pr)) {
+            return false;
+        }
+        let conflicts = plan.conflicts.iter().any(|c| {
+            (prs.contains(&c.a) && flying.contains(&c.b))
+                || (prs.contains(&c.b) && flying.contains(&c.a))
+        });
+        let depends = plan.dependencies.iter().any(|(before, after)| {
+            (prs.contains(before) && flying.contains(after))
+                || (prs.contains(after) && flying.contains(before))
+        });
+        !conflicts && !depends
+    }
+
     /// Whether every change in `prs` is peripheral in the current plan.
     fn all_peripheral(&self, prs: &[i64]) -> bool {
         if prs.is_empty() || !self.config.peripheral.enabled() {
@@ -4330,22 +4355,46 @@ impl<'a> Runner<'a> {
                         }
                     }
                     // Fill the window, each new batch on top of the last one in flight that is
-                    // not red.
+                    // not red. One slot may instead take a batch built on the base itself,
+                    // disjoint from everything in flight (a second root), so one red
+                    // stack cannot take the whole window down with it.
                     while occupied(&flights) < window
                         && !pending.is_empty()
                         && (self.options.max_batches == 0 || started < self.options.max_batches)
                         && !self.draining()
                     {
                         crate::interrupt::check("building the next batch")?;
-                        let parent = match stack_top(&flights) {
-                            Some(flight) => flight.candidate.tip.clone(),
-                            None => {
-                                let base = self.current_base()?;
-                                *lock(&self.base) = base.clone();
-                                base
+                        // The disjoint root takes the window's last slot (window of
+                        // at least 3): the front batch, when it is disjoint from
+                        // everything in flight, validates on the base itself instead
+                        // of on the deepest stacked candidate.
+                        let rooted = !self.config.disable_disjoint_root
+                            && window >= 3
+                            && occupied(&flights) + 1 >= window
+                            && !flights.is_empty()
+                            && !flights.iter().any(|flight| flight.rooted)
+                            && pending.front().is_some_and(|prs| {
+                                let in_flight: Vec<i64> = flights
+                                    .iter()
+                                    .flat_map(|flight| flight.candidate.prs.iter().copied())
+                                    .collect();
+                                self.batch_disjoint(prs, &in_flight)
+                            });
+                        let prs = pending.pop_front().unwrap_or_default();
+                        let parent = if rooted {
+                            let base = self.current_base()?;
+                            *lock(&self.base) = base.clone();
+                            base
+                        } else {
+                            match stack_top(&flights) {
+                                Some(flight) => flight.candidate.tip.clone(),
+                                None => {
+                                    let base = self.current_base()?;
+                                    *lock(&self.base) = base.clone();
+                                    base
+                                }
                             }
                         };
-                        let prs = pending.pop_front().unwrap_or_default();
                         started_prs.extend(prs.iter().copied());
                         let candidate = self.build_and_eject(&parent, &prs, pending, "")?;
                         if candidate.prs.is_empty() {
@@ -4358,7 +4407,7 @@ impl<'a> Runner<'a> {
                         )?;
                         let cancel = Arc::new(AtomicBool::new(false));
                         let speculation = Some(Speculation {
-                            depth: occupied(&flights) + 1,
+                            depth: if rooted { 1 } else { occupied(&flights) + 1 },
                             window,
                         });
                         let job =
@@ -4370,13 +4419,29 @@ impl<'a> Runner<'a> {
                         scope.spawn(move || {
                             let _ = tx.send((id, self.validate_one(job, &flag)));
                         });
+                        if rooted {
+                            self.event(
+                                "disjoint-root",
+                                &format!(
+                                    "{} validates on the base itself, disjoint from {}",
+                                    list(&candidate.prs),
+                                    list(
+                                        &flights
+                                            .iter()
+                                            .flat_map(|f| f.candidate.prs.iter().copied())
+                                            .collect::<Vec<_>>()
+                                    )
+                                ),
+                            );
+                        }
                         flights.push_back(Flight {
                             id,
                             candidate,
                             chosen,
                             cancel,
                             result: None,
-                            stacked: true,
+                            stacked: !rooted,
+                            rooted,
                             speculation,
                             retries: 0,
                             head_round: false,
@@ -4422,70 +4487,98 @@ impl<'a> Runner<'a> {
                         }
                         return Ok(refused_stop.clone());
                     }
-                    let (id, result) = match rx.recv_timeout(poll) {
-                        Ok(message) => message,
-                        // Nothing finished yet: look for recorded requests again.
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    // A timeout still falls through to deciding stored heads: a
+                    // decision deferred (a rotated disjoint root, say) may need no
+                    // new message to become decidable.
+                    let arrived = match rx.recv_timeout(poll) {
+                        Ok(message) => Some(message),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
                             return Err("validation channel closed".to_owned());
                         }
                     };
-                    if let Some(flight) = flights.iter_mut().find(|flight| flight.id == id) {
-                        flight.result = Some(result);
-                    }
-                    // Only after the result is stored, so `discard` waits for no message
-                    // this loop already took.
-                    crate::interrupt::check("acting on a finished validation")?;
-                    // A refused batch starts again at once, wherever it is in the window, not
-                    // when it reaches the head (see `refused_again`).
-                    if let Some(index) = flights.iter().position(|flight| flight.id == id) {
-                        let flight = &mut flights[index];
-                        if let Some((job, delay)) = self.refused_again(flight, index == 0) {
-                            self.start_again(scope, &tx, flight, job, delay);
+                    let arrived_id = arrived.as_ref().map(|(id, _)| *id);
+                    if let Some((id, result)) = arrived {
+                        if let Some(flight) = flights.iter_mut().find(|flight| flight.id == id) {
+                            flight.result = Some(result);
+                        } else {
+                            self.event(
+                                "result-lost",
+                                &format!("a validation result arrived for unknown flight {id}"),
+                            );
+                        }
+                        // Only after the result is stored, so `discard` waits for no message
+                        // this loop already took.
+                        crate::interrupt::check("acting on a finished validation")?;
+                        // A refused batch starts again at once, wherever it is in the window, not
+                        // when it reaches the head (see `refused_again`).
+                        if let Some(index) = flights.iter().position(|flight| flight.id == id) {
+                            let flight = &mut flights[index];
+                            if let Some((job, delay)) = self.refused_again(flight, index == 0) {
+                                self.start_again(scope, &tx, flight, job, delay);
+                            }
                         }
                     }
                     // A red batch behind the head is decided in order, once the batches
                     // beneath it are, but the batches built on its tree cannot land whatever
                     // they are: cancel them now, so their slots take other work at once
                     // instead of waiting for the head.
-                    if let Some(index) = flights.iter().position(|flight| flight.id == id) {
-                        if index > 0
-                            && flights[index].stacked
-                            && plainly_red(flights[index].result.as_ref())
-                        {
-                            let red = flights[index].candidate.prs.clone();
-                            let cancelled: Vec<i64> = flights
-                                .iter()
-                                .skip(index + 1)
-                                .flat_map(|flight| flight.candidate.prs.iter().copied())
-                                .collect();
-                            flights[index].stacked = false;
-                            cut_after(&mut flights, index, &rx, pending);
-                            self.event(
-                                "red-behind-head",
-                                &format!(
-                                    "{} is red behind the head: {}; it is decided once the \
+                    if let Some(id) = arrived_id {
+                        if let Some(index) = flights.iter().position(|flight| flight.id == id) {
+                            if index > 0
+                                && flights[index].stacked
+                                && plainly_red(flights[index].result.as_ref())
+                            {
+                                let red = flights[index].candidate.prs.clone();
+                                let cancelled: Vec<i64> = flights
+                                    .iter()
+                                    .skip(index + 1)
+                                    .filter(|flight| !flight.rooted)
+                                    .flat_map(|flight| flight.candidate.prs.iter().copied())
+                                    .collect();
+                                flights[index].stacked = false;
+                                cut_after(&mut flights, index, &rx, pending);
+                                self.event(
+                                    "red-behind-head",
+                                    &format!(
+                                        "{} is red behind the head: {}; it is decided once the \
                                      batches beneath it are, and later batches are built \
                                      beneath it",
-                                    list(&red),
-                                    if cancelled.is_empty() {
-                                        "nothing was built on it".to_owned()
-                                    } else {
-                                        format!(
-                                            "cancelled {}, built on its tree, to be built \
+                                        list(&red),
+                                        if cancelled.is_empty() {
+                                            "nothing was built on it".to_owned()
+                                        } else {
+                                            format!(
+                                                "cancelled {}, built on its tree, to be built \
                                              again",
-                                            list(&cancelled)
-                                        )
-                                    }
-                                ),
-                            );
+                                                list(&cancelled)
+                                            )
+                                        }
+                                    ),
+                                );
+                            }
                         }
+                    }
+                    // A disjoint root validates early but is decided in plan order:
+                    // while anything it jumped over is still pending or in flight, it
+                    // waits behind it (its candidate goes stale and is rebuilt, like
+                    // any speculation that did not hold).
+                    if flights.front().is_some_and(|flight| flight.rooted)
+                        && (flights.len() > 1 || !pending.is_empty())
+                    {
+                        flights.rotate_left(1);
                     }
                     // Land (or search) heads that have finished, in order.
                     while flights
                         .front()
                         .is_some_and(|flight| flight.result.is_some())
                     {
+                        if flights.front().is_some_and(|flight| flight.rooted)
+                            && (flights.len() > 1 || !pending.is_empty())
+                        {
+                            flights.rotate_left(1);
+                            break;
+                        }
                         let Some(mut head) = flights.pop_front() else {
                             break;
                         };
@@ -5872,9 +5965,12 @@ fn stack_top(flights: &VecDeque<Flight>) -> Option<&Flight> {
 }
 
 /// Places taken in the window: every batch in flight but one cut out of the stack, which only
-/// waits for its turn to be decided.
+/// waits for its turn to be decided. A disjoint root holds a place: it is validating.
 fn occupied(flights: &VecDeque<Flight>) -> usize {
-    flights.iter().filter(|flight| flight.stacked).count()
+    flights
+        .iter()
+        .filter(|flight| flight.stacked || flight.rooted)
+        .count()
 }
 
 /// Whether `result` is a red verdict: a validation that ran to its end and is not green, not
@@ -5900,7 +5996,17 @@ fn cut_after(
     rx: &mpsc::Receiver<(u64, JobResult)>,
     pending: &mut VecDeque<Vec<i64>>,
 ) {
-    let cut: Vec<Flight> = flights.drain(index + 1..).collect();
+    let drained: Vec<Flight> = flights.drain(index + 1..).collect();
+    // Disjoint roots among the drained are not built on the red batch: they stay.
+    let mut cut: Vec<Flight> = Vec::new();
+    let mut roots: Vec<Flight> = Vec::new();
+    for flight in drained {
+        if flight.rooted {
+            roots.push(flight);
+        } else {
+            cut.push(flight);
+        }
+    }
     for flight in &cut {
         flight.cancel.store(true, Ordering::Relaxed);
     }
@@ -5913,7 +6019,11 @@ fn cut_after(
         match rx.recv() {
             Ok((id, result)) => {
                 if !waiting.remove(&id) {
-                    if let Some(kept) = flights.iter_mut().find(|flight| flight.id == id) {
+                    if let Some(kept) = flights
+                        .iter_mut()
+                        .chain(roots.iter_mut())
+                        .find(|flight| flight.id == id)
+                    {
                         kept.result = Some(result);
                     }
                 }
@@ -5924,6 +6034,7 @@ fn cut_after(
     for flight in cut.into_iter().rev() {
         pending.push_front(flight.candidate.prs);
     }
+    flights.extend(roots);
 }
 
 fn discard(
@@ -5931,25 +6042,41 @@ fn discard(
     rx: &mpsc::Receiver<(u64, JobResult)>,
     pending: &mut VecDeque<Vec<i64>>,
 ) {
-    for flight in flights.iter() {
+    // A disjoint root is built on the base, not on anything being discarded: it
+    // keeps its slot and its validation.
+    let mut kept: VecDeque<Flight> = VecDeque::new();
+    let mut dropped: Vec<Flight> = Vec::new();
+    while let Some(flight) = flights.pop_front() {
+        if flight.rooted {
+            kept.push_back(flight);
+        } else {
+            dropped.push(flight);
+        }
+    }
+    for flight in &dropped {
         flight.cancel.store(true, Ordering::Relaxed);
     }
-    let mut waiting: BTreeSet<u64> = flights
+    let mut waiting: BTreeSet<u64> = dropped
         .iter()
         .filter(|flight| flight.result.is_none())
         .map(|flight| flight.id)
         .collect();
     while !waiting.is_empty() {
         match rx.recv() {
-            Ok((id, _)) => {
-                waiting.remove(&id);
+            Ok((id, result)) => {
+                if !waiting.remove(&id) {
+                    if let Some(flight) = kept.iter_mut().find(|flight| flight.id == id) {
+                        flight.result = Some(result);
+                    }
+                }
             }
             Err(_) => break,
         }
     }
-    while let Some(flight) = flights.pop_back() {
+    for flight in dropped.into_iter().rev() {
         pending.push_front(flight.candidate.prs);
     }
+    flights.append(&mut kept);
 }
 
 /// A log file's text, with any bytes that are not UTF-8 replaced; `None` when unreadable.

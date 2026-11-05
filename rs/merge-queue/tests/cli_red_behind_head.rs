@@ -155,28 +155,26 @@ fn a_red_batch_behind_the_head_frees_the_slots_of_the_batches_built_on_it() {
     fx.mq_ok(&["submit", "3", "--head", "c"]);
     let mut daemon = Daemon::start(&fx);
     wait_for("the window to fill", &started, |lines| lines.len() >= 3);
-    assert_eq!(
-        started_lines(&started)[..3],
-        ["a_t0_", "a_b_t0_", "a_b_c_t0_"]
-    );
-    // Change 2 fails while change 1, the head, still validates. Its red result cancels
-    // change 3, built on its tree, and change 3 is built again beneath it, on change 1.
+    // The window's last slot is a disjoint root: change 3 validates on the base itself,
+    // not on change 2's tree (the disjoint second root; before it, the third start was
+    // the stacked a_b_c candidate).
+    assert_eq!(started_lines(&started)[..3], ["a_t0_", "a_b_t0_", "c_t0_"]);
+    // Change 2 fails while change 1, the head, still validates. Nothing was built on
+    // change 2's tree, so nothing is cancelled: change 3's root validation stands.
     open(&gates, "a_b_t0_");
-    wait_for("change 3 rebuilt on change 1", &started, |lines| {
-        lines.iter().any(|line| line == "a_c_t0_")
-    });
-    // A change submitted now is taken in and built on top of change 3, still before change 1
-    // has finished.
+    open(&gates, "c_t0_");
+    // A change submitted now is taken in and built on change 1, still before change 1
+    // has finished; it is rebuilt on change 3 once change 3 lands.
     fx.branch("d", &[("tests/d", "ok\n")]);
     let out = fx.mq_ok(&["submit", "4", "--head", "d"]);
     assert!(out.contains("recorded #4"), "{out}");
     wait_for("change 4 taken in", &started, |lines| {
-        lines.iter().any(|line| line == "a_c_d_t0_")
+        lines.iter().any(|line| line == "a_d_t0_")
     });
     assert!(!gates.join("a_t0_").exists());
-    // Change 1 lands, change 2 is decided red and ejected, and 3 and 4 land on change 1.
+    // Change 1 lands, change 2 is decided red and ejected, and 3 and 4 land.
     open(&gates, "a_t0_");
-    open(&gates, "a_c_t0_");
+    open(&gates, "a_d_t0_");
     open(&gates, "a_c_d_t0_");
     assert_eq!(daemon.exit_code(Duration::from_secs(90)), Some(0));
     assert_eq!(status(&fx, 1), "landed");
@@ -188,17 +186,17 @@ fn a_red_batch_behind_the_head_frees_the_slots_of_the_batches_built_on_it() {
         assert!(files.lines().any(|line| line == file), "{files}");
     }
     assert!(!files.lines().any(|line| line == "tests/b"), "{files}");
-    // The batch built on change 2 was cancelled, never validated to its end: its gate never
-    // opened, and nothing was validated on change 2's tree after it.
+    // Nothing was ever validated on change 2's tree but change 2 itself: with the
+    // disjoint root there is no stacked candidate on it to cancel.
     let lines = started_lines(&started);
     assert_eq!(
         lines.iter().filter(|line| line.contains('b')).count(),
-        2,
+        1,
         "{lines:?}"
     );
-    // Deciding change 2 later did not throw away what was built beneath it: changes 3 and 4
-    // were each validated once.
-    for set in ["a_c_t0_", "a_c_d_t0_"] {
+    // Deciding change 2 later did not throw away the root or the intake batch: each
+    // was validated once on the tree it landed from.
+    for set in ["c_t0_", "a_c_d_t0_"] {
         assert_eq!(
             lines.iter().filter(|line| *line == set).count(),
             1,
@@ -221,7 +219,7 @@ fn a_red_batch_behind_the_head_frees_the_slots_of_the_batches_built_on_it() {
                 && event["detail"]
                     .as_str()
                     .unwrap()
-                    .starts_with("#2 is red behind the head: cancelled #3")
+                    .starts_with("#2 is red behind the head: nothing was built on it")
         }),
         "{events}"
     );

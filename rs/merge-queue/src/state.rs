@@ -888,6 +888,11 @@ pub struct Config {
     /// wants decision history worth ordering by.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub value_ordering: bool,
+    /// Turn off the disjoint second root: with a window of at least 2, one slot validates
+    /// a batch built on the base itself, disjoint (no textual conflict, no dependency)
+    /// from every batch in flight, so one red stack cannot take the whole window down.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_disjoint_root: bool,
     /// Concurrent git probes while planning (base and pairwise conflict checks, each a git
     /// subprocess). 0 means [`DEFAULT_PROBE_PARALLELISM`]. Probe results are cached across
     /// runs in `probe-cache.json`, so this bounds only cache misses.
@@ -980,6 +985,7 @@ impl Default for Config {
             depth: DEFAULT_DEPTH,
             max_depth: 0,
             value_ordering: false,
+            disable_disjoint_root: false,
             probe_parallelism: 0,
             union_paths: Vec::new(),
             regenerate: RegenerateConfig::default(),
