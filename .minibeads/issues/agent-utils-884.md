@@ -39,6 +39,8 @@ Two follow-on defects lose or damage messages:
 - Test: a sender whose paste is never observed releases the pane lock within seconds, and the next waiter delivers.
 - Test: a waiter cancelled before typing is retried and delivered, not moved to failed.
 - Test: a "[Pasted text #N +k lines]" placeholder is recognised as our paste, both for observation and for the stale-composer clear, which submits it.
+- Item 4, first attempt (the lead, 2026-11-05 1:12 PM ET, P1): a FRESH delivery recognises the collapsed placeholder as its own paste on the first attempt, not only on a stranded retry. The evidence: the placeholder appeared just after our paste, and its `+k lines` matches the prompt's expected line count. Test: a fresh 19-line prompt drawn as "[Pasted text #N +18 lines]" is submitted on the first pass.
+- Item 4, Enter under uncertainty (the owner's rule): after the Enter, verify that the composer emptied or the prompt was accepted. If not, press a bare Enter again a bounded number of times (never retyping), and report possibly_submitted only after the bound. Test: a composer that keeps the placeholder after the first Enter gets a second Enter, and the outcome is delivered once it empties.
 - Landed alone; the SHA goes to the lead for an immediate deploy on the consumer host.
 
 # Notes
@@ -63,3 +65,5 @@ Tests:
 - `a_stranded_retry_reports_the_paste_lost_after_the_late_paste_window`.
 - `a_stranded_retry_submits_its_paste_drawn_as_a_placeholder_of_another_size`.
 - `stale_composer::tests::a_draft_agentctl_typed_is_submitted_not_cleared`.
+
+New evidence from the lead, 2026-11-05 at 1:12 PM ET: a consumer team's pane had 5 stranded "[Pasted text #NNNN +18 lines]" composers today (8:50, 8:55, 10:52, 12:45 and 13:07 ET). The 12:45 and 13:04 cases came from senders still on the old 300 s path (a pinned pre-a5bdddf0 agentctl, now being updated). The root problem remains: Claude Code collapses a long paste to a placeholder, so the composer match fails on the first attempt. The two item 4 acceptance criteria above were added for this.
