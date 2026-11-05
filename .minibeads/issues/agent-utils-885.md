@@ -34,6 +34,9 @@ P0. One orphaned `wrkslots create` blocks every later create in a consumer proje
    - **Deadlock:** a validate-batch seal combined with an unclassifiable create journal deadlocks `recover`, because `_validate_batch_seal_paired_finish` classifies all create journals first. When `--slot` names a create journal that overlaps no seal target, recover it before the seal.
    - **Hooks done:** after hooks have completed, the right recovery is forward (publish the row). Abort needs a verified clean worktree removal that includes initialized submodules.
 
+6. **Journal gone, history names it (2026-11-05, 06:53 AM ET).** A hand repair that moved the create journal aside made every recover refuse with "recovery journal … is missing while append-only history still names it" (rc 3). Provide a supported way to make such an interrupted create terminal, or at least a runbook in the userguide.
+7. **Landing order:** the minimal classification change (5, first bullet) lands first and alone, with a tight gate. The deadlock, forward/abort and missing-journal items follow as separate landings.
+
 # Acceptance Criteria
 
 - Test: SIGTERM a create's parent mid-create, leaving an owner-less create journal; then a create of an unrelated slot succeeds.
@@ -43,4 +46,4 @@ P0. One orphaned `wrkslots create` blocks every later create in a consumer proje
 
 # Notes
 
-Reported by the lead on 2026-11-05 at 06:41 AM ET (P0). Today's unblock was done by an approved hand repair, so this is P0 for recurrence. Assigned to mu-salvage, which pauses #881 for it.
+Reported by the lead on 2026-11-05 at 06:41 AM ET (P0). The hand repair failed, and the consumer's merge queue has been stopped since 06:41 ET: urgent again. Assigned to mu-salvage, which pauses #881 for it.
