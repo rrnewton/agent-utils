@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-local-shard-default: audit, classify-create-journals and clean-caches read other machines'' shards only under --all-machines'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-validate
 depends_on:
   agent-utils-876: blocks
 created_at: 2026-11-05T08:36:45.091501022+00:00
-updated_at: 2026-11-05T09:21:58.524416380+00:00
+updated_at: 2026-11-05T11:38:44.890559824+00:00
+closed_at: 2026-11-05T11:38:44.890559714+00:00
 ---
 
 # Description

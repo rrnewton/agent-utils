@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-foreign-shard-write: a mutation never appends to another machine''s event log'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-validate
 created_at: 2026-11-05T09:21:58.468320581+00:00
-updated_at: 2026-11-05T09:21:58.468320581+00:00
+updated_at: 2026-11-05T11:38:44.885509914+00:00
+closed_at: 2026-11-05T11:38:44.885509773+00:00
 ---
 
 # Description
