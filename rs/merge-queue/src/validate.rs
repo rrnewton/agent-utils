@@ -53,6 +53,14 @@ pub const INFRA_BLOCKED_MARKER: &str = "INFRA-BLOCKED";
 /// Exit status that goes with [`INFRA_BLOCKED_MARKER`].
 pub const INFRA_BLOCKED_EXIT: i32 = 6;
 
+/// The verdict of a hold while a change's suspect tests run again beside the run (see
+/// [`Ran::suspect_only`] and [`crate::suspect`]).
+pub const SUSPECT_FLAKE_MARKER: &str = "SUSPECT-FLAKE";
+
+/// Result-row shapes (`shape`) that make a failure suspect: a timeout, or a run that reached no
+/// verdict. Neither is an assertion the change failed.
+const SUSPECT_SHAPES: [&str; 2] = ["timeout", "no-verdict"];
+
 /// Marker line a validator prints on a red run to name the failed steps that are deterministic
 /// checks (`RERUN-EXEMPT: step1,step2`): their answer depends only on the tree, so a rerun of the
 /// same commit cannot change it. When every failure of the run is in a named step, the queue
@@ -194,6 +202,9 @@ pub struct Ran {
     /// validator's `INFRA-BLOCKED:` marker, exit 6). A run with any of these is neither green
     /// nor red: its change is held for a ruling.
     pub infra_blocked: Vec<TestId>,
+    /// Failed tests whose result row says the failure was a timeout or reached no verdict
+    /// (`shape`), not an assertion. See [`Ran::suspect_only`].
+    pub suspect: Vec<TestId>,
     /// Steps the validator names as deterministic checks on this red run (its `RERUN-EXEMPT:`
     /// marker): a rerun of the same commit cannot change their answer. See
     /// [`Ran::deterministic_red`].
@@ -266,6 +277,18 @@ impl Ran {
             && failed
                 .iter()
                 .all(|test| self.rerun_exempt.iter().any(|step| step.step == test.step))
+    }
+
+    /// The failed tests, when this red run attributed its failures and every one is suspect (a
+    /// timeout or no verdict, as the validator shaped it): what a suspect-flake rerun confirms
+    /// before the change is blamed. `None` for any other run.
+    pub fn suspect_only(&self) -> Option<BTreeSet<TestId>> {
+        if self.cancelled || self.refused || self.results.unattributed {
+            return None;
+        }
+        let failed = self.failed();
+        (!failed.is_empty() && failed.iter().all(|test| self.suspect.contains(test)))
+            .then_some(failed)
     }
 
     /// Failed tests. A red run with no attributed failure reports none;
@@ -659,11 +682,12 @@ fn run_logged(
 /// A shell-template runner with a JSON-lines results contract.
 pub struct CommandValidator(pub ValidatorConfig);
 
-/// One `$MQ_RESULTS` line: `(id, outcome, duration_ms, log)`.
+/// One `$MQ_RESULTS` line: `(id, outcome, duration_ms, log, shape)`.
 ///
 /// Contract: `id` is `step` or `step::case` with no whitespace or `#` in
-/// either part (see [`TestId::parse`]); `duration_ms` and `log` are
-/// optional, and a missing duration means unavailable, not zero.
+/// either part (see [`TestId::parse`]); `duration_ms`, `log` and `shape` are
+/// optional, and a missing duration means unavailable, not zero. `shape` says how a
+/// failed test failed when it was not an assertion: `timeout` or `no-verdict`.
 #[derive(Deserialize)]
 struct ResultLine {
     id: String,
@@ -672,6 +696,8 @@ struct ResultLine {
     duration_ms: Option<u64>,
     #[serde(default)]
     log: Option<String>,
+    #[serde(default)]
+    shape: Option<String>,
 }
 
 impl Validator for CommandValidator {
@@ -737,6 +763,7 @@ impl Validator for CommandValidator {
         let argv = vec!["sh".to_owned(), "-c".to_owned(), self.0.run.clone()];
         let finished = run_logged(&self.0, &argv, checkout, &env, &log, cancel)?;
         let mut results = TestResults::default();
+        let mut suspect: BTreeSet<TestId> = BTreeSet::new();
         if let Ok(text) = std::fs::read_to_string(&results_path) {
             for line in text.lines().filter(|line| !line.trim().is_empty()) {
                 let parsed: ResultLine = serde_json::from_str(line).map_err(|error| {
@@ -749,8 +776,17 @@ impl Validator for CommandValidator {
                         results_path.display()
                     )
                 })?;
+                let id = TestId::parse(&parsed.id)?;
+                if outcome == Outcome::Fail
+                    && parsed
+                        .shape
+                        .as_deref()
+                        .is_some_and(|shape| SUSPECT_SHAPES.contains(&shape))
+                {
+                    suspect.insert(id.clone());
+                }
                 results.record(TestResult {
-                    id: TestId::parse(&parsed.id)?,
+                    id,
                     outcome,
                     duration_ms: parsed.duration_ms,
                     log: parsed.log,
@@ -825,6 +861,11 @@ impl Validator for CommandValidator {
                 Vec::new()
             } else {
                 rerun_exempt(exit, &log_text)
+            },
+            suspect: if refused {
+                Vec::new()
+            } else {
+                suspect.into_iter().collect()
             },
             cannot_execute,
             effective_selection: None,
@@ -1016,6 +1057,7 @@ impl Validator for DagrunValidator {
                     flaky_passes: Vec::new(),
                     infra_blocked: Vec::new(),
                     rerun_exempt: Vec::new(),
+                    suspect: Vec::new(),
                     cannot_execute: None,
                     effective_selection: Some(Selection::default()),
                     cpu: None,
@@ -1082,6 +1124,7 @@ impl Validator for DagrunValidator {
             } else {
                 rerun_exempt(exit, &log_text)
             },
+            suspect: Vec::new(),
             cannot_execute,
             effective_selection: whole_steps,
             cpu: finished.cpu,
@@ -1511,6 +1554,7 @@ dagrun: PASS - 1 passed";
             flaky_passes: Vec::new(),
             infra_blocked: Vec::new(),
             rerun_exempt: exempt.iter().map(|step| TestId::step(*step)).collect(),
+            suspect: Vec::new(),
             cannot_execute: None,
             effective_selection: None,
             cpu: None,
@@ -1574,6 +1618,7 @@ dagrun: PASS - 1 passed";
                 flaky_passes: Vec::new(),
                 infra_blocked: Vec::new(),
                 rerun_exempt: Vec::new(),
+                suspect: Vec::new(),
                 cannot_execute: None,
                 effective_selection: None,
                 cpu: None,

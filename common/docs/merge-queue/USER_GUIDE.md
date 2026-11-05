@@ -142,6 +142,8 @@ This command creates the state directory and writes `config.json`.
 | `--red-without-probe MODE` | `eject` | What a red validation that names failed tests does when its follow-up probe cannot run: `eject` the change (the red run is the verdict) or `hold` it for its owner. |
 | `--fail-fast` | off | Ask the runner to stop each candidate validation at its first red step: `$MQ_FAIL_FAST` is `1` for every validation except the complete run on the base (see "Fail-fast runs"). |
 | `--confirm-reruns` | off | Confirm a red before blaming a change: search a red batch's prefixes, and rerun a failure at the same commit (`$MQ_RERUN_FROM`), so that a failure is blamed only when seen twice. Off, the first red is the verdict: a red change on its own is ejected on that sighting, and each change of a red batch goes back as a batch of its own (see "Keeping the base green"). |
+| `--suspect-flake-reruns` | off | With confirmation off, hold a single change whose red run failed only on suspect tests (timeouts, or runs that reached no verdict, as the runner shapes its results) instead of ejecting it, run those tests again at its commit beside the run, and re-queue it if they pass or eject it, seen twice, if they fail again. Once per head. See "Suspect flakes". |
+| `--suspect-flake-timeout-secs SECS` | `0` (1800) | Wall limit of one suspect-flake rerun. |
 | `--split-red-batches` | off | With `--confirm-reruns`, still send each change of a red batch of several changes back as a batch of its own instead of searching the batch's prefixes (a search holds the run for its whole length). Each red single-change batch is then confirmed by one rerun of its failed tests at the same commit before its change is ejected. No effect without `--confirm-reruns`. |
 | `--offload MODE` | `off` | Where validations run: `off` (in this process, as always), `compare` (in this process, which decides, and also on donors, whose receipts are only compared) or `decide` (on donors only; an accepted receipt is the verdict). See "Donor validators". |
 | `--tool-identity NAME=COMMAND` | none | A tool the validation depends on (repeatable): the command prints its identity, for example a tool repository's commit or a toolchain version, never a hash of a binary (builds are not byte-identical across hosts). A donor whose answer differs does not run the job (see "Tool identity and receipts"). merge-queue's own revision is always compared. |
@@ -808,6 +810,9 @@ on which files two changes share.
   scratch/precheck.log   the output of the last precheck
   scratch/precheck-background/     the background worker's own reused worktree
   scratch/precheck-background.log  the output of its last check
+  scratch/suspect/       the suspect-flake worker's own reused worktree
+  suspect/<pr>.json      the verdict of a change's suspect-flake rerun, until a run acts on it
+  suspect/<pr>-<commit>/ that rerun's log and results
   precheck/verdicts/<head>-<digest>.json  one precheck verdict per head and command (kept 14 days)
   intake/pending/<id>.json   one request recorded while a run held the writer lock, until applied
   intake/refused/<id>.json   one recorded request that could not be applied, with the reason (kept a week)
@@ -914,6 +919,10 @@ An **item record** (`items/<pr>.json`) has these fields:
   single-change batches instead of searching it, so confirmation costs only a rerun of a single
   change's failed tests at its own commit. Absent (the default) means off. A binary older than
   this field refuses a config that has it.
+- `suspect_flake_reruns`: `true`, with `confirm_reruns` off, holds a single change whose red run
+  failed only on suspect tests and reruns them beside the run (see "Suspect flakes"). Absent (the
+  default) means off. A binary older than this field refuses a config that has it.
+- `suspect_flake_timeout_secs`: wall limit of one suspect-flake rerun (absent or `0`: `1800`).
 
 **`donors`** fields (only read when `validator.offload` is not off; absent means the defaults):
 
@@ -1460,6 +1469,31 @@ under `precheck/verdicts/` like the others.
   log says so (`precheck-culprit`).
 - A background check that could not run is tried again after 30 minutes. The worker kills its
   check when the process stops or exits.
+
+### Suspect flakes
+
+With same-commit confirmation off, the first red is the verdict, and a test that only timed out
+under load costs its change an ejection and a resubmission. `validator.suspect_flake_reruns`
+gives such a red one more look, without holding the run for it.
+
+- A runner may say how a failed test failed, with `"shape"` on its result row: `timeout` (it ran
+  out of time: a wall or CPU limit, an exit 124) or `no-verdict` (the run reached no verdict).
+  A failure without a shape is an assertion.
+- When a single-change batch is red, the run attributed its failures, and every failed test has
+  one of those shapes, the change is held (`SUSPECT-FLAKE`) instead of ejected: the batches built
+  on it are rebuilt without it, and the run goes on. The window is not halved.
+- A worker thread in the process that runs the queue validates just those tests again at the red
+  run's exact commit, in a checkout of its own (`scratch/suspect/`), as a plain validation
+  (`$MQ_SELECTION=tests`), never a rerun composed from the red run, under
+  `validator.suspect_flake_timeout_secs`. One rerun at a time.
+- The run acts on the verdict at its next batch boundary: if the tests pass, the change goes back
+  into the plan, its history recording them as GREEN_FLAKY; if they fail again, the change is
+  ejected, seen twice; if the rerun could not run, the change goes back into the plan and its next
+  validation decides. A one-shot `run` waits for its reruns before it ends.
+- Once per head (`suspect_reruns` on the item): a second suspect red of the same head is blamed as
+  any red is. A hold whose rerun never reports (its process stopped) expires 15 minutes past the
+  rerun's limit and re-queues the change; a run that starts hands the reruns of changes still held
+  to its own worker again.
 
 ## The decision log
 

@@ -31,6 +31,7 @@ pub mod recount;
 pub mod run;
 pub mod serve;
 pub mod state;
+pub mod suspect;
 pub mod sync;
 pub mod tests;
 pub mod validate;

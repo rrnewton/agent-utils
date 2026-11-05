@@ -451,7 +451,7 @@ fn work(queue: &mpsc::Receiver<Job>, asked: &Asked) {
 }
 
 /// Check out `head` in `checkout`, reusing the worktree there.
-fn prepare(git: &Git, checkout: &Path, head: &str) -> Result<(), String> {
+pub(crate) fn prepare(git: &Git, checkout: &Path, head: &str) -> Result<(), String> {
     if checkout.join(".git").exists() {
         let worktree = Git::new(checkout);
         if worktree

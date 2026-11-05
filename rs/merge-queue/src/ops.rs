@@ -272,6 +272,11 @@ fn submit_resolved(
         requires: submission.requires,
         source: submission.source,
         close_pending: false,
+        suspect_reruns: if same_head {
+            existing.as_ref().map_or(0, |old| old.suspect_reruns)
+        } else {
+            0
+        },
         validation_refusals: if same_head {
             existing.as_ref().map_or(0, |old| old.validation_refusals)
         } else {
@@ -484,6 +489,15 @@ pub fn held_batch(state: &State, prs: &[i64]) -> Result<(Vec<Item>, HeldCandidat
         }
         if item.flaky_hold_until.is_empty() {
             return Err(format!("#{pr} is not held for a ruling"));
+        }
+        if item.hold_verdict == crate::validate::SUSPECT_FLAKE_MARKER {
+            return Err(format!(
+                "#{pr} is held {} while {} run again beside the queue, not {}: there is no pass \
+                 to accept; it goes back to the queue if they pass",
+                item.hold_verdict,
+                item.flaky_nodes.join(", "),
+                crate::validate::FLAKY_MARKER
+            ));
         }
         if !item.hold_verdict.is_empty() {
             return Err(format!(

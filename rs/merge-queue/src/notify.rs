@@ -692,6 +692,7 @@ mod unit {
             source: String::new(),
             close_pending: false,
             validation_refusals: 0,
+            suspect_reruns: 0,
             next_retry_at: String::new(),
             last_refusal: String::new(),
             flaky_nodes: Vec::new(),

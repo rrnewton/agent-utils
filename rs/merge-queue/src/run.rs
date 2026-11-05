@@ -91,11 +91,16 @@ pub struct RunOptions {
     /// How often a run with a batch in flight looks for requests recorded while it holds the
     /// queue ([`INTAKE_POLL`] when unset).
     pub intake_poll: Option<Duration>,
-    /// Wait at the end of the run until the pull requests it landed are closed (see
-    /// [`Closer`]): a one-shot run, whose process ends with it. Under `serve` the closer goes on
-    /// beside the next run, which records what it closed.
-    pub wait_for_closes: bool,
+    /// Wait at the end of the run for the work it left beside it: the pull requests it landed
+    /// to close (see [`Closer`]) and the suspect-flake reruns it asked for
+    /// ([`crate::suspect`]). A one-shot run, whose process ends with it. Under `serve` that
+    /// work goes on beside the next run, which acts on its results.
+    pub wait_for_background: bool,
 }
+
+/// How long a suspect-flake hold outlasts its rerun's wall limit before it expires and
+/// re-queues the change (the rerun's checkout and admission come first).
+const SUSPECT_HOLD_MARGIN: Duration = Duration::from_secs(15 * 60);
 
 /// How often a run with a batch in flight looks for recorded requests, unless
 /// [`RunOptions::intake_poll`] says otherwise.
@@ -1263,16 +1268,18 @@ impl<'a> Runner<'a> {
             if let Some(item) = items.get_mut(pr) {
                 let nodes = item.flaky_nodes.join(", ");
                 let label = item.hold_label().to_owned();
-                let kind = if item.hold_verdict.is_empty() {
-                    "green-flaky-hold-expired"
+                let (kind, without) = if item.hold_verdict.is_empty() {
+                    ("green-flaky-hold-expired", "a ruling")
+                } else if item.hold_verdict == crate::validate::SUSPECT_FLAKE_MARKER {
+                    ("suspect-flake-hold-expired", "the rerun's verdict")
                 } else {
-                    "infra-blocked-hold-expired"
+                    ("infra-blocked-hold-expired", "a ruling")
                 };
                 item.clear_hold();
                 item.log(
                     kind,
                     format!(
-                        "{label} hold expired without a ruling ({nodes}); re-queued for validation"
+                        "{label} hold expired without {without} ({nodes}); re-queued for validation"
                     ),
                 );
                 self.state.save_item(item)?;
@@ -3167,6 +3174,7 @@ impl<'a> Runner<'a> {
             flaky_passes: Vec::new(),
             infra_blocked: Vec::new(),
             rerun_exempt: Vec::new(),
+            suspect: Vec::new(),
             cannot_execute: None,
             effective_selection: None,
             cpu: None,
@@ -3271,6 +3279,12 @@ impl<'a> Runner<'a> {
                 &format!("could not release expired GREEN_FLAKY holds: {error}"),
             );
         }
+        if let Err(error) = self.resume_suspects() {
+            self.event(
+                "suspect-flake",
+                &format!("held reruns not resumed: {error}"),
+            );
+        }
         if self.options.with_peers {
             if let Err(error) = self.run_peers() {
                 self.event("peers", &format!("could not drain peers: {error}"));
@@ -3330,10 +3344,21 @@ impl<'a> Runner<'a> {
 
     fn finish(&self, stop: String) -> Result<RunReport, String> {
         self.prune_donor_jobs(true);
-        if self.options.wait_for_closes && self.hosting.is_some() {
-            wait_for_closes();
+        if self.options.wait_for_background {
+            if self.hosting.is_some() {
+                wait_for_closes();
+            }
+            crate::suspect::wait(
+                self.config.validator.suspect_flake_timeout() + SUSPECT_HOLD_MARGIN,
+            );
         }
         self.record_closes();
+        if let Err(error) = self.settle_suspects() {
+            self.event(
+                "suspect-flake",
+                &format!("rerun verdicts not read: {error}"),
+            );
+        }
         let report = {
             let mut report = lock(&self.report).clone();
             report.stopped = stop;
@@ -3502,6 +3527,201 @@ impl<'a> Runner<'a> {
         self.writer.is_some() && !self.simulating() && self.started.elapsed() < INTAKE_FOR
     }
 
+    /// The tests to run again beside the run when `candidate`'s red run `ran` is a suspect flake
+    /// ([`crate::suspect`]): a single change, red only on suspect tests, with
+    /// `validator.suspect_flake_reruns` on and `confirm_reruns` off, and no suspect-flake rerun
+    /// of its head yet.
+    fn suspect_flake(&self, candidate: &Candidate, ran: &Ran) -> Option<BTreeSet<TestId>> {
+        let validator = &self.config.validator;
+        if !validator.suspect_flake_reruns
+            || validator.confirm_reruns
+            || self.simulating()
+            || candidate.prs.len() != 1
+        {
+            return None;
+        }
+        let first = lock(&self.items)
+            .get(&candidate.prs[0])
+            .is_some_and(|item| item.suspect_reruns == 0);
+        first.then(|| ran.suspect_only()).flatten()
+    }
+
+    /// Hold `candidate`'s change, validated as `vid` with `chosen`, while its suspect `tests` run
+    /// again at its commit beside the run ([`crate::suspect`]). It sits out this run until the
+    /// rerun's verdict comes ([`Self::settle_suspects`]); past the rerun's limit with no verdict,
+    /// the hold expires and re-queues it like any expired hold.
+    fn hold_suspect(
+        &self,
+        candidate: &Candidate,
+        chosen: &Chosen,
+        vid: usize,
+        tests: &BTreeSet<TestId>,
+    ) -> Result<(), String> {
+        let pr = candidate.prs[0];
+        let nodes: Vec<String> = tests.iter().map(ToString::to_string).collect();
+        let until =
+            retry_after_time(self.config.validator.suspect_flake_timeout() + SUSPECT_HOLD_MARGIN);
+        let claim = ValidationClaim::new(
+            chosen.selection.clone(),
+            chosen.policy.clone(),
+            candidate.tip.clone(),
+        );
+        let held = self.held_candidate(candidate, &claim, vid);
+        lock(&self.excluded).insert(pr);
+        {
+            let mut items = lock(&self.items);
+            if let Some(item) = items.get_mut(&pr) {
+                item.flaky_nodes = nodes.clone();
+                item.flaky_hold_until = until.clone();
+                item.hold_verdict = crate::validate::SUSPECT_FLAKE_MARKER.to_owned();
+                item.held_candidate = Some(held);
+                item.accepted = None;
+                item.suspect_reruns = item.suspect_reruns.saturating_add(1);
+                item.deciding_report = self.run_dir.join("report.md").display().to_string();
+                item.deciding_failed.clear();
+                item.log(
+                    "held-suspect-flake",
+                    format!(
+                        "{}: {} timed out or reached no verdict, seen once; rerunning them at {} \
+                         beside the run, held until {until}",
+                        crate::validate::SUSPECT_FLAKE_MARKER,
+                        nodes.join(", "),
+                        short(&candidate.tip)
+                    ),
+                );
+                self.state.save_item(item)?;
+            }
+        }
+        let tests: Vec<TestId> = tests.iter().cloned().collect();
+        crate::suspect::ask(&self.state.root, &self.config, pr, &candidate.tip, &tests);
+        self.event(
+            "suspect-flake",
+            &format!(
+                "#{pr} red only on suspect tests ({}), seen once: held, rerunning them at {} \
+                 beside the run",
+                nodes.join(", "),
+                short(&candidate.tip)
+            ),
+        );
+        Ok(())
+    }
+
+    /// Act on the suspect-flake reruns that have ended ([`crate::suspect`]): a pass re-queues the
+    /// change, with the tests that passed on the rerun recorded as GREEN_FLAKY in its history; a
+    /// failure ejects it, seen twice; a rerun that could not run re-queues it, so that its next
+    /// validation decides. Returns the changes re-queued, which this run may plan again.
+    fn settle_suspects(&self) -> Result<Vec<i64>, String> {
+        if self.simulating() {
+            return Ok(Vec::new());
+        }
+        let held: Vec<(i64, String)> = lock(&self.items)
+            .values()
+            .filter(|item| {
+                item.status == ItemStatus::Queued
+                    && item.hold_verdict == crate::validate::SUSPECT_FLAKE_MARKER
+            })
+            .filter_map(|item| Some((item.pr, item.held_candidate.as_ref()?.tip.clone())))
+            .collect();
+        let mut requeued = Vec::new();
+        for (pr, commit) in held {
+            let Some(verdict) = crate::suspect::kept(&self.state.root, pr, &commit) else {
+                continue;
+            };
+            if verdict.outcome == crate::suspect::FAIL {
+                let failed: Vec<TestId> = verdict
+                    .failed
+                    .iter()
+                    .filter_map(|test| TestId::parse(test).ok())
+                    .collect();
+                if let Some(item) = lock(&self.items).get_mut(&pr) {
+                    item.clear_hold();
+                }
+                self.eject(
+                    pr,
+                    "failed-tests",
+                    &format!(
+                        "{} fail with #{pr} at {} and failed again on a rerun of that commit \
+                         beside the run (seen twice; {}; log {})",
+                        ids(&failed),
+                        short(&commit),
+                        verdict.detail,
+                        verdict.log
+                    ),
+                    &failed,
+                )?;
+            } else {
+                let passed = verdict.outcome == crate::suspect::PASS;
+                let note = {
+                    let mut items = lock(&self.items);
+                    let Some(item) = items.get_mut(&pr) else {
+                        continue;
+                    };
+                    let nodes = item.flaky_nodes.join(", ");
+                    item.clear_hold();
+                    let note = if passed {
+                        format!(
+                            "{}: {nodes} passed on a rerun of {} beside the run after failing \
+                             once; re-queued",
+                            crate::validate::FLAKY_MARKER,
+                            short(&commit)
+                        )
+                    } else {
+                        format!(
+                            "the rerun of {nodes} at {} could not run ({}); re-queued, and its \
+                             next validation decides",
+                            short(&commit),
+                            verdict.detail
+                        )
+                    };
+                    item.log(
+                        if passed {
+                            "suspect-flake-passed"
+                        } else {
+                            "suspect-flake-could-not-run"
+                        },
+                        note.clone(),
+                    );
+                    self.state.save_item(item)?;
+                    note
+                };
+                lock(&self.excluded).remove(&pr);
+                requeued.push(pr);
+                self.event("suspect-flake", &format!("#{pr}: {note}"));
+            }
+            crate::suspect::forget(&self.state.root, pr);
+        }
+        Ok(requeued)
+    }
+
+    /// At the start of a run: act on reruns that ended while no run held the queue, and hand
+    /// those of the changes still held to this process's worker again (one that ran in a process
+    /// that stopped ended with it).
+    fn resume_suspects(&self) -> Result<(), String> {
+        self.settle_suspects()?;
+        if self.simulating() {
+            return Ok(());
+        }
+        let held: Vec<(i64, String, Vec<TestId>)> = lock(&self.items)
+            .values()
+            .filter(|item| {
+                item.status == ItemStatus::Queued
+                    && item.hold_verdict == crate::validate::SUSPECT_FLAKE_MARKER
+            })
+            .filter_map(|item| {
+                let tests = item
+                    .flaky_nodes
+                    .iter()
+                    .filter_map(|test| TestId::parse(test).ok())
+                    .collect();
+                Some((item.pr, item.held_candidate.as_ref()?.tip.clone(), tests))
+            })
+            .collect();
+        for (pr, commit, tests) in held {
+            crate::suspect::ask(&self.state.root, &self.config, pr, &commit, &tests);
+        }
+        Ok(())
+    }
+
     /// Record on their items the closes the closer made (see [`Closer`]), under the writer lock,
     /// and take the recorded items into the run.
     fn record_closes(&self) {
@@ -3546,6 +3766,20 @@ impl<'a> Runner<'a> {
             return Ok(());
         };
         self.record_closes();
+        // A change a suspect-flake rerun cleared goes back into this run's plan.
+        let released = self.settle_suspects().unwrap_or_else(|error| {
+            self.event(
+                "suspect-flake",
+                &format!("rerun verdicts not read: {error}"),
+            );
+            Vec::new()
+        });
+        let busy: BTreeSet<i64> = busy
+            .iter()
+            .copied()
+            .filter(|pr| !released.contains(pr))
+            .collect();
+        let busy = &busy;
         let applied = match crate::intake::apply_except(self.state, &self.config, writer, busy) {
             Ok(applied) => applied,
             Err(error) => {
@@ -3553,7 +3787,7 @@ impl<'a> Runner<'a> {
                 return Ok(());
             }
         };
-        if applied.is_empty() {
+        if applied.is_empty() && released.is_empty() {
             return Ok(());
         }
         for one in &applied {
@@ -4160,6 +4394,16 @@ impl<'a> Runner<'a> {
                                 discard(&mut flights, &rx, pending);
                             }
                             self.split_red(&head.candidate, &ran, vid, pending);
+                            BatchOutcome::Done
+                        } else if let Some(tests) = self.suspect_flake(&head.candidate, &ran) {
+                            // A single change red only on suspect tests (timeouts, or runs with
+                            // no verdict), seen once: held, and those tests run again at its
+                            // commit beside the run, which goes on. The window is not halved:
+                            // nothing is known against the changes behind it.
+                            if head.stacked {
+                                discard(&mut flights, &rx, pending);
+                            }
+                            self.hold_suspect(&head.candidate, &head.chosen, vid, &tests)?;
                             BatchOutcome::Done
                         } else {
                             // Everything behind a red batch was built on its tree, unless it
@@ -5497,6 +5741,8 @@ fn receipt_ran(receipt: &crate::donor::Receipt, dir: &std::path::Path) -> Result
         } else {
             crate::validate::rerun_exempt(receipt.exit, &receipt.log_tail)
         },
+        // A receipt carries no result shapes: a donor's red is never a suspect flake.
+        suspect: Vec::new(),
         cannot_execute: None,
         effective_selection: receipt.effective_selection.clone(),
         cpu: receipt.cpu_ms.map(Duration::from_millis),

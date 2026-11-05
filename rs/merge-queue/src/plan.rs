@@ -526,6 +526,26 @@ pub fn make_plan(
             );
             continue;
         }
+        if item.is_flaky_held_at(&at) && item.hold_verdict == crate::validate::SUSPECT_FLAKE_MARKER
+        {
+            hold(
+                &mut held,
+                Held {
+                    pr: item.pr,
+                    kind: item.hold_kind().into(),
+                    reason: format!(
+                        "{}: {} timed out or reached no verdict once; they run again beside the \
+                         run, and it goes back to the queue if they pass (held until {})",
+                        item.hold_label(),
+                        item.flaky_nodes.join(", "),
+                        item.flaky_hold_until,
+                    ),
+                    with: vec![],
+                    paths: vec![],
+                },
+            );
+            continue;
+        }
         if item.is_flaky_held_at(&at) {
             let why = if item.hold_verdict == crate::validate::INFRA_BLOCKED_MARKER {
                 "the host refused every measurement of them on a run and on its rerun"
@@ -970,6 +990,7 @@ mod unit {
             source: String::new(),
             close_pending: false,
             validation_refusals: 0,
+            suspect_reruns: 0,
             next_retry_at: String::new(),
             last_refusal: String::new(),
             flaky_nodes: Vec::new(),

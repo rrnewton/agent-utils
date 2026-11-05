@@ -143,6 +143,10 @@ pub struct Item {
     /// change stays `queued` across refusals; this count drives the backoff.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub validation_refusals: u32,
+    /// Suspect-flake reruns of this head (`validator.suspect_flake_reruns`): at most one, so a
+    /// second suspect red is blamed as any red is. Left out of the record while zero.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub suspect_reruns: u32,
     /// RFC 3339 UTC time before which validation should not be retried after a refusal
     /// (empty when not deferred).
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -265,6 +269,8 @@ impl Item {
     pub fn hold_kind(&self) -> &'static str {
         if self.hold_verdict == crate::validate::INFRA_BLOCKED_MARKER {
             "held-infra-blocked"
+        } else if self.hold_verdict == crate::validate::SUSPECT_FLAKE_MARKER {
+            "held-suspect-flake"
         } else {
             "held-green-flaky"
         }

@@ -136,7 +136,21 @@ pub struct ValidatorConfig {
     /// Nothing changes with `confirm_reruns` off, which always splits.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub split_red_batches: bool,
+    /// With `confirm_reruns` off, a single change whose red run failed only on suspect tests
+    /// (timeouts, or runs that reached no verdict, as the validator shapes its result rows) is
+    /// held instead of ejected, and those tests run again at the same commit beside the run
+    /// ([`crate::suspect`]): it goes back to the queue if they pass and is ejected if they fail
+    /// again. Once per head. Off by default.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub suspect_flake_reruns: bool,
+    /// Wall limit in seconds of one suspect-flake rerun; 0 means
+    /// [`DEFAULT_SUSPECT_FLAKE_TIMEOUT_SECS`].
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub suspect_flake_timeout_secs: u64,
 }
+
+/// Default wall limit of a suspect-flake rerun.
+pub const DEFAULT_SUSPECT_FLAKE_TIMEOUT_SECS: u64 = 1800;
 
 fn is_zero_u32(value: &u32) -> bool {
     *value == 0
@@ -417,6 +431,15 @@ impl ValidatorConfig {
     /// Resolved base backoff in seconds (stored verbatim; 0 = no delay).
     pub fn refusal_backoff(&self) -> u64 {
         self.refusal_backoff_secs
+    }
+
+    /// Resolved wall limit of a suspect-flake rerun.
+    pub fn suspect_flake_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(if self.suspect_flake_timeout_secs == 0 {
+            DEFAULT_SUSPECT_FLAKE_TIMEOUT_SECS
+        } else {
+            self.suspect_flake_timeout_secs
+        })
     }
 
     /// Resolved deferral bound.

@@ -609,6 +609,15 @@ enum Command {
         /// one same-commit rerun of its failed tests before its change is ejected.
         #[arg(long)]
         split_red_batches: bool,
+        /// With confirmation off, hold a single change whose red run failed only on timeouts or
+        /// runs with no verdict (as the validator shapes its results), run those tests again at
+        /// its commit beside the run, and re-queue it if they pass or eject it if they fail
+        /// again; once per head.
+        #[arg(long)]
+        suspect_flake_reruns: bool,
+        /// Wall limit in seconds of a suspect-flake rerun (0: 1800).
+        #[arg(long, default_value_t = 0)]
+        suspect_flake_timeout_secs: u64,
         /// Where validations run: `off` (in this process; the default), `compare` (in this
         /// process, which decides, and also on donors, whose receipts are only compared), or
         /// `decide` (on donors only; an accepted receipt is the verdict).
@@ -1095,6 +1104,7 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> i32 {
     };
     // A background precheck still running would outlive the process in its own process group.
     crate::precheck::stop_background();
+    crate::suspect::stop();
     code
 }
 
@@ -1302,6 +1312,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             fail_fast,
             confirm_reruns,
             split_red_batches,
+            suspect_flake_reruns,
+            suspect_flake_timeout_secs,
             offload,
             tool_identity,
             tool_refresh,
@@ -1441,6 +1453,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     fail_fast,
                     confirm_reruns,
                     split_red_batches,
+                    suspect_flake_reruns,
+                    suspect_flake_timeout_secs,
                     offload: if offload == "off" {
                         String::new()
                     } else {
@@ -1972,8 +1986,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     // A one-shot run reports its own progress; no heartbeat shows a window.
                     window: None,
                     intake_poll: None,
-                    // Its process ends with it: it waits for the pull requests it landed to close.
-                    wait_for_closes: true,
+                    // Its process ends with it: it waits for the work it left beside it.
+                    wait_for_background: true,
                 },
             )?;
             let report = runner.holding(&lock).run()?;
