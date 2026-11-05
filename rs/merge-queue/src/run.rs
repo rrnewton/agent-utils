@@ -107,6 +107,38 @@ const SUSPECT_HOLD_MARGIN: Duration = Duration::from_secs(15 * 60);
 /// [`RunOptions::intake_poll`] says otherwise.
 pub const INTAKE_POLL: Duration = Duration::from_secs(15);
 
+/// Wait at most `poll` for one validation result. A timeout is `Ok(None)`
+/// (the caller falls through to deciding stored heads), but a stop request
+/// that arrived while waiting is an error on the timeout branch too, so a
+/// SIGTERM with no result pending stops the run at the next poll instead
+/// of being ignored until a result arrives.
+fn wait_for_result<T>(rx: &mpsc::Receiver<T>, poll: Duration) -> Result<Option<T>, String> {
+    wait_for_result_stoppable(rx, poll, crate::interrupt::requested)
+}
+
+/// [`wait_for_result`] with its stop predicate given, so tests can drive
+/// the timeout branch without raising a process-wide signal flag.
+fn wait_for_result_stoppable<T>(
+    rx: &mpsc::Receiver<T>,
+    poll: Duration,
+    stop_requested: impl Fn() -> bool,
+) -> Result<Option<T>, String> {
+    match rx.recv_timeout(poll) {
+        Ok(message) => Ok(Some(message)),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            if stop_requested() {
+                // The same wording `interrupt::check` gives the flag.
+                return Err(
+                    "interrupted by a stop request before waiting for a                      validation result; no verdict, the changes stay queued"
+                        .to_owned(),
+                );
+            }
+            Ok(None)
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err("validation channel closed".to_owned()),
+    }
+}
+
 /// How long a run keeps taking in recorded requests. After that it finishes the batches in
 /// flight and ends, so the next run reloads the configuration and the validator's tools.
 pub const INTAKE_FOR: Duration = Duration::from_secs(2 * 3600);
@@ -5032,14 +5064,12 @@ impl<'a> Runner<'a> {
                     }
                     // A timeout still falls through to deciding stored heads: a
                     // decision deferred (a rotated disjoint root, say) may need no
-                    // new message to become decidable.
-                    let arrived = match rx.recv_timeout(poll) {
-                        Ok(message) => Some(message),
-                        Err(mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            return Err("validation channel closed".to_owned());
-                        }
-                    };
+                    // new message to become decidable. But a stop request is
+                    // checked on the timeout branch too: with no result
+                    // pending, SIGTERM must stop the run promptly instead of
+                    // waiting for a result that may never arrive (the run
+                    // then stops gracefully, changes still queued).
+                    let arrived = wait_for_result(&rx, poll)?;
                     let arrived_id = arrived.as_ref().map(|(id, _)| *id);
                     if let Some((id, result)) = arrived {
                         if let Some(flight) = flights.iter_mut().find(|flight| flight.id == id) {
@@ -7603,5 +7633,33 @@ mod unit {
         assert_eq!(refusal_backoff(10, 2), Duration::from_secs(60));
         assert_eq!(refusal_backoff(0, 0), Duration::ZERO);
         assert_eq!(refusal_backoff(3, 0), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_stop_request_with_no_result_pending_exits_the_poll_promptly() {
+        // SIGTERM while flights are in progress and no result ever
+        // arrives: the timeout branch of the result poll must honour the
+        // stop flag at the next poll, not wait for a result.
+        let (_tx, rx) = mpsc::channel::<u32>();
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        assert_eq!(
+            wait_for_result_stoppable(&rx, Duration::from_millis(10), || stop
+                .load(Ordering::SeqCst))
+            .unwrap(),
+            None,
+            "a plain timeout is not a stop"
+        );
+        stop.store(true, Ordering::SeqCst);
+        let stopped = wait_for_result_stoppable(&rx, Duration::from_millis(10), || {
+            stop.load(Ordering::SeqCst)
+        });
+        let error = stopped.expect_err("a stop request ends the poll");
+        assert!(error.contains("stop request"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the poll exits promptly, took {:?}",
+            started.elapsed()
+        );
     }
 }

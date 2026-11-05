@@ -77,6 +77,10 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
@@ -167,6 +171,12 @@ pub struct Heartbeat {
     /// call can wait on the request budget); empty when none is running.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sync_started_at: String,
+    /// Intake requests being applied right now (their prechecks run one by
+    /// one and can take a while). While this is nonzero the daemon is
+    /// applying, not stalled: `status` says so instead of offering a kill
+    /// remedy, and the heartbeat is kept fresh while they run.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub applying_intakes: usize,
 }
 
 impl Heartbeat {
@@ -199,6 +209,7 @@ impl Heartbeat {
             last_sync: String::new(),
             sync_error: String::new(),
             sync_started_at: String::new(),
+            applying_intakes: 0,
         }
     }
 
@@ -1067,6 +1078,39 @@ fn apply_intake(state: &State, config: &Config, lock: &crate::state::Lock) {
     }
 }
 
+/// [`apply_intake`] with the heartbeat kept fresh while it runs: intake
+/// prechecks run one per submit on this thread and can take minutes for a
+/// backlog, which used to leave the heartbeat stale and made `status`
+/// offer a kill remedy for a healthy daemon. The heartbeat names how many
+/// intakes are applying, and a helper thread refreshes it until they are
+/// done, exactly as a work cycle's heartbeat is kept fresh.
+fn apply_intake_fresh(
+    state: &State,
+    config: &Config,
+    lock: &crate::state::Lock,
+    heartbeat: &mut Heartbeat,
+) {
+    let pending = crate::intake::summary(state).pending;
+    if pending == 0 {
+        return;
+    }
+    heartbeat.applying_intakes = pending;
+    heartbeat.touch();
+    let _ = write_heartbeat(state, heartbeat);
+    let shared = Mutex::new(heartbeat.clone());
+    let done = AtomicBool::new(false);
+    let window = Arc::new(Mutex::new(Vec::new()));
+    std::thread::scope(|scope| {
+        scope.spawn(|| refresh_heartbeat(state, &shared, &done, &window));
+        let _stop = SetOnDrop(&done);
+        apply_intake(state, config, lock);
+    });
+    *heartbeat = shared.into_inner().unwrap_or_else(PoisonError::into_inner);
+    heartbeat.applying_intakes = 0;
+    heartbeat.touch();
+    let _ = write_heartbeat(state, heartbeat);
+}
+
 /// Record the closes of landed pull requests that a label sync made while another writer held
 /// the queue, under the writer lock the caller holds.
 fn record_closed(state: &State, lock: &crate::state::Lock) {
@@ -1341,7 +1385,7 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
             // Requests recorded during the last run go in first, so the queue lists them.
             if crate::intake::has_pending(state) {
                 if let Ok(lock) = state.lock() {
-                    apply_intake(state, &config, &lock);
+                    apply_intake_fresh(state, &config, &lock, &mut heartbeat);
                 }
             }
             let _ = crate::drain::clear(state);
@@ -1357,7 +1401,7 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
         // iteration's items fingerprint sees them.
         if crate::intake::has_pending(state) {
             if let Ok(lock) = state.lock() {
-                apply_intake(state, &config, &lock);
+                apply_intake_fresh(state, &config, &lock, &mut heartbeat);
             }
         }
         // The label sync runs beside the loop, never in its way: a sync that finished is folded
@@ -1460,7 +1504,7 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
                         match state.lock() {
                             Ok(lock) => {
                                 clear_busy_error(&mut heartbeat, &mut busy_error);
-                                apply_intake(state, &config, &lock);
+                                apply_intake_fresh(state, &config, &lock, &mut heartbeat);
                                 record_closed(state, &lock);
                                 if let Some(due) = schedule.due.as_ref() {
                                     if *due > retry_seen {
@@ -1753,6 +1797,18 @@ pub fn collect_status(state: &State, stale_after_secs: u64) -> Result<StatusRepo
             "remove the stale pid file {} and start the daemon with `merge-queue serve`",
             state.serve_pid_path().display()
         ),
+        // Intakes applying: the daemon is working through its intake
+        // prechecks, not stalled — never offer a kill remedy for it.
+        Liveness::Stale
+            if heartbeat
+                .as_ref()
+                .is_some_and(|h| h.applying_intakes > 0) =>
+        {
+            format!(
+                "applying {} intakes",
+                heartbeat.as_ref().map_or(0, |h| h.applying_intakes)
+            )
+        }
         // Only reachable when even the in-cycle heartbeat thread has gone
         // quiet: a working daemon with a fresh heartbeat is `Running`.
         Liveness::Stale => format!(
@@ -2098,6 +2154,25 @@ mod unit {
             !text.contains("sync:") && !text.contains("sync error"),
             "{text}"
         );
+        let _ = std::fs::remove_dir_all(&state.root);
+    }
+
+    #[test]
+    fn status_never_offers_a_kill_remedy_while_intakes_are_applying() {
+        // A backlog of intake prechecks (14 submits, say) can keep the
+        // daemon busy applying for minutes: status must say "applying N
+        // intakes", never a kill remedy for a healthy daemon.
+        let state = temp_state("applying-intakes");
+        std::fs::write(state.serve_pid_path(), format!("{}\n", std::process::id())).unwrap();
+        let mut heartbeat = Heartbeat::new(std::process::id(), 2, false);
+        heartbeat.applying_intakes = 14;
+        heartbeat.heartbeat_unix = unix_now().saturating_sub(110);
+        write_heartbeat(&state, &heartbeat).unwrap();
+        let report = collect_status(&state, 10).unwrap();
+        assert_eq!(report.remedy, "applying 14 intakes", "{report:?}");
+        let text = render_status(&report);
+        assert!(text.contains("applying 14 intakes"), "{text}");
+        assert!(!text.contains("kill"), "{text}");
         let _ = std::fs::remove_dir_all(&state.root);
     }
 
