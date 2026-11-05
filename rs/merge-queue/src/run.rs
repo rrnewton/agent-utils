@@ -648,6 +648,9 @@ struct Job {
     /// Every change in the batch is peripheral: the runner gets `$MQ_PERIPHERAL=1` so
     /// its selection can be the focused one.
     peripheral: bool,
+    /// The batch was built on the base itself as a disjoint root (see [`Flight::rooted`]);
+    /// carried to the donor job so the stale sweeps can keep it under `keep_stale_roots`.
+    rooted: bool,
 }
 
 /// A batch's place in the speculation window.
@@ -2041,6 +2044,7 @@ impl<'a> Runner<'a> {
                 &flight.chosen,
                 flight.speculation,
                 self.all_peripheral(&flight.candidate.prs),
+                flight.rooted,
             ),
             delay,
         ))
@@ -3481,6 +3485,7 @@ impl<'a> Runner<'a> {
             &job.extra,
             &self.config.validator,
             &donors.tool,
+            job.rooted,
         )?;
         lock(&donors.published).push((published.id.clone(), job.commit.clone()));
         Ok(published.id)
@@ -3516,6 +3521,17 @@ impl<'a> Runner<'a> {
             // stale-base refusals.
             let stale =
                 !base.is_empty() && !landed && !self.git.is_ancestor(&base, commit).unwrap_or(true);
+            // A kept stale root is still wanted while the run lives: its
+            // verdict decides the batch, so a base move alone never retires
+            // it here (the claim-time sweep honours the same rule). Once the
+            // run has ended it is superseded like anything else.
+            if stale && !ended && self.config.keep_stale_roots {
+                if let Ok(record) = donors.store.get(id) {
+                    if record.rooted {
+                        return true;
+                    }
+                }
+            }
             let reason = if landed {
                 crate::donor::CANDIDATE_LANDED.to_owned()
             } else if stale {
@@ -3671,9 +3687,35 @@ impl<'a> Runner<'a> {
                     return Ok(ran);
                 }
                 crate::donor::JobState::Cancelled => {
-                    return Err(format!(
-                        "donor job {published} was cancelled outside this run"
+                    // Cancelled by something other than this run (the stale
+                    // sweep, an operator, another run's pruning): this run's
+                    // own cancellations return above via the cancel flag, so
+                    // anything reaching here carries no verdict. Refuse the
+                    // batch like a validator that could not execute: its
+                    // changes stay queued with no strike, and the run goes
+                    // on instead of ending on the head loop's `?`.
+                    let why = record
+                        .history
+                        .iter()
+                        .rev()
+                        .find(|line| line.contains("cancelled:"))
+                        .map(|line| line.as_str())
+                        .unwrap_or("cancelled outside this run");
+                    self.event(
+                        "donor",
+                        &format!(
+                            "v{id}: donor job {published} was cancelled outside this run \
+                             ({why}); no verdict, the batch is refused and stays queued"
+                        ),
+                    );
+                    let mut ran = stopped(false, None);
+                    ran.refused = true;
+                    ran.cannot_execute = Some(format!(
+                        "{} on donors: job {published} was cancelled outside this run \
+                         ({why}); no verdict",
+                        crate::validate::CANNOT_EXECUTE
                     ));
+                    return Ok(ran);
                 }
                 crate::donor::JobState::Leased => waiting_since = Instant::now(),
                 crate::donor::JobState::Queued => {
@@ -5116,8 +5158,13 @@ impl<'a> Runner<'a> {
                             depth: if rooted { 1 } else { occupied(&flights) + 1 },
                             window,
                         });
-                        let job =
-                            batch_job(&candidate, &chosen, speculation, self.all_peripheral(&prs));
+                        let job = batch_job(
+                            &candidate,
+                            &chosen,
+                            speculation,
+                            self.all_peripheral(&prs),
+                            rooted,
+                        );
                         let id = next_id;
                         next_id += 1;
                         let tx = tx.clone();
@@ -6495,6 +6542,7 @@ impl<'a> Runner<'a> {
                             speculation: None,
                             selection: delta.clone(),
                             peripheral: false,
+                            rooted: false,
                             policy: if exact {
                                 chosen.policy.clone()
                             } else {
@@ -6770,6 +6818,7 @@ impl<'a> Runner<'a> {
                     policy: "failed-tests".to_owned(),
                     extra: BTreeSet::new(),
                     peripheral: false,
+                    rooted: false,
                 });
             }
             for (i, result) in probes.iter().zip(self.validate_all(jobs)) {
@@ -6844,6 +6893,7 @@ impl<'a> Runner<'a> {
                 policy: "all".to_owned(),
                 extra: BTreeSet::new(),
                 peripheral: false,
+                rooted: false,
             }])
             .pop()
             .ok_or("no widen result")??;
@@ -7156,6 +7206,7 @@ fn batch_job(
     chosen: &Chosen,
     speculation: Option<Speculation>,
     peripheral: bool,
+    rooted: bool,
 ) -> Job {
     Job {
         purpose: "batch",
@@ -7167,6 +7218,7 @@ fn batch_job(
         policy: chosen.policy.clone(),
         extra: chosen.extra.clone(),
         peripheral,
+        rooted,
     }
 }
 

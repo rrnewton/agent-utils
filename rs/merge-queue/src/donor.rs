@@ -228,6 +228,12 @@ pub struct Job {
     /// claim it, and its receipt is a comparison, never the verdict.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub compare_only: bool,
+    /// The batch was built on the base itself as a disjoint root. Under
+    /// `keep_stale_roots` its validation is still wanted after the base moves
+    /// (a green result requeues the batch, a red one decides it), so the
+    /// claim-time stale sweep and the run's own stale pruning leave it alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rooted: bool,
 }
 
 impl Job {
@@ -790,6 +796,7 @@ impl Store {
         extra: &BTreeSet<TestId>,
         validator: &ValidatorConfig,
         tool: &ToolIdentity,
+        rooted: bool,
     ) -> Result<Job, String> {
         let _lock = self.lock()?;
         self.prune()?;
@@ -821,6 +828,7 @@ impl Store {
             candidate_gone: None,
             could_not_run: Vec::new(),
             compare_only: false,
+            rooted,
         };
         self.write(&job)?;
         Ok(job)
@@ -1334,11 +1342,14 @@ impl Store {
     /// base): it can never land as published, so offering it again only burns a donor's
     /// setup time on a stale-base refusal. A stale job is not a donor failure: no
     /// could-not-run strike is recorded. `contains(commit)` answers whether that candidate
-    /// contains `base`. Returns the cancelled ids.
+    /// contains `base`. With `keep_stale_roots`, a rooted job is exempt however stale:
+    /// its run still wants the verdict (green requeues the batch, red decides it), so
+    /// only genuinely stale non-root jobs are cancelled. Returns the cancelled ids.
     pub fn sweep_stale(
         &self,
         base: &str,
         contains: &dyn Fn(&str) -> bool,
+        keep_stale_roots: bool,
     ) -> Result<Vec<String>, String> {
         let reason = format!(
             "stale: the base moved to {}, which its candidate does not contain",
@@ -1348,6 +1359,7 @@ impl Store {
             .jobs()?
             .into_iter()
             .filter(|job| matches!(job.state, JobState::Queued | JobState::Leased))
+            .filter(|job| !(keep_stale_roots && job.rooted))
             .filter(|job| !contains(&job.commit))
             .map(|job| job.id)
             .collect();
@@ -2780,6 +2792,10 @@ mod unit {
     }
 
     fn publish(store: &Store, commit: &str) -> Job {
+        publish_rooted(store, commit, false)
+    }
+
+    fn publish_rooted(store: &Store, commit: &str, rooted: bool) -> Job {
         let validator = validator();
         let tool = ToolIdentity {
             validator_digest: validator_digest(&validator).unwrap(),
@@ -2798,6 +2814,7 @@ mod unit {
                 &BTreeSet::new(),
                 &validator,
                 &tool,
+                rooted,
             )
             .unwrap()
     }
@@ -3181,7 +3198,7 @@ mod unit {
         let stale = publish(&store, "c1");
         let fresh = publish(&store, "c2");
         let cancelled = store
-            .sweep_stale("base99", &|commit| commit == "c2")
+            .sweep_stale("base99", &|commit| commit == "c2", false)
             .unwrap();
         assert_eq!(cancelled, vec![stale.id.clone()]);
         let job = store.read(&stale.id).unwrap();
@@ -3196,11 +3213,42 @@ mod unit {
         assert!(job.could_not_run.is_empty(), "stale is not a donor failure");
         // The sweep is idempotent, and the fresh job is still claimable.
         assert!(store
-            .sweep_stale("base99", &|commit| commit == "c2")
+            .sweep_stale("base99", &|commit| commit == "c2", false)
             .unwrap()
             .is_empty());
         let claimed = store.claim("d1", "h1", 1).unwrap().expect("the fresh job");
         assert_eq!(claimed.id, fresh.id);
+    }
+
+    #[test]
+    fn the_sweep_keeps_rooted_jobs_only_under_keep_stale_roots() {
+        // Queued and leased roots alike survive while the flag is on; a
+        // non-root stale job is still swept, and with the flag off a root
+        // is swept like anything else.
+        let store = Store::new(&temp("stale-sweep-roots"));
+        let queued_root = publish_rooted(&store, "c1", true);
+        let leased_root = publish_rooted(&store, "c2", true);
+        let plain = publish(&store, "c3");
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("oldest job");
+        assert_eq!(claimed.id, queued_root.id);
+        // Lease the second root too, so both root states are covered.
+        let claimed = store.claim("d2", "h1", 1).unwrap().expect("next job");
+        assert_eq!(claimed.id, leased_root.id);
+        let cancelled = store
+            .sweep_stale("base99", &|commit| commit == "fresh", true)
+            .unwrap();
+        assert_eq!(cancelled, vec![plain.id.clone()]);
+        assert_eq!(store.read(&queued_root.id).unwrap().state, JobState::Leased);
+        assert_eq!(store.read(&leased_root.id).unwrap().state, JobState::Leased);
+        assert_eq!(store.read(&plain.id).unwrap().state, JobState::Cancelled);
+        let cancelled = store
+            .sweep_stale("base99", &|commit| commit == "fresh", false)
+            .unwrap();
+        assert_eq!(cancelled.len(), 2, "{cancelled:?}");
+        assert_eq!(
+            store.read(&queued_root.id).unwrap().state,
+            JobState::Cancelled
+        );
     }
 
     #[test]

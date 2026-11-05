@@ -564,11 +564,13 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             // Freshness before setup: never hand out a job whose candidate no longer
             // contains the current base. It is cancelled as stale here, not refused by
             // the donor after its expensive setup, and costs the donor no strike.
+            // Kept stale roots are exempt under `keep_stale_roots`: their run still
+            // wants the verdict, so they are neither cancelled nor handed out as stale.
             {
                 let git = crate::git::Git::new(&config.repo);
                 if let Ok((base, _)) = crate::ops::refresh(&git, &config, &[]) {
                     let contains = |commit: &str| git.is_ancestor(&base, commit).unwrap_or(true);
-                    match store.sweep_stale(&base, &contains) {
+                    match store.sweep_stale(&base, &contains, config.keep_stale_roots) {
                         Ok(cancelled) if !cancelled.is_empty() => eprintln!(
                             "merge-queue donor claim: cancelled {} stale donor job(s) \
                              whose candidate does not contain {}",

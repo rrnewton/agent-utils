@@ -1553,3 +1553,133 @@ fn a_job_whose_candidate_no_longer_contains_the_base_is_cancelled_at_claim_time(
         "{job}"
     );
 }
+
+#[test]
+fn an_outside_cancellation_refuses_the_batch_and_the_run_goes_on() {
+    // A donor job cancelled by anything other than the run (here, an
+    // external edit standing in for the stale sweep or an operator) is no
+    // verdict: the batch is refused and stays queued, and the run ends
+    // normally instead of failing with "cancelled outside this run".
+    let fx = Fixture::new("donor-outside-cancel");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "decide",
+        "--refusal-max-retries",
+        "0",
+        "--refusal-backoff-secs",
+        "0",
+    ]);
+    fx.branch("a", &[("a.txt", "a\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let id = jobs(&fx)[0]["id"].as_str().unwrap().to_owned();
+    let path = job_path(&fx, &id);
+    let mut job: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    job["state"] = Value::String("cancelled".to_owned());
+    job["lease"] = Value::Null;
+    job["history"] = serde_json::json!(["cancelled outside this run (test)"]);
+    std::fs::write(&path, serde_json::to_string_pretty(&job).unwrap()).unwrap();
+    let (code, report, stderr) = finish(run);
+    // Exit 3 is the refusal code (retry later), as for a could-not-run
+    // bound: not the run-ending error this used to be.
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(
+        report["validations"][0]["refused"] == true,
+        "no verdict, refused: {report}"
+    );
+    let deferred: Vec<i64> = report["deferred"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|entry| {
+            entry["prs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|pr| pr.as_i64().unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(deferred, vec![1], "{report}");
+    assert_eq!(item_status(&fx, 1), "queued");
+}
+
+#[test]
+fn kept_stale_roots_keep_their_donor_jobs_and_decide_after_a_landing() {
+    // Three disjoint roots on one base, all validated by donors. The first
+    // landing moves the base; with keep_stale_roots the other roots' donor
+    // jobs must survive every claim-time sweep (each donor claim sweeps)
+    // and still decide: the red single change is ejected, the green one is
+    // requeued at the front with "green at <base>" and lands rebuilt.
+    let fx = Fixture::new("donor-kept-roots");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    let runner = r#"for t in $(ls tests); do o=pass; if grep -q FAIL "tests/$t"; then o=fail; fi; printf '{"id":"%s","outcome":"%s"}\n' "$t" "$o" >> "$MQ_RESULTS"; done; exit 0"#;
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        runner,
+        "--offload",
+        "decide",
+    ]);
+    set_config(&fx, |config| {
+        config["depth"] = serde_json::json!(3);
+        config["roots"] = serde_json::json!(3);
+        config["keep_stale_roots"] = serde_json::json!(true);
+        config["max_batch"] = serde_json::json!(1);
+    });
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/b", "FAIL\n")]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    let clones: Vec<(PathBuf, String)> = (1..=3)
+        .map(|n| {
+            (
+                donor_clone(&fx, &format!("donor-host-{n}")),
+                format!("d{n}"),
+            )
+        })
+        .collect();
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let (code, report, stderr) = std::thread::scope(|scope| {
+        for (clone, name) in &clones {
+            scope.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = donor(&fx, clone, name, &[]);
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            });
+        }
+        let run = spawn_run(&fx, &[]);
+        let outcome = finish(run);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        outcome
+    });
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(item_status(&fx, 1), "landed", "{report}");
+    assert_eq!(item_status(&fx, 2), "ejected", "{report}");
+    assert_eq!(item_status(&fx, 3), "landed", "{report}");
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    let third = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["pr"] == 3)
+        .expect("change 3 listed");
+    assert!(third["history"].to_string().contains("green at"), "{third}");
+}
