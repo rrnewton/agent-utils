@@ -163,6 +163,10 @@ pub struct Heartbeat {
     /// Why the most recent label sync failed; cleared by a successful one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sync_error: String,
+    /// RFC 3339 UTC time the label sync in flight started (it runs beside the loop, and its API
+    /// call can wait on the request budget); empty when none is running.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sync_started_at: String,
 }
 
 impl Heartbeat {
@@ -194,6 +198,7 @@ impl Heartbeat {
             last_sync_at: String::new(),
             last_sync: String::new(),
             sync_error: String::new(),
+            sync_started_at: String::new(),
         }
     }
 
@@ -741,8 +746,8 @@ pub struct ServeOptions {
     /// Deadline for one notification send; a send still running then has
     /// its process group killed and counts as a failed attempt.
     pub notify_timeout: Duration,
-    /// Also ingest pull requests carrying this label, inside the loop and
-    /// under the writer lock (`serve --sync-label`).
+    /// Also ingest pull requests carrying this label, on a thread beside the
+    /// loop (`serve --sync-label`).
     pub sync_label: Option<String>,
     /// Interval between label syncs.
     pub sync_every: Duration,
@@ -1031,6 +1036,21 @@ fn apply_intake(state: &State, config: &Config, lock: &crate::state::Lock) {
     }
 }
 
+/// Record the closes of landed pull requests that a label sync made while another writer held
+/// the queue, under the writer lock the caller holds.
+fn record_closed(state: &State, lock: &crate::state::Lock) {
+    match crate::sync::record_closed(state, lock) {
+        Ok(closed) if !closed.is_empty() => {
+            eprintln!(
+                "merge-queue serve: recorded {} pull request close(s) made while the queue was busy",
+                closed.len()
+            );
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("merge-queue serve: cannot record closes: {error}"),
+    }
+}
+
 /// Deliver owed notifications under the writer lock the caller holds.
 fn sweep_notifications(
     state: &State,
@@ -1051,66 +1071,123 @@ fn sweep_notifications(
     }
 }
 
-/// One label sync under the writer lock. Returns whether it ran (a busy lock
-/// means retry on the next poll). Failures are logged and recorded in the
-/// heartbeat, never returned: syncing must not stop validation.
-fn sync_label(
-    state: &State,
-    config: &Config,
-    label: &str,
-    limit: u32,
-    notifier: &notify::Notifier,
-    heartbeat: &mut Heartbeat,
-) -> bool {
-    let lock = match state.lock() {
-        Ok(lock) => lock,
-        Err(_) => return false,
-    };
-    let source = crate::sync::ReadySource::Label(label.to_owned());
-    match crate::sync::sync(state, config, &source, limit, Some(&lock), Some(notifier)) {
-        Ok(report) => {
-            let list = |prs: &[i64]| {
-                prs.iter()
-                    .map(|pr| format!("#{pr}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
+/// A label sync running on its own thread. Its API call can wait minutes on the request budget,
+/// so the loop never waits for it: planning, intake and the heartbeat go on, and the loop folds
+/// the outcome in once the thread is done.
+struct LabelSync {
+    handle: std::thread::JoinHandle<Result<crate::sync::SyncReport, String>>,
+    started: Instant,
+}
+
+impl LabelSync {
+    /// Start one sync of `label`: list it (no lock held), then reconcile under the writer lock
+    /// when it is free, or record the submissions for its holder when it is not (a run takes
+    /// them while it runs). Postponed closes of landed pull requests are made without the lock
+    /// and recorded by the next holder ([`crate::sync::record_closed`]).
+    fn start(
+        state: &State,
+        config: &Config,
+        label: &str,
+        limit: u32,
+        notifier: &notify::Notifier,
+    ) -> Self {
+        let (state, config, notifier) = (state.clone(), config.clone(), notifier.clone());
+        let source = crate::sync::ReadySource::Label(label.to_owned());
+        let handle = std::thread::spawn(move || {
+            let listing = crate::sync::list(&state, &config, &source, limit)?;
+            let mut report = match state.lock() {
+                Ok(lock) => crate::sync::reconcile(
+                    &state,
+                    &config,
+                    &source,
+                    listing,
+                    crate::sync::Apply::Locked(&lock),
+                    Some(&notifier),
+                )?,
+                Err(busy) => crate::sync::reconcile(
+                    &state,
+                    &config,
+                    &source,
+                    listing,
+                    crate::sync::Apply::Record(&busy),
+                    Some(&notifier),
+                )?,
             };
-            let mut summary = format!(
-                "{} listed, submitted [{}], withdrawn [{}]",
-                report.listed,
-                list(&report.submitted),
-                list(&report.withdrawn)
-            );
-            if !report.refused.is_empty() {
-                let refused: Vec<i64> = report.refused.iter().map(|(pr, _)| *pr).collect();
-                summary.push_str(&format!(", refused [{}]", list(&refused)));
+            if config.land.close_prs {
+                crate::sync::close_postponed(&state, &config)?;
+                if let Ok(lock) = state.lock() {
+                    report.closed = crate::sync::record_closed(&state, &lock)?;
+                }
             }
-            if report.truncated {
-                summary.push_str(&format!(
-                    ", listed the limit ({limit}) so withdrew nothing unlisted: raise --sync-limit"
-                ));
-            }
-            if !report.submitted.is_empty()
-                || !report.withdrawn.is_empty()
-                || !report.refused.is_empty()
-            {
-                eprintln!("merge-queue serve: sync --label {label}: {summary}");
-            }
-            for (pr, why) in &report.refused {
-                eprintln!("merge-queue serve: sync --label {label}: refused #{pr}: {why}");
-            }
-            heartbeat.last_sync_at = now();
-            heartbeat.last_sync = summary;
-            heartbeat.sync_error.clear();
-        }
-        Err(error) => {
-            if heartbeat.sync_error != error {
-                eprintln!("merge-queue serve: sync --label {label} failed: {error}");
-            }
-            heartbeat.sync_error = error;
+            report.api_remaining = crate::github::Hosting::new(&config.github, &state.root)
+                .ok()
+                .map(|hosting| hosting.budget.remaining());
+            Ok(report)
+        });
+        Self {
+            handle,
+            started: Instant::now(),
         }
     }
-    true
+
+    /// Wait for the sync and fold its outcome into `heartbeat`, logging what it did.
+    fn finish(self, label: &str, limit: u32, heartbeat: &mut Heartbeat) {
+        let outcome = self
+            .handle
+            .join()
+            .unwrap_or_else(|_| Err("the label sync thread panicked".to_owned()));
+        heartbeat.sync_started_at.clear();
+        match outcome {
+            Ok(report) => {
+                let list = |prs: &[i64]| {
+                    prs.iter()
+                        .map(|pr| format!("#{pr}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                let mut summary = format!(
+                    "{} listed, submitted [{}], withdrawn [{}]",
+                    report.listed,
+                    list(&report.submitted),
+                    list(&report.withdrawn)
+                );
+                if !report.recorded.is_empty() {
+                    summary.push_str(&format!(
+                        ", recorded [{}] for the run holding the queue",
+                        list(&report.recorded)
+                    ));
+                }
+                if !report.refused.is_empty() {
+                    let refused: Vec<i64> = report.refused.iter().map(|(pr, _)| *pr).collect();
+                    summary.push_str(&format!(", refused [{}]", list(&refused)));
+                }
+                if report.truncated {
+                    summary.push_str(&format!(
+                        ", listed the limit ({limit}) so withdrew nothing unlisted: raise --sync-limit"
+                    ));
+                }
+                if !report.submitted.is_empty()
+                    || !report.withdrawn.is_empty()
+                    || !report.recorded.is_empty()
+                    || !report.refused.is_empty()
+                {
+                    eprintln!("merge-queue serve: sync --label {label}: {summary}");
+                }
+                for (pr, why) in &report.refused {
+                    eprintln!("merge-queue serve: sync --label {label}: refused #{pr}: {why}");
+                }
+                heartbeat.last_sync_at = now();
+                heartbeat.last_sync = summary;
+                heartbeat.sync_error.clear();
+            }
+            Err(error) => {
+                if heartbeat.sync_error != error {
+                    eprintln!("merge-queue serve: sync --label {label} failed: {error}");
+                }
+                heartbeat.sync_error = error;
+            }
+        }
+    }
 }
 
 fn trigger_label(items: bool, base: bool, retry: bool, backoff: bool) -> String {
@@ -1215,8 +1292,10 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
     let mut retry_seen = String::new();
     // Backoff retry after failed work cycles: when, and as RFC 3339 text.
     let mut failure_retry: Option<(Instant, String)> = None;
-    // When the last label sync ran (`--sync-label`); `None` means due now.
+    // When the last label sync started (`--sync-label`); `None` means due now.
     let mut last_sync: Option<Instant> = None;
+    // The label sync in flight, if any.
+    let mut label_sync: Option<LabelSync> = None;
     // The busy-lock error the heartbeat shows, until the daemon gets the lock or has no work.
     let mut busy_error = String::new();
 
@@ -1249,20 +1328,30 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
                 apply_intake(state, &config, &lock);
             }
         }
-        // Ingest the label first, so what it submits is seen by this
-        // iteration's items fingerprint and validated without waiting a poll.
+        // The label sync runs beside the loop, never in its way: a sync that finished is folded
+        // in (what it submitted changes this iteration's items fingerprint), and one is started
+        // when it is due. With `--once` the single cycle includes its sync, so it waits for it.
         if let Some(label) = &options.sync_label {
-            if last_sync.is_none_or(|at| at.elapsed() >= options.sync_every)
-                && sync_label(
-                    state,
-                    &config,
-                    label,
-                    options.sync_limit,
-                    &notifier,
-                    &mut heartbeat,
-                )
+            if label_sync
+                .as_ref()
+                .is_some_and(|sync| sync.handle.is_finished())
             {
-                last_sync = Some(Instant::now());
+                if let Some(done) = label_sync.take() {
+                    last_sync = Some(done.started);
+                    done.finish(label, options.sync_limit, &mut heartbeat);
+                }
+            }
+            if label_sync.is_none() && last_sync.is_none_or(|at| at.elapsed() >= options.sync_every)
+            {
+                let started =
+                    LabelSync::start(state, &config, label, options.sync_limit, &notifier);
+                heartbeat.sync_started_at = now();
+                if options.once {
+                    last_sync = Some(started.started);
+                    started.finish(label, options.sync_limit, &mut heartbeat);
+                } else {
+                    label_sync = Some(started);
+                }
             }
         }
         let fingerprint = items_fingerprint(state);
@@ -1340,6 +1429,7 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
                             Ok(lock) => {
                                 clear_busy_error(&mut heartbeat, &mut busy_error);
                                 apply_intake(state, &config, &lock);
+                                record_closed(state, &lock);
                                 if let Some(due) = schedule.due.as_ref() {
                                     if *due > retry_seen {
                                         retry_seen.clone_from(due);
@@ -1743,6 +1833,9 @@ pub fn render_status(report: &StatusReport) -> String {
                             format!(" ({})", h.last_sync)
                         }
                     ));
+                }
+                if !h.sync_started_at.is_empty() {
+                    out.push_str(&format!("  sync in flight since {}\n", h.sync_started_at));
                 }
                 if !h.sync_error.is_empty() {
                     out.push_str(&format!("  sync error: {}\n", h.sync_error));

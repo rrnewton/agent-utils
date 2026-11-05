@@ -383,21 +383,33 @@ SIGINT or SIGTERM during a stop exits immediately. `merge-queue run` stops the s
 | `--agentctl WORD` | configured | Command (and leading arguments) to run instead of the configured agentctl for notifications. Repeatable. Supplement: `MERGE_QUEUE_AGENTCTL` (shell-style words) when neither flag nor config names one. |
 | `--agentctl-registry PATH` | configured | agentctl registry the notifications address instead of the configured `notify.registry`. Supplement: `MERGE_QUEUE_AGENTCTL_REGISTRY` when this flag is not given. |
 | `--notify-timeout-secs N` | `30` | Seconds one notification send may run; then its whole process group is killed and the send counts as a failed attempt (minimum 1). |
-| `--sync-label LABEL` | none | Also ingest pull requests carrying LABEL, inside the daemon's own loop: the same ingestion as `merge-queue sync --label LABEL` (one batched list call, approval at head when configured, withdrawal when the label goes away), under the writer lock the work cycle uses. Needs `github.repo`. |
+| `--sync-label LABEL` | none | Also ingest pull requests carrying LABEL, on a thread beside the daemon's loop: the same ingestion as `merge-queue sync --label LABEL` (one batched list call, approval at head when configured, withdrawal when the label goes away). Nothing waits for it. Needs `github.repo`. |
 | `--sync-every SECS` | `60` | Seconds between label syncs (with `--sync-label`; minimum 10). Each sync spends at least one hosting API request. |
 | `--sync-limit N` | `100` | Pull requests one label sync lists at most (with `--sync-label`). Each 100 costs one request of the budget, three with `require_approval_at_head`, so the default sync costs 1 or 3. A sync that lists `N` may have been cut short, so it withdraws nothing it did not list, and its summary says so. |
 | `--offload MODE` | configured | Override `validator.offload` for this run: `off`, `compare` or `decide`. |
 
 With `--sync-label LABEL` the daemon ingests labelled pull requests itself, so a change
-labelled ready that nobody submits is never missed. Each sync runs at the top of a loop
-iteration, before the daemon looks for new work, under the same writer lock the work cycle
-takes (never a second writer). What it submits is therefore validated in the same iteration.
-A busy lock (a `run` or another command holding it) retries on the next poll. A failed sync
-(the hosting service down, the request budget spent) is logged once per distinct error and
-recorded as `sync_error` in the heartbeat and `status`. It never stops validation of what is
-already queued. A successful sync records `last_sync_at` and a one-line summary.
+labelled ready that nobody submits is never missed. Each sync runs on its own thread, started
+when one is due and none is in flight. Its list call can wait minutes on a paced or slow
+hosting service, so the daemon never waits for it: from the first cycle after startup it
+plans and validates what is already queued, takes recorded requests and keeps its heartbeat
+fresh, and the heartbeat's `sync_started_at` shows a sync in flight. When the listing
+arrives:
+
+- If the writer lock is free, the sync submits and withdraws under it (never a second
+  writer), and the next loop iteration validates what it submitted.
+- If a run holds the lock, the sync records its submissions as requests for that run, which
+  takes them into a free slot of its window (see "Intake while a run holds the queue").
+  Withdrawals wait for a sync that gets the lock.
+- Landed pull requests whose close the request budget postponed are closed without the lock.
+  Each close is noted under `<state>/closed/`, and the next holder of the lock records it on
+  the change.
+
+A failed sync (the hosting service down, the request budget spent) is logged once per distinct
+error and recorded as `sync_error` in the heartbeat and `status`. It never stops validation of
+what is already queued. A successful sync records `last_sync_at` and a one-line summary.
 Notifications its withdrawals owe go out through the daemon's own `--agentctl` and send
-timeout.
+timeout. `serve --once` waits for its one sync, so that single cycle includes it.
 
 With `--shadow` the daemon is a soak harness: it plans, validates and would land exactly as a
 live daemon would, but every landing advances only the in-memory simulated base. Run reports

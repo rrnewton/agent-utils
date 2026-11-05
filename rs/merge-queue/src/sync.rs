@@ -73,6 +73,10 @@ pub struct SyncReport {
     /// a queued one is also withdrawn (and so appears in `withdrawn`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unapproved: Vec<i64>,
+    /// Submissions recorded for the next holder of the writer lock, because another writer
+    /// (a run) held it (see `crate::intake`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recorded: Vec<i64>,
     /// Submissions refused, with the reason.
     pub refused: Vec<(i64, String)>,
     /// Landed pull requests closed now (postponed closes retried).
@@ -198,38 +202,55 @@ fn entries_from_file(path: &PathBuf) -> Result<Vec<Entry>, String> {
         .collect()
 }
 
-/// Reconcile the queue with `source`.
-///
-/// `lock` is the queue writer lock the caller holds; `None` is a dry run,
-/// which reports what would change and writes nothing. The notification
-/// sweep a withdrawal triggers runs under that same lock, with `notifier`
-/// (the daemon passes its own, so its `--agentctl` and send timeout apply)
-/// or, when `None`, the configured one.
-pub fn sync(
+/// What a source listed, before anything changed: [`list`] reads it (one API call for a
+/// GitHub source), [`reconcile`] acts on it.
+#[derive(Clone, Debug)]
+pub struct Listing {
+    entries: Vec<Entry>,
+    drafts: Vec<i64>,
+    truncated: bool,
+}
+
+/// How [`reconcile`] changes the queue.
+#[derive(Clone, Copy)]
+pub enum Apply<'a> {
+    /// Change nothing: report what would change.
+    DryRun,
+    /// Submit and withdraw under the writer lock the caller holds.
+    Locked(&'a Lock),
+    /// Another writer holds the lock (the text says which): record the submissions for its
+    /// next holder (`crate::intake`), so a run in progress can take them. Withdrawals wait for
+    /// a sync that gets the lock.
+    Record(&'a str),
+}
+
+/// The hosting client a sync from `source` uses: none for a ready file unless landed pull
+/// requests are closed.
+fn hosting_for(
+    state: &State,
+    config: &Config,
+    source: &ReadySource,
+) -> Result<Option<Hosting>, String> {
+    Ok(match source {
+        ReadySource::File(_) if !config.land.close_prs => None,
+        _ => Some(Hosting::new(&config.github, &state.root)?),
+    })
+}
+
+/// Read what `source` lists now. For a GitHub source this is the one list call, which can wait
+/// on the request budget; it changes nothing, so a caller need not hold the writer lock.
+pub fn list(
     state: &State,
     config: &Config,
     source: &ReadySource,
     limit: u32,
-    lock: Option<&Lock>,
-    notifier: Option<&crate::notify::Notifier>,
-) -> Result<SyncReport, String> {
-    let dry_run = lock.is_none();
-    let tag = source.tag();
-    let mut report = SyncReport {
-        source: tag.clone(),
-        dry_run,
-        ..SyncReport::default()
-    };
-    let hosting = match source {
-        ReadySource::File(_) if !config.land.close_prs => None,
-        _ => Some(Hosting::new(&config.github, &state.root)?),
-    };
+) -> Result<Listing, String> {
     let mut drafts = Vec::new();
     let mut truncated = false;
     let entries = match source {
         ReadySource::File(path) => entries_from_file(path)?,
         ReadySource::Label(_) | ReadySource::AllOpen => {
-            let hosting = hosting.as_ref().ok_or("no hosting configured")?;
+            let hosting = Hosting::new(&config.github, &state.root)?;
             let label = match source {
                 ReadySource::Label(label) => Some(label.as_str()),
                 _ => None,
@@ -281,9 +302,70 @@ pub fn sync(
                 .collect()
         }
     };
-    report.listed = entries.len();
-    report.drafts = drafts;
-    report.truncated = truncated;
+    Ok(Listing {
+        entries,
+        drafts,
+        truncated,
+    })
+}
+
+/// Reconcile the queue with `source`.
+///
+/// `lock` is the queue writer lock the caller holds; `None` is a dry run,
+/// which reports what would change and writes nothing. The notification
+/// sweep a withdrawal triggers runs under that same lock, with `notifier`
+/// (the daemon passes its own, so its `--agentctl` and send timeout apply)
+/// or, when `None`, the configured one.
+pub fn sync(
+    state: &State,
+    config: &Config,
+    source: &ReadySource,
+    limit: u32,
+    lock: Option<&Lock>,
+    notifier: Option<&crate::notify::Notifier>,
+) -> Result<SyncReport, String> {
+    let hosting = hosting_for(state, config, source)?;
+    let listing = list(state, config, source, limit)?;
+    let apply = match lock {
+        Some(lock) => Apply::Locked(lock),
+        None => Apply::DryRun,
+    };
+    let mut report = reconcile(state, config, source, listing, apply, notifier)?;
+    if let Some(lock) = lock {
+        if config.land.close_prs && hosting.is_some() {
+            close_postponed(state, config)?;
+            report.closed = record_closed(state, lock)?;
+        }
+    }
+    report.api_remaining = hosting.map(|h| h.budget.remaining());
+    Ok(report)
+}
+
+/// Act on what `source` listed: submit new changes and moved heads, and withdraw the changes
+/// this source added that it no longer lists (see [`Apply`] for how). Closing landed pull
+/// requests is separate ([`close_postponed`], [`record_closed`]).
+pub fn reconcile(
+    state: &State,
+    config: &Config,
+    source: &ReadySource,
+    listing: Listing,
+    apply: Apply<'_>,
+    notifier: Option<&crate::notify::Notifier>,
+) -> Result<SyncReport, String> {
+    let tag = source.tag();
+    let Listing {
+        entries,
+        drafts,
+        truncated,
+    } = listing;
+    let mut report = SyncReport {
+        source: tag.clone(),
+        dry_run: matches!(apply, Apply::DryRun),
+        listed: entries.len(),
+        drafts,
+        truncated,
+        ..SyncReport::default()
+    };
     let items: BTreeMap<i64, _> = state.items()?.into_iter().map(|i| (i.pr, i)).collect();
     let listed: std::collections::BTreeSet<i64> = entries.iter().map(|e| e.pr).collect();
     let mut submissions = Vec::new();
@@ -356,72 +438,138 @@ pub fn sync(
         }
     }
     withdraw.sort_unstable();
-    if let Some(lock) = lock {
-        let numbers: Vec<i64> = submissions.iter().map(|s| s.pr).collect();
-        if !submissions.is_empty() {
-            for (pr, result) in numbers
-                .iter()
-                .zip(ops::submit_many(state, config, submissions)?)
-            {
-                match result {
-                    Ok(_) => report.submitted.push(*pr),
-                    Err(error) => report.refused.push((*pr, error)),
-                }
-            }
-        }
-        let approval_withdrawn = !approval_withdraw.is_empty();
-        for pr in withdraw {
-            let why = if approval_withdraw.contains(&pr) {
-                format!("{tag}: no approving review at current head (require_approval_at_head)")
-            } else {
-                format!("{tag} no longer lists it")
-            };
-            ops::withdraw(state, pr, &why)?;
-            report.withdrawn.push(pr);
-        }
-        if approval_withdrawn {
-            // Fire the existing withdrawn notification now rather than
-            // waiting for the daemon: `ops::withdraw` above set the
-            // withdrawn status the notify sweep derives its transition
-            // from, and the sweep dedups, so a later daemon cycle will
-            // not resend. Best-effort, as in `serve`: a failed send is
-            // recorded on the item and never fails the sync.
-            let configured;
-            let notifier = match notifier {
-                Some(notifier) => notifier,
-                None => {
-                    configured = crate::notify::Notifier::resolve(None, None, config);
-                    &configured
-                }
-            };
-            if let Err(error) = crate::notify::sweep_locked(state, lock, config, notifier) {
-                eprintln!("merge-queue sync: notification sweep failed: {error}");
-            }
-        }
-        if config.land.close_prs {
-            if let Some(hosting) = &hosting {
-                for mut item in state.items()? {
-                    if item.status != ItemStatus::Landed || !item.close_pending {
-                        continue;
-                    }
-                    match hosting.close(item.pr, &close_comment(&item.landed_as)) {
-                        Ok(()) => {
-                            item.close_pending = false;
-                            item.log("closed", "pull request closed after landing");
-                            state.save_item(&item)?;
-                            report.closed.push(item.pr);
-                        }
-                        Err(_) => break,
+    match apply {
+        Apply::Locked(lock) => {
+            let numbers: Vec<i64> = submissions.iter().map(|s| s.pr).collect();
+            if !submissions.is_empty() {
+                for (pr, result) in
+                    numbers
+                        .iter()
+                        .zip(ops::submit_many(state, config, submissions)?)
+                {
+                    match result {
+                        Ok(_) => report.submitted.push(*pr),
+                        Err(error) => report.refused.push((*pr, error)),
                     }
                 }
             }
+            let approval_withdrawn = !approval_withdraw.is_empty();
+            for pr in withdraw {
+                let why = if approval_withdraw.contains(&pr) {
+                    format!("{tag}: no approving review at current head (require_approval_at_head)")
+                } else {
+                    format!("{tag} no longer lists it")
+                };
+                ops::withdraw(state, pr, &why)?;
+                report.withdrawn.push(pr);
+            }
+            if approval_withdrawn {
+                // Fire the existing withdrawn notification now rather than
+                // waiting for the daemon: `ops::withdraw` above set the
+                // withdrawn status the notify sweep derives its transition
+                // from, and the sweep dedups, so a later daemon cycle will
+                // not resend. Best-effort, as in `serve`: a failed send is
+                // recorded on the item and never fails the sync.
+                let configured;
+                let notifier = match notifier {
+                    Some(notifier) => notifier,
+                    None => {
+                        configured = crate::notify::Notifier::resolve(None, None, config);
+                        &configured
+                    }
+                };
+                if let Err(error) = crate::notify::sweep_locked(state, lock, config, notifier) {
+                    eprintln!("merge-queue sync: notification sweep failed: {error}");
+                }
+            }
         }
-    } else {
-        report.submitted = submissions.iter().map(|s| s.pr).collect();
-        report.withdrawn = withdraw;
+        Apply::Record(busy) => {
+            for submission in submissions {
+                let pr = submission.pr;
+                let seen = submission.head.clone();
+                match crate::intake::record(
+                    state,
+                    crate::intake::Request::Submit(Box::new(submission)),
+                    busy,
+                    &seen,
+                ) {
+                    Ok(_) => report.recorded.push(pr),
+                    Err(error) => report.refused.push((pr, error)),
+                }
+            }
+        }
+        Apply::DryRun => {
+            report.submitted = submissions.iter().map(|s| s.pr).collect();
+            report.withdrawn = withdraw;
+        }
     }
-    report.api_remaining = hosting.map(|h| h.budget.remaining());
     Ok(report)
+}
+
+/// Where a pull request closed after landing waits, until a holder of the writer lock records
+/// the close on its item ([`record_closed`]).
+fn closed_dir(state: &State) -> PathBuf {
+    state.root.join("closed")
+}
+
+/// Close the landed pull requests whose close the request budget postponed, oldest first,
+/// stopping at the first that fails (the budget is likely spent). The API calls can wait on the
+/// budget, so this takes no writer lock: each close is noted under `<state>/closed/` for
+/// [`record_closed`], and a change noted there is not closed again.
+pub fn close_postponed(state: &State, config: &Config) -> Result<(), String> {
+    let hosting = Hosting::new(&config.github, &state.root)?;
+    for item in state.items()? {
+        if item.status != ItemStatus::Landed || !item.close_pending {
+            continue;
+        }
+        let note = closed_dir(state).join(format!("{}.json", item.pr));
+        if note.exists() {
+            continue;
+        }
+        match hosting.close(item.pr, &close_comment(&item.landed_as)) {
+            Ok(()) => crate::state::write_json(&note, &item.pr)?,
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
+/// Record on their items the closes [`close_postponed`] noted, under the writer lock the caller
+/// holds. Returns the changes recorded.
+pub fn record_closed(state: &State, _lock: &Lock) -> Result<Vec<i64>, String> {
+    let dir = closed_dir(state);
+    let notes = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("cannot list {}: {error}", dir.display())),
+    };
+    let mut prs: Vec<i64> = notes
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()?
+                .strip_suffix(".json")?
+                .parse()
+                .ok()
+        })
+        .collect();
+    prs.sort_unstable();
+    let mut recorded = Vec::new();
+    for pr in prs {
+        if let Some(mut item) = state.item(pr)? {
+            if item.status == ItemStatus::Landed && item.close_pending {
+                item.close_pending = false;
+                item.log("closed", "pull request closed after landing");
+                state.save_item(&item)?;
+                recorded.push(pr);
+            }
+        }
+        let note = dir.join(format!("{pr}.json"));
+        std::fs::remove_file(&note)
+            .map_err(|error| format!("cannot remove {}: {error}", note.display()))?;
+    }
+    Ok(recorded)
 }
 
 /// The comment left on a pull request closed after landing.

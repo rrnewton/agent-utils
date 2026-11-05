@@ -767,13 +767,14 @@ enum Command {
         /// cycle, at most 3 attempts per transition). Minimum 1.
         #[arg(long, default_value_t = 30, value_name = "SECS")]
         notify_timeout_secs: u64,
-        /// Also ingest pull requests carrying LABEL, inside the daemon's own
-        /// loop: the same ingestion as `merge-queue sync --label LABEL` (one
-        /// batched list call, approval at head when configured, withdrawal
-        /// when the label goes away), under the writer lock the work cycle
-        /// uses, so there is no second writer. A failed sync is logged and
-        /// recorded in the heartbeat and never stops validation. Needs
-        /// `github.repo` configured.
+        /// Also ingest pull requests carrying LABEL, on a thread beside the
+        /// daemon's loop: the same ingestion as `merge-queue sync --label
+        /// LABEL` (one batched list call, approval at head when configured,
+        /// withdrawal when the label goes away). Nothing waits for its list
+        /// call: queued changes are planned meanwhile, and what it finds while
+        /// a run holds the writer lock is recorded for that run. A failed sync
+        /// is logged and recorded in the heartbeat and never stops validation.
+        /// Needs `github.repo` configured.
         #[arg(long, value_name = "LABEL")]
         sync_label: Option<String>,
         /// Seconds between label syncs (with --sync-label; minimum 10). Each
