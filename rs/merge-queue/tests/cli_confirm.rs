@@ -355,3 +355,68 @@ exit $rc"#,
         "{events:?}"
     );
 }
+
+/// Like [`RUNNER`], and a test file that says FLAKY fails unless the run is a same-commit rerun.
+const FLAKY_RUNNER: &str = r#"echo "run-$$" > "$MQ_HANDLE_FILE"
+[ -n "$MQ_RERUN_FROM" ] && echo "$MQ_RERUN_FROM" >> "$RERUNS"
+if [ "$MQ_SELECTION" = tests ]; then set -- $MQ_TESTS; else set -- $(ls tests); fi
+rc=0
+for t in "$@"; do
+  o=pass
+  if [ -f "tests/$t" ] && grep -q FAIL "tests/$t"; then o=fail; rc=1; fi
+  if [ -f "tests/$t" ] && grep -q FLAKY "tests/$t" && [ -z "$MQ_RERUN_FROM" ]; then o=fail; rc=1; fi
+  printf '{"id":"%s","outcome":"%s"}\n' "$t" "$o" >> "$MQ_RESULTS"
+done
+exit $rc"#;
+
+#[test]
+fn split_red_batches_splits_a_red_batch_and_confirms_each_single_before_ejecting_it() {
+    let fx = setup(
+        "confirm-split",
+        FLAKY_RUNNER,
+        &[
+            "--confirm-reruns",
+            "--split-red-batches",
+            "--max-batch",
+            "3",
+            "--trust-base",
+        ],
+    );
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/b", "FAIL\n")]);
+    fx.branch("c", &[("tests/c", "FLAKY\n")]);
+    for (pr, head) in [("1", "a"), ("2", "b"), ("3", "c")] {
+        fx.mq_ok(&["submit", pr, "--head", head]);
+    }
+    let (report, reruns) = run(&fx);
+    // Split, not searched: every probe is a single's same-commit rerun (the base is trusted, so
+    // it is never probed), none a prefix of several changes of the red batch.
+    let validations = report["validations"].as_array().unwrap();
+    assert!(
+        validations
+            .iter()
+            .all(|v| v["purpose"] != "probe" || v["prs"].as_array().unwrap().len() == 1),
+        "{report}"
+    );
+    assert!(
+        purposes(&report).iter().filter(|p| *p == "batch").count() >= 4,
+        "the red batch and a batch for each of its changes: {report}"
+    );
+    // #2 failed again on its rerun at its own commit: ejected, seen twice.
+    let ejected = report["ejected"].as_array().unwrap();
+    assert_eq!(ejected.len(), 1, "{report}");
+    assert_eq!(ejected[0]["pr"], 2, "{report}");
+    let reason = ejected[0]["reason"].as_str().unwrap();
+    assert!(reason.contains("(seen twice)"), "{reason}");
+    assert!(!reason.contains(UNCONFIRMED), "{reason}");
+    // #3 failed once and passed on its rerun: it lands, its failure recorded as flaky.
+    let landed: Vec<i64> = landed(&report).into_iter().flatten().collect();
+    assert!(landed.contains(&1) && landed.contains(&3), "{report}");
+    // Each single was confirmed by one rerun of the same commit, handed the red run's handle.
+    let handed: Vec<String> = std::fs::read_to_string(&reruns)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(handed.len(), 2, "{handed:?}");
+}

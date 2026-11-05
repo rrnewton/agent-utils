@@ -142,6 +142,7 @@ This command creates the state directory and writes `config.json`.
 | `--red-without-probe MODE` | `eject` | What a red validation that names failed tests does when its follow-up probe cannot run: `eject` the change (the red run is the verdict) or `hold` it for its owner. |
 | `--fail-fast` | off | Ask the runner to stop each candidate validation at its first red step: `$MQ_FAIL_FAST` is `1` for every validation except the complete run on the base (see "Fail-fast runs"). |
 | `--confirm-reruns` | off | Confirm a red before blaming a change: search a red batch's prefixes, and rerun a failure at the same commit (`$MQ_RERUN_FROM`), so that a failure is blamed only when seen twice. Off, the first red is the verdict: a red change on its own is ejected on that sighting, and each change of a red batch goes back as a batch of its own (see "Keeping the base green"). |
+| `--split-red-batches` | off | With `--confirm-reruns`, still send each change of a red batch of several changes back as a batch of its own instead of searching the batch's prefixes (a search holds the run for its whole length). Each red single-change batch is then confirmed by one rerun of its failed tests at the same commit before its change is ejected. No effect without `--confirm-reruns`. |
 | `--offload MODE` | `off` | Where validations run: `off` (in this process, as always), `compare` (in this process, which decides, and also on donors, whose receipts are only compared) or `decide` (on donors only; an accepted receipt is the verdict). See "Donor validators". |
 | `--tool-identity NAME=COMMAND` | none | A tool the validation depends on (repeatable): the command prints its identity, for example a tool repository's commit or a toolchain version, never a hash of a binary (builds are not byte-identical across hosts). A donor whose answer differs does not run the job (see "Tool identity and receipts"). merge-queue's own revision is always compared. |
 | `--tool-refresh NAME=COMMAND` | none | How a donor brings the tool `NAME` (one of `--tool-identity`) up to date, for example a fetch of the tool repository (repeatable). A donor whose answer differs runs it once and asks again: an older donor then takes the job, and one that still differs declines it. |
@@ -909,6 +910,10 @@ An **item record** (`items/<pr>.json`) has these fields:
 - `confirm_reruns`: `true` turns same-commit confirmation on: red batches are searched and a
   blamed failure must be seen twice (see "Keeping the base green"). Absent (the default) means
   off: the first red is the verdict. A binary older than this field refuses a config that has it.
+- `split_red_batches`: `true`, with `confirm_reruns`, splits a red batch of several changes into
+  single-change batches instead of searching it, so confirmation costs only a rerun of a single
+  change's failed tests at its own commit. Absent (the default) means off. A binary older than
+  this field refuses a config that has it.
 
 **`donors`** fields (only read when `validator.offload` is not off; absent means the defaults):
 

@@ -129,6 +129,13 @@ pub struct ValidatorConfig {
     /// its own validation.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub confirm_reruns: bool,
+    /// With `confirm_reruns` on, a red batch of several changes still goes back as
+    /// single-change batches, as with it off, instead of being searched with prefix probes
+    /// (which hold the run for their whole length). Each single-change batch that is red is then
+    /// confirmed by one same-commit rerun of its failed tests before its change is ejected.
+    /// Nothing changes with `confirm_reruns` off, which always splits.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub split_red_batches: bool,
 }
 
 fn is_zero_u32(value: &u32) -> bool {

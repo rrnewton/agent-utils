@@ -19,7 +19,8 @@
 //!   change that answer, so one sighting confirms it. With it off (the default), every first
 //!   red is the verdict: retries belong in the validator, not in an outer loop here. A red batch
 //!   of several changes is then split instead of searched: each change goes back as a batch of
-//!   its own and stays alone in every later plan of the run.
+//!   its own and stays alone in every later plan of the run. `validator.split_red_batches` splits
+//!   with confirmation on too, so only a single change's red is confirmed before it is blamed.
 //! * Every landing records its selection, policy and scope; a focused landing leaves an
 //!   obligation that only a green complete run discharges.
 //!
@@ -4049,16 +4050,18 @@ impl<'a> Runner<'a> {
                                 pending,
                             )?;
                             BatchOutcome::Done
-                        } else if !self.config.validator.confirm_reruns
+                        } else if (!self.config.validator.confirm_reruns
+                            || self.config.validator.split_red_batches)
                             && head.candidate.prs.len() > 1
                         {
-                            // Same-commit confirmation is off: the red is the verdict, and a
-                            // batch of several changes is not searched here (the probes and the
-                            // remainder would hold this loop for their whole length, with no
-                            // request taken and no free slot filled). Each change goes back, in
-                            // order, as a batch of its own: built on the one before, each is a
-                            // prefix of the red batch, decided by its own validation. The
-                            // window is not halved, so they validate side by side.
+                            // Same-commit confirmation is off, or on only for single changes
+                            // (`split_red_batches`): a batch of several changes is not searched
+                            // here (the probes and the remainder would hold this loop for their
+                            // whole length, with no request taken and no free slot filled). Each
+                            // change goes back, in order, as a batch of its own: built on the one
+                            // before, each is a prefix of the red batch, decided by its own
+                            // validation (confirmed before an ejection when confirmation is on).
+                            // The window is not halved, so they validate side by side.
                             if head.stacked {
                                 discard(&mut flights, &rx, pending);
                             }

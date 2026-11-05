@@ -604,6 +604,11 @@ enum Command {
         /// batch of several changes goes back as single-change batches.
         #[arg(long)]
         confirm_reruns: bool,
+        /// With --confirm-reruns, still split a red batch of several changes into single-change
+        /// batches instead of searching it with prefix probes; each red single is confirmed by
+        /// one same-commit rerun of its failed tests before its change is ejected.
+        #[arg(long)]
+        split_red_batches: bool,
         /// Where validations run: `off` (in this process; the default), `compare` (in this
         /// process, which decides, and also on donors, whose receipts are only compared), or
         /// `decide` (on donors only; an accepted receipt is the verdict).
@@ -1296,6 +1301,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             red_without_probe,
             fail_fast,
             confirm_reruns,
+            split_red_batches,
             offload,
             tool_identity,
             tool_refresh,
@@ -1434,6 +1440,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     },
                     fail_fast,
                     confirm_reruns,
+                    split_red_batches,
                     offload: if offload == "off" {
                         String::new()
                     } else {
