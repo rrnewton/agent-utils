@@ -22884,10 +22884,22 @@ def _submodule_source_identities(
         _ensure_no_symlink_components(checkout_path, managed, "submodule checkout")
         _ensure_no_symlink_components(config.root, source, "source submodule")
         if not source.is_dir() or source.is_symlink():
-            raise Refusal(
-                f"source submodule is unavailable: {source}. Preserve the slot until "
-                "its remote authority can be established"
+            # No source copy stands in for this submodule (#910): the
+            # slot's own module repository is its identity instead, and an
+            # unpopulated worktree has no identity at all.
+            if not _submodule_worktree_populated(managed):
+                identities.append((0, 0))
+                continue
+            git_directory = Path(
+                vcs._run(managed, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
             )
+            try:
+                identities.append(_directory_device_inode(git_directory))
+            except OSError as exc:
+                raise Refusal(
+                    f"cannot inspect submodule repository {git_directory}: {exc}"
+                ) from exc
+            continue
         try:
             identities.append(_directory_device_inode(source))
         except OSError as exc:
@@ -22910,20 +22922,85 @@ def _submodule_salvage_checkouts_uncached(
     ):
         relative = Path(relative_value)
         managed = checkout_path / relative
+        if not _submodule_worktree_populated(managed):
+            # Nothing was ever checked out here, so there is nothing to
+            # salvage and nothing that can be lost by removal (#910).
+            print(
+                f"wrkslots: skipping uninitialised submodule "
+                f"{checkout.name}/{relative_value}: nothing is checked out",
+                file=sys.stderr,
+            )
+            continue
         source = _source_submodule_directory(config, vcs, source_repository, relative)
         _ensure_no_symlink_components(checkout_path, managed, "submodule checkout")
         _ensure_no_symlink_components(config.root, source, "source submodule")
-        if not source.is_dir() or source.is_symlink():
-            raise Refusal(
-                f"source submodule is unavailable for {checkout.name}/{relative_value}: "
-                f"{source}. Preserve the slot until its remote authority can be established"
-            )
-        if vcs.repository_root(source) != source.absolute():
-            raise Refusal(f"source submodule is not a Git root: {source}")
         remote = config.default_remote
         managed_authority = vcs.remote_authority(managed, remote)
         head = vcs.head(managed)
         stored_path = (Path(checkout.path) / relative).as_posix()
+        try:
+            source_is_root = (
+                source.is_dir()
+                and not source.is_symlink()
+                and vcs.repository_root(source) == source.absolute()
+            )
+        except Refusal:
+            source_is_root = False
+        if not source_is_root:
+            # The primary repository no longer declares this submodule, or
+            # never initialised its own copy: judge the slot's copy by its
+            # own recorded remote instead of refusing (#910, #871). Its own
+            # module repository stands in as the recorded repository, as
+            # for an unlisted submodule (#859); salvage then either proves
+            # HEAD published at that remote or bundles it locally, and
+            # refuses only what it can do neither for.
+            git_directory = Path(
+                vcs._run(
+                    managed, ["rev-parse", "--absolute-git-dir"]
+                ).stdout.strip()
+            )
+            try:
+                repository = git_directory.relative_to(config.root).as_posix()
+            except ValueError:
+                raise Refusal(
+                    f"source submodule is unavailable for {checkout.name}/{relative_value}: "
+                    f"{source}, and its own repository {git_directory} is outside "
+                    "the project root; preserve the slot until its remote "
+                    "authority can be established"
+                ) from None
+            mirror = _absolute_local_remote_directory(managed, managed_authority)
+            if mirror is not None and (
+                vcs._run(
+                    mirror, ["rev-parse", "--is-bare-repository"], check=False
+                ).stdout.strip()
+                != "true"
+            ):
+                # The slot's remote is a local module mirror (the layout
+                # _submodule_network_authority judges at the source's own
+                # remote), not a remote in its own right: without the
+                # source there is no authority to judge it by.
+                raise Refusal(
+                    f"source submodule is unavailable for {checkout.name}/{relative_value}: "
+                    f"{source}. Preserve the slot until its remote authority "
+                    "can be established"
+                )
+            result.append(
+                (
+                    Checkout(
+                        name=f"{checkout.name}/{relative_value}",
+                        path=stored_path,
+                        repository=repository,
+                        branch="",
+                        start_point=head,
+                        remote=remote,
+                        remote_url_sha256=managed_authority.sha256,
+                        landed_ref=_landed_ref_for_remote(config, remote),
+                        head=head,
+                    ),
+                    managed,
+                )
+            )
+            continue
         source_relative = source.relative_to(config.root).as_posix()
         submodule = Checkout(
             name=f"{checkout.name}/{relative_value}",
@@ -22944,6 +23021,25 @@ def _submodule_salvage_checkouts_uncached(
         _submodule_network_authority(config, submodule, managed, vcs, managed_authority)
         result.append((submodule, managed))
     return tuple(result)
+
+
+def _checkout_is_self_sourced(
+    config: Config, checkout: Checkout, path: Path, vcs: _GitVcs
+) -> bool:
+    """Whether a candidate's recorded repository is its own module repository.
+
+    That is the fallback for a submodule the primary no longer declares
+    (#910): there is no durable source repository, so unpublished work is
+    bundled locally and never pushed through its own remote.
+    """
+    try:
+        _relative, repository = _stored_repository_path(config, checkout.repository)
+        git_directory = Path(
+            vcs._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
+        )
+    except Refusal:
+        return False
+    return repository.resolve() == git_directory.resolve()
 
 
 def _is_unlisted_submodule_worktree(vcs: _GitVcs, checkout_path: Path, relative: str) -> bool:
@@ -23463,7 +23559,7 @@ def _salvage_one_checkout(
         )
     vcs.assert_remote_authority(path, checkout.remote, facts.remote_authority)
     if not facts.dirty and containing:
-        return {
+        receipt: dict[str, object] = {
             "checkout": checkout.name,
             "source_head": facts.head,
             "salvage_commit": facts.commit,
@@ -23472,6 +23568,11 @@ def _salvage_one_checkout(
             "remote_ref": None,
             "containing_remote_refs": list(containing),
         }
+        if _checkout_is_self_sourced(config, checkout, path, vcs):
+            # The primary no longer declares this submodule, so publication
+            # was proven at the slot's own recorded remote (#910).
+            receipt["evidence"] = "remote-verified"
+        return receipt
     if facts.shallow is not None:
         raise _shallow_history_refusal(facts)
     # A submodule whose remote is its source repository is never pushed
@@ -23596,7 +23697,16 @@ def _salvage_agent_slot(
         for submodule, submodule_path in _submodule_salvage_checkouts(
             config, checkout, vcs
         ):
-            candidates.append((submodule, submodule_path, True, None, drift is not None))
+            candidates.append(
+                (
+                    submodule,
+                    submodule_path,
+                    True,
+                    None,
+                    drift is not None
+                    or _checkout_is_self_sourced(config, submodule, submodule_path, vcs),
+                )
+            )
         if owner_proven_dead:
             # A module repository the branch no longer lists is salvaged
             # like a listed one (never pushed) instead of refusing the whole

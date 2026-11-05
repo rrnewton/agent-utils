@@ -58455,6 +58455,78 @@ def test_archive_drifted_checkouts_salvages_an_unlisted_submodule(
     )
 
 
+def _slot_with_primary_dropped_leaf(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, Path]:
+    """A dead-owner slot whose nested leaf the primary no longer initialises (#910)."""
+    project, tree, component, _component_head = _drifted_slot_with_submodules(tmp_path)
+    repository = project / "repo"
+    leaf = component / "leaf"
+    # The primary's own component copy no longer initialises the leaf, so
+    # no source submodule stands in for the slot's copy.
+    git(
+        repository / "component",
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "deinit",
+        "-f",
+        "leaf",
+    )
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    return project, tree, component, leaf
+
+
+def test_remove_accepts_nested_submodule_the_primary_dropped_when_remote_verified(
+    tmp_path: Path,
+) -> None:
+    project, tree, _component, _leaf = _slot_with_primary_dropped_leaf(tmp_path)
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    receipt = _drift_receipts(project)["product/component/leaf"]
+    assert receipt["disposition"] == "already-published"
+    assert receipt["evidence"] == "remote-verified"
+    assert receipt["containing_remote_refs"]
+
+
+def test_remove_bundles_nested_submodule_the_primary_dropped_when_unpublished(
+    tmp_path: Path,
+) -> None:
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    git(leaf, "checkout", "-q", "-b", "local-work")
+    local_head = commit_local(leaf, "local.txt", "leaf only\n", "leaf only")
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    receipt = _drift_receipts(project)["product/component/leaf"]
+    assert receipt["disposition"] == "archived-local"
+    assert _bundle_reaches(tmp_path, receipt, local_head, "restored-dropped-leaf.git")
+
+
+def test_remove_skips_an_uninitialised_nested_submodule(tmp_path: Path) -> None:
+    project, tree, component, _leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    git(
+        component,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "deinit",
+        "-f",
+        "leaf",
+    )
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+
+
 def test_archive_drifted_checkouts_refuses_an_unlisted_submodule_for_a_live_owner(
     tmp_path: Path,
 ) -> None:

@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-dead-actor-journal: a provably dead actor''s journal never blocks unrelated mutations'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-wrkslots
 created_at: 2026-11-05T22:24:35.086869239+00:00
-updated_at: 2026-11-05T22:24:35.086869239+00:00
+updated_at: 2026-11-05T23:44:25.000000000+00:00
+closed_at: 2026-11-05T23:44:25.000000000+00:00
 ---
 
 # Description

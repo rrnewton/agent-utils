@@ -1016,9 +1016,12 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The two remaining #885 cases (an unscoped recovery resolving an
     # absent sealed target, and an abort making a missing create journal
     # terminal) are mapped.
-    assert len(all_tests) == 2146
+    # The three #910 cases (a nested submodule the primary dropped is
+    # remote-verified, bundled when unpublished, and skipped when
+    # uninitialised) are mapped.
+    assert len(all_tests) == 2149
     assert len(ordinary) == 339
-    assert len(mapped) == 1807
+    assert len(mapped) == 1810
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
