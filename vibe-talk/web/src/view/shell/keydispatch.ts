@@ -4,7 +4,7 @@
 // and the column it runs in. The keymap itself, what each binding does, and registering the listeners are the
 // page's.
 
-import { chordMatches, swallow, typesCharacter } from "./chords.ts";
+import { MAC_FIELD_EDIT_LETTERS, appleKeyboard, chordMatches, swallow, typesCharacter } from "./chords.ts";
 import type { KeyChord, KeyEvent } from "./chords.ts";
 
 /** A keydown, as the dispatch reads it. */
@@ -42,8 +42,8 @@ export interface KeyDispatchDependencies<Target, Pane, Column> {
   keepsOwnKeys(target: Target): boolean;
   /** The keys are in use: the one selection moves from wherever the mouse put it. */
   keysInUse(): void;
-  /** Whether the key is a Mac text field's own Ctrl edit, left to the field. */
-  macFieldEditKey(event: DispatchedKey, target: Target): boolean;
+  /** The name of the reader's Ctrl or Cmd key: "Cmd" on an Apple keyboard. */
+  modKeyName(): string;
   /** The element holding the focus, for a key with no target. */
   activeElement(): Target;
   /** Whether the main screen is up, where the lists stand in columns. */
@@ -88,6 +88,15 @@ export interface KeyDispatch<Target> {
   onEverywhereKey(event: DispatchedKey | null | undefined): void;
   /** Whether `chord` of `binding` may fire with the focus on `target`. */
   chordAllowed(binding: KeyBinding<Target>, chord: KeyChord, target: Target): boolean;
+  /**
+   * Whether `event` is one of the keys that edit text in every field on a Mac, pressed in a text field on an
+   * Apple keyboard: Ctrl and one of `MAC_FIELD_EDIT_LETTERS`, without Cmd. Such a key is the field's, never
+   * a chord of the page, so in a message box on a Mac Ctrl+K deletes to the end of the line as it does
+   * everywhere else there, and Cmd+K is the channel picker. Off the field, and on other keyboards, Ctrl
+   * works as Cmd does. Ctrl+S is not one of them, and goes to the message box on a Mac as it does
+   * everywhere else.
+   */
+  macFieldEditKey(event: DispatchedKey, target: Target): boolean;
 }
 
 export function createKeyDispatch<Target, Pane, Column>(deps: KeyDispatchDependencies<Target, Pane, Column>): KeyDispatch<Target> {
@@ -95,6 +104,14 @@ export function createKeyDispatch<Target, Pane, Column>(deps: KeyDispatchDepende
     if (typesCharacter(chord) && !deps.singleKeysOn()) return false;
     if (chord.mod || chord.key === "Escape" || binding.inField) return true;
     return !deps.isTextField(target) && !deps.keepsOwnKeys(target);
+  }
+
+  function macFieldEditKey(event: DispatchedKey, target: Target): boolean {
+    if (!event.ctrlKey || event.metaKey || !deps.isTextField(target) || !appleKeyboard(deps.modKeyName())) return false;
+    const key = String(event.key || "");
+    const letter = /^[a-z]$/i.test(key) ? key.toLowerCase() : /^Key[A-Z]$/.test(String(event.code || ""))
+      ? String(event.code).slice(3).toLowerCase() : "";
+    return letter !== "" && MAC_FIELD_EDIT_LETTERS.includes(letter);
   }
 
   /** The key's target, else the focus. */
@@ -130,6 +147,7 @@ export function createKeyDispatch<Target, Pane, Column>(deps: KeyDispatchDepende
 
   return {
     chordAllowed,
+    macFieldEditKey,
     onPageKey(event) {
       if (!event || event.isComposing || event.keyCode === 229) return;
       // `#239 single-selection`. A key moves the one selection from wherever the mouse put it. Said
@@ -138,7 +156,7 @@ export function createKeyDispatch<Target, Pane, Column>(deps: KeyDispatchDepende
       deps.keysInUse();
       if (event.defaultPrevented) return;
       const target = targetOf(event);
-      if (deps.macFieldEditKey(event, target)) return;
+      if (macFieldEditKey(event, target)) return;
       inColumnOf(target, () => dispatchKey(event, target));
     },
     onEverywhereKey(event) {

@@ -15,7 +15,7 @@ export type { RowShortcuts, ShortcutButton } from "./rowshortcuts.ts";
 export { createChannelPick } from "./channelpick.ts";
 export type { ChannelPick } from "./channelpick.ts";
 export type { ActionMenu, ActionMenuDependencies } from "./actionmenu.ts";
-export { MAC_FIELD_EDIT_LETTERS, chordMatches, isLetterKey, modHeld, swallow, typedKey, typesCharacter } from "./chords.ts";
+export { MAC_FIELD_EDIT_LETTERS, appleKeyboard, chordMatches, isLetterKey, modHeld, swallow, typedKey, typesCharacter } from "./chords.ts";
 export type { KeyChord, KeyEvent } from "./chords.ts";
 export { createReplySight } from "./draftsight.ts";
 export type { ReplySight } from "./draftsight.ts";

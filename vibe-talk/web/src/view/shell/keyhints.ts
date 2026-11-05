@@ -3,7 +3,7 @@
 // said from the keymap in the words on their own keyboard. The keymap itself, and when the keys are said again,
 // are the page's.
 
-import { typesCharacter } from "./chords.ts";
+import { appleKeyboard, typesCharacter } from "./chords.ts";
 import type { KeyChord } from "./chords.ts";
 import type { RowShortcuts } from "./rowshortcuts.ts";
 
@@ -33,7 +33,7 @@ export const KEY_WORDS: Readonly<Record<string, string>> = {
 export function chordWords(chord: KeyChord, mod: string): string {
   const parts: string[] = [];
   if (chord.mod) parts.push(mod);
-  if (chord.alt) parts.push(mod === "Cmd" ? "Option" : "Alt");
+  if (chord.alt) parts.push(appleKeyboard(mod) ? "Option" : "Alt");
   if (chord.shift) parts.push("Shift");
   const letter = /^[a-z]$/.test(chord.key);
   parts.push(KEY_WORDS[chord.key] || (letter && (chord.shift || chord.mod) ? chord.key.toUpperCase() : chord.key));
@@ -149,7 +149,7 @@ export function createKeyHints(deps: KeyHintsDependencies): KeyHints {
       const off = document.createElement("p");
       off.className = "hint";
       off.textContent = `Single-key shortcuts are off in Settings: only Esc, the arrows, Enter, PgUp, PgDn, Home, End ` +
-        `and the ${mod} and ${mod === "Cmd" ? "Option" : "Alt"} chords act.`;
+        `and the ${mod} and ${appleKeyboard(mod) ? "Option" : "Alt"} chords act.`;
       groups.push(off);
     }
     for (const group of deps.groups) {

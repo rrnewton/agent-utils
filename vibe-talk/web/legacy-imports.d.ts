@@ -24,7 +24,6 @@ declare const createScreens: LegacyImports["createScreens"];
 declare const typedKey: LegacyImports["typedKey"];
 declare const swallow: LegacyImports["swallow"];
 declare const modHeld: LegacyImports["modHeld"];
-declare const MAC_FIELD_EDIT_LETTERS: LegacyImports["MAC_FIELD_EDIT_LETTERS"];
 declare const createActionMenu: LegacyImports["createActionMenu"];
 declare const createPromptsTray: LegacyImports["createPromptsTray"];
 declare const createKeyDispatch: LegacyImports["createKeyDispatch"];

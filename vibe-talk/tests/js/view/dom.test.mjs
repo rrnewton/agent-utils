@@ -393,6 +393,9 @@ test("`#624 voice-page-modularity`: the keyboard dispatch runs the first binding
   const field = { field: true };
   const side = { pane: "side" };
   const inSide = { in: side };
+  const slider = { own: true };
+  let mod = "Cmd";
+  let main = true;
   const bind = (name, chords, extra = {}) => ({ chords, run: () => { log.push(name); return extra.takes ?? true; }, ...extra });
   const keymap = [
     { chords: [{ key: "?" }] },
@@ -401,17 +404,19 @@ test("`#624 voice-page-modularity`: the keyboard dispatch runs the first binding
     bind("done", [{ key: "e" }], { group: "message" }),
     bind("filter", [{ key: "f" }], { group: "filters" }),
     bind("escape", [{ key: "Escape" }]),
-    bind("send", [{ key: "s", mod: true }], { everywhere: true }),
+    { chords: [{ key: "s", mod: true }], everywhere: true, run: (event, target) => { log.push(target === field ? "send from the focus" : "send"); return true; } },
+    bind("bare", [{ key: "b" }, { key: "b", mod: true }], { everywhere: true }),
+    bind("in field", [{ key: "x" }], { inField: true }),
   ];
   const keys = createKeyDispatch({
     keymap: () => keymap,
     singleKeysOn: () => single,
     isTextField: (target) => Boolean(target && target.field),
-    keepsOwnKeys: () => false,
+    keepsOwnKeys: (target) => Boolean(target && target.own),
     keysInUse: () => log.push("keys"),
-    macFieldEditKey: (event) => event.key === "k" && event.ctrlKey,
+    modKeyName: () => mod,
     activeElement: () => field,
-    onMain: () => true,
+    onMain: () => main,
     paneFor: (target) => (target && target.in) || null,
     paneColumn: (pane) => pane.pane,
     mainColumn: () => "main",
@@ -429,7 +434,7 @@ test("`#624 voice-page-modularity`: the keyboard dispatch runs the first binding
     return [...log, `prevented ${event.prevented}`];
   };
   assert.deepStrictEqual(press({ key: "j" }), ["keys", "in main", "passes", "acted", "down", "prevented 1"],
-    "a binding that did not take the key let the walk go on, or the reader's acting was not noted for each");
+    "the walk stopped at a binding that did not take the key, or the reader's acting in the list was not noted before the key that moves");
   assert.deepStrictEqual(press({ key: "f", target: inSide }), ["keys", "in side", "filter", "prevented 1"], "the key ran outside its list's column, or a filter key counted as acting in the list");
   assert.deepStrictEqual(press({ key: "e", repeat: true }), ["keys", "in main", "scroll e", "prevented 0"], "a held e was a Done on every row");
   assert.deepStrictEqual(press({ key: "j", target: field }), ["keys", "in main", "scroll j", "prevented 0"], "a single key fired in a text field");
@@ -437,12 +442,25 @@ test("`#624 voice-page-modularity`: the keyboard dispatch runs the first binding
   single = false;
   assert.deepStrictEqual(press({ key: "e" }), ["keys", "in main", "scroll e", "prevented 0"], "a single key fired with the single keys off");
   single = true;
-  assert.deepStrictEqual(press({ key: "k", ctrlKey: true }), ["keys", "prevented 0"], "a Mac field's own Ctrl edit was taken");
-  assert.deepStrictEqual(press({ key: "s", metaKey: true, target: null }), ["keys", "in main", "send", "keys", "prevented 1"],
-    "Cmd+S was not heard first at the window, or the document's listener ran it again");
+  assert.deepStrictEqual(press({ key: "j", target: slider }), ["keys", "in main", "scroll j", "prevented 0"], "a single key fired on an element that keeps its own keys");
+  assert.deepStrictEqual(press({ key: "x", target: field }), ["keys", "in main", "in field", "prevented 1"], "a binding marked inField did not fire in a field");
+  main = false;
+  assert.deepStrictEqual(press({ key: "f", target: inSide }), ["keys", "in main", "filter", "prevented 1"], "off the main screen a key went to a list's column");
+  main = true;
+  assert.deepStrictEqual(press({ key: "k", ctrlKey: true, target: field }), ["keys", "prevented 0"], "a Mac field's own Ctrl edit was taken");
+  assert.equal(keys.macFieldEditKey({ key: "л", code: "KeyK", ctrlKey: true }, field), true, "a Mac field's Ctrl edit was not read by place on a layout for another script");
+  assert.deepStrictEqual([keys.macFieldEditKey({ key: "k", ctrlKey: true }, {}), keys.macFieldEditKey({ key: "k", ctrlKey: true, metaKey: true }, field),
+    keys.macFieldEditKey({ key: "s", ctrlKey: true }, field)], [false, false, false], "off a field, with Cmd held too, or for Ctrl+S, the key was left to the field");
+  mod = "Ctrl";
+  assert.deepStrictEqual(press({ key: "k", ctrlKey: true, target: field }), ["keys", "in main", "scroll k", "prevented 0"], "Ctrl in a field was left to it off an Apple keyboard");
+  mod = "Cmd";
+  assert.deepStrictEqual(press({ key: "s", metaKey: true, target: null }), ["keys", "in main", "send from the focus", "keys", "prevented 1"],
+    "Cmd+S was not heard first at the window, ran without the focus as its target, or the document's listener ran it again");
+  assert.deepStrictEqual(press({ key: "s", ctrlKey: true, target: field }), ["keys", "in main", "send from the focus", "keys", "prevented 1"], "Ctrl+S in a field on a Mac was left to the field");
+  assert.deepStrictEqual(press({ key: "b" }), ["keys", "in main", "bare", "prevented 1"], "the bare chord of an everywhere binding was taken at the window");
   assert.deepStrictEqual(press({ key: "s", ctrlKey: true, repeat: true }), ["keys", "prevented 1"], "a held chord's repeats were not refused, or ran it");
   assert.deepStrictEqual(press({ key: "j", isComposing: true }), ["prevented 0"], "a key fired while an input method composed");
-  assert.deepStrictEqual(press({ key: "/", keyCode: 229 }), ["prevented 0"]);
+  assert.deepStrictEqual(press({ key: "/", keyCode: 229 }), ["prevented 0"], "a key fired while an input method held it (keyCode 229)");
   assert.equal(keys.chordAllowed(keymap[3], { key: "e" }, {}), true);
 });
 
@@ -466,7 +484,6 @@ test("`#624 voice-page-modularity`: the keys are said from the keymap in the rea
   const nodes = {};
   const byId = (id) => (nodes[id] ??= node());
   byId("discord-log").children = [row];
-  byId("open-settings").attributes["aria-keyshortcuts"] = "stale";
   const keymap = [
     { group: "Page", chords: [{ key: "/" }, { key: "/", mod: true }], does: "Search", controls: ["search-toggle"] },
     { group: "Page", chords: [{ key: "," }], does: () => "Settings, now", controls: ["open-settings"] },

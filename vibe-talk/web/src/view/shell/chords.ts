@@ -69,6 +69,9 @@ export const modHeld = (event: KeyEvent): boolean => Boolean(event.ctrlKey || ev
  */
 export const MAC_FIELD_EDIT_LETTERS = "abdefhklnoptvy";
 
+/** Whether a keyboard whose Ctrl or Cmd key is named `mod` says Cmd and Option, as an Apple one does. */
+export const appleKeyboard = (mod: string): boolean => mod === "Cmd";
+
 /** Whether `chord` is the key `event` reports. Shift counts for letters and named keys only. */
 export function chordMatches(chord: KeyChord, event: KeyEvent): boolean {
   if (Boolean(chord.mod) !== modHeld(event) || Boolean(chord.alt) !== Boolean(event.altKey)) return false;
