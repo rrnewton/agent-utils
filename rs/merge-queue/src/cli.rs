@@ -767,6 +767,11 @@ enum Command {
         /// batch with a better historical green rate.
         #[arg(long)]
         value_ordering: bool,
+        /// Only start a disjoint second root when the red share of the last 20
+        /// decided validations in the decision records is at least this percent
+        /// (0, the default, always starts one when it fits).
+        #[arg(long, default_value_t = 0)]
+        disjoint_root_min_red_percent: u32,
         /// Confirm each red by validating the same commit again (`$MQ_RERUN_FROM`) and search a
         /// red batch with prefix probes. Off by default: the first red is the verdict, and a red
         /// batch of several changes goes back as single-change batches.
@@ -1489,6 +1494,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             peripheral_max_batch,
             conflict_footprints,
             value_ordering,
+            disjoint_root_min_red_percent,
             confirm_reruns,
             split_red_batches,
             suspect_flake_reruns,
@@ -1644,6 +1650,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     tool_refresh,
                 },
                 value_ordering,
+                disjoint_root_min_red_percent,
                 conflict_prior: crate::state::ConflictPriorConfig {
                     footprints: conflict_footprints,
                 },

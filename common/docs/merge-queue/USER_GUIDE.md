@@ -875,6 +875,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `max_depth` | `0` | The largest adaptive window; `0` means fixed at `depth`. |
 | `value_ordering` | `false` | Value-ordered scheduling: a waiting batch whose historical green rate (per change, from the decision log) beats the deepest in-flight batch's aborts it for its slot; the aborted batch is replanned later in the run (a `value-abort` event). |
 | `disable_disjoint_root` | `false` | Turn off the disjoint second root: with a window of at least 2, one slot validates a batch built on the base itself, disjoint (no textual conflict, no dependency) from every batch in flight, so a red stack cannot take the whole window down. |
+| `disjoint_root_min_red_percent` | `0` | Only start a disjoint second root when the red share of the last 20 decided validations in the decision records is at least this percent; `0` (the default) always starts one when it fits. Set it with `init --disjoint-root-min-red-percent`. |
 | `union_paths` | `[]` | Attribute patterns merged with Git's union driver (see "Union merges"). |
 | `priority` | absent | `{label, ci_paths}`: the priority label (absent or empty: `mq-priority`; `-`: off) and the CI path patterns for label suggestions. Left out of the file while both are defaults. See "Priority changes". |
 | `regenerate` | empty | `{paths, command, when}`; see "Generated files". |
@@ -1488,9 +1489,16 @@ The base moves only to a commit whose exact tree passed validation (the bors rul
    first on the base, each next one on the candidate before it, and up to *window* of them validate
    at once. With a window of at least 2, one slot instead takes a
    **disjoint root**: a later batch that shares no change, no textual conflict and no dependency
-   with anything in flight, built on the base itself (a `disjoint-root` event). It is not cancelled
-   when the stack is discarded; when the stack's head lands first it is rebuilt like any stale
-   candidate. `disable_disjoint_root` turns it off. Green batches land in order, as soon as every batch ahead of them has landed, and the
+   with anything in flight, built on the base itself (a `disjoint-root` event). It records the
+   batches in flight when it starts, the ones it jumped over. It is not cancelled when the stack
+   is discarded, and it is decided as soon as every batch it jumped over is decided, without
+   waiting for the rest of the queue: if none of them landed, its parent is still the base and it
+   lands on its own validation. The moment any batch ahead of it lands, it is cancelled instead
+   (a `disjoint-root-cancelled` event), its slot is freed at once, and its changes go back to the
+   front of the queue to be rebuilt on the new base. A disjoint root never lands on a base other
+   than the commit it was built on. `disable_disjoint_root` turns it off, and
+   `disjoint_root_min_red_percent` only starts one when the recent red rate makes a red head likely.
+   Green batches land in order, as soon as every batch ahead of them has landed, and the
    next batch starts at once on top of the last one in flight.
 2. **AIMD.** The window starts at `depth`, grows by one per landed batch up to `max_depth`, and
    halves per red batch it searches or decides alone whose every failure timed out or reached no

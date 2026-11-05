@@ -642,6 +642,10 @@ struct Flight {
     /// Built on the base itself, disjoint from every batch in flight (a second root):
     /// a red or discarded stack does not cancel it, and it counts in the window.
     rooted: bool,
+    /// For a rooted batch, the ids of the batches in flight when it started: every
+    /// batch ahead of it in plan order. It is decided as soon as all of them are
+    /// decided, and cancelled the moment any of them lands. Empty for other batches.
+    jumped_over: BTreeSet<u64>,
     /// Where it sat in the window when it started.
     speculation: Option<Speculation>,
     /// Validations of this candidate that admission refused and that were started again (see
@@ -3404,6 +3408,93 @@ impl<'a> Runner<'a> {
         !conflicts && !depends
     }
 
+    /// Cancel every rooted flight in `flights`, wait for each to stop, and put its
+    /// changes back at the front of `pending` in their original order. This is the
+    /// same cancellation path a discarded stacked batch takes: the cancel flag is
+    /// set and the loop waits for the validation to report, storing results that
+    /// arrive meanwhile for batches that are kept. The rooted slot is freed at
+    /// once, so the caller can refill the window in the same iteration.
+    fn cancel_rooted(
+        &self,
+        flights: &mut VecDeque<Flight>,
+        rx: &mpsc::Receiver<(u64, JobResult)>,
+        pending: &mut VecDeque<Vec<i64>>,
+        why: &str,
+    ) {
+        let mut kept: VecDeque<Flight> = VecDeque::new();
+        let mut cancelled: Vec<Flight> = Vec::new();
+        while let Some(flight) = flights.pop_front() {
+            if flight.rooted {
+                cancelled.push(flight);
+            } else {
+                kept.push_back(flight);
+            }
+        }
+        if cancelled.is_empty() {
+            *flights = kept;
+            return;
+        }
+        for flight in &cancelled {
+            flight.cancel.store(true, Ordering::Relaxed);
+        }
+        let mut waiting: BTreeSet<u64> = cancelled
+            .iter()
+            .filter(|flight| flight.result.is_none())
+            .map(|flight| flight.id)
+            .collect();
+        while !waiting.is_empty() {
+            match rx.recv() {
+                Ok((id, result)) => {
+                    if !waiting.remove(&id) {
+                        if let Some(flight) = kept.iter_mut().find(|flight| flight.id == id) {
+                            flight.result = Some(result);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let prs: Vec<i64> = cancelled
+            .iter()
+            .flat_map(|flight| flight.candidate.prs.iter().copied())
+            .collect();
+        for flight in cancelled.into_iter().rev() {
+            pending.push_front(flight.candidate.prs);
+        }
+        *flights = kept;
+        self.event(
+            "disjoint-root-cancelled",
+            &format!(
+                "{} cancelled: {why}; its changes go back to the front of the queue to \
+                 be rebuilt on the new base",
+                list(&prs)
+            ),
+        );
+    }
+
+    /// Cancel a rooted flight whose parent is no longer the base: it can never
+    /// land as built, so it must not hold its slot or spend the rest of its
+    /// validation. A rooted batch only ever lands on its own parent.
+    fn cancel_stale_rooted(
+        &self,
+        flights: &mut VecDeque<Flight>,
+        rx: &mpsc::Receiver<(u64, JobResult)>,
+        pending: &mut VecDeque<Vec<i64>>,
+    ) {
+        let base = lock(&self.base).clone();
+        if flights
+            .iter()
+            .any(|flight| flight.rooted && flight.candidate.parent != base)
+        {
+            self.cancel_rooted(
+                flights,
+                rx,
+                pending,
+                "the base moved from the commit it was built on",
+            );
+        }
+    }
+
     /// Whether every change in `prs` is peripheral in the current plan.
     fn all_peripheral(&self, prs: &[i64]) -> bool {
         if prs.is_empty() || !self.config.peripheral.enabled() {
@@ -4226,8 +4317,21 @@ impl<'a> Runner<'a> {
             } else {
                 None
             };
+            // Recent red rate for the optional disjoint-root gate (see
+            // `Config::disjoint_root_min_red_percent`); decision records are only
+            // appended at the end of a run, so this is stable for the run.
+            let recent_red_rate = if self.config.disjoint_root_min_red_percent > 0 {
+                crate::decisions::recent_red_rate(&self.state.root, 20)
+            } else {
+                None
+            };
             let result = (|| -> Result<String, String> {
                 loop {
+                    // A landing since the last iteration (a head decided below,
+                    // or a ruling taken in with intake) moves the base off a
+                    // rooted batch's parent: cancel it now, before the window
+                    // is filled, so its slot and changes are reused at once.
+                    self.cancel_stale_rooted(&mut flights, &rx, pending);
                     self.publish_window(
                         flights
                             .iter()
@@ -4384,6 +4488,10 @@ impl<'a> Runner<'a> {
                         // everything in flight, validates on the base itself instead
                         // of on the deepest stacked candidate.
                         let rooted = !self.config.disable_disjoint_root
+                            && (self.config.disjoint_root_min_red_percent == 0
+                                || recent_red_rate.is_some_and(|rate| {
+                                    rate * 100.0 >= self.config.disjoint_root_min_red_percent as f64
+                                }))
                             && window >= 3
                             && occupied(&flights) + 1 >= window
                             && !flights.is_empty()
@@ -4457,6 +4565,11 @@ impl<'a> Runner<'a> {
                             result: None,
                             stacked: !rooted,
                             rooted,
+                            jumped_over: if rooted {
+                                flights.iter().map(|flight| flight.id).collect()
+                            } else {
+                                BTreeSet::new()
+                            },
                             speculation,
                             retries: 0,
                             head_round: false,
@@ -4574,29 +4687,56 @@ impl<'a> Runner<'a> {
                             }
                         }
                     }
-                    // A disjoint root validates early but is decided in plan order:
-                    // while anything it jumped over is still pending or in flight, it
-                    // waits behind it (its candidate goes stale and is rebuilt, like
-                    // any speculation that did not hold).
-                    if flights.front().is_some_and(|flight| flight.rooted)
-                        && (flights.len() > 1 || !pending.is_empty())
-                    {
-                        flights.rotate_left(1);
+                    // A disjoint root is decided as soon as every batch it
+                    // jumped over is decided, with no wait on the rest of
+                    // pending or on batches started after it. If any batch it
+                    // jumped over landed, the base has moved off its parent
+                    // and it is cancelled instead (see `cancel_stale_rooted`
+                    // at the top of the loop and after each landing below).
+                    self.cancel_stale_rooted(&mut flights, &rx, pending);
+                    if let Some(index) = flights.iter().position(|flight| {
+                        flight.rooted
+                            && flight.result.is_some()
+                            && rooted_decidable(flight, &flights)
+                    }) {
+                        if index > 0 {
+                            if let Some(root) = flights.remove(index) {
+                                flights.push_front(root);
+                            }
+                        }
                     }
                     // Land (or search) heads that have finished, in order.
                     while flights
                         .front()
                         .is_some_and(|flight| flight.result.is_some())
                     {
-                        if flights.front().is_some_and(|flight| flight.rooted)
-                            && (flights.len() > 1 || !pending.is_empty())
-                        {
-                            flights.rotate_left(1);
+                        if flights.front().is_some_and(|flight| {
+                            flight.rooted && !rooted_decidable(flight, &flights)
+                        }) {
                             break;
                         }
+                        if flights.front().is_some_and(|flight| flight.rooted) {
+                            // A rooted batch never lands on a base other
+                            // than its parent.
+                            let base = lock(&self.base).clone();
+                            if flights
+                                .front()
+                                .is_some_and(|flight| flight.candidate.parent != base)
+                            {
+                                self.cancel_rooted(
+                                    &mut flights,
+                                    &rx,
+                                    pending,
+                                    "the base moved from the commit it was built on",
+                                );
+                                break;
+                            }
+                        }
+                        let base_before = lock(&self.base).clone();
                         let Some(mut head) = flights.pop_front() else {
                             break;
                         };
+                        let head_prs = head.candidate.prs.clone();
                         // A refusal from behind the head, or one stored while later batches were
                         // cut (see `cut_after`), gets its retries here.
                         if let Some((job, delay)) = self.refused_again(&mut head, true) {
@@ -4811,6 +4951,18 @@ impl<'a> Runner<'a> {
                                 // window as the loop goes on.
                                 refused_stop = reason;
                             }
+                        }
+                        // A landing by the batch just decided moves the base
+                        // off a rooted batch's parent: cancel the root at
+                        // once, before any other head is decided, so its
+                        // validation is cut short and its slot freed.
+                        if lock(&self.base).as_str() != base_before.as_str() {
+                            self.cancel_rooted(
+                                &mut flights,
+                                &rx,
+                                pending,
+                                &format!("{} landed and moved the base", list(&head_prs)),
+                            );
                         }
                     }
                 }
@@ -5977,6 +6129,18 @@ impl<'a> Runner<'a> {
 /// The batch in flight the next batch is built on: the last one not cut out of the stack.
 fn stack_top(flights: &VecDeque<Flight>) -> Option<&Flight> {
     flights.iter().rev().find(|flight| flight.stacked)
+}
+
+/// Whether a rooted batch may be decided now: every batch it jumped over (in
+/// flight when it started, ahead of it in plan order) has left the window, so
+/// none of them can still land ahead of it. Batches started after it, and
+/// batches still waiting in `pending`, do not delay its decision.
+fn rooted_decidable(flight: &Flight, flights: &VecDeque<Flight>) -> bool {
+    flight.rooted
+        && flight
+            .jumped_over
+            .iter()
+            .all(|id| flights.iter().all(|other| other.id != *id))
 }
 
 /// Places taken in the window: every batch in flight but one cut out of the stack, which only

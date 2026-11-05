@@ -376,6 +376,46 @@ pub fn change_rates(state_root: &Path) -> Option<(f64, BTreeMap<i64, f64>)> {
     ))
 }
 
+/// The red share of the most recent decided (green/red) validations in the
+/// decision records: at most `limit` of them, newest first by their end time.
+/// `None` when no decided validation is recorded, so a caller gating on the
+/// rate treats no history as no evidence of a red head.
+pub fn recent_red_rate(state_root: &Path, limit: usize) -> Option<f64> {
+    if limit == 0 {
+        return None;
+    }
+    let dir = state_root.join("decisions");
+    let mut decided: Vec<(String, bool)> = Vec::new();
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.ends_with(".jsonl") || name == "rulings.jsonl" || name == "skips.jsonl" {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Ok(decision) = serde_json::from_str::<Decision>(line) else {
+                continue;
+            };
+            let is_green = match decision.outcome.as_str() {
+                "green" => true,
+                "red" => false,
+                _ => continue,
+            };
+            decided.push((decision.at, is_green));
+        }
+    }
+    decided.sort_by(|a, b| b.0.cmp(&a.0));
+    decided.truncate(limit);
+    if decided.is_empty() {
+        return None;
+    }
+    let red = decided.iter().filter(|(_, green)| !green).count();
+    Some(red as f64 / decided.len() as f64)
+}
+
 /// Inputs for turning one run's report into decision records.
 pub struct Sources<'a> {
     /// Item records by change number (for submission times, sources and claims).
@@ -1366,6 +1406,36 @@ mod unit {
             landed: None,
             reconstructed: false,
         }
+    }
+
+    #[test]
+    fn recent_red_rate_takes_the_newest_decided_validations() {
+        let root = std::env::temp_dir().join(format!(
+            "mq-decisions-red-rate-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let dir = dir(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut records = Vec::new();
+        for (at, outcome) in [
+            ("2026-11-01T10:00:00Z", "green"),
+            ("2026-11-02T10:00:00Z", "green"),
+            ("2026-11-03T10:00:00Z", "red"),
+            ("2026-11-04T10:00:00Z", "red"),
+            ("2026-11-05T10:00:00Z", "refused"),
+        ] {
+            let mut record = decision("batch", 1, outcome, 1.0);
+            record.at = at.to_owned();
+            records.push(serde_json::to_string(&record).unwrap());
+        }
+        std::fs::write(dir.join("2026-11-05.jsonl"), records.join("\n")).unwrap();
+        assert_eq!(recent_red_rate(&root, 20), Some(0.5));
+        assert_eq!(recent_red_rate(&root, 2), Some(1.0));
+        assert_eq!(recent_red_rate(&root, 0), None);
+        let empty = root.join("empty");
+        assert_eq!(recent_red_rate(&empty, 20), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

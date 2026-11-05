@@ -893,6 +893,12 @@ pub struct Config {
     /// from every batch in flight, so one red stack cannot take the whole window down.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disable_disjoint_root: bool,
+    /// Only start a disjoint second root when the recent red rate (the red share
+    /// of the last 20 decided validations in the decision records, as a percent)
+    /// is at least this threshold, so a root is only spent when a red head is
+    /// likely. The default 0 turns the gate off: a root starts whenever one fits.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub disjoint_root_min_red_percent: u32,
     /// Concurrent git probes while planning (base and pairwise conflict checks, each a git
     /// subprocess). 0 means [`DEFAULT_PROBE_PARALLELISM`]. Probe results are cached across
     /// runs in `probe-cache.json`, so this bounds only cache misses.
@@ -986,6 +992,7 @@ impl Default for Config {
             max_depth: 0,
             value_ordering: false,
             disable_disjoint_root: false,
+            disjoint_root_min_red_percent: 0,
             probe_parallelism: 0,
             union_paths: Vec::new(),
             regenerate: RegenerateConfig::default(),
