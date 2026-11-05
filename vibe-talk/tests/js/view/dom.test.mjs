@@ -1035,12 +1035,15 @@ test("`#624 voice-page-modularity`: Alt+↓ and Alt+↑ step through the channel
     picker: () => picker,
     channelsInPickerOrder: () => [{ id: "a" }, { id: "b" }, { id: 3 }],
     selectedChannelId: () => state.selected,
-    chooseChannel: (id) => { log.push(`choose ${id}`); state.selected = id; },
+    chooseChannel: (id) => { log.push(`choose ${JSON.stringify(id)}`); state.selected = id; },
     changeChannel: () => log.push("change"),
     settleFocus: () => log.push("settled"),
   });
   const run = (act) => { log.length = 0; return [act(), ...log]; };
-  assert.deepStrictEqual(run(() => keys.stepChannel({ key: "ArrowDown" })), [true, "choose 3", "change", "settled"], "Alt+↓ did not choose the next channel by its id as a string");
+  assert.deepStrictEqual(run(() => keys.stepChannel({ key: "ArrowDown" })), [true, 'choose "3"', "change", "settled"], "Alt+↓ did not choose the next channel by its id as a string");
+  assert.deepStrictEqual(run(() => keys.stepChannel({ key: "ArrowUp" })), [true, 'choose "b"', "change", "settled"],
+    "the selected \"3\" was not found as the numeric id 3, so Alt+↑ did not step back from it");
+  state.selected = "3";
   assert.deepStrictEqual(run(() => keys.stepChannel({ key: "ArrowDown" })), [true], "Alt+↓ on the last channel wrapped round");
   state.selected = "a";
   assert.deepStrictEqual(run(() => keys.stepChannel({ key: "ArrowUp" })), [true], "Alt+↑ on the first channel wrapped round");
@@ -1049,8 +1052,11 @@ test("`#624 voice-page-modularity`: Alt+↓ and Alt+↑ step through the channel
   picker.disabled = true;
   assert.deepStrictEqual([run(() => keys.stepChannel({ key: "ArrowDown" })), run(() => keys.pickChannel())], [[false], [false]], "a disabled picker was stepped or opened");
   picker.disabled = false;
+  picker.hidden = true;
+  assert.deepStrictEqual([run(() => keys.stepChannel({ key: "ArrowDown" })), run(() => keys.pickChannel())], [[false], [false]], "a hidden picker was stepped or opened");
+  picker.hidden = false;
   state.onScreen = false;
-  assert.deepStrictEqual(run(() => keys.pickChannel()), [false]);
+  assert.deepStrictEqual([run(() => keys.stepChannel({ key: "ArrowDown" })), run(() => keys.pickChannel())], [[false], [false]], "the channel keys acted off the channel's list");
   state.onScreen = true;
   const was = globalThis.document;
   globalThis.document = { activeElement: picker };
@@ -1067,6 +1073,8 @@ test("`#624 voice-page-modularity`: Alt+↓ and Alt+↑ step through the channel
     assert.deepStrictEqual(run(() => keys.channelPicked()), [undefined], "a change with the focus gone from the picker moved it");
     picker.showPicker = () => { throw new Error("NotAllowedError"); };
     assert.deepStrictEqual(run(() => keys.pickChannel()), [true, "picker focus"], "a browser refusing to open the picker from a key failed the key");
+    delete picker.showPicker;
+    assert.deepStrictEqual(run(() => keys.pickChannel()), [true, "picker focus"], "a picker that cannot be opened from script failed the key");
   } finally {
     globalThis.document = was;
   }
