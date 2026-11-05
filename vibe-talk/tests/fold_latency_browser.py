@@ -10,9 +10,13 @@ Against a fake API of twenty threads, one with twelve long replies and the rest 
 unpacked in the Threads view (Unpack all):
 
 * Shift+O: four presses 60 ms apart on the last reply fold the four last replies, each folded in the frame
-  after its key; each press's handler (the keydown from the window's capture to the end of its dispatch)
-  under `--budget-ms` at the median and twice that at most, and from the key to the next frame drawn
-  under `--frame-ms` at the median.
+  after its key; each press's handler (the keydown task on the main thread, from the window's capture
+  to the end of its dispatch) under `--cpu-ms` at the median and twice that at most, and from the key
+  to the next frame drawn under the wall budget at the median. The budgets follow the owner's rule
+  (#866): the main-thread (CPU) budget bites at ~1.5x the measured solo median, and the wall budget
+  is forgiving at 8x the CPU budget, derived unless `--frame-ms` overrides it. Handler time is the
+  page's own work; frame time also carries queueing and rendering, so contention is absorbed by
+  the wall budget, never by loosening the CPU one.
 * e: the same on another thread's replies, each marked Done in the frame after its key, held to the same.
 * style: hiding one row restyles a few elements, not the page: under `--restyle-max` elements in the
   browser's own trace (on a touch screen a rule of #429 keyboard-hides-bar restyled every element of the
@@ -115,6 +119,11 @@ WATCH_JS = """(ids) => {
   window.__ids = ids;
   if (window.__watching) return;
   window.__watching = true;
+  window.__longtasks = 0;
+  try {
+    new PerformanceObserver((list) => { window.__longtasks += list.getEntries().length; })
+      .observe({type: 'longtask', buffered: true});
+  } catch (error) { /* longtask timing unavailable in this browser */ }
   addEventListener('keydown', (event) => {
     if (event.key !== 'O' && event.key !== 'e') return;
     const press = {start: performance.now(), stamp: event.timeStamp, handler: null, frame: null};
@@ -149,10 +158,17 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--screenshots", type=Path, help="directory to write one PNG per size into (default: none)")
     parser.add_argument("--size", choices=[size[0] for size in SIZES], action="append",
                         help="walk only at these sizes, repeatable (default: all of them)")
-    parser.add_argument("--budget-ms", type=float, default=50.0,
-                        help="most a press's handler may take at the median, in ms; twice it at most (default: 50)")
-    parser.add_argument("--frame-ms", type=float, default=120.0,
-                        help="most from a key to the next frame drawn at the median, in ms (default: 120)")
+    parser.add_argument("--cpu-ms", type=float, default=21.0,
+                        help="most a press's handler may take on the main thread at the median, in ms; "
+                             "twice it at most (default: 21, ~1.5x the measured solo median)")
+    parser.add_argument("--frame-ms", type=float, default=0.0,
+                        help="most from a key to the next frame drawn at the median, in ms "
+                             "(default: 0 = derived, 8x the CPU budget)")
+    parser.add_argument("--budget-ms", type=float, default=None,
+                        help="deprecated alias for --cpu-ms")
+    parser.add_argument("--calib-idle-ms", type=float, default=88.0,
+                        help="idle time of the in-page calibration workload in ms, measured solo on this "
+                             "host class; handler times are divided by the measured slowdown (default: 88)")
     parser.add_argument("--restyle-max", type=int, default=500,
                         help="most elements hiding one row may restyle (default: 500)")
     parser.add_argument("--report-only", action="store_true",
@@ -162,6 +178,8 @@ def arguments() -> argparse.Namespace:
 
 def main() -> int:
     args = arguments()
+    if args.budget_ms is not None:
+        args.cpu_ms = args.budget_ms
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as error:
@@ -216,16 +234,40 @@ def presses(desk: Desk, key: str, ids: list[str]) -> tuple[list[float], list[flo
             {str(id): float(at) - first for id, at in seen.items()})
 
 
+# A fixed CPU-bound workload run in the page itself. Its solo time on this host class is
+# --calib-idle-ms; the ratio of the median of five runs to that is how much slower this
+# browser currently executes the same work, so handler task times divided by it are
+# work-equivalent (CPU) milliseconds rather than contention-stretched wall ones (#866).
+CALIB_JS = """() => { const samples = []; for (let s = 0; s < 5; s++) { const t0 = performance.now();
+  let x = 0; for (let i = 0; i < 3000000; i++) { x += Math.sin(x + i) * Math.cos(i); }
+  samples.push(performance.now() - t0); if (x === 12345) console.log(x); } return samples; }"""
+
+
+def load_factor(page: Page, args: argparse.Namespace) -> float:
+    """How much slower than idle this browser currently runs fixed work (>= 1)."""
+    raw = page.evaluate(CALIB_JS)
+    assert isinstance(raw, list) and raw
+    samples = [float(one) for one in raw]
+    return max(1.0, statistics.median(samples) / float(args.calib_idle_ms))
+
+
 def judge(desk: Desk, args: argparse.Namespace, what: str, handler: list[float], frame: list[float],
           seen: dict[str, float], ids: list[str]) -> str:
-    said = (f"{what}: handlers {', '.join(f'{ms:.0f}' for ms in handler)} ms, key to frame "
-            f"{', '.join(f'{ms:.0f}' for ms in frame)} ms, rows drawn at {', '.join(f'{seen.get(id, -1):.0f}' for id in ids)} ms")
+    cpu_ms = args.cpu_ms
+    frame_ms = args.frame_ms if args.frame_ms > 0 else 8 * cpu_ms
+    factor = load_factor(desk.page, args)
+    work = [ms / factor for ms in handler]
+    longtasks = desk.page.evaluate("() => window.__longtasks || 0")
+    said = (f"{what}: handlers {', '.join(f'{ms:.0f}' for ms in handler)} ms "
+            f"({', '.join(f'{ms:.0f}' for ms in work)} work-equivalent at load x{factor:.1f}), key to frame "
+            f"{', '.join(f'{ms:.0f}' for ms in frame)} ms, rows drawn at {', '.join(f'{seen.get(id, -1):.0f}' for id in ids)} ms"
+            f" (main-thread budget {cpu_ms:.0f} ms, wall budget {frame_ms:.0f} ms, {longtasks} long tasks)")
     if not args.report_only:
         desk.check(len(handler) == 4, f"{what}: not four presses heard: {said}")
         desk.check(all(id in seen for id in ids), f"{what}: not every press drew its row: {said}")
-        desk.check(statistics.median(handler) <= args.budget_ms and max(handler) <= 2 * args.budget_ms,
-                   f"{what}: over the {args.budget_ms:.0f} ms budget: {said}")
-        desk.check(statistics.median(frame) <= args.frame_ms, f"{what}: the frames came late: {said}")
+        desk.check(statistics.median(work) <= cpu_ms and max(work) <= 2 * cpu_ms,
+                   f"{what}: over the {cpu_ms:.0f} ms main-thread budget: {said}")
+        desk.check(statistics.median(frame) <= frame_ms, f"{what}: the frames came late: {said}")
     return said
 
 

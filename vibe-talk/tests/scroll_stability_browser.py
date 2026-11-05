@@ -530,6 +530,24 @@ class Reader:
                            " area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * at); }", fraction)
         self.quiet(250)
 
+    def settled(self, list_id: str = "discord-log", seconds: float = 10.0) -> None:
+        """Wait until the first on-screen row is unchanged across two samples a frame apart.
+
+        A fixed quiet() assumes the page finished its reads and re-anchoring
+        within that window; under host load it has not, and still() then
+        judges a reader mid-move (#866). Waiting for observed stability
+        keeps the same judgement with a forgiving wall deadline.
+        """
+        deadline = time.monotonic() + seconds
+        previous: tuple[str, float] | None = None
+        while time.monotonic() < deadline:
+            current = self.first(list_id)
+            if previous is not None and current[0] == previous[0] and abs(current[1] - previous[1]) <= STILL_PX:
+                return
+            previous = current
+            self.frames(2)
+        self.check(False, f"the first row of #{list_id} never settled within {seconds:.0f}s")
+
     def still(self, before: tuple[str, float], why: str, list_id: str = "discord-log") -> None:
         """The row the reader was on is still the first on screen, within a pixel of where it was."""
         after = self.first(list_id)
@@ -990,7 +1008,7 @@ def thread_walk(reader: Reader) -> None:
     before = reader.first(list_id)
     reader.wait_for(f"() => document.querySelectorAll('#{list_id} > li[data-id]').length > {rows}",
                     "scrolled to the head of the long thread, no older page came")
-    reader.quiet()
+    reader.settled(list_id)
     reader.still(before, "older replies coming in above", list_id)
     reader.notes.append("the long thread opened at its foot, held it, and kept its row as older replies came")
 
