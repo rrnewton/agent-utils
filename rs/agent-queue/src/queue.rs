@@ -665,6 +665,63 @@ fn repend_never_typed(directories: &QueueDirectories, path: &Path) -> Result<boo
     Ok(true)
 }
 
+/// Return every inflight item a tracking drainer may have typed (its paste
+/// started) to the pending lane it came from, marked stranded, and return
+/// their identifiers (#884 item 4 (D)).
+///
+/// Such an item's paste may still sit in the agent's composer — a service
+/// that stopped right after pasting, or crashed, leaves it there. Filing it
+/// as possibly submitted strands that paste in the composer and abandons a
+/// prompt the agent never saw. As a stranded pending item the next drain
+/// presses Enter on the paste if the composer still holds it, and never
+/// types the prompt again; if the paste is gone, the ordinary stranded
+/// bounds report it possibly submitted. Untracked items (older drainers)
+/// are left for [`recover_inflight`] to quarantine.
+pub fn repend_stranded_inflight(directories: &QueueDirectories) -> Result<Vec<String>> {
+    let mut repended = Vec::new();
+    for path in json_paths(&directories.inflight)? {
+        let Ok(mut document) = load_message(&path) else {
+            continue;
+        };
+        if document.get("paste_tracking") != Some(&Value::Bool(true))
+            || !document.contains_key("paste_started_at")
+        {
+            continue;
+        }
+        let lane = match document.get("inflight_from").and_then(Value::as_str) {
+            Some("inbox") => &directories.inbox,
+            Some("inbox.v2") => &directories.inbox_v2,
+            _ => continue,
+        };
+        if !lane.is_dir() {
+            continue;
+        }
+        if !document.contains_key("stranded_at") {
+            let stranded_at = document
+                .get("paste_started_at")
+                .cloned()
+                .unwrap_or_else(|| json!(unix_seconds()));
+            document.insert("stranded_at".to_owned(), stranded_at);
+        }
+        for field in [
+            "possibly_submitted",
+            "inflight_at",
+            "paste_tracking",
+            "inflight_from",
+            "paste_started_at",
+        ] {
+            document.remove(field);
+        }
+        document.insert("delivery_state".to_owned(), json!("pending"));
+        atomic_json(&path, &Value::Object(document))?;
+        let filename = path.file_name().expect("listed path has filename");
+        let identifier = message_id_from_path(&path)?;
+        transition(&path, &lane.join(filename))?;
+        repended.push(identifier);
+    }
+    Ok(repended)
+}
+
 /// Quarantine every item left in `inflight/` as `possibly_submitted`, never replaying it, and
 /// return their identifiers. An item a tracking drainer provably never
 /// typed is returned to its pending lane instead ([`repend_never_typed`])
@@ -1442,5 +1499,44 @@ mod tests {
             message_state(&queue.0, "pasted").unwrap(),
             Some(MessageState::Failed)
         );
+    }
+
+    #[test]
+    fn stranded_recovery_repends_items_whose_paste_started() {
+        // #884 item 4 (D): an item a drainer may have typed goes back to
+        // pending as stranded — its paste may still be in the composer for
+        // the next drain to flush with Enter — never straight to failed/.
+        let queue = TestQueue::new();
+        let directories = prepare(&queue.0).unwrap();
+        put(&queue.0, "pasted", true).unwrap();
+        let path = directories.inbox.join("pasted.json");
+        let mut document = load_message(&path).unwrap();
+        document.insert("possibly_submitted".to_owned(), json!(true));
+        document.insert("paste_tracking".to_owned(), json!(true));
+        document.insert("inflight_from".to_owned(), json!("inbox"));
+        document.insert("paste_started_at".to_owned(), json!(123.0));
+        atomic_json(&path, &Value::Object(document)).unwrap();
+        transition(&path, &directories.inflight.join("pasted.json")).unwrap();
+        // An untracked item is left for the ordinary quarantine.
+        put(&queue.0, "legacy", true).unwrap();
+        transition(
+            &directories.inbox.join("legacy.json"),
+            &directories.inflight.join("legacy.json"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            repend_stranded_inflight(&directories).unwrap(),
+            vec!["pasted"]
+        );
+        assert_eq!(
+            message_state(&queue.0, "pasted").unwrap(),
+            Some(MessageState::Pending)
+        );
+        let back = load_message(&directories.inbox.join("pasted.json")).unwrap();
+        assert_eq!(back["stranded_at"], json!(123.0), "{back:?}");
+        assert!(back.get("paste_started_at").is_none(), "{back:?}");
+        assert!(back.get("possibly_submitted").is_none(), "{back:?}");
+        assert_eq!(recover_inflight(&directories).unwrap(), vec!["legacy"]);
     }
 }

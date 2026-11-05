@@ -1399,6 +1399,23 @@ pub fn submit_verified(
         &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
     )?;
 
+    // A stop after the paste was typed presses the submission key once on
+    // our own staged paste before the unknown outcome is reported, so the
+    // paste does not sit in the composer holding every later prompt while
+    // the service exits (#884 item 4 (D)). Best effort: the outcome stays
+    // unknown to the caller either way.
+    let flush_staged_on_cancel = |terminal: &dyn PromptTerminal| {
+        let Ok(screen) = terminal.read_screen(pane_id) else {
+            return;
+        };
+        let Some(view) = composer_view(harness, &screen) else {
+            return;
+        };
+        if staged(&view, text, placeholders_before) || composer_is_this_text(&view, text) {
+            let key = submit_key(harness, &view, runtime);
+            let _ = terminal.send_keys(pane_id, key);
+        }
+    };
     let cancelled_after_typing = || {
         Err(AdapterError::unavailable(format!(
             "pane {pane_id}: delivery was cancelled after the prompt was pasted; outcome is unknown"
@@ -1410,6 +1427,7 @@ pub fn submit_verified(
     let mut prev_tail: Option<String> = None;
     let view = loop {
         if runtime.cancelled() {
+            flush_staged_on_cancel(terminal);
             return cancelled_after_typing();
         }
         let screen = terminal.read_screen(pane_id)?;
@@ -1532,6 +1550,7 @@ pub fn submit_verified(
             None => {
                 runtime.sleep(POLL);
                 if runtime.cancelled() {
+                    flush_staged_on_cancel(terminal);
                     return cancelled_after_typing();
                 }
                 terminal.read_screen(pane_id)?
@@ -4698,6 +4717,33 @@ mod tests {
         let receipt = receipt(submit(&screen, "check the build"));
         assert!(!receipt.queued, "{receipt:?}");
         assert_eq!(screen.state().submitted, ["check the build"]);
+    }
+
+    #[test]
+    fn a_stop_after_the_paste_presses_enter_before_reporting_the_outcome_unknown() {
+        // #884 item 4 (D): a service stopping right after pasting must not
+        // leave its paste sitting in the composer. The first Enter is
+        // dropped; the stop arrives; one more bare Enter goes out before
+        // the unknown outcome is reported. Nothing is ever retyped.
+        let screen = FakeScreen::new("claude", false);
+        screen.state().drop_keys = 1;
+        let runtime = StoppingClock {
+            clock: Clock::default(),
+            stop_after: Duration::from_millis(300),
+        };
+        let outcome = submit_verified(
+            &screen,
+            "w1:p1",
+            "claude",
+            "check the build",
+            SubmitTimeouts::default(),
+            &runtime,
+        );
+        assert!(outcome.is_err(), "{outcome:?}");
+        let state = screen.state();
+        assert_eq!(state.keys, ["Enter", "Enter"]);
+        assert_eq!(state.submitted, ["check the build"]);
+        assert_eq!(state.pastes.len(), 1, "typed once, never retyped");
     }
 
     #[test]

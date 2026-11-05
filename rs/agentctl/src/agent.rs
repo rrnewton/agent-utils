@@ -23,9 +23,9 @@ pub use agent_queue::queue::CancelOutcome;
 pub use agent_queue::queue::MessageState as QueueMessageState;
 use agent_queue::queue::{
     delivery_attempts, failed_metadata, identifiers, identifiers_if_directory, load_message,
-    message_id_from_path, pending_in_queue_order, quarantine_raw, recover_inflight, set_aside,
-    set_aside_reason, unix_seconds, DirectoryIdentity as QueueDirectoryIdentity, Lane,
-    QueueDirectories,
+    message_id_from_path, pending_in_queue_order, quarantine_raw, recover_inflight,
+    repend_stranded_inflight, set_aside, set_aside_reason, unix_seconds,
+    DirectoryIdentity as QueueDirectoryIdentity, Lane, QueueDirectories,
 };
 use fs2::FileExt;
 use serde::Serialize;
@@ -1751,6 +1751,11 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
         "queue delivery lock",
     )?;
     let mut delivered = Vec::new();
+    // An item a previous process may have typed goes back to pending as
+    // stranded before anything is quarantined: this drain presses Enter on
+    // its paste if the composer still holds it, and never types it again,
+    // instead of filing it possibly submitted unseen (#884 item 4 (D)).
+    let _repended_stranded = repend_stranded_inflight(&directories)?;
     let mut quarantined = recover_inflight(&directories)?;
     let mut cancelled = Vec::new();
     // A digest item recovered in flight is best-effort, at most once: set
@@ -5421,6 +5426,59 @@ mod tests {
             !directory.path().join("failed/midturn.json").exists(),
             "never filed as possibly submitted"
         );
+    }
+
+    /// #884 item 4 (D): on restart, an item a previous process may have typed
+    /// whose paste still sits in the composer is flushed with a bare Enter —
+    /// never retyped, never filed to failed/ unseen.
+    #[test]
+    fn a_restarted_drain_flushes_an_inflight_paste_still_in_the_composer() {
+        let directory = TestDirectory::new("restart-flush");
+        let text = "the prompt a stopped service left pasted";
+        let screen = crate::submission::fake::FakeScreen::new("claude", false);
+        screen.leave_draft(text);
+        let fake = FakeAgent::with_screen(screen);
+        enqueue(directory.path(), text, Some("restarted")).unwrap();
+        // The previous process moved it to inflight and started its paste.
+        let inbox_path = directory.path().join("inbox/restarted.json");
+        let inflight_path = directory.path().join("inflight/restarted.json");
+        fs::create_dir_all(directory.path().join("inflight")).unwrap();
+        fs::rename(&inbox_path, &inflight_path).unwrap();
+        let mut document = match read_private_json(&inflight_path).unwrap() {
+            Value::Object(document) => document,
+            other => panic!("queued prompt is not an object: {other}"),
+        };
+        document.insert("paste_tracking".to_owned(), json!(true));
+        document.insert("paste_started_at".to_owned(), json!(unix_seconds()));
+        document.insert("inflight_from".to_owned(), json!("inbox"));
+        document.insert("possibly_submitted".to_owned(), json!(true));
+        atomic_json(&inflight_path, &Value::Object(document)).unwrap();
+
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            DrainOptions {
+                ready_timeout: Duration::ZERO,
+                ..DrainOptions::default()
+            },
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.delivered, ["restarted"], "{result:?}");
+        assert!(result.quarantined.is_empty(), "{result:?}");
+        assert!(
+            !directory.path().join("failed/restarted.json").exists(),
+            "never filed as possibly submitted"
+        );
+        let screen = fake.screen.as_ref().unwrap().state();
+        assert!(
+            screen.pastes.is_empty(),
+            "never retyped: {:?}",
+            screen.pastes
+        );
+        assert_eq!(screen.keys, ["Enter"]);
+        assert_eq!(screen.submitted, [text]);
     }
 
     /// #884 pane-lock-held-on-unobserved-paste: a sender cancelled before it typed anything (it
