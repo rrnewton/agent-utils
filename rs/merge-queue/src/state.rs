@@ -261,6 +261,56 @@ impl DonorsConfig {
     }
 }
 
+/// Default seconds one peripheral-classifier call may run before the change counts as
+/// binary-touching.
+pub const DEFAULT_PERIPHERAL_TIMEOUT_SECS: u64 = 30;
+
+/// Peripheral-change classification: a consumer hook that says, per change, whether it is
+/// peripheral (touches no input of the product binary build and no test or fixture the
+/// full selection would run differently) or binary-touching. Fail closed: any answer
+/// other than a first line of exactly `peripheral`, any error, and any timeout all mean
+/// binary-touching.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PeripheralConfig {
+    /// Shell command run in a checkout of the change head with `$MQ_BASE`, `$MQ_HEAD` and
+    /// `$MQ_PR`. Empty disables the lane: every change is binary-touching.
+    pub command: String,
+    /// Seconds one call may run (0 = 30).
+    pub timeout_secs: u64,
+    /// Largest batch of only peripheral changes (0 = twice `max_batch`).
+    pub max_batch: usize,
+}
+
+impl PeripheralConfig {
+    /// Whether the lane is on.
+    pub fn enabled(&self) -> bool {
+        !self.command.trim().is_empty()
+    }
+
+    /// Resolved per-call timeout.
+    pub fn timeout(&self) -> u64 {
+        if self.timeout_secs == 0 {
+            DEFAULT_PERIPHERAL_TIMEOUT_SECS
+        } else {
+            self.timeout_secs
+        }
+    }
+
+    /// Resolved batch cap for all-peripheral batches.
+    pub fn batch_limit(&self, max_batch: usize) -> usize {
+        if self.max_batch == 0 {
+            max_batch.max(1) * 2
+        } else {
+            self.max_batch
+        }
+    }
+}
+
+fn is_default_peripheral(value: &PeripheralConfig) -> bool {
+    value == &PeripheralConfig::default()
+}
+
 /// The front of the queue: which changes are planned ahead of all other work.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -864,6 +914,9 @@ pub struct Config {
     /// Donor-validator settings (used when `validator.offload` is not off).
     #[serde(skip_serializing_if = "is_default_donors")]
     pub donors: DonorsConfig,
+    /// Peripheral-change classification (an empty command disables the lane).
+    #[serde(default, skip_serializing_if = "is_default_peripheral")]
+    pub peripheral: PeripheralConfig,
     /// Landing configuration.
     pub land: LandConfig,
     /// The precheck of submitted heads. Omitted from config.json when unset.
@@ -908,6 +961,7 @@ impl Default for Config {
             classifier: ClassifierConfig::default(),
             validator: ValidatorConfig::default(),
             donors: DonorsConfig::default(),
+            peripheral: PeripheralConfig::default(),
             land: LandConfig::default(),
             precheck: PrecheckConfig::default(),
             notify: NotifyConfig::default(),

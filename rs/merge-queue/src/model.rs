@@ -433,6 +433,14 @@ pub struct PlannedItem {
     /// A priority change, planned ahead of all other work.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prioritized: bool,
+    /// The peripheral hook calls this change peripheral (absent in plans from older
+    /// builds, and whenever no hook is configured: binary-touching).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub peripheral: bool,
+    /// Whether the peripheral answer came from the probe cache (`cache`) or a fresh
+    /// hook call (`hook`); empty when not peripheral-classified.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub peripheral_source: String,
 }
 
 /// Pairwise textual conflict between two queued heads (from `git merge-tree`).

@@ -655,6 +655,22 @@ fn probe_options_for(state: &State, config: &Config, git: &Git) -> ProbeOptions 
         cache_dir: Some(state.root.clone()),
         parallelism: config.probe_parallelism(),
         config_hash: Some(probe_config_hash(git, &config_material)),
+        peripheral: config
+            .peripheral
+            .enabled()
+            .then(|| crate::plan::PeripheralHook {
+                command: config.peripheral.command.clone(),
+                timeout_secs: config.peripheral.timeout(),
+            }),
+    }
+}
+
+/// The peripheral batch cap a plan uses, resolved against its `max_batch`.
+fn peripheral_limit(config: &Config, max_batch: usize) -> usize {
+    if config.peripheral.enabled() {
+        config.peripheral.batch_limit(max_batch)
+    } else {
+        0
     }
 }
 
@@ -691,6 +707,7 @@ pub fn plan(state: &State, config: &Config, max_batch: usize) -> Result<Plan, St
         PlanOptions {
             max_batch,
             priority: config.priority.clone(),
+            peripheral_max_batch: peripheral_limit(config, max_batch),
         },
     ))
 }
@@ -750,6 +767,7 @@ pub fn plan_on(
         PlanOptions {
             max_batch,
             priority: config.priority.clone(),
+            peripheral_max_batch: peripheral_limit(config, max_batch),
         },
     ))
 }
@@ -772,6 +790,7 @@ pub struct PlanContinuation {
     pins: Vec<crate::state::PinConfig>,
     probe_options: ProbeOptions,
     max_batch: usize,
+    peripheral_max_batch: usize,
     priority: PriorityConfig,
     external: BTreeMap<i64, Held>,
 }
@@ -815,6 +834,7 @@ impl PlanContinuation {
             PlanOptions {
                 max_batch: self.max_batch,
                 priority: self.priority.clone(),
+                peripheral_max_batch: self.peripheral_max_batch,
             },
         ))
     }
@@ -870,6 +890,7 @@ pub fn plan_staged(
         PlanOptions {
             max_batch,
             priority: config.priority.clone(),
+            peripheral_max_batch: peripheral_limit(config, max_batch),
         },
     );
     let continuation = PlanContinuation {
@@ -883,6 +904,7 @@ pub fn plan_staged(
         pins,
         probe_options,
         max_batch,
+        peripheral_max_batch: peripheral_limit(config, max_batch),
         priority: config.priority.clone(),
         external,
     };

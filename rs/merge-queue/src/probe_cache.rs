@@ -75,6 +75,14 @@ impl Default for PairEntry {
     }
 }
 
+/// One cached peripheral classification for `(base, head)`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PeripheralEntry {
+    /// The hook answered `peripheral`.
+    pub peripheral: bool,
+}
+
 /// On-disk cache document.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -85,6 +93,9 @@ pub struct ProbeCacheFile {
     pub base: BTreeMap<String, BaseEntry>,
     /// Pairwise probes by `config:lo:hi`.
     pub pairs: BTreeMap<String, PairEntry>,
+    /// Peripheral classifications by `cmdhash:base:head`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub peripheral: BTreeMap<String, PeripheralEntry>,
 }
 
 /// An in-memory probe cache, optionally backed by `probe-cache.json` in a state directory.
@@ -168,6 +179,25 @@ impl ProbeCache {
         }
     }
 
+    /// Cache key for a peripheral classification, keyed by the hook (command + timeout)
+    /// hash, the base and the head: a changed head or base asks again.
+    pub fn peripheral_key(cmd_hash: &str, base: &str, head: &str) -> String {
+        format!("{cmd_hash}:{base}:{head}")
+    }
+
+    /// The cached peripheral classification for `key`, if any.
+    pub fn peripheral(&self, key: &str) -> Option<PeripheralEntry> {
+        self.file.peripheral.get(key).copied()
+    }
+
+    /// Record a peripheral classification.
+    pub fn put_peripheral(&mut self, key: String, entry: PeripheralEntry) {
+        if self.file.peripheral.get(&key) != Some(&entry) {
+            self.file.peripheral.insert(key, entry);
+            self.dirty = true;
+        }
+    }
+
     /// The cached pairwise probe for `key`, if any.
     pub fn pair(&self, key: &str) -> Option<&PairEntry> {
         self.file.pairs.get(key)
@@ -203,6 +233,12 @@ impl ProbeCache {
             let hi = parts.next().unwrap_or_default();
             let lo = parts.next().unwrap_or_default();
             heads.contains(lo) && heads.contains(hi)
+        });
+        self.file.peripheral.retain(|key, _| {
+            let mut parts = key.rsplitn(3, ':');
+            let head = parts.next().unwrap_or_default();
+            let entry_base = parts.next().unwrap_or_default();
+            entry_base == base && heads.contains(head)
         });
         if (self.file.base.len(), self.file.pairs.len()) != before {
             self.dirty = true;

@@ -131,6 +131,13 @@ pub struct Features {
     /// policy and the change's paths were readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classification: Option<ChangeClass>,
+    /// The peripheral hook calls this change peripheral (only with the lane configured).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub peripheral: bool,
+    /// Whether the peripheral answer came from the cache (`cache`) or a fresh hook call
+    /// (`hook`); empty when the lane is off.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub peripheral_source: String,
 }
 
 /// What the configured test-footprint policy says of a change (see the `change-classifier`
@@ -425,6 +432,12 @@ pub fn from_report(report: &Value, sources: &Sources<'_>, reconstructed: bool) -
                         only_force_full: classified.only_force_full(),
                         only_inert: classified.only_inert(),
                     }),
+                    peripheral: planned
+                        .and_then(|p| p.get("peripheral")?.as_bool())
+                        .unwrap_or(false),
+                    peripheral_source: planned
+                        .and_then(|p| p.get("peripheral_source")?.as_str().map(str::to_owned))
+                        .unwrap_or_default(),
                 }
             })
             .clone()

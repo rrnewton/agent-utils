@@ -56,6 +56,25 @@ pub struct ProbeStats {
     pub peak_concurrency: usize,
 }
 
+/// One change's peripheral classification (see `state::PeripheralConfig`): whether the
+/// consumer hook calls it peripheral, and whether that answer came from the cache.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PeripheralMark {
+    /// The hook answered `peripheral`.
+    pub peripheral: bool,
+    /// The answer came from the probe cache, not a fresh hook call.
+    pub cached: bool,
+}
+
+/// The peripheral classifier hook probing passes to [`probe_with_options`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeripheralHook {
+    /// Shell command (see `state::PeripheralConfig::command`).
+    pub command: String,
+    /// Seconds one call may run before the change counts as binary-touching.
+    pub timeout_secs: u64,
+}
+
 /// Locally probed relationships between the base and the queued heads.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Probe {
@@ -77,6 +96,9 @@ pub struct Probe {
     /// Cache and concurrency accounting for the run that produced this probe. Planning
     /// ignores it; it exists so callers can report what probing actually cost.
     pub stats: ProbeStats,
+    /// Peripheral classification per change (absent: binary-touching, the fail-closed
+    /// default, including when no hook is configured).
+    pub peripheral: BTreeMap<i64, PeripheralMark>,
 }
 
 /// Knobs for [`probe_with_options`].
@@ -90,6 +112,8 @@ pub struct ProbeOptions {
     /// Hash of the merge configuration, from `probe_cache::probe_config_hash`. `None`
     /// derives it from the repository's Git settings alone.
     pub config_hash: Option<String>,
+    /// Peripheral classifier hook; `None` classifies nothing (all binary-touching).
+    pub peripheral: Option<PeripheralHook>,
 }
 
 impl Default for ProbeOptions {
@@ -98,6 +122,7 @@ impl Default for ProbeOptions {
             cache_dir: None,
             parallelism: DEFAULT_PROBE_PARALLELISM,
             config_hash: None,
+            peripheral: None,
         }
     }
 }
@@ -110,6 +135,7 @@ impl ProbeOptions {
             cache_dir: None,
             parallelism: 1,
             config_hash: None,
+            peripheral: None,
         }
     }
 }
@@ -204,6 +230,68 @@ pub fn probe_first_stage(
     options: ProbeOptions,
 ) -> Result<Probe, String> {
     probe_impl(git, base_sha, heads, regenerable, options)
+}
+
+/// Ask the peripheral hook about one change: run its command in a temporary worktree of
+/// `head`. Only a first output line of exactly `peripheral` is peripheral; a hook that
+/// cannot run, answers anything else, or runs past its timeout is binary-touching
+/// (fail closed), and that answer is what gets cached.
+fn classify_peripheral(git: &Git, hook: &PeripheralHook, base: &str, head: &str, pr: i64) -> bool {
+    let dir = std::env::temp_dir().join(format!(
+        "merge-queue-peripheral-{}-{pr}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let added = git.run(&[
+        "worktree",
+        "add",
+        "--detach",
+        "--quiet",
+        &dir.display().to_string(),
+        head,
+    ]);
+    let answer = added.and_then(|_| {
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(&hook.command)
+            .current_dir(&dir)
+            .env("MQ_BASE", base)
+            .env("MQ_HEAD", head)
+            .env("MQ_PR", pr.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("cannot run peripheral.command: {error}"))?;
+        let limit = std::time::Duration::from_secs(hook.timeout_secs.max(1));
+        let started = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    let mut out = String::new();
+                    if let Some(mut stdout) = child.stdout.take() {
+                        use std::io::Read;
+                        let _ = stdout.read_to_string(&mut out);
+                    }
+                    return Ok(out.lines().next().map(str::trim) == Some("peripheral"));
+                }
+                Ok(None) if started.elapsed() <= limit => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(false);
+                }
+                Err(error) => return Err(format!("cannot wait for peripheral.command: {error}")),
+            }
+        }
+    });
+    let _ = git.run(&["worktree", "remove", "--force", &dir.display().to_string()]);
+    let _ = std::fs::remove_dir_all(&dir);
+    answer.unwrap_or(false)
 }
 
 fn probe_impl(
@@ -411,6 +499,33 @@ fn probe_impl(
     stats.cache_misses = stats.base_misses + stats.pair_misses;
     stats.peak_concurrency = base_peak.max(merge_peak);
     probe.stats = stats;
+    // Peripheral classification: cached per (hook, base, head), so an unchanged pair is
+    // never re-asked and a changed head or base always is. No hook, no marks: every
+    // change is binary-touching.
+    if let Some(hook) = &options.peripheral {
+        let cmd_hash = probe_config_hash(
+            git,
+            &format!("peripheral:{}:{}", hook.command, hook.timeout_secs),
+        );
+        for (pr, head) in &live {
+            let key = ProbeCache::peripheral_key(&cmd_hash, base_sha, head);
+            let mark = match cache.peripheral(&key) {
+                Some(entry) => PeripheralMark {
+                    peripheral: entry.peripheral,
+                    cached: true,
+                },
+                None => {
+                    let peripheral = classify_peripheral(git, hook, base_sha, head, *pr);
+                    cache.put_peripheral(key, crate::probe_cache::PeripheralEntry { peripheral });
+                    PeripheralMark {
+                        peripheral,
+                        cached: false,
+                    }
+                }
+            };
+            probe.peripheral.insert(*pr, mark);
+        }
+    }
     // Keep the cache proportional to the queue: entries for other heads or bases can no longer
     // be asked for (entries under another merge configuration are kept, so switching back hits). The cache is an optimisation: a failed write
     // must not fail planning.
@@ -427,6 +542,9 @@ pub struct PlanOptions {
     pub max_batch: usize,
     /// Priority label and CI paths (for the label suggestion).
     pub priority: PriorityConfig,
+    /// Maximum changes in a batch of only peripheral changes (0 = `max_batch`: no
+    /// wider peripheral batches, and no separation either when 0 with no hook).
+    pub peripheral_max_batch: usize,
 }
 
 /// Not at the front (priority changes and their dependencies sort first), then priority,
@@ -814,6 +932,11 @@ pub fn make_plan(
             });
         }
     };
+    // Peripheral changes never share a batch with binary-touching ones, and a run of
+    // peripheral changes chunks at the wider peripheral cap: they cannot conflict
+    // through the product binary, so width is cheap for them.
+    let peripheral_limit = options.peripheral_max_batch.max(max_batch);
+    let mut current_peripheral = false;
     for pr in &selected {
         let item = by_pr[pr];
         if item.solo || item.exact || item.prioritized {
@@ -829,9 +952,30 @@ pub fn make_plan(
             close(&mut current, &mut batches, note);
             continue;
         }
+        let peripheral = probe.peripheral.get(pr).is_some_and(|mark| mark.peripheral);
+        if !current.is_empty() && peripheral != current_peripheral {
+            let note = if current_peripheral { "peripheral" } else { "" };
+            close(&mut current, &mut batches, note);
+        }
+        if current.is_empty() {
+            current_peripheral = peripheral;
+        }
         current.push(*pr);
-        if current.len() >= max_batch {
-            close(&mut current, &mut batches, "max-batch");
+        let limit = if peripheral {
+            peripheral_limit
+        } else {
+            max_batch
+        };
+        if current.len() >= limit {
+            close(
+                &mut current,
+                &mut batches,
+                if peripheral {
+                    "peripheral"
+                } else {
+                    "max-batch"
+                },
+            );
         }
     }
     close(&mut current, &mut batches, "");
@@ -851,6 +995,20 @@ pub fn make_plan(
             files: probe.files.get(&item.pr).map_or(0, BTreeSet::len),
             conflict_degree: degrees[&item.pr],
             prioritized: item.prioritized,
+            peripheral: probe
+                .peripheral
+                .get(&item.pr)
+                .is_some_and(|mark| mark.peripheral),
+            peripheral_source: probe
+                .peripheral
+                .get(&item.pr)
+                .map_or_else(String::new, |mark| {
+                    if mark.cached {
+                        "cache".to_owned()
+                    } else {
+                        "hook".to_owned()
+                    }
+                }),
         })
         .collect();
     let suggest_priority = queued
@@ -1032,6 +1190,7 @@ mod unit {
     fn opts(max_batch: usize) -> PlanOptions {
         PlanOptions {
             max_batch,
+            peripheral_max_batch: 0,
             ..PlanOptions::default()
         }
     }
@@ -1043,6 +1202,37 @@ mod unit {
         let batches: Vec<_> = plan.batches.iter().map(|b| b.prs.clone()).collect();
         assert_eq!(batches, vec![vec![2, 3], vec![1]]);
         assert!(plan.held.is_empty());
+    }
+
+    #[test]
+    fn peripheral_changes_batch_wide_and_never_mix_with_binary_touching() {
+        let items = vec![
+            item(1, 100, "t1"),
+            item(2, 100, "t2"),
+            item(3, 100, "t3"),
+            item(4, 100, "t4"),
+            item(5, 100, "t5"),
+        ];
+        let mut probe = probe_for(&items);
+        for pr in [1, 2, 4, 5] {
+            probe.peripheral.insert(
+                pr,
+                PeripheralMark {
+                    peripheral: true,
+                    cached: pr == 5,
+                },
+            );
+        }
+        let mut options = opts(1);
+        options.peripheral_max_batch = 3;
+        let plan = make_plan(&items, "main", "B", &probe, options);
+        let batches: Vec<_> = plan.batches.iter().map(|b| b.prs.clone()).collect();
+        assert_eq!(batches, vec![vec![1, 2], vec![3], vec![4, 5]], "{plan:?}");
+        assert_eq!(plan.batches[0].note, "peripheral");
+        let by_pr: BTreeMap<i64, _> = plan.items.iter().map(|i| (i.pr, i)).collect();
+        assert!(by_pr[&1].peripheral && by_pr[&1].peripheral_source == "hook");
+        assert!(by_pr[&5].peripheral && by_pr[&5].peripheral_source == "cache");
+        assert!(!by_pr[&3].peripheral && by_pr[&3].peripheral_source.is_empty());
     }
 
     #[test]
@@ -1127,6 +1317,7 @@ mod unit {
             .insert(3, ["validation.dag.yaml".to_owned()].into());
         let options = PlanOptions {
             max_batch: 4,
+            peripheral_max_batch: 0,
             priority: PriorityConfig {
                 ci_paths: vec!["ci".into(), "*.dag.yaml".into()],
                 ..PriorityConfig::default()
@@ -1264,6 +1455,73 @@ mod unit {
         assert_eq!(pairs, vec![(1, 2), (2, 4)]);
         assert_eq!(probe.ancestry, vec![(1, 4)]);
         assert!(probe.base_conflicts.is_empty());
+    }
+
+    #[test]
+    fn peripheral_hook_classifies_fail_closed_and_caches_per_base_and_head() {
+        use crate::git::testrepo::*;
+        let tmp = TempDir::new("probe-peripheral");
+        let cache_tmp = TempDir::new("probe-peripheral-cache");
+        let git = init(&tmp.0);
+        write(&tmp.0, "shared.txt", "1\n");
+        git_commit(&tmp.0);
+        let base = git.rev_parse("main").unwrap();
+        let a = branch(&tmp.0, "a", "main", &[("peripheral.txt", "x\n")]);
+        let b = branch(&tmp.0, "b", "main", &[("src.txt", "x\n")]);
+        let heads: BTreeMap<i64, Option<String>> = [(1, Some(a.clone())), (2, Some(b))].into();
+        let calls = tmp.0.join("hook-calls");
+        let hook = PeripheralHook {
+            command: format!(
+                "echo call >> {}; if [ -f peripheral.txt ]; then echo peripheral; else echo binary-touching; fi",
+                calls.display()
+            ),
+            timeout_secs: 30,
+        };
+        let options = ProbeOptions {
+            cache_dir: Some(cache_tmp.0.clone()),
+            parallelism: 1,
+            config_hash: None,
+            peripheral: Some(hook.clone()),
+        };
+        let first = probe_with_options(
+            &git,
+            &base,
+            &heads,
+            &crate::git::nothing_regenerable,
+            options.clone(),
+        )
+        .unwrap();
+        assert!(first.peripheral[&1].peripheral && !first.peripheral[&1].cached);
+        assert!(!first.peripheral[&2].peripheral && !first.peripheral[&2].cached);
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+        // Same (base, head): the cache answers, the hook does not run again.
+        let second = probe_with_options(
+            &git,
+            &base,
+            &heads,
+            &crate::git::nothing_regenerable,
+            options.clone(),
+        )
+        .unwrap();
+        assert!(second.peripheral[&1].peripheral && second.peripheral[&1].cached);
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+        // A hook that errors is binary-touching too.
+        let broken = ProbeOptions {
+            peripheral: Some(PeripheralHook {
+                command: "exit 3".to_owned(),
+                timeout_secs: 30,
+            }),
+            ..options
+        };
+        let failed = probe_with_options(
+            &git,
+            &base,
+            &heads,
+            &crate::git::nothing_regenerable,
+            broken,
+        )
+        .unwrap();
+        assert!(!failed.peripheral[&1].peripheral);
     }
 
     fn git_commit(dir: &std::path::Path) {
@@ -1446,6 +1704,7 @@ mod unit {
                 cache_dir: Some(cache_tmp.0.clone()),
                 parallelism: 8,
                 config_hash: None,
+                peripheral: None,
             },
         )
         .unwrap();
@@ -1480,6 +1739,7 @@ mod unit {
             cache_dir: Some(cache_tmp.0.clone()),
             parallelism: 8,
             config_hash: None,
+            peripheral: None,
         };
         let first = probe_with_options(
             &git,
@@ -1519,6 +1779,7 @@ mod unit {
             cache_dir: Some(cache_tmp.0.clone()),
             parallelism: 4,
             config_hash: Some("cfg-a".to_owned()),
+            peripheral: None,
         };
         let first = probe_with_options(
             &git,
@@ -1591,6 +1852,7 @@ mod unit {
                     cache_dir: None,
                     parallelism: 8,
                     config_hash: None,
+                    peripheral: None,
                 },
             )
             .unwrap();
@@ -1610,6 +1872,7 @@ mod unit {
             cache_dir: Some(cache_tmp.0.clone()),
             parallelism: 8,
             config_hash: None,
+            peripheral: None,
         };
         // The first stage leaves no pair unknown: an optimistic first batch could pair two
         // conflicting changes (ejecting one the plan would only hold) or a change stacked on a
@@ -1663,6 +1926,7 @@ mod unit {
             cache_dir: Some(cache_tmp.0.clone()),
             parallelism: 4,
             config_hash: None,
+            peripheral: None,
         };
         let warm = probe_with_options(
             &git,
@@ -1729,6 +1993,7 @@ mod unit {
                 cache_dir: Some(cache_tmp.0.clone()),
                 parallelism: 32,
                 config_hash: None,
+                peripheral: None,
             },
         )
         .unwrap();
@@ -1743,6 +2008,7 @@ mod unit {
                 cache_dir: Some(cache_tmp.0.clone()),
                 parallelism: 32,
                 config_hash: None,
+                peripheral: None,
             },
         )
         .unwrap();
@@ -1808,6 +2074,7 @@ mod unit {
                     cache_dir: Some(before_cache.0.clone()),
                     parallelism: 32,
                     config_hash: None,
+                    peripheral: None,
                 },
             )
             .unwrap();
@@ -1819,6 +2086,7 @@ mod unit {
                 cache_dir: Some(after_cache.0.clone()),
                 parallelism: 32,
                 config_hash: None,
+                peripheral: None,
             };
             let cpu0 = cpu_ticks();
             let start = std::time::Instant::now();

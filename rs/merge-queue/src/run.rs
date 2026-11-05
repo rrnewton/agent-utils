@@ -612,6 +612,9 @@ struct Job {
     policy: String,
     /// Tests beyond the complete suite, with [`Selection::All`] (see [`Chosen::extra`]).
     extra: BTreeSet<TestId>,
+    /// Every change in the batch is peripheral: the runner gets `$MQ_PERIPHERAL=1` so
+    /// its selection can be the focused one.
+    peripheral: bool,
 }
 
 /// A batch's place in the speculation window.
@@ -1705,7 +1708,12 @@ impl<'a> Runner<'a> {
         );
         flight.result = None;
         Some((
-            batch_job(&flight.candidate, &flight.chosen, flight.speculation),
+            batch_job(
+                &flight.candidate,
+                &flight.chosen,
+                flight.speculation,
+                self.all_peripheral(&flight.candidate.prs),
+            ),
             delay,
         ))
     }
@@ -2971,6 +2979,9 @@ impl<'a> Runner<'a> {
         if self.config.validator.fail_fast && job.purpose != "widen" {
             extra.push((crate::validate::FAIL_FAST_ENV.to_owned(), "1".to_owned()));
         }
+        if job.peripheral {
+            extra.push((crate::validate::PERIPHERAL_ENV.to_owned(), "1".to_owned()));
+        }
         if !job.extra.is_empty() {
             extra.push((
                 crate::validate::EXTRA_TESTS_ENV.to_owned(),
@@ -3353,12 +3364,36 @@ impl<'a> Runner<'a> {
     }
 
     /// The policy's selection for `commit` relative to `base`.
+    /// Whether every change in `prs` is peripheral in the current plan.
+    fn all_peripheral(&self, prs: &[i64]) -> bool {
+        if prs.is_empty() || !self.config.peripheral.enabled() {
+            return false;
+        }
+        let report = lock(&self.report);
+        prs.iter().all(|pr| {
+            report
+                .plan
+                .items
+                .iter()
+                .any(|item| item.pr == *pr && item.peripheral)
+        })
+    }
+
     fn select(&self, commit: &str, base: &str) -> Result<Chosen, String> {
+        self.select_peripheral(commit, base, false)
+    }
+
+    fn select_peripheral(
+        &self,
+        commit: &str,
+        base: &str,
+        peripheral: bool,
+    ) -> Result<Chosen, String> {
         let slot = self.slots.take();
-        let result = self
-            .slots
-            .checkout(slot, commit)
-            .and_then(|checkout| self.validator.select(&checkout, base, commit));
+        let result = self.slots.checkout(slot, commit).and_then(|checkout| {
+            self.validator
+                .select_with(&checkout, base, commit, peripheral)
+        });
         self.slots.give(slot);
         result
     }
@@ -4255,13 +4290,18 @@ impl<'a> Runner<'a> {
                         if candidate.prs.is_empty() {
                             continue;
                         }
-                        let chosen = self.select(&candidate.tip, &candidate.parent)?;
+                        let chosen = self.select_peripheral(
+                            &candidate.tip,
+                            &candidate.parent,
+                            self.all_peripheral(&candidate.prs),
+                        )?;
                         let cancel = Arc::new(AtomicBool::new(false));
                         let speculation = Some(Speculation {
                             depth: occupied(&flights) + 1,
                             window,
                         });
-                        let job = batch_job(&candidate, &chosen, speculation);
+                        let job =
+                            batch_job(&candidate, &chosen, speculation, self.all_peripheral(&prs));
                         let id = next_id;
                         next_id += 1;
                         let tx = tx.clone();
@@ -5358,6 +5398,7 @@ impl<'a> Runner<'a> {
                             parent: rebuilt.parent.clone(),
                             speculation: None,
                             selection: delta.clone(),
+                            peripheral: false,
                             policy: if exact {
                                 chosen.policy.clone()
                             } else {
@@ -5632,6 +5673,7 @@ impl<'a> Runner<'a> {
                     selection: focus.clone(),
                     policy: "failed-tests".to_owned(),
                     extra: BTreeSet::new(),
+                    peripheral: false,
                 });
             }
             for (i, result) in probes.iter().zip(self.validate_all(jobs)) {
@@ -5705,6 +5747,7 @@ impl<'a> Runner<'a> {
                 selection: Selection::All,
                 policy: "all".to_owned(),
                 extra: BTreeSet::new(),
+                peripheral: false,
             }])
             .pop()
             .ok_or("no widen result")??;
@@ -5938,7 +5981,12 @@ fn wait_unless_cancelled(delay: Duration, cancel: &AtomicBool) -> bool {
 
 /// The validation of the batch `candidate`, with `chosen`'s tests, from `speculation`'s place in
 /// the window.
-fn batch_job(candidate: &Candidate, chosen: &Chosen, speculation: Option<Speculation>) -> Job {
+fn batch_job(
+    candidate: &Candidate,
+    chosen: &Chosen,
+    speculation: Option<Speculation>,
+    peripheral: bool,
+) -> Job {
     Job {
         purpose: "batch",
         prs: candidate.prs.clone(),
@@ -5948,6 +5996,7 @@ fn batch_job(candidate: &Candidate, chosen: &Chosen, speculation: Option<Specula
         selection: chosen.selection.clone(),
         policy: chosen.policy.clone(),
         extra: chosen.extra.clone(),
+        peripheral,
     }
 }
 

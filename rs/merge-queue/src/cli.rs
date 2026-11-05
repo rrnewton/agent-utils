@@ -625,6 +625,18 @@ enum Command {
         /// reported as `skip`.
         #[arg(long)]
         fail_fast: bool,
+        /// Peripheral classifier: a shell command run in a checkout of each change head
+        /// (with `$MQ_BASE`, `$MQ_HEAD`, `$MQ_PR`) whose first output line of exactly
+        /// `peripheral` marks the change peripheral. Anything else, an error, or a timeout
+        /// means binary-touching. Empty (the default) disables the peripheral lane.
+        #[arg(long, default_value = "")]
+        peripheral_command: String,
+        /// Seconds one peripheral-classifier call may run (0: 30).
+        #[arg(long, default_value_t = 0)]
+        peripheral_timeout_secs: u64,
+        /// Largest batch of only peripheral changes (0: twice --max-batch).
+        #[arg(long, default_value_t = 0)]
+        peripheral_max_batch: usize,
         /// Confirm each red by validating the same commit again (`$MQ_RERUN_FROM`) and search a
         /// red batch with prefix probes. Off by default: the first red is the verdict, and a red
         /// batch of several changes goes back as single-change batches.
@@ -1336,6 +1348,9 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             max_deferrals,
             red_without_probe,
             fail_fast,
+            peripheral_command,
+            peripheral_timeout_secs,
+            peripheral_max_batch,
             confirm_reruns,
             split_red_batches,
             suspect_flake_reruns,
@@ -1489,6 +1504,11 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     },
                     tool_identity,
                     tool_refresh,
+                },
+                peripheral: crate::state::PeripheralConfig {
+                    command: peripheral_command,
+                    timeout_secs: peripheral_timeout_secs,
+                    max_batch: peripheral_max_batch,
                 },
                 land: LandConfig {
                     driver: land,

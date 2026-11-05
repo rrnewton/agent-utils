@@ -72,6 +72,10 @@ pub const RERUN_EXEMPT_MARKER: &str = "RERUN-EXEMPT";
 /// the runner may stop at the first red step and report the steps it skipped as `skip`.
 pub const FAIL_FAST_ENV: &str = "MQ_FAIL_FAST";
 
+/// Environment variable set to `1` for a validation (and its selection) whose batch is
+/// only peripheral changes: the runner's selection may then be the focused one.
+pub const PERIPHERAL_ENV: &str = "MQ_PERIPHERAL";
+
 /// Environment variable set to `1` when the queue watches the run's streamed verdicts and
 /// stops it at the first deterministic failure (see [`Ran::early_red`]): the runner opts in
 /// by appending each verdict as it happens and declaring its deterministic steps early
@@ -361,6 +365,19 @@ pub const EXTRA_TESTS_ENV: &str = "MQ_EXTRA_TESTS";
 pub trait Validator: Sync {
     /// Ask the selection policy which tests the change from `base` to the checkout's HEAD needs.
     fn select(&self, checkout: &Path, base: &str, head: &str) -> Result<Chosen, String>;
+
+    /// [`Validator::select`] for a batch of only peripheral changes: the select command
+    /// gets `$MQ_PERIPHERAL=1` and may answer the focused selection.
+    fn select_with(
+        &self,
+        checkout: &Path,
+        base: &str,
+        head: &str,
+        peripheral: bool,
+    ) -> Result<Chosen, String> {
+        let _ = peripheral;
+        self.select(checkout, base, head)
+    }
     /// Run `selection` in `checkout`, writing logs under `out`. Setting `cancel` stops the run
     /// early (its process group is killed) and marks the result cancelled.
     fn run(
@@ -451,6 +468,16 @@ fn shared_select(
     base: &str,
     head: &str,
 ) -> Result<Chosen, String> {
+    shared_select_peripheral(config, checkout, base, head, false)
+}
+
+fn shared_select_peripheral(
+    config: &ValidatorConfig,
+    checkout: &Path,
+    base: &str,
+    head: &str,
+    peripheral: bool,
+) -> Result<Chosen, String> {
     if config.select.trim().is_empty() {
         return Ok(Chosen {
             selection: Selection::All,
@@ -464,6 +491,7 @@ fn shared_select(
         .current_dir(checkout)
         .env("MQ_BASE", base)
         .env("MQ_HEAD", head)
+        .env(PERIPHERAL_ENV, if peripheral { "1" } else { "0" })
         .stdin(Stdio::null())
         .output()
         .map_err(|error| format!("cannot run validator.select: {error}"))?;
@@ -811,6 +839,16 @@ struct ResultLine {
 impl Validator for CommandValidator {
     fn select(&self, checkout: &Path, base: &str, head: &str) -> Result<Chosen, String> {
         shared_select(&self.0, checkout, base, head)
+    }
+
+    fn select_with(
+        &self,
+        checkout: &Path,
+        base: &str,
+        head: &str,
+        peripheral: bool,
+    ) -> Result<Chosen, String> {
+        shared_select_peripheral(&self.0, checkout, base, head, peripheral)
     }
 
     fn run(
@@ -1167,6 +1205,16 @@ pub fn parse_journal(text: &str) -> TestResults {
 impl Validator for DagrunValidator {
     fn select(&self, checkout: &Path, base: &str, head: &str) -> Result<Chosen, String> {
         shared_select(&self.0, checkout, base, head)
+    }
+
+    fn select_with(
+        &self,
+        checkout: &Path,
+        base: &str,
+        head: &str,
+        peripheral: bool,
+    ) -> Result<Chosen, String> {
+        shared_select_peripheral(&self.0, checkout, base, head, peripheral)
     }
 
     fn run(

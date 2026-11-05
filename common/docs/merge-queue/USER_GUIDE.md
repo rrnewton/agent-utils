@@ -141,6 +141,9 @@ This command creates the state directory and writes `config.json`.
 | `--green-flaky-hold-secs SECS` | `7200` | How long a change is held for a ruling after a GREEN_FLAKY or INFRA-BLOCKED result (see "Held for a ruling") before it is re-queued for a fresh validation. |
 | `--red-without-probe MODE` | `eject` | What a red validation that names failed tests does when its follow-up probe cannot run: `eject` the change (the red run is the verdict) or `hold` it for its owner. |
 | `--fail-fast` | off | Ask the runner to stop each candidate validation at its first red step: `$MQ_FAIL_FAST` is `1` for every validation except the complete run on the base (see "Fail-fast runs"). |
+| `--peripheral-command CMD` | off | Consumer hook marking changes peripheral (see the `peripheral` fields). |
+| `--peripheral-timeout-secs N` | `30` | Seconds one classifier call may run before the change counts as binary-touching. |
+| `--peripheral-max-batch N` | twice `--max-batch` | Largest batch of only peripheral changes. |
 | `--confirm-reruns` | off | Confirm a red before blaming a change: search a red batch's prefixes, and rerun a failure at the same commit (`$MQ_RERUN_FROM`), so that a failure is blamed only when seen twice. Off, the first red is the verdict: a red change on its own is ejected on that sighting, and each change of a red batch goes back as a batch of its own (see "Keeping the base green"). |
 | `--suspect-flake-reruns` | off | With confirmation off, hold a single change whose red run failed only on suspect tests (timeouts, or runs that reached no verdict, as the runner shapes its results) instead of ejecting it, run those tests again at its commit beside the run, and re-queue it if they pass or eject it, seen twice, if they fail again. Once per head. See "Suspect flakes". |
 | `--suspect-flake-timeout-secs SECS` | `0` (1800) | Wall limit of one suspect-flake rerun. |
@@ -947,6 +950,23 @@ An **item record** (`items/<pr>.json`) has these fields:
   on both jobs, counted by `donor status`) and never decides the batch. Deciding donors never
   claim the duplicates. In `compare` mode every donor already only compares, so the list has
   no effect there.
+
+**`peripheral`** fields (the peripheral lane; absent means off):
+
+- `command`: a shell command run in a checkout of each change head with `$MQ_BASE`,
+  `$MQ_HEAD` and `$MQ_PR`. A first output line of exactly `peripheral` marks the change
+  peripheral; anything else, an error, or a timeout means binary-touching (fail closed).
+  The consumer's rule lives in this command: peripheral only when the change touches no
+  input of the product binary build and no test or fixture the full selection would run
+  differently. Empty (the default) disables the lane.
+- `timeout_secs`: seconds one call may run (default `30`).
+- `max_batch`: largest batch of only peripheral changes (absent or `0`: twice `max_batch`).
+
+Answers are cached in `probe-cache.json` per (hook, base, head): an unchanged pair is never
+re-asked, a changed head or base always is, and the plan and decision records say whether an
+answer came from the `hook` or the `cache`. Peripheral changes never share a batch with
+binary-touching ones, batch up to the wider cap, and validate with `$MQ_PERIPHERAL=1` set
+for the select command and the runner, so the selection can be the focused one.
 
 **`land`** fields:
 
