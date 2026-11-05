@@ -614,6 +614,7 @@ test("`#624 voice-page-modularity`: a scroll key no binding took goes to the lis
   const log = [];
   const area = { clientHeight: 400, scrollTop: 1000, children: [], focus: (options) => log.push(`focus ${options.preventScroll}`) };
   const inList = { parentNode: area };
+  const otherInList = { parentNode: area };
   const rows = [{ id: "first" }, { id: "last" }];
   const pane = { row: inList, scroller: () => area };
   const field = { field: true };
@@ -622,6 +623,7 @@ test("`#624 voice-page-modularity`: a scroll key no binding took goes to the lis
   const slider = { own: true, tagName: "INPUT" };
   const button = { space: true };
   let side = false;
+  let main = true;
   const keys = createScrollKeys({
     scrollArea: () => (side ? "side" : area),
     sideScroll: () => "side",
@@ -635,8 +637,8 @@ test("`#624 voice-page-modularity`: a scroll key no binding took goes to the lis
     scrollsItself: (node) => Boolean(node && node.tall),
     keepsOwnKeys: (node) => Boolean(node && node.own),
     pressedBySpace: (node) => Boolean(node && node.space),
-    onMain: () => true,
-    paneFor: (node) => (node === inList || node === undefined ? pane : null),
+    onMain: () => main,
+    paneFor: (node) => (node === inList || node === otherInList ? pane : null),
     paneRows: () => rows,
     selectRow: (_pane, row, bring) => log.push(`select ${row.id} ${bring}`),
     followPageScroll: (_pane, _row, up) => log.push(`follow ${up}`),
@@ -663,7 +665,15 @@ test("`#624 voice-page-modularity`: a scroll key no binding took goes to the lis
   assert.deepStrictEqual(route(key(" "), button), [1000, false], "Space was taken from a button");
   assert.deepStrictEqual(route(key("PageDown"), { elsewhere: true }), ["room opened", "focus true", 1000, false], "the list did not take the focus from elsewhere");
   assert.deepStrictEqual(route(key("PageDown", { ctrlKey: true }), field), [1000, false], "a Ctrl chord was routed");
-  assert.deepStrictEqual(route(key("Enter"), field), [1000, false]);
+  assert.deepStrictEqual(route(key("Enter"), field), [1000, false], "a key a browser does not scroll with was routed");
+  assert.deepStrictEqual(route(key("PageUp", { metaKey: true }), field), [1000, false], "Cmd+PgUp in a field paged the list");
+  assert.deepStrictEqual(route(key("End", { metaKey: true }), picker), [1000, false], "Cmd+End on a picker went to the list's end");
+  assert.deepStrictEqual(route(key("End"), picker), ["walk ended", "newest", 1000, true], "End on a picker did not take the list to its newest line");
+  assert.deepStrictEqual(route(key(" "), inList), ["room opened", "follow false", 1000, false], "Space from the selected message did not open the room and follow down");
+  assert.deepStrictEqual(route(key("PageDown"), otherInList), ["room opened", 1000, false], "a page key from another row of the list was followed as if from the selected one");
+  main = false;
+  assert.deepStrictEqual(route(key("PageDown"), inList), ["room opened", 1000, false], "off the main screen a page key looked for a list's pane");
+  main = true;
   log.length = 0;
   assert.equal(keys.jumpList(field, true), true);
   assert.deepStrictEqual(log, ["walk ended", "newest"], "Ctrl+End on the main list was not the Newest chip");

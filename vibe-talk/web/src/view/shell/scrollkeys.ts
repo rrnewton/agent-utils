@@ -30,7 +30,7 @@ export interface ScrolledPane<Row> {
 }
 
 export interface ScrollKeysDependencies<Pane extends ScrolledPane<HTMLElement>> {
-  /** The main screen's list scroller: the left column's, or the right one's while the keys are there. */
+  /** The main screen's list scroller of the column the code is working in (`inColumn`): the left one's, or the right one's. */
   scrollArea(): HTMLElement;
   /** The right column's scroller, as the left column's code sees it. */
   sideScroll(): HTMLElement;
