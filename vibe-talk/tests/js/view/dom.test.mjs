@@ -1218,3 +1218,51 @@ test("`#624 voice-page-modularity`: the row keys open, enter and leave threads, 
     globalThis.document = was;
   }
 });
+
+test("`#624 voice-page-modularity`: n goes to the next unread row below the selection or the screen's top, and e marks Done and moves on without taking the focus from a box", () => {
+  const { createDoneKeys } = VIEW_SHELL;
+  const log = [];
+  const rowOf = (id, attributes = {}) => ({ id, attributes, getAttribute(name) { return name === "data-id" ? id : this.attributes[name] ?? null; }, hasAttribute(name) { return name in this.attributes; } });
+  let rows = [rowOf("1"), rowOf("2"), rowOf("3"), rowOf("c4", { "data-card": "" }), rowOf("5")];
+  const state = { read: new Set(["1", "2", "3"]), done: new Set(), inView: new Set(["2", "3", "c4", "5"]), row: null, took: true, again: true };
+  const keys = createDoneKeys({
+    keyContext: () => ({ pane: "pane", row: state.row }),
+    rowForAct: (_target, runLine, stay) => { log.push(`rowForAct ${runLine} ${stay}`); return { pane: state.row ? "pane" : null, row: state.row, took: state.took }; },
+    paneRows: () => rows,
+    rowInView: (_pane, row) => state.inView.has(row.id),
+    rowIsRead: (row) => state.read.has(row.id),
+    selectRow: (...args) => log.push(`select ${args.slice(1).map((one) => one.id).join(" ")}`),
+    setStatus: (text) => log.push(`say ${text}`),
+    paneRowFor: (_pane, id, card) => (state.again ? rows.find((row) => row.id === id && row.hasAttribute("data-card") === card) || null : null),
+    nearRow: (_pane, at) => rows[at] || null,
+    takeRow: (_pane, row, focus) => log.push(`take ${row.id} ${focus}`),
+    bringIntoView: (...args) => log.push(`bring ${args.slice(1).map((one) => one.id).join(" ")}`),
+    idsOf: (row) => (row.hasAttribute("data-card") ? [] : [row.id]),
+    isDone: (id) => state.done.has(id),
+    toggleDone: (ids) => log.push(`toggle ${ids}`),
+  });
+  const run = (act) => { log.length = 0; return [act(), ...log]; };
+  assert.deepStrictEqual(run(() => keys.nextUnreadFromKeyboard({})), [true, "select c4"], "n with nothing selected did not start below the screen's top, or skipped a card with unread replies");
+  rows[3].attributes["data-thread-read"] = "";
+  state.row = rows[0];
+  assert.deepStrictEqual(run(() => keys.nextUnreadFromKeyboard({})), [true, "select 5"], "n from a selection out of sight did not start at the screen's top, or stopped on a card said read");
+  state.row = rows[4];
+  assert.deepStrictEqual(run(() => keys.nextUnreadFromKeyboard({})), [true, "say Nothing unread below."]);
+  state.row = rows[1];
+  state.read.delete("3");
+  assert.deepStrictEqual(run(() => keys.doneFromKeyboard({})), [true, "rowForAct false false", "toggle 2", "take 3 true", "bring 3"], "e did not mark Done and move to the next unread with the focus");
+  state.done.add("2");
+  assert.deepStrictEqual(run(() => keys.doneFromKeyboard({})), [true, "rowForAct false false", "toggle 2", "take 2 true", "bring 2"], "e on a Done message moved on, or did not stay on it");
+  state.done.delete("2");
+  assert.deepStrictEqual(run(() => keys.doneFromKeyboard({ tagName: "TEXTAREA" })), [true, "rowForAct false true", "toggle 2", "take 3 false", "bring 3"], "e from a box took the focus from it");
+  state.again = false;
+  assert.deepStrictEqual(run(() => keys.doneFromKeyboard({})), [true, "rowForAct false false", "toggle 2", "take 2 true", "bring 2"], "a Done whose rows went did not land on the row now where it was");
+  state.row = rows[3];
+  assert.deepStrictEqual(run(() => keys.doneFromKeyboard({})), [false, "rowForAct false false"], "e on a card with no message of its own was taken");
+  state.row = null;
+  assert.deepStrictEqual(run(() => keys.doneFromKeyboard({})), [true, "rowForAct false false"]);
+  state.took = false;
+  assert.deepStrictEqual(run(() => keys.doneFromKeyboard({})), [false, "rowForAct false false"]);
+  rows = [];
+  assert.deepStrictEqual(run(() => keys.nextUnreadFromKeyboard({})), [false]);
+});

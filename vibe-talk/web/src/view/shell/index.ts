@@ -39,3 +39,5 @@ export { createChannelKeys } from "./channelkeys.ts";
 export type { ChannelKeys, ChannelKeysDependencies, ChannelPicker, SteppedChannel } from "./channelkeys.ts";
 export { createRowKeys } from "./rowkeys.ts";
 export type { ActedRow, OpenRowMenu, RowKeys, RowKeysDependencies } from "./rowkeys.ts";
+export { createDoneKeys } from "./donekeys.ts";
+export type { DoneKeys, DoneKeysDependencies, DoneRow } from "./donekeys.ts";

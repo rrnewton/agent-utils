@@ -7165,73 +7165,29 @@ function rowForAct(target, runLine = false, stay = false) {
 }
 
 /**
- * The first unread message after `at` in `rows`, by the read rule both read modes share. Over the cards
- * a card, which holds no message, is unread while it says its thread has unread replies (`#407
- * unpack-row-parity`: its messages unpacked under it are rows of their own, read by the same rule).
- */
-const unreadAfter = (rows, at) => rows.slice(at + 1).find((row) =>
-  (row.hasAttribute("data-card") ? !row.hasAttribute("data-thread-read") : !rowIsRead(row))) || null;
-
-/** n: the next unread message below the selected one, or below the top of the screen. */
-function nextUnreadFromKeyboard(target) {
-  const { pane, row } = keyContext(target);
-  const rows = pane ? paneRows(pane) : [];
-  if (!pane || rows.length === 0) return false;
-  let from = row && rowInView(pane, row) ? rows.indexOf(row) : -1;
-  if (from < 0) {
-    const seen = rows.findIndex((one) => rowInView(pane, one));
-    from = seen < 0 ? -1 : seen - 1;
-  }
-  const next = unreadAfter(rows, from);
-  if (next) selectRow(pane, next);
-  else setStatus("Nothing unread below.");
-  return true;
-}
-
-/**
- * After a Done made from the keyboard: on to the unread row `next` it chose before the act, else back
- * on the message itself, else (it has gone, under Hide read) the row now where it was. The rows are
- * already the new ones: the list is redrawn before the write goes out, so `next` is found again by its
- * id, a card told from a message (`paneRowFor`). `stay` moves the selection without the focus, as
- * `rowForAct` says.
+ * The Done and next-unread keys: n to the next unread message, and e and Ctrl+E (Cmd+E) Done or not and on.
+ * One owner in web/src/view/shell/donekeys.ts (`#624 voice-page-modularity`); the page destructures its keys
+ * under their old names.
  *
- * @param {KeyPane} pane
- * @param {HTMLElement | null} next
- * @param {string} ownId
- * @param {number} at
- * @param {boolean} [stay]
+ * @type {import("./src/view/shell/index.ts").DoneKeys}
  */
-function landAfterDone(pane, next, ownId, at, stay = false) {
-  const again = next ? paneRowFor(pane, next.getAttribute("data-id"), next.hasAttribute("data-card")) : null;
-  const row = again || paneRowFor(pane, ownId, false) || nearRow(pane, at);
-  if (!row) return;
-  takeRow(pane, row, !stay);
-  bringIntoView(pane, row);
-}
-
-/**
- * e, and Ctrl+E (Cmd+E): Done or not Done, the act of the row's Done button; marked Done, on to the
- * next unread below (question 2).
- *
- * The chord is e for a reader typing (`cmd-e-done`): in a message box or the search, where e is a
- * letter, it acts on the message the keys act on, the selected one of the column of the box, and moves
- * the selection on without taking the focus from the box. False when there is no message to act on,
- * so that the chord is left to the browser.
- */
-function doneFromKeyboard(target) {
-  const stay = isTextField(target);
-  const { pane, row, took } = rowForAct(target, false, stay);
-  if (!pane || !row) return took;
-  const ids = idsOf(row);
-  if (ids.length === 0) return false;
-  const marking = !ids.every((id) => doneState().archived.has(id));
-  const rows = paneRows(pane);
-  const at = rows.indexOf(row);
-  const next = marking ? unreadAfter(rows, at) : null;
-  guardQuietly(() => toggleArchived(ids, row))();
-  landAfterDone(pane, next, ids[0], at, stay);
-  return true;
-}
+const doneKeys = createDoneKeys({
+  keyContext: (target) => keyContext(target),
+  rowForAct: (target, runLine, stay) => rowForAct(target, runLine, stay),
+  paneRows: (pane) => paneRows(pane),
+  rowInView: (pane, row) => rowInView(pane, row),
+  rowIsRead: (row) => rowIsRead(row),
+  selectRow: (pane, row) => selectRow(pane, row),
+  setStatus: (text) => setStatus(text),
+  paneRowFor: (pane, id, card) => paneRowFor(pane, id, card),
+  nearRow: (pane, at) => nearRow(pane, at),
+  takeRow: (pane, row, focus) => takeRow(pane, row, focus),
+  bringIntoView: (pane, row) => bringIntoView(pane, row),
+  idsOf: (row) => idsOf(row),
+  isDone: (id) => doneState().archived.has(id),
+  toggleDone: (ids, row) => guardQuietly(() => toggleArchived(ids, row))(),
+});
+const { nextUnreadFromKeyboard, doneFromKeyboard } = doneKeys;
 
 /**
  * Shift+E: read and collapse (`#295 shift-e-read-collapse`). The owner's idiom for "dealt with, and
@@ -17655,7 +17611,7 @@ function heldBackByMain(to, target, rows, done) {
 /**
  * A Done on `ids`, with the line right above the row they make Done: the line slides down past
  * every row already read and stops above the first still to read — the row e selects next
- * (`unreadAfter`), so the bookmark and the selection stay together — or below the last row; in a
+ * (view/shell `unreadAfter`), so the bookmark and the selection stay together — or below the last row; in a
  * thread, no further than Main's next message still to read (`heldBackByMain`). Null when the line
  * is anywhere else, or the row is not wholly Done by this.
  */
