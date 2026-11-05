@@ -261,7 +261,8 @@ path.
 ## Move a project's worktrees onto one btrfs image (opt-in)
 
 `worktrees_image` in `.wrkslots.yml` puts every slot in one sparse btrfs
-image mounted at the slots directory; the registry stays outside it.
+image mounted beside the control directory (`.slots-image`); each slot is
+bind-mounted at its original real path and the registry stays outside it.
 Kernel mount only (`sudo -n mount -o loop`): btrfs has no unprivileged
 FUSE fallback, so a host without passwordless sudo cannot enable it.
 Absent key means today's behaviour. Design and trial numbers:
@@ -273,28 +274,36 @@ symlink (agent delivery binds to the real cwd, so symlinked slots become
 unreachable); migrate only stopped slots, or in place via a bind mount at
 the unchanged path; whoever migrates a slot is never inside its tree.
 
-Procedure (refined from the devbig014 throwaway trial):
+Procedure (refined from the throwaway trial and the first live migration):
 
-1. Quiesce slots (`audit` clean), write the rollback plan first.
+1. Write the rollback plan first. Per slot it is one step: unmount the
+   bind; the original directory is still beneath it.
 2. Add the config, then create and mount:
-   `worktrees_image: {path: worktrees.img, size_bytes: <bytes>, fs: btrfs, mount: kernel}`,
+   `worktrees_image: {path: worktrees.img, size_bytes: <bytes>, fs: btrfs, mount: kernel, slot_quota_bytes: <bytes>}`,
    `wrkslots worktrees-image create`, `wrkslots worktrees-image mount`.
    Creation marks the zero-byte backing file `+C` before truncating;
-   the reverse order silently loses NOCOW on a btrfs host.
-3. Migrate quiesced: rename `slots` aside, mount at the *same path*
-   (Git worktree metadata holds absolute paths), copy with
-   `cp -a --reflink=always`, compare full listings, verify
-   `git worktree list --porcelain` and `wrkslots status` CONSISTENT.
-4. Rollback before reclaiming the old tree: unmount, rename back,
-   remove the config block, verify status. After real work on the
-   image, copy back first — never just rename.
-5. Move one live slot at a time with `wrkslots migrate <slot>` (idle
-   slots only; verified copy, same path, registry unchanged). New slots
-   in image mode are btrfs subvolumes; `slot_quota_bytes` bounds each.
+   the reverse order silently loses NOCOW on a btrfs host. Set
+   `slot_representation: worktree` so new slots are subvolumes, not
+   ext4 images nested in btrfs.
+3. Migrate one **stopped** slot at a time: `wrkslots migrate <slot>`
+   copies it into an image subvolume (special files such as FIFOs in
+   build caches are skipped — they are runtime residue, not content),
+   verifies the listing, and bind-mounts it at the unchanged path.
+   The registry never changes and agent cwd never moves. Verify:
+   `wrkslots status` CONSISTENT, `findmnt` shows the bind, `git status`
+   through the path, and an agentctl delivery probe.
+4. New slots are born as subvolume + bind. Config loads re-establish
+   the image mount and every recorded bind (the reboot check: unmount
+   both, run any wrkslots command, watch them return).
+5. Keep each original under its bind for a 7-day soak, then delete it
+   as a separate approved step. Live slots are never migrated and no
+   ancestor of a live slot is ever renamed.
 6. Operate: `worktrees-image status|grow --to-size-bytes N|trim|unmount`.
    Grow refreshes the loop capacity (`losetup -c`) before resizing;
    without it the guest silently keeps its old size. Slot-writing
    commands refuse while the image is not verifiably mounted — never
-   work around that by writing into the empty mount point.
+   work around that by writing into the empty mount point. Alarm on
+   host-allocated bytes and host free space; a sparse image must never
+   let its host reach zero (keep a fallocate floor in the image).
 
 Run `worktrees/wrkslots --help` for the complete CLI.

@@ -424,7 +424,35 @@ Hard constraints for any revised plan:
   directory is still there. No project-wide rollback exists because
   no project-wide cutover exists.
 
-## 14. Open questions
+## 14. Trial D outcome (2026-11-05, executed)
+
+The revised plan ran for one released slot, with the coordinator's GO:
+
+- Config enabled (`worktrees_image` in the tracked harness config,
+  copied to the live file, never symlinked; `slot_representation`
+  switched to `worktree` so new slots are subvolumes, not ext4 nested
+  in btrfs). Image: 2 TiB sparse, `+C`, 32 GiB fallocate floor,
+  256 GiB per-slot qgroup, mounted at `worktrees/.slots-image`.
+- `wrkslots migrate audit-perrow-20261104`: copied into a subvolume,
+  bound at the original path, original kept beneath. Post-checks:
+  registry CONSISTENT with zero journals; `findmnt` shows the btrfs
+  bind; Git works through the path; unmounting bind and image and
+  running any wrkslots command re-established both (the reboot
+  equivalent). A new probe slot was born as subvolume + bind the same
+  way. Remaining slots migrate only when their agents stop, each
+  with a coordinator GO; the operator's own slot is last.
+- **FIFO finding (fixed, `7aa89d5a`):** the first migrate copy failed
+  on named pipes inside build caches (`rs/target/.../rejections/*.json`
+  FIFOs). Special files are runtime residue, not slot content:
+  migration now skips them, compares only migratable entries, and
+  deletes a partial subvolume after any failed copy so a retry never
+  refuses on its own debris. A unit test with a real FIFO covers it.
+- Decisions recorded by the coordinator after verification: a
+  finished lane's slot is removed rather than migrated; probe slots
+  are removed by the coordinator when their heartbeat TTL expires;
+  the live test-stack slot stays on the host until its owner frees it.
+
+## 15. Open questions
 
 - Snapshot retention policy (count/age/who approves deletion).
 - Default `size_bytes` and the host-allocated alarm threshold.
