@@ -563,6 +563,83 @@ pub fn walk(
     })
 }
 
+/// The final delivery outcome a sender is told about (#904
+/// agent-teams-delivery-outcome): the recipient-side ledger state folded
+/// into the four outcomes `agent-teams status` reports. Terminal recipient
+/// failures other than `possibly_submitted` are `failed`; anything still
+/// in flight is `pending`.
+#[must_use]
+pub fn delivery_outcome(recipient_state: &str) -> &'static str {
+    match recipient_state {
+        "delivered" | "journaled" => "delivered",
+        "possibly_submitted" => "possibly_submitted",
+        "refused" | "fenced" | "expired" | "retracted" | "superseded" | "lost"
+        | "ambiguous-expired" | "journaled-halted" => "failed",
+        _ => "pending",
+    }
+}
+
+/// Ask the recipient for its ledger state over the first route that
+/// answers (the existing `receipt` serve verb, which first reconciles the
+/// recipient's queue). Trust note: the answer is accepted only from a
+/// route built for the addressed contact — a skipped route is never its
+/// authority (see `ask_receipt`) — and it is recorded as a reply-kind
+/// report from the recipient team, never as a new instruction.
+pub fn query_recipient_state(
+    entry_value: &mut Value,
+    routes: &[Box<dyn Route>],
+    team: &str,
+) -> Option<Value> {
+    let id = entry_value["envelope"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let label = entry_value["addressed_to"]
+        .as_str()
+        .unwrap_or("recipient")
+        .to_string();
+    ask_receipt(entry_value, routes, &label, &id, team)
+}
+
+/// Record a recipient-reported state in the sender's ledger (its outbox
+/// entry): `delivery_outcome`, when it was reported and the raw recipient
+/// state. When the outcome first becomes `possibly_submitted` or `failed`
+/// the sender gets a durable notice — `notices/<id>.json` in its state,
+/// kind `reply` (an outcome report is a reply from the recipient team,
+/// accepted under the same allowlist as any reply; it carries no body to
+/// act on) plus a team-log event — once, not on every later query.
+/// Returns the outcome.
+pub fn record_delivery_outcome(state: &Path, entry: &mut Value, recipient_state: &str) -> String {
+    let outcome = delivery_outcome(recipient_state).to_string();
+    let id = entry["envelope"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let already_noticed = entry
+        .get("outcome_notice_at")
+        .is_some_and(|at| !at.is_null());
+    entry["delivery_outcome"] = json!(outcome);
+    entry["delivery_outcome_recipient_state"] = json!(recipient_state);
+    entry["delivery_outcome_at"] = json!(format_rfc3339_ms(now_unix_ms()));
+    if matches!(outcome.as_str(), "possibly_submitted" | "failed") && !already_noticed {
+        entry["outcome_notice_at"] = json!(format_rfc3339_ms(now_unix_ms()));
+        let notice = json!({
+            "event": "delivery-outcome",
+            "kind": "reply",
+            "id": id,
+            "outcome": outcome,
+            "recipient_state": recipient_state,
+            "addressed_to": entry["addressed_to"],
+            "at": entry["outcome_notice_at"],
+        });
+        log_event(state, &notice);
+        let notices = state.join("notices");
+        let _ = fs::create_dir_all(&notices);
+        let _ = write_json_atomic(&notices.join(format!("{id}.json")), &notice);
+    }
+    outcome
+}
+
 /// Map a receiver ledger state onto the sender-side state.
 pub fn map_receiver_state(state: &str) -> String {
     match state {
@@ -662,5 +739,123 @@ pub fn log_event(state: &Path, event: &Value) {
         // One formatted buffer, one write: a short-lived serve process
         // must never leave a torn line behind.
         let _ = file.write_all(format!("{event}\n").as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use crate::route::AttemptOutcome;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_state(name: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "agent-teams-outcome-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A route whose `receipt` verb is answered by the recipient side's
+    /// own serve handler over its state — the serve/route machinery,
+    /// without a subprocess.
+    struct ServeRoute {
+        state: PathBuf,
+        host: String,
+    }
+
+    impl Route for ServeRoute {
+        fn name(&self) -> &str {
+            "serve-test"
+        }
+        fn run_verb(&self, verb: &str, payload: &Value) -> AttemptOutcome {
+            AttemptOutcome::Answered(crate::serve::handle_verb(
+                &self.state,
+                &self.host,
+                &self.host,
+                verb,
+                payload,
+            ))
+        }
+    }
+
+    #[test]
+    fn outcomes_fold_recipient_states() {
+        assert_eq!(delivery_outcome("delivered"), "delivered");
+        assert_eq!(delivery_outcome("possibly_submitted"), "possibly_submitted");
+        assert_eq!(delivery_outcome("refused"), "failed");
+        assert_eq!(delivery_outcome("expired"), "failed");
+        assert_eq!(delivery_outcome("accepted"), "pending");
+        assert_eq!(delivery_outcome("claimed"), "pending");
+        assert_eq!(delivery_outcome("unknown"), "pending");
+    }
+
+    #[test]
+    fn a_cancelled_before_typing_delivery_reports_possibly_submitted_to_the_sender() {
+        // End to end (#904): the recipient accepted a message, its queue
+        // item was cancelled before typing and parked in failed/, and the
+        // sender — who only ever saw `accepted` — queries the recipient
+        // through serve/route and records the final outcome.
+        let receiver = temp_state("receiver");
+        let sender = temp_state("sender");
+        let id = "tm-sim-0123456789abcdef";
+        // Recipient queue with the cancelled item in failed/.
+        let queue = receiver.join("queue");
+        agent_queue::queue::prepare(&queue).unwrap();
+        fs::write(
+            queue.join("failed").join(format!("{id}.json")),
+            json!({"id": id, "text": "hello", "queued_at": 1.0}).to_string(),
+        )
+        .unwrap();
+        // Recipient ledger: accepted, handed to that queue.
+        let ledger = crate::ledger::ledger_dir(&receiver, "recv");
+        fs::create_dir_all(&ledger).unwrap();
+        fs::write(
+            crate::ledger::entry_path(&receiver, "recv", id),
+            json!({
+                "id": id, "state": "accepted",
+                "target": {"kind": "agentctl-queue", "queue_dir": queue.to_string_lossy()},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // Sender outbox: still `accepted`.
+        let mut entry = json!({
+            "id": id, "addressed_to": "recv@host-a", "state": "accepted",
+            "envelope": {"id": id, "key": "k1"}, "attempts": [],
+        });
+        let routes: Vec<Box<dyn Route>> = vec![Box::new(ServeRoute {
+            state: receiver.clone(),
+            host: "host-a".to_string(),
+        })];
+        let answer = query_recipient_state(&mut entry, &routes, "recv").expect("recipient answers");
+        assert_eq!(answer["state"], "possibly_submitted", "{answer}");
+        let outcome =
+            record_delivery_outcome(&sender, &mut entry, answer["state"].as_str().unwrap());
+        assert_eq!(outcome, "possibly_submitted");
+        assert_eq!(entry["delivery_outcome"], "possibly_submitted");
+        // The sender got a notice, once.
+        let notice_path = sender.join("notices").join(format!("{id}.json"));
+        let notice: Value =
+            serde_json::from_str(&fs::read_to_string(&notice_path).unwrap()).unwrap();
+        assert_eq!(notice["kind"], "reply");
+        assert_eq!(notice["outcome"], "possibly_submitted");
+        let noticed_at = entry["outcome_notice_at"].clone();
+        let _ = record_delivery_outcome(&sender, &mut entry, "possibly_submitted");
+        assert_eq!(
+            entry["outcome_notice_at"], noticed_at,
+            "notice is once only"
+        );
+        // The recipient recorded its reply-kind outcome report too.
+        assert!(receiver
+            .join("teams.d/recv/notices")
+            .join(format!("{id}.json"))
+            .is_file());
+        let _ = fs::remove_dir_all(&receiver);
+        let _ = fs::remove_dir_all(&sender);
     }
 }

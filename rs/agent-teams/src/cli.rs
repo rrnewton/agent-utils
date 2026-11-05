@@ -1863,7 +1863,68 @@ fn cmd_status(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         .into_iter()
         .next()
         .ok_or_else(|| err("usage", "status needs an ID"))?;
-    let outbox = read_outbox(&globals.state, &id);
+    let mut outbox = read_outbox(&globals.state, &id);
+    // #904 agent-teams-delivery-outcome: ask the recipient side, through
+    // the existing serve/route machinery (the `receipt` verb), what
+    // finally happened, and record the outcome in the sender's ledger
+    // (the outbox entry). A recipient that cannot be reached leaves the
+    // locally recorded outcome in place; status stays a pure read of it.
+    let mut recipient_state: Option<String> = None;
+    if let Some(entry) = outbox.as_mut() {
+        if !crate::sender::is_terminal(entry["state"].as_str().unwrap_or_default()) {
+            if let Ok(teams) = globals.load_teams() {
+                if let Ok(routes) = globals.load_routes() {
+                    let (to_team, to_host_arg) =
+                        parse_target(entry["addressed_to"].as_str().unwrap_or_default());
+                    if let Ok(team_entry) =
+                        teams.pick_entry(&to_team, to_host_arg.as_deref(), &globals.host)
+                    {
+                        let team_entry = team_entry.clone();
+                        let sender_decl = entry["envelope"]["from"]["team"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        if let Ok(route_objs) = routes_for_entry(
+                            globals,
+                            &teams,
+                            &routes,
+                            &to_team,
+                            &team_entry,
+                            Some(&sender_decl),
+                        ) {
+                            if let Some(answer) =
+                                crate::sender::query_recipient_state(entry, &route_objs, &to_team)
+                            {
+                                if answer["known"].as_bool() == Some(true) {
+                                    let state =
+                                        answer["state"].as_str().unwrap_or("accepted").to_string();
+                                    crate::sender::record_delivery_outcome(
+                                        &globals.state,
+                                        entry,
+                                        &state,
+                                    );
+                                    recipient_state = Some(state);
+                                    let _ = crate::jsonfile::write_json_atomic(
+                                        &crate::sender::outbox_path(&globals.state, &id),
+                                        entry,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let outcome = outbox.as_ref().map(|entry| {
+        entry["delivery_outcome"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                crate::sender::delivery_outcome(entry["state"].as_str().unwrap_or_default())
+                    .to_string()
+            })
+    });
     let ledger = find_ledger_entry_any_team(globals, &id);
     if globals.json || has_flag(args, "--json") {
         println!(
@@ -1871,6 +1932,8 @@ fn cmd_status(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
             serde_json::to_string_pretty(&json!({
                 "id": id,
                 "outbox": outbox,
+                "delivery_outcome": outcome,
+                "recipient_state": recipient_state,
                 "ledger": ledger.map(|(team, entry)| json!({"team": team, "entry": entry})),
             }))?
         );
@@ -1888,6 +1951,9 @@ fn cmd_status(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                 entry["addressed_to"].as_str().unwrap_or("?"),
                 entry["envelope"]["key"].as_str().unwrap_or("?")
             );
+            if let Some(outcome) = &outcome {
+                println!("delivery_outcome: {outcome}");
+            }
             if let Some(attempts) = entry["attempts"].as_array() {
                 for attempt in attempts {
                     println!(

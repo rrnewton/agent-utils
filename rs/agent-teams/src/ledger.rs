@@ -822,6 +822,23 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
         Value::Null
     };
     let written = write_json_atomic(&entry_path(state, team, id), &entry);
+    // #904: a possibly_submitted outcome is reported back toward the sender
+    // as a reply-kind outcome report under this team's notices, so the
+    // sender's next receipt query (and any watcher reading notices) learns
+    // the message may not have arrived instead of seeing bare `accepted`.
+    if new_state == "possibly_submitted" {
+        let notice = json!({
+            "event": "delivery-outcome", "kind": "reply", "team": team, "id": id,
+            "outcome": "possibly_submitted", "detail": detail,
+            "at": format_rfc3339_ms(now_unix_ms()),
+        });
+        crate::sender::log_event(state, &notice);
+        write_notice(
+            &state.join("teams.d").join(team).join("notices"),
+            id,
+            &notice,
+        );
+    }
     unlock(lock);
     written.ok()?;
     Some(new_state.to_string())
