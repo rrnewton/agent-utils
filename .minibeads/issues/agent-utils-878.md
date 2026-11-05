@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-legacy-validate-recover: audit and recover agree on a legacy absent validate row'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-validate
 created_at: 2026-11-05T09:32:58.474545063+00:00
-updated_at: 2026-11-05T09:32:58.474545063+00:00
+updated_at: 2026-11-05T15:06:38.813089034+00:00
+closed_at: 2026-11-05T15:06:38.813088914+00:00
 ---
 
 # Description
