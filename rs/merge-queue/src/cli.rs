@@ -360,6 +360,9 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
                 count(crate::donor::JobState::Done),
                 count(crate::donor::JobState::Cancelled)
             );
+            for alert in store.give_back_alerts(config.donors.give_back_alert())? {
+                println!("{alert}");
+            }
             let could_not_run: usize = jobs.iter().map(|j| j.could_not_run.len()).sum();
             if could_not_run > 0 {
                 // Receipts that said validation never ran: no verdict, no comparison.

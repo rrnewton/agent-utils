@@ -216,6 +216,9 @@ pub struct DonorsConfig {
     /// comparison and never decides the batch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compare_only: Vec<String>,
+    /// Consecutive give-backs with the same reason from one donor that raise an
+    /// `ERROR:` alert in `donor status` and the serve heartbeat (0 = 3).
+    pub alert_after_give_backs: u32,
 }
 
 impl DonorsConfig {
@@ -243,6 +246,15 @@ impl DonorsConfig {
             256 * 1024 * 1024
         } else {
             self.max_bundle_bytes
+        }
+    }
+
+    /// Resolved give-back alert threshold.
+    pub fn give_back_alert(&self) -> usize {
+        if self.alert_after_give_backs == 0 {
+            DEFAULT_RETRY_BOUND as usize
+        } else {
+            self.alert_after_give_backs as usize
         }
     }
 

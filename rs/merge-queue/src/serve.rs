@@ -970,8 +970,25 @@ fn run_cycle(
                 eprintln!("merge-queue serve: {text}");
                 Some(text)
             };
+            // A donor that keeps giving jobs back with the same reason is an ERROR the
+            // health tick must see, even though no single give-back is a queue failure.
+            let give_back = state.config().ok().and_then(|config| {
+                crate::donor::Store::new(&state.root)
+                    .give_back_alerts(config.donors.give_back_alert())
+                    .ok()
+                    .filter(|alerts| !alerts.is_empty())
+                    .map(|alerts| alerts.join("; "))
+            });
+            if let Some(alert) = &give_back {
+                eprintln!("merge-queue serve: {alert}");
+            }
             if report.stopped.is_empty() {
-                heartbeat.last_error = alarm_text.unwrap_or_default();
+                heartbeat.last_error = match (alarm_text, give_back) {
+                    (Some(alarm), Some(alert)) => format!("{alarm}; {alert}"),
+                    (Some(alarm), None) => alarm,
+                    (None, Some(alert)) => alert,
+                    (None, None) => String::new(),
+                };
                 true
             } else {
                 heartbeat.last_error =

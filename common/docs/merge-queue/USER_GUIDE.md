@@ -945,6 +945,10 @@ An **item record** (`items/<pr>.json`) has these fields:
   before the run stops with an error (default `900`). Nothing is ejected.
 - `max_could_not_run`: could-not-run receipts one job may collect before it is cancelled, and
   one donor may return for it before it is left out (absent or `0`: `3`).
+- `alert_after_give_backs`: consecutive give-backs (releases or declines) with the same
+  reason from one donor that raise an `ERROR:` line in `donor status` and the serve
+  heartbeat's `last error` (absent or `0`: `3`). An accepted receipt from the donor resets
+  its run.
 - `compare_only`: donor names that only ever compare in `decide` mode. Each published job
   gets a duplicate only they may claim; its receipt is recorded as a comparison (`comparison`
   on both jobs, counted by `donor status`) and never decides the batch. Deciding donors never

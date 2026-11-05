@@ -1030,8 +1030,9 @@ impl Store {
             }
         ));
         if decline && !job.declined_by.contains(&donor) {
-            job.declined_by.push(donor);
+            job.declined_by.push(donor.clone());
         }
+        self.note_give_back(&donor, reason);
         self.write(&job)
     }
 
@@ -1188,6 +1189,7 @@ impl Store {
         if let Some(local) = &job.local {
             job.comparison = Some(compare(local, &receipt.verdict()));
         }
+        self.note_receipt(&receipt.donor.name.clone());
         job.receipt = Some(receipt);
         self.write(&job)
     }
@@ -1304,6 +1306,61 @@ impl Store {
             }
         }
         Ok(cancelled)
+    }
+
+    /// One donor's current run of consecutive give-backs with one reason.
+    fn give_back_runs(&self) -> BTreeMap<String, (String, usize)> {
+        std::fs::read_to_string(self.dir.join("give-backs.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_give_back_runs(&self, runs: &BTreeMap<String, (String, usize)>) -> Result<(), String> {
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|error| format!("cannot create {}: {error}", self.dir.display()))?;
+        let text =
+            serde_json::to_string(runs).map_err(|error| format!("cannot encode: {error}"))?;
+        write_private(&self.dir.join("give-backs.json"), text.as_bytes())
+    }
+
+    /// Record a give-back by `donor` for `reason`: same reason extends its run, a new
+    /// reason starts one. Called with the store lock held.
+    fn note_give_back(&self, donor: &str, reason: &str) {
+        let mut runs = self.give_back_runs();
+        let entry = runs
+            .entry(donor.to_owned())
+            .or_insert_with(|| (reason.to_owned(), 0));
+        if entry.0 == reason {
+            entry.1 += 1;
+        } else {
+            *entry = (reason.to_owned(), 1);
+        }
+        let _ = self.save_give_back_runs(&runs);
+    }
+
+    /// Record an accepted receipt from `donor`: it proved it can validate, so its
+    /// give-back run resets. Called with the store lock held.
+    fn note_receipt(&self, donor: &str) {
+        let mut runs = self.give_back_runs();
+        if runs.remove(donor).is_some() {
+            let _ = self.save_give_back_runs(&runs);
+        }
+    }
+
+    /// `ERROR:` alerts for donors whose current give-back run reaches `threshold`.
+    pub fn give_back_alerts(&self, threshold: usize) -> Result<Vec<String>, String> {
+        Ok(self
+            .give_back_runs()
+            .into_iter()
+            .filter(|(_, (_, count))| *count >= threshold.max(1))
+            .map(|(donor, (reason, count))| {
+                format!(
+                    "ERROR: donor {donor} gave back {count} consecutive jobs ({reason}); \
+                     check that donor"
+                )
+            })
+            .collect())
     }
 
     /// The job's current record.
@@ -2165,6 +2222,44 @@ mod unit {
             exit: Some(0),
             ..Receipt::default()
         }
+    }
+
+    #[test]
+    fn three_consecutive_give_backs_with_one_reason_alert_and_a_receipt_resets() {
+        let store = Store::new(&temp("give-back-alert"));
+        assert!(store.give_back_alerts(3).unwrap().is_empty());
+        for commit in ["c1", "c2", "c3"] {
+            publish(&store, commit);
+            let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+            let token = claimed.lease.as_ref().unwrap().token.clone();
+            store
+                .release(&claimed.id, &token, "the revision differs", false)
+                .unwrap();
+        }
+        let alerts = store.give_back_alerts(3).unwrap();
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(
+            alerts[0].starts_with("ERROR: donor d1 gave back 3 consecutive jobs"),
+            "{alerts:?}"
+        );
+        assert!(store.give_back_alerts(4).unwrap().is_empty());
+        // An accepted receipt proves the donor can validate: the run resets.
+        publish(&store, "c4");
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        store
+            .report(&claimed.id, &token, receipt(&claimed, "d1"))
+            .unwrap();
+        assert!(store.give_back_alerts(3).unwrap().is_empty());
+        // A different donor's single give-back is not d1's run, and a new reason
+        // starts a new run.
+        publish(&store, "c5");
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        store
+            .release(&claimed.id, &token, "no base", false)
+            .unwrap();
+        assert!(store.give_back_alerts(3).unwrap().is_empty());
     }
 
     #[test]
