@@ -32,9 +32,10 @@
 # each check serves the page and its fake API on a port the kernel picks (bound to port 0, or for
 # the two that start the real server, send-order and pwa-installability, probed free just before),
 # launches Chromium in a fresh temporary profile, and keeps its state in temporary directories. The
-# fixed ports are the screenshot harness's (VIBE_TALK_SHOTS_PORT and the two above it), and it is
-# the only step that uses them; it also writes its PNGs under vibe-talk/debug/screenshots/, a new
-# stamped directory each run. The lane at 1 and at 4 was compared check by check.
+# screenshot harness's server and mock take 18091 to 18093 (VIBE_TALK_SHOTS_PORT moves them), or,
+# when any of those is held and no port was asked for, three free ports the kernel picks: until #887
+# vibe-talk-screenshots-port a held default failed the whole run. It also writes its PNGs under
+# vibe-talk/debug/screenshots/, a new stamped directory each run. The lane at 1 and at 4 was compared check by check.
 #
 # HOW TO RUN IT
 #

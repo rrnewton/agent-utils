@@ -107,6 +107,7 @@ run_sh() {
             XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
             DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
             VIBE_TALK_ENGINE="${ENGINE_FOR_RUN:-$ENGINE}" \
+            ${SHOTS_PORT_FOR_RUN:+VIBE_TALK_SHOTS_PORT=$SHOTS_PORT_FOR_RUN} \
             bash "$RUN_SH" "$@" 2>&1)" || rc=$?
     [ "$rc" -ne 124 ] || fail "run.sh hung (timed out) on: $*"
     printf '%s\n' "$out" >> "$ALL_OUTPUT"
@@ -647,7 +648,7 @@ ok "--screenshots refuses port 18081, naming the ci container"
 # The default must be neither of those, and the plan must say so out loud rather than leaving the
 # reader to trust it.
 out="$(run_sh --screenshots --dry-run)"
-grep -q '127.0.0.1:18091' <<< "$out" \
+grep -Eq '127\.0\.0\.1:[0-9]+' <<< "$out" \
     || fail "--screenshots --dry-run does not say which port it would use: $out"
 if grep -q 'command not found' <<< "$out"; then
     fail "--screenshots executes prose from its generated-config heredoc: $out"
@@ -657,13 +658,53 @@ grep -q -- '--fake-discord' <<< "$out" \
 grep -q 'nothing was built, started, or photographed' <<< "$out" \
     || fail "--screenshots --dry-run does not say it did nothing: $out"
 grep -qv ':8080' <<< "$out" || fail "--screenshots --dry-run mentions port 8080: $out"
-ok "--screenshots --dry-run plans a throwaway fake server on 18091 and starts nothing"
+ok "--screenshots --dry-run plans a throwaway fake server on a named port and starts nothing"
+if python3 -c 'import socket
+for port in (18091, 18092, 18093):
+    socket.socket().bind(("127.0.0.1", port))' 2>/dev/null; then
+    grep -q '127.0.0.1:18091' <<< "$out" \
+        || fail "--screenshots --dry-run does not use the free default 18091: $out"
+    ok "--screenshots uses 18091 when it and the two ports above it are free"
+fi
+
+# #887 vibe-talk-screenshots-port: with no port asked for, a default someone else holds is passed
+# over, never a failure: a test stack holding 18091 used to fail every validation run on its host.
+# Hold it here (it may already be held, which proves the same).
+shots_holder=""
+if python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 18091))' 2>/dev/null; then
+    python3 -c 'import socket, time; s = socket.socket(); s.bind(("127.0.0.1", 18091)); s.listen(); time.sleep(60)' &
+    shots_holder=$!
+    sleep 0.3
+fi
+rc=0; out="$(run_sh --screenshots --dry-run)" || rc=$?
+[ "$rc" -eq 0 ] || fail "--screenshots --dry-run failed while port 18091 was held: $out"
+grep -q '127.0.0.1:18091' <<< "$out" \
+    && fail "--screenshots --dry-run planned the held port 18091: $out"
+grep -Eq '127\.0\.0\.1:[0-9]+' <<< "$out" \
+    || fail "--screenshots --dry-run names no port while 18091 is held: $out"
+ok "--screenshots passes over a held port when none was asked for"
+if command -v ss >/dev/null 2>&1; then
+    rc=0; out="$(SHOTS_PORT_FOR_RUN=18091 run_sh --screenshots --dry-run)" || rc=$?
+    [ "$rc" -ne 0 ] || fail "--screenshots took the held port 18091 it was told to use: $out"
+    grep -q 'already listening on port 18091' <<< "$out" \
+        || fail "--screenshots does not say the port it was told to use is taken: $out"
+    ok "--screenshots refuses a port it was told to use when it is taken"
+fi
+[ -z "$shots_holder" ] || kill "$shots_holder" 2>/dev/null || true
+wait "$shots_holder" 2>/dev/null || true
+
+# The override is honoured: the plan uses exactly the port given.
+shots_free="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+out="$(SHOTS_PORT_FOR_RUN="$shots_free" run_sh --screenshots --dry-run)"
+grep -q "127.0.0.1:$shots_free" <<< "$out" \
+    || fail "--screenshots ignores VIBE_TALK_SHOTS_PORT=$shots_free: $out"
+ok "--screenshots honours VIBE_TALK_SHOTS_PORT"
 
 # It must need NONE of the owner's configuration: this is the action you reach for on a machine
 # with no deployment at all, and reading ~/.config/vibe-talk/env would hand it the real bot token
 # for no reason. run_sh_isolated_config points XDG_CONFIG_HOME at an empty tree.
 out="$(run_sh_isolated_config --screenshots --dry-run)"
-grep -q '127.0.0.1:18091' <<< "$out" \
+grep -Eq '127\.0\.0\.1:[0-9]+' <<< "$out" \
     || fail "--screenshots needs a configuration file it should never read: $out"
 ok "--screenshots reads none of the owner's configuration"
 

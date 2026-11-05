@@ -118,9 +118,11 @@
 #
 #                  It starts its OWN throwaway server, native (not a container), with
 #                  --fake-discord, on port 18091 by default — never 8080, and it refuses to use it.
-#                  The mock vendor takes 18092 and 18093 beside it. --port, or the environment
+#                  The mock vendor takes 18092 and 18093 beside it. When any of those is taken, it
+#                  takes three free ports the kernel picks instead. --port, or the environment
 #                  variable VIBE_TALK_SHOTS_PORT when --port is absent, moves all three (P, P+1,
-#                  P+2), so several checkouts can photograph at once. It never touches the running
+#                  P+2), and a port asked for that way is refused when taken, so several checkouts
+#                  can photograph at once. It never touches the running
 #                  vibe-talk, or its config, or its logs. BOTH processes are stopped again when the
 #                  run ends, including on failure.
 #
@@ -399,7 +401,50 @@ if [ "$SCREENSHOTS" = 1 ]; then
     SHOTS_SCRIPT="$SCRIPT_DIR/screenshots.py"
     [ -x "$SHOTS_SCRIPT" ] || die "the screenshot harness is missing or not executable: $SHOTS_SCRIPT"
 
-    SHOTS_PORT="${PORT_OVERRIDE:-${VIBE_TALK_SHOTS_PORT:-18091}}"
+    SHOTS_PORT="${PORT_OVERRIDE:-${VIBE_TALK_SHOTS_PORT:-}}"
+    # No port asked for: 18091 to 18093 when all three are free, else three consecutive free ones,
+    # the first picked by the kernel (bound to port 0), the next two proved free by binding them
+    # too. The fixed default alone failed whenever anything else held it -- a test stack left
+    # running, a second gate photographing at the same time -- and that failed the whole
+    # validation run over a port nobody had asked for (#887 vibe-talk-screenshots-port). A port
+    # the caller chose is still refused below when taken.
+    if [ -z "$SHOTS_PORT" ]; then
+        SHOTS_PORT="$(python3 - <<'PY'
+import socket
+
+
+def free(run):
+    held = []
+    try:
+        for port in run:
+            sock = socket.socket()
+            held.append(sock)
+            sock.bind(("127.0.0.1", port))
+    except OSError:
+        return False
+    finally:
+        for sock in held:
+            sock.close()
+    return True
+
+
+if free((18091, 18092, 18093)):
+    print(18091)
+    raise SystemExit
+for _ in range(64):
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        first = probe.getsockname()[1]
+    run = (first, first + 1, first + 2)
+    if run[-1] > 65535 or {8080, 18081} & set(run) or not free(run):
+        continue
+    print(first)
+    break
+PY
+)" || SHOTS_PORT=""
+        [ -n "$SHOTS_PORT" ] || die "--screenshots found no three consecutive free ports on
+127.0.0.1 in 64 tries. Pass one with --port or VIBE_TALK_SHOTS_PORT."
+    fi
     case "$SHOTS_PORT" in
         ''|*[!0-9]*) die "--port must be a number, got: $SHOTS_PORT" ;;
     esac
@@ -410,11 +455,11 @@ if [ "$SCREENSHOTS" = 1 ]; then
     if [ "$SHOTS_PORT" = 8080 ]; then
         die "--screenshots refuses port 8080. That is the LIVE vibe-talk, serving the owner's
 agent. This action stands up a throwaway server of its own and must never contend with it.
-Leave --port off to use $((18091)), or pass a different one."
+Leave --port off to use 18091 (or free ports when it is taken), or pass a different one."
     fi
     if [ "$SHOTS_PORT" = 18081 ]; then
         die "--screenshots refuses port 18081. That is the unrelated vibe-talk:ci container.
-Leave --port off to use 18091, or pass a different one."
+Leave --port off to use 18091 (or free ports when it is taken), or pass a different one."
     fi
     # Anything else already listening is a stale run or a coincidence, and binding on top of it
     # would photograph somebody else's server.
@@ -440,7 +485,7 @@ starts. Stop it, or choose another port with --port."
             die "--port $SHOTS_PORT puts the offline ElevenLabs mock on port $shots_extra_port,
 which is either the LIVE vibe-talk (8080) or the unrelated vibe-talk:ci container (18081). The
 mock takes the TWO PORTS ABOVE the one you chose, so choose one whose two successors are neither.
-Leave --port off to use 18091, 18092 and 18093, which are reserved for exactly this."
+Leave --port off to use 18091, 18092 and 18093, or three free ports when any is taken."
         fi
         if command -v ss >/dev/null 2>&1 &&
             ss -ltn 2>/dev/null | grep -Eq "[:.]${shots_extra_port}[[:space:]]"; then
