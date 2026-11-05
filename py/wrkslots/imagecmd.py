@@ -686,7 +686,9 @@ def _cmd_wt_image_help(args: argparse.Namespace) -> int:
     return 0
 
 
-def _wt_settings(args: argparse.Namespace):
+def _wt_settings(
+    args: argparse.Namespace,
+) -> "tuple[cli.Config, worktreesimage.WorktreesImageSettings]":
     config = _config(args)
     if config.worktrees_image is None:
         raise _refuse(
