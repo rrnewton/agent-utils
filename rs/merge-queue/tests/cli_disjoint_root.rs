@@ -104,7 +104,7 @@ fn latest_report(fx: &Fixture) -> Value {
         .unwrap()
 }
 
-fn batch_validations<'a>(report: &'a Value, pr: i64) -> Vec<&'a Value> {
+fn batch_validations(report: &Value, pr: i64) -> Vec<&Value> {
     report["validations"]
         .as_array()
         .unwrap()
