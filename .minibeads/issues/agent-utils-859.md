@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-unlisted-module-salvage: salvage an unlisted submodule repo and retire a dead owner''s slot instead of refusing'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-validate
 created_at: 2026-11-05T00:28:47.850557378+00:00
-updated_at: 2026-11-05T00:28:47.850557378+00:00
+updated_at: 2026-11-05T03:08:32.756735589+00:00
+closed_at: 2026-11-05T03:08:32.756735489+00:00
 ---
 
 # Description

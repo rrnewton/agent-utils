@@ -1,11 +1,12 @@
 ---
 title: 'service-sender-team: a --from-service sender is attributed to its own team, not the host''s first declaration'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-validate
 created_at: 2026-11-05T01:19:28.704170781+00:00
-updated_at: 2026-11-05T01:19:28.704170781+00:00
+updated_at: 2026-11-05T03:08:32.760608842+00:00
+closed_at: 2026-11-05T03:08:32.760608712+00:00
 ---
 
 # Description
