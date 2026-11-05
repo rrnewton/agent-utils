@@ -56,6 +56,7 @@ class WorktreesImageSettings:
     size_bytes: int
     filesystem: str = "btrfs"
     mount: str = "kernel"
+    slot_quota_bytes: int | None = None
 
     def image_file(self, root: Path) -> Path:
         """The backing image file for a project rooted at ``root``."""
@@ -79,6 +80,10 @@ WORKTREES_IMAGE_DOCS: dict[str, str] = {
         "How the worktrees image is mounted: kernel (sudo -n mount -o loop) or auto "
         "(the same; btrfs has no unprivileged FUSE fallback). fuse is refused."
     ),
+    "slot_quota_bytes": (
+        "Optional per-slot qgroup limit in bytes (referenced, post-compression). "
+        "Each new slot becomes a btrfs subvolume inside the image."
+    ),
 }
 
 
@@ -87,7 +92,7 @@ def settings_from_obj(value: object) -> WorktreesImageSettings:
 
     if not isinstance(value, dict):
         raise WorktreesImageError("configuration.worktrees_image must be a mapping")
-    unknown = sorted(set(value) - {"path", "size_bytes", "fs", "mount"})
+    unknown = sorted(set(value) - {"path", "size_bytes", "fs", "mount", "slot_quota_bytes"})
     if unknown:
         raise WorktreesImageError(
             f"configuration.worktrees_image has unknown keys: {', '.join(unknown)}"
@@ -121,8 +126,15 @@ def settings_from_obj(value: object) -> WorktreesImageSettings:
         raise WorktreesImageError(
             f"configuration.worktrees_image.mount must be one of {', '.join(MOUNTS)}, not {mount!r}"
         )
+    quota = value.get("slot_quota_bytes")
+    if quota is not None and (not isinstance(quota, int) or isinstance(quota, bool) or quota < 1):
+        raise WorktreesImageError("configuration.worktrees_image.slot_quota_bytes must be a positive integer")
     return WorktreesImageSettings(
-        relative_path=candidate.as_posix(), size_bytes=size, filesystem=str(filesystem), mount=str(mount)
+        relative_path=candidate.as_posix(),
+        size_bytes=size,
+        filesystem=str(filesystem),
+        mount=str(mount),
+        slot_quota_bytes=quota,
     )
 
 
@@ -264,6 +276,68 @@ def trim_image(mount_point: Path) -> str:
     """Return freed guest blocks to the host sparse file via fstrim."""
 
     return _run(["fstrim", "-v", str(mount_point)], sudo=True).stdout.strip()
+
+
+def is_subvolume(path: Path) -> bool:
+    """True when ``path`` is a btrfs subvolume root (inode 256)."""
+
+    try:
+        return path.stat().st_ino == 256
+    except OSError:
+        return False
+
+
+def create_slot_subvolume(path: Path, quota_bytes: int | None) -> None:
+    """Create one slot directory as a btrfs subvolume, with optional quota."""
+
+    _run(["btrfs", "subvolume", "create", str(path)], sudo=True)
+    _run(["chown", f"{os.getuid()}:{os.getgid()}", str(path)], sudo=True)
+    if quota_bytes is not None:
+        _run(["btrfs", "qgroup", "limit", str(quota_bytes), str(path)], sudo=True)
+
+
+def delete_slot_subvolume(path: Path) -> None:
+    """Delete an emptied slot subvolume."""
+
+    _run(["btrfs", "subvolume", "delete", str(path)], sudo=True)
+
+
+def listing_signature(root: Path) -> list[tuple[str, str, int]]:
+    """Sorted (relative path, kind, size) for every entry under ``root``."""
+
+    signature: list[tuple[str, str, int]] = []
+    for current, dirs, files in os.walk(root):
+        for name in dirs + files:
+            entry = Path(current) / name
+            relative = entry.relative_to(root).as_posix()
+            if entry.is_symlink():
+                signature.append((relative, "link", len(os.readlink(entry))))
+            elif entry.is_dir():
+                signature.append((relative, "dir", 0))
+            else:
+                signature.append((relative, "file", entry.stat().st_size))
+    return sorted(signature)
+
+
+def process_inside(path: Path) -> bool:
+    """Best-effort: any process whose cwd is inside ``path``."""
+
+    target = str(path)
+    try:
+        proc = Path("/proc")
+        entries = list(proc.iterdir())
+    except OSError:
+        return True
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            cwd = os.readlink(entry / "cwd")
+        except OSError:
+            continue
+        if cwd == target or cwd.startswith(target + "/"):
+            return True
+    return False
 
 
 def status_report(root: Path, worktrees: Path, settings: WorktreesImageSettings) -> dict[str, object]:

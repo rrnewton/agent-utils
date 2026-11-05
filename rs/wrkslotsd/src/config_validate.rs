@@ -371,7 +371,7 @@ fn worktrees_image_settings(raw: &Map<String, Value>) -> Result<Value> {
     let unknown: Vec<&str> = section
         .keys()
         .map(String::as_str)
-        .filter(|key| !matches!(*key, "path" | "size_bytes" | "fs" | "mount"))
+        .filter(|key| !matches!(*key, "path" | "size_bytes" | "fs" | "mount" | "slot_quota_bytes"))
         .collect();
     if !unknown.is_empty() {
         return Err(format!(
@@ -414,11 +414,16 @@ fn worktrees_image_settings(raw: &Map<String, Value>) -> Result<Value> {
             "configuration.worktrees_image.mount must be one of kernel, auto, not {mount:?}"
         ));
     }
+    let quota = match section.get("slot_quota_bytes") {
+        None => Value::Null,
+        Some(value) => json!(as_int(value, "configuration.worktrees_image.slot_quota_bytes", 1)?),
+    };
     Ok(json!({
         "fs": filesystem,
         "mount": mount,
         "path": path,
         "size_bytes": size,
+        "slot_quota_bytes": quota,
     }))
 }
 

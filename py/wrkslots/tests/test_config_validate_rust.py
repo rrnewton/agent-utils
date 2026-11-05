@@ -75,6 +75,7 @@ def _expected(root: Path) -> dict[str, object]:
                 "mount": config.worktrees_image.mount,
                 "path": config.worktrees_image.relative_path,
                 "size_bytes": config.worktrees_image.size_bytes,
+                "slot_quota_bytes": config.worktrees_image.slot_quota_bytes,
             }
         ),
     }

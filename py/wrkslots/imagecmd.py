@@ -212,6 +212,20 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
     wt_trim.set_defaults(handler=_cmd_wt_image_trim)
     wt_image.set_defaults(handler=_cmd_wt_image_help, wt_image_parser=wt_image)
 
+    migrate = subparsers.add_parser(
+        "migrate",
+        help="move one slot into the project worktrees image (same path)",
+        description=(
+            "Copy one idle slot into a btrfs subvolume inside the mounted project "
+            "worktrees image, verify the copy file by file, and swap it in at the "
+            "same path. The registry record and slot path do not change. Refuses "
+            "while any process works inside the slot."
+        ),
+        formatter_class=formatter,
+    )
+    _slot_arguments(migrate)
+    migrate.set_defaults(handler=_cmd_migrate)
+
     run = subparsers.add_parser(
         "run",
         help="run a command boxed to one slot (limits + confined file-system view)",
@@ -568,7 +582,7 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
         help="program to run boxed instead of the interactive shell, after a literal -- (default: SHELL -i)",
     )
     shell_command.set_defaults(handler=_cmd_shell_command)
-    for name in ("image", "worktrees-image", "run", "box", "sandbox", "limits", "shell-command"):
+    for name in ("image", "worktrees-image", "migrate", "run", "box", "sandbox", "limits", "shell-command"):
         _fill_help(subparsers.choices[name])
 
 
@@ -760,6 +774,46 @@ def _cmd_wt_image_trim(args: argparse.Namespace) -> int:
     except worktreesimage.WorktreesImageError as exc:
         raise _refuse(str(exc)) from exc
     print(output or "trimmed")
+    return 0
+
+
+def _cmd_migrate(args: argparse.Namespace) -> int:
+    from wrkslots import cli
+
+    config, settings = _wt_settings(args)
+    if config.worktrees_image_state != worktreesimage.MOUNTED:
+        raise _refuse(
+            f"worktrees image is {config.worktrees_image_state}; run "
+            "'wrkslots worktrees-image mount' first"
+        )
+    slot_path = cli._slot_directory(config, args.slot, args.slot_type)
+    if not slot_path.is_dir():
+        raise _refuse(f"slot directory is missing: {slot_path}")
+    if worktreesimage.is_subvolume(slot_path):
+        print(f"{args.slot} is already inside the worktrees image")
+        return 0
+    if worktreesimage.process_inside(slot_path):
+        raise _refuse(f"a process is working inside {slot_path}; migrate only an idle slot")
+    before = worktreesimage.listing_signature(slot_path)
+    staging = slot_path.with_name(f".migrate-{args.slot}")
+    backup = slot_path.with_name(f".migrate-old-{args.slot}")
+    if staging.exists() or backup.exists():
+        raise _refuse(f"migration staging already exists beside {slot_path}; inspect it first")
+    try:
+        worktreesimage.create_slot_subvolume(staging, settings.slot_quota_bytes)
+        shutil.copytree(slot_path, staging, dirs_exist_ok=True, symlinks=True)
+        if worktreesimage.listing_signature(staging) != before:
+            raise _refuse("migrated copy does not match the slot file by file; original kept")
+        slot_path.rename(backup)
+        try:
+            staging.rename(slot_path)
+        except OSError:
+            backup.rename(slot_path)
+            raise
+        shutil.rmtree(backup)
+    except worktreesimage.WorktreesImageError as exc:
+        raise _refuse(str(exc)) from exc
+    print(f"migrated {args.slot} into the worktrees image at {slot_path}")
     return 0
 
 

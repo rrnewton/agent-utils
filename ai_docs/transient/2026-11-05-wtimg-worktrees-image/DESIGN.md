@@ -329,7 +329,49 @@ incompressible data where it matters.
    procedure (§12 of the landing change), each stating the kernel-only
    requirement where an operator will see it before enabling.
 
-## 12. Open questions
+## 12. Revision 2 (2026-11-05, owner decision 08:13 ET)
+
+The owner adopted this as the direction for **all** worktrees: a
+first-class wrkslots storage mode beside host-disk and per-slot-ext4,
+with built-in live migration and a per-slot migrate command. The
+per-slot ext4 mode was rejected for large repositories because it gives
+up sharing and copy-on-write between slots; the project image keeps
+both (reflink/snapshot inside one btrfs). The owner's "two-level
+image" idea is noted only, not a feature request.
+
+Implemented as step 2 on top of step 1 (landed `194e2814`):
+
+- **A. First-class mode.** With `worktrees_image` mounted, `create`
+  makes each new slot a btrfs **subvolume** in the image;
+  `slot_quota_bytes` in the section sets its qgroup limit. Decision:
+  subvolume-per-slot + qgroups (the owner's isolation-plus-sharing
+  question) — sharing via reflink/snapshot inside the image, bounds
+  via qgroups, at the measured cost that quotas count referenced
+  (post-compression) bytes. Emptied slot subvolumes are deleted with
+  `btrfs subvolume delete` in the normal removal path.
+- **B. Live migration.** `wrkslots migrate <slot>` copies one idle
+  slot into a subvolume at the *same path*, verifies the listing file
+  by file, swaps, and deletes the original; the registry record never
+  changes. Project-level cutover follows the owner's sequence —
+  rename `worktrees` → `worktrees_old`, mount the image at
+  `worktrees`, move slots one at a time, delete the old tree last —
+  rehearsed below. Journal/registry implication, measured: at
+  cutover there must be **no outstanding journals** (migrate/create
+  refuse otherwise in spirit; the operator runs `wrkslots status`
+  first), and because slot paths do not change, no registry rewrite
+  is needed; events gain only the normal lifecycle entries.
+- **C.** is the subvolume/qgroup decision above.
+
+### Measurements (owner questions 1–4), throwaway `wtimg-m2`/`wtimg-m4`
+
+| Question | Result |
+|---|---|
+| (1) delete → host return | With `discard=async` (the host's default), deleting 512 MiB in the guest returned host allocation 517 MiB → 5 MiB within 15 s of `sync`, no pause and no explicit trim; a later `fstrim` reclaimed only residue (5 MiB → 2 MiB). No build-latency impact was observed during the churn writes; trim is a backstop (e.g. after bulk slot removal), not the mechanism. |
+| (2) host ENOSPC | On a size-capped tmpfs host driven to 100%, the kernel logged `BTRFS warning: unexpected block io error` but the guest stayed read-write, scrub found no errors, and all data read back after freeing host space. Read-only abort was *not* reproduced — tmpfs page-cache buffering absorbs what a disk-backed host would surface as EIO at writeback, so the honest claim is narrower: protect with headroom monitoring plus a partial `fallocate` floor (preallocate a floor, e.g. 10% of apparent size, so guest metadata always has backing) and alarm on host-allocated bytes. Never let the host reach 0 under a sparse image. |
+| (3) fragmentation | Identical 512 MiB + 2,000 random-overwrite churn: backing file with `+C` had **11 extents**, without `+C` **54 extents**. NOCOW measurably contains host fragmentation; the gap grows with churn age. |
+| (4) in-flight migration | Rehearsed end to end: rename, mount at the same path, per-slot subvolume + copy, status CONSISTENT, Git history intact. Two findings: `cp --reflink=always` across host→image fails `EXDEV` (different filesystems) — migration copies are plain, reflink pays only *inside* the image; and a partial copy leaves a broken `.git` gitfile, so verification (full listing + Git) must precede the swap, as `wrkslots migrate` does. In flat layout, mounting at `worktrees/` also moves the control directory inside the image; §6's recommendation (mount at the slots directory, control outside) stands unless the operator accepts the copied-registry cutover. |
+
+## 13. Open questions
 
 - Snapshot retention policy (count/age/who approves deletion).
 - Default `size_bytes` and the host-allocated alarm threshold.

@@ -4255,6 +4255,12 @@ def _remove_slot_directory(config: Config, path: Path) -> None:
 
     image = _slot_image_at(config, path)
     if image is None:
+        if config.worktrees_image is not None and worktreesimage.is_subvolume(path):
+            try:
+                worktreesimage.delete_slot_subvolume(path)
+            except worktreesimage.WorktreesImageError as exc:
+                raise OSError(errno.ENOTEMPTY, str(exc)) from exc
+            return
         path.rmdir()
         return
     try:
@@ -26945,6 +26951,21 @@ def _cmd_create(args: argparse.Namespace) -> int:
             journal_path=journal_path,
         )
         representation = _requested_representation(config, args)
+        if (
+            config.worktrees_image is not None
+            and representation != "image"
+            and config.worktrees_image_state == worktreesimage.MOUNTED
+        ):
+            # First-class project-image mode: the slot directory is a btrfs
+            # subvolume inside the one project image, so slots share extents
+            # (reflink/snapshot) while qgroups bound each slot.
+            try:
+                worktreesimage.create_slot_subvolume(
+                    slot_path, config.worktrees_image.slot_quota_bytes
+                )
+            except worktreesimage.WorktreesImageError as exc:
+                raise Refusal(str(exc)) from exc
+            _fsync_directory(slot_path.parent)
         if representation == "image":
             # The slot directory becomes the mount point of a fresh image; for
             # the flat layout `git worktree add` then fills the empty image root.
@@ -26952,7 +26973,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 config, args.slot, args.slot_type, slot_path, image_settings
             )
             _fsync_directory(slot_path.parent)
-        elif config.layout == "nested":
+        elif config.layout == "nested" and not (
+            config.worktrees_image is not None
+            and config.worktrees_image_state == worktreesimage.MOUNTED
+        ):
             slot_path.mkdir(mode=0o755)
             _fsync_directory(slot_path.parent)
         for item in plan:

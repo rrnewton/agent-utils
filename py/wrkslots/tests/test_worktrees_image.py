@@ -112,6 +112,24 @@ def _config(tmp_path: Path, state: str) -> cli.Config:
     )
 
 
+def test_listing_signature_and_quota(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "b.txt").write_text("x", encoding="utf-8")
+    signature = worktreesimage.listing_signature(tmp_path)
+    assert ("a.txt", "file", 5) in signature
+    assert ("sub", "dir", 0) in signature
+    assert not worktreesimage.process_inside(tmp_path / "nowhere")
+    settings = worktreesimage.settings_from_obj(
+        {"path": "w.img", "size_bytes": 2 * GIB, "slot_quota_bytes": 7}
+    )
+    assert settings.slot_quota_bytes == 7
+    with pytest.raises(worktreesimage.WorktreesImageError):
+        worktreesimage.settings_from_obj(
+            {"path": "w.img", "size_bytes": 2 * GIB, "slot_quota_bytes": 0}
+        )
+
+
 def test_create_guard_refuses_unmounted(tmp_path: Path) -> None:
     with pytest.raises(cli.Refusal, match="never written onto the host"):
         cli._require_worktrees_image_mounted(_config(tmp_path, worktreesimage.NOT_MOUNTED), "create a slot")

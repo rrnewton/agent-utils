@@ -282,7 +282,10 @@ Procedure (refined from the devbig014 throwaway trial):
 4. Rollback before reclaiming the old tree: unmount, rename back,
    remove the config block, verify status. After real work on the
    image, copy back first — never just rename.
-5. Operate: `worktrees-image status|grow --to-size-bytes N|trim|unmount`.
+5. Move one live slot at a time with `wrkslots migrate <slot>` (idle
+   slots only; verified copy, same path, registry unchanged). New slots
+   in image mode are btrfs subvolumes; `slot_quota_bytes` bounds each.
+6. Operate: `worktrees-image status|grow --to-size-bytes N|trim|unmount`.
    Grow refreshes the loop capacity (`losetup -c`) before resizing;
    without it the guest silently keeps its old size. Slot-writing
    commands refuse while the image is not verifiably mounted — never
