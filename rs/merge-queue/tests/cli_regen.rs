@@ -1200,3 +1200,77 @@ fn rows_a_real_conflict_the_command_reports_ejects_the_change_as_a_conflict() {
     assert_eq!(rows, vec![(1, digest("0\n")), (2, digest("0\nb\n"))]);
     assert_eq!(current, "2");
 }
+
+/// The history kinds of change `pr`.
+fn history_kinds(fx: &Fixture, pr: i64) -> Vec<String> {
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["pr"] == pr)
+        .map(|item| {
+            item["history"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| event["kind"].as_str().unwrap().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn rows_a_conflict_with_a_batch_in_flight_sets_the_change_aside_until_it_meets_the_base() {
+    // One change per batch, two in flight: #2's batch is built on #1's candidate, where its
+    // header conflicts. #1 has not landed yet, so #2 is set aside, not ejected; the next run
+    // builds it on the base, with #1 landed, where the conflict is real.
+    let fx = rows_setup("rows-conflict-in-flight", ROWS_REGEN);
+    wire_change(&fx, "b", "main", 2, Some("# revisions after b"));
+    wire_change(&fx, "c", "main", 2, Some("# revisions after c"));
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let args = ["run", "--json", "--max-batch", "1", "--depth", "2"];
+    let r = report(&fx.mq_ok(&args));
+    assert_eq!(landed(&r), vec![vec![1]], "{r}");
+    assert!(r["ejected"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(r["requeued"], serde_json::json!([2]), "{r}");
+    assert!(
+        history_kinds(&fx, 2).contains(&"set-aside".to_owned()),
+        "{:?}",
+        history_kinds(&fx, 2)
+    );
+    let r = report(&fx.mq_ok(&args));
+    assert!(landed(&r).is_empty(), "{r}");
+    assert_eq!(r["ejected"][0]["pr"], 2, "{r}");
+    assert_eq!(r["ejected"][0]["kind"], "conflict", "{r}");
+    let reason = r["ejected"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(
+            "conflicts on rev/table.txt: both sides changed its header; rebase and resubmit"
+        ),
+        "{reason}"
+    );
+}
+
+#[test]
+fn rows_a_change_set_aside_behind_a_red_batch_lands_once_that_batch_is_ejected() {
+    // #2 fails to combine only onto #1's candidate, and #1 is red: ejecting #2 for it would
+    // have thrown away a change that combines with the base.
+    let fx = rows_setup("rows-set-aside-red", ROWS_REGEN);
+    wire_change(&fx, "b", "main", 2, Some("# revisions after b"));
+    fx.branch_from("b", "b", &[("tests/zz", "FAIL\n")]);
+    wire_change(&fx, "c", "main", 2, Some("# revisions after c"));
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    fx.mq_ok(&["submit", "2", "--head", "c"]);
+    let args = ["run", "--json", "--max-batch", "1", "--depth", "2"];
+    let r = report(&fx.mq_ok(&args));
+    assert!(landed(&r).is_empty(), "{r}");
+    assert_eq!(r["ejected"][0]["pr"], 1, "{r}");
+    assert_eq!(r["ejected"].as_array().unwrap().len(), 1, "{r}");
+    let r = report(&fx.mq_ok(&args));
+    assert_eq!(landed(&r), vec![vec![2]], "{r}");
+    let (rows, current) = landed_rows(&fx);
+    assert_eq!(rows, vec![(1, digest("0\n")), (2, digest("0\nc\n"))]);
+    assert_eq!(current, "2");
+}

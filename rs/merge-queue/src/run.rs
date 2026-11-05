@@ -1628,6 +1628,11 @@ impl<'a> Runner<'a> {
 
     /// Set aside every change depending (transitively) on `pr` and drop it from `pending`.
     fn drop_dependents(&self, pr: i64, pending: &mut VecDeque<Vec<i64>>) {
+        self.drop_dependents_because(pr, pending, &format!("depend on ejected #{pr}"));
+    }
+
+    /// [`Self::drop_dependents`], saying `why` they are set aside.
+    fn drop_dependents_because(&self, pr: i64, pending: &mut VecDeque<Vec<i64>>, why: &str) {
         let deps = lock(&self.deps).clone();
         let mut dropped = BTreeSet::from([pr]);
         loop {
@@ -1649,7 +1654,7 @@ impl<'a> Runner<'a> {
         }
         pending.retain(|batch| !batch.is_empty());
         let dropped: Vec<i64> = dropped.into_iter().collect();
-        self.requeue(&dropped, &format!("depend on ejected #{pr}"));
+        self.requeue(&dropped, why);
     }
 
     /// Combine `prs` onto `parent`. Excluded changes are skipped; changes whose dependencies
@@ -2679,7 +2684,14 @@ impl<'a> Runner<'a> {
         context: &str,
     ) -> Result<Candidate, String> {
         let (candidate, rejected) = self.build(parent, prs)?;
+        // Built on a batch still in flight, not on the base, a change may fail to combine
+        // because of a change that never lands: it is set aside, not ejected.
+        let in_flight = parent != lock(&self.base).as_str();
         for (pr, kind, detail) in rejected {
+            if in_flight {
+                self.set_aside(pr, kind, &detail, parent, pending)?;
+                continue;
+            }
             let reason = match kind {
                 "conflict" => format!(
                     "does not combine onto {}{context}: conflicts on {detail}; rebase and resubmit",
@@ -2709,6 +2721,36 @@ impl<'a> Runner<'a> {
             self.drop_dependents(pr, pending);
         }
         Ok(candidate)
+    }
+
+    /// A change that does not combine onto `parent`, the candidate of a batch still in flight:
+    /// what it fails on may be a change that never lands, so it is set aside for the rest of the
+    /// run instead of ejected, with the changes that depend on it. The next run plans it on the
+    /// base, where it is ejected only if it still does not combine.
+    fn set_aside(
+        &self,
+        pr: i64,
+        kind: &str,
+        detail: &str,
+        parent: &str,
+        pending: &mut VecDeque<Vec<i64>>,
+    ) -> Result<(), String> {
+        let why = format!(
+            "set aside: does not combine onto {}, the candidate of a batch still in flight \
+             ({kind}: {detail}); the next run plans it on the base, and ejects it only if it \
+             still does not combine there",
+            short(parent)
+        );
+        if !self.simulating() {
+            let mut items = lock(&self.items);
+            if let Some(item) = items.get_mut(&pr) {
+                item.log("set-aside", why.clone());
+                self.state.save_item(item)?;
+            }
+        }
+        self.requeue(&[pr], &why);
+        self.drop_dependents_because(pr, pending, &format!("depend on #{pr}, set aside"));
+        Ok(())
     }
 
     /// Run validations concurrently and wait for all of them.

@@ -308,7 +308,12 @@ beneath the red batch. The run checks for requests every `--poll-ms` under `serv
 seconds under `run`.
 
 - The plan is made on the candidate of the last batch in flight, so a change that conflicts
-  with work in flight is held for the next run, not ejected. A change stacked on a change in
+  with work in flight is held for the next run, not ejected. A change that fails only when its
+  batch is built on a batch in flight (a conflict in a regenerated file, a generator that fails
+  on the combined tree) is set aside the same way, with the changes that depend on it: its
+  history says `set-aside`, it stays queued, and the next run builds it on the base. It is
+  ejected only if it does not combine onto the base itself, so a change is never ejected for a
+  conflict with a change that never lands. A change stacked on a change in
   flight, or submitted `--after` one, is planned on top of it and depends on it: if that change
   is ejected, the stacked one is set aside, never rebuilt without it.
 - Landing order does not change. A batch planned this way lands only after every batch beneath
