@@ -1180,6 +1180,91 @@ pub fn install_termination_handler() {
     });
 }
 
+/// Whether this process was asked to terminate, once [`install_termination_handler`] has run
+/// (#870 agentctl-service-slow-stop): the one predicate every long wait of a service reads.
+#[must_use]
+pub fn termination_requested() -> bool {
+    terminated_flag().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How long a service may take to stop after SIGTERM before [`spawn_termination_guard`] ends
+/// it: well inside the 5 s a stop should take, and far inside systemd's 90 s stop timeout.
+pub const SERVICE_STOP_GRACE: Duration = Duration::from_secs(3);
+
+/// How often [`sleep_unless_terminated`] looks at the termination flag.
+const TERMINATION_POLL: Duration = Duration::from_millis(100);
+
+/// Sleep for `duration`, or until termination is requested, whichever comes first; whether the
+/// whole duration passed. A plain sleep resumes after the signal that sets the flag, so a
+/// service that sleeps between passes never saw SIGTERM (#870 agentctl-service-slow-stop).
+pub fn sleep_unless_terminated(duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    loop {
+        if termination_requested() {
+            return false;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        thread::sleep(left.min(TERMINATION_POLL));
+    }
+}
+
+/// End a service that was asked to terminate but has not stopped `grace` later (#870
+/// agentctl-service-slow-stop): a thread that waits for the termination flag, then for `done`
+/// for up to `grace`, then logs what it abandons, as `in_flight` describes it, and ends the
+/// process as SIGTERM's default
+/// action would, so that systemd counts the stop as clean and never waits out its stop timeout.
+/// Locks are released with the process, and queue documents are written atomically, so what was
+/// in flight is left as a crash would leave it, for the next start to recover.
+pub fn spawn_termination_guard(
+    service: &'static str,
+    grace: Duration,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    in_flight: fn() -> Option<String>,
+) {
+    let spawned = thread::Builder::new()
+        .name("agentctl-termination-guard".to_owned())
+        .spawn(move || {
+            while !termination_requested() {
+                if done.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                thread::sleep(TERMINATION_POLL);
+            }
+            let deadline = Instant::now() + grace;
+            while Instant::now() < deadline {
+                if done.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                thread::sleep(TERMINATION_POLL / 2);
+            }
+            let what = in_flight().map_or_else(String::new, |what| format!(" ({what})"));
+            eprintln!(
+                "agentctl: {service} did not stop within {:.0}s of the termination request; \
+                 abandoning what is still in flight{what} and exiting",
+                grace.as_secs_f64()
+            );
+            terminate_as_signalled();
+        });
+    if let Err(error) = spawned {
+        eprintln!("agentctl: {service}: the termination guard could not start: {error}");
+    }
+}
+
+/// End the process as SIGTERM's default action does; exit 143 if that somehow does not.
+fn terminate_as_signalled() -> ! {
+    // SAFETY: restoring the default disposition and signalling this process take scalar
+    // arguments; the default action of SIGTERM ends the process.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        libc::kill(libc::getpid(), libc::SIGTERM);
+    }
+    thread::sleep(Duration::from_secs(1));
+    std::process::exit(143)
+}
+
 /// Production wall-clock runtime for readiness polling.
 #[derive(Clone, Debug)]
 pub struct SystemRuntime {

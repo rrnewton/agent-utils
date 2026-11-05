@@ -1292,8 +1292,13 @@ pub struct Interrupt {
 pub trait Clock {
     /// Seconds since the Unix epoch.
     fn now(&self) -> f64;
-    /// Pause between passes.
+    /// Pause between passes; it ends early once [`Clock::terminated`] does.
     fn sleep(&self, duration: Duration);
+    /// Whether the watcher was asked to stop (#870 agentctl-service-slow-stop): it saves its
+    /// state and returns at the next pass boundary or sleep.
+    fn terminated(&self) -> bool {
+        false
+    }
 }
 
 /// The real clock.
@@ -1308,7 +1313,11 @@ impl Clock for SystemClock {
     }
 
     fn sleep(&self, duration: Duration) {
-        std::thread::sleep(duration);
+        crate::agent::sleep_unless_terminated(duration);
+    }
+
+    fn terminated(&self) -> bool {
+        crate::agent::termination_requested()
     }
 }
 
@@ -4293,14 +4302,27 @@ pub fn watch_agents(
         if options.once {
             return Ok(report);
         }
-        between_passes(
-            probe,
-            notifier,
-            clock,
-            &mut state,
-            paths.as_ref().map(|(state_path, _)| state_path.as_path()),
-            options,
-        );
+        // Termination ends the watcher at a pass boundary, its state saved (#870
+        // agentctl-service-slow-stop): after the pass that was running, or in the sleep after it.
+        if !clock.terminated() {
+            between_passes(
+                probe,
+                notifier,
+                clock,
+                &mut state,
+                paths.as_ref().map(|(state_path, _)| state_path.as_path()),
+                options,
+            );
+        }
+        if clock.terminated() {
+            if let Some((state_path, _)) = paths.as_ref() {
+                if let Err(error) = save_state(&mut state, state_path) {
+                    log(error);
+                }
+            }
+            log("stopping: termination requested");
+            return Ok(report);
+        }
     }
 }
 
@@ -4321,6 +4343,9 @@ fn between_passes(
     let mut checks = 0;
     while !options.check_only && step > 0.0 && next_pass - clock.now() > step {
         clock.sleep(options.blocked_check);
+        if clock.terminated() {
+            return checks;
+        }
         checks += 1;
         let Some(row) = check_blocked(probe, notifier, state, clock.now(), options) else {
             continue;

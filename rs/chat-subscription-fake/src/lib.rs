@@ -160,6 +160,36 @@ impl FakeBackend {
         );
         backend
     }
+
+    /// The conformance backend with its owner message after a first durable checkpoint, then a
+    /// heartbeat: the order a host that starts with no saved cursor accepts, so the message is
+    /// admitted as a request (process tests of a running bridge).
+    ///
+    /// # Panics
+    ///
+    /// Panics only if compile-time fixture constants violate public domain bounds.
+    #[must_use]
+    pub fn checkpoint_first(backend_name: &str) -> Self {
+        let mut backend = Self::conformance(backend_name);
+        let message = backend.script.as_ref().and_then(|script| {
+            script.iter().find_map(|item| match item {
+                SubscriptionItem::Batch(batch) => batch.events().first().cloned(),
+                SubscriptionItem::Heartbeat(_) => None,
+            })
+        });
+        let message = message.expect("the conformance script starts with its message");
+        backend.script = Some(
+            vec![
+                SubscriptionItem::Batch(fixture_delivery(1, CommittableEvent::Checkpoint)),
+                SubscriptionItem::Batch(fixture_delivery(2, message)),
+                SubscriptionItem::Heartbeat(Heartbeat::new(
+                    EventSequence::new(3).expect("fixture sequence is nonzero"),
+                )),
+            ]
+            .into(),
+        );
+        backend
+    }
 }
 
 fn fixture_delivery(sequence: u64, event: CommittableEvent) -> DeliveryBatch {

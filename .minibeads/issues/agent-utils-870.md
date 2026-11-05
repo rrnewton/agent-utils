@@ -1,11 +1,11 @@
 ---
 title: 'agentctl-service-slow-stop: watch-agents and chat run exit within seconds of SIGTERM'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-start
 created_at: 2026-11-05T05:23:02.772443148+00:00
-updated_at: 2026-11-05T05:23:02.772443148+00:00
+updated_at: 2026-11-05T08:00:00.000000000+00:00
 ---
 
 # Description
@@ -48,3 +48,16 @@ Stopping `agentctl watch-agents` and, intermittently, `agentctl chat run` waits 
 # Notes
 
 Reported by the lead on 2026-11-05 at 00:18 AM ET (P1). Assigned to cl-start after #869 agentctl-test-fsync-churn.
+
+## Resolution
+
+[opus 5.5] cl-start, 2026-11-05.
+
+- **watch-agents:** installs the termination handler at start, not at its first in-process send. Its clock sleeps in slices that read `agent::termination_requested()`. It saves its state and exits 0 at the next pass boundary or sleep.
+- **chat run:** installs the handler at start too.
+- **Guard:** both run a termination guard (`agent::spawn_termination_guard`). A stop still running 3 s (watch-agents) or 4 s (chat run) after the signal is abandoned. The guard logs what was in flight, including the owner-loop step for chat run, and ends the process as SIGTERM's default action does, so systemd counts the stop as clean.
+- **Root cause for chat run, reproduced:** a provider plugin that never answers Close held the stop for its whole Close deadline: 10 s with the fake plugin, up to 120 s for a real manifest.
+- **Tests:**
+  - `tests/service_stop.rs`: watch-agents stops from its sleep (exit 0, state saved, about 0.04 s) and from a pass stuck in a Herdr call (about 3 s).
+  - `py/tests/test_agentctl_chat_launch_rust.py`: chat run stops with a delivery in flight, and the request is never recorded as delivered. It also stops with a plugin that ignores Close; that test took 10 s before the fix.
+- **Unverified:** the deploy-side check, `agentctl services refresh` of a watcher and a bridge on both hosts, waits for the next refresh after this lands.

@@ -2683,6 +2683,12 @@ struct AckWorkers {
 /// passes `service_log`. If the second cannot start, the error comes with the first worker, which
 /// the caller joins once it has stopped the service.
 #[allow(clippy::too_many_arguments)]
+/// How long `chat run` may take to stop after SIGTERM before its termination guard abandons
+/// what is still in flight (#870 agentctl-service-slow-stop). A clean stop, the provider plugin's
+/// Close included, takes about 2 s; anything still joined or waited on after this is left as a
+/// crash would leave it, for the next start to recover, instead of for systemd's 90 s timeout.
+pub const CHAT_STOP_GRACE: Duration = Duration::from_secs(4);
+
 /// How long one owner-loop step may take before the service log names it (#858
 /// chat-reply-wake-latency): a pass that holds the loop this long holds every other kind of work
 /// with it.
@@ -2695,8 +2701,25 @@ struct SlowStep {
     started: Instant,
 }
 
+/// The owner-loop step running now, for the termination guard's log line (#870
+/// agentctl-service-slow-stop).
+static OWNER_LOOP_STEP: Mutex<Option<&'static str>> = Mutex::new(None);
+
+/// What the owner loop was doing, if it was inside a named step: what a stop that took too long
+/// abandoned.
+#[must_use]
+pub fn owner_loop_step() -> Option<String> {
+    let step = *OWNER_LOOP_STEP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    step.map(|name| format!("the owner loop was in its step: {name}"))
+}
+
 impl SlowStep {
     fn new(name: &'static str) -> Self {
+        *OWNER_LOOP_STEP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(name);
         Self {
             name,
             started: Instant::now(),
@@ -2706,6 +2729,9 @@ impl SlowStep {
 
 impl Drop for SlowStep {
     fn drop(&mut self) {
+        *OWNER_LOOP_STEP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let took = self.started.elapsed();
         if took >= SLOW_STEP {
             service_log(format_args!(

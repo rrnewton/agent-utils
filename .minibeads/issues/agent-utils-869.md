@@ -1,11 +1,11 @@
 ---
 title: 'agentctl-test-fsync-churn: run the agentctl durability tests on a memory-backed scratch directory'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: cl-start
 created_at: 2026-11-05T04:31:59.492939592+00:00
-updated_at: 2026-11-05T04:31:59.492939592+00:00
+updated_at: 2026-11-05T08:00:00.000000000+00:00
 ---
 
 # Description
@@ -41,3 +41,7 @@ Do not weaken the durability the tests prove. The fsync calls stay; only the bac
 Found on 2026-11-04 while investigating a disk-writer report from the lead. The flagged process's own session file was only being appended to (same inode, about 160 KB per 45 s); the volume came from gate children.
 
 Assigned to cl-start after #852 P0b; reassign to whichever lane frees first.
+
+## Resolution
+
+[opus 5.5] cl-start, 2026-11-05. Landed as d23e7c2c. `rust.agentctl.test` runs with TMPDIR on a per-step tmpfs directory (/dev/shm, else $XDG_RUNTIME_DIR), removed when the step exits; fsyncs and assertions unchanged. Measured with the exact step command in its own systemd scope (dagrun's step cgroups have no io controller, so they have no io.stat): wbytes 194 MiB to the /tmp disk and 199 MiB to the slot's loop disk (build outputs), about 0.4 GiB against about 18 GiB before. All 2126 cases passed in 340 s in the gate. /dev/shm comes first because $XDG_RUNTIME_DIR pushed a headless test's control socket path to the 108-byte limit. The faster disk also exposed a real bug, fixed in 9e57a7d1: a prompt typed to the previous agent in the millisecond of a repoint was reminded to the new agent.

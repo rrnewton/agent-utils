@@ -38,6 +38,14 @@ from pathlib import Path
 control = Path(os.environ["FAKE_HERDR_DIR"])
 args = sys.argv[1:]
 
+# A call that starts with one of these words never answers, as a Herdr call stuck behind a busy
+# pane does; it leaves a marker naming itself first (#870 agentctl-service-slow-stop).
+for hang in filter(None, os.environ.get("FAKE_HERDR_HANG", "").split(",")):
+    if args[:len(hang.split())] == hang.split():
+        (control / "hung").write_text(" ".join(args))
+        import time
+        time.sleep(600)
+
 def pane():
     harness = control / "harness.pid"
     agent = None
@@ -50,13 +58,15 @@ def pane():
         "workspace_id": "w7",
         "cwd": os.environ["FAKE_PANE_CWD"],
         "agent": agent,
-        "agent_status": "working" if agent else "unknown",
+        "agent_status": os.environ.get("FAKE_AGENT_STATUS", "working") if agent else "unknown",
         "agent_session": session,
         "terminal_id": "term-1",
         "tab_id": "w7:t1",
     }
 
-if args[:2] == ["pane", "get"]:
+if args[:2] == ["pane", "read"] and "FAKE_SCREEN" in os.environ:
+    print(os.environ["FAKE_SCREEN"], end="")
+elif args[:2] == ["pane", "get"]:
     print(json.dumps({"result": {"pane": pane()}}))
 elif args[:2] == ["workspace", "get"]:
     print(json.dumps({"result": {"workspace": {"workspace_id": "w7", "label": "project-space"}}}))
@@ -345,6 +355,113 @@ def test_launch_sigterm_exits_within_a_few_seconds(fixture: Fixture) -> None:
     _stdout, _stderr = process.communicate(timeout=10)
     assert time.monotonic() - started < 10
     assert process.returncode == 0
+
+
+def _process_gone(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except OSError:
+        return True
+    return state == "Z"
+
+
+def test_run_sigterm_with_a_delivery_in_flight_exits_within_five_seconds(
+    fixture: Fixture, tmp_path: Path
+) -> None:
+    # #870 agentctl-service-slow-stop: `chat run` exits within 5 s of SIGTERM while it is
+    # delivering an owner request whose typing never finishes, and the request is still waiting
+    # for delivery afterwards, never recorded as delivered.
+    config = tmp_path / "conformance.json"
+    document = json.loads(fixture.config.read_text())
+    document["channel_ids"] = ["channels/conformance"]
+    # The fake plugin's conformance script serves its one owner message only to this exact
+    # backend configuration.
+    document["backend_configuration"] = {
+        "schema": "fixture.config.v1",
+        "data": {"subscription": "subscriptions/conformance"},
+    }
+    document["subscription_environment"] = ["CHAT_SUBSCRIPTION_FAKE_SCRIPT"]
+    config.write_text(json.dumps(document))
+    config.chmod(0o600)
+    process = fixture.launch(
+        config=config,
+        extra_env={
+            "CHAT_SUBSCRIPTION_FAKE_SCRIPT": "checkpoint-first",
+            "FAKE_AGENT_STATUS": "idle",
+            "FAKE_SCREEN": "• Ready for the next task.\n\n› \n",
+            "FAKE_HERDR_HANG": "pane send-text,pane send-keys",
+        },
+    )
+    try:
+        assert _wait_for(lambda: bool(fixture.bridge_processes()), 60)
+        bridge = fixture.bridge_processes()[0]
+        log = fixture.state / "bridge.log"
+
+        def admitted() -> list[Path]:
+            return list(fixture.state.glob("requests/*.json"))
+
+        assert _wait_for(lambda: bool(admitted()), 60), (
+            "no request was admitted: "
+            + (log.read_text()[-3000:] if log.exists() else "no bridge log")
+        )
+        # The owner loop starts delivering the request at once, and each attempt waits for the
+        # pane's composer, or hangs in Herdr's typing call, for longer than this.
+        time.sleep(2)
+        started = time.monotonic()
+        os.kill(bridge, signal.SIGTERM)
+        assert _wait_for(lambda: _process_gone(bridge), 10)
+        took = time.monotonic() - started
+        assert took < 5, f"chat run took {took:.1f}s to stop"
+        status = subprocess.run(
+            [
+                str(fixture.agentctl),
+                "--registry", str(fixture.registry),
+                "--herdr-bin", str(fixture.herdr),
+                "chat", "status", "--bridge-state", str(fixture.state),
+            ],
+            env=fixture.env(),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert "first message" not in status.stdout or "delivered" not in status.stdout, status.stdout
+        requests = admitted()
+        assert requests, list(fixture.state.iterdir())
+        for path in requests:
+            record = json.loads(path.read_text())
+            assert record.get("delivered_at_millis") is None, record
+    finally:
+        process.send_signal(signal.SIGTERM)
+        process.communicate(timeout=60)
+
+
+def test_run_sigterm_with_a_plugin_that_ignores_close_exits_within_five_seconds(
+    fixture: Fixture, tmp_path: Path
+) -> None:
+    # #870 agentctl-service-slow-stop: a provider plugin that never answers Close makes the stop
+    # report "plugin required forced shutdown"; `chat run` still exits within 5 s of SIGTERM.
+    config = tmp_path / "stalling.json"
+    document = json.loads(fixture.config.read_text())
+    document["subscription_environment"] = ["CHAT_SUBSCRIPTION_FAKE_STALL"]
+    config.write_text(json.dumps(document))
+    config.chmod(0o600)
+    process = fixture.launch(config=config, extra_env={"CHAT_SUBSCRIPTION_FAKE_STALL": "commit"})
+    try:
+        assert _wait_for(lambda: bool(fixture.bridge_processes()), 60)
+        bridge = fixture.bridge_processes()[0]
+        log = fixture.state / "bridge.log"
+        assert _wait_for(
+            lambda: log.exists() and "subscribed without a saved cursor" in log.read_text(), 60
+        ), (log.read_text()[-3000:] if log.exists() else "no bridge log")
+        time.sleep(1)
+        started = time.monotonic()
+        os.kill(bridge, signal.SIGTERM)
+        assert _wait_for(lambda: _process_gone(bridge), 30)
+        took = time.monotonic() - started
+        assert took < 5, f"chat run took {took:.1f}s to stop: {log.read_text()[-2000:]}"
+    finally:
+        process.send_signal(signal.SIGTERM)
+        process.communicate(timeout=60)
 
 
 def test_launch_agent_label_override_is_persisted(fixture: Fixture) -> None:

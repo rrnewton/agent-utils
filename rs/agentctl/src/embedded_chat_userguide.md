@@ -3297,7 +3297,15 @@ takes a duration back from now (`30m`, `2h`, `7d`) or an RFC 3339 time, and
 
 ## Service management
 
-`chat run` is a foreground process and exits cleanly after SIGINT or SIGTERM.
+`chat run` is a foreground process and exits cleanly after SIGINT or SIGTERM,
+within seconds (#870 agentctl-service-slow-stop). A stop still joining or
+waiting on something 4 s after the signal, such as a provider plugin that never
+answers Close or a delivery stuck in a Herdr call, is abandoned: the service log
+says `chat run did not stop within 4s of the termination request; abandoning
+what is still in flight` and names the owner-loop step it was in, and the
+process ends as SIGTERM's default action would, which a service manager counts
+as a clean stop. What was in flight is left as a crash would leave it: a prompt
+not yet typed stays pending, and the next start recovers the rest.
 Run it under a service manager that restarts it on failure, with the same state
 directory: `Restart=on-failure` in a systemd unit, as in the example below. A
 unit without a restart policy leaves chat down after the first failure the

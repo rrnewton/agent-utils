@@ -43,7 +43,14 @@ fn main() {
         }
         return;
     }
-    let mut backend = FakeBackend::conformance("fake-process-plugin");
+    // `checkpoint-first` serves the conformance message after a durable checkpoint, so a bridge
+    // that starts with no saved cursor admits it as a request.
+    let mut backend =
+        if std::env::var("CHAT_SUBSCRIPTION_FAKE_SCRIPT").as_deref() == Ok("checkpoint-first") {
+            FakeBackend::checkpoint_first("fake-process-plugin")
+        } else {
+            FakeBackend::conformance("fake-process-plugin")
+        };
     if let Err(error) = chat_subscription_plugin::serve_stdio(&mut backend) {
         eprintln!("fake chat plugin failed: {error}");
         std::process::exit(1);

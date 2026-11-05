@@ -1365,6 +1365,15 @@ with the UTC time (`2026-10-28T17:26:00Z agentctl watch-agents: ...`), and a
 send that failed is logged with its reason and when it is next tried, so a
 redirected log shows how long notices went undelivered.
 
+The watcher stops within seconds of SIGTERM or SIGINT (#870
+agentctl-service-slow-stop). Between passes it saves its state and exits 0,
+logging `stopping: termination requested`. A pass that has not finished 3 s
+after the signal, such as one stuck in a Herdr call, is abandoned: the watcher
+logs `watch-agents did not stop within 3s of the termination request;
+abandoning what is still in flight ...` and ends as SIGTERM's default action
+would, which a service manager counts as a clean stop. What the pass left in
+flight is left as a crash would leave it, and the next start recovers it.
+
 #### The owner's requests held, and prompts quarantined as misroutes
 
 Two conditions are about delivery rather than about an agent's screen, and both

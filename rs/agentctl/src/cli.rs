@@ -3321,12 +3321,28 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             .keeping_screens(!value.once);
             let mut notifier = crate::agent_watch::ManagedNotifier::new(&client, &args.registry)
                 .with_owner_alarm_bridge(value.owner_alarm_bridge);
+            // SIGTERM sets the termination flag from the start, not only once the first notice
+            // goes through an in-process send; the watch loop reads it at every pass boundary
+            // and sleep, and a pass stuck past the grace is abandoned (#870
+            // agentctl-service-slow-stop).
+            let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if !value.once {
+                crate::agent::install_termination_handler();
+                crate::agent::spawn_termination_guard(
+                    "watch-agents",
+                    crate::agent::SERVICE_STOP_GRACE,
+                    std::sync::Arc::clone(&stopped),
+                    || Some("a pass that was still running".to_owned()),
+                );
+            }
             let report = crate::agent_watch::watch_agents(
                 &mut probe,
                 &mut notifier,
                 &crate::agent_watch::SystemClock,
                 &options,
-            )?;
+            );
+            stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            let report = report?;
             write_json(&report).map_err(Failure::Output)?;
             return Ok(if report["ok"] == true { 0 } else { 1 });
         }
@@ -5066,6 +5082,18 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
             // A person's messages go ahead of agent-to-agent sends (#556 chat-delivery-latency).
             let manager = ManagedAgents::new(&client, &registry)?.with_lock_priority();
+            // SIGTERM sets the termination flag from the start, so every in-process drain and
+            // wait reads it, and a shutdown still joining or waiting on something past the grace
+            // is abandoned rather than left for systemd's stop timeout (#870
+            // agentctl-service-slow-stop).
+            let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            crate::agent::install_termination_handler();
+            crate::agent::spawn_termination_guard(
+                "chat run",
+                crate::chat_service::CHAT_STOP_GRACE,
+                std::sync::Arc::clone(&stopped),
+                crate::chat_service::owner_loop_step,
+            );
             let result = crate::chat_service::run_with_settings(
                 &value.operate.state.dir(&registry),
                 &client,
@@ -5086,8 +5114,9 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                     }),
                     registry: Some(registry.clone()),
                 },
-            )
-            .map_err(Failure::Chat)?;
+            );
+            stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            let result = result.map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
