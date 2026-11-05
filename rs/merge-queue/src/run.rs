@@ -498,6 +498,9 @@ enum BatchOutcome {
     /// Validation admission refused: the batch stays queued and is retried after backoff.
     /// Never an ejection and never a landing.
     Deferred(String, Vec<i64>),
+    /// Like [`BatchOutcome::Deferred`] for an admission refusal, but the run goes on: the
+    /// batches behind it are rebuilt on the base and refill the window in this run.
+    RefusedDeferred(String),
 }
 
 /// Worktree slots for concurrent validations, reused between candidates.
@@ -1514,7 +1517,9 @@ impl<'a> Runner<'a> {
                 BatchOutcome::BaseMoved(_) => {
                     self.return_ruled(&accepted, "the base moved while it was landing")?;
                 }
-                BatchOutcome::Stop(reason, _) | BatchOutcome::Deferred(reason, _) => {
+                BatchOutcome::Stop(reason, _)
+                | BatchOutcome::Deferred(reason, _)
+                | BatchOutcome::RefusedDeferred(reason) => {
                     self.return_ruled(&accepted, &reason)?;
                 }
             }
@@ -4071,6 +4076,8 @@ impl<'a> Runner<'a> {
             let mut started = 0usize;
             let mut started_prs: BTreeSet<i64> = BTreeSet::new();
             let mut full_loaded = false;
+            let mut deferred_this_run: BTreeSet<i64> = BTreeSet::new();
+            let mut refused_stop = String::new();
             let result = (|| -> Result<String, String> {
                 loop {
                     self.publish_window(
@@ -4119,6 +4126,7 @@ impl<'a> Runner<'a> {
                             .flat_map(|flight| flight.candidate.prs.iter().copied())
                             .collect();
                         busy.extend(lock(&self.excluded).iter().copied());
+                        busy.extend(deferred_this_run.iter().copied());
                         for pr in self.retried_holds() {
                             busy.remove(&pr);
                         }
@@ -4144,6 +4152,7 @@ impl<'a> Runner<'a> {
                                     .flat_map(|flight| flight.candidate.prs.iter().copied())
                                     .collect();
                                 busy.extend(lock(&self.excluded).iter().copied());
+                                busy.extend(deferred_this_run.iter().copied());
                                 let tip = match stack_top(&flights) {
                                     Some(last) => last.candidate.tip.clone(),
                                     None => self.current_base()?,
@@ -4249,7 +4258,7 @@ impl<'a> Runner<'a> {
                                 crate::drain::DRAINED
                             ));
                         }
-                        return Ok(String::new());
+                        return Ok(refused_stop.clone());
                     }
                     let (id, result) = match rx.recv_timeout(poll) {
                         Ok(message) => message,
@@ -4341,13 +4350,11 @@ impl<'a> Runner<'a> {
                             discard(&mut flights, &rx, pending);
                             let (retry_after, _) =
                                 self.defer_refusal(&head.candidate.prs, &detail)?;
-                            BatchOutcome::Deferred(
-                                format!(
-                                    "validation refused for {} ({detail}); stays queued, retry after {retry_after}",
-                                    list(&head.candidate.prs)
-                                ),
-                                head.candidate.prs.clone(),
-                            )
+                            deferred_this_run.extend(head.candidate.prs.iter().copied());
+                            BatchOutcome::RefusedDeferred(format!(
+                                "validation refused for {} ({detail}); stays queued, retry after {retry_after}",
+                                list(&head.candidate.prs)
+                            ))
                         } else if !ran.infra_blocked.is_empty() {
                             // The host refused every measurement of some tests on the
                             // run and its rerun (INFRA-BLOCKED): no result, so neither
@@ -4526,6 +4533,13 @@ impl<'a> Runner<'a> {
                                 // backoff). Later batches were discarded above and stay
                                 // in `pending` for the next run.
                                 return Ok(reason);
+                            }
+                            BatchOutcome::RefusedDeferred(reason) => {
+                                // Already recorded as deferred; the changes stay queued
+                                // and out of this run's plans. The discarded batches
+                                // behind it are rebuilt on the base and refill the
+                                // window as the loop goes on.
+                                refused_stop = reason;
                             }
                         }
                     }
