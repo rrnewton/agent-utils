@@ -1748,6 +1748,26 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
     let mut delivered = Vec::new();
     let mut quarantined = recover_inflight(&directories)?;
     let mut cancelled = Vec::new();
+    // A digest item recovered in flight is best-effort, at most once: set
+    // it aside in cancelled/, never filed to failed/ or retried (#903).
+    quarantined.retain(|id| {
+        if id.starts_with(crate::failed_digest::DIGEST_ID_PREFIX) {
+            let filename = format!("{id}.json");
+            let _ = fs::create_dir_all(&directories.cancelled);
+            let _ = fs::rename(
+                directories.failed.join(&filename),
+                directories.cancelled.join(&filename),
+            );
+            let _ = fs::rename(
+                directories.failed.join(format!("{filename}.error")),
+                directories.cancelled.join(format!("{filename}.error")),
+            );
+            cancelled.push(id.clone());
+            false
+        } else {
+            true
+        }
+    });
     let mut typed = 0_usize;
     let mut blocked = None;
     // Burst pacing (#731 agentctl-paste-tail-flush): deliveries the last
@@ -3050,7 +3070,12 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
         pending: identifiers_if_directory(&directories.inbox)?,
         composer_unreadable,
         inflight: identifiers_if_directory(&directories.inflight)?,
-        failed: identifiers_if_directory(&directories.failed)?,
+        // A digest item that itself landed in failed/ is not a failed
+        // message: never list it as one (#903 follow-up).
+        failed: identifiers_if_directory(&directories.failed)?
+            .into_iter()
+            .filter(|id| !id.starts_with(crate::failed_digest::DIGEST_ID_PREFIX))
+            .collect(),
         failed_entries: crate::failed_digest::failed_entries(root),
     })
 }
@@ -6401,13 +6426,17 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
         fs::write(
             failed.join("lead-1.json.error"),
             serde_json::json!({
                 "artifact": "lead-1.json",
                 "outcome": "possibly_submitted",
                 "error": "control command was cancelled",
-                "failed_at": 200.0,
+                "failed_at": now,
             })
             .to_string(),
         )

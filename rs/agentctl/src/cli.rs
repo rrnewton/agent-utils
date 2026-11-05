@@ -221,6 +221,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl drain reviewer --ready-timeout 60\n  agentctl drain reviewer --deadline 40 --lock-timeout 10 --max-items 1\n\nThe drain types inbox/ and inbox.v2/ together, oldest first, one prompt at a time, except that\nthe owner's prompts (chat-bridge requests and console input) go ahead of the agent backlog. Just before typing each prompt it\nchecks for a tombstone (agentctl cancel) and for an expired --ttl, and sets such a prompt aside in\ncancelled/ instead. A prompt refused as composer_unreadable (a blank terminal grid while Herdr still\nproves the harness working in its pinned foreground process; nothing was typed) is probed again\ninside the same drain after 15 s, then 60 s, then 5 min, bounded by --max-attempts, --deadline and\ncancellation; each probe re-runs readiness and the inbox -> inflight -> processed flow, so a pane\nthat recovers delivers exactly once, and one that does not stays pending with the\ncomposer_unreadable reason recorded in its delivery_error (also shown by agentctl status).\nExit 0 when every examined prompt was confirmed, 75 when prompts remain pending\n(not ready, a bound reached, or a lock timeout), 76 when one was quarantined as possibly submitted."
     )]
     Drain(Drain),
+    /// Acknowledge failed queue entries: archive them so they stop appearing in status, requests and digests
+    #[command(
+        after_help = "Examples:\n  agentctl failed ack reviewer --all\n  agentctl failed ack reviewer msg-1 msg-2\n\nMoves the named failed entries (or every one with --all) to failed-archive-<date>/ beside the queue's failed/ and records them shown, so no digest names them again. Exit 0 when every named entry was archived, 1 when one names no failed entry."
+    )]
+    Failed(FailedAck),
     /// Follow a headless agent's event log: one line per event (turns, prose, tools, inputs with their sender), read-only and lock-free
     #[command(
         after_help = "Examples:\n  agentctl tail coordinator --follow\n  agentctl tail coordinator --last 50 --types assistant.text,turn.\n  agentctl tail coordinator --json --since 4180\n  agentctl tail coordinator --at 4182\n\nThe log is REGISTRY/agents/NAME/events/<generation>.jsonl (schema v1, one JSON object per line; see\n`agentctl userguide`). Any number of tails may run beside the agent; closing one never touches it.\nA hole in the sequence (pruned or unreadable lines) prints as a gap line. Not to be confused with\n`agentctl read --output tail`, which reads an interactive agent's pane."
@@ -1385,6 +1390,18 @@ struct Drain {
     #[command(flatten)]
     delivery: Delivery,
 }
+#[derive(Args)]
+struct FailedAck {
+    #[command(flatten)]
+    agent: Named,
+    /// Acknowledge every failed entry for this agent
+    #[arg(long)]
+    all: bool,
+    /// Failed message identifiers to acknowledge
+    #[arg(value_name = "MESSAGE_ID")]
+    ids: Vec<String>,
+}
+
 #[derive(Args)]
 struct Cancel {
     #[command(flatten)]
@@ -3020,6 +3037,7 @@ fn writes_registry(command: &Commands) -> bool {
         | Commands::Stop(_)
         | Commands::Send(_)
         | Commands::Drain(_)
+        | Commands::Failed(_)
         | Commands::RunHeadless(_)
         | Commands::Interrupt(_)
         | Commands::Compact(_)
@@ -4329,6 +4347,17 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             } else {
                 76
             });
+        }
+        Commands::Failed(value) => {
+            if !value.all && value.ids.is_empty() {
+                return Err(Failure::Usage(
+                    "agentctl failed ack needs --all or at least one MESSAGE_ID".to_owned(),
+                ));
+            }
+            let moved = manager.ack_failed(&value.agent.name, &value.ids, value.all)?;
+            write_json(&json!({"agent": value.agent.name, "acked": moved}))
+                .map_err(Failure::Output)?;
+            return Ok(0);
         }
         Commands::Read(value) => {
             if manager.is_cloud(&value.agent.name)? {

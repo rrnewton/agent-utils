@@ -10426,9 +10426,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             // failed entries it was never told about gets one digest prompt
             // queued, so this pass delivers it when the agent is next idle.
             // The digest never re-delivers the failed message itself.
+            let mut digest_id: Option<String> = None;
             if !check_only {
                 if let Ok(queue) = self.queue(name) {
-                    let _ = crate::failed_digest::queue_digest(&queue);
+                    digest_id = crate::failed_digest::queue_digest(&queue).ok().flatten();
                 }
             }
             let Ok(pending) = self.pending_prompts(name) else {
@@ -10459,6 +10460,19 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     Ok(result) => result.blocked.clone(),
                     Err(_) => None,
                 };
+                // Best-effort, at most once (#903 follow-up): a digest this
+                // pass did not confirm is taken out of circulation at once,
+                // so it is never retried, retyped, or left blocking the
+                // inbox behind a real message.
+                if let Some(id) = &digest_id {
+                    let delivered =
+                        matches!(&drained, Ok(result) if result.delivered.iter().any(|d| d == id));
+                    if !delivered {
+                        if let Ok(queue) = self.queue(name) {
+                            let _ = crate::failed_digest::discard_unconfirmed(&queue, id);
+                        }
+                    }
+                }
                 let drain_error = drained.err().map(|error| error.to_string());
                 let mut remaining = self
                     .pending_prompts(name)
@@ -10474,6 +10488,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                         .pending_prompts(name)
                         .ok()
                         .and_then(|left| left.into_iter().next())
+                        .filter(|(identifier, _)| Some(identifier) != digest_id.as_ref())
                     {
                         let _ = self.drain_one(
                             name,
@@ -11624,6 +11639,14 @@ its drain would also type, so it was not queued",
             readback: None,
         };
         agent::drain_priority_managed(&client, &self.target(&record)?, &queue, identifier, options)
+    }
+
+    /// Archive one agent's failed queue entries (`agentctl failed ack`,
+    /// #903 follow-up): moved to `failed-archive-<date>/` and recorded
+    /// shown, so they leave `status`/`requests` and every digest.
+    pub fn ack_failed(&self, agent_name: &str, ids: &[String], all: bool) -> Result<Vec<String>> {
+        let queue = self.queue(agent_name)?;
+        crate::failed_digest::ack_failed(&queue, ids, all).map_err(fail)
     }
 
     /// Drain only prompts known not to have been injected.
