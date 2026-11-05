@@ -2357,7 +2357,8 @@ test("`#348 settings-dynamic-lists`: Escape closes the pop-out before Settings, 
   await page.el("close-settings").click();
   assert.equal(page.el("dismissed-send-popout").hidden, true, "the pop-out stayed up over the channel");
   // The negative control: a page whose Escape does not know the pop-out leaves Settings at once.
-  const blind = newPage(new Map(), brokenScript('  if (closeOpenMenu("menu:dismissed")) return true;\n', ""));
+  const blind = newPage(new Map(), await brokenModule([{ file: "src/view/shell/screenkeys.ts",
+    find: '      if (deps.closeOpenMenu("menu:dismissed")) return true;\n', replace: "" }]));
   await signIn(blind);
   await showDiscord(blind, []);
   await outgoingDismiss(await failedSend(blind, "another message")).click();

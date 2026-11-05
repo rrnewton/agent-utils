@@ -4955,9 +4955,9 @@ test("`#277 reply-in-column`: Escape on the other column's list does what it doe
   assert.equal(draftMarkerOf(rowWithId(page, "200")).hidden, false, "the words were not kept as a draft");
 
   // THE CONTROL: Back that puts down whatever reply is open, wherever the keys are.
-  const { page: control } = await replyColumnsPage(brokenScript(
-    "else if (replyOnScreen() && replyKeysHere()) closeReply();",
-    "else if (replyOnScreen()) closeReply();"));
+  const { page: control } = await replyColumnsPage(await brokenModule([{ file: "src/view/shell/screenkeys.ts",
+    find: "else if (replyOnScreen() && deps.replyKeysHere()) deps.closeReply();",
+    replace: "else if (replyOnScreen()) deps.closeReply();" }]));
   await replyButton(rowWithId(control, "200")).click();
   await control.el("reply-text").setValue("still writing on the left");
   await press(control, control.el("reply-text"), "Escape");

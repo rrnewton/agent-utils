@@ -690,3 +690,117 @@ test("`#624 voice-page-modularity`: a scroll key no binding took goes to the lis
   assert.deepStrictEqual([log, area.scrollTop], [["select first false"], 0]);
   assert.equal(keys.listEdge({ nowhere: true }, true), false, "Home and End outside a list were taken");
 });
+
+test("`#624 voice-page-modularity`: the search, Settings, Help, Back and Escape keys act by the screen that is up, and Escape takes the first that applies", () => {
+  const { createScreenKeys } = VIEW_SHELL;
+  const log = [];
+  let screen = "main";
+  let helpReturn = "main";
+  const state = { search: false, docked: false, keysHere: true, threadList: false, channel: true, view: "all", cards: false,
+    menus: [], rowMenu: false, litCard: false, allFocus: false, composer: null, place: { pane: null, row: null } };
+  const field = { focus: () => log.push("field focus"), select: () => log.push("field select") };
+  const keys = createScreenKeys({
+    screens: { screen: () => screen, helpReturn: () => helpReturn, setHelpReturn: (to) => { helpReturn = to; } },
+    showScreen: (name) => { log.push(`show ${name}`); screen = name; },
+    closeSettings: () => { log.push("close settings"); screen = "main"; },
+    showHelp: (entry) => { log.push(`help ${entry}`); screen = "help"; },
+    byId: () => field,
+    searchOpen: () => state.search,
+    setSearchOpen: (open) => { log.push(`search ${open}`); state.search = open; },
+    openMenus: () => state.menus,
+    closeOpenMenu: (name) => { const open = state.menus.includes(name); if (open) log.push(`closed ${name}`); state.menus = state.menus.filter((one) => one !== name); return open; },
+    closeRowMenuOnEscape: () => state.rowMenu,
+    replyDocked: () => state.docked,
+    replyKeysHere: () => state.keysHere,
+    closeReply: () => log.push("reply closed"),
+    threadListOnScreen: () => state.threadList,
+    threadListBack: () => log.push("thread list back"),
+    channelOnScreen: () => state.channel,
+    selectionView: () => state.view,
+    sideShowsCards: () => state.cards,
+    leaveThread: () => log.push("thread left"),
+    keyContext: () => state.place,
+    selectRow: (_pane, row, bring) => log.push(`select ${row.id} ${bring}`),
+    settleFocus: () => log.push("focus settled"),
+    isComposer: (node) => node === state.composer,
+    focusList: (pane) => log.push(`focus list ${pane}`),
+    paneFor: () => "pane",
+    forgetChannelPick: () => log.push("pick forgotten"),
+    putOutLitCard: () => state.litCard,
+    clearAllThreadFocus: () => state.allFocus,
+  });
+  const run = (act) => { log.length = 0; const did = act(); return [did, ...log]; };
+  assert.deepStrictEqual(run(() => keys.searchFromKeyboard()), [true, "search true", "field focus", "field select"]);
+  assert.deepStrictEqual(run(() => keys.searchFromKeyboard()), [true, "field focus", "field select"], "a search already open was opened again");
+  state.search = false;
+  screen = "settings";
+  assert.deepStrictEqual(run(() => keys.searchFromKeyboard()), [true, "close settings", "search true", "field focus", "field select"], "/ in Settings did not leave it for the search");
+  state.search = false;
+  screen = "call";
+  assert.deepStrictEqual(run(() => keys.searchFromKeyboard()), [false], "/ searched off the main screen");
+  state.menus = ["menu:pace", "menu:row"];
+  assert.deepStrictEqual(run(() => keys.searchFromAnywhere()), [true, "closed menu:pace", "closed menu:row"], "Ctrl+/ left a menu open, or was not taken off the main screen");
+  screen = "signin";
+  assert.deepStrictEqual(run(() => keys.settingsFromKeyboard()), [true, "show settings"]);
+  assert.deepStrictEqual(run(() => keys.settingsFromKeyboard()), [true, "close settings"], ", in Settings did not leave it");
+  screen = "call";
+  assert.deepStrictEqual(run(() => keys.settingsFromKeyboard()), [false]);
+  assert.deepStrictEqual(run(() => keys.keysFromKeyboard()), [false], "? opened Help from a screen the gear does not reach");
+  screen = "settings";
+  assert.deepStrictEqual(run(() => keys.keysFromKeyboard()), [true, "help keyboard"]);
+  assert.deepStrictEqual([helpReturn, run(() => keys.keysFromKeyboard()), helpReturn], ["settings", [true, "help keyboard"], "settings"], "? in Help forgot where it was pressed");
+  assert.deepStrictEqual(run(() => keys.goBack()), [true, "show settings"], "Back from Help did not return to where ? was pressed");
+  assert.deepStrictEqual(run(() => keys.goBack()), [true, "close settings"]);
+  state.docked = true;
+  state.keysHere = false;
+  state.view = "thread";
+  assert.deepStrictEqual(run(() => keys.goBack()), [true, "thread left"], "Back in the other column put down the reply");
+  assert.equal(keys.replyOnScreen(), true);
+  state.keysHere = true;
+  assert.deepStrictEqual(run(() => keys.goBack()), [true, "reply closed"]);
+  state.docked = false;
+  state.cards = true;
+  assert.deepStrictEqual(run(() => keys.goBack()), [false], "Back over the right column's cards left a thread");
+  state.cards = false;
+  state.threadList = true;
+  assert.deepStrictEqual(run(() => keys.goBack()), [true, "thread list back"]);
+  state.threadList = false;
+  state.view = "all";
+  const target = { id: "target" };
+  state.rowMenu = true;
+  assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true], "a ⋯ menu was not closed first");
+  state.rowMenu = false;
+  state.menus = ["menu:prompts", "menu:dismissed"];
+  assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true, "closed menu:prompts"]);
+  assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true, "closed menu:dismissed"]);
+  const sheet = { className: "msg-details", parentNode: null };
+  const row = { id: "row", className: "row", children: [sheet], removeChild: (child) => { log.push(`removed ${child.className}`); } };
+  sheet.parentNode = row;
+  state.place = { pane: "pane", row };
+  const was = globalThis.document;
+  globalThis.document = { activeElement: sheet };
+  try {
+    assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true, "removed msg-details", "select row false"], "the details sheet with the focus in it was not closed onto its message");
+  } finally {
+    globalThis.document = was;
+  }
+  state.place = { pane: null, row: null };
+  state.search = true;
+  assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true, "search false", "focus settled"]);
+  const box = { value: "draft", nodeType: 1, hidden: false, parentNode: null };
+  state.composer = box;
+  assert.deepStrictEqual(run(() => keys.onEscape({}, box)), [true, "focus list pane"], "a box with words in it went Back, or kept the focus");
+  box.value = "";
+  state.view = "thread";
+  assert.deepStrictEqual(run(() => keys.onEscape({}, box)), [true, "thread left"], "an empty box did not go Back at once");
+  state.view = "all";
+  assert.deepStrictEqual(run(() => keys.onEscape({}, box)), [true, "focus list pane"], "an empty box with no Back did not leave for the list");
+  assert.deepStrictEqual(run(() => keys.onEscape({}, { id: "thread-select" })), [true, "pick forgotten", "focus list pane"], "Escape on the bar's picker did not leave it");
+  state.litCard = true;
+  assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true]);
+  state.litCard = false;
+  state.allFocus = true;
+  assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true]);
+  state.allFocus = false;
+  assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [false], "Escape with nothing to do did something");
+});

@@ -1806,7 +1806,8 @@ test("`#299 all-thread-strip`: a press on a strip selects its thread in All — 
   await press(page, area, "Escape");
   assert.deepStrictEqual(focusOf(page), NO_FOCUS);
   // The control: with no Esc step, Esc leaves the thread selected.
-  const blind = newPage(new Map(), brokenScript("  if (clearAllThreadFocus()) return true;\n", ""));
+  const blind = newPage(new Map(), await brokenModule([{ file: "src/view/shell/screenkeys.ts",
+    find: "      if (deps.clearAllThreadFocus()) return true;\n", replace: "" }]));
   const data = threadData();
   blind.threadingSupported = true;
   blind.threads = data.threads;

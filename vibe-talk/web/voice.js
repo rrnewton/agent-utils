@@ -7909,168 +7909,43 @@ function channelPicked() {
 // --- search, Settings, help and Escape
 
 /**
- * "/": the search, with its field ready to type in. It was Ctrl+S (Cmd+S) as well until `#248
- * composer-key` gave that chord to the message box; the glass over the list is the other way in, and
- * Ctrl+/ (Cmd+/) the way in from anywhere (`searchFromAnywhere`). Settings and Help are left
- * first, as their Back button leaves them: the search is over the list they cover. Anywhere else off
- * the main screen there is nothing to search, and nothing happens. Pressed again while the search is
- * open, the field takes the focus back with its text selected, ready to be typed over. Returns whether
- * it did anything.
- */
-function searchFromKeyboard() {
-  if (screens.screen() === "settings" || screens.screen() === "help") closeSettings();
-  if (screens.screen() !== "main") return false;
-  if (!searchField.open()) setSearchOpen(true);
-  const field = el("search-field");
-  field.focus();
-  if (typeof field.select === "function") field.select();
-  return true;
-}
-
-/**
- * Ctrl+/ (Cmd+/): the search from anywhere, whatever holds the focus. `#344 search-shortcut`. The owner:
- * "want reliable cmd-/ for search ... Sometimes just pressing '/' doesn't work". A bare "/" is a character
- * in a field, the type-to-find of a picker, a step of a slider, and nothing with single keys off, so
- * after a send (the focus stays in the box) or a channel chosen with the mouse (it stays on the picker)
- * it searched nothing. The chord has none of those exceptions.
+ * The keys for the search ("/", Ctrl+/), Settings (","), Help ("?") and Escape, and where Back goes from
+ * the screen that is up. One owner in web/src/view/shell/screenkeys.ts (`#624 voice-page-modularity`); the
+ * page destructures its keys under their old names.
  *
- * An open ⋯ menu, the pace popover or the prompts tray closes first, as the back gesture closes them, so
- * the back stack stays in step (`#304 back-gesture-in-app`). A reply open in a list stays open: the
- * search is over the list it is in. So does a message's details sheet, which is part of its row, not something over the
- * list. Then it is "/" (`searchFromKeyboard`). Returns true wherever it is pressed, on sign-in too, where
- * there is nothing to search: the chord is never the browser's.
+ * @type {import("./src/view/shell/index.ts").ScreenKeys}
  */
-function searchFromAnywhere() {
-  for (const name of openMenus()) closeOpenMenu(name);
-  searchFromKeyboard();
-  return true;
-}
-
-/**
- * "," and Ctrl+, (Cmd+,): Settings, from the screens the gear is on (the main one and sign-in), and
- * back out of Settings or Help to where the reader was, as Back takes them. Every control in Settings
- * keeps its value the moment it changes, so leaving is all that "save and exit" needs. Returns whether
- * it did anything.
- */
-function settingsFromKeyboard() {
-  if (screens.screen() === "settings" || screens.screen() === "help") {
-    closeSettings();
-    return true;
-  }
-  if (screens.screen() === "main" || screens.screen() === "signin") {
-    showScreen("settings");
-    return true;
-  }
-  return false;
-}
-
-/** Leave Help: back to Settings, or to wherever `?` was pressed (`helpReturn`). */
-function closeHelp() {
-  showScreen(screens.helpReturn());
-}
-
-/**
- * "?" and Ctrl+? (Cmd+?, which is Cmd+Shift+/): the list of every key, the Keyboard entry of the Help
- * screen, and Escape back to where it was pressed with the place of the reader kept. From the screens
- * the gear reaches. Ctrl+/ (Cmd+/) was this until `#344 search-shortcut` gave it to the search.
- */
-function keysFromKeyboard() {
-  if (screens.screen() !== "help") {
-    if (!["main", "signin", "settings"].includes(screens.screen())) return false;
-    screens.setHelpReturn(screens.screen());
-  }
-  showHelp("keyboard");
-  return true;
-}
-
-/**
- * Whether the reply's box is on screen: open in a list of the main screen (`#410 inline-reply-editor`).
- * c and Ctrl+S write in it, and Back puts it down — before it leaves a thread.
- */
-function replyOnScreen() {
-  return replyState.docked && screens.screen() === "main";
-}
-
-/**
- * Where Back goes from the screen that is up, taken; false when there is no Back to take. The thread
- * list's is what it was chosen from (`threadListBack`, `#281 view-keys`): it covers the left column,
- * so a thread there is not on screen to leave.
- *
- * `#277 reply-in-column`. A reply open in a column is that column's Back, not the other's: Escape on
- * the other column's list does there what it does with no reply open, and leaves the reply, out of
- * sight of the keys, as it is. Escape runs in the column of the keys (`paneColumn`).
- */
-function goBack() {
-  if (screens.screen() === "settings") closeSettings();
-  else if (screens.screen() === "help") closeHelp();
-  else if (replyOnScreen() && replyKeysHere()) closeReply();
-  else if (threadListOnScreen()) threadListBack();
-  // Not over the right column's cards, whose column still holds the thread it showed last: that Back
-  // was the X with nothing to close, and put the cards back at their foot. `#277 thread-card-focus`.
-  else if (channelOnScreen() && selection().view === "thread" && !(columnWork.side() && columns.side.mode === "list")) leaveThread();
-  else return false;
-  return true;
-}
-
-/** Close the details sheet on the message the keys act on. Returns whether one was open. */
-function closeDetailsOn(target) {
-  const { pane, row } = keyContext(target);
-  const sheet = row ? childByClass(row, "msg-details") : null;
-  if (!pane || !row || !sheet) return false;
-  const inside = nodeWithin(sheet, document.activeElement);
-  row.removeChild(sheet);
-  if (inside) selectRow(pane, row, false);
-  return true;
-}
-
-/**
- * What Escape does: the first that applies of the proposal's section 5.2. An open ⋯ menu, the pace
- * popover, the prompts tray, or a details sheet closes; then the search; then a message box with text
- * in it is left, the draft kept and the focus back on the list (question 4), while an empty one goes
- * Back at once, there being nothing to keep; a picker on the bar is left for the list, whatever it
- * holds (`isBarPicker`); then a highlighted thread card on screen is put out (`#277
- * thread-card-focus`); then a thread selected in All by its strip is let go (`#299 all-thread-strip`);
- * then Back: out of Settings, Help or Reply, out of the thread list to what it
- * was chosen from, or out of a thread — to the thread list, for one opened from it (`#281 view-keys`).
- * Returns whether it did anything. With none of those it does nothing:
- * in particular it marks nothing read, which is the proposal's answer to the clients whose Escape does.
- */
-function onEscape(event, target) {
-  if (closeRowMenuOnEscape(event)) return true;
-  // The pace popover and the prompts tray, as the back gesture closes them (`#304 back-gesture-in-app`).
-  if (closeOpenMenu("menu:pace") || closeOpenMenu("menu:prompts") || closeOpenMenu("menu:actions")) return true;
-  // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed, before Settings itself.
-  if (closeOpenMenu("menu:dismissed")) return true;
-  if (closeDetailsOn(target)) return true;
-  if (searchField.open() && screens.screen() === "main") {
-    setSearchOpen(false);
-    settleFocus();
-    return true;
-  }
-  if (isComposer(target) && shownNode(target)) {
-    if (String(target.value || "") === "" && goBack()) return true;
-    focusList(paneFor(target));
-    return true;
-  }
-  if (isBarPicker(target)) {
-    channelPickByKey.forget();
-    focusList(paneFor(target));
-    return true;
-  }
-  if (putOutLitCard()) return true;
-  // `#299 all-thread-strip`. A thread selected in All by its strip is let go before All is left.
-  if (clearAllThreadFocus()) return true;
-  return goBack();
-}
-
-/**
- * A picker on the bar of the main screen: the channel's, or the thread's. Every single key on one is
- * its own (`keepsOwnKeys`), so Escape is the way off it, back to the list, as from a message box
- * with text in it: the first Escape leaves the picker and the next goes Back.
- */
-function isBarPicker(node) {
-  return screens.screen() === "main" && Boolean(node) && ["discord-channel", "thread-select"].includes(String(node.id || ""));
-}
+const screenKeys = createScreenKeys({
+  screens,
+  showScreen: (name) => showScreen(name),
+  closeSettings: () => closeSettings(),
+  showHelp: (entry) => showHelp(entry),
+  byId: (id) => el(id),
+  searchOpen: () => searchField.open(),
+  setSearchOpen: (open) => setSearchOpen(open),
+  openMenus: () => openMenus(),
+  closeOpenMenu: (name) => closeOpenMenu(name),
+  closeRowMenuOnEscape: (event) => closeRowMenuOnEscape(event),
+  replyDocked: () => replyState.docked,
+  replyKeysHere: () => replyKeysHere(),
+  closeReply: () => closeReply(),
+  threadListOnScreen: () => threadListOnScreen(),
+  threadListBack: () => threadListBack(),
+  channelOnScreen: () => channelOnScreen(),
+  selectionView: () => selection().view,
+  sideShowsCards: () => columnWork.side() && columns.side.mode === "list",
+  leaveThread: () => leaveThread(),
+  keyContext: (target) => keyContext(target),
+  selectRow: (pane, row, bring) => selectRow(pane, row, bring),
+  settleFocus: () => settleFocus(),
+  isComposer: (node) => isComposer(node),
+  focusList: (pane) => focusList(pane),
+  paneFor: (node) => paneFor(node),
+  forgetChannelPick: () => channelPickByKey.forget(),
+  putOutLitCard: () => putOutLitCard(),
+  clearAllThreadFocus: () => clearAllThreadFocus(),
+});
+const { searchFromKeyboard, searchFromAnywhere, settingsFromKeyboard, closeHelp, keysFromKeyboard, replyOnScreen, onEscape } = screenKeys;
 
 // --- the keymap
 

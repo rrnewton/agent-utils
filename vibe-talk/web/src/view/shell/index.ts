@@ -29,3 +29,5 @@ export { COPIED_MESSAGE, COPIED_SELECTION, NOTHING_TO_COPY, createHighlightCopy,
 export type { CopiedPane, CopyEvent, HighlightCopy, HighlightCopyDependencies, MessageCopy } from "./highlightcopy.ts";
 export { SCROLL_KEYS, createScrollKeys, pageStep } from "./scrollkeys.ts";
 export type { ScrollKeyEvent, ScrollKeys, ScrollKeysDependencies, ScrolledPane } from "./scrollkeys.ts";
+export { createScreenKeys } from "./screenkeys.ts";
+export type { KeyPlace, ScreenKeys, ScreenKeysDependencies } from "./screenkeys.ts";
