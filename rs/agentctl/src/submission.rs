@@ -63,7 +63,9 @@ pub fn in_lock_timeouts() -> SubmitTimeouts {
 }
 
 /// The start of the refusal a stranded retry gives once the late-paste window passed with no
-/// sign of the earlier paste: it was lost, and the drain types the prompt again.
+/// sign of the earlier paste: it was lost. The prompt is never typed again; the drain keeps
+/// it stranded and reports it possibly submitted only after a bounded number of such
+/// passes (#884 item 4).
 pub const LATE_PASTE_LOST: &str = "late_paste_lost";
 
 /// Whether `detail` is the refusal of a stranded retry whose earlier paste was lost.
@@ -737,6 +739,59 @@ fn paste_placeholders(text: &str) -> usize {
     count
 }
 
+/// The `+k` line counts Claude Code can report for a paste of `text`.
+///
+/// Claude Code counts logical lines, so screen wrap never changes the count.
+/// A trailing newline ends the last line instead of starting a new one, and
+/// renderers differ on whether they count it, so both counts are accepted;
+/// any other size is a different paste.
+fn expected_line_counts(text: &str) -> Vec<usize> {
+    let newlines = text.matches('\n').count();
+    let logical = text.lines().count().saturating_sub(1);
+    if logical == newlines {
+        vec![newlines]
+    } else {
+        vec![logical, newlines]
+    }
+}
+
+/// Whether the `+k lines` count of a paste placeholder can be the count
+/// Claude Code reports for `text`.
+///
+/// Without wrapping, the count is the logical line count (see
+/// [`expected_line_counts`]). Claude Code also counts wrapped rows: a long
+/// logical line drawn across several terminal rows adds to the count, by an
+/// amount that depends on the pane's width. A wrapped count therefore lies
+/// between the logical line count and the character count; a count outside
+/// that range, however recently the placeholder appeared, is another paste.
+fn paste_line_count_matches(text: &str, count: usize) -> bool {
+    if expected_line_counts(text).contains(&count) {
+        return true;
+    }
+    let total = count + 1;
+    let logical = text.lines().count().max(1);
+    total >= logical && total <= text.chars().count().max(logical)
+}
+
+/// Whether a paste placeholder drawn in `view`'s composer is the paste of
+/// `text`: it appeared after our paste (more placeholders than
+/// `placeholders_before`) and, for a `[Pasted text #N ...]` placeholder, its
+/// `+k lines` count matches `text` (see [`paste_line_count_matches`]). A
+/// `[Pasted Content N chars]` placeholder names only a length another paste
+/// can share, so any new one counts as staged; printed evidence (see
+/// [`printed`]) still has to name this prompt before a receipt is believed.
+/// A `[Pasted text #N ...]` placeholder of an impossible size is someone
+/// else's paste, however recently it appeared (#884 item 4).
+fn placeholder_is_ours(view: &ComposerView, text: &str, placeholders_before: usize) -> bool {
+    if paste_placeholders(&view.composer) <= placeholders_before {
+        return false;
+    }
+    placeholder_labels(&view.composer).iter().any(|label| {
+        crate::stale_draft::pasted_line_count_pub(label)
+            .is_some_and(|count| paste_line_count_matches(text, count))
+    }) || view.composer.contains("[Pasted Content ")
+}
+
 fn staged(view: &ComposerView, text: &str, placeholders_before: usize) -> bool {
     // Faint placeholder text is excluded so a short prompt is not "found" inside it.
     let composer = compact(&view.composer_solid);
@@ -746,7 +801,7 @@ fn staged(view: &ComposerView, text: &str, placeholders_before: usize) -> bool {
     }
     composer.contains(&wanted)
         || composer.contains(&suffix(text, 80))
-        || paste_placeholders(&view.composer) > placeholders_before
+        || placeholder_is_ours(view, text, placeholders_before)
 }
 
 /// Bottom `K` non-blank rows of a screen, for harness-agnostic tail checks.
@@ -777,9 +832,18 @@ pub(crate) fn static_tail_holds(screen: &str, text: &str) -> bool {
         return false;
     }
     if paste_placeholders(&bottom_region(screen)) > 0 && !squash(text).is_empty() {
-        // A placeholder in the tail whose line/char size could be ours is a
-        // clog signal; exact attribution stays with stale_draft.
-        return true;
+        // A placeholder in the tail whose line/char size is ours is a clog
+        // signal; a placeholder of another size is someone else's paste and
+        // must never be submitted as ours (#884 item 4).
+        let region = bottom_region(screen);
+        let ours = placeholder_labels(&region).iter().any(|label| {
+            crate::stale_draft::pasted_line_count_pub(label)
+                .is_some_and(|count| paste_line_count_matches(text, count))
+        }) || region
+            .contains(&format!("[Pasted Content {} chars]", text.chars().count()));
+        if ours {
+            return true;
+        }
     }
     let words: Vec<String> = text
         .split_whitespace()
@@ -813,7 +877,7 @@ fn composer_is_this_text(view: &ComposerView, text: &str) -> bool {
         if let Some(end) = region[start..].find(']') {
             let label = &region[start..=start + end];
             if let Some(m) = crate::stale_draft::pasted_line_count_pub(label) {
-                return text.lines().count().saturating_sub(1) == m;
+                return expected_line_counts(text).contains(&m);
             }
         }
     }
@@ -1271,8 +1335,8 @@ pub fn submit_verified(
         if waited.is_some_and(|waited| waited >= window) {
             return refuse(format!(
                 "{LATE_PASTE_LOST}: pane {pane_id}: the paste an earlier pass typed never showed \
-                 in the {harness} composer in {window:.0}s; it was lost, and the prompt is typed \
-                 again"
+                 in the {harness} composer in {window:.0}s; it was lost, and the prompt is never \
+                 typed again"
             ));
         }
         return refuse(format!(
@@ -2667,6 +2731,70 @@ mod tests {
         let receipt = receipt(submit(&screen, text));
         assert_eq!(receipt.key_presses, 1);
         assert_eq!(screen.state().submitted, [text]);
+    }
+
+    #[test]
+    fn a_fresh_collapsed_paste_is_submitted_on_the_first_attempt() {
+        // #884 item 4: a fresh 19-line prompt Claude Code draws only as
+        // "[Pasted text #N +18 lines]" is recognised as our paste on the
+        // first pass: one paste, one Enter, no stranded retry.
+        let screen = FakeScreen::new("claude", false);
+        let text = (1..=19)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (outcome, elapsed) = submit_with(&screen, &text, in_lock_timeouts());
+        let receipt = receipt(outcome);
+        assert_eq!(receipt.key_presses, 1);
+        assert!(
+            elapsed <= STAGE_IN_LOCK + Duration::from_secs(1),
+            "{elapsed:?}"
+        );
+        let state = screen.state();
+        assert_eq!(state.pastes.len(), 1);
+        assert_eq!(state.pastes[0], text);
+        assert_eq!(state.keys, ["Enter"]);
+        assert_eq!(state.submitted, [text]);
+    }
+
+    #[test]
+    fn a_collapsed_paste_with_a_trailing_newline_is_submitted_on_the_first_attempt() {
+        // The typed text ends with a newline; Claude Code's `+k` count for it
+        // still names this paste, under either trailing-newline convention.
+        let screen = FakeScreen::new("claude", false);
+        let text = "line one\nline two\nline three\nline four\nline five\n";
+        let receipt = receipt(submit(&screen, text));
+        assert_eq!(receipt.key_presses, 1);
+        assert_eq!(screen.state().submitted, [text]);
+    }
+
+    #[test]
+    fn a_fresh_delivery_never_submits_a_placeholder_of_another_size() {
+        // A placeholder that appears while we wait but is not our paste's
+        // size is someone else's: no Enter is pressed on it, and the delivery
+        // is reported stranded with what the composer showed (#884 item 4).
+        let replay = Replay::new(
+            claude_screen(&["• earlier"], "", IDLE_STATUS),
+            claude_screen(&["• earlier"], "[Pasted text #999 +99 lines]", PASTE_STATUS),
+            claude_screen(&["• earlier"], "", IDLE_STATUS),
+        );
+        let clock = Clock::default();
+        let outcome = submit_verified(
+            &replay,
+            "w1:p1",
+            "claude",
+            "line one\nline two\nline three\nline four",
+            in_lock_timeouts(),
+            &clock,
+        );
+        let reason = refusal(outcome);
+        assert!(
+            crate::unknown_harness::is_stranded_prompt(&reason),
+            "{reason}"
+        );
+        assert!(reason.contains("[Pasted text #999 +99 lines]"), "{reason}");
+        assert_eq!(replay.pastes.lock().unwrap().len(), 1);
+        assert!(replay.keys.lock().unwrap().is_empty());
     }
 
     /// Rows Codex v0.159.1 drew at the bottom of its pane, read with

@@ -499,7 +499,7 @@ impl AgentApi for HerdrClient {
             // Inside the pane's locks only for a short stage window (#884
             // pane-lock-held-on-unobserved-paste): a paste not drawn by then is reported
             // stranded, the drain releases every lock, and a later pass presses Enter on it
-            // once it shows, or types it again only once it is surely lost.
+            // once it shows; it is never typed again, even once it is surely lost.
             return crate::pane_admission::admit(
                 pane_id,
                 &sender_or(runtime, "agentctl"),
@@ -1128,6 +1128,11 @@ impl AgentRuntime for BatchTrackingRuntime<'_> {
         }
     }
 }
+
+/// Passes that find an earlier paste lost (never drawn in the whole late-paste
+/// window) before the prompt is reported possibly submitted. The paste is
+/// never typed again at any pass count (#884 item 4).
+const MAX_LOST_PASTE_PASSES: u64 = 3;
 
 /// Record on a pending item that its prompt was left stranded at the bottom of a TUI's screen
 /// (#850 unknown-harness-mode): when that was first seen, how many passes found it so, and the
@@ -2448,16 +2453,35 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     // for the next pass to flush.
                     document.remove("possibly_submitted");
                     let paste_lost = crate::submission::is_late_paste_lost(&detail);
-                    if crate::unknown_harness::is_stranded_prompt(&detail) {
+                    if crate::unknown_harness::is_stranded_prompt(&detail) || paste_lost {
+                        // A lost paste is never typed again either (#884 item 4): it
+                        // stays stranded, flushed with Enter only if it ever shows.
                         note_stranded(&mut document, &identifier, &typed, &detail);
-                    } else if paste_lost {
-                        // An earlier pass's paste never showed in the whole late-paste window:
-                        // it was lost, so this pass types the prompt afresh.
-                        document.remove("stranded_at");
-                        document.remove("stranded_passes");
-                        document.remove("typed_as");
                     } else if !stranded {
                         document.remove("typed_as");
+                    }
+                    if paste_lost
+                        && document
+                            .get("stranded_passes")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0)
+                            >= MAX_LOST_PASTE_PASSES
+                    {
+                        // The bound is reached: the paste is reported possibly
+                        // submitted, never retyped, and later inbox items are
+                        // not held behind it.
+                        document.insert("possibly_submitted".to_owned(), Value::Bool(true));
+                        document.insert("delivery_error".to_owned(), json!(detail.clone()));
+                        document.insert("delivery_failed_at".to_owned(), json!(unix_seconds()));
+                        strip_paste_stamps(&mut document);
+                        atomic_json(&inflight_path, &Value::Object(document))?;
+                        let failed_path = directories
+                            .failed
+                            .join(path.file_name().expect("validated queued filename"));
+                        transition(&inflight_path, &failed_path)?;
+                        failed_metadata(&failed_path, "possibly_submitted", &detail)?;
+                        quarantined.push(identifier.clone());
+                        break 'retry;
                     }
                     document.remove("inflight_at");
                     document.remove("paste_tracking");
@@ -2468,8 +2492,12 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));
                     atomic_json(&inflight_path, &Value::Object(document))?;
                     transition(&inflight_path, &path)?;
-                    if paste_lost && !runtime.cancelled() {
-                        continue 'retry;
+                    if paste_lost {
+                        // The composer is empty (the paste is lost, not staged),
+                        // so later inbox items can still be delivered in this
+                        // pass; this item stays pending, never retyped.
+                        blocked = Some(detail);
+                        break 'retry;
                     }
                     // An unreadable composer typed nothing, so probe it again
                     // after a bounded backoff within this drain (see
@@ -5268,6 +5296,77 @@ mod tests {
         let screen = fake.screen.as_ref().unwrap().state();
         assert_eq!(screen.pastes, [text], "typed exactly once");
         assert_eq!(screen.queued, [text], "queued behind the running turn");
+    }
+
+    /// #884 item 4 (C): a paste that never showed in the whole late-paste window is
+    /// lost, and it is never typed again. Below the bound the item stays pending
+    /// without holding later inbox items; at the bound it is reported possibly
+    /// submitted, still without a retype.
+    #[test]
+    fn a_lost_paste_is_never_retyped_and_later_items_still_deliver() {
+        let directory = TestDirectory::new("lost-paste");
+        let fake =
+            FakeAgent::with_screen(crate::submission::fake::FakeScreen::new("claude", false));
+        let first = "the prompt whose paste was lost";
+        let second = "a later prompt in the same inbox";
+        enqueue(directory.path(), first, Some("first")).unwrap();
+        enqueue(directory.path(), second, Some("second")).unwrap();
+        // An earlier pass typed `first` long ago; its paste never showed.
+        let first_path = directory.path().join("inbox/first.json");
+        let mut document = match read_private_json(&first_path).unwrap() {
+            Value::Object(document) => document,
+            other => panic!("queued prompt is not an object: {other}"),
+        };
+        document.insert("stranded_at".to_owned(), json!(unix_seconds() - 400.0));
+        document.insert("typed_as".to_owned(), json!(first));
+        atomic_json(&first_path, &Value::Object(document)).unwrap();
+        let options = || DrainOptions {
+            ready_timeout: Duration::ZERO,
+            ..DrainOptions::default()
+        };
+        let drain = |fake: &FakeAgent| {
+            drain_with_runtime(
+                fake,
+                &target(),
+                directory.path(),
+                options(),
+                &FakeRuntime::default(),
+            )
+            .unwrap()
+        };
+
+        // Pass 1: lost, stays pending, and the later item delivers in the same pass.
+        let result = drain(&fake);
+        assert_eq!(result.delivered, ["second"], "{result:?}");
+        assert!(result.quarantined.is_empty(), "{result:?}");
+        let document = read_private_json(&first_path).unwrap();
+        assert_eq!(document["delivery_state"], "pending", "{document}");
+        assert_eq!(document["stranded_passes"], 1, "{document}");
+        assert!(document.get("possibly_submitted").is_none(), "{document}");
+        assert_eq!(
+            fake.screen.as_ref().unwrap().state().pastes,
+            [second],
+            "the lost prompt was never typed again"
+        );
+
+        // Pass 2: still below the bound, still pending, still never typed.
+        let result = drain(&fake);
+        assert!(result.quarantined.is_empty(), "{result:?}");
+        let document = read_private_json(&first_path).unwrap();
+        assert_eq!(document["stranded_passes"], 2, "{document}");
+
+        // Pass 3: the bound. Possibly submitted at last, never retyped.
+        let result = drain(&fake);
+        assert_eq!(result.quarantined, ["first"], "{result:?}");
+        assert!(
+            directory.path().join("failed/first.json").is_file(),
+            "the lost prompt is filed as possibly submitted"
+        );
+        assert_eq!(
+            fake.screen.as_ref().unwrap().state().pastes,
+            [second],
+            "the lost prompt was never typed again"
+        );
     }
 
     /// #884 pane-lock-held-on-unobserved-paste: a sender cancelled before it typed anything (it
