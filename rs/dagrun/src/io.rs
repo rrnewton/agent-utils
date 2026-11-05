@@ -153,7 +153,7 @@ fn err(msg: impl Into<String>) -> DagJsonError {
 /// `cmds`, `timeouts`, `env_vars`, `description` vs `desc`. Silently ignored, the instruction is
 /// simply not carried out and the document still says it was: the step runs with no timeout, no
 /// dependency, no environment, and nothing anywhere reports it.
-const STEP_KEYS: [&str; 26] = [
+const STEP_KEYS: [&str; 27] = [
     "cmd",
     "cmdtype",
     "cpu_timeout",
@@ -173,6 +173,7 @@ const STEP_KEYS: [&str; 26] = [
     "jobs_flag",
     "labels",
     "networkonly",
+    "priority",
     "skip_reason",
     "timeout",
     "write_domain_guarantee",
@@ -1434,6 +1435,7 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             delegated_children: opt_bool(sm, "delegated_children", false)?,
             timeout: opt_int(sm, "timeout", default_step_timeout)?,
             cpu_timeout: opt_int(sm, "cpu_timeout", 0)?,
+            priority: opt_int(sm, "priority", 0)?,
             jobs_flag: opt_str_or_none(sm, "jobs_flag")?,
             jobs_env: match opt_str_or_none(sm, "jobs_env")? {
                 Some(value) => Some(resolve_jobs_env(Some(&value)).map_err(|error| {
@@ -1948,6 +1950,10 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     if step.cpu_timeout != 0 {
         s.push_str(&key);
         s.push_str(&format!("\"cpu_timeout\": {},\n", step.cpu_timeout));
+    }
+    if step.priority != 0 {
+        s.push_str(&key);
+        s.push_str(&format!("\"priority\": {},\n", step.priority));
     }
     s.push_str(&key);
     s.push_str(&format!(

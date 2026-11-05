@@ -1170,10 +1170,16 @@ def _plan_order(
       list scheduling).
     Both are identical across the Python and Rust builds for the same estimates + DAG."""
     tags = [step.tag for step in cfg.steps]
+    # Priority (#860) is the primary dispatch key under every planner; the
+    # planner's own key breaks ties. All-default priorities reproduce the
+    # previous orders exactly.
+    priority = {step.tag: step.priority for step in cfg.steps}
     if planner is Planner.CRITICAL_PATH:
-        return sorted(tags, key=lambda t: (-bottom.get(t, 0.0), t))
-    # greedy-lpt: stable reverse sort by est (ties keep registration order).
-    return sorted(tags, key=lambda t: est.get(t, 0.0), reverse=True)
+        return sorted(tags, key=lambda t: (-priority.get(t, 0), -bottom.get(t, 0.0), t))
+    # greedy-lpt: stable reverse sort by (priority, est).
+    return sorted(
+        tags, key=lambda t: (priority.get(t, 0), est.get(t, 0.0)), reverse=True
+    )
 
 
 # --------------------------------------------------------------------------- CPA allocator

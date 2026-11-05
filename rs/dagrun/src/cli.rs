@@ -219,7 +219,7 @@ dagrun --help\n\n\
 {store}\n  {store_dir}\n  {store_note}\n\n\
 {planning}\n  {pl1}\n  {pl2}\n  {pl3}\n  {plan_note}\n\n\
 {schema}  {schema_note}\n  \
-step:   group, job, desc, description, labels[], cmd, cmdtype, manifest{{lane,category,test?,mode?,backend?}}, result_manifests[], deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, delegated_children, hint{{}}\n  \
+step:   group, job, desc, description, labels[], cmd, cmdtype, manifest{{lane,category,test?,mode?,backend?}}, result_manifests[], deps[], env{{}}, timeout, priority, jobs_flag, jobs_env, networkonly, engine_only, delegated_children, hint{{}}\n  \
 hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,\n          classification(\"cpu-bound\"|\"latency-bound\"|\"light\"), preferred_inner_jobs\n  \
 top:    include[{{path,namespace,after[]?}}], description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,\n          outer_mem_safety_factor, default_step_timeout, default_jobs_flag, default_jobs_env\n  \
 desc = short label; description = long-form docs (often multi-line, great in YAML)\n  \
@@ -988,6 +988,7 @@ fn box_config(
             // command could possibly consume inside its wall budget, so the wall bound is the one
             // that fires and the CPU guard stays a backstop.
             cpu_timeout: timeout_s.saturating_mul(cores),
+            priority: 0,
             jobs_flag: None,
             jobs_env: None,
             skip_reason: None,

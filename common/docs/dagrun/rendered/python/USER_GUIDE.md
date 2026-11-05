@@ -325,6 +325,15 @@ The default `greedy-lpt` planner favors the longest ready step. The
 planner additionally chooses inner widths from measured speedup curves. Stable
 tag ordering breaks ties, so repeated plans over the same inputs are identical.
 
+A step may declare `priority: N` (an integer, default 0). Among READY steps,
+higher priority dispatches first under every planner; the planner's own order
+breaks ties, so with every priority at the default the dispatch order is
+exactly what it was before. Priority is only a hint about which ready steps
+start first when slots or resources are short: it adds no dependency, and it
+never delays a step whose dependencies are unmet. Use it to start cheap
+static checks before long builds under contention. The run journal records
+each step's priority with its `step_start` record, in dispatch order.
+
 By default, past profile samples refine duration and resident-memory estimates. Duration may move
 in either direction. An authored `rss_baseline_bytes` is a safety floor: ordinary feedback may
 raise it when a run used more, but one quiet run never lowers the next run's enforced memory cap.

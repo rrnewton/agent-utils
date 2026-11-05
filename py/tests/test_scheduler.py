@@ -43,6 +43,7 @@ def _step(
     deps: list[str] | None = None,
     resources: dict[str, int] | None = None,
     est: float = 0.0,
+    priority: int = 0,
     skip_reason: IntentionalSkipReason | None = None,
 ) -> Step:
     return Step(
@@ -52,8 +53,68 @@ def _step(
         cmd,
         deps=list(deps or []),
         hint=ResourceHint(resources=dict(resources or {}), est_duration_s=est),
+        priority=priority,
         skip_reason=skip_reason,
     )
+
+
+def _dispatch_order(tmp_path: Path, steps: list[Step], *, jobs: int) -> list[str]:
+    """Step tags in the order their commands first ran."""
+    log = tmp_path / "dispatch.txt"
+    run_dag(DagConfig(steps=tuple(steps)), jobs=jobs, verbosity=0)
+    return log.read_text(encoding="utf-8").split()
+
+
+def _recording_step(tmp_path: Path, job: str, *, est: float = 0.0, priority: int = 0) -> Step:
+    log = tmp_path / "dispatch.txt"
+    return _step(
+        "g",
+        job,
+        f"echo {job} >> {log}",
+        est=est,
+        priority=priority,
+    )
+
+
+def test_priority_dispatches_before_lpt_when_slots_are_short(tmp_path: Path) -> None:
+    steps = [
+        _recording_step(tmp_path, "long-low", est=100.0),
+        _recording_step(tmp_path, "short-high", est=1.0, priority=5),
+        _recording_step(tmp_path, "long-high", est=50.0, priority=5),
+        _recording_step(tmp_path, "short-low", est=10.0),
+    ]
+    assert _dispatch_order(tmp_path, steps, jobs=1) == [
+        "long-high",
+        "short-high",
+        "long-low",
+        "short-low",
+    ]
+
+
+def test_all_default_priorities_keep_lpt_order_exactly(tmp_path: Path) -> None:
+    steps = [
+        _recording_step(tmp_path, "mid", est=10.0),
+        _recording_step(tmp_path, "longest", est=100.0),
+        _recording_step(tmp_path, "unestimated", est=0.0),
+    ]
+    assert _dispatch_order(tmp_path, steps, jobs=1) == ["longest", "mid", "unestimated"]
+
+
+def test_enough_slots_start_everything_at_once(tmp_path: Path) -> None:
+    log = tmp_path / "dispatch.txt"
+    steps = [
+        _step(
+            "g",
+            job,
+            f"echo start-{job} >> {log}; sleep 0.5; echo end-{job} >> {log}",
+            priority=priority,
+        )
+        for job, priority in (("a", 0), ("b", 9), ("c", 3))
+    ]
+    run_dag(DagConfig(steps=tuple(steps)), jobs=8, verbosity=0)
+    lines = log.read_text(encoding="utf-8").split()
+    assert all(line.startswith("start-") for line in lines[:3])
+    assert sorted(lines) == ["end-a", "end-b", "end-c", "start-a", "start-b", "start-c"]
 
 
 def test_default_config_enables_small_forcing_caps() -> None:

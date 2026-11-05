@@ -307,6 +307,11 @@ class Step:
     # set much tighter than a load-tolerant wall timeout without flaking. Enforced
     # only when cgroup boxing is active (cpu.stat available); otherwise inert.
     cpu_timeout: int = 0
+    # Dispatch hint (#860): among READY steps, higher priority starts first
+    # when slots or resources are short; the longest-estimated-first (LPT)
+    # order is the tie-break. It adds no dependency and changes nothing when
+    # every step leaves it at the default 0.
+    priority: int = 0
     # Template for the inner-parallelism flag appended to `cmd` when this step declares
     # `preferred_inner_jobs`. None inherits DagConfig.default_jobs_flag; "" disables appending
     # (the step manages a fixed declared width, which the planner cannot resize). See

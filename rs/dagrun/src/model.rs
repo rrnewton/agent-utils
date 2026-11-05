@@ -476,6 +476,10 @@ pub struct Step {
     // Python's `Step.cpu_timeout`; both runners enforce it identically under cgroup boxing.
     /// User-plus-system CPU-time timeout in seconds; zero disables the guard.
     pub cpu_timeout: i64,
+    /// Dispatch hint (#860): among ready steps, higher priority starts first
+    /// when slots or resources are short; longest-estimated-first is the
+    /// tie-break. Adds no dependency; the default 0 keeps today's order.
+    pub priority: i64,
     /// Template for the inner-parallelism flag appended to `cmd` when this step declares
     /// `preferred_inner_jobs`. `None` inherits `DagConfig::default_jobs_flag`; an empty string
     /// disables appending (the step manages its own concurrency), making that declared width rigid
@@ -2062,6 +2066,7 @@ mod tests {
             manifest: None,
             result_manifests: None,
             integration_test_binaries: None,
+            priority: 0,
             deps: vec![],
             env: BTreeMap::new(),
             hint,
@@ -2093,6 +2098,7 @@ mod tests {
             manifest: None,
             result_manifests: None,
             integration_test_binaries: None,
+            priority: 0,
             deps: vec![],
             env: BTreeMap::new(),
             hint: ResourceHint::default(),
@@ -2567,6 +2573,7 @@ mod cpu_timeout_multiplier_tests {
             manifest: None,
             result_manifests: None,
             integration_test_binaries: None,
+            priority: 0,
             deps: vec![],
             env: std::collections::BTreeMap::new(),
             hint: ResourceHint::default(),
@@ -2743,6 +2750,7 @@ mod carry_tests {
             manifest: None,
             result_manifests: None,
             integration_test_binaries: None,
+            priority: 0,
             deps: vec![],
             env: BTreeMap::new(),
             hint: ResourceHint::default(),

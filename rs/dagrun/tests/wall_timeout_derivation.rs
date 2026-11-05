@@ -38,6 +38,7 @@ fn step(timeout: i64, cpu_timeout: i64) -> Step {
         manifest: None,
         result_manifests: None,
         integration_test_binaries: None,
+        priority: 0,
         deps: Vec::new(),
         env: Default::default(),
         hint: Default::default(),

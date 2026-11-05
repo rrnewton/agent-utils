@@ -930,6 +930,7 @@ STEP_KEYS: frozenset[str] = frozenset(
         "delegated_children",
         "timeout",
         "cpu_timeout",
+        "priority",
         "jobs_flag",
         "jobs_env",
         "skip_reason",
@@ -1218,6 +1219,7 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 delegated_children=_opt_bool(sm, "delegated_children", False),
                 timeout=_opt_int(sm, "timeout", default_step_timeout),
                 cpu_timeout=_opt_int(sm, "cpu_timeout", 0),
+                priority=_opt_int(sm, "priority", 0),
                 jobs_flag=_opt_str_or_none(sm, "jobs_flag"),
                 jobs_env=_jobs_env_field(sm, "jobs_env", where),
                 skip_reason=skip_reason,
@@ -1359,6 +1361,7 @@ def _step_to_json(step: Step) -> dict[str, object]:
         # unchanged; absence parses back to 0, keeping round-trip stable. Positioned
         # immediately after `timeout` to match the Rust serializer's key order.
         "cpu_timeout": step.cpu_timeout,
+        "priority": step.priority,
         "jobs_flag": step.jobs_flag,
         "jobs_env": step.jobs_env,
         "skip_reason": step.skip_reason.value if step.skip_reason is not None else None,
@@ -1368,6 +1371,8 @@ def _step_to_json(step: Step) -> dict[str, object]:
         del obj["timeout"]
     if step.cpu_timeout == 0:
         del obj["cpu_timeout"]
+    if step.priority == 0:
+        del obj["priority"]
     if step.cmdtype is CmdType.UNKNOWN:
         del obj["cmdtype"]
     if not step.labels:

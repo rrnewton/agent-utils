@@ -1223,27 +1223,39 @@ fn plan_order(
     est: &HashMap<String, f64>,
     bottom: &HashMap<String, f64>,
 ) -> Vec<String> {
+    // Priority (#860) is the primary dispatch key under every planner; the
+    // planner's own key breaks ties. All-default priorities reproduce the
+    // previous orders exactly.
+    let priority: HashMap<String, i64> = cfg.steps.iter().map(|s| (s.tag(), s.priority)).collect();
     let mut tags: Vec<String> = cfg.steps.iter().map(|s| s.tag()).collect();
     match planner {
         // CPA list-schedules by critical-path order at the allocated weights, so it uses the same
         // bottom-level ordering as CriticalPath (PLANNER_DESIGN.md §5.7).
         Planner::CriticalPath | Planner::Cpa => {
-            // by bottom_level DESC, ties by tag ASC.
+            // by priority DESC, then bottom_level DESC, ties by tag ASC.
             tags.sort_by(|a, b| {
-                let ba = bottom.get(a).copied().unwrap_or(0.0);
-                let bb = bottom.get(b).copied().unwrap_or(0.0);
-                bb.partial_cmp(&ba)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.cmp(b))
+                let pa = priority.get(a).copied().unwrap_or(0);
+                let pb = priority.get(b).copied().unwrap_or(0);
+                pb.cmp(&pa).then_with(|| {
+                    let ba = bottom.get(a).copied().unwrap_or(0.0);
+                    let bb = bottom.get(b).copied().unwrap_or(0.0);
+                    bb.partial_cmp(&ba)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.cmp(b))
+                })
             });
         }
         Planner::GreedyLpt => {
-            // STABLE reverse sort by est (ties keep registration/cfg order), matching Python's
-            // sorted(..., reverse=True). Vec::sort_by is stable.
+            // STABLE reverse sort by (priority, est) (ties keep registration/cfg order),
+            // matching Python's sorted(..., reverse=True). Vec::sort_by is stable.
             tags.sort_by(|a, b| {
-                let ea = est.get(a).copied().unwrap_or(0.0);
-                let eb = est.get(b).copied().unwrap_or(0.0);
-                eb.partial_cmp(&ea).unwrap_or(std::cmp::Ordering::Equal)
+                let pa = priority.get(a).copied().unwrap_or(0);
+                let pb = priority.get(b).copied().unwrap_or(0);
+                pb.cmp(&pa).then_with(|| {
+                    let ea = est.get(a).copied().unwrap_or(0.0);
+                    let eb = est.get(b).copied().unwrap_or(0.0);
+                    eb.partial_cmp(&ea).unwrap_or(std::cmp::Ordering::Equal)
+                })
             });
         }
     }
@@ -2863,6 +2875,7 @@ mod tests {
             delegated_children: false,
             timeout: 1800,
             cpu_timeout: 0,
+            priority: 0,
             jobs_flag: None,
             jobs_env: None,
             skip_reason: None,
@@ -4039,6 +4052,7 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,8,5.0,0,True,False,0,1000
             delegated_children: false,
             timeout: 1800,
             cpu_timeout: 0,
+            priority: 0,
             jobs_flag: None,
             jobs_env: None,
             skip_reason: None,

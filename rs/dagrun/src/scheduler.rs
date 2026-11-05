@@ -1657,10 +1657,16 @@ impl Runner {
         // reverse sort).
         let order: Vec<String> = order_override.unwrap_or_else(|| {
             let mut o: Vec<String> = capped.steps.iter().map(|s| s.tag()).collect();
+            // Priority first (#860), LPT as the tie-break (stable, matching
+            // Python's stable reverse sort).
             o.sort_by(|a, b| {
-                let ea = steps[a].hint.est_duration_s;
-                let eb = steps[b].hint.est_duration_s;
-                eb.partial_cmp(&ea).unwrap_or(std::cmp::Ordering::Equal)
+                let pa = steps[a].priority;
+                let pb = steps[b].priority;
+                pb.cmp(&pa).then_with(|| {
+                    let ea = steps[a].hint.est_duration_s;
+                    let eb = steps[b].hint.est_duration_s;
+                    eb.partial_cmp(&ea).unwrap_or(std::cmp::Ordering::Equal)
+                })
             });
             o
         });
@@ -3736,6 +3742,7 @@ fn run_step(ctx: StepCtx) {
             &[
                 ("step", tag.clone()),
                 ("pid", pid.to_string()),
+                ("priority", step.priority.to_string()),
                 ("timeout_s", wall_budget.to_string()),
                 ("cmd", run_cmd.clone()),
             ],
@@ -6691,6 +6698,7 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
             delegated_children: false,
             timeout: 1800,
             cpu_timeout: 0,
+            priority: 0,
             jobs_flag: None,
             jobs_env: None,
             skip_reason: None,

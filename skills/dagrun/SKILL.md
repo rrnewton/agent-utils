@@ -13,3 +13,8 @@ The installed CLI is the source of truth:
 - `dagrun quickstart`
 - `dagrun --help`
 - `dagrun --userguide`
+
+A step may declare `priority: N` (integer, default 0): among ready steps the
+higher priority dispatches first when slots or resources are short, with the
+planner's order as tie-break. It adds no dependency; all-default priorities
+keep the previous dispatch order exactly.

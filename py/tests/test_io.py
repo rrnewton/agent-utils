@@ -408,6 +408,32 @@ def test_cpu_timeout_roundtrip_and_conditional_emit() -> None:
     assert dag_to_json(dag_from_json(out)) == out
 
 
+def test_priority_roundtrip_conditional_emit_and_schema() -> None:
+    doc = (
+        '{"steps": ['
+        '{"group": "g", "job": "hi", "cmd": "true", "priority": 7},'
+        '{"group": "g", "job": "lo", "cmd": "true"}]}'
+    )
+    cfg = dag_from_json(doc)
+    by_tag = cfg.by_tag()
+    assert by_tag["g.hi"].priority == 7
+    assert by_tag["g.lo"].priority == 0
+
+    out = dag_to_json(cfg)
+    assert out.count('"priority"') == 1
+    assert dag_to_json(dag_from_json(out)) == out
+
+    # Non-integer priorities are schema errors, not silent coercions.
+    with pytest.raises(DagJsonError):
+        dag_from_json(
+            '{"steps": [{"group": "g", "job": "x", "cmd": "true", "priority": 1.5}]}'
+        )
+    with pytest.raises(DagJsonError):
+        dag_from_json(
+            '{"steps": [{"group": "g", "job": "x", "cmd": "true", "priority": "high"}]}'
+        )
+
+
 def test_delegated_children_is_explicit_and_roundtrips() -> None:
     cfg = dag_from_json(
         '{"steps":['

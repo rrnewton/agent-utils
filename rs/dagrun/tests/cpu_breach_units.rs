@@ -133,6 +133,7 @@ fn sleeping_step() -> DagConfig {
         // Generous wall backstop: the CPU guard, not the wall clock, must be what fires.
         timeout: WALL_BUDGET_S,
         cpu_timeout: CPU_BUDGET_S,
+        priority: 0,
         jobs_flag: None,
         jobs_env: None,
         skip_reason: None,

@@ -791,9 +791,14 @@ class Runner:
         if order is not None:
             self.order = list(order)
         else:
+            # Priority first (#860), LPT as the tie-break; the sort is stable,
+            # so all-default priorities keep today's order exactly.
             self.order = sorted(
                 (s.tag for s in self.cfg.steps),
-                key=lambda tag: self.steps[tag].hint.est_duration_s,
+                key=lambda tag: (
+                    self.steps[tag].priority,
+                    self.steps[tag].hint.est_duration_s,
+                ),
                 reverse=True,
             )
         # Remaining capacity per named scarce resource (mutable copy of the caps).
@@ -1650,11 +1655,14 @@ class Runner:
 
         sink = StepStream(step.tag, self.evidence)
         if self.evidence is not None:
+            # The journal's step_start sequence is the dispatch order; each
+            # record also carries the step's priority (#860).
             self.evidence.record(
                 "step_start",
                 [
                     ("step", step.tag),
                     ("pid", str(proc.pid)),
+                    ("priority", str(step.priority)),
                     ("timeout_s", str(wall_budget)),
                     ("cmd", run_cmd),
                 ],

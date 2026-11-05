@@ -1667,6 +1667,7 @@ mod tests {
             delegated_children: false,
             timeout: 0,
             cpu_timeout: 0,
+            priority: 0,
             jobs_flag: None,
             jobs_env: None,
             manifest: None,
