@@ -1212,6 +1212,36 @@ impl Store {
         Ok(true)
     }
 
+    /// Cancel every live job whose candidate does not contain `base` (the queue's current
+    /// base): it can never land as published, so offering it again only burns a donor's
+    /// setup time on a stale-base refusal. A stale job is not a donor failure: no
+    /// could-not-run strike is recorded. `contains(commit)` answers whether that candidate
+    /// contains `base`. Returns the cancelled ids.
+    pub fn sweep_stale(
+        &self,
+        base: &str,
+        contains: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<String>, String> {
+        let reason = format!(
+            "stale: the base moved to {}, which its candidate does not contain",
+            crate::plan::short(base)
+        );
+        let stale: Vec<String> = self
+            .jobs()?
+            .into_iter()
+            .filter(|job| matches!(job.state, JobState::Queued | JobState::Leased))
+            .filter(|job| !contains(&job.commit))
+            .map(|job| job.id)
+            .collect();
+        let mut cancelled = Vec::new();
+        for id in stale {
+            if self.cancel_live(&id, &reason)? {
+                cancelled.push(id);
+            }
+        }
+        Ok(cancelled)
+    }
+
     /// The queue no longer wants job `id`'s candidate, in compare mode: a queued job is
     /// cancelled, a leased one is kept for its donor (see [`Job::candidate_gone`]). Returns
     /// whether the job changed.
@@ -2135,6 +2165,34 @@ mod unit {
             exit: Some(0),
             ..Receipt::default()
         }
+    }
+
+    #[test]
+    fn a_stale_job_is_cancelled_by_the_sweep_and_never_claimed() {
+        let store = Store::new(&temp("stale-sweep"));
+        let stale = publish(&store, "c1");
+        let fresh = publish(&store, "c2");
+        let cancelled = store
+            .sweep_stale("base99", &|commit| commit == "c2")
+            .unwrap();
+        assert_eq!(cancelled, vec![stale.id.clone()]);
+        let job = store.read(&stale.id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert!(
+            job.history
+                .join("\n")
+                .contains("stale: the base moved to base99"),
+            "{:?}",
+            job.history
+        );
+        assert!(job.could_not_run.is_empty(), "stale is not a donor failure");
+        // The sweep is idempotent, and the fresh job is still claimable.
+        assert!(store
+            .sweep_stale("base99", &|commit| commit == "c2")
+            .unwrap()
+            .is_empty());
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("the fresh job");
+        assert_eq!(claimed.id, fresh.id);
     }
 
     #[test]

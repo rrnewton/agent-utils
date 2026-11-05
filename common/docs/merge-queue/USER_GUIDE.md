@@ -1355,6 +1355,13 @@ again. In `decide` mode a job no donor takes within `donors.claim_timeout_secs` 
 with an error that asks whether a donor is running and whether its tools match. Nothing is
 ejected either way.
 
+**Stale jobs.** A published candidate is built on the base at publish time. Once the base
+moves to a commit the candidate does not contain, the job can never land as published: the
+queue cancels it as `stale: the base moved to <base>, which its candidate does not contain`
+when a run settles its jobs, and a claim sweeps stale jobs before leasing anything, so a
+donor never spends its setup on one. Stale is not a donor failure and counts toward no
+could-not-run bound.
+
 ## Using it on a repository validated by a dagrun DAG
 
 ```sh

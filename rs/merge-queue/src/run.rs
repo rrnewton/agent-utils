@@ -3172,20 +3172,32 @@ impl<'a> Runner<'a> {
         published.retain(|(id, commit)| {
             let landed = !base.is_empty()
                 && (*commit == base || self.git.is_ancestor(commit, &base).unwrap_or(false));
+            // A candidate that does not contain the current base can never land as
+            // published: cancel it now instead of letting donors re-lease it into
+            // stale-base refusals.
+            let stale =
+                !base.is_empty() && !landed && !self.git.is_ancestor(&base, commit).unwrap_or(true);
             let reason = if landed {
-                crate::donor::CANDIDATE_LANDED
+                crate::donor::CANDIDATE_LANDED.to_owned()
+            } else if stale {
+                format!(
+                    "stale: the base moved to {}, which its candidate does not contain",
+                    short(&base)
+                )
             } else if ended {
                 "superseded: the run that published it ended without landing its candidate"
+                    .to_owned()
             } else {
                 return true;
             };
             // In compare mode the receipt for a landed candidate can still be compared (it
             // cannot affect landing), so a leased job is kept for its donor. A candidate that
             // did not land (ejected, or left to the next run) is not worth a donor's time.
+            // A stale candidate's receipt compares nothing, so it is cancelled either way.
             let retired = if donors.mode == crate::state::Offload::Compare && landed {
-                donors.store.retire(id, reason)
+                donors.store.retire(id, &reason)
             } else {
-                donors.store.cancel_live(id, reason)
+                donors.store.cancel_live(id, &reason)
             };
             match retired {
                 Ok(true) => self.event("donor", &format!("job {id} retired: {reason}")),

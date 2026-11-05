@@ -266,6 +266,27 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
                     )
                 }
             }
+            // Freshness before setup: never hand out a job whose candidate no longer
+            // contains the current base. It is cancelled as stale here, not refused by
+            // the donor after its expensive setup, and costs the donor no strike.
+            {
+                let git = crate::git::Git::new(&config.repo);
+                if let Ok((base, _)) = crate::ops::refresh(&git, &config, &[]) {
+                    let contains = |commit: &str| git.is_ancestor(&base, commit).unwrap_or(true);
+                    match store.sweep_stale(&base, &contains) {
+                        Ok(cancelled) if !cancelled.is_empty() => eprintln!(
+                            "merge-queue donor claim: cancelled {} stale donor job(s) \
+                             whose candidate does not contain {}",
+                            cancelled.len(),
+                            crate::plan::short(&base)
+                        ),
+                        Ok(_) => {}
+                        Err(error) => {
+                            eprintln!("merge-queue donor claim: stale sweep failed: {error}")
+                        }
+                    }
+                }
+            }
             let job = store.claim(&donor, &host, jobs)?;
             let text = serde_json::to_string(&crate::donor::Claimed { job })
                 .map_err(|error| error.to_string())?;

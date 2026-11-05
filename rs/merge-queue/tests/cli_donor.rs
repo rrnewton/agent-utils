@@ -1241,3 +1241,46 @@ fn compare_only_donors_compare_in_decide_mode_and_never_decide() {
     assert_eq!(main["receipt"]["donor"]["name"], "d1", "{main}");
     assert_eq!(main["comparison"], "match", "{main}");
 }
+
+#[test]
+fn a_job_whose_candidate_no_longer_contains_the_base_is_cancelled_at_claim_time() {
+    let fx = Fixture::new("donor-stale-claim");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "decide",
+    ]);
+    two_changes(&fx);
+    let mut run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    // The run dies without settling the job; meanwhile the base moves past its candidate.
+    run.kill().unwrap();
+    run.wait().unwrap();
+    assert_eq!(jobs(&fx)[0]["state"], "queued");
+    fx.write("moved.txt", "moved\n");
+    fx.commit_all("move the base");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    // A donor asking for work triggers the freshness sweep: the job is cancelled as
+    // stale, never leased, and the donor is told nothing to do.
+    let clone = donor_clone(&fx, "donor-host");
+    let out = donor(&fx, &clone, "d1", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let job = &jobs(&fx)[0];
+    assert_eq!(job["state"], "cancelled", "{job}");
+    assert!(
+        job["history"]
+            .to_string()
+            .contains("stale: the base moved to"),
+        "{job}"
+    );
+}
