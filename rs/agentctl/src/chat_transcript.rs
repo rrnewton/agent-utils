@@ -99,6 +99,10 @@ pub(crate) struct ReplySource {
     /// A conversation a live process names, for a Claude Code record that names none: the owner
     /// loop binds it into the record.
     pub(crate) unbound_session: Option<String>,
+    /// Whether the target is an agentcloud session, whose replies the bridge reads from the
+    /// session's own history (`agentcloudctl history`) rather than from a screen.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) session_history: bool,
 }
 
 /// The [`ReplySource`] the transcript reader shares with the owner loop: `None` until the first
@@ -108,6 +112,12 @@ pub(crate) type SharedReplySource = Arc<Mutex<Option<ReplySource>>>;
 /// The agent a reader made by [`CoordinatorTranscript::for_agent`] follows: `None` while the
 /// bridge serves a headless agent, whose transcript it does not read.
 type SharedTarget = Arc<Mutex<Option<String>>>;
+
+/// The evidence recorded for an agentcloud target, whose replies come from its session history.
+pub(crate) const CLOUD_EVIDENCE: &str =
+    "the target is an agentcloud session: the bridge reads its \
+     replies from the session's own history (`agentcloudctl history`), and through `agentctl chat \
+     reply`";
 
 /// The evidence recorded while the reader rests for a headless target.
 pub(crate) const HEADLESS_EVIDENCE: &str = "the target is headless: the bridge reads no screen or \
@@ -300,6 +310,23 @@ impl CoordinatorTranscript {
                 "agentctl: no transcript of the coordinator was found; replies keep the \
                         text read from its screen"
             };
+            // An agentcloud session's replies come from the session's own history, which the
+            // bridge reads in place of a screen (`ManagedAgents::read_capture`).
+            let cloud =
+                crate::harness::HarnessAdapter::name(&crate::harness::agentcloud::AgentCloud);
+            if unread_harness.as_deref() == Some(cloud) {
+                self.share(ReplySource {
+                    evidence: CLOUD_EVIDENCE.to_owned(),
+                    session_history: true,
+                    ..ReplySource::default()
+                });
+                self.report(
+                    "agentctl: the coordinator is an agentcloud session; replies are read from \
+                     its session history"
+                        .to_owned(),
+                );
+                return;
+            }
             let evidence = match unread_harness {
                 Some(harness) => format!(
                     "the target's harness ({harness}) writes no transcript agentctl reads: its \
@@ -322,6 +349,7 @@ impl CoordinatorTranscript {
             evidence: found.evidence.clone(),
             discovered,
             unbound_session: bind,
+            session_history: false,
         });
         if self
             .follower
@@ -800,6 +828,44 @@ mod tests {
     }
 
     #[test]
+    fn an_agentcloud_targets_replies_come_from_its_session_history() {
+        // An agentcloud session writes no local transcript: the bridge reads its replies from the
+        // session's own history in place of a screen (`ManagedAgents::read_capture`), so the
+        // source says so, and nothing is followed that would hold those replies back.
+        let root = scratch("cloud-target");
+        let registry = registry_with(
+            &root,
+            &serde_json::json!({"harness": "agentcloud", "cwd": "/work", "pane_id": "wJ:p1"}),
+        );
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let source = SharedReplySource::default();
+        let mut reader = CoordinatorTranscript::for_agent(
+            registry,
+            Some("coord".to_owned()),
+            Box::new({
+                let logs = Arc::clone(&logs);
+                move |line| logs.lock().unwrap().push(line)
+            }),
+            Box::new(Vec::new),
+            Arc::clone(&source),
+        );
+        assert!(reader.blocks().is_empty());
+        assert!(!reader.following());
+        let found = source.lock().unwrap().clone().unwrap();
+        assert!(found.session_history);
+        assert_eq!(found.path, None);
+        assert_eq!(found.evidence, CLOUD_EVIDENCE);
+        assert!(logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("replies are read from its session history")));
+        let saved = serde_json::to_value(&found).unwrap();
+        assert_eq!(saved["session_history"], true);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn a_target_whose_harness_writes_no_transcript_replies_through_its_screen() {
         // #852 unknown-tui-bridge: an agent driven by the generic screen rules has no transcript
         // agentctl reads, so its reply text comes from its screen, and the source says so.
@@ -1125,6 +1191,7 @@ mod tests {
                 evidence: "process 4242 names it".to_owned(),
                 discovered: true,
                 unbound_session: Some("s-live".to_owned()),
+                session_history: false,
             })
         );
         assert!(logs.lock().unwrap()[0].contains("discovered"));

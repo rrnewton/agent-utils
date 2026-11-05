@@ -902,7 +902,11 @@ with `--harness unknown`, replies through its screen: `chat health` says
 `reply text: the screen only: the target's harness (unknown) writes no
 transcript agentctl reads ...`, and never names another agent's transcript (a
 `reply-source.json` written for the previous agent reads `not looked for yet`
-until the service records the new one).
+until the service records the new one). An agentcloud target has no local
+transcript or screen to read: its replies come from the session's own history
+(`agentcloudctl history`), which the bridge reads where it reads a screen for
+other targets, and `chat health` says `reply text: the agentcloud session's
+history: ...`.
 
 Its screen is read in the layout above even when its program draws it
 differently. A screen whose every row starts one or more columns in, with turns

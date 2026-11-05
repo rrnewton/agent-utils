@@ -16034,6 +16034,7 @@ esac
             evidence: "process 7 names it".into(),
             discovered: false,
             unbound_session: None,
+            session_history: false,
         });
         let state = state
             .with_transcript_replies(Box::new(FollowedEmpty))
@@ -16093,6 +16094,7 @@ esac
             evidence: "process 7 names it".into(),
             discovered: true,
             unbound_session: None,
+            session_history: false,
         });
         let state = state
             .with_transcript_replies(Box::new(HeldBlocks(vec![chat_runtime::TranscriptBlock {

@@ -841,6 +841,10 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
                         ""
                     }
                 ),
+                None if source["session_history"] == Value::Bool(true) => format!(
+                    "the agentcloud session's history: {}",
+                    source["evidence"].as_str().unwrap_or("?")
+                ),
                 None => format!(
                     "the screen only: {}",
                     source["evidence"]
@@ -1095,6 +1099,27 @@ mod tests {
             "{}",
             health.text
         );
+        // An agentcloud target's replies come from its session history, and health says so.
+        let health = assess(
+            Observed {
+                reply_source: Some(json!({
+                    "agent": "coord",
+                    "source": {"path": null, "evidence": crate::chat_transcript::CLOUD_EVIDENCE,
+                               "discovered": false, "session_history": true},
+                    "capture_misses": [],
+                })),
+                ..healthy()
+            },
+            options(),
+        );
+        assert!(
+            health.text.contains(
+                "reply text: the agentcloud session's history: the target is an agentcloud session"
+            ),
+            "{}",
+            health.text
+        );
+        assert!(!health.text.contains("the screen only"), "{}", health.text);
         // The same record written for this agent is shown.
         let health = assess(
             Observed {
