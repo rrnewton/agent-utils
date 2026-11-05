@@ -20,6 +20,7 @@ Generic, configured per registry (for example in the watcher's config):
 3. Dedupe by (agent, heading hash), and keep a delivery record.
 
 Heading parsing and ack rules: port the rules of the consumer's existing respond-please watcher script (read it in that team's checkout); do not import its code.
+4. (Owner addition, 2026-11-04 22:19 ET.) When the designated coordinator runs `agentctl send <lane>`, the output ends with the open status-file requests still waiting, one entry each (lane, age, heading excerpt), for example "3 more waiting: A 12m (...), B 4m (...)", or "0 waiting". A new `agentctl requests` command prints the same list. Same parser and ack rules as the watcher. Each reply must remind the coordinator of the remaining requests BY NAME, never as a bare count.
 
 # Acceptance Criteria
 
@@ -30,6 +31,7 @@ Heading parsing and ack rules: port the rules of the consumer's existing respond
   - working -> idle with an open request -> an immediate page;
   - dedupe;
   - never typed into a jammed pane (#844 routing).
+- `agentctl send` (as coordinator) ends with the named waiting list, and "0 waiting" when empty; `agentctl requests` prints the same list; tests for both.
 - Config documented in the userguide; gate passes. First deployment: the other team's registry on the lead host.
 
 # Notes
