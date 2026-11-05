@@ -11,6 +11,8 @@ export { outgoingFromSaved, savedWire } from "./saved.ts";
 export type { OutgoingEntry, OutgoingPart, OutgoingWire } from "./saved.ts";
 export { QUICK_DRAFTS_KEY, createChannelDrafts } from "./drafts.ts";
 export { createOutboxPump, createSendNumbers } from "./pump.ts";
+export { INBOX_PAGE_GONE_MS, INBOX_WRITES_KEY, createInboxWriteLedger, inboxRetryWait, retryingWrite, transientWriteFailure } from "./inboxwrites.ts";
+export type { InboxWriteKind, InboxWriteLedger, InboxWriteLedgerDependencies, PendingInboxWrite, RetryDependencies, WriteFailure } from "./inboxwrites.ts";
 export type { OutboxPump, SendNumbers } from "./pump.ts";
 export { DRAFT_LEDGER_KEY, createDraftLedger, createDraftRound, draftIdentity } from "./draftledger.ts";
 export type { DraftEntry, DraftKind, DraftLedger, DraftLedgerDependencies, DraftRound } from "./draftledger.ts";

@@ -9205,6 +9205,8 @@ function forgetMessages() {
   dropMessageCache();
   clearChannelScreen();
   forgetBookmarks();
+  // `#892 voice-page-optimistic-done`. Nor the Done writes it kept to send again.
+  inboxLedger.clear();
   // ...nor where the reader was in it: the record names a thread this credential read, and the
   // next one opens the channel as a first visit does. `#189 restore-ui-state`.
   uiState.forget();
@@ -12379,7 +12381,7 @@ async function writeInBatches(route, ids, landed) {
   const stored = [];
   for (let start = 0; start < ids.length; start += DISMISS_BATCH) {
     const batch = ids.slice(start, start + DISMISS_BATCH);
-    const part = await api(route, { method: "POST", body: { messages: batch } });
+    const part = await inboxPost(route, { messages: batch });
     landed.push(...batch);
     stored.push(...((part && part.messages) || batch).map(String));
   }
@@ -22252,6 +22254,87 @@ function queueInboxWrite(task) {
   return inboxWrites.run(task);
 }
 
+// --- Done and its put back, kept until the server has them ---------------------------------------
+//
+// `#892 voice-page-optimistic-done`. The owner: "This comes back to our model of local state plus
+// synchronization." A Done or a put back is drawn the moment it is made, and its write is kept on the
+// device until the server has answered it (web/src/core/outbox `createInboxWriteLedger`). A write the
+// server never heard (offline, a dropped connection, a proxy answering for a restarting server) goes again
+// by itself, 1 s, then doubling to every 30 s, in order, the writes behind it waiting behind it
+// (`inboxPost`); the status line says so once, and takes it back once it is answered. A page closed
+// meanwhile sends what it kept when it next opens, or once the connection comes back, and reads the channel
+// again once the server has it (`sendLeftOverInboxWrites`); a page still open on the device, sending its own,
+// is left to send them, and a page going hands its own over at once (`inboxLedger.leave`). What the server
+// answers and refuses is taken back as it always was. Writing a Done twice is safe where sending a message
+// twice is not: the server keeps a set.
+
+/** The Done and put-back writes not yet answered, kept on the device. */
+const inboxLedger = createInboxWriteLedger({
+  storage: deviceStorageOnUse(),
+  now: () => Date.now(),
+  makeRoom: () => dropMessageCache(),
+  // This page load's own name, as the back stack's (`BACK_SESSION`): another page open on the device keeps
+  // its own writes.
+  page: BACK_SESSION,
+});
+
+/** Whose writes are made now: the credential's fingerprint, never the credential. */
+function inboxWriteOwner() {
+  try {
+    return tokenFingerprint(token());
+  } catch (_error) {
+    return "";
+  }
+}
+
+/** What the status line says while a write the server has not answered waits to go again. */
+const INBOX_WAITING_WORDS = "Kept on this device: the server has not answered, and it goes again by itself.";
+
+/**
+ * POST `body` to `route`, again by itself while the server does not answer (`retryingWrite`): the server's
+ * answer, or its refusal thrown. Said once on the status line while it waits, and taken back once answered,
+ * if nothing was said since.
+ *
+ * @param {string} route
+ * @param {unknown} body
+ */
+async function inboxPost(route, body) {
+  let waited = false;
+  try {
+    const answer = await retryingWrite(() => api(route, { method: "POST", body }), {
+      wait: (ms) => new Promise((resolve) => { clockOnUse().setTimeout(resolve, ms); }),
+      waiting: () => {
+        // Still here, and still sending: another page open on the device leaves these writes to this one.
+        inboxLedger.beat();
+        if (!waited) setStatus(INBOX_WAITING_WORDS);
+        waited = true;
+      },
+    });
+    // Answered after the server had gone quiet: the writes a page that went meanwhile left can go too.
+    if (waited) sendLeftOverInboxWrites();
+    return answer;
+  } finally {
+    if (waited && statusSays(INBOX_WAITING_WORDS)) dismissStatus();
+  }
+}
+
+/**
+ * Send the writes a page closed before the server answered, oldest first, behind any made since, and read
+ * the channel on screen again once the server has one of its own (`#892 voice-page-optimistic-done`). Each
+ * is kept until answered, as a write made here is. Only this credential's, and none older than a day.
+ */
+function sendLeftOverInboxWrites() {
+  for (const left of inboxLedger.takeLeftOver(inboxWriteOwner())) {
+    const kept = inboxLedger.add(left.kind, left.channel, left.messages, left.owner, left.at);
+    const route = `/api/v1/channels/${encodeURIComponent(left.channel)}/${left.kind}`;
+    queueInboxWrite(() => writeInBatches(route, [...left.messages], []))
+      .then(() => {
+        if (String(selectedChannelId()) === left.channel) refreshAfterLiveMutation();
+      }, () => {})
+      .finally(() => inboxLedger.settle(kept));
+  }
+}
+
 // --- what a refused Done or put back takes back --------------------------------------------------
 //
 // `#326 refused-undo-restores-done`. Found in the final reviews of #306 done-stale-across-views and
@@ -22462,6 +22545,8 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   let payload;
   /** The ids of the batches the server has taken, when there are several. */
   const landed = [];
+  /** The write as kept on the device until answered (`inboxLedger`, `#892 voice-page-optimistic-done`). */
+  let kept = null;
   try {
     held = markHeldDone(requested, true, doneSettlesHere());
     mirrored = mirrorArchived(requested, true);
@@ -22478,10 +22563,11 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     setStatus(saidAtOnce);
     await refreshAfterInboxChange();
     renderTodoControls();
+    kept = inboxLedger.add("dismiss", channel, body.messages ? body.messages.map(String) : requested, inboxWriteOwner());
     const writing = queueInboxWrite(async () => {
       const route = `/api/v1/channels/${encodeURIComponent(channel)}/dismiss`;
       if (!body.messages || body.messages.length <= DISMISS_BATCH) {
-        return api(route, { method: "POST", body });
+        return inboxPost(route, body);
       }
       // `#202 read-through-here`: "through here" over a long list names more ids than one request
       // may carry, so it goes in batches, and the undo covers all of them.
@@ -22532,6 +22618,8 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     if (landed.length > 0) error.landed = landed.length;
     throw error;
   } finally {
+    // Answered, taken or refused: no longer kept on the device to send again.
+    if (kept !== null) inboxLedger.settle(kept);
     // Once a failure has been taken back, so what waits on it (`doneSaved`) finds the messages put
     // back. It runs after the lines below, which leave the Done as it is.
     saved();
@@ -22613,6 +22701,8 @@ async function restoreMessages(ids) {
   let settled = false;
   /** The ids of the batches the server has taken. */
   const landed = [];
+  /** The write as kept on the device until answered (`inboxLedger`, `#892 voice-page-optimistic-done`). */
+  let kept = null;
   try {
     // `#245 done-feedback`. Unread again, so no longer being drawn as just marked Done: the Undo chip
     // and z (`undoDismissal`) and the row's own button (`toggleArchived`) all come through here.
@@ -22631,6 +22721,7 @@ async function restoreMessages(ids) {
     setStatus(saidBack);
     await refreshAfterInboxChange();
     renderTodoControls();
+    kept = inboxLedger.add("restore", channel, restored, inboxWriteOwner());
     // In batches the server accepts, as the dismissal that made them went: the undo of a long Done
     // through here names more ids than one request may carry. `#240 reading-bookmark`.
     const writing = queueInboxWrite(() => writeInBatches(`/api/v1/channels/${encodeURIComponent(channel)}/restore`,
@@ -22681,6 +22772,8 @@ async function restoreMessages(ids) {
     if (landed.length > 0) error.landed = landed.length;
     throw error;
   } finally {
+    // Answered, taken or refused: no longer kept on the device to send again.
+    if (kept !== null) inboxLedger.settle(kept);
     // Refused, once taken back, so what waits on it finds the messages as the server holds them.
     saving();
   }
@@ -24632,8 +24725,13 @@ function doneHeldHere(ids) {
  */
 async function markAnsweredDone(channel, id) {
   if (channel !== String(selectedChannelId())) {
-    await queueInboxWrite(() => api(`/api/v1/channels/${encodeURIComponent(channel)}/dismiss`,
-      { method: "POST", body: { messages: [id] } }));
+    // Kept until answered, and sent again while unheard, as every Done is (`#892 voice-page-optimistic-done`).
+    const kept = inboxLedger.add("dismiss", channel, [String(id)], inboxWriteOwner());
+    try {
+      await queueInboxWrite(() => inboxPost(`/api/v1/channels/${encodeURIComponent(channel)}/dismiss`, { messages: [id] }));
+    } finally {
+      inboxLedger.settle(kept);
+    }
     return true;
   }
   const found = answeredRow(id);
@@ -30924,6 +31022,11 @@ replyDrafts.load();
 // `#500 sent-receipts-pile-up`. Before the outbox, whose confirmed sends are no longer saved.
 loadOwnPosts();
 loadOutgoingMessages();
+// `#892 voice-page-optimistic-done`. The Done writes a page closed before the server had them: now, when the
+// connection comes back, and whenever a write of this page's is answered. A page going hands its own over.
+sendLeftOverInboxWrites();
+window.addEventListener("online", () => sendLeftOverInboxWrites());
+window.addEventListener("pagehide", () => inboxLedger.leave());
 // `#193 compose-draft-loss`. What was dismissed from the outbox in the last days, for Settings.
 loadDismissedSends();
 dismissedSendsView.render();

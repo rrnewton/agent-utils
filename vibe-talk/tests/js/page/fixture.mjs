@@ -5066,6 +5066,10 @@ const TUNING_BANDS = {
   // `#892 voice-page-optimistic-done`. How many keys' timings are kept for a look back from the console:
   // enough for a run of presses to compare, few enough that a page left timing for a day holds nothing much.
   KEY_TIMINGS_KEPT: [20, 1000, "keys timed and kept for the console, while key timing is on"],
+  // `#892 voice-page-optimistic-done`. A Done the server never heard goes again by itself: soon enough
+  // that a dropped connection costs a moment, never so often that an hour offline is a request a second.
+  INBOX_RETRY_FIRST_MS: [250, 5000, "the first wait before a Done the server never heard goes again"],
+  INBOX_RETRY_MAX_MS: [10000, 120000, "the longest wait between attempts of a Done the server never heard"],
   // `#595 cache-full-history`. Not a tuning at all: the value the server's contract sends as
   // `max_days` for no age limit. Any other would read a real limit as none, or none as 65535 days.
   SERVER_CACHE_NO_AGE_LIMIT: [65535, 65535,

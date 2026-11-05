@@ -501,3 +501,89 @@ test("unconfirmed sends: every id in the outbox asked once per load, a later cal
   sends.settleOnce();
   assert.deepStrictEqual(asked, ["a", "b"], "once per load");
 });
+
+test("`#892 voice-page-optimistic-done`: the Done writes not yet answered are kept on the device, each page its own, and handed over once a page has gone: its owner's, none older than a day", () => {
+  const { createInboxWriteLedger, INBOX_WRITES_KEY, INBOX_PAGE_GONE_MS } = OUTBOX;
+  const kept = new Map();
+  const storage = { getItem: (k) => kept.get(k) ?? null, setItem: (k, v) => kept.set(k, v), removeItem: (k) => kept.delete(k) };
+  let now = 1_000_000_000;
+  let roomMade = 0;
+  const ledgerOf = (page, store = storage) => createInboxWriteLedger({ storage: store, now: () => now, makeRoom: () => { roomMade += 1; }, page });
+  const saved = () => (JSON.parse(kept.get(INBOX_WRITES_KEY) || "{}").writes || []).map((one) => [one.page, one.kind, one.messages, one.owner]);
+  const a = ledgerOf("a");
+  const done = a.add("dismiss", "c1", ["1", "2"], "me");
+  const back = a.add("restore", "c1", ["2"], "me");
+  assert.notEqual(done, back, "two writes were given one id");
+  assert.deepStrictEqual(saved(), [["a", "dismiss", ["1", "2"], "me"], ["a", "restore", ["2"], "me"]], "a write was not on the device at once, in order");
+  a.settle(done);
+  assert.deepStrictEqual(saved(), [["a", "restore", ["2"], "me"]], "an answered write is still kept");
+  assert.equal(a.size(), 1);
+
+  // Page b opens beside a, which is still here: a's writes are a's, and b's own go beside them.
+  const b = ledgerOf("b");
+  assert.deepStrictEqual(b.takeLeftOver("me"), [], "a page took the writes of a page still here");
+  b.add("dismiss", "c1", ["3"], "me");
+  assert.deepStrictEqual(saved(), [["a", "restore", ["2"], "me"], ["b", "dismiss", ["3"], "me"]], "one page's write wrote over another's");
+  // a goes quiet past the limit, still signing while it sends (`beat`) until then.
+  now += INBOX_PAGE_GONE_MS;
+  a.beat();
+  assert.deepStrictEqual(ledgerOf("c").takeLeftOver("me"), [], "a page that signed just now was taken for gone");
+  now += INBOX_PAGE_GONE_MS + 1;
+  b.beat();
+  const c = ledgerOf("c");
+  const left = c.takeLeftOver("me");
+  assert.deepStrictEqual(left.map((one) => [one.page, one.messages]), [["a", ["2"]]], "the writes of a page gone quiet were not handed over");
+  assert.deepStrictEqual(saved(), [["b", "dismiss", ["3"], "me"]], "a page still here lost its writes, or a taken one stayed");
+  assert.deepStrictEqual(ledgerOf("d").takeLeftOver("me"), [], "what was left over was handed over twice");
+  // Kept again as it is sent, under the time it was first made, so a write never outlives its day.
+  c.add(left[0].kind, left[0].channel, left[0].messages, left[0].owner, left[0].at);
+  assert.equal(JSON.parse(kept.get(INBOX_WRITES_KEY)).writes.at(-1).at, left[0].at, "a write sent again took a new birthday");
+  // A page going hands its own over at once.
+  b.leave();
+  assert.deepStrictEqual(ledgerOf("e").takeLeftOver("me").map((one) => one.messages), [["3"]], "a page that left kept its writes from the next");
+
+  // Only the owner's, none stale, none malformed; the rest forgotten.
+  kept.set(INBOX_WRITES_KEY, JSON.stringify({ beats: {}, writes: [
+    { id: "w1", kind: "dismiss", channel: "c1", messages: ["7"], at: now - 1000, owner: "me", page: "old" },
+    { id: "w2", kind: "dismiss", channel: "c1", messages: ["8"], at: now - 1000, owner: "someone else", page: "old" },
+    { id: "w3", kind: "dismiss", channel: "c1", messages: ["9"], at: now - 25 * 60 * 60 * 1000, owner: "me", page: "old" },
+    { id: "w4", kind: "sideways", channel: "c1", messages: ["10"], at: now, owner: "me", page: "old" },
+    { id: "w5", kind: "restore", channel: "c2", messages: [], at: now, owner: "me", page: "old" },
+  ] }));
+  assert.deepStrictEqual(ledgerOf("f").takeLeftOver("me").map((one) => one.id), ["w1"], "another owner's, a stale or a malformed write was handed over");
+  assert.deepStrictEqual(saved(), [], "what was not handed over was kept");
+  const g = ledgerOf("g");
+  g.add("dismiss", "c1", ["11"], "me");
+  g.clear();
+  assert.deepStrictEqual(saved(), [], "another credential found this one's writes");
+
+  // A full device: room is made once, and the write kept after it.
+  let full = true;
+  const tight = { getItem: storage.getItem, removeItem: storage.removeItem,
+    setItem: (k, v) => { if (full) { full = false; throw new Error("QuotaExceededError"); } kept.set(k, v); } };
+  ledgerOf("h", tight).add("dismiss", "c1", ["13"], "me");
+  assert.equal(roomMade, 1, "a full device did not make room");
+  assert.deepStrictEqual(saved().at(-1), ["h", "dismiss", ["13"], "me"], "the write was not kept once room was made");
+});
+
+test("`#892 voice-page-optimistic-done`: a write the server never answered goes again by itself, waiting 1 s and doubling to 30 s; the server's own refusal is thrown at once", async () => {
+  const { retryingWrite, transientWriteFailure, inboxRetryWait } = OUTBOX;
+  assert.deepStrictEqual([1, 2, 3, 4, 5, 6, 7, 20].map(inboxRetryWait), [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
+  assert.equal(transientWriteFailure({ network: true }), true, "a request that never reached the server does not go again");
+  assert.equal(transientWriteFailure({ gatewayStatus: 502 }), true, "a proxy's page in the server's place does not go again");
+  for (const status of [408, 429, 503, 504]) assert.equal(transientWriteFailure({ status }), true, `${status} does not go again`);
+  for (const status of [400, 401, 403, 404, 409, 500, 502]) assert.equal(transientWriteFailure({ status }), false, `the server's ${status} went again instead of being taken back`);
+  assert.equal(transientWriteFailure(null), false);
+  const waits = [];
+  const waiting = [];
+  let failures = [{ network: true }, { status: 503 }];
+  const answer = await retryingWrite(async () => {
+    const failure = failures.shift();
+    if (failure) throw Object.assign(new Error("unanswered"), failure);
+    return "taken";
+  }, { wait: async (ms) => { waits.push(ms); }, waiting: (_error, attempt) => waiting.push(attempt) });
+  assert.deepStrictEqual([answer, waits, waiting], ["taken", [1000, 2000], [1, 2]]);
+  failures = [{ network: true }, { status: 502 }];
+  await assert.rejects(retryingWrite(async () => { throw Object.assign(new Error("refused"), failures.shift()); },
+    { wait: async () => {}, waiting: () => {} }), /refused/, "the server's refusal was not thrown");
+});

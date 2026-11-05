@@ -3698,3 +3698,110 @@ test("`#892 voice-page-optimistic-done`: e and Undo say what they did at once, w
   assert.equal(page.el("error").hidden, false, "a refused Done said nothing");
   assert.equal(page.el("status-line").hidden, true, "a refused Done left the line saying it was marked");
 });
+
+// --- Done kept until the server has it (`#892 voice-page-optimistic-done`) ------------------------------
+//
+// "This comes back to our model of local state plus synchronization." A Done the server never heard is not
+// taken back: it is kept on the device, goes again by itself in order, and is sent by the next page to open
+// if this one closes first. One the server answered and refused is taken back, as the tests above say.
+
+/** What the device keeps of the Done writes not yet answered. */
+const keptWrites = (page) => JSON.parse(page.storage.get("vibe-talk.inbox-writes") || "{}").writes || [];
+
+/** The words the status line says while a write the server has not answered waits to go again. */
+const WAITING = "Kept on this device: the server has not answered, and it goes again by itself.";
+
+test("`#892 voice-page-optimistic-done`: a Done the server never heard stays drawn and kept, goes again by itself, and the Done behind it waits its turn", async () => {
+  const page = await keyboardPageAtTop();
+  let down = 2;
+  page.inboxWriteHook = async () => {
+    if (down > 0) {
+      down -= 1;
+      throw new TypeError("Failed to fetch");
+    }
+    return null;
+  };
+  void doneButton(channelRow(page, "2")).click();
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: ["2"] }], "the premise is the Done sent once and unheard");
+  assert.equal(channelRow(page, "2").getAttribute("data-archived"), "true", "a Done the server never heard was taken back");
+  assert.equal(page.el("error").hidden, true, "a Done that goes again by itself was said as a failure");
+  assert.equal(page.el("status").textContent, WAITING, "a Done waiting to go again said nothing");
+  assert.deepStrictEqual(keptWrites(page).map((one) => [one.kind, one.messages]), [["dismiss", ["2"]]],
+    "the Done was not kept on the device");
+  // Another Done meanwhile waits behind it: the server hears them in the order they were made.
+  void doneButton(channelRow(page, "3")).click();
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.equal(page.dismissCalls.length, 1, "a later Done went ahead of one waiting to go again");
+  assert.equal(channelRow(page, "3").getAttribute("data-archived"), "true", "a Done behind a waiting one was not drawn");
+  assert.equal(page.expireTimers(1000), 1, "nothing sends the Done again after a second");
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.equal(page.dismissCalls.length, 2, "the Done did not go again");
+  assert.equal(page.expireTimers(2000), 1, "the second wait is not twice the first");
+  for (let i = 0; i < 6; i += 1) await page.settle();
+  assert.deepStrictEqual(page.dismissCalls.slice(2), [{ messages: ["2"] }, { messages: ["3"] }],
+    "once heard, the Done and the one behind it did not go in order");
+  assert.equal(page.dealtWith.has("2") && page.dealtWith.has("3"), true, "the server never had the Dones");
+  assert.deepStrictEqual(keptWrites(page), [], "a Done the server has is still kept on the device");
+  assert.equal(page.el("status").textContent === WAITING && !page.el("status-line").hidden, false,
+    "the line still says the Done is waiting once the server has it");
+  assert.equal(channelRow(page, "2").getAttribute("data-archived"), "true");
+
+  // THE CONTROL: with an unheard Done taken for the server's answer, it is taken back, as a refusal is.
+  const refused = newPage(new Map(), await brokenModule([{ file: "src/core/outbox/inboxwrites.ts",
+    find: "  if (error.network === true || (Number(error.gatewayStatus) || 0) > 0) return true;\n", replace: "" }]));
+  await signIn(refused);
+  await showDiscord(refused, tallChannel(30));
+  refused.inboxWriteHook = async () => { throw new TypeError("Failed to fetch"); };
+  await doneButton(channelRow(refused, "2")).click().catch(() => {});
+  for (let i = 0; i < 3; i += 1) await refused.settle();
+  assert.equal(channelRow(refused, "2").getAttribute("data-archived"), "false",
+    "with an unheard Done taken for a refusal it was still kept, so this test cannot see the difference");
+});
+
+test("`#892 voice-page-optimistic-done`: a page closed before the server heard a Done or an Undo sends it when it next opens, in order, only under the same sign-in, and draws what the server then holds", async () => {
+  const page = await keyboardPageAtTop();
+  page.inboxWriteHook = async () => { throw new TypeError("Failed to fetch"); };
+  void doneButton(channelRow(page, "2")).click();
+  void doneButton(channelRow(page, "4")).click();
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  void doneButton(channelRow(page, "4")).click();
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.deepStrictEqual(keptWrites(page).map((one) => [one.kind, one.messages]),
+    [["dismiss", ["2"]], ["dismiss", ["4"]], ["restore", ["4"]]], "the writes were not kept in the order made");
+  assert.equal(page.dealtWith.size, 0, "the premise is the server never hearing any of them");
+
+  // Another page opened on the device meanwhile leaves them alone: this one is still here, sending them.
+  const beside = reloadWith(page.storage, tallChannel(30));
+  await signIn(beside);
+  for (let i = 0; i < 3; i += 1) await beside.settle();
+  assert.deepStrictEqual([beside.dismissCalls, beside.restoreCalls], [[], []], "a page sent another live page's writes");
+  assert.equal(keptWrites(page).length, 3, "a page opened beside this one dropped its writes");
+
+  // The page closes; the next one opens on the same device and sign-in.
+  for (const fn of page.windowListenersFor("pagehide", false)) await fn({ type: "pagehide" });
+  const next = reloadWith(page.storage, tallChannel(30));
+  await signIn(next);
+  for (let i = 0; i < 6; i += 1) await next.settle();
+  assert.deepStrictEqual(next.dismissCalls, [{ messages: ["2"] }, { messages: ["4"] }], "the kept Dones were not sent");
+  assert.deepStrictEqual(next.restoreCalls, [{ messages: ["4"] }], "the kept Undo was not sent after its Done");
+  assert.equal(next.dealtWith.has("2"), true);
+  assert.equal(next.dealtWith.has("4"), false, "the Undo did not land after the Done it undoes");
+  assert.deepStrictEqual(keptWrites(next), [], "writes the server has are still kept");
+  await reopenedChannel(next);
+  for (let i = 0; i < 3; i += 1) await next.settle();
+  assert.equal(channelRow(next, "2").getAttribute("data-archived"), "true", "the reopened page does not draw the kept Done");
+  assert.equal(channelRow(next, "4").getAttribute("data-archived"), "false", "the reopened page draws a Done its kept Undo put back");
+
+  // Another sign-in's writes are never sent under this one.
+  const theirs = await keyboardPageAtTop();
+  theirs.inboxWriteHook = async () => { throw new TypeError("Failed to fetch"); };
+  void doneButton(channelRow(theirs, "5")).click();
+  for (let i = 0; i < 3; i += 1) await theirs.settle();
+  for (const fn of theirs.windowListenersFor("pagehide", false)) await fn({ type: "pagehide" });
+  theirs.storage.set("vibe-talk.token", "another-token");
+  const other = reloadWith(theirs.storage, tallChannel(30));
+  for (let i = 0; i < 6; i += 1) await other.settle();
+  assert.deepStrictEqual(other.dismissCalls, [], "another sign-in's Done was sent under this one");
+  assert.deepStrictEqual(keptWrites(other), [], "another sign-in's Done was kept for later");
+});
