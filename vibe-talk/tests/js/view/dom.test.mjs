@@ -1180,7 +1180,7 @@ test("`#624 voice-page-modularity`: the row keys open, enter and leave threads, 
     assert.deepStrictEqual(run(() => keys.threadFromKeyboard({})), [true, "click thread-card-open", "focus list side pane"], "→ on a card did not open its thread");
     state.card = rowOf({ "data-card": "" }, [button("side-card-open"), button("thread-card-open")]);
     state.columns = false;
-    assert.deepStrictEqual(run(() => keys.threadFromKeyboard({})), [true, "click side-card-open", "settled"], "→ on a thread card did not press its replies button, or kept the focus in one column");
+    assert.deepStrictEqual(run(() => keys.threadFromKeyboard({})), [true, "click side-card-open", "settled"], "→ on a thread card did not press its replies button, or did not settle the focus in one column");
     state.columns = true;
     state.card = null;
     assert.deepStrictEqual(run(() => keys.threadOutFromKeyboard()), [false], "← from the left column in two columns was taken");
@@ -1263,6 +1263,19 @@ test("`#624 voice-page-modularity`: n goes to the next unread row below the sele
   assert.deepStrictEqual(run(() => keys.doneFromKeyboard({})), [true, "rowForAct false false"]);
   state.took = false;
   assert.deepStrictEqual(run(() => keys.doneFromKeyboard({})), [false, "rowForAct false false"]);
+  state.row = rows[2];
+  state.read = new Set(["1", "2", "3", "5"]);
+  delete rows[3].attributes["data-thread-read"];
+  state.again = true;
+  assert.deepStrictEqual(run(() => keys.doneFromKeyboard({})), [true, "rowForAct false false", "toggle 3", "take c4 true", "bring c4"],
+    "a Done did not move on to the card with unread replies, found again as a card");
+  state.read = new Set(["3", "5"]);
+  state.inView = new Set(["2", "3"]);
+  state.row = null;
+  assert.deepStrictEqual(run(() => keys.nextUnreadFromKeyboard({})), [true, "select 2"],
+    "n with nothing selected did not start at the screen's top: it took the unread row above the screen, or skipped the first in sight");
+  state.row = rows[4];
+  assert.deepStrictEqual(run(() => keys.nextUnreadFromKeyboard({})), [true, "select 2"], "n from a selection out of sight below did not start at the screen's top");
   rows = [];
   assert.deepStrictEqual(run(() => keys.nextUnreadFromKeyboard({})), [false]);
 });

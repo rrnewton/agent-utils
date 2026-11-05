@@ -17611,8 +17611,8 @@ function heldBackByMain(to, target, rows, done) {
 /**
  * A Done on `ids`, with the line right above the row they make Done: the line slides down past
  * every row already read and stops above the first still to read — the row e selects next
- * (view/shell `unreadAfter`), so the bookmark and the selection stay together — or below the last row; in a
- * thread, no further than Main's next message still to read (`heldBackByMain`). Null when the line
+ * (`unreadAfter` in web/src/view/shell/donekeys.ts), so the bookmark and the selection stay together —
+ * or below the last row; in a thread, no further than Main's next message still to read (`heldBackByMain`). Null when the line
  * is anywhere else, or the row is not wholly Done by this.
  */
 function singleDoneBump(ids) {
