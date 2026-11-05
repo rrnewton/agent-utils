@@ -1079,6 +1079,13 @@ pub struct Config {
     /// whatever `max_batch` says. 0 (the default) always allows width.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub batch_min_pass_percent: u32,
+    /// Success predictor (SubmitQueue §4.2): when on, decision records carry the
+    /// trained model's `predicted_pass` per change and per batch (see
+    /// `predict`), instead of only the base-rate prior. Off by default: today's
+    /// behaviour until an operator trains (`merge-queue model train`) and
+    /// enables it. Scheduling does not read it; the planner does, separately.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub predict: bool,
     /// Concurrent git probes while planning (base and pairwise conflict checks, each a git
     /// subprocess). 0 means [`DEFAULT_PROBE_PARALLELISM`]. Probe results are cached across
     /// runs in `probe-cache.json`, so this bounds only cache misses.
@@ -1180,6 +1187,7 @@ impl Default for Config {
             keep_stale_roots: false,
             stack_min_pass_percent: 0,
             batch_min_pass_percent: 0,
+            predict: false,
             probe_parallelism: 0,
             union_paths: Vec::new(),
             regenerate: RegenerateConfig::default(),

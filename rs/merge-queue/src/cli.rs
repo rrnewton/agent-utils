@@ -128,6 +128,78 @@ enum SignalCommand {
     },
 }
 
+/// `merge-queue model` subcommands (success predictor, SubmitQueue §4.2).
+#[derive(Debug, Subcommand)]
+enum ModelCommand {
+    /// Train the success model on this queue's decision history and persist it
+    /// to `model.json` in the state directory. Prints calibration (reliability
+    /// bins, Brier score, chronological holdout). Trains offline: no scheduling
+    /// changes until `predict` is enabled in the config.
+    Train,
+    /// Show the persisted model: ranked feature weights, calibration, pairs.
+    Show,
+    /// Re-score the persisted model against all decided history it can read
+    /// and print calibration. Does not retrain.
+    Eval,
+}
+
+fn model_command(state: &State, action: ModelCommand) -> Result<i32, String> {
+    match action {
+        ModelCommand::Train => {
+            let model = crate::predict::train_from_state(&state.root)?;
+            print!("{}", crate::predict::render(&model));
+            println!(
+                "model written to {}",
+                crate::predict::path(&state.root).display()
+            );
+            Ok(0)
+        }
+        ModelCommand::Show => {
+            let model = crate::predict::load(&state.root).ok_or_else(|| {
+                "no trained model; remedy: run `merge-queue model train` first".to_owned()
+            })?;
+            print!("{}", crate::predict::render(&model));
+            Ok(0)
+        }
+        ModelCommand::Eval => {
+            let model = crate::predict::load(&state.root).ok_or_else(|| {
+                "no trained model; remedy: run `merge-queue model train` first".to_owned()
+            })?;
+            let decisions = crate::predict::read_decisions(&state.root)?;
+            let mut signals = std::collections::BTreeMap::new();
+            for pr in crate::signal::prs(&state.root) {
+                signals.insert(pr, crate::signal::read(&state.root, pr)?);
+            }
+            let items: std::collections::BTreeMap<i64, crate::model::Item> = state
+                .items()?
+                .into_iter()
+                .map(|item| (item.pr, item))
+                .collect();
+            let examples = crate::predict::examples(&decisions, &signals, &items);
+            let scored: Vec<(f64, f64)> = examples
+                .iter()
+                .map(|e| (model.predict_raw(&e.x), e.y))
+                .collect();
+            let metrics = crate::predict::evaluate(&scored, model.base_rate);
+            println!(
+                "eval on {} decided change-instances: brier {:.3} (base-rate {:.3}) log-loss {:.3} auc {:.2}",
+                metrics.n, metrics.brier, metrics.base_brier, metrics.log_loss, metrics.auc
+            );
+            for (lo, n, mean_p, obs) in &metrics.bins {
+                println!(
+                    "  {:.1}-{:.1}: n={} predicted {:.2} observed {:.2}",
+                    lo,
+                    lo + 0.1,
+                    n,
+                    mean_p,
+                    obs
+                );
+            }
+            Ok(0)
+        }
+    }
+}
+
 fn signal_command(state: &State, action: SignalCommand) -> Result<i32, String> {
     match action {
         SignalCommand::Add { pr, kind, json } => {
@@ -1160,6 +1232,13 @@ enum Command {
     Signal {
         #[command(subcommand)]
         action: SignalCommand,
+    },
+    /// Train, show or evaluate the success-prediction model (SubmitQueue §4.2).
+    /// Training reads only this queue's recorded history; predictions are
+    /// recorded only when `predict` is enabled in the config (default off).
+    Model {
+        #[command(subcommand)]
+        action: ModelCommand,
     },
     /// Show daemon liveness, the current window and slot occupancy.
     Status {
@@ -2363,6 +2442,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
         }
         Command::Donor { action } => donor_command(&state, action),
         Command::Signal { action } => signal_command(&state, action),
+        Command::Model { action } => model_command(&state, action),
         Command::Status {
             json,
             stale_after_secs,
@@ -2477,6 +2557,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     priority: &config.priority,
                     classifier_policy: &config.classifier.policy,
                     prior: crate::decisions::prior_rates(&state.root),
+                    model: None,
+                    model_vectors: std::collections::BTreeMap::new(),
                 };
                 crate::decisions::reconstruct(&state.root, &sources, since, until)?
             } else {

@@ -101,6 +101,10 @@ pub struct DecisionChange {
     pub ready_to_land_s: Option<f64>,
     /// What the change looks like.
     pub features: Features,
+    /// The trained model's predicted pass probability for this change; `null`
+    /// unless `Config::predict` is on and a model is trained (see `predict`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicted_pass: Option<f64>,
 }
 
 /// Per-change features for the decision log and for future batching priors.
@@ -429,6 +433,12 @@ pub struct Sources<'a> {
     pub classifier_policy: &'a str,
     /// Base rates from earlier decision records; `None` records no prediction.
     pub prior: Option<PriorRates>,
+    /// Trained success model (`Config::predict` on); wins over `prior` for
+    /// `predicted_pass` when present.
+    pub model: Option<crate::predict::Model>,
+    /// Latest history feature vector per change, for `model` (see
+    /// `predict::latest_vectors`); the batch width feature is patched per batch.
+    pub model_vectors: BTreeMap<i64, Vec<f64>>,
 }
 
 fn str_field<'v>(value: &'v Value, key: &str) -> &'v str {
@@ -689,6 +699,7 @@ pub fn from_report(report: &Value, sources: &Sources<'_>, reconstructed: bool) -
                 DecisionChange {
                     pr: *pr,
                     features: feature(*pr, &head),
+                    predicted_pass: None,
                     head,
                     ready_at: ready.map(format_time),
                     ready_to_land_s: match (ready, landed_at) {
@@ -700,26 +711,52 @@ pub fn from_report(report: &Value, sources: &Sources<'_>, reconstructed: bool) -
                 }
             })
             .collect();
+        // Trained model first (Config::predict): per-change probabilities from
+        // each change's latest history vector, batch = product discounted by
+        // known pair conflicts. A change with no history vector gets the
+        // model's base rate.
+        let mut changes = changes;
+        let model_predicted = sources.model.as_ref().map(|model| {
+            let width_feature = (changes.len().max(1) as f64).ln();
+            let mut ps: Vec<(i64, f64)> = Vec::new();
+            for change in &mut changes {
+                let p = match sources.model_vectors.get(&change.pr) {
+                    Some(vector) => {
+                        let mut vector = vector.clone();
+                        if let Some(last) = vector.last_mut() {
+                            *last = width_feature;
+                        }
+                        model.predict_raw(&vector)
+                    }
+                    None => model.base_rate,
+                };
+                change.predicted_pass = Some(p);
+                ps.push((change.pr, p));
+            }
+            model.batch_pass(&ps)
+        });
         // Base-rate prediction: each change contributes its first component's
         // historical green rate, or the global rate when it has none.
-        let predicted_pass = sources.prior.as_ref().map(|prior| {
-            if changes.is_empty() {
-                prior.global
-            } else {
-                let sum: f64 = changes
-                    .iter()
-                    .map(|change| {
-                        change
-                            .features
-                            .components
-                            .first()
-                            .and_then(|component| prior.by_component.get(component))
-                            .copied()
-                            .unwrap_or(prior.global)
-                    })
-                    .sum();
-                sum / changes.len() as f64
-            }
+        let predicted_pass = model_predicted.or_else(|| {
+            sources.prior.as_ref().map(|prior| {
+                if changes.is_empty() {
+                    prior.global
+                } else {
+                    let sum: f64 = changes
+                        .iter()
+                        .map(|change| {
+                            change
+                                .features
+                                .components
+                                .first()
+                                .and_then(|component| prior.by_component.get(component))
+                                .copied()
+                                .unwrap_or(prior.global)
+                        })
+                        .sum();
+                    sum / changes.len() as f64
+                }
+            })
         });
         let donor = v
             .get("donor")
@@ -1169,6 +1206,23 @@ pub struct Stats {
     /// What the records could not hold (reconstruction only).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub not_reconstructable: Vec<String>,
+    /// Calibration of recorded `predicted_pass` against decided outcomes;
+    /// `null` when no decided record carries a prediction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<Calibration>,
+}
+
+/// How honest the recorded predictions were (batch level).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Calibration {
+    /// Decided records with a prediction.
+    pub n: usize,
+    /// Mean Brier score of the predictions.
+    pub brier: f64,
+    /// Brier score of predicting the window base rate throughout.
+    pub base_brier: f64,
+    /// Reliability bins: (lower edge, count, mean predicted, observed rate).
+    pub bins: Vec<(f64, usize, f64, f64)>,
 }
 
 fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
@@ -1243,6 +1297,28 @@ pub fn stats(decisions: &[Decision], since: DateTime<Utc>, until: DateTime<Utc>)
                 counts
             }),
         };
+    }
+    let scored: Vec<(f64, f64)> = decisions
+        .iter()
+        .filter_map(|decision| {
+            let p = decision.predicted_pass?;
+            let y = match decision.outcome.as_str() {
+                "green" => 1.0,
+                "red" => 0.0,
+                _ => return None,
+            };
+            Some((p, y))
+        })
+        .collect();
+    if !scored.is_empty() {
+        let base = scored.iter().map(|(_, y)| y).sum::<f64>() / scored.len() as f64;
+        let metrics = crate::predict::evaluate(&scored, base);
+        stats.calibration = Some(Calibration {
+            n: metrics.n,
+            brier: metrics.brier,
+            base_brier: metrics.base_brier,
+            bins: metrics.bins,
+        });
     }
     stats.landed_per_validate_hour =
         (stats.validate_hours > 0.0).then(|| stats.landed as f64 / stats.validate_hours);
@@ -1334,6 +1410,22 @@ pub fn render(stats: &Stats) -> String {
             .map_or("-".to_owned(), |rate| format!("{rate:.2}")),
         stats.culprits
     ));
+    if let Some(c) = &stats.calibration {
+        out.push_str(&format!(
+            "  predictions: {} decided with predicted_pass; brier {:.3} (base-rate {:.3})\n",
+            c.n, c.brier, c.base_brier
+        ));
+        for (lo, n, mean_p, obs) in &c.bins {
+            out.push_str(&format!(
+                "    {:.1}-{:.1}: n={} predicted {:.2} observed {:.2}\n",
+                lo,
+                lo + 0.1,
+                n,
+                mean_p,
+                obs
+            ));
+        }
+    }
     let l = &stats.ready_to_land_s;
     out.push_str(&format!(
         "  ready to land: {} change(s); p50 {}, p90 {}, p99 {}, max {}\n",
@@ -1452,6 +1544,7 @@ mod unit {
                 ready_at: None,
                 ready_to_land_s: Some(pr as f64 * 100.0),
                 features: Features::default(),
+                predicted_pass: None,
             })
             .collect();
         let mut red2 = decision("batch", 2, "red", 900.0);

@@ -27,6 +27,7 @@ pub mod ops;
 pub mod pins;
 pub mod plan;
 pub mod precheck;
+pub mod predict;
 pub mod probe_cache;
 pub mod recount;
 pub mod run;

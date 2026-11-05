@@ -4048,12 +4048,22 @@ impl<'a> Runner<'a> {
         let value = serde_json::to_value(report)
             .map_err(|error| format!("cannot encode the run report: {error}"))?;
         let items = lock(&self.items).clone();
+        let (model, model_vectors) = if self.config.predict {
+            (
+                crate::predict::load(&self.state.root),
+                crate::predict::latest_vectors(&self.state.root),
+            )
+        } else {
+            (None, std::collections::BTreeMap::new())
+        };
         let sources = crate::decisions::Sources {
             items: &items,
             git: Some(&self.git),
             priority: &self.config.priority,
             classifier_policy: &self.config.classifier.policy,
             prior: crate::decisions::prior_rates(&self.state.root),
+            model,
+            model_vectors,
         };
         let decisions = crate::decisions::from_report(&value, &sources, false);
         crate::decisions::append(&self.state.root, &decisions, &self.config.decisions)?;
