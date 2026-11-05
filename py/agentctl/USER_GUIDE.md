@@ -1372,7 +1372,9 @@ after the signal, such as one stuck in a Herdr call, is abandoned: the watcher
 logs `watch-agents did not stop within 3s of the termination request;
 abandoning what is still in flight ...` and ends as SIGTERM's default action
 would, which a service manager counts as a clean stop. What the pass left in
-flight is left as a crash would leave it, and the next start recovers it.
+flight is left as a crash would leave it, and the next start recovers it. The
+log marks each stop with `watch-agents: termination requested; stopping` and
+`watch-agents stopped N.Ns after the termination request`.
 
 #### The owner's requests held, and prompts quarantined as misroutes
 

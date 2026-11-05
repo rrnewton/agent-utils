@@ -61,3 +61,9 @@ Reported by the lead on 2026-11-05 at 00:18 AM ET (P1). Assigned to cl-start aft
   - `tests/service_stop.rs`: watch-agents stops from its sleep (exit 0, state saved, about 0.04 s) and from a pass stuck in a Herdr call (about 3 s).
   - `py/tests/test_agentctl_chat_launch_rust.py`: chat run stops with a delivery in flight, and the request is never recorded as delivered. It also stops with a plugin that ignores Close; that test took 10 s before the fix.
 - **Unverified:** the deploy-side check, `agentctl services refresh` of a watcher and a bridge on both hosts, waits for the next refresh after this lands.
+
+## Follow-up (2026-11-05)
+
+On devbig030 the refresh restarted the watcher in 0.26 s and the bridge in 0.1 s, but one bridge restart took 12.3 s. The bridge log puts that stop 56 s after startup had finished, and no guard line was printed. So it was not a SIGTERM during startup, and the log alone cannot say where the time went.
+- **Found while testing:** a stop while the provider plugin had not yet said hello waited for the plugin Hello timeout (10 s), cut to 4 s by the guard. `connect_unless` in chat-subscription-plugin now abandons the Hello at once when the bridge is stopping. Tests: `a_hello_wait_ends_when_the_host_abandons_it_and_the_plugin_is_reaped` (conformance), and `test_run_sigterm_during_startup_exits_within_five_seconds[at-exec, plugin-handshake]`. Measured stop times: 0.1 s at exec; during the handshake, 4.11 s before the fix and 0.10 s after.
+- **Logging:** both services now log `termination requested; stopping` and `stopped N.Ns after the termination request`, so the next slow restart shows whether the stop or the start was slow.

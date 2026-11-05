@@ -3361,6 +3361,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 &options,
             );
             stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::agent::log_stop_time("watch-agents");
             let report = report?;
             write_json(&report).map_err(Failure::Output)?;
             return Ok(if report["ok"] == true { 0 } else { 1 });
@@ -5217,6 +5218,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                 },
             );
             stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::agent::log_stop_time("chat run");
             let result = result.map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)

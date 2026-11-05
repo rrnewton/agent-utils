@@ -4993,8 +4993,12 @@ fn provider_generation(
         overflowed,
         timeouts,
         || {
+            // A stop while the plugin has not said hello ends the wait at once (#870
+            // agentctl-service-slow-stop); it used to hold the stop for the whole Hello timeout.
             command
-                .connect(timeouts)
+                .connect_unless(timeouts, &|| {
+                    stop.is_stopped() || crate::agent::termination_requested()
+                })
                 .map_err(|error| ProviderGenerationError::Retryable(error.to_string()))
         },
         log,

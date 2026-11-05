@@ -1233,6 +1233,8 @@ pub fn spawn_termination_guard(
                 }
                 thread::sleep(TERMINATION_POLL);
             }
+            let _ = termination_seen().set(Instant::now());
+            eprintln!("agentctl: {service}: termination requested; stopping");
             let deadline = Instant::now() + grace;
             while Instant::now() < deadline {
                 if done.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1250,6 +1252,24 @@ pub fn spawn_termination_guard(
         });
     if let Err(error) = spawned {
         eprintln!("agentctl: {service}: the termination guard could not start: {error}");
+    }
+}
+
+/// When [`spawn_termination_guard`] saw the termination request.
+fn termination_seen() -> &'static std::sync::OnceLock<Instant> {
+    static SEEN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    &SEEN
+}
+
+/// Log how long `service` took to stop after the termination request its guard saw, so a slow
+/// stop can be told from a slow start in the service's log (#870 agentctl-service-slow-stop).
+/// Logs nothing when no termination was requested.
+pub fn log_stop_time(service: &str) {
+    if let Some(seen) = termination_seen().get() {
+        eprintln!(
+            "agentctl: {service} stopped {:.1}s after the termination request",
+            seen.elapsed().as_secs_f64()
+        );
     }
 }
 

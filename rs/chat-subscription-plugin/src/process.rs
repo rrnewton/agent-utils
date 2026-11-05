@@ -31,6 +31,8 @@ use chat_subscription::{
 
 use crate::{ClientFrame, PluginBackend, PluginError};
 
+/// How often [`ProcessPluginChild::connect_unless`] asks whether to abandon the Hello phase.
+pub const HELLO_ABANDON_POLL: Duration = Duration::from_millis(100);
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const EXEC_READY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CLEANUP_ADMISSIONS: usize = 32;
@@ -2323,8 +2325,24 @@ impl ProcessPluginChild {
     /// Returns [`ProcessPluginError`] after terminating the process group, joining the worker, and
     /// reaping the leader when transport setup, negotiation, or supervision fails.
     pub fn connect(
+        self,
+        timeouts: ProcessPhaseTimeouts,
+    ) -> Result<(ProcessPluginBackend, ProcessPluginCancellation), ProcessPluginError> {
+        self.connect_unless(timeouts, &|| false)
+    }
+
+    /// [`Self::connect`], abandoning the Hello phase as soon as `abandon` returns true: a host
+    /// that is stopping need not wait out the Hello timeout of a plugin that never says hello.
+    /// `abandon` is polled every [`HELLO_ABANDON_POLL`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::connect`], and `plugin_hello_abandoned` when `abandon` ended the Hello phase;
+    /// the process group is terminated and its leader reaped either way.
+    pub fn connect_unless(
         mut self,
         timeouts: ProcessPhaseTimeouts,
+        abandon: &dyn Fn() -> bool,
     ) -> Result<(ProcessPluginBackend, ProcessPluginCancellation), ProcessPluginError> {
         let process_id = self.id();
         let (reader, writer) = self
@@ -2377,7 +2395,23 @@ impl ProcessPluginChild {
             close_port,
             activity,
         ));
-        let capabilities = match hello_receiver.recv_timeout(timeouts.hello()) {
+        let hello_deadline = Instant::now() + timeouts.hello();
+        let hello = loop {
+            let left = hello_deadline.saturating_duration_since(Instant::now());
+            match hello_receiver.recv_timeout(left.min(HELLO_ABANDON_POLL)) {
+                Err(mpsc::RecvTimeoutError::Timeout) if !left.is_zero() => {
+                    if abandon() {
+                        return Err(ProcessPluginError::new(
+                            "plugin_hello_abandoned",
+                            "the host stopped waiting for the plugin's Hello",
+                        )
+                        .with_cleanup(core.finish(Duration::ZERO)));
+                    }
+                }
+                other => break other,
+            }
+        };
+        let capabilities = match hello {
             Ok(Ok(capabilities)) => capabilities,
             Ok(Err(error)) => {
                 return Err(

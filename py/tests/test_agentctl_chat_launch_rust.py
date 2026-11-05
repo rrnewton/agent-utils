@@ -279,12 +279,14 @@ def fixture(tmp_path: Path) -> Generator[Fixture, None, None]:
     made.close()
 
 
-def _wait_for(predicate: Callable[[], bool], timeout: float = 30.0) -> bool:
+def _wait_for(
+    predicate: Callable[[], bool], timeout: float = 30.0, interval: float = 0.1
+) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if predicate():
             return True
-        time.sleep(0.1)
+        time.sleep(interval)
     return False
 
 
@@ -459,6 +461,63 @@ def test_run_sigterm_with_a_plugin_that_ignores_close_exits_within_five_seconds(
         assert _wait_for(lambda: _process_gone(bridge), 30)
         took = time.monotonic() - started
         assert took < 5, f"chat run took {took:.1f}s to stop: {log.read_text()[-2000:]}"
+    finally:
+        process.send_signal(signal.SIGTERM)
+        process.communicate(timeout=60)
+
+
+def _children(pid: int) -> list[int]:
+    found: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if fields[1] == str(pid):
+            found.append(int(entry.name))
+    return found
+
+
+@pytest.mark.parametrize("moment", ["at-exec", "plugin-handshake"])
+def test_run_sigterm_during_startup_exits_within_five_seconds(
+    fixture: Fixture, tmp_path: Path, moment: str
+) -> None:
+    # #870 agentctl-service-slow-stop: a stop that lands while `chat run` is still starting,
+    # right after it was exec'd or while its provider plugin has not finished its handshake,
+    # ends within 5 s, as a stop of a running bridge does.
+    if moment == "plugin-handshake":
+        config = tmp_path / "startup.json"
+        document = json.loads(fixture.config.read_text())
+        document["subscription_environment"] = ["CHAT_SUBSCRIPTION_FAKE_STALL"]
+        config.write_text(json.dumps(document))
+        config.chmod(0o600)
+        process = fixture.launch(config=config, extra_env={"CHAT_SUBSCRIPTION_FAKE_STALL": "hello"})
+    else:
+        process = fixture.launch()
+    try:
+        assert _wait_for(lambda: bool(fixture.bridge_processes()), 60, interval=0.01)
+        bridge = fixture.bridge_processes()[0]
+        log = fixture.state / "bridge.log"
+        if moment == "plugin-handshake":
+            # The plugin is spawned and waits for ever before its hello.
+            assert _wait_for(lambda: bool(_children(bridge)), 60, interval=0.01), (
+                log.read_text()[-3000:] if log.exists() else "no bridge log"
+            )
+            time.sleep(0.5)
+        started = time.monotonic()
+        os.kill(bridge, signal.SIGTERM)
+        assert _wait_for(lambda: _process_gone(bridge), 30)
+        took = time.monotonic() - started
+        assert took < 5, (
+            f"chat run took {took:.1f}s to stop: "
+            + (log.read_text()[-2000:] if log.exists() else "no bridge log")
+        )
+        # It stopped by itself: the termination guard, which abandons a stop after 4 s, did
+        # not have to end it.
+        text = log.read_text() if log.exists() else ""
+        assert "did not stop within" not in text, text[-2000:]
     finally:
         process.send_signal(signal.SIGTERM)
         process.communicate(timeout=60)

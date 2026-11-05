@@ -418,6 +418,20 @@ impl PinnedPluginCommand {
     ) -> Result<(ProcessPluginBackend, ProcessPluginCancellation), ProcessPluginError> {
         self.spawn()?.connect(timeouts)
     }
+
+    /// [`Self::connect`], abandoning the Hello phase once `abandon` returns true, as a stopping
+    /// bridge does rather than wait out the plugin's Hello timeout.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::connect`], and when `abandon` ended the Hello phase.
+    pub fn connect_unless(
+        self,
+        timeouts: ProcessPhaseTimeouts,
+        abandon: &dyn Fn() -> bool,
+    ) -> Result<(ProcessPluginBackend, ProcessPluginCancellation), ProcessPluginError> {
+        self.spawn()?.connect_unless(timeouts, abandon)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]

@@ -3305,7 +3305,12 @@ says `chat run did not stop within 4s of the termination request; abandoning
 what is still in flight` and names the owner-loop step it was in, and the
 process ends as SIGTERM's default action would, which a service manager counts
 as a clean stop. What was in flight is left as a crash would leave it: a prompt
-not yet typed stays pending, and the next start recovers the rest.
+not yet typed stays pending, and the next start recovers the rest. A stop that
+lands while the provider plugin has not yet said hello, during startup or a
+reconnect, ends that wait at once instead of waiting out the plugin's Hello
+timeout. The log marks each stop with `chat run: termination requested;
+stopping` and `chat run stopped N.Ns after the termination request`, so a slow
+stop can be told from a slow start.
 Run it under a service manager that restarts it on failure, with the same state
 directory: `Restart=on-failure` in a systemd unit, as in the example below. A
 unit without a restart policy leaves chat down after the first failure the

@@ -322,6 +322,33 @@ fn stalled_hello_is_bounded_and_reaped() {
 }
 
 #[test]
+fn a_hello_wait_ends_when_the_host_abandons_it_and_the_plugin_is_reaped() {
+    let child = spawn(Some("hello"));
+    let process_id = child.id();
+    let long = ProcessPhaseTimeouts::new(
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        Duration::from_millis(200),
+        Duration::from_millis(200),
+        Duration::from_millis(200),
+    )
+    .expect("fixture deadlines are valid");
+    let started = Instant::now();
+    let error = match child.connect_unless(long, &|| started.elapsed() > Duration::from_millis(150))
+    {
+        Ok(_) => panic!("a plugin that never answers Hello cannot connect"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "plugin_hello_abandoned");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_reaped(process_id);
+}
+
+#[test]
 fn stalled_start_is_bounded_and_reaped() {
     let child = spawn(Some("start"));
     let process_id = child.id();
