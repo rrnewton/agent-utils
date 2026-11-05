@@ -925,3 +925,94 @@ test("`#624 voice-page-modularity`: m and Ctrl+S find the box to write in, stay 
     globalThis.document = was;
   }
 });
+
+test("`#624 voice-page-modularity`: the view, filter and undo keys choose from the main screen, in the left column, and Undo takes the newest offer", () => {
+  const { createViewKeys } = VIEW_SHELL;
+  const log = [];
+  const state = { screen: "main", before: "main", view: "discord", side: false, channel: "c1", onScreen: true, readHidden: false,
+    threadList: false, search: false, pinned: false, links: false, done: null, send: null, sendHeld: true, bookmark: null, current: "c1" };
+  const keys = createViewKeys({
+    screens: { screen: () => state.screen, beforeSettings: () => state.before, view: () => state.view },
+    inSide: () => state.side,
+    mainColumn: () => "main",
+    inColumn: (column, act) => { log.push(`in ${column}`); const was = state.side; state.side = column === "side"; try { return act(); } finally { state.side = was; } },
+    closeSettings: () => { log.push("close settings"); state.screen = state.before; },
+    pressViewSwitch: () => { log.push("switch"); state.view = state.view === "voice" ? "discord" : "voice"; },
+    selectedChannelId: () => state.channel,
+    channelOnScreen: () => state.onScreen && state.screen === "main" && state.view === "discord",
+    chooseView: (which) => log.push(`view ${which}`),
+    settleFocus: () => log.push("settled"),
+    readModeHidden: () => state.readHidden,
+    cycleReadMode: () => log.push("cycle read"),
+    readModeSaid: () => "Fold read",
+    setStatus: (text) => log.push(`say ${text}`),
+    threadListOnScreen: () => state.threadList,
+    searchOpen: () => state.search,
+    setSearchOpen: (open) => { log.push(`search ${open}`); state.search = open; },
+    pinnedOnly: () => state.pinned,
+    setPinnedOnly: (...args) => { log.push(`pinned ${args.join(" ")}`); state.pinned = args[0]; },
+    linksOnly: () => state.links,
+    setLinksOnly: (on) => { log.push(`links ${on}`); state.links = on; },
+    cycleAuthorFilter: () => log.push("author"),
+    focusChannelList: () => log.push("focus list"),
+    doneOffer: () => state.done,
+    undoDone: () => log.push("undo done"),
+    sendOffer: () => state.send,
+    sendHeld: () => state.sendHeld,
+    putBackSend: (id) => log.push(`put back ${id}`),
+    bookmarkOffer: () => state.bookmark,
+    currentChannelId: () => state.current,
+    undoBookmarkRemoval: () => log.push("bookmark back"),
+  });
+  const run = (act) => { log.length = 0; return [act(), ...log]; };
+  assert.deepStrictEqual(run(() => keys.viewFromKeyboard("flat", false)), [true, "view flat", "settled"]);
+  state.side = true;
+  assert.deepStrictEqual(run(() => keys.viewFromKeyboard("main", false)), [true, "in main", "view main", "settled"], "a view was chosen in the right column");
+  state.side = false;
+  assert.deepStrictEqual(run(() => keys.viewFromKeyboard("main", true)), [true], "a held key's repeat chose a view");
+  state.screen = "settings";
+  assert.deepStrictEqual(run(() => keys.viewFromKeyboard("threads", false)), [true, "close settings", "view threads", "settled"], "Settings over the main screen was not left for the view");
+  state.screen = "settings";
+  state.before = "signin";
+  assert.deepStrictEqual(run(() => keys.viewFromKeyboard("threads", false)), [false], "a view was chosen from Settings over the sign-in screen");
+  state.screen = "main";
+  state.before = "main";
+  state.view = "voice";
+  assert.deepStrictEqual(run(() => keys.viewFromKeyboard("columns", false)), [true, "switch", "view columns", "settled"], "the call's view did not give way to the channel");
+  state.channel = "";
+  assert.deepStrictEqual(run(() => keys.viewFromKeyboard("main", false)), [false], "a view was chosen with no channel");
+  assert.deepStrictEqual(run(() => keys.voiceFromKeyboard(false)), [true, "switch"], "Ctrl+0 needed a channel, or did not go to the call's view");
+  assert.deepStrictEqual(run(() => keys.voiceFromKeyboard(false)), [true], "Ctrl+0 on the call's view left it");
+  state.screen = "signin";
+  assert.deepStrictEqual(run(() => keys.voiceFromKeyboard(false)), [false]);
+  state.screen = "main";
+  state.channel = "c1";
+  state.view = "discord";
+  assert.deepStrictEqual(run(() => keys.readModeFromKeyboard()), [true, "cycle read", "say Fold read"]);
+  state.readHidden = true;
+  assert.deepStrictEqual(run(() => keys.readModeFromKeyboard()), [false], "h cycled a hidden read button");
+  state.side = true;
+  assert.deepStrictEqual(run(() => keys.filterFromKeyboard("pinned")), [true, "in main", "search true", "pinned true", "focus list"],
+    "Shift+P did not filter the left column, open the bar, or pass one argument");
+  state.side = false;
+  assert.deepStrictEqual(run(() => keys.filterFromKeyboard("links")), [true, "links true", "focus list"]);
+  assert.deepStrictEqual(run(() => keys.filterFromKeyboard("author")), [true, "author", "focus list"]);
+  state.threadList = true;
+  assert.deepStrictEqual(run(() => keys.filterFromKeyboard("pinned")), [false], "a filter key over the thread list filtered the column behind it");
+  state.threadList = false;
+  assert.deepStrictEqual(run(() => keys.undoFromKeyboard()), [true, "say Nothing to undo."]);
+  state.done = { at: 2 };
+  state.send = { id: "s1", at: 5 };
+  state.bookmark = { channel: "c1", at: 3 };
+  assert.deepStrictEqual(run(() => keys.undoFromKeyboard()), [true, "put back s1"], "the newest offer was not taken back first");
+  state.send = null;
+  assert.deepStrictEqual(run(() => keys.undoFromKeyboard()), [true, "bookmark back"]);
+  state.bookmark = { channel: "c2", at: 9 };
+  assert.deepStrictEqual(run(() => keys.undoFromKeyboard()), [true, "undo done"], "another channel's removed bookmark was put back from here");
+  state.done = { };
+  state.send = { id: "s2" };
+  state.sendHeld = false;
+  assert.deepStrictEqual(run(() => keys.undoFromKeyboard()), [true, "undo done"], "a dismissed send no longer held was offered");
+  state.onScreen = false;
+  assert.deepStrictEqual(run(() => keys.undoFromKeyboard()), [false]);
+});

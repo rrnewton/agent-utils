@@ -7608,147 +7608,46 @@ const highlightCopy = createHighlightCopy({
 const channelOnScreen = () => screens.screen() === "main" && screens.view() === "discord";
 
 /**
- * Ctrl+1 to Ctrl+4 (Cmd on an Apple keyboard): Main, All, the thread list, and two columns, the four
- * views in the picker's order (`chooseView`). `#281 view-keys`. The owner, 2026-10-13: "Change the 1 2
- * 3 keystrokes ... so it is Cmd-1 through Cmd-3. It should work irrespective of whether we have the
- * text box selected etc. ... TBH I think two column view should just be Cmd-4 as the 4th view."
+ * The keys for the views (Ctrl+0 to Ctrl+4), the read mode (h), the filters (Shift+P, Shift+L, the author
+ * filter's) and Undo (z). One owner in web/src/view/shell/viewkeys.ts (`#624 voice-page-modularity`); the
+ * page destructures its keys under their old names.
  *
- * A chord, so it fires in a message box and in the search as it does anywhere else, and types nothing
- * there; and from Settings and Help, which are left as their Back leaves them — and a reply open in a
- * list is put down as a draft, for any view but two columns, which keep it (`chooseView`, `#277
- * reply-in-column`) — and from the call's view, which gives way to the channel as its switch does. Its default is kept from the browser
- * — in Chromium that is the tab switch, which it hands the page first (`IDC_SELECT_TAB_*` is not among
- * the shortcuts it reserves) — whenever it chose a view, and on a held key's repeats, which choose
- * nothing. Where no view can be chosen (the sign-in screen, no channel) it is left to the browser.
- *
- * THE BARE 1, 2 AND 3 ARE RETIRED. Kept beside the chords they would have had to change meaning — 2
- * was the Threads screen and 3 was All — and a key that silently does the other thing is worse than
- * one that does nothing; a reader who wants a view has one chord for it, from anywhere.
- *
- * @param {"main" | "flat" | "threads" | "columns"} which
- * @param {boolean} repeat
+ * @type {import("./src/view/shell/index.ts").ViewKeys}
  */
-/**
- * Ctrl+0 (Cmd+0 on an Apple keyboard): the voice (call) view, as the view switch goes there.
- * `#525 cmd-0-voice-view`. The owner, 2026-10-25: "Cmd-0 go to voice view. We have these great
- * constant time shortcuts to jump to views Cmd-1 thru Cmd-4.. but what about voice channel?
- * Make that Cmd-0."
- *
- * The rules of Ctrl+1 to Ctrl+4, mirrored: a chord, so it fires in a message box and in the
- * search; from Settings and Help opened over the main screen, which it closes; a held key's
- * repeats taken but choosing nothing; and where it can choose nothing (the sign-in screen)
- * it is left to the browser, whose own Ctrl+0 is its zoom reset — kept from the browser only
- * when the page takes the chord, as 1 to 4 keep its tab switch. No channel need be chosen:
- * the call's view is not a view of one. Already there, it is taken and stays.
- *
- * @param {boolean} repeat
- */
-function voiceFromKeyboard(repeat) {
-  if (columnWork.side()) return inColumn(columns.main, () => voiceFromKeyboard(repeat));
-  const covering = screens.screen() === "settings" || screens.screen() === "help";
-  if (!(screens.screen() === "main" || (covering && screens.beforeSettings() === "main"))) {
-    return false;
-  }
-  if (repeat) return true;
-  if (covering) closeSettings();
-  if (screens.view() !== "voice") pressViewSwitch();
-  return true;
-}
-
-function viewFromKeyboard(which, repeat) {
-  // A view is the page's, whichever column the keys are in.
-  if (columnWork.side()) return inColumn(columns.main, () => viewFromKeyboard(which, repeat));
-  const channel = String(selectedChannelId() || "");
-  const covering = screens.screen() === "settings" || screens.screen() === "help";
-  // Settings and Help are left for the screen they were opened over, which is the channel's only when
-  // that is the main screen.
-  if (!channel || !(screens.screen() === "main" || (covering && screens.beforeSettings() === "main"))) {
-    return false;
-  }
-  if (repeat) return true;
-  if (covering) closeSettings();
-  if (screens.view() !== "discord") pressViewSwitch();
-  if (!channelOnScreen()) return false;
-  chooseView(which);
-  settleFocus();
-  return true;
-}
-
-/**
- * h: the cycle of the Hide read button: Show read, Fold read, Hide read. The button's own act
- * (`cycleReadMode`), so the key, the button's words and the list are one state; and said on the status
- * line, as the button is not where the reader's eyes are. `#432 read-mode-unify`.
- */
-function readModeFromKeyboard() {
-  if (!channelOnScreen() || el("todo-filter").hidden) return false;
-  cycleReadMode();
-  setStatus(READ_MODE_SAID[readModes.mode()]);
-  return true;
-}
-
-/**
- * Shift+P and Shift+L: the Pinned and Links filters, which live in the search bar. So the bar opens
- * with them, as a filter in force must be on screen (`setSearchOpen`), and the focus goes back to the
- * list, where the reader is going to read what is left.
- */
-function filterFromKeyboard(which) {
-  // The bar and its Pinned filter are the left column's, whichever column the keys are in. `#229`.
-  if (columnWork.side()) return inColumn(columns.main, () => filterFromKeyboard(which));
-  // Over the thread list on its own they would filter the column behind it. `#281 view-keys`.
-  if (!channelOnScreen() || threadListOnScreen()) return false;
-  if (!searchField.open()) setSearchOpen(true);
-  if (which === "pinned") setPinnedOnly(!pinsView().only);
-  else if (which === "author") cycleAuthorFilter();
-  else setLinksOnly(!searchField.links());
-  focusList(channelPane);
-  return true;
-}
-
-/**
- * `#443 undo-key-general`. Every undo still on offer, newest first, each with the act its chip
- * performs — the chip's own click, word for word, so the key and the chip can never disagree about
- * what Undo does. An offer counts while its chip is up: a Done while `lastDismissal` stands, a
- * dismissed send while its copy is held, a removed bookmark in the channel it was removed in (its
- * chip is drawn nowhere else, and undoing another channel's removal from here would move a line
- * the reader is not looking at). Stamped as each was made (`nextUndoAt`); an offer a build from
- * before the stamps left standing has none, and counts oldest.
- *
- * @returns {Array<() => void>}
- */
-function liveUndos() {
-  /** @type {Array<{at: number, run: () => void}>} */
-  const held = [];
-  if (lastDismissal.current() !== null) {
-    held.push({ at: lastDismissal.current().at || 0, run: () => guardQuietly(undoDismissal)() });
-  }
-  const sendOffer = sendUndo.current();
-  if (sendOffer && dismissedSends.find(sendOffer.id)) {
-    held.push({ at: sendOffer.at || 0, run: () => {
-      const offer = sendUndo.current();
-      if (offer) putBackDismissedSend(offer.id);
-    } });
-  }
-  const bookmarkOffer = bookmarkUndos.current();
-  if (bookmarkOffer && bookmarkOffer.channel === currentChannelId()) {
-    held.push({ at: bookmarkOffer.at || 0, run: undoBookmarkRemoval });
-  }
-  return held.sort((a, b) => b.at - a.at).map(({ run }) => run);
-}
-
-/**
- * z, and Ctrl+Z (Cmd+Z on a Mac) outside a text field: undo the newest thing that can still be
- * taken back, whatever kind it is — a Done, a send dismissed from the outbox, a bookmark taken
- * away. The owner: "if we have an undo keystroke it should be a general undo action that applies
- * to anything that we can undo and anything that pops up an undo chip." Pressed again it takes the
- * next one back, while its chip is still up.
- */
-function undoFromKeyboard() {
-  if (!channelOnScreen()) return false;
-  const [newest] = liveUndos();
-  if (!newest) setStatus("Nothing to undo.");
-  else newest();
-  return true;
-}
+const viewKeys = createViewKeys({
+  screens,
+  inSide: () => columnWork.side(),
+  mainColumn: () => columns.main,
+  inColumn: (column, act) => inColumn(column, act),
+  closeSettings: () => closeSettings(),
+  pressViewSwitch: () => pressViewSwitch(),
+  selectedChannelId: () => selectedChannelId(),
+  channelOnScreen: () => channelOnScreen(),
+  chooseView: (which) => chooseView(which),
+  settleFocus: () => settleFocus(),
+  readModeHidden: () => el("todo-filter").hidden,
+  cycleReadMode: () => cycleReadMode(),
+  readModeSaid: () => READ_MODE_SAID[readModes.mode()],
+  setStatus: (text) => setStatus(text),
+  threadListOnScreen: () => threadListOnScreen(),
+  searchOpen: () => searchField.open(),
+  setSearchOpen: (open) => setSearchOpen(open),
+  pinnedOnly: () => pinsView().only,
+  setPinnedOnly: (on) => setPinnedOnly(on),
+  linksOnly: () => searchField.links(),
+  setLinksOnly: (on) => setLinksOnly(on),
+  cycleAuthorFilter: () => cycleAuthorFilter(),
+  focusChannelList: () => focusList(channelPane),
+  doneOffer: () => lastDismissal.current(),
+  undoDone: () => guardQuietly(undoDismissal)(),
+  sendOffer: () => sendUndo.current(),
+  sendHeld: (id) => Boolean(dismissedSends.find(id)),
+  putBackSend: (id) => putBackDismissedSend(id),
+  bookmarkOffer: () => bookmarkUndos.current(),
+  currentChannelId: () => currentChannelId(),
+  undoBookmarkRemoval: () => undoBookmarkRemoval(),
+});
+const { voiceFromKeyboard, viewFromKeyboard, readModeFromKeyboard, filterFromKeyboard, undoFromKeyboard } = viewKeys;
 
 /**
  * The keys to the message box: m and Ctrl+S (Cmd+S) take the reader to the box to write in, and ↑ in the

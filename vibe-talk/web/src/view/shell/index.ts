@@ -33,3 +33,5 @@ export { createScreenKeys } from "./screenkeys.ts";
 export type { KeyPlace, ScreenKeys, ScreenKeysDependencies } from "./screenkeys.ts";
 export { createWriteKeys } from "./writekeys.ts";
 export type { WriteKeys, WriteKeysDependencies } from "./writekeys.ts";
+export { createViewKeys } from "./viewkeys.ts";
+export type { UndoOfferStamp, ViewChoice, ViewKeys, ViewKeysDependencies } from "./viewkeys.ts";

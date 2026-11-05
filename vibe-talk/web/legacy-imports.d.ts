@@ -32,6 +32,7 @@ declare const createHighlightCopy: LegacyImports["createHighlightCopy"];
 declare const createScrollKeys: LegacyImports["createScrollKeys"];
 declare const createScreenKeys: LegacyImports["createScreenKeys"];
 declare const createWriteKeys: LegacyImports["createWriteKeys"];
+declare const createViewKeys: LegacyImports["createViewKeys"];
 declare const pageStep: LegacyImports["pageStep"];
 declare const createRowShortcuts: LegacyImports["createRowShortcuts"];
 declare const createChannelPick: LegacyImports["createChannelPick"];

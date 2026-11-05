@@ -20,7 +20,7 @@ const READ_MODE_LABELS: Readonly<Record<string, string>> = Object.freeze({ show:
  */
 const READ_MODE_VERBS: Readonly<Record<string, string>> = Object.freeze({ show: "Show", fold: "Fold", hide: "Hide" });
 
-/** What h says on the status line of each mode it moves to (`readModeFromKeyboard`). `#432 read-mode-unify`. */
+/** What h says on the status line of each mode it moves to (view/shell `readModeFromKeyboard`). `#432 read-mode-unify`. */
 const READ_MODE_SAID: Readonly<Record<string, string>> = Object.freeze({
   show: "Show read: everything shown.",
   fold: "Fold read: read runs folded.",
