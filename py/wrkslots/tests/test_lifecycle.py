@@ -46252,6 +46252,76 @@ def test_audit_row_round_trips_as_absent_validate_input(
         wrkslots._read_absent_validate_rows_input(config, str(input_path))
 
 
+def test_status_and_audit_agree_when_authority_and_owner_disagree(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#879: one liveness answer per row.
+
+    The recorded owner process is dead (its boot ended), but the row's
+    liveness authority -- here the registered command -- reports the
+    agent alive.  Status used to report only the owner question
+    ("dead") while audit reported the authority's answer, so the same
+    row read as free in one command and occupied in the other.  Both
+    now report _row_liveness's one answer.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project, slot="slot01", agent="codex-1").returncode == 0
+    set_liveness(project, "alive")
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    current = wrkslots._find_record(state, "slot01")
+    assert current.owner is not None
+    dead_owner = replace(
+        current.owner, boot_id="finished-boot", cgroup_path="/finished"
+    )
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, replace(current, owner=dead_owner)),
+        action="test-owner-exited",
+        slot="slot01",
+    )
+
+    status = command(project, "status", "--format", "json")
+    assert status.returncode == 0, status.stderr
+    status_row = json.loads(status.stdout)["active"][0]
+    assert status_row["liveness_state"] == "alive", status_row
+    assert "liveness_detail" in status_row
+
+    code, out = _audit_json(project, capsys)
+    assert code == 0
+    audit_row = next(
+        item for item in json.loads(out)["slots"] if item["slot"] == "slot01"
+    )
+    assert audit_row["liveness_state"] == "alive", audit_row
+    assert status_row["liveness_state"] == audit_row["liveness_state"]
+
+    # The mirror disagreement: authority dead, owner process live.
+    # Both report the authority's "dead"; audit still blocks removal
+    # on the live owner, so neither tool frees the slot.
+    set_liveness(project, "dead")
+    state = wrkslots._load_active(config)
+    current = wrkslots._find_record(state, "slot01")
+    live = wrkslots._read_process_identity(os.getpid())
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, replace(current, owner=live)),
+        action="test-owner-live",
+        slot="slot01",
+    )
+    status = command(project, "status", "--format", "json")
+    assert status.returncode == 0, status.stderr
+    status_row = json.loads(status.stdout)["active"][0]
+    assert status_row["liveness_state"] == "dead", status_row
+    code, out = _audit_json(project, capsys)
+    assert code == 0
+    audit_row = next(
+        item for item in json.loads(out)["slots"] if item["slot"] == "slot01"
+    )
+    assert audit_row["liveness_state"] == "dead", audit_row
+    assert audit_row["verdict"] == "BLOCKED", audit_row["reasons"]
+
+
 def test_absent_validate_legacy_row_without_owner_agrees(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

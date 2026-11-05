@@ -37194,14 +37194,30 @@ def _status_record(
     tolerate_hold_error: bool = False,
     storage_inconsistencies: Sequence[StorageInconsistency] = (),
     owner_release: tuple[_OwnerRelease, str | None] | None = None,
+    liveness: tuple[str, str] | None = None,
 ) -> dict[str, object]:
     process_state, process_detail = _process_state(record.owner)
+    # #879: one liveness source.  Status used to report only the owner
+    # process question, which reads "indeterminate" for exactly the
+    # rows whose run or registered authority audit asks (an ownerless
+    # validate row with a live run read as indeterminate here and
+    # alive in audit).  Both commands now carry the authority answer
+    # from _owner_liveness_states beside the owner evidence.
+    liveness_state, liveness_detail = (
+        liveness
+        if liveness is not None
+        else _owner_liveness_states(config, (record,))[
+            (record.machine, record.slot, record.generation)
+        ]
+    )
     age, expired = _heartbeat_diagnosis(record)
     value = _record_to_obj(record)
     if owner_release is not None:
         value["owner_release"] = _owner_release_obj(*owner_release)
     value["owner_state"] = process_state
     value["owner_detail"] = process_detail
+    value["liveness_state"] = liveness_state
+    value["liveness_detail"] = liveness_detail
     value["heartbeat_age_seconds"] = int(age)
     value["heartbeat_expired"] = expired
     hold = hold_result.value
@@ -37426,6 +37442,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                 if item["machine"] is None or item["machine"] == config.machine
             ]
         )
+        doctor_records = [record for state in states for record in state.slots]
+        doctor_liveness = _owner_liveness_states(config, doctor_records)
         rows = [
             _status_record(
                 config,
@@ -37433,9 +37451,11 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                 hold_result=hold_results[(record.machine, record.slot)],
                 tolerate_hold_error=True,
                 owner_release=doctor_releases.get((record.machine, record.slot)),
+                liveness=doctor_liveness[
+                    (record.machine, record.slot, record.generation)
+                ],
             )
-            for state in states
-            for record in state.slots
+            for record in doctor_records
         ]
     cap = config.max_active_slots
     if args.format == "json":
@@ -37517,6 +37537,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 config, ordinary_journals
             ),
         )
+        visible_records = [
+            record
+            for state in states
+            for record in state.slots
+            if args.slot is None or record.slot == args.slot
+        ]
+        liveness_states = _owner_liveness_states(config, visible_records)
         records = [
             _status_record(
                 config,
@@ -37528,10 +37555,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
                     if item.machine == record.machine and item.slot == record.slot
                 ),
                 owner_release=status_releases.get((record.machine, record.slot)),
+                liveness=liveness_states[
+                    (record.machine, record.slot, record.generation)
+                ],
             )
-            for state in states
-            for record in state.slots
-            if args.slot is None or record.slot == args.slot
+            for record in visible_records
         ]
     if args.format == "json":
         print(

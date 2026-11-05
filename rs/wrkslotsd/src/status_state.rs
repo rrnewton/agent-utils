@@ -236,6 +236,7 @@ pub(crate) fn status_records(
     tolerate_hold_error: bool,
 ) -> Result<(Vec<String>, Vec<Value>)> {
     let (cfg, _selected) = load_cfg(root, None)?;
+    let config = crate::config_validate::load_config(root, None)?;
     let machines = discover_machines(&cfg.control)?;
     let (_hold_machines, hold_entries) = load_record_holds(root)?;
     let mut records: Vec<Value> = Vec::new();
@@ -310,6 +311,18 @@ pub(crate) fn status_records(
                 })?)
             };
             let (state, detail) = process_state(identity.as_ref());
+            // #879: one liveness source — the same authority answer
+            // audit reports, beside the owner process evidence.
+            let slot_type = value
+                .get("slot_type")
+                .and_then(Value::as_str)
+                .unwrap_or("agent");
+            let liveness = if slot_type == "validate" {
+                let paths = crate::audit_state::validation_row_paths(&cfg, &value);
+                crate::audit_state::validation_liveness(&cfg, &config, &value, &paths)?
+            } else {
+                crate::remove_write::liveness_answer(&cfg, &config, &value)?
+            };
             let heartbeat_at = value
                 .get("heartbeat_at")
                 .and_then(Value::as_str)
@@ -355,6 +368,8 @@ pub(crate) fn status_records(
                 .ok_or_else(|| "active record is not an object".to_string())?;
             object.insert("owner_state".to_string(), json!(state));
             object.insert("owner_detail".to_string(), json!(detail));
+            object.insert("liveness_state".to_string(), json!(liveness.state));
+            object.insert("liveness_detail".to_string(), json!(liveness.detail));
             object.insert("heartbeat_age_seconds".to_string(), json!(age_seconds));
             object.insert("heartbeat_expired".to_string(), json!(age > ttl as f64));
             object.insert("held".to_string(), json!(held));

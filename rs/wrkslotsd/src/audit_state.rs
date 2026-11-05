@@ -5003,7 +5003,7 @@ fn cgroup_matches(recorded: &str, observed: &str) -> bool {
         || (prefix == "/" && observed.starts_with('/'))
 }
 
-fn validation_row_paths(cfg: &Cfg, record: &Value) -> Vec<PathBuf> {
+pub(crate) fn validation_row_paths(cfg: &Cfg, record: &Value) -> Vec<PathBuf> {
     let slot = record
         .get("slot")
         .and_then(Value::as_str)
@@ -5042,7 +5042,7 @@ fn validation_row_paths(cfg: &Cfg, record: &Value) -> Vec<PathBuf> {
 /// retained run handles are judged with the oracle's process,
 /// unit, control-group, and late-change evidence; unreadable
 /// host evidence refuses by name in the no-handle case.
-fn validation_liveness(
+pub(crate) fn validation_liveness(
     cfg: &Cfg,
     config: &Value,
     record: &Value,

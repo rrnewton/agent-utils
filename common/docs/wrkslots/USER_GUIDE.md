@@ -236,6 +236,12 @@ interrupted, or unregistered slots; exits 2 when an expired slot cannot be class
 evidence is unavailable; and exits 0 only when neither condition exists. The output names the
 affected slots and the next command. It never converts an unknown result into permission to remove.
 
+`status`, `doctor` and `audit` report the same `liveness_state` and `liveness_detail` for a
+row -- the answer of the row's one liveness authority (the validation run for a validation row,
+the registered liveness command for an agent row) -- beside `owner_state`, which is only the
+recorded owner process's evidence and can read `indeterminate` where the authority answers
+`alive`, for example an ownerless validation row with a live run.
+
 By default `audit`, like `status` and `doctor`, reads only the local machine's shard. A shard
 recorded by another machine (a stale copy, usually) is named in a NOTE -- with its machine and
 modification time, and in the JSON payload's `foreign_shards` -- but never read, so it cannot skew
