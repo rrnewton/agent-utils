@@ -2099,3 +2099,30 @@ test("`#624 voice-page-modularity`: the keys' and the selection's listeners moun
     [globalThis.document, globalThis.window] = was;
   }
 });
+
+test("`#624 voice-page-modularity`: a mount's listening adds each listener with its options and takes every one down once", () => {
+  const { createListening } = VIEW_DOM;
+  const calls = [];
+  const target = (name) => ({
+    addEventListener: (type, listener, options) => calls.push(["add", name, type, listener, options]),
+    removeEventListener: (type, listener, options) => calls.push(["remove", name, type, listener, options]),
+  });
+  const a = target("a");
+  const b = target("b");
+  const heard = [];
+  const listening = createListening();
+  const first = (event) => heard.push(event);
+  const second = () => heard.push("second");
+  listening.listen(a, "click", first);
+  listening.listen(b, "keydown", second, { capture: true });
+  assert.deepStrictEqual(calls.map(([kind, name, type, , options]) => [kind, name, type, options]),
+    [["add", "a", "click", undefined], ["add", "b", "keydown", { capture: true }]]);
+  calls[0][3]("event");
+  assert.deepStrictEqual(heard, ["event"], "the listener added is not the one given");
+  listening.unmount();
+  assert.deepStrictEqual(calls.slice(2).map(([kind, name, type, listener, options]) => [kind, name, type, listener, options]),
+    [["remove", "a", "click", first, undefined], ["remove", "b", "keydown", second, { capture: true }]],
+    "a listener was not taken down, or taken down with other options than it was added with");
+  listening.unmount();
+  assert.equal(calls.length, 4, "a second unmount took listeners down again");
+});

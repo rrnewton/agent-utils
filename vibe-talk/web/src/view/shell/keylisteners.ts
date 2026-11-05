@@ -4,6 +4,8 @@
 // whatever holds the focus heard first, a copy with nothing selected, the single-key switch, and the clicks, the
 // focus and the pointer that move the one selection. Mounted once, in the page's order, and taken down again.
 
+import { createListening } from "../dom/index.ts";
+
 /** A list the keys move through, as far as its listeners read it. */
 export interface ListenedPane {
   scroller(): HTMLElement;
@@ -44,13 +46,7 @@ export interface KeyListeners {
  * adds before and after this call.
  */
 export function mountKeyListeners<Pane extends ListenedPane>(deps: KeyListenersDependencies<Pane>): KeyListeners {
-  const taken: (() => void)[] = [];
-  const listen = <Kind extends Event>(target: EventTarget, type: string, listener: (event: Kind) => void,
-    options?: AddEventListenerOptions): void => {
-    const heard = listener as EventListener;
-    target.addEventListener(type, heard, options);
-    taken.push(() => target.removeEventListener(type, heard, options));
-  };
+  const { listen, unmount } = createListening();
   // `#224 keyboard-shortcuts`. Every key the page answers, in one place: see `keyDispatch.onPageKey`.
   listen<KeyboardEvent>(document, "keydown", (event) => deps.onPageKey(event));
   // `#344 search-shortcut`. ...but for the chords that act whatever holds the focus, heard before any other
@@ -72,9 +68,5 @@ export function mountKeyListeners<Pane extends ListenedPane>(deps: KeyListenersD
   }
   listen<PointerEvent>(document, "pointermove", (event) => deps.onPointerMove(event));
   listen<PointerEvent>(document, "pointerdown", (event) => deps.onPointerDown(event));
-  return {
-    unmount() {
-      for (const take of taken.splice(0)) take();
-    },
-  };
+  return { unmount };
 }
