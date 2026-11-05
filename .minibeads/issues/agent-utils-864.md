@@ -26,9 +26,14 @@ There are three gaps:
    - That slot's superproject HEAD was detached from its recorded branch, so salvage was off even though the owner was proven dead.
    - Check whether `not detached` is still required once the drifted checkout has been archived (`--archive-drifted-checkouts`). If it is, say why in the refusal text.
 
+4. **A nested checkout that tracks zero files breaks drift archiving.**
+   - Seen again on three later removals.
+   - `wrkslots remove --archive-drifted-checkouts` runs `git add -u -- . ':(exclude…)'` in every checkout.
+   - In a checkout whose commit has an empty tree (an "initialize review base" commit), Git dies with `pathspec '.' did not match any file(s) known to git`, and the removal is refused.
+
 These are out of scope here; they were seen on the same retry:
 - Two slots were refused because the SOURCE submodule directory is empty (`source submodule is unavailable`). That needs the shared source checkout to be populated; it is not a wrkslots defect.
-- One slot failed `git add -u -- .` with "pathspec '.' did not match", in a checkout whose remote URL changed. File that separately if it recurs.
+- That slot's remote-URL refusal (an ssh origin that was switched to https) is #868 wrkslots-remote-url-equivalence. Its `pathspec '.'` failure is gap 4 above.
 
 The lead's full retry note, with line references against `py/wrkslots/cli.py` at ec150b5e, is in the coordinator handoff directory as `859-retry-refusals.md`.
 
@@ -36,15 +41,18 @@ The lead's full retry note, with line references against `py/wrkslots/cli.py` at
 
 - Make unlisted-module discovery recursive. Walk `modules/` inside every module repository, at any depth, and give each nested repository the same listed/unlisted test and salvage bundle as a top-level one. Record the nesting path in the salvage manifest.
 - Move bundle verification out of the lock. Write and fsck the bundle before taking the batch lock (or in a phase that holds no lock); take the lock only to re-check that nothing changed and to delete. If verification has to stay inside the lock, scale the budget with bundle size, and print the budget used, so a big bundle never meets a fixed 60 s.
+- In drift archiving, skip `git add -u` when the checkout tracks no files (`git ls-files` is empty). Otherwise use a form that cannot fail on an empty index, for example `git add -u :/` with the excludes, and treat Git's "did not match" as nothing to stage only when the index is empty.
 - Keep every existing refusal for live owners and for unpublished work.
 
 # Acceptance Criteria
 
 - A test builds a superproject → submodule → nested submodule fixture, makes the nested one unlisted in a dead-owner slot, and proves it is bundled, verified, and then removed (and is still refused for a live owner).
 - A test (or a measured run) shows that fsck of a bundle larger than the budget's worth of work no longer exits 3 under the lock.
+- A test archives a drifted dead-owner slot whose nested checkout sits at a commit with an empty tree, and the removal completes.
 - The detached-HEAD case is either salvaged after drift archiving or refused with text that names the reason.
 - A retry on the four slots is reported back to the coordinator, with bytes freed, or the remaining refusals quoted verbatim.
 
 # Notes
 
 Requested by the lead on 2026-11-04 at 11:04 PM ET. Assigned to mu-validate, queued after its current latency-test rework.
+Gap 4 (a nested checkout with zero tracked files) was added on 2026-11-04 at the lead's request; it is the same salvage path.
