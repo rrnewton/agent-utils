@@ -27,7 +27,7 @@ const REQUIRED: [&str; 7] = [
     "heartbeat_ttl_seconds",
     "liveness_command",
 ];
-const OPTIONAL: [&str; 14] = [
+const OPTIONAL: [&str; 15] = [
     "liveness_batch_command",
     "max_active_slots",
     "layout",
@@ -42,6 +42,7 @@ const OPTIONAL: [&str; 14] = [
     "retire_freeze",
     "image",
     "sandbox",
+    "worktrees_image",
 ];
 
 fn name_valid(value: &str) -> bool {
@@ -357,6 +358,67 @@ fn image_settings(raw: &Map<String, Value>) -> Result<Value> {
         "backend": backend,
         "ceiling_bytes": ceiling,
         "state_ceiling_bytes": state_ceiling,
+    }))
+}
+
+fn worktrees_image_settings(raw: &Map<String, Value>) -> Result<Value> {
+    let Some(section) = raw.get("worktrees_image") else {
+        return Ok(Value::Null);
+    };
+    let section = section
+        .as_object()
+        .ok_or_else(|| "configuration.worktrees_image must be a JSON object".to_owned())?;
+    let unknown: Vec<&str> = section
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !matches!(*key, "path" | "size_bytes" | "fs" | "mount"))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "configuration.worktrees_image has invalid fields: unknown {}",
+            unknown.join(", ")
+        ));
+    }
+    let path = section
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| "configuration.worktrees_image.path must be a non-empty string".to_owned())?;
+    if path.starts_with('/') || path.split('/').any(|part| part == "..") {
+        return Err(
+            "configuration.worktrees_image.path must be a project-relative path without '..'"
+                .to_owned(),
+        );
+    }
+    let size = section
+        .get("size_bytes")
+        .ok_or_else(|| "configuration.worktrees_image.size_bytes is required".to_owned())?;
+    let size = as_int(size, "configuration.worktrees_image.size_bytes", 1024_i64.pow(3))?;
+    let filesystem = section.get("fs").and_then(Value::as_str).unwrap_or("btrfs");
+    if filesystem != "btrfs" {
+        return Err(format!(
+            "configuration.worktrees_image.fs must be one of btrfs, not {filesystem:?}"
+        ));
+    }
+    let mount = section.get("mount").and_then(Value::as_str).unwrap_or("kernel");
+    if mount == "fuse" {
+        return Err(
+            "configuration.worktrees_image.mount 'fuse' is unavailable: btrfs has no \
+             unprivileged FUSE driver (no fuse2fs equivalent); use 'kernel' with \
+             passwordless sudo, or do not enable worktrees_image on this host"
+                .to_owned(),
+        );
+    }
+    if !matches!(mount, "kernel" | "auto") {
+        return Err(format!(
+            "configuration.worktrees_image.mount must be one of kernel, auto, not {mount:?}"
+        ));
+    }
+    Ok(json!({
+        "fs": filesystem,
+        "mount": mount,
+        "path": path,
+        "size_bytes": size,
     }))
 }
 
@@ -1058,6 +1120,7 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         "sandbox": sandbox_settings(raw)?,
         "slot_representation": representation,
         "worktrees": worktrees.to_string_lossy(),
+        "worktrees_image": worktrees_image_settings(raw)?,
     }))
 }
 

@@ -258,4 +258,34 @@ drift heuristics, or attach and re-home an existing local branch during `create`
 to require a fresh branch; use `import-existing` only for a checkout already provisioned at its final
 path.
 
+## Move a project's worktrees onto one btrfs image (opt-in)
+
+`worktrees_image` in `.wrkslots.yml` puts every slot in one sparse btrfs
+image mounted at the slots directory; the registry stays outside it.
+Kernel mount only (`sudo -n mount -o loop`): btrfs has no unprivileged
+FUSE fallback, so a host without passwordless sudo cannot enable it.
+Absent key means today's behaviour. Design and trial numbers:
+`ai_docs/transient/2026-11-05-wtimg-worktrees-image/DESIGN.md`.
+
+Procedure (refined from the devbig014 throwaway trial):
+
+1. Quiesce slots (`audit` clean), write the rollback plan first.
+2. Add the config, then create and mount:
+   `worktrees_image: {path: worktrees.img, size_bytes: <bytes>, fs: btrfs, mount: kernel}`,
+   `wrkslots worktrees-image create`, `wrkslots worktrees-image mount`.
+   Creation marks the zero-byte backing file `+C` before truncating;
+   the reverse order silently loses NOCOW on a btrfs host.
+3. Migrate quiesced: rename `slots` aside, mount at the *same path*
+   (Git worktree metadata holds absolute paths), copy with
+   `cp -a --reflink=always`, compare full listings, verify
+   `git worktree list --porcelain` and `wrkslots status` CONSISTENT.
+4. Rollback before reclaiming the old tree: unmount, rename back,
+   remove the config block, verify status. After real work on the
+   image, copy back first — never just rename.
+5. Operate: `worktrees-image status|grow --to-size-bytes N|trim|unmount`.
+   Grow refreshes the loop capacity (`losetup -c`) before resizing;
+   without it the guest silently keeps its old size. Slot-writing
+   commands refuse while the image is not verifiably mounted — never
+   work around that by writing into the empty mount point.
+
 Run `worktrees/wrkslots --help` for the complete CLI.

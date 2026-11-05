@@ -16,7 +16,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar
 
-from wrkslots import sandbox, slotimage
+from wrkslots import sandbox, slotimage, worktreesimage
 
 if TYPE_CHECKING:
     from wrkslots import cli
@@ -179,6 +179,38 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
     convert.set_defaults(handler=_cmd_image_convert)
 
     image.set_defaults(handler=_cmd_image_help, image_parser=image)
+
+    wt_image = subparsers.add_parser(
+        "worktrees-image",
+        help="manage the one btrfs image holding every slot (opt-in worktrees_image)",
+        description=(
+            "Manage the project worktrees image: one sparse btrfs image mounted at the "
+            "slots directory, holding every slot. Configured by the worktrees_image "
+            "section; absent means slots live on the host file system. Kernel mount "
+            "only (sudo -n mount -o loop): btrfs has no unprivileged FUSE fallback. "
+            "Slot-writing commands refuse unless the image is verifiably mounted, so "
+            "slots are never written onto the host underneath the mount point."
+        ),
+        formatter_class=formatter,
+    )
+    wt_actions = wt_image.add_subparsers(dest="worktrees_image_command", metavar="ACTION")
+    wt_create = wt_actions.add_parser(
+        "create", help="create the sparse btrfs image file (does not mount it)"
+    )
+    wt_create.set_defaults(handler=_cmd_wt_image_create)
+    wt_mount = wt_actions.add_parser("mount", help="mount the worktrees image at the slots directory")
+    wt_mount.set_defaults(handler=_cmd_wt_image_mount)
+    wt_unmount = wt_actions.add_parser("unmount", help="unmount the worktrees image")
+    wt_unmount.set_defaults(handler=_cmd_wt_image_unmount)
+    wt_status = wt_actions.add_parser("status", help="show image file, mount state, and allocated bytes")
+    wt_status.add_argument("--format", choices=("human", "json"), default="human")
+    wt_status.set_defaults(handler=_cmd_wt_image_status)
+    wt_grow = wt_actions.add_parser("grow", help="grow the image online (truncate, loop refresh, resize)")
+    wt_grow.add_argument("--to-size-bytes", type=int, required=True, help="new apparent size in bytes")
+    wt_grow.set_defaults(handler=_cmd_wt_image_grow)
+    wt_trim = wt_actions.add_parser("trim", help="return freed guest blocks to the host (fstrim)")
+    wt_trim.set_defaults(handler=_cmd_wt_image_trim)
+    wt_image.set_defaults(handler=_cmd_wt_image_help, wt_image_parser=wt_image)
 
     run = subparsers.add_parser(
         "run",
@@ -536,7 +568,7 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
         help="program to run boxed instead of the interactive shell, after a literal -- (default: SHELL -i)",
     )
     shell_command.set_defaults(handler=_cmd_shell_command)
-    for name in ("image", "run", "box", "sandbox", "limits", "shell-command"):
+    for name in ("image", "worktrees-image", "run", "box", "sandbox", "limits", "shell-command"):
         _fill_help(subparsers.choices[name])
 
 
@@ -645,6 +677,88 @@ def _fill_help(parser: argparse.ArgumentParser) -> None:
 def _slot_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("slot", help="registered slot name")
     parser.add_argument("--slot-type", choices=("agent", "validate"), default="agent", help="slot type (default: agent)")
+
+
+def _cmd_wt_image_help(args: argparse.Namespace) -> int:
+    parser = args.wt_image_parser
+    assert isinstance(parser, argparse.ArgumentParser)
+    parser.print_help()
+    return 0
+
+
+def _wt_settings(args: argparse.Namespace):
+    config = _config(args)
+    if config.worktrees_image is None:
+        raise _refuse(
+            "no worktrees_image configured; add a worktrees_image section "
+            "(path, size_bytes, fs: btrfs, mount: kernel) to enable it"
+        )
+    return config, config.worktrees_image
+
+
+def _cmd_wt_image_create(args: argparse.Namespace) -> int:
+    config, settings = _wt_settings(args)
+    try:
+        worktreesimage.create_image(settings.image_file(config.root), settings.size_bytes)
+    except worktreesimage.WorktreesImageError as exc:
+        raise _refuse(str(exc)) from exc
+    print(f"created {settings.image_file(config.root)} ({settings.size_bytes} bytes, sparse btrfs)")
+    return 0
+
+
+def _cmd_wt_image_mount(args: argparse.Namespace) -> int:
+    config, settings = _wt_settings(args)
+    try:
+        worktreesimage.mount_image(settings.image_file(config.root), config.worktrees)
+    except worktreesimage.WorktreesImageError as exc:
+        raise _refuse(str(exc)) from exc
+    print(f"mounted {settings.image_file(config.root)} at {config.worktrees}")
+    return 0
+
+
+def _cmd_wt_image_unmount(args: argparse.Namespace) -> int:
+    config, settings = _wt_settings(args)
+    try:
+        worktreesimage.unmount_image(config.worktrees)
+    except worktreesimage.WorktreesImageError as exc:
+        raise _refuse(str(exc)) from exc
+    print(f"unmounted {config.worktrees}")
+    return 0
+
+
+def _cmd_wt_image_status(args: argparse.Namespace) -> int:
+    config, settings = _wt_settings(args)
+    report = worktreesimage.status_report(config.root, config.worktrees, settings)
+    if args.format == "json":
+        print(json.dumps(report, indent=2))
+        return 0
+    print(f"image: {report['image_file']} (exists={report['image_exists']})")
+    print(f"mount point: {report['mount_point']} state={report['state']}")
+    if report["image_exists"]:
+        print(f"apparent={report['apparent_bytes']} allocated={report['allocated_bytes']}")
+    if report["state"] != worktreesimage.MOUNTED:
+        print("remedy: wrkslots worktrees-image mount")
+    return 0
+
+
+def _cmd_wt_image_grow(args: argparse.Namespace) -> int:
+    config, settings = _wt_settings(args)
+    try:
+        worktreesimage.grow_image(settings.image_file(config.root), config.worktrees, args.to_size_bytes)
+    except worktreesimage.WorktreesImageError as exc:
+        raise _refuse(str(exc)) from exc
+    print(f"grew {settings.image_file(config.root)} to {args.to_size_bytes} bytes")
+    return 0
+
+
+def _cmd_wt_image_trim(args: argparse.Namespace) -> int:
+    config, settings = _wt_settings(args)
+    try:
+        output = worktreesimage.trim_image(config.worktrees)
+    except worktreesimage.WorktreesImageError as exc:
+        raise _refuse(str(exc)) from exc
+    print(output or "trimmed")
+    return 0
 
 
 def _cmd_image_help(args: argparse.Namespace) -> int:

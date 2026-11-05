@@ -44,7 +44,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set
 from pathlib import Path, PurePosixPath
 from typing import IO, NoReturn, Protocol, TextIO, TypedDict, TypeVar, cast, overload
 
-from wrkslots import __version__, imagecmd, sandbox, slotimage, yamlconfig
+from wrkslots import __version__, imagecmd, sandbox, slotimage, worktreesimage, yamlconfig
 
 VERSION = __version__
 SCHEMA = 2
@@ -524,6 +524,7 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "retire_freeze",
         "image",
         "sandbox",
+        "worktrees_image",
     }
 )
 REQUIRED_CONFIG_KEYS = frozenset(
@@ -607,6 +608,12 @@ CONFIG_KEY_DOCS: dict[str, str] = {
         "launchers). The box is the same for plain and image slots. `wrkslots sandbox "
         "show-config` prints the effective values; `wrkslots sandbox write-defaults` adds "
         "missing keys."
+    ),
+    "worktrees_image": (
+        "One sparse btrfs image holding every slot, mounted at the slots directory. "
+        "Absent means slots live directly on the host file system (the default). "
+        "Manage it with `wrkslots worktrees-image`; kernel mount only (sudo -n), "
+        "because btrfs has no unprivileged FUSE fallback."
     ),
 }
 CONFIG_HEADER = (
@@ -1038,6 +1045,12 @@ class Config:
     slot_representation: str = "worktree"
     image_settings: slotimage.ImageSettings = slotimage.ImageSettings()
     sandbox_settings: sandbox.SandboxSettings = sandbox.SandboxSettings()
+    #: Opt-in project worktrees image (one btrfs image for every slot);
+    #: None when absent, which is the historical default. The mount state
+    #: is classified at load; slot-writing commands refuse unless it is
+    #: "mounted" (see worktreesimage.classify_mount).
+    worktrees_image: worktreesimage.WorktreesImageSettings | None = None
+    worktrees_image_state: str = "disabled"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2157,6 +2170,7 @@ def _config_key_order(path: tuple[str, ...], keys: Iterable[str]) -> list[str]:
         ("sandbox",): sandbox.SETTING_KEYS,
         ("sandbox", "limits"): sandbox.LIMIT_KEYS,
         ("image",): tuple(slotimage.IMAGE_DOCS),
+        ("worktrees_image",): tuple(worktreesimage.WORKTREES_IMAGE_DOCS),
     }
     known = tables.get(path)
     names = list(keys)
@@ -2172,6 +2186,9 @@ def config_comments() -> dict[tuple[str, ...], str]:
     comments.update({("sandbox", key): text for key, text in sandbox.SETTING_DOCS.items()})
     comments.update({("sandbox", "limits", key): text for key, text in sandbox.LIMIT_DOCS.items()})
     comments.update({("image", key): text for key, text in slotimage.IMAGE_DOCS.items()})
+    comments.update(
+        {("worktrees_image", key): text for key, text in worktreesimage.WORKTREES_IMAGE_DOCS.items()}
+    )
     return comments
 
 
@@ -3973,7 +3990,14 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         slot_representation=_parse_slot_representation(raw),
         image_settings=_parse_image_settings(raw),
         sandbox_settings=_parse_sandbox_settings(raw),
+        worktrees_image=_parse_worktrees_image(raw, root, worktrees),
     )
+    if config.worktrees_image is not None:
+        object.__setattr__(
+            config,
+            "worktrees_image_state",
+            worktreesimage.current_state(config.root, config.worktrees, config.worktrees_image),
+        )
     _activate_representation(config)
     return config
 
@@ -4018,6 +4042,28 @@ def _parse_image_settings(raw: Mapping[str, object]) -> slotimage.ImageSettings:
         ),
         backend=str(backend),
     )
+
+
+def _parse_worktrees_image(
+    raw: Mapping[str, object], root: Path, worktrees: Path
+) -> worktreesimage.WorktreesImageSettings | None:
+    value = raw.get("worktrees_image")
+    if value is None:
+        return None
+    try:
+        settings = worktreesimage.settings_from_obj(_as_mapping(value, "configuration.worktrees_image"))
+    except worktreesimage.WorktreesImageError as exc:
+        raise StateError(str(exc)) from exc
+    image_file = settings.image_file(root)
+    try:
+        image_file.resolve().relative_to(worktrees.resolve())
+    except ValueError:
+        pass
+    else:
+        raise StateError(
+            "configuration.worktrees_image.path must live outside the slots directory it mounts"
+        )
+    return settings
 
 
 def _parse_sandbox_settings(raw: Mapping[str, object]) -> sandbox.SandboxSettings:
@@ -26746,10 +26792,31 @@ def _print_setup_hook_results(
         )
 
 
+def _require_worktrees_image_mounted(config: Config, action: str) -> None:
+    """Refuse a slot-writing action unless the worktrees image is mounted.
+
+    Writing into an unmounted slots directory would create slots on the
+    host underneath the mount point, where the next mount would hide
+    them. Read-only commands report the state instead of refusing.
+    """
+
+    if config.worktrees_image is None:
+        return
+    if config.worktrees_image_state == worktreesimage.MOUNTED:
+        return
+    raise Refusal(
+        f"cannot {action}: worktrees image is {config.worktrees_image_state} "
+        f"(expected mounted at {config.worktrees}); run "
+        "'wrkslots worktrees-image mount' and fix what it reports; "
+        "slots are never written onto the host underneath the mount"
+    )
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     _require_coordinator_authorized(args, "worktree creation")
     args.slot_type = _require_slot_type(args, "worktree creation")
     config = _load_new_slot_config(args, "worktree creation")
+    _require_worktrees_image_mounted(config, "create a slot")
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
     _validate_agent_name(args.agent)
