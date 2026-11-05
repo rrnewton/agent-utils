@@ -1989,12 +1989,12 @@ test("`#624 voice-page-modularity`: Shift+E folds first, marks Done only what is
   const quiet = [];
   const shiftE = createReadCollapse({
     rowForAct: (target) => { log.push(`row for ${target.id}`); return state.act; },
-    idsOf: () => state.ids,
+    idsOf: (of) => { assert.equal(of, state.act.row, "the ids were asked of another row"); return state.ids; },
     runQuietly: (act) => { quiet.push(act().catch((error) => log.push(`error ${error.message}`))); },
-    channelId: () => state.channel,
-    foldForRead: (_pane, folding) => { log.push(`fold ${folding.id}`); return state.folded; },
+    channelId: () => { log.push("channel?"); return state.channel; },
+    foldForRead: (on, folding) => { log.push(`fold ${on.name} ${folding.id}`); return state.folded; },
     isDone: (id) => state.done.has(id),
-    markRowDone: async (ids) => { log.push(`done ${ids.join(",")}`); if (state.fail) throw new Error(state.fail); },
+    markRowDone: async (ids, of) => { log.push(`done ${ids.join(",")} ${of.id}`); if (state.fail) throw new Error(state.fail); },
     doneSaved: async (ids) => { log.push(`saved? ${ids.join(",")}`); return state.saved; },
     markReadInService: async (channel, id) => { log.push(`service ${channel} ${id}`); if (state.moveTo) state.channel = state.moveTo; return { id }; },
     doneReadWords: (mark, also) => `already Done, read ${mark.id}${also}`,
@@ -2002,28 +2002,32 @@ test("`#624 voice-page-modularity`: Shift+E folds first, marks Done only what is
     setStatus: (text) => log.push(`say ${text}`),
   });
   const press = async () => { log.length = 0; quiet.length = 0; const took = shiftE.readCollapseFromKeyboard({ id: "t" }); await Promise.all(quiet); return [took, ...log]; };
-  assert.deepStrictEqual(await press(), [true, "row for t", "fold row", "done 3,4", "saved? 3,4", "service c1 4", "say marked read 4, and collapsed"]);
+  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "done 3,4 row", "saved? 3,4", "service c1 4", "channel?", "say marked read 4, and collapsed"]);
   state.done = new Set(["3", "4"]);
   state.folded = false;
-  assert.deepStrictEqual(await press(), [true, "row for t", "fold row", "saved? 3,4", "service c1 4", "say already Done, read 4"],
+  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "saved? 3,4", "service c1 4", "channel?", "say already Done, read 4"],
     "a message Done already was marked again, or its service half was not asked");
   state.done = new Set(["3"]);
   state.saved = false;
-  assert.deepStrictEqual(await press(), [true, "row for t", "fold row", "done 3,4", "saved? 3,4"], "the service was asked for a Done not saved");
+  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "done 3,4 row", "saved? 3,4"], "the service was asked for a Done not saved");
   state.saved = true;
   state.fail = "refused";
-  assert.deepStrictEqual(await press(), [true, "row for t", "fold row", "done 3,4", "error refused"], "a Done that failed asked the service, or was not said");
+  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "done 3,4 row", "error refused"], "a Done that failed asked the service, or was not said");
   state.fail = null;
   state.moveTo = "c2";
-  assert.deepStrictEqual(await press(), [true, "row for t", "fold row", "done 3,4", "saved? 3,4", "service c1 4"], "the status line spoke over another channel");
+  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "done 3,4 row", "saved? 3,4", "service c1 4", "channel?"], "the status line spoke over another channel");
   state.moveTo = null;
   state.channel = "c1";
   state.ids = [];
   assert.deepStrictEqual(await press(), [false, "row for t"], "a row of no message was acted on");
+  state.ids = ["5"];
+  state.act = { pane, row: null, took: false };
+  assert.deepStrictEqual(await press(), [false, "row for t"], "a key with no row acted, or asked a row's ids of nothing");
+  state.ids = [];
   state.act = { pane: null, row: null, took: true };
   assert.deepStrictEqual(await press(), [true, "row for t"], "a key taken with no row to act on was given back");
   log.length = 0;
   state.ids = ["9"];
   await shiftE.readAndCollapse(pane, row, ["9"]);
-  assert.deepStrictEqual(log, ["fold row", "done 9", "saved? 9", "service c1 9", "say marked read 9"]);
+  assert.deepStrictEqual(log, ["channel?", "fold channel row", "done 9 row", "saved? 9", "service c1 9", "channel?", "say marked read 9"]);
 });

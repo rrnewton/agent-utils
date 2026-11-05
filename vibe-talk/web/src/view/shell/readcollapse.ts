@@ -29,8 +29,9 @@ export interface ReadCollapseDependencies<Pane, Mark> {
   doneSaved(ids: string[]): Promise<boolean>;
   /** Ask the server to move the chat service's read marker of `channel` through the message `id`. */
   markReadInService(channel: string, id: string): Promise<Mark>;
-  /** What the status line says of `mark`, for a message Done already or marked Done now; `also` follows the mark. */
+  /** What the status line says of the service's `mark` for a message that was Done already; `also` follows it. */
   doneReadWords(mark: Mark, also: string): string;
+  /** What the status line says of the service's `mark` for a message Shift+E marked Done; `also` follows it. */
   serviceReadWords(mark: Mark, also: string): string;
   /** Say `text` on the status line. */
   setStatus(text: string): void;
