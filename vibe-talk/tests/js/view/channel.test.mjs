@@ -831,7 +831,10 @@ test("`#624 voice-page-modularity`: the search's and the filter chips' listeners
       const listeners = [];
       elements.set(id, { id, value: "", listeners,
         addEventListener: (type, listener) => listeners.push({ type, listener }),
-        removeEventListener: (type, listener) => listeners.splice(listeners.findIndex((one) => one.type === type && one.listener === listener), 1) });
+        removeEventListener: (type, listener) => {
+          const at = listeners.findIndex((one) => one.type === type && one.listener === listener);
+          if (at >= 0) listeners.splice(at, 1);
+        } });
     }
     return elements.get(id);
   };
@@ -852,10 +855,11 @@ test("`#624 voice-page-modularity`: the search's and the filter chips' listeners
     setLinksRaw: (raw) => log.push(`raw ${raw}`),
     keepingFilterPlace: (change) => { log.push("keep place ("); change(); log.push(")"); },
     liftingHideRead: (change) => { log.push("lift ("); change(); log.push(")"); },
-    setQuery: (text) => { state.query = text; log.push(`query ${text}`); },
+    // The search keeps its own form of the words, so what is asked of it afterwards is its query, not the field's text.
+    setQuery: (text) => { state.query = `<${text}>`; log.push(`query ${text}`); },
     query: () => state.query,
     setMarked: (text) => log.push(`marked ${JSON.stringify(text)}`),
-    searchTyped: () => state.typed,
+    searchTyped: (text) => { log.push(`typed? ${JSON.stringify(text)}`); return state.typed; },
     renderEveryColumnsTools: () => log.push("chips"),
     sideColumnUp: () => state.side,
     refilterSideCards: () => log.push("side cards"),
@@ -875,11 +879,11 @@ test("`#624 voice-page-modularity`: the search's and the filter chips' listeners
   fire("link-kinds", "focusin", { target: null });
   assert.deepStrictEqual(into, { block: "nearest", inline: "nearest" });
   el("search-field").value = "foo";
-  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["keep place (", "lift (", "query foo", "chips", ")", ")", "mark soon"]);
+  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["keep place (", "lift (", "query foo", "typed? \"<foo>\"", "chips", ")", ")", "mark soon"]);
   state.typed = false;
   state.side = true;
-  el("search-field").value = "";
-  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["keep place (", "lift (", "query ", "marked \"\"", "chips", "side cards", ")", ")", "mark soon"],
+  el("search-field").value = " ";
+  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["keep place (", "lift (", "query  ", "typed? \"< >\"", "marked \"< >\"", "chips", "side cards", ")", ")", "mark soon"],
     "a cleared search kept its marks, or the right column's cards were not filtered again");
   assert.deepStrictEqual([run(() => fire("search-field", "keydown", { key: "Enter" })), run(() => { state.older = true; fire("search-field", "keydown", { key: "Enter" }); }),
     run(() => fire("search-field", "keydown", { key: "Escape" })), run(() => fire("search-field", "keydown", { key: "Escape", isComposing: true })),
