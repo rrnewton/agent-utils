@@ -6,6 +6,8 @@
 //!
 //! ```text
 //! <state>/decisions/<YYYY-MM-DD>.jsonl   one line per validation, by UTC day of its end
+//! <state>/decisions/skips.jsonl          one line per change left out of its batch
+//! <state>/decisions/rulings.jsonl        one line per ruling on a held batch
 //! ```
 //!
 //! A record names the candidate (changes, heads, the commit and the base it was combined onto),
@@ -188,6 +190,15 @@ pub struct LandedBy {
 /// Directory of the decision log.
 pub fn dir(state_root: &Path) -> PathBuf {
     state_root.join("decisions")
+}
+
+/// The UTC day a day file of validation records is for (`YYYY-MM-DD.jsonl`); `None` for any
+/// other file in the directory, such as `skips.jsonl` or `rulings.jsonl`.
+fn day_of(name: &str) -> Option<&str> {
+    let day = name.strip_suffix(".jsonl")?;
+    chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        .ok()
+        .map(|_| day)
 }
 
 fn parse_time(text: &str) -> Option<DateTime<Utc>> {
@@ -650,8 +661,90 @@ pub fn append_skips(state_root: &Path, skips: &[SkipRecord]) -> Result<(), Strin
     Ok(())
 }
 
+/// Schema identifier of one ruling record.
+pub const RULING_SCHEMA: &str = "merge-queue-ruling/v1";
+
+/// A ruling on a batch that passed only after retries (GREEN_FLAKY), and what came of it: an
+/// `accept-flaky` ruling given with `merge-queue accept-flaky`, or a `known-flaky` one, where
+/// every retried test was on the known-flaky list. Written beside the validation records.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RulingRecord {
+    /// [`RULING_SCHEMA`].
+    pub schema: String,
+    /// `accept-flaky` or `known-flaky`.
+    pub ruling: String,
+    /// The batch's changes, in order.
+    pub prs: Vec<i64>,
+    /// The heads they were validated at, aligned with `prs`.
+    pub heads: Vec<String>,
+    /// The validated candidate.
+    pub commit: String,
+    /// The base it was combined onto.
+    pub base: String,
+    /// The tests that passed only after a retry.
+    pub flaky: Vec<String>,
+    /// Who ruled: the person or agent, or the known-flaky entries' authors.
+    pub by: String,
+    /// Why: the reason given, or the issues tracking the known-flaky tests.
+    pub reason: String,
+    /// RFC 3339 UTC time the ruling was given.
+    pub ruled_at: String,
+    /// `landed` (exactly the validated commit) or `requeued` (validated again).
+    pub outcome: String,
+    /// What decided the outcome.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    /// The run that validated the candidate, and the validation (`v<N>`).
+    pub validated_in: String,
+    /// The run that acted on the ruling.
+    pub run: String,
+    /// RFC 3339 UTC time it acted.
+    pub at: String,
+}
+
+/// Append one ruling record to `decisions/rulings.jsonl`.
+pub fn append_ruling(state_root: &Path, record: &RulingRecord) -> Result<(), String> {
+    let dir = dir(state_root);
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    let path = dir.join("rulings.jsonl");
+    let mut line = serde_json::to_string(record)
+        .map_err(|error| format!("cannot encode a ruling record: {error}"))?;
+    line.push('\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(line.as_bytes()))
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+/// Read every ruling record (none when the file does not exist).
+pub fn read_rulings(state_root: &Path) -> Result<Vec<RulingRecord>, String> {
+    let path = dir(state_root).join("rulings.jsonl");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(number, line)| {
+            serde_json::from_str(line).map_err(|error| {
+                format!(
+                    "{}:{}: bad ruling record: {error}",
+                    path.display(),
+                    number + 1
+                )
+            })
+        })
+        .collect()
+}
+
 /// Delete day files older than the age bound, then the oldest until the total fits the size
-/// bound. The newest file is always kept.
+/// bound. The newest day file is always kept; the other files (skips, rulings) are not day files
+/// and are left alone.
 pub fn prune(dir: &Path, bounds: &DecisionsConfig, now: DateTime<Utc>) -> Result<(), String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(());
@@ -660,7 +753,7 @@ pub fn prune(dir: &Path, bounds: &DecisionsConfig, now: DateTime<Utc>) -> Result
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let day = name.strip_suffix(".jsonl")?.to_owned();
+            let day = day_of(&name)?.to_owned();
             let size = entry.metadata().ok()?.len();
             Some((day, entry.path(), size))
         })
@@ -684,7 +777,7 @@ pub fn prune(dir: &Path, bounds: &DecisionsConfig, now: DateTime<Utc>) -> Result
     Ok(())
 }
 
-/// Read every record in the log that ended in `[since, until)`.
+/// Read every validation record in the log (the day files) that ended in `[since, until)`.
 pub fn read(
     state_root: &Path,
     since: DateTime<Utc>,
@@ -697,7 +790,12 @@ pub fn read(
     let mut paths: Vec<PathBuf> = entries
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(day_of)
+                .is_some()
+        })
         .collect();
     paths.sort();
     let mut out = Vec::new();
@@ -1180,6 +1278,10 @@ mod unit {
         ] {
             std::fs::write(dir.join(format!("{day}.jsonl")), "x".repeat(100)).unwrap();
         }
+        // Not day files: never pruned, never counted, never mistaken for the newest day.
+        for other in ["skips.jsonl", "rulings.jsonl"] {
+            std::fs::write(dir.join(other), "y".repeat(400)).unwrap();
+        }
         let now = parse_time("2026-11-03T12:00:00Z").unwrap();
         let bounds = DecisionsConfig {
             keep_days: 30,
@@ -1193,16 +1295,67 @@ mod unit {
             .collect();
         left.sort();
         // 2026-09-01 is past the age bound; then the oldest go until 250 bytes fit.
-        assert_eq!(left, ["2026-11-02.jsonl", "2026-11-03.jsonl"]);
+        assert_eq!(
+            left,
+            [
+                "2026-11-02.jsonl",
+                "2026-11-03.jsonl",
+                "rulings.jsonl",
+                "skips.jsonl"
+            ]
+        );
         // The newest file survives even alone over the size bound.
         let tiny = DecisionsConfig {
             keep_days: 30,
             max_bytes: 1,
         };
         prune(&dir, &tiny, now).unwrap();
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3);
         assert!(dir.join("2026-11-03.jsonl").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_takes_validation_records_from_day_files_only() {
+        let root = std::env::temp_dir().join(format!(
+            "mq-decisions-read-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let dir = dir(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Other records beside the day files: a skip and a ruling, which are not decisions.
+        let skip = SkipRecord {
+            decision: "skip".to_owned(),
+            pr: 7,
+            reason: "recount-pins refused".to_owned(),
+            run: "20261104T000000Z".to_owned(),
+            at: "2026-11-04T00:00:00Z".to_owned(),
+        };
+        append_skips(&root, std::slice::from_ref(&skip)).unwrap();
+        let ruling = RulingRecord {
+            schema: RULING_SCHEMA.to_owned(),
+            ruling: "accept-flaky".to_owned(),
+            prs: vec![7],
+            heads: vec!["a".repeat(40)],
+            commit: "b".repeat(40),
+            base: "c".repeat(40),
+            flaky: vec!["t".to_owned()],
+            by: "owner".to_owned(),
+            reason: "known flake".to_owned(),
+            ruled_at: "2026-11-04T00:00:00Z".to_owned(),
+            outcome: "landed".to_owned(),
+            detail: String::new(),
+            validated_in: "20261104T000000Z v0".to_owned(),
+            run: "20261104T000100Z".to_owned(),
+            at: "2026-11-04T00:01:00Z".to_owned(),
+        };
+        append_ruling(&root, &ruling).unwrap();
+        let since = parse_time("2026-11-01T00:00:00Z").unwrap();
+        let until = parse_time("2026-11-05T00:00:00Z").unwrap();
+        assert_eq!(read(&root, since, until).unwrap(), Vec::new());
+        assert_eq!(read_rulings(&root).unwrap(), vec![ruling]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

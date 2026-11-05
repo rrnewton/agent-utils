@@ -3,8 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::git::Git;
-use crate::model::{now, Held, Item, ItemStatus, Plan, Requirement};
-use crate::plan::{make_plan, probe_first_stage, probe_with_options, PlanOptions, ProbeOptions};
+use crate::model::{now, Held, HeldCandidate, Item, ItemStatus, Plan, Requirement, Ruling};
+use crate::plan::{
+    make_plan, probe_first_stage, probe_with_options, short, PlanOptions, ProbeOptions,
+};
 use crate::probe_cache::probe_config_hash;
 use crate::state::{Config, State};
 use crate::state::{PriorityConfig, RegenerateConfig};
@@ -310,6 +312,16 @@ fn submit_resolved(
         } else {
             String::new()
         },
+        held_candidate: if same_head {
+            existing.as_ref().and_then(|old| old.held_candidate.clone())
+        } else {
+            None
+        },
+        accepted: if same_head {
+            existing.as_ref().and_then(|old| old.accepted.clone())
+        } else {
+            None
+        },
         deciding_report: existing
             .as_ref()
             .map_or_else(String::new, |old| old.deciding_report.clone()),
@@ -383,9 +395,7 @@ pub fn retry_recorded(state: &State, pr: i64, recorded_at: &str) -> Result<Item,
         format!("escalated: {}", item.escalated)
     };
     item.escalated.clear();
-    item.flaky_nodes.clear();
-    item.flaky_hold_until.clear();
-    item.hold_verdict.clear();
+    item.clear_hold();
     item.validation_refusals = 0;
     item.next_retry_at.clear();
     item.last_refusal.clear();
@@ -404,6 +414,143 @@ pub fn retry_recorded(state: &State, pr: i64, recorded_at: &str) -> Result<Item,
         state.save_shadow_refusals(&ledger)?;
     }
     Ok(item)
+}
+
+/// The held batch `prs` names, checked for `merge-queue accept-flaky`: every change is queued
+/// and held for a GREEN_FLAKY ruling with the candidate it was validated in recorded, they were
+/// all validated together, and `prs` is that whole batch, each still at the head validated.
+/// Returns the items and the candidate.
+pub fn held_batch(state: &State, prs: &[i64]) -> Result<(Vec<Item>, HeldCandidate), String> {
+    let mut items = Vec::new();
+    let mut held: Option<HeldCandidate> = None;
+    for pr in prs {
+        let item = state
+            .item(*pr)?
+            .ok_or_else(|| format!("#{pr} is not in the queue"))?;
+        if item.status != ItemStatus::Queued {
+            return Err(format!("#{pr} is {}, not queued", item.status.as_str()));
+        }
+        if item.flaky_hold_until.is_empty() {
+            return Err(format!("#{pr} is not held for a ruling"));
+        }
+        if !item.hold_verdict.is_empty() {
+            return Err(format!(
+                "#{pr} is held {} (the host refused to measure {}), not {}: there is no pass to \
+                 accept; `merge-queue retry {pr}` validates it again once the host is fixed",
+                item.hold_verdict,
+                item.flaky_nodes.join(", "),
+                crate::validate::FLAKY_MARKER
+            ));
+        }
+        let Some(candidate) = item.held_candidate.clone() else {
+            return Err(format!(
+                "#{pr}'s hold records no validated candidate (it was held after a red batch's \
+                 rerun, or by an older version of the queue): `merge-queue retry {pr}` validates \
+                 it again"
+            ));
+        };
+        match &held {
+            Some(first) if first.tip != candidate.tip => {
+                return Err(format!(
+                    "#{} and #{pr} were held in different batches ({} and {}): accept one batch at \
+                     a time",
+                    prs[0],
+                    short(&first.tip),
+                    short(&candidate.tip)
+                ));
+            }
+            Some(_) => {}
+            None => held = Some(candidate),
+        }
+        items.push(item);
+    }
+    let held = held.ok_or("name the changes of the held batch")?;
+    let named: BTreeSet<i64> = prs.iter().copied().collect();
+    let batch: BTreeSet<i64> = held.prs().into_iter().collect();
+    if named != batch {
+        return Err(format!(
+            "the held batch is {} (validated together at {}): name every change of it, and only \
+             those",
+            held.prs()
+                .iter()
+                .map(|pr| format!("#{pr}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            short(&held.tip)
+        ));
+    }
+    for item in &items {
+        let validated = held
+            .changes
+            .iter()
+            .find(|change| change.pr == item.pr)
+            .map(|change| change.head.as_str())
+            .unwrap_or_default();
+        if item.head != validated {
+            return Err(format!(
+                "#{}'s head is {}, not the head {} the held batch validated: `merge-queue retry \
+                 {}` validates it again",
+                item.pr,
+                short(&item.head),
+                short(validated),
+                item.pr
+            ));
+        }
+    }
+    Ok((items, held))
+}
+
+/// Accept the GREEN_FLAKY passes of the held batch `prs` (see [`held_batch`]): the ruling is
+/// recorded on every change of it, and the next run acts on it, landing exactly the commit that
+/// was validated if the base has not moved, and otherwise returning the batch to the queue for
+/// a new validation. `recorded_at` is the time the request was recorded while another writer
+/// held the queue (see [`crate::intake`]), or empty.
+pub fn accept_flaky(
+    state: &State,
+    prs: &[i64],
+    by: &str,
+    reason: &str,
+    recorded_at: &str,
+) -> Result<HeldCandidate, String> {
+    if by.trim().is_empty() || reason.trim().is_empty() {
+        return Err("a ruling names who gives it (--by) and why (--reason)".to_owned());
+    }
+    let (items, held) = held_batch(state, prs)?;
+    let recorded = if recorded_at.is_empty() {
+        String::new()
+    } else {
+        format!("; recorded at {recorded_at} while another writer held the queue")
+    };
+    let ruling = Ruling {
+        by: by.to_owned(),
+        reason: reason.to_owned(),
+        at: if recorded_at.is_empty() {
+            now()
+        } else {
+            recorded_at.to_owned()
+        },
+    };
+    for mut item in items {
+        item.accepted = Some(ruling.clone());
+        item.log(
+            "accepted-flaky",
+            format!(
+                "{by} accepted the {} passes ({}) of {} at {}: {reason}; the next run lands that \
+                 commit if the base is still {}{recorded}",
+                crate::validate::FLAKY_MARKER,
+                item.flaky_nodes.join(", "),
+                held.prs()
+                    .iter()
+                    .map(|pr| format!("#{pr}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                short(&held.tip),
+                short(&held.parent)
+            ),
+        );
+        state.save_item(&item)?;
+    }
+    Ok(held)
 }
 
 /// Probe options for one queue: the persistent cache in the state

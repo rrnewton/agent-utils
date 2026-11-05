@@ -532,17 +532,37 @@ pub fn make_plan(
             } else {
                 "passed only after a retry"
             };
+            let ruling = match (&item.held_candidate, &item.accepted) {
+                (Some(candidate), Some(ruling)) => format!(
+                    "accepted by {}: a run lands {} if the base is still {}",
+                    ruling.by,
+                    short(&candidate.tip),
+                    short(&candidate.parent)
+                ),
+                (Some(candidate), None) => format!(
+                    "`merge-queue accept-flaky {} --by WHO --reason WHY` lands the validated commit \
+                     {}, and `merge-queue retry {}` validates it again",
+                    candidate
+                        .prs()
+                        .iter()
+                        .map(i64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    short(&candidate.tip),
+                    item.pr
+                ),
+                _ => format!("`merge-queue retry {}` returns it to the queue", item.pr),
+            };
             hold(
                 &mut held,
                 Held {
                     pr: item.pr,
                     kind: item.hold_kind().into(),
                     reason: format!(
-                        "validation was {} ({}: {why}); held for a ruling until {}; `merge-queue retry {}` returns it to the queue",
+                        "validation was {} ({}: {why}); held for a ruling until {}; {ruling}",
                         item.hold_label(),
                         item.flaky_nodes.join(", "),
                         item.flaky_hold_until,
-                        item.pr
                     ),
                     with: vec![],
                     paths: vec![],
@@ -955,6 +975,8 @@ mod unit {
             flaky_nodes: Vec::new(),
             flaky_hold_until: String::new(),
             hold_verdict: String::new(),
+            held_candidate: None,
+            accepted: None,
             escalated: String::new(),
             deciding_report: String::new(),
             deciding_failed: vec![],

@@ -56,6 +56,40 @@ struct Cli {
     command: Command,
 }
 
+/// `merge-queue known-flaky` verbs.
+#[derive(Debug, Subcommand)]
+enum KnownFlakyCommand {
+    /// Add a test to the list (or replace its entry). The entry covers the test, its cells
+    /// (`TEST[cell]`) and its cases (`TEST::case`).
+    Add {
+        /// The test ID.
+        test: String,
+        /// The issue tracking its flakiness: a link or a tracker ID.
+        #[arg(long)]
+        issue: String,
+        /// Who adds it.
+        #[arg(long)]
+        by: String,
+        /// Why it is known flaky.
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Remove a test's entry from the list.
+    Remove {
+        /// The test ID, exactly as listed.
+        test: String,
+        /// Who removes it (printed with the removal).
+        #[arg(long)]
+        by: String,
+    },
+    /// Print the list.
+    List {
+        /// Print the list as JSON (schema merge-queue-known-flaky/v1).
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// `merge-queue donor` verbs.
 #[derive(Debug, Subcommand)]
 enum DonorCommand {
@@ -686,6 +720,27 @@ enum Command {
         /// Change numbers.
         #[arg(required = true)]
         prs: Vec<i64>,
+    },
+    /// Accept the GREEN_FLAKY passes of a held batch as a ruling: a run lands exactly the
+    /// commit that was validated if the base has not moved since, and otherwise validates the
+    /// batch again. Name every change of the held batch. While a run holds the writer lock the
+    /// ruling is recorded, and the run acts on it as soon as its window has room.
+    AcceptFlaky {
+        /// The held batch's change numbers.
+        #[arg(required = true)]
+        prs: Vec<i64>,
+        /// Who gives the ruling.
+        #[arg(long)]
+        by: String,
+        /// Why the retried tests' failures are not the batch's.
+        #[arg(long)]
+        reason: String,
+    },
+    /// The known-flaky list: tests whose flakiness is known and tracked. A GREEN_FLAKY result
+    /// whose retried tests are all on it lands without a hold, the tests recorded as flaky.
+    KnownFlaky {
+        #[command(subcommand)]
+        action: KnownFlakyCommand,
     },
     /// List changes and their status, then the requests recorded while a run held the queue
     /// (`#N pending-intake: ...`) until they are applied.
@@ -1635,6 +1690,105 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             }
             Ok(0)
         }
+        Command::AcceptFlaky { prs, by, reason } => {
+            let config = state.config()?;
+            if by.trim().is_empty() || reason.trim().is_empty() {
+                return Err("a ruling names who gives it (--by) and why (--reason)".to_owned());
+            }
+            let lock = match state.lock() {
+                Ok(lock) => lock,
+                Err(busy) => {
+                    let (_, held) = ops::held_batch(&state, &prs)?;
+                    let request = intake::Request::AcceptFlaky {
+                        prs: prs.clone(),
+                        by,
+                        reason,
+                    };
+                    let what = request.describe();
+                    let (entry, new) = intake::record(&state, request, &busy, "")?;
+                    let when = if new {
+                        "recorded".to_owned()
+                    } else {
+                        format!(
+                            "already recorded at {}, not recorded again",
+                            entry.recorded_at
+                        )
+                    };
+                    println!(
+                        "{what}: {when}: {busy}; the run acts on it as soon as its window has \
+                         room (or when it ends): it lands {} if the base is still {}, and \
+                         otherwise validates the batch again",
+                        short(&held.tip),
+                        short(&held.parent)
+                    );
+                    return Ok(0);
+                }
+            };
+            intake::report(
+                "merge-queue accept-flaky",
+                intake::apply(&state, &config, &lock),
+            );
+            let held = ops::accept_flaky(&state, &prs, &by, &reason, "")?;
+            println!(
+                "accepted the {} passes of {}: the next run lands {} if the base is still {}, \
+                 and otherwise validates the batch again",
+                crate::validate::FLAKY_MARKER,
+                held.prs()
+                    .iter()
+                    .map(|pr| format!("#{pr}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                short(&held.tip),
+                short(&held.parent)
+            );
+            Ok(0)
+        }
+        Command::KnownFlaky { action } => match action {
+            KnownFlakyCommand::Add {
+                test,
+                issue,
+                by,
+                reason,
+            } => {
+                let entry = crate::known_flaky::add(&state.root, &test, &issue, &by, &reason)?;
+                println!(
+                    "{} is on the known-flaky list (tracked by {}): a GREEN_FLAKY result that \
+                     retried only listed tests lands without a hold",
+                    entry.test, entry.issue
+                );
+                Ok(0)
+            }
+            KnownFlakyCommand::Remove { test, by } => {
+                let entry = crate::known_flaky::remove(&state.root, &test)?;
+                println!(
+                    "{} removed from the known-flaky list by {by} (it was tracked by {})",
+                    entry.test, entry.issue
+                );
+                Ok(0)
+            }
+            KnownFlakyCommand::List { json } => {
+                let list = crate::known_flaky::load(&state.root)?;
+                if json {
+                    let text = serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?;
+                    println!("{text}");
+                } else if list.entries.is_empty() {
+                    println!("the known-flaky list is empty");
+                } else {
+                    for entry in &list.entries {
+                        let why = if entry.reason.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", entry.reason)
+                        };
+                        println!(
+                            "{} tracked by {} (added by {} at {}){why}",
+                            entry.test, entry.issue, entry.by, entry.added_at
+                        );
+                    }
+                }
+                Ok(0)
+            }
+        },
         Command::List { all, json } => {
             let by_pr = records_by_pr(&state)?;
             let items: Vec<&Item> = by_pr

@@ -1,11 +1,11 @@
-//! Intake that never waits for a run. `submit`, `withdraw` and `retry` change item records, which
-//! needs the writer lock, and a run holds that lock for its whole length. When the lock is busy
-//! they record the request under `<state>/intake/pending/` instead, one file each, and the next
-//! holder of the lock applies the requests in the order they were recorded before it reads the
-//! queue: the `serve` daemon at its next cycle, a `run`, a `sync`, or the next intake command
-//! that finds the lock free. A request that cannot be applied then (its change landed meanwhile,
-//! its head no longer resolves) is kept under `intake/refused/` with the reason, and `status`
-//! shows it.
+//! Intake that never waits for a run. `submit`, `withdraw`, `retry` and `accept-flaky` change
+//! item records, which needs the writer lock, and a run holds that lock for its whole length.
+//! When the lock is busy they record the request under `<state>/intake/pending/` instead, one
+//! file each, and the next holder of the lock applies the requests in the order they were
+//! recorded before it reads the queue: the `serve` daemon at its next cycle, a `run`, a `sync`,
+//! or the next intake command that finds the lock free. A request that cannot be applied then
+//! (its change landed meanwhile, its head no longer resolves) is kept under `intake/refused/`
+//! with the reason, and `status` shows it.
 //!
 //! A run whose speculative window has room does not wait for its own end: it applies the
 //! requests for changes it has not started, and plans them on top of the batches in flight
@@ -58,23 +58,42 @@ pub enum Request {
         /// Change number.
         pr: i64,
     },
+    /// `merge-queue accept-flaky` of one held batch.
+    AcceptFlaky {
+        /// The batch's change numbers.
+        prs: Vec<i64>,
+        /// Who gave the ruling.
+        by: String,
+        /// Why.
+        reason: String,
+    },
 }
 
 impl Request {
-    /// The change the request is about.
+    /// The change the request is about (for a batch, its first change).
     pub fn pr(&self) -> i64 {
         match self {
             Self::Submit(submission) => submission.pr,
             Self::Withdraw { pr, .. } | Self::Retry { pr } => *pr,
+            Self::AcceptFlaky { prs, .. } => prs.first().copied().unwrap_or_default(),
         }
     }
 
-    /// `submit #N`, `withdraw #N` or `retry #N`.
+    /// `submit #N`, `withdraw #N`, `retry #N` or `accept-flaky #N, #M`.
     pub fn describe(&self) -> String {
         let verb = match self {
             Self::Submit(_) => "submit",
             Self::Withdraw { .. } => "withdraw",
             Self::Retry { .. } => "retry",
+            Self::AcceptFlaky { prs, .. } => {
+                return format!(
+                    "accept-flaky {}",
+                    prs.iter()
+                        .map(|pr| format!("#{pr}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
         };
         format!("{verb} #{}", self.pr())
     }
@@ -144,7 +163,7 @@ pub struct Pending {
     pub pr: i64,
     /// Always [`PENDING_INTAKE`], so a `list --json` reader tells these from item records.
     pub status: &'static str,
-    /// `submit`, `withdraw` or `retry`.
+    /// `submit`, `withdraw`, `retry` or `accept-flaky`.
     pub op: String,
     /// For a submission, its head ref.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -426,6 +445,17 @@ fn perform(state: &State, config: &Config, entry: &Entry) -> Result<String, Stri
             ops::retry_recorded(state, *pr, recorded)?;
             Ok(format!("#{pr} is back in the queue"))
         }
+        Request::AcceptFlaky { prs, by, reason } => {
+            let held = ops::accept_flaky(state, prs, by, reason, recorded)?;
+            Ok(format!(
+                "accepted the {} passes of {} at {}; a run lands that commit if the base is \
+                 still {}",
+                crate::validate::FLAKY_MARKER,
+                entry.request.describe().trim_start_matches("accept-flaky "),
+                short(&held.tip),
+                short(&held.parent)
+            ))
+        }
     }
 }
 
@@ -494,6 +524,7 @@ pub fn pending(state: &State) -> Vec<Pending> {
             ),
             Request::Withdraw { .. } => ("withdraw", String::new(), String::new()),
             Request::Retry { .. } => ("retry", String::new(), String::new()),
+            Request::AcceptFlaky { .. } => ("accept-flaky", String::new(), String::new()),
         };
         out.push((
             entry.request.clone(),

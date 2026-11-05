@@ -370,9 +370,22 @@ pub fn render_report(state: &State, item: &Item, transition: &Transition) -> Str
         "held-green-flaky" => {
             text.push_str(&format!("flaky_tests: {}\n", item.flaky_nodes.join(", ")));
             text.push_str(&format!("hold_until: {}\n", item.flaky_hold_until));
-            text.push_str(
-                "remedy: rule on the flaky pass, then `merge-queue retry <pr>` returns it to the queue; the hold expires and re-queues it at hold_until either way\n",
-            );
+            match &item.held_candidate {
+                Some(candidate) => text.push_str(&format!(
+                    "remedy: rule on the flaky pass: `merge-queue accept-flaky {} --by WHO --reason WHY` lands the validated commit {} if the base is still {}, and `merge-queue retry <pr>` validates it again; the hold expires and re-queues it at hold_until either way\n",
+                    candidate
+                        .prs()
+                        .iter()
+                        .map(i64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    candidate.tip,
+                    candidate.parent
+                )),
+                None => text.push_str(
+                    "remedy: rule on the flaky pass, then `merge-queue retry <pr>` returns it to the queue; the hold expires and re-queues it at hold_until either way\n",
+                ),
+            }
         }
         "held-infra-blocked" => {
             text.push_str(&format!("blocked_tests: {}\n", item.flaky_nodes.join(", ")));
@@ -667,6 +680,8 @@ mod unit {
             flaky_nodes: Vec::new(),
             flaky_hold_until: String::new(),
             hold_verdict: String::new(),
+            held_candidate: None,
+            accepted: None,
             escalated: String::new(),
             deciding_report: String::new(),
             deciding_failed: vec![],

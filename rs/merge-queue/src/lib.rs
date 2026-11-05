@@ -19,6 +19,7 @@ pub mod git;
 pub mod github;
 pub mod intake;
 pub mod interrupt;
+pub mod known_flaky;
 pub mod model;
 pub mod notify;
 pub mod ops;

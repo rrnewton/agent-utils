@@ -43,7 +43,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::git::{Combined, Git};
-use crate::model::{now, Discharge, Item, ItemStatus, Obligation, Plan};
+use crate::model::{
+    now, Discharge, HeldCandidate, HeldChange, Item, ItemStatus, Obligation, Plan, Ruling,
+};
 use crate::ops::{self, repo};
 use crate::plan::short;
 use crate::state::{write_json, Config, Lock, State};
@@ -672,6 +674,22 @@ impl Hold {
     }
 }
 
+/// [`RulingRecord::ruling`](crate::decisions::RulingRecord) of a ruling given with
+/// `merge-queue accept-flaky`.
+const ACCEPT_FLAKY: &str = "accept-flaky";
+
+/// [`RulingRecord::ruling`](crate::decisions::RulingRecord) of the known-flaky list's standing
+/// ruling.
+const KNOWN_FLAKY: &str = "known-flaky";
+
+/// A ruling on a batch that passed only after retries: the batch's validated candidate, who
+/// ruled and why, and the tests retried.
+struct Accepted {
+    held: HeldCandidate,
+    ruling: Ruling,
+    flaky: Vec<String>,
+}
+
 enum Culprit {
     /// The bare parent fails the focus (seen twice, or once for a deterministic check), with
     /// how that was confirmed.
@@ -1080,12 +1098,15 @@ impl<'a> Runner<'a> {
     /// INFRA-BLOCKED hold names tests the host refused to measure on a run and its rerun. The
     /// hold notifies through the item's recorded notify target (the `held-green-flaky` or
     /// `held-infra-blocked` transition); on expiry the change is re-queued, never landed
-    /// unruled and never held silently.
+    /// unruled and never held silently. `held` is what a green batch's GREEN_FLAKY hold
+    /// validated, recorded so that an accepted ruling lands exactly that commit (see
+    /// [`Self::act_on_rulings`]).
     fn hold_for_ruling(
         &self,
         candidate: &Candidate,
         hold: Hold,
         tests: &[TestId],
+        held: Option<HeldCandidate>,
     ) -> Result<String, String> {
         let nodes: Vec<String> = tests.iter().map(ToString::to_string).collect();
         let until = retry_after_time(Duration::from_secs(
@@ -1111,6 +1132,8 @@ impl<'a> Runner<'a> {
                     item.flaky_nodes = nodes.clone();
                     item.flaky_hold_until = until.clone();
                     item.hold_verdict = verdict.clone();
+                    item.held_candidate = held.clone();
+                    item.accepted = None;
                     item.deciding_report = self.run_dir.join("report.md").display().to_string();
                     item.deciding_failed.clear();
                     item.log(
@@ -1168,9 +1191,7 @@ impl<'a> Runner<'a> {
                 } else {
                     "infra-blocked-hold-expired"
                 };
-                item.flaky_nodes.clear();
-                item.flaky_hold_until.clear();
-                item.hold_verdict.clear();
+                item.clear_hold();
                 item.log(
                     kind,
                     format!(
@@ -1188,6 +1209,353 @@ impl<'a> Runner<'a> {
             ),
         );
         Ok(())
+    }
+
+    /// What `candidate`, validated as `vid` of this run with `claim`, is: the record a hold
+    /// keeps and a ruling lands.
+    fn held_candidate(
+        &self,
+        candidate: &Candidate,
+        claim: &ValidationClaim,
+        vid: usize,
+    ) -> HeldCandidate {
+        let run = lock(&self.report).run.clone();
+        let items = lock(&self.items);
+        HeldCandidate {
+            tip: candidate.tip.clone(),
+            parent: candidate.parent.clone(),
+            changes: candidate
+                .prs
+                .iter()
+                .map(|pr| HeldChange {
+                    pr: *pr,
+                    head: items
+                        .get(pr)
+                        .map(|item| item.head.clone())
+                        .unwrap_or_default(),
+                })
+                .collect(),
+            prefixes: candidate.prefixes.clone(),
+            claim: claim.clone(),
+            run,
+            validation: vid,
+        }
+    }
+
+    /// The known-flaky list (see [`crate::known_flaky`]); `None`, with an event, when it cannot
+    /// be read, so that every GREEN_FLAKY result is held as if no test were on it.
+    fn known_flaky_list(&self) -> Option<crate::known_flaky::KnownFlaky> {
+        match crate::known_flaky::load(&self.state.root) {
+            Ok(list) => Some(list),
+            Err(error) => {
+                self.event(
+                    KNOWN_FLAKY,
+                    &format!(
+                        "{error}; GREEN_FLAKY results are held as if no test were on the list"
+                    ),
+                );
+                None
+            }
+        }
+    }
+
+    /// The known-flaky list's standing ruling on `ran`: `Some` when it is green only after
+    /// retries and every test it retried is on the list, naming the entries' authors and the
+    /// issues tracking the tests.
+    fn known_flaky(&self, ran: &Ran) -> Option<Ruling> {
+        if !ran.green() || ran.flaky_passes.is_empty() {
+            return None;
+        }
+        let list = self.known_flaky_list()?;
+        let covered = list.cover_all(&ran.flaky_passes)?;
+        let mut by: Vec<&str> = covered.iter().map(|(_, entry)| entry.by.as_str()).collect();
+        by.sort_unstable();
+        by.dedup();
+        Some(Ruling {
+            by: format!("the known-flaky list ({})", by.join(", ")),
+            reason: covered
+                .iter()
+                .map(|(test, entry)| {
+                    if entry.test == test.to_string() {
+                        format!("{test}: {}", entry.issue)
+                    } else {
+                        format!("{test} as {}: {}", entry.test, entry.issue)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+            at: covered
+                .iter()
+                .map(|(_, entry)| entry.added_at.clone())
+                .max()
+                .unwrap_or_default(),
+        })
+    }
+
+    /// The accepted rulings waiting (`merge-queue accept-flaky`), one per held batch, read from
+    /// the item records and taken into this run's copy of them. A batch with a change in `busy`
+    /// waits. Shadow and dry runs act on no ruling; records that cannot be read hold none.
+    fn accepted_rulings(&self, busy: &BTreeSet<i64>) -> Vec<Accepted> {
+        if self.simulating() {
+            return Vec::new();
+        }
+        let records = match self.state.items() {
+            Ok(records) => records,
+            Err(error) => {
+                self.event(
+                    ACCEPT_FLAKY,
+                    &format!("cannot read the queue for rulings: {error}; they wait"),
+                );
+                return Vec::new();
+            }
+        };
+        let mut rulings: Vec<Accepted> = Vec::new();
+        let mut items = lock(&self.items);
+        for item in records {
+            if item.status != ItemStatus::Queued || busy.contains(&item.pr) {
+                continue;
+            }
+            let (Some(held), Some(ruling)) = (item.held_candidate.clone(), item.accepted.clone())
+            else {
+                continue;
+            };
+            if !rulings.iter().any(|known| known.held.tip == held.tip) {
+                rulings.push(Accepted {
+                    held,
+                    ruling,
+                    flaky: item.flaky_nodes.clone(),
+                });
+            }
+            items.insert(item.pr, item);
+        }
+        rulings.retain(|accepted| accepted.held.prs().iter().all(|pr| !busy.contains(pr)));
+        rulings
+    }
+
+    /// Act on accepted rulings: land each held candidate at exactly the commit validated, when
+    /// every change of it is still queued at the head validated with the ruling on it, the base
+    /// is still the commit it was built on, and the commit is still in the repository; otherwise
+    /// return the batch to the queue for a new validation. `flights` are the batches in flight,
+    /// built on that same base without the held batch: a landing cancels them first, and their
+    /// changes go back to `pending`. Each ruling's outcome goes to the decision log. Returns why
+    /// the run must stop, when a landing left the base to be checked by hand.
+    fn act_on_rulings(
+        &self,
+        rulings: Vec<Accepted>,
+        flights: &mut VecDeque<Flight>,
+        rx: &mpsc::Receiver<(u64, JobResult)>,
+        pending: &mut VecDeque<Vec<i64>>,
+    ) -> Result<Option<String>, String> {
+        for accepted in rulings {
+            let held = &accepted.held;
+            let prs = held.prs();
+            let candidate = match self.ruled_candidate(held)? {
+                Ok(candidate) => candidate,
+                Err(why) => {
+                    self.return_ruled(&accepted, &why)?;
+                    continue;
+                }
+            };
+            if !flights.is_empty() {
+                let cancelled: Vec<i64> = flights
+                    .iter()
+                    .flat_map(|flight| flight.candidate.prs.iter().copied())
+                    .collect();
+                self.event(
+                    ACCEPT_FLAKY,
+                    &format!(
+                        "cancelling {} in flight: built on {} without {}, which lands first",
+                        list(&cancelled),
+                        short(&held.parent),
+                        list(&prs)
+                    ),
+                );
+                discard(flights, rx, pending);
+            }
+            let note = format!(
+                "{} passes ({}) accepted by {}: {}; validated in run {} as v{}",
+                crate::validate::FLAKY_MARKER,
+                accepted.flaky.join(", "),
+                accepted.ruling.by,
+                accepted.ruling.reason,
+                held.run,
+                held.validation
+            );
+            let flaky: BTreeSet<TestId> = accepted
+                .flaky
+                .iter()
+                .filter_map(|test| TestId::parse(test).ok())
+                .collect();
+            self.event(
+                ACCEPT_FLAKY,
+                &format!(
+                    "landing {} at {}, validated in run {} as v{}: the base is still {}",
+                    list(&prs),
+                    short(&held.tip),
+                    held.run,
+                    held.validation,
+                    short(&held.parent)
+                ),
+            );
+            match self.land_with(
+                &candidate,
+                held.claim.clone(),
+                Vec::new(),
+                flaky,
+                Some(&note),
+            )? {
+                BatchOutcome::Done => {
+                    {
+                        let mut items = lock(&self.items);
+                        for pr in &prs {
+                            if let Some(item) = items.get_mut(pr) {
+                                item.clear_hold();
+                                self.state.save_item(item)?;
+                            }
+                        }
+                    }
+                    self.log_ruling(ACCEPT_FLAKY, &accepted, "landed", "");
+                }
+                BatchOutcome::Stop(reason, unlanded) if unlanded.is_empty() => {
+                    self.log_ruling(ACCEPT_FLAKY, &accepted, "stopped", &reason);
+                    return Ok(Some(reason));
+                }
+                BatchOutcome::BaseMoved(_) => {
+                    self.return_ruled(&accepted, "the base moved while it was landing")?;
+                }
+                BatchOutcome::Stop(reason, _) | BatchOutcome::Deferred(reason, _) => {
+                    self.return_ruled(&accepted, &reason)?;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The candidate an accepted ruling lands, or why it cannot land as validated any more.
+    fn ruled_candidate(&self, held: &HeldCandidate) -> Result<Result<Candidate, String>, String> {
+        {
+            let items = lock(&self.items);
+            for change in &held.changes {
+                let pr = change.pr;
+                let why = match items.get(&pr) {
+                    None => format!("#{pr} is not in the queue"),
+                    Some(item) if item.status != ItemStatus::Queued => {
+                        format!("#{pr} is {} now", item.status.as_str())
+                    }
+                    Some(item) if item.head != change.head => format!(
+                        "#{pr}'s head moved from {} to {}",
+                        short(&change.head),
+                        short(&item.head)
+                    ),
+                    Some(item)
+                        if item.accepted.is_none()
+                            || item
+                                .held_candidate
+                                .as_ref()
+                                .is_none_or(|other| other.tip != held.tip) =>
+                    {
+                        format!("#{pr} is no longer held in this batch with the ruling on it")
+                    }
+                    Some(_) => continue,
+                };
+                return Ok(Err(why));
+            }
+        }
+        let base = self.current_base()?;
+        if base != held.parent {
+            return Ok(Err(format!(
+                "the base moved from {} to {} since {} was validated",
+                short(&held.parent),
+                short(&base),
+                short(&held.tip)
+            )));
+        }
+        if self
+            .git
+            .run(&["cat-file", "-e", &format!("{}^{{commit}}", held.tip)])
+            .is_err()
+        {
+            return Ok(Err(format!(
+                "the validated commit {} is no longer in the queue's repository",
+                short(&held.tip)
+            )));
+        }
+        Ok(Ok(Candidate {
+            prs: held.prs(),
+            parent: held.parent.clone(),
+            tip: held.tip.clone(),
+            prefixes: held.prefixes.clone(),
+        }))
+    }
+
+    /// Return an accepted batch that cannot land as validated to the queue: its hold and the
+    /// ruling are cleared, so it is planned and validated again, and the outcome is logged.
+    fn return_ruled(&self, accepted: &Accepted, why: &str) -> Result<(), String> {
+        let prs = accepted.held.prs();
+        {
+            let mut items = lock(&self.items);
+            for pr in &prs {
+                let Some(item) = items.get_mut(pr) else {
+                    continue;
+                };
+                if item.status != ItemStatus::Queued {
+                    continue;
+                }
+                item.clear_hold();
+                item.log(
+                    "accepted-flaky-requeued",
+                    format!(
+                        "the ruling by {} cannot land {} as validated: {why}; validated again",
+                        accepted.ruling.by,
+                        short(&accepted.held.tip)
+                    ),
+                );
+                self.state.save_item(item)?;
+            }
+        }
+        self.event(
+            ACCEPT_FLAKY,
+            &format!(
+                "{} back in the queue for a new validation: {why}",
+                list(&prs)
+            ),
+        );
+        self.log_ruling(ACCEPT_FLAKY, accepted, "requeued", why);
+        Ok(())
+    }
+
+    /// Append a ruling's outcome to the decision log (see [`crate::decisions::RulingRecord`]).
+    /// Like the rest of the log it is an observation: a failure to write it is reported and
+    /// never fails the run.
+    fn log_ruling(&self, kind: &str, accepted: &Accepted, outcome: &str, detail: &str) {
+        if self.simulating() {
+            return;
+        }
+        let held = &accepted.held;
+        let record = crate::decisions::RulingRecord {
+            schema: crate::decisions::RULING_SCHEMA.to_owned(),
+            ruling: kind.to_owned(),
+            prs: held.prs(),
+            heads: held
+                .changes
+                .iter()
+                .map(|change| change.head.clone())
+                .collect(),
+            commit: held.tip.clone(),
+            base: held.parent.clone(),
+            flaky: accepted.flaky.clone(),
+            by: accepted.ruling.by.clone(),
+            reason: accepted.ruling.reason.clone(),
+            ruled_at: accepted.ruling.at.clone(),
+            outcome: outcome.to_owned(),
+            detail: detail.to_owned(),
+            validated_in: format!("{} v{}", held.run, held.validation),
+            run: lock(&self.report).run.clone(),
+            at: now(),
+        };
+        if let Err(error) = crate::decisions::append_ruling(&self.state.root, &record) {
+            self.event("decisions", &format!("ruling not logged: {error}"));
+        }
     }
 
     /// Retry a refused batch validation with backoff. Returns the final `(id, ran)`.
@@ -2731,6 +3099,13 @@ impl<'a> Runner<'a> {
 
     /// Execute the run. Errors after the run started stop it and are recorded in the report.
     pub fn run(self) -> Result<RunReport, String> {
+        // Accepted rulings before anything else: a ruling given before its hold expired is
+        // honoured, and its landing comes before any new batch is built on the base.
+        let ruled = {
+            let (_tx, rx) = mpsc::channel::<(u64, JobResult)>();
+            let rulings = self.accepted_rulings(&BTreeSet::new());
+            self.act_on_rulings(rulings, &mut VecDeque::new(), &rx, &mut VecDeque::new())
+        };
         if let Err(error) = self.release_expired_flaky_holds() {
             self.event(
                 "green-flaky-hold-expired",
@@ -2742,11 +3117,11 @@ impl<'a> Runner<'a> {
                 self.event("peers", &format!("could not drain peers: {error}"));
             }
         }
-        let mut stop = match self.drive() {
-            Ok(stop) => stop,
+        let mut stop = match ruled.map(|stop| stop.map_or_else(|| self.drive(), Ok)) {
+            Ok(Ok(stop)) => stop,
             // A drain declining to start a validation stops the run; it is not a failure.
-            Err(error) if error.contains(crate::drain::DRAINED) => error,
-            Err(error) => format!("error: {error}"),
+            Ok(Err(error)) if error.contains(crate::drain::DRAINED) => error,
+            Ok(Err(error)) | Err(error) => format!("error: {error}"),
         };
         if !stop.is_empty() {
             self.event("stopped", &stop);
@@ -3214,6 +3589,39 @@ impl<'a> Runner<'a> {
                                 None => self.current_base()?,
                             };
                             self.take_intake(&tip, &busy, max_batch, pending)?;
+                            // A ruling taken in just now is acted on at once, not at the end
+                            // of the run, when other batches may have moved the base.
+                            let rulings = self.accepted_rulings(&busy);
+                            if !rulings.is_empty() {
+                                if let Some(stop) =
+                                    self.act_on_rulings(rulings, &mut flights, &rx, pending)?
+                                {
+                                    return Ok(stop);
+                                }
+                                // What went back to the queue, and what a landing cancelled in
+                                // flight, is planned again on top of what is still in flight.
+                                let mut busy: BTreeSet<i64> = flights
+                                    .iter()
+                                    .flat_map(|flight| flight.candidate.prs.iter().copied())
+                                    .collect();
+                                busy.extend(lock(&self.excluded).iter().copied());
+                                let tip = match flights.back() {
+                                    Some(last) => last.candidate.tip.clone(),
+                                    None => self.current_base()?,
+                                };
+                                if let Err(error) =
+                                    self.plan_intake(&tip, &busy, max_batch, pending)
+                                {
+                                    self.event(
+                                        "plan-intake",
+                                        &format!(
+                                            "cannot plan on top of {}: {error}; the changes wait \
+                                             for the next run",
+                                            short(&tip)
+                                        ),
+                                    );
+                                }
+                            }
                         }
                     }
                     // Fill the window, each new batch on top of the last one in flight.
@@ -3362,6 +3770,7 @@ impl<'a> Runner<'a> {
                                 &head.candidate,
                                 Hold::InfraBlocked,
                                 &ran.infra_blocked,
+                                None,
                             )?;
                             BatchOutcome::Deferred(
                                 format!(
@@ -3371,16 +3780,60 @@ impl<'a> Runner<'a> {
                                 ),
                                 head.candidate.prs.clone(),
                             )
+                        } else if let Some(ruling) = self.known_flaky(&ran) {
+                            // Green only after retries, but every retried test is on the
+                            // known-flaky list: the list is the standing ruling, so the
+                            // batch lands on this validation with the tests recorded as
+                            // flaky.
+                            let claim = ValidationClaim::new(
+                                head.chosen.selection.clone(),
+                                head.chosen.policy.clone(),
+                                head.candidate.tip.clone(),
+                            );
+                            let accepted = Accepted {
+                                held: self.held_candidate(&head.candidate, &claim, vid),
+                                ruling,
+                                flaky: ran.flaky_passes.iter().map(ToString::to_string).collect(),
+                            };
+                            self.event(
+                                "known-flaky",
+                                &format!(
+                                    "{} passed only after a retry ({}), every one on the \
+                                     known-flaky list ({}); landing",
+                                    list(&head.candidate.prs),
+                                    accepted.flaky.join(", "),
+                                    accepted.ruling.reason
+                                ),
+                            );
+                            let outcome = self.land(
+                                &head.candidate,
+                                claim,
+                                vec![vid],
+                                ran.flaky_passes.iter().cloned().collect(),
+                            )?;
+                            if matches!(outcome, BatchOutcome::Done) {
+                                window = (window + 1).min(self.max_window);
+                                self.log_ruling(KNOWN_FLAKY, &accepted, "landed", "");
+                            }
+                            outcome
                         } else if ran.green() && !ran.flaky_passes.is_empty() {
                             // Green only because some tests passed after a retry
                             // inside the run (GREEN_FLAKY): hold for a ruling,
                             // never land on the plain pass. Batches behind it were
-                            // built on its tree.
+                            // built on its tree. The hold records the candidate, so
+                            // an accepted ruling lands it without validating again.
                             discard(&mut flights, &rx, pending);
+                            let claim = ValidationClaim::new(
+                                head.chosen.selection.clone(),
+                                head.chosen.policy.clone(),
+                                head.candidate.tip.clone(),
+                            );
+                            let held = self.held_candidate(&head.candidate, &claim, vid);
                             let until = self.hold_for_ruling(
                                 &head.candidate,
                                 Hold::GreenFlaky,
                                 &ran.flaky_passes,
+                                Some(held),
                             )?;
                             BatchOutcome::Deferred(
                                 format!(
@@ -3657,6 +4110,20 @@ impl<'a> Runner<'a> {
         validations: Vec<usize>,
         flaky: BTreeSet<TestId>,
     ) -> Result<BatchOutcome, String> {
+        self.land_with(candidate, claim, validations, flaky, None)
+    }
+
+    /// [`Self::land`]. With `ruling`, the candidate was validated by an earlier run and held
+    /// for a ruling, which was accepted: that validation is the evidence for the exact-commit
+    /// rule, in place of this run's own, and `ruling` says so with the landing.
+    fn land_with(
+        &self,
+        candidate: &Candidate,
+        claim: ValidationClaim,
+        validations: Vec<usize>,
+        flaky: BTreeSet<TestId>,
+        ruling: Option<&str>,
+    ) -> Result<BatchOutcome, String> {
         crate::interrupt::check(&format!("landing {}", list(&candidate.prs)))?;
         let requiring: Vec<Item> = {
             let items = lock(&self.items);
@@ -3693,7 +4160,10 @@ impl<'a> Runner<'a> {
                 candidate.prs.clone(),
             ));
         }
-        if self.config.exact_sha && !self.covered(&candidate.tip, &claim.selection) {
+        if self.config.exact_sha
+            && ruling.is_none()
+            && !self.covered(&candidate.tip, &claim.selection)
+        {
             return Ok(BatchOutcome::Stop(
                 format!(
                     "exact-commit rule: {} has no green coverage of {} recorded at that exact commit; refusing to land",
@@ -3717,7 +4187,7 @@ impl<'a> Runner<'a> {
                 &claim,
                 validations,
                 flaky,
-                "",
+                ruling.unwrap_or_default(),
             )?;
             return Ok(BatchOutcome::Done);
         }
@@ -3766,21 +4236,36 @@ impl<'a> Runner<'a> {
                         Vec::new(),
                     ));
                 }
-                self.record_landed(&candidate.prs, &now, &claim, validations, flaky, "")?;
+                self.record_landed(
+                    &candidate.prs,
+                    &now,
+                    &claim,
+                    validations,
+                    flaky,
+                    ruling.unwrap_or_default(),
+                )?;
                 Ok(BatchOutcome::Done)
             }
-            "command" => self.land_by_command(candidate, &claim, validations, flaky),
+            "command" => self.land_by_command(
+                candidate,
+                &claim,
+                validations,
+                flaky,
+                ruling.unwrap_or_default(),
+            ),
             other => Err(format!("unknown land.driver {other:?}")),
         }
     }
 
     /// The per-change driver: run `land.command` once per change and check the resulting tree.
+    /// `note` goes with the landing (see [`Self::land_with`]).
     fn land_by_command(
         &self,
         candidate: &Candidate,
         claim: &ValidationClaim,
         validations: Vec<usize>,
         flaky: BTreeSet<TestId>,
+        note: &str,
     ) -> Result<BatchOutcome, String> {
         // A per-change driver (such as a hosted rebase merge) rewrites commit IDs, so an
         // unchanged base is recognised by its tree, not its commit.
@@ -3792,7 +4277,16 @@ impl<'a> Runner<'a> {
         }
         let items = lock(&self.items).clone();
         let mut tip = now;
-        let partial_note = "partial batch: the driver stopped before the rest; this intermediate tree was not validated on its own";
+        let partial_note = [
+            "partial batch: the driver stopped before the rest; this intermediate tree was not validated on its own",
+            note,
+        ]
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("; ");
+        let partial_note = partial_note.as_str();
         for (i, pr) in candidate.prs.iter().enumerate() {
             let item = &items[pr];
             let prefix = self.regenerated_prefix(candidate, i + 1)?;
@@ -3855,7 +4349,7 @@ impl<'a> Runner<'a> {
             }
             tip = after;
         }
-        self.record_landed(&candidate.prs, &tip, claim, validations, flaky, "")?;
+        self.record_landed(&candidate.prs, &tip, claim, validations, flaky, note)?;
         Ok(BatchOutcome::Done)
     }
 
@@ -3951,8 +4445,38 @@ impl<'a> Runner<'a> {
                         current.prs.clone(),
                     ));
                 }
+                // A rerun of a red batch that passed only after retries of tests all on the
+                // known-flaky list is a plain flaky pass: the list is the standing ruling.
+                Culprit::Held(Hold::GreenFlaky, tests)
+                    if self
+                        .known_flaky_list()
+                        .is_some_and(|list| list.cover_all(&tests).is_some()) =>
+                {
+                    self.event(
+                        "known-flaky",
+                        &format!(
+                            "the rerun of {} passed only after retries of {}, every one on the \
+                             known-flaky list",
+                            list(&current.prs),
+                            ids(&tests)
+                        ),
+                    );
+                    flaky.extend(tests);
+                    let mut claim = ValidationClaim::new(
+                        chosen.selection.clone(),
+                        chosen.policy.clone(),
+                        current.tip.clone(),
+                    );
+                    if carried {
+                        claim.policy = format!("carried-forward+delta({})", chosen.policy);
+                        claim.scope = Scope::Focused;
+                    }
+                    return self.land(&current, claim, validations, flaky);
+                }
+                // The hold of a red batch's rerun records no candidate: what was validated
+                // there is the rerun of its failed tests, not a green batch to land as is.
                 Culprit::Held(hold, tests) => {
-                    let until = self.hold_for_ruling(&current, hold, &tests)?;
+                    let until = self.hold_for_ruling(&current, hold, &tests, None)?;
                     return Ok(BatchOutcome::Deferred(
                         format!(
                             "{} rerun of {} on the same tree ({}); held for a ruling until {until}, not landed",

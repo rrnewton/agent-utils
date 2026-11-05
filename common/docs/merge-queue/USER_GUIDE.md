@@ -241,10 +241,54 @@ that ends a hold (see "Held for a ruling"): the change is validated again. While
 writer lock, the retry is recorded and applied when the lock frees (see "Intake while a run holds
 the queue").
 
+### `merge-queue accept-flaky PR... --by WHO --reason WHY`
+
+This command is the ruling that accepts the GREEN_FLAKY passes of a held batch (see "Held for a
+ruling") without validating it again. Name every change of the held batch, in any order, and
+only those; the hold must be a GREEN_FLAKY hold of a green batch, which records the candidate it
+validated. `--by` and `--reason` are required and go in each change's history (`accepted-flaky`)
+and in the decision log (`decisions/rulings.jsonl`, see "The decision log").
+
+A run then acts on the ruling, before it builds anything new on the base:
+
+- If every change is still queued at the head that was validated, the base is still the commit
+  the candidate was built on, and the candidate is still in the queue's repository, the run lands
+  exactly that commit, with the retried tests recorded as flaky and the ruling noted with the
+  landing. The earlier validation is the evidence for the exact-commit rule. Batches in flight
+  were built on that base without the held batch, so they are cancelled first and built again
+  on top of it.
+- Otherwise the hold and the ruling are cleared (`accepted-flaky-requeued`, with the reason) and
+  the batch is validated again like any queued change.
+
+While a run holds the writer lock, the ruling is recorded (see "Intake while a run holds the
+queue"), and the run acts on it as soon as its window has a free slot, or when it ends. A
+refusal names what is wrong: a part of the batch, a change not held, an INFRA-BLOCKED hold (there
+is no pass to accept; `retry` once the host is fixed), or a hold that recorded no candidate (a
+red batch's rerun, or a hold made by an older version); `retry` validates those again.
+
+### `merge-queue known-flaky add TEST --issue ISSUE --by WHO`
+
+The known-flaky list holds tests whose flakiness is known and tracked by an issue. It is a
+standing ruling: a GREEN_FLAKY result whose retried tests are all on the list lands at once,
+without a hold, the tests recorded as flaky with the landing, and the ruling goes to the decision
+log as `known-flaky`. A result that retried any test not on the list is held as before.
+
+- `add TEST --issue ISSUE --by WHO [--reason WHY]` adds the test, or replaces its entry. `ISSUE`
+  is a link or a tracker ID. An entry covers its test, the test's cells (`TEST[cell]`, as a
+  runner that runs one test in several configurations names them) and its cases
+  (`TEST::case`); an entry for one cell covers that cell only.
+- `remove TEST --by WHO` removes the entry for exactly `TEST`.
+- `list [--json]` prints the list (schema `merge-queue-known-flaky/v1`).
+
+The list is `known-flaky.json` in the state directory, replaced atomically, so a run reads either
+the old list or the new one. A list that cannot be read covers nothing (an event says so), so
+results are held as if it were empty.
+
 ### Intake while a run holds the queue
 
 A run holds the writer lock from start to finish, which can be many minutes. `submit`,
-`withdraw` and `retry` never wait for it and never fail because of it. When the lock is busy,
+`withdraw`, `retry` and `accept-flaky` never wait for it and never fail because of it. When the
+lock is busy,
 each one records its request as a file under `intake/pending/`, prints `recorded ...` and exits 0.
 The next holder of the lock applies the recorded requests in the order they were recorded,
 before it reads the queue. That holder is the `serve` daemon at its next poll, a `run`, a
@@ -735,6 +779,9 @@ on which files two changes share.
   notifications/        notification report files the daemon sends with `--file`
   runs/<run-id>/         one directory per run (layout below)
   decisions/<day>.jsonl  the decision log: one record per validation, by UTC day (see "The decision log")
+  decisions/skips.jsonl  one record per change left out of its batch
+  decisions/rulings.jsonl  one record per ruling on a GREEN_FLAKY batch
+  known-flaky.json       the known-flaky list (see `merge-queue known-flaky`)
   obligations/<id>.json  one record per focused landing still owed a complete run
   scratch/slot-<n>/      one reused worktree per concurrent validation
   scratch/slot-<n>.lock  flock held by the run while a validation uses slot <n>
@@ -755,8 +802,8 @@ concurrent validation, plus one for selection queries.
 
 Growing collections live in their own subdirectories. Records are written atomically (temporary
 file, then rename). `run`, `sync` and `widen` take the writer lock and fail fast if another writer
-holds it. `submit`, `withdraw` and `retry` record their request when it is held (see "Intake
-while a run holds the queue").
+holds it. `submit`, `withdraw`, `retry` and `accept-flaky` record their request when it is held
+(see "Intake while a run holds the queue").
 
 An **item record** (`items/<pr>.json`) has these fields:
 
@@ -770,6 +817,9 @@ An **item record** (`items/<pr>.json`) has these fields:
 - `flaky_nodes`, `flaky_hold_until`, `hold_verdict`: present only while the change is held for a
   ruling (see "Held for a ruling"). `hold_verdict` is `INFRA-BLOCKED` for that hold and absent
   for a GREEN_FLAKY one.
+- `held_candidate`: with a green batch's GREEN_FLAKY hold, what it validated: `{tip, parent,
+  changes: [{pr, head}], prefixes, claim, run, validation}`. `accepted`: `{by, reason, at}` once
+  `accept-flaky` accepted it, until a run acts on the ruling.
 - `history`: a list of `{at, kind, detail}` events. A refusal adds a `validation-refused` event.
 
 ## Configuration (`config.json`)
@@ -1009,9 +1059,14 @@ exit status means nothing. Each change of the batch stays `queued` with the test
 `flaky_nodes`, the hold's end in `flaky_hold_until` (`--green-flaky-hold-secs`, two hours by
 default) and, for INFRA-BLOCKED, `hold_verdict: INFRA-BLOCKED`. `plan` holds it as
 `held-green-flaky` or `held-infra-blocked`, its `--notify` recipient gets that notification, and
-batches built on top of it are discarded. `merge-queue retry PR` is the ruling that returns it to
-the queue; when the hold ends without one, the change is re-queued for a fresh validation (which
-holds it again if the result is the same). A donor's receipt carries the markers in its log tail.
+batches built on top of it are discarded. Two rulings end a hold: `merge-queue retry PR` returns
+the change to the queue for a new validation, and `merge-queue accept-flaky` accepts a green
+batch's GREEN_FLAKY passes and lands the very commit that was validated if the base has not
+moved (the hold records it in `held_candidate`). When the hold ends without a ruling, the change
+is re-queued for a fresh validation (which holds it again if the result is the same). A
+GREEN_FLAKY result whose retried tests are all on the known-flaky list is never held: the list is
+a standing ruling, and the batch lands (see `merge-queue known-flaky`). A donor's receipt carries
+the markers in its log tail.
 
 **`dagrun`.** Test IDs are DAG step names. A selection becomes `dagrun run --dag DAG --keep-going
 --selected a,b`, which also runs each selected step's dependencies; `all` omits `--selected`. The
@@ -1333,6 +1388,14 @@ Each change's `features`, for the log and for future batching priors:
 The log is pruned after every run to `decisions.keep_days` (default 90) and
 `decisions.max_bytes` (default 64 MiB), oldest day first; the newest day is always kept. Writing it
 never fails a run: a failure is recorded as a `decisions` event.
+
+Two other files sit beside the day files; `stats` and the pruning read only the day files.
+`decisions/skips.jsonl` has one line per change left out of its batch. `decisions/rulings.jsonl`
+has one line per ruling on a GREEN_FLAKY batch (schema `merge-queue-ruling/v1`): `ruling`
+(`accept-flaky`, or `known-flaky` for the list's standing ruling), `prs` and their `heads`, the
+validated `commit` and its `base`, the retried tests (`flaky`), `by`, `reason`, `ruled_at`,
+`outcome` (`landed`, `requeued`, or `stopped` when the landing left the base to check by hand)
+with its `detail`, `validated_in` (run and validation), and the `run` that acted on it with `at`.
 
 ## Priority changes
 

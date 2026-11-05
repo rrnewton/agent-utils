@@ -165,6 +165,16 @@ pub struct Item {
     /// them on a run and on its rerun of the same commit). Left out of the record while empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub hold_verdict: String,
+    /// What a GREEN_FLAKY hold validated: the exact candidate, the base it was built on and the
+    /// validation, so that a ruling accepting the flaky passes (`merge-queue accept-flaky`) can
+    /// land that very commit without validating it again. Set with the hold, cleared with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_candidate: Option<HeldCandidate>,
+    /// The ruling that accepted this held change's flaky passes, until a run acts on it: the run
+    /// lands the held candidate if the base has not moved, and otherwise returns the change to
+    /// the queue for a new validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted: Option<Ruling>,
     /// Why the change was escalated to its owner, when validation did not run the bounded
     /// number of times (or a red run's probe could not run under `red_without_probe: hold`).
     /// The change stays `queued` but is held until `merge-queue retry` clears this.
@@ -194,6 +204,52 @@ fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
+/// The candidate a GREEN_FLAKY hold validated (see [`Item::held_candidate`]).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HeldCandidate {
+    /// The validated commit.
+    pub tip: String,
+    /// The base commit it was combined onto.
+    pub parent: String,
+    /// The batch's changes in order, each with the head it was validated at.
+    pub changes: Vec<HeldChange>,
+    /// The commit after each change, aligned with `changes`.
+    pub prefixes: Vec<String>,
+    /// What the validation selected, and how it was chosen.
+    pub claim: ValidationClaim,
+    /// The run that validated it (`runs/<id>/`).
+    pub run: String,
+    /// The validation's number in that run (`v<N>`).
+    pub validation: usize,
+}
+
+impl HeldCandidate {
+    /// The batch's change numbers, in order.
+    pub fn prs(&self) -> Vec<i64> {
+        self.changes.iter().map(|change| change.pr).collect()
+    }
+}
+
+/// One change of a [`HeldCandidate`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HeldChange {
+    /// Change number.
+    pub pr: i64,
+    /// The head it was validated at.
+    pub head: String,
+}
+
+/// A ruling on a held change: who gave it, why, and when.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Ruling {
+    /// Who gave it (agent or person).
+    pub by: String,
+    /// Why.
+    pub reason: String,
+    /// RFC 3339 UTC time it was given.
+    pub at: String,
+}
+
 impl Item {
     /// The verdict this change's hold waits on a ruling for: `GREEN_FLAKY` or `INFRA-BLOCKED`.
     pub fn hold_label(&self) -> &str {
@@ -212,6 +268,16 @@ impl Item {
         } else {
             "held-green-flaky"
         }
+    }
+
+    /// Clear this change's hold for a ruling: the held tests, the expiry, the verdict, the
+    /// validated candidate and any ruling on it.
+    pub fn clear_hold(&mut self) {
+        self.flaky_nodes.clear();
+        self.flaky_hold_until.clear();
+        self.hold_verdict.clear();
+        self.held_candidate = None;
+        self.accepted = None;
     }
 
     /// Whether this queued change is inside its hold for a ruling at `at`.
