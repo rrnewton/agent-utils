@@ -2452,9 +2452,8 @@ test("the list changing size under a reader who has not scrolled decides the jum
 
   // THE CONTROL: the list and its panes not watched. Each is left as the last scroll decided it, and
   // all three have to see that.
-  const control = await run(brokenScript(
-    '  for (const box of [el("scroll-area"), ...el("scroll-area").children]) geometry.observe(box);\n', ""
-  ));
+  const control = await run(await brokenModule([{ file: "src/view/channel/listwatch.ts",
+    find: "    for (const box of [area, ...Array.from(area.children)]) geometry.observe(box);\n", replace: "" }]));
   assert.deepStrictEqual(control, { windowShrank: false, windowGrew: true, rowGrewBelow: false });
 });
 

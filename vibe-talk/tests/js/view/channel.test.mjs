@@ -892,3 +892,80 @@ test("`#624 voice-page-modularity`: the search's and the filter chips' listeners
   chips.unmount();
   assert.deepStrictEqual([...elements.values()].filter((one) => one.listeners.length > 0).map((one) => one.id), [], "a listener was left mounted");
 });
+
+test("`#624 voice-page-modularity`: watching the lists answers a scroll at once, decides once per burst of resizes after the task, leaves the right column's own rooms unwatched, and stops", () => {
+  const { mountListWatch } = CHANNEL_VIEW;
+  const log = [];
+  const element = (id, children = []) => {
+    const listeners = [];
+    return { id, children, listeners,
+      addEventListener: (type, listener) => listeners.push({ type, listener }),
+      removeEventListener: (type, listener) => {
+        const at = listeners.findIndex((one) => one.type === type && one.listener === listener);
+        if (at >= 0) listeners.splice(at, 1);
+      } };
+  };
+  const area = element("scroll-area", [element("pane-discord"), element("pane-voice")]);
+  const overscroll = element("side-overscroll");
+  const overextend = element("side-overextend");
+  const side = element("side-scroll", [element("side-log"), overscroll, overextend, element("side-cards")]);
+  const ids = { "scroll-area": area, "side-scroll": side, "side-overscroll": overscroll, "side-overextend": overextend };
+  const watchers = [];
+  const tasks = [];
+  const state = { resize: true, back: false, returnRow: null, onScreen: false, sideShowing: false };
+  const deps = {
+    byId: (id) => ids[id],
+    leftById: (id) => ids[id],
+    sizeWatcher: (report) => {
+      if (!state.resize) return null;
+      const watcher = { report, watched: [], stopped: false, observe(box) { this.watched.push(box.id); }, disconnect() { this.stopped = true; } };
+      watchers.push(watcher);
+      return watcher;
+    },
+    afterThisTask: (act) => tasks.push(act),
+    placeChipsOverComposer: () => log.push("chips off the box"),
+    renderJumpNewest: () => log.push("jump"),
+    replyBackOffered: () => state.back,
+    replyReturnRow: () => state.returnRow,
+    dropReplyBack: () => log.push("drop back"),
+    rowOnScreen: (row) => { log.push(`on screen? ${row}`); return state.onScreen; },
+    renderScrollTools: () => log.push("tools"),
+    maybeLoadOlder: () => log.push("older"),
+    maybeLoadOlderTurns: () => log.push("older turns"),
+    requestVisibleSummaries: (...args) => log.push(`summaries ${args.length}`),
+    fitGrowingBoxes: () => log.push("fit boxes"),
+    scheduleColumnLinks: () => log.push("links"),
+    fitOverscroll: (on) => log.push(`fit room ${on.id}`),
+    sideShowing: () => state.sideShowing,
+    renderSideJumpNewest: () => log.push("side jump"),
+  };
+  const watch = mountListWatch(deps);
+  const scroll = () => { log.length = 0; for (const one of area.listeners.filter((each) => each.type === "scroll")) one.listener({}); return [...log]; };
+  const runTasks = () => { log.length = 0; for (const act of tasks.splice(0)) act(); return [...log]; };
+  assert.deepStrictEqual(scroll(), ["chips off the box", "jump", "older", "older turns", "summaries 0"]);
+  state.back = true;
+  assert.deepStrictEqual(scroll(), ["chips off the box", "jump", "drop back", "tools", "older", "older turns", "summaries 0"], "a way back to a reply that has gone was kept");
+  state.returnRow = "r";
+  assert.deepStrictEqual(scroll(), ["chips off the box", "jump", "on screen? r", "older", "older turns", "summaries 0"], "a way back to a reply off screen was dropped");
+  state.onScreen = true;
+  assert.deepStrictEqual(scroll(), ["chips off the box", "jump", "on screen? r", "drop back", "tools", "older", "older turns", "summaries 0"]);
+  assert.deepStrictEqual(watchers.map((one) => one.watched), [["scroll-area", "pane-discord", "pane-voice"], ["side-scroll", "side-log", "side-cards"]],
+    "a list or a part of it went unwatched, or the right column's own rooms were watched");
+  const [main, right] = watchers;
+  main.report();
+  main.report();
+  right.report();
+  assert.equal(tasks.length, 2, "a burst of resizes asked for more than one decision per list");
+  assert.deepStrictEqual(runTasks(), ["jump", "chips off the box", "fit boxes", "links", "fit room side-scroll", "links"], "the decisions were made inside the report, or the right column jumped while not showing");
+  state.sideShowing = true;
+  right.report();
+  main.report();
+  assert.deepStrictEqual(runTasks(), ["fit room side-scroll", "side jump", "links", "jump", "chips off the box", "fit boxes", "links"], "a later burst was not decided again");
+  watch.unmount();
+  assert.deepStrictEqual([area.listeners.length, watchers.map((one) => one.stopped)], [0, [true, true]], "the scroll listener or a size watcher outlived unmount");
+  state.resize = false;
+  watchers.length = 0;
+  const bare = mountListWatch(deps);
+  assert.deepStrictEqual([watchers.length, area.listeners.length], [0, 1], "a browser with no ResizeObserver lost the scroll listener, or watched sizes anyway");
+  bare.unmount();
+});

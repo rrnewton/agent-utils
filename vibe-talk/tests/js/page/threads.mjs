@@ -337,12 +337,14 @@ test("the floating chips keep their height clear above the composer, and never s
   assert.match(cssBlock("#status-line"), /bottom:\s*calc\(var\(--chips-foot, 0\.5rem\) \+ var\(--scroll-tools-clearance, 0px\) \+ var\(--read-steer-clearance, 0px\)\);/,
     "the status pill does not rise with the chips, and stands on the box being typed in");
   // The edge is measured where it moves: on a scroll, a change of the list's geometry, and the room.
-  assert.match(SCRIPT_CODE, /addEventListener\("scroll", \(\) => \{\s*(\/\/[^\n]*\n\s*)*placeChipsOverComposer\(\);/,
+  // Both in the lists' watch (web/src/view/channel `mountListWatch`, `#624 voice-page-modularity`).
+  assert.match(PAGE_CODE, /listen\(deps\.byId\("scroll-area"\), "scroll", \(\) => \{\s*deps\.placeChipsOverComposer\(\);/,
     "a scroll moves the box under the chips and nothing moves them");
-  // In the same deferred decision as the jump; what else that decision redraws after it (`#261
-  // two-column-connectors`' links) may follow.
-  assert.match(SCRIPT_CODE, /renderJumpNewest\(\);\s*(\/\/[^\n]*\n\s*)*placeChipsOverComposer\(\);[^{}]*\}, 0\);/,
+  // In the same deferred decision as the jump, after the task the browser reported the sizes in; what else that
+  // decision redraws after it (`#261 two-column-connectors`' links) may follow.
+  assert.match(PAGE_CODE, /deps\.afterThisTask\(\(\) => \{\s*decisionDue = false;\s*deps\.renderJumpNewest\(\);\s*deps\.placeChipsOverComposer\(\);/,
     "the box moving without a scroll leaves the chips where they were");
+  assert.match(SCRIPT_CODE, /afterThisTask: \(act\) => \{ setTimeout\(act, 0\); \}/, "the lists' decision is not made after the task");
   // Written by the chips' owner (web/src/view/shell `createChipsOverComposer`, `#624 voice-page-modularity`).
   assert.match(PAGE_CODE, /"--composer-top", `\$\{top\}px`/, "nothing writes the box's top edge for the stylesheet");
 });

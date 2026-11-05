@@ -31371,85 +31371,32 @@ mountFilterChips({
   swallow: (event) => swallow(event),
 });
 
-// The chip is an offer to go somewhere the reader may simply go themselves. Once they are there it
-// has nothing left to say, so it takes itself away rather than waiting to be tapped — and since
-// `#207 scrollback-jump` it is offered the moment they scroll far enough up the history to want it.
-// Only the jump, not every chip: this runs on every scroll event. See `renderJumpNewest`.
-el("scroll-area").addEventListener("scroll", () => {
-  // `#245 done-feedback`. First, so the chips keep off the message box in the frame it moved in.
-  placeChipsOverComposer();
-  renderJumpNewest();
-  // `#204 reply-arrow`. The way back to a reply goes once the reply is on screen again, however
-  // the reader brought it there: a chip offering to go where they already are is clutter.
-  if (replyArrows().back !== null) {
-    const reply = replyReturnRow();
-    if (reply === null || rowOnScreen(reply)) {
-      replyArrows().back = null;
-      renderScrollTools();
-    }
-  }
-  // ...and the other end of the same list: arriving at the top is a request for what is above it.
-  // Both lists, because both of them now have something above them: the channel has older
-  // messages and the transcript has an older record. Each declines unless its own view is the one
-  // on screen, so exactly one of them can act on any given scroll.
-  maybeLoadOlder();
-  voiceTranscript().maybeLoadOlderTurns();
-  // `#49 cached-summaries`. Summaries are produced as the reader scrolls, so this is where they
-  // are asked for. It is cheap on the ordinary event: the summaries owner's `summariesAsked` answers
-  // for every row that has already been asked about, and a scroll that reveals nothing new issues
-  // nothing.
-  requestVisibleSummaries();
+// Watching the lists move (`#207 scrollback-jump`, `#245 done-feedback`, `#204 reply-arrow`, `#49 cached-summaries`,
+// `#340 composer-grow-box`, `#261 two-column-connectors`, `#229 desktop-two-column`, `#338 column-overscroll`):
+// what a scroll of Main's list asks for, and what a change of size of either list asks for once the browser has
+// finished telling of it. One owner in web/src/view/channel/listwatch.ts (`#624 voice-page-modularity`), mounted
+// here, in the page's order; its `unmount` waits for the ordered boot's teardown.
+mountListWatch({
+  byId: (id) => el(id),
+  leftById: (id) => leftEl(id),
+  sizeWatcher: (report) => (typeof window.ResizeObserver === "function" ? new window.ResizeObserver(() => report()) : null),
+  afterThisTask: (act) => { setTimeout(act, 0); },
+  placeChipsOverComposer: () => placeChipsOverComposer(),
+  renderJumpNewest: () => renderJumpNewest(),
+  replyBackOffered: () => replyArrows().back !== null,
+  replyReturnRow: () => replyReturnRow(),
+  dropReplyBack: () => { replyArrows().back = null; },
+  rowOnScreen: (row) => rowOnScreen(row),
+  renderScrollTools: () => renderScrollTools(),
+  maybeLoadOlder: () => maybeLoadOlder(),
+  maybeLoadOlderTurns: () => voiceTranscript().maybeLoadOlderTurns(),
+  requestVisibleSummaries: () => requestVisibleSummaries(),
+  fitGrowingBoxes: () => fitGrowingBoxes(),
+  scheduleColumnLinks: () => scheduleColumnLinks(),
+  fitOverscroll: (area) => fitOverscroll(area),
+  sideShowing: () => sideShowing(),
+  renderSideJumpNewest: () => inColumn(columns.side, renderJumpNewest),
 });
-// `#207 scrollback-jump`. How far the list runs below the reader also changes WITHOUT a scroll, and
-// the listener above never hears of it: the window resized or turned, the reading column dragged
-// narrower, a row or the chips' room growing or shrinking below the reader. A reader 40px
-// up whose newest row then shrank by 30 is on the newest line with a jump offering to take them
-// there; one on the newest line whose last row grew is up the history with no way back offered.
-// So the list's box and everything directly in it — the two panes, the search's empty notice — are
-// watched too, and the jump decided again from where the reader now is.
-//
-// AFTER the observer returns, not inside it: deciding can show or hide the jump, that resizes
-// #scroll-tools, and a size changed from inside a ResizeObserver callback is the loop the browser
-// reports as an error. One decision per burst of resizes; it is cheap, but a row drawn is a resize.
-if (typeof window.ResizeObserver === "function") {
-  let decisionDue = false;
-  const geometry = new window.ResizeObserver(() => {
-    if (decisionDue) return;
-    decisionDue = true;
-    setTimeout(() => {
-      decisionDue = false;
-      renderJumpNewest();
-      // `#245 done-feedback`. The message box moves without a scroll too: the window, a view or
-      // screen changing, the box itself resized.
-      placeChipsOverComposer();
-      // `#340 composer-grow-box`. A box shown again, by a view, a screen or a send card going, is
-      // measured where the browser does not size it.
-      fitGrowingBoxes();
-      // `#261 two-column-connectors`. A row folded or opened moves the roots below it with no scroll.
-      scheduleColumnLinks();
-    }, 0);
-  });
-  for (const box of [el("scroll-area"), ...el("scroll-area").children]) geometry.observe(box);
-  // `#229 desktop-two-column`. The right column's list, for its own jump.
-  let sideDue = false;
-  const sideGeometry = new window.ResizeObserver(() => {
-    if (sideDue) return;
-    sideDue = true;
-    setTimeout(() => {
-      sideDue = false;
-      // `#338 column-overscroll`. The room past the foot fitted to the rows as they now are, the cards' too.
-      fitOverscroll(leftEl("side-scroll"));
-      if (sideShowing()) inColumn(columns.side, renderJumpNewest);
-      scheduleColumnLinks();
-    }, 0);
-  });
-  // Not the room past the foot itself, which only this page sizes: a size it is given while an observer
-  // of its neighbours is being told of theirs is one the browser could not report in the same frame. Nor
-  // the room held for a card (`#459 pack-keeps-card-still`), for the same reason.
-  for (const box of [leftEl("side-scroll"), ...leftEl("side-scroll").children]) {
-    if (box !== leftEl("side-overscroll") && box !== leftEl("side-overextend")) sideGeometry.observe(box);
-  }
-}
 /**
  * How much stands under the main screen's lists, for the dock-growth keepers below: the dock, and the
  * send card while it is docked under the thread list (`#269 approval-card-inline` x `#281 view-keys`).
