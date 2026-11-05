@@ -38,6 +38,32 @@ pub const CANNOT_EXECUTE: &str = "the validator could not execute";
 /// Marker printed by an admission wrapper when it refuses to run validation at all.
 pub const REFUSAL_MARKER: &str = "COULD_NOT_RUN";
 
+/// Scope line a validator prints with a refusal: `MQ_COULD_NOT_RUN_SCOPE: host <reason>`
+/// or `MQ_COULD_NOT_RUN_SCOPE: job <reason>`. A host-scope refusal is the host's fault,
+/// never the change's: it costs the job no strike. No line means job scope.
+pub const COULD_NOT_RUN_SCOPE_MARKER: &str = "MQ_COULD_NOT_RUN_SCOPE";
+
+/// Parse a [`COULD_NOT_RUN_SCOPE_MARKER`] line from runner output: `(is_host, reason)`.
+pub fn could_not_run_scope(log_text: &str) -> Option<(bool, String)> {
+    for line in log_text.lines() {
+        let Some(rest) = line.trim().strip_prefix(COULD_NOT_RUN_SCOPE_MARKER) else {
+            continue;
+        };
+        let rest = rest.trim_start_matches(':').trim();
+        if let Some(reason) = rest.strip_prefix("host") {
+            return Some((true, reason.trim().to_owned()));
+        }
+        if let Some(reason) = rest.strip_prefix("job") {
+            return Some((false, reason.trim().to_owned()));
+        }
+    }
+    None
+}
+
+/// Environment variable set to `1` when a donor probes its validator after a host-scope
+/// refusal: admission checks only, exit 0 means ready to validate again.
+pub const PROBE_ENV: &str = "MQ_PROBE";
+
 /// Marker line a validator prints when the run is green only because some tests passed
 /// after a retry inside the run (`GREEN_FLAKY: id1,id2`). The queue holds such a batch
 /// for a ruling instead of landing it; see [`Ran::flaky_passes`].

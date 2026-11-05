@@ -3352,6 +3352,21 @@ impl<'a> Runner<'a> {
                 }
                 crate::donor::JobState::Leased => waiting_since = Instant::now(),
                 crate::donor::JobState::Queued => {
+                    // While every eligible donor is paused for a host fault, waiting
+                    // is the right answer: their probes, not the claim timeout,
+                    // decide when work resumes.
+                    if waiting_since.elapsed() > claim_timeout
+                        && !donors.store.host_fault_list().is_empty()
+                    {
+                        self.event(
+                            "donor",
+                            &format!(
+                                "v{id}: still waiting for job {published}: donor(s) \
+                                 paused for a host fault"
+                            ),
+                        );
+                        waiting_since = Instant::now();
+                    }
                     if waiting_since.elapsed() > claim_timeout {
                         let _ = donors.store.cancel(&published, "no donor took it in time");
                         return Err(format!(

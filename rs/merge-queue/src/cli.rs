@@ -229,6 +229,10 @@ enum DonorCommand {
         /// Most leases this donor holds at once.
         #[arg(long, default_value_t = 1)]
         jobs: usize,
+        /// The donor's validator probe (MQ_PROBE=1) passed after a host fault:
+        /// clear the fault so this claim may lease again.
+        #[arg(long)]
+        probe_passed: bool,
     },
     /// Queue host: extend a lease (token on stdin); prints continue or stop.
     Renew {
@@ -355,7 +359,15 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             print_json_reply(&serde_json::to_value(&info).map_err(|error| error.to_string())?)?;
             Ok(0)
         }
-        DonorCommand::Claim { donor, host, jobs } => {
+        DonorCommand::Claim {
+            donor,
+            host,
+            jobs,
+            probe_passed,
+        } => {
+            if probe_passed {
+                store.clear_host_fault(&donor);
+            }
             let cap = config.donors.max_jobs_per_donor;
             let jobs = if cap > 0 { jobs.min(cap) } else { jobs };
             // Answer the tool identity now, so a job published before a tool moved is offered
@@ -463,6 +475,12 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             );
             for alert in store.give_back_alerts(config.donors.give_back_alert())? {
                 println!("{alert}");
+            }
+            for (donor, reason, since) in store.host_fault_list() {
+                println!(
+                    "ERROR: donor {donor}: host cannot validate: {reason} (since {since}); \
+                     it is leased nothing until an admitted validation or a passing probe"
+                );
             }
             let could_not_run: usize = jobs.iter().map(|j| j.could_not_run.len()).sum();
             if could_not_run > 0 {

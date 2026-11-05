@@ -951,6 +951,19 @@ An **item record** (`items/<pr>.json`) has these fields:
   reason from one donor that raise an `ERROR:` line in `donor status` and the serve
   heartbeat's `last error` (absent or `0`: `3`). An accepted receipt from the donor resets
   its run.
+
+**Host-scope could-not-run.** A validator that cannot run at all on its host (a wedged
+worktree allocator, say) prints `MQ_COULD_NOT_RUN_SCOPE: host <reason>` with its exit-75
+refusal; `job <reason>` (or no line) keeps today's per-job strikes. A host-scope refusal
+costs the job no strike and never cancels it: the job is queued again, the history says
+`host could not run: <reason>`, the donor is recorded faulted and leased nothing, and
+`donor status` plus the serve heartbeat show an `ERROR:` line for it. The donor pauses
+claiming, probes its validator with `MQ_PROBE=1` (admission checks only, exit 0 = ready,
+back-off 30 s doubling to 10 min), and resumes with a probe-passed claim that clears the
+fault; an admitted receipt clears it too. Validators that never print the line get a
+backstop: could-not-run for two different jobs in a row with the same last output line
+counts as a host fault, and both strikes come off. While every eligible donor is faulted,
+a decide-mode run keeps waiting instead of spending its claim timeout.
 - `compare_only`: donor names that only ever compare in `decide` mode. Each published job
   gets a duplicate only they may claim; its receipt is recorded as a comparison (`comparison`
   on both jobs, counted by `donor status`) and never decides the batch. Deciding donors never
