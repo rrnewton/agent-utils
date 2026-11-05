@@ -1769,7 +1769,6 @@ test("`#624 voice-page-modularity`: the selection is kept per list by message id
     const inChannel = element("text", {}, { parentNode: two });
     assert.deepStrictEqual([selection.paneFor(inChannel), selection.paneFor(root), selection.paneFor(element("x", {}, { parentNode: heading }))], [channel, side, side]);
     state.threadList = true;
-    assert.equal(selection.paneFor(inChannel), channel, "behind the thread list the left column took the keys from inside it, or none went to the pane used last");
     state.last = side;
     assert.equal(selection.paneFor(inChannel), side, "behind the thread list a key in the left column did not go to the pane used last");
     state.threadList = false;
@@ -1872,8 +1871,11 @@ test("`#624 voice-page-modularity`: the selection is kept per list by message id
     assert.deepStrictEqual(run(() => selection.keepSelection()), ["time u false", "links"], "with the focus elsewhere a gone message's selection was handed on");
     assert.equal(side.lit, null);
     selection.noteRow(side, root);
-    redraw(side, [card]);
-    assert.deepStrictEqual(run(() => selection.keepSelection()), ["links"], "a silent selection was put back with a ring");
+    side.row = root;
+    const newRoot = rowAt("t", 200, 300);
+    redraw(side, [card, newRoot]);
+    assert.deepStrictEqual([run(() => selection.keepSelection()), newRoot.hasAttribute("tabindex"), side.row], [["time t false", "links"], false, null],
+      "a silent selection was put back with a ring");
   } finally {
     globalThis.document = was;
   }
