@@ -6283,7 +6283,7 @@ function watchBoxInsertions(box) {
 // THE FIX IS TO LET THE BROWSER DO IT. Every scroller can take the focus (`tabindex="-1"` in
 // web/voice.html: from script and a click, never a Tab stop), the screen's scroller takes it whenever
 // the screen or the view changes (`settleFocus`), and a scroll key arriving from somewhere that
-// cannot scroll anything hands it the focus on the way past (`routeScrollKey`). The browser's own
+// cannot scroll anything hands it the focus on the way past (`scrollKeys.routeScrollKey`). The browser's own
 // default, which runs after this page's listener, then scrolls it, at the browser's distances and
 // with its smoothing. The page scrolls a list itself only where the browser's default would do
 // something else with the key: PgUp and PgDn in a text field (a page of caret movement) and on a
@@ -7003,130 +7003,32 @@ function inColumnGone(node) {
 
 // --- scrolling
 
-/** How far a page key moves a list: seven-eighths of what it shows, as Chromium pages a scroller. */
-function pageStep(area) {
-  return Math.max(1, Math.round((area.clientHeight || 0) * 0.875));
-}
-
-/** To the end of `area`. On the main screen exactly what the Newest chip does, which End is. */
-function toNewest(area) {
-  if (area === el("scroll-area")) jumpToNewest();
-  else toFoot(area);
-}
-
 /**
- * The reader's own way to the newest line — the Newest chip, End — which also ends a walk back a
- * filter change was making for a message older than anything loaded (`#243 filter-keeps-selection`):
- * the reader has gone somewhere else, and is not brought back when it lands.
- */
-function jumpToNewest() {
-  endFilterWalk();
-  // `#338 column-overscroll`. Onto the foot, out of any room past it: where the list opens.
-  if (el("scroll-area") === leftEl("side-scroll")) closeOverscroll();
-  scrollToNewest();
-}
-
-/** Move `area` for a page key, or Home or End, that the browser would have spent on something else. */
-function scrollForKey(area, key) {
-  if (key === "Home") area.scrollTop = 0;
-  else if (key === "End") toNewest(area);
-  else area.scrollTop += (key === "PageUp" ? -1 : 1) * pageStep(area);
-}
-
-/** The keys a browser scrolls with. Space is " ", as `KeyboardEvent.key` spells it. */
-const SCROLL_KEYS = ["PageUp", "PageDown", "Home", "End", " ", "ArrowUp", "ArrowDown"];
-
-/**
- * A scroll key no binding took, sent to the list on screen when it came from somewhere that cannot
- * use it.
+ * The scroll keys: a page key, Home, End, Space or an arrow no binding took, sent to the list on screen
+ * (`routeScrollKey`), the Newest chip and End (`jumpToNewest`), and Home, End, Ctrl+Home and Ctrl+End
+ * (`listEdge`, `jumpList`). One owner in web/src/view/shell/scrollkeys.ts (`#624 voice-page-modularity`).
  *
- *   * In a text field, Home, End, Space and the arrows are the field's. So are the page keys while
- *     the field holds more than it shows; otherwise they page the list, and the field keeps the
- *     focus and the text, so the reader is never stuck in a box.
- *   * On a picker, the arrows and Space choose and open, as they always did; the page keys and
- *     Home/End page the list rather than skipping options. A slider and the width handle keep all.
- *   * Inside the list, the browser scrolls it already; from the selected message, the ring follows
- *     the page once it comes to rest (`followPageScroll`).
- *   * A focused button keeps Space, which presses it.
- *   * Anywhere else (nothing focused, a control in the dock or the header) the list takes the
- *     focus, and the browser's own default, which runs after this, scrolls it.
- *
- * With Ctrl or Alt held, nothing: Ctrl+Home and Ctrl+End are a binding of their own, and Alt with
- * the arrows belongs to the channels. Cmd is let through, for the Cmd+Up and Cmd+Down of a Mac.
+ * @type {import("./src/view/shell/index.ts").ScrollKeys}
  */
-function routeScrollKey(event, target) {
-  const key = event.key;
-  if (!SCROLL_KEYS.includes(key) || event.ctrlKey || event.altKey) return;
-  const area = visibleScroller(target);
-  if (!area) return;
-  const paging = key === "PageUp" || key === "PageDown";
-  if (isTextField(target)) {
-    if (paging && !event.shiftKey && !event.metaKey && !scrollsItself(target)) {
-      swallow(event);
-      openOverscrollForKey(area, event);
-      scrollForKey(area, key);
-    }
-    return;
-  }
-  if (keepsOwnKeys(target)) {
-    const picker = String(target.tagName || "").toUpperCase() === "SELECT";
-    if (picker && (paging || key === "Home" || key === "End") && !event.shiftKey && !event.metaKey) {
-      swallow(event);
-      openOverscrollForKey(area, event);
-      scrollForKey(area, key);
-    }
-    return;
-  }
-  if (target && nodeWithin(area, target)) {
-    openOverscrollForKey(area, event);
-    const pane = screens.screen() === "main" ? paneFor(target) : null;
-    if (pane && pane.row === target && (paging || key === " ")) {
-      followPageScroll(pane, target, key === "PageUp" || (key === " " && Boolean(event.shiftKey)));
-    }
-    return;
-  }
-  if (key === " " && pressedBySpace(target)) return;
-  openOverscrollForKey(area, event);
-  if (typeof area.focus === "function") area.focus({ preventScroll: true });
-}
-
-/**
- * `#338 column-overscroll`. A page key about to scroll `area` down — PgDn, Space — opens the room past the
- * right column's foot first, for a reader resting there: pressed afresh, never repeating as it is held, so
- * a held key stops on the foot as a fling of the wheel does, and the next press goes on. ↓ is a binding of
- * its own (`stepSelection`), which opens the room only where it goes on past the last message.
- *
- * @param {HTMLElement} area
- * @param {KeyboardEvent} event
- */
-function openOverscrollForKey(area, event) {
-  const down = event.key === "PageDown" || (event.key === " " && !event.shiftKey);
-  if (down && !event.repeat && !event.metaKey) openOverscroll(area);
-}
-
-/** Ctrl+Home and Ctrl+End (Cmd on a Mac): the list to its top or its newest line, from anywhere. */
-function jumpList(target, newest) {
-  const area = visibleScroller(target);
-  if (!area) return false;
-  if (newest) toNewest(area);
-  else area.scrollTop = 0;
-  return true;
-}
-
-/**
- * Home and End over the channel: its top or its newest message, as the browser would scroll there,
- * and that message selected. Home asks for no more history than scrolling to the top does: the
- * scroll listener steps back once, as it always has. Elsewhere they are the browser's.
- */
-function listEdge(target, newest) {
-  const pane = paneFor(target);
-  const rows = pane ? paneRows(pane) : [];
-  if (!pane || rows.length === 0) return false;
-  if (newest) toNewest(pane.scroller());
-  else pane.scroller().scrollTop = 0;
-  selectRow(pane, rows[newest ? rows.length - 1 : 0], false);
-  return true;
-}
+const scrollKeys = createScrollKeys({
+  scrollArea: () => el("scroll-area"),
+  sideScroll: () => leftEl("side-scroll"),
+  toFoot: (area) => toFoot(area),
+  endFilterWalk: () => endFilterWalk(),
+  closeOverscroll: () => closeOverscroll(),
+  openOverscroll: (area) => openOverscroll(area),
+  scrollToNewest: () => scrollToNewest(),
+  visibleScroller: (node) => visibleScroller(node),
+  isTextField: (node) => isTextField(node),
+  scrollsItself: (node) => scrollsItself(node),
+  keepsOwnKeys: (node) => keepsOwnKeys(node),
+  pressedBySpace: (node) => pressedBySpace(node),
+  onMain: () => screens.screen() === "main",
+  paneFor: (node) => paneFor(node),
+  paneRows: (pane) => paneRows(pane),
+  selectRow: (pane, row, bring) => selectRow(pane, row, bring),
+  followPageScroll: (pane, row, up) => followPageScroll(pane, row, up),
+});
 
 // --- moving the selection
 
@@ -8248,12 +8150,12 @@ const KEYMAP = [
   {
     group: KEYS_PAGE, chords: [{ key: "Home" }, { key: "End" }],
     does: "The top of the list or its newest message, and select it",
-    run: (event, target) => listEdge(target, event.key === "End"),
+    run: (event, target) => scrollKeys.listEdge(target, event.key === "End"),
   },
   {
     group: KEYS_PAGE, chords: [{ key: "Home", mod: true }, { key: "End", mod: true }],
     does: "The top or the newest from anywhere, a message box included",
-    run: (event, target) => jumpList(target, event.key === "End"),
+    run: (event, target) => scrollKeys.jumpList(target, event.key === "End"),
   },
   {
     // `#344 search-shortcut`. The chord is heard first, at the window, so it searches whatever holds
@@ -8721,7 +8623,7 @@ const keyDispatch = createKeyDispatch({
   inColumn: (column, act) => inColumn(column, act),
   listGroups: [KEYS_MOVING, KEYS_MESSAGE],
   readerActed: () => readerActed(),
-  routeScrollKey: (event, target) => routeScrollKey(event, target),
+  routeScrollKey: (event, target) => scrollKeys.routeScrollKey(event, target),
 });
 
 // --- saying the keys
@@ -33044,7 +32946,7 @@ for (const id of ["expand-all", "collapse-all", "summarise"]) {
     if (inside) el("action-menu-open").focus({ preventScroll: true });
   });
 }
-el("jump-newest").addEventListener("click", jumpToNewest);
+el("jump-newest").addEventListener("click", () => scrollKeys.jumpToNewest());
 // `#129 message-search`. The glass is a toggle, and the second tap is the way out: a control that
 // only ever opens leaves the reader looking for a close button that is not on a phone keyboard.
 el("search-toggle").addEventListener("click", () => setSearchOpen(!searchField.open()));

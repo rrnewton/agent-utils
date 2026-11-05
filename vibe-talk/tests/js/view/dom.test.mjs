@@ -607,3 +607,76 @@ test("`#296 copy-highlighted-message`, `#624 voice-page-modularity`: the highlig
     globalThis.document = was;
   }
 });
+
+test("`#624 voice-page-modularity`: a scroll key no binding took goes to the list on screen only from where it cannot be used", () => {
+  const { createScrollKeys, pageStep, SCROLL_KEYS } = VIEW_SHELL;
+  assert.deepStrictEqual([pageStep({ clientHeight: 800 }), pageStep({}), SCROLL_KEYS.includes(" ")], [700, 1, true]);
+  const log = [];
+  const area = { clientHeight: 400, scrollTop: 1000, children: [], focus: (options) => log.push(`focus ${options.preventScroll}`) };
+  const inList = { parentNode: area };
+  const rows = [{ id: "first" }, { id: "last" }];
+  const pane = { row: inList, scroller: () => area };
+  const field = { field: true };
+  const tall = { field: true, tall: true };
+  const picker = { own: true, tagName: "select" };
+  const slider = { own: true, tagName: "INPUT" };
+  const button = { space: true };
+  let side = false;
+  const keys = createScrollKeys({
+    scrollArea: () => (side ? "side" : area),
+    sideScroll: () => "side",
+    toFoot: () => log.push("foot"),
+    endFilterWalk: () => log.push("walk ended"),
+    closeOverscroll: () => log.push("room closed"),
+    openOverscroll: () => log.push("room opened"),
+    scrollToNewest: () => log.push("newest"),
+    visibleScroller: () => area,
+    isTextField: (node) => Boolean(node && node.field),
+    scrollsItself: (node) => Boolean(node && node.tall),
+    keepsOwnKeys: (node) => Boolean(node && node.own),
+    pressedBySpace: (node) => Boolean(node && node.space),
+    onMain: () => true,
+    paneFor: (node) => (node === inList || node === undefined ? pane : null),
+    paneRows: () => rows,
+    selectRow: (_pane, row, bring) => log.push(`select ${row.id} ${bring}`),
+    followPageScroll: (_pane, _row, up) => log.push(`follow ${up}`),
+  });
+  const key = (name, fields = {}) => {
+    const event = { key: name, ctrlKey: false, altKey: false, shiftKey: false, metaKey: false, repeat: false, prevented: false, ...fields };
+    event.preventDefault = () => { event.prevented = true; };
+    return event;
+  };
+  const route = (event, target) => {
+    log.length = 0;
+    area.scrollTop = 1000;
+    keys.routeScrollKey(event, target);
+    return [...log, area.scrollTop, event.prevented];
+  };
+  assert.deepStrictEqual(route(key("PageDown"), field), ["room opened", 1350, true], "PgDn in a short field did not page the list");
+  assert.deepStrictEqual(route(key("PageUp"), tall), [1000, false], "a field that scrolls itself lost its page keys");
+  assert.deepStrictEqual(route(key("ArrowDown"), field), [1000, false], "an arrow was taken from a field");
+  assert.deepStrictEqual(route(key("PageDown", { repeat: true }), field), [1350, true], "a held PgDn opened the room past the foot");
+  assert.deepStrictEqual(route(key("Home"), picker), [0, true], "Home on a picker did not go to the list's top");
+  assert.deepStrictEqual(route(key("ArrowDown"), picker), [1000, false], "an arrow was taken from a picker");
+  assert.deepStrictEqual(route(key("PageDown"), slider), [1000, false], "a slider lost its keys");
+  assert.deepStrictEqual(route(key(" ", { shiftKey: true }), inList), ["follow true", 1000, false], "Shift+Space from the selected message did not follow up");
+  assert.deepStrictEqual(route(key(" "), button), [1000, false], "Space was taken from a button");
+  assert.deepStrictEqual(route(key("PageDown"), { elsewhere: true }), ["room opened", "focus true", 1000, false], "the list did not take the focus from elsewhere");
+  assert.deepStrictEqual(route(key("PageDown", { ctrlKey: true }), field), [1000, false], "a Ctrl chord was routed");
+  assert.deepStrictEqual(route(key("Enter"), field), [1000, false]);
+  log.length = 0;
+  assert.equal(keys.jumpList(field, true), true);
+  assert.deepStrictEqual(log, ["walk ended", "newest"], "Ctrl+End on the main list was not the Newest chip");
+  side = true;
+  log.length = 0;
+  keys.jumpToNewest();
+  assert.deepStrictEqual(log, ["walk ended", "room closed", "newest"], "the Newest chip on the right left the room past the foot open");
+  log.length = 0;
+  assert.equal(keys.listEdge(inList, true), true);
+  assert.deepStrictEqual(log, ["foot", "select last false"], "End over a list that is not the main one did not go to its foot and select its newest");
+  area.scrollTop = 500;
+  log.length = 0;
+  assert.equal(keys.listEdge(inList, false), true);
+  assert.deepStrictEqual([log, area.scrollTop], [["select first false"], 0]);
+  assert.equal(keys.listEdge({ nowhere: true }, true), false, "Home and End outside a list were taken");
+});

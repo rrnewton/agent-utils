@@ -29,6 +29,8 @@ declare const createPromptsTray: LegacyImports["createPromptsTray"];
 declare const createKeyDispatch: LegacyImports["createKeyDispatch"];
 declare const createKeyHints: LegacyImports["createKeyHints"];
 declare const createHighlightCopy: LegacyImports["createHighlightCopy"];
+declare const createScrollKeys: LegacyImports["createScrollKeys"];
+declare const pageStep: LegacyImports["pageStep"];
 declare const createRowShortcuts: LegacyImports["createRowShortcuts"];
 declare const createChannelPick: LegacyImports["createChannelPick"];
 declare const createShellNotices: LegacyImports["createShellNotices"];

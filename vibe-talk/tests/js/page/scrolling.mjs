@@ -3686,8 +3686,8 @@ test("`#338 column-overscroll`: at a desk PgDn or Space at the foot of the right
   // End and the chip landing where the room already is, rather than closing it: the reader stays in it.
   const kept = await run(await brokenModule([{ file: "src/view/channel/footroom.ts",
     find: "    if (area === deps.side()) closeOverscroll();\n    area.scrollTop = area.scrollHeight;\n  }",
-    replace: "    area.scrollTop = area.scrollHeight;\n  }" }], brokenScriptEach(
-    ["  if (el(\"scroll-area\") === leftEl(\"side-scroll\")) closeOverscroll();\n", ""],
+    replace: "    area.scrollTop = area.scrollHeight;\n  }" }, { file: "src/view/shell/scrollkeys.ts",
+    find: "    if (deps.scrollArea() === deps.sideScroll()) deps.closeOverscroll();\n", replace: "" }], brokenScriptEach(
     ["  el(\"jump-newest\").addEventListener(\"click\", inThisColumn(() => {\n    closeOverscroll();\n",
       "  el(\"jump-newest\").addEventListener(\"click\", inThisColumn(() => {\n"],
   )));
