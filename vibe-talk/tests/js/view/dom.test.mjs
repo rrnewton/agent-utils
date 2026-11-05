@@ -1024,3 +1024,50 @@ test("`#624 voice-page-modularity`: the view, filter and undo keys choose from t
   state.onScreen = false;
   assert.deepStrictEqual(run(() => keys.undoFromKeyboard()), [false]);
 });
+
+test("`#624 voice-page-modularity`: Alt+↓ and Alt+↑ step through the channels and stop at the ends, and only a channel chosen from the picker Ctrl+K opened hands the keys back", () => {
+  const { createChannelKeys } = VIEW_SHELL;
+  const log = [];
+  const picker = { hidden: false, disabled: false, focus: () => log.push("picker focus"), showPicker: () => log.push("picker open") };
+  const state = { onScreen: true, selected: "b" };
+  const keys = createChannelKeys({
+    channelOnScreen: () => state.onScreen,
+    picker: () => picker,
+    channelsInPickerOrder: () => [{ id: "a" }, { id: "b" }, { id: 3 }],
+    selectedChannelId: () => state.selected,
+    chooseChannel: (id) => { log.push(`choose ${id}`); state.selected = id; },
+    changeChannel: () => log.push("change"),
+    settleFocus: () => log.push("settled"),
+  });
+  const run = (act) => { log.length = 0; return [act(), ...log]; };
+  assert.deepStrictEqual(run(() => keys.stepChannel({ key: "ArrowDown" })), [true, "choose 3", "change", "settled"], "Alt+↓ did not choose the next channel by its id as a string");
+  assert.deepStrictEqual(run(() => keys.stepChannel({ key: "ArrowDown" })), [true], "Alt+↓ on the last channel wrapped round");
+  state.selected = "a";
+  assert.deepStrictEqual(run(() => keys.stepChannel({ key: "ArrowUp" })), [true], "Alt+↑ on the first channel wrapped round");
+  state.selected = "gone";
+  assert.deepStrictEqual(run(() => keys.stepChannel({ key: "ArrowDown" })), [true], "a channel not in the picker stepped somewhere");
+  picker.disabled = true;
+  assert.deepStrictEqual([run(() => keys.stepChannel({ key: "ArrowDown" })), run(() => keys.pickChannel())], [[false], [false]], "a disabled picker was stepped or opened");
+  picker.disabled = false;
+  state.onScreen = false;
+  assert.deepStrictEqual(run(() => keys.pickChannel()), [false]);
+  state.onScreen = true;
+  const was = globalThis.document;
+  globalThis.document = { activeElement: picker };
+  try {
+    assert.deepStrictEqual(run(() => keys.channelPicked()), [undefined], "a picker reached by a click handed the keys back on a change");
+    assert.deepStrictEqual(run(() => keys.pickChannel()), [true, "picker focus", "picker open"]);
+    assert.deepStrictEqual(run(() => keys.channelPicked()), [undefined, "settled"], "a channel chosen from Ctrl+K's picker kept the keys on it");
+    assert.deepStrictEqual(run(() => keys.channelPicked()), [undefined], "the next change on the picker was taken for Ctrl+K's too");
+    keys.pickChannel();
+    keys.forgetPick();
+    assert.deepStrictEqual(run(() => keys.channelPicked()), [undefined], "a pick forgotten by Esc handed the keys back");
+    keys.pickChannel();
+    globalThis.document = { activeElement: null };
+    assert.deepStrictEqual(run(() => keys.channelPicked()), [undefined], "a change with the focus gone from the picker moved it");
+    picker.showPicker = () => { throw new Error("NotAllowedError"); };
+    assert.deepStrictEqual(run(() => keys.pickChannel()), [true, "picker focus"], "a browser refusing to open the picker from a key failed the key");
+  } finally {
+    globalThis.document = was;
+  }
+});

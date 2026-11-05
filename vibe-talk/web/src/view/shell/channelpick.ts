@@ -2,8 +2,8 @@
 // (`#224 keyboard-shortcuts`, question 11; `#624 voice-page-modularity`, moved from the legacy script into
 // view/shell). Only then does a channel chosen from it hand the keys back to the list: a picker reached by a
 // click or by Tab keeps the focus through a change, because on Windows and Linux ↑ and ↓ on a closed picker
-// step it one channel at a time, firing `change` at each step. Opening the picker and moving the focus are the
-// page's (`pickChannel`, `channelPicked`).
+// step it one channel at a time, firing `change` at each step. Opening the picker and moving the focus are
+// channelkeys.ts's (`pickChannel`, `channelPicked`).
 
 /** The flag's commands and question. */
 export interface ChannelPick {

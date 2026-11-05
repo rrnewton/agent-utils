@@ -7683,62 +7683,24 @@ const writeKeys = createWriteKeys({
 });
 const { composeFromKeyboard, writeFromKeyboard, newestFromComposer } = writeKeys;
 
-/** Alt+↓ and Alt+↑ (Option on a Mac): the next or previous channel, in the order of the picker. */
-function stepChannel(event) {
-  if (!channelOnScreen()) return false;
-  const picker = el("discord-channel");
-  if (picker.hidden || picker.disabled) return false;
-  // In the order shown, across service groups. `#355 provider-grouped-channels`.
-  const order = channelsInPickerOrder();
-  const at = order.findIndex((channel) => String(channel.id) === String(selectedChannelId()));
-  const next = at < 0 ? null : order[at + (event.key === "ArrowDown" ? 1 : -1)];
-  // At either end the list stops, rather than wrapping round to a channel at the other end.
-  if (!next) return true;
-  chooseChannel(String(next.id));
-  guardQuietly(changeSelectedChannel)();
-  settleFocus();
-  return true;
-}
-
 /**
- * Whether the channel picker was opened by Ctrl+K (Cmd+K) and no channel has been chosen from it
- * since: web/src/view/shell `createChannelPick` (`#624 voice-page-modularity`). See `channelPicked`.
- */
-const channelPickByKey = createChannelPick();
-
-/** Ctrl+K (Cmd+K): the channel picker, open (question 11). See `channelPicked` for the way back. */
-function pickChannel() {
-  if (!channelOnScreen()) return false;
-  const picker = el("discord-channel");
-  if (picker.hidden || picker.disabled) return false;
-  channelPickByKey.openedByKey();
-  picker.focus();
-  if (typeof picker.showPicker === "function") {
-    try {
-      picker.showPicker();
-    } catch (_error) {
-      // A browser that will not open it from a key still has it focused: Space or Alt+↓ opens it.
-    }
-  }
-  return true;
-}
-
-/**
- * A channel chosen from the picker Ctrl+K opened: the keys go back to the list, on the new channel.
+ * The channel keys: Alt+↓ and Alt+↑ through the channels, Ctrl+K (Cmd+K) for the picker, and the keys back
+ * to the list once a channel is chosen from the picker Ctrl+K opened. One owner in
+ * web/src/view/shell/channelkeys.ts (`#624 voice-page-modularity`); the page destructures its keys under
+ * their old names.
  *
- * Without it the focus stayed on the picker, where every single key is the picker's own: j did
- * nothing, Esc had nothing to do, and the ↑ or ↓ meant for the next message chose another channel
- * (or, on a Mac, opened the picker again). Only after Ctrl+K: a picker reached by a click or by Tab
- * keeps the focus through a change, because on Windows and Linux ↑ and ↓ on a closed picker step it
- * one channel at a time, firing `change` at each step, and taking the focus at the first step would
- * stop a reader walking through the channels that way. Esc on a picker of the bar hands the focus to
- * the list however it was reached (`onEscape`).
+ * @type {import("./src/view/shell/index.ts").ChannelKeys}
  */
-function channelPicked() {
-  if (!channelPickByKey.byKey() || document.activeElement !== el("discord-channel")) return;
-  channelPickByKey.forget();
-  settleFocus();
-}
+const channelKeys = createChannelKeys({
+  channelOnScreen: () => channelOnScreen(),
+  picker: () => el("discord-channel"),
+  channelsInPickerOrder: () => channelsInPickerOrder(),
+  selectedChannelId: () => selectedChannelId(),
+  chooseChannel: (id) => chooseChannel(id),
+  changeChannel: () => guardQuietly(changeSelectedChannel)(),
+  settleFocus: () => settleFocus(),
+});
+const { stepChannel, pickChannel, channelPicked } = channelKeys;
 
 // --- search, Settings, help and Escape
 
@@ -7775,7 +7737,7 @@ const screenKeys = createScreenKeys({
   isComposer: (node) => isComposer(node),
   focusList: (pane) => focusList(pane),
   paneFor: (node) => paneFor(node),
-  forgetChannelPick: () => channelPickByKey.forget(),
+  forgetChannelPick: () => channelKeys.forgetPick(),
   putOutLitCard: () => putOutLitCard(),
   clearAllThreadFocus: () => clearAllThreadFocus(),
 });
