@@ -206,3 +206,107 @@ fn watch_agents_abandons_a_pass_stuck_in_herdr_within_seconds_of_sigterm() {
         scratch.stderr()
     );
 }
+
+// `agentctl watch`, the restore watcher (#909 watch-sigterm-stop): it slept out its interval through
+// SIGTERM, a plain sleep, and never read the termination flag, so every stop or restart of its unit
+// waited out systemd's 90 s and ended in SIGKILL. Run report-only (`--check-only`), so it starts,
+// restarts and remounts nothing.
+
+/// Start `agentctl watch --check-only` on `scratch`, against `herdr`: the stand-in that never
+/// answers, or one that fails at once, so a pass finishes in moments.
+fn restore_watch(scratch: &Scratch, herdr: &Path) -> Child {
+    let home = scratch.root.join("home");
+    Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .current_dir(&scratch.root)
+        .env("HOME", &home)
+        .env("AGENTCTL_HOME", home.join(".agentctl"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env_remove("HERDR_SOCKET_PATH")
+        .arg("--registry")
+        .arg(scratch.root.join("registry"))
+        .arg("--herdr-bin")
+        .arg(herdr)
+        .args(["watch", "--check-only", "--interval", "600", "--state-dir"])
+        .arg(scratch.root.join("state"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(scratch.root.join("stderr")).expect("stderr file"))
+        .process_group(0)
+        .spawn()
+        .expect("start watch")
+}
+
+#[test]
+fn watch_stops_from_its_interval_wait_within_a_second_of_sigterm() {
+    let scratch = Scratch::new("restore-sleep");
+    let down = scratch.root.join("herdr-down");
+    fs::write(
+        &down,
+        "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/calls\"\nexit 1\n",
+    )
+    .expect("write herdr");
+    fs::set_permissions(&down, fs::Permissions::from_mode(0o700)).expect("herdr mode");
+    let mut child = restore_watch(&scratch, &down);
+    // The first pass has run, and saved its health, once this file is there; the watch then waits
+    // 10 minutes for the next.
+    assert!(
+        wait_for(Duration::from_secs(60), || scratch
+            .root
+            .join("state/health.json")
+            .exists()),
+        "the first pass never finished: {}",
+        scratch.stderr()
+    );
+    thread::sleep(Duration::from_millis(300));
+    let (took, status) = terminate(&mut child, STOP_LIMIT);
+    let status = status.expect("watch exited");
+    assert!(
+        took < Duration::from_secs(1),
+        "took {took:?}: {}",
+        scratch.stderr()
+    );
+    assert!(status.success(), "{status:?}: {}", scratch.stderr());
+    let said = scratch.stderr();
+    assert!(
+        said.contains("agentctl watch: stopping: termination requested"),
+        "{said}"
+    );
+    assert!(
+        said.contains("agentctl: watch stopped "),
+        "the stop time was not logged: {said}"
+    );
+}
+
+#[test]
+fn watch_abandons_a_pass_stuck_in_herdr_within_seconds_of_sigterm_and_starts_no_other() {
+    let scratch = Scratch::new("restore-mid-pass");
+    let mut child = restore_watch(&scratch, &scratch.root.join("herdr"));
+    assert!(
+        wait_for(Duration::from_secs(60), || !calls(&scratch.root).is_empty()),
+        "the pass never asked Herdr anything: {}",
+        scratch.stderr()
+    );
+    thread::sleep(Duration::from_millis(300));
+    let asked = calls(&scratch.root).lines().count();
+    let (took, status) = terminate(&mut child, STOP_LIMIT);
+    let status = status.expect("watch exited");
+    assert!(took < STOP_LIMIT, "took {took:?}: {}", scratch.stderr());
+    // Ended as SIGTERM's default action ends a process, which systemd counts as a clean stop.
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{}", scratch.stderr());
+    assert!(
+        scratch
+            .stderr()
+            .contains("abandoning what is still in flight"),
+        "{}",
+        scratch.stderr()
+    );
+    assert_eq!(
+        calls(&scratch.root).lines().count(),
+        asked,
+        "a stopping watch asked Herdr more: {}",
+        calls(&scratch.root)
+    );
+}

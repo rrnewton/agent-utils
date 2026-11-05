@@ -410,8 +410,13 @@ pub trait Host {
     fn boot_time(&self) -> Option<u64>;
     /// Seconds since the Unix epoch.
     fn now(&self) -> f64;
-    /// Pause.
+    /// Pause; ended early once termination is requested (`terminated`).
     fn sleep(&self, duration: Duration);
+    /// Whether this process was asked to stop (SIGTERM or SIGINT): the watch starts no other pass
+    /// (#909 watch-sigterm-stop). Never, unless the host says so.
+    fn terminated(&self) -> bool {
+        false
+    }
     /// Run a program with a deadline, never through a shell.
     fn run(&self, argv: &[String], cwd: Option<&Path>, timeout: Duration) -> CommandOutcome;
 }
@@ -453,7 +458,13 @@ impl Host for SystemHost {
     }
 
     fn sleep(&self, duration: Duration) {
-        std::thread::sleep(duration);
+        // A plain sleep resumes after the signal that sets the termination flag, so the watch
+        // slept out its interval through SIGTERM (#909 watch-sigterm-stop).
+        crate::agent::sleep_unless_terminated(duration);
+    }
+
+    fn terminated(&self) -> bool {
+        crate::agent::termination_requested()
     }
 
     fn run(&self, argv: &[String], cwd: Option<&Path>, timeout: Duration) -> CommandOutcome {
@@ -2415,7 +2426,9 @@ fn alert<A: ManagedApi + ?Sized>(
     }
 }
 
-/// Run the watch: one pass with `once`, otherwise forever, one pass per interval.
+/// Run the watch: one pass with `once`, otherwise one pass per interval until termination is
+/// requested (`Host::terminated`), when it answers the last pass's health. A pass in progress
+/// finishes, its waits cut short; no other starts (#909 watch-sigterm-stop).
 pub fn watch<A: ManagedApi + ?Sized>(
     client: &A,
     registry: &Path,
@@ -2482,7 +2495,13 @@ pub fn watch<A: ManagedApi + ?Sized>(
         if options.once {
             return Ok(health);
         }
-        host.sleep(options.interval);
+        if !host.terminated() {
+            host.sleep(options.interval);
+        }
+        if host.terminated() {
+            eprintln!("agentctl watch: stopping: termination requested");
+            return Ok(health);
+        }
     }
 }
 

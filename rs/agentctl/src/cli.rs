@@ -3320,6 +3320,20 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             if let Some(problem) = designation_problem(&client, &args.registry, &mut config) {
                 eprintln!("agentctl watch: {problem}");
             }
+            // SIGTERM and SIGINT set the termination flag from the start: the watch reads it at
+            // every pass boundary and sleep, exits 0 there, and a pass still running past the
+            // grace is abandoned (#909 watch-sigterm-stop, the shape of #870
+            // agentctl-service-slow-stop). It used to sleep out systemd's 90 s stop timeout.
+            let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if !value.once {
+                crate::agent::install_termination_handler();
+                crate::agent::spawn_termination_guard(
+                    "watch",
+                    crate::agent::SERVICE_STOP_GRACE,
+                    std::sync::Arc::clone(&stopped),
+                    || Some("a pass that was still running".to_owned()),
+                );
+            }
             let health = crate::restore::watch(
                 &client,
                 &args.registry,
@@ -3333,9 +3347,18 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     state_dir: value.state_dir,
                     queue_stale: Duration::from_secs(u64::from(value.queue_stale_minutes) * 60),
                 },
-            )?;
+            );
+            stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::agent::log_stop_time("watch");
+            let health = health?;
             write_json(&health).map_err(Failure::Output)?;
-            return Ok(if health["ok"] == true { 0 } else { 1 });
+            // A requested stop is a clean one, whatever the last pass found.
+            let stopping = !value.once && crate::agent::termination_requested();
+            return Ok(if stopping || health["ok"] == true {
+                0
+            } else {
+                1
+            });
         }
         Commands::WatchAgents(value) => {
             let client = HerdrClient::with_executable("direct", &args.herdr_bin)
