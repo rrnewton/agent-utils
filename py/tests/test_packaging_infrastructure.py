@@ -997,9 +997,12 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The two #872 (a) classify cases (an interrupted cargo-home removal
     # does not block a different validate slot, but still blocks its own)
     # are mapped.
-    assert len(all_tests) == 2135
+    # The #876 foreign-shard case (retirement and cleanup skip a row
+    # recorded by another machine, and a direct foreign append is refused)
+    # is mapped.
+    assert len(all_tests) == 2136
     assert len(ordinary) == 339
-    assert len(mapped) == 1796
+    assert len(mapped) == 1797
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

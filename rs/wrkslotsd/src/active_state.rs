@@ -36,6 +36,8 @@ pub(crate) struct Cfg {
     pub(crate) layout: String,
     pub(crate) default_remote: String,
     pub(crate) default_landed_ref: String,
+    /// The selected local machine; event appends may only target it (#876).
+    pub(crate) machine: String,
 }
 
 #[derive(Clone)]
@@ -1077,6 +1079,7 @@ pub(crate) fn load_cfg(
             .map(str::to_owned)
             .ok_or_else(|| format!("validated configuration is missing {key}"))
     };
+    let selected = text("machine")?;
     let cfg = Cfg {
         root: PathBuf::from(text("root")?),
         worktrees: PathBuf::from(text("worktrees")?),
@@ -1084,8 +1087,8 @@ pub(crate) fn load_cfg(
         layout: text("layout")?,
         default_remote: text("default_remote")?,
         default_landed_ref: text("default_landed_ref")?,
+        machine: selected.clone(),
     };
-    let selected = text("machine")?;
     Ok((cfg, selected))
 }
 

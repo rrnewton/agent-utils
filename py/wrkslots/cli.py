@@ -6595,9 +6595,33 @@ def _archive_to_obj(state: ArchiveState) -> dict[str, object]:
 
 
 def _event_directory(config: Config, machine: str | None = None) -> Path:
+    """The read-only event directory for a machine.
+
+    Readers may name any machine (``status``/``doctor``/``audit`` with
+    ``--all-machines`` do).  Writers must use :func:`_event_write_directory`,
+    which refuses a foreign machine.
+    """
+
     selected = machine or config.machine
     _validate_name(selected, "machine")
     return config.control / f"EVENTS.{selected}"
+
+
+def _event_write_directory(config: Config, machine: str) -> Path:
+    """The event directory a write may append to: always the local shard.
+
+    Every append resolves through here, so no caller can write another
+    machine's history by passing a row's recorded machine (#876).  The
+    refusal names both machines so the stale copied shard is visible.
+    """
+
+    if machine != config.machine:
+        raise StateError(
+            f"refusing to append to a foreign machine's event log: "
+            f"this host is {config.machine!r}, the record names {machine!r}; "
+            f"the foreign shard EVENTS.{machine} is read-only here"
+        )
+    return _event_directory(config, machine)
 
 
 def _event_digest(value: Mapping[str, object]) -> str:
@@ -6902,7 +6926,7 @@ class _EventWriter:
 
 
 def _event_writer(config: Config, machine: str) -> _EventWriter:
-    directory = _event_directory(config, machine)
+    directory = _event_write_directory(config, machine)
     if directory.exists() and (directory.is_symlink() or not directory.is_dir()):
         raise StateError(f"append-only event log is not a real directory: {directory}")
     created = not directory.exists()
@@ -29593,12 +29617,36 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                 retained.append(
                     {**entry, "outcome": "retained", "reason": derived.reason}
                 )
+    # A foreign candidate (a row recorded by another machine, visible only
+    # through a copied shard) is never attempted: attempting it would append
+    # its history to the other machine's log (#876).  It is reported as
+    # skipped-foreign and does not consume the bounded batch.
+    skipped_foreign: list[dict[str, object]] = []
+    local_pending: list[_RetirementCandidate] = []
+    for candidate in pending:
+        if candidate.machine != config.machine:
+            skipped_foreign.append(
+                {
+                    "machine": candidate.machine,
+                    "slot": candidate.slot,
+                    "generation": candidate.generation,
+                    "sha256": candidate.sha256,
+                    "outcome": "skipped-foreign",
+                    "reason": (
+                        f"recorded by foreign machine {candidate.machine!r}; "
+                        f"this host is {config.machine!r} and never writes "
+                        "another machine's shard"
+                    ),
+                }
+            )
+            continue
+        local_pending.append(candidate)
     # A blocked candidate (a hold, a live recorded owner, a missing or
     # drifted handoff artifact) is never attempted: it is reported retained
     # with its named reason, writes no attempt history, and does not
     # consume the bounded batch.
     attemptable: list[_RetirementCandidate] = []
-    for candidate in pending:
+    for candidate in local_pending:
         if candidate.blocked_reason is None:
             attemptable.append(candidate)
             continue
@@ -29844,6 +29892,7 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
         "retained": retained,
         "deferred": deferred,
         "could_not_determine": could_not_determine,
+        "skipped_foreign": skipped_foreign,
         "recovery_required": bool(could_not_determine),
         **({"actions": actions} if include_expired else {}),
     }
@@ -29852,8 +29901,14 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
     else:
         print(
             f"removed={len(removed)} retained={len(retained)} "
-            f"deferred={len(deferred)} could_not_determine={len(could_not_determine)}"
+            f"deferred={len(deferred)} could_not_determine={len(could_not_determine)} "
+            f"skipped_foreign={len(skipped_foreign)}"
         )
+        for item in skipped_foreign:
+            print(
+                f"SKIPPED_FOREIGN: {item['machine']}/{item['slot']} "
+                f"generation={item['generation']} reason={item['reason']}"
+            )
         for item in removed:
             print(
                 f"REMOVED: {item['machine']}/{item['slot']} "
@@ -35112,9 +35167,21 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
         requested = set(only)
         for slot in sorted(requested & set(absent_slots)):
             _assert_not_in_absent_batch(slot, absent_slots)
+        # A row recorded by a foreign machine is never cleaned here: its
+        # slot name could select a local directory that is not its cache,
+        # and nothing about it may be written (#876).  Such rows are
+        # reported below, never selected.
+        foreign_cache_rows = sorted(
+            (state.machine, record.slot)
+            for state in states
+            if state.machine != config.machine
+            for record in state.slots
+            if not requested or record.slot in requested
+        )
         cache_slots = {
             record.slot: CacheSlot(record.slot, record.machine, record.checkouts)
             for state in states
+            if state.machine == config.machine
             for record in state.slots
             if record.slot not in absent_slots
             and (not requested or record.slot in requested)
@@ -35296,6 +35363,9 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
         },
         "removed_bytes": removed_bytes,
         "slots": rows,
+        "skipped_foreign": [
+            {"machine": machine, "slot": slot} for machine, slot in foreign_cache_rows
+        ],
     }
     if args.format == "json":
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -35322,6 +35392,13 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                     if row["policy_note"] is not None
                     else ""
                 )
+            )
+        for machine, slot in foreign_cache_rows:
+            print(
+                f"SKIPPED_FOREIGN: {machine}/{slot} "
+                f"reason=recorded by foreign machine {machine!r}; "
+                f"this host is {config.machine!r} and never writes "
+                "another machine's shard"
             )
     return 0
 

@@ -30565,6 +30565,82 @@ def test_abort_create_ordinary_git_remove_preserves_last_moment_dirty_file(
     assert str(tree) in git(repository, "worktree", "list", "--porcelain").stdout
 
 
+def _foreign_shard_snapshot(project: Path) -> dict[str, bytes]:
+    control = control_directory(project)
+    result: dict[str, bytes] = {}
+    for path in sorted(control.rglob("*")):
+        if path.is_file() and (
+            path.name.startswith(("ACTIVE.otherhost", "ARCHIVED.otherhost"))
+            or "EVENTS.otherhost" in path.parts
+        ):
+            result[str(path.relative_to(control))] = path.read_bytes()
+    return result
+
+
+def test_foreign_shard_is_never_written_by_retirement_or_cleanup(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path, cache_globs=("target",)
+    )
+    made = create(project, machine="otherhost")
+    assert made.returncode == 0, made.stderr
+    slot = checkout(project, slot="slot01")
+    (slot.parent / "HANDOFF.md").write_text("queue slot01\n", encoding="utf-8")
+    assert raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        machine="otherhost",
+    ).returncode == 0
+    foreign_before = _foreign_shard_snapshot(project)
+    assert foreign_before
+
+    retired = raw_command(
+        project,
+        "retire-pending",
+        "--limit",
+        "4",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--format",
+        "json",
+    )
+    assert retired.returncode == 0, retired.stderr
+    assert _foreign_shard_snapshot(project) == foreign_before
+    # The foreign row is never attempted: candidates derive from the
+    # local table, so nothing about it is removed or recorded.
+    report = json.loads(retired.stdout)
+    assert [row["slot"] for row in report["removed"]] == []
+    assert report["skipped_foreign"] == []
+
+    cleaned = raw_command(project, "clean-caches")
+    assert cleaned.returncode == 0, cleaned.stderr
+    assert _foreign_shard_snapshot(project) == foreign_before
+    cleaned_json = raw_command(project, "clean-caches", "--format", "json")
+    assert cleaned_json.returncode == 0, cleaned_json.stderr
+    assert json.loads(cleaned_json.stdout)["skipped_foreign"] == [
+        {"machine": "otherhost", "slot": "slot01"}
+    ]
+    assert _foreign_shard_snapshot(project) == foreign_before
+
+    # A table rebuild stays local: the local table is rebuilt from the
+    # local log only, so the foreign row never appears in it.
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._load_active(config).slots == ()
+    assert _foreign_shard_snapshot(project) == foreign_before
+
+    # A direct foreign append raises the refusal and writes nothing.
+    config = wrkslots._load_config(str(project), "testhost")
+    with pytest.raises(wrkslots.StateError, match="foreign machine"):
+        wrkslots._write_event_file(
+            config, "otherhost", "retirement-attempted", {"slot": "slot01"}
+        )
+    assert _foreign_shard_snapshot(project) == foreign_before
+
+
 def test_audit_associates_recovery_journals_from_other_machine_shards(
     tmp_path: Path,
 ) -> None:
@@ -32494,12 +32570,17 @@ def test_clean_caches_reports_and_reclaims_across_machine_shards(
     cleaned = command(project, "clean-caches", "--yes", "--format", "json")
 
     assert cleaned.returncode == 0, cleaned.stderr
-    rows = {row["slot"]: row for row in json.loads(cleaned.stdout)["slots"]}
-    assert set(rows) == {"slot01", "slot02"}
+    payload = json.loads(cleaned.stdout)
+    rows = {row["slot"]: row for row in payload["slots"]}
+    # #876: a row recorded by a foreign machine is skipped, never cleaned
+    # here; it is reported under skipped_foreign instead.
+    assert set(rows) == {"slot01"}
     assert rows["slot01"]["machine"] == "testhost"
-    assert rows["slot02"]["machine"] == "otherhost"
+    assert payload["skipped_foreign"] == [
+        {"machine": "otherhost", "slot": "slot02"}
+    ]
     assert not (checkout(project, "slot01") / "target").exists()
-    assert not (checkout(project, "slot02") / "target").exists()
+    assert (checkout(project, "slot02") / "target").is_dir()
 
 
 @pytest.mark.parametrize("delete", (False, True))
@@ -32576,7 +32657,8 @@ def test_clean_caches_replays_each_machine_log_once_and_reports_outside_locks(
     captured = capsys.readouterr()
 
     assert result == 0, captured.err
-    rows = {row["slot"]: row for row in json.loads(captured.out)["slots"]}
+    payload = json.loads(captured.out)
+    rows = {row["slot"]: row for row in payload["slots"]}
     if delete:
         assert set(rows) == {"slot01"}
         assert rows["slot01"]["action"] == "REMOVED"
@@ -32585,18 +32667,18 @@ def test_clean_caches_replays_each_machine_log_once_and_reports_outside_locks(
         assert lock_free_during_measurement == [False]
         assert not (checkout(project, "slot01") / "target").exists()
     else:
+        # #876: the foreign row is skipped, never replayed or measured here.
         assert {slot: row["action"] for slot, row in rows.items()} == {
             "slot01": "REPORT",
             "slot02": "HELD",
-            "slot03": "REPORT",
         }
+        assert payload["skipped_foreign"] == [
+            {"machine": "otherhost", "slot": "slot03"}
+        ]
         assert rows["slot02"]["hold_reason"] == "retain"
         assert rows["slot02"]["paths"] == []
-        assert sorted(replays) == [
-            ("otherhost", frozenset({"slot03"})),
-            ("testhost", frozenset({"slot01", "slot02"})),
-        ]
-        assert lock_free_during_measurement == [True, True]
+        assert replays == [("testhost", frozenset({"slot01", "slot02"}))]
+        assert lock_free_during_measurement == [True]
         assert (checkout(project, "slot01") / "target").is_dir()
     assert (checkout(project, "slot02") / "target").is_dir()
     assert (checkout(project, "slot03") / "target").is_dir()

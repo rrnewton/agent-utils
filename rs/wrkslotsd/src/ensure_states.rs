@@ -246,6 +246,15 @@ pub(crate) fn utc_now() -> String {
 }
 
 pub(crate) fn append_event(cfg: &Cfg, machine: &str, kind: &str, payload: Value) -> Result<Value> {
+    // Every append resolves through here, so no caller can write another
+    // machine's history by passing a row's recorded machine (#876).  The
+    // refusal names both machines so the stale copied shard is visible.
+    if machine != cfg.machine {
+        return Err(format!(
+            "refusing to append to a foreign machine's event log: this host is {:?}, the record names {:?}; the foreign shard EVENTS.{machine} is read-only here",
+            cfg.machine, machine
+        ));
+    }
     let directory = cfg.control.join(format!("EVENTS.{machine}"));
     if directory.exists()
         && directory
