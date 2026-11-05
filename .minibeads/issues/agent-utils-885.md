@@ -37,6 +37,8 @@ P0. One orphaned `wrkslots create` blocks every later create in a consumer proje
 6. **Journal gone, history names it (2026-11-05, 06:53 AM ET).** A hand repair that moved the create journal aside made every recover refuse with "recovery journal … is missing while append-only history still names it" (rc 3). Provide a supported way to make such an interrupted create terminal, or at least a runbook in the userguide.
 7. **Landing order:** the minimal classification change (5, first bullet) lands first and alone, with a tight gate. The deadlock, forward/abort and missing-journal items follow as separate landings.
 
+8. **Unscoped vs scoped recover (2026-11-05, 09:13 AM ET).** On the same state, unscoped `recover --coordinator-pid P` refused ("validation-batch seal recovery retained 1 target (sealed target absent while ACTIVE row remains)"), while `recover --slot <slot> --coordinator-pid P` resolved it (finish recovered; seal resolved). Make the unscoped path do the same, or name the `--slot` to use.
+
 # Acceptance Criteria
 
 - Test: SIGTERM a create's parent mid-create, leaving an owner-less create journal; then a create of an unrelated slot succeeds.
@@ -46,4 +48,4 @@ P0. One orphaned `wrkslots create` blocks every later create in a consumer proje
 
 # Notes
 
-Reported by the lead on 2026-11-05 at 06:41 AM ET (P0). The hand repair failed, and the consumer's merge queue has been stopped since 06:41 ET: urgent again. Assigned to mu-salvage, which pauses #881 for it.
+Reported by the lead on 2026-11-05 at 06:41 AM ET (P0). Part (a), 5c4796cc, resolved the consumer's outage at 09:13 AM ET: the create was recovered forward and validations resumed. The remaining items are P0 for recurrence. Assigned to mu-salvage, which pauses #881 for it.
