@@ -415,7 +415,7 @@ class BindRecord:
 
 
 def load_bind_records(control: Path) -> dict[str, BindRecord]:
-    """Recorded binds with their mount identity (legacy strings included)."""
+    """Recorded binds with their mount identity (the earlier string form included)."""
 
     path = record_path(control)
     if not path.is_file():
