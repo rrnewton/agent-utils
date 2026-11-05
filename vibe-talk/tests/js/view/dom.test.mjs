@@ -758,6 +758,7 @@ test("`#624 voice-page-modularity`: the search, Settings, Help, Back and Escape 
     forgetChannelPick: () => log.push("pick forgotten"),
     putOutLitCard: () => state.litCard,
     clearAllThreadFocus: () => state.allFocus,
+    clearLinkedMark: () => state.linked,
   });
   const run = (act) => { log.length = 0; const did = act(); return [did, ...log]; };
   state.menus = ["menu:actions"];
@@ -853,6 +854,10 @@ test("`#624 voice-page-modularity`: the search, Settings, Help, Back and Escape 
   state.allFocus = true;
   assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true]);
   state.allFocus = false;
+  // `#890 voice-page-linked-highlight`. The linked message's mark, after everything else and before Back.
+  state.linked = true;
+  assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true], "Escape left the linked message's mark on screen");
+  state.linked = false;
   assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [false], "Escape with nothing to do did something");
 });
 

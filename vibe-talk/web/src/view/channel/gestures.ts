@@ -258,6 +258,8 @@ export function createRowGestures(deps: RowGesturesDependencies): RowGestures {
       // its run: a finger there neither archives this message nor opens its details, and a hold
       // there would leave `suppressNextRowClick` behind a click the line keeps to itself.
       if (within(li.seamLine, event.target) || within(li.seamBelowLine, event.target)) return;
+      // `#890 voice-page-linked-highlight`. Nor on the linked message's note, whose × puts the mark out.
+      if (within(childByClass(li, "linked-marker"), event.target)) return;
       active = true;
       startX = event.clientX;
       startY = event.clientY;

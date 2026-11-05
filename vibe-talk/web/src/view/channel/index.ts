@@ -127,3 +127,5 @@ export { mountListControls } from "./listcontrols.ts";
 export type { ListControls, ListControlsDependencies } from "./listcontrols.ts";
 export { mountSideControls } from "./sidecontrols.ts";
 export type { GestureStart, SideControls, SideControlsDependencies } from "./sidecontrols.ts";
+export { LINKED_MARK_WORDS, createLinkedMark } from "./linkedmark.ts";
+export type { LinkedMark, LinkedMarkDependencies, LinkedMessage } from "./linkedmark.ts";

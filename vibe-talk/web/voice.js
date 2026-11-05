@@ -1324,6 +1324,52 @@ const deepLinks = createDeepLinks({
   arriving: () => visits.arriving() || layoutShown.restoring(),
 });
 
+// `#890 voice-page-linked-highlight`. The message a link landed on, marked until the reader puts the mark out (Esc, its
+// ×, another link): one owner in web/src/view/channel/linkedmark.ts, drawn on every row and card as it is drawn
+// (`discordNode`, `sideCard`), so neither the selection nor a list drawn again takes it away.
+const linkedMark = createLinkedMark({
+  rowsDrawn: () => ["discord-log", "side-log", "pinned-log", "side-pinned-log", "side-cards"]
+    .flatMap((id) => {
+      const list = leftEl(id);
+      return list ? /** @type {HTMLElement[]} */ ([...list.children]) : [];
+    }),
+  // A card holds its thread's first message.
+  idsOf: (row) => {
+    if (!row.hasAttribute("data-card")) return idsOf(row);
+    const root = /** @type {any} */ (row).cardRoot;
+    return root && root.id !== undefined && root.id !== null ? [String(root.id)] : [];
+  },
+  channel: () => String(selectedChannelId()),
+  rowShown: (row) => linkedRowShown(row),
+  // Put out by the reader, the address lets go of the message too, so a reload does not mark it again.
+  // Only where the address still names that message: a link landing since has a place of its own there.
+  dismissed: (linked) => {
+    const focus = deepLinks.focus();
+    if (!focus || String(focus.message) !== linked.id || String(focus.channel) !== linked.channel) return;
+    deepLinks.setFocus(null);
+    syncDeepLinkAddress();
+  },
+});
+
+/**
+ * Whether any of `row` shows in a list on screen: the cards where they cycle, else the list a column shows, between
+ * what floats over its head and its foot. A mark scrolled out of sight is not what Esc is asked about.
+ */
+function linkedRowShown(row) {
+  if (screens.screen() !== "main" || screens.view() !== "discord" || !rowShown(row)) return false;
+  if (row.parentNode === leftEl("side-cards")) {
+    if (!cardsCycle()) return false;
+    const box = row.getBoundingClientRect();
+    const area = leftEl("side-scroll").getBoundingClientRect();
+    return box.bottom > area.top && box.top < area.bottom;
+  }
+  let shown = false;
+  eachColumn(() => {
+    if (row.parentNode === visibleList() && rowOnScreen(row)) shown = true;
+  });
+  return shown;
+}
+
 /**
  * Note a choice of view or channel the reader made, for `applyDeepLink` to lose to. A layout
  * the page itself restores (`layoutShown.restoring()` — a turned or resized window) is no choice.
@@ -1417,6 +1463,8 @@ function landOnDeepLink(id, center = false) {
     // A card folded into a run of read threads: the run opened, which draws the cards anew.
     openReadRun(card);
     card = cardOf() || card;
+    // `#890 voice-page-linked-highlight`. Marked before it is brought on screen, which the note's line moves.
+    linkedMark.set(String(selectedChannelId()), String(id));
     if (!rowShown(card)) {
       setStatus("Hide read is hiding that message.");
       return true;
@@ -1432,7 +1480,8 @@ function landOnDeepLink(id, center = false) {
   if (!row) return false;
   if (String(row.className).split(/\s+/).includes("search-hidden")) setSearchOpen(false);
   openReadRun(row);
-  revealRow(row, center);
+  linkedMark.set(String(selectedChannelId()), String(id));
+  revealRow(rowHolding(id) || row, center);
   renderScrollTools();
   setStatus("Here is the linked message.");
   return true;
@@ -6916,6 +6965,7 @@ const screenKeys = createScreenKeys({
   forgetChannelPick: () => channelKeys.forgetPick(),
   putOutLitCard: () => putOutLitCard(),
   clearAllThreadFocus: () => clearAllThreadFocus(),
+  clearLinkedMark: () => linkedMark.clearOnEscape(),
 });
 const { searchFromKeyboard, searchFromAnywhere, settingsFromKeyboard, closeHelp, keysFromKeyboard, replyOnScreen, onEscape } = screenKeys;
 
@@ -19175,6 +19225,8 @@ function discordNode(messages) {
   // address of every link it draws, which the source held and the drawn text does not, so a pasted
   // address still finds its row.
   searchable(li, message.author, text, ...anchorsIn(body).map((link) => link.href));
+  // `#890 voice-page-linked-highlight`. The linked message, marked on every drawing of its row.
+  linkedMark.drawOn(li, messages.map((one) => String(one.id)));
   return li;
 }
 
@@ -27474,6 +27526,8 @@ function sideCard({ choice, view = cardView(choice), text, summarized, root, age
   // search reaches it, as it reaches the cards of the Threads list; and by its first message's words
   // where the card says a summary of them. `#262 search-load-older`.
   searchable(row, text, threadName(choice, Infinity), root);
+  // `#890 voice-page-linked-highlight`. A card whose first message is the linked one is marked as its row is.
+  linkedMark.drawOn(row);
   return row;
 }
 
@@ -30269,6 +30323,7 @@ function forgetToken() {
   // `#462 webapp-deep-links`: signing out forgets where the reader was, address included — a
   // reload after it must not reopen the signed-out reader's place from the query alone.
   deepLinks.signOut();
+  linkedMark.clear();
   // `#543 in-app-message-links`: and the jumps taken by links, whose spots are the signed-out reader's.
   linkJumps.forget();
   try {

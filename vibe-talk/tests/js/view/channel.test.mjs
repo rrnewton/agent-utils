@@ -1342,3 +1342,98 @@ test("`#624 voice-page-modularity`: the thread's back gesture commits only a lon
   controls.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
+
+test("`#890 voice-page-linked-highlight`: the linked message is marked on every drawing of its row until Esc, its × or another link puts the mark out", () => {
+  const { createLinkedMark, LINKED_MARK_WORDS } = CHANNEL_VIEW;
+  const element = (tag, className = "") => {
+    const attrs = new Map();
+    const listeners = [];
+    const el = {
+      tagName: tag.toUpperCase(), className, children: [], textContent: "", listeners,
+      setAttribute: (name, value) => attrs.set(name, String(value)), getAttribute: (name) => attrs.get(name) ?? null,
+      hasAttribute: (name) => attrs.has(name), removeAttribute: (name) => attrs.delete(name),
+      append: (...kids) => el.children.push(...kids),
+      insertBefore: (kid, ref) => { const at = ref ? el.children.indexOf(ref) : -1; el.children.splice(at < 0 ? el.children.length : at, 0, kid); },
+      removeChild: (kid) => { el.children.splice(el.children.indexOf(kid), 1); },
+      addEventListener: (type, listener) => listeners.push({ type, listener }),
+    };
+    return el;
+  };
+  const was = globalThis.document;
+  globalThis.document = { createElement: (tag) => element(tag) };
+  try {
+    const state = { channel: "c1", shown: true, rows: [], dismissed: 0 };
+    // Each in a list, as a row drawn and shown is.
+    const list = { id: "discord-log" };
+    const row = (...ids) => { const one = element("li", "discord-message"); one.ids = ids; one.parentNode = list; one.append(element("div", "meta")); return one; };
+    const mark = createLinkedMark({
+      rowsDrawn: () => state.rows,
+      idsOf: (one) => one.ids,
+      channel: () => state.channel,
+      rowShown: () => state.shown,
+      dismissed: (one) => { state.dismissed += 1; state.last = one; },
+    });
+    const marker = (one) => one.children.find((kid) => kid.className === "linked-marker");
+    const linked = (one) => one.getAttribute("data-linked") === "true" && Boolean(marker(one));
+    const [a, b, c] = [row("1"), row("2", "3"), row("4")];
+    state.rows = [a, b, c];
+    assert.equal(mark.linked(), null);
+    mark.set("c1", "3");
+    assert.deepStrictEqual(mark.linked(), { channel: "c1", id: "3" });
+    assert.deepStrictEqual([linked(a), linked(b), linked(c)], [false, true, false], "the row holding the linked message is not the one marked");
+    assert.equal(b.children[0], marker(b), "the note is not at the row's head");
+    // After a reply's arrow and a thread's strip, which lead the row.
+    const reply = row("3");
+    reply.insertBefore(element("button", "thread-strip"), reply.children[0]);
+    reply.insertBefore(element("button", "reply-jump"), reply.children[0]);
+    mark.drawOn(reply);
+    assert.deepStrictEqual(reply.children.map((kid) => kid.className), ["reply-jump", "thread-strip", "linked-marker", "meta"],
+      "the note went ahead of the arrow or the strip");
+    const words = marker(b).children;
+    assert.equal(words[0].textContent, LINKED_MARK_WORDS.note);
+    assert.equal(words[1].getAttribute("aria-label"), LINKED_MARK_WORDS.clear, "the × says nothing to a screen reader");
+    // Drawn again: the row the list draws now holding it is marked, once; one no longer holding it is not.
+    const again = row("2", "3");
+    mark.drawOn(again);
+    mark.drawOn(again);
+    assert.equal(again.children.filter((kid) => kid.className === "linked-marker").length, 1, "a row drawn twice took two notes");
+    b.ids = ["2"];
+    mark.drawOn(b);
+    assert.equal(linked(b), false, "a reused row that no longer holds the message kept the mark");
+    b.ids = ["2", "3"];
+    mark.drawOn(b, ["2", "3"]);
+    assert.equal(linked(b), true);
+    // Another channel's row with the same id is not the linked message.
+    state.channel = "c2";
+    const elsewhere = row("3");
+    mark.drawOn(elsewhere);
+    assert.equal(linked(elsewhere), false, "a message of the same id in another channel was marked");
+    state.channel = "c1";
+    // Another link moves it.
+    mark.set("c1", "4");
+    assert.deepStrictEqual([linked(a), linked(b), linked(again), linked(c)], [false, false, false, true], "the old mark stayed when a new link moved it");
+    assert.equal(state.dismissed, 0, "another link moving the mark was taken for the reader putting it out");
+    // Esc: only where the mark is on screen.
+    state.shown = false;
+    assert.equal(mark.clearOnEscape(), false, "Esc put out a mark out of sight");
+    assert.equal(linked(c), true);
+    state.shown = true;
+    assert.equal(mark.clearOnEscape(), true);
+    assert.equal(linked(c), false);
+    assert.equal(mark.linked(), null);
+    assert.equal(mark.clearOnEscape(), false, "a second Esc found a mark");
+    assert.equal(state.dismissed, 1, "Esc putting the mark out was not said once");
+    assert.deepStrictEqual(state.last, { channel: "c1", id: "4" }, "Esc said another message was put out");
+    // The ×.
+    mark.set("c1", "1");
+    marker(a).children[1].listeners.find((one) => one.type === "click").listener({});
+    assert.deepStrictEqual([linked(a), mark.linked()], [false, null], "the × did not put the mark out");
+    assert.equal(state.dismissed, 2, "the × putting the mark out was not said");
+    assert.equal(mark.clear(), false, "a mark already out was put out again");
+    mark.set("c1", "1");
+    mark.clear();
+    assert.equal(state.dismissed, 2, "putting the mark out for the page (signing out) was taken for the reader's");
+  } finally {
+    globalThis.document = was;
+  }
+});

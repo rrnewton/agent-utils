@@ -1125,6 +1125,71 @@
 }
 
 /*
+ * `#890 voice-page-linked-highlight`. THE LINKED MESSAGE, MARKED UNTIL PUT OUT. The owner, 2026-11-05: "when we
+ * specifically load a page highlighting a message that it should have a PROMINENT highlight that is persistent."
+ * The landing's flash above fades, and the selection goes with the mouse; this stays: an accent edge on the row's
+ * start, its surface tinted, and a "Linked message" note with a × at its head, until Esc, the ×, or another link
+ * (web/src/view/channel `createLinkedMark`).
+ *
+ * Inset shadows, which neither the selection's ring (an outline) nor its surface (a background) touches, so a
+ * selected linked row shows both; and back at full strength, as a lit row is, a read message or card included.
+ * Each selector carries `body`, one element more than the rules it must win over that load later: a summarised
+ * thread's root row's edge (`data-root-child`) and a read card's receding (`data-thread-read`), both in
+ * 20-desktop-regime.css.
+ */
+body #side-log li.discord-message[data-linked="true"],
+body #side-cards li.discord-message[data-linked="true"],
+body #discord-log li.discord-message[data-linked="true"],
+body #pinned-log li.discord-message[data-linked="true"],
+body .side-card-row[data-linked="true"] {
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
+  box-shadow: inset 0.3rem 0 0 var(--accent), inset 0 0 0 100vmax color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.linked-marker {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  width: fit-content;
+  margin: 0.15rem 0 0.3rem;
+  padding: 0 0 0 0.55rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 0.8rem;
+  font-weight: 600;
+  line-height: 1.6;
+}
+
+/* Across the card's two columns, over the button that says what the thread is about. */
+.side-card-row > .linked-marker {
+  grid-column: 1 / -1;
+  margin-inline-start: 0.6rem;
+}
+
+.linked-marker-clear {
+  /* A target a thumb can take, though the note is small. */
+  min-width: 2.25rem;
+  min-height: 2rem;
+  padding: 0 0.45rem;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.linked-marker-clear:hover,
+.linked-marker-clear:focus-visible {
+  background: color-mix(in srgb, var(--bg) 25%, transparent);
+}
+
+/*
  * A RUN OF READ MESSAGES, COLLAPSED. `#221 read-modes`: under Fold read each run of read
  * messages is one line, "… 12 read messages …", and a tap on it opens the run.
  *

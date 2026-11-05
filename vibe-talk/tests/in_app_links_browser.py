@@ -26,6 +26,10 @@ At 1280x800 and at 393x852 with touch, the same walk:
   to 201, "#lead team › message": two entries over the start, All again on 201 -> Back: the thread, on
   206 -> Back: All, 220 at the height it was, on the entry the first jump was taken from.
 
+`#890 voice-page-linked-highlight`: the first landing on 206 is drawn marked as the linked message, an edge
+on the row and a "Linked message" note at its head, on screen, with a × a thumb can take; on the desk the
+mouse crossing another message selects it and the mark stays.
+
 No page error at any step. Pass --screenshots DIR to keep a PNG of each landing.
 """
 
@@ -143,6 +147,36 @@ class Link:
 
 
 LANDED_JS = """(id) => document.querySelector(`#discord-log > li[data-id="${id}"]`)?.getAttribute('data-landed') === 'true'"""
+
+def box_of(value: object) -> dict[str, float] | None:
+    """A box `MARK_JS` measured, its numbers as floats; None where the element is not drawn."""
+    if not isinstance(value, dict):
+        return None
+    return {str(key): float(number) for key, number in value.items() if isinstance(number, (int, float))}
+
+
+def number_of(value: object) -> float:
+    """A coordinate the page answered, as a float."""
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+# `#890 voice-page-linked-highlight`. The linked message's mark as the browser draws it: the row's attribute and
+# edge, the note at its head and the × on the note, with the boxes of the note and the × and the window's height.
+MARK_JS = """(id) => {
+    const row = document.querySelector(`#discord-log > li[data-id="${id}"]`);
+    if (!row) return null;
+    const note = row.querySelector(':scope > .linked-marker');
+    const clear = note && note.querySelector('.linked-marker-clear');
+    const box = (node) => {
+        if (!node) return null;
+        const r = node.getBoundingClientRect();
+        return {top: r.top, bottom: r.bottom, width: r.width, height: r.height};
+    };
+    return {linked: row.getAttribute('data-linked'), shadow: getComputedStyle(row).boxShadow,
+            note: box(note), words: note ? note.textContent : '', clear: box(clear),
+            area: box(document.getElementById('scroll-area')),
+            selected: document.querySelector('#discord-log > li[data-selected="true"]')?.getAttribute('data-id') || null};
+}"""
 
 
 def arguments() -> argparse.Namespace:
@@ -306,6 +340,47 @@ class Reader:
         self.desk.check(moved <= 2, f"{what}: Back put the reader's message at {after.top}, "
                                     f"not {before.top} ({moved:.0f}px off)")
 
+    def linked_mark(self, message_id: str) -> None:
+        """`#890 voice-page-linked-highlight`. The landed message drawn marked, its note on screen with a × a thumb
+        can take; and on a desk, still marked after the mouse crosses another message and selects it."""
+        mark: Json | None = self.page.evaluate(MARK_JS, message_id)
+        self.desk.check(mark is not None and mark["linked"] == "true", f"{message_id} is not marked as the linked message")
+        assert mark is not None
+        # Both of the mark's inset shadows, the edge and the tint: a later rule (a summarised root's edge) that
+        # won the cascade would leave one.
+        self.desk.check(str(mark["shadow"]).count("inset") >= 2,
+                        f"the linked message does not draw its edge and tint: {mark['shadow']!r}")
+        note, clear, area = box_of(mark["note"]), box_of(mark["clear"]), box_of(mark["area"])
+        self.desk.check(note is not None and note["height"] > 0 and "Linked message" in str(mark["words"]),
+                        f"the linked message's note is not drawn: {note}")
+        assert note is not None and area is not None
+        self.desk.check(note["top"] >= area["top"] - 1 and note["bottom"] <= area["bottom"] + 1,
+                        f"the linked message's note is off the screen: {note} in {area}")
+        self.desk.check(clear is not None and clear["width"] >= 24 and clear["height"] >= 24,
+                        f"the note's × is too small to take: {clear}")
+        assert clear is not None
+        if not self.phone:
+            other: Json | None = self.page.evaluate(
+                """(id) => {
+                    const row = [...document.querySelectorAll('#discord-log > li[data-id]')]
+                        .find((one) => one.getAttribute('data-id') !== id && one.getBoundingClientRect().height > 0
+                            && one.getBoundingClientRect().top > document.getElementById('scroll-area').getBoundingClientRect().top);
+                    if (!row) return null;
+                    const r = row.getBoundingClientRect();
+                    return {id: row.getAttribute('data-id'), x: r.left + r.width / 2, y: r.top + Math.min(r.height / 2, 12)};
+                }""",
+                message_id,
+            )
+            self.desk.check(other is not None, "no other message on screen to cross with the mouse")
+            assert other is not None
+            self.page.mouse.move(number_of(other["x"]), number_of(other["y"]), steps=4)
+            self.desk.settled()
+            after: Json | None = self.page.evaluate(MARK_JS, message_id)
+            assert after is not None
+            self.desk.check(after["selected"] == other["id"], f"the mouse did not select {other['id']}: {after['selected']}")
+            self.desk.check(after["linked"] == "true", "the mouse crossing another message took the mark away")
+        self.desk.notes.append(f"{message_id} marked, note {note['height']:.0f}px, x {clear['width']:.0f}x{clear['height']:.0f}px")
+
     def walk(self) -> None:
         notes = self.desk.notes
         start = self.spot("220").index
@@ -327,6 +402,7 @@ class Reader:
                         f"the address does not name the landed message: {landed.search}")
         self.desk.shot("landed-reply")
         notes.append(f"reply link {link.text!r} landed 206 in its thread, +1 entry")
+        self.linked_mark("206")
 
         self.back()
         after = self.wait_back_where("220", "Back after the jump did not come back")

@@ -146,7 +146,8 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
     {
       group: KEYS_PAGE, chords: [{ key: "Escape" }],
       does: "Back: closes a menu, the search or a sheet, takes " +
-        "the highlight off a thread card, lets go of a thread selected in All, leaves Settings, " +
+        "the highlight off a thread card, lets go of a thread selected in All, takes the mark off a linked message, " +
+        "leaves Settings, " +
         "Help, Reply or a thread — one opened from the thread list goes back to it — and leaves the thread list for " +
         "the view it was chosen from. In a message box with text in it, leaves the box first and keeps the draft; " +
         "on the channel or view picker, back to the messages",

@@ -9,8 +9,8 @@ import { moduleForTests } from "../../../web/build.mjs";
 
 import { CHANNEL, CSS, GLYPHS, HOLD_MS, HTML_CODE, PRESENT_ROWS, REPO, SCRIPT, SCRIPT_CODE, SETTINGS,
   assertMarkupContains, assistantSays, atBottomOf, backFacts, backlog, brokenModule, brokenScript,
-  cssBlock, cssRules, doneButton, inReadingMode, linkPairs, linksOf, longMessage, message, newPage,
-  pagedTimeline, passTime, reReadChannel, readAloudMessages, reloadWith, reopenedChannel, rowMore,
+  cssBlock, cssRules, doneButton, inReadingMode, linkPairs, linksOf, longMessage, message, mouseTo, newPage,
+  pagedTimeline, passTime, press, reReadChannel, readAloudMessages, reloadWith, reopenedChannel, rowMore,
   rowMoreButton, rowMoreMenu, rowState, rowWithId, search, showDiscord, showLinks, signIn,
   sourceConstant, startTalking, statusText, storedPin, tapKind, tapPin, test, threadData,
   turnTodoOn, unfiltered, untilDeepLink, upstreamReadButton } from "./fixture.mjs";
@@ -1581,4 +1581,143 @@ test("the channel composer says where the message goes in its placeholder, not i
   assert.match(SCRIPT_CODE, /const destination = selection\(\)\.threadId \? "Reply in this thread" : "Message the main channel";/);
   assert.match(SCRIPT_CODE, /el\("channel-compose-text"\)\.placeholder = `\$\{destination\}…`;/);
   assert.doesNotMatch(SCRIPT_CODE, /Write a message…|Write a thread reply…/, "the old, less informative hint came back");
+});
+
+// --- `#890 voice-page-linked-highlight` -------------------------------------------------------------------
+
+/** The page opened on a link to `linkedThreadData`'s answer `204` in its thread. */
+async function openedOnLink({ script = SCRIPT } = {}) {
+  const data = linkedThreadData();
+  const page = newPage(new Map(), script, (p) => {
+    p.enableHistory();
+    p.setAddress({ search: "?c=1110000000000000001&v=thread&t=spaces%2FA%2Fthreads%2Fanother" +
+      "&m=discord%3A1110000000000000001%3A204%3Aspaces%252FA%252Fthreads%252Fanother" });
+  });
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await untilDeepLink(page, () => rowWithId(page, "204")?.getAttribute("data-landed") === "true");
+  return page;
+}
+
+/** The ids of the rows marked as the linked message, in the list on screen. */
+const linkedIds = (page) => page.el("discord-log").children
+  .filter((row) => row.getAttribute("data-linked") === "true").map((row) => row.getAttribute("data-id"));
+
+/** Scroll Main's list so `row` stands just under its top. */
+async function bringOnScreen(page, row) {
+  const area = page.el("scroll-area");
+  area.scrollTop += row.getBoundingClientRect().top - area.getBoundingClientRect().top - 40;
+  await area.dispatch("scroll");
+  await page.settle();
+}
+
+/** The note at the head of `row`, saying it is the linked message. */
+const linkedNote = (row) => row && row.children.find((node) => node.className === "linked-marker");
+
+test("`#890 voice-page-linked-highlight`: the message a page opens on stays marked through the mouse, the keys, a scroll and the list drawn again, until Esc", async () => {
+  const page = await openedOnLink();
+  assert.deepStrictEqual(linkedIds(page), ["204"], "the linked message is not the one marked");
+  const note = linkedNote(rowWithId(page, "204"));
+  assert.ok(note, "no note on the linked message");
+  assert.match(note.text(), /Linked message/);
+  const clear = note.descendants().find((node) => node.className === "linked-marker-clear");
+  assert.equal(clear.getAttribute("aria-label"), "Stop highlighting the linked message");
+  // The landing's flash fades; the mark does not.
+  await passTime(page, 3000);
+  await page.settle();
+  assert.equal(rowWithId(page, "204").getAttribute("data-landed"), null, "fixture: the landing's flash did not fade");
+  assert.deepStrictEqual(linkedIds(page), ["204"], "the mark went with the landing's flash");
+
+  // The mouse crossing another message selects it, and leaves the mark where it is.
+  const other = page.el("discord-log").children.find((row) => row.getAttribute("data-id") !== "204");
+  await mouseTo(page, other, 20, other.getBoundingClientRect().top + 5);
+  assert.equal(other.getAttribute("data-selected"), "true", "fixture: the mouse did not select the message it crossed");
+  assert.deepStrictEqual(linkedIds(page), ["204"], "the mouse took the mark away");
+  // The keys moving the selection.
+  await press(page, page.el("scroll-area"), "ArrowUp");
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  assert.notEqual(page.el("discord-log").children.find((row) => row.getAttribute("data-selected") === "true")?.getAttribute("data-id"),
+    undefined, "fixture: the keys selected nothing");
+  assert.deepStrictEqual(linkedIds(page), ["204"], "a selection change took the mark away");
+  // A scroll.
+  page.el("scroll-area").scrollTop = 0;
+  await page.el("scroll-area").dispatch("scroll");
+  await page.settle();
+  assert.deepStrictEqual(linkedIds(page), ["204"], "a scroll took the mark away");
+  // The list drawn again from nothing: All, and back to the thread; and the poll's re-read.
+  const drawn = rowWithId(page, "204");
+  page.el("thread-select").value = "flat";
+  await page.el("thread-select").dispatch("change");
+  await page.settle();
+  page.el("thread-select").value = "thread:spaces/A/threads/another";
+  await page.el("thread-select").dispatch("change");
+  await page.settle();
+  await reReadChannel(page);
+  assert.notEqual(rowWithId(page, "204"), drawn, "fixture: the row was not drawn again");
+  assert.deepStrictEqual(linkedIds(page), ["204"], "the list drawn again lost the mark");
+  assert.equal(page.el("discord-log").children.filter((row) => linkedNote(row)).length, 1, "the note is not on one row only");
+
+  // Esc puts it out, and only it: the thread stays open, and the next Esc is Back as before.
+  await bringOnScreen(page, rowWithId(page, "204"));
+  await press(page, page.el("scroll-area"), "Escape");
+  assert.deepStrictEqual(linkedIds(page), [], "Esc did not put the mark out");
+  assert.equal(linkedNote(rowWithId(page, "204")), undefined, "the note outlived the mark");
+  assert.equal(page.el("thread-heading").hidden, false, "the Esc that put out the mark also left the thread");
+  assert.ok(page.pure("deepLinks.focus() === null"), "the address still names the message whose mark the reader put out");
+  await press(page, page.el("scroll-area"), "Escape");
+  assert.equal(page.el("thread-heading").hidden, true, "Esc after the mark was out did not go Back");
+  const escEntry = page.el("keyboard-keys").descendants().find((node) => node.tagName === "kbd" && node.textContent === "Esc");
+  assert.match(escEntry.parentNode.text(), /takes the mark off a linked message/, "the ? list does not say Esc puts the mark out");
+
+  // NEGATIVE CONTROL: with the rows drawn without the mark, the list drawn again loses it.
+  const bare = await openedOnLink({ script: brokenScript("  linkedMark.drawOn(li, messages.map((one) => String(one.id)));\n", "") });
+  assert.deepStrictEqual(linkedIds(bare), ["204"], "the control lost the mark before any drawing");
+  bare.el("thread-select").value = "flat";
+  await bare.el("thread-select").dispatch("change");
+  await bare.settle();
+  bare.el("thread-select").value = "thread:spaces/A/threads/another";
+  await bare.el("thread-select").dispatch("change");
+  await bare.settle();
+  await reReadChannel(bare);
+  assert.deepStrictEqual(linkedIds(bare), [], "the control kept the mark without drawing it");
+});
+
+test("`#890 voice-page-linked-highlight`: the × on its note puts the mark out, and another link moves it", async () => {
+  const page = await openedOnLink();
+  // Another link: the answer's own link, to the channel's first message in Main.
+  await tapLink(page, linkIn(rowWithId(page, "204")));
+  await untilDeepLink(page, () => page.el("thread-heading").hidden && rowWithId(page, "200")?.getAttribute("data-landed") === "true");
+  assert.deepStrictEqual(linkedIds(page), ["200"], "another link did not move the mark");
+  assert.ok(linkedNote(rowWithId(page, "200")), "the moved mark has no note");
+  assert.equal(page.pure("deepLinks.focus() && deepLinks.focus().message"), "200", "another link lost its own place in the address");
+  // Scrolled out of sight, the mark is not what Esc asks about: it stays, and Esc is left to do what it did.
+  const area = page.el("scroll-area");
+  area.scrollTop = area.scrollHeight;
+  await area.dispatch("scroll");
+  await page.settle();
+  assert.ok(rowWithId(page, "200").getBoundingClientRect().bottom < area.getBoundingClientRect().top,
+    "fixture: the marked message is still on screen");
+  await press(page, page.el("scroll-area"), "Escape");
+  assert.deepStrictEqual(linkedIds(page), ["200"], "Esc put out a mark scrolled out of sight");
+  await bringOnScreen(page, rowWithId(page, "200"));
+  await press(page, page.el("scroll-area"), "Escape");
+  assert.deepStrictEqual(linkedIds(page), [], "Esc did not put out the mark back on screen");
+  // Back in the thread, the old message is no longer marked.
+  await page.browserBack();
+  await untilDeepLink(page, () => !page.el("thread-heading").hidden && rowWithId(page, "204"));
+  assert.deepStrictEqual(linkedIds(page), [], "the old message kept the mark after another link moved it");
+
+  // The ×, on a page opened on the link.
+  const again = await openedOnLink();
+  const clear = linkedNote(rowWithId(again, "204")).descendants().find((node) => node.className === "linked-marker-clear");
+  await clear.click();
+  await again.settle();
+  assert.deepStrictEqual(linkedIds(again), [], "the × did not put the mark out");
+  assert.equal(again.el("thread-heading").hidden, false, "the × did more than put the mark out");
+  // And Esc with no mark is Back, as before.
+  await press(again, again.el("scroll-area"), "Escape");
+  assert.equal(again.el("thread-heading").hidden, true);
 });

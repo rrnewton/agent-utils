@@ -70,6 +70,8 @@ export interface ScreenKeysDependencies<Pane> {
   putOutLitCard(): boolean;
   /** Let go of a thread selected in All by its strip; whether there was one (`#299 all-thread-strip`). */
   clearAllThreadFocus(): boolean;
+  /** Put out the linked message's mark where it is on screen; whether it was (`#890 voice-page-linked-highlight`). */
+  clearLinkedMark(): boolean;
 }
 
 /** The keys. Each returns whether it did anything, as a binding of the keymap does. */
@@ -133,7 +135,7 @@ export interface ScreenKeys {
    * Back at once, there being nothing to keep; a picker on the bar is left for the list, whatever it
    * holds (`isBarPicker`); then a highlighted thread card on screen is put out (`#277
    * thread-card-focus`); then a thread selected in All by its strip is let go (`#299 all-thread-strip`);
-   * then Back: out of Settings, Help or Reply, out of the thread list to what it
+   * then the linked message's mark on screen is put out (`#890 voice-page-linked-highlight`); then Back: out of Settings, Help or Reply, out of the thread list to what it
    * was chosen from, or out of a thread — to the thread list, for one opened from it (`#281 view-keys`).
    * With none of those it does nothing: in particular it marks nothing read, which is the proposal's
    * answer to the clients whose Escape does.
@@ -248,6 +250,8 @@ export function createScreenKeys<Pane>(deps: ScreenKeysDependencies<Pane>): Scre
       if (deps.putOutLitCard()) return true;
       // `#299 all-thread-strip`. A thread selected in All by its strip is let go before All is left.
       if (deps.clearAllThreadFocus()) return true;
+      // `#890 voice-page-linked-highlight`. The linked message's mark, the last thing on screen before Back.
+      if (deps.clearLinkedMark()) return true;
       return goBack();
     },
   };
