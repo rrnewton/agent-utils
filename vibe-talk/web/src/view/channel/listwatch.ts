@@ -6,19 +6,12 @@
 // and taken down again.
 
 import { createListening } from "../dom/index.ts";
+import type { SizeWatcher, SizeWatching } from "../dom/index.ts";
 
-/** A ResizeObserver, as far as watching the lists uses one. */
-export interface SizeWatcher {
-  observe(target: Element): void;
-  disconnect(): void;
-}
-
-export interface ListWatchDependencies {
+export interface ListWatchDependencies extends SizeWatching {
   /** An element of the page by id, in the column the code is working in, and in the left column. */
   byId(id: string): HTMLElement;
   leftById(id: string): HTMLElement;
-  /** A ResizeObserver calling `report`, or null where the browser has none. */
-  sizeWatcher(report: () => void): SizeWatcher | null;
   /** Run `act` once the current task is done (`setTimeout(act, 0)`). */
   afterThisTask(act: () => void): void;
   /** Keep the chips off the message box (`#245 done-feedback`). */
@@ -59,6 +52,11 @@ export interface ListWatch {
 export function mountListWatch(deps: ListWatchDependencies): ListWatch {
   const { listen, unmount: unlisten } = createListening();
   const watchers: SizeWatcher[] = [];
+  const watch = (report: () => void): SizeWatcher => {
+    const watcher = deps.sizeWatcher(report);
+    watchers.push(watcher);
+    return watcher;
+  };
   // The chip is an offer to go somewhere the reader may simply go themselves. Once they are there it
   // has nothing left to say, so it takes itself away rather than waiting to be tapped — and since
   // `#207 scrollback-jump` it is offered the moment they scroll far enough up the history to want it.
@@ -99,30 +97,29 @@ export function mountListWatch(deps: ListWatchDependencies): ListWatch {
   // AFTER the observer returns, not inside it: deciding can show or hide the jump, that resizes
   // #scroll-tools, and a size changed from inside a ResizeObserver callback is the loop the browser
   // reports as an error. One decision per burst of resizes; it is cheap, but a row drawn is a resize.
-  let decisionDue = false;
-  const geometry = deps.sizeWatcher(() => {
-    if (decisionDue) return;
-    decisionDue = true;
-    deps.afterThisTask(() => {
-      decisionDue = false;
-      deps.renderJumpNewest();
-      // `#245 done-feedback`. The message box moves without a scroll too: the window, a view or
-      // screen changing, the box itself resized.
-      deps.placeChipsOverComposer();
-      // `#340 composer-grow-box`. A box shown again, by a view, a screen or a send card going, is
-      // measured where the browser does not size it.
-      deps.fitGrowingBoxes();
-      // `#261 two-column-connectors`. A row folded or opened moves the roots below it with no scroll.
-      deps.scheduleColumnLinks();
+  if (deps.canWatchSizes()) {
+    let decisionDue = false;
+    const geometry = watch(() => {
+      if (decisionDue) return;
+      decisionDue = true;
+      deps.afterThisTask(() => {
+        decisionDue = false;
+        deps.renderJumpNewest();
+        // `#245 done-feedback`. The message box moves without a scroll too: the window, a view or
+        // screen changing, the box itself resized.
+        deps.placeChipsOverComposer();
+        // `#340 composer-grow-box`. A box shown again, by a view, a screen or a send card going, is
+        // measured where the browser does not size it.
+        deps.fitGrowingBoxes();
+        // `#261 two-column-connectors`. A row folded or opened moves the roots below it with no scroll.
+        deps.scheduleColumnLinks();
+      });
     });
-  });
-  if (geometry) {
-    watchers.push(geometry);
     const area = deps.byId("scroll-area");
     for (const box of [area, ...Array.from(area.children)]) geometry.observe(box);
     // `#229 desktop-two-column`. The right column's list, for its own jump.
     let sideDue = false;
-    const sideGeometry = deps.sizeWatcher(() => {
+    const sideGeometry = watch(() => {
       if (sideDue) return;
       sideDue = true;
       deps.afterThisTask(() => {
@@ -136,12 +133,9 @@ export function mountListWatch(deps: ListWatchDependencies): ListWatch {
     // Not the room past the foot itself, which only this page sizes: a size it is given while an observer
     // of its neighbours is being told of theirs is one the browser could not report in the same frame. Nor
     // the room held for a card (`#459 pack-keeps-card-still`), for the same reason.
-    if (sideGeometry) {
-      watchers.push(sideGeometry);
-      const side = deps.leftById("side-scroll");
-      for (const box of [side, ...Array.from(side.children)]) {
-        if (box !== deps.leftById("side-overscroll") && box !== deps.leftById("side-overextend")) sideGeometry.observe(box);
-      }
+    const side = deps.leftById("side-scroll");
+    for (const box of [side, ...Array.from(side.children)]) {
+      if (box !== deps.leftById("side-overscroll") && box !== deps.leftById("side-overextend")) sideGeometry.observe(box);
     }
   }
   return {

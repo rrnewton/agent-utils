@@ -118,6 +118,6 @@ export type { ReplyRouting, ReplyState } from "./replystate.ts";
 export { mountFilterChips } from "./filterchips.ts";
 export type { FilterChips, FilterChipsDependencies, SearchKey } from "./filterchips.ts";
 export { mountListWatch } from "./listwatch.ts";
-export type { ListWatch, ListWatchDependencies, SizeWatcher } from "./listwatch.ts";
+export type { ListWatch, ListWatchDependencies } from "./listwatch.ts";
 export { mountListKeepers } from "./listkeepers.ts";
-export type { KeeperWatcher, ListKeepers, ListKeepersDependencies } from "./listkeepers.ts";
+export type { ListKeepers, ListKeepersDependencies } from "./listkeepers.ts";

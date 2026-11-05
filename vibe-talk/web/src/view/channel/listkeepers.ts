@@ -7,13 +7,8 @@
 // in the page's order, and taken down again.
 
 import { createListening } from "../dom/index.ts";
+import type { SizeWatcher, SizeWatching } from "../dom/index.ts";
 import type { UnderListNote, UnderLists } from "./underlists.ts";
-
-/** A ResizeObserver, as far as the keepers use one. */
-export interface KeeperWatcher {
-  observe(target: Element): void;
-  disconnect(): void;
-}
 
 /** What the right column's keeper noted of its reader at its last pass or scroll. */
 interface Footing {
@@ -23,10 +18,7 @@ interface Footing {
   readonly context: string;
 }
 
-export interface ListKeepersDependencies<Column> {
-  /** Whether the browser can watch sizes, and a watcher calling `report` where it can. */
-  canWatchSizes(): boolean;
-  sizeWatcher(report: () => void): KeeperWatcher;
+export interface ListKeepersDependencies<Column> extends SizeWatching {
   /** An element of the page by id, in the column the code is working in, and in the left column. */
   el(id: string): HTMLElement;
   leftEl(id: string): HTMLElement;
@@ -87,8 +79,8 @@ export interface ListKeepers {
 /** Mount the keepers of the lists' readers. */
 export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>): ListKeepers {
   const { listen, unmount: unlisten } = createListening();
-  const watchers: KeeperWatcher[] = [];
-  const watch = (report: () => void): KeeperWatcher => {
+  const watchers: SizeWatcher[] = [];
+  const watch = (report: () => void): SizeWatcher => {
     const watcher = deps.sizeWatcher(report);
     watchers.push(watcher);
     return watcher;
@@ -280,8 +272,8 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
   // `#214 reply-arrow`. Where an arrow meets the row directly above it is layout, and layout changes
   // without a redraw: the window resized or turned, the reading column dragged, the reader's type
   // size, a row folding or opening above an arrow. So the channel's list is watched, and the arrows
-  // measured again once the observer has returned, as the jump is decided above. Measuring only moves
-  // drawings that are out of the flow, so it cannot resize the list and come round again.
+  // measured again once the observer has returned, as the lists' watch decides the jump (`mountListWatch`).
+  // Measuring only moves drawings that are out of the flow, so it cannot resize the list and come round again.
   if (deps.canWatchSizes()) {
     let measureDue = false;
     watch(() => {

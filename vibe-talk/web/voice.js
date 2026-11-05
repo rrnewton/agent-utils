@@ -31376,10 +31376,20 @@ mountFilterChips({
 // what a scroll of Main's list asks for, and what a change of size of either list asks for once the browser has
 // finished telling of it. One owner in web/src/view/channel/listwatch.ts (`#624 voice-page-modularity`), mounted
 // here, in the page's order; its `unmount` waits for the ordered boot's teardown.
+/**
+ * Watching sizes, as the page offers it to the mounts that watch the lists: a ResizeObserver, where the browser
+ * has one (web/src/view/dom `SizeWatching`).
+ *
+ * @type {import("./src/view/dom/index.ts").SizeWatching}
+ */
+const sizeWatching = {
+  canWatchSizes: () => typeof window.ResizeObserver === "function",
+  sizeWatcher: (report) => new window.ResizeObserver(() => report()),
+};
 mountListWatch({
+  ...sizeWatching,
   byId: (id) => el(id),
   leftById: (id) => leftEl(id),
-  sizeWatcher: (report) => (typeof window.ResizeObserver === "function" ? new window.ResizeObserver(() => report()) : null),
   afterThisTask: (act) => { setTimeout(act, 0); },
   placeChipsOverComposer: () => placeChipsOverComposer(),
   renderJumpNewest: () => renderJumpNewest(),
@@ -31462,8 +31472,7 @@ function cardsPlacedUnderLists() {
 // web/src/view/channel/listkeepers.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its
 // `unmount` waits for the ordered boot's teardown.
 mountListKeepers({
-  canWatchSizes: () => typeof window.ResizeObserver === "function",
-  sizeWatcher: (report) => new window.ResizeObserver(() => report()),
+  ...sizeWatching,
   el: (id) => el(id),
   leftEl: (id) => leftEl(id),
   screens,

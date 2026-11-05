@@ -919,9 +919,9 @@ test("`#624 voice-page-modularity`: watching the lists answers a scroll at once,
   const deps = {
     byId: (id) => ids[id],
     leftById: (id) => leftIds[id],
+    canWatchSizes: () => { asked.push("can watch?"); return state.resize; },
     sizeWatcher: (report) => {
       asked.push("size watcher");
-      if (!state.resize) return null;
       const watcher = { report, watched: [], stopped: false, observe(box) { this.watched.push(box.id); }, disconnect() { this.stopped = true; } };
       watchers.push(watcher);
       return watcher;
@@ -971,8 +971,8 @@ test("`#624 voice-page-modularity`: watching the lists answers a scroll at once,
   watchers.length = 0;
   asked.length = 0;
   const bare = mountListWatch(deps);
-  assert.deepStrictEqual([asked, area.listeners.length], [["size watcher"], 1],
-    "a browser with no ResizeObserver lost the scroll listener, or a second watcher was asked for after the first was refused");
+  assert.deepStrictEqual([asked, area.listeners.length], [["can watch?"], 1],
+    "a browser with no ResizeObserver lost the scroll listener, or a watcher was asked of it");
   bare.unmount();
 });
 
@@ -998,13 +998,14 @@ test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line
   const was = globalThis.setTimeout;
   globalThis.setTimeout = (act) => { timers.push(act); return timers.length; };
   try {
+    const underLists = createUnderLists();
     const keepers = mountListKeepers({
       canWatchSizes: () => state.sizes,
       sizeWatcher: (report) => { const watcher = { report, watched: [], stopped: false, observe(target) { this.watched.push(target.id); }, disconnect() { this.stopped = true; } }; watchers.push(watcher); return watcher; },
       el: (id) => els[id],
       leftEl: (id) => lefts[id],
       screens: { screen: () => state.screen, view: () => state.view },
-      underLists: createUnderLists(),
+      underLists,
       cardsDrawn: { opening: () => state.opening },
       columns,
       layoutShown: { columns: () => state.columns },
@@ -1068,6 +1069,19 @@ test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line
     state.dock += 40;
     assert.deepStrictEqual(run(() => mainDock.report()), [], "growth off the main screen was followed");
     state.screen = "main";
+    // `#269 approval-card-inline` x `#281 view-keys`. A send card coming up docked under the thread list: the reader at
+    // Main's foot is judged by how far from it they were just before, not by how near it they are left.
+    main.clientHeight = 500;
+    mainDock.report();
+    for (const [gap, kept] of [[20, true], [80, false]]) {
+      underLists.cardCame(gap);
+      state.dock += 60;
+      main.scrollTop = 100;
+      state.bottom = new Set(["scroll-area"]);
+      assert.deepStrictEqual(run(() => mainDock.report()), [], "the card's coming was judged by where the reader is left");
+      assert.equal(main.scrollTop, kept ? 2000 : 100, `a reader ${gap}px from the foot as the card came was ${kept ? "not " : ""}taken to it`);
+    }
+    state.bottom = new Set();
     // The right column under the same dock: the cards follow their foot unless they are opening; a thread, in its column.
     assert.deepStrictEqual(run(() => sideDock.report()), ["in side"], "the right column's first report did more than note");
     state.dock += 30;
@@ -1128,10 +1142,8 @@ test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line
     keepers.unmount();
     assert.deepStrictEqual([side.listeners.length, watchers.every((one) => one.stopped)], [0, true], "a listener or a watcher outlived unmount");
     // Without a ResizeObserver: nothing watched, and no scroll listener for the foot keeper either.
-    state.sizes = false;
-    watchers.length = 0;
     mountListKeepers({ canWatchSizes: () => false, sizeWatcher: () => assert.fail("a watcher was made"), el: (id) => els[id], leftEl: (id) => lefts[id] });
-    assert.deepStrictEqual([watchers.length, side.listeners.length], [0, 0]);
+    assert.equal(side.listeners.length, 0, "the foot keeper listened without a watcher to keep");
   } finally {
     globalThis.setTimeout = was;
   }
