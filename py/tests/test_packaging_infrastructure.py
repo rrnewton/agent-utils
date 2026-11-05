@@ -994,9 +994,12 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # (https://github.com/rrnewton/agent-utils/issues/298).
     # The two absent cargo-home recovery cases of #872 (finalize as
     # absent, and a missing authorization flag still refused) are mapped.
-    assert len(all_tests) == 2133
+    # The two #872 (a) classify cases (an interrupted cargo-home removal
+    # does not block a different validate slot, but still blocks its own)
+    # are mapped.
+    assert len(all_tests) == 2135
     assert len(ordinary) == 339
-    assert len(mapped) == 1794
+    assert len(mapped) == 1796
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

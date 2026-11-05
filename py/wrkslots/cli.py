@@ -9904,16 +9904,66 @@ def _create_journal_items(
     )
 
 
+def _ownerless_cargo_home_journal_is_unrelated(
+    config: Config,
+    raw: Mapping[str, object],
+    *,
+    requested_slot: str,
+    requested_slot_type: str,
+) -> bool:
+    """Whether an interrupted journal is a cargo-home removal disjoint from a create.
+
+    Only an ``ownerless-validate-remove`` whose fully decoded authorization
+    names a cargo home, and whose target and fenced paths cannot overlap the
+    requested slot path, is unrelated. Any other interrupted mutation, and
+    any journal that does not decode cleanly, keeps the blanket refusal.
+    """
+
+    if raw.get("kind") != "ownerless-validate-remove":
+        return False
+    try:
+        authorization, target, fenced, _phase = _ownerless_validation_paths(
+            config, raw
+        )
+        requested_path = _slot_directory(config, requested_slot, requested_slot_type)
+    except (Refusal, StateError, KeyError, TypeError, ValueError):
+        return False
+    if authorization.target_kind != "cargo-home":
+        return False
+    for candidate in (target, fenced):
+        if _path_is_within(candidate, requested_path) or _path_is_within(
+            requested_path, candidate
+        ):
+            return False
+    return True
+
+
 def _classify_create_journal(
     config: Config,
     path: Path,
     states: Sequence[ActiveState],
     archives: Sequence[ArchiveState],
-) -> _CreateJournalClassification:
+    *,
+    requested_slot: str | None = None,
+    requested_slot_type: str = "agent",
+    skipped_paths: list[Path] | None = None,
+) -> _CreateJournalClassification | None:
     raw, identity, completed = _read_stable_physical_journal(
         config, path, states
     )
     if raw.get("kind") != "create":
+        if (
+            requested_slot is not None
+            and _ownerless_cargo_home_journal_is_unrelated(
+                config,
+                raw,
+                requested_slot=requested_slot,
+                requested_slot_type=requested_slot_type,
+            )
+        ):
+            if skipped_paths is not None and path not in skipped_paths:
+                skipped_paths.append(path)
+            return None
         raise Refusal(
             f"interrupted {raw.get('kind')!r} mutation {path.name} cannot coexist "
             "with an operation that permits only verified disjoint create journals"
@@ -9983,11 +10033,26 @@ def _classify_create_journals(
     archives: Sequence[ArchiveState],
     *,
     excluded_paths: AbstractSet[Path] = frozenset(),
+    requested_slot: str | None = None,
+    requested_slot_type: str = "agent",
+    skipped_paths: list[Path] | None = None,
 ) -> tuple[_CreateJournalClassification, ...]:
     rows = tuple(
-        _classify_create_journal(config, path, states, archives)
+        row
         for path in _outstanding_journals(config)
         if path not in excluded_paths
+        for row in (
+            _classify_create_journal(
+                config,
+                path,
+                states,
+                archives,
+                requested_slot=requested_slot,
+                requested_slot_type=requested_slot_type,
+                skipped_paths=skipped_paths,
+            ),
+        )
+        if row is not None
     )
     seen_slots: set[tuple[str, str]] = set()
     seen_agents: set[str] = set()
@@ -10156,7 +10221,12 @@ def _classify_disjoint_create_journals_for_record(
     excluded_paths: AbstractSet[Path] = frozenset(),
 ) -> tuple[_CreateJournalClassification, ...]:
     rows = _classify_create_journals(
-        config, states, archives, excluded_paths=excluded_paths
+        config,
+        states,
+        archives,
+        excluded_paths=excluded_paths,
+        requested_slot=record.slot if record.slot_type == "validate" else None,
+        requested_slot_type=record.slot_type,
     )
     _assert_interrupted_creates_unrelated_to_record(config, rows, record)
     return rows
@@ -26450,6 +26520,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             states,
             archives,
             excluded_paths=cleanup_exclusions,
+            requested_slot=args.slot,
+            requested_slot_type=args.slot_type,
         )
         _assert_interrupted_creates_unrelated(
             config,
@@ -26495,6 +26567,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             states,
             archives,
             excluded_paths=cleanup_exclusions,
+            requested_slot=args.slot,
+            requested_slot_type=args.slot_type,
         )
         if _validate_batch_paired_finish_path(config) != paired_finish_path:
             raise Refusal(
@@ -26736,8 +26810,15 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
     before_paths = tuple(
         path for path in _outstanding_journals(config) if path not in absent_paths
     )
+    skipped_paths: list[Path] = []
     rows = _classify_create_journals(
-        config, before_states, before_archives, excluded_paths=absent_paths
+        config,
+        before_states,
+        before_archives,
+        excluded_paths=absent_paths,
+        requested_slot=slot,
+        requested_slot_type=slot_type,
+        skipped_paths=skipped_paths,
     )
     _assert_interrupted_creates_unrelated(
         config, rows, slot=slot, agent=agent, slot_type=slot_type
@@ -26749,10 +26830,16 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
         raise Refusal("interrupted absent-validation-row batch changed while classified")
     if before_rows != _global_rows(after_states, after_archives):
         raise Refusal("active registry changed while create journals were classified")
-    if before_paths != tuple(row.path for row in rows):
+    if before_paths != tuple(
+        sorted((*[row.path for row in rows], *skipped_paths))
+    ):
         raise Refusal("recovery journal set changed before it was classified")
     _assert_create_journal_classifications_stable(
-        config, rows, after_states, after_archives, excluded_paths=absent_paths
+        config,
+        rows,
+        after_states,
+        after_archives,
+        excluded_paths=absent_paths | frozenset(skipped_paths),
     )
     payload = {
         "blocking": False,

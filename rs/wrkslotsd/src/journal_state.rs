@@ -544,7 +544,7 @@ fn finish_shape(
     Ok(())
 }
 
-fn validation_authorization(value: &Value) -> Result<(String, String)> {
+pub(crate) fn validation_authorization(value: &Value) -> Result<(String, String)> {
     let label = "validation recovery authorization";
     let raw = as_mapping(value, label)?;
     exact_keys(
@@ -683,7 +683,7 @@ fn frozen_directory(cfg: &Cfg) -> PathBuf {
         .join(format!(".{root_name}-frozen-validate"))
 }
 
-fn recovery_target(cfg: &Cfg, raw_path: &str, target_kind: &str) -> Result<PathBuf> {
+pub(crate) fn recovery_target(cfg: &Cfg, raw_path: &str, target_kind: &str) -> Result<PathBuf> {
     if target_kind == "frozen-checkout" {
         if !raw_path.starts_with('/') {
             return Err(

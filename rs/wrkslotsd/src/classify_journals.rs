@@ -325,13 +325,55 @@ fn field(value: &Value, key: &str) -> String {
         .to_string()
 }
 
+/// Whether an interrupted journal is a cargo-home removal disjoint
+/// from the requested slot: only an `ownerless-validate-remove` whose
+/// fully decoded authorization names a cargo home, and whose target and
+/// fenced paths cannot overlap the requested slot path. Any other
+/// interrupted mutation, and any journal that does not decode cleanly,
+/// keeps the blanket refusal (the Python `_ownerless_cargo_home_journal_is_unrelated`).
+fn ownerless_cargo_home_journal_is_unrelated(
+    cfg: &Cfg,
+    raw: &Map<String, Value>,
+    requested_slot: &str,
+    requested_slot_type: &str,
+) -> bool {
+    if raw.get("kind").and_then(Value::as_str) != Some("ownerless-validate-remove") {
+        return false;
+    }
+    let (target, fenced) = (|| -> Result<(PathBuf, PathBuf)> {
+        let (target_kind, auth_path) =
+            crate::journal_state::validation_authorization(&raw["authorization"])?;
+        let target = crate::journal_state::recovery_target(cfg, &auth_path, &target_kind)?;
+        if target_kind != "cargo-home" {
+            return Err("not a cargo home".to_string());
+        }
+        let raw_fenced = field(&Value::Object(raw.clone()), "fenced");
+        let fenced =
+            crate::config_validate::relative_inside(&cfg.root, &raw_fenced, "fenced path")?.1;
+        Ok((target, fenced))
+    })()
+    .unwrap_or_default();
+    if target.as_os_str().is_empty() {
+        return false;
+    }
+    let requested = match slot_directory(cfg, requested_slot, requested_slot_type) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    ![&target, &fenced]
+        .iter()
+        .any(|candidate| within(candidate, &requested) || within(&requested, candidate))
+}
+
 fn classify_one(
     cfg: &Cfg,
     config: &Value,
     path: &Path,
     states: &[(String, Vec<Value>)],
     archives: &[Vec<Value>],
-) -> Result<Row> {
+    requested_slot: &str,
+    requested_slot_type: &str,
+) -> Result<Option<Row>> {
     if !path.exists() && path.symlink_metadata().is_err() {
         return Err(format!(
             "recovery journal {} is missing while append-only history still names it",
@@ -349,6 +391,10 @@ fn classify_one(
         &raw,
     )?;
     if kind != "create" {
+        if ownerless_cargo_home_journal_is_unrelated(cfg, &raw, requested_slot, requested_slot_type)
+        {
+            return Ok(None);
+        }
         return Err(format!(
             "interrupted {kind:?} mutation {} cannot coexist with an operation that permits only verified disjoint create journals",
             path.file_name().unwrap_or_default().to_string_lossy()
@@ -676,7 +722,7 @@ fn classify_one(
     } else {
         format!("{owner_state}-incomplete-create")
     };
-    Ok(Row {
+    Ok(Some(Row {
         machine,
         slot,
         agent,
@@ -693,7 +739,7 @@ fn classify_one(
         state,
         journal: path.to_path_buf(),
         identity,
-    })
+    }))
 }
 
 /// Classify outstanding create journals for the requested slot.
@@ -745,8 +791,13 @@ pub(crate) fn classify_create_journals(
     let paths = outstanding(&cfg.control)?;
     let mut rows: Vec<Row> = Vec::new();
     for path in &paths {
-        // Only create journals are classified; other kinds refuse in classify_one.
-        rows.push(classify_one(&cfg, &config, path, &states, &archives)?);
+        // Only create journals are classified; other kinds refuse in
+        // classify_one, except a validated ownerless cargo-home removal
+        // disjoint from the requested slot, which is skipped.
+        if let Some(row) = classify_one(&cfg, &config, path, &states, &archives, &slot, slot_type)?
+        {
+            rows.push(row);
+        }
     }
     {
         let mut seen_slots: BTreeSet<(String, String)> = BTreeSet::new();

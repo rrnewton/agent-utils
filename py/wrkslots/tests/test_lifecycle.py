@@ -10230,6 +10230,122 @@ def test_recover_absent_cargo_home_refuses_missing_authorization_flag(
     assert journal_path.exists()
 
 
+def test_classify_create_journals_tolerates_absent_ownerless_cargo_home(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "ignored" / "validate" / "cargo-homes" / "validate-cargo-absent"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(project, target, field="cargo_home")
+    interrupted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validate-journal"},
+    )
+    assert interrupted.returncode == 86
+    journal_path = control_directory(project) / "ACTIVE.testhost.journal"
+    assert journal_path.is_file()
+
+    # Something outside wrkslots deleted both the target and the fenced
+    # path; only a dangling slot-N symlink remains (the lead-host state).
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    shutil.rmtree(target)
+    assert not Path(journal["fenced"]).exists()
+    dangling = target.parent / "slot-2"
+    dangling.symlink_to(target.name)
+
+    # A new, different validate slot is unrelated to the interrupted
+    # cargo-home removal and must be admitted.
+    admitted = raw_command(
+        project,
+        "classify-create-journals",
+        "validate02",
+        "--slot-type",
+        "validate",
+        "--agent",
+        "validate-2",
+        "--format",
+        "json",
+    )
+    assert admitted.returncode == 0, admitted.stderr
+    payload = json.loads(admitted.stdout)
+    assert payload["blocking"] is False
+    assert payload["requested"]["slot"] == "validate02"
+
+    assert journal_path.is_file()
+
+
+def test_classify_create_journals_refuses_the_interrupted_cargo_slot_itself(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    # A cargo home under the validate-slots root: the journal's recorded
+    # slot identity is the target name, so requesting that exact slot
+    # overlaps the interrupted removal and must still refuse.
+    target = project / "worktrees" / "validate" / "validate-cargo-held"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(
+        project, target, field="cargo_home", name="validate-held"
+    )
+    interrupted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validate-journal"},
+    )
+    assert interrupted.returncode == 86
+    journal_path = control_directory(project) / "ACTIVE.testhost.journal"
+    assert journal_path.is_file()
+    shutil.rmtree(target)
+
+    refused = raw_command(
+        project,
+        "classify-create-journals",
+        target.name,
+        "--slot-type",
+        "validate",
+        "--agent",
+        "validate-2",
+        "--format",
+        "json",
+    )
+    assert refused.returncode == 3
+    assert journal_path.is_file()
+
+    # A different validate slot in the same root remains admissible.
+    admitted = raw_command(
+        project,
+        "classify-create-journals",
+        "validate02",
+        "--slot-type",
+        "validate",
+        "--agent",
+        "validate-2",
+        "--format",
+        "json",
+    )
+    assert admitted.returncode == 0, admitted.stderr
+
+
 def test_ownerless_cargo_home_allows_nested_git_cache_and_records_determination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
