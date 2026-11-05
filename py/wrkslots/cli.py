@@ -4249,6 +4249,8 @@ def _refresh_worktrees_bind_mounts(config: Config) -> None:
         return
     points: dict[Path, str] = {}
     for slot, record in records.items():
+        if record.target:
+            points[Path(record.target)] = record.subvolume
         for slot_type in SLOT_TYPES:
             try:
                 canonical = _slot_directory(config, slot, slot_type)
@@ -4573,6 +4575,13 @@ def _requested_representation(config: Config, args: argparse.Namespace) -> str:
 def _is_owned_image_root(path: Path) -> bool:
     target = Path(os.path.abspath(path))
     return any(mount_point == target for mount_point, _source in _OWNED_REPRESENTATION_MOUNTS)
+
+
+def _is_owned_worktrees_bind_root(path: Path) -> bool:
+    """Whether ``path`` is a recorded worktrees-image bind's mount point."""
+
+    target = Path(os.path.abspath(path))
+    return any(point == target for point, _device, _root in _OWNED_WORKTREES_BIND_MOUNTS)
 
 
 def _load_new_slot_config(args: argparse.Namespace, operation: str) -> Config:
@@ -16536,21 +16545,24 @@ class _GitVcs:
         if force:
             args.append("--force")
         args.extend(("--", str(checkout)))
-        if not _is_owned_image_root(checkout):
+        bind_root = _is_owned_worktrees_bind_root(checkout)
+        if not bind_root and not _is_owned_image_root(checkout):
             self._run(repository, args)
             return
         # A flat image-backed checkout's root is the image's mount point, which
-        # cannot be removed. Git deletes the working tree's contents, fails only
-        # on that final rmdir, and still deletes the administrative directory.
-        # Accept exactly that outcome; the image itself is destroyed with the
-        # slot directory afterwards.
+        # cannot be removed; a flat worktrees-image checkout's root is its
+        # recorded bind mount, the same case. Git deletes the working tree's
+        # contents, fails only on that final rmdir, and still deletes the
+        # administrative directory. Accept exactly that outcome; the image or
+        # subvolume itself is destroyed with the slot directory afterwards.
         result = self._run(repository, args, check=False)
         if result.returncode == 0:
             return
+        residue = frozenset() if bind_root else slotimage.REPRESENTATION_RESIDUE
         leftover = [
             entry.name
             for entry in checkout.iterdir()
-            if entry.name not in slotimage.REPRESENTATION_RESIDUE
+            if entry.name not in residue
         ]
         if leftover or checkout.absolute() in self.listed_worktrees(repository):
             detail = (result.stderr or result.stdout).strip().splitlines()
@@ -39416,6 +39428,50 @@ def _git_removal_finished_at_image_root(
     return not _git_registers_checkout(config, checkout, path, vcs)
 
 
+def _drop_rebound_canonical_bind(
+    config: Config, slot: str, original: Path, fenced: Path
+) -> bool:
+    """Drop a canonical bind a config load re-established beside the fence.
+
+    True when the canonical path is gone afterwards. Both paths must be
+    mounts of the slot's recorded subvolume (same device and mount root in
+    the current table): then the canonical mount shows the very content the
+    fence already holds, and unmounting it loses nothing. Anything else is
+    left in place for the caller's refusal.
+    """
+
+    if _worktrees_bind_slot(config, original) != slot:
+        return False
+    try:
+        records = worktreesimage.load_bind_records(config.control)
+        table = slotimage.mount_table()
+    except (worktreesimage.WorktreesImageError, slotimage.ImageError, Refusal):
+        return False
+    bind = records.get(slot)
+    if bind is None:
+        return False
+    at = {entry.mount_point: entry for entry in table}
+    canonical_entry = at.get(original)
+    fenced_entry = at.get(fenced)
+    if canonical_entry is None or fenced_entry is None:
+        return False
+    expected_root = f"/{bind.subvolume}"
+    if (
+        canonical_entry.root != expected_root
+        or fenced_entry.root != expected_root
+        or canonical_entry.device != fenced_entry.device
+    ):
+        return False
+    try:
+        worktreesimage.umount_point(original)
+        if original.is_dir() and not original.is_symlink():
+            original.rmdir()
+    except (worktreesimage.WorktreesImageError, OSError):
+        return False
+    _refresh_owned_mounts(config)
+    return not original.exists() and not original.is_symlink()
+
+
 def _begin_or_resume_path_fence(
     config: Config,
     record: ActiveRecord,
@@ -39430,6 +39486,14 @@ def _begin_or_resume_path_fence(
     original_present = original.exists() or original.is_symlink()
     fenced_present = fenced.exists() or fenced.is_symlink()
     newly_fenced = False
+    if original_present and fenced_present:
+        # A config load once re-established a fenced slot's bind at its
+        # canonical path (#898): the canonical path is then the same recorded
+        # subvolume mounted a second time, not slot content in the way. Drop
+        # that mount and its empty mount point and resume at the fence. Any
+        # other second path keeps the refusal below.
+        if _drop_rebound_canonical_bind(config, record.slot, original, fenced):
+            original_present = original.exists() or original.is_symlink()
     if original_present and fenced_present:
         raise Refusal(f"both canonical and fenced slot paths exist for {record.slot}")
     if original_present:

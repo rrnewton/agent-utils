@@ -412,6 +412,13 @@ class BindRecord:
 
     subvolume: str
     mount_id: int | None = None
+    #: Absolute path the bind currently targets: the canonical slot path, or
+    #: its fenced sibling while a removal holds the fence. Relocating the
+    #: bind updates this in the same step, so re-establishing binds after a
+    #: reboot or config reload never resurrects the canonical mount of a
+    #: fenced slot. None in records written before targets were kept; those
+    #: bind at the canonical path.
+    target: str | None = None
 
 
 def load_bind_records(control: Path) -> dict[str, BindRecord]:
@@ -432,9 +439,11 @@ def load_bind_records(control: Path) -> dict[str, BindRecord]:
             records[str(slot)] = BindRecord(subvolume=item)
         elif isinstance(item, dict) and isinstance(item.get("subvolume"), str):
             mount_id = item.get("mount_id")
+            target = item.get("target")
             records[str(slot)] = BindRecord(
                 subvolume=item["subvolume"],
                 mount_id=mount_id if isinstance(mount_id, int) else None,
+                target=target if isinstance(target, str) else None,
             )
         else:
             raise WorktreesImageError(f"malformed worktrees image record: {path}")
@@ -456,7 +465,11 @@ def save_bind_records(control: Path, records: dict[str, BindRecord]) -> None:
     temporary = path.with_name(path.name + ".tmp")
     payload = {
         "binds": {
-            slot: {"subvolume": record.subvolume, "mount_id": record.mount_id}
+            slot: {
+                "subvolume": record.subvolume,
+                "mount_id": record.mount_id,
+                "target": record.target,
+            }
             for slot, record in sorted(records.items())
         }
     }
@@ -503,7 +516,9 @@ def bind_slot(control: Path, mount_dir: Path, slot: str, slot_path: Path) -> Non
     slot_path.mkdir(parents=True, exist_ok=True)
     _run(["mount", "--bind", str(source), str(slot_path)], sudo=True)
     records = load_bind_records(control)
-    records[slot] = BindRecord(subvolume=slot, mount_id=mount_id_at(slot_path))
+    records[slot] = BindRecord(
+        subvolume=slot, mount_id=mount_id_at(slot_path), target=str(slot_path)
+    )
     save_bind_records(control, records)
 
 
@@ -527,8 +542,18 @@ def relocate_bind(control: Path, mount_dir: Path, slot: str, source: Path, desti
         _run(["mount", "--bind", str(mount_dir / record.subvolume), str(source)], sudo=True)
         raise
     _run(["mount", "--bind", str(mount_dir / record.subvolume), str(destination)], sudo=True)
-    records[slot] = BindRecord(subvolume=record.subvolume, mount_id=mount_id_at(destination))
+    records[slot] = BindRecord(
+        subvolume=record.subvolume,
+        mount_id=mount_id_at(destination),
+        target=str(destination),
+    )
     save_bind_records(control, records)
+
+
+def umount_point(path: Path) -> None:
+    """Unmount whatever is mounted at ``path``; the bind record is untouched."""
+
+    _run(["umount", str(path)], sudo=True)
 
 
 def unbind_slot(control: Path, slot: str, slot_path: Path) -> None:
@@ -541,19 +566,32 @@ def unbind_slot(control: Path, slot: str, slot_path: Path) -> None:
 
 
 def ensure_binds(control: Path, mount_dir: Path, slots_dir: Path) -> list[str]:
-    """Re-establish the image mount and every recorded bind; return actions."""
+    """Re-establish the image mount and every recorded bind; return actions.
+
+    Each bind goes back at its recorded target. A slot whose canonical path
+    has a fenced sibling is mid-removal: its bind lives at (or is headed to)
+    the fenced path, and resurrecting the canonical mount would make every
+    later recovery refuse that both paths exist, so it is left alone.
+    """
 
     actions: list[str] = []
     if not mount_dir.is_dir() or next(mount_dir.iterdir(), None) is None:
         pass
-    binds = load_binds(control)
+    records = load_bind_records(control)
     entries = slotimage.mount_table()
     mounted_points = {entry.mount_point for entry in entries}
-    for slot in sorted(binds):
-        slot_path = slots_dir / slot
-        if slot_path in mounted_points:
+    for slot in sorted(records):
+        record = records[slot]
+        canonical = slots_dir / slot
+        target = Path(record.target) if record.target else canonical
+        if target == canonical and any(
+            sibling.name.startswith(f".{slot}.fenced.")
+            for sibling in slots_dir.glob(f".{slot}.fenced.*")
+        ):
             continue
-        bind_slot(control, mount_dir, slot, slot_path)
+        if target in mounted_points:
+            continue
+        bind_slot(control, mount_dir, slot, target)
         actions.append(f"bound slot {slot} from the worktrees image")
     return actions
 

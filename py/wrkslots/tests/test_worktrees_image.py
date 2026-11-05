@@ -9,6 +9,8 @@ repeated here because the shared test host cannot guarantee loop devices.
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -209,11 +211,13 @@ def test_bind_fence_and_remove_cycle(
 
     worktreesimage.bind_slot(control, mount_dir, "s1", slot_path)
     assert worktreesimage.load_bind_records(control)["s1"].mount_id == 777
+    assert worktreesimage.load_bind_records(control)["s1"].target == str(slot_path)
 
     fenced = config.worktrees / (".s1.fenced.1." + "a" * 32)
     cli._rename_slot_path(config, slot_path, fenced)
     assert fenced.is_dir() and not slot_path.exists()
     assert worktreesimage.load_binds(control) == {"s1": "s1"}
+    assert worktreesimage.load_bind_records(control)["s1"].target == str(fenced)
     assert [call[0] for call in fake.calls] == ["mount", "umount", "mount"]
 
     cli._remove_slot_directory(config, fenced)
@@ -246,6 +250,139 @@ def test_remove_refuses_when_the_bind_unmount_fails_and_a_retry_finishes(
     cli._remove_slot_directory(config, slot_path)
     assert not slot_path.exists() and not (mount_dir / "s1").exists()
     assert worktreesimage.load_binds(control) == {}
+
+
+def test_reload_never_rebinds_a_fenced_slot_at_its_canonical_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The lead-host failure: a removal fenced mqfix, then a config reload
+    # re-established its bind at the canonical path and recover refused that
+    # both paths exist. ensure_binds must leave a fenced slot alone, and
+    # must re-bind at the recorded (fenced) target after a reboot.
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    canonical = config.worktrees / "s1"
+    fenced = config.worktrees / (".s1.fenced.1." + "b" * 32)
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(slotimage, "mount_table", lambda: [])
+
+    worktreesimage.save_bind_records(
+        control,
+        {"s1": worktreesimage.BindRecord(subvolume="s1", mount_id=5, target=str(canonical))},
+    )
+    fenced.mkdir(parents=True)
+    assert worktreesimage.ensure_binds(control, mount_dir, config.worktrees) == []
+    assert not canonical.exists()
+
+    worktreesimage.save_bind_records(
+        control,
+        {"s1": worktreesimage.BindRecord(subvolume="s1", mount_id=5, target=str(fenced))},
+    )
+    fenced.rmdir()
+    actions = worktreesimage.ensure_binds(control, mount_dir, config.worktrees)
+    assert actions == ["bound slot s1 from the worktrees image"]
+    assert fenced.is_dir() and not canonical.exists()
+
+
+def test_drop_rebound_canonical_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    control = config.control
+    canonical = config.worktrees / "s1"
+    fenced = config.worktrees / (".s1.fenced.1." + "c" * 32)
+    canonical.mkdir(parents=True)
+    fenced.mkdir(parents=True)
+    worktreesimage.save_bind_records(
+        control,
+        {"s1": worktreesimage.BindRecord(subvolume="s1", mount_id=5, target=str(fenced))},
+    )
+    def entry(point: Path, root: str) -> slotimage.MountEntry:
+        return slotimage.MountEntry(
+            mount_point=point, fstype="btrfs", source="/dev/loop2", device="0:1", root=root
+        )
+
+    monkeypatch.setattr(
+        slotimage, "mount_table", lambda: [entry(canonical, "/s1"), entry(fenced, "/s1")]
+    )
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    assert cli._drop_rebound_canonical_bind(config, "s1", canonical, fenced)
+    assert not canonical.exists() and fenced.is_dir()
+
+    # A canonical path whose mount is not the recorded subvolume is content
+    # in the way, and recovery must keep refusing.
+    canonical.mkdir(parents=True)
+    monkeypatch.setattr(
+        slotimage, "mount_table", lambda: [entry(canonical, "/other"), entry(fenced, "/s1")]
+    )
+    assert not cli._drop_rebound_canonical_bind(config, "s1", canonical, fenced)
+    assert canonical.is_dir()
+
+
+def test_remove_worktree_accepts_the_recorded_bind_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Real bind mount, real Git: a flat checkout at the bind root cannot be
+    # rmdir'ed by git, but git still empties it and drops its registration;
+    # the recorded bind root accepts exactly that outcome (#898 follow-up).
+    if shutil.which("sudo") is None or shutil.which("git") is None:
+        pytest.skip("needs sudo and git")
+    probe = subprocess.run(
+        ["sudo", "-n", "true"], capture_output=True, text=True, check=False
+    )
+    if probe.returncode != 0:
+        pytest.skip("needs passwordless sudo for a real bind mount")
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "bind-test")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "bind-test@example.invalid")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "bind-test")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "bind-test@example.invalid")
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "init"], cwd=repository, check=True
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    mounted = subprocess.run(
+        ["sudo", "-n", "mount", "--bind", str(source), str(slot)],
+        capture_output=True, text=True, check=False,
+    )
+    if mounted.returncode != 0:
+        pytest.skip(f"real bind mount unavailable: {mounted.stderr.strip()}")
+    try:
+        subprocess.run(
+            ["git", "worktree", "add", str(slot), "-b", "flat1"],
+            cwd=repository, check=True, capture_output=True, text=True,
+        )
+        (slot / "work.txt").write_text("work\n", encoding="utf-8")
+        monkeypatch.setattr(
+            cli, "_OWNED_WORKTREES_BIND_MOUNTS", frozenset({(slot, "0:1", "/")})
+        )
+        cli._GitVcs().remove_worktree(repository, slot, force=True)
+        assert slot.absolute() not in cli._GitVcs().listed_worktrees(repository)
+        assert list(slot.iterdir()) == []
+        # A leftover file means git did not finish: the same call refuses.
+        (slot / "leftover.txt").write_text("x", encoding="utf-8")
+
+        def refuse_run(repo: Path, args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(
+                ["git"], 255, "", "failed to delete: Device or resource busy"
+            )
+
+        monkeypatch.setattr(cli._GitVcs, "_run", staticmethod(refuse_run))
+        with pytest.raises(cli.Refusal, match="git worktree remove failed"):
+            cli._GitVcs().remove_worktree(repository, slot, force=True)
+    finally:
+        subprocess.run(
+            ["sudo", "-n", "umount", str(slot)], capture_output=True, check=False
+        )
 
 
 def test_listing_signature_and_quota(tmp_path: Path) -> None:
