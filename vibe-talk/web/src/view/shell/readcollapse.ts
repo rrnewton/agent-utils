@@ -33,8 +33,14 @@ export interface ReadCollapseDependencies<Pane, Mark> {
   doneReadWords(mark: Mark, also: string): string;
   /** What the status line says of the service's `mark` for a message Shift+E marked Done; `also` follows it. */
   serviceReadWords(mark: Mark, also: string): string;
+  /** What the status line says the moment Shift+E is pressed, nothing answered yet; `also` follows it. */
+  localReadWords(wasDone: boolean, also: string): string;
   /** Say `text` on the status line. */
   setStatus(text: string): void;
+  /** Whether the status line is up and still says `text`, nothing said over it since. */
+  statusSays(text: string): boolean;
+  /** Take the status line away. */
+  dismissStatus(): void;
 }
 
 /** Shift+E. */
@@ -80,8 +86,14 @@ export interface ReadCollapse<Pane> {
    * sent reply's is since `#327 done-races-remaining`): an Undo pressed while it was on its way, the
    * Undo itself saved, leaves the service unasked for a message put back.
    *
-   * The status line says where the message was marked, and that it was collapsed, once the service has
-   * answered; nothing over another channel the reader has gone to meanwhile.
+   * NOTHING ON THE KEY WAITS FOR THE NETWORK (`#892 voice-page-optimistic-done`). The owner: "Shouldn't that
+   * be a completely local operation with no network round trip?" The fold, the Done mark and the status line
+   * are drawn in the key's own task, the same frame: the status line says at once that the message was
+   * marked read here, and collapsed (`localReadWords`). The server's Done and the service's marker follow
+   * behind it. Once the service has answered, the line says where the message was marked — only while it
+   * still says what the key said, nothing said over it since and not yet taken away (`statusSays`), and
+   * nothing over another channel the reader has gone to meanwhile. Until #892, the line waited for both
+   * round trips, and said "Saving" until then.
    */
   readAndCollapse(pane: Pane, row: HTMLElement, ids: string[]): Promise<void>;
 }
@@ -91,11 +103,24 @@ export function createReadCollapse<Pane, Mark>(deps: ReadCollapseDependencies<Pa
     const channel = String(deps.channelId());
     const folded = deps.foldForRead(pane, row);
     const wasDone = ids.every((id) => deps.isDone(id));
-    if (!wasDone) await deps.markRowDone(ids, row);
-    if (!(await deps.doneSaved(ids))) return;
-    const mark = await deps.markReadInService(channel, ids[ids.length - 1] as string);
-    if (channel !== String(deps.channelId())) return;
+    // Marked Done here and drawn so before this returns; only its write is still on its way.
+    const marking = wasDone ? null : deps.markRowDone(ids, row);
     const also = folded ? ", and collapsed" : "";
+    const said = deps.localReadWords(wasDone, also);
+    deps.setStatus(said);
+    // A Done that failed, or was put back meanwhile, takes back what was said at once, if nothing was said
+    // since; the failure itself is said by the act it failed for.
+    const unsay = (): void => {
+      if (deps.statusSays(said)) deps.dismissStatus();
+    };
+    const unsaying = (error: unknown): never => {
+      unsay();
+      throw error;
+    };
+    if (marking) await marking.catch(unsaying);
+    if (!(await deps.doneSaved(ids))) return unsay();
+    const mark = await deps.markReadInService(channel, ids[ids.length - 1] as string);
+    if (channel !== String(deps.channelId()) || !deps.statusSays(said)) return;
     deps.setStatus(wasDone ? deps.doneReadWords(mark, also) : deps.serviceReadWords(mark, also));
   }
 

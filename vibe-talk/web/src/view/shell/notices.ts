@@ -32,6 +32,11 @@ export interface ShellNoticesDependencies {
 export interface ShellNotices {
   /** Say `text` on the status line, until it takes itself away. */
   setStatus(text: unknown): void;
+  /**
+   * Whether the status line is up and saying `text` still: nothing said over it, and not yet taken away. What
+   * an act said at once checks before saying more once the network answers (`#892 voice-page-optimistic-done`).
+   */
+  statusSays(text: unknown): boolean;
   /** Take the status line away: a hide, not an erase. */
   dismissStatus(): void;
   /** Keep the status line up as it is, its timer let go, until it is said again or taken away: for a picture of it. */
@@ -71,6 +76,10 @@ export function createShellNotices(deps: ShellNoticesDependencies): ShellNotices
     el("status-line").hidden = false;
     el("status").textContent = deps.redact(text);
     statusTimer = deps.clock.setTimeout(dismissStatus, STATUS_DISMISS_MS);
+  }
+
+  function statusSays(text: unknown): boolean {
+    return !el("status-line").hidden && el("status").textContent === deps.redact(text);
   }
 
   /**
@@ -149,6 +158,7 @@ export function createShellNotices(deps: ShellNoticesDependencies): ShellNotices
 
   return {
     setStatus,
+    statusSays,
     dismissStatus,
     holdStatus() {
       if (statusTimer !== null) deps.clock.clearTimeout(statusTimer);

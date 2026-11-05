@@ -31,5 +31,15 @@ function doneReadWords(mark: ServiceReadMark, also = ""): string {
   return `Already read here, not in ${mark.service}${also}${mark.why ? `: ${mark.why}` : "."}`;
 }
 
-export { doneReadWords, serviceReadWords };
+/**
+ * What the status line says of Shift+E's read the moment it is pressed, before the server or the chat service
+ * has answered anything (`#892 voice-page-optimistic-done`): marked read here, or already read here when
+ * `wasDone`, with `also`. The service's half is said over it once answered (`serviceReadWords`,
+ * `doneReadWords`), while nothing else has been said since.
+ */
+function localReadWords(wasDone: boolean, also = ""): string {
+  return wasDone ? `Already read here${also}.` : `Marked read here${also}.`;
+}
+
+export { doneReadWords, localReadWords, serviceReadWords };
 export type { ServiceReadMark };

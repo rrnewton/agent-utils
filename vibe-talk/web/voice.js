@@ -446,7 +446,7 @@ const shellNotices = createShellNotices({
   holdingReader: (mutate) => holdingReader(mutate),
   detailChanged: (text) => connectionReadouts.detail(text),
 });
-const { setStatus, dismissStatus, setState, showError, clearError, showDetail, addDetail, dismissBanner } = shellNotices;
+const { setStatus, statusSays, dismissStatus, setState, showError, clearError, showDetail, addDetail, dismissBanner } = shellNotices;
 
 // The state dot (`setState`): one of idle, working, live, unresponsive, ended, suspended, error, which
 // web/voice.css colours. `suspended` is `#54 resume-recovery`: the socket died while the page was in the
@@ -6647,7 +6647,10 @@ const readCollapse = createReadCollapse({
   markReadInService: (channel, id) => markReadInService(channel, id),
   doneReadWords: (mark, also) => doneReadWords(mark, also),
   serviceReadWords: (mark, also) => serviceReadWords(mark, also),
+  localReadWords: (wasDone, also) => localReadWords(wasDone, also),
   setStatus: (text) => setStatus(text),
+  statusSays: (text) => statusSays(text),
+  dismissStatus: () => dismissStatus(),
 });
 const { readCollapseFromKeyboard } = readCollapse;
 
@@ -7022,6 +7025,31 @@ const keyDispatch = createKeyDispatch({
   listGroups: [KEYS_MOVING, KEYS_MESSAGE],
   readerActed: () => readerActed(),
   routeScrollKey: (event, target) => scrollKeys.routeScrollKey(event, target),
+});
+
+/** Whether the address the page was opened at asks for key timing: the page writes its own place over it later. */
+const keyTimingInAddress = /[?&]key-timing(=|&|$)/.test(window.location.search || "");
+
+/**
+ * How long each key takes to show (`#892 voice-page-optimistic-done`): the page's own work on it, and the
+ * frame painted after it, said on the console and marked on the browser's performance timeline. Off unless
+ * asked for, by `?key-timing` in the address or by the device setting (`DEVICE_SETTINGS.keyTiming`, set from
+ * the console). One owner in web/src/view/shell/keytiming.ts.
+ *
+ * @type {import("./src/view/shell/index.ts").KeyTiming}
+ */
+const keyTiming = createKeyTiming({
+  enabled: () => keyTimingInAddress || deviceSettings().get(DEVICE_SETTINGS.keyTiming),
+  now: () => performance.now(),
+  afterPaint: (act) => requestAnimationFrame(() => setTimeout(act, 0)),
+  report: (entry, start) => {
+    console.info(`[key-timing] ${keyTimingLine(entry)}`);
+    try {
+      performance.measure(`key ${entry.chord}`, { start, duration: entry.paint || 0 });
+    } catch (_error) {
+      // A browser without user timing still has the console line.
+    }
+  },
 });
 
 // --- saying the keys
@@ -21963,8 +21991,8 @@ async function markRowDone(ids, row = null) {
 //     on: its ring turns from blue to grey over a quarter of a second while the row fades to the
 //     read look, holds there, then lets the ring go. That is `data-done-flash`, "marking" and then
 //     "fading", which web/voice.css animates FROM the selected unread look; an animation rather than
-//     a transition, because on a threaded channel the Done redraws the row as a new element, which a
-//     transition has no earlier style to start from. A row still selected keeps its grey ring: the
+//     a transition, because on a threaded channel a redraw from the store can draw the row as a new
+//     element, which a transition has no earlier style to start from. A row still selected keeps its grey ring: the
 //     fading phase lets go only of a ring the selection is not drawing anyway.
 //   * Every way of marking comes through it: the Done button, the e key and a swipe through
 //     `toggleArchived`, Shift+E's read and collapse (`markRowDone`), Done through here (the ⋯ menu)
@@ -21986,9 +22014,10 @@ const DONE_FLASH_FADE_MS = 300;
 
 /**
  * Which messages are being drawn as just marked Done, and in which phase: "marking" or "fading".
- * Kept BY ID, not on the row, because on a threaded channel the Done redraws every row from the store
- * (`renderCachedTimeline`), and the row that was marked is a new element by the time it is drawn
- * read. `renderChannelRows` puts the phase on whichever row now stands for the message.
+ * Kept BY ID, not on the row, because on a threaded channel a redraw from the store
+ * (`renderCachedTimeline`: under Hide read, a read, a mode change) draws every row as a new element, and
+ * may do so while the moment runs. `renderChannelRows` puts the phase on whichever row now stands for
+ * the message. (A Done itself dresses the rows where they stand since `#892 voice-page-optimistic-done`.)
  */
 const doneFlashing = new Map();
 
@@ -22109,7 +22138,7 @@ async function refreshAfterInboxChange() {
     return;
   }
   if (providerFacts.threading()) {
-    renderCachedTimeline();
+    renderDoneChange();
     saveChannelScope();
     return;
   }
@@ -22138,6 +22167,22 @@ async function refreshAfterInboxChange() {
     renderChannelRows();
     saveChannelScope();
   }
+}
+
+/**
+ * A Done or a put back, drawn on a threaded channel's list (`#892 voice-page-optimistic-done`). It changes
+ * which rows the list holds only under Hide read; otherwise every row stays, and dressing the rows on screen
+ * again (`renderChannelRows`), the reader held on the same message, is the whole of it. Rebuilding every row
+ * from the store (`renderCachedTimeline`), as every Done did before, put a whole-list redraw in the key's own
+ * task: about 100 ms of every e and Shift+E over 300 rows. Without threads, nothing (`renderCachedTimeline`).
+ */
+function renderDoneChange() {
+  if (!providerFacts.threading() || hidingRead() || selection().view === "threads") {
+    renderCachedTimeline();
+    return;
+  }
+  holdingMessage(() => holdingReplyArrows(renderChannelRows));
+  renderScrollTools();
 }
 
 /**
@@ -22381,6 +22426,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   // Done, while it was being saved, when it came back offering to put back a message already back.
   const act = Symbol("done");
   const at = nextUndoAt();
+  const saidAtOnce = dealtWithWords(requested.length);
   lastDismissal.set({ channel, messages: requested, bump, name, act, at });
   const offered = () => lastDismissal.current() !== null && lastDismissal.current().act === act;
   // Before anything here changes, so that what the server holds is known if it refuses (`#326`).
@@ -22427,9 +22473,11 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     move = staged;
     if (staged) inOtherColumn(renderScrollTools);
     listed = readModes.hiding() && !providerFacts.threading() ? [...el("discord-log").children] : null;
+    // `#892 voice-page-optimistic-done`. Said now, as drawn now, before anything awaits: Done here does not
+    // wait for the server, and a failure is said by the error line. It used to say "Saving" until answered.
+    setStatus(saidAtOnce);
     await refreshAfterInboxChange();
     renderTodoControls();
-    setStatus(`Saving ${requested.length} local change${requested.length === 1 ? "" : "s"}…`);
     const writing = queueInboxWrite(async () => {
       const route = `/api/v1/channels/${encodeURIComponent(channel)}/dismiss`;
       if (!body.messages || body.messages.length <= DISMISS_BATCH) {
@@ -22446,6 +22494,8 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     }
     payload = await writing;
   } catch (error) {
+    // `#892 voice-page-optimistic-done`. What was said at once is taken back, if nothing was said since.
+    if (statusSays(saidAtOnce)) dismissStatus();
     // Only what the server did not take is taken back: the batches before the one that failed are
     // Done there, so they stay Done here, and are what Undo puts back. The bookmark's move, sent only
     // after the whole write, is taken back, which leaves the line above them all.
@@ -22494,11 +22544,14 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     const still = new Set(lastDismissal.current().messages);
     lastDismissal.set({ channel, messages: stored.filter((id) => still.has(id) || !requested.includes(id)), bump, name, act, at });
   }
-  const count = stored.length;
-  setStatus(
-    `${count} message${count === 1 ? "" : "s"} marked as dealt with here — not in the source chat service.`
-  );
+  // Said again only where the server stored another count than was said, and nothing was said since.
+  if (stored.length !== requested.length && statusSays(saidAtOnce)) setStatus(dealtWithWords(stored.length));
   renderTodoControls();
+}
+
+/** What the status line says of a Done of `count` messages. */
+function dealtWithWords(count) {
+  return `${count} message${count === 1 ? "" : "s"} marked as dealt with here — not in the source chat service.`;
 }
 
 /** Move the source provider's monotone read cursor without changing local Done/archive state. */
@@ -22541,6 +22594,7 @@ async function restoreMessages(ids) {
   // On its way from now on, for what waits on a Done of these messages to be saved (`doneSaved`,
   // `#327 done-races-remaining`): settled once the write has been answered and a refusal taken back.
   const saving = noteDoneSaving(restored);
+  const saidBack = `${restored.length} message${restored.length === 1 ? "" : "s"} back in the list.`;
   // `#229 desktop-two-column`. Put back in the other column as well.
   const column = columnWork.active();
   // What the lines in the `try` change, for a refusal to take back: from the notes above on, a slip
@@ -22572,9 +22626,11 @@ async function restoreMessages(ids) {
       lastDismissal.set(left.length === 0 ? null : { ...lastDismissal.current(), messages: left });
     }
     offer = lastDismissal.current();
+    // `#892 voice-page-optimistic-done`. Said now, as drawn now, before anything awaits; a refusal is said by
+    // the error line.
+    setStatus(saidBack);
     await refreshAfterInboxChange();
     renderTodoControls();
-    setStatus(`Restoring ${restored.length} message${restored.length === 1 ? "" : "s"}…`);
     // In batches the server accepts, as the dismissal that made them went: the undo of a long Done
     // through here names more ids than one request may carry. `#240 reading-bookmark`.
     const writing = queueInboxWrite(() => writeInBatches(`/api/v1/channels/${encodeURIComponent(channel)}/restore`,
@@ -22591,6 +22647,8 @@ async function restoreMessages(ids) {
       await loadTodo({ keepPosition: true, ownAct: true, readAs: "mutation" });
     }
   } catch (error) {
+    // `#892 voice-page-optimistic-done`. What was said at once is taken back, if nothing was said since.
+    if (statusSays(saidBack)) dismissStatus();
     // Only what the server did not put back is Done again: the batches before the one that failed
     // are back there, so they stay back here, and are no longer the last dismissal's. A read of the
     // to-do list that failed after every batch landed takes nothing back.
@@ -22626,8 +22684,6 @@ async function restoreMessages(ids) {
     // Refused, once taken back, so what waits on it finds the messages as the server holds them.
     saving();
   }
-  const count = restored.length;
-  setStatus(`${count} message${count === 1 ? "" : "s"} back in the list.`);
   renderTodoControls();
 }
 
@@ -22651,7 +22707,7 @@ function mirrorArchived(ids, done) {
       else doneState().archived.delete(id);
     }
     const drawn = [...el("discord-log").children].some((row) => idsOf(row).some((id) => ids.includes(id)));
-    if (drawn && changed.length) renderCachedTimeline();
+    if (drawn && changed.length) renderDoneChange();
     else syncUnreadReplies();
   });
   return changed;
@@ -30492,7 +30548,7 @@ document.addEventListener("pointerdown", closeRowMenuOutside);
 // web/src/view/shell/keylisteners.ts (`#624 voice-page-modularity`), mounted here, in the page's order; the page
 // never takes them down, and its `unmount` waits for the ordered boot to have a teardown.
 mountKeyListeners({
-  onPageKey: (event) => keyDispatch.onPageKey(event),
+  onPageKey: (event) => keyTiming.around(event, () => keyDispatch.onPageKey(event)),
   onEverywhereKey: (event) => keyDispatch.onEverywhereKey(event),
   onPageBeforeCopy: (event) => highlightCopy.onPageBeforeCopy(event),
   onPageCopy: (event) => highlightCopy.onPageCopy(event),

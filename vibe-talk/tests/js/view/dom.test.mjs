@@ -132,10 +132,14 @@ test("`#624 voice-page-modularity`: the status line says a thing, takes itself a
   notices.setStatus("Saved with secret-token-1.");
   assert.equal(el("status-line").hidden, false);
   assert.equal(el("status").textContent, "Saved with [redacted].", "a credential never reaches the line");
+  // `#892 voice-page-optimistic-done`: whether it still says what was said, as it was said.
+  assert.equal(notices.statusSays("Saved with secret-token-1."), true, "the line does not say what it was told to");
+  assert.equal(notices.statusSays("Saved."), false);
   assert.equal(timers[0].ms, STATUS_DISMISS_MS);
   timers[0].run();
   assert.equal(el("status-line").hidden, true);
   assert.equal(el("status").textContent, "Saved with [redacted].", "a hide, not an erase");
+  assert.equal(notices.statusSays("Saved with secret-token-1."), false, "a line taken away still says it");
   silent = "The voice service is not answering.";
   notices.setStatus("Something else.");
   notices.dismissStatus();
@@ -2034,12 +2038,12 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
   assert.ok(keymap.map((binding) => (typeof binding.does === "function" ? binding.does() : "")).join("\n").includes("Copy its link in its chat service:"));
 });
 
-test("`#624 voice-page-modularity`: Shift+E folds first, marks Done only what is not Done, waits for the Done to be saved before asking the service, and says nothing over another channel", async () => {
+test("`#624 voice-page-modularity`, `#892 voice-page-optimistic-done`: Shift+E folds first, marks Done only what is not Done and says so at once, waits for the Done to be saved before asking the service, and says its answer only over its own words", async () => {
   const { createReadCollapse } = VIEW_SHELL;
   const log = [];
   const pane = { name: "channel" };
   const row = { id: "row" };
-  const state = { act: { pane, row, took: false }, ids: ["3", "4"], channel: "c1", done: new Set(), saved: true, folded: true, moveTo: null, fail: null };
+  const state = { act: { pane, row, took: false }, ids: ["3", "4"], channel: "c1", done: new Set(), saved: true, folded: true, moveTo: null, fail: null, line: { text: "", up: false }, sayOver: null };
   const quiet = [];
   const shiftE = createReadCollapse({
     rowForAct: (target) => { log.push(`row for ${target.id}`); return state.act; },
@@ -2052,30 +2056,47 @@ test("`#624 voice-page-modularity`: Shift+E folds first, marks Done only what is
     channelId: () => { log.push("channel?"); return state.channel; },
     foldForRead: (on, folding) => { log.push(`fold ${on.name} ${folding.id}`); return state.folded; },
     isDone: (id) => state.done.has(id),
-    markRowDone: async (ids, of) => { log.push(`done ${ids.join(",")} ${of.id}`); if (state.fail) throw new Error(state.fail); },
+    // Marked here at once, as the page's does; only the write is awaited.
+    markRowDone: (ids, of) => { log.push(`done ${ids.join(",")} ${of.id}`); return state.fail ? Promise.reject(new Error(state.fail)) : Promise.resolve(); },
     doneSaved: async (ids) => { log.push(`saved? ${ids.join(",")}`); return state.saved; },
-    markReadInService: async (channel, id) => { log.push(`service ${channel} ${id}`); if (state.moveTo) state.channel = state.moveTo; return { id }; },
+    markReadInService: async (channel, id) => {
+      log.push(`service ${channel} ${id}`);
+      if (state.moveTo) state.channel = state.moveTo;
+      if (state.sayOver) state.line = { text: state.sayOver, up: true };
+      return { id };
+    },
     doneReadWords: (mark, also) => `already Done, read ${mark.id}${also}`,
     serviceReadWords: (mark, also) => `marked read ${mark.id}${also}`,
-    setStatus: (text) => log.push(`say ${text}`),
+    localReadWords: (wasDone, also) => `${wasDone ? "already" : "marked"} here${also}`,
+    setStatus: (text) => { log.push(`say ${text}`); state.line = { text, up: true }; },
+    statusSays: (text) => state.line.up && state.line.text === text,
+    dismissStatus: () => { log.push("unsay"); state.line = { ...state.line, up: false }; },
   });
   const press = async () => { log.length = 0; quiet.length = 0; const took = shiftE.readCollapseFromKeyboard({ id: "t" }); await Promise.all(quiet); return [took, ...log]; };
-  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "done 3,4 row", "saved? 3,4", "service c1 4", "channel?", "say marked read 4, and collapsed"]);
+  // Said at once, before anything is awaited: `press` would show "say" after "saved?" otherwise.
+  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "done 3,4 row", "say marked here, and collapsed",
+    "saved? 3,4", "service c1 4", "channel?", "say marked read 4, and collapsed"]);
   state.done = new Set(["3", "4"]);
   state.folded = false;
-  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "saved? 3,4", "service c1 4", "channel?", "say already Done, read 4"],
+  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "say already here", "saved? 3,4", "service c1 4", "channel?", "say already Done, read 4"],
     "a message Done already was marked again, or its service half was not asked");
   state.done = new Set(["3"]);
   state.saved = false;
-  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "done 3,4 row", "saved? 3,4"], "the service was asked for a Done not saved");
+  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "done 3,4 row", "say marked here", "saved? 3,4", "unsay"],
+    "the service was asked for a Done not saved, or the read said at once stayed said");
   state.saved = true;
   state.fail = "refused";
-  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "done 3,4 row", "error refused"], "a Done that failed asked the service, or was not said");
+  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "done 3,4 row", "say marked here", "unsay", "error refused"],
+    "a Done that failed asked the service, was not said, or left the read said");
   state.fail = null;
   state.moveTo = "c2";
-  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "done 3,4 row", "saved? 3,4", "service c1 4", "channel?"], "the status line spoke over another channel");
+  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "done 3,4 row", "say marked here", "saved? 3,4", "service c1 4", "channel?"], "the status line spoke over another channel");
   state.moveTo = null;
   state.channel = "c1";
+  state.sayOver = "something else";
+  assert.deepStrictEqual(await press(), [true, "row for t", "channel?", "fold channel row", "done 3,4 row", "say marked here", "saved? 3,4", "service c1 4", "channel?"],
+    "the service's answer was said over what was said since");
+  state.sayOver = null;
   state.ids = [];
   assert.deepStrictEqual(await press(), [false, "row for t"], "a row of no message was acted on");
   state.ids = ["5"];
@@ -2087,7 +2108,7 @@ test("`#624 voice-page-modularity`: Shift+E folds first, marks Done only what is
   log.length = 0;
   state.ids = ["9"];
   await shiftE.readAndCollapse(pane, row, ["9"]);
-  assert.deepStrictEqual(log, ["channel?", "fold channel row", "done 9 row", "saved? 9", "service c1 9", "channel?", "say marked read 9"]);
+  assert.deepStrictEqual(log, ["channel?", "fold channel row", "done 9 row", "say marked here", "saved? 9", "service c1 9", "channel?", "say marked read 9"]);
 });
 
 test("`#624 voice-page-modularity`: the keys' and the selection's listeners mount in the page's order, the switch restored before the keys are said, and unmount every one", () => {
@@ -2179,4 +2200,41 @@ test("`#624 voice-page-modularity`: a mount's listening adds each listener with 
     "a listener was not taken down, or taken down with other options than it was added with");
   listening.unmount();
   assert.equal(calls.length, 4, "a second unmount took listeners down again");
+});
+
+test("`#892 voice-page-optimistic-done`: key timing runs every key, times it only when asked for, from the browser's own stamp, and reports once painted", () => {
+  const { createKeyTiming, chordOf, keyTimingLine } = VIEW_SHELL;
+  let on = false;
+  let clock = 100;
+  const painted = [];
+  const reports = [];
+  const timing = createKeyTiming({
+    enabled: () => on,
+    now: () => clock,
+    afterPaint: (act) => painted.push(act),
+    report: (entry, start) => reports.push([keyTimingLine(entry), start]),
+  });
+  const ran = [];
+  timing.around({ key: "E", shiftKey: true, timeStamp: 90 }, () => { ran.push("off"); clock += 5; });
+  assert.deepStrictEqual([ran, painted.length, timing.recent()], [["off"], 0, []], "a key was not run, or was timed while timing is off");
+  on = true;
+  timing.around({ key: "E", shiftKey: true, timeStamp: 100 }, () => { ran.push("on"); clock += 12; });
+  assert.deepStrictEqual(ran, ["off", "on"]);
+  assert.deepStrictEqual(timing.recent().map((one) => [one.chord, one.handler, one.paint]), [["Shift+E", 17, null]],
+    "the handler was not timed from the browser's stamp");
+  assert.deepStrictEqual(reports, [], "a key was reported before its frame was painted");
+  clock = 140;
+  painted.shift()();
+  assert.deepStrictEqual(reports, [["Shift+E: handler 17.0 ms, paint 40.0 ms", 100]]);
+  // A key that throws is timed all the same, and the throw is the page's.
+  assert.throws(() => timing.around({ key: "e", timeStamp: 0 }, () => { throw new Error("slip"); }), /slip/);
+  assert.equal(timing.recent().at(-1).chord, "e");
+  timing.around({ key: "Shift", shiftKey: true }, () => ran.push("shift"));
+  assert.notEqual(timing.recent().at(-1).chord, "Shift+Shift", "a modifier pressed on its own was timed as a key");
+  assert.equal(ran.at(-1), "shift", "a modifier pressed on its own was not run");
+  for (let i = 0; i < 150; i += 1) timing.around({ key: "j" }, () => {});
+  assert.equal(timing.recent().length, 100, "every key timed was kept");
+  assert.deepStrictEqual([chordOf({ key: "?", shiftKey: true }), chordOf({ key: "k", ctrlKey: true }),
+    chordOf({ key: "ArrowDown", shiftKey: true }), chordOf({ key: "l", metaKey: true, shiftKey: false })],
+  ["?", "Ctrl+k", "Shift+ArrowDown", "Cmd+l"]);
 });

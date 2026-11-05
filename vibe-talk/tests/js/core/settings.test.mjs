@@ -125,6 +125,7 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["threadsMain", "vibe-talk.voice.threads-main", false, [[true, "on"], [false, "off"]], false],
     ["threadCardFolded", "vibe-talk.voice.thread-card-folded", false, [[true, "on"], [false, "off"]], false],
     ["keyboardDebug", "vibe-talk.voice.keyboard-debug", false, [[true, "1"], [false, null]], false],
+    ["keyTiming", "vibe-talk.voice.key-timing", false, [[true, "1"], [false, null]], false],
     ["msgScale", "vibe-talk.voice.msg-scale", 100, [[120, "120"], [80, "80"]], THROWN],
     ["readingWidth", "vibe-talk.voice.width", 72, [[90, "90"], [45, "45"]], THROWN],
     ["collapsedLines", "vibe-talk.voice.collapsed-lines", 3, [[0, "0"], [8, "8"]], THROWN],

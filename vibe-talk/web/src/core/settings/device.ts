@@ -192,6 +192,16 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (on: boolean) => (on ? "1" : null),
     refused: { value: false },
   } satisfies DeviceSetting<boolean>,
+  /**
+   * `#892 voice-page-optimistic-done`. Whether each key's time to its paint is said on the console
+   * (web/src/view/shell/keytiming.ts): kept "1", forgotten when off. Set from the console; no control.
+   */
+  keyTiming: {
+    key: "vibe-talk.voice.key-timing",
+    read: (raw: string | null) => raw === "1",
+    write: (on: boolean) => (on ? "1" : null),
+    refused: { value: false },
+  } satisfies DeviceSetting<boolean>,
 });
 
 /** The device's settings, kept in its storage. */

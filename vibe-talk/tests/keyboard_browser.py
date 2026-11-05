@@ -1050,10 +1050,11 @@ def shift_e(walk: Walk, api: FakeApi, target: str) -> None:
         if len(api.dismissals()) > marked:
             break
         walk.page.wait_for_timeout(20)
-    # Said once the chat service has answered: "Marked read here ...", after the Done's own words. Polled
-    # rather than awaited, so a page that says something else fails on the checks below, which say what.
+    # Said once the chat service has answered: "Marked read here and in ...", over the words said at once
+    # (`#892 voice-page-optimistic-done`). Polled rather than awaited, so a page that says something else
+    # fails on the checks below, which say what.
     for _ in range(250):
-        if str(walk.page.evaluate("() => document.getElementById('status').textContent")).startswith("Marked read here"):
+        if str(walk.page.evaluate("() => document.getElementById('status').textContent")).startswith("Marked read here and in"):
             break
         walk.page.wait_for_timeout(20)
     walk.settled()

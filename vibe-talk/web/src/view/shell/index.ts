@@ -53,6 +53,8 @@ export { KEYS_MESSAGE, KEYS_MOVING, KEYS_PAGE, KEYS_VIEW, KEYS_WRITING, createKe
 export type { KeymapActs, KeymapBinding } from "./keymap.ts";
 export { createReadCollapse } from "./readcollapse.ts";
 export type { CollapsedRow, ReadCollapse, ReadCollapseDependencies } from "./readcollapse.ts";
+export { chordOf, createKeyTiming, keyTimingLine } from "./keytiming.ts";
+export type { KeyTiming, KeyTimingDependencies, KeyTimingEntry, TimedKey } from "./keytiming.ts";
 export { mountKeyListeners } from "./keylisteners.ts";
 export type { KeyListeners, KeyListenersDependencies, ListenedPane } from "./keylisteners.ts";
 export { READER_WORDS, createReaderRow } from "./readerrow.ts";

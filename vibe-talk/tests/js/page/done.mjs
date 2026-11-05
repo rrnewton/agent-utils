@@ -1086,15 +1086,19 @@ test("e DRAWS THE MOMENT ON THE ROW IT MARKED, though the selection moves on: ma
   assert.equal(flashOf(page, "1"), null, "putting a message back drew it as marked Done");
 });
 
-test("ON A THREADED CHANNEL, where a Done redraws every row, the new row carries the moment (#245)", async () => {
-  // The store redraws the list as new elements (`renderCachedTimeline`), so a flag put on the row
-  // that was pressed would be thrown away with it. The moment is kept by message, and drawn again.
+test("ON A THREADED CHANNEL a Done dresses the rows where they stand, and a row drawn again carries the moment (#245, #892)", async () => {
+  // `#892 voice-page-optimistic-done`: a Done no longer rebuilds every row from the store
+  // (`renderCachedTimeline`), which put a whole-list redraw on every key; the row pressed is the row drawn
+  // Done. A list that is drawn again from the store (a read, a mode change) draws new elements, which a flag
+  // put on the row pressed would not reach: the moment is kept by message, and drawn again.
   const page = newPage();
   page.threadingSupported = true;
   await signIn(page);
   await showDiscord(page, tallChannel(12));
   const pressed = channelRow(page, "3");
   await doneButton(pressed).click();
+  assert.equal(channelRow(page, "3"), pressed, "a Done drew every row again: the whole-list redraw is back");
+  page.pure("renderCachedTimeline()");
   const drawn = channelRow(page, "3");
   assert.notEqual(drawn, pressed, "the fixture did not redraw the row, so this proves nothing new");
   assert.equal(drawn.getAttribute("data-archived"), "true");
@@ -2749,15 +2753,15 @@ function slipBefore(script, line, nth = 1) {
 }
 
 /** The last line a Done draws before its write is queued, and the same for an Undo. */
-const BEFORE_DONE_WRITE = "    setStatus(`Saving ${requested.length} local change";
-const BEFORE_UNDO_WRITE = "    setStatus(`Restoring ${restored.length} message";
+const BEFORE_DONE_WRITE = "    const writing = queueInboxWrite(async () => {\n      const route = `/api/v1/channels/";
+const BEFORE_UNDO_WRITE = "    setStatus(saidBack);";
 /** The line after an Undo's notes, before its `try`: a slip there is one nothing takes back, as before. */
 const UNDO_OUTSIDE_TRY = "  // `#229 desktop-two-column`. Put back in the other column as well.\n";
 /**
  * A Done's `catch` letting a slip through untouched, as when the lines before the write were outside the
  * `try`, and its `finally` ending the wait on it (`saved`) or, as then, not: for negative controls.
  */
-const DONE_CATCH = "  } catch (error) {\n    // Only what the server did not take is taken back: the batches before the one that failed are\n";
+const DONE_CATCH = "    if (statusSays(saidAtOnce)) dismissStatus();\n    // Only what the server did not take is taken back: the batches before the one that failed are\n";
 const DONE_SLIP_UNTAKEN = [DONE_CATCH, `${DONE_CATCH}    if (error.message === "a slip in the page") throw error;\n`];
 const DONE_SAVED = "    saved();\n  }\n  settleInboxWrite(requested, true, new Set(requested));\n";
 const DONE_SLIP_UNSAVED = [DONE_SAVED, DONE_SAVED.replace("    saved();", "    if (globalThis.slipReached !== 1) saved();")];
@@ -3549,8 +3553,8 @@ test("`#327 done-races-remaining`: an Undo that slips in the page before its wri
 // Shift+E now looks again once its Done is saved, as a sent reply does since `#327`.
 
 /** The line that looks again after Shift+E's own Done, as first written (only for a Done made before): for negative controls. */
-const SHIFT_E_LOOKS_AGAIN = { file: "src/view/shell/readcollapse.ts", find: "    if (!(await deps.doneSaved(ids))) return;\n",
-  replace: "    if (wasDone && !(await deps.doneSaved(ids))) return;\n" };
+const SHIFT_E_LOOKS_AGAIN = { file: "src/view/shell/readcollapse.ts", find: "    if (!(await deps.doneSaved(ids))) return unsay();\n",
+  replace: "    if (wasDone && !(await deps.doneSaved(ids))) return unsay();\n" };
 
 /**
  * The chat service's marker supported: message 3 selected and opened (`openThree`), Shift+E pressed
@@ -3598,4 +3602,99 @@ test("`#370 shift-e-undo-marker`: an Undo pressed while Shift+E's own Done is on
   assert.equal(control.page.dealtWith.has("3"), false, "the premise is the message put back on the server");
   assert.deepStrictEqual(control.asked, ["3"],
     "with the look again missing the chat service was not asked for the message put back, so this test cannot see it");
+});
+
+// --- nothing on the key waits for the network (`#892 voice-page-optimistic-done`) ---------------------
+//
+// The owner, 2026-11-05: "I'm experiencing some latency on pressing shift-e to mark down and collapse the
+// current message. Why? Shouldn't that be a completely local operation with no network round trip?" The
+// fold, the Done and the row's read look were already drawn at once; the status line waited for the Done's
+// write and then the chat service's marker, two round trips, and said "Saving" until then.
+
+/** What the status line says, whether or not a phone's line has room for all of it. */
+const said = (page) => page.el("status").textContent;
+
+/**
+ * Message 3 opened (`openThree`), the chat service's marker supported, and every Done write and every ask of
+ * the service held on the wire until let go. Answers the page, the server floor's asks, and `release`, which
+ * lets every held request go.
+ */
+async function openThreeHeld(script = SCRIPT) {
+  const held = [];
+  let asked = null;
+  const { page } = await openThree(script, (p) => {
+    p.upstreamReadMarkSupported = true;
+    asked = serverFloor(p);
+    const answer = p.upstreamReadResponse;
+    p.upstreamReadResponse = (body) => new Promise((resolve) => { held.push(() => resolve(answer(body))); });
+  });
+  page.inboxWriteHook = async () => new Promise((resolve) => { held.push(() => resolve(null)); });
+  const release = async () => {
+    while (held.length > 0) {
+      held.shift()();
+      for (let i = 0; i < 3; i += 1) await page.settle();
+    }
+  };
+  return { page, asked: () => asked, held, release };
+}
+
+test("`#892 voice-page-optimistic-done`: Shift+E folds, marks Done and says so with every write still on the wire; the service's answer is said after", async () => {
+  const { page, asked, held, release } = await openThreeHeld();
+  await pressHere(page, "E", { shiftKey: true });
+  assert.ok(held.length > 0, "the premise is Shift+E's Done held on its way");
+  assert.deepStrictEqual(page.dealtWith.has("3"), false, "the premise is the Done not yet on the server");
+  const row = channelRow(page, "3");
+  assert.equal(row.getAttribute("data-collapsed"), "true", "the fold waited for the network");
+  assert.equal(row.getAttribute("data-archived"), "true", "the Done waited for the network");
+  assert.equal(row.getAttribute("data-done-flash"), "marking", "the moment of marking waited for the network");
+  assert.equal(page.el("status-line").hidden, false, "the status line waited for the network");
+  assert.equal(said(page), "Marked read here, and collapsed.", "the status line waited for the network");
+  assert.deepStrictEqual(page.upstreamReadCalls, [], "the chat service was asked before the Done was saved");
+  await release();
+  await release();
+  assert.equal(page.dealtWith.has("3"), true, "the Done never reached the server");
+  assert.deepStrictEqual(asked(), ["3"], "the chat service was not asked once, after the Done was saved");
+  assert.equal(said(page), "Marked read here and in Discord, and collapsed.", "the service's answer was not said");
+
+  // ...but never over something said since: the service's answer waits for nothing, and says nothing late.
+  const later = await openThreeHeld();
+  await pressHere(later.page, "E", { shiftKey: true });
+  later.page.pure("setStatus('Something else.')");
+  await later.release();
+  await later.release();
+  assert.deepStrictEqual(later.asked(), ["3"], "the premise is the service asked and answered");
+  assert.equal(said(later.page), "Something else.", "the service's late answer was said over what was said since");
+
+  // THE CONTROL: the line said only once the service has answered, as before #892.
+  const control = await openThreeHeld(await brokenModule([{ file: "src/view/shell/readcollapse.ts",
+    find: "    deps.setStatus(said);\n", replace: "" }]));
+  await pressHere(control.page, "E", { shiftKey: true });
+  assert.notEqual(said(control.page), "Marked read here, and collapsed.",
+    "with the line said only after the network it still said the read at once, so this test cannot see it");
+});
+
+test("`#892 voice-page-optimistic-done`: e and Undo say what they did at once, with the write still on the wire; a Done refused takes back what was said", async () => {
+  const { page, held, release } = await openThreeHeld();
+  await pressHere(page, "e");
+  assert.ok(held.length > 0, "the premise is e's Done held on its way");
+  assert.equal(channelRow(page, "3").getAttribute("data-archived"), "true", "the Done waited for the network");
+  assert.equal(said(page), "1 message marked as dealt with here — not in the source chat service.",
+    "the status line waited for the network");
+  await release();
+  assert.equal(said(page), "1 message marked as dealt with here — not in the source chat service.",
+    "a saved Done said something more, though nothing about it changed");
+  page.el("undo-dismiss").click().catch(() => {});
+  await page.settle();
+  assert.ok(held.length > 0, "the premise is the Undo held on its way");
+  assert.equal(channelRow(page, "3").getAttribute("data-archived"), "false", "the Undo waited for the network");
+  assert.equal(said(page), "1 message back in the list.", "the Undo's words waited for the network");
+  await release();
+
+  // Refused: the row unread again, the failure on the error line, and the words said at once taken away.
+  page.inboxWriteHook = async (kind) => (kind === "dismiss" ? providerDown() : null);
+  await pressHere(page, "e").catch(() => {});
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.equal(channelRow(page, "3").getAttribute("data-archived"), "false", "a refused Done stayed");
+  assert.equal(page.el("error").hidden, false, "a refused Done said nothing");
+  assert.equal(page.el("status-line").hidden, true, "a refused Done left the line saying it was marked");
 });
