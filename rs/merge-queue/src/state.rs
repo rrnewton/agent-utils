@@ -28,7 +28,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::git::CombineMode;
-use crate::model::{Item, KeptValidation, Obligation};
+use crate::model::{Item, KeptValidation, NotifyMode, Obligation};
 
 /// Current configuration schema identifier.
 pub const CONFIG_SCHEMA: &str = "merge-queue-config/v1";
@@ -469,6 +469,10 @@ impl PrecheckConfig {
 
 fn is_default_hooks(hooks: &HooksConfig) -> bool {
     hooks == &HooksConfig::default()
+}
+
+fn is_default_notify_mode(mode: &NotifyMode) -> bool {
+    mode.is_default()
 }
 
 fn is_default_precheck(value: &PrecheckConfig) -> bool {
@@ -1157,6 +1161,12 @@ pub struct Config {
     pub precheck: PrecheckConfig,
     /// Push-notification configuration (state-change messages via agentctl).
     pub notify: NotifyConfig,
+    /// How hooks and built-in notify divide reports queue-wide:
+    /// `both` (default), `hooks-only` or `notify-only`. A per-item
+    /// `submit --notify-mode` overrides it. Omitted from config.json
+    /// while `both`, so an older config still loads unchanged.
+    #[serde(default, skip_serializing_if = "is_default_notify_mode")]
+    pub notify_mode: NotifyMode,
     /// Event hooks (5891). Omitted from config.json when off.
     #[serde(default, skip_serializing_if = "is_default_hooks")]
     pub hooks: HooksConfig,
@@ -1210,6 +1220,7 @@ impl Default for Config {
             land: LandConfig::default(),
             precheck: PrecheckConfig::default(),
             notify: NotifyConfig::default(),
+            notify_mode: NotifyMode::default(),
             hooks: HooksConfig::default(),
             unknown_fields: std::collections::BTreeMap::new(),
         }

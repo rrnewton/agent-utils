@@ -540,11 +540,10 @@ pub fn sweep_locked(
     config: &Config,
     notifier: &Notifier,
 ) -> Result<usize, String> {
-    let _ = config;
     let mut delivered = 0usize;
     let numbers: Vec<i64> = state.items()?.into_iter().map(|item| item.pr).collect();
     for pr in numbers {
-        if deliver_one(state, notifier, pr) {
+        if deliver_one(state, config, notifier, pr) {
             delivered += 1;
         }
     }
@@ -556,12 +555,12 @@ pub fn sweep_locked(
 /// submitter only when that run ends. The caller holds the writer lock, as for [`sweep_locked`]
 /// (a submission is only ever applied under it). Returns whether it delivered one.
 pub fn deliver_now(state: &State, config: &Config, pr: i64) -> bool {
-    deliver_one(state, &Notifier::resolve(None, None, config), pr)
+    deliver_one(state, config, &Notifier::resolve(None, None, config), pr)
 }
 
 /// Handle item `pr` as [`sweep_locked`] handles each item. Returns whether it delivered a
 /// notification.
-fn deliver_one(state: &State, notifier: &Notifier, pr: i64) -> bool {
+fn deliver_one(state: &State, config: &Config, notifier: &Notifier, pr: i64) -> bool {
     // Fresh read: an earlier send in the same sweep may have taken a while.
     let item = match state.item(pr) {
         Ok(Some(item)) => item,
@@ -574,6 +573,40 @@ fn deliver_one(state: &State, notifier: &Notifier, pr: i64) -> bool {
     let Some((transition, attempts)) = owed(&item) else {
         return false;
     };
+    // `hooks-only`: a configured hook for this verdict is the delivery, so
+    // the built-in send is suppressed (recorded once, as a given-up
+    // transition). No configured hook keeps the send, so nothing is
+    // silently dropped. The effective mode is named in the record.
+    let effective = item.effective_notify_mode(config.notify_mode);
+    if let Some(hook) =
+        crate::hooks::notify_suppressed_by(effective, transition.verdict, &config.hooks)
+    {
+        let reason = format!(
+            "notify_mode {}: hook {hook} is configured for {}",
+            effective.as_str(),
+            transition.verdict
+        );
+        let _ = update_delivery(state, pr, &transition, |fresh| {
+            fresh.notify_delivery = NotifyDelivery {
+                key: transition.key.clone(),
+                attempts: MAX_ATTEMPTS,
+                delivered: false,
+                last_error: reason.clone(),
+            };
+            fresh.log(
+                "notify-suppressed",
+                format!(
+                    "{} not sent to {}: {reason}; the hook is the delivery",
+                    transition.verdict, item.notify
+                ),
+            );
+        });
+        eprintln!(
+            "merge-queue notify: #{pr} {} not sent to {}: {reason}",
+            transition.verdict, item.notify
+        );
+        return false;
+    }
     // A name agentctl can never accept (a hosting login such as `SomeUser`, say) is not
     // retried: one record says why, and the transition counts as given up.
     if let Some(why) = unaddressable(&item.notify) {
@@ -683,6 +716,7 @@ mod unit {
             shepherd: String::new(),
             submitted_by: "lane-fictional".to_owned(),
             notify: "lane-fictional".to_owned(),
+            notify_mode: None,
             title: String::new(),
             after: vec![],
             solo: false,

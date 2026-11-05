@@ -1262,22 +1262,40 @@ impl<'a> Runner<'a> {
         }
         let items = lock(&self.items);
         let mut entries = Vec::new();
+        let mut allowed: Vec<i64> = Vec::new();
         for pr in prs {
             if let Some(item) = items.get(pr) {
+                // `notify-only`: notify is the delivery for this verdict, so
+                // the hook is skipped for this change (only when a notify
+                // target will actually receive it; see `crate::hooks`).
+                let effective = item.effective_notify_mode(self.config.notify_mode);
+                if crate::hooks::hook_suppressed_by_notify(effective, event, &item.notify) {
+                    continue;
+                }
+                allowed.push(*pr);
                 entries.push(serde_json::json!({
                     "pr": pr, "head": item.head, "shepherd": item.shepherd,
                     "notify": item.notify, "title": item.title,
+                    "notify_mode": effective.as_str(),
                 }));
+            } else {
+                // No item record (a base move past the batch, say): the hook
+                // is the only channel that can report it, so it fires.
+                allowed.push(*pr);
             }
         }
         drop(items);
+        if allowed.is_empty() {
+            return;
+        }
         if let Some(first) = entries.first() {
             extra["pr"] = first["pr"].clone();
             extra["head"] = first["head"].clone();
             extra["shepherd"] = first["shepherd"].clone();
             extra["notify"] = first["notify"].clone();
+            extra["notify_mode"] = first["notify_mode"].clone();
         }
-        extra["prs"] = serde_json::json!(prs);
+        extra["prs"] = serde_json::json!(allowed);
         extra["items"] = serde_json::json!(entries);
         crate::hooks::fire(&self.state.root, &self.config.hooks, event, extra);
     }

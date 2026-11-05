@@ -182,6 +182,7 @@ recorded submission shows the refusal under `intake refused` in `status`.
 | `--prioritized` | off | A priority change, as the priority label makes one under `sync`: planned ahead of all other work and validated in a batch of its own. It still lands only on its own exact green. See "Priority changes". |
 | `--by NAME` | empty | Who is submitting (an agent or a person). |
 | `--notify NAME` | empty | agentctl session name the `serve` daemon notifies exactly once per state change (landed, ejected, refusal-deferred, escalated, withdrawn). Stored on the item next to `submitted_by`; resubmitting without it keeps the recorded name. Ready files set it per line with `notify=NAME`. |
+| `--notify-mode MODE` | config | Per-change override of the queue's `notify_mode`: `both`, `hooks-only` or `notify-only`. Stored on the item; resubmitting without it keeps the recorded override. See "Event hooks". Ready files set it per line with `notify-mode=MODE`. |
 | `--title TEXT` | empty | A one-line description. |
 | `--tested-with SELECTION` | none | The tests you ran on this head: `all`, a comma- or space-separated list of test IDs, or `@FILE` with one ID per line (`#` starts a comment). This becomes the change's validation claim. Without it, the change has no claim. |
 | `--policy NAME` | `manual` | The name of the policy that chose `--tested-with`, for example `path-routing`. |
@@ -511,7 +512,9 @@ versioned JSON payload on stdin (`$MQ_HOOK_EVENT` and `$MQ_HOOK_PR` in the envir
 fire-and-forget: a bounded worker pool runs hooks with a per-hook timeout
 (`hooks.timeout_secs`, default 30), the queue never waits on one and never fails because of
 one, and every finished hook is logged to `<state>/hooks.jsonl` with its exit status,
-duration, and stdout/stderr tails. The existing `--notify` delivery is unchanged.
+duration, and stdout/stderr tails. By default the existing `--notify` delivery is
+unchanged beside them; `notify_mode` (next paragraph) can make hooks the only
+delivery for the events they cover.
 
 | Field | Event |
 |---|---|
@@ -536,7 +539,26 @@ Every field absent (or empty) is off. The payload is `merge-queue-hook/v1`:
 Fields that do not apply to an event are empty. A per-item `shepherd` — the agent driving a
 change to landing, set with `submit --shepherd NAME`, changed with
 `merge-queue shepherd PR NAME` (or `--clear`) — is carried in every payload for that item,
-separate from `notify` (who gets reports).
+separate from `notify` (who gets reports). Each payload also carries the item's effective
+`notify_mode`.
+
+Which channel reports a change is set by `notify_mode` in `config.json` — one of `both`
+(the default), `hooks-only` or `notify-only`, set at `init --notify-mode` — and overridable
+per change with `submit --notify-mode MODE` (a ready file spells it `notify-mode=MODE`).
+A resubmission without the flag keeps the recorded override. In `both` mode hooks and the
+built-in `--notify` delivery each fire independently, exactly as before. In `hooks-only`
+mode the built-in delivery is skipped for a verdict that has a configured hook — `landed`
+for `on_land`, `ejected` for `on_eject`, `escalated` for `on_escalated`, `held-green-flaky`
+for `on_held` — and still fires for any other verdict (for example `withdrawn` or
+`refusal-deferred`, and a landing when no `on_land` is configured), so a change is never
+silently dropped when its event has no hook. `notify-only` is the mirror: a hook whose
+verdict notify reports is skipped for a change that has a `--notify` target, and still
+fires otherwise (including `on_red`, `on_base_moved` and `on_intake_refused`, which notify
+never reports). The effective mode is recorded in the change's `submitted` history event,
+shown as `notify_mode` by `list --json`, and named in the `notify-suppressed` history
+event (with the hook that is the delivery) whenever `hooks-only` suppresses a send. A
+router that consumes hooks and routes events itself — suppressing infrastructure reds,
+say — runs its queue in `hooks-only` so the built-in delivery does not bypass it.
 
 ## Notifications
 
@@ -933,6 +955,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `validator` | empty | How validation runs; see below. |
 | `land` | `push` from `init` | How a validated candidate reaches the base; see below. |
 | `notify` | empty | `{agentctl, registry}`: command words for state-change notifications, and the agentctl registry they address (left out of the file while empty); see "Notifications". |
+| `notify_mode` | `both` | `both`, `hooks-only` or `notify-only`: how event hooks and built-in notify divide reports (left out of the file while `both`); see "Event hooks". Set with `init --notify-mode`, overridable per change with `submit --notify-mode`. |
 | `classifier` | absent | `{policy}`: the test-footprint policy path for decision-log features (see `--classifier-policy`). Left out of the file while unset. |
 | `decisions` | absent | `{keep_days, max_bytes}`: bounds of the decision log, pruned after every run (absent or `0`: 90 days and 64 MiB; the newest day file is always kept). Left out of the file while both are defaults. |
 

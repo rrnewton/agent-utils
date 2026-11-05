@@ -59,6 +59,55 @@ impl NotifyDelivery {
     }
 }
 
+/// How built-in `--notify` delivery and event hooks divide state-change
+/// reports for an item. `both` (the default) is the historical behaviour:
+/// hooks and notify each fire independently. `hooks-only` makes hooks the
+/// primary channel: notify is skipped only for a verdict that has a
+/// configured hook (see `crate::hooks`), and still fires when no hook is
+/// configured for that verdict, so a change is never silently dropped.
+/// `notify-only` is the mirror: a hook with a notify counterpart is skipped
+/// when the item has a notify target that will receive that verdict, and
+/// still fires otherwise (including for events notify never reports).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NotifyMode {
+    /// Hooks and built-in notify both fire (historical behaviour).
+    #[default]
+    Both,
+    /// Hooks primary; notify only as a fallback when no hook is configured.
+    HooksOnly,
+    /// Notify primary; hooks only as a fallback when notify cannot report it.
+    NotifyOnly,
+}
+
+impl NotifyMode {
+    /// Stable machine-facing value (`both`, `hooks-only`, `notify-only`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::HooksOnly => "hooks-only",
+            Self::NotifyOnly => "notify-only",
+        }
+    }
+
+    /// Parse a `notify_mode` value.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "both" => Ok(Self::Both),
+            "hooks-only" => Ok(Self::HooksOnly),
+            "notify-only" => Ok(Self::NotifyOnly),
+            other => Err(format!(
+                "notify_mode is {other:?}; expected both, hooks-only or notify-only"
+            )),
+        }
+    }
+
+    /// Whether this is the default (`both`).
+    pub fn is_default(self) -> bool {
+        self == Self::Both
+    }
+}
+
 /// One entry in an item's history.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Event {
@@ -111,6 +160,11 @@ pub struct Item {
     /// `merge-queue shepherd`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub shepherd: String,
+    /// Per-item `notify_mode` override; `None` inherits `config.notify_mode`.
+    /// Set with `submit --notify-mode`; a resubmission without it keeps the
+    /// recorded override (like `notify` and `shepherd`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_mode: Option<NotifyMode>,
     /// Notification delivery for the current transition (dedup + retry bound).
     #[serde(default, skip_serializing_if = "NotifyDelivery::is_empty")]
     pub notify_delivery: NotifyDelivery,
@@ -288,6 +342,12 @@ pub struct Ruling {
 }
 
 impl Item {
+    /// The effective `notify_mode` for this change: its per-item override
+    /// when set, otherwise the queue's configured `notify_mode`.
+    pub fn effective_notify_mode(&self, config_mode: NotifyMode) -> NotifyMode {
+        self.notify_mode.unwrap_or(config_mode)
+    }
+
     /// The verdict this change's hold waits on a ruling for: `GREEN_FLAKY` or `INFRA-BLOCKED`.
     pub fn hold_label(&self) -> &str {
         if self.hold_verdict.is_empty() {

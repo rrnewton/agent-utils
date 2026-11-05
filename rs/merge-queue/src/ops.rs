@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::git::Git;
-use crate::model::{now, Held, HeldCandidate, Item, ItemStatus, Plan, Requirement, Ruling};
+use crate::model::{
+    now, Held, HeldCandidate, Item, ItemStatus, NotifyMode, Plan, Requirement, Ruling,
+};
 use crate::plan::{
     make_plan, probe_first_stage, probe_with_options, short, PlanOptions, ProbeOptions,
 };
@@ -159,6 +161,10 @@ pub struct Submission {
     /// keeps any name a previous submission recorded.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub shepherd: String,
+    /// Per-item `notify_mode` override; `None` keeps any override a
+    /// previous submission recorded, else inherits the queue config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_mode: Option<NotifyMode>,
     /// One-line description.
     pub title: String,
     /// Changes that must land first.
@@ -260,6 +266,11 @@ fn submit_resolved(
     } else {
         submission.shepherd.clone()
     };
+    // A notify_mode override is a subscription like notify: a
+    // resubmission without one keeps the recorded override.
+    let notify_mode = submission
+        .notify_mode
+        .or_else(|| existing.as_ref().and_then(|old| old.notify_mode));
     let notify_delivery = existing
         .as_ref()
         .map_or_else(Default::default, |old| old.notify_delivery.clone());
@@ -278,6 +289,7 @@ fn submit_resolved(
         submitted_by: submission.by,
         notify,
         shepherd,
+        notify_mode,
         notify_delivery,
         title: submission.title,
         after: submission.after,
@@ -375,6 +387,18 @@ fn submit_resolved(
             submission.recorded_at
         ));
     }
+    // The effective mode is part of the submission record, so the history
+    // (and, through the item record, `list --json`) shows which channel
+    // will report this change before any transition happens.
+    detail.push_str(&format!(
+        "; notify_mode={}{}",
+        item.effective_notify_mode(config.notify_mode).as_str(),
+        if item.notify_mode.is_some() {
+            " (per-item)"
+        } else {
+            " (config)"
+        }
+    ));
     // The precheck runs on the head alone, before any batch is built on it.
     let mut refusal = None;
     if submission.skip_precheck {
@@ -418,6 +442,29 @@ fn submit_resolved(
         item.deciding_failed.clear();
         item.log("ejected", format!("refused at submission: {text}"));
         state.save_item(&item)?;
+        // An ejection at submission is an ejection: fire `on_eject` here
+        // too, otherwise `hooks-only` would suppress the notify below for
+        // a hook that never ran and the refusal would reach nobody.
+        let effective = item.effective_notify_mode(config.notify_mode);
+        if config.hooks.any()
+            && !crate::hooks::hook_suppressed_by_notify(effective, "on_eject", &item.notify)
+        {
+            crate::hooks::fire(
+                &state.root,
+                &config.hooks,
+                "on_eject",
+                serde_json::json!({
+                    "pr": item.pr,
+                    "head": item.head,
+                    "shepherd": item.shepherd,
+                    "notify": item.notify,
+                    "notify_mode": effective.as_str(),
+                    "reason": text,
+                    "kind": "refused-at-submission",
+                    "failing": [],
+                }),
+            );
+        }
         crate::notify::deliver_now(state, config, item.pr);
         return Err(text);
     }

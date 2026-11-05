@@ -100,6 +100,8 @@ struct Entry {
     title: String,
     by: String,
     notify: String,
+    /// Per-change `notify_mode` from a ready file (`notify-mode=MODE`).
+    notify_mode: Option<crate::model::NotifyMode>,
     /// Whether an approving review at `head` was seen. Always true for
     /// sources that carry no review data (ready files) and when the
     /// approval rule is off, so those paths are unchanged.
@@ -168,6 +170,7 @@ fn entries_from_file(path: &PathBuf) -> Result<Vec<Entry>, String> {
                 title: String::new(),
                 by: String::new(),
                 notify: String::new(),
+                notify_mode: None,
                 approved_at_head: true,
                 notify_is_default: false,
             };
@@ -193,6 +196,9 @@ fn entries_from_file(path: &PathBuf) -> Result<Vec<Entry>, String> {
                     "prioritized" => entry.prioritized = true,
                     "by" => entry.by = value,
                     "notify" => entry.notify = value,
+                    "notify-mode" => {
+                        entry.notify_mode = Some(crate::model::NotifyMode::parse(&value)?)
+                    }
                     "title" => entry.title = value.replace('_', " "),
                     other => return Err(format!("#{pr}: unknown field {other:?}")),
                 }
@@ -300,6 +306,7 @@ pub fn list(
                         } else {
                             String::new()
                         },
+                        notify_mode: None,
                         notify_is_default: require_approval,
                     }
                 })
@@ -419,6 +426,7 @@ pub fn reconcile(
             by: entry.by,
             notify,
             shepherd: String::new(),
+            notify_mode: entry.notify_mode,
             title: entry.title,
             after: entry.after,
             solo: entry.solo,

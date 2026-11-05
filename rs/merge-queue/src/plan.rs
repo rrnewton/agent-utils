@@ -1178,6 +1178,7 @@ mod unit {
             submitted_by: String::new(),
             shepherd: String::new(),
             notify: String::new(),
+            notify_mode: None,
             notify_delivery: crate::model::NotifyDelivery::default(),
             title: String::new(),
             after: vec![],

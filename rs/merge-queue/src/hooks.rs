@@ -8,10 +8,13 @@
 //! fire-and-forget: a bounded worker pool runs them, each with a timeout,
 //! and the queue never waits on a hook or fails because of one. Every
 //! finished hook is logged to `<state>/hooks.jsonl` with its exit status,
-//! duration and stdout/stderr tails. The existing `--notify` delivery is
-//! unchanged; a hook is how a team reacts programmatically (page a
-//! shepherd, post to a channel) with low latency, including when the
-//! notified agent is gone or in a long turn.
+//! duration and stdout/stderr tails. By default (`notify_mode: both`) the
+//! existing `--notify` delivery is unchanged beside them; `hooks-only`
+//! suppresses that delivery for a verdict whose hook is configured, and
+//! `notify-only` suppresses a hook whose verdict notify will deliver
+//! (see [`NotifyMode`]). A hook is how a team reacts programmatically
+//! (page a shepherd, post to a channel) with low latency, including when
+//! the notified agent is gone or in a long turn.
 //!
 //! Payload shape (fields that do not apply to an event are empty):
 //!
@@ -32,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::model::now;
+use crate::model::{now, NotifyMode};
 use crate::state::HooksConfig;
 
 /// Payload schema.
@@ -77,6 +80,59 @@ fn sender() -> Option<SyncSender<Job>> {
         Some(tx)
     })
     .clone()
+}
+
+/// The hook event that reports the same state change as the notify
+/// verdict `verdict`, when one exists. Verdicts with no counterpart
+/// (`withdrawn`, `refusal-deferred`, held verdicts other than
+/// `held-green-flaky`) are notify-only in the sense that no hook can
+/// take their place.
+pub fn hook_for_verdict(verdict: &str) -> Option<&'static str> {
+    match verdict {
+        "landed" => Some("on_land"),
+        "ejected" => Some("on_eject"),
+        "escalated" => Some("on_escalated"),
+        "held-green-flaky" => Some("on_held"),
+        _ => None,
+    }
+}
+
+/// The notify verdict that reports the same state change as hook
+/// `event`, when one exists. Events with no counterpart (`on_red`,
+/// `on_base_moved`, `on_intake_refused`) are hook-only in the same sense.
+pub fn verdict_for_hook(event: &str) -> Option<&'static str> {
+    match event {
+        "on_land" => Some("landed"),
+        "on_eject" => Some("ejected"),
+        "on_escalated" => Some("escalated"),
+        "on_held" => Some("held-green-flaky"),
+        _ => None,
+    }
+}
+
+/// In `hooks-only` mode, the hook that makes notify delivery of
+/// `verdict` redundant, when that hook is actually configured. `None`
+/// means notify must still fire (the mode is not `hooks-only`, the
+/// verdict has no hook counterpart, or no command is configured for
+/// it) so the change is never silently dropped.
+pub fn notify_suppressed_by(
+    mode: NotifyMode,
+    verdict: &str,
+    hooks: &HooksConfig,
+) -> Option<&'static str> {
+    if mode != NotifyMode::HooksOnly {
+        return None;
+    }
+    let event = hook_for_verdict(verdict)?;
+    hooks.command_for(event).is_some().then_some(event)
+}
+
+/// In `notify-only` mode, whether hook `event` is redundant for an item
+/// whose notify target is `notify`: only when notify reports the same
+/// state change and a target will actually receive it. Events notify
+/// never reports, and items with no notify target, keep their hook.
+pub fn hook_suppressed_by_notify(mode: NotifyMode, event: &str, notify: &str) -> bool {
+    mode == NotifyMode::NotifyOnly && verdict_for_hook(event).is_some() && !notify.is_empty()
 }
 
 /// Fire one event hook, if `config` names a command for it. Never blocks
@@ -288,6 +344,55 @@ mod tests {
         let log = wait_for(&state.join("hooks.jsonl"), "timeout log");
         assert!(log.contains("\"exit\":\"timeout\""), "{log}");
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn notify_mode_suppression_needs_a_configured_counterpart() {
+        let hooks = config("true");
+        // hooks-only + a configured on_land suppresses the landed notify.
+        assert_eq!(
+            notify_suppressed_by(NotifyMode::HooksOnly, "landed", &hooks),
+            Some("on_land")
+        );
+        // hooks-only with no hook for the verdict still notifies.
+        assert_eq!(
+            notify_suppressed_by(NotifyMode::HooksOnly, "ejected", &hooks),
+            None
+        );
+        assert_eq!(
+            notify_suppressed_by(NotifyMode::HooksOnly, "withdrawn", &hooks),
+            None
+        );
+        // The default and notify-only never suppress notify.
+        assert_eq!(
+            notify_suppressed_by(NotifyMode::Both, "landed", &hooks),
+            None
+        );
+        assert_eq!(
+            notify_suppressed_by(NotifyMode::NotifyOnly, "landed", &hooks),
+            None
+        );
+        // notify-only suppresses only a hook notify will actually deliver.
+        assert!(hook_suppressed_by_notify(
+            NotifyMode::NotifyOnly,
+            "on_land",
+            "lane"
+        ));
+        assert!(!hook_suppressed_by_notify(
+            NotifyMode::NotifyOnly,
+            "on_land",
+            ""
+        ));
+        assert!(!hook_suppressed_by_notify(
+            NotifyMode::NotifyOnly,
+            "on_red",
+            "lane"
+        ));
+        assert!(!hook_suppressed_by_notify(
+            NotifyMode::Both,
+            "on_land",
+            "lane"
+        ));
     }
 
     #[test]

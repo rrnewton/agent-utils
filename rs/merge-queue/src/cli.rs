@@ -941,6 +941,14 @@ enum Command {
         /// daemon started in a bare queue repository is no registry.
         #[arg(long, value_name = "PATH")]
         agentctl_registry: Option<PathBuf>,
+        /// How event hooks and built-in `--notify` delivery divide reports
+        /// queue-wide: `both` (the default: each fires independently),
+        /// `hooks-only` (notify is skipped for a verdict whose hook is
+        /// configured, and still fires when none is) or `notify-only`
+        /// (the mirror for hooks). Stored as `notify_mode`; overridable
+        /// per change with `submit --notify-mode`.
+        #[arg(long, default_value = "both", value_parser = ["both", "hooks-only", "notify-only"])]
+        notify_mode: String,
         /// Overwrite an existing config.json (items and history are kept).
         #[arg(long)]
         force: bool,
@@ -1003,6 +1011,14 @@ enum Command {
         /// change it later with `merge-queue shepherd`.
         #[arg(long, value_name = "NAME", default_value = "")]
         shepherd: String,
+        /// Per-change `notify_mode` override (`both`, `hooks-only` or
+        /// `notify-only`), overriding the queue's configured `notify_mode`
+        /// for this change only. Resubmitting without it keeps the
+        /// recorded override. In `hooks-only` the built-in `--notify`
+        /// delivery is skipped for a verdict whose hook is configured and
+        /// still fires when none is; `notify-only` is the mirror for hooks.
+        #[arg(long, value_name = "MODE", value_parser = ["both", "hooks-only", "notify-only"])]
+        notify_mode: Option<String>,
         /// Queue the head without the configured precheck (`precheck.command`), for a refusal
         /// that is wrong. Recorded in the change's history.
         #[arg(long)]
@@ -1647,6 +1663,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             push_retry_backoff_secs,
             agentctl,
             agentctl_registry,
+            notify_mode,
             force,
         } => {
             if state.exists() && !force {
@@ -1815,6 +1832,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     push_max_retries,
                     push_retry_backoff_secs,
                 },
+                notify_mode: crate::model::NotifyMode::parse(&notify_mode)?,
                 notify: NotifyConfig {
                     agentctl,
                     registry: match agentctl_registry {
@@ -1851,6 +1869,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             policy,
             notify,
             shepherd,
+            notify_mode,
             skip_precheck,
         } => {
             let config = state.config()?;
@@ -1870,6 +1889,10 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 by,
                 notify,
                 shepherd,
+                notify_mode: notify_mode
+                    .as_deref()
+                    .map(crate::model::NotifyMode::parse)
+                    .transpose()?,
                 title,
                 after,
                 solo,
@@ -2251,9 +2274,17 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             // Requests recorded while a run held the writer lock are not in any item record yet.
             let pending = intake::pending(&state);
             if json {
+                // The effective mode (per-item override or the queue config)
+                // is always visible, even when the item inherits it.
+                let config_mode = state
+                    .config()
+                    .map(|config| config.notify_mode)
+                    .unwrap_or_default();
                 let mut rows = serde_json::to_value(&items).map_err(|e| e.to_string())?;
                 if let Some(rows) = rows.as_array_mut() {
                     for (row, item) in rows.iter_mut().zip(&items) {
+                        row["notify_mode"] =
+                            serde_json::json!(item.effective_notify_mode(config_mode).as_str());
                         let waiting = held(item);
                         if !waiting.is_empty() {
                             row["waiting_on"] =
