@@ -9,6 +9,7 @@
 //!   serve.heartbeat.json   fixed: `serve` heartbeat, rewritten every cycle
 //!   union.attributes       fixed: generated from `union_paths`, when set
 //!   api-budget.json        fixed: API requests charged in the last hour (bounded)
+//!   kept-validations.json  fixed: green validations a stopped run kept for the next run
 //!   items/<pr>.json        one record per submitted change
 //!   notifications/         notification reports sent by the daemon (`notify`)
 //!   runs/<run-id>/         one directory per `run`: plan, events, validations, report
@@ -27,7 +28,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::git::CombineMode;
-use crate::model::{Item, Obligation};
+use crate::model::{Item, KeptValidation, Obligation};
 
 /// Current configuration schema identifier.
 pub const CONFIG_SCHEMA: &str = "merge-queue-config/v1";
@@ -587,7 +588,43 @@ pub struct LandConfig {
     /// with a comment naming the commit that contains it. Closes the budget cannot afford yet
     /// are retried by `sync`.
     pub close_prs: bool,
+    /// Extra attempts for a `push` landing after a transient remote-side rejection (one that
+    /// is not a non-fast-forward: a remote fault, a 5xx, a dropped connection). 0 means
+    /// [`DEFAULT_PUSH_MAX_RETRIES`]. A non-fast-forward is never retried here: it goes down
+    /// the base-moved path and the batch is rebuilt.
+    #[serde(default)]
+    pub push_max_retries: usize,
+    /// Base backoff in seconds between push retries, doubled per retry (0 means
+    /// [`DEFAULT_PUSH_RETRY_BACKOFF_SECS`]): with the defaults, three tries span about two
+    /// minutes before the run gives up and keeps the green validations for the next run.
+    #[serde(default)]
+    pub push_retry_backoff_secs: u64,
 }
+
+impl LandConfig {
+    /// Resolved extra push attempts after a transient rejection.
+    pub fn push_retries(&self) -> usize {
+        if self.push_max_retries == 0 {
+            DEFAULT_PUSH_MAX_RETRIES
+        } else {
+            self.push_max_retries
+        }
+    }
+
+    /// Resolved base backoff between push retries.
+    pub fn push_retry_backoff(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(if self.push_retry_backoff_secs == 0 {
+            DEFAULT_PUSH_RETRY_BACKOFF_SECS
+        } else {
+            self.push_retry_backoff_secs
+        })
+    }
+}
+
+/// Default extra push attempts after a transient rejection (three tries in all).
+pub const DEFAULT_PUSH_MAX_RETRIES: usize = 2;
+/// Default base push-retry backoff in seconds (delays of 40 s then 80 s).
+pub const DEFAULT_PUSH_RETRY_BACKOFF_SECS: u64 = 40;
 
 /// Generated files the queue regenerates instead of treating their conflicts as real.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1131,6 +1168,26 @@ impl State {
         ledger: &std::collections::BTreeMap<i64, ShadowRefusal>,
     ) -> Result<(), String> {
         write_json(&self.shadow_refusals_path(), ledger)
+    }
+
+    /// Path of the kept-validations file: green batch validations a stopped run
+    /// left for the next run (one fixed file, replaced as entries land or go stale).
+    pub fn kept_validations_path(&self) -> PathBuf {
+        self.root.join("kept-validations.json")
+    }
+
+    /// The kept green validations; empty when there are none.
+    pub fn kept_validations(&self) -> Result<Vec<KeptValidation>, String> {
+        let path = self.kept_validations_path();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        read_json(&path)
+    }
+
+    /// Replace the kept green validations.
+    pub fn save_kept_validations(&self, kept: &[KeptValidation]) -> Result<(), String> {
+        write_json(&self.kept_validations_path(), &kept)
     }
 
     /// Open (without creating) the state directory at `root`.

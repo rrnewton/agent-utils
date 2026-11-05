@@ -48,7 +48,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::git::{Combined, Git};
 use crate::model::{
-    now, Discharge, HeldCandidate, HeldChange, Item, ItemStatus, Obligation, Plan, Ruling,
+    now, Discharge, HeldCandidate, HeldChange, Item, ItemStatus, KeptValidation, Obligation, Plan,
+    Ruling,
 };
 use crate::ops::{self, repo};
 use crate::plan::short;
@@ -1354,6 +1355,230 @@ impl<'a> Runner<'a> {
             run,
             validation: vid,
         }
+    }
+
+    /// Keep this run's green batch validations that did not land (a push that
+    /// failed after its retries, or another stop with batches in flight) for
+    /// the next run, replacing any kept entry for the same changes. An entry
+    /// whose changes landed, were ejected, moved head, or are held for a ruling
+    /// is dropped: only a plain green validation of still-queued heads is kept.
+    fn save_kept_validations(&self, report: &RunReport) {
+        if self.simulating() || self.options.dry_run {
+            return;
+        }
+        let landed: BTreeSet<i64> = report
+            .landed
+            .iter()
+            .flat_map(|landed| landed.prs.iter().copied())
+            .collect();
+        let ejected: BTreeSet<i64> = report.ejected.iter().map(|ejection| ejection.pr).collect();
+        let items = lock(&self.items).clone();
+        let still_valid = |kept: &KeptValidation| {
+            kept.changes.iter().all(|change| {
+                items.get(&change.pr).is_some_and(|item| {
+                    item.status == ItemStatus::Queued
+                        && item.head == change.head
+                        && item.held_candidate.is_none()
+                        && item.hold_verdict.is_empty()
+                        && item.flaky_hold_until.is_empty()
+                })
+            })
+        };
+        let mut kept: Vec<KeptValidation> = match self.state.kept_validations() {
+            Ok(kept) => kept
+                .into_iter()
+                .filter(|entry| {
+                    still_valid(entry)
+                        && !entry
+                            .prs()
+                            .iter()
+                            .any(|pr| landed.contains(pr) || ejected.contains(pr))
+                })
+                .collect(),
+            Err(error) => {
+                self.event(
+                    "kept-validations",
+                    &format!("kept validations not read: {error}"),
+                );
+                Vec::new()
+            }
+        };
+        let mut added: Vec<i64> = Vec::new();
+        for validation in &report.validations {
+            if validation.purpose != "batch" || !validation.green() || validation.prs.is_empty() {
+                continue;
+            }
+            if validation
+                .prs
+                .iter()
+                .any(|pr| landed.contains(pr) || ejected.contains(pr))
+            {
+                continue;
+            }
+            let entry = KeptValidation {
+                tip: validation.commit.clone(),
+                parent: validation.parent.clone(),
+                changes: validation
+                    .prs
+                    .iter()
+                    .map(|pr| HeldChange {
+                        pr: *pr,
+                        head: items
+                            .get(pr)
+                            .map(|item| item.head.clone())
+                            .unwrap_or_default(),
+                    })
+                    .collect(),
+                claim: ValidationClaim::new(
+                    validation.selection.clone(),
+                    validation.policy.clone(),
+                    validation.commit.clone(),
+                ),
+                run: report.run.clone(),
+                validation: validation.id,
+            };
+            if !still_valid(&entry) {
+                continue;
+            }
+            kept.retain(|old| old.prs() != entry.prs());
+            added.extend(entry.prs().iter().copied());
+            kept.push(entry);
+        }
+        if let Err(error) = self.state.save_kept_validations(&kept) {
+            self.event(
+                "kept-validations",
+                &format!("kept validations not saved: {error}"),
+            );
+        } else if !added.is_empty() {
+            self.event(
+                "kept-validations",
+                &format!(
+                    "{} kept green for the next run (the base has not moved under them)",
+                    list(&added)
+                ),
+            );
+        }
+    }
+
+    /// Land the green validations kept by an earlier stopped run, without
+    /// validating again, while the base has not moved under them: an entry is
+    /// used only when every change is still queued at the validated head, the
+    /// candidate rebuilt on the current base has exactly the validated tree,
+    /// and the selection is the validated one. Entries that no longer match
+    /// are dropped (their changes are planned and validated as usual); the
+    /// rest stay kept. Returns why the run must stop, when a landing did.
+    fn land_kept(&self) -> Result<Option<String>, String> {
+        if self.simulating()
+            || self.options.dry_run
+            || !matches!(self.config.land.driver.as_str(), "push" | "command")
+        {
+            return Ok(None);
+        }
+        let mut kept = self.state.kept_validations()?;
+        if kept.is_empty() {
+            return Ok(None);
+        }
+        {
+            let items = lock(&self.items);
+            kept.retain(|entry| {
+                entry.changes.iter().all(|change| {
+                    items.get(&change.pr).is_some_and(|item| {
+                        item.status == ItemStatus::Queued && item.head == change.head
+                    })
+                }) && self.git.has_commit(&entry.tip)
+            });
+        }
+        loop {
+            if kept.is_empty() {
+                break;
+            }
+            let base = self.current_base()?;
+            let base_tree = self.git.tree_of(&base)?;
+            let Some(index) = kept.iter().position(|entry| {
+                self.git
+                    .tree_of(&entry.parent)
+                    .is_ok_and(|tree| tree == base_tree)
+            }) else {
+                break;
+            };
+            let entry = kept.remove(index);
+            let prs = entry.prs();
+            let (candidate, _) = match self.build(&base, &prs) {
+                Ok(built) => built,
+                Err(error) => {
+                    kept.insert(index, entry);
+                    self.state.save_kept_validations(&kept)?;
+                    return Err(error);
+                }
+            };
+            if candidate.prs != prs
+                || self.git.tree_of(&candidate.tip)? != self.git.tree_of(&entry.tip)?
+            {
+                self.event(
+                    "kept-validations",
+                    &format!(
+                        "{} no longer builds to the kept validated tree; validating it again",
+                        list(&prs)
+                    ),
+                );
+                self.state.save_kept_validations(&kept)?;
+                continue;
+            }
+            let chosen = self.select(&candidate.tip, &candidate.parent)?;
+            if chosen.selection != entry.claim.selection {
+                self.event(
+                    "kept-validations",
+                    &format!(
+                        "{} selects different tests than the kept validation; validating it again",
+                        list(&prs)
+                    ),
+                );
+                self.state.save_kept_validations(&kept)?;
+                continue;
+            }
+            let claim = ValidationClaim::new(
+                chosen.selection.clone(),
+                entry.claim.policy.clone(),
+                candidate.tip.clone(),
+            );
+            let note = format!(
+                "validated in run {} as v{} and kept from that run; the base has not moved \
+                 under it and its tree and selection are unchanged",
+                entry.run, entry.validation
+            );
+            match self.land_with(&candidate, claim, Vec::new(), BTreeSet::new(), Some(&note))? {
+                BatchOutcome::Done => {
+                    self.event(
+                        "kept-validations",
+                        &format!(
+                            "{} landed on the kept validation from run {}",
+                            list(&prs),
+                            entry.run
+                        ),
+                    );
+                    self.state.save_kept_validations(&kept)?;
+                }
+                BatchOutcome::BaseMoved(_) => {
+                    self.event(
+                        "kept-validations",
+                        &format!(
+                            "{}: the base moved under the kept validation; validating it again",
+                            list(&prs)
+                        ),
+                    );
+                    self.state.save_kept_validations(&kept)?;
+                }
+                BatchOutcome::Stop(reason, _)
+                | BatchOutcome::Deferred(reason, _)
+                | BatchOutcome::RefusedDeferred(reason) => {
+                    kept.insert(0, entry);
+                    self.state.save_kept_validations(&kept)?;
+                    return Ok(Some(reason));
+                }
+            }
+        }
+        self.state.save_kept_validations(&kept)?;
+        Ok(None)
     }
 
     /// The known-flaky list (see [`crate::known_flaky`]); `None`, with an event, when it cannot
@@ -3555,11 +3780,23 @@ impl<'a> Runner<'a> {
                 self.event("peers", &format!("could not drain peers: {error}"));
             }
         }
-        let mut stop = match ruled.map(|stop| stop.map_or_else(|| self.drive(), Ok)) {
-            Ok(Ok(stop)) => stop,
-            // A drain declining to start a validation stops the run; it is not a failure.
-            Ok(Err(error)) if error.contains(crate::drain::DRAINED) => error,
-            Ok(Err(error)) | Err(error) => format!("error: {error}"),
+        // Kept green validations from an earlier stopped run land first, on
+        // their own validation, before anything new is planned (see
+        // `land_kept`); a stop there (a push still failing) ends this run too,
+        // with the entries still kept.
+        let mut stop = match ruled {
+            Ok(Some(stop)) => stop,
+            Ok(None) => match self.land_kept() {
+                Ok(Some(stop)) => stop,
+                Ok(None) => match self.drive() {
+                    Ok(stop) => stop,
+                    // A drain declining to start a validation stops the run; it is not a failure.
+                    Err(error) if error.contains(crate::drain::DRAINED) => error,
+                    Err(error) => format!("error: {error}"),
+                },
+                Err(error) => format!("error: {error}"),
+            },
+            Err(error) => format!("error: {error}"),
         };
         if !stop.is_empty() {
             self.event("stopped", &stop);
@@ -3638,6 +3875,9 @@ impl<'a> Runner<'a> {
             };
             report
         };
+        // Green validations that did not land stay usable by the next run
+        // while the base has not moved under them (see `land_kept`).
+        self.save_kept_validations(&report);
         write_json(&self.run_dir.join("report.json"), &report)?;
         std::fs::write(self.run_dir.join("report.md"), render_report(&report))
             .map_err(|error| format!("cannot write report: {error}"))?;
@@ -5076,6 +5316,16 @@ impl<'a> Runner<'a> {
         note: &str,
     ) -> Result<(), String> {
         *lock(&self.base) = tip.to_owned();
+        // A landed change's kept validation (if any) is spent.
+        if !self.simulating() {
+            if let Ok(mut kept) = self.state.kept_validations() {
+                let before = kept.len();
+                kept.retain(|entry| !entry.prs().iter().any(|pr| prs.contains(pr)));
+                if kept.len() != before {
+                    let _ = self.state.save_kept_validations(&kept);
+                }
+            }
+        }
         {
             let items = lock(&self.items);
             lock(&self.landed_heads).extend(
@@ -5258,57 +5508,92 @@ impl<'a> Runner<'a> {
         let base_ref = format!("refs/heads/{}", self.config.base);
         match self.config.land.driver.as_str() {
             "push" => {
-                let pushed = if self.config.remote.is_empty() {
-                    self.git
-                        .run(&["update-ref", &base_ref, &candidate.tip, &candidate.parent])
-                        .map(drop)
-                } else {
-                    let spec = format!("{}:{base_ref}", candidate.tip);
-                    self.git
-                        .run_net(&["push", "--quiet", &self.config.remote, &spec])
-                        .map(drop)
-                };
-                let now = self.current_base()?;
-                if let Err(error) = pushed {
-                    if now == candidate.tip {
-                        // The remote took the push and only the report of it failed (a
-                        // dropped connection, a timeout after the update): it landed.
-                        self.event(
-                            "push",
-                            &format!(
-                                "{}: {error}; the base is the pushed tip {}, so it landed",
-                                list(&candidate.prs),
+                // A transient remote-side rejection (a remote fault, a 5xx, a
+                // dropped connection: anything but a non-fast-forward, which
+                // means the base moved and the batch rebuilds) is retried with
+                // bounded backoff before the run gives up. The base is checked
+                // after every attempt: a base that moved is never retried into.
+                let retries = self.config.land.push_retries();
+                let mut attempt = 0usize;
+                loop {
+                    attempt += 1;
+                    let pushed = if self.config.remote.is_empty() {
+                        self.git
+                            .run(&["update-ref", &base_ref, &candidate.tip, &candidate.parent])
+                            .map(drop)
+                    } else {
+                        let spec = format!("{}:{base_ref}", candidate.tip);
+                        self.git
+                            .run_net(&["push", "--quiet", &self.config.remote, &spec])
+                            .map(drop)
+                    };
+                    let now = self.current_base()?;
+                    if let Err(error) = pushed {
+                        if now == candidate.tip {
+                            // The remote took the push and only the report of it failed (a
+                            // dropped connection, a timeout after the update): it landed.
+                            self.event(
+                                "push",
+                                &format!(
+                                    "{}: {error}; the base is the pushed tip {}, so it landed",
+                                    list(&candidate.prs),
+                                    short(&now)
+                                ),
+                            );
+                        } else if now != candidate.parent {
+                            return Ok(BatchOutcome::BaseMoved(candidate.prs.clone()));
+                        } else if transient_push_error(&error) && attempt <= retries {
+                            let delay = self.config.land.push_retry_backoff()
+                                * (1u32 << (attempt - 1).min(16));
+                            self.event(
+                                "push-retry",
+                                &format!(
+                                    "{}: transient push failure ({error}); retry {} of {retries} in {}s",
+                                    list(&candidate.prs),
+                                    attempt,
+                                    delay.as_secs()
+                                ),
+                            );
+                            let never = AtomicBool::new(false);
+                            if !wait_unless_cancelled(delay, &never) {
+                                crate::interrupt::check("retrying a transient push failure")?;
+                            }
+                            continue;
+                        } else if transient_push_error(&error) {
+                            return Ok(BatchOutcome::Stop(
+                                format!(
+                                    "push failed after {} attempts (transient remote rejection): {error}",
+                                    attempt
+                                ),
+                                candidate.prs.clone(),
+                            ));
+                        } else {
+                            return Ok(BatchOutcome::Stop(
+                                format!("push failed: {error}"),
+                                candidate.prs.clone(),
+                            ));
+                        }
+                    }
+                    if now != candidate.tip {
+                        return Ok(BatchOutcome::Stop(
+                            format!(
+                                "pushed {} but the base is now {}; check the base by hand",
+                                short(&candidate.tip),
                                 short(&now)
                             ),
-                        );
-                    } else if now != candidate.parent {
-                        return Ok(BatchOutcome::BaseMoved(candidate.prs.clone()));
-                    } else {
-                        return Ok(BatchOutcome::Stop(
-                            format!("push failed: {error}"),
-                            candidate.prs.clone(),
+                            Vec::new(),
                         ));
                     }
+                    self.record_landed(
+                        &candidate.prs,
+                        &now,
+                        &claim,
+                        validations,
+                        flaky,
+                        ruling.unwrap_or_default(),
+                    )?;
+                    return Ok(BatchOutcome::Done);
                 }
-                if now != candidate.tip {
-                    return Ok(BatchOutcome::Stop(
-                        format!(
-                            "pushed {} but the base is now {}; check the base by hand",
-                            short(&candidate.tip),
-                            short(&now)
-                        ),
-                        Vec::new(),
-                    ));
-                }
-                self.record_landed(
-                    &candidate.prs,
-                    &now,
-                    &claim,
-                    validations,
-                    flaky,
-                    ruling.unwrap_or_default(),
-                )?;
-                Ok(BatchOutcome::Done)
             }
             "command" => self.land_by_command(
                 candidate,
@@ -6131,6 +6416,34 @@ fn stack_top(flights: &VecDeque<Flight>) -> Option<&Flight> {
     flights.iter().rev().find(|flight| flight.stacked)
 }
 
+/// Whether a push failure is a transient remote-side rejection worth retrying:
+/// a remote fault or a dropped connection, never a non-fast-forward (the base
+/// moved; the batch rebuilds instead) and never a plain local refusal.
+fn transient_push_error(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    if lower.contains("non-fast-forward") || lower.contains("non fast forward") {
+        return false;
+    }
+    [
+        "fatal error in commit_refs",
+        "remote rejected",
+        "connection reset",
+        "connection closed",
+        "remote end hung up",
+        "timed out",
+        "timeout",
+        "502",
+        "503",
+        "504",
+        "bad gateway",
+        "service unavailable",
+        "internal server error",
+        "internal error",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 /// Whether a rooted batch may be decided now: every batch it jumped over (in
 /// flight when it started, ahead of it in plan order) has left the window, so
 /// none of them can still land ahead of it. Batches started after it, and
@@ -6776,6 +7089,22 @@ mod unit {
             donor: None,
             early_red: false,
         }
+    }
+
+    #[test]
+    fn transient_push_errors_exclude_non_fast_forward() {
+        assert!(transient_push_error(
+            "remote: fatal error in commit_refs while verifying commit graph"
+        ));
+        assert!(transient_push_error(
+            "! [remote rejected] main (hook declined)"
+        ));
+        assert!(transient_push_error("error: RPC failed; HTTP 503"));
+        assert!(transient_push_error("Connection reset by peer"));
+        assert!(!transient_push_error(
+            "! [remote rejected] main -> main (non-fast-forward)"
+        ));
+        assert!(!transient_push_error("permission denied"));
     }
 
     #[test]

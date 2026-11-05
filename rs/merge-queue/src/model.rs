@@ -234,6 +234,33 @@ impl HeldCandidate {
     }
 }
 
+/// A green batch validation a stopped run kept for the next run (see
+/// [`crate::state::State::kept_validations`]): the next run lands it without
+/// validating again while the base has not moved under it, checked by the
+/// validated tree, the changes' heads, and the selection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KeptValidation {
+    /// The validated commit.
+    pub tip: String,
+    /// The commit the batch was combined onto.
+    pub parent: String,
+    /// The batch's changes in order, each with the head it was validated at.
+    pub changes: Vec<HeldChange>,
+    /// What the validation selected, and how it was chosen.
+    pub claim: ValidationClaim,
+    /// The run that validated it (`runs/<id>/`).
+    pub run: String,
+    /// The validation's number in that run (`v<N>`).
+    pub validation: usize,
+}
+
+impl KeptValidation {
+    /// The batch's change numbers, in order.
+    pub fn prs(&self) -> Vec<i64> {
+        self.changes.iter().map(|change| change.pr).collect()
+    }
+}
+
 /// One change of a [`HeldCandidate`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HeldChange {

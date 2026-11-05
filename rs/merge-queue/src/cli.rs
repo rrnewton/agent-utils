@@ -823,6 +823,15 @@ enum Command {
         /// reach the base without being validated on their own).
         #[arg(long)]
         allow_batches: bool,
+        /// Extra attempts for a `push` landing after a transient remote-side rejection
+        /// (not a non-fast-forward), with the backoff doubled per retry (0: 2 extra
+        /// attempts, three tries in all).
+        #[arg(long, default_value_t = 0)]
+        push_max_retries: usize,
+        /// Base backoff in seconds between push retries (0: 40, so the default
+        /// retries span about two minutes).
+        #[arg(long, default_value_t = 0)]
+        push_retry_backoff_secs: u64,
         /// Command (and leading arguments) the `serve` daemon runs instead of `agentctl`
         /// to push state-change notifications, e.g. a wrapper or a test fake. Repeatable.
         /// The daemon runs `<command> send <name> --deliver-while-working --file <report>`.
@@ -1506,6 +1515,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             land,
             land_command,
             allow_batches,
+            push_max_retries,
+            push_retry_backoff_secs,
             agentctl,
             agentctl_registry,
             force,
@@ -1664,6 +1675,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     command: land_command,
                     allow_batches,
                     close_prs,
+                    push_max_retries,
+                    push_retry_backoff_secs,
                 },
                 notify: NotifyConfig {
                     agentctl,

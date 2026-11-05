@@ -1005,6 +1005,10 @@ for the select command and the runner, so the selection can be the focused one.
 - `command`: the shell template for the `command` driver.
 - `allow_batches`: for the `command` driver, allow batches of several changes (default `false`,
   which makes every batch one change).
+- `push_max_retries`: extra attempts for a `push` landing after a transient remote-side
+  rejection (default `0`, meaning 2 extra attempts, three tries in all).
+- `push_retry_backoff_secs`: base backoff in seconds between push retries, doubled per retry
+  (default `0`, meaning 40, so the default retries span about two minutes).
 
 ## Validators
 
@@ -1444,10 +1448,21 @@ for its own changes only.
 ## Land drivers
 
 - **`push`.** The remote base is fast-forwarded to the exact validated candidate with a plain
-  (non-force) push. A rejected push means the base moved: the batch is rebuilt on the new base and
-  validated again. After the push, the queue fetches the base and requires it to equal the
-  candidate. For a local repository (`--remote ''`) the base branch is moved with a
-  compare-and-swap `git update-ref`.
+  (non-force) push. A non-fast-forward rejection means the base moved: the batch is rebuilt on
+  the new base and validated again. A transient remote-side rejection instead (a remote fault
+  such as a `commit_refs` failure, a 5xx, or a dropped connection: anything that is not a
+  non-fast-forward) is retried with bounded backoff (`land.push_max_retries` extra attempts,
+  `land.push_retry_backoff_secs` doubled per retry; with the defaults, three tries span about
+  two minutes), and the base is checked after every attempt. After the push, the queue fetches
+  the base and requires it to equal the candidate. For a local repository (`--remote ''`) the
+  base branch is moved with a compare-and-swap `git update-ref`.
+
+  If a run stops anyway (a push still failing after its retries, or another stop with batches
+  in flight), its green batch validations are kept in `kept-validations.json` instead of being
+  discarded. The next run lands a kept batch first, without validating again, while the base
+  has not moved under it: every change is still queued at the validated head, the candidate
+  rebuilt on the current base has exactly the validated tree, and the selection is the
+  validated one. A kept batch that no longer matches is dropped and validated as usual.
 - **`command`.** The template runs once per change, in order, in the repository directory, with:
 
   | Variable | Value |
