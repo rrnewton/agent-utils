@@ -1,11 +1,12 @@
 ---
 title: 'dagrun-priority-hints: ready steps dispatch by priority when parallelism is short, without adding dependencies'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-validate
 created_at: 2026-11-05T01:17:10.423978592+00:00
-updated_at: 2026-11-05T01:17:10.423978592+00:00
+updated_at: 2026-11-05T03:40:42.385841358+00:00
+closed_at: 2026-11-05T03:40:42.385841198+00:00
 ---
 
 # Description
