@@ -125,3 +125,5 @@ export { mountListGestures } from "./listgestures.ts";
 export type { ListGestures, ListGesturesDependencies, PulledTouch } from "./listgestures.ts";
 export { mountListControls } from "./listcontrols.ts";
 export type { ListControls, ListControlsDependencies } from "./listcontrols.ts";
+export { mountSideControls } from "./sidecontrols.ts";
+export type { GestureStart, SideControls, SideControlsDependencies } from "./sidecontrols.ts";

@@ -30865,49 +30865,32 @@ el("channel-compose-text").addEventListener("keydown", (event) =>
   onComposerKey(event, guardQuietly(sendChannelMessage), el("channel-compose-text"))
 );
 watchBoxInsertions(el("channel-compose-text"));
-// A thread's back gesture under way: a column's `entryState().backGesture` (`#624 voice-page-modularity`).
-el("scroll-area").addEventListener("pointerdown", (event) => {
-  if (selection().view !== "thread" || event.pointerType === "mouse") return;
-  if (["TEXTAREA", "INPUT", "BUTTON"].includes(String(event.target && /** @type {Element} */ (event.target).tagName).toUpperCase())) return;
-  entryState().backGesture = { x: event.clientX, y: event.clientY };
+// The thread's back gesture and the right column's controls (`#304 back-gesture-in-app`, `#229 desktop-two-column`,
+// `#388 thread-header-collapse`, `#281 view-keys`, `#262 search-load-older`, `#404`, `#419`, `#426`): a swipe right out
+// of a thread, the layout button, the X, the card at the top of a thread, the card's flight ending, and the Threads
+// view's chips. One owner in web/src/view/channel/sidecontrols.ts (`#624 voice-page-modularity`), mounted here, in the
+// page's order; its `unmount` waits for the ordered boot's teardown.
+mountSideControls({
+  byId: (id) => el(id),
+  leftById: (id) => leftEl(id),
+  inThread: () => selection().view === "thread",
+  backGesture: () => entryState().backGesture,
+  setBackGesture: (start) => { entryState().backGesture = start; },
+  claimClick: () => rowGestures.claimClick(),
+  closeThread: () => guardQuietly(closeThread)(),
+  toggleColumns: () => toggleColumns(),
+  closeSide: () => closeSideByX(),
+  threadCardIds: THREAD_CARD_LISTS.map(([id]) => id),
+  threadCardPressed: (card, event) => threadCardPressed(card, event),
+  endCardFlightPart: (node, event) => endCardFlightPart(node, event),
+  loadOlderThreads: () => guardQuietly(loadOlderThreads)(),
+  searchReplies: () => guardQuietly(repliesControlPressed)(),
+  nextUnpack: () => setUnpackMode(cardPacking.nextMode()),
+  toggleMainRows: () => setMainRowsShown(!mainRowsChoice.on()),
+  nextOrder: () => setThreadOrder(nextThreadOrder()),
 });
-el("scroll-area").addEventListener("pointerup", (event) => {
-  const start = entryState().backGesture;
-  entryState().backGesture = null;
-  if (!start || selection().view !== "thread") return;
-  const dx = event.clientX - start.x;
-  const dy = event.clientY - start.y;
-  if (dx >= SWIPE_COMMIT_PX && dx > Math.abs(dy)) {
-    rowGestures.claimClick();
-    guardQuietly(closeThread)();
-  }
-});
-el("scroll-area").addEventListener("pointercancel", () => { entryState().backGesture = null; });
-// `#229 desktop-two-column`. The layout button, and the right column's own controls: each acts in
-// the right column, as its counterpart in #pane-discord acts in the left.
-el("column-toggle").addEventListener("click", toggleColumns);
-// The X's one act, which the back gesture's is too (`#304 back-gesture-in-app`).
-el("side-close").addEventListener("click", closeSideByX);
-// `#388 thread-header-collapse`. A press on the card at the top of a thread, in either column, folds it
-// to a bar or opens it again; drawn as the device last chose before anything is shown.
-for (const [id] of THREAD_CARD_LISTS) {
-  leftEl(id).addEventListener("click", (event) => threadCardPressed(leftEl(id), event));
-}
+// `#388 thread-header-collapse`. The card at the top of a thread drawn as the device last chose before anything is shown.
 renderThreadCardFold();
-// The card moving up as its thread opens ends with its animation, or the thread's fading in with its
-// own: each ends its own part (`endCardFlightPart`).
-for (const id of ["thread-card", "side-thread-card", "pane-discord", "side-pane"]) {
-  leftEl(id).addEventListener("animationend", (event) => endCardFlightPart(leftEl(id), event));
-}
-// `#281 view-keys`. The next page of older threads, read where the cards are.
-el("side-more-threads").addEventListener("click", guardQuietly(loadOlderThreads));
-// `#262 search-load-older`. The cards' own way further back for the search, and Stop while it walks.
-leftEl("side-search-replies").addEventListener("click", guardQuietly(repliesControlPressed));
-// `#404 threads-unpack-all`. Every thread's messages under its card, in the Threads view.
-leftEl("side-unpack").addEventListener("click", () => setUnpackMode(cardPacking.nextMode()));
-leftEl("side-main").addEventListener("click", () => setMainRowsShown(!mainRowsChoice.on()));
-// `#426 threads-sort-toggle`. The cards' order, in the Threads view.
-leftEl("side-order").addEventListener("click", () => setThreadOrder(nextThreadOrder()));
 renderUnpackToggle();
 renderMainToggle();
 renderOrderToggle();

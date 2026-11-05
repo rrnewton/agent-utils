@@ -1267,3 +1267,69 @@ test("`#624 voice-page-modularity`: the list's tools reach the act each names, i
   controls.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
+
+test("`#624 voice-page-modularity`: the thread's back gesture commits only a long enough swipe right in a thread, the right column's controls reach their acts in the page's order, and come down again", () => {
+  const { mountSideControls, SWIPE_COMMIT_PX } = CHANNEL_VIEW;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type, event = {}) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener(event));
+  let inThread = true;
+  let gesture = null;
+  const controls = mountSideControls({
+    byId: (id) => target(id),
+    leftById: (id) => target(`left ${id}`),
+    inThread: () => inThread,
+    backGesture: () => gesture,
+    setBackGesture: (start) => { gesture = start; },
+    claimClick: () => log.push("click claimed"),
+    closeThread: () => { log.push("thread closed"); return "closing"; },
+    toggleColumns: () => log.push("columns"),
+    closeSide: () => log.push("side closed"),
+    threadCardIds: ["thread-card", "side-thread-card"],
+    threadCardPressed: (card, event) => log.push(`card ${card.id} ${event.n}`),
+    endCardFlightPart: (node, event) => log.push(`flight ${node.id} ${event.n}`),
+    loadOlderThreads: () => log.push("older threads"),
+    searchReplies: () => log.push("replies"),
+    nextUnpack: () => log.push("unpack"),
+    toggleMainRows: () => log.push("main"),
+    nextOrder: () => log.push("order"),
+  });
+  assert.deepStrictEqual(log, ["listen scroll-area pointerdown", "listen scroll-area pointerup", "listen scroll-area pointercancel",
+    "listen column-toggle click", "listen side-close click", "listen left thread-card click", "listen left side-thread-card click",
+    "listen left thread-card animationend", "listen left side-thread-card animationend", "listen left pane-discord animationend",
+    "listen left side-pane animationend", "listen side-more-threads click", "listen left side-search-replies click", "listen left side-unpack click",
+    "listen left side-main click", "listen left side-order click"], "a listener was added out of the page's order");
+  log.length = 0;
+  const swipe = (down, up) => { fire("scroll-area", "pointerdown", down); fire("scroll-area", "pointerup", up); };
+  const touch = (x, y, target = { tagName: "li" }) => ({ pointerType: "touch", clientX: x, clientY: y, target });
+  swipe(touch(10, 10), touch(10 + SWIPE_COMMIT_PX, 20));
+  assert.deepStrictEqual(log, ["click claimed", "thread closed"], "a long enough swipe right did not leave the thread");
+  assert.equal(gesture, null, "the gesture outlived its pointerup");
+  log.length = 0;
+  swipe(touch(10, 10), touch(9 + SWIPE_COMMIT_PX, 10));
+  swipe(touch(10, 10), touch(10 + SWIPE_COMMIT_PX, 20 + SWIPE_COMMIT_PX));
+  swipe({ ...touch(10, 10), pointerType: "mouse" }, touch(500, 10));
+  swipe(touch(10, 10, { tagName: "textarea" }), touch(500, 10));
+  inThread = false;
+  swipe(touch(10, 10), touch(500, 10));
+  inThread = true;
+  fire("scroll-area", "pointerdown", touch(10, 10));
+  fire("scroll-area", "pointercancel");
+  fire("scroll-area", "pointerup", touch(500, 10));
+  assert.deepStrictEqual(log, [], "a short, steep, mouse, in-a-box, out-of-thread or cancelled swipe left the thread");
+  fire("column-toggle", "click");
+  fire("side-close", "click");
+  fire("left side-thread-card", "click", { n: 1 });
+  fire("left side-pane", "animationend", { n: 2 });
+  fire("side-more-threads", "click");
+  fire("left side-search-replies", "click");
+  fire("left side-unpack", "click");
+  fire("left side-main", "click");
+  fire("left side-order", "click");
+  assert.deepStrictEqual(log, ["columns", "side closed", "card left side-thread-card 1", "flight left side-pane 2", "older threads", "replies", "unpack", "main", "order"]);
+  controls.unmount();
+  assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+});

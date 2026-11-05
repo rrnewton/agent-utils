@@ -197,10 +197,11 @@ test("THE SWIPE DRIVES THE SAME DISMISSAL THE DONE BUTTON DOES, NOT A SECOND ONE
   }
   assert.ok(!HTML.includes('id="inbox-only"'), "a second filter is still in the markup");
   // TOUCH AND PEN ONLY. A horizontal mouse drag across a message is how a person selects text, and
-  // this list exists so a specific real message can be quoted and checked.
+  // this list exists so a specific real message can be quoted and checked. The row's own gesture, in
+  // web/src/view/channel's `createRowGestures` (`#624 voice-page-modularity`), not the thread's back gesture.
   assert.match(
-    SCRIPT_CODE,
-    /pointerType === "mouse"/,
+    PAGE_CODE,
+    /if \(!event \|\| event\.pointerType === "mouse"\)/,
     "a mouse drag across a message would now dismiss it instead of selecting text"
   );
 });
