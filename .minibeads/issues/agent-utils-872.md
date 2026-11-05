@@ -43,7 +43,9 @@ Keep refusing for worktree target kinds, when either path exists, or when the au
   - a worktree target kind is still refused;
   - a present target or fenced path is still refused;
   - missing authorization flags are still refused.
-- Landed alone, with the SHA sent to the lead at once for the consumer host's deploy.
+- (b) lands FIRST and alone; (a) follows. The consumer's validations run the agent-utils wrkslots pinned in its own submodule (f79789533dc0), and a newer pin can only land through the merge queue this journal blocks. The unblock therefore runs through a user-site wrkslots carrying (b).
+- Everything (b) writes (the event record, the journal removal, any state change) is readable by the pinned f79789533dc0 wrkslots, and that version's classify-create-journals passes on the post-recover state. A test runs f79789533dc0's `py/wrkslots` against the post-recover fixture.
+- The SHA is sent to the lead at once for the consumer host's deploy.
 
 # Notes
 
