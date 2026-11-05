@@ -47,3 +47,5 @@ export { READ_STEP, createSelectionKeys } from "./selectionkeys.ts";
 export type { KeyRow, SelectionKeys, SelectionKeysDependencies, SteppedMenu, SteppedPane } from "./selectionkeys.ts";
 export { createPointerSelection } from "./pointerselection.ts";
 export type { KeptMark, PointedPane, PointerMoved, PointerSelection, PointerSelectionDependencies, SelectionInputKinds } from "./pointerselection.ts";
+export { createKeySelection } from "./keyselection.ts";
+export type { KeyPane, KeySelection, KeySelectionDependencies, KeySelectionModel } from "./keyselection.ts";

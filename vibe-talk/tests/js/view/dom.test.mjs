@@ -1702,3 +1702,179 @@ test("`#624 voice-page-modularity`: the mouse and the keys move one selection, t
     globalThis.document = was;
   }
 });
+
+test("`#624 voice-page-modularity`: the selection is kept per list by message id, lit on one row of the page, brought into view the least, and put back after a redraw only where the reader is", () => {
+  const { createKeySelection } = VIEW_SHELL;
+  const log = [];
+  const element = (id, attributes = {}, extra = {}) => ({
+    id, attributes: { ...attributes }, parentNode: null, nodeType: 1, hidden: false, top: 0, bottom: 0, height: 0,
+    getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; },
+    hasAttribute(name) { return name in this.attributes; },
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    removeAttribute(name) { delete this.attributes[name]; },
+    getBoundingClientRect() { return { top: this.top, bottom: this.bottom, height: this.bottom - this.top }; },
+    focus(options) { log.push(`focus ${this.id}${options && options.preventScroll ? " quietly" : ""}`); globalThis.document.activeElement = this; },
+    ...extra,
+  });
+  const listOf = (id, rows, parentNode) => {
+    const list = element(id, {}, { parentNode, children: rows });
+    for (const row of rows) row.parentNode = list;
+    return list;
+  };
+  const rowAt = (id, top, bottom, attributes = {}) => Object.assign(element(id, { "data-id": id, ...attributes }), { top, bottom });
+  const page = element("page");
+  const paneOf = (name, rows) => {
+    const scroller = element(`${name}-scroll`, {}, { parentNode: page, scrollTop: 500 });
+    const state = { list: listOf(`${name}-list`, rows, scroller), context: "a" };
+    return { name, state, scroller: () => scroller, list: () => state.list, head: () => 100, foot: () => 500,
+      context: () => state.context, marks: new Map(), row: null, lit: null, follow: null };
+  };
+  const channel = paneOf("channel", [rowAt("1", 50, 150), rowAt("2", 150, 300), rowAt("3", 300, 480), rowAt("4", 480, 700)]);
+  const side = paneOf("side", [rowAt("t", 100, 200, { "data-card": "" }), rowAt("t", 200, 300), rowAt("u", 300, 400)]);
+  const reply = paneOf("reply", []);
+  const heading = element("side-heading", {}, { parentNode: page });
+  const compose = element("reply-compose", {}, { parentNode: page });
+  const screenEl = element("screen-settings");
+  const [one, two, three, four] = channel.state.list.children;
+  const [card, root, other] = side.state.list.children;
+  const state = { last: channel, threadList: false, sideUp: true, docked: false, screen: "main", lost: false };
+  const selection = createKeySelection({
+    keyPanes: () => [channel, side],
+    channelPane: () => channel,
+    sidePane: () => side,
+    lastPane: () => state.last,
+    takeLastPane: (pane) => { state.last = pane; log.push(`last ${pane.name}`); },
+    threadListOnScreen: () => state.threadList,
+    sideColumnUp: () => state.sideUp,
+    replyDocked: () => state.docked,
+    replyPane: () => reply,
+    screen: () => state.screen,
+    byId: (id) => (id === "screen-settings" ? screenEl : null),
+    leftById: (id) => ({ "side-heading": heading, "reply-compose": compose })[id],
+    rowShown: (row) => !row.hidden,
+    idsOf: (row) => (row.hasAttribute("data-card") ? [] : [row.getAttribute("data-id")]),
+    shownRowFor: (row) => (row.getAttribute("data-read-run") === "member" ? three : row),
+    rowTimeTabStop: (row, on) => log.push(`time ${row.id} ${on}`),
+    readerActedIn: (pane) => log.push(`acted ${pane.name}`),
+    putOutLanding: (row) => log.push(`landing out ${row.id}`),
+    noteLinkedSelection: () => log.push("links"),
+    focusLost: () => state.lost,
+    landingGap: () => 10,
+  });
+  const run = (act) => { log.length = 0; const result = act(); return result === undefined ? [...log] : [result, ...log]; };
+  const was = globalThis.document;
+  globalThis.document = { activeElement: null };
+  try {
+    // Which list a key is for.
+    const inChannel = element("text", {}, { parentNode: two });
+    assert.deepStrictEqual([selection.paneFor(inChannel), selection.paneFor(root), selection.paneFor(element("x", {}, { parentNode: heading }))], [channel, side, side]);
+    state.threadList = true;
+    assert.equal(selection.paneFor(inChannel), channel, "behind the thread list the left column took the keys from inside it, or none went to the pane used last");
+    state.last = side;
+    assert.equal(selection.paneFor(inChannel), side, "behind the thread list a key in the left column did not go to the pane used last");
+    state.threadList = false;
+    state.sideUp = false;
+    assert.equal(selection.paneFor(root), side, "with the right column gone, a key there was not handed to the pane used last");
+    side.state.list = null;
+    assert.equal(selection.paneFor(root), channel, "with no list on the right, the key did not go to the first pane with one");
+    side.state.list = listOf("side-list", [card, root, other], side.scroller());
+    state.sideUp = true;
+    state.last = channel;
+    state.docked = true;
+    assert.equal(selection.paneFor(element("box", {}, { parentNode: compose })), reply, "a box of a reply open in the stream was not its list's");
+    state.docked = false;
+    assert.equal(selection.paneFor(element("box", {}, { parentNode: compose })), channel);
+    assert.deepStrictEqual([selection.visibleScroller(inChannel), selection.visibleScroller(root)], [channel.scroller(), side.scroller()]);
+    globalThis.document.activeElement = root;
+    assert.equal(selection.visibleScroller(), side.scroller(), "the scroller was not the focus's by default");
+    globalThis.document.activeElement = null;
+    state.screen = "settings";
+    assert.equal(selection.visibleScroller(inChannel), screenEl, "off the main screen the scroll keys were not the screen's");
+    state.screen = "main";
+    // The rows and the row of a node.
+    three.hidden = true;
+    assert.deepStrictEqual(selection.paneRows(channel).map((row) => row.id), ["1", "2", "4"], "a hidden row was moved through");
+    three.hidden = false;
+    channel.state.list.children.push(element("day", {}));
+    channel.state.list.children.at(-1).parentNode = channel.state.list;
+    assert.deepStrictEqual(selection.paneRows(channel).map((row) => row.id), ["1", "2", "3", "4"], "a part of the list with no message was moved through");
+    assert.deepStrictEqual([selection.rowOf(channel, inChannel), selection.rowOf(channel, channel.state.list.children[4]), selection.rowOf(channel, root), selection.rowOf(channel, null)],
+      [two, null, null, null]);
+    channel.state.list.children.pop();
+    // A message's row, a card told from its root's row, a folded member shown as its run's line.
+    assert.deepStrictEqual([selection.paneRowFor(side, "t"), selection.paneRowFor(side, "t", true), selection.paneRowFor(side, "t", false), selection.paneRowFor(side, null)],
+      [card, card, root, null]);
+    two.attributes["data-read-run"] = "member";
+    assert.equal(selection.paneRowFor(channel, "2"), three, "a folded message did not stand as its run's line");
+    delete two.attributes["data-read-run"];
+    // Taking a row: noted per list, the one in use, drawn; the reader acting only when it is another.
+    assert.deepStrictEqual(run(() => selection.takeRow(channel, two, true)),
+      ["acted channel", "last channel", "landing out 2", "links", "time 2 true", "focus 2 quietly"]);
+    assert.deepStrictEqual([channel.marks.get("a"), channel.row, channel.lit, two.getAttribute("tabindex"), two.getAttribute("data-selected")],
+      [{ id: "2", card: false, drawn: true, index: 1 }, two, two, "0", "true"]);
+    assert.deepStrictEqual(run(() => selection.takeRow(channel, two, false)), ["last channel", "links", "time 2 true"], "the same row taken again was the reader acting, or was lit again");
+    assert.deepStrictEqual(run(() => selection.takeRow(channel, three, false)),
+      ["time 2 false", "acted channel", "last channel", "landing out 3", "links", "time 3 true"]);
+    assert.deepStrictEqual([two.hasAttribute("tabindex"), two.hasAttribute("data-selected"), channel.lit], [false, false, three], "the row before kept its tab stop or its light");
+    assert.deepStrictEqual([selection.markNames(selection.markOf(channel), three), selection.markNames(null, three), selection.markedRow(channel, selection.markOf(channel))], [true, false, three]);
+    assert.deepStrictEqual([selection.currentRow(channel, inChannel), selection.currentRow(channel, null), selection.drawnRow(channel)], [two, three, three]);
+    // A tap: silent. The pane in use is the one lit.
+    assert.deepStrictEqual(run(() => selection.noteRow(side, card)), ["acted side", "last side", "links"]);
+    assert.deepStrictEqual([side.marks.get("a"), side.row, side.lit, channel.lit, selection.drawnRow(side), selection.activePane()],
+      [{ id: "t", card: true, drawn: false, index: 0 }, null, null, null, null, side], "a tap drew its row, or the other column stayed lit");
+    assert.equal(selection.markNames(side.marks.get("a"), root), false, "a card's selection named its root's row");
+    assert.equal(selection.markNames({ id: "t", drawn: true, index: 0 }, root), true, "a selection a filter carried did not name the row by its id alone");
+    side.state.list = null;
+    assert.equal(selection.activePane(), channel, "the pane used last showing no list stayed the one in use");
+    side.state.list = listOf("side-list", [card, root, other], side.scroller());
+    state.last = channel;
+    selection.drawSelection();
+    assert.equal(channel.lit, three, "the pane in use did not light its selection again");
+    // Where the rows are.
+    assert.deepStrictEqual([selection.rowInView(channel, one), selection.rowInView(channel, four), selection.rowInView(channel, rowAt("x", 0, 100)), selection.firstRowInView(channel)],
+      [true, true, false, two], "the first row shown whole was not the first between the line and the chips");
+    one.top = 99; four.top = 501; four.bottom = 700;
+    assert.equal(selection.firstRowInView(channel), one, "a row a pixel under the line was not counted whole");
+    one.top = 50;
+    assert.deepStrictEqual([selection.nearRow(channel, 9), selection.nearRow(channel, -2), selection.nearRow(reply, 0)], [four, one, null]);
+    // Bringing into view the least, with the landing gap; a row taller than the room, arrived at going up, shows its foot.
+    const area = channel.scroller();
+    const bring = (row, from) => { area.scrollTop = 500; selection.bringIntoView(channel, row, from); return area.scrollTop; };
+    assert.deepStrictEqual([bring(one), bring(two), bring(four), bring(rowAt("x", 600, 650))], [440, 500, 710, 660]);
+    const tall = rowAt("tall", 0, 900);
+    assert.deepStrictEqual([bring(tall), bring(tall, -1), bring(rowAt("t2", 200, 450), -1)], [390, 910, 500], "a tall row did not show its head going down and its foot going up");
+    assert.deepStrictEqual(run(() => { area.scrollTop = 500; selection.selectRow(channel, four, false); return area.scrollTop; }),
+      [500, "time 3 false", "acted channel", "last channel", "landing out 4", "links", "time 4 true", "focus 4 quietly"]);
+    area.scrollTop = 500;
+    selection.selectRow(channel, one);
+    assert.equal(area.scrollTop, 440, "a row selected was not brought into view by default");
+    // A redraw that took the row away: the focus back where it was, else only in the pane in use.
+    const redraw = (pane, rows) => { pane.state.list = listOf(pane.state.list.id, rows, pane.scroller()); };
+    const newOne = rowAt("1", 50, 150);
+    globalThis.document.activeElement = one;
+    redraw(channel, [newOne, rowAt("2", 150, 300)]);
+    assert.deepStrictEqual(run(() => selection.keepSelection()), ["time 1 false", "time 1 true", "focus 1 quietly", "landing out 1", "links"]);
+    assert.deepStrictEqual([channel.row, channel.lit, newOne.getAttribute("tabindex"), one.hasAttribute("data-selected")], [newOne, newOne, "0", false], "the new row of the message did not take the ring, or the old one kept its light");
+    globalThis.document.activeElement = null;
+    state.lost = true;
+    selection.takeRow(side, other, false);
+    state.last = side;
+    redraw(channel, [rowAt("2", 150, 300), rowAt("5", 300, 400)]);
+    assert.deepStrictEqual(run(() => selection.keepSelection()), ["time 1 false", "time 2 true", "links"],
+      "a redraw of Main beside the reader gave Main's row the focus, or did not hand its selection to the row now where it was");
+    assert.deepStrictEqual(channel.marks.get("a"), { id: "2", card: false, drawn: true, index: 0 });
+    const newOther = rowAt("u", 300, 400);
+    redraw(side, [card, root, newOther]);
+    assert.deepStrictEqual(run(() => selection.keepSelection()), ["time u false", "time u true", "focus u quietly", "landing out u", "links"], "the pane in use did not get its focus back");
+    state.lost = false;
+    globalThis.document.activeElement = element("button");
+    redraw(side, [card, root]);
+    assert.deepStrictEqual(run(() => selection.keepSelection()), ["time u false", "links"], "with the focus elsewhere a gone message's selection was handed on");
+    assert.equal(side.lit, null);
+    selection.noteRow(side, root);
+    redraw(side, [card]);
+    assert.deepStrictEqual(run(() => selection.keepSelection()), ["links"], "a silent selection was put back with a ring");
+  } finally {
+    globalThis.document = was;
+  }
+});

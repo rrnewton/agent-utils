@@ -44,7 +44,7 @@ export interface KeptMark {
   readonly drawn: boolean;
 }
 
-export interface PointerSelectionDependencies<Pane extends PointedPane, Column> {
+export interface PointerSelectionDependencies<Pane extends PointedPane, Column, Mark extends KeptMark = KeptMark> {
   /** What the reader used last. */
   readonly inputKinds: SelectionInputKinds;
   /** Which screen is up, and the view of the main screen. */
@@ -75,8 +75,8 @@ export interface PointerSelectionDependencies<Pane extends PointedPane, Column> 
   /** Whether `row` is shown. */
   rowShown(row: HTMLElement): boolean;
   /** The selection `pane` keeps, or null, and whether it names `row`. */
-  markOf(pane: Pane): KeptMark | null;
-  markNames(mark: KeptMark | null, row: HTMLElement): boolean;
+  markOf(pane: Pane): Mark | null;
+  markNames(mark: Mark | null, row: HTMLElement): boolean;
   /** Start, or drop, the wait before the other column glides to its counterpart (`#261`). */
   dwellColumnGlide(pane: Pane, row: HTMLElement): void;
   driftFromColumnGlide(): void;
@@ -192,8 +192,8 @@ export interface PointerSelection<Pane> {
   inColumnGone(node: unknown): boolean;
 }
 
-export function createPointerSelection<Pane extends PointedPane, Column>(
-  deps: PointerSelectionDependencies<Pane, Column>,
+export function createPointerSelection<Pane extends PointedPane, Column, Mark extends KeptMark = KeptMark>(
+  deps: PointerSelectionDependencies<Pane, Column, Mark>,
 ): PointerSelection<Pane> {
   const kinds = deps.inputKinds;
   const drawnBy = (): boolean => kinds.drawnBy();

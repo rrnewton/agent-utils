@@ -39,6 +39,7 @@ declare const createDoneKeys: LegacyImports["createDoneKeys"];
 declare const createFoldKeys: LegacyImports["createFoldKeys"];
 declare const createSelectionKeys: LegacyImports["createSelectionKeys"];
 declare const createPointerSelection: LegacyImports["createPointerSelection"];
+declare const createKeySelection: LegacyImports["createKeySelection"];
 declare const pageStep: LegacyImports["pageStep"];
 declare const createRowShortcuts: LegacyImports["createRowShortcuts"];
 declare const createShellNotices: LegacyImports["createShellNotices"];

@@ -2859,7 +2859,7 @@ test("`#298 thread-card-header`: every way into a thread on the right puts its c
 });
 
 test("`#284 redraw-keeps-pane`: in two columns, with the focus lost while the reader is in the right column, a redraw of Main leaves the keys there — Esc still closes the right column's thread — and a redraw of the right column gives its own row the focus back", async () => {
-  const FIX = "    if (had || (lost && pane === active)) row.focus({ preventScroll: true });\n";
+  const FIX = "        if (had || (lost && pane === active)) row.focus({ preventScroll: true });\n";
   const run = async (script, redraw) => {
     const { page, server, data } = await twoColumnServer(null, script);
     const [first] = data.threads;
@@ -2900,7 +2900,8 @@ test("`#284 redraw-keeps-pane`: in two columns, with the focus lost while the re
   assert.equal(redrawn.kept, true, "a redraw of Main beside the reader lost Main's selection");
   // The control: the focus given back in whichever pane was redrawn, as before. Main takes it, and with it
   // the keys, and Esc there leaves the right column's thread open.
-  const anywhere = await run(brokenScript(FIX, "    if (lost) row.focus({ preventScroll: true });\n"), "main");
+  const anywhere = await run(await brokenModule([{ file: "src/view/shell/keyselection.ts", find: FIX,
+    replace: "        if (lost) row.focus({ preventScroll: true });\n" }]), "main");
   assert.equal(anywhere.where, "Main", "the negative control did not give Main the focus, so the check above proves nothing");
   assert.equal(anywhere.closed, false, "the negative control closed the thread anyway, so the check above proves nothing");
 
@@ -3299,8 +3300,8 @@ test("`#298 thread-card-header` x `#284 redraw-keeps-pane`: a click on a card's 
   // The controls: the keys left where the click found them, and the heading's keys left to Main.
   const stayed = await run(brokenScript("  if (sideShowing()) focusList(sidePane);\n", ""));
   assert.equal(stayed.closed, false, "the negative control closed the thread anyway, so the check above proves nothing");
-  const heading = await run(brokenScript(
-    "    if (pane === sidePane && node && nodeWithin(leftEl(\"side-heading\"), node)) return pane;\n", ""));
+  const heading = await run(await brokenModule([{ file: "src/view/shell/keyselection.ts",
+    find: "      if (pane === side && node && nodeWithin(deps.leftById(\"side-heading\"), node)) return pane;\n", replace: "" }]));
   assert.equal(heading.fromCard, false, "the negative control closed the thread from its card anyway, so the check above proves nothing");
 });
 
