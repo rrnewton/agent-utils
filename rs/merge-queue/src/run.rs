@@ -843,6 +843,7 @@ impl<'a> Runner<'a> {
         let git = repo(state, &config)?;
         let config_close_prs = config.land.close_prs && !simulate;
         let config_github = config.github.clone();
+        let config_net_timeout = config.net_timeout();
         let (run_id, run_dir) = state.new_run()?;
         let events = std::fs::File::create(run_dir.join("events.jsonl"))
             .map_err(|error| format!("cannot create events log: {error}"))?;
@@ -908,7 +909,11 @@ impl<'a> Runner<'a> {
             events: Mutex::new(events),
             handles: Mutex::new(BTreeMap::new()),
             hosting: if config_close_prs {
-                Some(crate::github::Hosting::new(&config_github, &state.root)?)
+                Some(crate::github::Hosting::new(
+                    &config_github,
+                    &state.root,
+                    config_net_timeout,
+                )?)
             } else {
                 None
             },
@@ -3731,13 +3736,25 @@ impl<'a> Runner<'a> {
                 };
                 let now = self.current_base()?;
                 if let Err(error) = pushed {
-                    if now != candidate.parent {
+                    if now == candidate.tip {
+                        // The remote took the push and only the report of it failed (a
+                        // dropped connection, a timeout after the update): it landed.
+                        self.event(
+                            "push",
+                            &format!(
+                                "{}: {error}; the base is the pushed tip {}, so it landed",
+                                list(&candidate.prs),
+                                short(&now)
+                            ),
+                        );
+                    } else if now != candidate.parent {
                         return Ok(BatchOutcome::BaseMoved(candidate.prs.clone()));
+                    } else {
+                        return Ok(BatchOutcome::Stop(
+                            format!("push failed: {error}"),
+                            candidate.prs.clone(),
+                        ));
                     }
-                    return Ok(BatchOutcome::Stop(
-                        format!("push failed: {error}"),
-                        candidate.prs.clone(),
-                    ));
                 }
                 if now != candidate.tip {
                     return Ok(BatchOutcome::Stop(

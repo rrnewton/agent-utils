@@ -152,6 +152,8 @@ pub struct Hosting {
     pub config: GitHubConfig,
     /// Budget.
     pub budget: Budget,
+    /// How long one `gh` call may run before its process group is killed and it fails.
+    pub timeout: std::time::Duration,
 }
 
 /// One pull request as the ready source reports it.
@@ -355,8 +357,12 @@ impl ListedPr {
 
 impl Hosting {
     /// A client for `config`, charging the budget file under `state_root` unless the
-    /// configuration names a shared one.
-    pub fn new(config: &GitHubConfig, state_root: &Path) -> Result<Self, String> {
+    /// configuration names a shared one; each call is killed and fails after `timeout`.
+    pub fn new(
+        config: &GitHubConfig,
+        state_root: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<Self, String> {
         if config.repo.is_empty() {
             return Err("github.repo (owner/name) is not configured".to_owned());
         }
@@ -373,6 +379,7 @@ impl Hosting {
         Ok(Self {
             config: config.clone(),
             budget: Budget { path, max_per_hour },
+            timeout,
         })
     }
 
@@ -380,11 +387,9 @@ impl Hosting {
         self.budget.charge(cost)?;
         let fleet_env = std::env::var(FLEET_REAL_GH_ENV).ok();
         let program: Vec<String> = resolve_gh_command(&self.config.gh, fleet_env.as_deref());
-        let output = Command::new(&program[0])
-            .args(&program[1..])
-            .args(args)
-            .output()
-            .map_err(|error| format!("cannot run {}: {error}", program.join(" ")))?;
+        let mut command = Command::new(&program[0]);
+        command.args(&program[1..]).args(args);
+        let output = crate::bounded::output_within(command, self.timeout, &program.join(" "))?;
         if !output.status.success() {
             return Err(format!(
                 "{} {} failed: {}",

@@ -233,7 +233,11 @@ fn hosting_for(
 ) -> Result<Option<Hosting>, String> {
     Ok(match source {
         ReadySource::File(_) if !config.land.close_prs => None,
-        _ => Some(Hosting::new(&config.github, &state.root)?),
+        _ => Some(Hosting::new(
+            &config.github,
+            &state.root,
+            config.net_timeout(),
+        )?),
     })
 }
 
@@ -250,7 +254,7 @@ pub fn list(
     let entries = match source {
         ReadySource::File(path) => entries_from_file(path)?,
         ReadySource::Label(_) | ReadySource::AllOpen => {
-            let hosting = Hosting::new(&config.github, &state.root)?;
+            let hosting = Hosting::new(&config.github, &state.root, config.net_timeout())?;
             let label = match source {
                 ReadySource::Label(label) => Some(label.as_str()),
                 _ => None,
@@ -517,7 +521,7 @@ fn closed_dir(state: &State) -> PathBuf {
 /// budget, so this takes no writer lock: each close is noted under `<state>/closed/` for
 /// [`record_closed`], and a change noted there is not closed again.
 pub fn close_postponed(state: &State, config: &Config) -> Result<(), String> {
-    let hosting = Hosting::new(&config.github, &state.root)?;
+    let hosting = Hosting::new(&config.github, &state.root, config.net_timeout())?;
     for item in state.items()? {
         if item.status != ItemStatus::Landed || !item.close_pending {
             continue;

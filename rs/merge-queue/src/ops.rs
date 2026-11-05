@@ -25,6 +25,7 @@ pub fn repo(state: &State, config: &Config) -> Result<Git, String> {
     let mut git = Git::new(&config.repo);
     git.net_wrapper = config.net_wrapper.clone();
     git.anonymous_fetch = config.github.anonymous_fetch;
+    git.net_timeout = config.net_timeout();
     if !config.identity.name.is_empty() && !config.identity.email.is_empty() {
         git.identity = Some((config.identity.name.clone(), config.identity.email.clone()));
     }
@@ -79,7 +80,12 @@ pub fn refresh(
     args.push(&config.remote);
     args.push(&base_spec);
     args.extend(head_specs.iter().map(String::as_str));
-    if git.run_net(&args).is_err() {
+    if let Err(error) = git.run_net(&args) {
+        // A hung transport is not a missing head: fetching one ref at a time would only wait
+        // again, once per ref.
+        if crate::bounded::is_timeout(&error) {
+            return Err(error);
+        }
         // One missing head fails the whole fetch; retry one ref at a time so the rest resolve.
         git.run_net(&[
             "fetch",

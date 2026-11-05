@@ -69,6 +69,9 @@ pub struct Git {
     /// Fetch without credentials: credential helpers are disabled and prompting is off for
     /// `fetch`, so a public repository costs no credential use.
     pub anonymous_fetch: bool,
+    /// How long a network command ([`Git::run_net`]) may run before its process group is
+    /// killed and it fails.
+    pub net_timeout: std::time::Duration,
 }
 
 impl Git {
@@ -80,6 +83,7 @@ impl Git {
             settings: Vec::new(),
             identity: None,
             anonymous_fetch: false,
+            net_timeout: crate::bounded::NET_TIMEOUT,
         }
     }
 
@@ -131,26 +135,36 @@ impl Git {
         settings
     }
 
-    /// Run a network git command through the configured wrapper.
+    /// Run a network git command through the configured wrapper, killed and failed after
+    /// [`Git::net_timeout`].
     pub fn run_net(&self, args: &[&str]) -> Result<String, String> {
-        if self.net_wrapper.is_empty() {
-            return self.run(args);
+        let (command, what) = if self.net_wrapper.is_empty() {
+            (self.command(args), format!("git {}", args.join(" ")))
+        } else {
+            let mut command = Command::new(&self.net_wrapper[0]);
+            command
+                .args(&self.net_wrapper[1..])
+                .arg("git")
+                .arg("-C")
+                .arg(&self.dir);
+            for setting in self.settings_for(args) {
+                command.arg("-c").arg(setting);
+            }
+            if self.anonymous_fetch && args.first() == Some(&"fetch") {
+                command.env("GIT_TERMINAL_PROMPT", "0");
+            }
+            command.args(args);
+            let what = format!("{} git {}", self.net_wrapper.join(" "), args.join(" "));
+            (command, what)
+        };
+        let output = crate::bounded::output_within(command, self.net_timeout, &what)?;
+        if !output.status.success() {
+            return Err(format!(
+                "{what} failed ({}): {}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
-        let mut command = Command::new(&self.net_wrapper[0]);
-        command
-            .args(&self.net_wrapper[1..])
-            .arg("git")
-            .arg("-C")
-            .arg(&self.dir);
-        for setting in self.settings_for(args) {
-            command.arg("-c").arg(setting);
-        }
-        if self.anonymous_fetch && args.first() == Some(&"fetch") {
-            command.env("GIT_TERMINAL_PROMPT", "0");
-        }
-        command.args(args);
-        let what = format!("{} git {}", self.net_wrapper.join(" "), args.join(" "));
-        let output = self.output(command, &what, &[0])?;
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 

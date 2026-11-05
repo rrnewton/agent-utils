@@ -1119,9 +1119,10 @@ impl LabelSync {
                     report.closed = crate::sync::record_closed(&state, &lock)?;
                 }
             }
-            report.api_remaining = crate::github::Hosting::new(&config.github, &state.root)
-                .ok()
-                .map(|hosting| hosting.budget.remaining());
+            report.api_remaining =
+                crate::github::Hosting::new(&config.github, &state.root, config.net_timeout())
+                    .ok()
+                    .map(|hosting| hosting.budget.remaining());
             Ok(report)
         });
         Self {

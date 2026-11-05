@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bench;
+pub mod bounded;
 pub mod build_info;
 pub mod cli;
 pub mod decisions;

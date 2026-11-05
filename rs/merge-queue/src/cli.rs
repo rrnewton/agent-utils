@@ -480,6 +480,10 @@ enum Command {
         /// Repeat for multiple words.
         #[arg(long, value_name = "WORD", allow_hyphen_values = true)]
         net_wrapper: Vec<String>,
+        /// Seconds one network command (`git fetch`, `ls-remote`, `push`, a `gh` call) may run
+        /// before it is killed and fails; 0 means 300.
+        #[arg(long, default_value_t = 0, value_name = "SECS")]
+        net_timeout_secs: u64,
         /// Validator kind: `command` (shell template with a JSON-lines results file) or `dagrun`.
         #[arg(long, default_value = "")]
         validator: String,
@@ -1183,6 +1187,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             recount_pins,
             close_prs,
             net_wrapper,
+            net_timeout_secs,
             validator,
             validator_run,
             select,
@@ -1231,6 +1236,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 remote,
                 base,
                 net_wrapper,
+                net_timeout_secs,
                 combine,
                 max_batch: max_batch.max(1),
                 depth: depth.max(1),

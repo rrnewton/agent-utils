@@ -121,6 +121,7 @@ This command creates the state directory and writes `config.json`.
 | `--agentctl WORD` | `agentctl` | Command (and leading arguments) the `serve` daemon runs instead of `agentctl` for state-change notifications. Repeatable. |
 | `--agentctl-registry PATH` | none | agentctl registry the notifications address: sends run `<command> --registry PATH send ...`. Stored absolute as `notify.registry`. Without it agentctl uses `.agentctl` in the daemon's working directory, which for a daemon started in a bare queue repository is no registry, so every send fails. |
 | `--net-wrapper WORD` | none | A command prefix for network Git operations, for example `--net-wrapper with-proxy`. Repeat it for a prefix of several words. |
+| `--net-timeout-secs SECS` | `0` (300) | How long one network command (`git fetch`, `ls-remote`, `push`, a `gh` call) may run before its process group is killed and it fails (see "Network commands are bounded"). |
 | `--validator KIND` | empty | `command` or `dagrun` (see "Validators"). `run` refuses to start without one. |
 | `--validator-run CMD` | empty | For `command`: the shell template that runs a selection. |
 | `--select CMD` | empty | Shell command printing the selection policy's test IDs for the checkout's HEAD relative to `$MQ_BASE`. Empty: every validation runs the complete suite. |
@@ -782,6 +783,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `remote` | `origin` from `init` | The remote. Empty means local-only. |
 | `base` | `main` | The base branch. |
 | `net_wrapper` | `[]` | A command prefix for network Git. |
+| `net_timeout_secs` | `0` | Seconds one network command may run before it is killed and fails; `0` means 300. An older binary warns about the field and ignores it. |
 | `combine` | `rebase` | `rebase` or `merge`. |
 | `max_batch` | `4` | The maximum number of changes per batch. |
 | `depth` | `2` | The initial window and the culprit-search probe width. |
@@ -1440,6 +1442,16 @@ separate from the queue's own validation: it checks this repository's contract a
 binary, while the queue's per-batch validation uses the validator you configured at `init`.
 
 For public repositories, `--anonymous-fetch` keeps fetches from spending credential uses at all.
+
+**Network commands are bounded.** Every network command the queue runs (`git fetch`,
+`ls-remote` and `push`, through `--net-wrapper` when one is set, and every `gh` call) gets
+`net_timeout_secs` (default 300 seconds). Past that its whole process group is killed and the
+command fails with `... timed out after Ns (its process group was killed)`. A hung transport, or
+a credential helper waiting for budget, then costs a retry at the next cycle instead of holding
+a run, a landing or the daemon's loop. A planning fetch that times out is not retried one ref at
+a time, because a hung transport is not a missing head. A landing push that reports a failure
+while the base already is the pushed tip has landed: the remote took it and only the report was
+lost, and the run says so in a `push` event.
 
 ## Generated files
 

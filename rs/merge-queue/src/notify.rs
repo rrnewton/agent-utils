@@ -49,6 +49,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::bounded::kill_group;
 use crate::model::{now, Item, ItemStatus, NotifyDelivery};
 use crate::state::{Config, Lock, State};
 
@@ -183,21 +184,6 @@ pub struct Notifier {
     /// Deadline for one send; on expiry the send's process group is killed
     /// and the send is a failed attempt.
     pub timeout: Duration,
-}
-
-/// Kill a send's whole process group (it was spawned as a group leader),
-/// then the child itself, and reap it. `kill(1)` is used because this crate
-/// forbids `unsafe` and so cannot call `kill(2)` directly.
-fn kill_group(child: &mut std::process::Child) {
-    let group = format!("-{}", child.id());
-    let _ = Command::new("kill")
-        .args(["-KILL", "--", &group])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 impl Notifier {

@@ -135,6 +135,10 @@ fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 /// Default bound on deferrals, and on could-not-run receipts per donor job.
 pub const DEFAULT_RETRY_BOUND: u32 = 3;
 
@@ -680,6 +684,12 @@ pub struct Config {
     pub base: String,
     /// Command prefix for network Git operations.
     pub net_wrapper: Vec<String>,
+    /// Seconds one network command (`git fetch`, `ls-remote`, `push`, a `gh` call) may run
+    /// before its process group is killed and it fails (0 = 300). A hung transport, or a
+    /// credential helper waiting for budget, then costs a retry instead of holding the run,
+    /// the landing or the daemon's loop.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub net_timeout_secs: u64,
     /// How changes are combined onto a candidate.
     pub combine: CombineMode,
     /// Maximum changes per batch.
@@ -767,6 +777,7 @@ impl Default for Config {
             remote: String::new(),
             base: "main".to_owned(),
             net_wrapper: Vec::new(),
+            net_timeout_secs: 0,
             combine: CombineMode::Rebase,
             max_batch: DEFAULT_MAX_BATCH,
             depth: DEFAULT_DEPTH,
@@ -799,6 +810,15 @@ impl Config {
     /// Whether `path` is a site of a configured pin.
     pub fn pin_site(&self, path: &str) -> bool {
         self.pins.iter().any(|pin| pin.covers(path))
+    }
+
+    /// Resolved network-command timeout (a configured 0 means [`crate::bounded::NET_TIMEOUT`]).
+    pub fn net_timeout(&self) -> std::time::Duration {
+        if self.net_timeout_secs == 0 {
+            crate::bounded::NET_TIMEOUT
+        } else {
+            std::time::Duration::from_secs(self.net_timeout_secs)
+        }
     }
 
     /// Resolved planning-probe concurrency (a configured 0 means the default).
