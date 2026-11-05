@@ -12188,6 +12188,137 @@ def test_coordinator_aborts_an_ownerless_orphaned_create(tmp_path: Path) -> None
     assert reader.returncode == 0, reader.stderr
 
 
+def _interrupted_create_with_populated_submodules(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path]:
+    """An interrupted create whose hooks are recorded complete, with submodules populated.
+
+    The caller then breaks one submodule checkout the way an interrupted
+    checkout does (worktree emptied, files staged as deleted, or authored
+    work written), so recovery meets that state at publication time.
+    """
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    target = checkout(project)
+    git(
+        target,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    )
+    journal = create_journal_path(project)
+    config = wrkslots._load_config(str(project), "testhost")
+    raw = wrkslots._as_mapping(
+        json.loads(journal.read_text(encoding="utf-8")), "test create journal"
+    )
+    changed = dict(raw)
+    changed["hook_progress"] = 1
+    wrkslots._write_journal(config, changed, journal_path=journal)
+    return project, journal, target / "component" / "leaf"
+
+
+def test_ownerless_orphaned_create_recovers_forward_when_hooks_complete(
+    tmp_path: Path,
+) -> None:
+    # #885: hooks are 1/1 done, so plain recovery publishes the row
+    # instead of aborting the create.
+    project, journal = _orphaned_ownerless_create(tmp_path)
+
+    recovered = command(
+        project, "recover", "--coordinator-pid", str(os.getpid()), "--slot", "slot01"
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert len(active_slots(project)) == 1
+    assert checkout(project).is_dir()
+    assert not journal.exists()
+
+
+def test_abort_create_removes_a_clean_initialized_submodule(tmp_path: Path) -> None:
+    # #885: an initialized, verified-clean submodule no longer blocks a
+    # supported abort; the worktree is removed including submodules.
+    project, journal, leaf = _interrupted_create_with_populated_submodules(tmp_path)
+    target = checkout(project)
+    assert (leaf / "leaf.txt").is_file()
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode == 0, aborted.stderr
+    assert active_slots(project) == []
+    assert not journal.exists()
+    assert not target.exists()
+    repository = project / "repo"
+    assert str(target) not in git(repository, "worktree", "list", "--porcelain").stdout
+
+
+def test_exact_create_recovers_before_a_validation_batch_seal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #885: a validate-batch seal and a disjoint create journal must not
+    # deadlock recover: the exact create named by --slot goes first.
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("old-validation",))
+    stub_validate_batch_censuses(monkeypatch)
+    recovered_seals: list[object] = []
+    monkeypatch.setattr(
+        wrkslots,
+        "_recover_validate_batch_seal_journal",
+        lambda *_args, **_kwargs: recovered_seals.append(True),
+    )
+    interrupt_validate_batch(
+        project,
+        monkeypatch,
+        "after-validate-batch-seal-target",
+        ("old-validation",),
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    seal = wrkslots._validate_batch_seal_journal_path(config)
+    assert seal.is_file()
+    # An orphaned owner-less create for a disjoint agent slot in the
+    # same project.
+    interrupted = create(
+        project,
+        bind_owner=False,
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    journal = create_journal_path(project)
+    assert journal.is_file()
+
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--slot",
+            "slot01",
+            "--abort-create",
+        ]
+    )
+    assert aborted == 0
+    assert not journal.exists()
+    assert not checkout(project).exists()
+    assert recovered_seals
+
+
 def test_create_recovery_refuses_task_scope_that_does_not_match_owner(
     tmp_path: Path,
 ) -> None:
@@ -30250,7 +30381,6 @@ def test_abort_create_removes_clean_worktree_with_uninitialized_submodule(
         ("moved", "cannot abort changed checkout"),
         ("operation", "unfinished Git operation"),
         ("identity", "does not belong to repository"),
-        ("initialized-clean", "initialized submodule"),
         ("nested-dirty-hidden", "initialized submodule"),
         ("deinitialized-unique-commit", "non-directory entry"),
         ("deinitialized-unique-branch", "non-directory entry"),
@@ -30279,7 +30409,6 @@ def test_abort_create_empty_admin_prune_preserves_every_preflight_refusal(
         evidence = tree / "preserve.txt"
         evidence.write_text("preserve me\n", encoding="utf-8")
     elif mutation in {
-        "initialized-clean",
         "nested-dirty-hidden",
         "deinitialized-unique-commit",
         "deinitialized-unique-branch",
@@ -30366,8 +30495,6 @@ def test_abort_create_empty_admin_prune_preserves_every_preflight_refusal(
                 "--untracked-files=all",
                 "--ignored=matching",
             ).stdout
-        else:
-            assert mutation == "initialized-clean"
         assert (
             git(tree, "status", "--porcelain=v2", "--untracked-files=all").stdout
             == ""

@@ -1008,9 +1008,12 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # recover-absent-validate-rows share one owner predicate) is mapped.
     # The #879 agreement case (status and audit share one liveness
     # answer per row) is mapped.
-    assert len(all_tests) == 2141
+    # The three further #885 cases (forward recovery after completed
+    # hooks, an abort removing a clean initialized submodule, and an
+    # exact create recovering before a validation-batch seal) are mapped.
+    assert len(all_tests) == 2143
     assert len(ordinary) == 339
-    assert len(mapped) == 1802
+    assert len(mapped) == 1804
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

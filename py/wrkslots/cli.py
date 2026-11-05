@@ -44346,6 +44346,87 @@ def _prune_empty_submodule_administration(
         os.close(git_fd)
 
 
+def _verify_initialized_submodules_for_abort(vcs: _GitVcs, checkout: Path) -> bool:
+    """Verify initialized submodules hold nothing an abort would lose (#885).
+
+    Returns False when no submodule is initialized.  Each initialized
+    submodule must sit at its recorded gitlink with a clean status
+    (ignored files included), no unfinished operation, no stash, and no
+    local branch carrying commits outside its HEAD; anything else is
+    preserved for inspection, never removed.
+    """
+
+    declared = _declared_initialized_submodules(checkout)
+    if not declared:
+        return False
+    all_repositories = [checkout, *declared]
+    for repository in declared:
+        supers = [
+            candidate
+            for candidate in all_repositories
+            if candidate != repository and _path_is_within(repository, candidate)
+        ]
+        superproject = max(supers, key=lambda item: len(item.parts))
+        relative = repository.relative_to(superproject).as_posix()
+        indexed = vcs._run(
+            superproject, ["ls-files", "--stage", "-z", "--", relative]
+        ).stdout
+        gitlink: str | None = None
+        for entry in indexed.split("\x00"):
+            metadata, separator, _path = entry.partition("\t")
+            fields = metadata.split()
+            if separator and len(fields) == 3 and fields[0] == "160000":
+                gitlink = fields[1]
+        label = f"initialized submodule {repository.relative_to(checkout).as_posix()}"
+        if gitlink is None:
+            raise Refusal(
+                f"cannot abort checkout with {label} that its superproject "
+                "does not record as a gitlink; preserve it for inspection"
+            )
+        head = vcs.head(repository)
+        if head != gitlink:
+            raise Refusal(
+                f"cannot abort checkout with {label} at changed HEAD {head} "
+                f"(recorded gitlink {gitlink}); preserve it for inspection"
+            )
+        operation_paths = vcs.operation_paths(repository)
+        if operation_paths:
+            raise Refusal(
+                f"cannot abort checkout with {label} with an unfinished Git "
+                f"operation: {operation_paths[0]}"
+            )
+        vcs.assert_ordinary_history(repository)
+        vcs.assert_ordinary_index(repository)
+        status = vcs.status(repository, (), include_ignored=True)
+        if status:
+            first = status.splitlines()[0]
+            raise Refusal(
+                f"cannot abort checkout with {label} that is dirty ({first}); "
+                "preserve it for inspection"
+            )
+        stash = vcs._run(
+            repository, ["show-ref", "--verify", "--quiet", "refs/stash"], check=False
+        )
+        if stash.returncode == 0:
+            raise Refusal(
+                f"cannot abort checkout with {label} holding a stash; "
+                "preserve it for inspection"
+            )
+        branches = vcs._run(
+            repository,
+            ["for-each-ref", "--format=%(objectname)", "refs/heads"],
+        ).stdout
+        for branch_head in branches.splitlines():
+            branch_head = branch_head.strip()
+            if branch_head and not vcs.is_ancestor(repository, branch_head, head):
+                raise Refusal(
+                    f"cannot abort checkout with {label} whose local branch "
+                    f"carries {branch_head} outside its HEAD; preserve it "
+                    "for inspection"
+                )
+    return True
+
+
 def _abort_create(
     config: Config,
     journal_path: Path,
@@ -44381,6 +44462,7 @@ def _abort_create(
             Checkout | None,
             tuple[CacheDirectory, ...],
             _EmptySubmoduleAdministration | None,
+            bool,
         ]
     ] = []
     for item in plan:
@@ -44429,8 +44511,13 @@ def _abort_create(
                 )
             present = True
             caches = _cache_directories_for_checkout(config, checkout)
-            submodule_administration = _empty_submodule_administration(
+            verified_initialized = _verify_initialized_submodules_for_abort(
                 vcs, destination
+            )
+            submodule_administration = (
+                None
+                if verified_initialized
+                else _empty_submodule_administration(vcs, destination)
             )
         elif destination.absolute() in vcs.listed_worktrees(repository):
             raise Refusal(
@@ -44441,6 +44528,7 @@ def _abort_create(
             checkout = None
             caches = ()
             submodule_administration = None
+            verified_initialized = False
         if vcs.branch_exists(repository, item.branch):
             branch_head = vcs.verify_ref(
                 repository, f"refs/heads/{item.branch}", "created branch"
@@ -44460,6 +44548,7 @@ def _abort_create(
                 checkout,
                 caches,
                 submodule_administration,
+                verified_initialized,
             )
         )
     if slot_path.exists():
@@ -44473,6 +44562,7 @@ def _abort_create(
         checkout,
         caches,
         submodule_administration,
+        verified_initialized,
     ) in preflight:
         if present:
             assert checkout is not None
@@ -44501,21 +44591,27 @@ def _abort_create(
                     f"cannot abort changed checkout {item.name}: source state is dirty "
                     f"({first}); preserve it for inspection"
                 )
-            current_submodule_administration = _empty_submodule_administration(
-                vcs, destination
-            )
-            if current_submodule_administration != submodule_administration:
-                raise Refusal(
-                    "submodule administration changed between abort preflight and "
-                    "removal"
+            if verified_initialized:
+                # Recheck the submodules still hold nothing to lose, then
+                # remove the worktree including them (#885).
+                _verify_initialized_submodules_for_abort(vcs, destination)
+                current_submodule_administration = None
+            else:
+                current_submodule_administration = _empty_submodule_administration(
+                    vcs, destination
                 )
+                if current_submodule_administration != submodule_administration:
+                    raise Refusal(
+                        "submodule administration changed between abort preflight and "
+                        "removal"
+                    )
             for cache in caches:
                 _remove_cache_directory(config, cache)
             if current_submodule_administration is not None:
                 _prune_empty_submodule_administration(
                     vcs, destination, current_submodule_administration
                 )
-            vcs.remove_worktree(repository, destination)
+            vcs.remove_worktree(repository, destination, force=verified_initialized)
             _fsync_directory(slot_path.parent)
     for (
         item,
@@ -44526,6 +44622,7 @@ def _abort_create(
         _checkout,
         _caches,
         _submodule_administration,
+        _verified_initialized,
     ) in preflight:
         vcs.delete_branch_at(repository, item.branch, expected_head)
     if slot_path.exists():
@@ -62550,6 +62647,7 @@ def _cmd_recover(
         else _LiveUseRecheckBudget()
     )
     processes = _RecoveryProcesses(coordinator, runner, handoff_writer, proof_fd)
+    exact_create_before_seal = False
     with _mutation_locks(config, args.wait_lock):
         _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
         recovered_partial = _recover_partial_updates(config, args.discard_partial)
@@ -62697,15 +62795,72 @@ def _cmd_recover(
             seal_journals = _validate_batch_seal_journals(config)
             selected_slot = getattr(args, "slot", None)
             selected_path: Path | None
+            exact_create_before_seal = False
             if seal_journals:
                 loaded_seal = _load_validate_batch_seal_journal(config)
                 assert loaded_seal is not None
                 _seal_path, _seal_raw, sealed_targets = loaded_seal
-                paired_finish = _validate_batch_seal_paired_finish(
-                    config,
-                    sealed_targets,
+                # #885: an exact-slot create journal that overlaps no seal
+                # target is recovered before the seal, whose pairing would
+                # otherwise classify (and possibly refuse on) that journal
+                # before its own recovery can run -- each blocks the other.
+                exact_create_path: Path | None = None
+                exact_create_before_seal = False
+                if selected_slot is not None:
+                    candidate = _journal_path_for_slot(config, selected_slot)
+                    if candidate in _outstanding_journals(config):
+                        _candidate, candidate_raw = _load_journal(
+                            config, selected_path=candidate
+                        )
+                        if candidate_raw.get("kind") == "create":
+                            try:
+                                create_paths = [
+                                    _slot_directory(
+                                        config,
+                                        selected_slot,
+                                        _as_str(
+                                            candidate_raw.get("slot_type", "agent"),
+                                            "create journal.slot_type",
+                                        ),
+                                    )
+                                ]
+                                create_paths.extend(
+                                    _stored_path(
+                                        config,
+                                        _planned_from_obj(
+                                            item, "create journal.planned"
+                                        ).destination,
+                                        "create journal checkout destination",
+                                    )
+                                    for item in _as_list(
+                                        candidate_raw["planned"],
+                                        "create journal.planned",
+                                    )
+                                )
+                                sealed_paths = [
+                                    target.path
+                                    for _slot, _generation, target in sealed_targets
+                                ]
+                                if all(
+                                    not _path_is_within(create_path, sealed_path)
+                                    and not _path_is_within(sealed_path, create_path)
+                                    for create_path in create_paths
+                                    for sealed_path in sealed_paths
+                                ):
+                                    exact_create_path = candidate
+                            except (Refusal, StateError, KeyError, TypeError, ValueError):
+                                exact_create_path = None
+                paired_finish = (
+                    None
+                    if exact_create_path is not None
+                    else _validate_batch_seal_paired_finish(config, sealed_targets)
                 )
-                if paired_finish is None:
+                if exact_create_path is not None:
+                    # Recover the exact create first; the seal is still
+                    # recovered after its dispatch (this command's tail).
+                    selected_path = exact_create_path
+                    exact_create_before_seal = True
+                elif paired_finish is None:
                     sealed_slots = {slot for slot, _generation, _target in sealed_targets}
                     if selected_slot is not None and selected_slot not in sealed_slots:
                         raise Refusal(
@@ -62728,15 +62883,16 @@ def _cmd_recover(
                         recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
                     )
                     return 0
-                if selected_slot is not None and selected_slot != paired_finish.slot:
-                    raise Refusal(
-                        "a private validation finish must be recovered before the "
-                        f"unrelated mutation for slot {selected_slot!r}; rerun with "
-                        f"--slot {paired_finish.slot}"
+                elif paired_finish is not None:
+                    if selected_slot is not None and selected_slot != paired_finish.slot:
+                        raise Refusal(
+                            "a private validation finish must be recovered before the "
+                            f"unrelated mutation for slot {selected_slot!r}; rerun with "
+                            f"--slot {paired_finish.slot}"
+                        )
+                    selected_path = _journal_path_for_slot(
+                        config, paired_finish.slot
                     )
-                selected_path = _journal_path_for_slot(
-                    config, paired_finish.slot
-                )
             else:
                 selected_path = (
                     _journal_path_for_slot(config, selected_slot)
@@ -62806,7 +62962,7 @@ def _cmd_recover(
             )
         kind = kind_hint
         seal_journals = _validate_batch_seal_journals(config)
-        if seal_journals:
+        if seal_journals and not exact_create_before_seal:
             if kind != "finish":
                 raise StateError(
                     "validation-batch seal evidence coexists with a non-finish journal"
