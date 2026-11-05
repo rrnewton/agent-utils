@@ -86,6 +86,15 @@ pub struct Team {
     pub reviewed: Option<Value>,
 }
 
+/// One registered service on a host.
+#[derive(Debug, Clone)]
+pub struct ServiceEntry {
+    /// The systemd unit the sender process must be inside.
+    pub unit: String,
+    /// The team this service sends as, when it names one (#861).
+    pub team: Option<String>,
+}
+
 /// One host in `teams.json`.
 #[derive(Debug, Clone)]
 pub struct Host {
@@ -95,8 +104,8 @@ pub struct Host {
     pub routes: Vec<String>,
     /// Path of the `agent-teams` binary on that host.
     pub agent_teams: Option<String>,
-    /// Registered services on this host: name -> systemd unit.
-    pub services: BTreeMap<String, String>,
+    /// Registered services on this host: name -> entry.
+    pub services: BTreeMap<String, ServiceEntry>,
 }
 
 /// The parsed `teams.json`, keeping the raw value for rewrites.
@@ -158,7 +167,22 @@ pub fn parse_teams(raw: Value, path: &Path) -> DataResult<TeamsFile> {
             if let Some(svc) = host_obj.get("services").and_then(Value::as_object) {
                 for (svc_name, svc_value) in svc {
                     if let Some(unit) = svc_value.get("unit").and_then(Value::as_str) {
-                        services.insert(svc_name.clone(), unit.to_string());
+                        let team = svc_value.get("team").and_then(Value::as_str);
+                        if let Some(team_name) = team {
+                            if !valid_team_name(team_name) {
+                                warnings.push(format!(
+                                    "host {name}: service {svc_name} names invalid team {team_name:?}"
+                                ));
+                                continue;
+                            }
+                        }
+                        services.insert(
+                            svc_name.clone(),
+                            ServiceEntry {
+                                unit: unit.to_string(),
+                                team: team.map(str::to_string),
+                            },
+                        );
                     }
                 }
             }

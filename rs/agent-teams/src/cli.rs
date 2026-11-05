@@ -425,8 +425,16 @@ fn cmd_show(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                 .map(|p| format!(" agent-teams={p}"))
                 .unwrap_or_default()
         );
-        for (svc, unit) in &host.services {
-            println!("  service {svc}: unit {unit}");
+        for (svc, entry) in &host.services {
+            println!(
+                "  service {svc}: unit {}{}",
+                entry.unit,
+                entry
+                    .team
+                    .as_ref()
+                    .map(|team| format!(" team {team}"))
+                    .unwrap_or_default()
+            );
         }
     }
     for (name, team) in &teams.teams {
@@ -510,6 +518,16 @@ fn cmd_check(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         for route_name in &host.routes {
             if !routes.routes.contains_key(route_name) {
                 problems.push(format!("host {name}: route {route_name:?} is not defined"));
+            }
+        }
+        // A service that names its team (#861) must name a declared team.
+        for (svc, entry) in &host.services {
+            if let Some(team) = &entry.team {
+                if !teams.teams.contains_key(team) {
+                    problems.push(format!(
+                        "host {name}: service {svc} names team {team:?}, which teams.json does not declare"
+                    ));
+                }
             }
         }
         let remote = name != &globals.host;
@@ -1136,6 +1154,28 @@ fn cmd_init(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     Ok(0)
 }
 
+/// Which team a `--from-service` sender speaks for (#861): the service
+/// entry's own `team` wins, then `--from-team`, then the legacy fallback of
+/// the host's only declaration. With several declarations and no team named
+/// either way, None: the caller refuses rather than guess.
+fn service_team(
+    entry: &crate::model::ServiceEntry,
+    args: &[String],
+    declaration_teams: &[String],
+) -> Option<String> {
+    entry
+        .team
+        .clone()
+        .or_else(|| flag_value(args, "--from-team"))
+        .or_else(|| {
+            if declaration_teams.len() == 1 {
+                Some(declaration_teams[0].clone())
+            } else {
+                None
+            }
+        })
+}
+
 /// Prove the sender for `send`/`reply`: the root coordinator of a declared
 /// team on this host, or a registered service. Lieutenants are refused.
 fn prove_sender(
@@ -1145,7 +1185,7 @@ fn prove_sender(
 ) -> Result<(String, String, Declaration), DataError> {
     if let Some(service) = flag_value(args, "--from-service") {
         let host = teams.hosts.get(&globals.host);
-        let unit = host.and_then(|h| h.services.get(&service)).ok_or_else(|| {
+        let entry = host.and_then(|h| h.services.get(&service)).ok_or_else(|| {
             err(
                 "refused",
                 format!(
@@ -1154,6 +1194,7 @@ fn prove_sender(
                 ),
             )
         })?;
+        let unit = &entry.unit;
         // A worker refused as itself cannot retry as a service.
         for (_, _, declaration) in load_declarations(&globals.state).unwrap_or_default() {
             if let Some(registry) = declaration
@@ -1176,12 +1217,36 @@ fn prove_sender(
                 format!("refused: sender-not-service (this process is not inside unit {unit})"),
             ));
         }
+        // The service sends as its own team (#861), never as whichever
+        // declaration sorts first on this host.
         let declarations = load_declarations(&globals.state).unwrap_or_default();
+        let declaration_teams: Vec<String> = declarations
+            .iter()
+            .map(|(name, _, _)| name.clone())
+            .collect();
+        let team = service_team(entry, args, &declaration_teams).ok_or_else(|| {
+            err(
+                "refused",
+                format!(
+                    "refused: sender-team-unknown (service {service:?} must name its team: set \
+                     \"team\" in its services entry in teams.json or pass --from-team)"
+                ),
+            )
+        })?;
         let own = declarations
             .into_iter()
-            .next()
+            .find(|(name, _, _)| name == &team)
             .map(|(_, _, d)| d)
-            .ok_or_else(|| err("refused", "refused: no declaration on this host"))?;
+            .ok_or_else(|| {
+                err(
+                    "refused",
+                    format!(
+                        "refused: sender-team-undeclared (no declaration for team {team:?} on \
+                         this host; declare it under the teams state dir or point the service \
+                         at a declared team)"
+                    ),
+                )
+            })?;
         return Ok((
             format!("service:{service}"),
             "service-unit".to_string(),
@@ -3497,6 +3562,47 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_team_entry_wins_over_flag_and_first_declaration() {
+        let entry = crate::model::ServiceEntry {
+            unit: "nightly.service".to_string(),
+            team: Some("team-b".to_string()),
+        };
+        let declarations = vec!["team-a".to_string(), "team-b".to_string()];
+        // Several declarations: the entry's team, not the first sorted.
+        assert_eq!(
+            service_team(&entry, &[], &declarations).as_deref(),
+            Some("team-b")
+        );
+        // The entry wins over --from-team too.
+        let args = vec!["--from-team".to_string(), "team-a".to_string()];
+        assert_eq!(
+            service_team(&entry, &args, &declarations).as_deref(),
+            Some("team-b")
+        );
+    }
+
+    #[test]
+    fn service_team_flag_then_single_declaration_legacy() {
+        let entry = crate::model::ServiceEntry {
+            unit: "nightly.service".to_string(),
+            team: None,
+        };
+        let declarations = vec!["team-a".to_string(), "team-b".to_string()];
+        let args = vec!["--from-team".to_string(), "team-b".to_string()];
+        assert_eq!(
+            service_team(&entry, &args, &declarations).as_deref(),
+            Some("team-b")
+        );
+        // No team named anywhere and several declarations: refuse to guess.
+        assert_eq!(service_team(&entry, &[], &declarations), None);
+        // The single-declaration legacy case is unchanged.
+        assert_eq!(
+            service_team(&entry, &[], &["only-team".to_string()]).as_deref(),
+            Some("only-team")
+        );
+    }
 
     #[test]
     fn synced_state_warning_flags_config_tree_only() {

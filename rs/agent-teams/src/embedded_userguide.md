@@ -167,7 +167,12 @@ explicit rule.
   - `--private` keeps the body off routes that expose it.
   - `--from-service NAME` needs NAME registered for this host with a systemd
     unit and this process inside that unit; it is refused when an agent
-    harness is in the ancestry.
+    harness is in the ancestry. The service sends as its own team: the
+    entry's `"team"` (`services.NAME = {"unit": "...", "team": "TEAM"}`)
+    wins, then `--from-team`; with neither, a host declaring exactly one
+    team keeps the legacy behaviour, and a host declaring several refuses
+    rather than attribute the message to the wrong team. The named team
+    must have a declaration on this host, and its `may_send_to` applies.
   - Proof is taken once, at the outbox write, in the sender's process tree:
     the ancestry must contain the designated coordinator's harness process.
 - `reply ID ...` — replies to the sender's team; key defaults to
