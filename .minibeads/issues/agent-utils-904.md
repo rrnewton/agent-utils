@@ -3,7 +3,7 @@ title: 'agent-teams-delivery-outcome: a sender sees each message''s final delive
 status: open
 priority: 1
 issue_type: feature
-assignee: cl-start
+assignee: '014: mu-loss'
 created_at: 2026-11-05T17:43:33.971221827+00:00
 updated_at: 2026-11-05T17:43:33.971221827+00:00
 ---
@@ -26,4 +26,4 @@ An agent-teams sender sees "accepted" when its message is queued, and nothing af
 
 # Notes
 
-Requested by the lead on 2026-11-05 at 12:43 PM ET (P1, together with #903), after the lost lead messages of that morning. Assigned to cl-start after #896 and #903.
+Requested by the lead on 2026-11-05 at 12:43 PM ET (P1, together with #903), after the lost lead messages of that morning. Moved to the lead team's Muse lane mu-loss (014) on 2026-11-05 at 12:44 PM ET, the lead's call.

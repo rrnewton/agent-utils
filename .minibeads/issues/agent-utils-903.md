@@ -3,7 +3,7 @@ title: 'queue-failed-digest: an agent is told about queued prompts that may not 
 status: open
 priority: 1
 issue_type: feature
-assignee: cl-start
+assignee: '014: mu-loss'
 created_at: 2026-11-05T17:43:33.966192443+00:00
 updated_at: 2026-11-05T17:43:33.966192443+00:00
 ---
@@ -27,4 +27,4 @@ When a queued prompt ends in an agent's `queue/failed/` (outcome `possibly_submi
 
 # Notes
 
-Requested by the lead on 2026-11-05 at 12:43 PM ET (P1, together with #904), after the coordinator's audit of failed/ found the lost messages (#901, #902 and #896's reply-154 spec were recovered from it). Composer-evidence false failures (a prompt typed but with no visible submission proof) are #896's job: positive evidence marks them delivered. Assigned to cl-start after #896.
+Requested by the lead on 2026-11-05 at 12:43 PM ET (P1, together with #904), after the coordinator's audit of failed/ found the lost messages (#901, #902 and #896's reply-154 spec were recovered from it). Composer-evidence false failures (a prompt typed but with no visible submission proof) are #896's job: positive evidence marks them delivered. Moved to the lead team's Muse lane mu-loss (014) on 2026-11-05 at 12:44 PM ET, the lead's call.
