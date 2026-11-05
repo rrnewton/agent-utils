@@ -299,3 +299,11 @@ body {
   display: none !important;
 }
 
+/* `#889 voice-page-copy-link-key`. Whether the page runs as the installed app, with no address bar: said here, where
+   the display mode is known, for the list of keys, which names Ctrl+Shift+L (Cmd+Shift+L) only where a browser tab's
+   address bar can take Ctrl+L (Cmd+L) first. */
+@media (display-mode: standalone) {
+  :root {
+    --app-standalone: 1;
+  }
+}

@@ -4,7 +4,7 @@
 // l, and pressing one of the row's own buttons. Which row the keys act on is selectionkeys.ts's (`rowForAct`);
 // every act a press on a row or card performs is the page's.
 
-import { answersEnter, childByClass, focusMinimally, nodeWithin } from "../dom/index.ts";
+import { answersEnter, childByClass, focusMinimally, isTextField, nodeWithin } from "../dom/index.ts";
 
 /** The row a key acts on: its pane and row, and whether the key was taken even with no row to act on. */
 export interface ActedRow<Pane> {
@@ -90,6 +90,8 @@ export interface RowKeysDependencies<Pane, Message> {
   openRowMenu(): OpenRowMenu | null;
   /** Copy `url`, `message`'s address, saying so in its service's name; its failure reported without ending a call. */
   copyUpstreamLink(url: string, message: Message): void;
+  /** `#889 voice-page-copy-link-key`. Copy `message`'s vibe-talk link, saying so, as the ⋯ menu's item does. */
+  copyDeepLink(message: Message): void;
 }
 
 /** The keys. Each returns whether it did anything, as a binding of the keymap does, but `pressRowButton` and `leaveThread`. */
@@ -141,6 +143,13 @@ export interface RowKeys {
    * like any unbound key rather than swallowed in silence.
    */
   copyLinkFromKeyboard(target: HTMLElement): boolean;
+  /**
+   * `#889 voice-page-copy-link-key`. Ctrl+L (Cmd+L): copy the selected message's vibe-talk link, the address
+   * that opens this app on it, as the ⋯ menu's "Copy vibe-talk link" does. Never in a text field, where the
+   * chord is the field's and the browser's (its address bar); with no message to act on, left to the browser, unless
+   * the press moved the selection instead (`rowForAct`'s `took`).
+   */
+  deepLinkFromKeyboard(target: HTMLElement): boolean;
 }
 
 export function createRowKeys<Pane, Message>(deps: RowKeysDependencies<Pane, Message>): RowKeys {
@@ -288,6 +297,19 @@ export function createRowKeys<Pane, Message>(deps: RowKeysDependencies<Pane, Mes
       const menu = deps.openRowMenu();
       if (menu && nodeWithin(row, menu.root)) menu.close();
       deps.copyUpstreamLink(url, message);
+      return true;
+    },
+    deepLinkFromKeyboard(target) {
+      if (isTextField(target)) return false;
+      // A press that only moved the selection (it was off screen) is taken, as the other row keys' are, rather than
+      // also handed to the browser's address bar; the next press copies.
+      const { row, took } = deps.rowForAct(target);
+      if (!row) return took;
+      const message = deps.firstMessage(row);
+      if (!message) return false;
+      const menu = deps.openRowMenu();
+      if (menu && nodeWithin(row, menu.root)) menu.close();
+      deps.copyDeepLink(message);
       return true;
     },
   };

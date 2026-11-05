@@ -1159,6 +1159,7 @@ test("`#624 voice-page-modularity`: the row keys open, enter and leave threads, 
     upstreamUrlOf: () => state.url,
     openRowMenu: () => state.menu,
     copyUpstreamLink: (url, message) => log.push(`copy ${url} ${message.id}`),
+    copyDeepLink: (message) => log.push(`copy deep ${message.id}`),
   });
   const run = (act) => { log.length = 0; return [act(), ...log]; };
   const was = globalThis.document;
@@ -1240,6 +1241,19 @@ test("`#624 voice-page-modularity`: the row keys open, enter and leave threads, 
     assert.deepStrictEqual(run(() => keys.copyLinkFromKeyboard({})), [true, "copy https://chat/1 m1"], "l closed another row's menu");
     state.url = null;
     assert.deepStrictEqual(run(() => keys.copyLinkFromKeyboard({})), [false], "l on a row with no address was taken");
+    // `#889 voice-page-copy-link-key`: Cmd+L copies the vibe-talk link, address in the service or none, and shuts
+    // the row's own menu as l does; never from a box being typed in.
+    assert.deepStrictEqual(run(() => keys.deepLinkFromKeyboard({})), [true, "copy deep m1"], "Cmd+L on a row with no service address copied nothing");
+    state.menu = { root: fold, close: () => log.push("menu closed") };
+    assert.deepStrictEqual(run(() => keys.deepLinkFromKeyboard({})), [true, "menu closed", "copy deep m1"], "Cmd+L left the row's own menu open");
+    assert.deepStrictEqual(run(() => keys.deepLinkFromKeyboard({ tagName: "TEXTAREA" })), [false], "Cmd+L was taken in a box being typed in");
+    // A press that only moved the selection onto the screen is taken, not also given to the address bar.
+    const actedWas = state.acted;
+    state.acted = { pane: null, row: null, took: true };
+    assert.deepStrictEqual(run(() => keys.deepLinkFromKeyboard({})), [true], "Cmd+L that moved the selection went to the browser too");
+    state.acted = { pane: null, row: null, took: false };
+    assert.deepStrictEqual(run(() => keys.deepLinkFromKeyboard({})), [false], "Cmd+L with no row was taken");
+    state.acted = actedWas;
   } finally {
     globalThis.document = was;
   }
@@ -1951,6 +1965,19 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
     [["undoFromKeyboard did", "undoFromKeyboard"], ["undoFromKeyboard did", "undoFromKeyboard"], [false]], "Ctrl+Z in a box was not left to the box");
   assert.deepStrictEqual([press("c", { ctrlKey: true }, target, { mod: true }), press("c")],
     [["copyChordFromKeyboard did", "copyChordFromKeyboard"], ["copyFromKeyboard did", "copyFromKeyboard"]]);
+  // `#889 voice-page-copy-link-key`. Ctrl+L (Cmd+L) and Ctrl+Shift+L (Cmd+Shift+L) copy the vibe-talk link; bare l the service's.
+  assert.deepStrictEqual([press("l", { metaKey: true }, target, { mod: true }), press("l", { metaKey: true, shiftKey: true }, target, { mod: true, shift: true }),
+    press("l")], [["deepLinkFromKeyboard did", "deepLinkFromKeyboard [object Object]"], ["deepLinkFromKeyboard did", "deepLinkFromKeyboard [object Object]"],
+    ["copyLinkFromKeyboard did", "copyLinkFromKeyboard [object Object]"]]);
+  const deepBinding = keymap.find((binding) => binding.rowControls && binding.rowControls.includes("row-copy-deep-link-button"));
+  assert.equal(deepBinding.repeats, true, "a held Cmd+L's repeats would go to the address bar");
+  const deepWords = () => deepBinding.does();
+  answers.standalone = false;
+  assert.match(deepWords(), /^Copy its vibe-talk link: .*In a browser tab, where Cmd\+L can go to the address bar, Cmd\+Shift\+L does the same$/,
+    "in a browser tab the list does not name the chord the address bar cannot take");
+  answers.standalone = true;
+  assert.doesNotMatch(deepWords(), /browser tab/, "the installed app's list names a fallback it does not need");
+  delete answers.standalone;
   assert.deepStrictEqual(press("p", {}, target, { shift: false }).slice(1), ["pressRowButton [object Object] row-pin-button"]);
   assert.equal(press("p")[0], true, "the pin key did not say it took the key when its button was pressed");
   answers.pressRowButton = null;
@@ -1990,14 +2017,15 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
   for (const [name] of calls.splice(0)) reached.add(name);
   const expected = ["bookmarkFromKeyboard", "bookmarkJumpFromKeyboard", "collapsedLinesFromKeyboard", "columnFromKeyboard",
     "columnsFromKeyboard", "composeFromKeyboard", "copyChordFromKeyboard", "copyFromKeyboard", "copyLinkFromKeyboard",
-    "detailsFromKeyboard", "doneFromKeyboard", "filterFromKeyboard", "foldOneFromKeyboard", "foldStepFromKeyboard", "jumpList",
+    "deepLinkFromKeyboard", "detailsFromKeyboard", "doneFromKeyboard", "filterFromKeyboard", "foldOneFromKeyboard", "foldStepFromKeyboard", "jumpList",
     "keyContext", "keysFromKeyboard", "listEdge", "mainRowsFromKeyboard", "menuFromKeyboard", "newestFromComposer",
     "nextUnreadFromKeyboard", "onEscape", "openFromKeyboard", "orderFromKeyboard", "packFromKeyboard", "pickChannel",
     "placeFromKeyboard", "pressRowButton", "readCollapseFromKeyboard", "readFromKeyboard", "readModeFromKeyboard",
     "replyFromKeyboard", "searchFromAnywhere", "searchFromKeyboard", "settingsFromKeyboard", "stepChannel", "stepFromKeyboard",
     "threadFromKeyboard", "threadOutFromKeyboard", "threadStripFromKeyboard", "undoFromKeyboard", "unpackFromKeyboard",
     "viewFromKeyboard", "voiceFromKeyboard", "writeFromKeyboard"];
-  const wording = ["chatServiceName", "manyChatServices", "maxCollapsedLines", "minCollapsedLines", "modKeyName", "threadOrderWords"];
+  const wording = ["chatServiceName", "manyChatServices", "maxCollapsedLines", "minCollapsedLines", "modKeyName", "standalone",
+    "threadOrderWords"];
   assert.deepStrictEqual([...reached].sort(), [...expected, ...wording].sort(), "an act is reached by no key, or a key asks for one the page does not give");
   // What the list says asks the page for the reader's words.
   assert.ok(words.includes("Cmd+[ goes back") && words.includes("Copy its link in Chat:") && words.includes("in turn: Newest, Oldest.") &&

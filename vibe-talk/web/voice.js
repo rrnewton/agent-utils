@@ -6735,10 +6735,11 @@ const rowKeys = createRowKeys({
   upstreamUrlOf: (message) => upstreamUrlOf(message),
   openRowMenu: () => rowMenus.open(),
   copyUpstreamLink: (url, message) => guardQuietly(() => copyUpstreamLink(url, upstreamServiceName(message)))(),
+  copyDeepLink: (message) => guardQuietly(() => copyDeepLink(message))(),
 });
 const {
   openFromKeyboard, pressRowButton, threadFromKeyboard, leaveThread, threadOutFromKeyboard, columnFromKeyboard,
-  replyFromKeyboard, menuFromKeyboard, readFromKeyboard, detailsFromKeyboard, copyLinkFromKeyboard,
+  replyFromKeyboard, menuFromKeyboard, readFromKeyboard, detailsFromKeyboard, copyLinkFromKeyboard, deepLinkFromKeyboard,
 } = rowKeys;
 
 /** The text the reader has selected on the page, or "". */
@@ -6954,6 +6955,11 @@ const KEYMAP = createKeymap({
   readFromKeyboard: (target) => readFromKeyboard(target),
   detailsFromKeyboard: (target) => detailsFromKeyboard(target),
   copyLinkFromKeyboard: (target) => copyLinkFromKeyboard(target),
+  deepLinkFromKeyboard: (target) => deepLinkFromKeyboard(target),
+  // `#889 voice-page-copy-link-key`. The installed app, where Ctrl+L (Cmd+L) has no address bar to go to: as the
+  // stylesheet says it (`--app-standalone`, styles/voice/00-frame.css), which decides the display mode, not this script.
+  standalone: () => typeof window.getComputedStyle === "function" &&
+    window.getComputedStyle(document.documentElement).getPropertyValue("--app-standalone").trim() === "1",
   copyChordFromKeyboard: () => highlightCopy.copyChordFromKeyboard(),
   copyFromKeyboard: () => highlightCopy.copyFromKeyboard(),
   nextUnreadFromKeyboard: (target) => nextUnreadFromKeyboard(target),
@@ -19072,6 +19078,8 @@ function discordNode(messages) {
   deepCopy.setAttribute("type", "button");
   deepCopy.setAttribute("title", "Copy a link that opens this app on this message");
   deepCopy.textContent = "Copy vibe-talk link";
+  // `#889 voice-page-copy-link-key`. Its chord, Ctrl+L (Cmd+L), said on it as the other copies' are.
+  sayRowShortcut(deepCopy, "row-copy-deep-link-button");
   deepCopy.addEventListener("click", inThisColumn(() => {
     setMenu(false);
     guardQuietly(() => copyDeepLink(message))();

@@ -555,6 +555,77 @@ test("Open in the ⋯ menu links to the message's own address in its service, an
     "a long press on the link opened the row's details");
 });
 
+test("`#889 voice-page-copy-link-key`: Cmd+L copies the vibe-talk link, not the service's, and leaves a text field alone", async () => {
+  // l copies the message's address in its service; Cmd+L (Ctrl+L off a Mac) copies this app's own link to it,
+  // through the same copy as the ⋯ menu's Copy vibe-talk link. Cmd+Shift+L does the same, for a browser tab
+  // whose Cmd+L goes to the address bar before the page hears it.
+  const page = newPage(new Map(), SCRIPT, (p) => p.enableHistory());
+  await signIn(page);
+  const address = "https://discord.com/channels/900000000000000001/900000000000000002/8000000000000000300";
+  const rows = await showDiscord(page, [
+    message({ id: "8000000000000000300", content: "with a link", upstream_url: address,
+      timestamp: "2026-08-19T04:31:00.000Z" }),
+    message({ id: "8000000000000000301", content: "without one", author: "ada", author_is_bot: false,
+      timestamp: "2026-08-19T04:36:00.000Z" }),
+  ]);
+  page.el("scroll-area").scrollTop = 0;
+  const deep = rows[0].descendants().find((node) => node.className === "row-copy-deep-link-button");
+  assert.equal(deep.getAttribute("aria-keyshortcuts"), "Control+L Meta+L Control+Shift+L Meta+Shift+L",
+    "a screen reader is not told the Copy vibe-talk link item's keys");
+
+  // The menu's own copy, for the link to compare with.
+  await rowMoreButton(rows[0]).click();
+  await deep.click();
+  await page.settle();
+  const link = page.clipboard;
+  assert.ok(typeof link === "string" && link.startsWith("https://vibe.example/?"), `the menu copied no vibe-talk link: ${link}`);
+
+  for (const fields of [{ ctrlKey: true }, { metaKey: true }, { ctrlKey: true, shiftKey: true }]) {
+    page.clipboard = undefined;
+    page.el("status").textContent = "";
+    const event = await press(page, rows[0], fields.shiftKey ? "L" : "l", fields);
+    assert.equal(event.defaulted, false, `${JSON.stringify(fields)}+L was left to the browser on a row`);
+    assert.equal(page.clipboard, link, `${JSON.stringify(fields)}+L did not copy the vibe-talk link`);
+    assert.notEqual(page.clipboard, address, "the chord copied the service's link");
+    assert.equal(page.el("status").textContent, "Copied the vibe-talk link.");
+  }
+  // A held chord's repeats are taken too: each would be the address bar's otherwise.
+  page.clipboard = undefined;
+  const held = await press(page, rows[0], "l", { ctrlKey: true, repeat: true });
+  assert.equal(held.defaulted, false, "a held Cmd+L's repeat went to the browser");
+  assert.equal(page.clipboard, link);
+  // A message with no address in its service still has a vibe-talk link.
+  page.clipboard = undefined;
+  await press(page, rows[1], "l", { ctrlKey: true });
+  assert.ok(String(page.clipboard).startsWith("https://vibe.example/?"), "Cmd+L copied nothing on a row with no service link");
+  // With the ⋯ menu open, the chord copies and shuts it, as the item does.
+  page.clipboard = undefined;
+  await rowMoreButton(rows[0]).click();
+  await press(page, rows[0], "l", { ctrlKey: true });
+  assert.equal(page.clipboard, link);
+  assert.equal(rowMoreMenu(rows[0]).hidden, true, "Cmd+L left the ⋯ menu open");
+  // Bare l is still the service's link.
+  page.clipboard = undefined;
+  await press(page, rows[0], "l");
+  assert.equal(page.clipboard, address, "l no longer copies the service's link");
+
+  // In a box being typed in, Cmd+L is the browser's (the address bar, or nothing), never a copy.
+  for (const id of ["channel-compose-text", "reply-text"]) {
+    page.clipboard = undefined;
+    const typed = await press(page, page.el(id), "l", { ctrlKey: true });
+    assert.equal(typed.defaulted, true, `Cmd+L was taken in #${id}`);
+    assert.equal(page.clipboard, undefined, `Cmd+L copied from #${id}`);
+  }
+
+  // The ? list names both chords, and says why the second is there.
+  const keys = page.el("keyboard-keys").descendants().filter((node) => node.tagName === "kbd");
+  const listed = keys.map((node) => node.textContent);
+  assert.ok(listed.includes("Ctrl+L or Ctrl+Shift+L"), `the list of keys does not name both chords: ${listed.join(" | ")}`);
+  const entry = keys.find((node) => node.textContent === "Ctrl+L or Ctrl+Shift+L").parentNode.text();
+  assert.match(entry, /Copy its vibe-talk link/);
+  assert.match(entry, /In a browser tab, where Ctrl\+L can go to the address bar, Ctrl\+Shift\+L does the same/);
+});
+
 test("`#481 slack-app-deep-link`: with the app chosen, Open takes the slack:// address and no tab; copies still copy the web address", async () => {
   // The app address is the server's, carried beside the web one; the choice is this device's,
   // kept in its own storage. Only the one shape is offered from it: anything else a message

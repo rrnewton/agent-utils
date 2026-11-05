@@ -95,6 +95,10 @@ export interface KeymapActs<Target> {
   readFromKeyboard(target: Target): unknown;
   detailsFromKeyboard(target: Target): unknown;
   copyLinkFromKeyboard(target: Target): unknown;
+  /** `#889 voice-page-copy-link-key`. Copy the selected message's vibe-talk link. */
+  deepLinkFromKeyboard(target: Target): unknown;
+  /** Whether the page runs as the installed app (no address bar), where Ctrl+L (Cmd+L) is the page's alone. */
+  standalone(): boolean;
   copyChordFromKeyboard(): unknown;
   copyFromKeyboard(): unknown;
   nextUnreadFromKeyboard(target: Target): unknown;
@@ -131,8 +135,8 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
     pressRowButton, onEscape, placeFromKeyboard, listEdge, jumpList, searchFromAnywhere, searchFromKeyboard,
     settingsFromKeyboard, keysFromKeyboard, stepFromKeyboard, stepChannel, pickChannel, openFromKeyboard,
     threadFromKeyboard, threadOutFromKeyboard, threadStripFromKeyboard, columnFromKeyboard, replyFromKeyboard,
-    menuFromKeyboard, readFromKeyboard, detailsFromKeyboard, copyLinkFromKeyboard, copyChordFromKeyboard,
-    copyFromKeyboard, nextUnreadFromKeyboard, doneFromKeyboard, readCollapseFromKeyboard, foldOneFromKeyboard,
+    menuFromKeyboard, readFromKeyboard, detailsFromKeyboard, copyLinkFromKeyboard, deepLinkFromKeyboard, standalone,
+    copyChordFromKeyboard, copyFromKeyboard, nextUnreadFromKeyboard, doneFromKeyboard, readCollapseFromKeyboard, foldOneFromKeyboard,
     foldStepFromKeyboard, collapsedLinesFromKeyboard, packFromKeyboard, unpackFromKeyboard, bookmarkFromKeyboard,
     bookmarkJumpFromKeyboard, viewFromKeyboard, voiceFromKeyboard, readModeFromKeyboard, filterFromKeyboard,
     undoFromKeyboard, orderFromKeyboard, mainRowsFromKeyboard, columnsFromKeyboard, composeFromKeyboard,
@@ -441,6 +445,21 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
       does: () => `Copy its link in ${manyChatServices() ? "its chat service" : chatServiceName()}: the message's own address there, where the server could form one`,
       rowControls: ["row-copy-link-button"],
       run: (_event, target) => copyLinkFromKeyboard(target),
+    },
+    {
+      // `#889 voice-page-copy-link-key`. Ctrl+L (Cmd+L): this app's own link to the message, the ⋯ menu's "Copy
+      // vibe-talk link". The owner, 2026-11-05: "Let's ad Cmd-l for copying the vibe talk link instead of the slack
+      // link"; bare l stays the service's link. Not in a text field, where it is the field's and the browser's. In a
+      // browser tab the chord may be the address bar's before the page hears it; in the installed app it is the
+      // page's alone. So Ctrl+Shift+L (Cmd+Shift+L) does the same, and the list names it where there is a tab. A held
+      // chord's repeats are taken too, as Ctrl+S's are: each would be the address bar's otherwise. Copying again is
+      // the same link.
+      group: KEYS_MESSAGE, chords: [{ key: "l", mod: true }, { key: "l", mod: true, shift: true }], repeats: true,
+      does: () => "Copy its vibe-talk link: the address that opens this app on this message, as the ⋯ menu's Copy " +
+        "vibe-talk link does" + (standalone() ? "" : `. In a browser tab, where ${modKeyName()}+L can go to the ` +
+        `address bar, ${modKeyName()}+Shift+L does the same`),
+      rowControls: ["row-copy-deep-link-button"],
+      run: (_event, target) => deepLinkFromKeyboard(target),
     },
     {
       // `#480 fold-one-message-key`. Shift+O: bare o shrinks or expands the message here, its
