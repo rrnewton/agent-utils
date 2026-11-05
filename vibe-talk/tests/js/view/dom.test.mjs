@@ -519,3 +519,91 @@ test("`#624 voice-page-modularity`: the keys are said from the keymap in the rea
     globalThis.document = was;
   }
 });
+
+test("`#296 copy-highlighted-message`, `#624 voice-page-modularity`: the highlighted message is copied in both flavours, never over the browser's own copy", async () => {
+  const { createHighlightCopy, htmlText, plainParagraphsHtml, COPIED_MESSAGE, NOTHING_TO_COPY, COPIED_SELECTION } = VIEW_SHELL;
+  assert.equal(htmlText(`a<b> & "c" 'd'`), "a&#60;b&#62; &#38; &#34;c&#34; &#39;d&#39;");
+  assert.equal(plainParagraphsHtml("one\ntwo\n \nthree"), "<p>one<br>two</p><p>three</p>");
+  const list = {};
+  const row = (attributes = {}, extra = {}) => ({ parentNode: list, getAttribute: (name) => attributes[name] ?? null,
+    hasAttribute: (name) => name in attributes, ...extra });
+  const messages = new Map();
+  let pane = null;
+  let selection = "";
+  let field = false;
+  const said = [];
+  const timers = [];
+  const written = [];
+  let writes = true;
+  const copies = createHighlightCopy({
+    isTextField: () => field,
+    selectedText: () => selection,
+    activePane: () => pane,
+    rowShown: () => true,
+    rowMessages: (lit) => messages.get(lit) || [],
+    combinedContent: (all) => all.map((one) => one.content).join("\n\n"),
+    renderedHtmlOf: (one) => one.html || "",
+    rawTextOf: (one) => one.content,
+    setStatus: (text) => said.push(text),
+    copyRefused: "refused",
+    writeClipboardText: async (text) => { written.push(text); return writes; },
+    guardQuietly: (run) => run,
+    setTimeout: (run) => timers.push(run),
+  });
+  const was = globalThis.document;
+  let execs = 0;
+  globalThis.document = { activeElement: null, execCommand: () => { execs += 1; return false; } };
+  const copyEvent = () => {
+    const data = {};
+    const event = { clipboardData: { setData: (type, value) => { data[type] = value; } }, prevented: false, preventDefault() { this.prevented = true; } };
+    return [event, data];
+  };
+  try {
+    const lit = row();
+    messages.set(lit, [{ content: "first\nline", html: "" }, { content: "second", html: "<b>second</b>" }]);
+    pane = { lit, list: () => list };
+    let [event, data] = copyEvent();
+    copies.onPageCopy(event);
+    assert.deepStrictEqual([data, event.prevented, said], [{ "text/plain": "first\nline\n\nsecond", "text/html": "<div><p>first<br>line</p></div><div><b>second</b></div>" }, true, [COPIED_MESSAGE]]);
+    const before = { prevented: false, preventDefault() { this.prevented = true; } };
+    copies.onPageBeforeCopy(before);
+    assert.equal(before.prevented, true, "beforecopy was left alone with a message to copy");
+    selection = "words";
+    [event, data] = copyEvent();
+    copies.onPageCopy(event);
+    assert.deepStrictEqual([data, event.prevented], [{}, false], "the message was copied over the words the reader selected");
+    said.length = 0;
+    assert.equal(copies.copyFromKeyboard(), true);
+    await Promise.resolve();
+    assert.deepStrictEqual([execs, written, said], [1, ["words"], [COPIED_SELECTION]], "c with words selected did not copy the words");
+    selection = "";
+    field = true;
+    assert.equal(copies.copyChordFromKeyboard(), false);
+    assert.equal(timers.length, 0, "Ctrl+C in a text field was taken from the browser");
+    field = false;
+    assert.equal(copies.copyChordFromKeyboard(), false, "the chord's default was not left to the browser");
+    [event, data] = copyEvent();
+    copies.onPageCopy(event);
+    assert.equal(data["text/plain"], "first\nline\n\nsecond");
+    written.length = 0;
+    timers.shift()();
+    assert.deepStrictEqual(written, [], "a copy the copy event served was copied again a task later");
+    copies.copyChordFromKeyboard();
+    said.length = 0;
+    writes = false;
+    timers.shift()();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepStrictEqual([written, said], [["first\nline\n\nsecond"], ["refused"]], "a chord no copy event answered was not copied a task later, or a refusal was not said");
+    pane = { lit: row({ "data-read-run": "head" }), list: () => list };
+    said.length = 0;
+    copies.copyFromKeyboard();
+    assert.deepStrictEqual(said, [NOTHING_TO_COPY], "the line of a collapsed run was copied");
+    pane = { lit: row({ "data-card": "" }, { cardRoot: { content: "the thread's first", html: "" } }), list: () => list };
+    [event, data] = copyEvent();
+    copies.onPageCopy(event);
+    assert.equal(data["text/plain"], "the thread's first", "a thread card did not copy its first message");
+  } finally {
+    globalThis.document = was;
+  }
+});

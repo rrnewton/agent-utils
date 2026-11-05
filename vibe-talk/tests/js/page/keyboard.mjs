@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { CHANNEL, CSS_CODE, DISCORD_POLL_MS, DONE_FLASH_FADE_MS, DONE_FLASH_HOLD_MS, HTML,
   HTML_CODE, LINE_PX, PAGE_ELEMENTS, RUN_TAIL, SCRIPT, SCRIPT_CODE, SCROLL_VIEWPORT_PX,
   SHORT_MESSAGE, UNPACK_STORAGE, asksFor, atBottomOf, backlog, bid, bodyOf, bookmarkAt, bookmarkRow,
-  brokenScript, brokenScriptEach, builtSince, cardIds, cardRow, channelRow, chooseReadMode, compose,
+  brokenModule, brokenScript, brokenScriptEach, builtSince, cardIds, cardRow, channelRow, chooseReadMode, compose,
   cssBlock, cssRules, deliver, doneButton, elidedOf, enterRunThread, failedSend, fillTranscript,
   focusName, focusOn, focused, foldButton, forwardPage, forwardTimeline, heldRow, helpEntry,
   inlineAnchors, joiningChannel, json, keyOn, keyboardMedia, keyboardPage, keyboardPageAtTop,
@@ -1984,18 +1984,16 @@ test("`#296 copy-highlighted-message`: NEGATIVE CONTROLS on the page itself: a p
     await pressCopy(page, row);
     return [plain, page.clipboard];
   };
-  const mutant = (from, to) => {
-    assert.ok(SCRIPT.includes(from), `web/voice.js no longer says ${JSON.stringify(from)}`);
-    return SCRIPT.replace(from, to);
-  };
+  /** The page with web/src/view/shell/highlightcopy.ts patched: `find` (there once) replaced. */
+  const mutant = (find, replace) => brokenModule([{ file: "src/view/shell/highlightcopy.ts", find, replace }]);
   assert.deepStrictEqual(await observe(SCRIPT), [longMessage("message 2"), "a sentence about"]);
   // Highlight ignored: nothing of the message is copied, and the browser has nothing to copy.
-  assert.deepStrictEqual(await observe(mutant("const row = pane ? pane.lit : null;", "const row = null;")),
+  assert.deepStrictEqual(await observe(await mutant("const row = pane ? pane.lit : null;", "const row = null;")),
     [CLIPBOARD_BEFORE, "a sentence about"], "a page that ignores the highlight passed");
   // Selection ignored: the message is copied over the words the reader selected.
   assert.deepStrictEqual(
-    await observe(mutant('const browserCopies = () => isTextField(document.activeElement) || selectedText() !== "";',
-      "const browserCopies = () => isTextField(document.activeElement);")),
+    await observe(await mutant('const browserCopies = (): boolean => deps.isTextField(document.activeElement) || deps.selectedText() !== "";',
+      "const browserCopies = (): boolean => deps.isTextField(document.activeElement);")),
     [longMessage("message 2"), longMessage("message 2")], "a page that copies the message over a selection passed");
 });
 

@@ -67,7 +67,7 @@ function copyThroughTextarea(value: string): boolean {
  * The copy a key in the page has noted while the `copy` event it expects may still come (`#296
  * copy-highlighted-message`; `#624 voice-page-modularity`, moved from the legacy script): from the key to
  * the end of its task, after the browser's default for it has run. What a copy holds, and answering the
- * event with it, are the page's (`onPageCopy`, `copyChordFromKeyboard`, `copyNow`).
+ * event with it, are view/shell/highlightcopy.ts's (`onPageCopy`, `copyChordFromKeyboard`, `copyNow`).
  */
 export interface PendingCopy<Copy> {
   /** The copy noted, or null. */

@@ -25,3 +25,5 @@ export { createKeyDispatch } from "./keydispatch.ts";
 export type { DispatchedKey, KeyBinding, KeyDispatch, KeyDispatchDependencies } from "./keydispatch.ts";
 export { KEY_WORDS, chordShortcuts, chordWords, createKeyHints, viewKeysNote } from "./keyhints.ts";
 export type { KeyHints, KeyHintsDependencies, SaidBinding } from "./keyhints.ts";
+export { COPIED_MESSAGE, COPIED_SELECTION, NOTHING_TO_COPY, createHighlightCopy, htmlText, plainParagraphsHtml } from "./highlightcopy.ts";
+export type { CopiedPane, CopyEvent, HighlightCopy, HighlightCopyDependencies, MessageCopy } from "./highlightcopy.ts";

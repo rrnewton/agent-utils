@@ -89,7 +89,6 @@ export {
   classWords,
   copyText,
   createOncePerFrame,
-  createPendingCopy,
   elementIn,
   focusMinimally,
   isLink,
@@ -106,7 +105,7 @@ export {
   shownNode,
   tagNameOf,
 } from "../view/dom/index.ts";
-export { SCREENS, createActionMenu, createChannelPick, createChipsOverComposer, createKeyDispatch, createKeyHints, createPromptsTray, createReplySight, createRowShortcuts, createScreens, createShellNotices, createUndoOffer, createUndoStamps, modHeld, swallow, typedKey } from "../view/shell/index.ts";
+export { SCREENS, createActionMenu, createChannelPick, createChipsOverComposer, createHighlightCopy, createKeyDispatch, createKeyHints, createPromptsTray, createReplySight, createRowShortcuts, createScreens, createShellNotices, createUndoOffer, createUndoStamps, modHeld, swallow, typedKey } from "../view/shell/index.ts";
 export {
   COMPOSER_FIELDS,
   COMPOSER_GROW_BOXES,
