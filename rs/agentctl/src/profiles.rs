@@ -41,6 +41,12 @@ pub(crate) struct LaunchProfile {
     pub(crate) record_edges: Option<bool>,
 }
 
+/// The roles a launch profile may give its agents (#897 chat-latency-stamps).
+pub(crate) const ROLES: [&str; 4] = ["coordinator", "liaison", "coordinator-hands", "worker"];
+/// The protocols a launch profile may give its agents: whether the agent runs its own tools or
+/// hands them to other agents (#897).
+pub(crate) const PROTOCOLS: [&str; 2] = ["self-tooling", "hands-delegating"];
+
 #[derive(Debug, Serialize)]
 pub(crate) struct PublicProfile {
     name: String,
@@ -209,6 +215,12 @@ struct RawProfile {
     agentcloud: Option<CloudLaunch>,
     #[serde(default)]
     record_edges: Option<bool>,
+    /// The agent's role, one of [`ROLES`], and its protocol, one of [`PROTOCOLS`]: checked here,
+    /// and read from the file by the chat bridge's latency stamps (#897).
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    protocol: Option<String>,
     /// Keys a newer agentctl added (#809 chat-bridge-json-forward-compat): named in the load
     /// warning, then forgotten. A profile is never written back from here.
     #[serde(flatten)]
@@ -1032,6 +1044,19 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
             )));
         }
         environment.push(format!("{key}={value}"));
+    }
+    for (field, value, allowed) in [
+        ("role", &raw.role, &ROLES[..]),
+        ("protocol", &raw.protocol, &PROTOCOLS[..]),
+    ] {
+        if let Some(value) = value {
+            if !allowed.contains(&value.as_str()) {
+                return Err(fail(format!(
+                    "profile {name:?} {field} must be one of {}, not {value:?}",
+                    allowed.join(", ")
+                )));
+            }
+        }
     }
     Ok(LaunchProfile {
         name,
@@ -2094,6 +2119,26 @@ mod tests {
             "sub-cloud".to_owned(),
             serde_json::from_value(profile).expect("profile shape"),
         )
+    }
+
+    #[test]
+    fn a_profile_may_name_its_role_and_protocol_from_fixed_lists() {
+        // #897 chat-latency-stamps: the chat bridge stamps requests with them.
+        for (role, protocol) in [("liaison", "hands-delegating"), ("worker", "self-tooling")] {
+            parse(serde_json::json!({
+                "harness": "claude", "mode": "interactive", "role": role, "protocol": protocol
+            }))
+            .expect("known role and protocol");
+        }
+        for (key, value) in [("role", "boss"), ("protocol", "telepathy")] {
+            let mut profile = serde_json::json!({"harness": "claude", "mode": "interactive"});
+            profile[key] = serde_json::json!(value);
+            let message = parse(profile).unwrap_err().to_string();
+            assert!(
+                message.contains(&format!("{key} must be one of")),
+                "{message}"
+            );
+        }
     }
 
     #[test]

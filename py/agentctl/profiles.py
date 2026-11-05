@@ -375,6 +375,12 @@ def _profile(name: str, raw: object) -> LaunchProfile:
     # Only the Rust edition records control edges; this edition accepts the switch and records none.
     if "record_edges" in raw and not isinstance(raw["record_edges"], bool):
         raise AgentDeliveryError(f"profile {name!r} record_edges must be true or false")
+    # Only the Rust edition's chat bridge stamps a request with these; this edition checks them.
+    for field, allowed in (("role", _ROLES), ("protocol", _PROTOCOLS)):
+        if raw.get(field) is not None and raw[field] not in allowed:
+            raise AgentDeliveryError(
+                f"profile {name!r} {field} must be one of {', '.join(allowed)}, not {raw[field]!r}"
+            )
     harness = _text(raw.get("harness"), f"{name}.harness")
     mode = _text(raw.get("mode"), f"{name}.mode")
     assert harness is not None and mode is not None
@@ -601,7 +607,10 @@ def _launch_env(value: object) -> LaunchEnv | None:
 _KNOWN_TOP_LEVEL_KEYS = frozenset({"schema", "profiles", "workspace", "wrkslots", "term_backend", "launch_env"})
 _PROFILE_FIELDS = frozenset({
     "harness", "mode", "model", "reasoning_effort", "argv", "env", "agentcloud", "record_edges",
+    "role", "protocol",
 })
+_ROLES = ("coordinator", "liaison", "coordinator-hands", "worker")
+_PROTOCOLS = ("self-tooling", "hands-delegating")
 
 
 def _unknown_key_paths(raw: dict[str, object]) -> set[str]:

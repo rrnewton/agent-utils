@@ -485,6 +485,10 @@ Within each profile, `harness` and `mode` are required. `model`,
 `reasoning_effort`, `argv`, and `env` are optional, and so is `record_edges`:
 `false` makes `start` with this profile record no `created_by` or `managed_by`
 edge (see [The coordinator and the control tree](#the-coordinator-and-the-control-tree-rust-edition)).
+`role` (`coordinator`, `liaison`, `coordinator-hands` or `worker`) and `protocol`
+(`self-tooling` or `hands-delegating`) are optional too: they launch nothing,
+and the Rust chat bridge stamps each request delivered to an agent of this
+profile with them (#897 chat-latency-stamps; see `agentctl chat userguide`).
 Values are parsed as JSON strings and passed as literal
 arguments or environment entries; they are never shell-expanded. A profile
 cannot specify the model or effort both structurally and in `argv`. When

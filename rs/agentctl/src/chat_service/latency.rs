@@ -20,6 +20,8 @@ pub struct LatencyOptions {
     pub since_millis: Option<u64>,
     /// Requests the text listing shows, newest first.
     pub last: usize,
+    /// Leave out requests admitted inside a jam window (#897 chat-latency-stamps).
+    pub exclude_jams: bool,
 }
 
 /// One stage interval: its name, and the request times it runs between.
@@ -33,7 +35,24 @@ fn between(from: Option<u64>, to: Option<u64>) -> Option<u64> {
     Some(to?.saturating_sub(from?))
 }
 
-const STAGES: [Stage; 5] = [
+/// The first tool call of the target's turn, where its transcript was followed (#897).
+fn first_tool(request: &RequestTimes) -> Option<u64> {
+    request
+        .turn_timing
+        .as_ref()
+        .filter(|timing| timing.split == "transcript")
+        .map(|timing| timing.first_tool_at_millis)?
+}
+
+/// Whether the target's turn was split from its transcript (#897).
+fn split(request: &RequestTimes) -> bool {
+    request
+        .turn_timing
+        .as_ref()
+        .is_some_and(|timing| timing.split == "transcript")
+}
+
+const STAGES: [Stage; 7] = [
     Stage {
         name: "posted_to_admitted",
         label: "posted -> admitted",
@@ -81,6 +100,32 @@ const STAGES: [Stage; 5] = [
             )
         },
     },
+    Stage {
+        name: "delivered_to_first_tool",
+        label: "delivered -> first tool call (thinking)",
+        interval: |request| {
+            if !split(request) {
+                return None;
+            }
+            between(
+                request.delivered_at_millis,
+                first_tool(request).or(request.first_reply_sent_at_millis),
+            )
+        },
+    },
+    Stage {
+        name: "first_tool_to_first_reply",
+        label: "first tool call -> first reply (tools)",
+        interval: |request| {
+            if !split(request) {
+                return None;
+            }
+            match first_tool(request) {
+                Some(tool) => between(Some(tool), request.first_reply_sent_at_millis),
+                None => request.first_reply_sent_at_millis.map(|_| 0),
+            }
+        },
+    },
 ];
 
 /// The nearest-rank `percentile` of `sorted`, which is in ascending order and not empty.
@@ -119,7 +164,8 @@ pub fn latency(
     options: LatencyOptions,
 ) -> Result<(Value, String), ChatServiceError> {
     let state = BridgeState::inspect(state_root)?;
-    let times: Vec<RequestTimes> = state
+    let jams = crate::chat_latency::read_jams(state_root);
+    let (times, jammed): (Vec<RequestTimes>, Vec<RequestTimes>) = state
         .request_times()?
         .into_iter()
         .filter(|request| {
@@ -127,7 +173,10 @@ pub fn latency(
                 .since_millis
                 .is_none_or(|since| request.admitted_at_millis >= since)
         })
-        .collect();
+        .partition(|request| {
+            !(options.exclude_jams
+                && crate::chat_latency::in_jam(&jams, request.admitted_at_millis))
+        });
     let mut stages = serde_json::Map::new();
     let mut text = format!(
         "chat latency: {} request(s){}, from the bridge's records (seconds; reactions carry no \
@@ -138,6 +187,25 @@ pub fn latency(
             .map(|since| format!(" admitted since {}", chat_runtime::utc_timestamp(since)))
             .unwrap_or_default()
     );
+    if !jammed.is_empty() {
+        let _ = writeln!(
+            text,
+            "{} request(s) admitted inside a jam window are left out (--exclude-jams)",
+            jammed.len()
+        );
+    } else if !options.exclude_jams {
+        let inside = times
+            .iter()
+            .filter(|request| crate::chat_latency::in_jam(&jams, request.admitted_at_millis))
+            .count();
+        if inside > 0 {
+            let _ = writeln!(
+                text,
+                "{inside} request(s) were admitted inside a jam window; --exclude-jams leaves \
+                 them out"
+            );
+        }
+    }
     let header = format!(
         "{:<42} {:>5} {:>8} {:>8} {:>8} {:>8}",
         "stage", "n", "p50", "p90", "p99", "max"
@@ -188,12 +256,19 @@ pub fn latency(
             for stage in &STAGES {
                 row[format!("{}_millis", stage.name)] = json!((stage.interval)(request));
             }
+            row["jammed"] = json!(crate::chat_latency::in_jam(
+                &jams,
+                request.admitted_at_millis
+            ));
             row
         })
         .collect();
     let document = json!({
         "schema": "agentctl-chat-latency/v1",
         "since_millis": options.since_millis,
+        "exclude_jams": options.exclude_jams,
+        "excluded_as_jammed": jammed.len(),
+        "jams": jams,
         "stages": stages,
         "requests": requests,
     });
@@ -231,6 +306,8 @@ mod tests {
             replies_captured: u32::from(reply.is_some()),
             replies_closed: false,
             settlement: None,
+            stamp: None,
+            turn_timing: None,
         }
     }
 
@@ -241,14 +318,25 @@ mod tests {
             STAGES.iter().map(|stage| (stage.interval)(&done)).collect();
         assert_eq!(
             intervals,
-            vec![Some(600), Some(500), Some(2_000), Some(6_000), Some(8_600)]
+            vec![
+                Some(600),
+                Some(500),
+                Some(2_000),
+                Some(6_000),
+                Some(8_600),
+                None,
+                None
+            ]
         );
         let waiting = request(None, None, None);
         let intervals: Vec<Option<u64>> = STAGES
             .iter()
             .map(|stage| (stage.interval)(&waiting))
             .collect();
-        assert_eq!(intervals, vec![None, Some(500), None, None, None]);
+        assert_eq!(
+            intervals,
+            vec![None, Some(500), None, None, None, None, None]
+        );
         // Without a provider time, the total starts at admission.
         let unposted = request(None, Some(2_000), Some(5_000));
         assert_eq!((STAGES[4].interval)(&unposted), Some(4_000));

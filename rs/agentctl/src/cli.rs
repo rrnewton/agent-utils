@@ -1541,9 +1541,15 @@ enum ChatCommand {
     /// Report each request's time from posted to admitted, acknowledged, delivered and first reply,
     /// with percentiles, from the bridge's own records
     #[command(
-        after_help = "Examples:\n  agentctl chat latency --bridge-state ~/.local/state/agentctl/chat\n  agentctl chat latency --bridge-state DIR --since 2h\n  agentctl chat latency --bridge-state DIR --since 2026-10-29T12:00:00Z --json\n\nStages, for each request the bridge retains: posted (the provider's message time) -> admitted\n(stored as a request); admitted -> acknowledged (the first reaction confirmed added); admitted ->\ndelivered (the prompt verified typed, or a headless model started it: when the second reaction is\nqueued); delivered -> first reply sent; and posted -> first reply sent. Chat providers such as\nSlack record no time on a reaction, so these come from the bridge's records; a request that has\nnot reached a stage is left out of that stage. The table gives the count, p50, p90, p99 and max\nin seconds (nearest rank), then the newest --last requests. --json prints one document (schema\nagentctl-chat-latency/v1) with every request and times in Unix milliseconds. Read-only; never\ncontacts Herdr or the provider."
+        after_help = "Examples:\n  agentctl chat latency --bridge-state ~/.local/state/agentctl/chat\n  agentctl chat latency --bridge-state DIR --since 2h\n  agentctl chat latency --bridge-state DIR --since 2026-10-29T12:00:00Z --json\n\nStages, for each request the bridge retains: posted (the provider's message time) -> admitted\n(stored as a request); admitted -> acknowledged (the first reaction confirmed added); admitted ->\ndelivered (the prompt verified typed, or a headless model started it: when the second reaction is\nqueued); delivered -> first reply sent; and posted -> first reply sent. Chat providers such as\nSlack record no time on a reaction, so these come from the bridge's records; a request that has\nnot reached a stage is left out of that stage. The table gives the count, p50, p90, p99 and max\nin seconds (nearest rank), then the newest --last requests. --json prints one document (schema\nagentctl-chat-latency/v1) with every request and times in Unix milliseconds. Read-only; never\ncontacts Herdr or the provider.\n\nStamps (#897): at delivery each request records what it was delivered to: target agent, launch\nprofile, harness, model, effort, adapter, role and protocol, from the agent record, its profile in\nprofiles.json (whose optional role and protocol keys say what the record cannot) and the registry's\ncoordinator designation; a value no source gives is `unknown`. Where the target's transcript is\nfollowed, the first reply is split into thinking (delivered -> first tool call) and tools (first\ntool call -> first reply); elsewhere the split is unavailable. --by groups the folded day summaries\nby any of profile (model, effort and adapter), model, effort, adapter, harness, launch-profile,\nrole, protocol and coordinator, comma-separated. Jams: the bridge records a jam window in\nlatency-jams.jsonl when errors said a delivery was blocked (a stranded paste or draft, the pane's\nlock, a held or paused queue, a refusal retried, a target down) for 5 minutes or more, never for an\nagent that was only busy; `chat jam` records one by hand. --exclude-jams leaves out requests\nadmitted inside one (for --by, those folded as jammed). The service writes last week's export to\nlatency-exports/<ISO week>.json and prunes latency stats, stamped rows (latency-records/) and\njams after 90 days; request records are never pruned by it. --export writes last week's export now."
     )]
     Latency(ChatLatency),
+    /// Record a period in which the bridge could not deliver (a jam), so `chat latency
+    /// --exclude-jams` leaves out the requests admitted in it
+    #[command(
+        after_help = "Examples:\n  agentctl chat jam --bridge-state DIR --start 2026-11-03T20:06:00-05:00 --end 2026-11-04T10:21:00-05:00 --cause composer-blocked --note \"stranded composer, #825\"\n  agentctl chat jam --bridge-state DIR --start 45m --cause bridge-restart\n\nThe window is appended to latency-jams.jsonl in the bridge state (source `operator`) beside the\nwindows the bridge records itself. Requests folded into day summaries before the window was\nrecorded keep their summary; the request listing and the stamped rows read windows when asked.\nWindows are pruned after 90 days. Prints the window as JSON."
+    )]
+    Jam(ChatJam),
     /// Inspect one exact active retained request without writes or external access
     Inspect(ChatInspect),
     /// Settle one delivery_uncertain request as delivered or abandoned, with a durable record
@@ -1860,18 +1866,46 @@ struct ChatLatency {
     /// Print one JSON document instead of the text report
     #[arg(long)]
     json: bool,
-    /// #801: show per-profile stage summaries instead of the request listing (only "profile")
-    #[arg(long, value_name = "WHAT")]
+    /// Show the folded day summaries grouped by these dimensions instead of the request listing:
+    /// a comma-separated list of profile (model, effort and adapter together), model, effort,
+    /// adapter, harness, launch-profile, role, protocol and coordinator
+    #[arg(long, value_name = "DIMENSIONS")]
     by: Option<String>,
-    /// With --by profile: first ET day, YYYY-MM-DD (default: every folded day)
+    /// Leave out requests admitted inside a jam window (with --by: summaries folded as jammed)
+    #[arg(long)]
+    exclude_jams: bool,
+    /// Write last week's export (latency-exports/<ISO week>.json) now, replacing one already
+    /// written, and print its path
+    #[arg(long)]
+    export: bool,
+    /// With --by: first ET day, YYYY-MM-DD (default: every folded day)
     #[arg(long, value_name = "DAY")]
     since_day: Option<String>,
-    /// With --by profile: last ET day, YYYY-MM-DD (default: today)
+    /// With --by: last ET day, YYYY-MM-DD (default: today)
     #[arg(long, value_name = "DAY")]
     until: Option<String>,
-    /// With --by profile: fold existing bridge records once (idempotent)
+    /// With --by: fold existing bridge records once (idempotent)
     #[arg(long)]
     backfill: bool,
+}
+
+#[derive(Args)]
+struct ChatJam {
+    #[command(flatten)]
+    state: ChatState,
+    /// Start of the window: a duration back from now (30m, 2h, 7d) or an RFC 3339 time
+    #[arg(long, value_name = "T", value_parser = latency_since)]
+    start: u64,
+    /// End of the window, in the same forms (default: now)
+    #[arg(long, value_name = "T", value_parser = latency_since)]
+    end: Option<u64>,
+    /// Why delivery was blocked: composer-blocked, pane-lock, queue-held, refused-retry,
+    /// target-down, bridge-restart, provider-gap or other
+    #[arg(long, value_name = "CAUSE")]
+    cause: String,
+    /// What happened, recorded with the window (default: none)
+    #[arg(long, value_name = "TEXT")]
+    note: Option<String>,
 }
 
 /// `chat latency --since`: Unix milliseconds of a duration back from now, or of an RFC 3339 time.
@@ -4878,12 +4912,42 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             }
             Ok(report.exit_code())
         }
+        ChatCommand::Jam(value) => {
+            let jam = crate::chat_latency::Jam {
+                start_millis: value.start,
+                end_millis: value.end.unwrap_or_else(crate::chat_runtime::unix_millis),
+                cause: value.cause,
+                source: "operator".to_owned(),
+                request: None,
+                note: value.note,
+            };
+            let state = value.state.dir(&registry);
+            crate::chat_runtime::BridgeState::inspect(&state)
+                .map_err(|e| Failure::Usage(e.to_string()))?;
+            crate::chat_latency::append_jam(&state, &jam).map_err(Failure::Usage)?;
+            write_json(&serde_json::json!(jam)).map_err(Failure::Output)?;
+            Ok(0)
+        }
+        ChatCommand::Latency(value) if value.export => {
+            let state = value.state.dir(&registry);
+            crate::chat_runtime::BridgeState::inspect(&state)
+                .map_err(|e| Failure::Usage(e.to_string()))?;
+            let now = crate::chat_runtime::unix_millis();
+            let today = crate::chat_latency::et_date(now as f64 / 1_000.0);
+            let day = crate::chat_latency::day_number(&today).unwrap_or(0);
+            let (this_monday, _) = crate::chat_latency::iso_week(day);
+            let path = crate::chat_latency::export_week(&state, this_monday - 7, now)
+                .map_err(Failure::Usage)?;
+            write_text(&format!("{}\n", path.display())).map_err(Failure::Output)?;
+            Ok(0)
+        }
         ChatCommand::Latency(value) if value.by.is_none() && !value.backfill => {
             let (document, text) = crate::chat_service::latency::latency(
                 &value.state.dir(&registry),
                 crate::chat_service::latency::LatencyOptions {
                     since_millis: value.since,
                     last: usize::from(value.last),
+                    exclude_jams: value.exclude_jams,
                 },
             )
             .map_err(Failure::Chat)?;
@@ -4912,65 +4976,50 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0.0, |d| d.as_secs_f64()),
             );
-            if value.by.as_deref().is_some_and(|by| by != "profile") {
-                return Err(Failure::Usage("--by accepts only \"profile\"".to_owned()));
-            }
-            let valid_day = |day: &str| {
-                day.len() == 10
-                    && day.as_bytes().get(4) == Some(&b'-')
-                    && day.as_bytes().get(7) == Some(&b'-')
-                    && day.chars().all(|c| c.is_ascii_digit() || c == '-')
-            };
+            let dimensions =
+                crate::chat_latency::parse_dimensions(value.by.as_deref().unwrap_or("profile"))
+                    .map_err(Failure::Usage)?;
+            let valid_day = |day: &str| crate::chat_latency::day_number(day).is_some();
             let since = value.since_day.as_deref().unwrap_or("0000-01-01");
             let until = value.until.as_deref().unwrap_or(&today);
-            if !valid_day(since) || !valid_day(until) {
+            if (since != "0000-01-01" && !valid_day(since)) || !valid_day(until) {
                 return Err(Failure::Usage(
                     "--since-day/--until need YYYY-MM-DD".to_owned(),
                 ));
             }
             let summaries = crate::chat_latency::read_window(&state, since, until);
-            // Merge each profile's days before computing quantiles.
-            let mut by_profile: std::collections::BTreeMap<
-                (String, String, String),
-                Vec<&crate::chat_latency::Summary>,
-            > = std::collections::BTreeMap::new();
-            for summary in &summaries {
-                by_profile
-                    .entry((
-                        summary.model.clone(),
-                        summary.effort.clone(),
-                        summary.adapter.clone(),
-                    ))
-                    .or_default()
-                    .push(summary);
-            }
+            // Merge each group's days before computing quantiles.
+            let groups = crate::chat_latency::group(&summaries, &dimensions, value.exclude_jams);
             if value.json {
-                let profiles: Vec<_> = by_profile
+                let rows: Vec<_> = groups
                     .iter()
-                    .map(|((model, effort, adapter), group)| {
-                        let merged = crate::chat_latency::merge(group);
-                        let stages: serde_json::Map<_, _> = merged
-                            .iter()
-                            .map(|(stage, counts)| {
-                                (
-                                    stage.clone(),
-                                    serde_json::json!({
-                                        "n": counts.iter().sum::<u32>(),
-                                        "median": crate::chat_latency::quantile_bucket(counts, 0.5).map(crate::chat_latency::bucket_label),
-                                        "p90": crate::chat_latency::quantile_bucket(counts, 0.9).map(crate::chat_latency::bucket_label),
-                                        "counts": counts,
-                                    }),
-                                )
-                            })
-                            .collect();
-                        serde_json::json!({"model": model, "effort": effort, "adapter": adapter, "folded": group.iter().map(|s| s.folded).sum::<u64>(), "stages": stages})
+                    .map(|(values, group)| {
+                        let mut row = serde_json::Map::new();
+                        for (name, value) in dimensions.iter().zip(values) {
+                            row.insert((*name).to_owned(), serde_json::json!(value));
+                        }
+                        row.insert(
+                            "folded".to_owned(),
+                            serde_json::json!(group.iter().map(|s| s.folded).sum::<u64>()),
+                        );
+                        row.insert(
+                            "stages".to_owned(),
+                            serde_json::Value::Object(crate::chat_latency::stages_json(group)),
+                        );
+                        serde_json::Value::Object(row)
                     })
                     .collect();
-                write_json(&serde_json::json!({"profiles": profiles})).map_err(Failure::Output)?;
+                write_json(&serde_json::json!({
+                    "by": dimensions,
+                    "exclude_jams": value.exclude_jams,
+                    "profiles": rows,
+                }))
+                .map_err(Failure::Output)?;
             } else {
-                for ((model, effort, adapter), group) in &by_profile {
+                for (values, group) in &groups {
                     println!(
-                        "{model} / {effort} / {adapter} ({} requests)",
+                        "{} ({} requests)",
+                        values.join(" / "),
                         group.iter().map(|s| s.folded).sum::<u64>()
                     );
                     let merged = crate::chat_latency::merge(group);

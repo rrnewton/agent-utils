@@ -34,6 +34,10 @@ pub struct RequestTimes {
     pub replies_closed: bool,
     /// An operator settlement's kind (`delivered` or `abandoned`), when settled (#784).
     pub settlement: Option<String>,
+    /// What it was delivered to, stamped at delivery (#897 chat-latency-stamps).
+    pub stamp: Option<DeliveryStamp>,
+    /// The target's turn for it, from its transcript (#897).
+    pub turn_timing: Option<TurnTiming>,
 }
 
 /// One reply that is not sent, as `chat health` reports it. Retry fields are read when the
@@ -180,6 +184,8 @@ impl BridgeState {
                     .settlement
                     .as_ref()
                     .map(|settlement| settlement.kind.as_str().to_owned()),
+                stamp: record.stamp.clone(),
+                turn_timing: record.turn_timing.clone(),
                 key: record.key,
             });
         }

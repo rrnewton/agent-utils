@@ -651,6 +651,22 @@ def test_explicit_null_agentcloud_on_a_local_profile_means_absent(tmp_path: Path
     assert "agentcloud" not in profiles["local"].public()
 
 
+def test_a_profile_role_and_protocol_are_checked_like_the_rust_edition(tmp_path: Path) -> None:
+    # The Rust chat bridge stamps requests with them; this edition only checks them.
+    _write_profiles(tmp_path, {
+        "lead": {"harness": "codex", "mode": "interactive", "role": "liaison",
+                 "protocol": "hands-delegating"},
+    })
+    _path, profiles = load_profiles(tmp_path)
+    assert "role" not in profiles["lead"].public()
+    for key, value in (("role", "boss"), ("protocol", "telepathy")):
+        root = tmp_path / key
+        root.mkdir()
+        _write_profiles(root, {"lead": {"harness": "codex", "mode": "interactive", key: value}})
+        with pytest.raises(AgentDeliveryError, match=f"{key} must be one of"):
+            load_profiles(root)
+
+
 @pytest.mark.parametrize("arguments", [
     ["--profile", "cloud"],
     ["--harness", "agentcloud"],

@@ -109,6 +109,51 @@ pub(crate) struct ReplySource {
 /// look.
 pub(crate) type SharedReplySource = Arc<Mutex<Option<ReplySource>>>;
 
+/// Prompt and tool-call times the reader saw in the followed transcript, newest last, for
+/// splitting a request's turn into thinking and tools (#897 chat-latency-stamps).
+#[derive(Debug, Default)]
+pub(crate) struct TurnMarks {
+    /// Whether a transcript is followed now; while none is, the split is unavailable.
+    pub(crate) following: bool,
+    /// When prompts were recorded, Unix milliseconds.
+    pub(crate) prompts: VecDeque<u64>,
+    /// When tool calls were recorded, Unix milliseconds.
+    pub(crate) tools: VecDeque<u64>,
+}
+
+/// Most times of each kind kept.
+const MAX_TURN_MARKS: usize = 4_096;
+
+impl TurnMarks {
+    fn note(&mut self, event: &Event) {
+        let at = event
+            .at()
+            .filter(|at| *at >= 0.0)
+            .map(|at| (at * 1000.0) as u64);
+        let (Some(at), list) = (
+            at,
+            match event {
+                Event::Prompt { .. } => &mut self.prompts,
+                Event::ToolCall { .. } => &mut self.tools,
+                _ => return,
+            },
+        ) else {
+            return;
+        };
+        // A tail read again repeats times; they stay in order either way.
+        if list.back().is_some_and(|last| *last >= at) {
+            return;
+        }
+        list.push_back(at);
+        while list.len() > MAX_TURN_MARKS {
+            list.pop_front();
+        }
+    }
+}
+
+/// The [`TurnMarks`] the transcript reader shares with the bridge state.
+pub(crate) type SharedTurnMarks = Arc<Mutex<TurnMarks>>;
+
 /// The agent a reader made by [`CoordinatorTranscript::for_agent`] follows: `None` while the
 /// bridge serves a headless agent, whose transcript it does not read.
 type SharedTarget = Arc<Mutex<Option<String>>>;
@@ -142,6 +187,8 @@ pub(crate) struct CoordinatorTranscript {
     ever_opened: bool,
     /// The agent followed, for a reader made by [`Self::for_agent`]; a repoint changes it.
     target: Option<SharedTarget>,
+    /// Prompt and tool-call times, shared with the bridge state (#897).
+    marks: Option<SharedTurnMarks>,
 }
 
 impl fmt::Debug for CoordinatorTranscript {
@@ -173,6 +220,29 @@ impl CoordinatorTranscript {
             trace: false,
             ever_opened: false,
             target: None,
+            marks: None,
+        }
+    }
+
+    /// Share the prompt and tool-call times read from now on through `marks` (#897).
+    #[must_use]
+    pub(crate) fn with_turn_marks(mut self, marks: SharedTurnMarks) -> Self {
+        self.marks = Some(marks);
+        self
+    }
+
+    /// Tell the shared marks whether a transcript is followed now, forgetting what was read when
+    /// `clear`.
+    fn share_following(&self, clear: bool) {
+        if let Some(marks) = &self.marks {
+            let mut marks = marks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            marks.following = self.follower.is_some();
+            if clear {
+                marks.prompts.clear();
+                marks.tools.clear();
+            }
         }
     }
 
@@ -384,6 +454,7 @@ impl CoordinatorTranscript {
     /// Read what the transcript gained, keeping its complete reply blocks.
     fn poll(&mut self) {
         self.relocate();
+        self.share_following(false);
         let Some(follower) = self.follower.as_mut() else {
             return;
         };
@@ -392,6 +463,7 @@ impl CoordinatorTranscript {
             Err(error) => {
                 let path = follower.path().display().to_string();
                 self.follower = None;
+                self.share_following(false);
                 self.report(format!(
                     "agentctl: the coordinator's transcript {path} cannot be read ({error}); {}",
                     if self.trace {
@@ -403,6 +475,14 @@ impl CoordinatorTranscript {
                 return;
             }
         };
+        if let Some(marks) = &self.marks {
+            let mut marks = marks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for event in &events {
+                marks.note(event);
+            }
+        }
         for event in events {
             if self.collect_events {
                 self.events.push_back(event.clone());
@@ -506,6 +586,7 @@ impl TranscriptReplies for CoordinatorTranscript {
         self.waited.clear();
         self.reported = None;
         self.located_at = None;
+        self.share_following(true);
         (self.log)(format!(
             "agentctl: the bridge now serves {}; its reply text is looked for again",
             agent.unwrap_or("a headless agent")

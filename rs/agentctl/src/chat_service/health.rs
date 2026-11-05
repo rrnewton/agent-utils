@@ -1045,6 +1045,8 @@ mod tests {
             replies_captured: replies,
             replies_closed: false,
             settlement: None,
+            stamp: None,
+            turn_timing: None,
         }
     }
 

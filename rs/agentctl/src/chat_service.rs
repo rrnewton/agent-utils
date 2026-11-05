@@ -1814,6 +1814,7 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         let agent = (!headless).then(|| state.config().agent_name.clone());
         let records = state.clone();
         let source = crate::chat_transcript::SharedReplySource::default();
+        let marks = crate::chat_transcript::SharedTurnMarks::default();
         state
             .with_transcript_replies(Box::new(
                 crate::chat_transcript::CoordinatorTranscript::for_agent(
@@ -1833,9 +1834,11 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
                             .unwrap_or_default()
                     }),
                     source.clone(),
-                ),
+                )
+                .with_turn_marks(marks.clone()),
             ))
             .with_reply_source(source)
+            .with_turn_marks(marks)
     };
     // Replies this start finds unsent and stale are held back before any pass can send them
     // (#781 chat-no-stale-replies-on-restart).
@@ -2001,6 +2004,7 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     let cancellation: SharedCancellation =
         Arc::new(Mutex::new(ProviderCancellationRegistry::default()));
     let _ = state.fold_latency_summaries_public();
+    log_latency_upkeep(&state);
     let output_wake: SharedWake = Arc::new(Mutex::new(None));
     let overflowed = Arc::new(AtomicBool::new(false));
     let (signal_handle, signal_thread) = spawn_signal_worker(
@@ -3495,6 +3499,7 @@ with other text, so the oldest were not read",
     if let Some(line) = already_reported_log_line(&capture.suppressed_ids) {
         control.log(line);
     }
+    log_latency_upkeep(state);
     // A not-sent notice still queued for a block whose reply has since been stored must not
     // reach the coordinator (#891 chat-notsent-after-posted).
     match chat_runtime::withdraw_answered_feedback(state, manager) {
@@ -7961,6 +7966,22 @@ fn connect_output<A: ManagedApi + ?Sized>(
 
 /// Write one service log line to standard error, prefixed with the UTC time it is written. A
 /// service manager often appends standard error to a file that records no times of its own.
+/// Write last week's latency export when it is missing, and prune latency stats past their
+/// retention, logging what happened (#897 chat-latency-stamps). Costs one file check otherwise.
+fn log_latency_upkeep(state: &BridgeState) {
+    match state.latency_upkeep() {
+        Ok(Some(path)) => service_log(format_args!(
+            "agentctl: chat latency export written to {}; latency stats older than {} days pruned",
+            path.display(),
+            crate::chat_latency::RETENTION_DAYS
+        )),
+        Ok(None) => {}
+        Err(error) => service_log(format_args!(
+            "agentctl: chat latency export not written: {error}"
+        )),
+    }
+}
+
 pub(crate) fn service_log(line: impl fmt::Display) {
     write_service_log(&mut io::stderr().lock(), line);
 }
@@ -16413,6 +16434,44 @@ esac
                 "{notice}"
             );
         }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn chat_latency_can_leave_out_requests_admitted_inside_a_jam() {
+        // #897 chat-latency-stamps: `--exclude-jams` drops requests admitted in a jam window and
+        // says how many; without it they are listed and marked.
+        let (_state, key, root) = state_with_request();
+        let now = chat_runtime::unix_millis();
+        crate::chat_latency::append_jam(
+            &root,
+            &crate::chat_latency::Jam {
+                start_millis: now - 3_600_000,
+                end_millis: now + 60_000,
+                cause: "bridge-restart".into(),
+                source: "operator".into(),
+                request: None,
+                note: Some("restarted for a deploy".into()),
+            },
+        )
+        .expect("jam");
+        let options = |exclude_jams| latency::LatencyOptions {
+            since_millis: None,
+            last: 20,
+            exclude_jams,
+        };
+        let (document, text) = latency::latency(&root, options(true)).expect("latency");
+        assert_eq!(document["requests"], serde_json::json!([]));
+        assert_eq!(document["excluded_as_jammed"], 1);
+        assert!(
+            text.contains("1 request(s) admitted inside a jam window are left out"),
+            "{text}"
+        );
+        let (document, text) = latency::latency(&root, options(false)).expect("latency");
+        assert_eq!(document["requests"][0]["key"], key.as_str());
+        assert_eq!(document["requests"][0]["jammed"], true);
+        assert_eq!(document["jams"][0]["cause"], "bridge-restart");
+        assert!(text.contains("--exclude-jams leaves them out"), "{text}");
         fs::remove_dir_all(root).ok();
     }
 

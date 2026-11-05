@@ -3342,6 +3342,58 @@ takes a duration back from now (`30m`, `2h`, `7d`) or an RFC 3339 time, and
 `agentctl-chat-latency/v1`). Only requests the bridge retains are counted;
 `chat close` retires a request with its times.
 
+### Stamps, the think/tool split, jams and the weekly export
+
+Each request is stamped when it is delivered with what it was delivered to
+(#897 chat-latency-stamps): the target agent, its launch profile, harness,
+model, effort and adapter (`tui` or `headless`), its role and its protocol.
+They come from the agent record, its profile in the registry's `profiles.json`
+and the registry's coordinator designation:
+
+- **role**: `coordinator` for the designated coordinator; otherwise the launch
+  profile's `role` (`coordinator`, `liaison`, `coordinator-hands` or `worker`);
+  otherwise `worker`. It is never read from the agent's name.
+- **protocol**: the launch profile's `protocol` (`self-tooling` or
+  `hands-delegating`), otherwise `unknown`.
+- any other field no source gives is `unknown`, never guessed.
+
+Where the target's transcript is followed (Claude Code, Codex, Muse), the
+bridge also keeps the transcript's prompt and tool-call times, and splits the
+first reply at the first tool call after the prompt: `delivered -> first tool
+call (thinking)` and `first tool call -> first reply (tools)`. A turn with no
+tool call before its first reply is all thinking. Elsewhere (headless, an
+unknown harness, no transcript found) the request records the split as
+`unavailable` and those rows leave it out.
+
+`chat latency --by DIMENSIONS` groups the folded day summaries (kept beside the
+requests in `latency/`, so they outlive retired requests) by any of `profile`
+(model, effort and adapter together), `model`, `effort`, `adapter`, `harness`,
+`launch-profile`, `role`, `protocol` and `coordinator`, comma-separated, with
+`--since-day` and `--until` as ET days:
+
+```sh
+agentctl chat latency --bridge-state DIR --by role,protocol --exclude-jams
+```
+
+A **jam** is a period in which delivery was blocked, not merely queued while the
+agent worked: waiting for a busy agent is the latency being measured. The
+bridge records one in `latency-jams.jsonl` when a delivery's errors said it was
+blocked (a stranded paste or a draft in the composer, the pane's lock, a held or
+paused queue, a refusal that is retried, a target that is down) for 5 minutes or
+more, from the first such error to the last, or to delivery. `chat jam --start
+T [--end T] --cause CAUSE [--note TEXT]` records one by hand, for example a
+bridge outage (`bridge-restart`) or a provider gap. `--exclude-jams` leaves out
+the requests admitted inside a jam: from the listing at once, and from `--by`
+for requests folded after the jam was recorded.
+
+Every folded request also leaves one row of timings and stamps, without its
+text, in `latency-records/<ET day>.jsonl`. Each week the service writes the
+export of the last full ISO week to `latency-exports/<week>.json` (schema
+`agentctl-chat-latency-export/v1`: per stamp combination and jam state, each
+stage's count, median and p90 buckets), and prunes day summaries, stamped rows,
+exports and jams older than 90 days. Request records are never pruned by it.
+`chat latency --export` writes last week's export at once.
+
 ## Service management
 
 `chat run` is a foreground process and exits cleanly after SIGINT or SIGTERM,

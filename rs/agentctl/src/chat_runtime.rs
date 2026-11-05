@@ -2811,6 +2811,17 @@ struct RequestRecord {
     /// When this request was folded into a latency summary (#801).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     latency_folded_at: Option<u64>,
+    /// What the request was delivered to, stamped at delivery (#897 chat-latency-stamps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stamp: Option<DeliveryStamp>,
+    /// The target's turn for this request, from its transcript, set at the first reply (#897).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_timing: Option<TurnTiming>,
+    /// When and why its delivery was first blocked, not merely queued behind the agent's work
+    /// (#897): a delivered request blocked for [`crate::chat_latency::JAM_AFTER_MILLIS`] or more
+    /// marks a jam window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocked: Option<BlockedDelivery>,
     /// How the last prompt typed for this request asked for replies: `command` (only the `chat
     /// reply` command) or `blocks` (marker lines, and the command where offered) (#896).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2822,6 +2833,54 @@ struct RequestRecord {
     /// chat-bridge-json-forward-compat).
     #[serde(flatten)]
     unknown: crate::forward_compat::KeptKeys,
+}
+
+/// What a request was delivered to (#897 chat-latency-stamps), read at delivery from the target's
+/// agent record, its launch profile and the bridge's labels for it. A field its source does not
+/// give is `unknown`, never guessed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryStamp {
+    /// The agent the prompt was delivered to.
+    pub target_agent: String,
+    /// Its launch profile.
+    pub profile: String,
+    /// Its harness.
+    pub harness: String,
+    /// Its model.
+    pub model: String,
+    /// Its effective reasoning effort.
+    pub effort: String,
+    /// `tui` or `headless`.
+    pub adapter: String,
+    /// Its role, from `chat label`, or `coordinator` for the registry's designated coordinator.
+    pub role: String,
+    /// Its protocol, from `chat label`.
+    pub protocol: String,
+}
+
+/// The first sign that a request's delivery was blocked (#897).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BlockedDelivery {
+    /// One of [`crate::chat_latency::JAM_CAUSES`].
+    pub cause: String,
+    /// When it was first seen.
+    pub since_millis: u64,
+    /// When it was last seen, or the delivery itself when it was blocked to the end.
+    pub last_millis: u64,
+}
+
+/// The target's turn for one request (#897): when its transcript shows the prompt and the first
+/// tool call after it. `split` is `transcript`, or `unavailable` where no transcript was followed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TurnTiming {
+    /// `transcript` or `unavailable`.
+    pub split: String,
+    /// When the transcript recorded the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_started_at_millis: Option<u64>,
+    /// When it recorded the first tool call after the prompt and before the first reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_tool_at_millis: Option<u64>,
 }
 
 impl SavedMessage {
@@ -2883,6 +2942,9 @@ impl RequestRecord {
             uncertain_reported_at_millis: None,
             latency_model: None,
             reply_mode: None,
+            stamp: None,
+            turn_timing: None,
+            blocked: None,
             latency_effort: None,
             latency_adapter: None,
             latency_folded_at: None,
@@ -5926,6 +5988,8 @@ pub struct BridgeState {
     latency_registry: Option<std::path::PathBuf>,
     /// #801 adapter at delivery: the bridge manager's headless verdict.
     latency_headless: bool,
+    /// Prompt and tool-call times the transcript reader keeps, for the think/tool split (#897).
+    turn_marks: Option<crate::chat_transcript::SharedTurnMarks>,
     #[cfg(test)]
     admission_fault_after: Arc<std::sync::Mutex<Option<usize>>>,
     #[cfg(test)]
@@ -6064,6 +6128,7 @@ impl BridgeState {
             transcript_settled: Arc::default(),
             latency_registry: None,
             latency_headless: false,
+            turn_marks: None,
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -6173,6 +6238,7 @@ impl BridgeState {
             transcript_settled: Arc::default(),
             latency_registry: None,
             latency_headless: false,
+            turn_marks: None,
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -6273,6 +6339,125 @@ impl BridgeState {
         self.latency_registry = registry;
         self.latency_headless = headless;
         self
+    }
+
+    /// The weekly latency upkeep (#897): [`crate::chat_latency::maintain`] for this state.
+    ///
+    /// # Errors
+    ///
+    /// The export cannot be written.
+    pub(crate) fn latency_upkeep(&self) -> std::result::Result<Option<PathBuf>, String> {
+        crate::chat_latency::maintain(&self.root, unix_millis())
+    }
+
+    /// Share the transcript reader's prompt and tool-call times, from which a request's turn is
+    /// split into thinking and tools (#897 chat-latency-stamps).
+    #[must_use]
+    pub(crate) fn with_turn_marks(
+        mut self,
+        marks: crate::chat_transcript::SharedTurnMarks,
+    ) -> Self {
+        self.turn_marks = Some(marks);
+        self
+    }
+
+    /// What a request delivered now is delivered to (#897 chat-latency-stamps): the served
+    /// agent's record, its launch profile in the registry's `profiles.json`, and the registry's
+    /// coordinator designation. The role is `coordinator` for the designated coordinator, else
+    /// the profile's `role`, else `worker`; the protocol is the profile's, else `unknown`. Every
+    /// other field a source does not give is `unknown`. Never fails delivery.
+    pub(crate) fn delivery_stamp_now(&self) -> DeliveryStamp {
+        use crate::chat_latency::UNKNOWN;
+        let text = |value: &Value| value.as_str().map(str::to_owned);
+        let agent = self.config.agent_name.clone();
+        let registry = self.latency_registry.as_deref();
+        let read = |path: PathBuf| -> Option<Value> {
+            serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+        };
+        let record = registry
+            .and_then(|registry| agent_queue::registry::directory(registry, &agent).ok())
+            .and_then(|dir| read(dir.join("agent.json")))
+            .unwrap_or(Value::Null);
+        let profile_name = text(&record["profile"]);
+        let profile = match (registry, &profile_name) {
+            (Some(registry), Some(name)) => read(registry.join("profiles.json"))
+                .map(|document| document["profiles"][name].clone())
+                .unwrap_or(Value::Null),
+            _ => Value::Null,
+        };
+        let designated = registry
+            .and_then(|registry| read(registry.join("coordinator.json")))
+            .is_some_and(|designation| {
+                designation["name"].as_str() == Some(agent.as_str())
+                    && (designation["token"].is_null() || designation["token"] == record["token"])
+            });
+        let first = |values: &[&Value]| {
+            values
+                .iter()
+                .find_map(|value| text(value))
+                .unwrap_or_else(|| UNKNOWN.to_owned())
+        };
+        DeliveryStamp {
+            profile: profile_name.unwrap_or_else(|| UNKNOWN.to_owned()),
+            harness: first(&[&record["harness"], &profile["harness"]]),
+            model: first(&[&record["model"], &profile["model"]]),
+            effort: first(&[
+                &record["effective_reasoning_effort"],
+                &record["reasoning_effort"],
+                &record["effort"],
+                &profile["reasoning_effort"],
+            ]),
+            adapter: if self.latency_headless {
+                "headless"
+            } else {
+                "tui"
+            }
+            .to_owned(),
+            role: if designated {
+                "coordinator".to_owned()
+            } else {
+                text(&profile["role"]).unwrap_or_else(|| "worker".to_owned())
+            },
+            protocol: first(&[&profile["protocol"]]),
+            target_agent: agent,
+        }
+    }
+
+    /// The target's turn for `record`, whose first reply came at `until` (#897): the first prompt
+    /// its transcript recorded from the start of the delivery, and the first tool call after
+    /// that prompt (or after delivery) and before `until`. `unavailable` while no transcript is
+    /// followed.
+    fn turn_timing_now(&self, record: &RequestRecord, until: u64) -> TurnTiming {
+        let unavailable = || TurnTiming {
+            split: "unavailable".to_owned(),
+            turn_started_at_millis: None,
+            first_tool_at_millis: None,
+        };
+        let (Some(marks), Some(delivered)) = (&self.turn_marks, record.delivered_at_millis) else {
+            return unavailable();
+        };
+        let marks = marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !marks.following {
+            return unavailable();
+        }
+        let from = record.delivery_started_at_millis.unwrap_or(delivered);
+        let turn_started_at_millis = marks
+            .prompts
+            .iter()
+            .copied()
+            .find(|at| (from..=until).contains(at));
+        let first_tool_at_millis = marks
+            .tools
+            .iter()
+            .copied()
+            .find(|at| (turn_started_at_millis.unwrap_or(delivered)..=until).contains(at));
+        TurnTiming {
+            split: "transcript".to_owned(),
+            turn_started_at_millis,
+            first_tool_at_millis,
+        }
     }
 
     /// The (model, effort, adapter) profile read from the registry now;
@@ -10635,19 +10820,29 @@ and the replies captured for them. The provider's own thread is the complete rec
 
     /// One request's stage durations and ET day; the first reply is
     /// read at ordinal 1 (ordinals start at 1) while it still exists.
-    fn latency_durations(&self, record: &RequestRecord) -> (String, [Option<u64>; 6]) {
+    fn latency_durations(
+        &self,
+        record: &RequestRecord,
+    ) -> (String, [Option<u64>; crate::chat_latency::STAGES.len()]) {
         let posted = parse_rfc3339_millis(&record.message.created_at);
         let admitted = record.admitted_at_millis;
         let ack = record.ack_completed_at_millis;
         let delivered = record.delivered_at_millis;
-        let first_reply = if record.reply_count > 0 {
-            self.read_reply(&record.key, 1)
-                .ok()
-                .map(|reply| reply.captured_at_millis)
-        } else {
-            None
+        let first_reply = self.first_reply_at(record);
+        // Thinking until the first tool call, then tools until the first reply; a turn with no
+        // tool call before its first reply is all thinking (#897).
+        let split = record
+            .turn_timing
+            .as_ref()
+            .filter(|timing| timing.split == "transcript");
+        let (think, tools) = match (split, delivered, first_reply) {
+            (Some(timing), Some(d), Some(r)) => match timing.first_tool_at_millis {
+                Some(tool) => (Some(tool.saturating_sub(d)), Some(r.saturating_sub(tool))),
+                None => (Some(r.saturating_sub(d)), Some(0)),
+            },
+            _ => (None, None),
         };
-        let durations: [Option<u64>; 6] = [
+        let durations = [
             posted.map(|p| admitted.saturating_sub(p)),
             ack.map(|a| a.saturating_sub(admitted)),
             match (ack, delivered) {
@@ -10666,33 +10861,90 @@ and the replies captured for them. The provider's own thread is the complete rec
                 (None, Some(d)) => Some(d.saturating_sub(admitted)),
                 _ => None,
             },
+            think,
+            tools,
         ];
         let day = crate::chat_latency::et_date(admitted as f64 / 1_000.0);
         (day, durations)
     }
 
-    /// Write one request's stage durations into its summary file; the
-    /// record's folded mark is the caller's job (#801).
+    /// When the request's first reply was captured, while it still exists.
+    fn first_reply_at(&self, record: &RequestRecord) -> Option<u64> {
+        (record.reply_count > 0)
+            .then(|| self.read_reply(&record.key, 1).ok())
+            .flatten()
+            .map(|reply| reply.captured_at_millis)
+    }
+
+    /// The key `record` folds under: its #897 stamp, or for a request delivered before stamps
+    /// its #801 profile tag with the other stamps unknown; and whether it was admitted inside a
+    /// jam window known now.
+    fn fold_key(
+        &self,
+        record: &RequestRecord,
+        jams: &[crate::chat_latency::Jam],
+    ) -> crate::chat_latency::FoldKey {
+        let bridge = self
+            .root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("bridge");
+        let tag = |value: &Option<String>| value.clone().unwrap_or_else(|| "unknown".to_owned());
+        let mut key = crate::chat_latency::FoldKey::unstamped(bridge, &self.config.agent_name);
+        match &record.stamp {
+            Some(stamp) => {
+                key.coordinator = stamp.target_agent.clone();
+                key.model = stamp.model.clone();
+                key.effort = stamp.effort.clone();
+                key.adapter = stamp.adapter.clone();
+                key.harness = stamp.harness.clone();
+                key.profile = stamp.profile.clone();
+                key.role = stamp.role.clone();
+                key.protocol = stamp.protocol.clone();
+            }
+            None => {
+                key.model = tag(&record.latency_model);
+                key.effort = tag(&record.latency_effort);
+                key.adapter = tag(&record.latency_adapter);
+            }
+        }
+        key.jammed = crate::chat_latency::in_jam(jams, record.admitted_at_millis);
+        key
+    }
+
+    /// Write one request's stage durations into its summary file, and its stamped row into the
+    /// day's archive (#897); the record's folded mark is the caller's job (#801).
     fn write_latency_summary(
         &self,
         record: &RequestRecord,
         day: &str,
-        durations: &[Option<u64>; 6],
+        durations: &[Option<u64>; crate::chat_latency::STAGES.len()],
     ) -> Result<()> {
-        crate::chat_latency::fold(
-            &self.root,
-            self.root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("bridge"),
-            &self.config.agent_name,
-            record.latency_model.as_deref().unwrap_or("unknown"),
-            record.latency_effort.as_deref().unwrap_or("unknown"),
-            record.latency_adapter.as_deref().unwrap_or("unknown"),
-            day,
-            durations,
-        )
-        .map_err(ChatRuntimeError::invalid)?;
+        let jams = crate::chat_latency::read_jams(&self.root);
+        let key = self.fold_key(record, &jams);
+        crate::chat_latency::fold(&self.root, &key, day, durations)
+            .map_err(ChatRuntimeError::invalid)?;
+        let stages: Map<String, Value> = crate::chat_latency::STAGES
+            .iter()
+            .zip(durations)
+            .map(|(stage, duration)| ((*stage).to_owned(), serde_json::json!(duration)))
+            .collect();
+        let row = serde_json::json!({
+            "schema": "agentctl-chat-latency-record/v1",
+            "key": record.key,
+            "day": day,
+            "posted_at_millis": parse_rfc3339_millis(&record.message.created_at),
+            "admitted_at_millis": record.admitted_at_millis,
+            "acknowledged_at_millis": record.ack_completed_at_millis,
+            "delivered_at_millis": record.delivered_at_millis,
+            "first_reply_at_millis": self.first_reply_at(record),
+            "stamp": record.stamp,
+            "turn_timing": record.turn_timing,
+            "jammed": key.jammed,
+            "stages_millis": stages,
+        });
+        crate::chat_latency::append_record(&self.root, day, &row)
+            .map_err(ChatRuntimeError::invalid)?;
         Ok(())
     }
 
@@ -12951,6 +13203,9 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 // Mark the in-memory record the capture path writes last;
                 // the summary folds after the final writes below.
                 request.latency_folded_at = Some(unix_millis());
+                if request.turn_timing.is_none() {
+                    request.turn_timing = Some(self.turn_timing_now(&request, unix_millis()));
+                }
                 latency_first_reply = Some(request.clone());
             }
             request.reply_bytes = next_request_bytes;
@@ -13460,6 +13715,30 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         self.set_delivery_phase(key, phase, error).map(|_| ())
     }
 
+    /// Record a jam window for `record`, just delivered, when errors said its delivery was
+    /// blocked over [`crate::chat_latency::JAM_AFTER_MILLIS`] or more (#897). Best-effort.
+    fn mark_jam(&self, record: &RequestRecord) {
+        let Some(blocked) = &record.blocked else {
+            return;
+        };
+        if blocked.last_millis.saturating_sub(blocked.since_millis)
+            < crate::chat_latency::JAM_AFTER_MILLIS
+        {
+            return;
+        }
+        let jam = crate::chat_latency::Jam {
+            start_millis: blocked.since_millis,
+            end_millis: blocked.last_millis,
+            cause: blocked.cause.clone(),
+            source: "bridge".to_owned(),
+            request: Some(record.key.clone()),
+            note: None,
+        };
+        if let Err(error) = crate::chat_latency::append_jam(&self.root, &jam) {
+            eprintln!("agentctl: chat jam window not recorded: {error}");
+        }
+    }
+
     fn set_delivery_phase(
         &self,
         key: &str,
@@ -13500,6 +13779,38 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 record.latency_model = Some(model);
                 record.latency_effort = Some(effort);
                 record.latency_adapter = Some(adapter);
+            }
+            if record.stamp.is_none() {
+                record.stamp = Some(self.delivery_stamp_now());
+            }
+            // Still blocked up to delivery when the last error said so.
+            let blocked_to_the_end = record
+                .delivery_error
+                .as_deref()
+                .and_then(crate::chat_latency::jam_cause)
+                .is_some();
+            if let (true, Some(blocked), Some(delivered)) = (
+                blocked_to_the_end,
+                record.blocked.as_mut(),
+                record.delivered_at_millis,
+            ) {
+                blocked.last_millis = delivered;
+            }
+            self.mark_jam(&record);
+        }
+        // The span in which errors said the delivery was blocked, not queued behind the agent's
+        // work (#897): from the first such error to the latest.
+        if let Some(cause) = detail.and_then(crate::chat_latency::jam_cause) {
+            let now = unix_millis();
+            match record.blocked.as_mut() {
+                Some(blocked) => blocked.last_millis = now,
+                None => {
+                    record.blocked = Some(BlockedDelivery {
+                        cause: cause.to_owned(),
+                        since_millis: now,
+                        last_millis: now,
+                    })
+                }
             }
         }
         record.delivery_error = detail.map(|value| bounded_detail(value, 2_000));
@@ -40445,6 +40756,234 @@ agentctl chat sent 001\nIf you have trouble, run: agentctl chat help 001"
         let back = pane.serving("coordinator", false, true, false);
         let prompt = prompted(&back, &keys[2]);
         assert!(!reply_mode_of(&back, &keys[2], &prompt).0, "{prompt}");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A registry holding `record` as the bridge's agent (`coordinator`), with `profiles` as its
+    /// `profiles.json` (#897 chat-latency-stamps).
+    fn stamp_registry(name: &str, record: Value, profiles: Option<Value>) -> PathBuf {
+        let registry = temporary(name);
+        let dir = agent_queue::registry::directory_at(
+            &registry,
+            "coordinator",
+            agent_queue::registry::Location::Current,
+        );
+        fs::create_dir_all(&dir).expect("agent directory");
+        fs::write(dir.join("agent.json"), record.to_string()).expect("agent record");
+        if let Some(profiles) = profiles {
+            fs::write(registry.join("profiles.json"), profiles.to_string()).expect("profiles");
+        }
+        registry
+    }
+
+    fn stamp_of(registry: &Path, name: &str) -> DeliveryStamp {
+        let root = temporary(name);
+        let state = BridgeState::initialize(&root, config())
+            .expect("initialize state")
+            .with_latency_profile(Some(registry.to_path_buf()), false);
+        let key = admitted(&state, 1).remove(0);
+        prompted(&state, &key);
+        let stamp = state
+            .read_request(&key)
+            .expect("record")
+            .stamp
+            .expect("stamped");
+        fs::remove_dir_all(root).expect("cleanup");
+        stamp
+    }
+
+    #[test]
+    fn a_delivered_request_is_stamped_from_its_agent_record_and_launch_profile() {
+        // #897 chat-latency-stamps: the record says what it can; the launch profile fills the
+        // model, effort, role and protocol it does not; the designated coordinator's role is
+        // `coordinator`; nothing is guessed.
+        let profiles = serde_json::json!({"schema": "agentctl-profiles/v1", "profiles": {
+            "lead": {"harness": "claude", "mode": "interactive", "model": "model-1",
+                     "reasoning_effort": "high", "role": "liaison",
+                     "protocol": "hands-delegating"}}});
+        let registry = stamp_registry(
+            "stamp-known",
+            serde_json::json!({"profile": "lead", "harness": "claude", "token": "t-1"}),
+            Some(profiles),
+        );
+        let stamp = stamp_of(&registry, "stamp-known-state");
+        assert_eq!(
+            stamp,
+            DeliveryStamp {
+                target_agent: "coordinator".into(),
+                profile: "lead".into(),
+                harness: "claude".into(),
+                model: "model-1".into(),
+                effort: "high".into(),
+                adapter: "tui".into(),
+                role: "liaison".into(),
+                protocol: "hands-delegating".into(),
+            }
+        );
+        fs::write(
+            registry.join("coordinator.json"),
+            serde_json::json!({"name": "coordinator", "token": "t-1"}).to_string(),
+        )
+        .expect("designation");
+        assert_eq!(stamp_of(&registry, "stamp-designated").role, "coordinator");
+        fs::remove_dir_all(registry).expect("cleanup");
+
+        // An adopted pane with an unknown harness and no profile: only the record speaks.
+        let registry = stamp_registry(
+            "stamp-unknown",
+            serde_json::json!({"harness": "unknown", "token": "t-2"}),
+            None,
+        );
+        let stamp = stamp_of(&registry, "stamp-unknown-state");
+        assert_eq!(
+            (
+                stamp.profile.as_str(),
+                stamp.harness.as_str(),
+                stamp.model.as_str(),
+                stamp.effort.as_str(),
+                stamp.role.as_str(),
+                stamp.protocol.as_str()
+            ),
+            ("unknown", "unknown", "unknown", "unknown", "worker", "unknown")
+        );
+        fs::remove_dir_all(registry).expect("cleanup");
+    }
+
+    #[test]
+    fn a_followed_transcript_splits_the_first_reply_into_thinking_and_tools() {
+        // #897: the transcript reader's prompt and tool-call times split delivered -> first reply
+        // at the first tool call; without a followed transcript the split is unavailable.
+        let root = temporary("turn-split");
+        let marks = crate::chat_transcript::SharedTurnMarks::default();
+        let state = BridgeState::initialize(&root, config())
+            .expect("initialize state")
+            .with_turn_marks(marks.clone());
+        let keys = admitted(&state, 2);
+        prompted(&state, &keys[0]);
+        let delivered = state
+            .read_request(&keys[0])
+            .unwrap()
+            .delivered_at_millis
+            .unwrap();
+        {
+            let mut marks = marks.lock().unwrap();
+            marks.following = true;
+            marks.prompts.push_back(delivered);
+            marks.tools.push_back(delivered.saturating_sub(60_000)); // an earlier turn's
+            marks.tools.push_back(delivered + 1);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        state
+            .capture_snapshot(&reply_block("001", "done"))
+            .expect("capture");
+        let timing = state
+            .read_request(&keys[0])
+            .unwrap()
+            .turn_timing
+            .expect("timing");
+        assert_eq!(timing.split, "transcript");
+        assert_eq!(timing.turn_started_at_millis, Some(delivered));
+        assert_eq!(timing.first_tool_at_millis, Some(delivered + 1));
+        let summaries = crate::chat_latency::read_window(&root, "0000-01-01", "9999-12-31");
+        let stages = crate::chat_latency::merge(&summaries.iter().collect::<Vec<_>>());
+        assert_eq!(stages["delivered_to_first_tool"].iter().sum::<u32>(), 1);
+        assert_eq!(stages["delivered_to_first_tool"][0], 1, "1 ms of thinking");
+        assert_eq!(stages["first_tool_to_first_reply"].iter().sum::<u32>(), 1);
+        // The stamped row is archived with the split.
+        let day = crate::chat_latency::et_date(delivered as f64 / 1_000.0);
+        let rows = fs::read_to_string(
+            root.join(crate::chat_latency::RECORDS_DIR)
+                .join(format!("{day}.jsonl")),
+        )
+        .expect("stamped rows");
+        assert!(rows.contains("\"split\":\"transcript\""), "{rows}");
+        // No transcript followed: unavailable, and no split stage is counted.
+        marks.lock().unwrap().following = false;
+        prompted(&state, &keys[1]);
+        state
+            .capture_snapshot(&reply_block("002", "done too"))
+            .expect("capture");
+        let timing = state
+            .read_request(&keys[1])
+            .unwrap()
+            .turn_timing
+            .expect("timing");
+        assert_eq!(timing.split, "unavailable");
+        let summaries = crate::chat_latency::read_window(&root, "0000-01-01", "9999-12-31");
+        let stages = crate::chat_latency::merge(&summaries.iter().collect::<Vec<_>>());
+        assert_eq!(stages["delivered_to_first_reply"].iter().sum::<u32>(), 2);
+        assert_eq!(stages["delivered_to_first_tool"].iter().sum::<u32>(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Move `key`'s blocked span back by `millis`, as if it had been blocked that long.
+    fn backdate_blocked(state: &BridgeState, key: &str, millis: u64) {
+        let path = state.request_path(key);
+        let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let since = record["blocked"]["since_millis"].as_u64().expect("blocked");
+        record["blocked"]["since_millis"] = serde_json::json!(since - millis);
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_blocked_delivery_marks_a_jam_and_a_busy_agent_does_not() {
+        // #897, with the lead's refinement: waiting while the agent works is the latency being
+        // measured, never a jam; a delivery blocked by a stranded paste for 5 minutes is one.
+        let root = temporary("jam-marks");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = admitted(&state, 2);
+        let stranded = "stranded prompt: pane p1: the prompt still sits at the bottom of the \
+                        screen after 4 Enter press(es)";
+        state
+            .put_delivery_phase(&keys[0], RequestPhase::Submitting, Some(stranded))
+            .unwrap();
+        backdate_blocked(&state, &keys[0], 10 * 60 * 1_000);
+        state
+            .put_delivery_phase(&keys[0], RequestPhase::Delivered, None)
+            .unwrap();
+        let jams = crate::chat_latency::read_jams(&root);
+        assert_eq!(jams.len(), 1, "{jams:?}");
+        assert_eq!(jams[0].cause, "composer-blocked");
+        assert_eq!(jams[0].request.as_deref(), Some(keys[0].as_str()));
+        assert!(jams[0].end_millis - jams[0].start_millis >= 10 * 60 * 1_000);
+        // Busy for as long: no blocked span, no jam.
+        let busy = "message chat-x remains pending without consuming a retry attempt: pane p1 \
+                    did not become idle/done within 0s; last status=working";
+        state
+            .put_delivery_phase(&keys[1], RequestPhase::Submitting, Some(busy))
+            .unwrap();
+        assert!(state.read_request(&keys[1]).unwrap().blocked.is_none());
+        state
+            .put_delivery_phase(&keys[1], RequestPhase::Delivered, None)
+            .unwrap();
+        assert_eq!(crate::chat_latency::read_jams(&root).len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn pruning_drops_a_ninety_one_day_old_latency_row_and_keeps_live_request_records() {
+        // #897, with the lead's refinement: only latency rows and stats are pruned; request
+        // records, which receipts, replies and the failed digest read, never are.
+        let root = temporary("latency-prune");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = admitted(&state, 1).remove(0);
+        let today = crate::chat_latency::et_date(unix_millis() as f64 / 1_000.0);
+        let old =
+            crate::chat_latency::day_string(crate::chat_latency::day_number(&today).unwrap() - 91);
+        crate::chat_latency::append_record(&root, &old, &serde_json::json!({"key": "old"}))
+            .unwrap();
+        // The request record itself is backdated past the retention too.
+        let path = state.request_path(&key);
+        let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["admitted_at_millis"] = serde_json::json!(unix_millis() - 120 * 86_400_000);
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(crate::chat_latency::prune(&root, &today) >= 1);
+        assert!(!root
+            .join(crate::chat_latency::RECORDS_DIR)
+            .join(format!("{old}.jsonl"))
+            .exists());
+        assert_eq!(state.request_keys().unwrap(), [key]);
+        assert!(path.exists());
         fs::remove_dir_all(root).expect("cleanup");
     }
 
