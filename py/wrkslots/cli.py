@@ -31519,6 +31519,43 @@ def _write_audit_cache_state(
         raise
 
 
+def _audit_journal_identities(
+    config: Config,
+) -> dict[str, tuple[str, str, str]]:
+    """Lightweight journal identities for audit revalidation.
+
+    Reading the journal files directly (no provenance validation, no
+    event replay, no pending-operation scan) is enough to tell whether
+    the journal a row was measured against is still the journal on
+    disk; full validation already ran for the snapshot rows. A journal
+    that exists only as pending event evidence has no file identity at
+    either read, so its row is kept unless a file appears.
+    """
+
+    identities: dict[str, tuple[str, str, str]] = {}
+    paths = set(config.control.glob("ACTIVE.*.journal"))
+    paths.update(config.control.glob("CREATE.*.journal"))
+    paths.update(config.control.glob("FINISH.*.journal"))
+    for path in sorted(paths):
+        try:
+            contents, _identity = _read_regular_file_identity(
+                path, "cache recovery journal", _JOURNAL_BYTES_LIMIT
+            )
+            raw = _strict_json_object(contents, "cache recovery journal")
+            if raw.get("kind") in {
+                "remove-validate-batch",
+                "recover-absent-validate-rows",
+            }:
+                continue
+            slot = _as_str(raw.get("slot"), "cache recovery journal.slot")
+            machine = _as_str(raw.get("machine"), "cache recovery journal.machine")
+            kind = _as_str(raw.get("kind"), "cache recovery journal.kind")
+            identities[slot] = (machine, f"{kind}-journal", _event_digest(raw))
+        except (OSError, Refusal, StateError) as exc:
+            identities[path.name] = ("", "unreadable", str(exc))
+    return identities
+
+
 def _audit_registry_revision(states: Sequence[ActiveState]) -> str:
     identity = [
         {"machine": state.machine, "revision": state.revision}
@@ -35542,6 +35579,42 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         journal_slots = {
             slot.slot: slot for slot in _all_journal_cache_slots(config, states=states)
         }
+        # Per-record snapshot identities for the stale-snapshot
+        # revalidation below: a later change invalidates only the row
+        # whose own identity changed, appeared, or disappeared.
+        # Identities are taken from the ACTIVE files, not from the
+        # event-replayed records above: revalidation re-reads the
+        # files, and an event-replayed record can differ from its
+        # file form without any registry change during the audit.
+        _file_states = [
+            _load_active_snapshot(config, machine)
+            for machine in _state_machines(config)
+        ]
+        snapshot_records = {
+            (record.machine, record.slot, record.generation): _record_sha256(record)
+            for state in _file_states
+            for record in state.slots
+        }
+        snapshot_by_slot = {
+            (record.machine, record.slot): (
+                record.generation,
+                _record_sha256(record),
+            )
+            for state in _file_states
+            for record in state.slots
+        }
+        snapshot_journals = _audit_journal_identities(config)
+        snapshot_seals = {
+            (machine, slot, generation): str(path)
+            for machine, slot, generation, path in seal_targets
+        }
+        snapshot_seal_by_slot = {
+            (machine, slot): (generation, str(path))
+            for machine, slot, generation, path in seal_targets
+        }
+        snapshot_seal_errors = {
+            (machine, name): error for machine, name, error in seal_errors
+        }
         metrics.finish(
             "registry",
             registry_started,
@@ -35610,6 +35683,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         except OSError as exc:
             raise Refusal(f"cannot enumerate worktree slots in {root}: {exc}") from exc
     registered = {(record.slot_type, record.slot) for record in records}
+    snapshot_on_disk = set(on_disk)
     rows: list[dict[str, object]] = []
     running_agent_count = 0
     audit_vcs = _AuditGitVcs()
@@ -35951,38 +36025,319 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     )
     # Revalidate the snapshot under a short lock before publishing (#797):
     # planning and census ran unlocked, so a registry change in between
-    # must not be published as current. Affected rows become UNKNOWN.
+    # must not be published as current. Invalidation is per record: only
+    # a row whose own record, journal, or seal identity changed,
+    # appeared, or disappeared becomes UNKNOWN; unchanged rows keep
+    # their measured verdicts. The registry revision alone is not an
+    # identity: a revision bump for an unrelated slot must not flip
+    # every row.
+    def _mark_unknown(row: dict[str, object], reason: str) -> None:
+        row["verdict"] = "UNKNOWN"
+        reasons = row.get("reasons")
+        if isinstance(reasons, list) and reason not in reasons:
+            reasons.append(reason)
+
+    _stale_reason = (
+        "registry changed during audit; this row was measured "
+        "against a stale snapshot and is reported as unknown"
+    )
     with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock):
-        # Revision-only re-read: no event replay, no record parsing.
-        current_identity = [
-            {
-                "machine": machine,
-                "revision": _as_int(
-                    _as_mapping(
-                        _read_json(_active_path(config, machine), "active state"),
-                        "active state",
-                    )["revision"],
-                    "active state.revision",
-                ),
-            }
+        # Snapshot-only re-read: parsing the ACTIVE files directly
+        # replays no event log, as the revision-only re-read before it
+        # did not; per-record digests are computed from the parsed
+        # records without another event pass.
+        current_states = [
+            _load_active_snapshot(config, machine)
             for machine in _state_machines(config)
         ]
-        current_revision = hashlib.sha256(
-            json.dumps(
-                sorted(current_identity, key=lambda item: item["machine"]),
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-    if current_revision != snapshot_revision:
-        for row in rows:
-            row["verdict"] = "UNKNOWN"
-            reasons = row.get("reasons")
-            if isinstance(reasons, list):
-                reasons.append(
-                    "registry changed during audit; this row was measured "
-                    "against a stale snapshot and is reported as unknown"
+        current_record_list = [
+            record for state in current_states for record in state.slots
+        ]
+        current_seal_targets, current_seal_errors = (
+            _audit_validate_batch_seal_evidence(config)
+        )
+    current_records = {
+        (record.machine, record.slot, record.generation): _record_sha256(record)
+        for record in current_record_list
+    }
+    current_journals = _audit_journal_identities(config)
+    current_seals = {
+        (machine, slot, generation): str(path)
+        for machine, slot, generation, path in current_seal_targets
+    }
+    current_seal_by_slot = {
+        (machine, slot): (generation, str(path))
+        for machine, slot, generation, path in current_seal_targets
+    }
+    current_seal_error_map = {
+        (machine, name): error for machine, name, error in current_seal_errors
+    }
+    current_on_disk: set[tuple[str, str]] = set()
+    for slot_type, root in _slot_roots(config).items():
+        if not root.exists():
+            continue
+        try:
+            current_on_disk.update(
+                (slot_type, entry.name)
+                for entry in root.iterdir()
+                if entry.is_dir()
+                and not entry.is_symlink()
+                and not entry.name.startswith("EVENTS.")
+                and not _is_representation_directory(config, entry)
+                and not (
+                    slot_type == "agent"
+                    and entry == _validate_slots_directory(config)
                 )
+            )
+        except OSError as exc:
+            raise Refusal(f"cannot enumerate worktree slots in {root}: {exc}") from exc
+    current_registered = {
+        (record.slot_type, record.slot) for record in current_record_list
+    }
+    kept_rows: list[dict[str, object]] = []
+    kept_slots: set[str] = set()
+    for row in rows:
+        slot = str(row["slot"])
+        row_machine: object = row.get("machine")
+        row_generation: object = row.get("generation")
+        row_slot_type: object = row.get("slot_type")
+        is_seal_error_row = (
+            row.get("owner_state") == "validation-batch-seal" and row_generation is None
+        )
+        if (
+            isinstance(row_machine, str)
+            and isinstance(row_generation, int)
+            and (row_machine, slot, row_generation) in snapshot_records
+        ):
+            stale = (
+                current_records.get((row_machine, slot, row_generation))
+                != snapshot_records[(row_machine, slot, row_generation)]
+                or snapshot_journals.get(slot) != current_journals.get(slot)
+                or snapshot_seal_by_slot.get((row_machine, slot))
+                != current_seal_by_slot.get((row_machine, slot))
+            )
+            if stale:
+                _mark_unknown(row, _stale_reason)
+            kept_rows.append(row)
+            kept_slots.add(slot)
+            continue
+        if is_seal_error_row:
+            seal_error_key = (
+                row_machine if isinstance(row_machine, str) else None,
+                slot,
+            )
+            if snapshot_seal_errors.get(seal_error_key) != current_seal_error_map.get(
+                seal_error_key
+            ):
+                _mark_unknown(row, _stale_reason)
+            kept_rows.append(row)
+            kept_slots.add(slot)
+            continue
+        if (
+            isinstance(row_slot_type, str)
+            and (row_slot_type, slot) in snapshot_on_disk
+            and row.get("record_sha256") is None
+        ):
+            if (row_slot_type, slot) not in current_on_disk:
+                continue
+            if (
+                snapshot_journals.get(slot) != current_journals.get(slot)
+                or (
+                    isinstance(row_machine, str)
+                    and snapshot_seal_by_slot.get((row_machine, slot))
+                    != current_seal_by_slot.get((row_machine, slot))
+                )
+            ):
+                _mark_unknown(row, _stale_reason)
+            kept_rows.append(row)
+            kept_slots.add(slot)
+            continue
+        if slot in snapshot_journals and row.get("record_sha256") is None:
+            if snapshot_journals.get(slot) != current_journals.get(slot):
+                _mark_unknown(row, _stale_reason)
+            kept_rows.append(row)
+            kept_slots.add(slot)
+            continue
+        if (
+            isinstance(row_machine, str)
+            and isinstance(row_generation, int)
+            and (row_machine, slot, row_generation) in snapshot_seals
+        ):
+            if (
+                current_seals.get((row_machine, slot, row_generation))
+                != snapshot_seals[(row_machine, slot, row_generation)]
+            ):
+                _mark_unknown(row, _stale_reason)
+            kept_rows.append(row)
+            kept_slots.add(slot)
+            continue
+        # A row no snapshot identity claims: keep it only when every
+        # snapshot identity still matches, otherwise it is stale.
+        if (
+            current_records != snapshot_records
+            or current_journals != snapshot_journals
+            or current_seals != snapshot_seals
+            or current_seal_error_map != snapshot_seal_errors
+            or current_on_disk != snapshot_on_disk
+        ):
+            _mark_unknown(row, _stale_reason)
+        kept_rows.append(row)
+        kept_slots.add(slot)
+    rows = kept_rows
+    for record in sorted(
+        current_record_list, key=lambda item: (item.machine, item.slot)
+    ):
+        if (record.machine, record.slot) in snapshot_by_slot:
+            continue
+        rows.append(
+            {
+                "slot": record.slot,
+                "machine": record.machine,
+                "agent": record.agent,
+                "slot_type": record.slot_type,
+                "generation": record.generation,
+                "record_sha256": _record_sha256(record),
+                "verdict": "UNKNOWN",
+                "reasons": [
+                    "slot appeared during audit and was not measured; "
+                    "this row is reported as unknown"
+                ],
+                "owner_state": "unknown",
+                "liveness_state": "unverifiable",
+                "heartbeat_age_seconds": 0,
+                "heartbeat_expired": False,
+                "cache_bytes": 0,
+                "cache_error": None,
+                "cache_status": "complete",
+            }
+        )
+        kept_slots.add(record.slot)
+    for row_slot_type, slot in sorted(
+        current_on_disk - snapshot_on_disk - current_registered
+    ):
+        if slot in kept_slots:
+            continue
+        journal_identity = current_journals.get(slot)
+        late_sealed = current_seal_by_slot.get((config.machine, slot))
+        if journal_identity is not None:
+            reason = (
+                f"interrupted {journal_identity[1].replace('-', ' ')} requires "
+                "wrkslots recover"
+            )
+            owner_state = journal_identity[1]
+            late_machine: object = journal_identity[0]
+            late_generation: object = None
+        elif late_sealed is not None:
+            reason = "interrupted validation-batch seal requires wrkslots recover"
+            owner_state = "validation-batch-seal"
+            late_machine = config.machine
+            late_generation = late_sealed[0]
+        elif row_slot_type == "validate":
+            reason = (
+                "validation directory has no active registry row; preserve "
+                "and inspect it, and use import-existing only for a "
+                "demonstrably live owner; destructive ownerless Git "
+                "worktree recovery is disabled"
+            )
+            owner_state = "unregistered"
+            late_machine = None
+            late_generation = None
+        else:
+            reason = "directory has no active registry row; inspect or import it"
+            owner_state = "unregistered"
+            late_machine = None
+            late_generation = None
+        rows.append(
+            {
+                "slot": slot,
+                "slot_type": row_slot_type,
+                "machine": late_machine,
+                "agent": None,
+                "generation": late_generation,
+                "record_sha256": None,
+                "verdict": "BLOCKED",
+                "reasons": [reason],
+                "owner_state": owner_state,
+                "liveness_state": "unverifiable",
+                "cache_bytes": 0,
+                "cache_error": None,
+                "cache_status": "complete",
+            }
+        )
+        kept_slots.add(slot)
+    for slot in sorted(current_journals):
+        if slot in snapshot_journals or slot in kept_slots:
+            continue
+        journal_machine, journal_state, _journal_digest = current_journals[slot]
+        rows.append(
+            {
+                "slot": slot,
+                "slot_type": None,
+                "machine": journal_machine,
+                "agent": None,
+                "generation": None,
+                "record_sha256": None,
+                "verdict": "BLOCKED",
+                "reasons": [
+                    f"interrupted {journal_state.replace('-', ' ')} requires "
+                    "wrkslots recover"
+                ],
+                "owner_state": journal_state,
+                "liveness_state": "unverifiable",
+                "cache_bytes": 0,
+                "cache_error": None,
+                "cache_status": "complete",
+            }
+        )
+        kept_slots.add(slot)
+    for row_machine, slot, row_generation, sealed_path in current_seal_targets:
+        if (row_machine, slot, row_generation) in snapshot_seals or slot in kept_slots:
+            continue
+        rows.append(
+            {
+                "slot": slot,
+                "slot_type": "validate",
+                "machine": row_machine,
+                "agent": None,
+                "generation": row_generation,
+                "record_sha256": None,
+                "verdict": "BLOCKED",
+                "reasons": [
+                    "interrupted validation-batch seal requires wrkslots recover; "
+                    f"recorded path={sealed_path}"
+                ],
+                "owner_state": "validation-batch-seal",
+                "liveness_state": "unverifiable",
+                "cache_bytes": 0,
+                "cache_error": None,
+                "cache_status": "complete",
+            }
+        )
+        kept_slots.add(slot)
+    for seal_machine, journal_name, error in current_seal_errors:
+        if (seal_machine, journal_name) in snapshot_seal_errors or (
+            journal_name in kept_slots
+        ):
+            continue
+        rows.append(
+            {
+                "slot": journal_name,
+                "slot_type": "validate",
+                "machine": seal_machine,
+                "agent": None,
+                "generation": None,
+                "record_sha256": None,
+                "verdict": "UNKNOWN",
+                "reasons": [f"validation-batch seal evidence is unreadable: {error}"],
+                "owner_state": "validation-batch-seal",
+                "liveness_state": "unverifiable",
+                "cache_bytes": 0,
+                "cache_error": None,
+                "cache_status": "complete",
+            }
+        )
+        kept_slots.add(journal_name)
+    worktree_count = len(current_on_disk)
     sorted_rows = sorted(rows, key=lambda row: str(row["slot"]))
     attention = [
         row

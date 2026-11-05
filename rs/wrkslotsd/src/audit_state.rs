@@ -5888,6 +5888,98 @@ pub(crate) fn parse_audit(
         );
     }
     let (seal_targets, seal_errors) = seal_evidence(&cfg);
+    // Per-record snapshot identities for the stale-snapshot
+    // revalidation below: a later change invalidates only the row
+    // whose own identity changed, appeared, or disappeared.
+    let snapshot_records: BTreeMap<(String, String, i64), Value> = records
+        .iter()
+        .map(|record| {
+            (
+                (
+                    record
+                        .get("machine")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    record
+                        .get("slot")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    record
+                        .get("generation")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                ),
+                record.clone(),
+            )
+        })
+        .collect();
+    let snapshot_by_slot: BTreeMap<(String, String), (i64, Value)> = records
+        .iter()
+        .map(|record| {
+            (
+                (
+                    record
+                        .get("machine")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    record
+                        .get("slot")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+                (
+                    record
+                        .get("generation")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                    record.clone(),
+                ),
+            )
+        })
+        .collect();
+    let snapshot_journals: BTreeMap<String, (String, String, Value)> = journals
+        .iter()
+        .map(|(slot, journal)| {
+            (
+                slot.clone(),
+                (
+                    journal.machine.clone(),
+                    journal.state.clone(),
+                    journal.raw.clone(),
+                ),
+            )
+        })
+        .collect();
+    let snapshot_seals: BTreeMap<(String, String, i64), PathBuf> = seal_targets
+        .iter()
+        .map(|target| {
+            (
+                (
+                    target.machine.clone(),
+                    target.slot.clone(),
+                    target.generation,
+                ),
+                target.path.clone(),
+            )
+        })
+        .collect();
+    let snapshot_seal_by_slot: BTreeMap<(String, String), (i64, PathBuf)> = seal_targets
+        .iter()
+        .map(|target| {
+            (
+                (target.machine.clone(), target.slot.clone()),
+                (target.generation, target.path.clone()),
+            )
+        })
+        .collect();
+    let snapshot_seal_errors: BTreeMap<(Option<String>, String), String> = seal_errors
+        .iter()
+        .map(|(machine, name, error)| ((machine.clone(), name.clone()), error.clone()))
+        .collect();
     let mut seal_by_slot: BTreeMap<(String, String), (i64, PathBuf)> = BTreeMap::new();
     for target in &seal_targets {
         seal_by_slot.insert(
@@ -5974,6 +6066,7 @@ pub(crate) fn parse_audit(
             )
         })
         .collect();
+    let snapshot_on_disk: BTreeSet<(String, String)> = on_disk.clone();
     let validation_paths: Vec<PathBuf> = records
         .iter()
         .filter(|record| record.get("slot_type").and_then(Value::as_str) == Some("validate"))
@@ -6302,35 +6395,418 @@ pub(crate) fn parse_audit(
             .cmp(b.get("slot").and_then(Value::as_str).unwrap_or_default())
     });
     // Revalidate the snapshot before publishing (#797): planning and
-    // census ran outside the state lock, so a registry revision change
-    // in between must not be published as current.
-    let current_machines = discover_machines(&cfg.control)?;
-    let mut current_revisions: Vec<(String, i64)> = Vec::new();
-    for machine in &current_machines {
-        let document = active_document(root, &cfg, machine)?;
-        current_revisions.push((
-            machine.clone(),
-            document
-                .get("revision")
+    // census ran outside the state lock, so a registry change in
+    // between must not be published as current. Invalidation is per
+    // record: only a row whose own record, journal, or seal identity
+    // changed, appeared, or disappeared becomes UNKNOWN.
+    let stale_reason = "registry changed during audit; this row was measured \
+         against a stale snapshot and is reported as unknown";
+    let record_key = |record: &Value| -> (String, String, i64) {
+        (
+            record
+                .get("machine")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            record
+                .get("slot")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            record
+                .get("generation")
                 .and_then(Value::as_i64)
                 .unwrap_or(0),
-        ));
+        )
+    };
+    let current_machines = discover_machines(&cfg.control)?;
+    let mut current_records_list: Vec<Value> = Vec::new();
+    for machine in &current_machines {
+        let document = active_document(root, &cfg, machine)?;
+        if let Some(slots) = document.get("slots").and_then(Value::as_array) {
+            current_records_list.extend(slots.iter().cloned());
+        }
     }
-    if current_revisions != shard_revisions {
-        for row in &mut rows {
-            if let Some(object) = row.as_object_mut() {
-                object.insert("verdict".to_string(), Value::String("UNKNOWN".to_string()));
-                if let Some(reasons) = object.get_mut("reasons").and_then(Value::as_array_mut) {
-                    reasons.push(Value::String(
-                        "registry changed during audit; this row was measured \
-                         against a stale snapshot and is reported as unknown"
-                            .to_string(),
-                    ));
-                }
+    let current_journals_map =
+        validated_journals(&cfg, &config, &events_by_machine, &current_records_list)?;
+    let (current_seal_targets, current_seal_errors) = seal_evidence(&cfg);
+    let current_records: BTreeMap<(String, String, i64), Value> = current_records_list
+        .iter()
+        .map(|record| (record_key(record), record.clone()))
+        .collect();
+    let current_journals: BTreeMap<String, (String, String, Value)> = current_journals_map
+        .iter()
+        .map(|(slot, journal)| {
+            (
+                slot.clone(),
+                (
+                    journal.machine.clone(),
+                    journal.state.clone(),
+                    journal.raw.clone(),
+                ),
+            )
+        })
+        .collect();
+    let current_seals: BTreeMap<(String, String, i64), PathBuf> = current_seal_targets
+        .iter()
+        .map(|target| {
+            (
+                (
+                    target.machine.clone(),
+                    target.slot.clone(),
+                    target.generation,
+                ),
+                target.path.clone(),
+            )
+        })
+        .collect();
+    let current_seal_by_slot: BTreeMap<(String, String), (i64, PathBuf)> = current_seal_targets
+        .iter()
+        .map(|target| {
+            (
+                (target.machine.clone(), target.slot.clone()),
+                (target.generation, target.path.clone()),
+            )
+        })
+        .collect();
+    let current_seal_error_map: BTreeMap<(Option<String>, String), String> = current_seal_errors
+        .iter()
+        .map(|(machine, name, error)| ((machine.clone(), name.clone()), error.clone()))
+        .collect();
+    let mut current_on_disk: BTreeSet<(String, String)> = BTreeSet::new();
+    for (slot_type, root_path) in [
+        ("agent", cfg.worktrees.clone()),
+        ("validate", validate_root.clone()),
+    ] {
+        if !root_path.is_dir() {
+            continue;
+        }
+        let listing = std::fs::read_dir(&root_path).map_err(|error| {
+            format!(
+                "cannot enumerate worktree slots in {}: {error}",
+                root_path.display()
+            )
+        })?;
+        for entry in listing {
+            let entry =
+                entry.map_err(|error| format!("cannot enumerate worktree slots: {error}"))?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("EVENTS.") {
+                continue;
+            }
+            if slot_type == "agent" && path == validate_root {
+                continue;
+            }
+            if path.is_dir() && !path.is_symlink() {
+                current_on_disk.insert((slot_type.to_string(), name));
             }
         }
     }
-    let worktree_count = on_disk.len();
+    let current_registered: BTreeSet<(String, String)> = current_records_list
+        .iter()
+        .map(|record| {
+            (
+                record
+                    .get("slot_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("agent")
+                    .to_string(),
+                record
+                    .get("slot")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect();
+    let mark_unknown = |row: &mut Value| {
+        if let Some(object) = row.as_object_mut() {
+            object.insert("verdict".to_string(), Value::String("UNKNOWN".to_string()));
+            if let Some(reasons) = object.get_mut("reasons").and_then(Value::as_array_mut) {
+                let reason = Value::String(stale_reason.to_string());
+                if !reasons.contains(&reason) {
+                    reasons.push(reason);
+                }
+            }
+        }
+    };
+    let mut kept_rows: Vec<Value> = Vec::new();
+    let mut kept_slots: BTreeSet<String> = BTreeSet::new();
+    for mut row in rows {
+        let slot = row
+            .get("slot")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let machine = row
+            .get("machine")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let generation = row.get("generation").and_then(Value::as_i64);
+        let slot_type = row
+            .get("slot_type")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let is_registered_row = match (&machine, generation) {
+            (Some(machine), Some(generation)) => {
+                snapshot_records.contains_key(&(machine.clone(), slot.clone(), generation))
+            }
+            _ => false,
+        };
+        if is_registered_row {
+            let machine = machine.clone().unwrap_or_default();
+            let generation = generation.unwrap_or(0);
+            let stale = current_records.get(&(machine.clone(), slot.clone(), generation))
+                != snapshot_records.get(&(machine.clone(), slot.clone(), generation))
+                || snapshot_journals.get(&slot) != current_journals.get(&slot)
+                || snapshot_seal_by_slot.get(&(machine.clone(), slot.clone()))
+                    != current_seal_by_slot.get(&(machine, slot.clone()));
+            if stale {
+                mark_unknown(&mut row);
+            }
+            kept_slots.insert(slot);
+            kept_rows.push(row);
+            continue;
+        }
+        if row.get("owner_state").and_then(Value::as_str) == Some("validation-batch-seal")
+            && generation.is_none()
+        {
+            let key = (machine.clone(), slot.clone());
+            if snapshot_seal_errors.get(&key) != current_seal_error_map.get(&key) {
+                mark_unknown(&mut row);
+            }
+            kept_slots.insert(slot);
+            kept_rows.push(row);
+            continue;
+        }
+        if let Some(slot_type) = &slot_type {
+            if snapshot_on_disk.contains(&(slot_type.clone(), slot.clone()))
+                && row.get("record_sha256").is_some_and(Value::is_null)
+            {
+                if !current_on_disk.contains(&(slot_type.clone(), slot.clone())) {
+                    continue;
+                }
+                let seal_stale = match &machine {
+                    Some(machine) => {
+                        snapshot_seal_by_slot.get(&(machine.clone(), slot.clone()))
+                            != current_seal_by_slot.get(&(machine.clone(), slot.clone()))
+                    }
+                    None => false,
+                };
+                if snapshot_journals.get(&slot) != current_journals.get(&slot) || seal_stale {
+                    mark_unknown(&mut row);
+                }
+                kept_slots.insert(slot);
+                kept_rows.push(row);
+                continue;
+            }
+        }
+        if snapshot_journals.contains_key(&slot)
+            && row.get("record_sha256").is_some_and(Value::is_null)
+        {
+            if snapshot_journals.get(&slot) != current_journals.get(&slot) {
+                mark_unknown(&mut row);
+            }
+            kept_slots.insert(slot);
+            kept_rows.push(row);
+            continue;
+        }
+        if let (Some(machine), Some(generation)) = (&machine, generation) {
+            let key = (machine.clone(), slot.clone(), generation);
+            if snapshot_seals.contains_key(&key) {
+                if current_seals.get(&key) != snapshot_seals.get(&key) {
+                    mark_unknown(&mut row);
+                }
+                kept_slots.insert(slot);
+                kept_rows.push(row);
+                continue;
+            }
+        }
+        if current_records != snapshot_records
+            || current_journals != snapshot_journals
+            || current_seals != snapshot_seals
+            || current_seal_error_map != snapshot_seal_errors
+            || current_on_disk != snapshot_on_disk
+        {
+            mark_unknown(&mut row);
+        }
+        kept_slots.insert(slot);
+        kept_rows.push(row);
+    }
+    rows = kept_rows;
+    let mut new_records: Vec<&Value> = current_records_list.iter().collect();
+    new_records.sort_by_key(|record| record_key(record));
+    for record in new_records {
+        let (machine, slot, generation) = record_key(record);
+        if snapshot_by_slot.contains_key(&(machine.clone(), slot.clone())) {
+            continue;
+        }
+        let digest = record_digest(record)?;
+        rows.push(json!({
+            "slot": slot,
+            "machine": machine,
+            "agent": record.get("agent").cloned().unwrap_or(Value::Null),
+            "slot_type": record.get("slot_type").cloned().unwrap_or(json!("agent")),
+            "generation": generation,
+            "record_sha256": digest,
+            "verdict": "UNKNOWN",
+            "reasons": ["slot appeared during audit and was not measured; this row is reported as unknown"],
+            "owner_state": "unknown",
+            "liveness_state": "unverifiable",
+            "heartbeat_age_seconds": 0,
+            "heartbeat_expired": false,
+            "cache_bytes": 0,
+            "cache_error": Value::Null,
+            "cache_status": "complete",
+        }));
+        kept_slots.insert(slot);
+    }
+    for (slot_type, slot) in current_on_disk
+        .difference(&snapshot_on_disk)
+        .filter(|item| !current_registered.contains(item))
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        if kept_slots.contains(&slot) {
+            continue;
+        }
+        let journal = current_journals_map.get(&slot);
+        let sealed = current_seal_by_slot.get(&(selected.clone(), slot.clone()));
+        let (reason, owner_state, machine_value, generation_value) = if let Some(journal) = journal
+        {
+            (
+                format!(
+                    "interrupted {} requires wrkslots recover",
+                    journal.state.replace('-', " ")
+                ),
+                journal.state.clone(),
+                json!(journal.machine),
+                Value::Null,
+            )
+        } else if let Some((generation, _path)) = sealed {
+            (
+                "interrupted validation-batch seal requires wrkslots recover".to_string(),
+                "validation-batch-seal".to_string(),
+                json!(selected),
+                json!(generation),
+            )
+        } else if slot_type == "validate" {
+            (
+                    "validation directory has no active registry row; preserve and inspect it, and use import-existing only for a demonstrably live owner; destructive ownerless Git worktree recovery is disabled".to_string(),
+                    "unregistered".to_string(),
+                    Value::Null,
+                    Value::Null,
+                )
+        } else {
+            (
+                "directory has no active registry row; inspect or import it".to_string(),
+                "unregistered".to_string(),
+                Value::Null,
+                Value::Null,
+            )
+        };
+        rows.push(json!({
+            "slot": slot,
+            "slot_type": slot_type,
+            "machine": machine_value,
+            "agent": Value::Null,
+            "generation": generation_value,
+            "record_sha256": Value::Null,
+            "verdict": "BLOCKED",
+            "reasons": [reason],
+            "owner_state": owner_state,
+            "liveness_state": "unverifiable",
+            "cache_bytes": 0,
+            "cache_error": Value::Null,
+            "cache_status": "complete",
+        }));
+        kept_slots.insert(slot);
+    }
+    for journal in current_journals_map.values() {
+        if snapshot_journals.contains_key(&journal.slot) || kept_slots.contains(&journal.slot) {
+            continue;
+        }
+        rows.push(json!({
+            "slot": journal.slot,
+            "slot_type": Value::Null,
+            "machine": journal.machine,
+            "agent": Value::Null,
+            "generation": Value::Null,
+            "record_sha256": Value::Null,
+            "verdict": "BLOCKED",
+            "reasons": [format!(
+                "interrupted {} requires wrkslots recover",
+                journal.state.replace('-', " ")
+            )],
+            "owner_state": journal.state,
+            "liveness_state": "unverifiable",
+            "cache_bytes": 0,
+            "cache_error": Value::Null,
+            "cache_status": "complete",
+        }));
+        kept_slots.insert(journal.slot.clone());
+    }
+    for target in &current_seal_targets {
+        let key = (
+            target.machine.clone(),
+            target.slot.clone(),
+            target.generation,
+        );
+        if snapshot_seals.contains_key(&key) || kept_slots.contains(&target.slot) {
+            continue;
+        }
+        rows.push(json!({
+            "slot": target.slot,
+            "slot_type": "validate",
+            "machine": target.machine,
+            "agent": Value::Null,
+            "generation": target.generation,
+            "record_sha256": Value::Null,
+            "verdict": "BLOCKED",
+            "reasons": [format!(
+                "interrupted validation-batch seal requires wrkslots recover; recorded path={}",
+                target.path.display()
+            )],
+            "owner_state": "validation-batch-seal",
+            "liveness_state": "unverifiable",
+            "cache_bytes": 0,
+            "cache_error": Value::Null,
+            "cache_status": "complete",
+        }));
+        kept_slots.insert(target.slot.clone());
+    }
+    for (machine, journal_name, error) in &current_seal_errors {
+        let key = (machine.clone(), journal_name.clone());
+        if snapshot_seal_errors.contains_key(&key) || kept_slots.contains(journal_name) {
+            continue;
+        }
+        rows.push(json!({
+            "slot": journal_name,
+            "slot_type": "validate",
+            "machine": machine,
+            "agent": Value::Null,
+            "generation": Value::Null,
+            "record_sha256": Value::Null,
+            "verdict": "UNKNOWN",
+            "reasons": [format!(
+                "validation-batch seal evidence is unreadable: {error}"
+            )],
+            "owner_state": "validation-batch-seal",
+            "liveness_state": "unverifiable",
+            "cache_bytes": 0,
+            "cache_error": Value::Null,
+            "cache_status": "complete",
+        }));
+        kept_slots.insert(journal_name.clone());
+    }
+    rows.sort_by(|a, b| {
+        a.get("slot")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(b.get("slot").and_then(Value::as_str).unwrap_or_default())
+    });
+    let worktree_count = current_on_disk.len();
     let disk = disk_status(&cfg, &config);
     let attention: Vec<String> = first_seen_names(
         rows.iter()
