@@ -16,7 +16,7 @@ The `vibe-talk.shots.screenshots` gate step hard-codes 127.0.0.1:18091 for its s
 
 # Design
 
-- The step picks a free port: bind to port 0 and read it back, or try a small range. Honour an override (for example `VIBE_TALK_SCREENSHOT_PORT`).
+- An override already exists: `VIBE_TALK_SHOTS_PORT` (vibe-talk/scripts/run.sh ~402). Keep that name; do not add a second variable. When it is unset and the default port is busy, the step picks a free port automatically (bind to port 0 and read it back).
 - Pass the chosen port to the screenshot server and to every client in the step (scripts/screenshots.py and anything else that reads 18091).
 - A busy port must never abort the DAG. If no port can be had, fail the step alone, with a message naming the holder if it is cheap to find.
 - Search for other hard-coded fixed ports in gate steps and fix them the same way, or list them in the issue's resolution.
@@ -24,7 +24,7 @@ The `vibe-talk.shots.screenshots` gate step hard-codes 127.0.0.1:18091 for its s
 # Acceptance Criteria
 
 - With a process listening on 127.0.0.1:18091, the screenshots step passes on another port, and the DAG completes.
-- The override environment variable is honoured.
+- `VIBE_TALK_SHOTS_PORT` is still honoured.
 - No other gate step depends on a fixed port, or each remaining one is listed with a reason.
 
 # Notes
