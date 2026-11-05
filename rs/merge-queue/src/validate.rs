@@ -565,8 +565,12 @@ fn run_logged(
         let cancelled = cancel.load(Ordering::Relaxed) || stopping;
         let timed_out = limit.is_some_and(|limit| started.elapsed() > limit);
         if cancelled || timed_out {
+            // Quiet: `kill(1)`'s complaints would land in the queue's own log, not the run's.
             let _ = Command::new("kill")
-                .args(["-TERM", &format!("-{}", child.id())])
+                .args(["-TERM", "--", &format!("-{}", child.id())])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status();
             let grace = Instant::now();
             while grace.elapsed() < Duration::from_secs(2) {
@@ -575,11 +579,9 @@ fn run_logged(
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            let _ = Command::new("kill")
-                .args(["-KILL", &format!("-{}", child.id())])
-                .status();
-            let _ = child.kill();
-            let _ = child.wait();
+            // The group is usually gone by now; whatever is left of it is killed without a
+            // "No such process" line when nothing is.
+            crate::bounded::kill_group(&mut child);
             if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(log) {
                 let why = if stopping {
                     "cancelled: the queue is stopping".to_owned()
