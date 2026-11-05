@@ -371,7 +371,12 @@ fn worktrees_image_settings(raw: &Map<String, Value>) -> Result<Value> {
     let unknown: Vec<&str> = section
         .keys()
         .map(String::as_str)
-        .filter(|key| !matches!(*key, "path" | "size_bytes" | "fs" | "mount" | "slot_quota_bytes"))
+        .filter(|key| {
+            !matches!(
+                *key,
+                "path" | "size_bytes" | "fs" | "mount" | "slot_quota_bytes"
+            )
+        })
         .collect();
     if !unknown.is_empty() {
         return Err(format!(
@@ -383,7 +388,9 @@ fn worktrees_image_settings(raw: &Map<String, Value>) -> Result<Value> {
         .get("path")
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
-        .ok_or_else(|| "configuration.worktrees_image.path must be a non-empty string".to_owned())?;
+        .ok_or_else(|| {
+            "configuration.worktrees_image.path must be a non-empty string".to_owned()
+        })?;
     if path.starts_with('/') || path.split('/').any(|part| part == "..") {
         return Err(
             "configuration.worktrees_image.path must be a project-relative path without '..'"
@@ -393,14 +400,21 @@ fn worktrees_image_settings(raw: &Map<String, Value>) -> Result<Value> {
     let size = section
         .get("size_bytes")
         .ok_or_else(|| "configuration.worktrees_image.size_bytes is required".to_owned())?;
-    let size = as_int(size, "configuration.worktrees_image.size_bytes", 1024_i64.pow(3))?;
+    let size = as_int(
+        size,
+        "configuration.worktrees_image.size_bytes",
+        1024_i64.pow(3),
+    )?;
     let filesystem = section.get("fs").and_then(Value::as_str).unwrap_or("btrfs");
     if filesystem != "btrfs" {
         return Err(format!(
             "configuration.worktrees_image.fs must be one of btrfs, not {filesystem:?}"
         ));
     }
-    let mount = section.get("mount").and_then(Value::as_str).unwrap_or("kernel");
+    let mount = section
+        .get("mount")
+        .and_then(Value::as_str)
+        .unwrap_or("kernel");
     if mount == "fuse" {
         return Err(
             "configuration.worktrees_image.mount 'fuse' is unavailable: btrfs has no \
@@ -416,7 +430,11 @@ fn worktrees_image_settings(raw: &Map<String, Value>) -> Result<Value> {
     }
     let quota = match section.get("slot_quota_bytes") {
         None => Value::Null,
-        Some(value) => json!(as_int(value, "configuration.worktrees_image.slot_quota_bytes", 1)?),
+        Some(value) => json!(as_int(
+            value,
+            "configuration.worktrees_image.slot_quota_bytes",
+            1
+        )?),
     };
     Ok(json!({
         "fs": filesystem,
