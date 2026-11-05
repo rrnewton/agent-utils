@@ -33,6 +33,8 @@ The workaround used on 2026-11-04 was a second agentterm view of the same sessio
 - Tests with recorded agentterm screens: idle/working detection, typing into the composer, and refusal on a stale pane.
 - A bridge repointed at an agentterm target types requests and captures replies by the chosen method. After a repoint, health names the right reply source and never the previous agent's transcript.
 - Unrecognised-TUI fallback tests for adopt, start and repoint.
+- D (the owner's requirement, not an extra): unknown-pane receipts require evidence; otherwise the request is uncertain. A delivery to an unknown-harness or agentterm pane gets a delivered receipt only with positive evidence that the input reached the agent (for an agentterm view of an agentcloud session, the session's agentcloudctl history showing the input). Without evidence it is uncertain, never retyped blindly, and alarmed per the #896 policy. Owner's words: "Unknown should still never justify false-positive claim of delivery to the agent when nothing is delivered."
+- D: an agentterm pane attached to an agentcloud session captures replies from that session's agentcloudctl history (moved here from #896 on 2026-11-05).
 - Userguide/help updated; gate passes.
 
 # Notes
@@ -57,3 +59,5 @@ P1, owner via the lead (2026-11-04 17:36-17:41 ET). Assigned to cl-start after #
   - Tested with screens laid out like the recorded idle and working agentterm screens (names replaced), and through the fake TUI.
   - Not done: the stale-composer clear for an agentterm draft (agentterm's clearing keys are unverified), and transcript harvesting. Replies are captured from the screen, as done in P0, or with `chat reply --file`.
 - Remaining: B and D.
+
+D scope set by the lead on 2026-11-05 at 1:04 PM ET: #896 left unknown-pane receipts unchanged to keep an interim agentterm target working, so evidence for unknown panes and agentterm-on-cloud history capture land here. Queued right after #896 and #897.
