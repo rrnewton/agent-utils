@@ -336,6 +336,84 @@ fn a_disjoint_root_waits_for_a_likely_red_head_when_gated() {
     assert_ne!(runs[0]["parent"], report["base_start"], "{report}");
 }
 
+/// After a red head is ejected and nothing the root jumped over landed, the
+/// still-validating root becomes the stack head: refills build on its tip, so
+/// when it lands the refills land straight after it with no base-moved
+/// rebuild.
+#[test]
+fn a_decidable_root_becomes_the_stack_head_for_refills() {
+    let (fx, started, gates) = gated_setup("disjoint-root-promoted");
+    fx.branch("a", &[("tests/a", "FAIL\n")]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.branch("d", &[("tests/d", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    fx.mq_ok(&["submit", "4", "--head", "d"]);
+    let mut daemon = Daemon::start(&fx);
+    wait_for("the window to fill", &started, |lines| lines.len() >= 3);
+    assert_eq!(started_lines(&started)[..3], ["a_t0_", "a_b_t0_", "c_t0_"]);
+    // The head and the batch on it come back red (the head's test fails), and
+    // the culprit search may probe the base; the root keeps validating.
+    open(&gates, "a_t0_");
+    open(&gates, "a_b_t0_");
+    open(&gates, "t0_");
+    // The ejected head leaves the root decidable: the refill of change 2 must
+    // be built on the root's tip (b_c), not on the base (b alone).
+    wait_for("change 2 rebuilt on the root tip", &started, |lines| {
+        lines.iter().any(|line| line == "b_c_t0_")
+    });
+    assert!(
+        !started_lines(&started).iter().any(|line| line == "b_t0_"),
+        "change 2 must not be rebuilt on the base: {:?}",
+        started_lines(&started)
+    );
+    open(&gates, "c_t0_");
+    open(&gates, "b_c_t0_");
+    open(&gates, "b_c_d_t0_");
+    assert_eq!(daemon.exit_code(Duration::from_secs(90)), Some(0));
+    assert_eq!(status(&fx, 1), "ejected");
+    assert_eq!(status(&fx, 2), "landed");
+    assert_eq!(status(&fx, 3), "landed");
+    assert_eq!(status(&fx, 4), "landed");
+    let lines = started_lines(&started);
+    for set in ["b_c_t0_", "b_c_d_t0_"] {
+        assert_eq!(
+            lines.iter().filter(|line| *line == set).count(),
+            1,
+            "{set}: {lines:?}"
+        );
+    }
+    let report = latest_report(&fx);
+    let root_runs = batch_validations(&report, 3);
+    assert_eq!(root_runs.len(), 1, "{report}");
+    // Nothing was rebuilt for a moved base in this run.
+    let runs = fx.queue().join(".git/merge-queue/runs");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(runs)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join("events.jsonl").is_file())
+        .collect();
+    dirs.sort();
+    let events = std::fs::read_to_string(dirs.pop().unwrap().join("events.jsonl")).unwrap();
+    assert!(
+        !events.lines().any(|line| {
+            let event: Value = serde_json::from_str(line).unwrap();
+            event["kind"] == "base-moved"
+        }),
+        "{events}"
+    );
+    assert!(
+        events.lines().any(|line| {
+            let event: Value = serde_json::from_str(line).unwrap();
+            event["kind"] == "disjoint-root-promoted"
+        }),
+        "{events}"
+    );
+}
+
 #[test]
 fn a_disjoint_root_is_cancelled_the_moment_the_head_lands() {
     let (fx, started, gates) = gated_setup("disjoint-root-green-head");

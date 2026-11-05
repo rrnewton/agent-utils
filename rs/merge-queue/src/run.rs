@@ -3724,6 +3724,41 @@ impl<'a> Runner<'a> {
         }
     }
 
+    /// Promote a rooted flight that has become decidable (every batch it
+    /// jumped over is decided, and its parent is still the base, so nothing
+    /// it jumped over landed) to an ordinary stacked head: batches refilling
+    /// the window now build on its tip, so when it lands they land straight
+    /// after it instead of going stale on the base and rebuilding. It stays
+    /// `rooted`, so a base move ahead of it still cancels it, and if it comes
+    /// back red the batches built on it are discarded with it, as for any
+    /// stacked head.
+    fn promote_decidable_roots(&self, flights: &mut VecDeque<Flight>) {
+        let base = lock(&self.base).clone();
+        let promoted: Vec<usize> = flights
+            .iter()
+            .enumerate()
+            .filter(|(_, flight)| {
+                flight.rooted
+                    && !flight.stacked
+                    && flight.candidate.parent == base
+                    && rooted_decidable(flight, flights)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in promoted {
+            let flight = &mut flights[index];
+            flight.stacked = true;
+            self.event(
+                "disjoint-root-promoted",
+                &format!(
+                    "{} promoted to the stack head (nothing it jumped over landed); \
+                     later batches build on its tip",
+                    list(&flight.candidate.prs)
+                ),
+            );
+        }
+    }
+
     /// Whether every change in `prs` is peripheral in the current plan.
     fn all_peripheral(&self, prs: &[i64]) -> bool {
         if prs.is_empty() || !self.config.peripheral.enabled() {
@@ -4576,6 +4611,10 @@ impl<'a> Runner<'a> {
                     // rooted batch's parent: cancel it now, before the window
                     // is filled, so its slot and changes are reused at once.
                     self.cancel_stale_rooted(&mut flights, &rx, pending);
+                    // A root left decidable by the last decisions, with
+                    // nothing it jumped over landed, heads the stack from
+                    // here: intake plans and refills build on its tip.
+                    self.promote_decidable_roots(&mut flights);
                     self.publish_window(
                         flights
                             .iter()
@@ -4717,6 +4756,9 @@ impl<'a> Runner<'a> {
                             }
                         }
                     }
+                    // A root that became decidable in this iteration (a
+                    // value-ordered abort, say) heads the stack for the refill.
+                    self.promote_decidable_roots(&mut flights);
                     // Fill the window, each new batch on top of the last one in flight that is
                     // not red. One slot may instead take a batch built on the base itself,
                     // disjoint from everything in flight (a second root), so one red

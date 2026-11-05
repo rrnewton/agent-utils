@@ -1521,7 +1521,10 @@ The base moves only to a commit whose exact tree passed validation (the bors rul
    lands on its own validation. The moment any batch ahead of it lands, it is cancelled instead
    (a `disjoint-root-cancelled` event), its slot is freed at once, and its changes go back to the
    front of the queue to be rebuilt on the new base. A disjoint root never lands on a base other
-   than the commit it was built on. `disable_disjoint_root` turns it off, and
+   than the commit it was built on. Once it is decidable and nothing it jumped over landed (a
+   red head was ejected, say), it is promoted to an ordinary stack head (a
+   `disjoint-root-promoted` event): batches refilling the window build on its tip, so when it
+   lands they land straight after it instead of going stale on the base. `disable_disjoint_root` turns it off, and
    `disjoint_root_min_red_percent` only starts one when the recent red rate makes a red head likely.
    Green batches land in order, as soon as every batch ahead of them has landed, and the
    next batch starts at once on top of the last one in flight.
