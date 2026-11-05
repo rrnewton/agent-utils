@@ -67,6 +67,16 @@ def _expected(root: Path) -> dict[str, object]:
         "sandbox": sandbox_module.settings_to_obj(config.sandbox_settings),
         "slot_representation": config.slot_representation,
         "worktrees": str(config.worktrees),
+        "worktrees_image": (
+            None
+            if config.worktrees_image is None
+            else {
+                "fs": config.worktrees_image.filesystem,
+                "mount": config.worktrees_image.mount,
+                "path": config.worktrees_image.relative_path,
+                "size_bytes": config.worktrees_image.size_bytes,
+            }
+        ),
     }
 
 
