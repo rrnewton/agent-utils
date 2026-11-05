@@ -2622,57 +2622,10 @@ impl<'a> Runner<'a> {
         Ok(candidate.prefix(i).to_owned())
     }
 
-    /// Whether green results recorded at exactly `commit` cover `selection`: every selected test
-    /// passed in the latest run at that commit that selected it, and an `all` selection needs a
-    /// complete run there whose failures were all rerun green there.
+    /// Whether green results recorded at exactly `commit` in this run cover `selection`; see
+    /// [`covered_by`].
     fn covered(&self, commit: &str, selection: &Selection) -> bool {
-        let report = lock(&self.report);
-        let runs = report
-            .validations
-            .iter()
-            .filter(|v| v.commit == commit && !v.cancelled && !v.refused);
-        let mut complete = false;
-        let mut complete_blocked = false;
-        let mut failing: BTreeSet<TestId> = BTreeSet::new();
-        let mut passed: BTreeSet<TestId> = BTreeSet::new();
-        for run in runs {
-            let unattributed = run.results.unattributed;
-            let failed = run.failed();
-            if run.selection.is_all() {
-                complete = true;
-                // An unattributed complete run proves only its exit status:
-                // green covers everything, red covers nothing.
-                complete_blocked = unattributed && !run.green();
-                failing = failed.iter().cloned().collect();
-                passed.clear();
-                continue;
-            }
-            for test in run.selection.tests().into_iter().flatten() {
-                if (unattributed && !run.green())
-                    || failed
-                        .iter()
-                        .any(|f| f == test || f.step == test.step && test.case.is_none())
-                {
-                    failing.insert(test.clone());
-                    passed.remove(test);
-                } else {
-                    failing
-                        .retain(|f| !(f == test || (test.case.is_none() && f.step == test.step)));
-                    passed.insert(test.clone());
-                }
-            }
-        }
-        match selection {
-            Selection::All => complete && !complete_blocked && failing.is_empty(),
-            Selection::Tests(tests) => tests.iter().all(|test| {
-                passed
-                    .iter()
-                    .any(|p| p == test || (p.case.is_none() && p.step == test.step))
-                    || (complete
-                        && !complete_blocked
-                        && !failing.iter().any(|f| f.step == test.step))
-            }),
-        }
+        covered_by(&lock(&self.report).validations, commit, selection)
     }
 
     /// Build, then eject whatever did not combine (and set its dependents aside).
@@ -5298,6 +5251,54 @@ fn output_tail(output: &std::process::Output, lines: usize) -> String {
     kept[kept.len().saturating_sub(lines)..].join(" | ")
 }
 
+/// Whether green results recorded at exactly `commit` in `validations` cover `selection`:
+/// every selected test passed in the latest run at that commit that selected it, and an `all`
+/// selection needs a complete run there whose failures were all rerun green there.
+fn covered_by(validations: &[ValidationRecord], commit: &str, selection: &Selection) -> bool {
+    let runs = validations
+        .iter()
+        .filter(|v| v.commit == commit && !v.cancelled && !v.refused);
+    let mut complete = false;
+    let mut complete_blocked = false;
+    let mut failing: BTreeSet<TestId> = BTreeSet::new();
+    let mut passed: BTreeSet<TestId> = BTreeSet::new();
+    for run in runs {
+        let failed = run.failed();
+        // A red run that is unattributed, or that names no failed test, proves only its exit
+        // status: red covers nothing.
+        let blind_red = !run.green() && (run.results.unattributed || failed.is_empty());
+        if run.selection.is_all() {
+            complete = true;
+            complete_blocked = blind_red;
+            failing = failed.iter().cloned().collect();
+            passed.clear();
+            continue;
+        }
+        for test in run.selection.tests().into_iter().flatten() {
+            if blind_red
+                || failed
+                    .iter()
+                    .any(|f| f == test || f.step == test.step && test.case.is_none())
+            {
+                failing.insert(test.clone());
+                passed.remove(test);
+            } else {
+                failing.retain(|f| !(f == test || (test.case.is_none() && f.step == test.step)));
+                passed.insert(test.clone());
+            }
+        }
+    }
+    match selection {
+        Selection::All => complete && !complete_blocked && failing.is_empty(),
+        Selection::Tests(tests) => tests.iter().all(|test| {
+            passed
+                .iter()
+                .any(|p| p == test || (p.case.is_none() && p.step == test.step))
+                || (complete && !complete_blocked && !failing.iter().any(|f| f.step == test.step))
+        }),
+    }
+}
+
 /// Tests a run did not see pass (skipped, errored, failed). No synthetic
 /// IDs exist to filter out: unattributed `all` runs record no per-test IDs.
 fn not_passed(ran: &Ran) -> BTreeSet<TestId> {
@@ -5660,6 +5661,60 @@ mod unit {
         assert_eq!(back.log, rec.log);
         assert_eq!(back.failed_results()[0].duration_ms, Some(42));
         assert_eq!(back.failed_results()[0].log.as_deref(), Some("logs/a.log"));
+    }
+
+    fn results_of(outcomes: &[(&str, Outcome)]) -> TestResults {
+        let mut results = TestResults::default();
+        for (id, outcome) in outcomes {
+            results.record(TestResult {
+                id: TestId::step(*id),
+                outcome: *outcome,
+                duration_ms: None,
+                log: None,
+            });
+        }
+        results
+    }
+
+    #[test]
+    fn a_red_run_that_names_no_failed_test_covers_nothing() {
+        let commit = "c".repeat(40);
+        let a = Selection::of([TestId::step("a")]);
+        // Red, with every reported test passed or skipped: only the exit status is known.
+        let blind = record(
+            results_of(&[("a", Outcome::Pass), ("b", Outcome::Skip)]),
+            Some(4),
+        );
+        assert!(!covered_by(
+            std::slice::from_ref(&blind),
+            &commit,
+            &Selection::All
+        ));
+        assert!(!covered_by(std::slice::from_ref(&blind), &commit, &a));
+        let probe = ValidationRecord {
+            selection: a.clone(),
+            ..blind.clone()
+        };
+        assert!(!covered_by(&[probe], &commit, &a));
+        // A red run that names its failure still covers the tests of other steps.
+        let named = record(
+            results_of(&[("a", Outcome::Pass), ("b", Outcome::Fail)]),
+            Some(1),
+        );
+        assert!(!covered_by(
+            std::slice::from_ref(&named),
+            &commit,
+            &Selection::All
+        ));
+        assert!(covered_by(&[named], &commit, &a));
+        // A green run covers, and a later blind red at the same commit takes that back.
+        let green = record(results_of(&[("a", Outcome::Pass)]), Some(0));
+        assert!(covered_by(
+            std::slice::from_ref(&green),
+            &commit,
+            &Selection::All
+        ));
+        assert!(!covered_by(&[green, blind], &commit, &Selection::All));
     }
 
     #[test]

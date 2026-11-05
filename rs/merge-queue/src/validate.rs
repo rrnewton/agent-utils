@@ -8,7 +8,8 @@
 //!   "duration_ms": 12, "log": "path/to/log"}` (`duration_ms` and `log` are optional; a missing
 //!   duration means duration unavailable, not zero). A command that writes no results still
 //!   works, but its exit status is then the only signal: every selected test inherits it and
-//!   the run is marked unattributed.
+//!   the run is marked unattributed. So is a red run whose results name no failed test, unless
+//!   dagrun-style verdict lines in its log name one.
 //! * `dagrun`: a dagrun DAG. Test IDs are step names; the selection becomes `--selected`, which
 //!   also runs each step's dependencies, and per-step verdicts come from the run journal.
 //!
@@ -86,11 +87,38 @@ pub fn infra_blocked(exit: Option<i32>, log_text: &str) -> Vec<TestId> {
 /// Only a red exit can carry it: in a green run, a refusal (exit 75), an INFRA-BLOCKED run
 /// (exit 6) or a run killed without an exit status, the marker text means nothing.
 pub fn rerun_exempt(exit: Option<i32>, log_text: &str) -> Vec<TestId> {
-    match exit {
-        Some(code) if code != 0 && code != REFUSAL_EXIT && code != INFRA_BLOCKED_EXIT => {
-            marker_ids(log_text, RERUN_EXEMPT_MARKER)
+    if red_exit(exit) {
+        marker_ids(log_text, RERUN_EXEMPT_MARKER)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Whether `exit` says the run is red: non-zero, and neither a refusal (exit 75) nor an
+/// INFRA-BLOCKED run (exit 6). A run killed without an exit status is not counted.
+fn red_exit(exit: Option<i32>) -> bool {
+    matches!(exit, Some(code) if code != 0 && code != REFUSAL_EXIT && code != INFRA_BLOCKED_EXIT)
+}
+
+/// A red run whose results name no failed test has lost its attribution, since a results file
+/// can drop a failure. When the runner also prints dagrun-style verdict lines, a step they show
+/// failed is recorded failed, unless the results reported it passed. A red run that names no
+/// failure anywhere proves only its exit status, so it is marked unattributed: it then covers
+/// nothing, and a culprit search reruns its whole selection.
+fn name_the_failures_of_a_red_run(results: &mut TestResults, log_text: &str) {
+    let logged = parse_step_lines(log_text);
+    let mut named = false;
+    for (id, outcome) in &logged.results {
+        if *outcome == Outcome::Fail && results.results.get(id) != Some(&Outcome::Pass) {
+            results.results.insert(id.clone(), Outcome::Fail);
+            if let Some(ms) = logged.durations_ms.get(id) {
+                results.durations_ms.insert(id.clone(), *ms);
+            }
+            named = true;
         }
-        _ => Vec::new(),
+    }
+    if !named {
+        results.unattributed = true;
     }
 }
 
@@ -749,6 +777,8 @@ impl Validator for CommandValidator {
         if refused {
             // Validation did not run: keep no test verdict from this attempt.
             results = TestResults::default();
+        } else if !cancelled && !reported_failures && !results.unattributed && red_exit(exit) {
+            name_the_failures_of_a_red_run(&mut results, &log_text);
         }
         Ok(Ran {
             results,
@@ -843,9 +873,13 @@ fn verdict_duration_ms(verdict: &str) -> Option<u64> {
 /// `[step] ✗ FAIL ...`, `[step] SKIPPED ...`.
 ///
 /// Step names go through [`TestId::parse`]; lines whose step is not a valid
-/// ID are skipped. Verdict-line durations are recorded where present.
+/// ID are skipped. Verdict-line durations are recorded where present. A failed
+/// step's captured output, printed between `[step] ----- detail -----` and
+/// `[step] ----- end detail -----` with every line tagged with the step, is
+/// whatever the step printed, so none of it is read as a verdict.
 pub fn parse_step_lines(text: &str) -> TestResults {
     let mut results = TestResults::default();
+    let mut in_detail: BTreeSet<&str> = BTreeSet::new();
     for line in text.lines() {
         let Some(rest) = line.strip_prefix('[') else {
             continue;
@@ -853,6 +887,18 @@ pub fn parse_step_lines(text: &str) -> TestResults {
         let Some((step, verdict)) = rest.split_once("] ") else {
             continue;
         };
+        match verdict.trim_end() {
+            "----- detail -----" => {
+                in_detail.insert(step);
+                continue;
+            }
+            "----- end detail -----" => {
+                in_detail.remove(step);
+                continue;
+            }
+            _ if in_detail.contains(step) => continue,
+            _ => {}
+        }
         let Ok(id) = TestId::parse(step) else {
             continue;
         };
@@ -1257,6 +1303,101 @@ dagrun: PASS - 1 passed";
         assert_eq!(results.durations_ms[&TestId::step("a.b")], 0);
         assert_eq!(results.durations_ms[&TestId::step("c.d")], 3000);
         assert!(!results.durations_ms.contains_key(&TestId::step("e.f")));
+    }
+
+    /// A failed step prints what it captured after its verdict, each line tagged with the step:
+    /// a nested run's own lines there are not verdicts of the step.
+    const SELF_TEST_FAIL: &str = "[self.test] ▶ START  driver self-test\n\
+[self.test] ✗ FAIL   driver self-test (71s, exit 2)\n\
+[self.test] ----- detail -----\n\
+[self.test] [inner.step] ✓ PASS   nested (0s)\n\
+[self.test] ✓ PASS   a line the self-test printed\n\
+[self.test] SKIPPED reason=a line the self-test printed\n\
+[self.test] ----- end detail -----\n\
+[other.step] ✓ PASS   other (2s)\n";
+
+    #[test]
+    fn a_failed_steps_captured_output_is_never_a_verdict() {
+        let results = parse_step_lines(SELF_TEST_FAIL);
+        assert_eq!(results.results.len(), 2, "{:?}", results.results);
+        assert_eq!(results.results[&TestId::step("self.test")], Outcome::Fail);
+        assert_eq!(results.durations_ms[&TestId::step("self.test")], 71_000);
+        assert_eq!(results.results[&TestId::step("other.step")], Outcome::Pass);
+    }
+
+    /// A runner that reports `self.test` skipped in its results file and exits red, the way a
+    /// results writer that misread the log above did.
+    fn lost_failure_runner(log: &str, results: &[(&str, &str)]) -> String {
+        let mut script = format!("printf '%s' '{log}'\n");
+        for (id, outcome) in results {
+            script.push_str(&format!(
+                "echo '{{\"id\":\"{id}\",\"outcome\":\"{outcome}\"}}' >> \"$MQ_RESULTS\"\n"
+            ));
+        }
+        script.push_str("exit 4\n");
+        script
+    }
+
+    #[test]
+    fn a_red_run_whose_results_name_no_failure_reads_the_verdict_lines() {
+        let tmp = TempDir::new("validate-lost-failure");
+        let v = from_config(&config(&lost_failure_runner(
+            SELF_TEST_FAIL,
+            &[("self.test", "skip"), ("other.step", "pass")],
+        )))
+        .unwrap();
+        let ran = v
+            .run(
+                &tmp.0,
+                &Selection::All,
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(!ran.results.unattributed);
+        assert_eq!(ran.failed(), BTreeSet::from([TestId::step("self.test")]));
+        assert_eq!(
+            ran.results.durations_ms.get(&TestId::step("self.test")),
+            Some(&71_000)
+        );
+    }
+
+    #[test]
+    fn a_red_run_that_names_no_failure_anywhere_is_unattributed() {
+        let tmp = TempDir::new("validate-no-failure");
+        // The results say the step passed, so a FAIL line for it is an attempt a retry
+        // superseded, not the failure: the run names none.
+        let v = from_config(&config(&lost_failure_runner(
+            "[a.b] ✗ FAIL   a (1s, exit 1)\n[a.b] ✓ PASS   a (1s)\n",
+            &[("a.b", "pass")],
+        )))
+        .unwrap();
+        let ran = v
+            .run(
+                &tmp.0,
+                &Selection::All,
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(ran.results.unattributed);
+        assert!(ran.failed().is_empty());
+        assert_eq!(ran.results.results[&TestId::step("a.b")], Outcome::Pass);
+        // A run held as INFRA-BLOCKED, or refused, is not red: it is left as reported.
+        for exit in [INFRA_BLOCKED_EXIT, REFUSAL_EXIT] {
+            let held = from_config(&config(&format!(
+                "echo '{{\"id\":\"a.b\",\"outcome\":\"skip\"}}' >> \"$MQ_RESULTS\"; exit {exit}"
+            )))
+            .unwrap()
+            .run(
+                &tmp.0,
+                &Selection::All,
+                &tmp.0.join(format!("h{exit}")),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert!(!held.results.unattributed, "exit {exit}");
+        }
     }
 
     #[test]
