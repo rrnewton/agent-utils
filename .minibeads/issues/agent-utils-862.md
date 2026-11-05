@@ -1,11 +1,11 @@
 ---
 title: 'watch-status-requests: watch-agents pages the coordinator when a status file raises a request, event-driven'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: cl-start
 created_at: 2026-11-05T02:58:17.088723802+00:00
-updated_at: 2026-11-05T02:58:17.088723802+00:00
+updated_at: 2026-11-05T08:27:33.000000000+00:00
 ---
 
 # Description
@@ -37,3 +37,15 @@ Heading parsing and ack rules: port the rules of the consumer's existing respond
 # Notes
 
 P1, owner request via the lead (2026-11-04). Assigned to cl-start after #852 P0b.
+
+## Resolution
+
+Delivered by cl-start in rs/agentctl/src/status_requests.rs, with its use in watch-agents, `agentctl send` and the new `agentctl requests`.
+
+- Configuration: REGISTRY/status-requests.json (`status_files` with `{agent}`, `marker`, `ack_words`, `bracketed_ack_words`, `repage_minutes`), documented in the userguide under "Requests in agents' status files".
+- Parser: the heading, answer and age rules of the reference watcher, ported (no tz crate: US daylight saving time is computed by hand, with first-occurrence semantics for ambiguous times). A local differential run against the reference script over 1264 status files agreed on every request, age, source and line. The only difference is that Rust marks a truncated heading with an ellipsis.
+- watch-agents: one durable page per (agent, heading hash) to the designated coordinator, routed past jammed or held agents (#844), else to the owner alarm. It pages again every `repage_minutes` until the heading is answered, and at once on working to idle. An inotify watch on the status directory pages between passes. State: `status_pages`; report: `status_requests`.
+- `agentctl send` from the designated coordinator ends with "N more waiting: lane 12m (heading), ..." or "0 waiting" on standard error, and `waiting_requests` in its JSON. `agentctl requests [--json]` prints the same list.
+- Tests: unit tests (parser, paging with a fake clock, jam routing, file-change paging, idle transition, crash-safe message IDs, inotify) and tests/status_requests.rs (send and requests through the binary).
+
+Not done here: the first deployment, on the lead host's other registry, belongs to the lead's coordinator.

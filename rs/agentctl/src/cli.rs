@@ -164,6 +164,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl health --blank-working\n  agentctl --registry ~/project/.agentctl health --blank-working --blank-working-minutes 10 --check-only\n\nOne pass, then exit: the tick-friendly form of the per-agent health checks (a tick or cron caller runs it;\nthere is no loop and no interval). Every registered running interactive agent except the coordinator is probed\nonce: Herdr's `agent explain` must say working under a rule whose region is the OSC title (title-only working;\na state derived from the screen never counts), and its rendered visible grid must be blank in every cell (the\nsame test as the composer_unreadable classification). Agents with no recorded pane (headless, agentcloud,\nstopped, paused) are listed as skipped, and an agent that cannot be probed is listed with its probe_error;\nneither starts nor ends an episode.\n\nAn episode is REGISTRY/.blank-working/NAME.json (schema agentctl-blank-working/v1): the first blank pass\nrecords since, later passes extend it, so the duration accumulates across separate invocations. At\n--blank-working-minutes (default: 5) one alert is queued for the coordinator through the same durable path\nas `agentctl send` (message ID derived from the agent and since, so a retry queues nothing twice); a failed\nalert is logged on standard error, never fails the pass, and is retried by the next pass. Continued blank\nsends nothing more; a pass that sees the grid non-blank or the title no longer working ends the episode, and\nonly a later blank stretch may alert again. `agentctl status NAME` shows an open episode as blank_working\n{since, minutes, alerted}. With --check-only the pass reports what it would alert and sends nothing (episode\nstate still advances). Prints the report as JSON (schema agentctl-blank-working/v1). Exit 0 when no agent is\npast its threshold and no alert failed, 1 otherwise."
     )]
     Health(Health),
+    /// List the requests agents raised in their status files that wait for the coordinator: each agent's oldest open request, how long it has waited, and its heading
+    #[command(
+        after_help = "Examples:\n  agentctl requests\n  agentctl requests --json\n\nTurned on by REGISTRY/status-requests.json, for example\n  {\"status_files\": \"temp/{agent}-status.md\"}\nwhere the path is relative to the directory holding the registry. A request is a `#` or `##`\nheading among the newest of an agent's status file whose heading or text carries the marker\n(default COORDINATOR_RESPOND_PLEASE); it is answered once its heading starts with ANSWERED,\nLANDED or another answered word, or carries [answered: ...]. The first line is the list\n`agentctl send` from the designated coordinator ends with: `0 waiting`, or `N waiting: A 12m\n(heading), B 4m (heading)`; one line per request follows, with its status file and line. Stopped\nagents and the coordinator are not read. See `agentctl userguide` for every rule and setting.\nExit 0, or 1 when the registry has no status-requests.json or it cannot be read."
+    )]
+    Requests(Requests),
     /// Record that an agent lands after another (the landing queue), list the queue, or drop a hold. `watch-agents` reads it: when OTHER finishes its turn with a verdict that does not start with BLOCKED, OTHER's child-done notice to the coordinator says NAME is next, and once that notice is queued the hold is marked released. Nothing is ever sent to NAME
     #[command(
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl hold cl-ingest --after cl-dedupe --note \"gate green, ready to push\"\n  agentctl --registry ~/project/.agentctl hold --list\n  agentctl --registry ~/project/.agentctl hold cl-ingest --release\n\nThe queue is REGISTRY/landing-queue.json (schema agentctl-landing-queue/v1). One hold per NAME: a new hold replaces the old.\nA chain (B after A, C after B) advances one step per finish. A released hold stays listed, with released_by and\nreleased_at, for a day. Prints the queue as JSON; --release exits 1 when NAME had no hold."
@@ -347,6 +352,13 @@ enum Commands {
     Quickstart,
     /// Print the operator reference, including dependencies and delivery guarantees
     Userguide,
+}
+
+#[derive(Args)]
+struct Requests {
+    /// Print the requests as one JSON document instead of text
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -3169,6 +3181,13 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             return Ok(0);
         }
         Commands::History(value) => return run_history(&args.registry, &value),
+        Commands::Requests(value) => {
+            let client = HerdrClient::with_executable("direct", &args.herdr_bin)
+                .map_err(AgentError::from)?;
+            let manager = ManagedAgents::new(&client, &args.registry)?;
+            let coordinator = manager.designated_coordinator().ok().flatten();
+            return run_requests(&args.registry, coordinator.as_deref(), value.json);
+        }
         Commands::Userguide => {
             print!("{}", crate::USER_GUIDE);
             return Ok(0);
@@ -3666,6 +3685,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         ambient_session: from_environment.ambient_session,
         hostname: from_environment.hostname,
     });
+    let mut send_waiting: Option<(Value, String)> = None;
     let mut result = match command {
         Commands::Mcp => {
             return Ok(crate::mcp::serve(
@@ -4113,6 +4133,13 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 environment("AGENTCTL_AGENT"),
             );
             let text = sender_header::stamp(&text, &sender, route);
+            // The designated coordinator's sends end with the status-file requests still
+            // waiting for it, by name (#862 watch-status-requests).
+            if let sender_header::Sender::Agent(name) = &sender {
+                if manager.designated_coordinator().ok().flatten().as_deref() == Some(name) {
+                    send_waiting = waiting_requests(&args.registry, name);
+                }
+            }
             if manager.is_headless(&value.agent.name)? {
                 let not_after = value.ttl.map(|ttl| {
                     crate::agent::now_millis().saturating_add((ttl * 1000.0).ceil() as u64)
@@ -4371,12 +4398,19 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         | Commands::Health(_)
         | Commands::Hold(_)
         | Commands::Tail(_)
-        | Commands::History(_) => {
+        | Commands::History(_)
+        | Commands::Requests(_) => {
             unreachable!()
         }
     };
     add_capabilities(&mut result);
+    if let Some((waiting, _)) = &send_waiting {
+        result["waiting_requests"] = waiting.clone();
+    }
     write_json(&result).map_err(Failure::Output)?;
+    if let Some((_, line)) = &send_waiting {
+        eprintln!("agentctl send: {line}");
+    }
     // `list` prints every row it could read; an unreadable row makes the listing incomplete.
     let incomplete = result.as_array().is_some_and(|rows| {
         rows.iter()
@@ -4388,6 +4422,73 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
 /// The warning `send` prints when its prompt is waiting in the harness's own queue behind a
 /// running turn (#570 agent-progress-monitoring), from the agent's `turn` view; `None` when the
 /// harness holds no queued input.
+/// The open status-file requests the coordinator `name` has waiting (#862 watch-status-requests),
+/// as a JSON list and the line `send` ends with (`0 waiting`, or `N more waiting: A 12m (...),
+/// ...`); `None` when the registry has no status-requests.json. A configuration that cannot be
+/// read is said in the line, so the coordinator learns the list is missing rather than empty.
+fn waiting_requests(registry: &Path, name: &str) -> Option<(Value, String)> {
+    match crate::status_requests::StatusConfig::load(registry) {
+        Ok(None) => None,
+        Ok(Some(config)) => {
+            let skip = std::collections::BTreeSet::from([name.to_owned()]);
+            let open = crate::status_requests::scan(
+                registry,
+                &config,
+                &skip,
+                std::time::SystemTime::now(),
+            );
+            Some((
+                json!(open),
+                crate::status_requests::waiting_line(&open, true),
+            ))
+        }
+        Err(error) => Some((
+            json!({"error": error}),
+            format!("status requests unreadable: {error}"),
+        )),
+    }
+}
+
+/// `agentctl requests`: print the open status-file requests, skipping the designated
+/// `coordinator`'s own status file.
+fn run_requests(registry: &Path, coordinator: Option<&str>, as_json: bool) -> Result<i32, Failure> {
+    let config = match crate::status_requests::StatusConfig::load(registry) {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            eprintln!(
+                "agentctl requests: status requests are not configured: {} is missing",
+                registry.join(crate::status_requests::CONFIG_FILE).display()
+            );
+            return Ok(1);
+        }
+        Err(error) => {
+            eprintln!("agentctl requests: {error}");
+            return Ok(1);
+        }
+    };
+    let skip: std::collections::BTreeSet<String> =
+        coordinator.map(str::to_owned).into_iter().collect();
+    let open = crate::status_requests::scan(registry, &config, &skip, std::time::SystemTime::now());
+    let line = crate::status_requests::waiting_line(&open, false);
+    if as_json {
+        write_json(&json!({"waiting": line, "requests": open})).map_err(Failure::Output)?;
+        return Ok(0);
+    }
+    let mut text = format!("{line}\n");
+    for request in &open {
+        text.push_str(&format!(
+            "{} {}m {}:{} {}\n",
+            request.agent,
+            request.age_minutes,
+            request.path.display(),
+            request.line,
+            request.heading
+        ));
+    }
+    print!("{text}");
+    Ok(0)
+}
+
 /// Refuse an interactive prompt too large to type, or warn about one that harnesses show
 /// collapsed (#705 oversized-prompt).
 fn interactive_prompt_size(text: &str) -> Option<Failure> {

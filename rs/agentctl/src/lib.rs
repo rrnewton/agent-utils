@@ -48,6 +48,7 @@ pub mod services;
 pub(crate) mod skill_install;
 pub mod stale_composer;
 pub(crate) mod stale_draft;
+pub mod status_requests;
 pub mod stuck;
 pub mod subagents;
 pub mod submission;

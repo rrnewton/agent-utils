@@ -1406,6 +1406,88 @@ are sent as priority notices, ahead of ordinary sends, to the coordinator:
   FILE`; for an owner's chat request, the chat bridge tells the owner, who can
   send it again in chat. The pass JSON lists them under `quarantines`.
 
+#### Requests in agents' status files
+
+A team can have its agents write their requests to the coordinator in their
+status files (the Rust edition reads them). An agent raises a request by putting
+a marker, `COORDINATOR_RESPOND_PLEASE` by default, in one of the newest headings
+of its status file or in the text under that heading. The coordinator answers,
+then edits the heading so it starts with `ANSWERED` or `LANDED`, or adds
+`[answered: ...]`. Without a watcher, nothing makes sure a request is seen: a
+request written while the coordinator is busy can wait for hours. Three things
+read these requests:
+
+- `agentctl watch-agents` pages the registry's designated coordinator about each
+  new request (else the watcher's `--coordinator`). It reads the status files'
+  directory through inotify, so a page goes out within a second or so of the
+  file being saved, not only at the next pass. It pages again every
+  `repage_minutes` until the heading is marked answered. It pages at once when
+  the agent goes from working to idle with its newest request still open, unless
+  a page went out in the last 2 minutes. Each page is one durable message in the
+  queue that names the agent, the status file and line, how long the request
+  has waited, and the heading. It is routed as the other notices about a jam are
+  (#844): never into the queue of an agent whose deliveries are jammed or held
+  this pass, but to the next `--notice-fallback`, else the owner's alarm. Pages
+  are recorded by agent and heading hash under `status_pages` in the watcher's
+  state, so editing a heading makes it a new request, and answering it drops the
+  record. The pass JSON summarises them under `status_requests`.
+- `agentctl send` run by the designated coordinator ends, on standard error,
+  with the requests still waiting, one entry per agent: `agentctl send: 2 more
+  waiting: lane-a 12m (land A0), lane-b 4m (decide B)`, or `agentctl send: 0
+  waiting`. Its JSON carries the same list as `waiting_requests`.
+- `agentctl requests` prints the list's first line and then one line per
+  request (agent, age, status file and line, heading); `--json` prints it as
+  one document. Exit 1 when the registry has no configuration or it cannot be
+  read.
+
+Turn it on with `REGISTRY/status-requests.json`; every field but the first is
+optional:
+
+```json
+{
+  "status_files": "temp/{agent}-status.md",
+  "marker": "COORDINATOR_RESPOND_PLEASE",
+  "ack_words": ["answered", "landed", "acknowledged", "acked", "ack", "decided", "superseded", "resolved", "handled"],
+  "bracketed_ack_words": ["answered", "acknowledged", "acked", "decided", "superseded", "resolved", "handled"],
+  "repage_minutes": 30
+}
+```
+
+- `status_files`: where each agent's status file is, relative to the directory
+  holding the registry, with `{agent}` once in the file name.
+- `marker`: the text that raises a request, matched case-sensitively.
+- `ack_words`: a heading that starts with one of these words, in any case,
+  after its timestamp, is answered (`07:40 AM EDT Sun 2026-10-25 — LANDED
+  ...`).
+- `bracketed_ack_words`: a heading with one of these words right after `[` or
+  `(` anywhere is answered (`(ANSWERED, coordinator)`, `[answered: ...]`).
+  `landed` is left out by default because agents write `(not landed)`
+  themselves.
+- `repage_minutes`: minutes between pages about one open request (default 30).
+
+How a request is read:
+
+- A section is a `#` or `##` heading and the text under it. A heading inside a
+  fenced code block is not one.
+- A marker does not count when it follows `was` (`Was:
+  COORDINATOR_RESPOND_PLEASE`, kept as history), when a sentence names it (the
+  marker followed by `heading`, `line`, `section`, `block`, `tag`, `marker`,
+  `comes`, `follows`, `when`, `once`, `only`, `after` or `outside`), or when a
+  bracketed answered word comes before it on its line.
+- Only the newest sections are read: the three at the file's newest end, plus
+  the newest by the time its heading gives. The newest end is the top unless
+  neighbouring headings with dates mostly grow downward.
+- A request's age comes from its heading's time, else from the file's last
+  write. A heading time can be `H:MM[:SS]`, with an optional AM or PM and an
+  optional zone (ET, EDT, EST, CT, CDT, CST, PT, PDT, PST, UTC, GMT, Z; no
+  zone means Eastern). It can have a date, `YYYY-MM-DD` or `Oct 25[, 2026]`.
+  A time with no date is placed on the latest day that does not put it more
+  than 5 minutes after the file's last write. A heading time more than 5
+  minutes in the future is treated as a misreading, and the request is aged
+  from the file instead.
+- Only agents whose record is not stopped, and that have a pane or a working
+  directory, are read. The designated coordinator's own file is skipped.
+
 #### Large registries
 
 A pass checks only the records it judges: a record that is not running or
