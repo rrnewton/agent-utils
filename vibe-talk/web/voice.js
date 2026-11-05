@@ -7032,137 +7032,29 @@ const scrollKeys = createScrollKeys({
 
 // --- moving the selection
 
-/** How far ↓ and ↑ scroll through a message taller than the room before moving on: half the room. */
-const READ_STEP = 0.5;
-
 /**
- * ↓ and ↑, j and k. The next or previous message, or, while the selected one runs past the foot of
- * the room (or above its head), half a room further through it first: the long answer of an agent is
- * read with the same key that moves on from it (the proposal's question 10).
+ * Moving the selection: ↓ and ↑, j and k through the messages and an open ⋯ menu, and the row every key about
+ * one message acts on (`keyContext`, `rowForAct`). One owner in web/src/view/shell/selectionkeys.ts (`#624
+ * voice-page-modularity`); the page destructures what it still calls under the old names.
  *
- * Starts from what is on screen when nothing is selected or the selection has been scrolled away,
- * never from a row far off: ↓ takes the top message showing, ↑ the bottom one. In a thread just
- * entered (`#221 read-modes`) the first key takes the message the entry landed on.
- *
- * `#338 column-overscroll`. ↓ past the last message of the right column, pressed afresh at its foot
- * (`held` is the key repeating), goes on into the room past it, as PgDn does.
+ * @type {import("./src/view/shell/index.ts").SelectionKeys<KeyPane>}
  */
-function stepSelection(pane, node, direction, held = false) {
-  const rows = paneRows(pane);
-  if (rows.length === 0) return false;
-  const area = pane.scroller();
-  const head = pane.head();
-  const foot = pane.foot();
-  const step = Math.max(1, Math.round((foot - head) * READ_STEP));
-  const current = currentRow(pane, node);
-  const at = current ? rows.indexOf(current) : -1;
-  if (at < 0 || !rowInView(pane, current)) {
-    const landed = entryLandingHolds() && rows.includes(entryState().landing.first) ? entryState().landing.first : null;
-    const seen = rows.filter((row) => rowInView(pane, row));
-    const start = landed || (seen.length > 0 ? seen[direction > 0 ? 0 : seen.length - 1] : rows[direction > 0 ? 0 : rows.length - 1]);
-    selectRow(pane, start);
-    return true;
-  }
-  // A message a click selected silently takes the ring now: the key moves on from it, or reads on
-  // through it, with the ring showing where the reader is.
-  if (document.activeElement !== current) selectRow(pane, current, false);
-  const box = current.getBoundingClientRect();
-  if (direction > 0 && box.bottom > foot + 1) {
-    area.scrollTop += Math.min(box.bottom - foot + REPLY_LANDING_GAP_PX, step);
-    return true;
-  }
-  if (direction < 0 && box.top < head - 1) {
-    area.scrollTop -= Math.min(head - box.top + REPLY_LANDING_GAP_PX, step);
-    return true;
-  }
-  const next = rows[at + direction];
-  // Past the last message the list still has the box to write in below it, and past the first the
-  // walk back to older history above: the key scrolls on toward either, as the arrow always did.
-  if (!next) {
-    if (direction > 0 && !held) openOverscroll(area);
-    area.scrollTop += direction * step;
-    return true;
-  }
-  selectRow(pane, next, true, direction);
-  return true;
-}
-
-/**
- * The items in the open ⋯ menu that are shown, in order: what ↓ and ↑ move through there. A link
- * counts as the buttons do — "Open in …" is one (`#409 open-upstream-link`) — so the arrows can
- * land on every item the eye can see.
- */
-function menuItems() {
-  const menu = rowMenus.open();
-  if (!menu) return [];
-  const items = [];
-  const walk = (node) => {
-    for (const kid of node.children || []) {
-      if (kid.hidden) continue;
-      const tag = String(kid.tagName).toUpperCase();
-      if ((tag === "BUTTON" && kid !== menu.button) || tag === "A") items.push(kid);
-      else walk(kid);
-    }
-  };
-  walk(menu.root);
-  return items;
-}
-
-/** ↓ and ↑ in an open ⋯ menu move through its items, as the arrows of a menu do, round from the ends. */
-function stepMenu(node, direction) {
-  const menu = rowMenus.open();
-  if (!menu || !nodeWithin(menu.root, node)) return false;
-  const items = menuItems();
-  if (items.length === 0) return false;
-  const at = items.indexOf(node);
-  const next = at < 0 ? items[direction > 0 ? 0 : items.length - 1] : items[(at + direction + items.length) % items.length];
-  focusMinimally(next);
-  return true;
-}
-
-/** ↓/j or ↑/k, wherever the focus is: the items of a menu, else the selection in the pane. `held`: the key repeating. */
-function stepFromKeyboard(target, direction, held = false) {
-  if (stepMenu(target, direction)) return true;
-  const pane = paneFor(target);
-  return pane ? stepSelection(pane, target, direction, held) : false;
-}
-
-/** The pane the keys move and its current row. */
-function keyContext(target) {
-  const pane = paneFor(target);
-  return { pane, row: pane ? currentRow(pane, target) : null };
-}
-
-/**
- * The row a key about one message acts on: `keyContext`, while any of the row is on screen. A row
- * scrolled out of sight, by the wheel or the scrollbar, is never acted on unseen: the key selects the
- * first message showing instead and does nothing else (`took`), so the next press acts on the row
- * the ring is round.
- *
- * The line of a collapsed run of read messages (`#221 read-modes`) stands for every message in the
- * run, so no key about ONE message acts on it; only Enter and o, which open the run (`runLine`).
- *
- * `stay` leaves the focus where it is, as for a chord pressed in a message box: the first message
- * showing is selected and drawn, and the box keeps the reader's typing.
- */
-function rowForAct(target, runLine = false, stay = false) {
-  const { pane, row } = keyContext(target);
-  if (!pane || !row) return { pane, row: null, took: false };
-  // A card of the right column is a thread, not a message: only Enter and o act on it, and highlight
-  // it (`#277 thread-card-focus`; → enters it, `cardForArrow`). `#229 desktop-two-column`.
-  if (row.hasAttribute("data-card")) return { pane, row: runLine ? row : null, took: false };
-  if (!runLine && row.getAttribute("data-read-run") === "head") {
-    setStatus("Read messages: Enter opens them.");
-    return { pane, row: null, took: true };
-  }
-  if (rowInView(pane, row)) return { pane, row, took: false };
-  const first = firstRowInView(pane);
-  if (first) {
-    takeRow(pane, first, !stay);
-    setStatus("Selected the first message showing.");
-  }
-  return { pane, row: null, took: Boolean(first) };
-}
+const selectionKeys = createSelectionKeys({
+  paneFor: (node) => paneFor(node),
+  paneRows: (pane) => paneRows(pane),
+  currentRow: (pane, node) => currentRow(pane, node),
+  rowInView: (pane, row) => rowInView(pane, row),
+  firstRowInView: (pane) => firstRowInView(pane),
+  landingHolds: () => entryLandingHolds(),
+  landingFirst: () => entryState().landing.first,
+  selectRow: (...args) => selectRow(...args),
+  takeRow: (pane, row, focus) => takeRow(pane, row, focus),
+  landingGap: () => REPLY_LANDING_GAP_PX,
+  openOverscroll: (area) => openOverscroll(area),
+  openRowMenu: () => rowMenus.open(),
+  setStatus: (text) => setStatus(text),
+});
+const { menuItems, stepFromKeyboard, keyContext, rowForAct } = selectionKeys;
 
 /**
  * The Done and next-unread keys: n to the next unread message, and e and Ctrl+E (Cmd+E) Done or not and on.

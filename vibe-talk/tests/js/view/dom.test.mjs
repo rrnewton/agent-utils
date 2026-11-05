@@ -1388,3 +1388,86 @@ test("`#624 voice-page-modularity`: Shift+E's fold keeps the reader's place, and
   state.acted = { pane: null, row: null, took: true };
   assert.deepStrictEqual(run(() => keys.foldOneFromKeyboard({})), [true]);
 });
+
+test("`#624 voice-page-modularity`: ↓ and ↑ read on through a tall message, start from what is on screen, walk an open menu round, and a key acts only on a row in sight", () => {
+  const { createSelectionKeys, READ_STEP } = VIEW_SHELL;
+  assert.equal(READ_STEP, 0.5);
+  const log = [];
+  const area = { scrollTop: 1000 };
+  const pane = { scroller: () => area, head: () => 100, foot: () => 500 };
+  const rowOf = (id, top, bottom, attributes = {}) => ({ id, attributes, getBoundingClientRect: () => ({ top, bottom }),
+    getAttribute(name) { return this.attributes[name] ?? null; }, hasAttribute(name) { return name in this.attributes; } });
+  const rows = [rowOf("1", -300, 50), rowOf("2", 120, 300), rowOf("3", 320, 900), rowOf("4", 300, 480)];
+  const state = { pane, current: null, inView: new Set(["2", "3"]), landing: false, landed: null, menu: null };
+  const item = (id, tag = "BUTTON", extra = {}) => ({ id, tagName: tag, hidden: false, focus: (options) => log.push(`focus ${id}${options && options.preventScroll ? " quietly" : ""}`), scrollIntoView: () => {}, ...extra });
+  const keys = createSelectionKeys({
+    paneFor: (node) => (node && node.outside ? null : state.pane),
+    paneRows: () => rows,
+    currentRow: () => state.current,
+    rowInView: (_pane, row) => state.inView.has(row.id),
+    firstRowInView: () => rows.find((row) => state.inView.has(row.id)) || null,
+    landingHolds: () => state.landing,
+    landingFirst: () => state.landed,
+    selectRow: (_pane, row, ...rest) => log.push(["select", row.id, ...rest].join(" ")),
+    takeRow: (_pane, row, focus) => log.push(`take ${row.id} ${focus}`),
+    landingGap: () => 8,
+    openOverscroll: () => log.push("room opened"),
+    openRowMenu: () => state.menu,
+    setStatus: (text) => log.push(`say ${text}`),
+  });
+  const run = (act) => { log.length = 0; area.scrollTop = 1000; return [act(), ...log, area.scrollTop]; };
+  const was = globalThis.document;
+  globalThis.document = { activeElement: null };
+  try {
+    assert.deepStrictEqual(run(() => keys.stepFromKeyboard({}, 1)), [true, "select 2", 1000], "↓ with nothing selected did not take the top message showing");
+    assert.deepStrictEqual(run(() => keys.stepFromKeyboard({}, -1)), [true, "select 3", 1000], "↑ with nothing selected did not take the bottom message showing");
+    state.landing = true;
+    state.landed = rows[3];
+    assert.deepStrictEqual(run(() => keys.stepFromKeyboard({}, 1)), [true, "select 4", 1000], "the first key in a thread just entered did not take the message the entry landed on");
+    state.landing = false;
+    state.current = rows[2];
+    assert.deepStrictEqual(run(() => keys.stepFromKeyboard({}, 1)), [true, "select 3 false", 1200], "↓ on a message running past the foot did not read half a room on through it, or the ring was not drawn");
+    state.current = rows[1];
+    globalThis.document.activeElement = rows[1];
+    assert.deepStrictEqual(run(() => keys.stepFromKeyboard({}, 1)), [true, "select 3 true 1", 1000], "↓ on a message that fits did not move on to the next, from above");
+    state.current = rows[3];
+    state.inView = new Set(["4"]);
+    globalThis.document.activeElement = rows[3];
+    assert.deepStrictEqual(run(() => keys.stepFromKeyboard({}, 1)), [true, "room opened", 1200], "↓ past the last message did not open the room past the foot and scroll on");
+    assert.deepStrictEqual(run(() => keys.stepFromKeyboard({}, 1, true)), [true, 1200], "a held ↓ past the last message opened the room past the foot");
+    state.current = rows[0];
+    state.inView = new Set(["1"]);
+    globalThis.document.activeElement = rows[0];
+    assert.deepStrictEqual(run(() => keys.stepFromKeyboard({}, -1)), [true, 800], "↑ on a message above the head did not read back through it, half a room at most");
+    assert.deepStrictEqual(run(() => keys.stepFromKeyboard({ outside: true }, 1)), [false, 1000], "↓ outside any list was taken");
+    const opener = item("opener");
+    const items = [item("a"), item("b", "A"), item("c", "BUTTON", { hidden: true }), { tagName: "DIV", hidden: false, children: [item("d")] }, opener];
+    const root = { children: items };
+    for (const one of [...items, ...items[3].children]) one.parentNode = one === items[3].children[0] ? items[3] : root;
+    state.menu = { root, button: opener };
+    assert.deepStrictEqual(keys.menuItems().map((one) => one.id), ["a", "b", "d"], "the menu's items are not its shown buttons and links, in order, without its own opener");
+    assert.deepStrictEqual(run(() => keys.stepFromKeyboard(items[3].children[0], 1)), [true, "focus a quietly", 1000], "↓ on the last item did not go round to the first");
+    assert.deepStrictEqual(run(() => keys.stepFromKeyboard(items[0], -1)), [true, "focus d quietly", 1000], "↑ on the first item did not go round to the last");
+    state.menu = null;
+    assert.deepStrictEqual(keys.menuItems(), []);
+    state.current = rows[1];
+    state.inView = new Set(["2"]);
+    assert.deepStrictEqual(keys.rowForAct({}), { pane, row: rows[1], took: false });
+    state.current = rowOf("card", 0, 10, { "data-card": "" });
+    assert.deepStrictEqual([keys.rowForAct({}), keys.rowForAct({}, true)], [{ pane, row: null, took: false }, { pane, row: state.current, took: false }], "a card was acted on as a message, or not by Enter and o");
+    state.current = rowOf("line", 0, 10, { "data-read-run": "head" });
+    log.length = 0;
+    assert.deepStrictEqual([keys.rowForAct({}), log], [{ pane, row: null, took: true }, ["say Read messages: Enter opens them."]], "a key about one message acted on a run's line");
+    state.current = rows[3];
+    log.length = 0;
+    assert.deepStrictEqual([keys.rowForAct({}, false, true), log], [{ pane, row: null, took: true }, ["take 2 false", "say Selected the first message showing."]],
+      "a row out of sight was acted on, or the first showing took the focus from a box");
+    state.inView = new Set();
+    log.length = 0;
+    assert.deepStrictEqual([keys.rowForAct({}), log], [{ pane, row: null, took: false }, []]);
+    state.pane = null;
+    assert.deepStrictEqual([keys.keyContext({}), keys.rowForAct({})], [{ pane: null, row: null }, { pane: null, row: null, took: false }]);
+  } finally {
+    globalThis.document = was;
+  }
+});

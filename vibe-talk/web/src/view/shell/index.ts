@@ -43,3 +43,5 @@ export { createDoneKeys } from "./donekeys.ts";
 export type { DoneKeys, DoneKeysDependencies, DoneRow } from "./donekeys.ts";
 export { createFoldKeys } from "./foldkeys.ts";
 export type { FoldKeys, FoldKeysDependencies, FoldableRow, FoldedPane } from "./foldkeys.ts";
+export { READ_STEP, createSelectionKeys } from "./selectionkeys.ts";
+export type { KeyRow, SelectionKeys, SelectionKeysDependencies, SteppedMenu, SteppedPane } from "./selectionkeys.ts";
