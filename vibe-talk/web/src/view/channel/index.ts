@@ -121,3 +121,5 @@ export { mountListWatch } from "./listwatch.ts";
 export type { ListWatch, ListWatchDependencies } from "./listwatch.ts";
 export { mountListKeepers } from "./listkeepers.ts";
 export type { ListKeepers, ListKeepersDependencies } from "./listkeepers.ts";
+export { mountListGestures } from "./listgestures.ts";
+export type { ListGestures, ListGesturesDependencies, PulledTouch } from "./listgestures.ts";

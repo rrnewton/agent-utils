@@ -2062,9 +2062,10 @@ test("the foot's affordance clears the chips, spins only while fetching, and nev
   );
   // PASSIVE, all four: the gesture only reads touches, and a listener that might cancel makes the
   // browser hold every scroll that starts on the list until this script has answered.
-  assert.match(SCRIPT_CODE, /const PASSIVE = \{ passive: true \};/);
+  // Mounted by the lists' gestures (web/src/view/channel `mountListGestures`, `#624 voice-page-modularity`).
+  assert.match(PAGE_CODE, /const PASSIVE = \{ passive: true \};/);
   for (const type of ["touchstart", "touchmove", "touchend", "touchcancel"]) {
-    const line = SCRIPT_CODE.split("\n").find((text) => text.includes(`addEventListener("${type}"`));
+    const line = PAGE_CODE.split("\n").find((text) => text.includes(`(el("scroll-area"), "${type}"`));
     assert.ok(line, `nothing listens for ${type}`);
     assert.match(line, /, PASSIVE\);\s*$/, `the ${type} listener can hold up a scroll`);
   }

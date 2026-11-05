@@ -1148,3 +1148,55 @@ test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line
     globalThis.setTimeout = was;
   }
 });
+
+test("`#624 voice-page-modularity`: the lists' gestures and scrolls are every one passive, reach the act each names, and come down again", () => {
+  const { mountListGestures } = CHANNEL_VIEW;
+  const log = [];
+  const target = (id) => ({ id, listeners: [],
+    addEventListener(type, listener, options) { this.listeners.push({ type, listener, options }); log.push(`listen ${id} ${type}${options && options.passive ? " passive" : ""}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const main = target("scroll-area");
+  const leftMain = target("left-scroll-area");
+  const side = target("side-scroll");
+  const doc = target("document");
+  const fire = (on, type, event) => { for (const one of on.listeners.filter((each) => each.type === type)) one.listener(event); };
+  const was = globalThis.document;
+  globalThis.document = doc;
+  try {
+    const gestures = mountListGestures({
+      byId: (id) => ({ "scroll-area": main })[id],
+      leftById: (id) => ({ "scroll-area": leftMain, "side-scroll": side })[id],
+      pullStart: (event) => log.push(`pull start ${event.id}`),
+      pullMove: (event) => log.push(`pull move ${event.id}`),
+      pullEnd: (...args) => { log.push(`pull end ${args.length}`); return "the refresh"; },
+      pullCancel: (...args) => log.push(`pull cancel ${args.length}`),
+      scheduleColumnLinks: (...args) => log.push(`links ${args.length}`),
+      footWheel: (event) => log.push(`foot wheel ${event.id}`),
+      footScrolled: (timeStamp) => log.push(`foot scrolled ${timeStamp}`),
+      finishPackSlide: (...args) => log.push(`slide ended ${args.length}`),
+    });
+    assert.deepStrictEqual(log, ["listen scroll-area touchstart passive", "listen scroll-area touchmove passive", "listen scroll-area touchend passive",
+      "listen scroll-area touchcancel passive", "listen left-scroll-area scroll passive", "listen side-scroll scroll passive", "listen side-scroll wheel passive",
+      "listen side-scroll wheel passive", "listen side-scroll keydown passive", "listen side-scroll scroll passive", "listen document visibilitychange"],
+      "a listener was added out of the page's order, or one that only reads was not passive");
+    log.length = 0;
+    fire(main, "touchstart", { id: "t1" });
+    fire(main, "touchmove", { id: "t2" });
+    const ended = main.listeners.find((one) => one.type === "touchend").listener({ id: "t3" });
+    assert.equal(ended, "the refresh", "the touchend listener did not answer the refresh it started, which the page suite waits for");
+    fire(main, "touchcancel", { id: "t4" });
+    fire(leftMain, "scroll", {});
+    fire(side, "wheel", { id: "w" });
+    fire(side, "keydown", {});
+    fire(side, "scroll", { timeStamp: 42 });
+    fire(side, "scroll", undefined);
+    fire(doc, "visibilitychange", {});
+    assert.deepStrictEqual(log, ["pull start t1", "pull move t2", "pull end 0", "pull cancel 0", "links 0", "foot wheel w", "slide ended 0", "slide ended 0",
+      "links 0", "foot scrolled 42", "links 0", "foot scrolled -Infinity", "links 0"],
+      "a gesture reached the wrong act, or a scroll with no time was not read as the earliest");
+    gestures.unmount();
+    assert.deepStrictEqual([main, leftMain, side, doc].map((one) => one.listeners.length), [0, 0, 0, 0], "a listener outlived unmount");
+  } finally {
+    globalThis.document = was;
+  }
+});

@@ -31506,49 +31506,24 @@ mountListKeepers({
   pinsView: () => pinsView(),
   measureReplyArrows: () => measureReplyArrows(),
 });
-// `#68 pull-to-refresh`. On #scroll-area rather than on the document, because the gesture is about
-// THIS list and because the page's other three scroll gestures already live here. Nothing calls
-// `preventDefault`: the pull only ever begins where the element has nothing left to scroll, so
-// there is no browser behaviour to suppress — `overscroll-behavior: contain` has already stopped
-// the drag becoming the browser's own page-level refresh.
-//
-// So all four are PASSIVE, and say so. A listener that might cancel makes the browser hold every
-// scroll that starts on this list until the script has answered, and this script is often busy —
-// drawing a page of rows, decoding a stream. The gesture only ever reads the touches; declaring
-// that lets the list scroll first and tell the page afterwards. `#188 pull-refresh-bottom`.
-const PASSIVE = { passive: true };
-el("scroll-area").addEventListener("touchstart", pullStart, PASSIVE);
-el("scroll-area").addEventListener("touchmove", pullMove, PASSIVE);
-el("scroll-area").addEventListener("touchend", guardQuietly(pullEnd), PASSIVE);
-// A cancel is the browser taking the gesture away — a phone call arriving, a system gesture
-// winning. It must not leave the affordance standing on the screen saying "release to refresh".
-el("scroll-area").addEventListener("touchcancel", pullCancel, PASSIVE);
-// `#261 two-column-connectors`. Each column's scroll moves the links' ends: one frame per burst, asked
-// for by listeners that only read (`scheduleColumnLinks`), and nothing at all in one column. Coming back
-// to the page draws them again, as a hidden page draws none.
-leftEl("scroll-area").addEventListener("scroll", scheduleColumnLinks, PASSIVE);
-leftEl("side-scroll").addEventListener("scroll", scheduleColumnLinks, PASSIVE);
-// `#338 column-overscroll`. A turn of the wheel down at the right column's foot opens the room past it, once
-// both the wheel and the list have rested there (`OVERSCROLL_REST_MS`): the scroll that brought the reader to
-// the foot, a fling's included, stops on it. Passive, so the browser scrolls for the wheel without waiting for
-// this page: it has already found the list at its end and moved nothing by the time the room opens, so the
-// turn that opened it is scrolled here, by as much as the browser would have; the turns after it the browser
-// scrolls into the room itself.
-leftEl("side-scroll").addEventListener("wheel", (/** @type {WheelEvent} */ event) => footRooms.wheel(event), PASSIVE);
-// `#460 pack-gap-slide`. The reader's own wheel or key on the list ends a slide at once: what they act on is
-// where it is laid out. Not a scroll, which the page's own place-keeping makes too; nor a press or a touch,
-// whose click lands on what was under the pointer as it went down, which ending the slide would move.
-for (const type of ["wheel", "keydown"]) {
-  leftEl("side-scroll").addEventListener(type, finishPackSlide, PASSIVE);
-}
-// ...and goes back below the screen as the reader goes back up past the foot, or once they have rested at
-// the foot without going into it (`waitOverscrollIdle`). A reader in it is noted where they have the last
-// card, for `holdOverscrollReader`.
-leftEl("side-scroll").addEventListener("scroll", (/** @type {Event | undefined} */ event) => {
-  // A browser's scroll event always carries its time; the page suite fires its scroll listeners with none.
-  footRooms.scrolled(event ? event.timeStamp : -Infinity);
-}, PASSIVE);
-document.addEventListener("visibilitychange", scheduleColumnLinks);
+// The lists' gestures and scrolls (`#68 pull-to-refresh`, `#188 pull-refresh-bottom`, `#261 two-column-connectors`,
+// `#338 column-overscroll`, `#460 pack-gap-slide`): the pull on Main's list, each column's scroll moving the links'
+// ends, the wheel at the right column's foot, the reader's own wheel or key ending a slide, and the room past the
+// foot following the scroll, every listener on a list passive. One owner in web/src/view/channel/listgestures.ts
+// (`#624 voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's
+// teardown.
+mountListGestures({
+  byId: (id) => el(id),
+  leftById: (id) => leftEl(id),
+  pullStart: (event) => pullStart(event),
+  pullMove: (event) => pullMove(event),
+  pullEnd: () => guardQuietly(pullEnd)(),
+  pullCancel: () => pullCancel(),
+  scheduleColumnLinks: () => scheduleColumnLinks(),
+  footWheel: (event) => footRooms.wheel(event),
+  footScrolled: (timeStamp) => footRooms.scrolled(timeStamp),
+  finishPackSlide: () => finishPackSlide(),
+});
 
 /**
  * Like `guard`, but for things that are not a call: it reports, and it does NOT tear down a live
