@@ -30,8 +30,14 @@ On a consumer team's bridge on this host (target: an agentcloud session viewed t
 - Test: an unknown harness with no delivery evidence gets no receipt, and the request is uncertain, retried and alarmed per policy.
 - Test: when evidence appears later (for example, the session history shows the message), the receipt follows then.
 - Test: for an agentcloud session, history-based evidence is used.
+- Reply path (owner reply 154 policy, folded in 2026-11-05): when the bridge follows NO transcript for a delivery (unknown or agentterm harness, headless, transcript not found), the request prompt gives ONLY "reply with `agentctl chat reply N --file FILE`, then `chat sent`", and no reply-block (fence) instructions. Fences are offered only where a transcript is followed. This is decided per delivery, including right after a `chat repoint`, and recorded in `chat status`. Test: a repoint from an agentcloud target to an unknown-harness pane switches the next prompt to command-only.
+- An agentterm pane attached to an agentcloud session captures replies from that session's agentcloudctl history, the same evidence source as receipts. Until then it falls under the command-only rule above.
 - The consumer team verifies the fix on its bridge.
 
 # Notes
 
 Relayed by the lead on 2026-11-05 (owner reply 164). Assigned to cl-start, right after #891. Testing is coordinated with the consumer team through the lead.
+
+Root cause (cl-start, 2026-11-05 ~11:15 AM ET): for an agentcloud record, `message_state` answers Processed unconditionally ("journaled at submission"). The bridge checks it before submitting, so it records the request delivered and never runs `agentcloudctl send`.
+
+Reply path folded in at the lead's request (2026-11-05, 12:40 PM ET). During the interim repoint of the consumer team's bridge to its agentterm pane (harness unknown), inbound delivery worked, but the agent's reply blocks for requests 049 and 050 never reached Slack. The prompt still offered fences although no transcript was followed, so the agent posted both by hand with `chat publish`. #852's progress notes say prompts switch to command-only with the target kind, but that did not hold after a runtime repoint.
