@@ -530,3 +530,22 @@
   opacity: 0.75;
 }
 
+
+/* `#880 voice-page-menu-placement`. Hide reader, from the action menu: the channel's row of big buttons goes, and
+   the list takes its room, with no band left where it was. The row's buttons keep their own `hidden`, so the keys
+   that act through them (`h`, `s`) still do. The call's row is Talk, and stays.
+   A WAY OUT OF SOUND STAYS, as with the keyboard up: while a call can be hung up, or a read is on (Read lit as its
+   Pause, or Stop shown), the row is drawn whatever the choice, so the sound is a tap from stopping and the read
+   strip, which hides the bar, never leaves the screen with no way out. The bar, standing at the foot now, keeps
+   the home indicator's inset the row used to keep; and a dock left with nothing in it goes. */
+:root[data-reader="hidden"]:has(#pane-discord:not([hidden])) #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-pane {
+  display: none;
+}
+
+:root[data-reader="hidden"]:has(#pane-discord:not([hidden])) #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-bar[data-placement="bottom"] {
+  padding-bottom: calc(0.35rem + env(safe-area-inset-bottom));
+}
+
+:root[data-reader="hidden"]:has(#pane-discord:not([hidden])) #dock:not(:has(#control-bar)):not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) {
+  display: none;
+}

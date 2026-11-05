@@ -405,6 +405,8 @@ export interface ElementById {
   "read-steer-quote": HTMLButtonElement;
   "read-steer-row": HTMLDivElement;
   "read-timeline": HTMLDivElement;
+  "reader-toggle": HTMLButtonElement;
+  "reader-toggle-label": HTMLSpanElement;
   "reading-full-group": HTMLElement;
   "reading-width": HTMLInputElement;
   "reading-width-state": HTMLParagraphElement;

@@ -15,7 +15,7 @@ import { BASE_CSS, CANNED, CONVAI_WRITE, CSS, CSS_CODE, CSS_UNCONDITIONAL, DESKT
   bigCardData, brokenModule, brokenScript, channelSummaryText, compose, cssBlock, cssBlockIn, cssBlockOutside,
   cssRules, cssRulesElsewhere, cssWithout, errorResponse, forwardTimeline, freshness, json,
   longMessage, markupHolds, markupPlace, mediaBody, message, newPage, pagedChannel, pickThread,
-  reReadChannel, replyButton, replyInStream, seamDetail, searchLanguage, secondOfSpeech,
+  press, reReadChannel, replyButton, replyInStream, seamDetail, searchLanguage, secondOfSpeech,
   session_lines, showDiscord, signIn, speech, startNeutralCall, startTalking, state, storedTexts,
   test, threadData, threadPage, turnDone, withoutStrings, words } from "./fixture.mjs";
 
@@ -464,6 +464,92 @@ test("the view control is a real button: pressed on the call's view, filled in t
   // The channel's view is the darker one: the quiet page ground, never the accent.
   assert.match(cssBlock(".switch"), /background:\s*var\(--bg\)/, "unpressed is not the quiet, darker ground");
   assert.doesNotMatch(cssBlock(".switch"), /var\(--accent\)/);
+});
+
+test("`#880 voice-page-menu-placement`: the hamburger is IMMEDIATELY LEFT of the view button, out of the pack", async () => {
+  // The owner, 2026-11-05: "Originally I asked for this hamburger icon just to the left of the channel voice
+  // view toggle." `#820 voice-page-action-menu` had put it left of the channel picker, inside the pack.
+  const beforeSwitch = HTML_CODE.slice(0, HTML_CODE.indexOf('id="view-switch"'));
+  assert.equal([...beforeSwitch.matchAll(/\bid="([^"]+)"/g)].at(-1)[1], "action-menu-open",
+    "the markup has something between the hamburger and the view button");
+  assertMarkupContains("control-bar", "action-menu-open");
+  assert.equal(markupHolds("bar-pack", "action-menu-open"), false, "the hamburger is in the pack, which scrolls");
+  const page = newPage();
+  const order = () => page.el("control-bar").children.filter((member) => !member.hidden).map((member) => member.id);
+  await signIn(page);
+  assert.deepStrictEqual(order().slice(-2), ["action-menu-open", "view-switch"], "the call's bar ends otherwise");
+  await showDiscord(page, [message({ content: "hi" })]);
+  assert.deepStrictEqual(order().slice(-2), ["action-menu-open", "view-switch"], "the channel's bar ends otherwise");
+  // On the main screen only, as the switch is.
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.equal(page.el("action-menu-open").hidden, true, "the hamburger is on Settings");
+});
+
+test("`#880 voice-page-menu-placement`: Hide reader takes the channel's row of big buttons away, keeps its keys, and is kept", async () => {
+  // The owner: "give me an option under hamburger to hide/show reader. Is hide the big bottom row of blue buttons".
+  const page = newPage();
+  page.enableStreamedAudio();
+  page.enableAbort();
+  await signIn(page);
+  const item = page.el("reader-toggle");
+  const word = () => page.el("reader-toggle-label").text();
+  const said = () => page.documentElement.getAttribute("data-reader");
+  assert.equal(item.hidden, true, "Hide reader is offered over the call, whose row is Talk");
+  assert.equal(said(), null, "the row ships hidden");
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "one block" }),
+    message({ id: "1000000000000000002", author_id: "1000000000000000012", content: "another block",
+      timestamp: "2026-08-19T05:31:00.000Z" }),
+  ]);
+  assert.equal(item.hidden, false, "Hide reader is not offered over the channel");
+  assert.equal(word(), "Hide reader");
+  // The pace popover is the row's: open, it goes with the row rather than staying a level nobody can see.
+  await page.el("read-speed").click();
+  assert.equal(page.el("speed-popover").hidden, false, "the premise: the pace popover open");
+  await page.el("action-menu-open").click();
+  await item.click();
+  await page.settle();
+  assert.equal(said(), "hidden", "Hide reader hid nothing");
+  assert.equal(page.el("speed-popover").hidden, true, "the pace popover stayed open with its row hidden");
+  assert.equal(word(), "Show reader", "the item's word does not follow the row");
+  assert.equal(page.el("action-menu").hidden, true, "choosing Hide reader left the menu open");
+  assert.equal(page.storage.get("vibe-talk.voice.reader-hidden"), "1", "the choice is not kept");
+  // The stylesheet takes the row away on the channel's view and leaves no band: the bar keeps the inset. But
+  // a way out of sound stays: while a call can be hung up or a read is on, the row is drawn whatever the choice.
+  const P = ':root[data-reader="hidden"]:has(#pane-discord:not([hidden]))';
+  const OUT = ':not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"]))' +
+    ':not(:has(#read-aloud-stop:not([hidden])))';
+  assert.match(cssBlock(`${P} #dock${OUT} #control-pane`), /display:\s*none/,
+    "the row is still drawn, or is hidden over Hang up, a lit Read or Stop");
+  assert.match(cssBlock(`${P} #dock${OUT} #control-bar[data-placement="bottom"]`), /safe-area-inset-bottom/,
+    "the bar at the foot loses the home indicator's inset");
+  assert.match(cssBlock(`${P} #dock:not(:has(#control-bar))${OUT}`), /display:\s*none/, "an empty dock stays as a band");
+  assert.equal(cssRules(CSS, `${P} #control-pane`).length, 0, "the row is hidden with no way out of sound kept");
+  // The keys act through the row's buttons, whose own `hidden` it left alone: h cycles, s reads.
+  assert.equal(page.el("todo-filter").hidden, false, "hiding the row hid its buttons, which the keys read");
+  const mode = page.el("todo-filter").getAttribute("data-read-mode");
+  await press(page, page.el("scroll-area"), "h");
+  assert.notEqual(page.el("todo-filter").getAttribute("data-read-mode"), mode, "h did nothing with the row hidden");
+  await press(page, page.el("scroll-area"), "h");
+  await press(page, page.el("scroll-area"), "h");
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  await press(page, page.el("scroll-area"), "s");
+  await page.settle();
+  assert.equal(page.el("read-aloud").getAttribute("data-active"), "true", "s read nothing with the row hidden");
+  // Kept across a reload: a new page on the same storage opens with the row hidden.
+  const again = newPage(page.storage);
+  await signIn(again);
+  assert.equal(again.documentElement.getAttribute("data-reader"), "hidden", "a reload forgot Hide reader");
+  assert.equal(again.el("reader-toggle-label").text(), "Show reader");
+  assert.equal(again.tab(), "discord", "the premise: a reload opens on the view it was left on");
+  assert.equal(again.el("reader-toggle").hidden, false, "Show reader is not offered after a reload");
+  await again.el("action-menu-open").click();
+  await again.el("reader-toggle").click();
+  await again.settle();
+  assert.equal(again.documentElement.getAttribute("data-reader"), null, "Show reader showed nothing");
+  assert.equal(again.el("reader-toggle-label").text(), "Hide reader");
+  assert.equal(again.storage.get("vibe-talk.voice.reader-hidden"), "0");
 });
 
 test("settings is a gear, not the word Settings", () => {
@@ -1600,11 +1686,29 @@ test("on a desk the view switch has one place, and the pane keeps the room for i
   const tray = cssBlockIn(DESKTOP_QUERY, '#control-bar[data-placement="bottom"] #prompts-tray');
   assert.match(tray, /left:\s*var\(--dock-inset\)/, "the tray spans the window rather than the column");
   assert.match(tray, /right:\s*var\(--dock-inset\)/, "the tray spans the window rather than the column");
-  // The room: the pane's right margin is the switch's width and a gap, and only while the switch is
-  // up (text mode takes it down, and the pane does not hold an empty corner for it).
+  // The room: the pane's right margin is the switch's width, the hamburger's beside it (`#880
+  // voice-page-menu-placement`) and their gaps, and only while the switch is up (text mode takes it down,
+  // and the pane does not hold an empty corner for it).
   const room = cssBlockIn(DESKTOP_QUERY, "#control-bar-bottom:has(#view-switch:not([hidden])) + #control-pane");
-  assert.match(room, /margin-right:\s*calc\(var\(--dock-switch\) \+ [\d.]+rem\)/, "the pane keeps no room for the switch");
+  assert.match(room, /margin-right:\s*calc\(var\(--dock-switch\) \+ var\(--dock-menu\) \+ [\d.]+rem\)/,
+    "the pane keeps no room for the switch and the hamburger");
   assert.match(cssValue(cssBlockIn(DESKTOP_QUERY, "#dock"), "--dock-switch") || "", /^[\d.]+rem$/);
+  // `#880 voice-page-menu-placement`. The hamburger in the corner too, IMMEDIATELY LEFT of the switch: on its
+  // floor, at its width and a gap from its left edge, as wide as the room kept for it.
+  const menu = cssBlockIn(DESKTOP_QUERY, '#control-bar[data-placement="bottom"] #action-menu-open');
+  assert.match(menu, /position:\s*absolute/, "the hamburger is not in the corner beside the switch");
+  assert.equal(cssValue(menu, "bottom"), cssValue(flick, "bottom"), "the hamburger is not on the switch's floor");
+  assert.match(menu, /right:\s*calc\(var\(--dock-inset\) \+ var\(--dock-switch\) \+ 0\.4rem\)/,
+    "the hamburger is not directly left of the switch");
+  assert.match(menu, /width:\s*var\(--dock-menu\)/, "the hamburger is wider or narrower than the room kept for it");
+  assert.match(cssValue(cssBlockIn(DESKTOP_QUERY, "#dock"), "--dock-menu") || "", /^[\d.]+rem$/);
+  // ...and with the reader's row hidden, the bar keeps that room, since no pane is there to.
+  const hiddenRoom = cssBlockIn(DESKTOP_QUERY,
+    ':root[data-reader="hidden"]:has(#pane-discord:not([hidden])) #dock:not(:has(#hang-up:not([hidden])))' +
+    ':not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) ' +
+    '#control-bar-bottom:has(#view-switch:not([hidden]))');
+  assert.equal(cssValue(hiddenRoom, "margin-right"), cssValue(room, "margin-right"),
+    "with the reader hidden, the bar runs under the switch");
   // ...and it is the pane that keeps it, the last thing in the dock and so on its last row.
   const dock = HTML_CODE.slice(HTML_CODE.indexOf('id="dock"'), HTML_CODE.indexOf("</footer>"));
   assert.ok(dock.indexOf('id="control-pane"') > dock.indexOf('id="control-bar-bottom"'));

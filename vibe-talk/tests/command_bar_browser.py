@@ -27,10 +27,13 @@ Against the page from before the change it fails at 1280x800 on the long thread,
 wrap onto a second row.
 
 `#820 voice-page-action-menu`, at 393x852 by touch and 1280x800 by mouse, on a channel whose newest messages
-are long: the hamburger, just left of the channel picker, opens the action menu over the list; Expand all
+are long: the hamburger, immediately left of the view button on the same row (`#880 voice-page-menu-placement`),
+opens the action menu over the list; Expand all
 in it opens every message and shuts the menu, Collapse all is then offered and folds them again, and
 Summaries is offered; none of the three floats in the chip row any more; Escape shuts the menu and gives
-the focus back to the hamburger. The view button says the view on screen and is pressed on the call's (#845),
+the focus back to the hamburger. `#880 voice-page-menu-placement`: Hide reader in the menu takes the reader's row of
+big buttons away, the list taking its room and the dock only the bar, says Show reader, leaves h working,
+and is still in force after a reload; Show reader puts the row back. The view button says the view on screen and is pressed on the call's (#845),
 by a tap and by Enter and Space from the keys. It reuses keyboard_browser's fixture: its fake API and asset server. --web-root DIR runs it
 against another copy of the page; --screenshots DIR keeps a PNG of each step; --port N serves the
 fixture on that port (default: one the system picks).
@@ -73,7 +76,7 @@ DOCK_JS = """() => {
     return right - left > 0.5 ? {...r, left, right, width: right - left} : null;
   };
   const controls = [...document.querySelectorAll(
-    '#open-settings, #bar-pack > *, #view-switch, #control-pane > button, #control-pane > .control')]
+    '#open-settings, #bar-pack > *, #action-menu-open, #view-switch, #control-pane > button, #control-pane > .control')]
     .filter(drawn).map((node) => [node, clipped(node, box(node))]).filter(([, r]) => r)
     .map(([node, r]) => ({id: node.id || node.className, ...r}));
   const select = document.getElementById('thread-select');
@@ -239,14 +242,17 @@ def large_font_after_call(browser: Browser, url: str, width: int, height: int, n
 # `#820 voice-page-action-menu`: the menu, its items, the chips over the list, and the view button.
 MENU_JS = """() => {
   const shown = (id) => { const n = document.getElementById(id); return Boolean(n && !n.hidden && n.getClientRects().length); };
-  const box = (id) => { const r = document.getElementById(id).getBoundingClientRect(); return {left: r.left, right: r.right, top: r.top, bottom: r.bottom}; };
+  const box = (id) => { const r = document.getElementById(id).getBoundingClientRect(); return {left: r.left, right: r.right, top: r.top, bottom: r.bottom, height: r.height}; };
   const tools = document.getElementById('scroll-tools');
   return {
     open: shown('action-menu'), expanded: document.getElementById('action-menu-open').getAttribute('aria-expanded'),
     expand: shown('expand-all'), collapse: shown('collapse-all'), summaries: shown('summarise'),
     floating: ['expand-all', 'collapse-all', 'summarise'].filter((id) => tools.contains(document.getElementById(id))),
     folded: document.querySelectorAll('#discord-log > li[data-collapsed="true"]').length,
-    hamburger: box('action-menu-open'), picker: box('discord-channel'),
+    hamburger: box('action-menu-open'), switch: box('view-switch'),
+    pane: shown('control-pane'), reader: document.getElementById('reader-toggle-label').textContent,
+    dock: box('dock'), barHeight: document.getElementById('control-bar').getBoundingClientRect().height,
+    list: box('scroll-area'), mode: document.getElementById('todo-filter').getAttribute('data-read-mode'),
     focus: document.activeElement ? document.activeElement.id : null,
     pressed: document.getElementById('view-switch').getAttribute('aria-pressed'),
     word: document.getElementById('view-switch-label').textContent,
@@ -276,6 +282,79 @@ def press(page: Page, selector: str, touch: bool) -> None:
         page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
 
 
+def beside(now: Json, where: str) -> None:
+    """`#880 voice-page-menu-placement`: the hamburger IMMEDIATELY LEFT of the view button, on its row."""
+    menu, switch = now["hamburger"], now["switch"]
+    gap = number(switch, "left") - number(menu, "right")
+    check(-0.5 <= gap <= 12, f"{where}: the hamburger is not immediately left of the view button ({gap:.1f}px): {menu} {switch}")
+    down = min(number(menu, "bottom"), number(switch, "bottom")) - max(number(menu, "top"), number(switch, "top"))
+    check(down > 0.5 * number(menu, "height"), f"{where}: the hamburger is not on the view button's row: {menu} {switch}")
+
+
+def hide_reader(page: Page, where: str, touch: bool, shots: Path | None, width: int, height: int) -> None:
+    """`#880 voice-page-menu-placement`: Hide reader, its keys, a reload, and Show reader."""
+    before = menu_state(page)
+    check(before["pane"] is True and before["reader"] == "Hide reader", f"{where}: the premise, the row shown: {before}")
+    press(page, "#action-menu-open", touch)
+    page.wait_for_timeout(200)
+    press(page, "#reader-toggle", touch)
+    page.wait_for_timeout(300)
+    now = menu_state(page)
+    shot(page, shots, f"{width}x{height}-reader-hidden")
+    check(now["pane"] is False and now["reader"] == "Show reader" and now["open"] is False,
+          f"{where}: Hide reader left {now}")
+    # No band where the row was: the dock holds only the bar, and the list took the room.
+    check(number(now["dock"], "height") - float(now["barHeight"]) <= 14,  # type: ignore[arg-type]
+          f"{where}: with the reader hidden the dock is {number(now['dock'], 'height'):.0f}px for a "
+          f"{now['barHeight']}px bar")
+    check(number(now["dock"], "bottom") >= height - 0.5, f"{where}: the dock left the window's foot: {now['dock']}")
+    # On a phone the row is a band of its own, and the list takes all of it; on a desk the row stands beside the
+    # bar, so the dock keeps its height and the bar takes the row's width.
+    shrank = number(before["dock"], "height") - number(now["dock"], "height")
+    grown = number(now["list"], "height") - number(before["list"], "height")
+    check(abs(grown - shrank) <= 2, f"{where}: the dock gave {shrank:.0f}px and the list took {grown:.0f}px")
+    if width < 1000:
+        check(shrank >= 30, f"{where}: hiding the reader gave the list only {shrank:.0f}px")
+    beside(now, f"{where}, reader hidden")
+    # A way out of sound stays: with Hang up, Stop or a lit Read the row is drawn whatever the choice.
+    for way, show, hide in (
+        ("Hang up", "el('hang-up').hidden = false", "el('hang-up').hidden = true"),
+        ("Stop", "el('read-aloud-stop').hidden = false", "el('read-aloud-stop').hidden = true"),
+        ("a lit Read", "el('read-aloud').setAttribute('data-active', 'true')",
+         "el('read-aloud').setAttribute('data-active', 'false')"),
+    ):
+        page.evaluate(f"() => {{ const el = (id) => document.getElementById(id); {show}; }}")
+        page.wait_for_timeout(100)
+        check(menu_state(page)["pane"] is True, f"{where}: the reader hidden over {way}, with no way out of the sound")
+        page.evaluate(f"() => {{ const el = (id) => document.getElementById(id); {hide}; }}")
+        page.wait_for_timeout(100)
+    check(menu_state(page)["pane"] is False, f"{where}: the row did not go again after the sound")
+    # The keys still act through the hidden row: h steps the read mode, and back round.
+    page.focus("#scroll-area")
+    page.keyboard.press("h")
+    page.wait_for_timeout(200)
+    stepped = menu_state(page)["mode"]
+    check(stepped != before["mode"], f"{where}: h did nothing with the reader hidden ({stepped})")
+    for _ in range(2):
+        page.keyboard.press("h")
+        page.wait_for_timeout(150)
+    check(menu_state(page)["mode"] == before["mode"], f"{where}: h did not come back round")
+    # Kept: a reload opens with it hidden.
+    page.reload()
+    page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+    check(page.get_attribute("#view-switch", "aria-pressed") == "false", f"{where}: the reload left the channel")
+    page.wait_for_selector(FIRST_ROW, state="visible", timeout=10_000)
+    page.wait_for_timeout(300)
+    now = menu_state(page)
+    check(now["pane"] is False and now["reader"] == "Show reader", f"{where}: a reload forgot Hide reader: {now}")
+    press(page, "#action-menu-open", touch)
+    page.wait_for_timeout(200)
+    press(page, "#reader-toggle", touch)
+    page.wait_for_timeout(300)
+    now = menu_state(page)
+    check(now["pane"] is True and now["reader"] == "Hide reader", f"{where}: Show reader left {now}")
+
+
 def action_menu(browser: Browser, url: str, width: int, height: int, touch: bool, shots: Path | None,
                 notes: list[str]) -> None:
     """`#820 voice-page-action-menu`: the hamburger's menu of the channel's actions, and the view button."""
@@ -288,8 +367,7 @@ def action_menu(browser: Browser, url: str, width: int, height: int, touch: bool
     check(now["pressed"] == "false" and now["word"] == "Channel", f"{where}: the view button on the channel says {now}")
     check(now["open"] is False and now["expanded"] == "false", f"{where}: the menu is open before it is asked for: {now}")
     check(now["floating"] == [], f"{where}: {now['floating']} still float in the chip row")
-    check(now["hamburger"]["right"] <= now["picker"]["left"] + 0.5,  # type: ignore[index]
-          f"{where}: the hamburger is not left of the channel picker: {now['hamburger']} {now['picker']}")
+    beside(now, where)
     folded = count(now["folded"])
     check(folded > 0, f"{where}: the premise, long messages folded in the list: {now}")
     press(page, "#action-menu-open", touch)
@@ -318,6 +396,7 @@ def action_menu(browser: Browser, url: str, width: int, height: int, touch: bool
     page.wait_for_timeout(150)
     now = menu_state(page)
     check(now["open"] is False and now["focus"] == "action-menu-open", f"{where}: Escape left {now}")
+    hide_reader(page, where, touch, shots, width, height)
     # The view button: a press, then Enter and Space from the keys.
     press(page, "#view-switch", touch)
     page.wait_for_timeout(300)
@@ -340,7 +419,8 @@ def action_menu(browser: Browser, url: str, width: int, height: int, touch: bool
           f"{where}: the view button's name changed with it: {page.get_attribute('#view-switch', 'aria-label')!r}")
     check(not errors, f"{where}: the page threw: {errors}")
     page.context.close()
-    notes.append(f"{where}: the hamburger left of the picker opened the menu, Expand all opened {folded} folded "
+    notes.append(f"{where}: the hamburger immediately left of the view button opened the menu, Hide reader took the "
+                 "row away with no band, kept its keys and a reload, Show reader put it back, Expand all opened {folded} folded "
                  "messages and shut it, Collapse all folded them again, Summaries offered, none of them in the chip "
                  "row, Escape shut it onto the hamburger; the view button pressed on the call's view and not on the channel's, by a tap, Enter and Space")
 

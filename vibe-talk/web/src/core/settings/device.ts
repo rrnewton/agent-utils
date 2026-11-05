@@ -81,6 +81,9 @@ export const DEVICE_SETTINGS = Object.freeze({
   } satisfies DeviceSetting<boolean>,
   /** `#340 composer-grow-box`. Whether the message box grows to its text. */
   composerGrow: offUnlessOn("vibe-talk.voice.composer-grow", false),
+  /** `#880 voice-page-menu-placement`. Whether the channel's row of big reader buttons is hidden: a screen-layout
+   * choice, kept on this device as `composerGrow` is. A refused read shows it. */
+  readerHidden: offUnlessOn("vibe-talk.voice.reader-hidden", false),
   /** Whether Enter in the reply box sends. */
   enterSends: onUnlessOff("vibe-talk.voice.enter-sends"),
   /** `#224 keyboard-shortcuts`. Whether single keys are shortcuts. */

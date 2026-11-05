@@ -107,6 +107,8 @@
   #dock {
     --dock-inset: 0.6rem;
     --dock-switch: 7.5rem;
+    /* `#880 voice-page-menu-placement`. The action menu's hamburger, left of the switch: a bar button's width. */
+    --dock-menu: 2.75rem;
     /* The bar's floor: see `#control-bar-bottom`. */
     --bar-floor: 8rem;
     position: relative;
@@ -139,9 +141,9 @@
    * THE SWITCH'S ONE PLACE: the lower right corner of the window, at the end of the dock's row.
    *
    * Taken out of the bar's flow and set in the corner, with the pane keeping the room for it — the
-   * pane's right margin, below, is exactly the switch's fixed width and the pane's own gap. So the
-   * row ends Hide read, Pace, Read, switch, the switch the same width in the same corner whatever
-   * the bar holds. Placed against the dock and kept clear by the pane, never over anything: the dock is
+   * pane's right margin, below, is exactly the switch's fixed width, the action menu's hamburger beside
+   * it (`#880 voice-page-menu-placement`) and their gaps. So the row ends Hide read, Pace, Read,
+   * hamburger, switch, the switch the same width in the same corner whatever the bar holds. Placed against the dock and kept clear by the pane, never over anything: the dock is
    * still the frame's third grid row, and the switch's room is in its flow.
    *
    * 7.5rem holds "Channel" in DejaVu Sans, one of the widest common faces, at the 0.85rem every
@@ -173,8 +175,28 @@
     font-size: inherit;
   }
 
+  /* `#880 voice-page-menu-placement`. The hamburger IMMEDIATELY LEFT OF THE SWITCH, by the owner's words: in the
+     corner beside it, on the same floor, and the pane keeps the room for both. */
+  #control-bar[data-placement="bottom"] #action-menu-open {
+    position: absolute;
+    right: calc(var(--dock-inset) + var(--dock-switch) + 0.4rem);
+    bottom: 0.4rem;
+    width: var(--dock-menu);
+    min-width: 0;
+    box-sizing: border-box;
+  }
+
   #control-bar-bottom:has(#view-switch:not([hidden])) + #control-pane {
-    margin-right: calc(var(--dock-switch) + 0.4rem);
+    margin-right: calc(var(--dock-switch) + var(--dock-menu) + 0.8rem);
+  }
+
+  /* ...and with the reader's row hidden, the bar keeps that room itself: it takes the row, short of the corner. */
+  :root[data-reader="hidden"]:has(#pane-discord:not([hidden])) #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-bar-bottom:has(#view-switch:not([hidden])) {
+    margin-right: calc(var(--dock-switch) + var(--dock-menu) + 0.8rem);
+  }
+
+  :root[data-reader="hidden"]:has(#pane-discord:not([hidden])) #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-bar[data-placement="bottom"] {
+    padding-bottom: 0;
   }
 
   /* A fixed width needs a word that cannot push past it: "Channel" fits with room to spare, and a
@@ -206,17 +228,17 @@
   /* The pane is a row of buttons, not a tile, in markup order — Sound, Clear, Hang up, Talk on
      the call; Hide read, Pace, Read on the channel, the order the phone tile shows them in.
      `margin-left: auto` keeps it at the right of the row, against the room it keeps for the
-     switch. It keeps its width (`#406 command-bar-one-row`): the bar beside it is what gives way,
+     switch and the hamburger. It keeps its width (`#406 command-bar-one-row`): the bar beside it is what gives way,
      its pickers ending in an ellipsis and its pack scrolling sideways, so the row stays one row.
      Only with the bar at its floor — a large default font, after a call, when Talk carries its
      note, in the narrowest desk — does the pane wrap its own buttons, as a last resort, rather than
      run under the bar or the switch: its widest is what the dock has less the bar's floor, the
-     switch's room and the gaps.
+     room for the switch and the hamburger, and the gaps.
      `static`, so the pace popover is placed against the dock: see `.popover` below. */
   #control-pane {
     flex: 0 0 auto;
     min-width: 0;
-    max-width: calc(100% - var(--bar-floor) - var(--dock-switch) - 0.4rem - 0.5rem);
+    max-width: calc(100% - var(--bar-floor) - var(--dock-switch) - var(--dock-menu) - 0.8rem - 0.5rem);
     display: flex;
     flex-wrap: wrap;
     justify-content: flex-end;

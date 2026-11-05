@@ -7,7 +7,8 @@
 import type { ElementById } from "../dom/index.ts";
 
 /** The menu's items, each shown only where it has work to do. */
-const ACTION_MENU_ITEMS = Object.freeze(["expand-all", "collapse-all", "summarise"] as const);
+// `#880 voice-page-menu-placement`: and Hide reader, offered on the channel's view.
+const ACTION_MENU_ITEMS = Object.freeze(["expand-all", "collapse-all", "summarise", "reader-toggle"] as const);
 
 /** What the menu asks of the page. */
 export interface ActionMenuDependencies {

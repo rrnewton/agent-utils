@@ -7083,6 +7083,17 @@ const setPromptsOpen = promptsTray.setOpen;
 const actionMenu = createActionMenu({ byId: (id) => /** @type {any} */ (el(id)), changed: () => scheduleBackSync() });
 const setActionMenuOpen = actionMenu.setOpen;
 
+/**
+ * `#880 voice-page-menu-placement`. The channel's row of big reader buttons, shown or hidden from the action
+ * menu and kept on this device: web/src/view/shell `createReaderRow`. web/voice.css takes the row away.
+ */
+const readerRow = createReaderRow({
+  byId: (id) => /** @type {any} */ (el(id)),
+  root: () => document.documentElement,
+  stored: () => deviceSettings().get(DEVICE_SETTINGS.readerHidden),
+  keep: (hidden) => deviceSettings().keep(DEVICE_SETTINGS.readerHidden, hidden),
+});
+
 // --- the server ------------------------------------------------------------------------------
 
 /**
@@ -7539,9 +7550,6 @@ const barPlacement = mountBarPlacement({
  */
 const PACK_VIEWS = {
   "audio-source": ["discord"],
-  // `#820 voice-page-action-menu`. The list's actions: Expand or Collapse all, on the call's transcript as on
-  // the channel, and Summaries on the channel.
-  "action-menu-open": ["discord", "voice"],
   "discord-channel": ["discord"],
   // `gchat-thread-selector`. Main, All, or one thread of the channel picked beside it.
   "thread-select": ["discord"],
@@ -7578,6 +7586,12 @@ function renderControlBar() {
   // to the agent... then the UI shifts and I lose the toggle". The message box is in the call's
   // transcript now, so the switch is on the main screen in every state, a call and a draft included.
   el("view-switch").hidden = !main;
+  // `#820 voice-page-action-menu`. The list's actions: Expand or Collapse all, on the call's transcript as on
+  // the channel, and Summaries and Hide reader on the channel. Beside the switch, on the main screen as it is
+  // (`#880 voice-page-menu-placement`).
+  el("action-menu-open").hidden = !main;
+  el("reader-toggle").hidden = screens.view() !== "discord";
+  if (actionMenu.open()) actionMenu.render();
   el("open-settings").hidden = Object.prototype.hasOwnProperty.call(SCREEN_TITLES, screens.screen());
   // The pack, by the same rule and as a LOOP rather than by name: `#60 canned-prompt-buttons` adds
   // members here, and a member added later is decided by the same line as the rest.
@@ -7602,6 +7616,7 @@ function renderControlBar() {
   if (el("action-menu-open").hidden && actionMenu.open()) setActionMenuOpen(false);
   const members = [
     el("open-settings"),
+    el("action-menu-open"),
     el("view-switch"),
     .../** @type {HTMLCollectionOf<HTMLElement>} */ (el("bar-pack").children),
   ];
@@ -30754,6 +30769,8 @@ el("prompts-open").addEventListener("click", () => setPromptsOpen(!promptsTray.o
 // `#820 voice-page-action-menu`. The action menu's opener, a toggle as the tray's is.
 el("action-menu-open").addEventListener("click", () => setActionMenuOpen(!actionMenu.open()));
 setActionMenuOpen(false);
+// `#880 voice-page-menu-placement`. The reader's row as this device keeps it, before the first frame.
+readerRow.render();
 // ...and stated once at load, rather than left to the first tap. The markup ships shut, but shut is
 // a state the opener has to be ASSERTING for a screen reader to hear it — an `aria-expanded` that
 // only appears after somebody has already opened the tray is no use to the reader who needs it.
@@ -31327,9 +31344,15 @@ el("clear-backlog").addEventListener("click", guardQuietly(clearBacklog));
 el("undo-dismiss").addEventListener("click", guardQuietly(undoDismissal));
 // `#564 message-summary-toggle`. The chip is Settings' switch, kept and synced like it.
 el("summarise").addEventListener("click", () => applySummarizeCollapsed(!storedSummarizeCollapsed()));
-// `#820 voice-page-action-menu`. Those three are the action menu's items: choosing one closes it, after the
+// `#880 voice-page-menu-placement`. Hide reader, Show reader. The pace popover is the row's, and goes with it rather
+// than staying open, undrawn, as a level Escape and the back gesture would close first.
+el("reader-toggle").addEventListener("click", () => {
+  readerRow.setHidden(!readerRow.hidden());
+  if (readerRow.hidden()) closeSpeedPopover();
+});
+// `#820 voice-page-action-menu`. Those are the action menu's items: choosing one closes it, after the
 // item's own act (registered just above), and gives the keys back to its opener rather than to nothing.
-for (const id of ["expand-all", "collapse-all", "summarise"]) {
+for (const id of ["expand-all", "collapse-all", "summarise", "reader-toggle"]) {
   el(id).addEventListener("click", () => {
     const inside = nodeWithin(el("action-menu"), document.activeElement);
     setActionMenuOpen(false);

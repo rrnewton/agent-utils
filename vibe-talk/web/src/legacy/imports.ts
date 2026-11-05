@@ -103,7 +103,7 @@ export {
   shownNode,
   tagNameOf,
 } from "../view/dom/index.ts";
-export { KEYS_MESSAGE, KEYS_MOVING, KEYS_PAGE, KEYS_VIEW, KEYS_WRITING, SCREENS, createActionMenu, createChannelKeys, createChipsOverComposer, createDoneKeys, createFoldKeys, createHighlightCopy, createKeyDispatch, createKeyHints, createKeySelection, createKeymap, createPointerSelection, createPromptsTray, createReadCollapse, createReplySight, createRowKeys, createRowShortcuts, createScreenKeys, createScreens, createScrollKeys, createSelectionKeys, createShellNotices, createUndoOffer, createUndoStamps, createViewKeys, createWriteKeys, modHeld, mountKeyListeners, pageStep, swallow } from "../view/shell/index.ts";
+export { KEYS_MESSAGE, KEYS_MOVING, KEYS_PAGE, KEYS_VIEW, KEYS_WRITING, SCREENS, createActionMenu, createChannelKeys, createChipsOverComposer, createDoneKeys, createFoldKeys, createHighlightCopy, createKeyDispatch, createKeyHints, createKeySelection, createKeymap, createPointerSelection, createPromptsTray, createReadCollapse, createReaderRow, createReplySight, createRowKeys, createRowShortcuts, createScreenKeys, createScreens, createScrollKeys, createSelectionKeys, createShellNotices, createUndoOffer, createUndoStamps, createViewKeys, createWriteKeys, modHeld, mountKeyListeners, pageStep, swallow } from "../view/shell/index.ts";
 export {
   COMPOSER_FIELDS,
   COMPOSER_GROW_BOXES,

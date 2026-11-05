@@ -55,3 +55,5 @@ export { createReadCollapse } from "./readcollapse.ts";
 export type { CollapsedRow, ReadCollapse, ReadCollapseDependencies } from "./readcollapse.ts";
 export { mountKeyListeners } from "./keylisteners.ts";
 export type { KeyListeners, KeyListenersDependencies, ListenedPane } from "./keylisteners.ts";
+export { READER_WORDS, createReaderRow } from "./readerrow.ts";
+export type { ReaderRow, ReaderRowDependencies } from "./readerrow.ts";

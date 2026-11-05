@@ -24,6 +24,7 @@ declare const createScreens: LegacyImports["createScreens"];
 declare const swallow: LegacyImports["swallow"];
 declare const modHeld: LegacyImports["modHeld"];
 declare const createActionMenu: LegacyImports["createActionMenu"];
+declare const createReaderRow: LegacyImports["createReaderRow"];
 declare const createPromptsTray: LegacyImports["createPromptsTray"];
 declare const createKeyDispatch: LegacyImports["createKeyDispatch"];
 declare const createKeyHints: LegacyImports["createKeyHints"];

@@ -255,6 +255,32 @@ test("`#820 voice-page-action-menu`: the action menu's open state on its opener 
     [false, true, "false", 2]);
 });
 
+test("`#880 voice-page-menu-placement`: the reader's row, hidden or shown, on the root and in the item's word, kept and held", () => {
+  const { createReaderRow, READER_WORDS } = VIEW_SHELL;
+  const attributes = new Map();
+  const root = { setAttribute: (name, value) => attributes.set(name, value), removeAttribute: (name) => attributes.delete(name) };
+  const label = { textContent: "" };
+  const kept = [];
+  let stored = true;
+  let reads = 0;
+  const row = createReaderRow({
+    byId: (id) => { assert.equal(id, "reader-toggle-label"); return label; },
+    root: () => root,
+    stored: () => { reads += 1; return stored; },
+    keep: (hidden) => kept.push(hidden),
+  });
+  assert.equal(reads, 0, "made, it read the storage before its first use");
+  row.render();
+  assert.deepStrictEqual([attributes.get("data-reader"), label.textContent, row.hidden()], ["hidden", READER_WORDS.hidden, true]);
+  assert.equal(READER_WORDS.hidden, "Show reader", "the word is not what a press does");
+  row.setHidden(false);
+  assert.deepStrictEqual([attributes.has("data-reader"), label.textContent, row.hidden(), kept], [false, "Hide reader", false, [false]]);
+  // A browser that will not keep it: the page still holds the choice it was given.
+  stored = true;
+  assert.equal(row.hidden(), false, "the choice made here was lost to the storage's answer");
+  assert.equal(reads, 1, "the storage was read again after the first use");
+});
+
 test("`#624 voice-page-modularity`: the channel picker opened by Ctrl+K is remembered until a choice or Esc forgets it", () => {
   const { createChannelPick } = VIEW_SHELL;
   const pick = createChannelPick();
