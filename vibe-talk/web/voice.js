@@ -7752,12 +7752,12 @@ function undoFromKeyboard() {
 
 /**
  * The keys to the message box: m and Ctrl+S (Cmd+S) take the reader to the box to write in, and ↑ in the
- * channel's empty box selects the newest message. One owner in web/src/view/shell/composekeys.ts (`#624
+ * channel's empty box selects the newest message. One owner in web/src/view/shell/writekeys.ts (`#624
  * voice-page-modularity`); the page destructures its keys under their old names.
  *
- * @type {import("./src/view/shell/index.ts").ComposeKeys}
+ * @type {import("./src/view/shell/index.ts").WriteKeys}
  */
-const composeKeys = createComposeKeys({
+const writeKeys = createWriteKeys({
   byId: (id) => el(id),
   leftById: (id) => leftEl(id),
   screen: () => screens.screen(),
@@ -7782,7 +7782,7 @@ const composeKeys = createComposeKeys({
   paneRows: (pane) => paneRows(pane),
   selectRow: (pane, row) => selectRow(pane, row),
 });
-const { composeFromKeyboard, writeFromKeyboard, newestFromComposer } = composeKeys;
+const { composeFromKeyboard, writeFromKeyboard, newestFromComposer } = writeKeys;
 
 /** Alt+↓ and Alt+↑ (Option on a Mac): the next or previous channel, in the order of the picker. */
 function stepChannel(event) {

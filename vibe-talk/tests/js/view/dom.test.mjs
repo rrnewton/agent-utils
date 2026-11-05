@@ -827,7 +827,7 @@ test("`#624 voice-page-modularity`: the search, Settings, Help, Back and Escape 
 });
 
 test("`#624 voice-page-modularity`: m and Ctrl+S find the box to write in, stay in one on screen, and ↑ in the empty channel box selects the newest message", () => {
-  const { createComposeKeys } = VIEW_SHELL;
+  const { createWriteKeys } = VIEW_SHELL;
   const log = [];
   const node = (id, extra = {}) => ({ id, nodeType: 1, hidden: false, parentNode: null, value: "",
     focus: (options) => log.push(`focus ${id}${options && options.preventScroll ? " quietly" : ""}`), scrollIntoView: () => {}, ...extra });
@@ -835,8 +835,10 @@ test("`#624 voice-page-modularity`: m and Ctrl+S find the box to write in, stay 
   for (const id of ["reply-text", "compose-text", "channel-compose-text", "side-tools", "scroll-tools"]) nodes[id] = node(id);
   const sideBox = node("side-compose-text");
   const chip = node("chip", { parentNode: nodes["side-tools"] });
+  const leftChip = node("left-chip", { parentNode: nodes["scroll-tools"] });
+  let gone = false;
   const state = { screen: "main", view: "discord", reply: false, channel: true, threadList: false, mainRows: false, behind: false, side: false, rows: ["r1", "r2"] };
-  const keys = createComposeKeys({
+  const keys = createWriteKeys({
     byId: (id) => (state.side && id === "channel-compose-text" ? sideBox : nodes[id]),
     leftById: (id) => nodes[id],
     screen: () => state.screen,
@@ -848,8 +850,8 @@ test("`#624 voice-page-modularity`: m and Ctrl+S find the box to write in, stay 
     threadListBack: () => { log.push("thread list back"); state.threadList = false; },
     mainRowsOnScreen: () => state.mainRows,
     behindThreadList: () => state.behind,
-    inColumnGone: () => false,
-    isComposer: (held) => Boolean(held && /compose-text$/.test(held.id)),
+    inColumnGone: () => gone,
+    isComposer: (held) => Boolean(held && /compose-text$|^reply-text$/.test(held.id)),
     inSide: () => state.side,
     activeColumn: () => (state.side ? "side" : "main"),
     mainColumn: () => "main",
@@ -877,6 +879,9 @@ test("`#624 voice-page-modularity`: m and Ctrl+S find the box to write in, stay 
     state.behind = true;
     assert.deepStrictEqual(run(() => keys.composeFromKeyboard()), [false], "a box behind the thread list took the focus");
     state.behind = false;
+    state.channel = false;
+    assert.deepStrictEqual(run(() => keys.composeFromKeyboard()), [false], "m wrote in the channel's box with the channel not on screen");
+    state.channel = true;
     state.side = true;
     sideBox.hidden = true;
     assert.deepStrictEqual(run(() => keys.composeFromKeyboard()), [true, "in main", "focus channel-compose-text quietly"], "a column with no box did not go to Main's");
@@ -889,10 +894,20 @@ test("`#624 voice-page-modularity`: m and Ctrl+S find the box to write in, stay 
     state.threadList = true;
     state.mainRows = true;
     assert.deepStrictEqual(run(() => keys.writeFromKeyboard()), [true, "in main", "focus channel-compose-text quietly"], "the thread list with Main channel's box was left");
-    state.threadList = false;
     state.mainRows = false;
+    state.reply = true;
+    assert.deepStrictEqual(run(() => keys.writeFromKeyboard()), [true, "in main", "focus reply-text"], "the thread list with a reply open among its cards was left");
+    state.reply = false;
+    state.threadList = false;
     globalThis.document.activeElement = nodes["channel-compose-text"];
     assert.deepStrictEqual(run(() => keys.writeFromKeyboard()), [true], "Ctrl+S in a box on screen moved the focus");
+    gone = true;
+    assert.deepStrictEqual(run(() => keys.writeFromKeyboard()), [true, "in main", "focus channel-compose-text quietly"], "Ctrl+S stayed in a box whose column has gone");
+    gone = false;
+    globalThis.document.activeElement = leftChip;
+    state.side = true;
+    assert.deepStrictEqual(run(() => keys.writeFromKeyboard()), [true, "in main", "focus channel-compose-text quietly"], "the left column's chips did not write in its box");
+    state.side = false;
     globalThis.document.activeElement = chip;
     assert.deepStrictEqual(run(() => keys.writeFromKeyboard()), [true, "in side", "focus side-compose-text quietly"], "the right column's chips did not write in its box");
     state.side = true;

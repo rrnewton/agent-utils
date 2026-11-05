@@ -6,7 +6,7 @@
 
 import { focusMinimally, nodeWithin, shownNode } from "../dom/index.ts";
 
-export interface ComposeKeysDependencies<Pane, Column> {
+export interface WriteKeysDependencies<Pane, Column> {
   /** An element of the page by id, in the column the code is working in. */
   byId(id: string): HTMLElement;
   /** An element of the left column by id, whichever column the code is working in. */
@@ -55,7 +55,7 @@ export interface ComposeKeysDependencies<Pane, Column> {
 }
 
 /** The keys. Each returns whether it did anything, as a binding of the keymap does. */
-export interface ComposeKeys {
+export interface WriteKeys {
   /**
    * m (`#538 c-key-copy`; c before): the box to write in: the channel's (a thread's, in a thread), the reply's
    * on Reply, or on the call's view the agent's, under the transcript (`#241 voice-composer`). Going to the
@@ -74,7 +74,7 @@ export interface ComposeKeys {
    * could jump to it if it's not highlighted (or send message if it is highlighted with non-zero chars
    * in it)."
    *
-   * The box is the one c chooses (`composeFromKeyboard`): the channel's, the thread's the reader is in
+   * The box is the one m chooses (`composeFromKeyboard`): the channel's, the thread's the reader is in
    * (on the right, in two columns, when the keys are there), the reply's on Reply, or the agent's on
    * the call's view. Settings and Help are left first, as their Back leaves them, because the box is on
    * the screen they cover. Returns whether it did anything; the bindings that call it keep the
@@ -103,7 +103,7 @@ export interface ComposeKeys {
   newestFromComposer(target: HTMLElement | null | undefined): boolean;
 }
 
-export function createComposeKeys<Pane, Column>(deps: ComposeKeysDependencies<Pane, Column>): ComposeKeys {
+export function createWriteKeys<Pane, Column>(deps: WriteKeysDependencies<Pane, Column>): WriteKeys {
   function composeFromKeyboard(): boolean {
     // `#410 inline-reply-editor`. A reply open anywhere is the one box drawn: it is where writing goes,
     // from either column.
