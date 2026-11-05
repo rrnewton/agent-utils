@@ -1,13 +1,14 @@
 ---
 title: 'voice-page-menu-placement: the hamburger sits left of the view toggle, and its menu hides or shows the reader row'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: cl-refactor
 labels:
 - vibe-talk
 created_at: 2026-11-05T10:54:21.325423710+00:00
-updated_at: 2026-11-05T10:54:21.325423710+00:00
+updated_at: 2026-11-05T12:08:54.140099731+00:00
+closed_at: 2026-11-05T12:08:54.140099611+00:00
 ---
 
 # Description
@@ -34,3 +35,12 @@ This follows #820 voice-page-action-menu, whose design placed the hamburger "jus
 # Notes
 
 Relayed by the lead on 2026-11-05. Assigned to cl-refactor, ahead of #624 batch 62.
+
+## Resolution
+
+[opus 5.5 cl-refactor] Landed as 2b9ae17e on github/main (gate 131/131, adversarial review recorded). The hamburger
+left the scrolling pack and sits immediately left of the Voice/Channel button on a phone, with the bar in the header,
+and on a desk (in the corner beside the switch). The action menu's "Hide reader" / "Show reader" item, on the channel's
+view, hides the row of big reader buttons with no band left, is kept on the device (`vibe-talk.voice.reader-hidden`,
+default shown), and leaves h and s working. The row is still drawn while Hang up, Stop or a lit Read is present, so a
+playing read or a live call is never left without a way to stop it. Unverified: the owner's own phone after the deploy.
