@@ -199,8 +199,12 @@ pub(super) fn apply_pending<A: ManagedApi + ?Sized>(
     // reads) and is receipted when its prompt is journaled, so it is not command-only.
     let headless = std::cell::Cell::new(false);
     let cloud = std::cell::Cell::new(false);
+    // A target driven by the generic rules has no transcript the bridge reads, so it replies by
+    // command (#896 chat-receipt-needs-evidence).
+    let unknown = std::cell::Cell::new(false);
     let validate = |agent: &str, pane: Option<&str>| {
         cloud.set(manager.is_cloud(agent).unwrap_or(false));
+        unknown.set(manager.is_unknown_harness(agent).unwrap_or(false));
         let pane_id = validate_target(manager, agent, pane)?;
         headless.set(pane_id.is_none() && !cloud.get());
         Ok(pane_id)
@@ -225,7 +229,7 @@ pub(super) fn apply_pending<A: ManagedApi + ?Sized>(
         return Ok(Some((outcome, None)));
     }
     let headless = headless.get();
-    let next = state.serving(&outcome.agent_name, headless, cloud.get());
+    let next = state.serving(&outcome.agent_name, headless, cloud.get(), unknown.get());
     Ok(Some((outcome, Some(next))))
 }
 

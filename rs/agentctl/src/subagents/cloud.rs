@@ -410,6 +410,52 @@ pub(crate) fn valid_endpoint(value: &str) -> bool {
             .any(|character| character.is_whitespace() || character.is_control())
 }
 
+/// The directory, in an agent's own directory, holding one record for each input sent to its
+/// agentcloud session (#896 chat-receipt-needs-evidence).
+const CLOUD_INPUTS_DIRECTORY: &str = "cloud-inputs";
+/// The schema of one such record.
+const CLOUD_INPUT_SCHEMA: &str = "agentctl-cloud-input/v1";
+/// How many of a session's newest inputs a history lookup reads for an idempotency key.
+const CLOUD_HISTORY_INPUTS: usize = 200;
+
+/// What a record in [`CLOUD_INPUTS_DIRECTORY`] says of an input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloudInputState {
+    /// The send was started; its outcome is not known.
+    Attempted,
+    /// agentcloud journaled the input.
+    Accepted,
+}
+
+impl CloudInputState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Attempted => "attempted",
+            Self::Accepted => "accepted",
+        }
+    }
+}
+
+/// The durable seq `agentcloudctl send` prints: the first number in its output.
+fn durable_seq(stdout: &str) -> Option<u64> {
+    stdout
+        .split(|c: char| !c.is_ascii_digit())
+        .find(|digits| !digits.is_empty())
+        .and_then(|digits| digits.parse().ok())
+}
+
+/// The seq of the newest `user_input` with idempotency key `key` in `agentcloudctl history
+/// --raw` output, one wire frame per line.
+fn history_seq(raw: &str, key: &str) -> Option<u64> {
+    raw.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|frame| {
+            frame["event"]["type"] == "user_input" && frame["event"]["idempotency_key"] == key
+        })
+        .filter_map(|frame| frame["seq"].as_u64())
+        .max()
+}
+
 /// Insert the recorded endpoint after the verb, so no fallback can pick another orchestrator.
 fn with_endpoint(mut arguments: Vec<String>, endpoint: &str) -> Vec<String> {
     arguments.splice(1..1, ["--ws-url".to_owned(), endpoint.to_owned()]);
@@ -1514,6 +1560,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         // A timeout or capture failure can follow the service's durable acceptance, so every
         // uncertain outcome carries the same key and retry command as a nonzero exit.
         let arguments = with_endpoint(arguments, &endpoint);
+        // Noted before the send, so a send whose outcome is unknown is looked up in the session
+        // history later rather than taken as delivered or as never sent (#896).
+        self.note_cloud_input(&record.name, &key, CloudInputState::Attempted, None)?;
         let run = run_tool(
             &executable,
             &arguments,
@@ -1531,16 +1580,132 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 failure(verb, &run)
             )));
         }
+        // agentcloudctl exits 0 only once the input is durably journaled, and prints its seq:
+        // the input is in the session's history, which is the evidence `message_state` asks for.
+        let seq = durable_seq(&run.stdout);
+        self.note_cloud_input(&record.name, &key, CloudInputState::Accepted, seq)?;
         Ok(json!({
             "name": record.name,
             "session_id": session,
             "message_id": key,
             "outcome": "journaled",
+            "seq": seq,
             "delivery": verb,
             "from_session": caller,
             "end_of_turn": end_of_turn,
             "agentcloud": excerpt(&run.stdout),
         }))
+    }
+
+    /// The file that records what became of the input `message_id` sent to agent `agent_name`
+    /// (#896 chat-receipt-needs-evidence): one per input, in the agent's `cloud-inputs/`.
+    fn cloud_input_path(&self, agent_name: &str, message_id: &str) -> Result<PathBuf> {
+        Ok(self
+            .directory(agent_name)?
+            .join(CLOUD_INPUTS_DIRECTORY)
+            .join(format!("{message_id}.json")))
+    }
+
+    /// Record that the input `message_id` to agent `agent_name` is about to be sent, or was
+    /// journaled by agentcloud at `seq`.
+    fn note_cloud_input(
+        &self,
+        agent_name: &str,
+        message_id: &str,
+        state: CloudInputState,
+        seq: Option<u64>,
+    ) -> Result<()> {
+        let path = self.cloud_input_path(agent_name, message_id)?;
+        if let Some(parent) = path.parent() {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(parent)
+                .map_err(|error| fail(format!("{}: {error}", parent.display())))?;
+        }
+        let at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| fail(error.to_string()))?
+            .as_millis();
+        agent::atomic_json(
+            &path,
+            &json!({
+                "schema": CLOUD_INPUT_SCHEMA,
+                "message_id": message_id,
+                "state": state.as_str(),
+                "seq": seq,
+                "at_millis": u64::try_from(at).unwrap_or(u64::MAX),
+            }),
+        )
+        .map_err(|error| fail(error.to_string()))
+    }
+
+    /// What became of the input `message_id` to cloud agent `record`, from evidence alone (#896
+    /// chat-receipt-needs-evidence): `Processed` once agentcloud journaled it, which a send
+    /// that exited 0 recorded, or the session history shows under that idempotency key;
+    /// otherwise `None`, as for an input never sent. A send whose outcome was unknown and that
+    /// the history does not show is `None` too, so it is sent again under the same idempotency
+    /// key, which agentcloud journals at most once.
+    pub(super) fn cloud_message_state(
+        &self,
+        record: &AgentRecord,
+        message_id: &str,
+    ) -> Result<Option<agent::QueueMessageState>> {
+        if !super::message_id(message_id) {
+            return Ok(None);
+        }
+        let path = self.cloud_input_path(&record.name, message_id)?;
+        let noted = match agent::read_private_json(&path) {
+            Ok(document) => document,
+            Err(_) => return Ok(None),
+        };
+        if noted["state"] == CloudInputState::Accepted.as_str() {
+            return Ok(Some(agent::QueueMessageState::Processed));
+        }
+        match self.cloud_history_seq(record, message_id) {
+            Ok(Some(seq)) => {
+                self.note_cloud_input(
+                    &record.name,
+                    message_id,
+                    CloudInputState::Accepted,
+                    Some(seq),
+                )?;
+                Ok(Some(agent::QueueMessageState::Processed))
+            }
+            Ok(None) | Err(_) => Ok(None),
+        }
+    }
+
+    /// The durable seq of the newest input the session history of `record` holds under the
+    /// idempotency key `message_id`, among its last [`CLOUD_HISTORY_INPUTS`] inputs.
+    fn cloud_history_seq(&self, record: &AgentRecord, message_id: &str) -> Result<Option<u64>> {
+        let session = self.cloud_session_of(record)?;
+        let endpoint = self.cloud_endpoint(record)?;
+        let executable = resolve_tool(&self.cloud_tools.agentcloudctl, "--agentcloudctl-bin")?;
+        let arguments = with_endpoint(
+            vec![
+                "history".to_owned(),
+                "--session".to_owned(),
+                session.to_owned(),
+                "--type".to_owned(),
+                "user_input".to_owned(),
+                "--last".to_owned(),
+                CLOUD_HISTORY_INPUTS.to_string(),
+                "--raw".to_owned(),
+            ],
+            &endpoint,
+        );
+        let run = run_tool(
+            &executable,
+            &arguments,
+            control_timeout(),
+            self.child_session(),
+        )?;
+        if run.code != Some(0) {
+            return Err(client_error(failure("history", &run)));
+        }
+        Ok(history_seq(&run.stdout, message_id))
     }
 
     /// Durably journal one input through `agentcloudctl send`.
@@ -3076,7 +3241,8 @@ exit 0
     fn bridge_paths_deliver_capture_and_name_a_cloud_coordinator() {
         // The chat bridge drives a cloud target through the same manager
         // paths as any other: submission journals into the session, the
-        // queue state answers delivered, capture reads the session's own
+        // queue state answers delivered for what was journaled and nothing
+        // else (#896), capture reads the session's own
         // text blocks, and the session names its agent.
         let fixture = Fixture::new();
         fixture.list_row(false);
@@ -3089,9 +3255,12 @@ exit 0
         assert_eq!(sent.delivered.len(), 1);
         assert!(fixture.verbs().contains(&"send".to_owned()));
         assert_eq!(
-            manager.message_state("sub-worker", "any-id").unwrap(),
+            manager
+                .message_state("sub-worker", &sent.delivered[0])
+                .unwrap(),
             Some(crate::agent::QueueMessageState::Processed)
         );
+        assert_eq!(manager.message_state("sub-worker", "any-id").unwrap(), None);
         let drained = manager
             .drain("sub-worker", DrainOptions::default())
             .unwrap();
@@ -4060,6 +4229,140 @@ exit 0
             .unwrap_err()
             .to_string();
         assert!(message.contains("no live terminal tab"), "{message}");
+    }
+
+    /// One `agentcloudctl history --raw` frame: a durable `user_input` under `key` at `seq`.
+    fn history_frame(seq: u64, key: &str) -> String {
+        json!({"frame": "durable", "seq": seq, "event": {"type": "user_input", "idempotency_key": key, "text": "hello"}})
+            .to_string()
+    }
+
+    #[test]
+    fn a_cloud_input_is_processed_only_with_evidence_it_was_journaled() {
+        // #896 chat-receipt-needs-evidence: an input never sent is not delivered, so the bridge
+        // sends it rather than giving a receipt for nothing.
+        let fixture = Fixture::new();
+        fixture.list_row(true);
+        let manager = || fixture.manager().with_project_workspace(Some("subagents"));
+        manager()
+            .start("sub-worker", &fixture.root, fixture.options(None))
+            .unwrap();
+        let before = fixture.verbs().len();
+        assert_eq!(
+            manager().message_state("sub-worker", "chat-1").unwrap(),
+            None
+        );
+        assert_eq!(
+            fixture.verbs().len(),
+            before,
+            "nothing sent, nothing looked up"
+        );
+        // A send that exits 0 journaled the input, at the seq it printed.
+        let sent = manager()
+            .send_cloud("sub-worker", "hello", Some("chat-1"))
+            .unwrap();
+        assert_eq!(sent["seq"], 42);
+        assert_eq!(
+            manager().message_state("sub-worker", "chat-1").unwrap(),
+            Some(agent::QueueMessageState::Processed)
+        );
+        assert!(!fixture.verbs().contains(&"history".to_owned()));
+    }
+
+    #[test]
+    fn an_uncertain_cloud_send_is_processed_once_the_session_history_shows_it() {
+        // #896: a send that timed out or failed may still have been journaled. Until the session
+        // history shows its idempotency key it is not delivered, and the bridge may send it again
+        // under the same key; once the history shows it, it is delivered, and that is recorded.
+        let fixture = Fixture::new();
+        fixture.list_row(true);
+        let manager = || fixture.manager().with_project_workspace(Some("subagents"));
+        manager()
+            .start("sub-worker", &fixture.root, fixture.options(None))
+            .unwrap();
+        fixture.respond("send", None, Some("connection reset\n"), Some(1));
+        manager()
+            .send_cloud("sub-worker", "hello", Some("chat-2"))
+            .unwrap_err();
+        fixture.respond(
+            "history",
+            Some(&format!("{}\n", history_frame(7, "chat-other"))),
+            None,
+            None,
+        );
+        assert_eq!(
+            manager().message_state("sub-worker", "chat-2").unwrap(),
+            None
+        );
+        let history = fixture
+            .calls()
+            .into_iter()
+            .rfind(|call| call[0] == "history")
+            .expect("history read");
+        for word in ["--session", SESSION, "--type", "user_input", "--raw"] {
+            assert!(history.contains(&word.to_owned()), "{history:?}");
+        }
+        // A failed history read is no evidence either.
+        fixture.respond("history", None, Some("unavailable\n"), Some(1));
+        assert_eq!(
+            manager().message_state("sub-worker", "chat-2").unwrap(),
+            None
+        );
+        // Evidence appears: the receipt follows, and is kept without reading the history again.
+        fixture.respond(
+            "history",
+            Some(&format!(
+                "{}\n{}\n",
+                history_frame(8, "chat-other"),
+                history_frame(9, "chat-2")
+            )),
+            None,
+            None,
+        );
+        assert_eq!(
+            manager().message_state("sub-worker", "chat-2").unwrap(),
+            Some(agent::QueueMessageState::Processed)
+        );
+        let reads = fixture
+            .verbs()
+            .iter()
+            .filter(|verb| *verb == "history")
+            .count();
+        assert_eq!(
+            manager().message_state("sub-worker", "chat-2").unwrap(),
+            Some(agent::QueueMessageState::Processed)
+        );
+        assert_eq!(
+            fixture
+                .verbs()
+                .iter()
+                .filter(|verb| *verb == "history")
+                .count(),
+            reads
+        );
+        let noted: Value = agent::read_private_json(
+            &fixture
+                .root
+                .join("registry/agents/sub-worker/cloud-inputs/chat-2.json"),
+        )
+        .unwrap();
+        assert_eq!(noted["state"], "accepted");
+        assert_eq!(noted["seq"], 9);
+    }
+
+    #[test]
+    fn history_seq_reads_only_user_inputs_under_the_key() {
+        let raw = [
+            history_frame(3, "k"),
+            json!({"frame": "durable", "seq": 4, "event": {"type": "assistant", "idempotency_key": "k"}}).to_string(),
+            "not json".to_owned(),
+            history_frame(5, "k"),
+        ]
+        .join("\n");
+        assert_eq!(history_seq(&raw, "k"), Some(5));
+        assert_eq!(history_seq(&raw, "other"), None);
+        assert_eq!(durable_seq("journaled at seq 42\n"), Some(42));
+        assert_eq!(durable_seq("ok\n"), None);
     }
 
     #[test]

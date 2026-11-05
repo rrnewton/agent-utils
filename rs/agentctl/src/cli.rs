@@ -5028,18 +5028,23 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                                     // A headless agent replies only by the command, as its
                                     // prompts say; `chat run` learns that from the registry too.
                                     let agent = bridge.config().agent_name.clone();
-                                    let headless = bridge_registry.as_deref().is_some_and(|path| {
-                                        HerdrClient::with_executable("direct", &herdr_bin)
-                                            .ok()
-                                            .and_then(|client| {
-                                                ManagedAgents::new(&client, path).ok().and_then(
-                                                    |manager| manager.is_headless(&agent).ok(),
-                                                )
-                                            })
-                                            .unwrap_or(false)
-                                    });
+                                    // An unknown harness has no transcript followed (#896).
+                                    let (headless, unknown) = bridge_registry
+                                        .as_deref()
+                                        .and_then(|path| {
+                                            let client =
+                                                HerdrClient::with_executable("direct", &herdr_bin)
+                                                    .ok()?;
+                                            let manager = ManagedAgents::new(&client, path).ok()?;
+                                            Some((
+                                                manager.is_headless(&agent).unwrap_or(false),
+                                                manager.is_unknown_harness(&agent).unwrap_or(false),
+                                            ))
+                                        })
+                                        .unwrap_or((false, false));
                                     bridge
                                         .with_command_only_replies(headless)
+                                        .with_transcriptless_target(unknown)
                                         .with_prompt_commands(crate::chat_runtime::PromptCommands {
                                             bare: found_by_lookup,
                                             discoverable: found_by_lookup,

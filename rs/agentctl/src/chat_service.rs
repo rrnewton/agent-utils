@@ -1785,6 +1785,10 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     // session output), but its prompt is journaled at submission, which is
     // when its receipt belongs, as with a headless target's started prompt.
     let cloud = manager.is_cloud(&state.config().agent_name)?;
+    // A target driven by the generic rules (`--harness unknown`) has no transcript the bridge
+    // reads, and its pane may not show reply blocks as written, so its prompts ask for `chat
+    // reply` instead of blocks the bridge could not capture (#896 chat-receipt-needs-evidence).
+    let unknown = manager.is_unknown_harness(&state.config().agent_name)?;
     let prompt_commands = settings
         .registry
         .as_deref()
@@ -1796,6 +1800,7 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         .with_prompt_commands(prompt_commands)
         .with_reply_command_offered(offer_reply_command)
         .with_command_only_replies(headless)
+        .with_transcriptless_target(unknown)
         .with_receipt_when_started(headless || cloud)
         .with_latency_profile(Some(manager.registry().to_path_buf()), headless);
     // A coordinator's reply text comes from its transcript where that holds it (#710

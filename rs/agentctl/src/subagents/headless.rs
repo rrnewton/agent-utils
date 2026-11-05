@@ -183,6 +183,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         Ok(self.load(agent_name)?.is_headless())
     }
 
+    /// Whether `agent_name` is driven by the generic rules (`--harness unknown`): agentctl reads
+    /// no transcript of it, so the chat bridge cannot capture reply blocks from it reliably and
+    /// asks it to reply with `chat reply` (#896 chat-receipt-needs-evidence).
+    pub fn is_unknown_harness(&self, agent_name: &str) -> Result<bool> {
+        Ok(crate::unknown_harness::is_unknown(
+            &self.load(agent_name)?.harness,
+        ))
+    }
+
     /// Register a headless agent and, unless `options.launch` is false, start its wrapper as a
     /// detached process.
     pub fn start_headless(

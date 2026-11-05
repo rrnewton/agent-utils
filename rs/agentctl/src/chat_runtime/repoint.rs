@@ -330,17 +330,26 @@ impl BridgeState {
     }
 
     /// This state, serving `agent_name`, which is `headless`, an agentcloud session (`cloud`),
-    /// or neither, after a repoint: every process-local setting that depends on the kind of
-    /// target follows it (prompts that give only the `chat reply` command, for a headless agent;
+    /// or neither, and driven by the generic rules (`unknown`) or not, after a repoint: every
+    /// process-local setting that depends on the kind of target follows it (prompts that give
+    /// only the `chat reply` command, for a headless agent or one whose replies the bridge cannot
+    /// capture reliably, an unknown harness (#896);
     /// the receipt given when its prompt is started or journaled, for a headless or cloud agent;
     /// the latency profile), and the shared transcript reader follows the new agent's
     /// transcript, or rests for a headless one (#852 unknown-tui-bridge). Nothing keeps reading
     /// the previous agent.
     #[must_use]
-    pub(crate) fn serving(&self, agent_name: &str, headless: bool, cloud: bool) -> Self {
+    pub(crate) fn serving(
+        &self,
+        agent_name: &str,
+        headless: bool,
+        cloud: bool,
+        unknown: bool,
+    ) -> Self {
         let mut state = self
             .retargeted(agent_name)
             .with_command_only_replies(headless)
+            .with_transcriptless_target(unknown)
             .with_receipt_when_started(headless || cloud);
         state.latency_headless = headless;
         if let Some(source) = &state.transcript_replies {
@@ -789,7 +798,7 @@ mod tests {
             .with_transcript_replies(Box::new(Followed(std::sync::Arc::clone(&followed))));
         let queues = Queues::default();
 
-        let liaison = state.serving("liaison", true, false);
+        let liaison = state.serving("liaison", true, false, false);
         assert_eq!(liaison.config().agent_name, "liaison");
         assert!(liaison.command_only_replies && liaison.receipt_when_started);
         assert!(liaison.latency_headless);
@@ -815,7 +824,7 @@ mod tests {
             Some("liaison")
         );
 
-        let back = liaison.serving("coordb", false, false);
+        let back = liaison.serving("coordb", false, false, false);
         assert_eq!(back.config().agent_name, "coordb");
         assert!(!back.command_only_replies && !back.receipt_when_started);
         assert!(!back.latency_headless);
@@ -843,7 +852,7 @@ mod tests {
 
         // An agentcloud session prints its markers in its session output: its receipt comes when
         // its prompt is journaled, and its prompts still name the marker lines.
-        let cloud = back.serving("cloud-coord", false, true);
+        let cloud = back.serving("cloud-coord", false, true, false);
         assert!(cloud.receipt_when_started && !cloud.command_only_replies);
         assert_eq!(
             followed.lock().expect("lock").last(),

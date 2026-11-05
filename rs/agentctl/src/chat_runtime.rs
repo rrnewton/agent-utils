@@ -251,6 +251,11 @@ const _: () = assert!(
 );
 // A request admitted this long ago whose prompt is not typed is stalled.
 pub(crate) const DELIVERY_STALL_AFTER: Duration = Duration::from_secs(60);
+/// Where the bridge records how the last prompt it composed asked for replies (#896).
+const REPLY_PATH_FILE: &str = "reply-path.json";
+/// The schema of that record.
+const REPLY_PATH_SCHEMA: &str = "agentctl-chat-reply-path/v1";
+
 // The one provider payload schema whose quoted-message metadata the prompt shows. Every other
 // schema stays opaque, so its prompt simply has no quote.
 const GOOGLE_CHAT_MESSAGE_SCHEMA: &str = "google.chat.message.v1";
@@ -2806,6 +2811,10 @@ struct RequestRecord {
     /// When this request was folded into a latency summary (#801).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     latency_folded_at: Option<u64>,
+    /// How the last prompt typed for this request asked for replies: `command` (only the `chat
+    /// reply` command) or `blocks` (marker lines, and the command where offered) (#896).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reply_mode: Option<String>,
     /// An operator's settlement of an uncertain delivery (`chat settle`, #784).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     settlement: Option<RequestSettlement>,
@@ -2873,6 +2882,7 @@ impl RequestRecord {
             delivery_error: None,
             uncertain_reported_at_millis: None,
             latency_model: None,
+            reply_mode: None,
             latency_effort: None,
             latency_adapter: None,
             latency_folded_at: None,
@@ -5888,6 +5898,10 @@ pub struct BridgeState {
     // Whether the coordinator's screen is never read, as for a headless agent, so request prompts
     // give only the `chat reply` command and no marker lines; also process-local.
     command_only_replies: bool,
+    /// The target runs a harness the bridge follows no transcript of, an unknown one driven by
+    /// the generic rules: its prompts give only the `chat reply` command, though blocks seen on
+    /// its screen are still captured (#896 chat-receipt-needs-evidence).
+    transcriptless_target: bool,
     // Whether a request earns its ✅ receipt when the coordinator's queue shows that the model
     // started its prompt, as a headless agent's does, rather than when a drain verifies the
     // prompt in a pane; also process-local.
@@ -6040,6 +6054,7 @@ impl BridgeState {
             offer_reply_command: false,
             prompt_commands: PromptCommands::default(),
             command_only_replies: false,
+            transcriptless_target: false,
             receipt_when_started: false,
             typed_retirements: Arc::default(),
             transcript_replies: None,
@@ -6148,6 +6163,7 @@ impl BridgeState {
             offer_reply_command: false,
             prompt_commands: PromptCommands::default(),
             command_only_replies: false,
+            transcriptless_target: false,
             receipt_when_started: false,
             typed_retirements: Arc::default(),
             transcript_replies: None,
@@ -6220,6 +6236,16 @@ impl BridgeState {
     pub fn with_command_only_replies(mut self, command_only: bool) -> Self {
         self.command_only_replies = command_only;
         self.offer_reply_command |= command_only;
+        self
+    }
+
+    /// Set whether the target runs a harness the bridge follows no transcript of (an unknown
+    /// harness, driven by the generic rules), so its prompts give only the `chat reply` command
+    /// and no marker lines; marker lines it prints anyway are still captured from its screen
+    /// (#896 chat-receipt-needs-evidence).
+    #[must_use]
+    pub fn with_transcriptless_target(mut self, transcriptless: bool) -> Self {
+        self.transcriptless_target = transcriptless;
         self
     }
 
@@ -8681,6 +8707,8 @@ impl BridgeState {
         status["stages"] = Value::Object(stages);
         status["relay_alarms"] = relay_alarms;
         status["repoint"] = self.repoint_status_locked();
+        // How the last prompt asked for replies (#896 chat-receipt-needs-evidence).
+        status["reply_path"] = self.recorded_reply_path().unwrap_or(Value::Null);
         // The replies a restart held back as stale (#781 chat-no-stale-replies-on-restart).
         status["held_replies"] = serde_json::to_value(self.held_replies_locked()?)
             .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
@@ -9930,8 +9958,11 @@ adding one to the last number in both lines for each later reply.",
             ),
         };
         let executable = || env::current_exe();
-        let command = self
-            .offer_reply_command
+        // Decided for this delivery, from the target served now (#896): a target whose replies
+        // the bridge does not read from a transcript or session history gets the command only.
+        let (command_only, reply_path_reason) = self.reply_mode();
+        self.record_reply_path(command_only, reply_path_reason);
+        let command = (self.offer_reply_command || command_only)
             .then(|| self.reply_command(executable(), key, &reply_id))
             .flatten();
         let short_command = command
@@ -9949,24 +9980,30 @@ adding one to the last number in both lines for each later reply.",
         if let Some(help) = self.help_command(executable(), key, &reply_id) {
             footer.push(format!("If you have trouble, run: {help}"));
         }
-        if self.command_only_replies {
+        if command_only {
             let Some(command) = command else {
                 return Err(ChatRuntimeError::invalid(
                     "the `agentctl chat reply` command cannot be printed for this request (no \
                      executable at this process's path, or a word of the command is not \
-                     printable), and a coordinator whose screen is never read has no other way \
-                     to reply",
+                     printable), and a coordinator whose replies the bridge does not read has no \
+                     other way to reply",
                 ));
             };
             if let Some(short) = &short_command {
                 fields.push(format!("reply: {short} --file FILE"));
             }
+            // Then `chat sent` shows what the bridge holds (#896); its explicit form is long, so
+            // without caller lookup `chat help` prints it.
+            let sent = short_command
+                .as_ref()
+                .and_then(|_| self.sent_command(key, &reply_id))
+                .map_or_else(String::new, |sent| format!(", then check it with {sent}"));
             let command = short_command.map_or(command, |short| format!("{short} --file FILE"));
             footer.insert(
                 0,
                 format!(
                     "Nothing you print reaches the chat: send each reply by writing it to a file \
-and running this, once per reply: {command}"
+and running this, once per reply: {command}{sent}"
                 ),
             );
         } else {
@@ -9991,6 +10028,62 @@ and running this, once per reply: {command}"
             self.prompt_header(message, &fields),
             footer.join("\n")
         ))
+    }
+
+    /// Whether this bridge's prompts give only the `chat reply` command, and why (#896
+    /// chat-receipt-needs-evidence): yes for a headless target, a target driven by the generic
+    /// rules, or one whose transcript the reader looked for and did not find; no where the bridge
+    /// follows a transcript or an agentcloud session's history, whose reply blocks it captures.
+    /// Before the reader's first look, a target with a harness agentctl reads gets blocks.
+    pub(crate) fn reply_mode(&self) -> (bool, &'static str) {
+        if self.command_only_replies {
+            return (
+                true,
+                "the target is headless: its screen and transcript are not read",
+            );
+        }
+        if self.transcriptless_target {
+            return (
+                true,
+                "the target's harness is unknown: no transcript of it is followed",
+            );
+        }
+        match self.reply_source() {
+            Some(source) if source.path.is_none() && !source.session_history => {
+                (true, "no transcript of the target was found")
+            }
+            Some(source) if source.session_history => (
+                false,
+                "replies are read from the agentcloud session's history",
+            ),
+            Some(_) => (false, "replies are read from the target's transcript"),
+            None if self.transcript_replies.is_some() => {
+                (false, "the transcript reader has not looked yet")
+            }
+            None => (false, "replies are read from the target's screen"),
+        }
+    }
+
+    /// Save the reply path of the prompt being composed as `reply-path.json`, for `chat status`.
+    /// Best-effort: a failed write changes nothing about the prompt.
+    fn record_reply_path(&self, command_only: bool, reason: &str) {
+        let document = serde_json::json!({
+            "schema": REPLY_PATH_SCHEMA,
+            "agent_name": self.config.agent_name,
+            "command_only": command_only,
+            "reason": reason,
+            "at_millis": unix_millis(),
+        });
+        if let Err(error) = write_document(&self.root.join(REPLY_PATH_FILE), &document) {
+            eprintln!("agentctl: chat reply path not recorded: {error}");
+        }
+    }
+
+    /// The reply path of the last prompt composed for the agent this state serves, as
+    /// `reply-path.json` records it; `None` when none was recorded for that agent.
+    fn recorded_reply_path(&self) -> Option<Value> {
+        let document: Value = read_document(&self.root.join(REPLY_PATH_FILE), 4_096).ok()?;
+        (document["agent_name"] == serde_json::json!(self.config.agent_name)).then_some(document)
     }
 
     /// The prompt's header line: `[from SENDER via PROVIDER CHANNEL · FIELD ...]`, with the
@@ -11332,6 +11425,13 @@ write no reply markers and send no replies.\n",
                 "This bridge never reads your screen: nothing you print reaches the chat. Send \
 each reply by writing it to a file and running:\n  {reply}\nRunning it again with the same text \
 sends that text once. If it fails, read its error, fix the cause and run it again.\n"
+            ));
+        } else if self.reply_mode().0 {
+            page.push_str(&format!(
+                "This bridge follows no transcript of yours, so it cannot be relied on to read \
+your replies. Send each reply by writing it to a file and running:\n  {reply}\nRunning it \
+again with the same text sends that text once. If it fails, read its error, fix the cause and run \
+it again.\n"
             ));
         } else {
             page.push_str(&format!(
@@ -13383,6 +13483,11 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let submitting = phase == RequestPhase::Submitting;
         let delivered = phase == RequestPhase::Delivered;
         record.phase = phase;
+        if submitting {
+            // Decided again for every attempt, as its prompt is (#896).
+            let command_only = self.reply_mode().0;
+            record.reply_mode = Some(if command_only { "command" } else { "blocks" }.to_owned());
+        }
         if submitting && record.delivery_started_at_millis.is_none() {
             record.delivery_started_at_millis = Some(causal_wall_millis(record.admitted_at_millis));
         }
@@ -40193,11 +40298,153 @@ running this, once per reply: {} chat reply --bridge-state {} --request {key} --
         assert!(
             prompt.ends_with(
                 "\n\nNothing you print reaches the chat: send each reply by writing it to a file \
-and running this, once per reply: agentctl chat reply 001 --file FILE\n\
-If you have trouble, run: agentctl chat help 001"
+and running this, once per reply: agentctl chat reply 001 --file FILE, then check it with \
+agentctl chat sent 001\nIf you have trouble, run: agentctl chat help 001"
             ),
             "{prompt}"
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A shared reply source as the transcript reader leaves it: a transcript followed, an
+    /// agentcloud session's history, or none found (#896 chat-receipt-needs-evidence).
+    fn reply_source(
+        path: Option<&str>,
+        session_history: bool,
+    ) -> crate::chat_transcript::SharedReplySource {
+        let source = crate::chat_transcript::SharedReplySource::default();
+        set_reply_source(&source, path, session_history);
+        source
+    }
+
+    fn set_reply_source(
+        source: &crate::chat_transcript::SharedReplySource,
+        path: Option<&str>,
+        session_history: bool,
+    ) {
+        *source.lock().expect("reply source") = Some(crate::chat_transcript::ReplySource {
+            path: path.map(PathBuf::from),
+            evidence: "test".into(),
+            discovered: false,
+            unbound_session: None,
+            session_history,
+        });
+    }
+
+    /// Whether `prompt` asks only for the `chat reply` command, and the mode its delivery record
+    /// and `chat status` give.
+    fn reply_mode_of(state: &BridgeState, key: &str, prompt: &str) -> (bool, String, Value) {
+        let command_only = !prompt.contains("CHAT_REPLY");
+        if command_only {
+            assert!(
+                prompt.contains("Nothing you print reaches the chat"),
+                "{prompt}"
+            );
+            assert!(prompt.contains(" chat reply "), "{prompt}");
+        }
+        let record = state.read_request(key).expect("request record");
+        let status = state.status().expect("status");
+        (
+            command_only,
+            record.reply_mode.expect("mode in the delivery record"),
+            status["reply_path"].clone(),
+        )
+    }
+
+    #[test]
+    fn an_unknown_harness_gets_a_command_only_prompt_and_its_blocks_are_still_captured() {
+        // #896 chat-receipt-needs-evidence: no transcript of an unknown harness is followed, so
+        // its prompt asks only for `chat reply`. A block it prints anyway is still captured.
+        let root = temporary("transcriptless-prompt");
+        let state = BridgeState::initialize(&root, config())
+            .expect("initialize state")
+            .with_transcriptless_target(true);
+        let key = admitted(&state, 1).remove(0);
+        let prompt = prompted(&state, &key);
+        let (command_only, mode, status) = reply_mode_of(&state, &key, &prompt);
+        assert!(command_only, "{prompt}");
+        assert_eq!(mode, "command");
+        assert_eq!(status["command_only"], true, "{status}");
+        assert!(
+            status["reason"]
+                .as_str()
+                .unwrap()
+                .contains("harness is unknown"),
+            "{status}"
+        );
+        assert_eq!(
+            state
+                .capture_snapshot(&reply_block("001", "Printed anyway."))
+                .expect("capture")
+                .replies,
+            [(key, vec![1])]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_followed_transcript_gets_the_block_prompt_and_losing_it_switches_to_the_command() {
+        // #896: Claude Code with its transcript found keeps today's prompt; when the transcript is
+        // lost mid-session, the next prompt asks only for `chat reply`, and finding it again
+        // brings the blocks back.
+        let root = temporary("transcript-lost-prompt");
+        let source = reply_source(Some("/t/s-1.jsonl"), false);
+        let state = BridgeState::initialize(&root, config())
+            .expect("initialize state")
+            .with_reply_source(source.clone());
+        let keys = admitted(&state, 3);
+        let prompt = prompted(&state, &keys[0]);
+        let (command_only, mode, status) = reply_mode_of(&state, &keys[0], &prompt);
+        assert!(!command_only, "{prompt}");
+        assert_eq!(mode, "blocks");
+        assert_eq!(status["command_only"], false, "{status}");
+        set_reply_source(&source, None, false);
+        let prompt = prompted(&state, &keys[1]);
+        let (command_only, mode, status) = reply_mode_of(&state, &keys[1], &prompt);
+        assert!(command_only, "{prompt}");
+        assert_eq!(mode, "command");
+        assert!(
+            status["reason"].as_str().unwrap().contains("no transcript"),
+            "{status}"
+        );
+        set_reply_source(&source, Some("/t/s-2.jsonl"), false);
+        let prompt = prompted(&state, &keys[2]);
+        assert!(!reply_mode_of(&state, &keys[2], &prompt).0, "{prompt}");
+        // The earlier requests keep the mode their own prompts had.
+        assert_eq!(
+            state.read_request(&keys[0]).unwrap().reply_mode.as_deref(),
+            Some("blocks")
+        );
+        assert_eq!(
+            state.read_request(&keys[1]).unwrap().reply_mode.as_deref(),
+            Some("command")
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_repoint_from_an_agentcloud_session_to_an_unknown_pane_switches_the_next_prompt() {
+        // #896: the consumer's bridge served an agentcloud session, whose replies come from its
+        // history, then was repointed at runtime to an agentterm pane (an unknown harness). The
+        // next prompt asks only for `chat reply`; repointed back, the blocks return.
+        let root = temporary("repoint-cloud-unknown-prompt");
+        let source = reply_source(None, true);
+        let cloud = BridgeState::initialize(&root, config())
+            .expect("initialize state")
+            .with_reply_source(source)
+            .serving("coordinator", false, true, false);
+        let keys = admitted(&cloud, 3);
+        let prompt = prompted(&cloud, &keys[0]);
+        assert!(!reply_mode_of(&cloud, &keys[0], &prompt).0, "{prompt}");
+        let pane = cloud.serving("coordinator-tui", false, false, true);
+        let prompt = prompted(&pane, &keys[1]);
+        let (command_only, mode, status) = reply_mode_of(&pane, &keys[1], &prompt);
+        assert!(command_only, "{prompt}");
+        assert_eq!(mode, "command");
+        assert_eq!(status["agent_name"], "coordinator-tui", "{status}");
+        let back = pane.serving("coordinator", false, true, false);
+        let prompt = prompted(&back, &keys[2]);
+        assert!(!reply_mode_of(&back, &keys[2], &prompt).0, "{prompt}");
         fs::remove_dir_all(root).expect("cleanup");
     }
 

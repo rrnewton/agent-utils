@@ -48,6 +48,17 @@ For the compiled bridge, use the installed command as the authority:
 - `agentctl chat thread ID --last 20`
 - `agentctl chat userguide`
 
+## When the prompt gives only the command
+
+When the bridge follows no transcript of yours (a headless agent, an unknown
+harness such as an agentterm pane, or a transcript it could not find), the
+prompt gives no marker lines. Its footer says `Nothing you print reaches the
+chat` and names the `chat reply` command: write each reply to a file, run that
+command once per reply, then confirm it with `agentctl chat sent ID`. Marker
+lines you print in that case are not relied on. The next prompt may switch
+back when the bridge finds your transcript, so follow each prompt's own
+instructions.
+
 ## Reply with the two marker lines
 
 The prompt gives a reply ID and two marker lines:
@@ -129,7 +140,9 @@ the service's `agentctl chat run` command.
   added when the bridge admits the message.
 - ✅ is added, when the deployment has an acknowledgement reaction other than
   ✅, once the bridge's queue has typed the prompt into your pane and verified
-  it against your composer, printed or queued behind another prompt. Adding it
+  it against your composer, printed or queued behind another prompt (for an
+  agentcloud session: once agentcloud journaled it, as its send or the
+  session's history shows). Adding it
   can fail or lag like any provider call, so a missing ✅ does not prove the
   prompt was not delivered. An older deployment whose acknowledgement reaction
   is itself ✅ uses it to acknowledge admission instead; it can appear before

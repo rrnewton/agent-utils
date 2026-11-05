@@ -11315,8 +11315,8 @@ its drain would also type, so it was not queued",
             return self.headless_message_state(agent_name, message_id);
         }
         if record.is_cloud() {
-            // Journaled at submission: delivered, with no queue state.
-            return Ok(Some(agent::QueueMessageState::Processed));
+            // Delivered only with evidence that agentcloud journaled it (#896).
+            return self.cloud_message_state(&record, message_id);
         }
         record.supported()?;
         agent::message_state(&self.queue(agent_name)?, message_id)
@@ -11334,8 +11334,8 @@ its drain would also type, so it was not queued",
             return self.headless_message_state(agent_name, message_id);
         }
         if record.is_cloud() {
-            // Journaled at submission: delivered, with no queue state.
-            return Ok(Some(agent::QueueMessageState::Processed));
+            // Delivered only with evidence that agentcloud journaled it (#896).
+            return self.cloud_message_state(&record, message_id);
         }
         record.supported()?;
         agent::message_state(&self.queue(agent_name)?, message_id)

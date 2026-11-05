@@ -44,3 +44,44 @@ Root cause (cl-start, 2026-11-05 ~11:15 AM ET): for an agentcloud record, `messa
 Reply path folded in at the lead's request (2026-11-05, 12:40 PM ET). During the interim repoint of the consumer team's bridge to its agentterm pane (harness unknown), inbound delivery worked, but the agent's reply blocks for requests 049 and 050 never reached Slack. The prompt still offered fences although no transcript was followed, so the agent posted both by hand with `chat publish`. #852's progress notes say prompts switch to command-only with the target kind, but that did not hold after a runtime repoint.
 
 The reply-154 request itself (the lead, 2026-11-05 06:24 AM ET, P1) was lost in the #884 pane-lock window, in the coordinator's failed/ queue as possibly_submitted. Its full spec was recovered at 12:50 PM ET and is folded in above.
+
+## Resolution
+
+[opus 5.5] cl-start, 2026-11-05.
+
+**Root cause.** For an agentcloud record, `message_state` answered `Processed` for any message ID ("journaled at submission").
+- The bridge asks before it submits, so it recorded the request delivered, added the receipt and never ran `agentcloudctl send`.
+- The consumer's request 2e19c566 shows this: delivered 2 ms after delivery started, with nothing in the session history.
+
+**Receipts need evidence (agentcloud).**
+- The agent's `cloud-inputs/<key>.json` (one file per input, in its own directory) is written as `attempted` before each send.
+- It becomes `accepted` once `agentcloudctl send` exits 0, which it does only after journaling the input, and it keeps the seq that send printed.
+- `message_state` is `Processed` only for an accepted input, or for an attempted one whose key the session history shows (`agentcloudctl history --type user_input --last 200 --raw`). That evidence is then recorded.
+- Anything else is `None`: never sent, or sent with an unknown outcome and not shown in the history. The bridge then sends it again under the same idempotency key, which agentcloud journals at most once. The pending request stays under the existing retry and stall-alarm rules.
+
+**Reply path, decided per prompt** (owner reply 154).
+- A prompt asks only for `chat reply` (with no marker lines) when the bridge follows no transcript. That covers:
+  - a headless agent;
+  - an unknown harness, such as an agentterm pane;
+  - a transcript looked for and not found, including one lost mid-session.
+- Otherwise the prompt is unchanged: marker lines, plus the command where it is offered. That holds for a followed transcript or an agentcloud session's history.
+- The decision is made as each prompt is composed, for the target served then. `chat repoint` now passes the unknown-harness kind, as startup does, so a repoint from a cloud target to an unknown pane switches the next prompt.
+- Where caller lookup finds the bridge, the footer adds "then check it with agentctl chat sent ID". `chat help` gives the unknown-harness case its own text.
+- Fence capture stays as a fallback: blocks such a target prints anyway are still captured, but they are never asked for.
+- Each request record keeps its latest prompt's `reply_mode` (`blocks` or `command`). `chat status` shows `reply_path` (`command_only`, `reason`, agent, time) from `reply-path.json`.
+
+**Tests:**
+- `a_cloud_input_is_processed_only_with_evidence_it_was_journaled`: an unsent input is `None` with no agentcloud call, and becomes `Processed` after a send that exits 0.
+- `an_uncertain_cloud_send_is_processed_once_the_session_history_shows_it`: the history decides. A miss and a failed history read are `None`. A hit gives `Processed` and is recorded.
+- `history_seq_reads_only_user_inputs_under_the_key`.
+- `an_unknown_harness_gets_a_command_only_prompt_and_its_blocks_are_still_captured`.
+- `a_followed_transcript_gets_the_block_prompt_and_losing_it_switches_to_the_command`.
+- `a_repoint_from_an_agentcloud_session_to_an_unknown_pane_switches_the_next_prompt`.
+- `bridge_paths_deliver_capture_and_name_a_cloud_coordinator` now expects `None` for an ID that was never sent.
+
+**Not in this change:**
+- **An agentterm pane on an agentcloud session capturing replies from that session's history** (and using that history as delivery evidence) moves to #852 D. Until then, such a pane gets the command-only prompt.
+- **Pane receipts for an unknown harness are unchanged.** They already require the prompt to show on screen and then leave the composer.
+  - The weaker cases are still taken: "taken before Enter" (new rows under the paste) and a paste never drawn whose Enter changed the screen.
+  - Requiring an echo now would break the interim agentterm pane, whose side panel splits the echoed rows. That tightening comes with #852 D, which brings history-based evidence.
+- **The consumer team's verification on its bridge** is pending, through the lead.

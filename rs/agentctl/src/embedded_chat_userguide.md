@@ -908,7 +908,11 @@ until the service records the new one). An agentcloud target has no local
 transcript or screen to read: its replies come from the session's own history
 (`agentcloudctl history`), which the bridge reads where it reads a screen for
 other targets, and `chat health` says `reply text: the agentcloud session's
-history: ...`.
+history: ...`. Its receipt needs the same kind of evidence: an
+`agentcloudctl send` that exited 0, or the session's history showing the
+prompt under its idempotency key. A request with neither is sent again under
+the same key, which agentcloud journals at most once (#896
+chat-receipt-needs-evidence).
 
 Its screen is read in the layout above even when its program draws it
 differently. A screen whose every row starts one or more columns in, with turns
@@ -1891,6 +1895,29 @@ and its record keeps the reason, which `chat inspect` shows in
 `delivery_uncertain` instead, and its prompt is never typed again, because a
 second copy could reach the agent.
 
+### How a prompt asks for replies
+
+Each prompt asks for replies the way the bridge can read them, decided when
+that prompt is composed for the target served then, so a `chat repoint` takes
+effect at the next prompt (#896 chat-receipt-needs-evidence):
+
+- **Marker lines** (plus the `chat reply` command where it is offered), where
+  the bridge follows a transcript (Claude Code, Codex or Muse with the
+  transcript found) or an agentcloud session's history, and, before the
+  transcript reader's first look, for a harness agentctl reads.
+- **The `chat reply` command only**, with no marker lines, where it follows
+  none: a headless agent, a target adopted with `--harness unknown` (such as an
+  agentterm pane), or one whose transcript was looked for and not found,
+  including one lost mid-session. The footer reads `Nothing you print reaches
+  the chat: send each reply by writing it to a file and running this, once per
+  reply: ...` and, where the bridge is found by caller lookup, `then check it
+  with agentctl chat sent ID`. Blocks such a target prints on its screen anyway
+  are still captured as before; they are never asked for.
+
+The mode of each request's latest prompt is kept in its request record as
+`reply_mode` (`blocks` or `command`), and `chat status` gives the last prompt's
+as `reply_path`: `command_only`, the `reason`, the agent and when.
+
 ### Typing while an agent works
 
 Codex and Muse take an ordinary request while their turn runs: when a new
@@ -2020,7 +2047,7 @@ reply ID send every reply. Reply reminders and `--stale-composer-clear-after`
 are off for a headless agent. Give the agent permission to run the printed
 `chat reply` command and to write its reply files. Restart `chat run` when
 the agent is restarted in the other mode, since the prompts' reply
-instructions are chosen at startup.
+instructions are chosen at startup and at each `chat repoint`.
 
 ### Clearing a draft left in the composer
 
