@@ -1149,6 +1149,67 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         Ok(report)
     }
 
+    /// Move `agent_name`'s Herdr tab to the front of its workspace when it is a coordinator
+    /// (#849 coordinator-tab-first): the designated coordinator, or an agent launched with a
+    /// coordinator profile ([`crate::tab_order::is_coordinator_profile`]). Coordinators already at
+    /// the front keep their order. Best-effort: with no Herdr socket nothing happens, and a failed
+    /// move is reported on standard error and never fails the command that asked for it.
+    /// `socket` is the Herdr socket to use ([`crate::tab_order::socket_for`]); `None` does nothing.
+    pub fn bring_coordinator_tab_forward(&self, agent_name: &str, socket: Option<&Path>) {
+        let Some(socket) = socket else {
+            return;
+        };
+        if let Err(error) = self.bring_coordinator_tab_forward_through(agent_name, socket) {
+            eprintln!(
+                "agentctl: could not move coordinator {agent_name}'s tab to the front of its \
+                 workspace: {error}"
+            );
+        }
+    }
+
+    /// [`Self::bring_coordinator_tab_forward`] for every registered agent (`revive --all`).
+    pub fn bring_every_coordinator_tab_forward(&self, socket: Option<&Path>) {
+        if socket.is_none() {
+            return;
+        }
+        for name in self.registered_names().unwrap_or_default() {
+            self.bring_coordinator_tab_forward(&name, socket);
+        }
+    }
+
+    /// [`Self::bring_coordinator_tab_forward`] through the Herdr socket at `socket`: the index the
+    /// tab moved to, or `None` when it is no coordinator, has no tab, or was already in place.
+    pub(crate) fn bring_coordinator_tab_forward_through(
+        &self,
+        agent_name: &str,
+        socket: &Path,
+    ) -> std::result::Result<Option<usize>, String> {
+        let records = self.readable_records().map_err(|error| error.to_string())?;
+        let designated = self.designated_coordinator().ok().flatten();
+        let is_coordinator = |record: &AgentRecord| {
+            designated.as_deref() == Some(record.name.as_str())
+                || crate::tab_order::is_coordinator_profile(record.profile.as_deref())
+        };
+        let Some(record) = records.iter().find(|record| record.name == agent_name) else {
+            return Ok(None);
+        };
+        if !is_coordinator(record) || record.is_cloud() {
+            return Ok(None);
+        }
+        let (Some(workspace), Some(tab)) =
+            (record.workspace_id.as_deref(), record.tab_id.as_deref())
+        else {
+            return Ok(None);
+        };
+        let others = records
+            .iter()
+            .filter(|other| other.name != agent_name && is_coordinator(other))
+            .filter(|other| other.workspace_id.as_deref() == Some(workspace))
+            .filter_map(|other| other.tab_id.clone())
+            .collect();
+        crate::tab_order::bring_forward(socket, workspace, tab, &others)
+    }
+
     /// Atomic coordinator handover (#747): verify the new coordinator is alive (reviving
     /// its record first when it is dead), designate it, and only then stop the old one.
     /// Any failure before designation leaves the old coordinator running and designated.

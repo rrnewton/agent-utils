@@ -786,3 +786,141 @@ fn coordinator_set_moves_a_registryless_pin_of_an_archived_coordinator() {
         json!(Fake::harness(89))
     );
 }
+
+/// A fake Herdr socket at `path` that answers `connections` requests, `tab.list` with `tabs`
+/// (tab IDs of workspace `workspace`, front first) and `tab.move` with success, and records
+/// every request.
+fn fake_herdr_socket(
+    path: &Path,
+    workspace: &str,
+    tabs: &[&str],
+    connections: usize,
+) -> (Arc<Mutex<Vec<Value>>>, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&requests);
+    let listed: Vec<Value> = tabs
+        .iter()
+        .enumerate()
+        // Creation numbers that run against the shown order, as after a tab was moved.
+        .map(
+            |(index, tab)| json!({"tab_id": tab, "workspace_id": workspace, "number": 100 - index}),
+        )
+        .collect();
+    let server = std::thread::spawn(move || {
+        for _ in 0..connections {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let result = match request["method"].as_str() {
+                Some("tab.list") => json!({"tabs": listed}),
+                _ => json!({"tabs": []}),
+            };
+            let mut reply =
+                serde_json::to_vec(&json!({"id": request["id"], "result": result})).unwrap();
+            reply.push(b'\n');
+            (&stream).write_all(&reply).unwrap();
+            seen.lock().unwrap().push(request);
+        }
+    });
+    (requests, server)
+}
+
+/// Register `agent_name` in Herdr workspace `workspace`, launched with `profile`.
+fn register_in(fixture: &Fixture, agent_name: &str, pid: u64, profile: Option<&str>) {
+    register(fixture, agent_name, pid);
+    let manager = fixture.manager();
+    let mut record = manager.load(agent_name).unwrap();
+    record.workspace_id = Some("w1".to_owned());
+    record.profile = profile.map(str::to_owned);
+    manager.save(&record).unwrap();
+}
+
+#[test]
+fn a_coordinator_tab_moves_to_the_front_after_the_coordinators_already_there() {
+    // #849 coordinator-tab-first.
+    let fixture = Fixture::new();
+    register_in(&fixture, "coord-a", 81, Some("coordinator"));
+    register_in(&fixture, "worker-1", 82, None);
+    register_in(&fixture, "coord-b", 83, Some("muse-coordinator"));
+    let socket = fixture.root.join("herdr.sock");
+    let (requests, server) = fake_herdr_socket(
+        &socket,
+        "w1",
+        &["coord-a-tab", "worker-1-tab", "coord-b-tab"],
+        2,
+    );
+    let moved = fixture
+        .manager()
+        .bring_coordinator_tab_forward_through("coord-b", &socket)
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(moved, Some(1));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0]["method"], "tab.list");
+    assert_eq!(requests[0]["params"], json!({"workspace_id": "w1"}));
+    assert_eq!(requests[1]["method"], "tab.move");
+    assert_eq!(
+        requests[1]["params"],
+        json!({"tab_id": "coord-b-tab", "insert_index": 1})
+    );
+}
+
+#[test]
+fn the_designated_coordinator_tab_moves_to_the_front_whatever_its_profile() {
+    let fixture = Fixture::new();
+    register_in(&fixture, "worker-1", 82, None);
+    register_in(&fixture, "lead", 84, None);
+    fixture.manager().coordinator_set("lead").unwrap();
+    let socket = fixture.root.join("herdr.sock");
+    let (requests, server) = fake_herdr_socket(&socket, "w1", &["worker-1-tab", "lead-tab"], 2);
+    let moved = fixture
+        .manager()
+        .bring_coordinator_tab_forward_through("lead", &socket)
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(moved, Some(0));
+    assert_eq!(
+        requests.lock().unwrap()[1]["params"],
+        json!({"tab_id": "lead-tab", "insert_index": 0})
+    );
+}
+
+#[test]
+fn a_worker_tab_and_a_coordinator_tab_already_in_front_are_left_alone() {
+    let fixture = Fixture::new();
+    register_in(&fixture, "worker-1", 82, None);
+    register_in(&fixture, "coord-a", 81, Some("coordinator"));
+    let socket = fixture.root.join("herdr.sock");
+    // The worker is no coordinator: Herdr is never asked anything.
+    assert_eq!(
+        fixture
+            .manager()
+            .bring_coordinator_tab_forward_through("worker-1", &socket),
+        Ok(None)
+    );
+    // A coordinator already first lists the tabs and moves nothing.
+    let (requests, server) = fake_herdr_socket(&socket, "w1", &["coord-a-tab", "worker-1-tab"], 1);
+    let moved = fixture
+        .manager()
+        .bring_coordinator_tab_forward_through("coord-a", &socket)
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(moved, None);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn an_unreachable_herdr_socket_is_an_error_for_the_caller_to_report() {
+    let fixture = Fixture::new();
+    register_in(&fixture, "coord-a", 81, Some("coordinator"));
+    let socket = fixture.root.join("no-such-herdr.sock");
+    let error = fixture
+        .manager()
+        .bring_coordinator_tab_forward_through("coord-a", &socket)
+        .unwrap_err();
+    assert!(error.contains("cannot connect"), "{error}");
+}

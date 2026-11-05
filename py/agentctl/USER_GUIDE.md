@@ -1185,6 +1185,20 @@ takes as the coordinator's. `adopt
 same step, and `coordinator clear` removes the designation. `watch-agents` and
 `restore` use it when they are given no coordinator of their own.
 
+Coordinator tabs come first in their Herdr workspace. After `start`, `revive`,
+`adopt`, `attach-self` or `coordinator set`, when the agent is a coordinator
+(the designated one, or one launched with a profile named `coordinator` or
+ending in `-coordinator`), agentctl moves its tab to the front of its
+workspace, just after the tabs of any other coordinators already there, so
+several coordinators keep their order. Herdr's command line cannot move a tab,
+so agentctl asks Herdr's socket (`$HERDR_SOCKET_PATH`, else
+`~/.config/herdr/herdr.sock`) with `tab.list` and `tab.move`. It does so only
+when the Herdr program agentctl calls is the one serving that socket (inside a
+Herdr pane, the program `HERDR_BIN_PATH` names; elsewhere, a compiled program
+rather than a script), so a stand-in Herdr never moves the real server's tabs.
+The move is best-effort: with no socket nothing happens, and a failure is
+reported on standard error and never fails the command.
+
 Each agent record can carry two edges, each `{"agent", "registry", "token",
 "proof"}`:
 

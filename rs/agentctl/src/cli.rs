@@ -3665,9 +3665,13 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Some(kind) if !backend_explicit => (kind, true),
         _ => (selected_backend, backend_explicit),
     };
-    let client: Box<dyn crate::subagents::ManagedApi> = if backend_explicit
-        && selected_backend == term_backend::BackendKind::Tmux
-    {
+    let tmux = backend_explicit && selected_backend == term_backend::BackendKind::Tmux;
+    // The Herdr socket that moves coordinator tabs to the front (#849 coordinator-tab-first).
+    let tab_socket = (!tmux)
+        .then(|| crate::tab_order::socket_for(&args.herdr_bin))
+        .flatten();
+    let tab_socket = tab_socket.as_deref();
+    let client: Box<dyn crate::subagents::ManagedApi> = if tmux {
         Box::new(term_backend::TmuxBackend::new(
             args.tmux_bin.clone(),
             args.tmux_socket.clone(),
@@ -3886,7 +3890,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     slot,
                     record_edges,
                 };
-                if let Some(effort) = reasoning_effort.as_deref() {
+                let started = if let Some(effort) = reasoning_effort.as_deref() {
                     manager.start_with_reasoning_effort(
                         &value.agent.name,
                         &value.cwd,
@@ -3895,7 +3899,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     )?
                 } else {
                     manager.start(&value.agent.name, &value.cwd, options)?
-                }
+                };
+                manager.bring_coordinator_tab_forward(&value.agent.name, tab_socket);
+                started
             }
         }
         Commands::Adopt(value) => {
@@ -3911,10 +3917,15 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 },
             )?;
             manager.designate_after(&mut result, &value.agent.name, value.as_coordinator);
+            manager.bring_coordinator_tab_forward(&value.agent.name, tab_socket);
             result
         }
         Commands::Coordinator(value) => match value.command {
-            CoordinatorCommand::Set(agent) => manager.coordinator_set(&agent.name)?,
+            CoordinatorCommand::Set(agent) => {
+                let report = manager.coordinator_set(&agent.name)?;
+                manager.bring_coordinator_tab_forward(&agent.name, tab_socket);
+                report
+            }
             CoordinatorCommand::Show => {
                 let shown = manager.coordinator_show()?;
                 write_json(&shown).map_err(Failure::Output)?;
@@ -4090,6 +4101,14 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     timeout,
                 )?
             };
+            if !value.dry_run {
+                match value.name.as_deref() {
+                    Some(name) if !value.all => {
+                        manager.bring_coordinator_tab_forward(name, tab_socket);
+                    }
+                    _ => manager.bring_every_coordinator_tab_forward(tab_socket),
+                }
+            }
             add_capabilities(&mut result);
             if let Some(agents) = result.get_mut("agents") {
                 add_capabilities(agents);
@@ -4364,6 +4383,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 },
             )?;
             manager.designate_after(&mut result, &value.agent.name, value.as_coordinator);
+            manager.bring_coordinator_tab_forward(&value.agent.name, tab_socket);
             result
         }
         Commands::Reset(value) => manager.reset(&value.name)?,
