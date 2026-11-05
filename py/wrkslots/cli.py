@@ -11778,14 +11778,20 @@ def _agent_batch_item_deadline(
 ) -> Iterator[None]:
     """Bound the pre-deletion work of one remove-agent-batch item.
 
-    Entered once the item holds the registry lock.  Outside a batch it does
-    nothing.
+    Entered once the item holds the registry lock, and again around its
+    out-of-lock deletion and completion (#894): re-entry resumes the
+    item's existing budget rather than starting a new one, so the work
+    up to the first deletion is bounded exactly as when the whole
+    removal ran under the lock.  Outside a batch it does nothing.
     """
 
     if agent_batch is None:
         yield
         return
-    deadline = _ItemDeadline(agent_batch.item_seconds, time.monotonic())
+    deadline = agent_batch.active_item_deadline
+    if deadline is None:
+        deadline = _ItemDeadline(agent_batch.item_seconds, time.monotonic())
+        agent_batch.active_item_deadline = deadline
     token = _ITEM_DEADLINE.set(deadline)
     try:
         yield
@@ -42047,27 +42053,31 @@ def _cmd_remove_in_scope(
         assert finish_context is not None
         # The fenced tree is deleted with no registry lock held, so a
         # waiting admission or another removal's state transition proceeds
-        # meanwhile (#894).  A refusal or kill here leaves the journal for
-        # the next remove or recovery pass.
-        deleted_journal = _delete_prepared_deferred_finish(
-            config, prepared_deferred_finish, finish_context
-        )
-        completion_scope = (
-            _mutation_locks(config, args.wait_lock)
-            if wait_deadline is None
-            else _mutation_locks(config, args.wait_lock, deadline=wait_deadline)
-        )
-        with completion_scope:
-            _refuse_partial_state(config, allow_validate_batch_seals=True)
-            _complete_deferred_finish(
-                config,
-                prepared_deferred_finish,
-                deleted_journal,
-                coordinator=coordinator,
-                runner=runner,
-                handoff_writer=handoff_writer,
-                proof_fd=proof_fd,
+        # meanwhile (#894).  A batch item's budget resumes across the
+        # deletion and completion, so the work up to the first deletion
+        # is bounded exactly as when the removal ran under the lock; a
+        # refusal or kill here leaves the journal for the next remove or
+        # recovery pass.
+        with _agent_batch_item_deadline(agent_batch):
+            deleted_journal = _delete_prepared_deferred_finish(
+                config, prepared_deferred_finish, finish_context
             )
+            completion_scope = (
+                _mutation_locks(config, args.wait_lock)
+                if wait_deadline is None
+                else _mutation_locks(config, args.wait_lock, deadline=wait_deadline)
+            )
+            with completion_scope:
+                _refuse_partial_state(config, allow_validate_batch_seals=True)
+                _complete_deferred_finish(
+                    config,
+                    prepared_deferred_finish,
+                    deleted_journal,
+                    coordinator=coordinator,
+                    runner=runner,
+                    handoff_writer=handoff_writer,
+                    proof_fd=proof_fd,
+                )
     if agent_batch is not None and finish_context is not None:
         agent_batch.nested_git_evidence[:] = [
             dict(item) for item in finish_context.nested_git_evidence
@@ -43569,6 +43579,11 @@ class _AgentRemoveBatchContext:
         default_factory=lambda: _AGENT_REMOVE_BATCH_ITEM_SECONDS
     )
     last_seconds_before_deletion: float | None = None
+    # The item's budget, created on its first deadline entry and resumed
+    # when its removal continues outside the registry lock (#894), so the
+    # budget still bounds the work up to the first deletion exactly as
+    # when the whole removal ran under the lock.  Cleared per item.
+    active_item_deadline: _ItemDeadline | None = None
 
     def capture(self, targets: Sequence[Path]) -> None:
         """Replace the shared evidence with one new scan of ``targets``."""
@@ -44085,6 +44100,7 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
             current = (slot, generation, item_started)
             context.nested_git_evidence.clear()
             context.last_seconds_before_deletion = None
+            context.active_item_deadline = None
             try:
                 _cmd_remove(item_args, emit=False, agent_batch=context)
             except Refusal as exc:

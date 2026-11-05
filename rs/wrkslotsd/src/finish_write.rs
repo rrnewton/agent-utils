@@ -63,12 +63,14 @@ const CREDENTIAL_PACING_POLL_SECONDS: u64 = 5;
 
 fn credential_pacing_refused(output: &str) -> bool {
     let text = output.to_lowercase();
-    text.contains("credential pacing")
-        || (text.contains("credential") && text.contains("quit"))
+    text.contains("credential pacing") || (text.contains("credential") && text.contains("quit"))
 }
 
 fn network_operation(args: &[&str]) -> bool {
-    matches!(args.first(), Some(&"fetch") | Some(&"push") | Some(&"ls-remote"))
+    matches!(
+        args.first(),
+        Some(&"fetch") | Some(&"push") | Some(&"ls-remote")
+    )
 }
 
 /// Run one Git command, waiting out credential pacing on network commands.
@@ -90,9 +92,7 @@ fn git_run_paced(repo: &Path, args: &[&str], dev_null_dir: bool) -> Result<GitOu
                 repo.display()
             ));
         }
-        std::thread::sleep(
-            Duration::from_secs(CREDENTIAL_PACING_POLL_SECONDS).min(deadline - now),
-        );
+        std::thread::sleep(Duration::from_secs(CREDENTIAL_PACING_POLL_SECONDS).min(deadline - now));
     }
 }
 
