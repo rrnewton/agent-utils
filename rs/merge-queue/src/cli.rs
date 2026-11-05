@@ -1972,6 +1972,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     // A one-shot run reports its own progress; no heartbeat shows a window.
                     window: None,
                     intake_poll: None,
+                    // Its process ends with it: it waits for the pull requests it landed to close.
+                    wait_for_closes: true,
                 },
             )?;
             let report = runner.holding(&lock).run()?;

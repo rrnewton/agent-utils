@@ -10,7 +10,16 @@ const STUB_GH: &str = r#"#!/bin/sh
 echo "$*" >> "$GH_LOG"
 case "$1 $2" in
   "pr list") cat "$GH_LIST" ;;
-  "pr close") if [ -e "$GH_FAIL_CLOSE" ]; then rm -f "$GH_FAIL_CLOSE"; echo "close failed" >&2; exit 1; fi ;;
+  "pr close")
+    if [ -e "$GH_FAIL_CLOSE" ]; then rm -f "$GH_FAIL_CLOSE"; echo "close failed" >&2; exit 1; fi
+    if [ -e "$GH_FAIL_CLOSES" ]; then echo "close failed" >&2; exit 1; fi
+    # A close that cannot finish until a file appears (at most 20 s).
+    if [ -n "$GH_CLOSE_AFTER" ]; then
+      n=0
+      until [ -e "$GH_CLOSE_AFTER" ]; do
+        n=$((n + 1)); [ "$n" -gt 200 ] && { echo "close waited 20 s" >&2; exit 1; }; sleep 0.1
+      done
+    fi ;;
 esac
 "#;
 
@@ -20,7 +29,10 @@ struct Gh {
     stub: String,
     log: String,
     list: String,
+    /// Fails the next close.
     fail_close: String,
+    /// Fails every close while it exists.
+    fail_closes: String,
 }
 
 fn stub(fx: &Fixture) -> Gh {
@@ -35,6 +47,7 @@ fn stub(fx: &Fixture) -> Gh {
         log: fx.root.join("gh.log").display().to_string(),
         list: fx.root.join("gh-list.json").display().to_string(),
         fail_close: fx.root.join("gh-fail-close").display().to_string(),
+        fail_closes: fx.root.join("gh-fail-closes").display().to_string(),
     }
 }
 
@@ -129,6 +142,7 @@ fn env(gh: &Gh) -> Vec<(&str, &str)> {
         ("GH_LOG", gh.log.as_str()),
         ("GH_LIST", gh.list.as_str()),
         ("GH_FAIL_CLOSE", gh.fail_close.as_str()),
+        ("GH_FAIL_CLOSES", gh.fail_closes.as_str()),
     ]
 }
 
@@ -321,10 +335,7 @@ fn the_configured_priority_label_puts_a_change_at_the_front_and_resubmits_on_cha
     assert_eq!(item(&items(&fx), 2)["prioritized"], true);
 }
 
-#[test]
-fn landed_pull_requests_are_closed_and_a_failed_close_is_retried_by_sync() {
-    let fx = Fixture::new("sync-close");
-    let gh = stub(&fx);
+fn init_closing(fx: &Fixture, gh: &Gh, runner: &str) {
     fx.write("tests/t0", "ok\n");
     fx.commit_all("seed");
     git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
@@ -338,10 +349,17 @@ fn landed_pull_requests_are_closed_and_a_failed_close_is_retried_by_sync() {
         "--validator",
         "command",
         "--validator-run",
-        RUNNER,
+        runner,
         "--max-batch",
         "1",
     ]);
+}
+
+#[test]
+fn landed_pull_requests_whose_close_fails_are_closed_by_the_next_sync() {
+    let fx = Fixture::new("sync-close");
+    let gh = stub(&fx);
+    init_closing(&fx, &gh, RUNNER);
     let h1 = pull_request(&fx, 1, &[("tests/a", "ok\n")]);
     let h2 = pull_request(&fx, 2, &[("tests/b", "ok\n")]);
     std::fs::write(
@@ -350,8 +368,9 @@ fn landed_pull_requests_are_closed_and_a_failed_close_is_retried_by_sync() {
     )
     .unwrap();
     sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
-    // The first close fails (say, a transient error): it is postponed, not lost.
-    std::fs::write(&gh.fail_close, "").unwrap();
+    // Every close fails during the run (say, the request budget is spent): both changes land
+    // and their closes wait, not lost.
+    std::fs::write(&gh.fail_closes, "").unwrap();
     let out = fx.mq_env(&["run", "--json"], &env(&gh));
     assert!(
         out.status.success(),
@@ -359,15 +378,76 @@ fn landed_pull_requests_are_closed_and_a_failed_close_is_retried_by_sync() {
         String::from_utf8_lossy(&out.stderr)
     );
     let all = items(&fx);
-    assert_eq!(item(&all, 1)["status"], "landed");
-    assert_eq!(item(&all, 1)["close_pending"], true);
-    assert!(item(&all, 2).get("close_pending").is_none());
+    for pr in [1, 2] {
+        assert_eq!(item(&all, pr)["status"], "landed");
+        assert_eq!(item(&all, pr)["close_pending"], true);
+    }
+    std::fs::remove_file(&gh.fail_closes).unwrap();
     let r = sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
-    assert_eq!(r["closed"], serde_json::json!([1]));
+    assert_eq!(r["closed"], serde_json::json!([1, 2]));
+    let all = items(&fx);
+    assert!(item(&all, 1).get("close_pending").is_none());
+    assert!(item(&all, 2).get("close_pending").is_none());
     let log = std::fs::read_to_string(&gh.log).unwrap();
-    assert_eq!(log.matches("pr close 1 --repo o/n").count(), 2, "{log}");
+    // The closer stops at the first close that fails, oldest first: #2 was first tried by the
+    // sync.
     assert_eq!(log.matches("pr close 2 --repo o/n").count(), 1, "{log}");
     assert!(log.contains("Landed by merge-queue in "));
+}
+
+/// Like [`RUNNER`], and leaves `$MARKS/<test>` for every test it runs.
+const MARKING_RUNNER: &str = r#"rc=0; for t in $(ls tests); do touch "$MARKS/$t"; o=pass; grep -q FAIL "tests/$t" && { o=fail; rc=1; }; printf '{"id":"%s","outcome":"%s"}\n' "$t" "$o" >> "$MQ_RESULTS"; done; exit $rc"#;
+
+#[test]
+fn the_next_batch_validates_while_a_landed_pull_request_is_closed() {
+    let fx = Fixture::new("sync-close-beside");
+    let gh = stub(&fx);
+    init_closing(&fx, &gh, MARKING_RUNNER);
+    let h1 = pull_request(&fx, 1, &[("tests/a", "ok\n")]);
+    let h2 = pull_request(&fx, 2, &[("tests/b", "ok\n")]);
+    std::fs::write(
+        &gh.list,
+        listing(&[(1, &h1, false, &[]), (2, &h2, false, &[])]),
+    )
+    .unwrap();
+    sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
+    // A close cannot finish until #2's batch has run its test, and with a window of one that
+    // batch starts only after #1 has landed: closed in the run loop, #1's close would hold it
+    // back until the close gave up.
+    let marks = fx.root.join("marks");
+    std::fs::create_dir_all(&marks).unwrap();
+    let after = marks.join("b").display().to_string();
+    let mut vars = env(&gh);
+    vars.push(("MARKS", marks.to_str().unwrap()));
+    vars.push(("GH_CLOSE_AFTER", after.as_str()));
+    let out = fx.mq_env(&["run", "--json", "--depth", "1"], &vars);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let landed: Vec<i64> = report["landed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|l| {
+            l["prs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|pr| pr.as_i64().unwrap())
+        })
+        .collect();
+    assert_eq!(landed, vec![1, 2], "{report}");
+    // Both closed, each on its first try; the one-shot run waited for its closes and recorded them.
+    let all = items(&fx);
+    for pr in [1, 2] {
+        assert!(item(&all, pr).get("close_pending").is_none(), "{all}");
+    }
+    let log = std::fs::read_to_string(&gh.log).unwrap();
+    assert_eq!(log.matches("pr close 1 --repo o/n").count(), 1, "{log}");
+    assert_eq!(log.matches("pr close 2 --repo o/n").count(), 1, "{log}");
 }
 
 #[test]

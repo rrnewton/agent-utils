@@ -91,6 +91,10 @@ pub struct RunOptions {
     /// How often a run with a batch in flight looks for requests recorded while it holds the
     /// queue ([`INTAKE_POLL`] when unset).
     pub intake_poll: Option<Duration>,
+    /// Wait at the end of the run until the pull requests it landed are closed (see
+    /// [`Closer`]): a one-shot run, whose process ends with it. Under `serve` the closer goes on
+    /// beside the next run, which records what it closed.
+    pub wait_for_closes: bool,
 }
 
 /// How often a run with a batch in flight looks for recorded requests, unless
@@ -736,6 +740,63 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Closes landed pull requests beside the run loop. A close goes through the hosting request
+/// budget, which every client of the account on the host shares, and waits up to the network
+/// limit for it: closed in the loop, the four changes of one landing held every batch for up to
+/// 20 minutes while other clients had spent the budget. A landing marks its changes
+/// `close_pending` and wakes the closer, which closes them with no lock held
+/// ([`crate::sync::close_postponed`], which stops at the first close that fails and leaves the
+/// rest to the next wake or the label sync); the run records the closes at its batch
+/// boundaries ([`crate::sync::record_closed`]). One closer per process, so two runs in one
+/// process never close a change twice.
+#[derive(Default)]
+struct Closer {
+    /// A landing asked for closes since the closer last looked.
+    wanted: bool,
+    /// Whether the closer thread is running.
+    running: bool,
+    /// The closer thread, for a run that waits for its closes.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn closer() -> &'static Mutex<Closer> {
+    static CLOSER: std::sync::OnceLock<Mutex<Closer>> = std::sync::OnceLock::new();
+    CLOSER.get_or_init(Mutex::default)
+}
+
+/// Wake the closer, starting it when it is not running. A wake while it runs makes it look
+/// again once it is done, so a change marked during a pass is not left behind.
+fn close_beside(state: &State, config: &Config) {
+    let mut guard = lock(closer());
+    guard.wanted = true;
+    if guard.running {
+        return;
+    }
+    guard.running = true;
+    let (state, config) = (state.clone(), config.clone());
+    guard.thread = Some(std::thread::spawn(move || loop {
+        {
+            let mut guard = lock(closer());
+            if !guard.wanted {
+                guard.running = false;
+                return;
+            }
+            guard.wanted = false;
+        }
+        if let Err(error) = crate::sync::close_postponed(&state, &config) {
+            eprintln!("merge-queue: landed pull requests not closed yet: {error}");
+        }
+    }));
+}
+
+/// Wait until the closer has done what it was asked.
+fn wait_for_closes() {
+    let thread = lock(closer()).thread.take();
+    if let Some(thread) = thread {
+        let _ = thread.join();
+    }
 }
 
 /// Backoff before refusal retry `attempt` (0-based): base doubled per attempt, capped at 60s.
@@ -3269,6 +3330,10 @@ impl<'a> Runner<'a> {
 
     fn finish(&self, stop: String) -> Result<RunReport, String> {
         self.prune_donor_jobs(true);
+        if self.options.wait_for_closes && self.hosting.is_some() {
+            wait_for_closes();
+        }
+        self.record_closes();
         let report = {
             let mut report = lock(&self.report).clone();
             report.stopped = stop;
@@ -3437,6 +3502,34 @@ impl<'a> Runner<'a> {
         self.writer.is_some() && !self.simulating() && self.started.elapsed() < INTAKE_FOR
     }
 
+    /// Record on their items the closes the closer made (see [`Closer`]), under the writer lock,
+    /// and take the recorded items into the run.
+    fn record_closes(&self) {
+        let Some(writer) = self.writer else {
+            return;
+        };
+        if self.simulating() {
+            return;
+        }
+        match crate::sync::record_closed(self.state, writer) {
+            Ok(prs) if !prs.is_empty() => {
+                {
+                    let mut items = lock(&self.items);
+                    for pr in &prs {
+                        if let (Some(item), Ok(Some(fresh))) =
+                            (items.get_mut(pr), self.state.item(*pr))
+                        {
+                            *item = fresh;
+                        }
+                    }
+                }
+                self.event("closed", &format!("{} closed beside the run", list(&prs)));
+            }
+            Ok(_) => {}
+            Err(error) => self.event("closed", &format!("closes not recorded: {error}")),
+        }
+    }
+
     /// Apply the requests recorded for changes this run is not busy with (`busy`: in flight or
     /// set aside), then plan every queued change it is not busy with on top of `tip`, the
     /// candidate of its last batch in flight (or the base), and replace `pending` with the
@@ -3452,6 +3545,7 @@ impl<'a> Runner<'a> {
         let Some(writer) = self.writer else {
             return Ok(());
         };
+        self.record_closes();
         let applied = match crate::intake::apply_except(self.state, &self.config, writer, busy) {
             Ok(applied) => applied,
             Err(error) => {
@@ -4253,14 +4347,10 @@ impl<'a> Runner<'a> {
                         item.last_refusal.clear();
                         item.deciding_report = self.run_dir.join("report.md").display().to_string();
                         item.deciding_failed.clear();
-                        if let Some(hosting) = &self.hosting {
-                            match hosting.close(*pr, &crate::sync::close_comment(tip)) {
-                                Ok(()) => item.log("closed", "pull request closed after landing"),
-                                Err(error) => {
-                                    item.close_pending = true;
-                                    item.log("close-postponed", error);
-                                }
-                            }
+                        // Closed beside the loop (see [`Closer`]), never in it.
+                        if self.hosting.is_some() {
+                            item.close_pending = true;
+                            item.log("close-pending", "to be closed beside the run");
                         }
                         item.log(
                             "landed",
@@ -4275,6 +4365,9 @@ impl<'a> Runner<'a> {
                         self.state.save_item(item)?;
                     }
                 }
+            }
+            if self.hosting.is_some() {
+                close_beside(self.state, &self.config);
             }
             if claim.scope == Scope::Focused {
                 let index = lock(&self.report).landed.len();
