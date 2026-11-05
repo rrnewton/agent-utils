@@ -2663,6 +2663,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                     evidence: evidence.to_owned(),
                     printed: true,
                     settled: true,
+                    queued: false,
                 }))
             };
             // Muse writes the accepted intent the moment it takes a prompt, and never for a
@@ -4390,6 +4391,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 evidence,
                 printed: true,
                 settled: true,
+                queued: false,
             })
         };
         loop {

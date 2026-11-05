@@ -204,6 +204,7 @@ pub fn submit(
             evidence,
             printed,
             settled,
+            queued: false,
         }))
     };
 

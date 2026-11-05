@@ -2173,15 +2173,19 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             }
                         }
                         match outcome {
-                            Ok(Delivered::Confirmed { verified, .. }) => {
+                            Ok(Delivered::Confirmed {
+                                verified, queued, ..
+                            }) => {
                                 for (index, (member, inflight)) in active.iter().enumerate() {
                                     if verified {
                                         runtime.prompt_printed(&member.3);
                                     }
                                     let document = &mut documents[index];
                                     strip_paste_stamps(document);
-                                    document
-                                        .insert("delivery_state".to_owned(), json!("processed"));
+                                    document.insert(
+                                        "delivery_state".to_owned(),
+                                        json!(if queued { "queued" } else { "processed" }),
+                                    );
                                     document
                                         .insert("confirmed_at".to_owned(), json!(unix_seconds()));
                                     atomic_json(inflight, &Value::Object(document.clone()))?;
@@ -2567,7 +2571,11 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     transition(&inflight_path, &path)?;
                     continue 'retry;
                 }
-                Ok(Delivered::Confirmed { verified, evidence }) => {
+                Ok(Delivered::Confirmed {
+                    verified,
+                    evidence,
+                    queued,
+                }) => {
                     if verified {
                         runtime.prompt_printed(&identifier);
                     }
@@ -2580,7 +2588,13 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     }) {
                         document.insert("goal_answer".to_owned(), json!(evidence));
                     }
-                    document.insert("delivery_state".to_owned(), json!("processed"));
+                    // A prompt the agent queued behind its running turn was
+                    // delivered all the same; it is recorded `queued`, never
+                    // left to be filed possibly submitted (#884 item 4 (B)).
+                    document.insert(
+                        "delivery_state".to_owned(),
+                        json!(if queued { "queued" } else { "processed" }),
+                    );
                     document.insert("confirmed_at".to_owned(), json!(unix_seconds()));
                     atomic_json(&inflight_path, &Value::Object(document))?;
                     transition(
@@ -3386,6 +3400,10 @@ enum Delivered {
         verified: bool,
         /// What the screen showed as the proof, for a verified submission.
         evidence: Option<String>,
+        /// Whether the agent queued the prompt behind a running turn instead
+        /// of starting a turn with it (#884 item 4 (B)): delivered, and
+        /// recorded as `queued`, never as possibly submitted.
+        queued: bool,
     },
     /// Nothing was typed, so the prompt remains safe to retry.
     NotStaged(String),
@@ -3538,6 +3556,7 @@ fn deliver_one<A: AgentApi + ?Sized>(
             return Ok(Delivered::Confirmed {
                 verified: true,
                 evidence: Some(receipt.evidence),
+                queued: receipt.queued,
             })
         }
         Submission::NotStaged(reason) => return Ok(Delivered::NotStaged(reason)),
@@ -3576,6 +3595,7 @@ fn deliver_one<A: AgentApi + ?Sized>(
             Ok(()) => Ok(Delivered::Confirmed {
                 verified: client.working_wait_proves_printed(),
                 evidence: None,
+                queued: false,
             }),
             Err(error) => misrouted(&error).unwrap_or_else(|| {
                 Err(AgentError::delivery(format!(
@@ -3612,6 +3632,7 @@ fn deliver_one<A: AgentApi + ?Sized>(
                 return Ok(Delivered::Confirmed {
                     verified: client.working_wait_proves_printed(),
                     evidence: None,
+                    queued: false,
                 })
             }
             Err(error) => {
@@ -5093,6 +5114,7 @@ mod tests {
                 evidence: "prompt text appeared above the composer".to_owned(),
                 printed: true,
                 settled: true,
+                queued: false,
             }))
         }
     }
@@ -5366,6 +5388,38 @@ mod tests {
             fake.screen.as_ref().unwrap().state().pastes,
             [second],
             "the lost prompt was never typed again"
+        );
+    }
+
+    /// #884 item 4 (B): a prompt a busy Claude Code takes into its queued
+    /// messages was delivered. The drain records it `queued`, never files it
+    /// as possibly submitted.
+    #[test]
+    fn a_prompt_a_busy_claude_queues_is_delivered_and_marked_queued() {
+        let directory = TestDirectory::new("busy-queued");
+        let screen = crate::submission::fake::FakeScreen::new("claude", true);
+        screen.state().queued.push("an earlier prompt".to_owned());
+        screen.state().queued_hidden = true;
+        let fake = FakeAgent::with_screen(screen);
+        enqueue(directory.path(), "while you work", Some("midturn")).unwrap();
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            DrainOptions {
+                ready_timeout: Duration::ZERO,
+                ..DrainOptions::default()
+            },
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.delivered, ["midturn"], "{result:?}");
+        assert!(result.quarantined.is_empty(), "{result:?}");
+        let document = read_private_json(&directory.path().join("processed/midturn.json")).unwrap();
+        assert_eq!(document["delivery_state"], "queued", "{document}");
+        assert!(
+            !directory.path().join("failed/midturn.json").exists(),
+            "never filed as possibly submitted"
         );
     }
 
@@ -6121,6 +6175,7 @@ mod tests {
                 evidence: "the composer emptied".to_owned(),
                 printed: false,
                 settled: false,
+                queued: false,
             });
         let runtime = FakeRuntime::default();
         let error = send_with_runtime(

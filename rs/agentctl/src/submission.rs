@@ -131,6 +131,12 @@ pub struct SubmissionReceipt {
     /// a screen with no recognisable composer: then nothing showed that the prompt did not come
     /// back into the composer after a key the agent dropped.
     pub settled: bool,
+    /// Whether the agent took the prompt into its own queue behind a running
+    /// turn instead of starting a turn with it: the pane was already busy and
+    /// the prompt left the composer, or a queued-message marker is the
+    /// evidence. A queued prompt was delivered; it is not a submission that
+    /// may or may not have happened (#884 item 4 (B)).
+    pub queued: bool,
 }
 
 /// How a prompt submission was established.
@@ -1247,6 +1253,7 @@ pub fn submit_verified(
                             evidence: "stranded prompt flushed with Enter".to_owned(),
                             printed: true,
                             settled: true,
+                            queued: false,
                         }));
                     }
                     if now.saturating_sub(pressed_at) >= DRAFT_SUBMIT_TIMEOUT {
@@ -1353,6 +1360,12 @@ pub fn submit_verified(
         running_turn: running_turn(&screen) != Some(false),
         ..ShownBefore::new(text)
     };
+    // Whether a turn was already running before this paste: on such a pane the
+    // agent can only queue a prompt it accepts, never start a turn with it.
+    // A running-turn marker that was already showing therefore proves
+    // queueing, not submission (#884 item 4 (B)); a marker that appears after
+    // the key is a turn this prompt started.
+    let turn_before_paste = shown.running_turn;
     shown.note_before_paste(&before);
     // A harness that draws a paste placeholder faint (some Codex builds do) shows no solid text
     // for a paste left unsent; a new paste would join it, and the key would submit both.
@@ -1491,6 +1504,7 @@ pub fn submit_verified(
                     evidence: "prompt text appeared above the composer".to_owned(),
                     printed: true,
                     settled: true,
+                    queued: false,
                 }));
             }
         }
@@ -1558,6 +1572,10 @@ pub fn submit_verified(
             Some(current) => {
                 left_composer = true;
                 if let Some(evidence) = corroborated(&before, &current, text) {
+                    // On a pane that was already busy, leaving the composer
+                    // means the agent queued the prompt; a queue marker says
+                    // the same on any pane (#884 item 4 (B)).
+                    let queued = turn_before_paste || evidence.contains("queue marker");
                     let mut receipt = SubmissionReceipt {
                         key,
                         key_presses: presses,
@@ -1565,6 +1583,7 @@ pub fn submit_verified(
                         evidence,
                         printed: false,
                         settled: false,
+                        queued,
                     };
                     // No key is sent from here on: the prompt has left the composer.
                     let grace_deadline = now.saturating_add(PRINT_GRACE);
@@ -1575,6 +1594,7 @@ pub fn submit_verified(
                         if let Some((view, screen, read_at)) = &observed {
                             if let Some(evidence) = printed(view, screen, &shown) {
                                 receipt.elapsed = read_at.saturating_sub(started);
+                                receipt.queued |= evidence.contains("queue marker");
                                 receipt.evidence = evidence;
                                 receipt.printed = true;
                                 receipt.settled = true;
@@ -4664,9 +4684,20 @@ mod tests {
         screen.state().queued_hidden = true;
         let receipt = receipt(submit(&screen, "check the build"));
         assert_eq!(receipt.key, "Enter");
+        // #884 item 4 (B): taken into Claude Code's queue is a delivered
+        // receipt, marked queued — never an uncertain one.
+        assert!(receipt.queued, "{receipt:?}");
         let state = screen.state();
         assert_eq!(state.queued, ["an earlier prompt", "check the build"]);
         assert!(state.composer.is_empty());
+    }
+
+    #[test]
+    fn a_prompt_an_idle_claude_takes_is_not_a_queued_receipt() {
+        let screen = FakeScreen::new("claude", false);
+        let receipt = receipt(submit(&screen, "check the build"));
+        assert!(!receipt.queued, "{receipt:?}");
+        assert_eq!(screen.state().submitted, ["check the build"]);
     }
 
     #[test]
