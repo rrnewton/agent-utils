@@ -420,8 +420,17 @@ fn classify_one(
     let coordinator = crate::status_state::identity_from_value(
         raw.get("coordinator_lease").unwrap_or(&Value::Null),
     );
-    let (owner_state, owner_detail) = process_state(owner.as_ref());
     let (coordinator_state, coordinator_detail) = process_state(coordinator.as_ref());
+    // Owner-less create (#885): no owner generation was recorded, so the
+    // coordinator lease decides, mirroring `_create_journal_owner_state`.
+    let (owner_state, owner_detail) = if owner.is_none() {
+        (
+            coordinator_state.clone(),
+            "no owner process generation is recorded (owner-less create; the coordinator lease decides)".to_string(),
+        )
+    } else {
+        process_state(owner.as_ref())
+    };
     if !completed {
         if owner_state == "indeterminate" || coordinator_state == "indeterminate" {
             return Err(format!(
@@ -429,7 +438,10 @@ fn classify_one(
                 raw.get("slot").and_then(Value::as_str).unwrap_or_default()
             ));
         }
-        if owner_state != coordinator_state || !matches!(owner_state.as_str(), "live" | "dead") {
+        if owner.is_some()
+            && (owner_state != coordinator_state
+                || !matches!(owner_state.as_str(), "live" | "dead"))
+        {
             return Err(format!(
                 "create journal for slot {:?} has disagreeing process state: owner={owner_state} ({owner_detail}); coordinator={coordinator_state} ({coordinator_detail})",
                 raw.get("slot").and_then(Value::as_str).unwrap_or_default()

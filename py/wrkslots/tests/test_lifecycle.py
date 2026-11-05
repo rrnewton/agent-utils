@@ -12073,6 +12073,121 @@ def test_interrupted_create_requires_and_supports_recovery(tmp_path: Path) -> No
     assert not journal.exists()
 
 
+def _orphaned_ownerless_create(tmp_path: Path) -> tuple[Path, Path]:
+    """An owner-less create orphaned mid-provisioning (#885).
+
+    Its parent died after the first hook step, so the journal records
+    owner null, hook_progress 1, and a coordinator lease naming the
+    (still live) test process, exactly the blocking consumer state.
+    """
+    project, _repository, _remote = make_project(
+        tmp_path, post_provision_hooks=("true",)
+    )
+    interrupted = create(
+        project,
+        bind_owner=False,
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    journal = create_journal_path(project)
+    config = wrkslots._load_config(str(project), "testhost")
+    raw = wrkslots._as_mapping(
+        json.loads(journal.read_text(encoding="utf-8")), "test create journal"
+    )
+    assert raw["owner"] is None
+    changed = dict(raw)
+    changed["hook_progress"] = 1
+    wrkslots._write_journal(config, changed, journal_path=journal)
+    return project, journal
+
+
+def test_ownerless_orphaned_create_does_not_block_an_unrelated_create(
+    tmp_path: Path,
+) -> None:
+    project, journal = _orphaned_ownerless_create(tmp_path)
+
+    made = create(project, slot="slot02", agent="codex-2", branch="codex/other")
+
+    assert made.returncode == 0, made.stderr
+    rows = active_slots(project)
+    assert len(rows) == 1
+    row = rows[0]
+    assert isinstance(row, dict)
+    assert row["slot"] == "slot02"
+    assert journal.is_file()
+    same_slot = create(project, slot="slot01", agent="codex-1", branch="codex/task2")
+    assert same_slot.returncode != 0
+    assert "interrupted create" in same_slot.stderr
+
+
+def test_coordinator_aborts_an_ownerless_orphaned_create(tmp_path: Path) -> None:
+    project, journal = _orphaned_ownerless_create(tmp_path)
+    target = checkout(project)
+    assert target.is_dir()
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert active_slots(project) == []
+    assert not journal.exists()
+    assert not target.exists()
+    repository = project / "repo"
+    assert str(target) not in git(repository, "worktree", "list", "--porcelain").stdout
+    branches = git(repository, "branch", "--list", "codex/task").stdout
+    assert branches.strip() == ""
+
+    # The pinned wrkslots f79789533dc0 must classify the post-abort state
+    # cleanly (#885 compatibility, as in the #872 cargo-home case).
+    extracted = tmp_path / "pinned-wrkslots"
+    repo_root = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=Path(__file__).parent,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if repo_root.returncode != 0:
+        pytest.skip("pinned wrkslots commit f79789533dc0 is unavailable")
+    archive = subprocess.run(
+        ["git", "archive", "f79789533dc0", "py"],
+        cwd=repo_root.stdout.strip(),
+        capture_output=True,
+        check=False,
+    )
+    if archive.returncode != 0:
+        pytest.skip("pinned wrkslots commit f79789533dc0 is unavailable")
+    extracted.mkdir()
+    subprocess.run(
+        ["tar", "-x", "-C", str(extracted)], input=archive.stdout, check=True
+    )
+    reader = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, sys.argv[1]);"
+            "from wrkslots import cli;"
+            "config = cli._load_config(sys.argv[2], 'testhost');"
+            "cli._load_events(config);"
+            "states, archives = cli._validate_global_state(config);"
+            "assert cli._classify_create_journals(config, states, archives) == ()",
+            str(extracted / "py"),
+            str(project),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert reader.returncode == 0, reader.stderr
+
+
 def test_create_recovery_refuses_task_scope_that_does_not_match_owner(
     tmp_path: Path,
 ) -> None:

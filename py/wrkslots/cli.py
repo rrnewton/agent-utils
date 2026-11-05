@@ -10018,6 +10018,27 @@ def _ownerless_cargo_home_journal_is_unrelated(
     return True
 
 
+def _create_journal_owner_state(
+    owner: ProcessIdentity | None, coordinator_state: str
+) -> tuple[str, str]:
+    """The owner state a create journal is classified by (#885).
+
+    An owner-less (unbound) create recorded no owner generation, so there
+    is no owner whose liveness could be indeterminate or disagree: the
+    coordinator lease decides.  Every mutating classifier caller holds
+    the registry mutation lock for its whole run, so an incomplete
+    journal seen there cannot belong to an in-flight create.
+    """
+
+    if owner is None:
+        return (
+            coordinator_state,
+            "no owner process generation is recorded "
+            "(owner-less create; the coordinator lease decides)",
+        )
+    return _process_state(owner)
+
+
 def _classify_create_journal(
     config: Config,
     path: Path,
@@ -10052,8 +10073,8 @@ def _classify_create_journal(
     coordinator = _identity_from_obj(
         raw["coordinator_lease"], "create journal.coordinator_lease"
     )
-    owner_state, owner_detail = _process_state(owner)
     coordinator_state, coordinator_detail = _process_state(coordinator)
+    owner_state, owner_detail = _create_journal_owner_state(owner, coordinator_state)
     if not completed:
         if "indeterminate" in {owner_state, coordinator_state}:
             raise Refusal(
@@ -10061,7 +10082,9 @@ def _classify_create_journal(
                 f"indeterminate: owner={owner_state} ({owner_detail}); "
                 f"coordinator={coordinator_state} ({coordinator_detail})"
             )
-        if owner_state != coordinator_state or owner_state not in {"live", "dead"}:
+        if owner is not None and (
+            owner_state != coordinator_state or owner_state not in {"live", "dead"}
+        ):
             raise Refusal(
                 f"create journal for slot {raw.get('slot')!r} has disagreeing process "
                 f"state: owner={owner_state} ({owner_detail}); "
@@ -10072,8 +10095,10 @@ def _classify_create_journal(
             config, raw, states, archives, completed=completed
         )
     )
-    rebound_owner_state, _rebound_owner_detail = _process_state(owner)
     rebound_coordinator_state, _rebound_coordinator_detail = _process_state(coordinator)
+    rebound_owner_state, _rebound_owner_detail = _create_journal_owner_state(
+        owner, rebound_coordinator_state
+    )
     if not completed and (
         rebound_owner_state != owner_state
         or rebound_coordinator_state != coordinator_state
@@ -10184,9 +10209,11 @@ def _assert_create_journal_classifications_stable(
             coordinator = _identity_from_obj(
                 raw["coordinator_lease"], "create journal.coordinator_lease"
             )
+            coordinator_state = _process_state(coordinator)[0]
             if (
-                _process_state(owner)[0] != row.owner_state
-                or _process_state(coordinator)[0] != row.coordinator_state
+                _create_journal_owner_state(owner, coordinator_state)[0]
+                != row.owner_state
+                or coordinator_state != row.coordinator_state
             ):
                 raise Refusal(
                     f"create journal liveness changed while it was classified: {row.path}"
