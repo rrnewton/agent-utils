@@ -26,9 +26,18 @@ steps:
   - group: agentctl
     job: test
     desc: agentctl Rust tests
+    # TMPDIR: a memory-backed scratch directory of the step's own (#869
+    # agentctl-test-fsync-churn). The chat state tests create, fsync and rename thousands of
+    # files of under 1 KB; on a copy-on-write /tmp each fsync also writes metadata and log
+    # blocks, so the suite wrote about 18 GiB per run to the host disk, and on tmpfs about
+    # 16 MB. The fsyncs stay: only the backing store changes. /dev/shm comes first because its
+    # path is short: a test's control socket under $XDG_RUNTIME_DIR/at.XXXXXX/... reached the
+    # 108-byte limit of a Unix socket path.
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=4 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
+      scratch="$(mktemp -d /dev/shm/at.XXXXXX 2>/dev/null || mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/at.XXXXXX")" &&
+      trap 'rm -rf "$scratch"' EXIT &&
+      TMPDIR="$scratch" RUST_TEST_THREADS=4 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p agentctl ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
