@@ -1531,13 +1531,29 @@ impl Route {
         if status.success() {
             Ok(out)
         } else {
-            let text = String::from_utf8_lossy(&err);
-            let tail: Vec<&str> = text.lines().rev().take(3).collect();
+            // Some routes (agentcloudctl node exec) deliver the remote's stderr on
+            // their local stdout, beneath a local banner line: show both tails, and
+            // drop banner lines, so the remote's own error is what the operator sees.
+            let tail = |bytes: &[u8]| -> String {
+                let text = String::from_utf8_lossy(bytes);
+                let lines: Vec<&str> = text
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("note:"))
+                    .collect();
+                lines[lines.len().saturating_sub(3)..].join(" / ")
+            };
+            let stderr_tail = tail(&err);
+            let stdout_tail = tail(&out);
             Err(format!(
-                "queue route {} exited {}: {}",
+                "queue route {} exited {}: {}{}",
                 args.first().copied().unwrap_or(""),
                 status.code().unwrap_or(-1),
-                tail.into_iter().rev().collect::<Vec<_>>().join(" / ")
+                stderr_tail,
+                if stdout_tail.is_empty() {
+                    String::new()
+                } else {
+                    format!("; stdout: {stdout_tail}")
+                }
             ))
         }
     }
@@ -2222,6 +2238,24 @@ mod unit {
             exit: Some(0),
             ..Receipt::default()
         }
+    }
+
+    #[test]
+    fn a_route_error_shows_the_remote_stdout_tail_not_the_local_banner() {
+        let route = Route::new(vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "echo 'note: --ws-url wss://example.invalid'; echo remote-real-error; \
+             echo local-stderr >&2; exit 3"
+                .to_owned(),
+        ])
+        .unwrap();
+        let error = route
+            .call(&["claim"], b"", std::time::Duration::from_secs(30))
+            .unwrap_err();
+        assert!(error.contains("remote-real-error"), "{error}");
+        assert!(error.contains("local-stderr"), "{error}");
+        assert!(!error.contains("--ws-url"), "{error}");
     }
 
     #[test]
