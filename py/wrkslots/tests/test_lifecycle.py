@@ -57408,21 +57408,58 @@ def test_archive_nested_cache_repositories_keeps_files_hidden_by_unpublished_ign
     )
 
 
-@pytest.mark.parametrize("state", ("unlisted-submodule", "embedded-repository", "content-filter"))
+def test_archive_drifted_checkouts_salvages_an_unlisted_submodule(
+    tmp_path: Path,
+) -> None:
+    """A proven-dead owner's unlisted module is bundle-salvaged, not refused (#859)."""
+    project, tree, component, _component_head = _drifted_slot_with_submodules(tmp_path)
+    git(tree, "checkout", "-q", "-b", "codex/other")
+    # The branch stops listing the submodule, whose populated directory
+    # and private repository remain.
+    git(component, "checkout", "-q", "-b", "local-work")
+    local_head = commit_local(component, "local.txt", "submodule work\n", "submodule only")
+    git(tree, "rm", "-q", "--cached", "component")
+    git(tree, "commit", "-q", "-m", "drop the component gitlink")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    receipts = _drift_receipts(project)
+    assert _bundle_reaches(
+        tmp_path, receipts["product/component"], local_head, "restored-unlisted.git"
+    )
+
+
+def test_archive_drifted_checkouts_refuses_an_unlisted_submodule_for_a_live_owner(
+    tmp_path: Path,
+) -> None:
+    """The unlisted-module salvage is only for a proven-dead owner (#859)."""
+    project, tree, component, _component_head = _drifted_slot_with_submodules(tmp_path)
+    git(tree, "checkout", "-q", "-b", "codex/other")
+    git(component, "checkout", "-q", "-b", "local-work")
+    commit_local(component, "local.txt", "submodule work\n", "submodule only")
+    git(tree, "rm", "-q", "--cached", "component")
+    git(tree, "commit", "-q", "-m", "drop the component gitlink")
+    set_liveness(project, "alive")
+
+    refused = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert "state: REFUSED" in refused.stderr
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+
+
+@pytest.mark.parametrize("state", ("embedded-repository", "content-filter"))
 def test_archive_drifted_checkouts_refuses_state_its_bundle_cannot_keep(
     tmp_path: Path, state: str
 ) -> None:
     project, tree, component, _component_head = _drifted_slot_with_submodules(tmp_path)
     git(tree, "checkout", "-q", "-b", "codex/other")
-    if state == "unlisted-submodule":
-        # The branch stops listing the submodule, whose populated directory
-        # and private repository remain.
-        git(component, "checkout", "-q", "-b", "local-work")
-        commit_local(component, "local.txt", "submodule work\n", "submodule only")
-        git(tree, "rm", "-q", "--cached", "component")
-        git(tree, "commit", "-q", "-m", "drop the component gitlink")
-        expected = "no longer lists as an initialized submodule"
-    elif state == "embedded-repository":
+    if state == "embedded-repository":
         inner = tree / "scratch-repo"
         inner.mkdir()
         git(inner, "init", "-q")

@@ -21245,6 +21245,7 @@ def _salvage_candidate(
     detached_root: bool = False,
     accept_drift: bool = False,
     keep_private_state: bool = False,
+    salvage_unlisted_modules: bool = False,
 ) -> _SalvageCandidate:
     """Return HEAD, status digest, durable commit candidate, and dirty state.
 
@@ -21254,6 +21255,8 @@ def _salvage_candidate(
     ``accept_drift`` and ``keep_private_state`` facts are never memoized, so
     they can never stand in for a later call that still compares the recorded
     branch and remote, or that keeps only HEAD and the worktree.
+    ``salvage_unlisted_modules`` (a proven-dead owner's removal, #859) is
+    never memoized either: it changes a refusal into a salvage.
     """
 
     memo = _SALVAGE_FACTS_MEMO.get()
@@ -21263,6 +21266,7 @@ def _salvage_candidate(
         or ownerless_slot is not None
         or accept_drift
         or keep_private_state
+        or salvage_unlisted_modules
     ):
         return _salvage_candidate_uncached(
             config,
@@ -21278,6 +21282,7 @@ def _salvage_candidate(
             detached_root=detached_root,
             accept_drift=accept_drift,
             keep_private_state=keep_private_state,
+            salvage_unlisted_modules=salvage_unlisted_modules,
         )
     if detached_root:
         raise StateError("only an ownerless worktree may be salvaged with a detached root")
@@ -21492,7 +21497,13 @@ def _private_pseudoref_commits(vcs: _GitVcs, path: Path) -> set[str]:
 
 
 def _assert_no_unkept_repository_state(
-    vcs: _GitVcs, config: Config, checkout: Checkout, path: Path, *, submodule: bool
+    vcs: _GitVcs,
+    config: Config,
+    checkout: Checkout,
+    path: Path,
+    *,
+    submodule: bool,
+    salvage_unlisted_modules: bool = False,
 ) -> None:
     """Refuse what a drifted checkout's local bundle cannot keep.
 
@@ -21530,7 +21541,14 @@ def _assert_no_unkept_repository_state(
                 "which a bundle does not carry; preserve it"
             )
     if not submodule:
-        _assert_listed_module_repositories(vcs, config, checkout, path, git_directory)
+        _assert_listed_module_repositories(
+            vcs,
+            config,
+            checkout,
+            path,
+            git_directory,
+            salvage_unlisted=salvage_unlisted_modules,
+        )
     # Listing untracked files stops at an embedded repository and names it
     # with a trailing slash; salvage would record it only as a gitlink.
     untracked = vcs._run(
@@ -21546,6 +21564,13 @@ def _assert_no_unkept_repository_state(
     ).stdout.split("\0")
     for entry in untracked:
         if entry.endswith("/"):
+            # A dropped gitlink leaves its populated submodule directory
+            # untracked; when it is salvaged as its own candidate (#859) it
+            # is kept, unlike an arbitrary embedded repository.
+            if salvage_unlisted_modules and _is_unlisted_submodule_worktree(
+                vcs, path, entry.rstrip("/")
+            ):
+                continue
             raise Refusal(
                 f"checkout {checkout.name} holds a Git repository in untracked directory "
                 f"{entry}, which salvage does not keep; preserve it"
@@ -21553,9 +21578,20 @@ def _assert_no_unkept_repository_state(
 
 
 def _assert_listed_module_repositories(
-    vcs: _GitVcs, config: Config, checkout: Checkout, path: Path, git_directory: Path
+    vcs: _GitVcs,
+    config: Config,
+    checkout: Checkout,
+    path: Path,
+    git_directory: Path,
+    *,
+    salvage_unlisted: bool = False,
 ) -> None:
-    """Refuse a module repository in the worktree's Git directory that the checkout no longer lists."""
+    """Refuse a module repository in the worktree's Git directory that the checkout no longer lists.
+
+    With ``salvage_unlisted`` (a proven-dead owner's removal, #859) the
+    unlisted repositories are salvaged as their own candidates by
+    _salvage_agent_slot, so they are not refused here.
+    """
 
     # Every module repository kept in this worktree's Git directory must be
     # one the checkout lists, or its history would be deleted unseen.
@@ -21572,6 +21608,9 @@ def _assert_listed_module_repositories(
     for root, directories, files in os.walk(modules, followlinks=False):
         current = Path(root)
         if "HEAD" in files and (current / "objects").is_dir():
+            if salvage_unlisted:
+                directories[:] = [name for name in directories if name == "modules"]
+                continue
             if current not in listed_dirs:
                 raise Refusal(
                     f"checkout {checkout.name} keeps submodule repository {current} that "
@@ -21908,6 +21947,7 @@ def _salvage_candidate_uncached(
     detached_root: bool = False,
     accept_drift: bool = False,
     keep_private_state: bool = False,
+    salvage_unlisted_modules: bool = False,
 ) -> _SalvageCandidate:
     """See _salvage_candidate_facts.
 
@@ -21946,7 +21986,12 @@ def _salvage_candidate_uncached(
         raise StateError("private-state salvage requires its registry row")
     path = path_override or _stored_path(config, checkout.path, "checkout path")
     _assert_no_unkept_repository_state(
-        vcs, config, checkout, path, submodule=allow_detached
+        vcs,
+        config,
+        checkout,
+        path,
+        submodule=allow_detached,
+        salvage_unlisted_modules=salvage_unlisted_modules,
     )
     identity = {
         "GIT_AUTHOR_NAME": "wrkslots salvage",
@@ -22437,6 +22482,113 @@ def _submodule_salvage_checkouts_uncached(
         # update produces).
         _submodule_network_authority(config, submodule, managed, vcs, managed_authority)
         result.append((submodule, managed))
+    return tuple(result)
+
+
+def _is_unlisted_submodule_worktree(vcs: _GitVcs, checkout_path: Path, relative: str) -> bool:
+    """Whether ``relative`` under a checkout is a populated submodule worktree.
+
+    Its ``.git`` file must point into the checkout's own ``modules``
+    directory, which is what makes it a submodule repository the branch
+    stopped listing rather than an arbitrary embedded repository (#859).
+    """
+
+    worktree = checkout_path / relative
+    gitfile = worktree / ".git"
+    if not gitfile.is_file():
+        return False
+    try:
+        target = gitfile.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    if not target.startswith("gitdir:"):
+        return False
+    module_dir = Path(target.removeprefix("gitdir:").strip())
+    if not module_dir.is_absolute():
+        module_dir = (worktree / module_dir).resolve()
+    git_directory = Path(
+        vcs._run(checkout_path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
+    )
+    modules_root = git_directory / "modules"
+    return modules_root in module_dir.parents or module_dir.parent == modules_root
+
+
+def _unlisted_submodule_checkouts(
+    config: Config, checkout: Checkout, vcs: _GitVcs, checkout_path: Path
+) -> tuple[tuple[Checkout, Path], ...]:
+    """Return populated submodule worktrees the checkout no longer lists (#859).
+
+    A populated directory whose gitlink the branch dropped is invisible to
+    initialized_submodules, but its private repository still sits in the
+    checkout's ``modules`` directory and would be deleted unseen. Each found
+    worktree becomes a salvage candidate judged like a listed submodule;
+    when its source checkout is gone, its own module repository stands in as
+    the recorded repository (its remote is then the worktree's own, and
+    salvage archives it locally, never pushed).
+    """
+
+    listed = set(vcs.initialized_submodules(checkout_path))
+    git_directory = Path(
+        vcs._run(checkout_path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
+    )
+    modules_root = git_directory / "modules"
+    _relative, source_repository = _stored_repository_path(config, checkout.repository)
+    result: list[tuple[Checkout, Path]] = []
+    for root, directories, _files in os.walk(checkout_path, followlinks=False):
+        directories[:] = [name for name in directories if name != ".git"]
+        worktree = Path(root)
+        gitfile = worktree / ".git"
+        if worktree == checkout_path or not gitfile.is_file():
+            continue
+        try:
+            target = gitfile.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not target.startswith("gitdir:"):
+            continue
+        module_dir = Path(target.removeprefix("gitdir:").strip())
+        if not module_dir.is_absolute():
+            module_dir = (worktree / module_dir).resolve()
+        if modules_root not in module_dir.parents and module_dir.parent != modules_root:
+            continue
+        relative = worktree.relative_to(checkout_path).as_posix()
+        if relative in listed:
+            continue
+        remote = config.default_remote
+        managed_authority = vcs.remote_authority(worktree, remote)
+        head = vcs.head(worktree)
+        try:
+            source = _source_submodule_directory(
+                config, vcs, source_repository, Path(relative)
+            )
+        except Refusal:
+            source = None
+        if source is not None and source.is_dir() and not source.is_symlink():
+            repository = source.relative_to(config.root).as_posix()
+        else:
+            try:
+                repository = module_dir.relative_to(config.root).as_posix()
+            except ValueError:
+                raise Refusal(
+                    f"unlisted submodule repository {module_dir} is outside the "
+                    "project root; preserve it"
+                ) from None
+        result.append(
+            (
+                Checkout(
+                    name=f"{checkout.name}/{relative}",
+                    path=(Path(checkout.path) / relative).as_posix(),
+                    repository=repository,
+                    branch="",
+                    start_point=head,
+                    remote=remote,
+                    remote_url_sha256=managed_authority.sha256,
+                    landed_ref=_landed_ref_for_remote(config, remote),
+                    head=head,
+                ),
+                worktree,
+            )
+        )
     return tuple(result)
 
 
@@ -22951,6 +23103,7 @@ def _salvage_agent_slot(
     archive_root: Path | None = None,
     archive_drifted: bool = False,
     drift_refusal: str | None = None,
+    owner_proven_dead: bool = False,
 ) -> tuple[dict[str, object], ...]:
     """Salvage every checkout and initialized submodule of an agent slot.
 
@@ -22983,6 +23136,14 @@ def _salvage_agent_slot(
             config, checkout, vcs
         ):
             candidates.append((submodule, submodule_path, True, None, drift is not None))
+        if owner_proven_dead:
+            # A module repository the branch no longer lists is salvaged
+            # like a listed one (never pushed) instead of refusing the whole
+            # removal (#859); a live or unproven owner never reaches here.
+            for unlisted, unlisted_path in _unlisted_submodule_checkouts(
+                config, checkout, vcs, path
+            ):
+                candidates.append((unlisted, unlisted_path, True, None, True))
     prepared = [
         (
             checkout,
@@ -23001,6 +23162,7 @@ def _salvage_agent_slot(
                 allow_shallow=detached,
                 accept_drift=drift is not None,
                 keep_private_state=never_push,
+                salvage_unlisted_modules=owner_proven_dead and not detached,
             ),
         )
         for checkout, path, detached, drift, never_push in candidates
@@ -23192,6 +23354,7 @@ def _assert_salvage_still_matches(
         for value in receipts
     }
     targets: list[tuple[Checkout, Path, bool, bool]] = []
+    unlisted_names: set[str] = set()
     selected_checkouts = record.checkouts if checkouts is None else checkouts
     for checkout in selected_checkouts:
         path = (
@@ -23214,6 +23377,15 @@ def _assert_salvage_still_matches(
                 config, checkout, vcs, path_override=path
             )
         )
+        # Unlisted modules salvaged under #859 appear in the receipts but
+        # not in the listed enumeration; count them as targets so the
+        # exact-name check still holds.
+        for unlisted, unlisted_path in _unlisted_submodule_checkouts(
+            config, checkout, vcs, path
+        ):
+            if unlisted.name in by_name:
+                unlisted_names.add(unlisted.name)
+                targets.append((unlisted, unlisted_path, True, drift is not None))
     expected_names = {checkout.name for checkout, _path, _detached, _drift in targets}
     if (
         set(by_name) != expected_names
@@ -23221,6 +23393,9 @@ def _assert_salvage_still_matches(
         else not expected_names <= set(by_name)
     ):
         raise StateError("salvage receipts do not name every selected checkout exactly once")
+    unlisted_parents = {
+        name.rsplit("/", 1)[0] for name in unlisted_names if "/" in name
+    }
     prepared = [
         (
             checkout,
@@ -23237,6 +23412,9 @@ def _assert_salvage_still_matches(
                 allow_shallow=allow_detached,
                 accept_drift=drifted and not allow_detached,
                 keep_private_state=drifted,
+                salvage_unlisted_modules=(
+                    not allow_detached and checkout.name in unlisted_parents
+                ),
             ),
         )
         for checkout, path, allow_detached, drifted in targets
@@ -40085,6 +40263,7 @@ def _cmd_remove_in_scope(
                 archive_root=salvage_archive_root,
                 archive_drifted=archive_drifted,
                 drift_refusal=drift_refusal,
+                owner_proven_dead=owner_proven_dead,
             )
             evidence = tuple(
                 f"checkout {item['checkout']}: {item['disposition']} commit "
