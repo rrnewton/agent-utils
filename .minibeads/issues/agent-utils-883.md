@@ -3,7 +3,7 @@ title: 'wrkslots-shard-memory-and-heartbeat: shard-0 stays inside its memory cap
 status: open
 priority: 2
 issue_type: bug
-assignee: mu-salvage
+assignee: cl-start
 created_at: 2026-11-05T11:28:43.362021367+00:00
 updated_at: 2026-11-05T11:28:43.362021367+00:00
 ---
@@ -38,4 +38,4 @@ Two repeat offenders appeared in the gate ledger on 2026-11-05 after #875 fixed 
 
 # Notes
 
-From mu-salvage's look at the gate ledger on 2026-11-05. Assigned to mu-salvage after #881. If #879 changes the same liveness code, coordinate with mu-validate.
+From mu-salvage's look at the gate ledger on 2026-11-05. Assigned to mu-salvage after #881; moved to cl-start on 2026-11-05 at 10:20 AM ET because gate health fell to a 36% first-run pass rate. If #879 changes the same liveness code, coordinate with mu-validate.
