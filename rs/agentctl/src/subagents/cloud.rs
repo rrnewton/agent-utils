@@ -468,6 +468,105 @@ fn history_seq(raw: &str, key: &str) -> Option<u64> {
         .max()
 }
 
+/// The seq of the newest `user_input` in `agentcloudctl history --raw` output whose text holds
+/// the start of `text` (#852 D): the evidence for a prompt pasted into an agentterm view, which
+/// carries no idempotency key. The first [`VIEWED_PROBE`] letters and digits of a prompt (its
+/// header names the sender, the time and the reply ID) identify it; text the terminal added
+/// around it does not hide it.
+fn history_seq_of_text(raw: &str, text: &str) -> Option<u64> {
+    use crate::screen_heuristics::squash;
+    let probe: String = squash(text).chars().take(VIEWED_PROBE).collect();
+    if probe.is_empty() {
+        return None;
+    }
+    raw.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|frame| {
+            frame["event"]["type"] == "user_input"
+                && frame["event"]["text"]
+                    .as_str()
+                    .is_some_and(|input| squash(input).contains(&probe))
+        })
+        .filter_map(|frame| frame["seq"].as_u64())
+        .max()
+}
+
+/// How many letters and digits from the start of a prompt identify it in a session's history.
+const VIEWED_PROBE: usize = 64;
+
+/// An agentcloud session that a pane shows through `agentterm` (#852 D).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ViewedSession {
+    /// The session id agentterm was started with (`-s`, `--session`).
+    pub(crate) session: String,
+    /// The orchestrator endpoint it was started with (`--ws-url`, else its
+    /// `AGENTCLOUD_ORCHESTRATOR_URL`), if any.
+    pub(crate) endpoint: Option<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A stand-in for `/proc` in tests.
+    pub(crate) static PROC_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+fn proc_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = PROC_ROOT.with(|root| root.borrow().clone()) {
+        return root;
+    }
+    PathBuf::from("/proc")
+}
+
+/// The agentcloud session that Herdr pane `pane` shows through `agentterm`, if it does (#852 D).
+pub(crate) fn pane_views_session(pane: &str) -> Option<ViewedSession> {
+    viewed_session(&proc_root(), pane)
+}
+
+/// The session the `agentterm` process in Herdr pane `pane` views: a process whose environment
+/// names the pane (`HERDR_PANE_ID`) and whose program is `agentterm` started with a session id.
+fn viewed_session(proc_root: &Path, pane: &str) -> Option<ViewedSession> {
+    let entries = fs::read_dir(proc_root).ok()?;
+    let mut pids: Vec<u32> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .collect();
+    pids.sort_unstable();
+    pids.into_iter().find_map(|pid| {
+        let pid = pid.to_string();
+        if crate::inbox::environment_value(proc_root, &pid, "HERDR_PANE_ID").as_deref()
+            != Some(pane)
+        {
+            return None;
+        }
+        let raw = fs::read(proc_root.join(&pid).join("cmdline")).ok()?;
+        let argv: Vec<String> = raw
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
+        let program = Path::new(argv.first()?).file_name()?.to_str()?;
+        if program != "agentterm" {
+            return None;
+        }
+        let value = |short: &str, long: &str| {
+            argv.iter().enumerate().skip(1).find_map(|(index, arg)| {
+                if arg == short || arg == long {
+                    argv.get(index + 1).cloned()
+                } else {
+                    arg.strip_prefix(&format!("{long}=")).map(str::to_owned)
+                }
+            })
+        };
+        let session = value("-s", "--session").filter(|session| !session.is_empty())?;
+        let endpoint = value("-w", "--ws-url").or_else(|| {
+            crate::inbox::environment_value(proc_root, &pid, "AGENTCLOUD_ORCHESTRATOR_URL")
+                .filter(|url| !url.is_empty())
+        });
+        Some(ViewedSession { session, endpoint })
+    })
+}
+
 /// Insert the recorded endpoint after the verb, so no fallback can pick another orchestrator.
 fn with_endpoint(mut arguments: Vec<String>, endpoint: &str) -> Vec<String> {
     arguments.splice(1..1, ["--ws-url".to_owned(), endpoint.to_owned()]);
@@ -1687,6 +1786,111 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             }
             Ok(None) | Err(_) => Ok(None),
         }
+    }
+
+    /// The agentcloud session that unknown-harness `record`'s pane shows through `agentterm`,
+    /// if it does (#852 D).
+    pub(super) fn viewed_session_of(&self, record: &AgentRecord) -> Option<ViewedSession> {
+        if !crate::unknown_harness::is_unknown(&record.harness) {
+            return None;
+        }
+        viewed_session(&proc_root(), record.pane_id.as_deref()?)
+    }
+
+    /// `agentcloudctl history ARGUMENTS --session SESSION` against `endpoint` (the default one
+    /// when `None`), its standard output.
+    fn session_history(
+        &self,
+        session: &str,
+        endpoint: Option<&str>,
+        arguments: &[&str],
+    ) -> Result<String> {
+        let executable = resolve_tool(&self.cloud_tools.agentcloudctl, "--agentcloudctl-bin")?;
+        let mut words = vec!["history".to_owned()];
+        words.extend(arguments.iter().map(|word| (*word).to_owned()));
+        words.extend(["--session".to_owned(), session.to_owned()]);
+        let endpoint = endpoint.map_or_else(|| self.default_endpoint(), str::to_owned);
+        let run = run_tool(
+            &executable,
+            &with_endpoint(words, &endpoint),
+            control_timeout(),
+            self.child_session(),
+        )?;
+        if run.code != Some(0) {
+            return Err(client_error(failure("history", &run)));
+        }
+        Ok(run.stdout)
+    }
+
+    /// The queue state of `message_id` for unknown-harness `record`, as `queued` says, unless
+    /// its pane is an agentterm view of an agentcloud session (#852 D): then a prompt the pane
+    /// path could not prove submitted (failed, as possibly submitted) is `Processed` once the
+    /// session's history shows its text, which `cloud-inputs/` then records.
+    pub(super) fn viewed_message_state(
+        &self,
+        record: &AgentRecord,
+        message_id: &str,
+        queued: Option<agent::QueueMessageState>,
+    ) -> Result<Option<agent::QueueMessageState>> {
+        if queued != Some(agent::QueueMessageState::Failed) || !super::message_id(message_id) {
+            return Ok(queued);
+        }
+        let Some(view) = self.viewed_session_of(record) else {
+            return Ok(queued);
+        };
+        let noted = agent::read_private_json(&self.cloud_input_path(&record.name, message_id)?);
+        if noted.is_ok_and(|noted| noted["state"] == CloudInputState::Accepted.as_str()) {
+            return Ok(Some(agent::QueueMessageState::Processed));
+        }
+        let failed = agent_queue::queue::QueueDirectories::new(&self.queue(&record.name)?)
+            .failed
+            .join(format!("{message_id}.json"));
+        let Some(text) = agent_queue::queue::load_message(&failed)
+            .ok()
+            .and_then(|document| {
+                document
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+        else {
+            return Ok(queued);
+        };
+        let limit = CLOUD_HISTORY_INPUTS.to_string();
+        let raw = match self.session_history(
+            &view.session,
+            view.endpoint.as_deref(),
+            &["--type", "user_input", "--last", &limit, "--raw"],
+        ) {
+            Ok(raw) => raw,
+            Err(_) => return Ok(queued),
+        };
+        match history_seq_of_text(&raw, &text) {
+            Some(seq) => {
+                self.note_cloud_input(
+                    &record.name,
+                    message_id,
+                    CloudInputState::Accepted,
+                    Some(seq),
+                )?;
+                Ok(Some(agent::QueueMessageState::Processed))
+            }
+            None => Ok(queued),
+        }
+    }
+
+    /// The reply text of the agentcloud session that unknown-harness `record`'s pane views
+    /// through agentterm, from the session's history: its last `lines` rows (#852 D).
+    pub(super) fn viewed_capture(&self, view: &ViewedSession, lines: usize) -> Result<String> {
+        let raw = self.session_history(
+            &view.session,
+            view.endpoint.as_deref(),
+            &["--raw", "--last", "300"],
+        )?;
+        let text = reply_text_from_history(&raw);
+        let all: Vec<&str> = text.lines().collect();
+        let start = all.len().saturating_sub(lines.max(1));
+        Ok(all[start..].join("\n"))
     }
 
     /// The durable seq of the newest input the session history of `record` holds under the
@@ -4365,6 +4569,68 @@ exit 0
         .unwrap();
         assert_eq!(noted["state"], "accepted");
         assert_eq!(noted["seq"], 9);
+    }
+
+    #[test]
+    fn an_agentterm_process_names_the_session_its_pane_views() {
+        let proc_root = std::env::temp_dir().join(format!(
+            "agentctl-viewed-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let process = |pid: &str, pane: &str, cmdline: &str, environment: &str| {
+            let dir = proc_root.join(pid);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("environ"),
+                format!("HERDR_PANE_ID={pane}\0{environment}"),
+            )
+            .unwrap();
+            fs::write(dir.join("cmdline"), cmdline).unwrap();
+        };
+        process("10", "w1:p1", "/bin/bash\0", "");
+        process(
+            "11",
+            "w1:p1",
+            "/usr/local/bin/agentterm\0--session=s-1\0",
+            "AGENTCLOUD_ORCHESTRATOR_URL=wss://o.test/ws\0",
+        );
+        process(
+            "12",
+            "w1:p2",
+            "agentterm\0-w\0wss://p.test/ws\0-s\0s-2\0",
+            "",
+        );
+        process("13", "w1:p3", "claude\0-s\0x\0", "");
+        assert_eq!(
+            viewed_session(&proc_root, "w1:p1"),
+            Some(ViewedSession {
+                session: "s-1".into(),
+                endpoint: Some("wss://o.test/ws".into())
+            })
+        );
+        assert_eq!(
+            viewed_session(&proc_root, "w1:p2"),
+            Some(ViewedSession {
+                session: "s-2".into(),
+                endpoint: Some("wss://p.test/ws".into())
+            })
+        );
+        assert_eq!(viewed_session(&proc_root, "w1:p3"), None);
+        assert_eq!(viewed_session(&proc_root, "w9:p9"), None);
+        let text = "[from U0OWNER via slack C0CHANNEL · sent: 2026.11.05:14:11 EST · reply: <CHAT_REPLY_052>]";
+        let input = |seq: u64, text: &str| {
+            json!({"frame": "durable", "seq": seq, "event": {"type": "user_input", "text": text}})
+                .to_string()
+        };
+        let raw = [
+            input(5, "something else"),
+            input(6, &format!("]10;rgb:dcdc/dcdc/dcdc\\{text}\nbody")),
+        ]
+        .join("\n");
+        assert_eq!(history_seq_of_text(&raw, text), Some(6));
+        assert_eq!(history_seq_of_text(&raw, "[from someone else] other"), None);
+        fs::remove_dir_all(&proc_root).ok();
     }
 
     #[test]

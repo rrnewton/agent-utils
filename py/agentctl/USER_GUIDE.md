@@ -1895,11 +1895,21 @@ alone, with these rules:
   bottom of the screen (matching only its letters and digits, so wrapping,
   box borders and prompt glyphs do not matter) or the screen changes and
   settles, then Enter.
-- **Confirmation**: the prompt counts as submitted once the text no longer
-  sits at the bottom *as it did when staged*: the rows after it changed (a new
-  prompt line, output, a redrawn input box) or it left the bottom. A
-  line-oriented TUI keeps the submitted line on screen above its next prompt.
-  The new rows after that line are the proof.
+- **Confirmation needs evidence** (#852 D): the prompt counts as submitted only
+  when the screen shows it submitted: our text above the bottom rows, where a
+  line-oriented TUI keeps the submitted line, or on agentterm a new `You:` turn
+  in the conversation that shows the prompt's opening. Text that only left the
+  bottom, a screen that only changed, or the text in the composer proves
+  nothing. Without evidence within 30 s the outcome is unknown: the queue keeps
+  the prompt as possibly submitted and never types it again, and the chat
+  bridge reports the request as uncertain and alarms on it.
+- **agentterm on an agentcloud session**: when the pane runs `agentterm -s
+  SESSION` (found through the process whose environment names the pane), the
+  session's history is the evidence: a prompt whose submission the screen could
+  not prove counts as delivered once `agentcloudctl history` shows an input
+  holding its opening, recorded in the agent's `cloud-inputs/`. The chat bridge
+  reads that agent's replies from the session's history too, as it does for an
+  agentcloud record.
 - **Enter under uncertainty**: a leftover that is still identical gets another
   bare Enter, 1 s apart and then doubling up to 4 s, at most 5 presses. Text is
   never pasted twice. If the paste never showed and one Enter changed nothing,

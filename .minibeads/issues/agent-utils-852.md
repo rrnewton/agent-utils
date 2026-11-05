@@ -58,6 +58,16 @@ P1, owner via the lead (2026-11-04 17:36-17:41 ET). Assigned to cl-start after #
   - A composer draft that is not a placeholder is refused with the shared `composer already holds unsubmitted text` wording, so the bridge's alarm and draft reporting see it. An earlier pass's own stranded paste still gets Enter.
   - Tested with screens laid out like the recorded idle and working agentterm screens (names replaced), and through the fake TUI.
   - Not done: the stale-composer clear for an agentterm draft (agentterm's clearing keys are unverified), and transcript harvesting. Replies are captured from the screen, as done in P0, or with `chat reply --file`.
-- Remaining: B and D.
+- D (cl-start, 2026-11-05): unknown-pane receipts need evidence, and an agentterm view of an agentcloud session uses that session's history.
+  - A pane driven by the generic rules gives a receipt only when the screen shows the prompt submitted: our text above the bottom rows, or on agentterm a new `You:` turn in the conversation that holds the prompt's first 64 letters and digits (`harness::agentterm::submitted_turns`, with a side panel cut off first).
+  - Text that only left the bottom, a screen that only changed (taken before Enter, a paste never drawn), or the text in the composer or agentterm's `↳ queued:` row proves nothing. After 30 s with no evidence the outcome is unknown: the queue keeps the prompt as possibly submitted, never types it again, and the bridge reports the request uncertain and alarms on it.
+  - A pane whose process runs `agentterm -s SESSION` (found through the process whose environment names the pane; `--ws-url` or its `AGENTCLOUD_ORCHESTRATOR_URL` give the endpoint) takes its evidence from that session's history. A prompt the screen could not prove counts as `Processed` once a `user_input` holds its opening, even behind terminal colour replies (#900), and that is recorded in `cloud-inputs/`.
+  - Its replies are captured from the session's history, and the transcript reader names that history as the reply source, as for an agentcloud record. Prompts to it stay command-only (#896).
+  - Tests:
+    - recorded-layout `You:` turns, the composer and the queued row;
+    - the fake TUI with a swallowed input, an agentterm view with no turn, and a prompt stranded in the composer;
+    - process discovery, and history matching by text;
+    - an adopted unknown pane viewing a session: uncertain, then delivered from history, then replies captured from history.
+- Remaining: B (the auto-fallback to unknown, better refusal text, reminders by the agentterm frame).
 
 D scope set by the lead on 2026-11-05 at 1:04 PM ET: #896 left unknown-pane receipts unchanged to keep an interim agentterm target working, so evidence for unknown panes and agentterm-on-cloud history capture land here. Queued right after #896 and #897.

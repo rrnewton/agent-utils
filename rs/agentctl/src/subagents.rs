@@ -34,6 +34,7 @@ use crate::error::{AdapterError, AdapterErrorKind};
 use crate::submission::{GuardedInput, GuardedPrompt, Submission};
 
 mod cloud;
+pub(crate) use cloud::pane_views_session;
 mod control;
 mod headless;
 mod launch_spec;
@@ -11363,7 +11364,9 @@ its drain would also type, so it was not queued",
             return self.cloud_message_state(&record, message_id);
         }
         record.supported()?;
-        agent::message_state(&self.queue(agent_name)?, message_id)
+        let queued = agent::message_state(&self.queue(agent_name)?, message_id)?;
+        // An agentterm view of a cloud session: its history is the evidence (#852 D).
+        self.viewed_message_state(&record, message_id, queued)
     }
 
     pub(crate) fn message_state_with_runtime(
@@ -11382,7 +11385,9 @@ its drain would also type, so it was not queued",
             return self.cloud_message_state(&record, message_id);
         }
         record.supported()?;
-        agent::message_state(&self.queue(agent_name)?, message_id)
+        let queued = agent::message_state(&self.queue(agent_name)?, message_id)?;
+        // An agentterm view of a cloud session: its history is the evidence (#852 D).
+        self.viewed_message_state(&record, message_id, queued)
     }
 
     /// What the queue of `agent_name` recorded for a typed `/goal` command `message_id`: the
@@ -11927,6 +11932,11 @@ its drain would also type, so it was not queued",
             self.snapshot(&record, &text)?;
             return Ok(text);
         }
+        if let Some(view) = self.viewed_session_of(&record) {
+            let text = self.viewed_capture(&view, lines)?;
+            self.snapshot(&record, &text)?;
+            return Ok(text);
+        }
         self.checked_policy(&record, false)?;
         let text = agent::read_capture(self.client, &self.target(&record)?, lines)?;
         self.snapshot(&record, &text)?;
@@ -11975,6 +11985,14 @@ its drain would also type, so it was not queued",
         // from its journal — never a scrape of its `agentterm` pane.
         if record.is_cloud() {
             let text = self.cloud_capture_record(&record, lines)?;
+            if persist {
+                self.snapshot(&record, &text)?;
+            }
+            return Ok(text);
+        }
+        // So are those of a session an unknown-harness pane views through agentterm (#852 D).
+        if let Some(view) = self.viewed_session_of(&record) {
+            let text = self.viewed_capture(&view, lines)?;
             if persist {
                 self.snapshot(&record, &text)?;
             }
@@ -17363,6 +17381,89 @@ fi
             fixture.manager().pane_info("foreign").unwrap().status,
             "blocked"
         );
+    }
+
+    #[test]
+    fn an_agentterm_view_of_a_cloud_session_takes_evidence_and_replies_from_its_history() {
+        // #852 D: a pane driven by the generic rules that runs `agentterm -s SESSION`. A prompt
+        // the pane path could not prove submitted is delivered once the session's history shows
+        // its text; replies are read from that history, not the pane.
+        let fixture = Fixture::new();
+        fixture.prepare_foreign();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let mut options = fixture.adopt_options();
+        options.harness = crate::unknown_harness::HARNESS.to_owned();
+        fixture.manager().adopt("foreign", options).unwrap();
+        let pane = fixture.manager().load("foreign").unwrap().pane_id.unwrap();
+        let proc_dir = fixture.root.join("proc");
+        fs::create_dir_all(proc_dir.join("4242")).unwrap();
+        fs::write(
+            proc_dir.join("4242/environ"),
+            format!("TERM=xterm\0HERDR_PANE_ID={pane}\0"),
+        )
+        .unwrap();
+        fs::write(proc_dir.join("4242/cmdline"), "agentterm\0-s\0sess-1\0").unwrap();
+        cloud::PROC_ROOT.with(|root| *root.borrow_mut() = Some(proc_dir.clone()));
+        let tools = fixture.root.join("cloud-tools");
+        fs::create_dir_all(&tools).unwrap();
+        let script = tools.join("agentcloudctl");
+        fs::write(
+            &script,
+            "#!/bin/sh\ncat \"$(dirname \"$0\")/history.out\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let history = tools.join("history.out");
+        fs::write(&history, "").unwrap();
+        let manager = fixture.manager().with_cloud_tools(cloud::CloudTools {
+            agentcloudctl: script,
+            ..cloud::CloudTools::default()
+        });
+        assert_eq!(
+            cloud::pane_views_session(&pane),
+            Some(cloud::ViewedSession {
+                session: "sess-1".into(),
+                endpoint: None
+            })
+        );
+        let text = "[from U0OWNER via slack C0CHANNEL · sent: 2026.11.05:14:11 EST · reply: \
+                    <CHAT_REPLY_052>]\n\n<chat_message>\nping\n</chat_message>";
+        let queue = manager.queue("foreign").unwrap();
+        let directories = agent_queue::queue::prepare(&queue).unwrap();
+        agent::atomic_json(
+            &directories.failed.join("chat-1.json"),
+            &agent_queue::queue::plain_item("chat-1", text),
+        )
+        .unwrap();
+        assert_eq!(
+            manager.message_state("foreign", "chat-1").unwrap(),
+            Some(agent::QueueMessageState::Failed),
+            "no evidence yet: uncertain"
+        );
+        // The history shows it, after the colour replies the terminal put ahead of it.
+        let frame = serde_json::json!({"frame": "durable", "seq": 565_630, "event": {
+            "type": "user_input",
+            "text": format!("]10;rgb:dcdc/dcdc/dcdc\\]11;rgb:0000/0000/0000\\{text}")}});
+        fs::write(&history, format!("{frame}\n")).unwrap();
+        assert_eq!(
+            manager.message_state("foreign", "chat-1").unwrap(),
+            Some(agent::QueueMessageState::Processed)
+        );
+        let block = serde_json::json!({"frame": "durable", "event": {"type": "block",
+            "block": {"kind": "text", "text": "<CHAT_REPLY_052>\npong\n</CHAT_REPLY_052>"}}});
+        fs::write(&history, format!("{block}\n")).unwrap();
+        let capture = manager.read_capture("foreign", 50).unwrap();
+        assert!(capture.contains("pong"), "{capture}");
+        // Recorded: the receipt stays without reading the history again.
+        fs::write(&history, "").unwrap();
+        assert_eq!(
+            manager.message_state("foreign", "chat-1").unwrap(),
+            Some(agent::QueueMessageState::Processed)
+        );
+        cloud::PROC_ROOT.with(|root| *root.borrow_mut() = None);
     }
 
     #[test]

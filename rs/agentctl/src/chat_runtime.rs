@@ -40,7 +40,7 @@ mod observe;
 mod rejections;
 mod reply_reminders;
 mod repoint;
-mod screen_layout;
+pub(crate) mod screen_layout;
 
 pub use held_replies::{parse_held_handle, HeldReply, HoldReason, DEFAULT_HOLD_REPLIES_OLDER_THAN};
 

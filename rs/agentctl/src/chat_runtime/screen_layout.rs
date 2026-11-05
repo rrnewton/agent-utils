@@ -38,7 +38,7 @@ const AGENT_LABEL: &str = "Agent: ";
 
 /// `screen` in the scanner's layout, as the module documentation describes; the screen itself
 /// when it already is.
-pub(super) fn normalize(screen: &str) -> Cow<'_, str> {
+pub(crate) fn normalize(screen: &str) -> Cow<'_, str> {
     let mut rows: Vec<&str> = screen.split('\n').collect();
     if let Some(frame) = input_frame(&rows) {
         rows.truncate(frame);
@@ -153,7 +153,7 @@ fn relabel(rows: &mut [String]) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The width of the conversation left of the panel in [`agentterm_screen`].

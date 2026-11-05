@@ -602,7 +602,18 @@ fn record_hints(registry: &Path, name: &str) -> Option<(String, Hints)> {
         .ok()?
         .join("agent.json");
     let record: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    let harness = record["harness"].as_str()?.to_owned();
+    let mut harness = record["harness"].as_str()?.to_owned();
+    // A pane driven by the generic rules that shows an agentcloud session through agentterm:
+    // its replies are read from that session's history, as a cloud target's are (#852 D).
+    if crate::unknown_harness::is_unknown(&harness)
+        && record["pane_id"]
+            .as_str()
+            .and_then(crate::subagents::pane_views_session)
+            .is_some()
+    {
+        harness = crate::harness::HarnessAdapter::name(&crate::harness::agentcloud::AgentCloud)
+            .to_owned();
+    }
     let session = record_hints_session(&record);
     let hints = Hints {
         pid: record

@@ -101,6 +101,64 @@ pub fn frame(screen: &str) -> Option<Frame> {
     })
 }
 
+/// How many letters and digits from the start of a prompt identify it in a `You:` turn.
+const TURN_PROBE: usize = 64;
+
+/// How many submitted turns on `screen` show `text` (#852 D, unknown-pane receipts need
+/// evidence): agentterm draws an input the session took as a `You:` turn in its conversation,
+/// above the input frame. A turn shows `text` when its rows, up to the next labelled row,
+/// contain the first [`TURN_PROBE`] letters and digits of `text`. The same text sitting in the
+/// composer is not a turn: it means the input was not submitted. A side panel down the right edge
+/// is cut off first, so its rows never split a wrapped turn.
+#[must_use]
+pub fn submitted_turns(screen: &str, text: &str) -> usize {
+    use crate::screen_heuristics::squash;
+    let probe: String = squash(text).chars().take(TURN_PROBE).collect();
+    if probe.is_empty() {
+        return 0;
+    }
+    let normalized = crate::chat_runtime::screen_layout::normalize(screen);
+    let mut rows: Vec<&str> = normalized.lines().collect();
+    // Only the conversation counts: everything from the input frame down is dropped.
+    if let Some(top) = rows.iter().rposition(|row| {
+        let row = row.trim_start();
+        row.starts_with("╭ ") && row.ends_with('╮')
+    }) {
+        rows.truncate(top);
+    }
+    let label = |row: &str| -> Option<bool> {
+        let row = row.trim_start();
+        if row.starts_with("You: ") || row.starts_with("❯ ") {
+            Some(true)
+        } else if row.starts_with("Agent: ") || row.starts_with("··· ") || row.starts_with("↳ ")
+        {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    let mut count = 0;
+    let mut turn: Option<String> = None;
+    for row in rows.iter().chain(std::iter::once(&"Agent: ")) {
+        match label(row) {
+            Some(prompt) => {
+                if turn.take().is_some_and(|text| text.contains(&probe)) {
+                    count += 1;
+                }
+                if prompt {
+                    turn = Some(squash(row));
+                }
+            }
+            None => {
+                if let Some(text) = turn.as_mut() {
+                    text.push_str(&squash(row));
+                }
+            }
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -175,5 +233,36 @@ pub(crate) mod tests {
         assert_eq!(frame("plain shell prompt $ \n"), None);
         // A side panel's top border is no input frame: it has no composer row under it.
         assert_eq!(frame(" text ╭ nodes ────╮\n more │attached │\n"), None);
+    }
+    #[test]
+    fn a_submitted_turn_shows_the_prompt_and_the_composer_never_does() {
+        // #852 D: evidence is a `You:` turn in the conversation, never the composer.
+        let prompt = "[from U0OWNER via slack C0CHANNEL · sent: 2026.11.04:14:46 PST · reply: \
+                      <CHAT_REPLY_047> or agentctl chat reply 047]\n\n<chat_message>\nDid you \
+                      edit the weekly post to link it?\n</chat_message>";
+        let screen = crate::chat_runtime::screen_layout::tests::agentterm_screen();
+        assert_eq!(
+            submitted_turns(&screen, prompt),
+            1,
+            "wrapped beside a side panel"
+        );
+        assert_eq!(
+            submitted_turns(&screen, "[from someone else via slack] other"),
+            0
+        );
+        // The same prompt only in the composer: not submitted.
+        let composed = IDLE.replace(
+            "│> send a message to the session                                                                               │",
+            "│> [from U0OWNER via slack C0CHANNEL · sent: 2026.11.04:14:46 PST · reply: <CHAT_REPLY_047> or agentctl  │",
+        );
+        assert_eq!(submitted_turns(&composed, prompt), 0);
+        // Nor a queued one, which waits for the turn to end.
+        assert_eq!(
+            submitted_turns(
+                WORKING,
+                "[from lane-a via agentctl · reply: agentctl send lane-a] report 1 of 5"
+            ),
+            0
+        );
     }
 }

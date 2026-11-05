@@ -9,6 +9,13 @@
 //! * **Delivery** is acknowledged, never assumed: bracketed paste, poll until the paste shows
 //!   (our text at the bottom of the screen, or a change that settles), then Enter, then poll until
 //!   the text no longer sits at the bottom as it did when staged.
+//! * **A receipt needs evidence** (#852 D): the prompt shown as submitted, which is our text on
+//!   screen once it no longer sits where it was staged, or on an agentterm screen a new `You:` turn
+//!   that shows it
+//!   ([`crate::harness::agentterm::submitted_turns`]). Text that only left the bottom, a screen
+//!   that only changed, or the text in the composer proves nothing: the submission's outcome is
+//!   unknown, so the queue holds the prompt as possibly submitted, never types it again, and the
+//!   chat bridge reports the request uncertain.
 //! * **Enter under uncertainty**: an identical leftover gets another bare Enter, on a doubling
 //!   wait, at most [`MAX_ENTER_PRESSES`] in all, the menu guard checked before every press. Text is
 //!   never pasted twice: text of ours already stranded at the bottom gets Enter instead of a
@@ -196,6 +203,30 @@ pub fn submit(
         return refuse(reason);
     }
     let started = runtime.monotonic();
+    // What counts as the prompt shown submitted (#852 D).
+    let agentterm_view = crate::harness::agentterm::frame(&before).is_some();
+    let baseline = crate::harness::agentterm::submitted_turns(&before, text);
+    // Off agentterm, a line-oriented TUI keeps the submitted line on screen, above its next
+    // prompt and often within the bottom rows. Every caller asks this only once the text no
+    // longer sits where it was staged.
+    let submitted = |screen: &str| {
+        if agentterm_view {
+            crate::harness::agentterm::submitted_turns(screen, text) > baseline
+        } else {
+            screen::echoed_above(screen, text) || screen::locate_in_bottom(screen, text).is_some()
+        }
+    };
+    let unproven = |what: &str| -> Result<Submission> {
+        Err(AdapterError::unavailable(format!(
+            "pane {pane_id}: {what}, but no row shows the prompt submitted{}; its delivery is \
+             unproven, outcome is unknown",
+            if agentterm_view {
+                " (agentterm draws a submitted input as a `You:` turn)"
+            } else {
+                ""
+            }
+        )))
+    };
     let receipt = |presses: u32, evidence: String, printed: bool, settled: bool| {
         Ok(Submission::Verified(SubmissionReceipt {
             key: "Enter",
@@ -212,10 +243,22 @@ pub fn submit(
     // no longer at the bottom left it between passes.
     let staged = if runtime.stranded_retry() {
         if screen::locate_in_bottom(&before, text).is_none() {
+            let shown = if agentterm_view {
+                baseline > 0
+            } else {
+                screen::echoed_above(&before, text)
+            };
+            if !shown {
+                return unproven(
+                    "the stranded prompt left the bottom of the screen between passes",
+                );
+            }
             return receipt(
                 0,
-                "the stranded prompt left the bottom of the screen between passes".to_owned(),
-                screen::echoed_above(&before, text),
+                "the stranded prompt left the bottom of the screen between passes and shows \
+                 submitted"
+                    .to_owned(),
+                true,
                 true,
             );
         }
@@ -233,28 +276,43 @@ pub fn submit(
         match wait_staged(terminal, pane_id, text, &before, timeouts.stage, runtime)? {
             Staged::Shown(screen) => screen,
             Staged::Consumed => {
+                let deadline = runtime.monotonic().saturating_add(timeouts.submit);
+                if !await_submitted(terminal, pane_id, runtime, deadline, &submitted)? {
+                    return unproven("the text left the bottom before Enter");
+                }
                 return receipt(
                     0,
-                    "consumed before Enter: the text left the bottom and shows above it".to_owned(),
+                    "consumed before Enter: the text left the bottom and shows submitted"
+                        .to_owned(),
                     true,
                     true,
-                )
+                );
             }
             Staged::Answered(screen) => {
                 // One bare Enter under uncertainty: nothing on an input the TUI already took,
                 // the submission if the new rows were only a hint under it.
                 press_enter(terminal, pane_id, text, &screen)?;
+                let deadline = runtime.monotonic().saturating_add(timeouts.submit);
+                if !await_submitted(terminal, pane_id, runtime, deadline, &submitted)? {
+                    return unproven(
+                        "new rows followed the text before Enter, and one Enter was pressed under \
+                         uncertainty",
+                    );
+                }
                 return receipt(
                     1,
-                    "taken before Enter: new rows follow the text; one Enter pressed under \
-                     uncertainty"
+                    "taken before Enter: new rows follow the text, which shows submitted after \
+                     one Enter pressed under uncertainty"
                         .to_owned(),
                     true,
                     false,
                 );
             }
             Staged::Undrawn(screen) => {
-                return submit_undrawn(terminal, pane_id, text, &before, &screen, runtime, receipt)
+                return submit_undrawn(
+                    terminal, pane_id, text, &before, &screen, runtime, &submitted, &unproven,
+                    receipt,
+                )
             }
         }
     };
@@ -290,17 +348,21 @@ pub fn submit(
             }
         }
         if !tail.leftover(&now_screen, text) {
-            // Gone from the bottom; held for SETTLE so a redraw is not taken for a submission.
+            // Gone from the bottom; held for SETTLE so a redraw is not taken for a submission,
+            // then confirmed only by a row that shows it submitted (#852 D).
             let since = *gone_since.get_or_insert(now);
             if now.saturating_sub(since) >= SETTLE {
-                let echoed = screen::echoed_above(&now_screen, text)
-                    || screen::locate_in_bottom(&now_screen, text).is_some();
-                let evidence = if echoed {
-                    "the text left the bottom of the screen and shows above what follows it"
-                } else {
-                    "the text left the bottom of the screen"
-                };
-                return receipt(presses, evidence.to_owned(), echoed, true);
+                if submitted(&now_screen) {
+                    return receipt(
+                        presses,
+                        "the text left the bottom of the screen and shows submitted".to_owned(),
+                        true,
+                        true,
+                    );
+                }
+                if now >= deadline {
+                    return unproven("the text left the bottom of the screen");
+                }
             }
             continue;
         }
@@ -412,9 +474,36 @@ fn wait_staged(
     }
 }
 
+/// Poll `pane_id` until `submitted` holds for its screen or `deadline` passes; whether it held.
+fn await_submitted(
+    terminal: &dyn PromptTerminal,
+    pane_id: &str,
+    runtime: &dyn AgentRuntime,
+    deadline: Duration,
+    submitted: &dyn Fn(&str) -> bool,
+) -> Result<bool> {
+    loop {
+        if runtime.cancelled() {
+            return Err(AdapterError::unavailable(format!(
+                "pane {pane_id}: delivery was cancelled while its submission was confirmed; \
+                 outcome is unknown"
+            )));
+        }
+        if submitted(&terminal.read_screen(pane_id)?) {
+            return Ok(true);
+        }
+        if runtime.monotonic() >= deadline {
+            return Ok(false);
+        }
+        runtime.sleep(POLL);
+    }
+}
+
 /// A paste that never changed the screen: press Enter once (it may sit invisibly in the TUI's
-/// input) and watch. A change means the TUI took it; no change at all means it took no input,
-/// and the prompt is safe to retry.
+/// input) and watch. A change that shows the prompt submitted means the TUI took it; a change
+/// that does not proves nothing (#852 D); no change at all means it took no input, and the
+/// prompt is safe to retry.
+#[allow(clippy::too_many_arguments)]
 fn submit_undrawn(
     terminal: &dyn PromptTerminal,
     pane_id: &str,
@@ -422,17 +511,18 @@ fn submit_undrawn(
     before: &str,
     screen_now: &str,
     runtime: &dyn AgentRuntime,
+    submitted: &dyn Fn(&str) -> bool,
+    unproven: &dyn Fn(&str) -> Result<Submission>,
     receipt: impl Fn(u32, String, bool, bool) -> Result<Submission>,
 ) -> Result<Submission> {
     press_enter(terminal, pane_id, text, screen_now)?;
     let quiet = screen::quiet_key(screen_now);
-    let deadline = runtime.monotonic().saturating_add(UNDRAWN_WATCH);
+    let mut deadline = runtime.monotonic().saturating_add(UNDRAWN_WATCH);
+    let mut changed = false;
     loop {
         runtime.sleep(POLL);
         let after = terminal.read_screen(pane_id)?;
         if screen::quiet_key(&after) != quiet {
-            let shown = screen::echoed_above(&after, text)
-                || screen::locate_in_bottom(&after, text).is_some();
             if screen::above_static_tail(before, &after, text) == Some(true) {
                 // The late render arrived after the Enter: still at the bottom. Leave it for the
                 // next attempt, which submits it with Enter rather than pasting again.
@@ -442,14 +532,26 @@ fn submit_undrawn(
                      only"
                 )));
             }
-            return receipt(
-                1,
-                "the screen changed only after Enter on a paste it never showed".to_owned(),
-                shown,
-                false,
-            );
+            if submitted(&after) {
+                return receipt(
+                    1,
+                    "the screen showed the prompt submitted only after Enter on a paste it never \
+                     showed"
+                        .to_owned(),
+                    true,
+                    false,
+                );
+            }
+            if !changed {
+                // A change: give it the submit deadline to show the prompt submitted.
+                changed = true;
+                deadline = runtime.monotonic().saturating_add(SUBMIT_TIMEOUT);
+            }
         }
         if runtime.monotonic() >= deadline {
+            if changed {
+                return unproven("the screen changed only after Enter on a paste it never showed");
+            }
             return Ok(Submission::NotStaged(format!(
                 "pane {pane_id}: the paste never showed on screen and one Enter changed nothing: \
                  the TUI took no input; safe to retry"
@@ -507,6 +609,8 @@ pub(crate) mod fake {
         /// Draw the input in agentterm's input frame under this label (`idle`, `⠹ working
         /// 0:12`, ...), instead of a bare line.
         pub agentterm: Option<String>,
+        /// Enter takes the input but nothing shows it: no transcript row.
+        pub swallow: bool,
         /// Every prompt the TUI took, in order.
         pub submitted: Vec<String>,
         /// Every key and paste received.
@@ -531,13 +635,21 @@ pub(crate) mod fake {
 
     fn take(state: &mut State) {
         let line = std::mem::take(&mut state.input);
-        for (index, row) in line.split('\n').enumerate() {
-            let glyph = if index == 0 { "> " } else { "  " };
-            state.transcript.push(format!("{glyph}{row}"));
+        if !state.swallow {
+            // agentterm draws a submitted input as a `You:` turn, one column in.
+            let (first, rest, answer) = if state.agentterm.is_some() {
+                (" You: ", "      ", " Agent: ")
+            } else {
+                ("> ", "  ", "")
+            };
+            for (index, row) in line.split('\n').enumerate() {
+                let glyph = if index == 0 { first } else { rest };
+                state.transcript.push(format!("{glyph}{row}"));
+            }
+            state
+                .transcript
+                .push(format!("{answer}ok: got {} chars", line.len()));
         }
-        state
-            .transcript
-            .push(format!("ok: got {} chars", line.len()));
         state.submitted.push(line);
         state.drawn = true;
     }
@@ -838,18 +950,77 @@ mod tests {
             tui.read_screen("w1:p1")
         );
         assert_eq!(tui.state().submitted, vec![PROMPT.to_owned()]);
-        // Gone from the bottom since the last pass: confirmed without a key.
-        let outcome = submit(
+        // Gone from the bottom since the last pass, but nothing shows it submitted: unproven,
+        // never confirmed (#852 D).
+        let error = submit(
             &tui,
             "w1:p1",
             "some other prompt text entirely",
             timeouts(),
             &runtime,
         )
-        .unwrap();
-        assert!(matches!(outcome, Submission::Verified(_)), "{outcome:?}");
+        .unwrap_err();
+        assert!(error.message().contains("unproven"), "{error:?}");
         assert_eq!(enters(&tui), 2);
         assert_eq!(pastes(&tui), 0);
+    }
+
+    #[test]
+    fn a_receipt_needs_the_prompt_shown_submitted_never_only_gone() {
+        // #852 D chat-receipt evidence: a TUI that takes the input but shows nothing gives no
+        // receipt; the outcome is unknown, so the queue never types the prompt again.
+        let tui = FakeTui::new();
+        tui.state().swallow = true;
+        let error = run(&tui).unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("no row shows the prompt submitted"),
+            "{error:?}"
+        );
+        assert_eq!(pastes(&tui), 1);
+    }
+
+    #[test]
+    fn an_agentterm_receipt_needs_a_new_you_turn_and_text_in_the_composer_is_none() {
+        // #852 D: on agentterm the evidence is a `You:` turn in the conversation that shows the
+        // prompt. Text in the composer means it was not submitted.
+        let tui = FakeTui::new();
+        tui.state().agentterm = Some("idle".to_owned());
+        let Submission::Verified(receipt) = run(&tui).unwrap() else {
+            panic!("expected verified");
+        };
+        assert!(receipt.evidence.contains("shows submitted"), "{receipt:?}");
+        let screen = tui.read_screen("w1:p1").unwrap();
+        assert_eq!(
+            crate::harness::agentterm::submitted_turns(&screen, PROMPT),
+            1
+        );
+        // Taken, but no turn drawn: unproven.
+        let tui = FakeTui::new();
+        {
+            let mut state = tui.state();
+            state.agentterm = Some("idle".to_owned());
+            state.swallow = true;
+        }
+        let error = run(&tui).unwrap_err();
+        assert!(error.message().contains("`You:` turn"), "{error:?}");
+        // Still in the composer after every Enter: stranded and pending, never a receipt.
+        let tui = FakeTui::new();
+        {
+            let mut state = tui.state();
+            state.agentterm = Some("idle".to_owned());
+            state.drop_enters = 100;
+        }
+        let Submission::NotStaged(reason) = run(&tui).unwrap() else {
+            panic!("expected a pending refusal");
+        };
+        assert!(is_stranded_prompt(&reason), "{reason}");
+        let screen = tui.read_screen("w1:p1").unwrap();
+        assert_eq!(
+            crate::harness::agentterm::submitted_turns(&screen, PROMPT),
+            0
+        );
     }
 
     #[test]
