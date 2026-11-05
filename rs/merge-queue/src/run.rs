@@ -2695,13 +2695,19 @@ impl<'a> Runner<'a> {
         prs: &[i64],
         pending: &mut VecDeque<Vec<i64>>,
     ) -> Result<Vec<i64>, String> {
-        if self.simulating() || self.config.precheck.command.trim().is_empty() {
+        let precheck = &self.config.precheck;
+        if self.simulating()
+            || (precheck.command.trim().is_empty() && precheck.background.trim().is_empty())
+        {
             return Ok(prs.to_vec());
         }
         let base = lock(&self.base).clone();
         let mut kept = Vec::new();
         for &pr in prs {
             let item = lock(&self.items).get(&pr).cloned();
+            // The quick check is run here if it has no verdict yet. The slow one only counts if
+            // the background worker has kept its verdict by now: a change not checked yet joins
+            // the batch, and the worker is asked to check it.
             let verdict = item.as_ref().and_then(|item| {
                 crate::precheck::check(
                     &self.state.root,
@@ -2712,6 +2718,18 @@ impl<'a> Runner<'a> {
                     &item.head,
                     &base,
                 )
+                .filter(|verdict| verdict.outcome == crate::precheck::Outcome::Failed)
+                .or_else(|| {
+                    crate::precheck::background(
+                        &self.state.root,
+                        &self.config,
+                        &self.git,
+                        pr,
+                        &item.head_ref,
+                        &item.head,
+                        &base,
+                    )
+                })
             });
             match verdict {
                 Some(verdict) if verdict.outcome == crate::precheck::Outcome::Failed => {
@@ -3361,6 +3379,11 @@ impl<'a> Runner<'a> {
             }
         }
         write_json(&self.run_dir.join("plan.json"), plan)?;
+        self.ask_background(
+            plan.batches
+                .iter()
+                .flat_map(|batch| batch.prs.iter().copied()),
+        );
         self.event(
             if completed { "plan-complete" } else { "plan" },
             &format!(
@@ -3501,8 +3524,39 @@ impl<'a> Runner<'a> {
                 plan.held.len()
             ),
         );
+        self.ask_background(batches.iter().flatten().copied());
         *pending = batches;
         Ok(())
+    }
+
+    /// Hand `prs`, in order, to the background precheck worker, so that each verdict is usually
+    /// kept by the time the change's batch is built (see [`crate::precheck::background`]).
+    fn ask_background(&self, prs: impl IntoIterator<Item = i64>) {
+        if self.simulating() || self.config.precheck.background.trim().is_empty() {
+            return;
+        }
+        let base = lock(&self.base).clone();
+        let heads: Vec<(i64, String, String)> = {
+            let items = lock(&self.items);
+            prs.into_iter()
+                .filter_map(|pr| {
+                    items
+                        .get(&pr)
+                        .map(|item| (pr, item.head_ref.clone(), item.head.clone()))
+                })
+                .collect()
+        };
+        for (pr, head_ref, head) in heads {
+            crate::precheck::background(
+                &self.state.root,
+                &self.config,
+                &self.git,
+                pr,
+                &head_ref,
+                &head,
+                &base,
+            );
+        }
     }
 
     /// `batches` with each change split off a red batch in this run (see [`Self::split_red`])
@@ -3978,6 +4032,23 @@ impl<'a> Runner<'a> {
                                 window = (window + 1).min(self.max_window);
                             }
                             outcome
+                        } else if let culprits @ [_, ..] =
+                            &self.precheck_culprits(&head.candidate, &ran)[..]
+                        {
+                            // Every failure is a step the precheck reproduces, and some change
+                            // in the batch failed its precheck: that explains the red. Those
+                            // changes are ejected and the rest go back as one batch.
+                            if head.stacked {
+                                discard(&mut flights, &rx, pending);
+                            }
+                            self.eject_precheck_culprits(
+                                &head.candidate,
+                                &ran,
+                                vid,
+                                culprits,
+                                pending,
+                            )?;
+                            BatchOutcome::Done
                         } else if !self.config.validator.confirm_reruns
                             && head.candidate.prs.len() > 1
                         {
@@ -4479,6 +4550,86 @@ impl<'a> Runner<'a> {
         }
         self.record_landed(&candidate.prs, &tip, claim, validations, flaky, note)?;
         Ok(BatchOutcome::Done)
+    }
+
+    /// The changes of a red batch that explain it by their precheck: when every failure of the
+    /// run is a step `precheck.covers` names, each change whose head has a kept precheck failure
+    /// (quick or background), with that verdict. Empty otherwise.
+    fn precheck_culprits(
+        &self,
+        candidate: &Candidate,
+        ran: &Ran,
+    ) -> Vec<(i64, crate::precheck::Verdict)> {
+        let covers = &self.config.precheck.covers;
+        let failed = ran.failed();
+        if self.simulating()
+            || covers.is_empty()
+            || failed.is_empty()
+            || !failed.iter().all(|test| covers.contains(&test.step))
+        {
+            return Vec::new();
+        }
+        let heads: Vec<(i64, String)> = {
+            let items = lock(&self.items);
+            candidate
+                .prs
+                .iter()
+                .filter_map(|pr| items.get(pr).map(|item| (*pr, item.head.clone())))
+                .collect()
+        };
+        heads
+            .into_iter()
+            .filter_map(|(pr, head)| {
+                crate::precheck::kept_failure(&self.state.root, &self.config, &head)
+                    .map(|verdict| (pr, verdict))
+            })
+            .collect()
+    }
+
+    /// Eject `culprits` (see [`Self::precheck_culprits`]) with their precheck verdicts, and send
+    /// the rest of the red batch back at the front of `pending` as one batch: what failed is
+    /// explained, so they are not searched or split, and the batch is decided by its own
+    /// validation. A change that depends on a culprit is set aside with it.
+    fn eject_precheck_culprits(
+        &self,
+        candidate: &Candidate,
+        ran: &Ran,
+        vid: usize,
+        culprits: &[(i64, crate::precheck::Verdict)],
+        pending: &mut VecDeque<Vec<i64>>,
+    ) -> Result<(), String> {
+        let failed: Vec<TestId> = ran.failed().into_iter().collect();
+        let ejected: BTreeSet<i64> = culprits.iter().map(|(pr, _)| *pr).collect();
+        let rest: Vec<i64> = candidate
+            .prs
+            .iter()
+            .copied()
+            .filter(|pr| !ejected.contains(pr))
+            .collect();
+        self.event(
+            "precheck-culprit",
+            &format!(
+                "v{vid} {} red ({}): {} failed the precheck, which reproduces that; ejected{}",
+                list(&candidate.prs),
+                ids(&failed),
+                list(&ejected.iter().copied().collect::<Vec<_>>()),
+                if rest.is_empty() {
+                    String::new()
+                } else {
+                    format!(", and {} go back as one batch", list(&rest))
+                }
+            ),
+        );
+        if !rest.is_empty() {
+            pending.push_front(rest);
+        }
+        for (pr, verdict) in culprits {
+            let kept =
+                crate::precheck::verdict_path(&self.state.root, &verdict.head, &verdict.command);
+            self.eject(*pr, "precheck", &verdict.refusal(*pr, &kept), &failed)?;
+            self.drop_dependents(*pr, pending);
+        }
+        Ok(())
     }
 
     /// A red batch of several changes with same-commit confirmation off: each change goes back

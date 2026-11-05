@@ -528,6 +528,21 @@ enum Command {
         /// run (the change is then queued without it); 0 means 300.
         #[arg(long, default_value_t = 0, value_name = "SECS")]
         precheck_timeout_secs: u64,
+        /// Background precheck: shell command for checks too slow to wait for (a documentation
+        /// build, a linter that compiles), run on every queued head, one at a time, by a worker
+        /// beside the run. A head whose verdict is a failure is ejected when its batch is built;
+        /// one not checked yet joins the batch. Empty: none.
+        #[arg(long, default_value = "", value_name = "COMMAND")]
+        precheck_background: String,
+        /// Seconds one background precheck may run before it is killed and counts as one that
+        /// could not run; 0 means 1800.
+        #[arg(long, default_value_t = 0, value_name = "SECS")]
+        precheck_background_timeout_secs: u64,
+        /// A validation step the precheck commands reproduce (repeatable). When every failure of
+        /// a red batch is such a step and a change in it failed its precheck, that change is
+        /// ejected and the rest go back as one batch instead of one batch each.
+        #[arg(long = "precheck-covers", value_name = "STEP")]
+        precheck_covers: Vec<String>,
         /// Validator kind: `command` (shell template with a JSON-lines results file) or `dagrun`.
         #[arg(long, default_value = "")]
         validator: String,
@@ -1066,13 +1081,16 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> i32 {
             return code;
         }
     };
-    match dispatch(cli) {
+    let code = match dispatch(cli) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("merge-queue: {error}");
             1
         }
-    }
+    };
+    // A background precheck still running would outlive the process in its own process group.
+    crate::precheck::stop_background();
+    code
 }
 
 /// The item records by change number.
@@ -1259,6 +1277,9 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             net_timeout_secs,
             precheck,
             precheck_timeout_secs,
+            precheck_background,
+            precheck_background_timeout_secs,
+            precheck_covers,
             validator,
             validator_run,
             select,
@@ -1311,6 +1332,9 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 precheck: crate::state::PrecheckConfig {
                     command: precheck,
                     timeout_secs: precheck_timeout_secs,
+                    background: precheck_background,
+                    background_timeout_secs: precheck_background_timeout_secs,
+                    covers: precheck_covers,
                 },
                 combine,
                 max_batch: max_batch.max(1),

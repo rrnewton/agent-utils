@@ -277,6 +277,9 @@ impl PriorityConfig {
 /// Default deadline of one precheck, in seconds.
 pub const DEFAULT_PRECHECK_TIMEOUT_SECS: u64 = 300;
 
+/// Default deadline of one background precheck, in seconds.
+pub const DEFAULT_PRECHECK_BACKGROUND_TIMEOUT_SECS: u64 = 1800;
+
 /// The precheck every submitted head must pass before it is queued (see [`crate::precheck`]).
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -285,6 +288,20 @@ pub struct PrecheckConfig {
     pub command: String,
     /// Deadline of one run in seconds; 0 means [`DEFAULT_PRECHECK_TIMEOUT_SECS`].
     pub timeout_secs: u64,
+    /// Shell command a background worker runs on every queued head, for checks too slow to
+    /// wait for; empty runs none. Its failure ejects a change before it joins a batch, once
+    /// the verdict is known.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub background: String,
+    /// Deadline of one background run in seconds; 0 means
+    /// [`DEFAULT_PRECHECK_BACKGROUND_TIMEOUT_SECS`].
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub background_timeout_secs: u64,
+    /// Steps of the validation the two commands reproduce. When every failure of a red batch is
+    /// one of these and some change in it failed its precheck, that change is ejected and the
+    /// rest go back as one batch, not one batch each.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub covers: Vec<String>,
 }
 
 impl PrecheckConfig {
@@ -294,6 +311,15 @@ impl PrecheckConfig {
             DEFAULT_PRECHECK_TIMEOUT_SECS
         } else {
             self.timeout_secs
+        })
+    }
+
+    /// Resolved deadline of a background run.
+    pub fn background_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(if self.background_timeout_secs == 0 {
+            DEFAULT_PRECHECK_BACKGROUND_TIMEOUT_SECS
+        } else {
+            self.background_timeout_secs
         })
     }
 }

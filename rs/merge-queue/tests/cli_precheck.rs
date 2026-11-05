@@ -383,3 +383,185 @@ fn a_change_queued_before_the_precheck_is_checked_before_it_joins_a_batch() {
         .collect();
     assert_eq!(checked, ["1", "2"], "{:?}", lines(&calls));
 }
+
+/// A slow check for the background worker: fails a head whose test file says BADDOC, and logs
+/// each call with the directory it ran in.
+fn doc_check(calls: &Path) -> String {
+    format!(
+        r#"echo "$MQ_PR $PWD" >> '{}'
+bad=$(grep -l BADDOC tests/* 2>/dev/null)
+[ -z "$bad" ] && exit 0
+for f in $bad; do echo "error: broken documentation link in $f"; done
+exit 1"#,
+        calls.display()
+    )
+}
+
+/// Merge `precheck` into the queue's `precheck` configuration.
+fn configure_precheck(fx: &Fixture, precheck: Value) {
+    let path = state_dir(fx).join("config.json");
+    let mut config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for (key, value) in precheck.as_object().unwrap() {
+        config["precheck"][key] = value.clone();
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+}
+
+fn events(fx: &Fixture, report: &Value) -> Vec<(String, String)> {
+    let path = state_dir(fx)
+        .join("runs")
+        .join(report["run"].as_str().unwrap())
+        .join("events.jsonl");
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let event: Value = serde_json::from_str(line).unwrap();
+            (
+                event["kind"].as_str().unwrap().to_owned(),
+                event["detail"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_slow_check_runs_beside_the_run_and_ejects_a_change_before_its_batch() {
+    // One batch at a time, each validation 2 s: the worker checks #2 while #1 validates.
+    let slow_runner = format!("sleep 2\n{RUNNER}");
+    let (fx, _, _) = setup(
+        "precheck-background",
+        "exit 0",
+        &["--depth", "1", "--max-batch", "1"],
+    );
+    let doc_calls = fx.root.join("doc-calls");
+    let doc = fx.root.join("doc-check.sh");
+    std::fs::write(&doc, doc_check(&doc_calls)).unwrap();
+    configure_precheck(
+        &fx,
+        serde_json::json!({ "background": format!("sh '{}'", doc.display()) }),
+    );
+    let path = state_dir(&fx).join("config.json");
+    let mut config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    config["validator"]["run"] = Value::String(slow_runner);
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/b", "BADDOC\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    let report: Value = serde_json::from_str(&fx.mq_ok(&["run", "--json"])).unwrap();
+    assert_eq!(item(&fx, 1)["status"], "landed", "{report}");
+    let refused = item(&fx, 2);
+    assert_eq!(refused["status"], "ejected", "{report}");
+    let ejected = history(&refused)
+        .into_iter()
+        .find(|(kind, _)| kind == "ejected")
+        .unwrap()
+        .1;
+    assert!(
+        ejected.starts_with("precheck: #2: the precheck failed on"),
+        "{ejected}"
+    );
+    assert!(
+        ejected.contains("error: broken documentation link in tests/b"),
+        "{ejected}"
+    );
+    // #2 was never validated: one validation in the run, #1's.
+    assert_eq!(
+        report["validations"].as_array().unwrap().len(),
+        1,
+        "{report}"
+    );
+    // Both heads were checked once each, in the worker's own checkout.
+    let calls = lines(&doc_calls);
+    let mut prs: Vec<&str> = calls.iter().map(|line| &line[..1]).collect();
+    prs.sort_unstable();
+    assert_eq!(prs, ["1", "2"], "{calls:?}");
+    assert!(
+        calls
+            .iter()
+            .all(|line| line.ends_with("/scratch/precheck-background")),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn a_red_batch_its_precheck_explains_ejects_the_culprit_and_keeps_the_rest_together() {
+    // The worker's check of #1 waits until the first validation has started, so #1 joins the
+    // batch unchecked; the validation waits for that check to fail before it reports. It fails
+    // the `lint.doc` step when a test file says BADDOC.
+    let (fx, _, _) = setup("precheck-culprit", "exit 0", &["--max-batch", "3"]);
+    let validating = fx.root.join("validating");
+    let checked = fx.root.join("doc-failed");
+    let wait = |marker: &Path| {
+        format!(
+            "i=0; while [ ! -e '{}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done",
+            marker.display()
+        )
+    };
+    let runner = format!(
+        "touch '{}'\n{}\nsleep 0.5\nif [ \"$MQ_SELECTION\" = all ]; then \
+         if grep -q BADDOC tests/* 2>/dev/null; then o=fail; else o=pass; fi; \
+         printf '{{\"id\":\"lint.doc\",\"outcome\":\"%s\"}}\\n' \"$o\" >> \"$MQ_RESULTS\"; \
+         [ $o = fail ] && exit 1; fi\n{RUNNER}",
+        validating.display(),
+        wait(&checked)
+    );
+    let doc_calls = fx.root.join("doc-calls");
+    let doc = fx.root.join("doc-check.sh");
+    std::fs::write(
+        &doc,
+        doc_check(&doc_calls)
+            .replacen("\nbad=", &format!("\n{}\nbad=", wait(&validating)), 1)
+            .replacen(
+                "\nexit 1",
+                &format!("\ntouch '{}'\nexit 1", checked.display()),
+                1,
+            ),
+    )
+    .unwrap();
+    configure_precheck(
+        &fx,
+        serde_json::json!({
+            "background": format!("sh '{}'", doc.display()),
+            "covers": ["lint.doc"],
+        }),
+    );
+    let path = state_dir(&fx).join("config.json");
+    let mut config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    config["validator"]["run"] = Value::String(runner);
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    fx.branch("a", &[("tests/a", "BADDOC\n")]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    for (pr, head) in [("1", "a"), ("2", "b"), ("3", "c")] {
+        fx.mq_ok(&["submit", pr, "--head", head]);
+    }
+    let report: Value = serde_json::from_str(&fx.mq_ok(&["run", "--json"])).unwrap();
+    assert_eq!(item(&fx, 1)["status"], "ejected", "{report}");
+    let ejected = history(&item(&fx, 1))
+        .into_iter()
+        .find(|(kind, _)| kind == "ejected")
+        .unwrap()
+        .1;
+    assert!(
+        ejected.starts_with("precheck: #1: the precheck failed on"),
+        "{ejected}"
+    );
+    assert_eq!(item(&fx, 2)["status"], "landed", "{report}");
+    assert_eq!(item(&fx, 3)["status"], "landed", "{report}");
+    let seen = events(&fx, &report);
+    assert!(
+        seen.iter().any(|(kind, detail)| kind == "precheck-culprit"
+            && detail.contains("#1, #2, #3 red (lint.doc)")
+            && detail.ends_with("ejected, and #2, #3 go back as one batch")),
+        "{seen:?}"
+    );
+    assert!(!seen.iter().any(|(kind, _)| kind == "split"), "{seen:?}");
+    // The rest went back together: two validations in all, the red batch and theirs.
+    assert_eq!(
+        report["validations"].as_array().unwrap().len(),
+        2,
+        "{report}"
+    );
+}

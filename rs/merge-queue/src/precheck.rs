@@ -28,9 +28,20 @@
 //! A run checks every change again before it joins a batch, which answers at once from the kept
 //! verdict for a head checked at submission, and catches a change queued before the precheck
 //! was configured: one that fails is ejected there, before the batch is built.
+//!
+//! Checks too slow to wait for go in `precheck.background`: a worker thread runs that command on
+//! every queued head, one at a time, in its own checkout (`<state>/scratch/precheck-background/`)
+//! and never in the run's way. Its verdicts are kept like the others. A change whose background
+//! verdict is a failure is ejected when its batch is built; one not checked yet joins the batch,
+//! and its verdict counts when it comes. A red batch whose every failure is a step the
+//! precheck reproduces (`precheck.covers`) ejects the changes that failed their precheck, and
+//! the rest go back as one batch, not one batch each.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -51,6 +62,22 @@ const LINES_QUOTED: usize = 40;
 
 /// Days a verdict is kept.
 const VERDICTS_KEEP_DAYS: i64 = 14;
+
+/// The checkout [`check`] runs in, under `<state>/scratch/`.
+const CHECKOUT: &str = "precheck";
+
+/// The checkout the background worker runs in, so it never shares a working tree with
+/// [`check`].
+const BACKGROUND_CHECKOUT: &str = "precheck-background";
+
+/// How long a head whose background check could not run waits before it is checked again.
+const RETRY_COULD_NOT_RUN: Duration = Duration::from_secs(30 * 60);
+
+/// Set by [`stop_background`]: the worker kills its check and takes no more.
+static BACKGROUND_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Whether the worker is running a check.
+static BACKGROUND_BUSY: AtomicBool = AtomicBool::new(false);
 
 /// How one precheck ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -200,10 +227,45 @@ pub fn check(
     if let Some(verdict) = kept(state_root, head, command) {
         return Some(verdict);
     }
+    let target = Target {
+        pr,
+        head_ref,
+        head,
+        base,
+    };
+    Some(check_in(
+        state_root,
+        git,
+        &target,
+        command,
+        config.precheck.timeout(),
+        CHECKOUT,
+    ))
+}
+
+/// The change one check is for.
+struct Target<'a> {
+    pr: i64,
+    head_ref: &'a str,
+    head: &'a str,
+    base: &'a str,
+}
+
+/// Run `command` on `target` in the checkout `<state>/scratch/<checkout>`, under the deadline
+/// `limit`, and keep a pass or a failure.
+fn check_in(
+    state_root: &Path,
+    git: &Git,
+    target: &Target<'_>,
+    command: &str,
+    limit: Duration,
+    checkout: &str,
+) -> Verdict {
     let started = Instant::now();
-    let checkout = state_root.join("scratch").join("precheck");
+    let head = target.head;
+    let checkout = state_root.join("scratch").join(checkout);
     let verdict = match prepare(git, &checkout, head) {
-        Ok(()) => run(config, &checkout, command, pr, head_ref, head, base),
+        Ok(()) => run(limit, &checkout, command, target),
         Err(error) => Verdict {
             schema: VERDICT_SCHEMA.to_owned(),
             head: head.to_owned(),
@@ -221,7 +283,171 @@ pub fn check(
         let _ = write_json(&verdict_path(state_root, head, command), &verdict);
         prune(state_root);
     }
-    Some(verdict)
+    verdict
+}
+
+/// The kept verdict of the background command (`precheck.background`) on change `pr` at
+/// `head`. Without one, the head is handed to this process's background worker (once: a head
+/// already waiting there, or one that could not be checked by this process, is not handed over
+/// again) and this says `None` until its verdict is kept. `None` too when no background command
+/// is configured.
+pub fn background(
+    state_root: &Path,
+    config: &Config,
+    git: &Git,
+    pr: i64,
+    head_ref: &str,
+    head: &str,
+    base: &str,
+) -> Option<Verdict> {
+    let command = config.precheck.background.trim();
+    if command.is_empty() {
+        return None;
+    }
+    if let Some(verdict) = kept(state_root, head, command) {
+        return Some(verdict);
+    }
+    worker().ask(Job {
+        state_root: state_root.to_owned(),
+        git: git.clone(),
+        command: command.to_owned(),
+        limit: config.precheck.background_timeout(),
+        pr,
+        head_ref: head_ref.to_owned(),
+        head: head.to_owned(),
+        base: base.to_owned(),
+    });
+    None
+}
+
+/// The kept failure of either precheck command on `head`, the quick one first.
+pub fn kept_failure(state_root: &Path, config: &Config, head: &str) -> Option<Verdict> {
+    [&config.precheck.command, &config.precheck.background]
+        .into_iter()
+        .map(|command| command.trim())
+        .filter(|command| !command.is_empty())
+        .find_map(|command| {
+            kept(state_root, head, command).filter(|verdict| verdict.outcome == Outcome::Failed)
+        })
+}
+
+/// One head for the background worker.
+struct Job {
+    state_root: PathBuf,
+    git: Git,
+    command: String,
+    limit: Duration,
+    pr: i64,
+    head_ref: String,
+    head: String,
+    base: String,
+}
+
+/// Verdict paths handed to the worker and not kept yet: `None` while the check waits or runs,
+/// and the time it ended for one that could not run.
+type Asked = Mutex<BTreeMap<PathBuf, Option<Instant>>>;
+
+/// This process's background worker: one thread, one check at a time, in the order asked.
+struct Worker {
+    jobs: Mutex<mpsc::Sender<Job>>,
+    /// A head waiting or running is not handed over again, nor one that could not be checked
+    /// in the last [`RETRY_COULD_NOT_RUN`].
+    asked: &'static Asked,
+}
+
+fn worker() -> &'static Worker {
+    static WORKER: OnceLock<Worker> = OnceLock::new();
+    WORKER.get_or_init(|| {
+        static ASKED: Asked = Mutex::new(BTreeMap::new());
+        let (jobs, queue) = mpsc::channel::<Job>();
+        let spawned = std::thread::Builder::new()
+            .name("precheck-background".to_owned())
+            .spawn(move || work(&queue, &ASKED));
+        if let Err(error) = spawned {
+            eprintln!("merge-queue: cannot start the background precheck worker: {error}");
+        }
+        Worker {
+            jobs: Mutex::new(jobs),
+            asked: &ASKED,
+        }
+    })
+}
+
+impl Worker {
+    fn ask(&self, job: Job) {
+        let path = verdict_path(&job.state_root, &job.head, &job.command);
+        {
+            let mut asked = self.asked.lock().unwrap_or_else(PoisonError::into_inner);
+            match asked.get(&path) {
+                Some(None) => return,
+                Some(Some(ended)) if ended.elapsed() < RETRY_COULD_NOT_RUN => return,
+                _ => {}
+            }
+            asked.insert(path, None);
+        }
+        let _ = self
+            .jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .send(job);
+    }
+}
+
+/// Stop the background worker before this process exits: its check (in a process group of its
+/// own, which would outlive the process) is killed, and it takes no more. Waits up to two
+/// seconds for that; returns at once when no check is running.
+pub fn stop_background() {
+    BACKGROUND_STOP.store(true, Ordering::SeqCst);
+    let started = Instant::now();
+    while BACKGROUND_BUSY.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether a check in progress should be killed now: the process is stopping.
+fn stopping() -> bool {
+    crate::interrupt::requested() || BACKGROUND_STOP.load(Ordering::SeqCst)
+}
+
+/// Check each head handed over, in order, until the process is asked to stop.
+fn work(queue: &mpsc::Receiver<Job>, asked: &Asked) {
+    while let Ok(job) = queue.recv() {
+        if stopping() {
+            return;
+        }
+        let path = verdict_path(&job.state_root, &job.head, &job.command);
+        let target = Target {
+            pr: job.pr,
+            head_ref: &job.head_ref,
+            head: &job.head,
+            base: &job.base,
+        };
+        let outcome = match kept(&job.state_root, &job.head, &job.command) {
+            Some(verdict) => verdict.outcome,
+            None => {
+                BACKGROUND_BUSY.store(true, Ordering::SeqCst);
+                let outcome = check_in(
+                    &job.state_root,
+                    &job.git,
+                    &target,
+                    &job.command,
+                    job.limit,
+                    BACKGROUND_CHECKOUT,
+                )
+                .outcome;
+                BACKGROUND_BUSY.store(false, Ordering::SeqCst);
+                outcome
+            }
+        };
+        // A pass or a failure is kept on disk, where the next ask finds it. One that could not
+        // run is not handed over again for a while.
+        let mut asked = asked.lock().unwrap_or_else(PoisonError::into_inner);
+        if outcome == Outcome::CouldNotRun {
+            asked.insert(path, Some(Instant::now()));
+        } else {
+            asked.remove(&path);
+        }
+    }
 }
 
 /// Check out `head` in `checkout`, reusing the worktree there.
@@ -243,20 +469,12 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Run `command` in `checkout` under the configured deadline.
-fn run(
-    config: &Config,
-    checkout: &Path,
-    command: &str,
-    pr: i64,
-    head_ref: &str,
-    head: &str,
-    base: &str,
-) -> Verdict {
+/// Run `command` for `target` in `checkout` under the deadline `limit`.
+fn run(limit: Duration, checkout: &Path, command: &str, target: &Target<'_>) -> Verdict {
     let started = Instant::now();
     let mut verdict = Verdict {
         schema: VERDICT_SCHEMA.to_owned(),
-        head: head.to_owned(),
+        head: target.head.to_owned(),
         command: command.to_owned(),
         outcome: Outcome::CouldNotRun,
         exit: None,
@@ -265,7 +483,7 @@ fn run(
         elapsed_ms: 0,
         checked_at: String::new(),
     };
-    let log = checkout.with_file_name("precheck.log");
+    let log = checkout.with_extension("log");
     let outcome = (|| -> Result<(Outcome, Option<i32>, String), String> {
         let file = std::fs::File::create(&log)
             .map_err(|error| format!("cannot create {}: {error}", log.display()))?;
@@ -278,10 +496,10 @@ fn run(
                 .arg("-c")
                 .arg(command)
                 .current_dir(checkout)
-                .env("MQ_PR", pr.to_string())
-                .env("MQ_HEAD", head)
-                .env("MQ_HEAD_REF", head_ref)
-                .env("MQ_BASE", base)
+                .env("MQ_PR", target.pr.to_string())
+                .env("MQ_HEAD", target.head)
+                .env("MQ_HEAD_REF", target.head_ref)
+                .env("MQ_BASE", target.base)
                 .stdin(Stdio::null())
                 .stdout(file)
                 .stderr(err)
@@ -289,7 +507,6 @@ fn run(
                 .spawn()
                 .map_err(|error| format!("cannot start sh: {error}"))?
         };
-        let limit = config.precheck.timeout();
         loop {
             if let Some(status) = child
                 .try_wait()
@@ -310,8 +527,8 @@ fn run(
                     ),
                 });
             }
-            // A daemon asked to stop does not wait out the deadline.
-            if crate::interrupt::requested() {
+            // A daemon asked to stop, or a process about to exit, does not wait out the deadline.
+            if stopping() {
                 crate::bounded::kill_group(&mut child);
                 return Ok((
                     Outcome::CouldNotRun,

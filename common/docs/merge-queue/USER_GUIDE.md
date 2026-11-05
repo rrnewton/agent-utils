@@ -124,6 +124,9 @@ This command creates the state directory and writes `config.json`.
 | `--net-timeout-secs SECS` | `0` (300) | How long one network command (`git fetch`, `ls-remote`, `push`, a `gh` call) may run before its process group is killed and it fails (see "Network commands are bounded"). |
 | `--precheck CMD` | empty | Shell command every submitted head must pass before it is queued, run on the head alone (a formatter or documentation check, say). A head that fails it is ejected at submission with the command's output. Empty: no precheck. See "The precheck". |
 | `--precheck-timeout-secs SECS` | `0` (300) | How long one precheck may run before its process group is killed; the check then counts as one that could not run, and the change is queued without it. |
+| `--precheck-background CMD` | empty | Shell command for checks too slow to wait for (a documentation build, a linter that compiles), run on every queued head by a worker beside the run. A head whose verdict is a failure is ejected when its batch is built; one not checked yet joins the batch. Empty: none. See "Slow checks in the background". |
+| `--precheck-background-timeout-secs SECS` | `0` (1800) | How long one background precheck may run before its process group is killed; the check then counts as one that could not run. |
+| `--precheck-covers STEP` | none | A validation step the precheck commands reproduce (repeatable). When every failure of a red batch is such a step and a change in it failed its precheck, that change is ejected and the rest go back as one batch. |
 | `--validator KIND` | empty | `command` or `dagrun` (see "Validators"). `run` refuses to start without one. |
 | `--validator-run CMD` | empty | For `command`: the shell template that runs a selection. |
 | `--select CMD` | empty | Shell command printing the selection policy's test IDs for the checkout's HEAD relative to `$MQ_BASE`. Empty: every validation runs the complete suite. |
@@ -802,6 +805,8 @@ on which files two changes share.
   scratch/slot-<n>.lock  flock held by the run while a validation uses slot <n>
   scratch/precheck/      the reused worktree every precheck runs in
   scratch/precheck.log   the output of the last precheck
+  scratch/precheck-background/     the background worker's own reused worktree
+  scratch/precheck-background.log  the output of its last check
   precheck/verdicts/<head>-<digest>.json  one precheck verdict per head and command (kept 14 days)
   intake/pending/<id>.json   one request recorded while a run held the writer lock, until applied
   intake/refused/<id>.json   one recorded request that could not be applied, with the reason (kept a week)
@@ -852,7 +857,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `base` | `main` | The base branch. |
 | `net_wrapper` | `[]` | A command prefix for network Git. |
 | `net_timeout_secs` | `0` | Seconds one network command may run before it is killed and fails; `0` means 300. An older binary warns about the field and ignores it. |
-| `precheck` | absent | `{command, timeout_secs}`: the precheck of submitted heads (`timeout_secs` absent or `0`: 300). Left out of the file while unset; an older binary warns about the field and ignores it. See "The precheck". |
+| `precheck` | absent | `{command, timeout_secs, background, background_timeout_secs, covers}`: the precheck of submitted heads (`timeout_secs` absent or `0`: 300), the command a background worker runs on every queued head (`background_timeout_secs` absent or `0`: 1800), and the validation steps the two reproduce. Left out of the file while unset; an older binary warns about the field and ignores it, and one that knows `precheck` but not `background` or `covers` refuses the configuration. See "The precheck". |
 | `combine` | `rebase` | `rebase` or `merge`. |
 | `max_batch` | `4` | The maximum number of changes per batch. |
 | `depth` | `2` | The initial window and the culprit-search probe width. |
@@ -1428,7 +1433,28 @@ verdict of a head checked at submission. It catches a change queued before the p
 configured: if that change fails, it is ejected as `precheck` and the batch is built without
 it. Keep the command to checks that take seconds, or a minute at most on
 a warm build cache: it runs under the writer lock, so a run taking in recorded submissions or
-building a batch waits for it.
+building a batch waits for it. Slower checks belong in `precheck.background`.
+
+### Slow checks in the background
+
+`precheck.background` is a second shell command, for checks that take minutes (a documentation
+build, a linter that compiles the changed crates). It is never waited for. A worker thread in
+the process that runs the queue (the `serve` daemon, or `merge-queue run`) runs it on every
+queued head, one head at a time, in the order of the run's plan, in a checkout of its own
+(`scratch/precheck-background/`), with the same variables and exit statuses as
+`precheck.command` and a deadline of `precheck.background_timeout_secs`. Its verdicts are kept
+under `precheck/verdicts/` like the others.
+
+- When a batch is built, a change whose kept background verdict is a failure is ejected as
+  `precheck`, with the command's output, and the batch is built without it. A change not checked
+  yet joins the batch, and its verdict counts when it comes.
+- A red batch whose every failed test is a step listed in `precheck.covers` (the validation steps
+  the two commands reproduce, such as a formatter step and a documentation step), and in which
+  some change has a kept precheck failure, is explained by it: those changes are ejected, and the
+  rest of the batch goes back as one batch, without a culprit search or a split. The run's event
+  log says so (`precheck-culprit`).
+- A background check that could not run is tried again after 30 minutes. The worker kills its
+  check when the process stops or exits.
 
 ## The decision log
 
