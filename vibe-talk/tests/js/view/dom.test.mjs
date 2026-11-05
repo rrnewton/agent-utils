@@ -1093,10 +1093,13 @@ test("`#624 voice-page-modularity`: the row keys open, enter and leave threads, 
   const state = { acted: { pane: "channel pane", row, took: true }, card: null, columns: false, side: false, screen: "main", view: "discord", sideMode: "list",
     fromCards: false, threadList: false, selectionView: "all", reply: false, menu: null, url: "https://chat/1", composer: false };
   const keys = createRowKeys({
-    rowForAct: (_target, runLine) => (runLine || state.acted.row?.getAttribute("data-read-run") !== "head" ? state.acted : { pane: "channel pane", row: null, took: true }),
+    rowForAct: (_target, runLine, ...rest) => {
+      if (rest.length || (runLine !== undefined && runLine !== true)) log.push(`rowForAct asked ${runLine} ${rest}`);
+      return runLine || state.acted.row?.getAttribute("data-read-run") !== "head" ? state.acted : { pane: "channel pane", row: null, took: true };
+    },
     keyContext: () => ({ pane: state.acted.pane, row: state.acted.row }),
     openReadRun: () => log.push("open run"),
-    liveUnpackedRow: () => null,
+    liveUnpackedRow: () => state.unpacked || null,
     liveCardRow: () => "live card",
     selectRow: (_pane, selected, ...bring) => log.push(["select", selected.id || selected, ...bring].join(" ")),
     channelPane: () => "channel pane",
@@ -1113,7 +1116,7 @@ test("`#624 voice-page-modularity`: the row keys open, enter and leave threads, 
     view: () => state.view,
     sideMode: () => state.sideMode,
     sideFromCards: () => state.fromCards,
-    sideThreadId: () => "t1",
+    sideThreadId: () => state.sideThreadId || "t1",
     cardRowOnRight: (id) => (id === "t1" ? rowOf({ "data-card": "" }, [], "t1 card") : null),
     closeSideThread: () => log.push("side thread closed"),
     rowShown: () => true,
@@ -1140,6 +1143,13 @@ test("`#624 voice-page-modularity`: the row keys open, enter and leave threads, 
     assert.deepStrictEqual(run(() => keys.openFromKeyboard(enter, { tagName: "BUTTON" })), [false], "Enter on a button in a row was not left to it");
     row.attributes["data-read-run"] = "head";
     assert.deepStrictEqual(run(() => keys.openFromKeyboard({ key: "o" }, {})), [true, "open run", "select row false"], "o on the line of a run did not open it and keep the keys on it");
+    row.parentNode = null;
+    state.unpacked = "unpacked row";
+    assert.deepStrictEqual(run(() => keys.openFromKeyboard({ key: "o" }, {})), [true, "open run", "select unpacked row false"], "a run's line drawn anew in an unpacked block lost the keys");
+    state.unpacked = null;
+    assert.deepStrictEqual(run(() => keys.openFromKeyboard({ key: "o" }, {})), [true, "open run", "select live card false"], "a run's line drawn anew over the cards lost the keys");
+    row.parentNode = {};
+    assert.deepStrictEqual(run(() => keys.readFromKeyboard({})), [true], "s on the line of a run read it, or was not taken");
     delete row.attributes["data-read-run"];
     const cardRow = rowOf({ "data-card": "" }, [button("side-card")]);
     state.acted = { pane: "side pane", row: cardRow, took: true };
@@ -1149,6 +1159,7 @@ test("`#624 voice-page-modularity`: the row keys open, enter and leave threads, 
     state.acted = { pane: null, row: null, took: true };
     assert.deepStrictEqual(run(() => keys.openFromKeyboard(enter, {})), [true], "a key taken with no row to act on was not reported taken");
     assert.deepStrictEqual(run(() => keys.pressRowButton({}, "reply-button")), ["took"]);
+    assert.deepStrictEqual([run(() => keys.replyFromKeyboard({})), run(() => keys.menuFromKeyboard({}))], [[true], [true]], "r or . with no row to press, but taken, moved the focus");
     state.acted = { pane: null, row: null, took: false };
     assert.deepStrictEqual([run(() => keys.pressRowButton({}, "reply-button")), run(() => keys.replyFromKeyboard({}))], [[null], [false]]);
     state.acted = { pane: "channel pane", row, took: true };
@@ -1167,6 +1178,10 @@ test("`#624 voice-page-modularity`: the row keys open, enter and leave threads, 
     badge.hidden = false;
     state.card = rowOf({}, [button("thread-card-open")]);
     assert.deepStrictEqual(run(() => keys.threadFromKeyboard({})), [true, "click thread-card-open", "focus list side pane"], "→ on a card did not open its thread");
+    state.card = rowOf({ "data-card": "" }, [button("side-card-open"), button("thread-card-open")]);
+    state.columns = false;
+    assert.deepStrictEqual(run(() => keys.threadFromKeyboard({})), [true, "click side-card-open", "settled"], "→ on a thread card did not press its replies button, or kept the focus in one column");
+    state.columns = true;
     state.card = null;
     assert.deepStrictEqual(run(() => keys.threadOutFromKeyboard()), [false], "← from the left column in two columns was taken");
     state.side = true;
@@ -1175,6 +1190,9 @@ test("`#624 voice-page-modularity`: the row keys open, enter and leave threads, 
     state.fromCards = true;
     assert.deepStrictEqual(run(() => keys.threadOutFromKeyboard()), [true, "side thread closed", "select t1 card"],
       "← from a thread entered from its card did not go back to the cards, with the keys on that card brought into view");
+    state.sideThreadId = "gone";
+    assert.deepStrictEqual(run(() => keys.threadOutFromKeyboard()), [true, "side thread closed", "focus list side pane"], "← with the card it came from gone did not leave the keys on the cards");
+    state.sideThreadId = "t1";
     state.side = false;
     state.columns = false;
     assert.deepStrictEqual(run(() => keys.threadOutFromKeyboard()), [false], "← outside a thread was taken");
@@ -1192,6 +1210,8 @@ test("`#624 voice-page-modularity`: the row keys open, enter and leave threads, 
     state.menu = { root: fold, close: () => log.push("menu closed") };
     fold.parentNode = row;
     assert.deepStrictEqual(run(() => keys.copyLinkFromKeyboard({})), [true, "menu closed", "copy https://chat/1 m1"], "l left the row's own menu open over the status");
+    state.menu = { root: button("another row's item"), close: () => log.push("menu closed") };
+    assert.deepStrictEqual(run(() => keys.copyLinkFromKeyboard({})), [true, "copy https://chat/1 m1"], "l closed another row's menu");
     state.url = null;
     assert.deepStrictEqual(run(() => keys.copyLinkFromKeyboard({})), [false], "l on a row with no address was taken");
   } finally {

@@ -92,7 +92,7 @@ export interface RowKeysDependencies<Pane, Message> {
   copyUpstreamLink(url: string, message: Message): void;
 }
 
-/** The keys. Each returns whether it did anything, as a binding of the keymap does, but `pressRowButton`. */
+/** The keys. Each returns whether it did anything, as a binding of the keymap does, but `pressRowButton` and `leaveThread`. */
 export interface RowKeys {
   /**
    * Enter and o: what a tap on the selected message does (fold or unfold it, or in Read read it aloud:
