@@ -1,7 +1,7 @@
 ---
 title: 'wrkslots-image-remove-own-bind: remove a slot born in the worktrees image despite its own bind mount'
 status: open
-priority: 2
+priority: 1
 issue_type: bug
 assignee: mu-validate
 created_at: 2026-11-05T16:33:33.682649528+00:00
@@ -33,3 +33,5 @@ The live-use scan walks /proc/1's mounts and counts the slot's own wrkslots-mana
 Reported by the lead on 2026-11-05 at 11:33 AM ET (P2). The worktrees-image lane has finished, so this is queued for a wrkslots lane: mu-validate after #894 (also wrkslots remove).
 
 Seen once, possibly unrelated: removing a validation probe slot refused with "validation-run authority is unverifiable ... cannot enumerate user-systemd state: Failed to get property ControlGroup ... Remote peer disconnected". It looks like a transient user-systemd bus error. If it recurs, consider retrying that read once before refusing.
+
+Raised to P1 by the lead on 2026-11-05 at 12:38 PM ET. With the worktrees-image mode on in that harness, every new slot is born in the image, so every finished lane's slot is now unremovable (a second slot refused the same way). mu-validate may take it right after #894, or before it if #898 is smaller; its call. Until then, finished image slots stay in place, unreclaimed.
