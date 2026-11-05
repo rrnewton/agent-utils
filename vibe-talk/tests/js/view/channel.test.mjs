@@ -1200,3 +1200,70 @@ test("`#624 voice-page-modularity`: the lists' gestures and scrolls are every on
     globalThis.document = was;
   }
 });
+
+test("`#624 voice-page-modularity`: the list's tools reach the act each names, in the page's order, the action menu's items close it after their own acts, and come down again", () => {
+  const { mountListControls } = CHANNEL_VIEW;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [], checked: false,
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); },
+    focus(options) { log.push(`focus ${id} ${options && options.preventScroll}`); } });
+  const press = (id, type = "click") => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener({}));
+  let hidden = false;
+  let inside = true;
+  const controls = mountListControls({
+    byId: (id) => target(id),
+    leftById: (id) => target(`left ${id}`),
+    loadOlder: () => { log.push("older"); return "older asked"; },
+    searchInAll: () => log.push("search in All"),
+    serverMore: () => log.push("server more"),
+    searchAllChannels: (on) => log.push(`all channels ${on}`),
+    searchFurther: () => log.push("further"),
+    loadOlderTurns: () => log.push("older turns"),
+    setAllFolded: (folded) => log.push(`folded ${folded}`),
+    cycleReadMode: (...args) => log.push(`read mode ${args.length}`),
+    clearBacklog: () => log.push("clear backlog"),
+    undoDismissal: () => log.push("undo"),
+    toggleSummaries: () => log.push("summaries"),
+    readerHidden: () => hidden,
+    setReaderHidden: (wanted) => { hidden = wanted; log.push(`reader hidden ${wanted}`); },
+    closeSpeedPopover: () => log.push("pace closed"),
+    focusInActionMenu: () => inside,
+    closeActionMenu: () => log.push("menu closed"),
+    jumpToNewest: () => log.push("newest"),
+  });
+  assert.deepStrictEqual(log, ["listen load-older click", "listen left search-in-all click", "listen server-more click",
+    "listen search-all-channels change", "listen search-further click", "listen load-older-turns click", "listen collapse-all click",
+    "listen expand-all click", "listen todo-filter click", "listen clear-backlog click", "listen undo-dismiss click", "listen summarise click",
+    "listen reader-toggle click", "listen expand-all click", "listen collapse-all click", "listen summarise click", "listen reader-toggle click",
+    "listen jump-newest click"], "a listener was added out of the page's order");
+  log.length = 0;
+  assert.deepStrictEqual(press("load-older"), ["older asked"], "the control did not answer what it started, which the page suite waits for");
+  press("left search-in-all");
+  press("server-more");
+  nodes["search-all-channels"].checked = true;
+  press("search-all-channels", "change");
+  press("search-further");
+  press("load-older-turns");
+  press("todo-filter");
+  press("clear-backlog");
+  press("undo-dismiss");
+  press("jump-newest");
+  assert.deepStrictEqual(log, ["older", "search in All", "server more", "all channels true", "further", "older turns", "read mode 0",
+    "clear backlog", "undo", "newest"]);
+  log.length = 0;
+  // The menu's items: each one's act, then the menu closed and the keys back on the hamburger where they were in it.
+  press("expand-all");
+  inside = false;
+  press("collapse-all");
+  press("summarise");
+  inside = true;
+  press("reader-toggle");
+  press("reader-toggle");
+  assert.deepStrictEqual(log, ["folded false", "menu closed", "focus action-menu-open true", "folded true", "menu closed", "summaries", "menu closed",
+    "reader hidden true", "pace closed", "menu closed", "focus action-menu-open true", "reader hidden false", "menu closed", "focus action-menu-open true"],
+    "an item's act came after the menu closed, Hide reader left the pace popover open, or Show reader closed it again");
+  controls.unmount();
+  assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+});

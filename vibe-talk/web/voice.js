@@ -31328,38 +31328,32 @@ el("noise-rule-new").addEventListener("keydown", (event) => {
   if (event.key === "Enter") guardQuietly(noiseSettings.add)();
 });
 el("clear-alias").addEventListener("click", guardQuietly(channelSettings.clearChannelAlias));
-el("load-older").addEventListener("click", guardQuietly(olderControlPressed));
-// `#262 search-load-older`. One column on Main, a search nothing loaded matches: All has the replies.
-leftEl("search-in-all").addEventListener("click", guardQuietly(searchInAll));
-// `#605`-`#608 server-side-search`.
-el("server-more").addEventListener("click", guardQuietly(() => serverSearchOwner.more()));
-el("search-all-channels").addEventListener("change", () =>
-  chooseSearchAllChannels(/** @type {HTMLInputElement} */ (el("search-all-channels")).checked));
-el("search-further").addEventListener("click", guardQuietly(searchFurtherPressed));
-el("load-older-turns").addEventListener("click", guardQuietly(voiceTranscript().loadOlderTurns));
-el("collapse-all").addEventListener("click", () => setAllFolded(true));
-el("expand-all").addEventListener("click", () => setAllFolded(false));
-el("todo-filter").addEventListener("click", cycleReadMode);
-el("clear-backlog").addEventListener("click", guardQuietly(clearBacklog));
-el("undo-dismiss").addEventListener("click", guardQuietly(undoDismissal));
-// `#564 message-summary-toggle`. The chip is Settings' switch, kept and synced like it.
-el("summarise").addEventListener("click", () => applySummarizeCollapsed(!storedSummarizeCollapsed()));
-// `#880 voice-page-menu-placement`. Hide reader, Show reader. The pace popover is the row's, and goes with it rather
-// than staying open, undrawn, as a level Escape and the back gesture would close first.
-el("reader-toggle").addEventListener("click", () => {
-  readerRow.setHidden(!readerRow.hidden());
-  if (readerRow.hidden()) closeSpeedPopover();
+// The list's tools (`#65`, `#262 search-load-older`, `#605`-`#608 server-side-search`, `#221 read-modes`, `#564
+// message-summary-toggle`, `#820 voice-page-action-menu`, `#880 voice-page-menu-placement`): the ways further back,
+// the search's ways wider, the action menu's items closing it after their own acts, and the chips over the list. One
+// owner in web/src/view/channel/listcontrols.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its
+// `unmount` waits for the ordered boot's teardown.
+mountListControls({
+  byId: (id) => el(id),
+  leftById: (id) => leftEl(id),
+  loadOlder: () => guardQuietly(olderControlPressed)(),
+  searchInAll: () => guardQuietly(searchInAll)(),
+  serverMore: () => guardQuietly(() => serverSearchOwner.more())(),
+  searchAllChannels: (on) => chooseSearchAllChannels(on),
+  searchFurther: () => guardQuietly(searchFurtherPressed)(),
+  loadOlderTurns: () => guardQuietly(voiceTranscript().loadOlderTurns)(),
+  setAllFolded: (folded) => setAllFolded(folded),
+  cycleReadMode: () => cycleReadMode(),
+  clearBacklog: () => guardQuietly(clearBacklog)(),
+  undoDismissal: () => guardQuietly(undoDismissal)(),
+  toggleSummaries: () => applySummarizeCollapsed(!storedSummarizeCollapsed()),
+  readerHidden: () => readerRow.hidden(),
+  setReaderHidden: (hidden) => readerRow.setHidden(hidden),
+  closeSpeedPopover: () => closeSpeedPopover(),
+  focusInActionMenu: () => nodeWithin(el("action-menu"), document.activeElement),
+  closeActionMenu: () => setActionMenuOpen(false),
+  jumpToNewest: () => scrollKeys.jumpToNewest(),
 });
-// `#820 voice-page-action-menu`. Those are the action menu's items: choosing one closes it, after the
-// item's own act (registered just above), and gives the keys back to its opener rather than to nothing.
-for (const id of ["expand-all", "collapse-all", "summarise", "reader-toggle"]) {
-  el(id).addEventListener("click", () => {
-    const inside = nodeWithin(el("action-menu"), document.activeElement);
-    setActionMenuOpen(false);
-    if (inside) el("action-menu-open").focus({ preventScroll: true });
-  });
-}
-el("jump-newest").addEventListener("click", () => scrollKeys.jumpToNewest());
 // The search's and the filter chips' listeners (`#129 message-search`, `#206 pin-message`, `#211`/`#212
 // link-filter`, `#251 author-filter`, `#266 link-filter-kinds`, `#620 link-url-chip`): the glass and the filters
 // as toggles, each kind of link, and the search field's typing, Enter and Escape. One owner in
