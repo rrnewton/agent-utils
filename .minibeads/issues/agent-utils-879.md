@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-liveness-one-source: status and audit report the same owner liveness'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-validate
 created_at: 2026-11-05T09:32:58.478143832+00:00
-updated_at: 2026-11-05T09:32:58.478143832+00:00
+updated_at: 2026-11-05T17:19:37.663878761+00:00
+closed_at: 2026-11-05T17:19:37.663878430+00:00
 ---
 
 # Description
