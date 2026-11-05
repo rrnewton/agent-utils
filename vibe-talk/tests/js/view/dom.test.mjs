@@ -1577,11 +1577,11 @@ test("`#624 voice-page-modularity`: the mouse and the keys move one selection, t
     const button = (focusVisible) => node("button", page, { tagName: "BUTTON", matches: (selector) => selector === ":focus-visible" && focusVisible });
     const follows = (held) => { globalThis.document.activeElement = held; return selection.focusFollowsSelection(); };
     assert.deepStrictEqual(
-      [follows(null), follows(one), follows(channel.scroller()), follows(button(false)), follows(button(true)), follows({ tagName: "BUTTON" }),
+      [follows(one), follows(channel.scroller()), follows(button(false)), follows(button(true)), follows({ tagName: "BUTTON" }),
         follows(node("box", page, { tagName: "TEXTAREA" })), follows(node("pick", page, { tagName: "SELECT" }))],
-      [false, true, true, true, false, false, false, false],
+      [true, true, true, false, false, false, false],
       "the focus did not follow from a list or a clicked control, or followed out of a field, a picker, a control the keys reached or one the browser cannot say of");
-    globalThis.document.activeElement = node("box", page, { tagName: "TEXTAREA" });
+    globalThis.document.activeElement = null;
     state.lost = true;
     assert.equal(selection.focusFollowsSelection(), true, "the focus lost to the body did not follow");
     state.lost = false;

@@ -32,9 +32,9 @@ export interface PointedPane {
   scroller(): HTMLElement;
   list(): unknown;
   head(): number;
-  /** The row lit, and the row selected. */
+  /** The row lit, and the row selected with a ring (which `releaseRow` changes). */
   readonly lit: HTMLElement | null;
-  readonly row: HTMLElement | null;
+  row: HTMLElement | null;
   /** The row a page key's scroll is to move the ring from, once it comes to rest. */
   follow: HTMLElement | null;
 }
@@ -96,8 +96,9 @@ export interface PointerSelectionDependencies<Pane extends PointedPane, Column> 
   firstRowInView(pane: Pane): HTMLElement | null;
   /** Select `row` of `pane`; `bring` false leaves the scroll where it is. */
   selectRow(pane: Pane, row: HTMLElement, bring: boolean): void;
-  /** The selected row of `pane` when it is drawn, or null; giving it back its place in the tab order. */
+  /** The selected row of `pane` when it is drawn, or null. */
   drawnRow(pane: Pane): HTMLElement | null;
+  /** Take the `tabindex` back from the row of `pane` selected before `row`, and note `row` as the one holding it. */
   releaseRow(pane: Pane, row: HTMLElement): void;
   /** Give `row`'s time its tab stop, or take it away. */
   rowTimeTabStop(row: HTMLElement, on: boolean): void;
