@@ -1,13 +1,14 @@
 ---
 title: 'voice-page-copy-link-key: Cmd-L copies the vibe-talk link'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: cl-refactor
 labels:
 - vibe-talk
 created_at: 2026-11-05T15:17:20.313770248+00:00
-updated_at: 2026-11-05T15:17:20.313770248+00:00
+updated_at: 2026-11-05T20:03:01.193941049+00:00
+closed_at: 2026-11-05T20:03:01.193940899+00:00
 ---
 
 # Description
@@ -40,3 +41,9 @@ It is an owner-approved exception between #624 voice-page-modularity batches.
 # Notes
 
 Relayed by the lead on 2026-11-05 (owner reply 161). Assigned to cl-refactor, ahead of further #624 batches.
+
+## Resolution
+
+[opus 5.5] Landed as 2fbb7bd0 on main (gate base 79b69472). Ctrl+L (Cmd+L) on the selected message copies its vibe-talk link through the ⋯ menu's own copyDeepLink, so the link format still changes in one place; the status line says "Copied the vibe-talk link." (the menu's existing words). Bare l and the menu still copy the Slack/service link. Ctrl+Shift+L (Cmd+Shift+L) does the same for a browser tab whose Cmd+L goes to the address bar, and the ? list names it outside the installed app (display mode read from a CSS custom property). It is never taken in a text field. The menu item carries aria-keyshortcuts. Tests: dom.test.mjs (binding, wording in both modes, repeats, rowkeys) and a done.mjs page test.
+
+Unverified: real Chrome's routing of Cmd+L in a tab (headless CDP dispatch bypasses browser accelerators; the fallback covers it), and whether Safari takes Cmd+Shift+L for its sidebar first.
