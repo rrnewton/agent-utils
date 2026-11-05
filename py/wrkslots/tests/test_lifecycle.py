@@ -10092,6 +10092,144 @@ def test_ownerless_cargo_cleanup_ignores_an_unrelated_missing_slot(
     assert row["slot"] == "unrelated"
 
 
+def test_recover_finalizes_absent_ownerless_cargo_home(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "ignored" / "validate" / "cargo-homes" / "validate-cargo-absent"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(project, target, field="cargo_home")
+    interrupted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validate-journal"},
+    )
+    assert interrupted.returncode == 86
+    journal_path = control_directory(project) / "ACTIVE.testhost.journal"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["kind"] == "ownerless-validate-remove"
+    assert journal["phase"] == "prepared"
+
+    # Something outside wrkslots deleted both paths; only a dangling
+    # slot-N symlink pointing at the absent cargo home remains.
+    shutil.rmtree(target)
+    dangling = target.parent / "slot-2"
+    dangling.symlink_to(target.name)
+    assert dangling.is_symlink() and not dangling.exists()
+
+    recovered = raw_command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not journal_path.exists()
+    assert not os.path.lexists(dangling)
+    config = wrkslots._load_config(str(project), "testhost")
+    event = next(
+        item
+        for item in reversed(wrkslots._load_events(config))
+        if item["kind"] == "ownerless-validate-path-removed"
+    )
+    payload = wrkslots._as_mapping(event["payload"], "absent removal event payload")
+    assert payload["slot"] == target.name
+    assert payload["outcome"] == "absent"
+    authorization = wrkslots._as_mapping(
+        payload["authorization"], "absent removal authorization"
+    )
+    assert authorization["target_kind"] == "cargo-home"
+    evidence = wrkslots._as_mapping(
+        authorization["evidence"], "absent removal evidence"
+    )
+    assert evidence["kind"] == "terminal-record"
+
+    # The pinned wrkslots still deployed where this journal blocks
+    # validation must read the post-recover state cleanly.
+    extracted = tmp_path / "pinned-wrkslots"
+    repo_root = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=Path(__file__).parent,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if repo_root.returncode != 0:
+        pytest.skip("pinned wrkslots commit f79789533dc0 is unavailable")
+    archive = subprocess.run(
+        ["git", "archive", "f79789533dc0", "py"],
+        cwd=repo_root.stdout.strip(),
+        capture_output=True,
+        check=False,
+    )
+    if archive.returncode != 0:
+        pytest.skip("pinned wrkslots commit f79789533dc0 is unavailable")
+    extracted.mkdir()
+    subprocess.run(
+        ["tar", "-x", "-C", str(extracted)],
+        input=archive.stdout,
+        check=True,
+    )
+    reader = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, sys.argv[1]);"
+            "from wrkslots import cli;"
+            "config = cli._load_config(sys.argv[2], 'testhost');"
+            "events = cli._load_events(config);"
+            "assert any(e['kind'] == 'ownerless-validate-path-removed' for e in events);"
+            "states, archives = cli._validate_global_state(config);"
+            "assert cli._classify_create_journals(config, states, archives) == ()",
+            str(extracted / "py"),
+            str(project),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert reader.returncode == 0, reader.stderr
+
+
+def test_recover_absent_cargo_home_refuses_missing_authorization_flag(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "ignored" / "validate" / "cargo-homes" / "validate-cargo-unproven"
+    target.mkdir(parents=True)
+    record = prepare_terminal_validation_record(project, target, field="cargo_home")
+    interrupted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validate-journal"},
+    )
+    assert interrupted.returncode == 86
+    journal_path = control_directory(project) / "ACTIVE.testhost.journal"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal["authorization"]["no_live_use"] = False
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    shutil.rmtree(target)
+
+    refused = raw_command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert refused.returncode == 3
+    assert journal_path.exists()
+
+
 def test_ownerless_cargo_home_allows_nested_git_cache_and_records_determination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

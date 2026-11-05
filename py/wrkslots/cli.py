@@ -47433,7 +47433,7 @@ def _ownerless_validation_inputs(
     if target_present and fenced_present:
         raise Refusal("canonical and fenced validation paths both exist; preserve both")
     active = target if target_present else fenced if fenced_present else None
-    if phase != "removed" and active is None:
+    if phase != "removed" and active is None and authorization.target_kind != "cargo-home":
         raise Refusal(
             f"validation path disappeared during {phase} cleanup; removal outcome is "
             "UNKNOWN, so preserve the journal and inspect the authorized identity"
@@ -48798,6 +48798,29 @@ def _assert_excluded_validation_tree_bound(
         )
 
 
+def _remove_dangling_cargo_home_links(target: Path) -> None:
+    """Remove slot-N symlinks left dangling by an externally deleted cargo home."""
+
+    parent = target.parent
+    if parent.is_symlink() or not parent.is_dir():
+        return
+    removed = False
+    for entry in parent.iterdir():
+        if not entry.name.startswith("slot-") or not entry.is_symlink():
+            continue
+        try:
+            destination = Path(os.readlink(entry))
+        except OSError:
+            continue
+        resolved = destination if destination.is_absolute() else parent / destination
+        if Path(os.path.normpath(resolved)) != target or entry.exists():
+            continue
+        entry.unlink()
+        removed = True
+    if removed:
+        _fsync_directory(parent)
+
+
 def _recover_ownerless_validation(
     config: Config,
     path: Path,
@@ -48841,6 +48864,9 @@ def _recover_ownerless_validation(
         live_use_recheck=selected_live_use_recheck,
     )
     journal = dict(raw)
+    absent_finalize = active is None and authorization.target_kind == "cargo-home"
+    if absent_finalize:
+        _remove_dangling_cargo_home_links(target)
     if active is not None:
         try:
             authorization, target, fenced, active, repository = (
@@ -49079,6 +49105,7 @@ def _recover_ownerless_validation(
                 "recovery_id": recovery_identity,
                 "authorization": authorization_payload,
                 "recovery_actor": _identity_to_obj(coordinator),
+                **({"outcome": "absent"} if absent_finalize else {}),
             },
         )
     _interrupt_for_test("after-ownerless-validate-removal-event")

@@ -992,9 +992,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The agent-remove case whose nested .gitmodules indents an option
     # line with spaces under a tab-indented sibling is mapped
     # (https://github.com/rrnewton/agent-utils/issues/298).
-    assert len(all_tests) == 2131
+    # The two absent cargo-home recovery cases of #872 (finalize as
+    # absent, and a missing authorization flag still refused) are mapped.
+    assert len(all_tests) == 2133
     assert len(ordinary) == 339
-    assert len(mapped) == 1792
+    assert len(mapped) == 1794
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
