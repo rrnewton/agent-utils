@@ -3855,7 +3855,7 @@ function applyFoldStep(step, folds, field = null) {
  * browser's own default for the chord, and do nothing; a held bare key's are left alone, as before.
  *
  * @param {number} way
- * @param {KeyboardEvent} [event]
+ * @param {import("./src/view/shell/index.ts").DispatchedKey} [event]
  * @param {EventTarget | null} [target] Where the focus was: a message box showing in the list is kept
  *   where it is through the step (`foldStepField`).
  */
@@ -6997,7 +6997,7 @@ const KEYMAP = createKeymap({
   doneFromKeyboard: (target) => doneFromKeyboard(target),
   readCollapseFromKeyboard: (target) => readCollapseFromKeyboard(target),
   foldOneFromKeyboard: (target) => foldOneFromKeyboard(target),
-  foldStepFromKeyboard: (step, event, target) => foldStepFromKeyboard(step, /** @type {KeyboardEvent} */ (event), target),
+  foldStepFromKeyboard: (step, event, target) => foldStepFromKeyboard(step, event, target),
   collapsedLinesFromKeyboard: (step, target) => collapsedLinesFromKeyboard(step, target),
   packFromKeyboard: (target) => packFromKeyboard(target),
   unpackFromKeyboard: () => unpackFromKeyboard(),

@@ -1933,9 +1933,21 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
   const view = (key) => press(key, { metaKey: true, repeat: true }, target, { mod: true }).slice(1)[0];
   assert.deepStrictEqual(["1", "2", "3", "4"].map(view), ["viewFromKeyboard main true", "viewFromKeyboard flat true", "viewFromKeyboard threads true", "viewFromKeyboard columns true"]);
   const link = { tagName: "A" };
+  const given = (key, event = {}, chord = {}) => {
+    calls.length = 0;
+    find(key, chord).run({ key, ...event }, target);
+    return calls.map(([name, ...args]) => [name, ...args.map((arg) => (arg === target ? "target" : arg && typeof arg === "object" ? "event" : arg))]);
+  };
+  assert.deepStrictEqual([given(";"), given(":", { ctrlKey: true }, { mod: true }), given("(", {}, { mod: true }), given(")", {}, { mod: true })],
+    [[["foldStepFromKeyboard", 1, "event", "target"]], [["foldStepFromKeyboard", -1, "event", "target"]],
+      [["collapsedLinesFromKeyboard", -1, "target"]], [["collapsedLinesFromKeyboard", 1, "target"]]]);
+  assert.deepStrictEqual([given("["), given("]"), given("ArrowDown", {}, { alt: true }), given("0", { repeat: true }, { mod: true })],
+    [[["columnFromKeyboard", false]], [["columnFromKeyboard", true]], [["stepChannel", "event"]], [["voiceFromKeyboard", true]]]);
+  assert.deepStrictEqual(["p", "l", "m"].map((key) => given(key, {}, { shift: true })),
+    [[["filterFromKeyboard", "pinned"]], [["filterFromKeyboard", "links"]], [["filterFromKeyboard", "author"]]]);
   assert.deepStrictEqual([press("Enter", { ctrlKey: true }, field, { mod: true }), press("Enter", { ctrlKey: true }, link, { mod: true }), press("Enter", { ctrlKey: true }, target, { mod: true })],
     [[false], [false], ["writeFromKeyboard did", "writeFromKeyboard"]], "Ctrl+Enter took the key from a box or a link");
-  // Every act is reached by some key, and none is named twice over for nothing.
+  // Every act is reached by some key, and no key asks for an act the page does not give.
   const reached = new Set();
   for (const binding of keymap) {
     for (const chord of binding.chords) {
@@ -1959,7 +1971,8 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
     "replyFromKeyboard", "searchFromAnywhere", "searchFromKeyboard", "settingsFromKeyboard", "stepChannel", "stepFromKeyboard",
     "threadFromKeyboard", "threadOutFromKeyboard", "threadStripFromKeyboard", "undoFromKeyboard", "unpackFromKeyboard",
     "viewFromKeyboard", "voiceFromKeyboard", "writeFromKeyboard"];
-  assert.deepStrictEqual([...reached].filter((name) => expected.includes(name)).sort(), expected, "an act is reached by no key");
+  const wording = ["chatServiceName", "manyChatServices", "maxCollapsedLines", "minCollapsedLines", "modKeyName", "threadOrderWords"];
+  assert.deepStrictEqual([...reached].sort(), [...expected, ...wording].sort(), "an act is reached by no key, or a key asks for one the page does not give");
   // What the list says asks the page for the reader's words.
   assert.ok(words.includes("Cmd+[ goes back") && words.includes("Copy its link in Chat:") && words.includes("in turn: Newest, Oldest.") &&
     words.includes("everywhere: 0 to 8 lines"), "the list of keys does not say the chords, the service, the orders or the bounds from the page");
