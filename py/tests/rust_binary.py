@@ -24,6 +24,9 @@ TARGET_DIR = REPO_ROOT / "rs" / "target" / "validation-adapters" / "agentctl"
 def _build(
     packages: list[str], binaries: list[str], env: dict[str, str] | None = None
 ) -> dict[str, Path]:
+    # Bound Cargo's job parallelism (#883), as in the wrkslots helper.
+    build_env = dict(os.environ if env is None else env)
+    build_env["CARGO_BUILD_JOBS"] = "2"
     result = subprocess.run(
         [
             "cargo", "build", "--quiet", "--release", "--locked",
@@ -33,7 +36,7 @@ def _build(
             "--message-format", "json",
         ],
         cwd=REPO_ROOT, check=True, capture_output=True, text=True, timeout=1200,
-        env=env,
+        env=build_env,
     )
     built: dict[str, Path] = {}
     for line in result.stdout.splitlines():

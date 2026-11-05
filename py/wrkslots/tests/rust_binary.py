@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -22,6 +23,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 def rust_wrkslotsd() -> Path:
     """Return this session's freshly built release binary, or fail the build."""
     target = REPO_ROOT / "rs" / "target" / "validation-adapters" / "wrkslotsd"
+    # Bound Cargo's job parallelism (#883): a cold release build at the
+    # host's default width peaked past a test shard's memory cap, while
+    # two jobs keep the same binary with a much smaller build tree.
+    env = dict(os.environ)
+    env["CARGO_BUILD_JOBS"] = "2"
     result = subprocess.run(
         [
             "cargo", "build", "--quiet", "--release", "--locked",
@@ -29,7 +35,7 @@ def rust_wrkslotsd() -> Path:
             "-p", "wrkslotsd", "--bin", "wrkslotsd", "--target-dir", str(target),
             "--message-format", "json",
         ],
-        cwd=REPO_ROOT, check=True, capture_output=True, text=True, timeout=900,
+        cwd=REPO_ROOT, check=True, capture_output=True, text=True, timeout=900, env=env,
     )
     for line in result.stdout.splitlines():
         artifact: object = json.loads(line)
