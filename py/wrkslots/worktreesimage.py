@@ -330,7 +330,12 @@ def delete_slot_subvolume(path: Path) -> None:
 
 
 def listing_signature(root: Path) -> list[tuple[str, str, int]]:
-    """Sorted (relative path, kind, size) for every entry under ``root``."""
+    """Sorted (relative path, kind, size) for every migratable entry.
+
+    Special files (FIFOs, sockets, devices — runtime residue in build
+    caches) are skipped: they cannot be copied and are never slot
+    content, so migration neither copies nor compares them.
+    """
 
     signature: list[tuple[str, str, int]] = []
     for current, dirs, files in os.walk(root):
@@ -341,9 +346,20 @@ def listing_signature(root: Path) -> list[tuple[str, str, int]]:
                 signature.append((relative, "link", len(os.readlink(entry))))
             elif entry.is_dir():
                 signature.append((relative, "dir", 0))
-            else:
+            elif entry.is_file():
                 signature.append((relative, "file", entry.stat().st_size))
     return sorted(signature)
+
+
+def _skip_special(directory: str, names: list[str]) -> list[str]:
+    """``shutil.copytree`` ignore callback: skip special files."""
+
+    skipped: list[str] = []
+    for name in names:
+        entry = Path(directory) / name
+        if not entry.is_symlink() and not entry.is_dir() and not entry.is_file():
+            skipped.append(name)
+    return skipped
 
 
 def process_inside(path: Path) -> bool:

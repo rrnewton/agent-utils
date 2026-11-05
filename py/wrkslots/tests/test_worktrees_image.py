@@ -8,6 +8,7 @@ repeated here because the shared test host cannot guarantee loop devices.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -110,6 +111,14 @@ def _config(tmp_path: Path, state: str) -> cli.Config:
         ),
         worktrees_image_state=state,
     )
+
+
+def test_special_files_are_not_migratable(tmp_path: Path) -> None:
+    (tmp_path / "keep.txt").write_text("x", encoding="utf-8")
+    os.mkfifo(tmp_path / "pipe")
+    signature = worktreesimage.listing_signature(tmp_path)
+    assert signature == [("keep.txt", "file", 1)]
+    assert worktreesimage._skip_special(str(tmp_path), ["keep.txt", "pipe"]) == ["pipe"]
 
 
 def test_bind_record_round_trip(tmp_path: Path) -> None:

@@ -807,7 +807,20 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
         raise _refuse(f"image subvolume already exists: {subvolume}; inspect it first")
     try:
         worktreesimage.create_slot_subvolume(subvolume, settings.slot_quota_bytes)
-        shutil.copytree(slot_path, subvolume, dirs_exist_ok=True, symlinks=True)
+        try:
+            shutil.copytree(
+                slot_path,
+                subvolume,
+                dirs_exist_ok=True,
+                symlinks=True,
+                ignore=worktreesimage._skip_special,
+            )
+        except BaseException:
+            # A failed copy must not leave a partial subvolume that the
+            # next migrate attempt would refuse on; the original is
+            # untouched either way.
+            worktreesimage.delete_slot_subvolume(subvolume)
+            raise
         if worktreesimage.listing_signature(subvolume) != before:
             raise _refuse("migrated copy does not match the slot file by file; original kept")
         # Bind at the original real path: the path, registry record and
