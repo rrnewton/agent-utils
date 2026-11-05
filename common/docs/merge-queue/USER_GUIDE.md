@@ -1275,6 +1275,12 @@ differs warns at startup. A validator that checks its checkout's origin itself s
 the same way. `merge-queue donor same-repository URL URL` exits `0` when two URLs name one
 repository and prints both normalized forms.
 
+JSON replies (`donor info`, `claim`, `renew`, `report`) print exactly one JSON value on
+stdout, with any config warning carried in a `warnings` field of that value (and once on
+stderr): nothing may precede the JSON, because some routes merge the remote's stderr into
+stdout. The donor parses the last JSON line of a reply, tolerating leading noise lines
+(warnings, an exec route's notes) and logs skipped noise once.
+
 **Transport: no new ports.** A donor reaches the queue only by running this tool on the queue
 host through its `--queue` route. Each request appends its arguments to the route, for example
 `agentcloudctl node exec --node QUEUEHOST -- /path/merge-queue --repo /path/queue`,

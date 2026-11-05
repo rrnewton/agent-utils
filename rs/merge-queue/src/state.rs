@@ -1038,6 +1038,17 @@ impl Config {
     }
 }
 
+/// Config warnings collected in this process, for JSON replies (see [`State::config`]).
+static CONFIG_WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Drain the config warnings collected so far in this process.
+pub fn take_config_warnings() -> Vec<String> {
+    CONFIG_WARNINGS
+        .lock()
+        .map(|mut warnings| std::mem::take(&mut *warnings))
+        .unwrap_or_default()
+}
+
 /// Handle on a state directory.
 #[derive(Clone, Debug)]
 pub struct State {
@@ -1182,13 +1193,25 @@ impl State {
             let names: Vec<&str> = config.unknown_fields.keys().map(String::as_str).collect();
             let revision = crate::build_info::revision()
                 .map_or_else(|| "unknown".to_owned(), |r| r.describe());
-            eprintln!(
-                "merge-queue: warning: {} sets unknown field(s) {} — ignored by this build \
-                 (revision {revision}); the config may be newer than the binary, so upgrade \
-                 merge-queue if those settings should take effect",
+            let warning = format!(
+                "{} sets unknown field(s) {} — ignored by this build (revision {revision}); \
+                 the config may be newer than the binary, so upgrade merge-queue if those \
+                 settings should take effect",
                 self.config_path().display(),
                 names.join(", "),
             );
+            // Once per process on stderr, and collected for JSON replies (a route that
+            // merges stderr into stdout must not corrupt a JSON answer).
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                eprintln!("merge-queue: warning: {warning}");
+            }
+            if let Ok(mut collected) = CONFIG_WARNINGS.lock() {
+                if !collected.contains(&warning) {
+                    collected.push(warning);
+                }
+            }
         }
         if config.schema != CONFIG_SCHEMA {
             return Err(format!(

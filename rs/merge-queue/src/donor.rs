@@ -1472,6 +1472,42 @@ impl Route {
         Ok(Self { argv })
     }
 
+    /// Parse a queue reply that should be one JSON value: tolerate leading noise lines
+    /// (a route that merges the remote's stderr into stdout, an agentcloudctl note, a
+    /// config warning) by taking the last line that parses. Skipped noise is logged once.
+    fn parse_reply<T: serde::de::DeserializeOwned>(out: &[u8]) -> Result<T, String> {
+        if let Ok(value) = serde_json::from_slice::<T>(out) {
+            return Ok(value);
+        }
+        let text = String::from_utf8_lossy(out);
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        for (index, line) in lines.iter().enumerate().rev() {
+            if let Ok(value) = serde_json::from_str::<T>(line) {
+                let skipped = index;
+                if skipped > 0 {
+                    static LOGGED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !LOGGED.swap(true, Ordering::SeqCst) {
+                        eprintln!(
+                            "merge-queue donor: skipped {skipped} noise line(s) before the \
+                         queue's JSON reply (further noise is not logged)"
+                        );
+                    }
+                }
+                return Ok(value);
+            }
+        }
+        Err(format!(
+            "no JSON reply in the queue's answer: {}",
+            lines.last().copied().unwrap_or_default()
+        ))
+    }
+}
+
+impl Route {
     /// Run one request; stdout on success, the exit status and stderr tail otherwise.
     fn call(
         &self,
@@ -1777,9 +1813,7 @@ impl Worker<'_> {
                             token.as_bytes(),
                             ROUTE_TIMEOUT,
                         )
-                        .and_then(|out| {
-                            serde_json::from_slice::<Renewal>(&out).map_err(|e| e.to_string())
-                        });
+                        .and_then(|out| Route::parse_reply::<Renewal>(&out));
                     if let Ok(Renewal::Stop { reason }) = answer {
                         *lost
                             .lock()
@@ -2059,9 +2093,7 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
                     b"",
                     ROUTE_TIMEOUT,
                 );
-                match answer.and_then(|out| {
-                    serde_json::from_slice::<Claimed>(&out).map_err(|e| e.to_string())
-                }) {
+                match answer.and_then(|out| Route::parse_reply::<Claimed>(&out)) {
                     Ok(Claimed { job: Some(job) }) => {
                         claimed = true;
                         active.fetch_add(1, Ordering::SeqCst);
@@ -2108,7 +2140,7 @@ fn preflight_against_queue(
 ) -> Result<(), String> {
     let info = match route
         .call(&["donor", "info"], b"", ROUTE_TIMEOUT)
-        .and_then(|out| serde_json::from_slice::<QueueInfo>(&out).map_err(|e| e.to_string()))
+        .and_then(|out| Route::parse_reply::<QueueInfo>(&out))
     {
         Ok(info) => info,
         Err(error) => {
@@ -2238,6 +2270,24 @@ mod unit {
             exit: Some(0),
             ..Receipt::default()
         }
+    }
+
+    #[test]
+    fn a_reply_with_leading_noise_still_parses() {
+        let noisy = b"merge-queue: warning: config sets unknown field(s) peripheral -- ignored\n\
+                      note: --ws-url and AGENTCLOUD_ORCHESTRATOR_URL are both unset\n\
+                      {\"job\":null}\n";
+        let claimed: Claimed = Route::parse_reply(noisy).unwrap();
+        assert!(claimed.job.is_none());
+        // Noise with no JSON at all is an error naming the last line, not a parse panic.
+        let error = match Route::parse_reply::<Claimed>(b"note: only noise\n") {
+            Ok(_) => panic!("noise must not parse"),
+            Err(error) => error,
+        };
+        assert!(error.contains("no JSON reply"), "{error}");
+        // A clean reply parses exactly as before.
+        let clean: Claimed = Route::parse_reply(b"{\"job\":null}").unwrap();
+        assert!(clean.job.is_none());
     }
 
     #[test]

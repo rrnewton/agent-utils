@@ -321,6 +321,24 @@ fn donor_store(state: &State, config: &Config) -> crate::donor::Store {
     store
 }
 
+/// Print one JSON reply, carrying any config warnings in a `warnings` field:
+/// nothing else may reach stdout before the JSON (a route may merge stderr into it,
+/// and the donor takes the last JSON line either way).
+fn print_json_reply(value: &serde_json::Value) -> Result<(), String> {
+    let warnings = crate::state::take_config_warnings();
+    let mut value = value.clone();
+    if !warnings.is_empty() {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("warnings".to_owned(), serde_json::json!(warnings));
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&value).map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
 fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
     let config = state.config()?;
     let store = donor_store(state, &config);
@@ -334,10 +352,7 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
                 remote_url: crate::donor::remote_url(&config.repo, &config.remote),
                 merge_queue: crate::build_info::revision(),
             };
-            println!(
-                "{}",
-                serde_json::to_string(&info).map_err(|error| error.to_string())?
-            );
+            print_json_reply(&serde_json::to_value(&info).map_err(|error| error.to_string())?)?;
             Ok(0)
         }
         DonorCommand::Claim { donor, host, jobs } => {
@@ -376,17 +391,15 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
                 }
             }
             let job = store.claim(&donor, &host, jobs)?;
-            let text = serde_json::to_string(&crate::donor::Claimed { job })
-                .map_err(|error| error.to_string())?;
-            println!("{text}");
+            print_json_reply(
+                &serde_json::to_value(&crate::donor::Claimed { job })
+                    .map_err(|error| error.to_string())?,
+            )?;
             Ok(0)
         }
         DonorCommand::Renew { job } => {
             let renewal = store.renew(&job, &read_token()?)?;
-            println!(
-                "{}",
-                serde_json::to_string(&renewal).map_err(|error| error.to_string())?
-            );
+            print_json_reply(&serde_json::to_value(&renewal).map_err(|error| error.to_string())?)?;
             Ok(0)
         }
         DonorCommand::Bundle { job } => {
@@ -409,7 +422,7 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             let report: crate::donor::Report = serde_json::from_str(&text)
                 .map_err(|error| format!("unreadable report: {error}"))?;
             store.report(&job, &report.token, report.receipt)?;
-            println!("{{\"accepted\": true}}");
+            print_json_reply(&serde_json::json!({"accepted": true}))?;
             Ok(0)
         }
         DonorCommand::Release {
