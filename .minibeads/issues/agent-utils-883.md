@@ -23,6 +23,14 @@ Two repeat offenders appeared in the gate ledger on 2026-11-05 after #875 fixed 
   - Do not raise every shard's cap blindly; #851 set them deliberately.
 - **shard-4:** make the heartbeat-renewal test independent of wall-clock load. Use an injected clock or a deterministic renewal point instead of real elapsed time, keeping what it asserts: renewal marks only that row unknown.
 
+- **Data from 2026-11-05 (another lane's profiling).** shard-2 has the same nondeterministic blowup, before and after the worktrees-image landings:
+  - alone, it failed once at 377 s, then passed on a rerun;
+  - one solo pass peaked at about 0.91 GiB;
+  - in parallel gates it was OOM-killed at the 1.9 GiB cap around 40% of its tests;
+  - `test_worktrees_image.py` alone peaks at 48-66 MB.
+
+  Look for a test that occasionally balloons: a spawned process tree counted in the cgroup, a large in-memory log or fixture, a retry loop accumulating output. Sample per-test cgroup memory across several runs of shard-0 and shard-2.
+
 # Acceptance Criteria
 
 - shard-0 has no OOM kill in the next 24 h ledger readout, and its cap stays within the gate host's overall memory budget.
