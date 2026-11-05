@@ -1753,7 +1753,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
     quarantined.retain(|id| {
         if id.starts_with(crate::failed_digest::DIGEST_ID_PREFIX) {
             let filename = format!("{id}.json");
-            let _ = fs::create_dir_all(&directories.cancelled);
+            let _ = agent_queue::queue::prepare_lane(root, &directories.cancelled);
             let _ = fs::rename(
                 directories.failed.join(&filename),
                 directories.cancelled.join(&filename),
@@ -3021,12 +3021,28 @@ pub(crate) fn status_managed<A: AgentApi + ?Sized>(
     status_with_binding_mode(client, target, root, true)
 }
 
+/// Repair phase/lane subdirectories a careless creator left group- or
+/// other-readable (0755) — the one safe repair (owned by the caller, not
+/// writable by others) — so a queue with such a subdirectory stays
+/// reachable instead of refusing every operation. The queue root, a
+/// symlink, a foreign-owned or group-writable directory still refuses in
+/// [`validate_existing_queue`], and this creates nothing.
+fn repair_queue_subdirs(root: &Path) {
+    let directories = QueueDirectories::new(root);
+    for directory in directories.all().into_iter().chain(directories.lanes()) {
+        if fs::symlink_metadata(directory).is_ok() {
+            let _ = agent_queue::fsio::repair_private_directory(directory, "queue state directory");
+        }
+    }
+}
+
 fn status_with_binding_mode<A: AgentApi + ?Sized>(
     client: &A,
     target: &Target,
     root: &Path,
     allow_legacy_workspace_binding: bool,
 ) -> AgentResult<QueueStatus> {
+    repair_queue_subdirs(root);
     validate_existing_queue(root)?;
     validate_existing_binding(root, target, allow_legacy_workspace_binding)?;
     let info = resolve_target(client, target)?;

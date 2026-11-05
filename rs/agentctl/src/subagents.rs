@@ -11663,8 +11663,22 @@ its drain would also type, so it was not queued",
     /// #903 follow-up): moved to `failed-archive-<date>/` and recorded
     /// shown, so they leave `status`/`requests` and every digest.
     pub fn ack_failed(&self, agent_name: &str, ids: &[String], all: bool) -> Result<Vec<String>> {
+        // Refuse an unregistered name: never create a queue for one (a
+        // stray `agents/<typo>/queue/` in the registry is worse than the
+        // typo).
+        self.load(agent_name)?;
         let queue = self.queue(agent_name)?;
         crate::failed_digest::ack_failed(&queue, ids, all).map_err(fail)
+    }
+
+    /// One registered agent's failed queue entries (`agentctl failed list`).
+    pub fn failed_entries(
+        &self,
+        agent_name: &str,
+    ) -> Result<Vec<crate::failed_digest::FailedEntry>> {
+        self.load(agent_name)?;
+        let queue = self.queue(agent_name)?;
+        Ok(crate::failed_digest::failed_entries(&queue))
     }
 
     /// Drain only prompts known not to have been injected.

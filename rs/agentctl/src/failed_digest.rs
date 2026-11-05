@@ -552,8 +552,10 @@ pub fn discard_unconfirmed(root: &Path, id: &str) -> Result<bool, String> {
         Some(MessageState::Failed) => {
             let failed = root.join(agent_queue::queue::FAILED);
             let cancelled = root.join(agent_queue::queue::CANCELLED);
-            fs::create_dir_all(&cancelled)
-                .map_err(|e| format!("cannot create {}: {e}", cancelled.display()))?;
+            // Private (0700) like every queue directory, and repairs an
+            // existing non-private one: a 0755 queue state directory makes
+            // the whole queue refuse every later operation.
+            queue_subdir(root, &cancelled)?;
             fs::rename(
                 failed.join(format!("{id}.json")),
                 cancelled.join(format!("{id}.json")),
@@ -567,6 +569,14 @@ pub fn discard_unconfirmed(root: &Path, id: &str) -> Result<bool, String> {
         }
         _ => Ok(false),
     }
+}
+
+/// The one way digest code creates a directory under a queue: private
+/// (0700) like every queue directory, repairing an existing user-owned
+/// non-private one. A plain `create_dir_all` would leave 0755 and make
+/// the whole queue refuse every later operation.
+fn queue_subdir(root: &Path, path: &Path) -> Result<(), String> {
+    agent_queue::queue::prepare_lane(root, path).map_err(|error| error.to_string())
 }
 
 /// Move failed entries to `failed-archive-<YYYY-MM-DD>/` beside `failed/`
@@ -590,9 +600,21 @@ pub fn ack_failed(root: &Path, ids: &[String], all: bool) -> Result<Vec<String>,
     if targets.is_empty() {
         return Err("nothing to ack: name at least one failed id or --all".to_owned());
     }
+    // Verify every target before creating anything, so a bad name creates
+    // no archive directory (and an unregistered agent is refused earlier,
+    // in the manager, before its queue is ever touched).
+    for id in &targets {
+        agent_queue::queue::validate_message_id(id)
+            .map_err(|error| format!("invalid failed id {id:?}: {error}"))?;
+        if id.starts_with(DIGEST_ID_PREFIX) {
+            continue;
+        }
+        if !failed.join(format!("{id}.json")).is_file() {
+            return Err(format!("no failed entry {id} in {}", failed.display()));
+        }
+    }
     let archive = root.join(format!("failed-archive-{}", archive_date()));
-    fs::create_dir_all(&archive)
-        .map_err(|error| format!("cannot create {}: {error}", archive.display()))?;
+    queue_subdir(root, &archive)?;
     let mut moved = Vec::new();
     for id in &targets {
         agent_queue::queue::validate_message_id(id)
@@ -901,6 +923,71 @@ mod tests {
         assert!(discard_unconfirmed(&root, &id).unwrap());
         assert!(failed_entries(&root).iter().all(|e| e.id != id));
         assert!(root.join("cancelled").join(format!("{id}.json")).is_file());
+        // The set-aside path leaves the queue reachable: cancelled/ is
+        // private (0700) like every queue directory, so the queue's own
+        // privacy check still passes.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(root.join("failed"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "cancelled/ must be private");
+        }
+        assert!(
+            agent_queue::queue::validate_existing_queue(&root).is_ok(),
+            "queue stays reachable after a set-aside"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_directory_under_a_queue_is_private_after_digest_set_aside_and_ack() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("modes");
+        agent_queue::queue::prepare(&root).unwrap();
+        enable_since(&root, 1);
+        write_failed(&root, "msg-1", "one", "cancelled", 900);
+        write_failed(&root, "msg-2", "two", "cancelled", 950);
+        // Digest + set-aside paths.
+        let id = queue_digest_at(&root, 1_000.0).unwrap().expect("digest");
+        assert!(discard_unconfirmed(&root, &id).unwrap());
+        // Ack path (creates failed-archive-<date>/).
+        assert_eq!(
+            ack_failed(&root, &["msg-2".to_owned()], false).unwrap(),
+            ["msg-2"]
+        );
+        // Walk the whole queue tree: every directory is 0700.
+        fn walk(dir: &Path, bad: &mut Vec<String>) {
+            let mode = fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            if mode != 0o700 {
+                bad.push(format!("{} {mode:04o}", dir.display()));
+            }
+            for entry in fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, bad);
+                }
+            }
+        }
+        let mut bad = Vec::new();
+        walk(&root, &mut bad);
+        assert!(bad.is_empty(), "non-private queue dirs: {bad:?}");
+        assert!(agent_queue::queue::validate_existing_queue(&root).is_ok());
+        // A pre-existing 0755 queue subdir (from the old careless create)
+        // is reported by the pure queue check, then repaired by the next
+        // writer open (`prepare`), so the queue is reachable again.
+        fs::set_permissions(root.join("failed"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(agent_queue::queue::validate_existing_queue(&root).is_err());
+        agent_queue::queue::prepare(&root).unwrap();
+        assert!(agent_queue::queue::validate_existing_queue(&root).is_ok());
+        let mode = fs::metadata(root.join("failed"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "repaired by the writer open");
         let _ = fs::remove_dir_all(&root);
     }
 
