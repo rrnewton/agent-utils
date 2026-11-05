@@ -202,6 +202,17 @@ const SCRIPT_CODE = stripJsComments(SCRIPT);
 const MODULE_CODE = moduleSources().filter(({ generated }) => !generated).map(({ text }) => stripJsComments(text)).join("\n");
 
 /**
+ * The keymap's table, comments removed: every binding of web/src/view/shell/keymap.ts, between `return [` and its
+ * close (`#624 voice-page-modularity`). The tests of the keys read it off the source, so the list of keys is never
+ * checked against a second copy of it.
+ */
+const KEYMAP_TABLE = (() => {
+  const table = /\n {2}return \[([\s\S]*?)\n {2}\];\n\}/.exec(stripJsComments(readWeb("src/view/shell/keymap.ts")));
+  assert.ok(table, "web/src/view/shell/keymap.ts has no KEYMAP table");
+  return table[1];
+})();
+
+/**
  * `code` with the text of every string and template literal blanked, found by the pinned TypeScript
  * parser rather than by a pattern pairing quotes across a whole file, which a quote inside a regular
  * expression literal throws off for everything after it (`#624 voice-page-modularity`, where moving
@@ -10077,7 +10088,7 @@ export { ACKNOWLEDGED, ALIAS_NOTICE, ALICE, BASE_CSS, BIG, BIG_ROOT, BOTTOM_SLAC
   COLLAPSE_OVER_CHARS, CONVAI_WRITE, COUNTS_ALL_READ_MS, CSS, CSS_CODE, CSS_UNCONDITIONAL,
   DEFAULT_POST_PREFIX, DESKTOP_QUERY, DISCORD_POLL_MS, DONE_FLASH_FADE_MS, DONE_FLASH_HOLD_MS,
   FIXTURE_TREE, FakeElement, GATHERED, GLYPHS, HELP_SLUGS, HOLD_MS, HOVER_QUERY, HTML, HTML_CODE,
-  INBOX, INBOX_NOTICE, LINE_PX, LINK_ATTRS, MESSAGE_CACHE_KEY, MESSAGE_DAY, MESSAGE_SPACING_MS,
+  INBOX, INBOX_NOTICE, KEYMAP_TABLE, LINE_PX, LINK_ATTRS, MESSAGE_CACHE_KEY, MESSAGE_DAY, MESSAGE_SPACING_MS,
   MIC_TOGGLE_IDS, MINTED, MODULE_CODE, NOISE_MATCHING, OTHER_CHANNEL, OWN, OWNER, OWNERS_MESSAGE, OWN_READ_APPLY_ARM_MS,
   PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS, PAGE_READ_REASONS, PAGE_SCRIPTS, PRELUDE, PRESENT_CALL,
   PRESENT_ROWS, PRESENT_TIME,

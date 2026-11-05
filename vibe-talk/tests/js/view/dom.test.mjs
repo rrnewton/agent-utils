@@ -1880,3 +1880,89 @@ test("`#624 voice-page-modularity`: the selection is kept per list by message id
     globalThis.document = was;
   }
 });
+
+test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands each to the act it names, and says the chords in the reader's words", () => {
+  const { createKeymap, KEYS_PAGE, KEYS_MOVING, KEYS_MESSAGE, KEYS_VIEW, KEYS_WRITING } = VIEW_SHELL;
+  const calls = [];
+  const answers = { modKeyName: "Cmd", manyChatServices: false, chatServiceName: "Chat", threadOrderWords: "Newest, Oldest",
+    minCollapsedLines: 0, maxCollapsedLines: 8, keyContext: { row: null }, pressRowButton: "took" };
+  const acts = new Proxy({}, { get: (_acts, name) => (...args) => {
+    calls.push([name, ...args]);
+    return name in answers ? answers[name] : `${String(name)} did`;
+  } });
+  const keymap = createKeymap(acts);
+  assert.deepStrictEqual(calls, [], "making the table ran an act");
+  const groups = [KEYS_PAGE, KEYS_MOVING, KEYS_MESSAGE, KEYS_VIEW, KEYS_WRITING];
+  assert.deepStrictEqual([...new Set(keymap.map((binding) => binding.group))].sort(), [...groups].sort(), "a binding is in no group of the list, or a group has none");
+  for (const binding of keymap) {
+    assert.ok(binding.chords.length > 0 && (typeof binding.does === "string" || typeof binding.does === "function"));
+    assert.equal(typeof binding.run, binding.by ? "undefined" : "function", `${JSON.stringify(binding.chords[0])}: listed only, or answered twice`);
+  }
+  const target = { tagName: "LI" };
+  const field = { tagName: "TEXTAREA" };
+  const find = (key, extra = {}) => keymap.find((binding) => binding.run && binding.chords.some((chord) =>
+    chord.key === key && Boolean(chord.mod) === Boolean(extra.mod) && Boolean(chord.shift) === Boolean(extra.shift) && Boolean(chord.alt) === Boolean(extra.alt)));
+  const press = (key, event = {}, on = target, chord = {}) => {
+    calls.length = 0;
+    const binding = find(key, chord);
+    assert.ok(binding, `no binding runs ${key}`);
+    return [binding.run({ key, ...event }, on), ...calls.map((call) => call.join(" "))];
+  };
+  const escape = { key: "Escape" };
+  assert.deepStrictEqual((() => { calls.length = 0; const did = find("Escape").run(escape, target); return [did, calls[0][0], calls[0][1] === escape, calls[0][2] === target]; })(),
+    ["onEscape did", "onEscape", true, true]);
+  assert.deepStrictEqual([press("End"), press("Home"), press("End", { ctrlKey: true }, target, { mod: true })],
+    [["listEdge did", "listEdge [object Object] true"], ["listEdge did", "listEdge [object Object] false"], ["jumpList did", "jumpList [object Object] true"]]);
+  assert.deepStrictEqual([press("]", { metaKey: true }, target, { mod: true }), press("[", { ctrlKey: true }, target, { mod: true })],
+    [["placeFromKeyboard did", "placeFromKeyboard 1"], ["placeFromKeyboard did", "placeFromKeyboard -1"]]);
+  assert.deepStrictEqual([press("/", {}), press("/", { ctrlKey: true }, target, { mod: true })], [["searchFromKeyboard did", "searchFromKeyboard"], ["searchFromAnywhere did", "searchFromAnywhere"]]);
+  assert.deepStrictEqual(press("ArrowDown", { repeat: true }), ["stepFromKeyboard did", "stepFromKeyboard [object Object] 1 true"]);
+  assert.deepStrictEqual(press("ArrowUp"), ["stepFromKeyboard did", "stepFromKeyboard [object Object] -1"], "↑ was given a third argument");
+  assert.deepStrictEqual([press("e"), press("e", { repeat: true, ctrlKey: true }, target, { mod: true }), press("e", { repeat: true }, target, { mod: true })],
+    [["doneFromKeyboard did", "doneFromKeyboard [object Object]"], [false, "keyContext [object Object]"], [false]],
+    "a held e marked more than once, or a held Ctrl+E was given to the browser with a row to act on");
+  assert.deepStrictEqual([press("z"), press("z", { ctrlKey: true }, target, { mod: true }), press("z", { ctrlKey: true }, field, { mod: true })],
+    [["undoFromKeyboard did", "undoFromKeyboard"], ["undoFromKeyboard did", "undoFromKeyboard"], [false]], "Ctrl+Z in a box was not left to the box");
+  assert.deepStrictEqual([press("c", { ctrlKey: true }, target, { mod: true }), press("c")],
+    [["copyChordFromKeyboard did", "copyChordFromKeyboard"], ["copyFromKeyboard did", "copyFromKeyboard"]]);
+  assert.deepStrictEqual(press("p", {}, target, { shift: false }).slice(1), ["pressRowButton [object Object] row-pin-button"]);
+  assert.equal(press("p")[0], true, "the pin key did not say it took the key when its button was pressed");
+  answers.pressRowButton = null;
+  assert.equal(press("p")[0], false, "the pin key took a key it pressed nothing for");
+  answers.pressRowButton = "took";
+  const view = (key) => press(key, { metaKey: true, repeat: true }, target, { mod: true }).slice(1)[0];
+  assert.deepStrictEqual(["1", "2", "3", "4"].map(view), ["viewFromKeyboard main true", "viewFromKeyboard flat true", "viewFromKeyboard threads true", "viewFromKeyboard columns true"]);
+  const link = { tagName: "A" };
+  assert.deepStrictEqual([press("Enter", { ctrlKey: true }, field, { mod: true }), press("Enter", { ctrlKey: true }, link, { mod: true }), press("Enter", { ctrlKey: true }, target, { mod: true })],
+    [[false], [false], ["writeFromKeyboard did", "writeFromKeyboard"]], "Ctrl+Enter took the key from a box or a link");
+  // Every act is reached by some key, and none is named twice over for nothing.
+  const reached = new Set();
+  for (const binding of keymap) {
+    for (const chord of binding.chords) {
+      if (!binding.run) continue;
+      for (const event of [{ key: chord.key }, { key: chord.key, repeat: true, ctrlKey: true }]) {
+        calls.length = 0;
+        binding.run(event, target);
+        binding.run(event, field);
+        for (const [name] of calls) reached.add(name);
+      }
+    }
+  }
+  const words = keymap.map((binding) => (typeof binding.does === "function" ? binding.does() : binding.does)).join("\n");
+  for (const [name] of calls.splice(0)) reached.add(name);
+  const expected = ["bookmarkFromKeyboard", "bookmarkJumpFromKeyboard", "collapsedLinesFromKeyboard", "columnFromKeyboard",
+    "columnsFromKeyboard", "composeFromKeyboard", "copyChordFromKeyboard", "copyFromKeyboard", "copyLinkFromKeyboard",
+    "detailsFromKeyboard", "doneFromKeyboard", "filterFromKeyboard", "foldOneFromKeyboard", "foldStepFromKeyboard", "jumpList",
+    "keyContext", "keysFromKeyboard", "listEdge", "mainRowsFromKeyboard", "menuFromKeyboard", "newestFromComposer",
+    "nextUnreadFromKeyboard", "onEscape", "openFromKeyboard", "orderFromKeyboard", "packFromKeyboard", "pickChannel",
+    "placeFromKeyboard", "pressRowButton", "readCollapseFromKeyboard", "readFromKeyboard", "readModeFromKeyboard",
+    "replyFromKeyboard", "searchFromAnywhere", "searchFromKeyboard", "settingsFromKeyboard", "stepChannel", "stepFromKeyboard",
+    "threadFromKeyboard", "threadOutFromKeyboard", "threadStripFromKeyboard", "undoFromKeyboard", "unpackFromKeyboard",
+    "viewFromKeyboard", "voiceFromKeyboard", "writeFromKeyboard"];
+  assert.deepStrictEqual([...reached].filter((name) => expected.includes(name)).sort(), expected, "an act is reached by no key");
+  // What the list says asks the page for the reader's words.
+  assert.ok(words.includes("Cmd+[ goes back") && words.includes("Copy its link in Chat:") && words.includes("in turn: Newest, Oldest.") &&
+    words.includes("everywhere: 0 to 8 lines"), "the list of keys does not say the chords, the service, the orders or the bounds from the page");
+  answers.manyChatServices = true;
+  assert.ok(keymap.map((binding) => (typeof binding.does === "function" ? binding.does() : "")).join("\n").includes("Copy its link in its chat service:"));
+});

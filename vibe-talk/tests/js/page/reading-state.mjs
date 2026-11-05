@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 
 import { PAGE_CODE, SETTINGS, ACKNOWLEDGED, ALICE, BOTTOM_SLACK_PX, BOUND_NOTICE, CHANNEL, CODER, COUNTS_ALL_READ_MS,
-  CSS, CSS_CODE, DISCORD_POLL_MS, GATHERED, HTML, HTML_CODE, INBOX, LINE_PX, MESSAGE_CACHE_KEY,
+  CSS, CSS_CODE, DISCORD_POLL_MS, GATHERED, HTML, HTML_CODE, INBOX, KEYMAP_TABLE, LINE_PX, MESSAGE_CACHE_KEY,
   MESSAGE_SPACING_MS, OTHER_CHANNEL, OWN, OWNERS_MESSAGE, PAGE_ELEMENTS, RUN_TAIL, RUN_THREAD,
   SCRIPT, SCRIPT_CODE, SCROLL_VIEWPORT_PX, UI_STATE_KEY, allLeavingOut, arrowStyle,
   assertMarkupContains, assistantSays, atBottomOf, atTheHead, authorChannel, authorState, backlog,
@@ -5793,8 +5793,7 @@ test("`#251 author-filter`: Shift+M goes round the states with the bar that hold
 });
 
 /** Whether the page's table of keys names a control. */
-const KEYMAP_SOURCE_HAS = (id) => SCRIPT_CODE.slice(SCRIPT_CODE.indexOf("const KEYMAP = ["),
-  SCRIPT_CODE.indexOf("];", SCRIPT_CODE.indexOf("const KEYMAP = ["))).includes(`controls: ["${id}"]`);
+const KEYMAP_SOURCE_HAS = (id) => KEYMAP_TABLE.includes(`controls: ["${id}"]`);
 
 test("`#251 author-filter`: over the call view Mine is what you said and Theirs what the agent said", async () => {
   const page = newPage();

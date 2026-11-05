@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 
 import { CHANNEL, CSS_CODE, DISCORD_POLL_MS, DONE_FLASH_FADE_MS, DONE_FLASH_HOLD_MS, HTML,
-  HTML_CODE, LINE_PX, PAGE_ELEMENTS, RUN_TAIL, SCRIPT, SCRIPT_CODE, SCROLL_VIEWPORT_PX,
+  HTML_CODE, KEYMAP_TABLE, LINE_PX, PAGE_ELEMENTS, RUN_TAIL, SCRIPT, SCRIPT_CODE, SCROLL_VIEWPORT_PX,
   SHORT_MESSAGE, UNPACK_STORAGE, asksFor, atBottomOf, backlog, bid, bodyOf, bookmarkAt, bookmarkRow,
   brokenModule, brokenScript, brokenScriptEach, builtSince, cardIds, cardRow, channelRow, chooseReadMode, compose,
   cssBlock, cssRules, deliver, doneButton, elidedOf, enterRunThread, failedSend, fillTranscript,
@@ -441,9 +441,7 @@ test("the text size takes no key of its own: Ctrl or Cmd with = or - is the brow
     }
   }
   assert.equal(scaleOf(page), before, "a zoom chord changed the message text size");
-  const table = /const KEYMAP = \[([\s\S]*?)\n\];/.exec(SCRIPT_CODE);
-  assert.ok(table, "web/voice.js has no KEYMAP table");
-  assert.doesNotMatch(table[1], /msg-scale|MsgScale/, "the keymap took a key for the text size");
+  assert.doesNotMatch(KEYMAP_TABLE, /msg-scale|MsgScale/, "the keymap took a key for the text size");
   await page.el("open-settings").click();
   for (const id of ["msg-scale-smaller", "msg-scale-larger"]) {
     for (const key of ["Enter", " "]) {
@@ -1575,16 +1573,14 @@ test("Shift+E says a chat service that refused or did not ask, with the reason, 
 
 test("NO KEY MARKS EVERY MESSAGE ABOVE ONE READ ANY MORE: not Shift+E, nor any key the page answers (#295)", async () => {
   // In the table the keys are answered from, nothing names the act, its ⋯ item, or the backlog's clear.
-  const table = /const KEYMAP = \[([\s\S]*?)\n\];/.exec(SCRIPT_CODE);
-  assert.ok(table, "web/voice.js has no KEYMAP table");
-  assert.doesNotMatch(table[1], /markReadThroughHere|throughHere|row-read-through-button|clearBacklog|clear-backlog/,
+  assert.doesNotMatch(KEYMAP_TABLE, /markReadThroughHere|throughHere|row-read-through-button|clearBacklog|clear-backlog/,
     "a key still reaches Done through here or Clear the backlog");
   // Done through here's one caller is its ⋯ item's click: the definition and that call, nothing else.
   assert.equal([...SCRIPT_CODE.matchAll(/\bmarkReadThroughHere\(/g)].length, 2,
     "Done through here has a caller besides its ⋯ item");
   // Every chord of every binding in the table, pressed on the newest of six unread messages: nothing
   // marks more than that one message, and nothing marks through a boundary.
-  const chords = [...table[1].matchAll(/\{\s*key:\s*"((?:[^"\\]|\\.)+)"([^}]*)\}/g)].map((m) => ({
+  const chords = [...KEYMAP_TABLE.matchAll(/\{\s*key:\s*"((?:[^"\\]|\\.)+)"([^}]*)\}/g)].map((m) => ({
     key: JSON.parse(`"${m[1]}"`), shiftKey: /shift:\s*true/.test(m[2]), ctrlKey: /mod:\s*true/.test(m[2]),
     altKey: /alt:\s*true/.test(m[2]),
   }));
@@ -3896,10 +3892,8 @@ test("`#344 search-shortcut`: A HELD Ctrl+/ OPENS THE SEARCH ONCE, its repeats r
 });
 
 test("THE LIST OF KEYS IS THE KEYMAP: every binding's words and meaning, in the reader's own keyboard words", async () => {
-  // Read off the source's own table, so the list cannot be checked against a second copy of it.
-  const table = /const KEYMAP = \[([\s\S]*?)\n\];/.exec(SCRIPT_CODE);
-  assert.ok(table, "web/voice.js has no KEYMAP table");
-  const meanings = [...table[1].matchAll(/does:\s*((?:"(?:[^"\\]|\\.)*"\s*\+?\s*)+)/g)].map((m) =>
+  // Read off the source's own table (`KEYMAP_TABLE`), so the list cannot be checked against a second copy of it.
+  const meanings = [...KEYMAP_TABLE.matchAll(/does:\s*((?:"(?:[^"\\]|\\.)*"\s*\+?\s*)+)/g)].map((m) =>
     [...m[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((part) => JSON.parse(`"${part[1]}"`)).join(""));
   assert.ok(meanings.length >= 30, `only ${meanings.length} bindings were found in KEYMAP`);
   for (const [platform, mod, alt, other] of [["Linux x86_64", "Ctrl", "Alt", "Cmd"], ["MacIntel", "Cmd", "Option", "Ctrl"]]) {

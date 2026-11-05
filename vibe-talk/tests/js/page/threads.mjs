@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { WEB } from "../../../web/page_sources.mjs";
 
 import { PAGE_CODE, brokenModule, BASE_CSS, BIG, BIG_ROOT, CHANNEL, CHARS_PER_LINE, CSS_CODE, CSS_UNCONDITIONAL,
-  DESKTOP_QUERY, DISCORD_POLL_MS, FakeElement, HOLD_MS, HOVER_QUERY, HTML_CODE, LINE_PX,
+  DESKTOP_QUERY, DISCORD_POLL_MS, FakeElement, HOLD_MS, HOVER_QUERY, HTML_CODE, KEYMAP_TABLE, LINE_PX,
   MESSAGE_CACHE_KEY, OTHER_CHANNEL, PRESENT_ROWS, SCRIPT, SCRIPT_CODE, SCROLLBACK_PX,
   SCROLL_VIEWPORT_PX, SETTINGS, SMALL, THREADS_MAIN_STORAGE, TWO_COLUMN_QUERY, UNPACK_STORAGE,
   assertMarkupContains, atBottomOf, bigCardData, bodyOf, brokenScript, cardIds, cardOf, cardPart,
@@ -1872,8 +1872,7 @@ test("`#299 all-thread-strip`: the selection lives on — a live reply of the th
 test("`#299 all-thread-strip`: t presses the selected message's strip — selects its thread, again lets go, on another thread's message moves it — and does nothing on a message of no thread, outside All, or with single keys off; Esc order: a card left open on the right is not Esc's", async () => {
   const page = await threadPage();
   const [first, second] = page.threads;
-  const table = /const KEYMAP = \[([\s\S]*?)\n\];/.exec(SCRIPT_CODE)[1];
-  assert.match(table, /chords: \[\{ key: "t" \}\],\s*does: "In All, select its thread[^]*?rowControls: \["thread-strip"\],\s*run: \(event, target\) => threadStripFromKeyboard\(target\)/,
+  assert.match(KEYMAP_TABLE, /chords: \[\{ key: "t" \}\],\s*does: "In All, select its thread[^]*?rowControls: \["thread-strip"\],\s*run: \(_event, target\) => threadStripFromKeyboard\(target\)/,
     "t is not the strip's key in the keymap");
   assert.match(page.el("keyboard-keys").text(), /In All, select its thread, as a click on the colour strip at its left edge does/);
   let event = await press(page, rowWithId(page, "202"), "t");

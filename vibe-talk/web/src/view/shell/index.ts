@@ -49,3 +49,5 @@ export { createPointerSelection } from "./pointerselection.ts";
 export type { KeptMark, PointedPane, PointerMoved, PointerSelection, PointerSelectionDependencies, SelectionInputKinds } from "./pointerselection.ts";
 export { createKeySelection } from "./keyselection.ts";
 export type { KeyPane, KeySelection, KeySelectionDependencies, KeySelectionModel } from "./keyselection.ts";
+export { KEYS_MESSAGE, KEYS_MOVING, KEYS_PAGE, KEYS_VIEW, KEYS_WRITING, createKeymap } from "./keymap.ts";
+export type { KeymapActs, KeymapBinding } from "./keymap.ts";
