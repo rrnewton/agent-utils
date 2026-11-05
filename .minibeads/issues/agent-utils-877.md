@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-reap-archived-schema: reap-stray-worktrees reads archived records with the archive schema'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-validate
 created_at: 2026-11-05T09:32:58.471043721+00:00
-updated_at: 2026-11-05T09:32:58.471043721+00:00
+updated_at: 2026-11-05T13:03:20.510995042+00:00
+closed_at: 2026-11-05T13:03:20.510994941+00:00
 ---
 
 # Description
