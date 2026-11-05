@@ -34,6 +34,7 @@ Two repeat offenders appeared in the gate ledger on 2026-11-05 after #875 fixed 
 # Acceptance Criteria
 
 - shard-0 has no OOM kill in the next 24 h ledger readout, and its cap stays within the gate host's overall memory budget.
+- Revert the TEMPORARY 2.5 GiB stopgap cap for shards 0 and 2 (validation/python-components.dag.yaml, 2026-11-05) to the shared `wrkslots_test_hint` once the balloon is found.
 - The shard-4 test passes under a load test: for example, 4 parallel copies plus a CPU hog for 20 iterations, or the gate's own stress mode.
 
 # Notes
