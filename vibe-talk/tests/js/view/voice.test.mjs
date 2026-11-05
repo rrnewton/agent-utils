@@ -132,3 +132,81 @@ test("`#886 voice-page-autoplay`: off by default and kept; on, a read heard to i
   autoplay.setOn(false);
   assert.deepStrictEqual([kept, toggle.attributes["aria-pressed"], label.textContent], [[true, false], "false", "Autoplay: off"]);
 });
+
+test("`#624 voice-page-modularity`: the read-aloud controls reach the act each names in the page's order, Read is Pause, Stop or the mode by the read's state, and come down again", () => {
+  const { mountReadControls } = VIEW_VOICE;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type, event = {}) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener(event));
+  let inProgress = false;
+  let pending = null;
+  let mode = false;
+  let autoplaying = false;
+  const controls = mountReadControls({
+    byId: (id) => target(id),
+    win: () => target("window"),
+    stepReadSpeed: (direction) => log.push(`pace ${direction}`),
+    commitReadSpeedBox: (...args) => log.push(`pace box ${args.length}`),
+    stepReading: (delta) => { log.push(`block ${delta}`); return "stepped"; },
+    stepSection: (delta) => log.push(`section ${delta}`),
+    onReadGripDown: (event) => { log.push(`grip down ${event.n}`); return "grip"; },
+    onReadGripMove: (event) => log.push(`grip move ${event.n}`),
+    onReadGripUp: (...args) => log.push(`grip up ${args.length}`),
+    onReadGripKey: (event) => log.push(`grip key ${event.key}`),
+    moveReadSteer: (offset) => log.push(`home ${offset}`),
+    placeReadSteer: (...args) => log.push(`place ${args.length}`),
+    autoplayOn: () => autoplaying,
+    setAutoplay: (on) => { autoplaying = on; log.push(`autoplay ${on}`); },
+    forgetAutoplayHalt: () => log.push("halt forgotten"),
+    readInProgress: () => inProgress,
+    toggleReadingPaused: () => log.push("pause"),
+    pendingRead: () => pending,
+    readingMode: () => mode,
+    setReadingMode: (on) => { mode = on; log.push(`mode ${on}`); },
+    leaveReadingMode: (...args) => log.push(`leave ${args.length}`),
+  });
+  assert.deepStrictEqual(log, ["listen read-speed-down click", "listen read-speed-up click", "listen read-speed-box change",
+    "listen read-speed-box blur", "listen read-speed-box keydown", "listen read-prev click", "listen read-next click",
+    "listen read-section-prev click", "listen read-section-next click", "listen read-steer-grip pointerdown",
+    "listen read-steer-grip pointermove", "listen read-steer-grip pointerup", "listen read-steer-grip pointercancel",
+    "listen read-steer-grip lostpointercapture", "listen read-steer-grip keydown", "listen read-steer-grip dblclick",
+    "listen read-autoplay click", "listen window resize", "listen read-aloud click", "listen read-aloud-stop click",
+    "listen read-aloud-stop click"], "a listener was added out of the page's order");
+  log.length = 0;
+  fire("read-speed-down", "click");
+  fire("read-speed-up", "click");
+  fire("read-speed-box", "change", { n: 1 });
+  fire("read-speed-box", "blur", { n: 1 });
+  let refused = 0;
+  const key = (name) => ({ key: name, preventDefault: () => { refused += 1; } });
+  for (const name of ["Enter", "ArrowUp", "ArrowDown", "a"]) fire("read-speed-box", "keydown", key(name));
+  assert.equal(refused, 3, "the pace box kept a key's default it takes, or took one it does not");
+  assert.deepStrictEqual(fire("read-prev", "click"), [undefined], "a step answered what it did, which the page's never has");
+  fire("read-next", "click");
+  fire("read-section-prev", "click");
+  fire("read-section-next", "click");
+  assert.deepStrictEqual(fire("read-steer-grip", "pointerdown", { n: 1 }), ["grip"]);
+  fire("read-steer-grip", "pointermove", { n: 2 });
+  for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) fire("read-steer-grip", type, { n: 3 });
+  fire("read-steer-grip", "keydown", { key: "Home" });
+  fire("read-steer-grip", "dblclick");
+  fire("read-autoplay", "click");
+  fire("window", "resize", { n: 4 });
+  assert.deepStrictEqual(log, ["pace -1", "pace 1", "pace box 0", "pace box 0", "pace box 0", "pace 1", "pace -1", "block -1", "block 1",
+    "section -1", "section 1", "grip down 1", "grip move 2", "grip up 0", "grip up 0", "grip up 0", "grip key Home", "home null",
+    "autoplay true", "place 0"]);
+  log.length = 0;
+  // Read: the mode with nothing playing; Stop while a read is fetched; Pause or Resume while one plays or is held.
+  fire("read-aloud", "click");
+  pending = "7";
+  fire("read-aloud", "click");
+  inProgress = true;
+  fire("read-aloud", "click");
+  fire("read-aloud-stop", "click", { n: 5 });
+  assert.deepStrictEqual(log, ["mode true", "leave 0", "pause", "leave 0", "halt forgotten"]);
+  controls.unmount();
+  assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+});

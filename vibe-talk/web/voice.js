@@ -30850,55 +30850,34 @@ el("jump-bookmark").addEventListener("click", () => guardQuietly(jumpToBookmark)
 leftEl("jump-reading").addEventListener("click", () => readingJump.jump());
 el("back-to-reply").addEventListener("click", backToReply);
 
-el("read-speed-down").addEventListener("click", () => readAloudOwner().stepReadSpeed(-1));
-el("read-speed-up").addEventListener("click", () => readAloudOwner().stepReadSpeed(1));
-el("read-speed-box").addEventListener("change", readAloudOwner().commitReadSpeedBox);
-el("read-speed-box").addEventListener("blur", readAloudOwner().commitReadSpeedBox);
-el("read-speed-box").addEventListener("keydown", (event) => {
-  if (event.key === "Enter") {
-    event.preventDefault();
-    readAloudOwner().commitReadSpeedBox();
-  } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
-    event.preventDefault();
-    readAloudOwner().stepReadSpeed(event.key === "ArrowUp" ? 1 : -1);
-  }
-});
-
-// `#376 read-aloud-blocks`. Through the blocks of the read in progress.
-el("read-prev").addEventListener("click", () => { readAloudOwner().stepReading(-1); });
-el("read-next").addEventListener("click", () => { readAloudOwner().stepReading(1); });
-el("read-section-prev").addEventListener("click", () => { readAloudOwner().stepSection(-1); });
-el("read-section-next").addEventListener("click", () => { readAloudOwner().stepSection(1); });
-
-// `#442 read-strip-order`. The strip moved on a desk, by its grip: pointer, keys, double-click home.
-el("read-steer-grip").addEventListener("pointerdown", readAloudOwner().onReadGripDown);
-el("read-steer-grip").addEventListener("pointermove", readAloudOwner().onReadGripMove);
-el("read-steer-grip").addEventListener("pointerup", readAloudOwner().onReadGripUp);
-el("read-steer-grip").addEventListener("pointercancel", readAloudOwner().onReadGripUp);
-el("read-steer-grip").addEventListener("lostpointercapture", readAloudOwner().onReadGripUp);
-el("read-steer-grip").addEventListener("keydown", readAloudOwner().onReadGripKey);
-el("read-steer-grip").addEventListener("dblclick", () => { readAloudOwner().moveReadSteer(null); });
-// `#886 voice-page-autoplay`. The strip's Autoplay toggle.
-el("read-autoplay").addEventListener("click", () => autoplay.setOn(!autoplay.on()));
-if (typeof window.addEventListener === "function") window.addEventListener("resize", readAloudOwner().placeReadSteer);
-
-el("read-aloud").addEventListener("click", () => {
-  // `#434 read-aloud-pause`: while a read is playing or held, this button is its Pause/Resume —
-  // the media keys by another reach. Leaving the mode is what this button does with nothing
-  // playing, and what Stop beside it does while a read plays
-  // (`#442 read-strip-order`). `#451 read-strip-followups`: a read started with s outside the
-  // mode pauses here too, where it used to enter the mode over a read still playing.
-  if (readAloudOwner().readInProgress()) {
-    readAloudOwner().toggleReadingPaused();
-    return;
-  }
-  // A read still being fetched: this button says Stop there, and stops it — leaving the mode with
-  // it where the mode is on, as its Stop always has (`leaveReadingMode`).
-  if (readAloudOwner().pendingRead !== null) {
-    leaveReadingMode();
-    return;
-  }
-  setReadingMode(!readAloudOwner().readingMode);
+// The read-aloud controls (`#567 pace-stepper`, `#376 read-aloud-blocks`, `#442 read-strip-order`, `#434
+// read-aloud-pause`, `#451 read-strip-followups`, `#627 scrubber-thumb-arrows`, `#886 voice-page-autoplay`): the pace's
+// steps and box, the strip's arrows, grip and Autoplay, the window resizing under it, Read and Stop under the list.
+// One owner in web/src/view/voice/readcontrols.ts (`#624 voice-page-modularity`), mounted here, in the page's order;
+// its `unmount` waits for the ordered boot's teardown. Read and Stop leave reading mode by `setReadingMode` and
+// `leaveReadingMode`, below.
+mountReadControls({
+  byId: (id) => el(id),
+  win: () => (typeof window.addEventListener === "function" ? window : null),
+  stepReadSpeed: (direction) => readAloudOwner().stepReadSpeed(direction),
+  commitReadSpeedBox: () => readAloudOwner().commitReadSpeedBox(),
+  stepReading: (delta) => readAloudOwner().stepReading(delta),
+  stepSection: (delta) => readAloudOwner().stepSection(delta),
+  onReadGripDown: (event) => readAloudOwner().onReadGripDown(event),
+  onReadGripMove: (event) => readAloudOwner().onReadGripMove(event),
+  onReadGripUp: () => readAloudOwner().onReadGripUp(),
+  onReadGripKey: (event) => readAloudOwner().onReadGripKey(event),
+  moveReadSteer: (offset) => readAloudOwner().moveReadSteer(offset),
+  placeReadSteer: () => readAloudOwner().placeReadSteer(),
+  autoplayOn: () => autoplay.on(),
+  setAutoplay: (on) => autoplay.setOn(on),
+  forgetAutoplayHalt: () => autoplay.halt(null),
+  readInProgress: () => readAloudOwner().readInProgress(),
+  toggleReadingPaused: () => readAloudOwner().toggleReadingPaused(),
+  pendingRead: () => readAloudOwner().pendingRead,
+  readingMode: () => readAloudOwner().readingMode,
+  setReadingMode: (on) => setReadingMode(on),
+  leaveReadingMode: () => leaveReadingMode(),
 });
 
 /**
@@ -30916,9 +30895,6 @@ function leaveReadingMode() {
     if (!read.hidden && typeof read.focus === "function") read.focus();
   }
 }
-el("read-aloud-stop").addEventListener("click", leaveReadingMode);
-// `#886 voice-page-autoplay`. Stop forgets a Hang up's halt, as nothing it stopped will end and go on.
-el("read-aloud-stop").addEventListener("click", () => autoplay.halt(null));
 
 /** Turn reading mode on or off. The one path in and out of it, whichever control asked. */
 function setReadingMode(on) {
