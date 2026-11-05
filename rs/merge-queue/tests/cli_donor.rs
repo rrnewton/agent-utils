@@ -1091,6 +1091,202 @@ fn a_claim_timeout_fires_when_a_known_healthy_donor_is_idle() {
     assert_eq!(item_status(&fx, 2), "queued");
 }
 
+fn host_pause_path(clone: &Path) -> PathBuf {
+    clone
+        .join(".git")
+        .join("merge-queue-donor")
+        .join("host-pause.json")
+}
+
+fn host_faults(fx: &Fixture) -> Value {
+    let path = state_dir(fx).join("donor").join("host-faults.json");
+    std::fs::read_to_string(path)
+        .map(|text| serde_json::from_str(&text).unwrap())
+        .unwrap_or(serde_json::json!({}))
+}
+
+/// Set up a donor whose validator host-refuses until `probe-ok` and
+/// `validation-ok` marker files exist in the fixture root; returns its clone.
+fn host_fault_fixture(tag: &str) -> (Fixture, PathBuf) {
+    let fx = Fixture::new(tag);
+    let run_cmd = format!(
+        "if [ -n \"$MQ_PROBE\" ]; then echo probe >> {}; if [ -f {} ]; then exit 0; else exit 1; fi; fi; if [ -f {} ]; then exit 0; fi; echo 'MQ_COULD_NOT_RUN_SCOPE: host wedged'; echo COULD_NOT_RUN; exit 75",
+        fx.root.join("probes").display(),
+        fx.root.join("probe-ok").display(),
+        fx.root.join("validation-ok").display(),
+    );
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        &run_cmd,
+        "--offload",
+        "decide",
+    ]);
+    fx.branch("a", &[("a.txt", "a\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let clone = donor_clone(&fx, "donor-host");
+    (fx, clone)
+}
+
+fn probe_count(fx: &Fixture) -> usize {
+    std::fs::read_to_string(fx.root.join("probes"))
+        .map(|text| text.lines().count())
+        .unwrap_or(0)
+}
+
+/// A donor that restarts mid-pause must resume probing from its persisted
+/// pause, clear its ordinary queue fault with one probe-passed claim, and
+/// lease a job again instead of deadlocking against the queue fault.
+#[test]
+fn a_restarted_donor_resumes_probing_and_clears_its_host_fault() {
+    let (fx, clone) = host_fault_fixture("donor-restart-mid-pause");
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    // First process: host-scope refusal pauses it and faults it queue-side.
+    let out = donor(&fx, &clone, "d1", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pause_path = host_pause_path(&clone);
+    assert!(pause_path.exists(), "host-pause.json must be written");
+    let pause: Value =
+        serde_json::from_str(&std::fs::read_to_string(&pause_path).unwrap()).unwrap();
+    assert_eq!(pause["reason"], "wedged", "{pause}");
+    assert!(
+        pause["validator"]["run"]
+            .as_str()
+            .is_some_and(|run| !run.is_empty()),
+        "the pause must persist the validator to probe after a restart: {pause}"
+    );
+    assert_eq!(host_faults(&fx)["d1"]["reason"], "wedged");
+    assert_eq!(probe_count(&fx), 0, "no probe before the restart");
+
+    // Restart (a new donor process, same work dir) with the host fixed.
+    std::fs::write(fx.root.join("probe-ok"), "").unwrap();
+    std::fs::write(fx.root.join("validation-ok"), "").unwrap();
+    let out = donor(&fx, &clone, "d1", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        probe_count(&fx) >= 1,
+        "the restarted donor must run MQ_PROBE=1: {stderr}"
+    );
+    assert!(
+        !pause_path.exists(),
+        "a passing probe must remove host-pause.json"
+    );
+    assert!(
+        host_faults(&fx).get("d1").is_none(),
+        "the probe-passed claim must clear the ordinary fault: {}",
+        host_faults(&fx)
+    );
+    let (code, report, run_stderr) = finish(run);
+    assert_eq!(code, Some(0), "{run_stderr}");
+    assert_eq!(
+        report["landed"][0]["prs"],
+        serde_json::json!([1]),
+        "{report}"
+    );
+}
+
+/// Escalated variant: a restarted donor whose probe passes arms exactly the
+/// trial the queue allows; the fault stays recorded until that trial's
+/// admitted validation, which a further restart mid-pause must produce.
+#[test]
+fn a_restarted_donor_arms_one_trial_for_an_escalated_host_fault() {
+    let (fx, clone) = host_fault_fixture("donor-restart-escalated");
+    set_config(&fx, |config| {
+        config["donors"] = serde_json::json!({"host_fault_escalate_after": 1})
+    });
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let out = donor(&fx, &clone, "d1", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Restart with the probe fixed but validation still refusing: one
+    // probe-pass/launch-refuse cycle escalates the fault.
+    std::fs::write(fx.root.join("probe-ok"), "").unwrap();
+    let out = donor(&fx, &clone, "d1", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(probe_count(&fx) >= 1);
+    let faults = host_faults(&fx);
+    assert_eq!(faults["d1"]["escalated"], true, "{faults}");
+    assert!(host_pause_path(&clone).exists(), "the donor pauses again");
+
+    // Restart again mid-pause, now with validation fixed: the probe pass
+    // arms a trial claim and the admitted validation clears the fault.
+    std::fs::write(fx.root.join("validation-ok"), "").unwrap();
+    let out = donor(&fx, &clone, "d1", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        host_faults(&fx).get("d1").is_none(),
+        "the trial's admitted validation must clear the escalated fault: {}",
+        host_faults(&fx)
+    );
+    let (code, report, run_stderr) = finish(run);
+    assert_eq!(code, Some(0), "{run_stderr}");
+    assert_eq!(
+        report["landed"][0]["prs"],
+        serde_json::json!([1]),
+        "{report}"
+    );
+}
+
+/// A legacy host-pause.json (reason/since only, the pre-fix shape) or a
+/// malformed one must not crash the donor and must be logged as unusable.
+#[test]
+fn a_legacy_host_pause_is_logged_and_does_not_crash_the_donor() {
+    let (fx, clone) = host_fault_fixture("donor-restart-legacy-pause");
+    let mut run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let out = donor(&fx, &clone, "d1", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = run.kill();
+    let _ = run.wait();
+    // Downgrade the pause file to the legacy shape written before the fix.
+    std::fs::write(
+        host_pause_path(&clone),
+        r#"{"reason":"wedged","since":"2026-11-05T20:40:05Z"}"#,
+    )
+    .unwrap();
+    std::fs::write(fx.root.join("probe-ok"), "").unwrap();
+    std::fs::write(fx.root.join("validation-ok"), "").unwrap();
+    let out = donor(&fx, &clone, "d1", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("cannot resume probing"),
+        "startup must log why a validator-less pause cannot resume probing: {stderr}"
+    );
+    assert_eq!(probe_count(&fx), 0, "no validator snapshot, no probe");
+    assert!(
+        host_faults(&fx).get("d1").is_some(),
+        "the queue fault stays until a probe pass or admitted validation"
+    );
+}
+
 #[test]
 fn compare_mode_counts_a_could_not_run_receipt_and_compares_nothing() {
     let fx = Fixture::new("donor-compare-could-not-run");

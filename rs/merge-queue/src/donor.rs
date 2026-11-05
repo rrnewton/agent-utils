@@ -2011,6 +2011,72 @@ struct HostPause {
     delay: std::time::Duration,
 }
 
+/// Persist a host pause so a restarted donor can resume probing: the
+/// validator snapshot (`kind` + `run` are what `probe_host_validator`
+/// needs) and the current back-off, beside the human-readable reason.
+fn write_host_pause(work: &Path, pause: &HostPause) {
+    let _ = std::fs::create_dir_all(work);
+    let _ = std::fs::write(
+        work.join("host-pause.json"),
+        serde_json::json!({
+            "reason": pause.reason,
+            "since": pause.since,
+            "validator": pause.validator,
+            "delay_secs": pause.delay.as_secs(),
+        })
+        .to_string(),
+    );
+}
+
+/// Restore a host pause written by [`write_host_pause`], due to probe at
+/// once. `Ok(None)` means no pause file; `Err` names why a present file
+/// cannot resume probing (malformed, or a legacy `{reason, since}` file
+/// with no validator snapshot), so the caller can log it loudly instead of
+/// silently deadlocking against the queue-side host fault.
+fn restored_host_pause(work: &Path) -> Result<Option<HostPause>, String> {
+    let path = work.join("host-pause.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("{} is malformed: {error}", path.display()))?;
+    let reason = value["reason"].as_str().unwrap_or_default().to_owned();
+    let since = value["since"].as_str().unwrap_or_default().to_owned();
+    let Some(validator_value) = value.get("validator").filter(|v| !v.is_null()) else {
+        return Err(format!(
+            "{} has no validator snapshot (it was written before pauses persisted one); \
+             cannot resume probing from it",
+            path.display()
+        ));
+    };
+    let validator: ValidatorConfig =
+        serde_json::from_value(validator_value.clone()).map_err(|error| {
+            format!(
+                "{} has a malformed validator snapshot: {error}",
+                path.display()
+            )
+        })?;
+    if validator.kind.trim().is_empty() {
+        return Err(format!(
+            "{} has a validator snapshot with no kind; cannot resume probing from it",
+            path.display()
+        ));
+    }
+    let delay_secs = value["delay_secs"]
+        .as_u64()
+        .filter(|secs| (1..=600).contains(secs))
+        .unwrap_or(30);
+    Ok(Some(HostPause {
+        reason,
+        since,
+        validator,
+        next: std::time::Instant::now(),
+        delay: std::time::Duration::from_secs(delay_secs),
+    }))
+}
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -2395,11 +2461,6 @@ impl Worker<'_> {
                         "merge-queue donor {}: host cannot validate: {reason};                          pausing claims and probing",
                         self.options.name
                     );
-                    let _ = std::fs::create_dir_all(&self.options.work);
-                    let _ = std::fs::write(
-                        self.options.work.join("host-pause.json"),
-                        serde_json::json!({"reason": reason, "since": since}).to_string(),
-                    );
                     // The pause delay is the running back-off, not a fresh
                     // 30 s: a launch refusal right after a probe pass keeps
                     // doubling it (see `next_host_delay`).
@@ -2407,16 +2468,18 @@ impl Worker<'_> {
                         .next_host_delay
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *self
-                        .host_pause
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HostPause {
+                    let pause = HostPause {
                         reason,
                         since,
                         validator: job.validator.clone(),
                         next: std::time::Instant::now() + delay,
                         delay,
-                    });
+                    };
+                    write_host_pause(&self.options.work, &pause);
+                    *self
+                        .host_pause
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pause);
                 }
             }
             if !receipt.refused {
@@ -2468,14 +2531,42 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
     preflight_against_queue(options, &route, revision.as_ref())?;
     crate::interrupt::install();
     let jobs = options.jobs.max(1);
+    // A previous process may have paused on a host fault: restore that
+    // pause (due to probe at once) or the queue-side fault would refuse
+    // every claim and no probe would ever clear it.
+    let restored_pause = match restored_host_pause(&options.work) {
+        Ok(Some(pause)) => {
+            eprintln!(
+                "merge-queue donor {}: restoring host pause from {} ({}; paused since {}); probing",
+                options.name,
+                options.work.join("host-pause.json").display(),
+                pause.reason,
+                pause.since
+            );
+            Some(pause)
+        }
+        Ok(None) => None,
+        Err(why) => {
+            eprintln!(
+                "merge-queue donor {}: cannot resume probing: {why}; \
+                 if the queue holds a host fault for this donor it stays until a passing \
+                 probe claim (`donor claim --probe-passed`) or an admitted validation",
+                options.name
+            );
+            None
+        }
+    };
+    let restored_delay = restored_pause
+        .as_ref()
+        .map_or(std::time::Duration::from_secs(30), |pause| pause.delay);
     let worker = Worker {
         options,
         route: &route,
         host: host_name(),
         slots: Mutex::new((0..jobs).rev().collect()),
-        host_pause: Mutex::new(None),
+        host_pause: Mutex::new(restored_pause),
         probe_passed: AtomicBool::new(false),
-        next_host_delay: Mutex::new(std::time::Duration::from_secs(30)),
+        next_host_delay: Mutex::new(restored_delay),
     };
     let backoff: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     let active = AtomicUsize::new(0);
@@ -2931,6 +3022,59 @@ mod unit {
         publish(&store, "c2");
         host_refuse(&store);
         assert!(store.host_fault_escalations().is_empty());
+    }
+
+    #[test]
+    fn a_persisted_host_pause_restores_its_validator_for_a_restart() {
+        let work = temp("host-pause-restore");
+        assert!(restored_host_pause(&work).unwrap().is_none());
+        let pause = HostPause {
+            reason: "wedged".to_owned(),
+            since: "2026-11-05T20:40:05Z".to_owned(),
+            validator: validator(),
+            next: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            delay: std::time::Duration::from_secs(120),
+        };
+        write_host_pause(&work, &pause);
+        let text = std::fs::read_to_string(work.join("host-pause.json")).unwrap();
+        let written: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(written["validator"]["kind"], "command");
+        assert_eq!(written["validator"]["run"], "exit 0");
+        assert_eq!(written["delay_secs"], 120);
+        let restored = restored_host_pause(&work)
+            .unwrap()
+            .expect("a persisted pause must restore");
+        assert_eq!(restored.reason, "wedged");
+        assert_eq!(restored.since, "2026-11-05T20:40:05Z");
+        assert_eq!(restored.validator, validator());
+        assert_eq!(restored.delay, std::time::Duration::from_secs(120));
+        assert!(
+            restored.next <= std::time::Instant::now(),
+            "a restored pause must be due to probe at once"
+        );
+    }
+
+    #[test]
+    fn a_legacy_or_malformed_host_pause_cannot_resume_probing() {
+        let work = temp("host-pause-legacy");
+        std::fs::write(
+            work.join("host-pause.json"),
+            r#"{"reason":"wedged","since":"2026-11-05T20:40:05Z"}"#,
+        )
+        .unwrap();
+        let error = match restored_host_pause(&work) {
+            Ok(_) => panic!("a legacy pause must not restore"),
+            Err(error) => error,
+        };
+        assert!(error.contains("no validator snapshot"), "{error}");
+        assert!(error.contains("cannot resume probing"), "{error}");
+
+        std::fs::write(work.join("host-pause.json"), "not json").unwrap();
+        let error = match restored_host_pause(&work) {
+            Ok(_) => panic!("a malformed pause must not restore"),
+            Err(error) => error,
+        };
+        assert!(error.contains("malformed"), "{error}");
     }
 
     #[test]
