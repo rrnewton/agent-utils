@@ -3,7 +3,7 @@ title: 'wrkslots-unlisted-module-salvage: remove or bundle a clean nested submod
 status: open
 priority: 2
 issue_type: bug
-assignee: mu-validate
+assignee: mu-wrkslots
 created_at: 2026-11-05T06:48:32.900837659+00:00
 updated_at: 2026-11-05T06:48:32.900837659+00:00
 ---
@@ -49,3 +49,5 @@ Reuse #864's recursive nested-module walk; do not add a second traversal.
 # Notes
 
 Requested by the lead on 2026-11-05 at 01:48 AM ET. P2; it does not block landings. Assigned to mu-validate after #864 (it shares #864's nested walk and bundling), before #868.
+
+Moved from mu-validate to the new Muse ultra wrkslots lane mu-wrkslots on 2026-11-05 at 5:50 PM ET (the owner lifted the Muse lane cap; the lead asked for a dedicated wrkslots lane).

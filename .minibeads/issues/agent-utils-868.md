@@ -3,7 +3,7 @@ title: 'wrkslots-remote-url-equivalence: treat ssh and https spellings of the sa
 status: open
 priority: 2
 issue_type: bug
-assignee: mu-validate
+assignee: mu-wrkslots
 created_at: 2026-11-05T04:24:40.989072520+00:00
 updated_at: 2026-11-05T04:24:40.989072520+00:00
 ---
@@ -36,3 +36,5 @@ Cause: the slot record keeps only `remote_url_sha256`, a hash of the raw URL str
 # Notes
 
 Requested by the lead on 2026-11-04. Assigned to mu-validate after #864 (the same wrkslots salvage area); reassign to whichever lane frees first.
+
+Moved from mu-validate to the new Muse ultra wrkslots lane mu-wrkslots on 2026-11-05 at 5:50 PM ET (the owner lifted the Muse lane cap; the lead asked for a dedicated wrkslots lane).

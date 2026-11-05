@@ -3,7 +3,7 @@ title: 'package-contract-census-drift: the lifecycle partition check stops pinni
 status: open
 priority: 2
 issue_type: bug
-assignee: mu-validate
+assignee: mu-wrkslots
 created_at: 2026-11-05T08:49:54.492822744+00:00
 updated_at: 2026-11-05T08:49:54.492822744+00:00
 ---
@@ -32,3 +32,5 @@ The check's real purpose is that every lifecycle test lands in exactly one parti
 # Notes
 
 From mu-validate's #827 readout preview (2026-11-05). Assigned to mu-validate after #873.
+
+Moved from mu-validate to the new Muse ultra wrkslots lane mu-wrkslots on 2026-11-05 at 5:50 PM ET (the owner lifted the Muse lane cap; the lead asked for a dedicated wrkslots lane).

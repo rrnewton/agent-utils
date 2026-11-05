@@ -3,7 +3,7 @@ title: 'wrkslots-unlisted-module-salvage: recurse into nested module repos and v
 status: open
 priority: 2
 issue_type: bug
-assignee: mu-validate
+assignee: mu-wrkslots
 created_at: 2026-11-05T04:10:15.603371028+00:00
 updated_at: 2026-11-05T04:10:15.603371028+00:00
 ---
@@ -56,3 +56,5 @@ The lead's full retry note, with line references against `py/wrkslots/cli.py` at
 
 Requested by the lead on 2026-11-04 at 11:04 PM ET. Assigned to mu-validate, queued after its current latency-test rework.
 Gap 4 (a nested checkout with zero tracked files) was added on 2026-11-04 at the lead's request; it is the same salvage path.
+
+Moved from mu-validate to the new Muse ultra wrkslots lane mu-wrkslots on 2026-11-05 at 5:50 PM ET (the owner lifted the Muse lane cap; the lead asked for a dedicated wrkslots lane).

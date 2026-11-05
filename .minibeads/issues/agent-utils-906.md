@@ -3,7 +3,7 @@ title: 'wrkslots-shard-mount-namespace: wrkslots shards fail in full gates on mo
 status: open
 priority: 2
 issue_type: bug
-assignee: mu-validate
+assignee: mu-wrkslots
 created_at: 2026-11-05T18:04:37.530921232+00:00
 updated_at: 2026-11-05T18:04:37.530921232+00:00
 ---
@@ -33,3 +33,5 @@ Shard memory pressure is tracked separately in #883 wrkslots-shard-memory-and-he
 Named in the #827 readout of 2026-11-05. Coordinator noted the mode on 2026-11-04 ("wrkslots shard-6 fails on 'mount namespace indeterminate for a live PID', two runs, different tests; passes solo") and asked for it to be filed if the ledger showed it recurring; it has.
 
 Filed by mu-validate on 2026-11-05 from the #827 gate-flake readout (local number 901); renumbered to 906 on landing by the coordinator, since 901 was taken on main.
+
+Moved from mu-validate to the new Muse ultra wrkslots lane mu-wrkslots on 2026-11-05 at 5:50 PM ET (the owner lifted the Muse lane cap; the lead asked for a dedicated wrkslots lane).

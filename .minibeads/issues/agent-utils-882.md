@@ -3,7 +3,7 @@ title: 'wrkslots-insteadof-diagnosis: a fetch through a rewritten URL that fails
 status: open
 priority: 2
 issue_type: bug
-assignee: mu-salvage
+assignee: mu-wrkslots
 created_at: 2026-11-05T10:57:10.530106531+00:00
 updated_at: 2026-11-05T10:57:10.530106531+00:00
 ---
@@ -37,3 +37,5 @@ This is related to the insteadOf pitfall noted in #871.
 # Notes
 
 Reported by the lead on 2026-11-05 at 06:00 AM ET, from a consumer team (P2). The consumer team has already worked around it. Assigned to mu-salvage after #871.
+
+Moved from mu-salvage to the new Muse ultra wrkslots lane mu-wrkslots on 2026-11-05 at 5:50 PM ET (the owner lifted the Muse lane cap; the lead asked for a dedicated wrkslots lane).

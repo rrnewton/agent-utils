@@ -3,7 +3,7 @@ title: 'wrkslots-recover-verifies-checkouts: recover and create never report suc
 status: open
 priority: 1
 issue_type: bug
-assignee: mu-salvage
+assignee: mu-wrkslots
 created_at: 2026-11-05T10:57:10.526253628+00:00
 updated_at: 2026-11-05T10:57:10.526253628+00:00
 ---
@@ -35,3 +35,5 @@ A slot that reports success while its checkouts are empty is worse than a refusa
 # Notes
 
 Reported by the lead on 2026-11-05 at 06:00 AM ET, from a consumer team (P1). Assigned to mu-salvage, right after #875.
+
+Moved from mu-salvage to the new Muse ultra wrkslots lane mu-wrkslots on 2026-11-05 at 5:50 PM ET (the owner lifted the Muse lane cap; the lead asked for a dedicated wrkslots lane).
