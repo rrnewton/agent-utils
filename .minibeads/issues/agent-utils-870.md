@@ -5,7 +5,7 @@ priority: 1
 issue_type: bug
 assignee: cl-start
 created_at: 2026-11-05T05:23:02.772443148+00:00
-updated_at: 2026-11-05T08:00:00.000000000+00:00
+updated_at: 2026-11-05T12:29:49.000000000+00:00
 ---
 
 # Description
@@ -68,3 +68,4 @@ On devbig030 the refresh restarted the watcher in 0.26 s and the bridge in 0.1 s
 - **Found while testing:** a stop while the provider plugin had not yet said hello waited for the plugin Hello timeout (10 s), cut to 4 s by the guard. `connect_unless` in chat-subscription-plugin now abandons the Hello at once when the bridge is stopping. Tests: `a_hello_wait_ends_when_the_host_abandons_it_and_the_plugin_is_reaped` (conformance), and `test_run_sigterm_during_startup_exits_within_five_seconds[at-exec, plugin-handshake]`. Measured stop times: 0.1 s at exec; during the handshake, 4.11 s before the fix and 0.10 s after.
 - **Logging:** both services now log `termination requested; stopping` and `stopped N.Ns after the termination request`, so the next slow restart shows whether the stop or the start was slow.
 - **Second follow-up:** every restart of a long-running bridge took 90 s (systemd SIGKILL). The coordinator traced the unit cgroup: within 1.1 s only squashfuse_ll was left, the FUSE daemon of the provider tail packaged mount. It is reparented to systemd in its own session and sleeps through SIGTERM. New unit_cleanup module: when run by systemd as a service, both services log the unit processes when they stop. Before exit they SIGTERM everything but FUSE daemons, then unmount each FUSE daemon mount and SIGTERM it, then SIGKILL what is left and detach a killed daemon mount (fusermount -uz), 2 s apart. The signal handler now writes the stop line itself, because 47aeba8d stop lines came from a 100 ms poll that a fast stop beat.
+- **Verified on a deploy host with a7880603 (coordinator, 2026-11-05):** a bridge restart now takes 0.12 s, down from 90 s. squashfuse_ll exited on the unmount or on SIGTERM, with no SIGKILL and no dead mount left behind. The deploy-side check above is done for that host.
