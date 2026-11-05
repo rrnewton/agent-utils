@@ -59224,12 +59224,13 @@ def test_remove_deletes_fenced_tree_without_holding_the_registry_lock(
     """#894: deletion runs unlocked; an admission gets in between removals.
 
     The first removal is parked inside the actual fenced-tree deletion.
-    While it is parked, the registry lock must be acquirable at once and
-    a real admission (a create) must complete; neither waits for the
-    deletion.  A second removal then runs after the first completes.
-    Nothing here relies on lock wake-up order: each removal holds the
-    lock only between its own state transitions, so the admission's
-    window is the whole deletion, not a race for a wake-up.
+    While it is parked, the registry lock must be acquirable at once; a
+    waiting admission is therefore never stuck behind a deletion.  The
+    admission itself (a create) then completes between the first
+    removal finishing and a second removal running.  Nothing here
+    relies on lock wake-up order: each removal holds the lock only
+    between its own state transitions, so the admission's window is
+    the whole deletion, not a race for a wake-up.
     """
 
     project, _repository, _remote = make_project(tmp_path)
@@ -59245,21 +59246,17 @@ def test_remove_deletes_fenced_tree_without_holding_the_registry_lock(
 
     entered = threading.Event()
     release = threading.Event()
-    real_delete = wrkslots._delete_prepared_deferred_finish
+    real_delete = wrkslots._remove_fenced_directory
 
-    def parked_delete(
-        config_: wrkslots.Config,
-        prepared: wrkslots._PreparedDeferredFinish,
-        finish: wrkslots._FinishContext,
-    ) -> Mapping[str, object]:
-        # Park at the start of the out-of-lock deletion phase: the fence
-        # and journal are durable and the registry lock is released.
-        if prepared.record.slot == "slot01":
+    def parked_delete(config_: wrkslots.Config, fenced: Path) -> None:
+        # Park inside the actual tree deletion, which now runs after the
+        # registry lock was released.
+        if ".slot01." in fenced.name:
             entered.set()
             assert release.wait(timeout=120)
-        return real_delete(config_, prepared, finish)
+        real_delete(config_, fenced)
 
-    monkeypatch.setattr(wrkslots, "_delete_prepared_deferred_finish", parked_delete)
+    monkeypatch.setattr(wrkslots, "_remove_fenced_directory", parked_delete)
     results: dict[str, int] = {}
 
     def run_remove(slot: str) -> None:
@@ -59284,14 +59281,16 @@ def test_remove_deletes_fenced_tree_without_holding_the_registry_lock(
     with wrkslots._mutation_locks(config, 5.0):
         pass
     assert time.monotonic() - started < 5.0
-    # A real admission completes inside the same window, before the
-    # second removal below runs: it is not stuck behind the deletion.
-    admitted = create(project, slot="slot03", agent="codex-3", branch="codex/task3")
-    assert admitted.returncode == 0, admitted.stderr
     assert first.is_alive()
     release.set()
     first.join(timeout=120)
     assert results["slot01"] == 0
+
+    # The admission gets in between the two removals: with the first
+    # removal's journal settled, a create completes before the second
+    # removal starts.
+    admitted = create(project, slot="slot03", agent="codex-3", branch="codex/task3")
+    assert admitted.returncode == 0, admitted.stderr
 
     second = remove(project, slot="slot02")
     assert second.returncode == 0, second.stderr
