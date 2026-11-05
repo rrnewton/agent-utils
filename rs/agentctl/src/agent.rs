@@ -1177,7 +1177,55 @@ pub fn install_termination_handler() {
     ONCE.call_once(|| {
         let _ = signal_hook::flag::register(libc::SIGTERM, terminated_flag().clone());
         let _ = signal_hook::flag::register(libc::SIGINT, terminated_flag().clone());
+        for (signal, line) in [
+            (
+                libc::SIGTERM,
+                &b"agentctl: SIGTERM received; stopping\n"[..],
+            ),
+            (libc::SIGINT, &b"agentctl: SIGINT received; stopping\n"[..]),
+        ] {
+            // SAFETY: the action only calls clock_gettime and write and touches an atomic, all
+            // async-signal-safe; it allocates nothing and takes no lock.
+            let _ =
+                unsafe { signal_hook::low_level::register(signal, move || note_termination(line)) };
+        }
     });
+}
+
+/// When the first termination signal arrived, on the monotonic clock in nanoseconds; 0 for none.
+static TERMINATION_AT_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Inside the signal handler: record when the first termination signal arrived and say so on
+/// standard error at once, so the service's log shows each stop even when it finishes within
+/// the guard's first poll (#870 agentctl-service-slow-stop). Async-signal-safe.
+fn note_termination(line: &[u8]) {
+    let now = monotonic_nanos().max(1);
+    if TERMINATION_AT_NANOS
+        .compare_exchange(
+            0,
+            now,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+    {
+        // SAFETY: write is async-signal-safe and `line` is a valid buffer of its length.
+        let _ = unsafe { libc::write(libc::STDERR_FILENO, line.as_ptr().cast(), line.len()) };
+    }
+}
+
+/// The monotonic clock in nanoseconds, read with clock_gettime (async-signal-safe).
+fn monotonic_nanos() -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes only the supplied timespec.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) };
+    u64::try_from(now.tv_sec)
+        .unwrap_or(0)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(now.tv_nsec).unwrap_or(0))
 }
 
 /// Whether this process was asked to terminate, once [`install_termination_handler`] has run
@@ -1233,8 +1281,7 @@ pub fn spawn_termination_guard(
                 }
                 thread::sleep(TERMINATION_POLL);
             }
-            let _ = termination_seen().set(Instant::now());
-            eprintln!("agentctl: {service}: termination requested; stopping");
+            crate::unit_cleanup::log_unit_processes(service, "at the termination request");
             let deadline = Instant::now() + grace;
             while Instant::now() < deadline {
                 if done.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1248,6 +1295,7 @@ pub fn spawn_termination_guard(
                  abandoning what is still in flight{what} and exiting",
                 grace.as_secs_f64()
             );
+            crate::unit_cleanup::end_unit_survivors(service, Duration::from_secs(1));
             terminate_as_signalled();
         });
     if let Err(error) = spawned {
@@ -1255,22 +1303,24 @@ pub fn spawn_termination_guard(
     }
 }
 
-/// When [`spawn_termination_guard`] saw the termination request.
-fn termination_seen() -> &'static std::sync::OnceLock<Instant> {
-    static SEEN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    &SEEN
-}
-
-/// Log how long `service` took to stop after the termination request its guard saw, so a slow
-/// stop can be told from a slow start in the service's log (#870 agentctl-service-slow-stop).
-/// Logs nothing when no termination was requested.
+/// After a stop: log how long `service` took after the termination request, so a slow stop can
+/// be told from a slow start, log the other processes still in its systemd unit, and end them
+/// ([`crate::unit_cleanup::end_unit_survivors`]) so the unit's stop does not wait for them (#870
+/// agentctl-service-slow-stop). Does nothing when no termination was requested.
 pub fn log_stop_time(service: &str) {
-    if let Some(seen) = termination_seen().get() {
+    let received = TERMINATION_AT_NANOS.load(std::sync::atomic::Ordering::SeqCst);
+    if received == 0 && !termination_requested() {
+        return;
+    }
+    if received != 0 {
+        let elapsed = monotonic_nanos().saturating_sub(received);
         eprintln!(
             "agentctl: {service} stopped {:.1}s after the termination request",
-            seen.elapsed().as_secs_f64()
+            Duration::from_nanos(elapsed).as_secs_f64()
         );
     }
+    crate::unit_cleanup::log_unit_processes(service, "stopped");
+    crate::unit_cleanup::end_unit_survivors(service, crate::unit_cleanup::SURVIVOR_GRACE);
 }
 
 /// End the process as SIGTERM's default action does; exit 143 if that somehow does not.
@@ -4308,6 +4358,7 @@ fn io_error(action: &str, path: &Path, error: io::Error) -> AgentError {
 
 #[cfg(test)]
 mod tests {
+
     use std::collections::{BTreeMap, VecDeque};
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{symlink, PermissionsExt};

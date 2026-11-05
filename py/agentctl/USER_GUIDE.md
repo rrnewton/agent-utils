@@ -1373,8 +1373,13 @@ logs `watch-agents did not stop within 3s of the termination request;
 abandoning what is still in flight ...` and ends as SIGTERM's default action
 would, which a service manager counts as a clean stop. What the pass left in
 flight is left as a crash would leave it, and the next start recovers it. The
-log marks each stop with `watch-agents: termination requested; stopping` and
-`watch-agents stopped N.Ns after the termination request`.
+log marks each stop with `SIGTERM received; stopping`, written by the signal
+handler itself, and `watch-agents stopped N.Ns after the termination request`.
+Run by systemd as a service's main process, it also logs the unit's other
+processes when it stops and ends any still in the unit's cgroup before it
+exits, as `chat run` does: SIGTERM, then a clean unmount of any FUSE daemon's
+mount, then SIGKILL, 2 s apart, detaching the mount of a FUSE daemon that had to
+be killed.
 
 #### The owner's requests held, and prompts quarantined as misroutes
 

@@ -3310,9 +3310,19 @@ as a clean stop. What was in flight is left as a crash would leave it: a prompt
 not yet typed stays pending, and the next start recovers the rest. A stop that
 lands while the provider plugin has not yet said hello, during startup or a
 reconnect, ends that wait at once instead of waiting out the plugin's Hello
-timeout. The log marks each stop with `chat run: termination requested;
-stopping` and `chat run stopped N.Ns after the termination request`, so a slow
-stop can be told from a slow start.
+timeout. The log marks each stop with `SIGTERM received; stopping`, written
+by the signal handler itself, and `chat run stopped N.Ns after the termination
+request`, so a slow stop can be told from a slow start. Run by systemd as a
+service's main process, it also logs the unit's other processes (pid, command,
+state) when it stops, and ends any still in the unit's cgroup before it exits.
+systemd waits for the whole cgroup, so a helper that outlived the service, such
+as the FUSE daemon serving a packaged provider tail's mount, used to hold each
+stop until systemd's own SIGKILL 90 s later. Every process but the FUSE daemons
+gets SIGTERM and 2 s to exit; then each FUSE daemon's mount is unmounted
+(`fusermount -u`), which ends a daemon that SIGTERM does not wake, and the
+daemon gets SIGTERM and 2 s more; whatever is left gets SIGKILL, and the mount of
+a FUSE daemon killed that way is detached (`fusermount -uz`), so no dead mount
+stays behind. The log names every process that needed SIGKILL.
 Run it under a service manager that restarts it on failure, with the same state
 directory: `Restart=on-failure` in a systemd unit, as in the example below. A
 unit without a restart policy leaves chat down after the first failure the

@@ -55,6 +55,7 @@ pub mod submission;
 pub mod term;
 pub mod tui_prompts;
 pub mod turn_state;
+pub(crate) mod unit_cleanup;
 pub mod units;
 pub mod unknown_harness;
 pub mod work_state;
