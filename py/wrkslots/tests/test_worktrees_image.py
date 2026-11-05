@@ -112,6 +112,13 @@ def _config(tmp_path: Path, state: str) -> cli.Config:
     )
 
 
+def test_bind_record_round_trip(tmp_path: Path) -> None:
+    assert worktreesimage.load_binds(tmp_path) == {}
+    worktreesimage.save_binds(tmp_path, {"s1": "s1"})
+    assert worktreesimage.load_binds(tmp_path) == {"s1": "s1"}
+    assert worktreesimage.image_mount_dir(tmp_path) == tmp_path / ".slots-image"
+
+
 def test_listing_signature_and_quota(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
     (tmp_path / "sub").mkdir()

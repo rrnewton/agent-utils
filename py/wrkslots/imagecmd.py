@@ -725,20 +725,26 @@ def _cmd_wt_image_create(args: argparse.Namespace) -> int:
 def _cmd_wt_image_mount(args: argparse.Namespace) -> int:
     config, settings = _wt_settings(args)
     try:
-        worktreesimage.mount_image(settings.image_file(config.root), config.worktrees)
+        worktreesimage.ensure_image_mounted(config.root, config.control, settings)
+        worktreesimage.ensure_binds(
+            config.control, worktreesimage.image_mount_dir(config.control), config.worktrees
+        )
     except worktreesimage.WorktreesImageError as exc:
         raise _refuse(str(exc)) from exc
-    print(f"mounted {settings.image_file(config.root)} at {config.worktrees}")
+    print(
+        f"mounted {settings.image_file(config.root)} at "
+        f"{worktreesimage.image_mount_dir(config.control)} (binds re-established)"
+    )
     return 0
 
 
 def _cmd_wt_image_unmount(args: argparse.Namespace) -> int:
     config, settings = _wt_settings(args)
     try:
-        worktreesimage.unmount_image(config.worktrees)
+        worktreesimage.unmount_image(worktreesimage.image_mount_dir(config.control))
     except worktreesimage.WorktreesImageError as exc:
         raise _refuse(str(exc)) from exc
-    print(f"unmounted {config.worktrees}")
+    print(f"unmounted {worktreesimage.image_mount_dir(config.control)}")
     return 0
 
 
@@ -760,7 +766,7 @@ def _cmd_wt_image_status(args: argparse.Namespace) -> int:
 def _cmd_wt_image_grow(args: argparse.Namespace) -> int:
     config, settings = _wt_settings(args)
     try:
-        worktreesimage.grow_image(settings.image_file(config.root), config.worktrees, args.to_size_bytes)
+        worktreesimage.grow_image(settings.image_file(config.root), worktreesimage.image_mount_dir(config.control), args.to_size_bytes)
     except worktreesimage.WorktreesImageError as exc:
         raise _refuse(str(exc)) from exc
     print(f"grew {settings.image_file(config.root)} to {args.to_size_bytes} bytes")
@@ -770,7 +776,7 @@ def _cmd_wt_image_grow(args: argparse.Namespace) -> int:
 def _cmd_wt_image_trim(args: argparse.Namespace) -> int:
     config, settings = _wt_settings(args)
     try:
-        output = worktreesimage.trim_image(config.worktrees)
+        output = worktreesimage.trim_image(worktreesimage.image_mount_dir(config.control))
     except worktreesimage.WorktreesImageError as exc:
         raise _refuse(str(exc)) from exc
     print(output or "trimmed")
@@ -789,31 +795,28 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
     slot_path = cli._slot_directory(config, args.slot, args.slot_type)
     if not slot_path.is_dir():
         raise _refuse(f"slot directory is missing: {slot_path}")
-    if worktreesimage.is_subvolume(slot_path):
-        print(f"{args.slot} is already inside the worktrees image")
+    if args.slot in worktreesimage.load_binds(config.control):
+        print(f"{args.slot} is already bound from the worktrees image")
         return 0
     if worktreesimage.process_inside(slot_path):
-        raise _refuse(f"a process is working inside {slot_path}; migrate only an idle slot")
+        raise _refuse(f"a process is working inside {slot_path}; migrate only a stopped slot")
     before = worktreesimage.listing_signature(slot_path)
-    staging = slot_path.with_name(f".migrate-{args.slot}")
-    backup = slot_path.with_name(f".migrate-old-{args.slot}")
-    if staging.exists() or backup.exists():
-        raise _refuse(f"migration staging already exists beside {slot_path}; inspect it first")
+    mount_dir = worktreesimage.image_mount_dir(config.control)
+    subvolume = mount_dir / args.slot
+    if subvolume.exists():
+        raise _refuse(f"image subvolume already exists: {subvolume}; inspect it first")
     try:
-        worktreesimage.create_slot_subvolume(staging, settings.slot_quota_bytes)
-        shutil.copytree(slot_path, staging, dirs_exist_ok=True, symlinks=True)
-        if worktreesimage.listing_signature(staging) != before:
+        worktreesimage.create_slot_subvolume(subvolume, settings.slot_quota_bytes)
+        shutil.copytree(slot_path, subvolume, dirs_exist_ok=True, symlinks=True)
+        if worktreesimage.listing_signature(subvolume) != before:
             raise _refuse("migrated copy does not match the slot file by file; original kept")
-        slot_path.rename(backup)
-        try:
-            staging.rename(slot_path)
-        except OSError:
-            backup.rename(slot_path)
-            raise
-        shutil.rmtree(backup)
+        # Bind at the original real path: the path, registry record and
+        # agent cwd never change; the original stays beneath the bind
+        # until a separate, approved deletion.
+        worktreesimage.bind_slot(config.control, mount_dir, args.slot, slot_path)
     except worktreesimage.WorktreesImageError as exc:
         raise _refuse(str(exc)) from exc
-    print(f"migrated {args.slot} into the worktrees image at {slot_path}")
+    print(f"migrated {args.slot} into the worktrees image, bound at {slot_path} (original kept beneath)")
     return 0
 
 

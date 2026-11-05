@@ -166,18 +166,45 @@ def classify_mount(
 
 
 def current_state(root: Path, worktrees: Path, settings: WorktreesImageSettings) -> str:
-    """Classify the live slots directory (reads the real mount table)."""
+    """Classify the live image mount (reads the real mount table).
 
-    exists = worktrees.is_dir()
+    The image mounts beside the control directory, never at the slots
+    directory itself, so no live slot path is ever renamed or covered.
+    ``root``/``worktrees`` are kept for call-site stability; the mount
+    classified is the image mount directory derived from the project.
+    """
+
+    mount_dir = worktrees.parent / IMAGE_MOUNT_NAME
+    exists = mount_dir.is_dir()
     empty = True
     if exists:
         try:
-            empty = next(worktrees.iterdir(), None) is None
+            empty = next(mount_dir.iterdir(), None) is None
         except OSError:
             empty = False
     return classify_mount(
-        worktrees, slotimage.mount_table(), slots_dir_exists=exists, slots_dir_empty=empty
+        mount_dir, slotimage.mount_table(), slots_dir_exists=exists, slots_dir_empty=empty
     )
+
+
+def ensure_image_mounted(root: Path, control: Path, settings: WorktreesImageSettings) -> None:
+    """Mount the image beside the control directory if it is not mounted."""
+
+    mount_dir = image_mount_dir(control)
+    mount_dir.mkdir(parents=True, exist_ok=True)
+    state = classify_mount(
+        mount_dir,
+        slotimage.mount_table(),
+        slots_dir_exists=True,
+        slots_dir_empty=next(mount_dir.iterdir(), None) is None,
+    )
+    if state == MOUNTED:
+        return
+    _run(
+        ["mount", "-o", "loop,compress=zstd:3,noatime", str(settings.image_file(root)), str(mount_dir)],
+        sudo=True,
+    )
+    _run(["btrfs", "quota", "enable", str(mount_dir)], sudo=True)
 
 
 def _run(argv: list[str], *, sudo: bool = False) -> subprocess.CompletedProcess[str]:
@@ -340,15 +367,98 @@ def process_inside(path: Path) -> bool:
     return False
 
 
+IMAGE_MOUNT_NAME = ".slots-image"
+RECORD_NAME = ".worktrees-image.json"
+
+
+def image_mount_dir(control: Path) -> Path:
+    """Where the project image is mounted: beside the control files."""
+
+    return control / IMAGE_MOUNT_NAME
+
+
+def record_path(control: Path) -> Path:
+    """The durable record of slot bind mounts, beside the registry."""
+
+    return control / RECORD_NAME
+
+
+def load_binds(control: Path) -> dict[str, str]:
+    """Recorded binds: slot name to subvolume name inside the image."""
+
+    path = record_path(control)
+    if not path.is_file():
+        return {}
+    import json
+
+    value = json.loads(path.read_text(encoding="utf-8"))
+    binds = value.get("binds") if isinstance(value, dict) else None
+    if not isinstance(binds, dict):
+        raise WorktreesImageError(f"malformed worktrees image record: {path}")
+    return {str(key): str(item) for key, item in binds.items()}
+
+
+def save_binds(control: Path, binds: dict[str, str]) -> None:
+    """Persist the bind record atomically beside the registry."""
+
+    import json
+
+    path = record_path(control)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps({"binds": binds}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def bind_slot(control: Path, mount_dir: Path, slot: str, slot_path: Path) -> None:
+    """Bind a slot's image subvolume at its original real path; record it."""
+
+    source = mount_dir / slot
+    if not source.is_dir():
+        raise WorktreesImageError(f"slot subvolume is missing: {source}")
+    slot_path.mkdir(parents=True, exist_ok=True)
+    _run(["mount", "--bind", str(source), str(slot_path)], sudo=True)
+    binds = load_binds(control)
+    binds[slot] = slot
+    save_binds(control, binds)
+
+
+def unbind_slot(control: Path, slot: str, slot_path: Path) -> None:
+    """Unmount a slot's bind and drop its record (original stays beneath)."""
+
+    _run(["umount", str(slot_path)], sudo=True)
+    binds = load_binds(control)
+    binds.pop(slot, None)
+    save_binds(control, binds)
+
+
+def ensure_binds(control: Path, mount_dir: Path, slots_dir: Path) -> list[str]:
+    """Re-establish the image mount and every recorded bind; return actions."""
+
+    actions: list[str] = []
+    if not mount_dir.is_dir() or next(mount_dir.iterdir(), None) is None:
+        pass
+    binds = load_binds(control)
+    entries = slotimage.mount_table()
+    mounted_points = {entry.mount_point for entry in entries}
+    for slot in sorted(binds):
+        slot_path = slots_dir / slot
+        if slot_path in mounted_points:
+            continue
+        bind_slot(control, mount_dir, slot, slot_path)
+        actions.append(f"bound slot {slot} from the worktrees image")
+    return actions
+
+
 def status_report(root: Path, worktrees: Path, settings: WorktreesImageSettings) -> dict[str, object]:
     """Mount state, apparent size, and host-allocated bytes of the image."""
     image_file = settings.image_file(root)
     report: dict[str, object] = {
         "image_file": str(image_file),
-        "mount_point": str(worktrees),
+        "mount_point": str(worktrees.parent / IMAGE_MOUNT_NAME),
         "configured_size_bytes": settings.size_bytes,
         "state": current_state(root, worktrees, settings),
         "image_exists": image_file.is_file(),
+        "binds": load_binds(worktrees.parent),
     }
     if image_file.is_file():
         stat = image_file.stat()

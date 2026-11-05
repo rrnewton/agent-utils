@@ -3993,6 +3993,20 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         worktrees_image=_parse_worktrees_image(raw, root, worktrees),
     )
     if config.worktrees_image is not None:
+        # Re-establish the image mount and recorded slot binds on every
+        # load (the per-slot image precedent): after a reboot the slots
+        # are back at their original real paths before lifecycle logic
+        # inspects them. Failures leave the classified state in place;
+        # slot-writing commands refuse on it below.
+        try:
+            worktreesimage.ensure_image_mounted(config.root, config.control, config.worktrees_image)
+            worktreesimage.ensure_binds(
+                config.control,
+                worktreesimage.image_mount_dir(config.control),
+                config.worktrees,
+            )
+        except worktreesimage.WorktreesImageError:
+            pass
         object.__setattr__(
             config,
             "worktrees_image_state",
@@ -4255,11 +4269,15 @@ def _remove_slot_directory(config: Config, path: Path) -> None:
 
     image = _slot_image_at(config, path)
     if image is None:
-        if config.worktrees_image is not None and worktreesimage.is_subvolume(path):
+        if config.worktrees_image is not None and path.name in worktreesimage.load_binds(config.control):
             try:
-                worktreesimage.delete_slot_subvolume(path)
+                worktreesimage.unbind_slot(config.control, path.name, path)
+                worktreesimage.delete_slot_subvolume(
+                    worktreesimage.image_mount_dir(config.control) / path.name
+                )
             except worktreesimage.WorktreesImageError as exc:
                 raise OSError(errno.ENOTEMPTY, str(exc)) from exc
+            path.rmdir()
             return
         path.rmdir()
         return
@@ -26956,13 +26974,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
             and representation != "image"
             and config.worktrees_image_state == worktreesimage.MOUNTED
         ):
-            # First-class project-image mode: the slot directory is a btrfs
-            # subvolume inside the one project image, so slots share extents
+            # First-class project-image mode: the slot is born as a btrfs
+            # subvolume inside the one project image and bind-mounted at
+            # its original real path, so slots share extents
             # (reflink/snapshot) while qgroups bound each slot.
             try:
+                mount_dir = worktreesimage.image_mount_dir(config.control)
                 worktreesimage.create_slot_subvolume(
-                    slot_path, config.worktrees_image.slot_quota_bytes
+                    mount_dir / args.slot, config.worktrees_image.slot_quota_bytes
                 )
+                worktreesimage.bind_slot(config.control, mount_dir, args.slot, slot_path)
             except worktreesimage.WorktreesImageError as exc:
                 raise Refusal(str(exc)) from exc
             _fsync_directory(slot_path.parent)
