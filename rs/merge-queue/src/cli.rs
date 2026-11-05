@@ -660,7 +660,8 @@ enum Command {
     },
     /// Withdraw a queued change. While a run holds the writer lock the withdrawal is recorded
     /// and applied as soon as the lock is free; the run meanwhile does not land a batch that
-    /// holds the change.
+    /// holds the change. A change whose submission is itself still recorded can be withdrawn
+    /// too: the withdrawal is applied right after that submission.
     Withdraw {
         /// Change number.
         pr: i64,
@@ -1536,25 +1537,38 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             let lock = match state.lock() {
                 Ok(lock) => lock,
                 Err(busy) => {
-                    let item = state
-                        .item(pr)?
-                        .ok_or_else(|| format!("#{pr} is not in the queue"))?;
-                    if item.status == ItemStatus::Landed {
-                        return Err(format!("#{pr} has already landed"));
+                    // A change whose submission is still waiting may have no item record yet:
+                    // its withdrawal waits behind that submission, in recording order.
+                    let waiting = intake::waiting_submission(&state, pr);
+                    if waiting.is_none() {
+                        let item = state
+                            .item(pr)?
+                            .ok_or_else(|| format!("#{pr} is not in the queue"))?;
+                        if item.status == ItemStatus::Landed {
+                            return Err(format!("#{pr} has already landed"));
+                        }
                     }
+                    let behind = waiting
+                        .map(|submission| {
+                            format!(
+                                ", right after the submission of #{pr} recorded at {}",
+                                submission.recorded_at
+                            )
+                        })
+                        .unwrap_or_default();
                     let request = intake::Request::Withdraw { pr, reason };
                     let (entry, new) = intake::record(&state, request, &busy, "")?;
                     if new {
                         println!(
                             "recorded the withdrawal of #{pr} for the next cycle: {busy}; the \
                              run does not land a batch holding #{pr}, and the withdrawal is \
-                             applied as soon as the writer lock is free"
+                             applied as soon as the writer lock is free{behind}"
                         );
                     } else {
                         println!(
                             "already recorded the withdrawal of #{pr} at {}, not recorded \
                              again: {busy}; the run does not land a batch holding #{pr}, and the \
-                             withdrawal is applied as soon as the writer lock is free",
+                             withdrawal is applied as soon as the writer lock is free{behind}",
                             entry.recorded_at
                         );
                     }

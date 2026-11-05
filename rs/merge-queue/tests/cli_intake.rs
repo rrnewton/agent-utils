@@ -285,6 +285,101 @@ fn requests_recorded_while_the_lock_is_held_apply_in_order_at_the_next_writer() 
 }
 
 #[test]
+fn a_change_whose_submission_is_still_recorded_can_be_withdrawn_behind_it() {
+    let fx = queue("intake-withdraw-pending");
+    let before = fx.remote_main();
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    let lock = hold_writer_lock(&fx);
+    let out = fx.mq_ok(&["submit", "1", "--head", "a"]);
+    assert!(out.contains("recorded #1"), "{out}");
+    // #1 has no item record yet, only its recorded submission: the withdrawal is recorded
+    // behind it rather than refused.
+    assert_eq!(item(&fx, 1), Value::Null);
+    let out = fx.mq_ok(&["withdraw", "1", "--reason", "bad head"]);
+    assert!(out.contains("recorded the withdrawal of #1"), "{out}");
+    assert!(
+        out.contains("right after the submission of #1 recorded at"),
+        "{out}"
+    );
+    let ops: Vec<Value> = pending_rows(&fx)
+        .iter()
+        .map(|row| row["op"].clone())
+        .collect();
+    assert_eq!(ops, vec!["submit", "withdraw"]);
+    // A change with neither an item record nor a recorded submission is still refused.
+    let unknown = fx.mq(&["withdraw", "9"]);
+    assert!(!unknown.status.success());
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("#9 is not in the queue"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+    drop(lock);
+    // The next writer applies the submission, then the withdrawal: nothing is validated or landed.
+    let out = fx.mq(&["run", "--json"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("applied submit #1 recorded at"), "{stderr}");
+    assert!(
+        stderr.contains("applied withdraw #1 recorded at"),
+        "{stderr}"
+    );
+    let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(
+        report["validations"].as_array().unwrap().is_empty(),
+        "{report}"
+    );
+    assert_eq!(status(&fx, 1), "withdrawn");
+    assert_eq!(fx.remote_main(), before);
+    let kinds: Vec<String> = history(&item(&fx, 1))
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect();
+    assert_eq!(kinds, ["submitted", "withdrawn"], "{kinds:?}");
+    assert_eq!(status_json(&fx)["intake"]["pending"], 0);
+}
+
+#[test]
+fn a_bad_head_recorded_while_a_run_validates_is_stopped_before_it_is_planned() {
+    let (fx, gate) = gated("intake-withdraw-pending-run");
+    // One batch at a time, so both requests wait for the run's end.
+    let _daemon = Daemon::start_with(&fx, &["--depth", "1"]);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    wait_for("the batch to validate", Duration::from_secs(20), || {
+        status_json(&fx)["slots_in_use"] == 1
+    });
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    let out = fx.mq_ok(&["submit", "2", "--head", "b"]);
+    assert!(out.contains("recorded #2"), "{out}");
+    let out = fx.mq_ok(&["withdraw", "2", "--reason", "bad head"]);
+    assert!(out.contains("recorded the withdrawal of #2"), "{out}");
+    std::fs::write(&gate, "").unwrap();
+    wait_for(
+        "#1 to land and #2 to be withdrawn",
+        Duration::from_secs(30),
+        || status(&fx, 1) == "landed" && status(&fx, 2) == "withdrawn",
+    );
+    // #2 never validated: no validation directory names it.
+    let runs = state_dir(&fx).join("runs");
+    for run in std::fs::read_dir(&runs).unwrap().flatten() {
+        let Ok(validations) = std::fs::read_dir(run.path().join("validations")) else {
+            continue;
+        };
+        for validation in validations.flatten() {
+            let record =
+                std::fs::read_to_string(validation.path().join("record.json")).unwrap_or_default();
+            let record: Value = serde_json::from_str(&record).unwrap_or(Value::Null);
+            assert!(
+                !record["prs"]
+                    .as_array()
+                    .is_some_and(|prs| prs.iter().any(|pr| pr == 2)),
+                "#2 was validated: {record}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_recorded_request_that_cannot_be_applied_is_kept_with_its_reason() {
     let fx = queue("intake-refused");
     fx.branch("c", &[("tests/c", "ok\n")]);

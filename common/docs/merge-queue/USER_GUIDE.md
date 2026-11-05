@@ -223,7 +223,8 @@ Ready-file lines look like `PR [SHA] [head=REF] [priority=N] [after=N,N] [solo] 
 This command marks a queued change `withdrawn`. `--reason TEXT` (default `withdrawn by submitter`)
 is recorded in the change's history. Submitting the change again puts it back in the queue. While
 a run holds the writer lock, the withdrawal is recorded, and the run does not land a batch that
-holds the change (see "Intake while a run holds the queue").
+holds the change; a change whose submission is still recorded can be withdrawn the same way (see
+"Intake while a run holds the queue").
 
 ### `merge-queue retry PR...`
 
@@ -270,7 +271,9 @@ run checks for requests every `--poll-ms` under `serve` and every 15 seconds und
   resolves (`git ls-remote`), and that it matches `--sha` when one is given. A head that does
   not resolve is refused at once, as it would be with the lock free.
 - `withdraw` and `retry` first check that the change is in the queue (and, for `retry`, queued).
-  A withdrawal also takes effect inside the run that holds the lock: before landing a batch, the
+  A change whose submission is itself still recorded counts for `withdraw`: the withdrawal is
+  recorded behind that submission and applied right after it, so a bad head can be stopped
+  before the change is planned. A withdrawal also takes effect inside the run that holds the lock: before landing a batch, the
   run reads the recorded withdrawals. If one names a change in the batch, the run does not land
   that batch, stops, and leaves the batch queued. The next cycle applies the withdrawal and
   validates the rest again.

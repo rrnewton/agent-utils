@@ -11,6 +11,10 @@
 //! requests for changes it has not started, and plans them on top of the batches in flight
 //! (see `run`). Requests for a change it started wait for the run to end.
 //!
+//! A change whose submission is still waiting can be withdrawn too: the withdrawal is recorded
+//! behind the submission and applied right after it, so a bad head can be stopped while a run
+//! holds the lock.
+//!
 //! `list` and `status` show the waiting requests as `pending-intake`, so a submitter can see its
 //! request was taken. A request identical to the last one waiting for the same change is not
 //! recorded again (the command says it is already recorded), and identical requests recorded
@@ -282,6 +286,14 @@ pub fn record(
     };
     write_json(&pending_dir(state).join(format!("{id}.json")), &entry)?;
     Ok((entry, true))
+}
+
+/// The last submission of `pr` still waiting for the writer lock, if any. A change whose only
+/// record is a waiting submission has no item record yet.
+pub fn waiting_submission(state: &State, pr: i64) -> Option<Entry> {
+    pending_entries(state)
+        .into_iter()
+        .rfind(|entry| matches!(&entry.request, Request::Submit(submission) if submission.pr == pr))
 }
 
 /// Whether any request is waiting (a directory listing; no lock).
