@@ -14,7 +14,7 @@ export interface KeyPlace<Pane> {
 }
 
 export interface ScreenKeysDependencies<Pane> {
-  /** Which screen is up, the screen Help returns to, and showing one. */
+  /** Which screen is up, the screen Help returns to, and setting where it returns. */
   readonly screens: Pick<Screens, "screen" | "helpReturn" | "setHelpReturn">;
   /** Show the screen `name`. */
   showScreen(name: string): void;

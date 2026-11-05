@@ -136,7 +136,7 @@ export function wireNewlineKey(key: HTMLElement, box: HTMLElement): void {
   });
 }
 
-/** The message boxes are where Escape leaves the field before it goes Back (the page's `onEscape`). */
+/** The message boxes are where Escape leaves the field before it goes Back (view/shell's `onEscape`). */
 export const isComposer = (node: unknown): boolean =>
   Boolean(node) && COMPOSER_FIELDS.includes(String((node as { readonly id?: unknown }).id || ""));
 

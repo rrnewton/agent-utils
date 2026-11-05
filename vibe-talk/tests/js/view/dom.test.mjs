@@ -730,6 +730,10 @@ test("`#624 voice-page-modularity`: the search, Settings, Help, Back and Escape 
     clearAllThreadFocus: () => state.allFocus,
   });
   const run = (act) => { log.length = 0; const did = act(); return [did, ...log]; };
+  state.menus = ["menu:actions"];
+  assert.deepStrictEqual(run(() => keys.searchFromAnywhere()), [true, "closed menu:actions", "search true", "field focus", "field select"],
+    "Ctrl+/ on the main screen did not close the menu and then open the search");
+  state.search = false;
   assert.deepStrictEqual(run(() => keys.searchFromKeyboard()), [true, "search true", "field focus", "field select"]);
   assert.deepStrictEqual(run(() => keys.searchFromKeyboard()), [true, "field focus", "field select"], "a search already open was opened again");
   state.search = false;
@@ -743,6 +747,10 @@ test("`#624 voice-page-modularity`: the search, Settings, Help, Back and Escape 
   screen = "signin";
   assert.deepStrictEqual(run(() => keys.settingsFromKeyboard()), [true, "show settings"]);
   assert.deepStrictEqual(run(() => keys.settingsFromKeyboard()), [true, "close settings"], ", in Settings did not leave it");
+  screen = "help";
+  assert.deepStrictEqual(run(() => keys.settingsFromKeyboard()), [true, "close settings"], ", in Help did not leave it");
+  helpReturn = "signin";
+  assert.deepStrictEqual([run(() => keys.keysFromKeyboard()), helpReturn], [[true, "help keyboard"], "main"], "? on the main screen did not keep it to return to");
   screen = "call";
   assert.deepStrictEqual(run(() => keys.settingsFromKeyboard()), [false]);
   assert.deepStrictEqual(run(() => keys.keysFromKeyboard()), [false], "? opened Help from a screen the gear does not reach");
@@ -768,8 +776,14 @@ test("`#624 voice-page-modularity`: the search, Settings, Help, Back and Escape 
   state.view = "all";
   const target = { id: "target" };
   state.rowMenu = true;
-  assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true], "a ⋯ menu was not closed first");
+  state.menus = ["menu:pace"];
+  state.search = true;
+  assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true], "a ⋯ menu was not closed first, before the popover and the search");
   state.rowMenu = false;
+  assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true, "closed menu:pace"], "the popover was not closed before the search");
+  state.search = false;
+  state.menus = ["menu:actions"];
+  assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true, "closed menu:actions"]);
   state.menus = ["menu:prompts", "menu:dismissed"];
   assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true, "closed menu:prompts"]);
   assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true, "closed menu:dismissed"]);
@@ -796,6 +810,13 @@ test("`#624 voice-page-modularity`: the search, Settings, Help, Back and Escape 
   state.view = "all";
   assert.deepStrictEqual(run(() => keys.onEscape({}, box)), [true, "focus list pane"], "an empty box with no Back did not leave for the list");
   assert.deepStrictEqual(run(() => keys.onEscape({}, { id: "thread-select" })), [true, "pick forgotten", "focus list pane"], "Escape on the bar's picker did not leave it");
+  assert.deepStrictEqual(run(() => keys.onEscape({}, { id: "discord-channel" })), [true, "pick forgotten", "focus list pane"], "Escape on the channel picker did not leave it");
+  state.litCard = true;
+  assert.deepStrictEqual(run(() => keys.onEscape({}, { id: "discord-channel" })), [true, "pick forgotten", "focus list pane"], "a lit card was put out before the picker was left");
+  state.litCard = false;
+  screen = "settings";
+  assert.deepStrictEqual(run(() => keys.onEscape({}, { id: "discord-channel" })), [true, "close settings"], "off the main screen a picker named as the bar's was taken for it");
+  screen = "main";
   state.litCard = true;
   assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [true]);
   state.litCard = false;
