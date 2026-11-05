@@ -95,7 +95,7 @@ This command creates the state directory and writes `config.json`.
 | `--combine MODE` | `rebase` | `rebase` replays each change's non-merge commits in order, giving linear history like a rebase merge. Merge commits inside a change are dropped, as `git rebase` drops them. `merge` creates one merge commit per change. |
 | `--max-batch N` | `4` | The maximum number of changes per batch (at least 1). |
 | `--depth N` | `2` | The initial window (batches validating at the same time) and the number of concurrent probes during a culprit search (at least 1). |
-| `--max-depth N` | `0` | The largest the adaptive window may grow: +1 per landed batch, halved per red batch, never below 1. `0` keeps the window fixed at `--depth`. |
+| `--max-depth N` | `0` | The largest the adaptive window may grow: +1 per landed batch, halved per red batch whose every failure timed out or reached no verdict, never below 1. Any other red leaves it as it is. `0` keeps the window fixed at `--depth`. |
 | `--union-path PATTERN` | none | A Git attribute pattern merged with Git's `union` driver, when probing conflicts and when combining changes. Repeatable. Only for line-oriented, append-only files (see "Union merges"). |
 | `--priority-label LABEL` | `mq-priority` | The label that makes a pull request a priority change when `sync` reads it from the hosting service, compared without regard to case. `-` turns it off. See "Priority changes". |
 | `--classifier-policy PATH` | none | A test-footprint policy in the repository (version 2, such as `ci/test-footprints.json`), read at each plan's base commit. Decision-log features then take their components and a verdict from it, through the shared change classifier (`change-classify userguide`). |
@@ -135,7 +135,7 @@ This command creates the state directory and writes `config.json`.
 | `--dag FILE` | empty | For `dagrun`: the DAG file, relative to the candidate checkout. |
 | `--dagrun PATH` | empty | For `dagrun`: the dagrun executable, relative to the checkout or absolute (empty means `dagrun` on `PATH`). |
 | `--admission WORD` | none | A command prefix every validation runs under, such as a host admission wrapper. Repeat it for several words. |
-| `--refusal-max-retries N` | `3` | Extra attempts after an admission refusal (exit `75`, or a non-zero exit whose first output line starts with `COULD_NOT_RUN` and that attributed no failed test) within one `run`, each after a backoff delay. A refusal is never a pass and never red: the change stays queued. |
+| `--refusal-max-retries N` | `3` | Extra attempts after an admission refusal (exit `75`, or a non-zero exit whose first output line starts with `COULD_NOT_RUN` and that attributed no failed test) within one `run`, each after a backoff delay. Each attempt is a validation of its own beside the run's others, started when the refusal comes back rather than when the batch reaches the head, so the run goes on taking requests and landing meanwhile. A refusal is never a pass and never red: the change stays queued. |
 | `--refusal-backoff-secs SECS` | `2` | Base backoff between refusal retries, doubled per attempt and capped at 60 seconds. `0` means no delay. The same backoff sets the deferred change's next retry time. |
 | `--max-deferrals N` | `3` | How many times a change may be deferred because validation did not run (an admission refusal, a validator that cannot execute, a probe or donors that could not run) before it is escalated to its owner and held until `merge-queue retry` (see "Bounded retry"). |
 | `--green-flaky-hold-secs SECS` | `7200` | How long a change is held for a ruling after a GREEN_FLAKY or INFRA-BLOCKED result (see "Held for a ruling") before it is re-queued for a fresh validation. |
@@ -332,7 +332,9 @@ seconds under `run`.
 - Landing order does not change. A batch planned this way lands only after every batch beneath
   it, and a red batch beneath it sends it back to be built again, as for any batch.
 - Requests for a change in flight wait for the run to end (a withdrawal still keeps its batch
-  from landing, below). So do all requests during a drain, and after a run has been taking
+  from landing, below). A `retry` of a change the run holds, escalated to its owner or held for
+  a ruling, does not: it applies at the next free slot, and the run plans the change again on
+  top of the batches in flight. All requests wait during a drain, and after a run has been taking
   requests for two hours: it then finishes the batches in flight and ends, so the next run
   reloads the configuration and the validator's tools. The run report lists what the run
   applied under `intake`.
@@ -1002,8 +1004,14 @@ path-routing`.
 runner exits `75`, or it exits non-zero, its first non-empty output line starts with
 `COULD_NOT_RUN`, and it attributed no failed test — did not run, so it is
 neither a pass nor a failure. The queue records the validation as `refused` with no failed
-tests, retries it in the same run after a backoff (`refusal_backoff_secs` doubled per attempt,
-up to `refusal_max_retries` extra attempts), and if it is still refused, defers the batch: every
+tests, and starts it again in the same run after a backoff (`refusal_backoff_secs` doubled per
+attempt, up to `refusal_max_retries` extra attempts). The retry is a validation like any other,
+beside the batches still validating: the batches built on the refused one stay, since a refusal
+says nothing about the candidate, and the run goes on taking requests and landing while it waits.
+A batch refused behind the head is retried at once, not when it reaches the head, and if its
+retries run out there it gets them afresh when it becomes the head, since by then its refusal may
+be as old as the head's whole validation. If the batch is still refused after its last attempt,
+it is deferred once it is decided: every
 change in it stays `queued`, its `validation_refusals` count grows, `next_retry_at` is set from
 the backoff, the run report lists it under `deferred`, and the run stops with exit `3`. No
 culprit search runs and nothing is ejected for a refusal. While `next_retry_at` is in the
@@ -1346,8 +1354,11 @@ The base moves only to a commit whose exact tree passed validation (the bors rul
    at once. Green batches land in order, as soon as every batch ahead of them has landed, and the
    next batch starts at once on top of the last one in flight.
 2. **AIMD.** The window starts at `depth`, grows by one per landed batch up to `max_depth`, and
-   halves per red batch it searches or decides alone, never below one; a red batch that is split
-   (below) leaves it as it is. With `max_depth` 0 it stays at `depth`. The report's
+   halves per red batch it searches or decides alone whose every failure timed out or reached no
+   verdict (as the validator shapes its result rows), never below one: only such a red says the
+   host may be overloaded. Any other red names a culprit and says nothing against the batches
+   behind it, so it leaves the window as it is, as a red batch that is split (below) does. With
+   `max_depth` 0 it stays at `depth`. The report's
    `windows` field records the window each time a batch started.
 3. **A red head** cancels everything behind it: those candidates were built on its tree. Their
    validations are killed, reported as `cancelled` (never as red), and their batches go back to the

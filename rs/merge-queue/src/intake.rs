@@ -9,7 +9,9 @@
 //!
 //! A run whose speculative window has room does not wait for its own end: it applies the
 //! requests for changes it has not started, and plans them on top of the batches in flight
-//! (see `run`). Requests for a change it started wait for the run to end.
+//! (see `run`). Requests for a change it started wait for the run to end, except a `retry` of a
+//! change the run holds (escalated to its owner, or held for a ruling): that one applies at once,
+//! and the run plans the change again.
 //!
 //! A change whose submission is still waiting can be withdrawn too: the withdrawal is recorded
 //! behind the submission and applied right after it, so a bad head can be stopped while a run
@@ -329,6 +331,20 @@ pub fn pending_withdrawals(state: &State) -> BTreeSet<i64> {
         .filter_map(|path| read(path).ok())
         .filter_map(|entry| match entry.request {
             Request::Withdraw { pr, .. } => Some(pr),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Changes a waiting request retries. A run lets such a request through for a change it holds
+/// (escalated, or held for a ruling) instead of keeping it for the run's end (see `run`).
+pub fn pending_retries(state: &State) -> BTreeSet<i64> {
+    files(&pending_dir(state))
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|path| read(path).ok())
+        .filter_map(|entry| match entry.request {
+            Request::Retry { pr } => Some(pr),
             _ => None,
         })
         .collect()

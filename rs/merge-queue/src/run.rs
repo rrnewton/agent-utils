@@ -626,6 +626,13 @@ struct Flight {
     /// beneath it are still undecided (see [`cut_after`]): it keeps its place, to be decided in
     /// order, but no longer holds a place in the window, and nothing is built on it.
     stacked: bool,
+    /// Where it sat in the window when it started.
+    speculation: Option<Speculation>,
+    /// Validations of this candidate that admission refused and that were started again (see
+    /// [`Runner::refused_again`]).
+    retries: u32,
+    /// Whether its retries were counted afresh when it became the head.
+    head_round: bool,
 }
 
 /// Observations of one prefix during a culprit search.
@@ -1642,51 +1649,77 @@ impl<'a> Runner<'a> {
         }
     }
 
-    /// Retry a refused batch validation with backoff. Returns the final `(id, ran)`.
-    /// Each attempt is its own validation record (refused attempts are visible, never
-    /// counted as green or red).
-    fn retry_refused(
-        &self,
-        candidate: &Candidate,
-        chosen: &Chosen,
-        first: (usize, Ran),
-    ) -> Result<(usize, Ran), String> {
-        let retries = self.config.validator.refusal_retries();
-        let base = self.config.validator.refusal_backoff();
-        let (mut vid, mut ran) = first;
-        for attempt in 0..retries {
-            if !ran.refused() {
-                break;
-            }
-            let delay = refusal_backoff(attempt as u32, base);
-            self.event(
-                "validation-refused",
-                &format!(
-                    "{} refused ({}); retry {} of {retries} after {}s",
-                    list(&candidate.prs),
-                    refusal_detail(&ran),
-                    attempt + 1,
-                    delay.as_secs()
-                ),
-            );
-            sleep_unless_stopped(delay);
-            let (next_vid, next_ran) = self
-                .validate_all(vec![Job {
-                    purpose: "batch",
-                    prs: candidate.prs.clone(),
-                    commit: candidate.tip.clone(),
-                    parent: candidate.parent.clone(),
-                    speculation: None,
-                    selection: chosen.selection.clone(),
-                    policy: chosen.policy.clone(),
-                    extra: chosen.extra.clone(),
-                }])
-                .pop()
-                .ok_or("no retry result")??;
-            vid = next_vid;
-            ran = next_ran;
+    /// When admission refused `flight`'s validation and its retries are not used up, count the
+    /// retry, say so, clear the result, and return the job that validates the candidate again,
+    /// with the backoff to wait first. The caller starts it in the flight's place, like any
+    /// batch: a refusal says nothing about the candidate, so the batches built on it stay, and
+    /// the run goes on taking requests, landing and filling the window meanwhile. Each attempt
+    /// is its own validation record (refused attempts are visible, never counted as green or
+    /// red). `None` leaves the refusal as the flight's result: it defers the batch once the
+    /// batch is decided.
+    ///
+    /// The retries are counted afresh once the flight is the head (`at_head`): a batch whose
+    /// retries ran out behind the head may wait there for the whole of the head's validation,
+    /// and the refusal it holds by then is too old to defer it on.
+    fn refused_again(&self, flight: &mut Flight, at_head: bool) -> Option<(Job, Duration)> {
+        let Some(Ok((_, ran))) = flight.result.as_ref() else {
+            return None;
+        };
+        if !ran.refused() {
+            return None;
         }
-        Ok((vid, ran))
+        if at_head && !flight.head_round {
+            flight.head_round = true;
+            flight.retries = 0;
+        }
+        let retries = self.config.validator.refusal_retries();
+        if flight.retries as usize >= retries {
+            return None;
+        }
+        let delay = refusal_backoff(flight.retries, self.config.validator.refusal_backoff());
+        flight.retries += 1;
+        self.event(
+            "validation-refused",
+            &format!(
+                "{} refused ({}); retry {} of {retries} after {}s, beside the run",
+                list(&flight.candidate.prs),
+                refusal_detail(ran),
+                flight.retries,
+                delay.as_secs()
+            ),
+        );
+        flight.result = None;
+        Some((
+            batch_job(&flight.candidate, &flight.chosen, flight.speculation),
+            delay,
+        ))
+    }
+
+    /// Start `job`, `flight`'s validation again, on a thread of `scope` once `delay` has passed,
+    /// unless the flight is cancelled first. Its result comes on `tx` under the flight's id, as
+    /// the first one did.
+    fn start_again<'scope, 'env>(
+        &'env self,
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        tx: &mpsc::Sender<(u64, JobResult)>,
+        flight: &Flight,
+        job: Job,
+        delay: Duration,
+    ) {
+        let tx = tx.clone();
+        let cancel = Arc::clone(&flight.cancel);
+        let id = flight.id;
+        scope.spawn(move || {
+            let result = if wait_unless_cancelled(delay, &cancel) {
+                self.validate_one(job, &cancel)
+            } else {
+                Err(format!(
+                    "the retry of {} was cancelled before it started",
+                    list(&job.prs)
+                ))
+            };
+            let _ = tx.send((id, result));
+        });
     }
 
     fn requeue(&self, prs: &[i64], why: &str) {
@@ -3767,26 +3800,45 @@ impl<'a> Runner<'a> {
         };
         self.record_closes();
         // A change a suspect-flake rerun cleared goes back into this run's plan.
-        let released = self.settle_suspects().unwrap_or_else(|error| {
+        let mut released = self.settle_suspects().unwrap_or_else(|error| {
             self.event(
                 "suspect-flake",
                 &format!("rerun verdicts not read: {error}"),
             );
             Vec::new()
         });
-        let busy: BTreeSet<i64> = busy
+        let retried = self.retried_holds();
+        let mut busy: BTreeSet<i64> = busy
             .iter()
             .copied()
-            .filter(|pr| !released.contains(pr))
+            .filter(|pr| !released.contains(pr) && !retried.contains(pr))
             .collect();
-        let busy = &busy;
-        let applied = match crate::intake::apply_except(self.state, &self.config, writer, busy) {
+        let applied = match crate::intake::apply_except(self.state, &self.config, writer, &busy) {
             Ok(applied) => applied,
             Err(error) => {
                 self.event("intake", &format!("recorded requests not applied: {error}"));
                 return Ok(());
             }
         };
+        // A change held only until its owner's retry goes back into this run's plan once the
+        // retry has applied; one whose retry was refused stays held.
+        for pr in retried {
+            let returned = matches!(
+                self.state.item(pr),
+                Ok(Some(item)) if item.status == ItemStatus::Queued && !held_until_retry(&item)
+            );
+            if returned {
+                lock(&self.excluded).remove(&pr);
+                released.push(pr);
+                self.event(
+                    "retry",
+                    &format!("#{pr}: its owner's retry applied; planned again in this run"),
+                );
+            } else {
+                busy.insert(pr);
+            }
+        }
+        let busy = &busy;
         if applied.is_empty() && released.is_empty() {
             return Ok(());
         }
@@ -3805,6 +3857,27 @@ impl<'a> Runner<'a> {
             );
         }
         Ok(())
+    }
+
+    /// The changes this run holds until their owner's `retry` (escalated, or held for a ruling)
+    /// that a recorded `retry` names. Their requests apply at once rather than at the end of the
+    /// run, which plans them again (see [`Self::take_intake`]).
+    fn retried_holds(&self) -> BTreeSet<i64> {
+        let retried = crate::intake::pending_retries(self.state);
+        if retried.is_empty() {
+            return retried;
+        }
+        let excluded = lock(&self.excluded).clone();
+        let items = lock(&self.items);
+        retried
+            .into_iter()
+            .filter(|pr| {
+                excluded.contains(pr)
+                    && items.get(pr).is_some_and(|item| {
+                        item.status == ItemStatus::Queued && held_until_retry(item)
+                    })
+            })
+            .collect()
     }
 
     /// The planning half of [`Self::take_intake`]; `pending` changes only when it succeeds.
@@ -4039,12 +4112,16 @@ impl<'a> Runner<'a> {
                         && self.takes_intake()
                     {
                         // In flight or set aside; a change a red batch sent back to `pending`
-                        // is planned again with the rest.
+                        // is planned again with the rest, and a held change its owner retries
+                        // is released (see `take_intake`).
                         let mut busy: BTreeSet<i64> = flights
                             .iter()
                             .flat_map(|flight| flight.candidate.prs.iter().copied())
                             .collect();
                         busy.extend(lock(&self.excluded).iter().copied());
+                        for pr in self.retried_holds() {
+                            busy.remove(&pr);
+                        }
                         if crate::intake::has_pending_except(self.state, &busy) {
                             let tip = match stack_top(&flights) {
                                 Some(last) => last.candidate.tip.clone(),
@@ -4110,19 +4187,11 @@ impl<'a> Runner<'a> {
                         }
                         let chosen = self.select(&candidate.tip, &candidate.parent)?;
                         let cancel = Arc::new(AtomicBool::new(false));
-                        let job = Job {
-                            purpose: "batch",
-                            prs: candidate.prs.clone(),
-                            commit: candidate.tip.clone(),
-                            parent: candidate.parent.clone(),
-                            speculation: Some(Speculation {
-                                depth: occupied(&flights) + 1,
-                                window,
-                            }),
-                            selection: chosen.selection.clone(),
-                            policy: chosen.policy.clone(),
-                            extra: chosen.extra.clone(),
-                        };
+                        let speculation = Some(Speculation {
+                            depth: occupied(&flights) + 1,
+                            window,
+                        });
+                        let job = batch_job(&candidate, &chosen, speculation);
                         let id = next_id;
                         next_id += 1;
                         let tx = tx.clone();
@@ -4137,6 +4206,9 @@ impl<'a> Runner<'a> {
                             cancel,
                             result: None,
                             stacked: true,
+                            speculation,
+                            retries: 0,
+                            head_round: false,
                         });
                         started += 1;
                         lock(&self.report).windows.push(window);
@@ -4193,6 +4265,14 @@ impl<'a> Runner<'a> {
                     // Only after the result is stored, so `discard` waits for no message
                     // this loop already took.
                     crate::interrupt::check("acting on a finished validation")?;
+                    // A refused batch starts again at once, wherever it is in the window, not
+                    // when it reaches the head (see `refused_again`).
+                    if let Some(index) = flights.iter().position(|flight| flight.id == id) {
+                        let flight = &mut flights[index];
+                        if let Some((job, delay)) = self.refused_again(flight, index == 0) {
+                            self.start_again(scope, &tx, flight, job, delay);
+                        }
+                    }
                     // A red batch behind the head is decided in order, once the batches
                     // beneath it are, but the batches built on its tree cannot land whatever
                     // they are: cancel them now, so their slots take other work at once
@@ -4235,9 +4315,16 @@ impl<'a> Runner<'a> {
                         .front()
                         .is_some_and(|flight| flight.result.is_some())
                     {
-                        let Some(head) = flights.pop_front() else {
+                        let Some(mut head) = flights.pop_front() else {
                             break;
                         };
+                        // A refusal from behind the head, or one stored while later batches were
+                        // cut (see `cut_after`), gets its retries here.
+                        if let Some((job, delay)) = self.refused_again(&mut head, true) {
+                            self.start_again(scope, &tx, &head, job, delay);
+                            flights.push_front(head);
+                            break;
+                        }
                         // The batch being decided stays in the window until it is decided.
                         self.publish_window(
                             std::iter::once(head.candidate.prs.clone())
@@ -4247,13 +4334,8 @@ impl<'a> Runner<'a> {
                         let (vid, ran) = head
                             .result
                             .unwrap_or_else(|| Err("missing result".to_owned()))?;
-                        // Admission refusal: retry with backoff, then defer. Never land,
-                        // never search for a culprit, never eject.
-                        let (vid, ran) = if ran.refused() {
-                            self.retry_refused(&head.candidate, &head.chosen, (vid, ran))?
-                        } else {
-                            (vid, ran)
-                        };
+                        // Admission refusal, its retries used up (see `refused_again`): defer.
+                        // Never land, never search for a culprit, never eject.
                         let outcome = if ran.refused() {
                             let detail = refusal_detail(&ran);
                             discard(&mut flights, &rx, pending);
@@ -4411,7 +4493,14 @@ impl<'a> Runner<'a> {
                             if head.stacked {
                                 discard(&mut flights, &rx, pending);
                             }
-                            window = (window / 2).max(1);
+                            // Only a red whose every failure is a timeout or reached no verdict
+                            // says the host may be overloaded, so only it halves the window. Any
+                            // other red names a culprit and says nothing against the batches
+                            // behind it: halving for it kept the window near one while most
+                            // batches were red.
+                            if ran.suspect_only().is_some() {
+                                window = (window / 2).max(1);
+                            }
                             self.handle_red(&head.candidate, &head.chosen, &ran, vid, pending)?
                         };
                         match outcome {
@@ -5750,15 +5839,39 @@ fn receipt_ran(receipt: &crate::donor::Receipt, dir: &std::path::Path) -> Result
     })
 }
 
-/// Sleep for `delay`, returning early when a stop is requested.
-fn sleep_unless_stopped(delay: Duration) {
+/// Whether `item` waits for its owner's `retry`: escalated, or held for a ruling.
+fn held_until_retry(item: &Item) -> bool {
+    !item.escalated.is_empty() || !item.hold_verdict.is_empty() || !item.flaky_hold_until.is_empty()
+}
+
+/// Wait `delay`, unless `cancel` is set or the process is asked to stop first. Whether the whole
+/// delay passed.
+fn wait_unless_cancelled(delay: Duration, cancel: &AtomicBool) -> bool {
     let until = Instant::now() + delay;
-    while !crate::interrupt::requested() {
+    loop {
+        if cancel.load(Ordering::Relaxed) || crate::interrupt::requested() {
+            return false;
+        }
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            break;
+            return true;
         }
         std::thread::sleep(left.min(Duration::from_millis(100)));
+    }
+}
+
+/// The validation of the batch `candidate`, with `chosen`'s tests, from `speculation`'s place in
+/// the window.
+fn batch_job(candidate: &Candidate, chosen: &Chosen, speculation: Option<Speculation>) -> Job {
+    Job {
+        purpose: "batch",
+        prs: candidate.prs.clone(),
+        commit: candidate.tip.clone(),
+        parent: candidate.parent.clone(),
+        speculation,
+        selection: chosen.selection.clone(),
+        policy: chosen.policy.clone(),
+        extra: chosen.extra.clone(),
     }
 }
 

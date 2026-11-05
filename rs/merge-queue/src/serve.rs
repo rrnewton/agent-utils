@@ -1913,8 +1913,8 @@ pub fn render_status(report: &StatusReport) -> String {
     let intake = &report.intake;
     if intake.pending > 0 {
         out.push_str(&format!(
-            "intake: {} request(s) recorded while a run held the queue, applied when it ends \
-             (oldest {})\n",
+            "intake: {} request(s) recorded while a run held the queue, applied at its next free \
+             slot, or at its end for a change in flight (oldest {})\n",
             intake.pending, intake.oldest_pending
         ));
         for request in &intake.requests {

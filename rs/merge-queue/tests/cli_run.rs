@@ -11,11 +11,12 @@ use support::{git, Fixture};
 const RUNNER: &str = r#"if [ "$MQ_SELECTION" = all ]; then set -- $(ls tests); else set -- $MQ_TESTS; fi
 rc=0
 for t in "$@"; do
-  o=pass
+  o=pass; s=""
   if [ -f "tests/$t" ] && grep -q FAIL "tests/$t"; then o=fail; fi
+  if [ -f "tests/$t" ] && grep -q TIMEOUT "tests/$t"; then o=fail; s=',"shape":"timeout"'; fi
   if [ -f "tests/$t" ] && grep -q FLAKY "tests/$t" && [ ! -e "$FLAKY_MARKER" ]; then o=fail; touch "$FLAKY_MARKER"; fi
   [ $o = fail ] && rc=1
-  printf '{"id":"%s","outcome":"%s"}\n' "$t" "$o" >> "$MQ_RESULTS"
+  printf '{"id":"%s","outcome":"%s"%s}\n' "$t" "$o" "$s" >> "$MQ_RESULTS"
 done
 sleep 0.5
 exit $rc"#;
@@ -745,15 +746,16 @@ fn shadow_and_dry_runs_change_nothing() {
     assert!(fx.mq_ok(&["run", "--shadow"]).contains("Landed"));
 }
 
-#[test]
-fn adaptive_window_grows_on_landings_and_halves_on_red() {
+/// Seven changes, one at a time, the fifth red with `failure` in its test file; the report and
+/// the window each time a batch started.
+fn aimd_run(tag: &str, failure: &str) -> (Value, Vec<u64>) {
     let fx = setup(
-        "run-aimd",
+        tag,
         &["--max-batch", "1", "--depth", "2", "--max-depth", "4"],
     );
     let names = ["a", "b", "c", "d", "e", "f", "g"];
     for (i, name) in names.iter().enumerate() {
-        let body = if *name == "e" { "FAIL\n" } else { "ok\n" };
+        let body = if *name == "e" { failure } else { "ok\n" };
         fx.branch(name, &[(&format!("tests/{name}"), body)]);
         fx.mq_ok(&["submit", &(i + 1).to_string(), "--head", name]);
     }
@@ -765,6 +767,12 @@ fn adaptive_window_grows_on_landings_and_halves_on_red() {
         .iter()
         .map(|w| w.as_u64().unwrap())
         .collect();
+    (r, windows)
+}
+
+#[test]
+fn adaptive_window_grows_on_landings_and_halves_on_a_red_that_timed_out() {
+    let (r, windows) = aimd_run("run-aimd", "TIMEOUT\n");
     assert_eq!(windows[0], 2, "{windows:?}");
     assert!(
         windows.iter().any(|w| *w >= 3),
@@ -783,6 +791,23 @@ fn adaptive_window_grows_on_landings_and_halves_on_red() {
             assert_eq!(v["failed"], serde_json::json!([]));
         }
     }
+}
+
+#[test]
+fn a_red_that_names_a_culprit_leaves_the_window_as_it_was() {
+    // An assertion, not a timeout: the culprit is ejected, and nothing is known against the
+    // batches behind it, so the window keeps growing on landings and never shrinks.
+    let (r, windows) = aimd_run("run-aimd-culprit", "FAIL\n");
+    assert_eq!(windows[0], 2, "{windows:?}");
+    assert!(
+        windows.iter().any(|w| *w >= 3),
+        "window never grew: {windows:?}"
+    );
+    assert!(
+        windows.windows(2).all(|pair| pair[0] <= pair[1]),
+        "window shrank: {windows:?}"
+    );
+    assert_eq!(landed_prs(&r).len(), 6);
 }
 
 fn validated(report: &Value) -> Vec<(String, Vec<i64>)> {
