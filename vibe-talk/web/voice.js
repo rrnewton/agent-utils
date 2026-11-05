@@ -6746,260 +6746,60 @@ function keepSelection() {
  */
 const inputKinds = createInputKinds({ root: () => document.documentElement });
 
-/** Whether a selection made now is drawn, with a ring and the focus: after the keys or the mouse. */
-const drawnBy = () => inputKinds.drawnBy();
-
-/** The keys are in use: noted, and said on the root element as `data-input="keys"`. */
-function keysInUse() {
-  inputKinds.keys();
-}
-
-/** The mouse is in use: noted, and the keys' `data-input` taken off the root element. */
-function mouseInUse() {
-  inputKinds.mouse();
-}
-
-/** A finger or a pen is in use: noted, and said on the root as `data-input="touch"`. */
-function touchInUse() {
-  inputKinds.touch();
-}
-
-/** Whether a `pointermove` is a mouse really moving (`InputKinds.mouseMoved`, which says how it is told). */
-function mouseMoved(event) {
-  return inputKinds.mouseMoved(event);
-}
-
 /**
- * Whether a selection made by the mouse or a jump takes the focus with it: while the focus is on a
- * list (a row, a row's control, or the scroller), on nothing, or on a control off the lists that a
- * click focused. Never out of a field the reader is typing in, a picker or a slider, nor from a
- * control the keys reached (Tab to a button in the dock): the reader there is working by keyboard.
+ * The mouse and the keys move one selection: what the reader used last, a real mouse move or a click taking
+ * the selection (`pointRow`, `focusFollowsSelection`), the focus arriving in a list, a jump landing, the ring
+ * following a page of scrolling, and handing the keys to the list on screen. One owner in
+ * web/src/view/shell/pointerselection.ts (`#624 voice-page-modularity`); the page destructures what it still
+ * calls under the old names.
  *
- * A CLICKED CONTROL GIVES THE FOCUS UP. A click on Summarise or Show read focuses the button, and
- * without a ring (it is not `:focus-visible`), so nothing on screen says it holds the keys. The
- * mouse then moves over a message, which is drawn selected, ring and all; if the button kept the
- * focus, Enter pressed it again and the lit message was not touched, the owner's ambiguity over
- * again. `#239 single-selection`.
+ * @type {import("./src/view/shell/index.ts").PointerSelection<KeyPane>}
  */
-function focusFollowsSelection() {
-  if (screens.screen() !== "main") return false;
-  if (focusLost()) return true;
-  const held = document.activeElement;
-  if (isTextField(held) || keepsOwnKeys(held)) return false;
-  if (KEY_PANES.some((pane) => nodeWithin(pane.scroller(), held))) return true;
-  return !keyboardFocused(held);
-}
-
-/**
- * Whether `node` holds the focus the keys gave it, as the browser says by drawing its ring
- * (`:focus-visible`). A browser that cannot say counts as yes, which keeps the focus where it is.
- */
-function keyboardFocused(node) {
-  if (!node || typeof node.matches !== "function") return true;
-  try {
-    return node.matches(":focus-visible");
-  } catch (_error) {
-    return true;
-  }
-}
-
-/**
- * A real mouse move over `row` of `pane` takes the selection there: from the keyboard, from the
- * other column, from wherever it was. The focus goes with it while it is on a list (and stays on a
- * control of the row already holding it); the ring and the tint go with `data-selected`. Not while a
- * ⋯ menu is open: the menu holds the focus and its arrows, and a click outside it closes it first.
- *
- * The pointer on the selection is also what starts the wait before the other column glides to its
- * counterpart, and nothing else does (`dwellColumnGlide`, `#261 two-column-connectors`).
- */
-function pointRow(pane, row) {
-  if (rowMenus.open()) return;
-  const holding = nodeWithin(row, document.activeElement);
-  // Lit is drawn selected (`drawSelection` lights only that), so a move within the row already lit
-  // asks no more: not the pane's kept selection, which in the right column switches to that column
-  // and back on every move to read.
-  if (!(lastPane.current() === pane && pane.lit === row && (holding || !focusFollowsSelection()))) {
-    takeRow(pane, row, !holding && focusFollowsSelection());
-  }
-  dwellColumnGlide(pane, row);
-}
-
-/** Every `pointermove` on the page: a real mouse move puts the keys' look away and, over a row, selects it. */
-function onPointerMove(event) {
-  if (!mouseMoved(event)) return;
-  mouseInUse();
-  driftFromColumnGlide();
-  // A button held is a drag (text being selected, a scrollbar dragged), not a message being chosen.
-  if (event.buttons) return;
-  if (screens.screen() !== "main") return;
-  // `#298 thread-card-header`. The card at the top of the right column's thread is what its link joins
-  // to its root, and the mouse resting on it glides Main to that root, as on a card in the list.
-  const header = leftEl("side-thread-card");
-  if (nodeWithin(header, event.target)) {
-    dwellColumnGlide(sidePane, header);
-    return;
-  }
-  const pane = KEY_PANES.find((each) => nodeWithin(each.scroller(), event.target) && each.list() !== null);
-  const row = pane ? rowOf(pane, event.target) : null;
-  if (pane && row && rowShown(row)) pointRow(pane, row);
-}
-
-/**
- * Every `pointerdown` on the page: which kind of pointer the click or tap after it comes from. One in
- * a list of messages is the reader acting there, before anything the press goes on to do: a fold, a
- * reply's arrow, a swipe, a scroll begun by a finger. `#243 filter-keeps-selection`.
- */
-function onPointerDown(event) {
-  const kind = String((event && event.pointerType) || "");
-  if (kind === "mouse") mouseInUse();
-  else if (kind) touchInUse();
-  const target = event && event.target;
-  if (screens.screen() !== "main" || !target) return;
-  const pane = KEY_PANES.find((each) => { const list = each.list(); return list !== null && nodeWithin(list, target); });
-  if (pane) inColumn(paneColumn(pane), readerActed);
-  // The call's transcript, which no key moves through, is a list of messages a filter keeps a place in too.
-  else if (screens.view() !== "discord" && nodeWithin(el("transcript"), target)) inColumn(columns.main, readerActed);
-}
-
-/**
- * A click in a pane selects its row: drawn, after the mouse (the move to it has usually selected it
- * already), and SILENTLY after a tap on a touch screen, where the next key starts there and nothing
- * is lit. A click that did more than select (Reply, a thread's tag) has rebuilt the list or left the
- * screen, and finds no row here.
- */
-function noteClickedRow(pane, node) {
-  const row = rowOf(pane, node);
-  if (!row) return;
-  const mark = markOf(pane);
-  const drawn = drawnBy();
-  if (mark && markNames(mark, row) && (mark.drawn || !drawn) && lastPane.current() === pane) return;
-  if (!drawn) {
-    noteRow(pane, row);
-    return;
-  }
-  takeRow(pane, row, !nodeWithin(row, document.activeElement) && focusFollowsSelection());
-}
-
-/**
- * The focus arrived in a pane: by Tab, by a click on a row's control, by the page. The pane is the one
- * in use, and a row the focus is in is the selection, so that the keys act on the message that is
- * lit and the lit message is where a screen reader is. Drawn or silent as `drawnBy` says.
- */
-function onPaneFocus(pane, event) {
-  const row = rowOf(pane, event && event.target);
-  const mark = markOf(pane);
-  const same = Boolean(row && mark && markNames(mark, row));
-  if (row && !drawnBy()) {
-    if (!same) noteRow(pane, row);
-  } else if (row && !(same && mark && mark.drawn && pane.row === row)) {
-    takeRow(pane, row, false);
-  }
-  if (lastPane.current() !== pane && pane.list() !== null) {
-    lastPane.take(pane);
-    drawSelection();
-  }
-}
-
-/**
- * A jump landed on `row` (`revealRow`): it becomes the selection, drawn and with the focus as a
- * mouse's would be, or silently after a tap. Not a row of the list on screen (the Pinned filter's
- * stands in front of the channel's): nothing.
- */
-function selectLanded(row) {
-  const pane = columnWork.side() ? sidePane : channelPane;
-  if (rowOf(pane, row) !== row) return;
-  if (drawnBy()) takeRow(pane, row, focusFollowsSelection());
-  else noteRow(pane, row);
-}
-
-/** The scrollers `followPageScroll` listens on: one `scrollend` listener each, added once, for good. */
-const followedScrollers = new Set();
-
-/**
- * The keyboard selection follows a page of scrolling. PgUp, PgDn and Space are the browser's, and
- * scroll the list under a selected row without moving the focus; once the scroll has come to rest,
- * the ring moves to the first message shown whole, so the next key acts on what is on screen. Only
- * a selection the keyboard made, and only while it still holds the focus. Without a `scrollend` event
- * (older browsers) the ring stays put, and the next arrow starts from the screen as it always does.
- *
- * ONE WAIT PER PANE, and none for a key that cannot move the list (`up`: PgUp or Shift+Space at the
- * top; PgDn or Space at the end): a listener per key piled up under a held PgDn at the newest line,
- * and the next scroll to end, the wheel's, then moved the ring, which the wheel never does.
- */
-function followPageScroll(pane, row, up) {
-  const area = pane.scroller();
-  pane.follow = null;
-  if (!("onscrollend" in area)) return;
-  const end = Math.max(0, Number(area.scrollHeight) - Number(area.clientHeight));
-  if (up ? area.scrollTop <= 0 : area.scrollTop >= end - 1) return;
-  pane.follow = row;
-  if (followedScrollers.has(area)) return;
-  followedScrollers.add(area);
-  area.addEventListener("scrollend", () => {
-    for (const each of KEY_PANES) if (each.scroller() === area) settleFollow(each);
-  });
-}
-
-/** A page key's scroll has come to rest: the ring to the first message shown whole, if its row has gone by. */
-function settleFollow(pane) {
-  const row = pane.follow;
-  pane.follow = null;
-  if (!row || document.activeElement !== row || pane.row !== row) return;
-  if (rowInView(pane, row) && row.getBoundingClientRect().top >= pane.head() - 1) return;
-  const first = firstRowInView(pane);
-  if (first && first !== row) selectRow(pane, first, false);
-}
-
-/**
- * Give the list on screen the focus (the keyboard's selected message when it is drawn, else the
- * scroller) so that the scroll keys and the row keys reach it. `preventScroll`: taking the focus
- * must not move the list, because where the reader is has rules of its own.
- */
-function focusList(pane) {
-  const row = pane ? drawnRow(pane) : null;
-  if (row && pane) {
-    releaseRow(pane, row);
-    row.setAttribute("tabindex", "0");
-    rowTimeTabStop(row, true);
-  }
-  // The pane handed the keys is the one in use, and its selection the one lit.
-  if (pane && pane.list() !== null && lastPane.current() !== pane) {
-    lastPane.take(pane);
-    drawSelection();
-  }
-  // The pane's own list when one is named: in two columns the keys can be handed to either column.
-  const target = row || (pane ? pane.scroller() : visibleScroller());
-  if (target && document.activeElement !== target && typeof target.focus === "function") {
-    target.focus({ preventScroll: true });
-  }
-}
+const pointerSelection = createPointerSelection({
+  inputKinds,
+  screen: () => screens.screen(),
+  view: () => screens.view(),
+  focusLost: () => focusLost(),
+  keyPanes: () => KEY_PANES,
+  paneFor: (node) => paneFor(node),
+  channelPane: () => channelPane,
+  sidePane: () => sidePane,
+  lastPane: () => lastPane.current(),
+  takeLastPane: (pane) => lastPane.take(pane),
+  rowMenuOpen: () => Boolean(rowMenus.open()),
+  takeRow: (pane, row, focus) => takeRow(pane, row, focus),
+  noteRow: (pane, row) => noteRow(pane, row),
+  drawSelection: () => drawSelection(),
+  rowOf: (pane, node) => rowOf(pane, node),
+  rowShown: (row) => rowShown(row),
+  markOf: (pane) => markOf(pane),
+  markNames: (mark, row) => markNames(mark, row),
+  dwellColumnGlide: (pane, row) => dwellColumnGlide(pane, row),
+  driftFromColumnGlide: () => driftFromColumnGlide(),
+  byId: (id) => el(id),
+  leftById: (id) => leftEl(id),
+  inSide: () => columnWork.side(),
+  mainColumn: () => columns.main,
+  paneColumn: (pane) => paneColumn(pane),
+  inColumn: (column, act) => inColumn(column, act),
+  readerActed: () => readerActed(),
+  rowInView: (pane, row) => rowInView(pane, row),
+  firstRowInView: (pane) => firstRowInView(pane),
+  selectRow: (pane, row, bring) => selectRow(pane, row, bring),
+  drawnRow: (pane) => drawnRow(pane),
+  releaseRow: (pane, row) => releaseRow(pane, row),
+  rowTimeTabStop: (row, on) => rowTimeTabStop(row, on),
+  visibleScroller: () => visibleScroller(),
+  threadListOnScreen: () => threadListOnScreen(),
+  sideColumnUp: () => sideColumnUp(),
+});
+const {
+  drawnBy, keysInUse, onPointerMove, onPointerDown, noteClickedRow, onPaneFocus, selectLanded, followPageScroll,
+  focusList, settleFocus, behindThreadList, inColumnGone,
+} = pointerSelection;
 
 // Giving a control the focus scrolling only as far as shows it (`focusMinimally`, `#280
 // scroll-stability`) is web/src/view/dom's.
-
-/** `focusList`, unless the reader is typing in a field still on screen, which is never taken from them. */
-function settleFocus() {
-  const held = document.activeElement;
-  if (held && isTextField(held) && shownNode(held) && !behindThreadList(held) && !inColumnGone(held)) return;
-  focusList(screens.screen() === "main" ? paneFor(held) : null);
-}
-
-/**
- * Whether `node` is in the left column while the thread list covers it (`#281 view-keys`): drawn, as
- * far as its `hidden` says, but out of sight, so neither the focus nor the keys are left there.
- */
-function behindThreadList(node) {
-  return threadListOnScreen() && nodeWithin(leftEl("scroll-area"), node);
-}
-
-/**
- * Whether `node` is in the right column while it is not drawn — two columns or the thread list just
- * left, by a view key pressed in its box (`#281 view-keys`). Its `hidden` says nothing of that: the
- * stylesheet takes the column away, and the browser then drops the focus on the page's body.
- */
-function inColumnGone(node) {
-  return !sideColumnUp() && nodeWithin(leftEl("side-column"), node);
-}
 
 // --- scrolling
 

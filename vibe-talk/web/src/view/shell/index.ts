@@ -45,3 +45,5 @@ export { createFoldKeys } from "./foldkeys.ts";
 export type { FoldKeys, FoldKeysDependencies, FoldableRow, FoldedPane } from "./foldkeys.ts";
 export { READ_STEP, createSelectionKeys } from "./selectionkeys.ts";
 export type { KeyRow, SelectionKeys, SelectionKeysDependencies, SteppedMenu, SteppedPane } from "./selectionkeys.ts";
+export { createPointerSelection } from "./pointerselection.ts";
+export type { KeptMark, PointedPane, PointerMoved, PointerSelection, PointerSelectionDependencies, SelectionInputKinds } from "./pointerselection.ts";

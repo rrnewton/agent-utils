@@ -1497,3 +1497,208 @@ test("`#624 voice-page-modularity`: ↓ and ↑ read on through a tall message, 
     globalThis.document = was;
   }
 });
+
+test("`#624 voice-page-modularity`: the mouse and the keys move one selection, the focus follows it only off fields and keyboard controls, and a page of scrolling moves the ring once", () => {
+  const { createPointerSelection } = VIEW_SHELL;
+  const log = [];
+  const node = (id, parentNode = null, extra = {}) => ({ id, parentNode, nodeType: 1, hidden: false, ...extra });
+  const page = node("page");
+  const scrollerOf = (id) => {
+    const listeners = [];
+    return node(id, page, { scrollTop: 100, scrollHeight: 1000, clientHeight: 400, onscrollend: null, listeners,
+      addEventListener: (type, listener) => listeners.push([type, listener]), focus: (options) => log.push(`focus ${id}${options && options.preventScroll ? " quietly" : ""}`) });
+  };
+  const paneOf = (name) => {
+    const scroller = scrollerOf(`${name}-scroll`);
+    const list = node(`${name}-list`, scroller);
+    return { name, scroller: () => scroller, list: () => list, head: () => 50, lit: null, row: null, follow: null };
+  };
+  const channel = paneOf("channel");
+  const side = paneOf("side");
+  const rowIn = (pane, id, top = 100) => node(id, pane.list(), { top, getBoundingClientRect: () => ({ top }),
+    setAttribute: (name, value) => log.push(`${id} ${name}=${value}`), focus: (options) => log.push(`focus ${id}${options && options.preventScroll ? " quietly" : ""}`) });
+  const one = rowIn(channel, "1");
+  const two = rowIn(channel, "2", 300);
+  const sideRow = rowIn(side, "s");
+  const header = node("side-thread-card", page);
+  const transcript = node("transcript", page);
+  const leftArea = node("scroll-area", page);
+  const sideColumn = node("side-column", page);
+  const ids = { "side-thread-card": header, transcript, "scroll-area": leftArea, "side-column": sideColumn };
+  const state = { screen: "main", view: "discord", lost: false, last: channel, menu: false, moved: true, drawn: true, marks: new Map(), side: false,
+    inView: new Set(["1", "2", "s"]), drawnRow: null, visible: null, threadList: false, sideUp: true };
+  const selection = createPointerSelection({
+    inputKinds: {
+      keys: () => log.push("keys"), mouse: () => log.push("mouse"), touch: () => log.push("touch"),
+      mouseMoved: () => state.moved, drawnBy: () => state.drawn,
+    },
+    screen: () => state.screen,
+    view: () => state.view,
+    focusLost: () => state.lost,
+    keyPanes: () => [channel, side],
+    paneFor: (held) => [channel, side].find((pane) => held && pane.scroller() === held.paneScroller) || null,
+    channelPane: () => channel,
+    sidePane: () => side,
+    lastPane: () => state.last,
+    takeLastPane: (pane) => { state.last = pane; log.push(`last ${pane.name}`); },
+    rowMenuOpen: () => state.menu,
+    takeRow: (pane, row, focus) => log.push(`take ${pane.name} ${row.id} ${focus}`),
+    noteRow: (pane, row) => log.push(`note ${pane.name} ${row.id}`),
+    drawSelection: () => log.push("draw"),
+    rowOf: (pane, target) => [one, two, sideRow].find((row) => row.parentNode === pane.list() && (target === row || (target && target.parentNode === row))) || null,
+    rowShown: (row) => !row.hidden,
+    markOf: (pane) => state.marks.get(pane) || null,
+    markNames: (mark, row) => Boolean(mark) && mark.id === row.id,
+    dwellColumnGlide: (pane, row) => log.push(`dwell ${pane.name} ${row.id}`),
+    driftFromColumnGlide: () => log.push("drift"),
+    byId: (id) => ids[id],
+    leftById: (id) => ids[id],
+    inSide: () => state.side,
+    mainColumn: () => "main",
+    paneColumn: (pane) => (pane === side ? "side" : "main"),
+    inColumn: (column, act) => { log.push(`in ${column}`); act(); },
+    readerActed: () => log.push("acted"),
+    rowInView: (_pane, row) => state.inView.has(row.id),
+    firstRowInView: () => [one, two].find((row) => state.inView.has(row.id)) || null,
+    selectRow: (pane, row, ...rest) => log.push(["select", pane.name, row.id, ...rest].join(" ")),
+    drawnRow: () => state.drawnRow,
+    releaseRow: (pane, row) => log.push(`release ${pane.name} ${row.id}`),
+    rowTimeTabStop: (row, on) => log.push(`time ${row.id} ${on}`),
+    visibleScroller: () => state.visible,
+    threadListOnScreen: () => state.threadList,
+    sideColumnUp: () => state.sideUp,
+  });
+  const run = (act) => { log.length = 0; const result = act(); return result === undefined ? [...log] : [result, ...log]; };
+  const was = globalThis.document;
+  globalThis.document = { activeElement: null };
+  try {
+    assert.deepStrictEqual([run(() => selection.keysInUse()), run(() => selection.drawnBy())], [["keys"], [true]]);
+    // Where the focus is decides whether a selection takes it.
+    const button = (focusVisible) => node("button", page, { tagName: "BUTTON", matches: (selector) => selector === ":focus-visible" && focusVisible });
+    const follows = (held) => { globalThis.document.activeElement = held; return selection.focusFollowsSelection(); };
+    assert.deepStrictEqual(
+      [follows(null), follows(one), follows(channel.scroller()), follows(button(false)), follows(button(true)), follows({ tagName: "BUTTON" }),
+        follows(node("box", page, { tagName: "TEXTAREA" })), follows(node("pick", page, { tagName: "SELECT" }))],
+      [false, true, true, true, false, false, false, false],
+      "the focus did not follow from a list or a clicked control, or followed out of a field, a picker, a control the keys reached or one the browser cannot say of");
+    globalThis.document.activeElement = node("box", page, { tagName: "TEXTAREA" });
+    state.lost = true;
+    assert.equal(selection.focusFollowsSelection(), true, "the focus lost to the body did not follow");
+    state.lost = false;
+    state.screen = "settings";
+    assert.equal(selection.focusFollowsSelection(), false, "the focus followed off the main screen");
+    state.screen = "main";
+    globalThis.document.activeElement = channel.scroller();
+    // The mouse moving over a row takes it, with the focus; held still, dragging, or over a menu, it takes nothing.
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one })), ["mouse", "drift", "take channel 1 true", "dwell channel 1"]);
+    channel.lit = one;
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: node("text", one) })), ["mouse", "drift", "take channel 1 true", "dwell channel 1"],
+      "a move within the lit row did not hand it the focus it was to follow");
+    globalThis.document.activeElement = button(true);
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one })), ["mouse", "drift", "dwell channel 1"], "a move within the lit row asked again");
+    globalThis.document.activeElement = channel.scroller();
+    channel.lit = null;
+    state.moved = false;
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one })), [], "a list scrolled under a still pointer was taken as a move");
+    state.moved = true;
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one, buttons: 1 })), ["mouse", "drift"], "a drag chose a message");
+    state.menu = true;
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one })), ["mouse", "drift"], "a move took the selection from an open menu, or began a glide under it");
+    state.menu = false;
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: node("in-header", header) })), ["mouse", "drift", "dwell side side-thread-card"]);
+    two.hidden = true;
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: two })), ["mouse", "drift"], "a hidden row was selected");
+    two.hidden = false;
+    state.screen = "settings";
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one })), ["mouse", "drift"], "a move off the main screen selected");
+    state.screen = "main";
+    // A press says the pointer's kind, and one in a list or the transcript is the reader acting there.
+    assert.deepStrictEqual(run(() => selection.onPointerDown({ pointerType: "mouse", target: sideRow })), ["mouse", "in side", "acted"]);
+    state.view = "voice";
+    assert.deepStrictEqual(run(() => selection.onPointerDown({ pointerType: "pen", target: node("line", transcript) })), ["touch", "in main", "acted"]);
+    assert.deepStrictEqual(run(() => selection.onPointerDown({ pointerType: "", target: node("line", transcript) })), ["in main", "acted"]);
+    state.view = "discord";
+    assert.deepStrictEqual([run(() => selection.onPointerDown({ pointerType: "touch", target: node("line", transcript) })), run(() => selection.onPointerDown(null))],
+      [["touch"], []], "a press on the transcript of the channel's view, or no press at all, was the reader acting");
+    // A click selects its row: drawn after the mouse, silently after a tap, not again when it is already.
+    assert.deepStrictEqual(run(() => selection.noteClickedRow(channel, node("text", two))), ["take channel 2 true"]);
+    state.marks.set(channel, { id: "2", drawn: true });
+    assert.deepStrictEqual(run(() => selection.noteClickedRow(channel, two)), [], "a click on the row already drawn selected took it again");
+    state.drawn = false;
+    state.marks.set(channel, { id: "2", drawn: false });
+    assert.deepStrictEqual([run(() => selection.noteClickedRow(channel, two)), run(() => selection.noteClickedRow(channel, one)), run(() => selection.noteClickedRow(channel, page))],
+      [[], ["note channel 1"], []]);
+    // The focus arriving in a pane makes it the one in use, and its row the selection.
+    assert.deepStrictEqual([run(() => selection.onPaneFocus(side, { target: sideRow })), run(() => selection.onPaneFocus(channel, { target: two }))],
+      [["note side s", "last side", "draw"], ["last channel", "draw"]]);
+    state.drawn = true;
+    state.marks.set(channel, { id: "2", drawn: true });
+    channel.row = two;
+    assert.deepStrictEqual([run(() => selection.onPaneFocus(channel, { target: two })), run(() => selection.onPaneFocus(channel, { target: one })), run(() => selection.onPaneFocus(channel, null))],
+      [[], ["take channel 1 false"], []]);
+    // A jump landing.
+    assert.deepStrictEqual([run(() => selection.selectLanded(one)), run(() => selection.selectLanded(sideRow))], [["take channel 1 true"], []]);
+    state.side = true;
+    state.drawn = false;
+    assert.deepStrictEqual(run(() => selection.selectLanded(sideRow)), ["note side s"]);
+    state.side = false;
+    state.drawn = true;
+    // A page key's scroll: one listener per scroller, none for a key that cannot move it; at rest the ring to the first row showing.
+    const area = channel.scroller();
+    selection.followPageScroll(channel, two, false);
+    selection.followPageScroll(channel, two, false);
+    assert.deepStrictEqual([channel.follow, area.listeners.length], [two, 1], "a second page key added a second listener, or the row to follow was not kept");
+    area.scrollTop = 0;
+    selection.followPageScroll(channel, two, true);
+    assert.equal(channel.follow, null, "PgUp at the top waited to move the ring");
+    area.scrollTop = 600;
+    selection.followPageScroll(channel, two, false);
+    assert.equal(channel.follow, null, "PgDn at the end waited to move the ring");
+    area.scrollTop = 300;
+    selection.followPageScroll(channel, two, false);
+    channel.row = two;
+    globalThis.document.activeElement = two;
+    state.inView = new Set(["1"]);
+    assert.deepStrictEqual(run(() => area.listeners[0][1]()), ["select channel 1 false"]);
+    assert.equal(channel.follow, null);
+    assert.deepStrictEqual(run(() => area.listeners[0][1]()), [], "a scroll to end after the wait moved the ring");
+    state.inView = new Set(["1", "2"]);
+    selection.followPageScroll(channel, two, false);
+    assert.deepStrictEqual(run(() => area.listeners[0][1]()), [], "the ring moved off a row still shown whole");
+    const old = { scrollTop: 300, scrollHeight: 1000, clientHeight: 400 };
+    const oldPane = { ...channel, scroller: () => old, follow: one };
+    selection.followPageScroll(oldPane, two, false);
+    assert.equal(oldPane.follow, null, "without a scrollend event the ring waited to follow");
+    // Handing the keys to a list.
+    globalThis.document.activeElement = null;
+    state.last = side;
+    state.drawnRow = two;
+    assert.deepStrictEqual(run(() => selection.focusList(channel)), ["release channel 2", "2 tabindex=0", "time 2 true", "last channel", "draw", "focus 2 quietly"]);
+    state.drawnRow = null;
+    assert.deepStrictEqual(run(() => selection.focusList(side)), ["last side", "draw", "focus side-scroll quietly"]);
+    state.visible = area;
+    assert.deepStrictEqual(run(() => selection.focusList(null)), ["focus channel-scroll quietly"]);
+    globalThis.document.activeElement = area;
+    assert.deepStrictEqual(run(() => selection.focusList(null)), [], "the focus was taken again where it already was");
+    // Settling the focus leaves a field on screen alone, and not one behind the thread list or in a column gone.
+    const box = node("box", leftArea, { tagName: "TEXTAREA", paneScroller: channel.scroller() });
+    globalThis.document.activeElement = box;
+    assert.deepStrictEqual(run(() => selection.settleFocus()), []);
+    state.threadList = true;
+    assert.deepStrictEqual([selection.behindThreadList(box), selection.inColumnGone(box)], [true, false]);
+    assert.deepStrictEqual(run(() => selection.settleFocus()), ["last channel", "draw", "focus channel-scroll quietly"], "a field behind the thread list kept the focus");
+    state.threadList = false;
+    const sideBox = node("side-box", sideColumn, { tagName: "TEXTAREA" });
+    state.sideUp = false;
+    globalThis.document.activeElement = sideBox;
+    assert.deepStrictEqual([selection.inColumnGone(sideBox), selection.behindThreadList(sideBox)], [true, false]);
+    state.visible = side.scroller();
+    assert.deepStrictEqual(run(() => selection.settleFocus()), ["focus side-scroll quietly"], "a field in a column gone kept the focus");
+    state.sideUp = true;
+    state.screen = "settings";
+    globalThis.document.activeElement = node("button", page, { tagName: "BUTTON", paneScroller: channel.scroller() });
+    assert.deepStrictEqual(run(() => selection.settleFocus()), ["focus side-scroll quietly"], "off the main screen the focus went to a pane's list");
+  } finally {
+    globalThis.document = was;
+  }
+});
