@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-absent-cargo-home-journal: an interrupted cargo-home removal whose paths are gone must not block every validation'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-validate
 created_at: 2026-11-05T07:10:44.521788465+00:00
-updated_at: 2026-11-05T07:10:44.521788465+00:00
+updated_at: 2026-11-05T09:20:18.582308403+00:00
+closed_at: 2026-11-05T09:20:18.582308303+00:00
 ---
 
 # Description
