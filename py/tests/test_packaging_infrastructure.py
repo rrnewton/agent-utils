@@ -898,15 +898,16 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # that survives the locked reread or that a lock holder reports) are mapped.
     # The batch maps-filter ceiling case of 8eb8de0f (four selected trees fit
     # where one allowance would not) is mapped.
-    # The 38 dead-owner archiving cases are mapped. remove
+    # The 39 dead-owner archiving cases are mapped. remove
     # --archive-drifted-checkouts: three drift kinds removed after a verified
     # bundle; four commits that only worktree-private history reaches (the
     # HEAD reflog, a refs/rewritten ref, a reflog entry's old object,
     # ORIG_HEAD) kept; two index states of the checkout kept; a published
     # submodule, a submodule's private branch and a commit only a stale
-    # remote-tracking ref of the submodule names, all kept local; recovery
-    # refusing new submodule history; refusals for an unlisted submodule
-    # repository, an embedded untracked repository, a content filter, a live
+    # remote-tracking ref of the submodule names, all kept local; an unlisted
+    # submodule repository salvaged for a proven-dead owner and refused for a
+    # live one; recovery
+    # refusing new submodule history; refusals for an embedded untracked repository, a content filter, a live
     # registered liveness answer, a live consenting owner, a live releasing
     # owner, a bundle that cannot be made, and a checkout changed after
     # archiving; one journal recovery and one receipt-parser case. remove
@@ -991,9 +992,9 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The agent-remove case whose nested .gitmodules indents an option
     # line with spaces under a tab-indented sibling is mapped
     # (https://github.com/rrnewton/agent-utils/issues/298).
-    assert len(all_tests) == 2130
+    assert len(all_tests) == 2131
     assert len(ordinary) == 339
-    assert len(mapped) == 1791
+    assert len(mapped) == 1792
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
