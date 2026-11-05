@@ -1217,15 +1217,15 @@ test("`#624 voice-page-modularity`: the list's tools reach the act each names, i
     byId: (id) => target(id),
     leftById: (id) => target(`left ${id}`),
     loadOlder: () => { log.push("older"); return "older asked"; },
-    searchInAll: () => log.push("search in All"),
-    serverMore: () => log.push("server more"),
+    searchInAll: () => { log.push("search in All"); return "in All asked"; },
+    serverMore: () => { log.push("server more"); return "more asked"; },
     searchAllChannels: (on) => log.push(`all channels ${on}`),
-    searchFurther: () => log.push("further"),
-    loadOlderTurns: () => log.push("older turns"),
+    searchFurther: () => { log.push("further"); return "further asked"; },
+    loadOlderTurns: () => { log.push("older turns"); return "turns asked"; },
     setAllFolded: (folded) => log.push(`folded ${folded}`),
     cycleReadMode: (...args) => log.push(`read mode ${args.length}`),
-    clearBacklog: () => log.push("clear backlog"),
-    undoDismissal: () => log.push("undo"),
+    clearBacklog: () => { log.push("clear backlog"); return "cleared"; },
+    undoDismissal: () => { log.push("undo"); return "undone"; },
     toggleSummaries: () => log.push("summaries"),
     readerHidden: () => hidden,
     setReaderHidden: (wanted) => { hidden = wanted; log.push(`reader hidden ${wanted}`); },
@@ -1243,15 +1243,13 @@ test("`#624 voice-page-modularity`: the list's tools reach the act each names, i
     "listen reader-toggle click", "listen autoplay-toggle click", "listen jump-newest click"], "a listener was added out of the page's order");
   log.length = 0;
   assert.deepStrictEqual(press("load-older"), ["older asked"], "the control did not answer what it started, which the page suite waits for");
-  press("left search-in-all");
-  press("server-more");
+  // Each control answers what its act started, which the page suite waits for.
+  assert.deepStrictEqual([press("left search-in-all"), press("server-more")], [["in All asked"], ["more asked"]]);
   nodes["search-all-channels"].checked = true;
   press("search-all-channels", "change");
-  press("search-further");
-  press("load-older-turns");
+  assert.deepStrictEqual([press("search-further"), press("load-older-turns")], [["further asked"], ["turns asked"]]);
   press("todo-filter");
-  press("clear-backlog");
-  press("undo-dismiss");
+  assert.deepStrictEqual([press("clear-backlog"), press("undo-dismiss")], [["cleared"], ["undone"]]);
   press("jump-newest");
   assert.deepStrictEqual(log, ["older", "search in All", "server more", "all channels true", "further", "older turns", "read mode 0",
     "clear backlog", "undo", "newest"]);

@@ -201,7 +201,7 @@ test("THE SWIPE DRIVES THE SAME DISMISSAL THE DONE BUTTON DOES, NOT A SECOND ONE
   // web/src/view/channel's `createRowGestures` (`#624 voice-page-modularity`), not the thread's back gesture.
   assert.match(
     PAGE_CODE,
-    /if \(!event \|\| event\.pointerType === "mouse"\)/,
+    /li\.getAttribute\("data-read-run"\) === "head"\) \{\s*return;\s*\}\s*if \(!event \|\| event\.pointerType === "mouse"\) \{\s*return;/,
     "a mouse drag across a message would now dismiss it instead of selecting text"
   );
 });
