@@ -3531,9 +3531,15 @@ impl<'a> Runner<'a> {
             git: Some(&self.git),
             priority: &self.config.priority,
             classifier_policy: &self.config.classifier.policy,
+            prior: crate::decisions::prior_rates(&self.state.root),
         };
         let decisions = crate::decisions::from_report(&value, &sources, false);
-        crate::decisions::append(&self.state.root, &decisions, &self.config.decisions)
+        crate::decisions::append(&self.state.root, &decisions, &self.config.decisions)?;
+        // The per-PR signal log gets the same validations, with attribution.
+        if let Err(error) = crate::signal::append_validated(&self.state.root, &decisions) {
+            self.event("signal", &format!("signal log not written: {error}"));
+        }
+        Ok(())
     }
 
     /// Plan, then drain. Returns the reason the run stopped early, or an empty string.

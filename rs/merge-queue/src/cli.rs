@@ -90,6 +90,94 @@ enum KnownFlakyCommand {
     },
 }
 
+/// `merge-queue signal` verbs.
+#[derive(Debug, Subcommand)]
+enum SignalCommand {
+    /// Append one externally-produced signal (focused tests, a review, a full-validate
+    /// ledger run) to a change's log.
+    Add {
+        /// Change number.
+        pr: i64,
+        /// Signal kind: `focused-tests`, `review` or `full-validate` (the queue writes
+        /// `head` and `validated` itself).
+        #[arg(long)]
+        kind: String,
+        /// Kind-specific fields as one JSON object, e.g.
+        /// '{"actor":"dev","head":"abc","tests":["a"],"outcome":"pass"}'.
+        #[arg(long, default_value = "{}")]
+        json: String,
+    },
+    /// Print a change's signals, oldest first.
+    List {
+        /// Change number.
+        pr: i64,
+        /// Print as JSON lines (the stored records).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Synthesize `head` and `validated` signals from the decision records and item
+    /// histories already in the state. Idempotent; focused tests and reviews are
+    /// never invented.
+    Backfill,
+    /// Append signals not yet exported to DIR (one `<pr>.jsonl` per change there),
+    /// remembering what was sent.
+    Export {
+        /// Durable directory to append to.
+        #[arg(long, value_name = "DIR")]
+        to: PathBuf,
+    },
+}
+
+fn signal_command(state: &State, action: SignalCommand) -> Result<i32, String> {
+    match action {
+        SignalCommand::Add { pr, kind, json } => {
+            if !matches!(kind.as_str(), "focused-tests" | "review" | "full-validate") {
+                return Err(format!(
+                    "signal kind {kind:?} is not an external kind; use focused-tests, \
+                     review or full-validate (the queue writes head and validated itself)"
+                ));
+            }
+            let fields: serde_json::Value = serde_json::from_str(&json)
+                .map_err(|error| format!("--json is not a JSON object: {error}"))?;
+            if !fields.is_object() {
+                return Err("--json must be a JSON object".to_owned());
+            }
+            crate::signal::append(&state.root, pr, &kind, fields)?;
+            println!("recorded {kind} for #{pr}");
+            Ok(0)
+        }
+        SignalCommand::List { pr, json } => {
+            let records = crate::signal::read(&state.root, pr)?;
+            for record in records {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&record).map_err(|e| e.to_string())?
+                    );
+                } else {
+                    println!(
+                        "{} {} {}",
+                        record["at"].as_str().unwrap_or_default(),
+                        record["kind"].as_str().unwrap_or_default(),
+                        serde_json::to_string(&record).map_err(|e| e.to_string())?
+                    );
+                }
+            }
+            Ok(0)
+        }
+        SignalCommand::Backfill => {
+            let added = crate::signal::backfill(&state.root)?;
+            println!("backfilled {added} signal(s)");
+            Ok(0)
+        }
+        SignalCommand::Export { to } => {
+            let exported = crate::signal::export(&state.root, &to)?;
+            println!("exported {exported} signal(s) to {}", to.display());
+            Ok(0)
+        }
+    }
+}
+
 /// `merge-queue donor` verbs.
 #[derive(Debug, Subcommand)]
 enum DonorCommand {
@@ -969,6 +1057,12 @@ enum Command {
     Donor {
         #[command(subcommand)]
         action: DonorCommand,
+    },
+    /// The per-PR signal log (the model's history): add external signals, read them,
+    /// backfill from decisions and item histories, and export to a durable directory.
+    Signal {
+        #[command(subcommand)]
+        action: SignalCommand,
     },
     /// Show daemon liveness, the current window and slot occupancy.
     Status {
@@ -2113,6 +2207,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             Ok(0)
         }
         Command::Donor { action } => donor_command(&state, action),
+        Command::Signal { action } => signal_command(&state, action),
         Command::Status {
             json,
             stale_after_secs,
@@ -2226,6 +2321,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     git: Some(&git),
                     priority: &config.priority,
                     classifier_policy: &config.classifier.policy,
+                    prior: crate::decisions::prior_rates(&state.root),
                 };
                 crate::decisions::reconstruct(&state.root, &sources, since, until)?
             } else {

@@ -30,6 +30,7 @@ pub mod probe_cache;
 pub mod recount;
 pub mod run;
 pub mod serve;
+pub mod signal;
 pub mod state;
 pub mod suspect;
 pub mod sync;

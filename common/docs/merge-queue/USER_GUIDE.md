@@ -1665,6 +1665,30 @@ validated `commit` and its `base`, the retried tests (`flaky`), `by`, `reason`, 
 `outcome` (`landed`, `requeued`, or `stopped` when the landing left the base to check by hand)
 with its `detail`, `validated_in` (run and validation), and the `run` that acted on it with `at`.
 
+## The per-PR signal log
+
+Beside the decision log, the queue keeps one append-only JSONL per change in
+`signals/<pr>.jsonl` (schema `merge-queue-signal/v1`): the history a
+success-probability model reads. Kinds: `head` (new head, parent head, reason),
+`focused-tests` (actor, head, test IDs, outcomes), `review` (reviewer, model
+family, verdict, head), `validated` (batch members, candidate, verdict, failing
+tests, attribution `culprit`/`cleared`/`undetermined`), and `full-validate`
+(ledger run ID and verdict for an exact head or an ancestor). The queue writes
+`head` on every submit and `validated` on every run; external producers use:
+
+```sh
+merge-queue signal add 123 --kind focused-tests --json '{"actor":"dev","head":"abc","tests":["a"],"outcome":"pass"}'
+merge-queue signal list 123 [--json]
+merge-queue signal backfill   # synthesize head+validated from decisions and items; idempotent
+merge-queue signal export --to DIR   # append not-yet-exported lines to DIR/<pr>.jsonl
+```
+
+Only the queue binary writes the files. Backfill never invents focused tests or
+reviews. Decision records carry `predicted_pass`: the base-rate model - each
+change's first component's historical green rate over earlier decision records
+(global rate when a component has none), recorded once at least 10 decided
+validations exist, otherwise `null`.
+
 ## Priority changes
 
 A change that repairs the CI or validation infrastructure unblocks everything behind it, so it

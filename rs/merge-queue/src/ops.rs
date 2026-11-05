@@ -254,6 +254,9 @@ fn submit_resolved(
     // A resubmission at a new head is a new validation attempt: clear any refusal deferral.
     // A resubmission at the same head keeps the count so backoff is not reset by resubmitting.
     let same_head = existing.as_ref().is_some_and(|old| old.head == current);
+    let existing_head = existing
+        .as_ref()
+        .map_or_else(String::new, |old| old.head.clone());
     let mut item = Item {
         pr: submission.pr,
         head_ref: submission.head_ref,
@@ -406,6 +409,22 @@ fn submit_resolved(
         return Err(text);
     }
     state.save_item(&item)?;
+    // The signal log tracks heads across submissions, including same-head resubmits
+    // (parent_head then names no move).
+    let _ = crate::signal::append(
+        &state.root,
+        item.pr,
+        "head",
+        serde_json::json!({
+            "head": item.head,
+            "parent_head": if same_head {
+                item.head.clone()
+            } else {
+                existing_head
+            },
+            "reason": "unknown",
+        }),
+    );
     Ok(item)
 }
 

@@ -263,6 +263,69 @@ fn diff_stat(git: &Git, base: &str, head: &str) -> Option<(u64, u64, Vec<String>
     Some((added, deleted, paths))
 }
 
+/// Historical green rates from earlier decision records: the base-rate model.
+/// `global` is the overall green share of decided (green/red) validations;
+/// `by_component` is per first-component. `samples` counts decided validations.
+#[derive(Clone, Debug, Default)]
+pub struct PriorRates {
+    /// Overall green share (0..1).
+    pub global: f64,
+    /// Green share per first component of a change.
+    pub by_component: BTreeMap<String, f64>,
+    /// Decided validations the rates came from.
+    pub samples: usize,
+}
+
+/// Read the decision records under `state_root` into base rates. Fewer than 10
+/// decided validations is not a model: callers then record no prediction.
+pub fn prior_rates(state_root: &Path) -> Option<PriorRates> {
+    let dir = state_root.join("decisions");
+    let mut decided = 0usize;
+    let mut green = 0usize;
+    let mut per: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let entries = std::fs::read_dir(&dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.ends_with(".jsonl") || name == "rulings.jsonl" || name == "skips.jsonl" {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Ok(decision) = serde_json::from_str::<Decision>(line) else {
+                continue;
+            };
+            let is_green = match decision.outcome.as_str() {
+                "green" => true,
+                "red" => false,
+                _ => continue,
+            };
+            decided += 1;
+            green += usize::from(is_green);
+            for change in &decision.changes {
+                if let Some(component) = change.features.components.first() {
+                    let slot = per.entry(component.clone()).or_default();
+                    slot.1 += 1;
+                    slot.0 += usize::from(is_green);
+                }
+            }
+        }
+    }
+    if decided < 10 {
+        return None;
+    }
+    Some(PriorRates {
+        global: green as f64 / decided as f64,
+        by_component: per
+            .into_iter()
+            .map(|(k, (g, n))| (k, g as f64 / n as f64))
+            .collect(),
+        samples: decided,
+    })
+}
+
 /// Inputs for turning one run's report into decision records.
 pub struct Sources<'a> {
     /// Item records by change number (for submission times, sources and claims).
@@ -274,6 +337,8 @@ pub struct Sources<'a> {
     /// Test-footprint policy path in the repository (`classifier.policy`), read at the plan's
     /// base; empty for none.
     pub classifier_policy: &'a str,
+    /// Base rates from earlier decision records; `None` records no prediction.
+    pub prior: Option<PriorRates>,
 }
 
 fn str_field<'v>(value: &'v Value, key: &str) -> &'v str {
@@ -517,7 +582,7 @@ pub fn from_report(report: &Value, sources: &Sources<'_>, reconstructed: bool) -
             .as_ref()
             .and_then(|landed| landed.at.as_deref())
             .and_then(parse_time);
-        let changes = prs
+        let changes: Vec<DecisionChange> = prs
             .iter()
             .map(|pr| {
                 let item = sources.items.get(pr);
@@ -545,6 +610,27 @@ pub fn from_report(report: &Value, sources: &Sources<'_>, reconstructed: bool) -
                 }
             })
             .collect();
+        // Base-rate prediction: each change contributes its first component's
+        // historical green rate, or the global rate when it has none.
+        let predicted_pass = sources.prior.as_ref().map(|prior| {
+            if changes.is_empty() {
+                prior.global
+            } else {
+                let sum: f64 = changes
+                    .iter()
+                    .map(|change| {
+                        change
+                            .features
+                            .components
+                            .first()
+                            .and_then(|component| prior.by_component.get(component))
+                            .copied()
+                            .unwrap_or(prior.global)
+                    })
+                    .sum();
+                sum / changes.len() as f64
+            }
+        });
         let donor = v
             .get("donor")
             .and_then(Value::as_str)
@@ -577,7 +663,7 @@ pub fn from_report(report: &Value, sources: &Sources<'_>, reconstructed: bool) -
             speculation: v
                 .get("speculation")
                 .and_then(|speculation| serde_json::from_value(speculation.clone()).ok()),
-            predicted_pass: None,
+            predicted_pass,
             validator: ValidatorUsed {
                 kind: if donor.is_some() { "donor" } else { "local" }.to_owned(),
                 host: donor,
