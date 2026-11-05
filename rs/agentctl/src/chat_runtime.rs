@@ -3135,6 +3135,9 @@ pub(crate) struct DeliveryEntry {
     /// The start of the owner's message, on one line, cut short, for a notice to the owner that
     /// must say which message it means (#720 agentctl-muse-stale-draft).
     pub(crate) excerpt: String,
+    /// Whether an operator settled the request (`chat settle`): one written off as abandoned
+    /// keeps its `delivery_uncertain` phase, but is no longer waiting on anything.
+    pub(crate) settled: bool,
 }
 
 /// Characters of an owner's message a [`DeliveryEntry`] keeps.
@@ -3164,6 +3167,7 @@ impl DeliveryEntry {
                 .filter(|_| !typed)
                 .map(without_composer_preview),
             excerpt,
+            settled: record.settlement.is_some(),
         }
     }
 
@@ -3173,11 +3177,14 @@ impl DeliveryEntry {
     }
 
     /// Whether, `stall_after` or more after the request was admitted, the request does not record
-    /// its prompt as typed at `now_millis`. The phase alone decides: a reply the agent has stored
-    /// does not, because a prompt whose delivery is uncertain stays uncertain until an operator
-    /// settles it.
+    /// its prompt as typed at `now_millis` and no operator has settled it. A reply the agent has
+    /// stored does not count, because a prompt whose delivery is uncertain stays uncertain until
+    /// an operator settles it; one settled as abandoned is written off, so it stalls nothing
+    /// (#888 chat-alarm-settled-stall). Every stalled list (`delivery-alarm.json`, `chat status`,
+    /// the service log) asks this one question.
     pub(crate) fn stalled(&self, now_millis: u64, stall_after: Duration) -> bool {
         !self.typed()
+            && !self.settled
             && Duration::from_millis(now_millis.saturating_sub(self.admitted_at_millis))
                 >= stall_after
     }
@@ -19778,6 +19785,57 @@ pub(crate) mod tests {
             "the fallback must not reuse the refused operation id"
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_request_settled_as_abandoned_leaves_every_stalled_list() {
+        // #888 chat-alarm-settled-stall: the bridge kept writing an abandoned request into
+        // delivery-alarm.json's stalled list, though health left it out.
+        let (state, key, root) = state_with_old_request("settled-stall", config_without_reaction());
+        state
+            .set_delivery_phase(&key, RequestPhase::DeliveryUncertain, Some("fixture"))
+            .expect("make uncertain");
+        let admitted = state
+            .read_request(&key)
+            .expect("request")
+            .admitted_at_millis;
+        let later = admitted + 3_600_000;
+        let alarm = |state: &BridgeState| {
+            DeliveryAlarm::new(
+                &state.delivery_entries().expect("entries"),
+                later,
+                DELIVERY_STALL_AFTER,
+            )
+            .stalled
+            .into_iter()
+            .map(|request| request.key)
+            .collect::<Vec<_>>()
+        };
+        assert!(
+            alarm(&state).contains(&key),
+            "uncertain and unsettled, it is stalled"
+        );
+        state
+            .settle_request(
+                &key,
+                SettlementKind::Abandoned,
+                "operator",
+                None,
+                admitted + 6_000,
+            )
+            .expect("settle abandoned");
+        assert!(
+            !alarm(&state).contains(&key),
+            "the alarm drops a settled request"
+        );
+        let status = state.status().expect("status");
+        let listed = status["delivery_alarm"]["stalled"]
+            .as_array()
+            .expect("stalled list")
+            .iter()
+            .any(|request| request["key"] == serde_json::json!(key));
+        assert!(!listed, "chat status drops it too: {status}");
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]
@@ -40157,6 +40215,7 @@ If you have trouble, run: agentctl chat help 001"
             delivered_at_millis: None,
             reason: Some(format!("{key} waits")),
             excerpt: String::new(),
+            settled: false,
         };
         // The phase alone decides: a reply the agent stored does not take a request off the list,
         // as `status_says_how_far_each_prompt_got_and_lists_the_stalled_requests` shows.

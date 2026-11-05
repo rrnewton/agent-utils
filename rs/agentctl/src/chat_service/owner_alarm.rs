@@ -422,6 +422,7 @@ mod tests {
             delivered_at_millis: None,
             reason: (!reason.is_empty()).then(|| reason.to_owned()),
             excerpt: format!("message {key}"),
+            settled: false,
         }
     }
 

@@ -8441,6 +8441,15 @@ impl StallLog {
                 }
             };
             match self.logged.get_mut(key) {
+                // Written off by an operator: no longer stalled, so logged once and forgotten.
+                Some(_) if entry.settled && !entry.typed() => {
+                    lines.push(format!(
+                        "agentctl: chat request {key} was settled as abandoned after {}; it is no \
+                         longer reported as stalled",
+                        age()
+                    ));
+                    self.logged.remove(key);
+                }
                 Some(_) if entry.typed() => {
                     let typed_at = entry.delivered_at_millis.unwrap_or(now_millis);
                     let age = age_text(typed_at.saturating_sub(entry.admitted_at_millis));
@@ -10166,6 +10175,57 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         fs::remove_dir_all(root).expect("cleanup");
         assert_eq!(down["subscription_down"]["failures"], 2);
         assert!(recovered.get("subscription_down").is_none());
+    }
+
+    #[test]
+    fn a_settled_request_leaves_the_alarm_file_on_the_next_pass_and_after_a_restart() {
+        // #888 chat-alarm-settled-stall.
+        let (state, key, root) = state_with_request();
+        state
+            .put_delivery_phase(&key, RequestPhase::DeliveryUncertain, Some("fixture"))
+            .expect("make uncertain");
+        let timing = DeliveryTiming {
+            stall_after: Duration::ZERO,
+            ..DeliveryTiming::default()
+        };
+        let listed = || {
+            read_alarm_at(&root)["stalled"]
+                .as_array()
+                .expect("stalled list")
+                .iter()
+                .any(|request| request["key"] == serde_json::json!(key))
+        };
+        let mut watch = DeliveryWatch::new(timing);
+        let mut routes = RouteCache::new(Vec::new());
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        assert!(listed(), "an unsettled uncertain request is stalled");
+        // Settled after it was admitted, as the record requires.
+        let now = u64::try_from(std::time::UNIX_EPOCH.elapsed().expect("clock").as_millis())
+            .expect("millis");
+        state
+            .settle_request(
+                &key,
+                chat_runtime::SettlementKind::Abandoned,
+                "operator",
+                Some("superseded"),
+                now + 1_000,
+            )
+            .expect("settle");
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        assert!(!listed(), "the next pass drops it");
+        // A restarted bridge, reading an alarm file that still lists it, rewrites it without.
+        let mut stale = read_alarm_at(&root);
+        stale["stalled"] = serde_json::json!([{
+            "key": key,
+            "phase": "delivery_uncertain",
+            "admitted_at_millis": now,
+            "reason": "fixture",
+        }]);
+        fs::write(root.join("delivery-alarm.json"), stale.to_string()).expect("stale alarm");
+        let mut restarted = DeliveryWatch::new(timing);
+        restarted.scan(&state, &RecordingDelivery::default(), &mut routes);
+        assert!(!listed(), "a restart cleans an alarm file that lists it");
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     fn read_alarm_at(root: &Path) -> Value {
@@ -19359,6 +19419,7 @@ printf '%s\n' "$request" >> "$1" || exit 4
             delivered_at_millis: None,
             reason: Some(format!("{key} waits")),
             excerpt: String::new(),
+            settled: false,
         }
     }
 
@@ -19550,6 +19611,37 @@ printf '%s\n' "$request" >> "$1" || exit 4
             log.update(&entry(RequestPhase::Pending), &BTreeMap::new(), 680_000, &TEST_TIMING),
             ["agentctl: chat request k3 is not typed after 11.3 min (pending); trying again every 10s while Herdr reports the agent idle or done: k3 waits"]
         );
+    }
+
+    #[test]
+    fn a_stalled_request_settled_as_abandoned_is_logged_once_and_never_again() {
+        // #888 chat-alarm-settled-stall.
+        let mut log = StallLog::default();
+        let mut entry = delivery_entry("k9", RequestPhase::DeliveryUncertain, 0);
+        assert_eq!(
+            log.update(
+                std::slice::from_ref(&entry),
+                &BTreeMap::new(),
+                120_000,
+                &TEST_TIMING
+            )
+            .len(),
+            1
+        );
+        entry.settled = true;
+        assert_eq!(
+            log.update(std::slice::from_ref(&entry), &BTreeMap::new(), 130_000, &TEST_TIMING),
+            ["agentctl: chat request k9 was settled as abandoned after 2.2 min; it is no longer reported as stalled"]
+        );
+        assert!(log.logged.is_empty());
+        assert!(log
+            .update(
+                std::slice::from_ref(&entry),
+                &BTreeMap::new(),
+                86_400_000,
+                &TEST_TIMING
+            )
+            .is_empty());
     }
 
     #[test]
