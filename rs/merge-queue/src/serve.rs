@@ -986,6 +986,7 @@ fn run_cycle(
                             )
                         },
                     ));
+                    alerts.extend(store.host_fault_escalations());
                     if alerts.is_empty() {
                         None
                     } else {

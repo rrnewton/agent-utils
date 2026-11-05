@@ -106,6 +106,10 @@ pub fn remote_url(dir: &Path, remote: &str) -> Option<String> {
 /// Seconds a lease lasts without a renewal.
 pub const DEFAULT_LEASE_SECS: u64 = 120;
 
+/// Consecutive probe-pass/launch-refuse cycles after which a host fault
+/// escalates by default (see `Store::note_probe_pass`).
+pub const DEFAULT_HOST_FAULT_ESCALATE_AFTER: usize = 5;
+
 /// Where a job is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -363,6 +367,9 @@ pub struct Store {
     /// Donor names that only ever compare: they claim only `compare_only` duplicates, and
     /// deciding donors never claim those.
     pub compare_only: std::collections::BTreeSet<String>,
+    /// Consecutive probe-pass/launch-refuse cycles after which a host fault escalates:
+    /// a probe pass alone no longer clears it, only an admitted validation does.
+    pub host_fault_escalate_after: usize,
 }
 
 /// The store's lock, held only for one short operation.
@@ -629,6 +636,7 @@ impl Store {
             could_not_run_limit: crate::state::DEFAULT_RETRY_BOUND as usize,
             current_tools: None,
             compare_only: std::collections::BTreeSet::new(),
+            host_fault_escalate_after: DEFAULT_HOST_FAULT_ESCALATE_AFTER,
         }
     }
 
@@ -884,8 +892,12 @@ impl Store {
         self.restamp_queued()?;
         // A donor with a host fault is leased nothing until it reports an admitted
         // validation or claims after a passing probe (cleared in the claim handler).
-        if self.host_faults().contains_key(donor) {
-            return Ok(None);
+        // An escalated fault (see `note_host_fault`) keeps the fault recorded on a
+        // probe pass, but arms one trial claim so an admitted validation can clear it.
+        if let Some(fault) = self.host_faults().get(donor) {
+            if fault["trial"].as_bool() != Some(true) {
+                return Ok(None);
+            }
         }
         let jobs = self.jobs()?;
         let held = jobs
@@ -1502,22 +1514,163 @@ impl Store {
             .collect()
     }
 
+    /// Escalated host faults as `ERROR:` lines, for donor status and the serve
+    /// heartbeat: a donor that keeps passing its probe and then refusing at
+    /// launch, paused until an admitted validation clears it.
+    pub fn host_fault_escalations(&self) -> Vec<String> {
+        self.host_faults()
+            .into_iter()
+            .filter(|(_, fault)| fault["escalated"].as_bool() == Some(true))
+            .map(|(donor, fault)| {
+                format!(
+                    "ERROR: donor {donor}: host fault escalated after {} probe-pass/launch-refuse \
+                     cycle(s) ({}); it stays paused until an admitted validation, a probe pass \
+                     no longer clears it",
+                    fault["cycles"].as_u64().unwrap_or_default(),
+                    fault["reason"].as_str().unwrap_or_default()
+                )
+            })
+            .collect()
+    }
+
+    /// Whether every donor eligible for `job` is host-faulted, so a decide-mode
+    /// run should keep waiting rather than spend its claim timeout. Eligible
+    /// donors are the donors the store knows (from leases, receipts, give-backs
+    /// and faults) that may claim this job: not compare-only for a deciding job
+    /// (only compare-only for a duplicate), and not a donor this job declined.
+    /// With no known eligible donor, or any known eligible donor healthy, this
+    /// is false and the normal claim timeout applies.
+    pub fn every_eligible_donor_faulted(&self, job: &Job) -> bool {
+        let faults = self.host_faults();
+        if faults.is_empty() {
+            return false;
+        }
+        let mut known: std::collections::BTreeSet<String> = faults.keys().cloned().collect();
+        known.extend(self.give_back_runs().into_keys());
+        if let Ok(jobs) = self.jobs() {
+            for other in &jobs {
+                if let Some(lease) = &other.lease {
+                    known.insert(lease.donor.clone());
+                }
+                if let Some(receipt) = &other.receipt {
+                    known.insert(receipt.donor.name.clone());
+                }
+                known.extend(other.declined_by.iter().cloned());
+                for entry in &other.could_not_run {
+                    if let Some((donor, _)) = entry.split_once(": ") {
+                        known.insert(donor.to_owned());
+                    }
+                }
+            }
+        }
+        let eligible: Vec<&String> = known
+            .iter()
+            .filter(|name| {
+                (if job.compare_only {
+                    self.compare_only.contains(*name)
+                } else {
+                    !self.compare_only.contains(*name)
+                }) && !job.declined_by.iter().any(|declined| declined == *name)
+            })
+            .collect();
+        !eligible.is_empty()
+            && eligible
+                .iter()
+                .all(|name| faults.contains_key(name.as_str()))
+    }
+
+    /// Probe-pass/launch-refuse flap counts by donor (`host-flap.json`): how
+    /// many consecutive cycles of (probe passes, claim, host-scope refusal at
+    /// launch) a donor has completed, and whether the latest probe pass is
+    /// still awaiting its launch verdict.
+    fn host_flap(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        std::fs::read_to_string(self.dir.join("host-flap.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_host_flap(
+        &self,
+        flap: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|error| format!("cannot create {}: {error}", self.dir.display()))?;
+        let text =
+            serde_json::to_string(flap).map_err(|error| format!("cannot encode: {error}"))?;
+        write_private(&self.dir.join("host-flap.json"), text.as_bytes())
+    }
+
+    /// Record that `donor` claims after a passing probe. An ordinary fault is
+    /// cleared, as before, and the flap count remembers that this launch is
+    /// the verdict on that probe: a host-scope refusal now completes one
+    /// probe-pass/launch-refuse cycle instead of resetting the cycle count.
+    /// An escalated fault is not cleared: it stays recorded (and shown), and
+    /// one trial claim is armed so the donor can produce the admitted
+    /// validation that alone clears it.
+    pub fn note_probe_pass(&self, donor: &str) {
+        let mut flap = self.host_flap();
+        flap.entry(donor.to_owned())
+            .or_insert_with(|| serde_json::json!({"cycles": 0, "probe_passed": false}))
+            ["probe_passed"] = serde_json::json!(true);
+        let _ = self.save_host_flap(&flap);
+        let mut faults = self.host_faults();
+        match faults.get_mut(donor) {
+            Some(entry) if entry["escalated"].as_bool() == Some(true) => {
+                entry["trial"] = serde_json::json!(true);
+                let _ = self.save_host_faults(&faults);
+            }
+            Some(_) => {
+                faults.remove(donor);
+                let _ = self.save_host_faults(&faults);
+            }
+            None => {}
+        }
+    }
+
     /// Record (or refresh) a donor's host fault. Called with the store lock held.
+    /// A refusal at launch right after a probe pass completes a flap cycle;
+    /// after `host_fault_escalate_after` consecutive cycles the fault
+    /// escalates (see [`Store::note_probe_pass`]).
     fn note_host_fault(&self, donor: &str, reason: &str) {
+        let mut flap = self.host_flap();
+        let cycles = {
+            let entry = flap
+                .entry(donor.to_owned())
+                .or_insert_with(|| serde_json::json!({"cycles": 0, "probe_passed": false}));
+            if entry["probe_passed"].as_bool() == Some(true) {
+                entry["cycles"] =
+                    serde_json::json!(entry["cycles"].as_u64().unwrap_or_default() + 1);
+            }
+            entry["probe_passed"] = serde_json::json!(false);
+            entry["cycles"].as_u64().unwrap_or_default()
+        };
+        let _ = self.save_host_flap(&flap);
         let mut faults = self.host_faults();
         let entry = faults
             .entry(donor.to_owned())
             .or_insert_with(|| serde_json::json!({"reason": reason, "since": now()}));
         entry["reason"] = serde_json::json!(reason);
+        entry["cycles"] = serde_json::json!(cycles);
+        entry["escalated"] =
+            serde_json::json!(cycles >= self.host_fault_escalate_after.max(1) as u64);
+        entry.as_object_mut().map(|object| object.remove("trial"));
         let _ = self.save_host_faults(&faults);
     }
 
-    /// Clear a donor's host fault (an admitted validation, or a claim after a
-    /// passing probe). Called with the store lock held where one is held.
+    /// Clear a donor's host fault (an admitted validation). Its flap cycle
+    /// count goes with it: the next fault starts a fresh count. A claim after
+    /// a passing probe clears through [`Store::note_probe_pass`] instead, so
+    /// the cycle can be counted when its launch verdict arrives. Called with
+    /// the store lock held where one is held.
     pub fn clear_host_fault(&self, donor: &str) {
         let mut faults = self.host_faults();
         if faults.remove(donor).is_some() {
             let _ = self.save_host_faults(&faults);
+        }
+        let mut flap = self.host_flap();
+        if flap.remove(donor).is_some() {
+            let _ = self.save_host_flap(&flap);
         }
     }
 
@@ -1832,6 +1985,16 @@ struct Worker<'a> {
     host_pause: Mutex<Option<HostPause>>,
     /// Set when a probe just passed: the next claim carries --probe-passed.
     probe_passed: AtomicBool,
+    /// Delay for the next host pause. A probe pass followed by another launch
+    /// refusal keeps doubling it (30 s to 10 min) instead of resetting to
+    /// 30 s; only an admitted validation resets it.
+    next_host_delay: Mutex<std::time::Duration>,
+}
+
+/// The probe back-off after a pause whose current delay is `delay`: doubled,
+/// capped at ten minutes.
+fn doubled_probe_delay(delay: std::time::Duration) -> std::time::Duration {
+    (delay * 2).min(std::time::Duration::from_secs(600))
 }
 
 /// A donor paused after a host-scope could-not-run refusal.
@@ -2237,6 +2400,13 @@ impl Worker<'_> {
                         self.options.work.join("host-pause.json"),
                         serde_json::json!({"reason": reason, "since": since}).to_string(),
                     );
+                    // The pause delay is the running back-off, not a fresh
+                    // 30 s: a launch refusal right after a probe pass keeps
+                    // doubling it (see `next_host_delay`).
+                    let delay = *self
+                        .next_host_delay
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     *self
                         .host_pause
                         .lock()
@@ -2244,10 +2414,19 @@ impl Worker<'_> {
                         reason,
                         since,
                         validator: job.validator.clone(),
-                        next: std::time::Instant::now() + std::time::Duration::from_secs(30),
-                        delay: std::time::Duration::from_secs(30),
+                        next: std::time::Instant::now() + delay,
+                        delay,
                     });
                 }
+            }
+            if !receipt.refused {
+                // An admitted validation: the host really can run again, so
+                // the probe back-off starts over.
+                *self
+                    .next_host_delay
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    std::time::Duration::from_secs(30);
             }
             let body = serde_json::to_vec(&Report {
                 token: token.to_owned(),
@@ -2296,6 +2475,7 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
         slots: Mutex::new((0..jobs).rev().collect()),
         host_pause: Mutex::new(None),
         probe_passed: AtomicBool::new(false),
+        next_host_delay: Mutex::new(std::time::Duration::from_secs(30)),
     };
     let backoff: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     let active = AtomicUsize::new(0);
@@ -2332,13 +2512,20 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
                                 "merge-queue donor {}: host probe passed ({}; paused since {}); resuming",
                                 options.name, state.reason, state.since
                             );
+                            // If the launch right after this pass refuses
+                            // host-wide again, the back-off keeps doubling
+                            // from here instead of resetting to 30 s.
+                            *worker
+                                .next_host_delay
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                doubled_probe_delay(state.delay);
                             *pause = None;
                             let _ = std::fs::remove_file(options.work.join("host-pause.json"));
                             worker.probe_passed.store(true, Ordering::SeqCst);
                             false
                         } else {
-                            state.delay =
-                                (state.delay * 2).min(std::time::Duration::from_secs(600));
+                            state.delay = doubled_probe_delay(state.delay);
                             state.next = std::time::Instant::now() + state.delay;
                             true
                         }
@@ -2629,6 +2816,130 @@ mod unit {
         assert!(store.claim("d1", "h1", 1).unwrap().is_none());
         store.clear_host_fault("d1");
         assert!(store.claim("d1", "h1", 1).unwrap().is_some());
+    }
+
+    #[test]
+    fn every_eligible_donor_faulted_only_when_no_known_donor_is_healthy() {
+        // Nobody known at all: not a host pause, the claim timeout applies.
+        let store = Store::new(&temp("eligible-none"));
+        let job = publish(&store, "c1");
+        assert!(!store.every_eligible_donor_faulted(&job));
+
+        // The only known donor is the faulted one: every eligible donor is
+        // faulted, so a decide-mode run keeps waiting.
+        let store = Store::new(&temp("eligible-only-faulted"));
+        publish(&store, "c1");
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        store
+            .report(
+                &claimed.id,
+                &token,
+                refused_receipt(
+                    &claimed,
+                    "d1",
+                    "MQ_COULD_NOT_RUN_SCOPE: host wedged\nCOULD_NOT_RUN",
+                ),
+            )
+            .unwrap_err();
+        let waiting = store.read(&claimed.id).unwrap();
+        assert!(store.every_eligible_donor_faulted(&waiting));
+
+        // A second donor the store knows from an admitted receipt is healthy
+        // but idle: the timeout must fire, not the host-pause hold.
+        let store = Store::new(&temp("eligible-one-healthy"));
+        publish(&store, "c1");
+        let claimed = store.claim("d2", "h2", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        store
+            .report(&claimed.id, &token, receipt(&claimed, "d2"))
+            .unwrap();
+        publish(&store, "c2");
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        store
+            .report(
+                &claimed.id,
+                &token,
+                refused_receipt(
+                    &claimed,
+                    "d1",
+                    "MQ_COULD_NOT_RUN_SCOPE: host wedged\nCOULD_NOT_RUN",
+                ),
+            )
+            .unwrap_err();
+        let waiting = store.read(&claimed.id).unwrap();
+        assert!(!store.every_eligible_donor_faulted(&waiting));
+    }
+
+    #[test]
+    fn probe_pass_launch_refuse_cycles_escalate_until_an_admitted_validation() {
+        let mut store = Store::new(&temp("host-flap"));
+        store.host_fault_escalate_after = 3;
+        let host_refuse = |store: &Store| {
+            let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+            let token = claimed.lease.as_ref().unwrap().token.clone();
+            store
+                .report(
+                    &claimed.id,
+                    &token,
+                    refused_receipt(
+                        &claimed,
+                        "d1",
+                        "MQ_COULD_NOT_RUN_SCOPE: host wedged\nCOULD_NOT_RUN",
+                    ),
+                )
+                .unwrap_err();
+        };
+        publish(&store, "c1");
+        host_refuse(&store);
+        assert!(store.host_fault_escalations().is_empty());
+        // Each probe pass clears an ordinary fault, and the launch refusal
+        // right after it completes one cycle instead of resetting the count.
+        for cycle in 1..=3 {
+            store.note_probe_pass("d1");
+            host_refuse(&store);
+            if cycle < 3 {
+                assert!(
+                    store.host_fault_escalations().is_empty(),
+                    "cycle {cycle} must not escalate yet"
+                );
+            }
+        }
+        let escalations = store.host_fault_escalations();
+        assert_eq!(escalations.len(), 1, "{escalations:?}");
+        assert!(
+            escalations[0].contains("ERROR: donor d1"),
+            "{escalations:?}"
+        );
+        assert!(
+            escalations[0].contains("an admitted validation"),
+            "{escalations:?}"
+        );
+        // A probe pass no longer clears an escalated fault, but it arms one
+        // trial claim; only that job's admitted validation clears it.
+        store.note_probe_pass("d1");
+        assert_eq!(store.host_fault_list().len(), 1);
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a trial job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        store
+            .report(&claimed.id, &token, receipt(&claimed, "d1"))
+            .unwrap();
+        assert!(store.host_fault_list().is_empty());
+        assert!(store.host_fault_escalations().is_empty());
+        // The next fault starts a fresh count, not an escalated one.
+        publish(&store, "c2");
+        host_refuse(&store);
+        assert!(store.host_fault_escalations().is_empty());
+    }
+
+    #[test]
+    fn probe_backoff_doubles_to_ten_minutes_and_admission_resets_it() {
+        let mut delay = std::time::Duration::from_secs(30);
+        for want in [60, 120, 240, 480, 600, 600] {
+            delay = doubled_probe_delay(delay);
+            assert_eq!(delay, std::time::Duration::from_secs(want));
+        }
     }
 
     #[test]

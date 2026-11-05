@@ -220,6 +220,11 @@ pub struct DonorsConfig {
     /// Consecutive give-backs with the same reason from one donor that raise an
     /// `ERROR:` alert in `donor status` and the serve heartbeat (0 = 3).
     pub alert_after_give_backs: u32,
+    /// Consecutive probe-pass/launch-refuse cycles after which a donor's host
+    /// fault escalates: an `ERROR:` in `donor status` and the serve heartbeat,
+    /// and the fault then stays until an admitted validation, a probe pass
+    /// alone no longer clears it (0 = 5).
+    pub host_fault_escalate_after: u32,
 }
 
 impl DonorsConfig {
@@ -262,6 +267,15 @@ impl DonorsConfig {
     /// Whether donor `name` only ever compares (see `compare_only`).
     pub fn is_compare_only(&self, name: &str) -> bool {
         self.compare_only.iter().any(|only| only == name)
+    }
+
+    /// Resolved probe-pass/launch-refuse cycles before a host fault escalates.
+    pub fn host_fault_escalate_after(&self) -> usize {
+        if self.host_fault_escalate_after == 0 {
+            crate::donor::DEFAULT_HOST_FAULT_ESCALATE_AFTER
+        } else {
+            self.host_fault_escalate_after as usize
+        }
     }
 
     /// Resolved claim timeout.

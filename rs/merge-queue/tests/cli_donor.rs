@@ -1018,6 +1018,79 @@ fn could_not_run_receipts_are_bounded_and_the_batch_is_refused() {
     assert_eq!(item_status(&fx, 1), "queued");
 }
 
+/// With one donor host-faulted and another known donor healthy but idle, the
+/// claim timeout still fires: the host-pause hold applies only while every
+/// eligible donor is faulted (the user guide's rule).
+#[test]
+fn a_claim_timeout_fires_when_a_known_healthy_donor_is_idle() {
+    let fx = Fixture::new("donor-claim-timeout-healthy-idle");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        r#"if [ -n "$HOSTFAULT" ]; then echo 'MQ_COULD_NOT_RUN_SCOPE: host wedged'; echo COULD_NOT_RUN; exit 75; fi; exit 0"#,
+        "--offload",
+        "decide",
+    ]);
+    set_config(&fx, |config| {
+        config["donors"] = serde_json::json!({"claim_timeout_secs": 4})
+    });
+    // A healthy donor lands the first change, so the store knows it.
+    fx.branch("a", &[("a.txt", "a\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let clone = donor_clone(&fx, "donor-host-healthy");
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let out = donor(&fx, &clone, "d2", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (code, report, stderr) = finish(run);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        report["landed"][0]["prs"],
+        serde_json::json!([1]),
+        "{report}"
+    );
+    // The second change's only claim is a host fault from d1; d2 stays idle.
+    fx.branch("b", &[("b.txt", "b\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    let mut run = spawn_run(&fx, &[]);
+    wait_for("a queued job", Duration::from_secs(30), || {
+        jobs(&fx).iter().any(|job| job["state"] == "queued")
+    });
+    let bad_clone = donor_clone(&fx, "donor-host-faulted");
+    let out = donor(&fx, &bad_clone, "d1", &[("HOSTFAULT", "1")]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The run must stop on its claim timeout (seconds), not hold for the
+    // faulted donor's probes for ever.
+    let start = Instant::now();
+    let out = loop {
+        match run.try_wait().unwrap() {
+            Some(_) => break run.wait_with_output().unwrap(),
+            None if start.elapsed() < Duration::from_secs(60) => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            None => {
+                let _ = run.kill();
+                panic!("the run held for the host fault despite a healthy idle donor");
+            }
+        }
+    };
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("no donor took job"), "{stderr}");
+    assert_eq!(item_status(&fx, 2), "queued");
+}
+
 #[test]
 fn compare_mode_counts_a_could_not_run_receipt_and_compares_nothing() {
     let fx = Fixture::new("donor-compare-could-not-run");

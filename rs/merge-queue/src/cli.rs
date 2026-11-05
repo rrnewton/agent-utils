@@ -317,6 +317,7 @@ fn donor_store(state: &State, config: &Config) -> crate::donor::Store {
     let mut store = crate::donor::Store::new(&state.root);
     store.lease_secs = config.donors.lease();
     store.could_not_run_limit = config.donors.could_not_run_limit();
+    store.host_fault_escalate_after = config.donors.host_fault_escalate_after();
     if crate::state::Offload::parse(config.validator.offload.as_str())
         == Ok(crate::state::Offload::Decide)
     {
@@ -366,7 +367,7 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             probe_passed,
         } => {
             if probe_passed {
-                store.clear_host_fault(&donor);
+                store.note_probe_pass(&donor);
             }
             let cap = config.donors.max_jobs_per_donor;
             let jobs = if cap > 0 { jobs.min(cap) } else { jobs };
@@ -481,6 +482,9 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
                     "ERROR: donor {donor}: host cannot validate: {reason} (since {since}); \
                      it is leased nothing until an admitted validation or a passing probe"
                 );
+            }
+            for alert in store.host_fault_escalations() {
+                println!("{alert}");
             }
             let could_not_run: usize = jobs.iter().map(|j| j.could_not_run.len()).sum();
             if could_not_run > 0 {

@@ -921,6 +921,7 @@ impl<'a> Runner<'a> {
             let mut store = crate::donor::Store::new(&state.root);
             store.lease_secs = config.donors.lease();
             store.could_not_run_limit = config.donors.could_not_run_limit();
+            store.host_fault_escalate_after = config.donors.host_fault_escalate_after();
             if offload == crate::state::Offload::Decide {
                 store.compare_only = config.donors.compare_only.iter().cloned().collect();
             }
@@ -3583,9 +3584,12 @@ impl<'a> Runner<'a> {
                 crate::donor::JobState::Queued => {
                     // While every eligible donor is paused for a host fault, waiting
                     // is the right answer: their probes, not the claim timeout,
-                    // decide when work resumes.
+                    // decide when work resumes. With any eligible donor healthy
+                    // (known to the store but not faulted), the normal claim
+                    // timeout applies: a healthy donor that still does not claim
+                    // is a claim problem, not a host pause.
                     if waiting_since.elapsed() > claim_timeout
-                        && !donors.store.host_fault_list().is_empty()
+                        && donors.store.every_eligible_donor_faulted(&record)
                     {
                         self.event(
                             "donor",

@@ -952,6 +952,8 @@ An **item record** (`items/<pr>.json`) has these fields:
   reason from one donor that raise an `ERROR:` line in `donor status` and the serve
   heartbeat's `last error` (absent or `0`: `3`). An accepted receipt from the donor resets
   its run.
+- `host_fault_escalate_after`: consecutive probe-pass/launch-refuse cycles after which a
+  donor's host fault escalates (absent or `0`: `5`); see "Host-scope could-not-run" below.
 
 **Host-scope could-not-run.** A validator that cannot run at all on its host (a wedged
 worktree allocator, say) prints `MQ_COULD_NOT_RUN_SCOPE: host <reason>` with its exit-75
@@ -964,7 +966,15 @@ back-off 30 s doubling to 10 min), and resumes with a probe-passed claim that cl
 fault; an admitted receipt clears it too. Validators that never print the line get a
 backstop: could-not-run for two different jobs in a row with the same last output line
 counts as a host fault, and both strikes come off. While every eligible donor is faulted,
-a decide-mode run keeps waiting instead of spending its claim timeout.
+a decide-mode run keeps waiting instead of spending its claim timeout; with any eligible
+donor known but healthy, the normal claim timeout applies even if it never claims.
+
+A probe pass followed by a launch refusal is a flap cycle, not a recovery: the donor's
+probe back-off keeps doubling (30 s to 10 min) across such cycles instead of resetting,
+and only an admitted validation resets it. After `host_fault_escalate_after` consecutive
+cycles (5 by default) the fault escalates: `donor status` and the serve heartbeat raise an
+`ERROR:` for it, and the donor stays paused until an admitted validation clears it — a
+probe pass then only arms one trial claim, it no longer clears the fault.
 - `compare_only`: donor names that only ever compare in `decide` mode. Each published job
   gets a duplicate only they may claim; its receipt is recorded as a comparison (`comparison`
   on both jobs, counted by `donor status`) and never decides the batch. Deciding donors never
