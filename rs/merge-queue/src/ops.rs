@@ -169,6 +169,10 @@ pub struct Submission {
     pub source: String,
     /// Peer commits that must land first.
     pub requires: Vec<Requirement>,
+    /// Queue the head without the precheck (`submit --skip-precheck`), for a refusal that is
+    /// wrong.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub skip_precheck: bool,
     /// When the submission was recorded because another writer held the queue (see
     /// [`crate::intake`]); empty for one applied at once.
     #[serde(skip)]
@@ -195,18 +199,21 @@ pub fn submit_many(
         .filter(|s| s.pr > 0 && !s.head_ref.is_empty())
         .map(|s| (s.pr, s.head_ref.clone()))
         .collect();
-    let (_, heads) = refresh(&git, config, &wanted)?;
+    let (base, heads) = refresh(&git, config, &wanted)?;
     Ok(submissions
         .into_iter()
         .map(|submission| {
             let current = heads.get(&submission.pr).cloned().flatten();
-            submit_resolved(state, submission, current)
+            submit_resolved(state, config, &git, &base, submission, current)
         })
         .collect())
 }
 
 fn submit_resolved(
     state: &State,
+    config: &Config,
+    git: &Git,
+    base: &str,
     submission: Submission,
     current: Option<String>,
 ) -> Result<Item, String> {
@@ -347,7 +354,48 @@ fn submit_resolved(
             submission.recorded_at
         ));
     }
+    // The precheck runs on the head alone, before any batch is built on it.
+    let mut refusal = None;
+    if submission.skip_precheck {
+        if !config.precheck.command.trim().is_empty() {
+            detail.push_str("; precheck skipped (--skip-precheck)");
+        }
+    } else if let Some(verdict) = crate::precheck::check(
+        &state.root,
+        config,
+        git,
+        item.pr,
+        &item.head_ref,
+        &current,
+        base,
+    ) {
+        match verdict.outcome {
+            crate::precheck::Outcome::Passed => detail.push_str(&format!(
+                "; precheck passed ({:.1}s)",
+                verdict.elapsed_ms as f64 / 1000.0
+            )),
+            crate::precheck::Outcome::CouldNotRun => detail.push_str(&format!(
+                "; precheck could not run, so it was queued without one: {}",
+                verdict.reason
+            )),
+            crate::precheck::Outcome::Failed => {
+                let kept = crate::precheck::verdict_path(&state.root, &current, &verdict.command);
+                refusal = Some((verdict.refusal(item.pr, &kept), kept));
+            }
+        }
+    }
     item.log("submitted", detail);
+    if let Some((text, kept)) = refusal {
+        // Ejected before any batch is built, and the submitter hears of it now rather than
+        // when the run holding the queue ends.
+        item.status = ItemStatus::Ejected;
+        item.deciding_report = kept.display().to_string();
+        item.deciding_failed.clear();
+        item.log("ejected", format!("refused at submission: {text}"));
+        state.save_item(&item)?;
+        crate::notify::deliver_now(state, config, item.pr);
+        return Err(text);
+    }
     state.save_item(&item)?;
     Ok(item)
 }

@@ -425,6 +425,7 @@ pub fn reconcile(
             claim: None,
             source: tag.clone(),
             requires: Vec::new(),
+            skip_precheck: false,
             recorded_at: String::new(),
         });
     }

@@ -544,111 +544,128 @@ pub fn sweep_locked(
     let mut delivered = 0usize;
     let numbers: Vec<i64> = state.items()?.into_iter().map(|item| item.pr).collect();
     for pr in numbers {
-        // Fresh read: an earlier send in this sweep may have taken a while.
-        let item = match state.item(pr) {
-            Ok(Some(item)) => item,
-            Ok(None) => continue,
-            Err(error) => {
-                eprintln!("merge-queue notify: cannot read #{pr}: {error}");
-                continue;
-            }
-        };
-        let Some((transition, attempts)) = owed(&item) else {
-            continue;
-        };
-        // A name agentctl can never accept (a hosting login such as `SomeUser`, say) is not
-        // retried: one record says why, and the transition counts as given up.
-        if let Some(why) = unaddressable(&item.notify) {
-            let _ = update_delivery(state, pr, &transition, |fresh| {
-                fresh.notify_delivery = NotifyDelivery {
-                    key: transition.key.clone(),
-                    attempts: MAX_ATTEMPTS,
-                    delivered: false,
-                    last_error: why.clone(),
-                };
-                fresh.log(
-                    "notify-skipped",
-                    format!("{} not sent to {}: {why}", transition.verdict, item.notify),
-                );
-            });
-            eprintln!(
-                "merge-queue notify: #{pr} {} not sent to {}: {why}",
-                transition.verdict, item.notify
-            );
-            continue;
-        }
-        // Persist the attempt before sending: a daemon crash mid-send can
-        // then only lose the delivery mark, never the retry bound.
-        let recorded = update_delivery(state, pr, &transition, |fresh| {
-            fresh.notify_delivery = NotifyDelivery {
-                key: transition.key.clone(),
-                attempts,
-                delivered: false,
-                last_error: String::new(),
-            };
-        });
-        let item = match recorded {
-            Ok(Some(item)) => item,
-            Ok(None) => continue,
-            Err(error) => {
-                eprintln!("merge-queue notify: cannot record attempt for #{pr}: {error}");
-                continue;
-            }
-        };
-        let path = report_path(state, &item, &transition);
-        let outcome = std::fs::create_dir_all(reports_dir(state))
-            .map_err(|error| format!("cannot create notifications dir: {error}"))
-            .and_then(|()| {
-                std::fs::write(&path, render_report(state, &item, &transition))
-                    .map_err(|error| format!("cannot write {}: {error}", path.display()))
-            })
-            .and_then(|()| notifier.send(&item.notify, &path));
-        // Record the outcome on a fresh read: only mark the key we actually
-        // attempted, and only if it is still the owed transition.
-        match outcome {
-            Ok(()) => {
-                let marked = update_delivery(state, pr, &transition, |fresh| {
-                    fresh.notify_delivery.delivered = true;
-                    fresh.notify_delivery.last_error.clear();
-                    fresh.log(
-                        "notified",
-                        format!(
-                            "{} sent to {} (report {})",
-                            transition.verdict,
-                            item.notify,
-                            path.display()
-                        ),
-                    );
-                });
-                match marked {
-                    Ok(Some(_)) => delivered += 1,
-                    Ok(None) => {}
-                    Err(error) => {
-                        eprintln!("merge-queue notify: cannot record delivery for #{pr}: {error}");
-                    }
-                }
-            }
-            Err(error) => {
-                let gave_up = attempts >= MAX_ATTEMPTS;
-                let suffix = if gave_up { "; giving up" } else { "" };
-                let _ = update_delivery(state, pr, &transition, |fresh| {
-                    fresh.notify_delivery.last_error = error.clone();
-                    fresh.log(
-                        "notify-failed",
-                        format!(
-                            "{} to {} failed (attempt {attempts}/{MAX_ATTEMPTS}){suffix}: {error}",
-                            transition.verdict, item.notify
-                        ),
-                    );
-                });
-                eprintln!(
-                    "merge-queue notify: #{pr} {} to {} failed (attempt {attempts}/{MAX_ATTEMPTS}){suffix}: {error}",
-                    transition.verdict, item.notify
-                );
-            }
+        if deliver_one(state, notifier, pr) {
+            delivered += 1;
         }
     }
     Ok(delivered)
+}
+
+/// Deliver the notification item `pr` owes now, if it owes one, instead of at the daemon's next
+/// sweep: a change refused at submission while a run holds the queue would otherwise reach its
+/// submitter only when that run ends. The caller holds the writer lock, as for [`sweep_locked`]
+/// (a submission is only ever applied under it). Returns whether it delivered one.
+pub fn deliver_now(state: &State, config: &Config, pr: i64) -> bool {
+    deliver_one(state, &Notifier::resolve(None, None, config), pr)
+}
+
+/// Handle item `pr` as [`sweep_locked`] handles each item. Returns whether it delivered a
+/// notification.
+fn deliver_one(state: &State, notifier: &Notifier, pr: i64) -> bool {
+    // Fresh read: an earlier send in the same sweep may have taken a while.
+    let item = match state.item(pr) {
+        Ok(Some(item)) => item,
+        Ok(None) => return false,
+        Err(error) => {
+            eprintln!("merge-queue notify: cannot read #{pr}: {error}");
+            return false;
+        }
+    };
+    let Some((transition, attempts)) = owed(&item) else {
+        return false;
+    };
+    // A name agentctl can never accept (a hosting login such as `SomeUser`, say) is not
+    // retried: one record says why, and the transition counts as given up.
+    if let Some(why) = unaddressable(&item.notify) {
+        let _ = update_delivery(state, pr, &transition, |fresh| {
+            fresh.notify_delivery = NotifyDelivery {
+                key: transition.key.clone(),
+                attempts: MAX_ATTEMPTS,
+                delivered: false,
+                last_error: why.clone(),
+            };
+            fresh.log(
+                "notify-skipped",
+                format!("{} not sent to {}: {why}", transition.verdict, item.notify),
+            );
+        });
+        eprintln!(
+            "merge-queue notify: #{pr} {} not sent to {}: {why}",
+            transition.verdict, item.notify
+        );
+        return false;
+    }
+    // Persist the attempt before sending: a daemon crash mid-send can
+    // then only lose the delivery mark, never the retry bound.
+    let recorded = update_delivery(state, pr, &transition, |fresh| {
+        fresh.notify_delivery = NotifyDelivery {
+            key: transition.key.clone(),
+            attempts,
+            delivered: false,
+            last_error: String::new(),
+        };
+    });
+    let item = match recorded {
+        Ok(Some(item)) => item,
+        Ok(None) => return false,
+        Err(error) => {
+            eprintln!("merge-queue notify: cannot record attempt for #{pr}: {error}");
+            return false;
+        }
+    };
+    let path = report_path(state, &item, &transition);
+    let outcome = std::fs::create_dir_all(reports_dir(state))
+        .map_err(|error| format!("cannot create notifications dir: {error}"))
+        .and_then(|()| {
+            std::fs::write(&path, render_report(state, &item, &transition))
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))
+        })
+        .and_then(|()| notifier.send(&item.notify, &path));
+    // Record the outcome on a fresh read: only mark the key we actually
+    // attempted, and only if it is still the owed transition.
+    match outcome {
+        Ok(()) => {
+            let marked = update_delivery(state, pr, &transition, |fresh| {
+                fresh.notify_delivery.delivered = true;
+                fresh.notify_delivery.last_error.clear();
+                fresh.log(
+                    "notified",
+                    format!(
+                        "{} sent to {} (report {})",
+                        transition.verdict,
+                        item.notify,
+                        path.display()
+                    ),
+                );
+            });
+            match marked {
+                Ok(Some(_)) => return true,
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("merge-queue notify: cannot record delivery for #{pr}: {error}");
+                }
+            }
+        }
+        Err(error) => {
+            let gave_up = attempts >= MAX_ATTEMPTS;
+            let suffix = if gave_up { "; giving up" } else { "" };
+            let _ = update_delivery(state, pr, &transition, |fresh| {
+                fresh.notify_delivery.last_error = error.clone();
+                fresh.log(
+                    "notify-failed",
+                    format!(
+                        "{} to {} failed (attempt {attempts}/{MAX_ATTEMPTS}){suffix}: {error}",
+                        transition.verdict, item.notify
+                    ),
+                );
+            });
+            eprintln!(
+                "merge-queue notify: #{pr} {} to {} failed (attempt {attempts}/{MAX_ATTEMPTS}){suffix}: {error}",
+                transition.verdict, item.notify
+            );
+        }
+    }
+    false
 }
 
 #[cfg(test)]

@@ -518,6 +518,16 @@ enum Command {
         /// before it is killed and fails; 0 means 300.
         #[arg(long, default_value_t = 0, value_name = "SECS")]
         net_timeout_secs: u64,
+        /// Precheck: shell command every submitted head must pass, run on the head alone in a
+        /// checkout the queue keeps, before the change is queued (a formatter check, say). A
+        /// head that fails it is ejected at submission with the command's output. Empty: no
+        /// precheck.
+        #[arg(long, default_value = "", value_name = "COMMAND")]
+        precheck: String,
+        /// Seconds one precheck may run before it is killed and counts as one that could not
+        /// run (the change is then queued without it); 0 means 300.
+        #[arg(long, default_value_t = 0, value_name = "SECS")]
+        precheck_timeout_secs: u64,
         /// Validator kind: `command` (shell template with a JSON-lines results file) or `dagrun`.
         #[arg(long, default_value = "")]
         validator: String,
@@ -678,6 +688,10 @@ enum Command {
         /// next to --by; resubmitting without it keeps the recorded name.
         #[arg(long, value_name = "NAME", default_value = "")]
         notify: String,
+        /// Queue the head without the configured precheck (`precheck.command`), for a refusal
+        /// that is wrong. Recorded in the change's history.
+        #[arg(long)]
+        skip_precheck: bool,
     },
     /// Reconcile the queue with a ready source: a label, every open pull request, or a file.
     Sync {
@@ -1243,6 +1257,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             close_prs,
             net_wrapper,
             net_timeout_secs,
+            precheck,
+            precheck_timeout_secs,
             validator,
             validator_run,
             select,
@@ -1292,6 +1308,10 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 base,
                 net_wrapper,
                 net_timeout_secs,
+                precheck: crate::state::PrecheckConfig {
+                    command: precheck,
+                    timeout_secs: precheck_timeout_secs,
+                },
                 combine,
                 max_batch: max_batch.max(1),
                 depth: depth.max(1),
@@ -1439,6 +1459,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             requires,
             policy,
             notify,
+            skip_precheck,
         } => {
             let config = state.config()?;
             let claim = match tested_with {
@@ -1466,6 +1487,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     .iter()
                     .map(|spec| ops::resolve_requirement(&config, spec))
                     .collect::<Result<_, _>>()?,
+                skip_precheck,
                 recorded_at: String::new(),
             };
             let lock = match state.lock() {

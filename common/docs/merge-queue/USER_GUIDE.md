@@ -122,6 +122,8 @@ This command creates the state directory and writes `config.json`.
 | `--agentctl-registry PATH` | none | agentctl registry the notifications address: sends run `<command> --registry PATH send ...`. Stored absolute as `notify.registry`. Without it agentctl uses `.agentctl` in the daemon's working directory, which for a daemon started in a bare queue repository is no registry, so every send fails. |
 | `--net-wrapper WORD` | none | A command prefix for network Git operations, for example `--net-wrapper with-proxy`. Repeat it for a prefix of several words. |
 | `--net-timeout-secs SECS` | `0` (300) | How long one network command (`git fetch`, `ls-remote`, `push`, a `gh` call) may run before its process group is killed and it fails (see "Network commands are bounded"). |
+| `--precheck CMD` | empty | Shell command every submitted head must pass before it is queued, run on the head alone (a formatter or documentation check, say). A head that fails it is ejected at submission with the command's output. Empty: no precheck. See "The precheck". |
+| `--precheck-timeout-secs SECS` | `0` (300) | How long one precheck may run before its process group is killed; the check then counts as one that could not run, and the change is queued without it. |
 | `--validator KIND` | empty | `command` or `dagrun` (see "Validators"). `run` refuses to start without one. |
 | `--validator-run CMD` | empty | For `command`: the shell template that runs a selection. |
 | `--select CMD` | empty | Shell command printing the selection policy's test IDs for the checkout's HEAD relative to `$MQ_BASE`. Empty: every validation runs the complete suite. |
@@ -155,6 +157,10 @@ then records the exact head commit. Resubmitting a change replaces its record, k
 and sets its status back to `queued`. While a run holds the writer lock, the submission is
 recorded instead and applied when the lock frees (see "Intake while a run holds the queue").
 
+With a precheck configured, the head is checked before it is queued (see "The precheck"). A head
+that fails is ejected at once: `submit` exits non-zero and prints the command's output, and a
+recorded submission shows the refusal under `intake refused` in `status`.
+
 | Argument | Default | Meaning |
 |---|---|---|
 | `PR` | required | The change number (pull-request number). It must be positive. |
@@ -170,6 +176,7 @@ recorded instead and applied when the lock frees (see "Intake while a run holds 
 | `--tested-with SELECTION` | none | The tests you ran on this head: `all`, a comma- or space-separated list of test IDs, or `@FILE` with one ID per line (`#` starts a comment). This becomes the change's validation claim. Without it, the change has no claim. |
 | `--policy NAME` | `manual` | The name of the policy that chose `--tested-with`, for example `path-routing`. |
 | `--requires SPEC` | none | A commit in a peer repository that must be on that repository's base first: `PEER#PR`, the head of that peer change (which is then marked to land as its own commits), or `PEER@SHA`. Repeatable. See "Changes across repositories". |
+| `--skip-precheck` | off | Queue the head without the precheck, for a refusal that is wrong. The change's history records that the check was skipped. |
 
 The output names the head and, when there is a claim, says whether it was focused or complete:
 `queued #42 at 9b1c0e77aa (priority 50); validated with 2 tests (focused)`.
@@ -793,6 +800,9 @@ on which files two changes share.
   obligations/<id>.json  one record per focused landing still owed a complete run
   scratch/slot-<n>/      one reused worktree per concurrent validation
   scratch/slot-<n>.lock  flock held by the run while a validation uses slot <n>
+  scratch/precheck/      the reused worktree every precheck runs in
+  scratch/precheck.log   the output of the last precheck
+  precheck/verdicts/<head>-<digest>.json  one precheck verdict per head and command (kept 14 days)
   intake/pending/<id>.json   one request recorded while a run held the writer lock, until applied
   intake/refused/<id>.json   one recorded request that could not be applied, with the reason (kept a week)
   donor/lock             fixed: donor job store lock (held for milliseconds)
@@ -842,6 +852,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `base` | `main` | The base branch. |
 | `net_wrapper` | `[]` | A command prefix for network Git. |
 | `net_timeout_secs` | `0` | Seconds one network command may run before it is killed and fails; `0` means 300. An older binary warns about the field and ignores it. |
+| `precheck` | absent | `{command, timeout_secs}`: the precheck of submitted heads (`timeout_secs` absent or `0`: 300). Left out of the file while unset; an older binary warns about the field and ignores it. See "The precheck". |
 | `combine` | `rebase` | `rebase` or `merge`. |
 | `max_batch` | `4` | The maximum number of changes per batch. |
 | `depth` | `2` | The initial window and the culprit-search probe width. |
@@ -1355,6 +1366,50 @@ The base moves only to a commit whose exact tree passed validation (the bors rul
    ejections) and everything behind it is rebuilt on the new base and validated again.
 9. **Obligations.** Every focused landing leaves an obligation until a green complete run
    (`widen`, or `run --widen`) covers that commit or a later one. A red complete run leaves it open.
+
+## The precheck
+
+A change that fails a cheap, deterministic check (a formatter check, a documentation build)
+sinks every batch it joins, and with speculation the batches built on that one too, for the
+length of a validation. The precheck runs such checks once, on the submitted head alone, before
+the change is queued, so that head never joins a batch.
+
+`precheck.command` is a shell command. It runs at the root of a checkout of the submitted head
+that the queue keeps for it (`scratch/precheck/`, switched with a forced checkout plus
+`git clean -ffd`, so ignored build caches are kept), with these variables set:
+
+| Variable | Value |
+|---|---|
+| `MQ_PR` | The change number. |
+| `MQ_HEAD` | The head commit being checked. |
+| `MQ_HEAD_REF` | The head branch or ref it was submitted with. |
+| `MQ_BASE` | The base commit the queue fetched with it. |
+
+How it ends decides what happens:
+
+- **Exit 0** passes. The change is queued, and its `submitted` event says how long the check took.
+- **Any other exit** fails. The change is **ejected at submission**: its history holds a
+  `submitted` event, then an `ejected` event that begins `refused at submission:` and quotes the
+  last 40 lines of the command's output (paths inside the checkout are shortened to paths in the
+  repository; the whole output, up to 16 KiB, is kept with the verdict). `submit` exits non-zero
+  and prints the same text. A change submitted with `--notify NAME` is notified at once, even
+  while a run holds the queue, rather than when that run ends. `sync` treats the head as settled
+  and does not submit it again until the head moves.
+- **A check that could not run** says nothing about the change, so the change is queued anyway
+  and its `submitted` event says why the check was skipped. That covers exit 75 (a temporary
+  refusal), 126 and 127 (a command that cannot execute or is not found), death by a signal, a
+  command that cannot be started or a checkout that cannot be made, and a command still running
+  at `precheck.timeout_secs` (its process group is killed).
+
+A pass or a failure is kept per head and command under `precheck/verdicts/`, so submitting the
+same head again gets the same answer without running the command; a check that could not run is
+tried again the next time. A new head is a new check. `merge-queue submit --skip-precheck`
+queues a head without the check when a refusal is wrong; its history says so.
+
+The precheck runs where a submission becomes a queued change: a `submit` that takes the writer
+lock, a recorded submission when it is applied, and each change `sync` submits. Keep it to
+checks that take seconds, or a minute at most on a warm build cache: it runs under the writer
+lock, so a run taking in recorded submissions waits for it.
 
 ## The decision log
 

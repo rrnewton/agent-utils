@@ -274,6 +274,34 @@ impl PriorityConfig {
     }
 }
 
+/// Default deadline of one precheck, in seconds.
+pub const DEFAULT_PRECHECK_TIMEOUT_SECS: u64 = 300;
+
+/// The precheck every submitted head must pass before it is queued (see [`crate::precheck`]).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrecheckConfig {
+    /// Shell command run in a checkout of the submitted head alone; empty runs no precheck.
+    pub command: String,
+    /// Deadline of one run in seconds; 0 means [`DEFAULT_PRECHECK_TIMEOUT_SECS`].
+    pub timeout_secs: u64,
+}
+
+impl PrecheckConfig {
+    /// Resolved deadline.
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(if self.timeout_secs == 0 {
+            DEFAULT_PRECHECK_TIMEOUT_SECS
+        } else {
+            self.timeout_secs
+        })
+    }
+}
+
+fn is_default_precheck(value: &PrecheckConfig) -> bool {
+    *value == PrecheckConfig::default()
+}
+
 /// Default age bound of the decision log, in days.
 pub const DEFAULT_DECISIONS_KEEP_DAYS: u32 = 90;
 /// Default size bound of the decision log, in bytes.
@@ -760,6 +788,9 @@ pub struct Config {
     pub donors: DonorsConfig,
     /// Landing configuration.
     pub land: LandConfig,
+    /// The precheck of submitted heads. Omitted from config.json when unset.
+    #[serde(skip_serializing_if = "is_default_precheck")]
+    pub precheck: PrecheckConfig,
     /// Push-notification configuration (state-change messages via agentctl).
     pub notify: NotifyConfig,
     /// Top-level fields this build does not know, captured verbatim so a
@@ -800,6 +831,7 @@ impl Default for Config {
             validator: ValidatorConfig::default(),
             donors: DonorsConfig::default(),
             land: LandConfig::default(),
+            precheck: PrecheckConfig::default(),
             notify: NotifyConfig::default(),
             unknown_fields: std::collections::BTreeMap::new(),
         }

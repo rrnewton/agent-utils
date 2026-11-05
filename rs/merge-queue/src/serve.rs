@@ -1927,12 +1927,23 @@ pub fn render_status(report: &StatusReport) -> String {
             intake.refused
         ));
         for entry in &intake.recent_refusals {
+            // One line each: a refusal that quotes output (a precheck's) keeps it in its record.
+            let mut lines = entry.error.lines();
+            let first = lines.next().unwrap_or_default();
+            let more = lines.count();
             out.push_str(&format!(
-                "  {} recorded at {}, refused at {}: {}\n",
+                "  {} recorded at {}, refused at {}: {first}{}\n",
                 entry.request.describe(),
                 entry.recorded_at,
                 entry.refused_at,
-                entry.error
+                if more > 0 {
+                    format!(
+                        " (and {more} more line(s) in intake/refused/{}.json)",
+                        entry.id
+                    )
+                } else {
+                    String::new()
+                }
             ));
         }
     }
