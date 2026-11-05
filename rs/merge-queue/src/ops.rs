@@ -981,16 +981,44 @@ pub fn resolve_requirement(config: &Config, spec: &str) -> Result<Requirement, S
             .parse()
             .map_err(|_| format!("bad requirement {spec:?}: expected PEER#PR or PEER@SHA"))?;
         let peer = peer(config, name)?;
-        let _lock = peer.state.lock()?;
-        let mut item = peer
-            .state
-            .item(pr)?
-            .ok_or_else(|| format!("{name} has no change #{pr} in its queue"))?;
-        if !item.exact {
-            item.exact = true;
-            item.log("exact", "another repository requires its exact head");
-            peer.state.save_item(&item)?;
-        }
+        let item = match peer.state.lock() {
+            Ok(_lock) => {
+                let mut item = peer
+                    .state
+                    .item(pr)?
+                    .ok_or_else(|| format!("{name} has no change #{pr} in its queue"))?;
+                if !item.exact {
+                    item.exact = true;
+                    item.log("exact", "another repository requires its exact head");
+                    peer.state.save_item(&item)?;
+                }
+                item
+            }
+            Err(busy) => {
+                // The peer is mid-run and holds its writer lock for the
+                // whole validation: do not fail the submit. Record a
+                // mark-exact request on the peer through its busy-lock
+                // intake path (the peer applies it before it next plans,
+                // or at the run's end when the change is in flight), and
+                // resolve against the head the item has now. Applying the
+                // request refuses, noted in the item's history, if that
+                // head moved meanwhile.
+                let item = peer
+                    .state
+                    .item(pr)?
+                    .ok_or_else(|| format!("{name} has no change #{pr} in its queue"))?;
+                crate::intake::record(
+                    &peer.state,
+                    crate::intake::Request::MarkExact {
+                        pr,
+                        head: item.head.clone(),
+                    },
+                    &busy,
+                    &item.head,
+                )?;
+                item
+            }
+        };
         return Ok(Requirement {
             peer: name.to_owned(),
             commit: item.head,

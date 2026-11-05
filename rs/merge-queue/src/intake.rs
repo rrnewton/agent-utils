@@ -60,6 +60,15 @@ pub enum Request {
         /// Change number.
         pr: i64,
     },
+    /// Another queue's `submit --requires PEER#PR` asked for this change's
+    /// exact head while this queue's writer lock was busy: mark it exact
+    /// when applied, refusing if its head moved meanwhile.
+    MarkExact {
+        /// Change number.
+        pr: i64,
+        /// Head the requirement resolved to when it was recorded.
+        head: String,
+    },
     /// `merge-queue accept-flaky` of one held batch.
     AcceptFlaky {
         /// The batch's change numbers.
@@ -76,7 +85,7 @@ impl Request {
     pub fn pr(&self) -> i64 {
         match self {
             Self::Submit(submission) => submission.pr,
-            Self::Withdraw { pr, .. } | Self::Retry { pr } => *pr,
+            Self::Withdraw { pr, .. } | Self::Retry { pr } | Self::MarkExact { pr, .. } => *pr,
             Self::AcceptFlaky { prs, .. } => prs.first().copied().unwrap_or_default(),
         }
     }
@@ -85,6 +94,7 @@ impl Request {
     pub fn describe(&self) -> String {
         let verb = match self {
             Self::Submit(_) => "submit",
+            Self::MarkExact { .. } => "mark-exact",
             Self::Withdraw { .. } => "withdraw",
             Self::Retry { .. } => "retry",
             Self::AcceptFlaky { prs, .. } => {
@@ -461,6 +471,30 @@ fn perform(state: &State, config: &Config, entry: &Entry) -> Result<String, Stri
             ops::retry_recorded(state, *pr, recorded)?;
             Ok(format!("#{pr} is back in the queue"))
         }
+        Request::MarkExact { pr, head } => {
+            let mut item = state
+                .item(*pr)?
+                .ok_or_else(|| format!("#{pr} is not in the queue"))?;
+            if item.head != *head {
+                return Err(format!(
+                    "#{pr}'s head moved from {} to {} since the requirement was recorded;                      the dependent must be resubmitted against the new head",
+                    short(head),
+                    short(&item.head)
+                ));
+            }
+            if item.exact {
+                return Ok(format!("#{pr} is already exact"));
+            }
+            item.exact = true;
+            item.log(
+                "exact",
+                format!(
+                    "another repository requires its exact head (recorded at {recorded}                      while another writer held the queue)"
+                ),
+            );
+            state.save_item(&item)?;
+            Ok(format!("#{pr} is exact at {}", short(&item.head)))
+        }
         Request::AcceptFlaky { prs, by, reason } => {
             let held = ops::accept_flaky(state, prs, by, reason, recorded)?;
             Ok(format!(
@@ -565,6 +599,7 @@ pub fn pending(state: &State) -> Vec<Pending> {
             Request::Withdraw { .. } => ("withdraw", String::new(), String::new()),
             Request::Retry { .. } => ("retry", String::new(), String::new()),
             Request::AcceptFlaky { .. } => ("accept-flaky", String::new(), String::new()),
+            Request::MarkExact { head, .. } => ("mark-exact", String::new(), head.clone()),
         };
         out.push((
             entry.request.clone(),

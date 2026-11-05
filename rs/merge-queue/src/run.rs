@@ -3888,6 +3888,35 @@ impl<'a> Runner<'a> {
             },
             Err(error) => format!("error: {error}"),
         };
+        // Requests recorded while this run held the lock, for changes that
+        // were in flight when intake was taken, are applied now that
+        // nothing is in flight (a mark-exact a busy peer was asked for, a
+        // withdrawal, a retry): the peer's next holder must see them
+        // applied, not waiting.
+        if let Some(writer) = self.writer {
+            if !self.simulating() {
+                match crate::intake::apply_except(
+                    self.state,
+                    &self.config,
+                    writer,
+                    &BTreeSet::new(),
+                ) {
+                    Ok(applied) => {
+                        for one in &applied {
+                            let line = one.line();
+                            self.event("intake", &line);
+                            lock(&self.report).intake.push(line);
+                        }
+                    }
+                    Err(error) => {
+                        self.event(
+                            "intake",
+                            &format!("recorded requests not applied at the run's end: {error}"),
+                        );
+                    }
+                }
+            }
+        }
         if !stop.is_empty() {
             self.event("stopped", &stop);
         }
@@ -3922,7 +3951,7 @@ impl<'a> Runner<'a> {
                 with_peers: false,
                 ..self.options.clone()
             };
-            let report = Runner::new(&peer.state, options)?.run()?;
+            let report = Runner::new(&peer.state, options)?.holding(&_lock).run()?;
             lock(&self.report).peer_runs.push(PeerRun {
                 peer: name.clone(),
                 run: report.run.clone(),
