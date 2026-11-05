@@ -60,3 +60,9 @@ The >=90% full-gate pass rate is measured over a working day after these fixes l
 ## Fixes landed (mu-validate, 2026-11-03)
 
 [muse watermelon-full-preview] Landed on main as 086a381d: reply-ID hyphen parsing (`rs/agentctl/src/cli.rs`), parent-death probe race (`py/tests/test_herdr_chat_transport.py`), shared-deadline spawn headroom (`rs/chat-subscription-slack/tests/directory.rs`). Gate green on the stack (only failure was rustfmt on my own edit, fixed and rerun exclusively PASS). Overlap on landing was `rs/agentctl/src/cli.rs` + this issue file (another lane's note appended); combined tree verified (fmt OK; cli 41, chat_reply 10, directory 19, parent-death 4 tests pass) before landing. Left open: the >=90% full-gate pass rate must be measured over a working day after landing.
+
+Flakes seen on 2026-11-05 afternoon (each failed once and passed on an exclusive rerun of the same commit):
+- `cross.agentctl.differential-2`, case primary/muse14/resumed-drain: Rust said possibly_submitted, Python said delivered, with byte-identical inputs. It passed 222/222 on rerun (the lead, #904's gate).
+- `rust.agentctl.test`, `agent::tests::taking_a_target_lock_marks_every_lock_file_used`: "<dir>/legacy/<hash>.lock was not marked used" under /dev/shm. 2184/2185 passed, then 2185/2185 on rerun (post-landing gate on a6e0ee5c).
+- `python.wrkslots.shard-6`, `test_audit_state_rust.py::test_audit_census_resume_state_matches_python`: the same run; passed on rerun.
+- `vibe-talk.check.scroll-stability-browser`: the same run; passed on rerun (load sensitivity, #905).
