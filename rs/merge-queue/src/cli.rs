@@ -175,7 +175,8 @@ fn model_command(state: &State, action: ModelCommand) -> Result<i32, String> {
                 .into_iter()
                 .map(|item| (item.pr, item))
                 .collect();
-            let examples = crate::predict::examples(&decisions, &signals, &items);
+            let red_classes = crate::decisions::effective_red_classes(&state.root, &decisions);
+            let examples = crate::predict::examples(&decisions, &signals, &items, &red_classes);
             let scored: Vec<(f64, f64)> = examples
                 .iter()
                 .map(|e| (model.predict_raw(&e.x), e.y))
@@ -198,6 +199,112 @@ fn model_command(state: &State, action: ModelCommand) -> Result<i32, String> {
             Ok(0)
         }
     }
+}
+
+fn simulate_command(
+    state: &State,
+    trials: u64,
+    window: usize,
+    max_batch: usize,
+) -> Result<i32, String> {
+    let decisions = crate::predict::read_decisions(&state.root)?;
+    // Ground truth per change: its decided solo/batch outcome share; the
+    // planner's estimates come from the trained model when present, else the
+    // same rates (documented: an in-sample comparison, not a forecast).
+    let mut truth: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
+    {
+        let mut per: std::collections::BTreeMap<i64, (usize, usize)> =
+            std::collections::BTreeMap::new();
+        for d in &decisions {
+            let green = match d.outcome.as_str() {
+                "green" => true,
+                "red" => false,
+                _ => continue,
+            };
+            for c in &d.changes {
+                let slot = per.entry(c.pr).or_default();
+                slot.1 += 1;
+                slot.0 += usize::from(green);
+            }
+        }
+        for (pr, (g, n)) in per {
+            truth.insert(pr, (g as f64 + 1.0) / (n as f64 + 2.0));
+        }
+    }
+    if truth.len() < 3 {
+        return Err(format!(
+            "only {} changes with decided history; at least 3 are needed to simulate",
+            truth.len()
+        ));
+    }
+    let model = crate::predict::load(&state.root);
+    let estimates = truth.clone();
+    // Solo cost: median wall of decided width-1 validations, flat in width
+    // per the measured cost model; 1500s when no such record exists.
+    let mut walls: Vec<f64> = decisions
+        .iter()
+        .filter(|d| d.width == 1 && (d.outcome == "green" || d.outcome == "red"))
+        .map(|d| d.cost.wall_s)
+        .collect();
+    walls.sort_by(f64::total_cmp);
+    let solo_cost_s = walls
+        .get(walls.len() / 2)
+        .copied()
+        .unwrap_or(1500.0)
+        .max(1.0);
+    let order: Vec<i64> = truth.keys().copied().collect();
+    let caps = crate::plan_ev::Caps {
+        max_batch: max_batch.max(1),
+        window: window.max(1),
+        roots: window.max(1),
+        stack_allowed: true,
+        solo_cost_s,
+    };
+    println!(
+        "simulate: {} changes, solo cost {:.0}s, window {}, max_batch {}, {} trials/policy",
+        order.len(),
+        solo_cost_s,
+        caps.window,
+        caps.max_batch,
+        trials.max(1)
+    );
+    for (name, policy) in [
+        (
+            "optimistic (stacked, fixed width)",
+            crate::plan_ev::Policy::Optimistic,
+        ),
+        (
+            "k-roots (single-change roots)",
+            crate::plan_ev::Policy::Kroots,
+        ),
+        ("expected-value planner", crate::plan_ev::Policy::Ev),
+    ] {
+        let (mut landed, mut hours, mut validations, mut wasted) = (0.0, 0.0, 0.0, 0.0);
+        for seed in 1..=trials.max(1) {
+            let r = crate::plan_ev::simulate(
+                &truth,
+                &order,
+                policy,
+                &caps,
+                &estimates,
+                model.as_ref(),
+                seed,
+            );
+            landed += r.landed as f64;
+            hours += r.validate_hours;
+            validations += r.validations as f64;
+            wasted += r.wasted_hours;
+        }
+        let n = trials.max(1) as f64;
+        println!(
+            "  {name}: {:.2} landings/validate-hour, {:.1} validations, {:.2} wasted h per run",
+            if hours > 0.0 { landed / hours } else { 0.0 },
+            validations / n,
+            wasted / n
+        );
+    }
+    println!("note: per-change truth and estimates both derive from the recorded history (in-sample); refused/cancelled records are excluded, so absolute landings/h are optimistic — compare policies, not the level.");
+    Ok(0)
 }
 
 fn signal_command(state: &State, action: SignalCommand) -> Result<i32, String> {
@@ -1255,6 +1362,40 @@ enum Command {
     Model {
         #[command(subcommand)]
         action: ModelCommand,
+    },
+    /// Offline policy comparison on this queue's recorded history: Monte
+    /// Carlo replay of the pending changes under optimistic stacking, k
+    /// single-change roots, and the expected-value planner, reporting
+    /// landings per validate-hour and wasted hours. Read-only.
+    /// Reclassify one decided red validation (validation ID `RUN/VALIDATION`,
+    /// e.g. `20261104T155300Z/1`): appends an append-only reclassification
+    /// record with who/when/why; the original decision record is never
+    /// rewritten. Classes: real-defect, false-red, composition, infra,
+    /// unresolved, host. Surfaced in `stats` and the signal log; P1 training
+    /// excludes infra/false-red/host reds.
+    Reclassify {
+        /// Validation ID, `RUN/VALIDATION`.
+        validation_id: String,
+        /// The red class to assert.
+        #[arg(long, value_name = "CLASS")]
+        red_class: String,
+        /// Why (recorded verbatim).
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Who is reclassifying (default: $AGENTCTL_AGENT, else `operator`).
+        #[arg(long, default_value = "")]
+        by: String,
+    },
+    Simulate {
+        /// Monte Carlo trials per policy (deterministic seeds).
+        #[arg(long, default_value_t = 40)]
+        trials: u64,
+        /// Concurrent builds (window) for every policy.
+        #[arg(long, default_value_t = 6)]
+        window: usize,
+        /// Maximum changes per batch (cap) for optimistic/EV policies.
+        #[arg(long, default_value_t = 4)]
+        max_batch: usize,
     },
     /// Show daemon liveness, the current window and slot occupancy.
     Status {
@@ -2474,6 +2615,74 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
         Command::Donor { action } => donor_command(&state, action),
         Command::Signal { action } => signal_command(&state, action),
         Command::Model { action } => model_command(&state, action),
+        Command::Reclassify {
+            validation_id,
+            red_class,
+            reason,
+            by,
+        } => {
+            if !crate::decisions::RED_CLASSES.contains(&red_class.as_str()) {
+                return Err(format!(
+                    "red class {red_class:?} is not one of {}",
+                    crate::decisions::RED_CLASSES.join(", ")
+                ));
+            }
+            let (run, validation) = validation_id
+                .rsplit_once('/')
+                .and_then(|(run, n)| n.parse::<usize>().ok().map(|n| (run.to_owned(), n)))
+                .ok_or_else(|| {
+                    format!("validation ID {validation_id:?} is not RUN/VALIDATION (e.g. 20261104T155300Z/1)")
+                })?;
+            let decisions = crate::predict::read_decisions(&state.root)?;
+            let target = decisions
+                .iter()
+                .find(|d| d.run == run && d.validation == validation)
+                .ok_or_else(|| format!("no validation {validation_id} in the decision records"))?;
+            if target.outcome != "red" {
+                return Err(format!(
+                    "validation {validation_id} is {} not red; only decided red validations can be reclassified",
+                    target.outcome
+                ));
+            }
+            let by = if !by.is_empty() {
+                by
+            } else {
+                std::env::var("AGENTCTL_AGENT").unwrap_or_else(|_| "operator".to_owned())
+            };
+            let record = crate::decisions::Reclassification {
+                schema: crate::decisions::RECLASSIFY_SCHEMA.to_owned(),
+                run: run.clone(),
+                validation,
+                red_class: red_class.clone(),
+                reason: reason.clone(),
+                by: by.clone(),
+                at: crate::model::now(),
+            };
+            crate::decisions::append_reclassification(&state.root, &record)?;
+            for change in &target.changes {
+                crate::signal::append(
+                    &state.root,
+                    change.pr,
+                    "reclassified",
+                    serde_json::json!({
+                        "run": run,
+                        "validation": validation,
+                        "red_class": red_class,
+                        "reason": reason,
+                        "by": by,
+                    }),
+                )?;
+            }
+            println!(
+                "reclassified {validation_id} as {red_class} (append-only; original record unchanged)"
+            );
+            Ok(0)
+        }
+        Command::Simulate {
+            trials,
+            window,
+            max_batch,
+        } => simulate_command(&state, trials, window, max_batch),
         Command::Status {
             json,
             stale_after_secs,
@@ -2598,6 +2807,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     Vec::new(),
                 )
             };
+            crate::decisions::overlay_red_classes(&state.root, &mut decisions);
             if let Some(mode) = &mode {
                 decisions.retain(|decision| &decision.mode == mode);
             }

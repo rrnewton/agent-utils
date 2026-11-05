@@ -76,6 +76,13 @@ pub struct Decision {
     pub selection: String,
     /// `green`, `red`, `refused` (validation did not run) or `cancelled`.
     pub outcome: String,
+    /// Label hygiene for a red verdict: `real-defect`, `false-red`,
+    /// `composition`, `infra`, `unresolved`, or `host` (machine-set when the
+    /// red came from a host-side refusal, exit 75). Absent means unclassified
+    /// (today's behaviour); a later `reclassify` record overrides it
+    /// append-only, never by rewriting this record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub red_class: Option<String>,
     /// Failed tests of a red validation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed: Vec<String>,
@@ -803,6 +810,19 @@ pub fn from_report(report: &Value, sources: &Sources<'_>, reconstructed: bool) -
                     .map(|ms| ms as f64 / 1000.0),
             },
             selection,
+            // Machine red class: host when the red came from a host-side
+            // refusal (exit 75), real-defect when a culprit search named a
+            // change, else unresolved. Adjudicated classes (false-red,
+            // composition, infra) arrive only via `reclassify`.
+            red_class: (outcome == "red").then(|| {
+                if v.get("exit").and_then(Value::as_i64) == Some(75) {
+                    "host".to_owned()
+                } else if culprit.is_some() {
+                    "real-defect".to_owned()
+                } else {
+                    "unresolved".to_owned()
+                }
+            }),
             outcome: outcome.to_owned(),
             failed,
             culprit,
@@ -966,6 +986,96 @@ pub fn read_rulings(state_root: &Path) -> Result<Vec<RulingRecord>, String> {
             })
         })
         .collect()
+}
+
+/// Adjudicated red classes a `reclassify` record may assert.
+pub const RED_CLASSES: [&str; 6] = [
+    "real-defect",
+    "false-red",
+    "composition",
+    "infra",
+    "unresolved",
+    "host",
+];
+
+/// Schema identifier of one reclassification record.
+pub const RECLASSIFY_SCHEMA: &str = "merge-queue-reclassification/v1";
+
+/// One post-hoc reclassification of a decided red validation
+/// (`merge-queue reclassify RUN/VALIDATION --red-class CLASS --reason TEXT`).
+/// Append-only: the original decision record is never rewritten; readers
+/// overlay these in file order, latest wins.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Reclassification {
+    /// [`RECLASSIFY_SCHEMA`].
+    pub schema: String,
+    /// Run ID of the decided validation.
+    pub run: String,
+    /// Validation number within the run.
+    pub validation: usize,
+    /// The asserted red class (one of [`RED_CLASSES`]).
+    pub red_class: String,
+    /// Why.
+    pub reason: String,
+    /// Who reclassified.
+    pub by: String,
+    /// RFC 3339 UTC time.
+    pub at: String,
+}
+
+/// Append one reclassification to `decisions/reclassifications.jsonl`.
+pub fn append_reclassification(state_root: &Path, record: &Reclassification) -> Result<(), String> {
+    let dir = dir(state_root);
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    let path = dir.join("reclassifications.jsonl");
+    let mut line = serde_json::to_string(record).map_err(|error| error.to_string())?;
+    line.push('\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(line.as_bytes()))
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+/// Every reclassification, in append order (none when the file is absent).
+pub fn read_reclassifications(state_root: &Path) -> Vec<Reclassification> {
+    let Ok(text) = std::fs::read_to_string(dir(state_root).join("reclassifications.jsonl")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Effective red class per decided validation, `(run, validation) -> class`:
+/// the machine class on the record, overridden by reclassifications in order.
+pub fn effective_red_classes(
+    state_root: &Path,
+    decisions: &[Decision],
+) -> BTreeMap<(String, usize), String> {
+    let mut out: BTreeMap<(String, usize), String> = BTreeMap::new();
+    for decision in decisions {
+        if let Some(class) = &decision.red_class {
+            out.insert((decision.run.clone(), decision.validation), class.clone());
+        }
+    }
+    for record in read_reclassifications(state_root) {
+        out.insert((record.run, record.validation), record.red_class);
+    }
+    out
+}
+
+/// Overlay reclassifications onto copies of `decisions` (records on disk are
+/// never rewritten; this is the reader-side effective view).
+pub fn overlay_red_classes(state_root: &Path, decisions: &mut [Decision]) {
+    let effective = effective_red_classes(state_root, decisions);
+    for decision in decisions.iter_mut() {
+        if let Some(class) = effective.get(&(decision.run.clone(), decision.validation)) {
+            decision.red_class = Some(class.clone());
+        }
+    }
 }
 
 /// Delete day files older than the age bound, then the oldest until the total fits the size
@@ -1210,6 +1320,10 @@ pub struct Stats {
     /// `null` when no decided record carries a prediction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calibration: Option<Calibration>,
+    /// Red verdicts by effective red class (machine class overlaid with
+    /// reclassifications by the reader); absent when no red is classified.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub red_classes: BTreeMap<String, usize>,
 }
 
 /// How honest the recorded predictions were (batch level).
@@ -1267,6 +1381,9 @@ pub fn stats(decisions: &[Decision], since: DateTime<Utc>, until: DateTime<Utc>)
         }
         if decision.culprit.is_some() {
             stats.culprits += 1;
+        }
+        if let Some(class) = &decision.red_class {
+            *stats.red_classes.entry(class.clone()).or_default() += 1;
         }
         if let Some(landed) = &decision.landed {
             stats.landed += landed.prs.len();
@@ -1410,6 +1527,9 @@ pub fn render(stats: &Stats) -> String {
             .map_or("-".to_owned(), |rate| format!("{rate:.2}")),
         stats.culprits
     ));
+    if !stats.red_classes.is_empty() {
+        out.push_str(&format!("  red classes: {}\n", counts(&stats.red_classes)));
+    }
     if let Some(c) = &stats.calibration {
         out.push_str(&format!(
             "  predictions: {} decided with predicted_pass; brier {:.3} (base-rate {:.3})\n",
@@ -1492,6 +1612,7 @@ mod unit {
                 cpu_s: None,
             },
             selection: "all".to_owned(),
+            red_class: None,
             outcome: outcome.to_owned(),
             failed: Vec::new(),
             culprit: None,
@@ -1527,6 +1648,49 @@ mod unit {
         assert_eq!(recent_red_rate(&root, 0), None);
         let empty = root.join("empty");
         assert_eq!(recent_red_rate(&empty, 20), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reclassification_overlays_without_rewriting_and_stats_counts_it() {
+        let root = std::env::temp_dir().join(format!("mq-reclass-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(dir(&root)).unwrap();
+        let mut red = decision("batch", 1, "red", 10.0);
+        red.red_class = Some("unresolved".to_owned());
+        std::fs::write(
+            dir(&root).join("2026-11-03.jsonl"),
+            serde_json::to_string(&red).unwrap() + "\n",
+        )
+        .unwrap();
+        append_reclassification(
+            &root,
+            &Reclassification {
+                schema: RECLASSIFY_SCHEMA.to_owned(),
+                run: red.run.clone(),
+                validation: 1,
+                red_class: "infra".to_owned(),
+                reason: "host refused".to_owned(),
+                by: "test".to_owned(),
+                at: "2026-11-03T11:00:00Z".to_owned(),
+            },
+        )
+        .unwrap();
+        // The record on disk is unchanged; the reader-side overlay wins.
+        let raw: Decision = serde_json::from_str(
+            std::fs::read_to_string(dir(&root).join("2026-11-03.jsonl"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(raw.red_class.as_deref(), Some("unresolved"));
+        let mut overlaid = vec![red];
+        overlay_red_classes(&root, &mut overlaid);
+        assert_eq!(overlaid[0].red_class.as_deref(), Some("infra"));
+        let now = Utc::now();
+        let s = stats(&overlaid, now, now);
+        assert_eq!(s.red_classes.get("infra"), Some(&1));
+        assert!(render(&s).contains("red classes: infra 1"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

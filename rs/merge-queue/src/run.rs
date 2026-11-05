@@ -4736,6 +4736,44 @@ impl<'a> Runner<'a> {
             } else {
                 None
             };
+            // Expected-value context (Config::ev_planner): the trained model
+            // when present, else the historical rates as p; solo cost is the
+            // median decided width-1 wall. Stable for the run.
+            let ev: Option<(Option<crate::predict::Model>, BTreeMap<i64, f64>, f64)> = if self
+                .config
+                .ev_planner
+            {
+                let model = crate::predict::load(&self.state.root);
+                let mut p: BTreeMap<i64, f64> = BTreeMap::new();
+                if let Some(model) = &model {
+                    for (pr, vector) in crate::predict::latest_vectors(&self.state.root) {
+                        p.insert(pr, model.predict_raw(&vector));
+                    }
+                }
+                if p.is_empty() {
+                    if let Some((global, per)) = crate::decisions::change_rates(&self.state.root) {
+                        for (pr, rate) in per {
+                            p.insert(pr, rate);
+                        }
+                        let _ = global;
+                    }
+                }
+                let mut walls: Vec<f64> = crate::predict::read_decisions(&self.state.root)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|d| d.width == 1 && (d.outcome == "green" || d.outcome == "red"))
+                    .map(|d| d.cost.wall_s)
+                    .collect();
+                walls.sort_by(f64::total_cmp);
+                let solo = walls
+                    .get(walls.len() / 2)
+                    .copied()
+                    .unwrap_or(1500.0)
+                    .max(1.0);
+                Some((model, p, solo))
+            } else {
+                None
+            };
             // Recent red rate for the optional disjoint-root gate (see
             // `Config::disjoint_root_min_red_percent`); decision records are only
             // appended at the end of a run, so this is stable for the run.
@@ -4807,7 +4845,9 @@ impl<'a> Runner<'a> {
                     // not started yet.
                     if full_loaded
                         && want_more
-                        && (occupied(&flights) < window || self.config.value_ordering)
+                        && (occupied(&flights) < window
+                            || self.config.value_ordering
+                            || self.config.ev_planner)
                         && (!flights.is_empty() || !pending.is_empty())
                         && self.takes_intake()
                     {
@@ -4907,6 +4947,74 @@ impl<'a> Runner<'a> {
                                             rate(&flight.candidate.prs),
                                             list(&pending[0]),
                                             rate(&pending[0])
+                                        ),
+                                    );
+                                    pending.push_back(flight.candidate.prs);
+                                }
+                            }
+                        }
+                    }
+                    // Expected-value ordering and abort (Config::ev_planner):
+                    // pending batches sort by value (expected landed per
+                    // validate-hour, rationale in the report), and the
+                    // lowest-value in-flight build loses its slot to a
+                    // strictly better queued build.
+                    if let Some((model, p, solo)) = &ev {
+                        let value = |prs: &[i64], rooted: bool| {
+                            crate::plan_ev::value_of(prs, rooted, 1.0, p, model.as_ref(), *solo)
+                        };
+                        if pending.len() > 1 {
+                            let mut ordered: Vec<Vec<i64>> = pending.iter().cloned().collect();
+                            ordered.sort_by(|a, b| {
+                                value(b, true)
+                                    .value
+                                    .partial_cmp(&value(a, true).value)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            if ordered != pending.iter().cloned().collect::<Vec<_>>() {
+                                self.event(
+                                    "ev-plan",
+                                    &ordered
+                                        .iter()
+                                        .map(|prs| value(prs, true).rationale)
+                                        .collect::<Vec<_>>()
+                                        .join("; "),
+                                );
+                                *pending = ordered.into_iter().collect();
+                            }
+                        }
+                        if occupied(&flights) >= window && !pending.is_empty() {
+                            let inflight: Vec<f64> = flights
+                                .iter()
+                                .map(|f| value(&f.candidate.prs, f.rooted).value)
+                                .collect();
+                            let best = value(&pending[0], true);
+                            if let Some(index) = crate::plan_ev::should_abort(&inflight, best.value)
+                            {
+                                if flights[index].result.is_none() {
+                                    let flight = flights.remove(index).unwrap();
+                                    flight.cancel.store(true, Ordering::Relaxed);
+                                    let mut waiting = flight.result.is_none();
+                                    while waiting {
+                                        match rx.recv() {
+                                            Ok((id, result)) => {
+                                                if id == flight.id {
+                                                    waiting = false;
+                                                } else if let Some(other) =
+                                                    flights.iter_mut().find(|f| f.id == id)
+                                                {
+                                                    other.result = Some(result);
+                                                }
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    self.event(
+                                        "ev-abort",
+                                        &format!(
+                                            "{} aborted for {}; replanned later",
+                                            value(&flight.candidate.prs, flight.rooted).rationale,
+                                            best.rationale
                                         ),
                                     );
                                     pending.push_back(flight.candidate.prs);

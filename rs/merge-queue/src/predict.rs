@@ -79,6 +79,10 @@ pub struct Model {
     pub trained_at: String,
     /// Decided change-instances trained on (before the holdout split).
     pub samples: usize,
+    /// Change-instances excluded by red-class label hygiene (reds adjudicated
+    /// `infra` / `false-red` / `host`); 0 when no reclassification exists.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub excluded_labels: usize,
     /// Overall green share of the training labels.
     pub base_rate: f64,
     /// Feature means used for standardisation.
@@ -98,6 +102,10 @@ pub struct Model {
     pub holdout: Metrics,
     /// Metrics on the training split itself.
     pub train_metrics: Metrics,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 /// Where the persisted model lives inside a state root.
@@ -215,6 +223,7 @@ pub fn examples(
     decisions: &[Decision],
     signals: &BTreeMap<i64, Vec<serde_json::Value>>,
     items: &BTreeMap<i64, Item>,
+    red_classes: &BTreeMap<(String, usize), String>,
 ) -> Vec<Example> {
     // Attribution by (pr, run, validation) from the signal log.
     let mut attribution: BTreeMap<(i64, String, usize), String> = BTreeMap::new();
@@ -254,6 +263,19 @@ pub fn examples(
     let mut history = History::default();
     let mut out = Vec::new();
     for decision in &sorted {
+        // Label hygiene: reds adjudicated infra / false-red / host are not
+        // evidence about the change; they never become training examples
+        // (composition reds stay: they are the P_conf signal). History
+        // folding below still counts the validation as taken part in.
+        let effective_class = red_classes
+            .get(&(decision.run.clone(), decision.validation))
+            .cloned()
+            .or_else(|| decision.red_class.clone());
+        let excluded = decision.outcome == "red"
+            && matches!(
+                effective_class.as_deref(),
+                Some("infra" | "false-red" | "host")
+            );
         let batch_green = decision.outcome == "green";
         for change in &decision.changes {
             let f = &change.features;
@@ -307,13 +329,15 @@ pub fn examples(
                     1.0 / decision.width.max(1) as f64,
                 ),
             };
-            out.push(Example {
-                at: decision.at.clone(),
-                pr: change.pr,
-                x,
-                y,
-                w,
-            });
+            if !excluded {
+                out.push(Example {
+                    at: decision.at.clone(),
+                    pr: change.pr,
+                    x,
+                    y,
+                    w,
+                });
+            }
         }
         // Fold this decision into history only after scoring all its changes.
         history.decided += 1;
@@ -347,7 +371,10 @@ pub fn examples(
 /// red while each member was cleared in some other validation (alone or in a
 /// green batch). Green co-validations count against. Pairs need at least 3
 /// co-validations and the whole table at least 5 labelled pairs.
-fn pair_rates(decisions: &[Decision]) -> BTreeMap<String, (f64, usize)> {
+fn pair_rates(
+    decisions: &[Decision],
+    red_classes: &BTreeMap<(String, usize), String>,
+) -> BTreeMap<String, (f64, usize)> {
     let mut cleared_elsewhere: BTreeMap<i64, bool> = BTreeMap::new();
     for d in decisions {
         if d.outcome == "green" {
@@ -359,6 +386,14 @@ fn pair_rates(decisions: &[Decision]) -> BTreeMap<String, (f64, usize)> {
     let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new(); // (conflicts, total)
     for d in decisions {
         if d.outcome != "green" && d.outcome != "red" {
+            continue;
+        }
+        // Infra/false/host reds say nothing about the pair either.
+        let class = red_classes
+            .get(&(d.run.clone(), d.validation))
+            .map(String::as_str)
+            .or(d.red_class.as_deref());
+        if matches!(class, Some("infra" | "false-red" | "host")) {
             continue;
         }
         let prs: Vec<i64> = d.changes.iter().map(|c| c.pr).collect();
@@ -507,6 +542,7 @@ pub fn train(examples: &[Example], trained_at: &str) -> Result<Model, String> {
         schema: MODEL_SCHEMA.to_owned(),
         trained_at: trained_at.to_owned(),
         samples: examples.len(),
+        excluded_labels: 0,
         base_rate,
         means,
         sds,
@@ -541,9 +577,25 @@ pub fn train_from_state(state_root: &Path) -> Result<Model, String> {
         signals.insert(pr, crate::signal::read(state_root, pr)?);
     }
     let items = read_items(state_root);
-    let examples = examples(&decisions, &signals, &items);
+    let red_classes = crate::decisions::effective_red_classes(state_root, &decisions);
+    let examples = examples(&decisions, &signals, &items, &red_classes);
+    let excluded_labels = decisions
+        .iter()
+        .filter(|d| {
+            d.outcome == "red"
+                && matches!(
+                    red_classes
+                        .get(&(d.run.clone(), d.validation))
+                        .map(String::as_str)
+                        .or(d.red_class.as_deref()),
+                    Some("infra" | "false-red" | "host")
+                )
+        })
+        .map(|d| d.changes.len())
+        .sum();
     let mut model = train(&examples, &crate::model::now())?;
-    model.pair_conf = pair_rates(&decisions);
+    model.excluded_labels = excluded_labels;
+    model.pair_conf = pair_rates(&decisions, &red_classes);
     let text = serde_json::to_string_pretty(&model).map_err(|e| e.to_string())?;
     std::fs::write(path(state_root), text)
         .map_err(|e| format!("cannot write {}: {e}", path(state_root).display()))?;
@@ -576,6 +628,7 @@ pub fn read_decisions(state_root: &Path) -> Result<Vec<Decision>, String> {
             }
         }
     }
+    crate::decisions::overlay_red_classes(state_root, &mut out);
     Ok(out)
 }
 
@@ -607,8 +660,9 @@ pub fn latest_vectors(state_root: &Path) -> BTreeMap<i64, Vec<f64>> {
         }
     }
     let items = read_items(state_root);
+    let red_classes = crate::decisions::effective_red_classes(state_root, &decisions);
     let mut out: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
-    for example in examples(&decisions, &signals, &items) {
+    for example in examples(&decisions, &signals, &items, &red_classes) {
         out.insert(example.pr, example.x);
     }
     out
@@ -621,6 +675,12 @@ pub fn render(model: &Model) -> String {
         "model {} trained {} on {} decided change-instances (base rate {:.2})\n",
         model.schema, model.trained_at, model.samples, model.base_rate
     ));
+    if model.excluded_labels > 0 {
+        out.push_str(&format!(
+            "label hygiene: {} change-instance(s) excluded as infra/false-red/host reds\n",
+            model.excluded_labels
+        ));
+    }
     out.push_str("features by |weight| (positive raises predicted pass):\n");
     for (name, w) in model.explain() {
         out.push_str(&format!("  {name:<22} {w:+.3}\n"));
@@ -723,6 +783,58 @@ mod unit {
         assert!((discounted - 0.32).abs() < 1e-9);
         assert_eq!(model.p_conf(2, 1), Some(0.5));
         assert_eq!(model.p_conf(1, 3), None);
+    }
+
+    #[test]
+    fn infra_reds_are_excluded_but_composition_reds_train() {
+        let mk = |run: &str, outcome: &str, class: Option<&str>| crate::decisions::Decision {
+            schema: crate::decisions::DECISION_SCHEMA.to_owned(),
+            at: "2026-01-01T00:00:00Z".to_owned(),
+            started_at: "2026-01-01T00:00:00Z".to_owned(),
+            run: run.to_owned(),
+            mode: "run".to_owned(),
+            validation: 1,
+            purpose: "batch".to_owned(),
+            changes: vec![crate::decisions::DecisionChange {
+                pr: 1,
+                head: "h".to_owned(),
+                ready_at: None,
+                ready_to_land_s: None,
+                features: crate::decisions::Features::default(),
+                predicted_pass: None,
+            }],
+            commit: "c".to_owned(),
+            base: None,
+            width: 1,
+            speculation: None,
+            predicted_pass: None,
+            validator: crate::decisions::ValidatorUsed::default(),
+            cost: crate::decisions::Cost::default(),
+            selection: "all".to_owned(),
+            outcome: outcome.to_owned(),
+            red_class: class.map(str::to_owned),
+            failed: Vec::new(),
+            culprit: None,
+            landed: None,
+            reconstructed: false,
+        };
+        let decisions = vec![
+            mk("r1", "red", Some("infra")),
+            mk("r2", "red", Some("composition")),
+            mk("r3", "green", None),
+        ];
+        let examples = examples(
+            &decisions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            examples.len(),
+            2,
+            "infra excluded, composition + green kept"
+        );
+        assert!(examples.iter().any(|e| e.y == 0.0));
     }
 
     #[test]

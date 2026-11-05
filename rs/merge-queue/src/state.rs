@@ -1090,6 +1090,14 @@ pub struct Config {
     /// enables it. Scheduling does not read it; the planner does, separately.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub predict: bool,
+    /// Expected-value planner (SubmitQueue §4/§7.1, see `plan_ev`): when on,
+    /// pending batches are ordered by expected landed changes per
+    /// validate-hour and the lowest-value in-flight build is aborted when a
+    /// strictly better build queues. Existing knobs (`max_batch`, `depth`,
+    /// `roots`, the pass-rate gates) act as caps. Off by default; wants
+    /// `predict` history worth ordering by.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ev_planner: bool,
     /// Concurrent git probes while planning (base and pairwise conflict checks, each a git
     /// subprocess). 0 means [`DEFAULT_PROBE_PARALLELISM`]. Probe results are cached across
     /// runs in `probe-cache.json`, so this bounds only cache misses.
@@ -1198,6 +1206,7 @@ impl Default for Config {
             stack_min_pass_percent: 0,
             batch_min_pass_percent: 0,
             predict: false,
+            ev_planner: false,
             probe_parallelism: 0,
             union_paths: Vec::new(),
             regenerate: RegenerateConfig::default(),
