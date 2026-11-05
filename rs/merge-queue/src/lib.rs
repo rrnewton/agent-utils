@@ -17,6 +17,7 @@ pub mod donor;
 pub mod drain;
 pub mod git;
 pub mod github;
+pub mod hooks;
 pub mod intake;
 pub mod interrupt;
 pub mod known_flaky;

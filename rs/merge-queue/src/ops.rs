@@ -155,6 +155,10 @@ pub struct Submission {
     /// agentctl session name to notify on state changes; empty keeps any
     /// name a previous submission recorded.
     pub notify: String,
+    /// Agent name shepherding this change (event-hook payloads); empty
+    /// keeps any name a previous submission recorded.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub shepherd: String,
     /// One-line description.
     pub title: String,
     /// Changes that must land first.
@@ -248,6 +252,14 @@ fn submit_resolved(
     } else {
         submission.notify.clone()
     };
+    // A shepherd is a subscription like notify: empty keeps the old one.
+    let shepherd = if submission.shepherd.is_empty() {
+        existing
+            .as_ref()
+            .map_or_else(String::new, |old| old.shepherd.clone())
+    } else {
+        submission.shepherd.clone()
+    };
     let notify_delivery = existing
         .as_ref()
         .map_or_else(Default::default, |old| old.notify_delivery.clone());
@@ -265,6 +277,7 @@ fn submit_resolved(
         submitted_at: now(),
         submitted_by: submission.by,
         notify,
+        shepherd,
         notify_delivery,
         title: submission.title,
         after: submission.after,

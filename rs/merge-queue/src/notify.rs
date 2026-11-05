@@ -680,6 +680,7 @@ mod unit {
             head: "a".repeat(40),
             priority: 100,
             submitted_at: "2026-01-01T00:00:00Z".to_owned(),
+            shepherd: String::new(),
             submitted_by: "lane-fictional".to_owned(),
             notify: "lane-fictional".to_owned(),
             title: String::new(),

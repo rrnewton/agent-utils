@@ -1176,6 +1176,7 @@ mod unit {
             priority,
             submitted_at: at.to_owned(),
             submitted_by: String::new(),
+            shepherd: String::new(),
             notify: String::new(),
             notify_delivery: crate::model::NotifyDelivery::default(),
             title: String::new(),

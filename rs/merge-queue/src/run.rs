@@ -1130,7 +1130,8 @@ impl<'a> Runner<'a> {
                         item.escalated = escalation(item.validation_refusals);
                         item.next_retry_at.clear();
                         let note = item.escalated.clone();
-                        item.log("escalated", note);
+                        item.log("escalated", note.clone());
+                        self.fire_hook("on_escalated", &[*pr], serde_json::json!({"reason": note}));
                         escalated.push(*pr);
                     } else {
                         let delay =
@@ -1167,6 +1168,11 @@ impl<'a> Runner<'a> {
                 refusals = entry.refusals;
                 if entry.refusals >= limit {
                     entry.escalated = escalation(entry.refusals);
+                    self.fire_hook(
+                        "on_escalated",
+                        &[*pr],
+                        serde_json::json!({"reason": entry.escalated.clone()}),
+                    );
                     escalated.push(*pr);
                 }
             }
@@ -1215,6 +1221,35 @@ impl<'a> Runner<'a> {
     /// unruled and never held silently. `held` is what a green batch's GREEN_FLAKY hold
     /// validated, recorded so that an accepted ruling lands exactly that commit (see
     /// [`Self::act_on_rulings`]).
+    /// Fire one event hook (5891), if configured: payload for the batch
+    /// `prs`, with each change's head, shepherd and notify carried. Never
+    /// waits, never fails the run (see [`crate::hooks`]).
+    fn fire_hook(&self, event: &str, prs: &[i64], mut extra: serde_json::Value) {
+        if !self.config.hooks.any() || self.simulating() {
+            return;
+        }
+        let items = lock(&self.items);
+        let mut entries = Vec::new();
+        for pr in prs {
+            if let Some(item) = items.get(pr) {
+                entries.push(serde_json::json!({
+                    "pr": pr, "head": item.head, "shepherd": item.shepherd,
+                    "notify": item.notify, "title": item.title,
+                }));
+            }
+        }
+        drop(items);
+        if let Some(first) = entries.first() {
+            extra["pr"] = first["pr"].clone();
+            extra["head"] = first["head"].clone();
+            extra["shepherd"] = first["shepherd"].clone();
+            extra["notify"] = first["notify"].clone();
+        }
+        extra["prs"] = serde_json::json!(prs);
+        extra["items"] = serde_json::json!(entries);
+        crate::hooks::fire(&self.state.root, &self.config.hooks, event, extra);
+    }
+
     fn hold_for_ruling(
         &self,
         candidate: &Candidate,
@@ -1260,6 +1295,16 @@ impl<'a> Runner<'a> {
                     self.state.save_item(item)?;
                 }
             }
+        }
+        if matches!(hold, Hold::GreenFlaky) {
+            self.fire_hook(
+                "on_held",
+                &candidate.prs,
+                serde_json::json!({
+                    "failing": nodes,
+                    "detail": format!("{label}: held for a ruling until {until}"),
+                }),
+            );
         }
         self.event(
             kind,
@@ -5143,6 +5188,27 @@ impl<'a> Runner<'a> {
                         let (vid, ran) = head
                             .result
                             .unwrap_or_else(|| Err("missing result".to_owned()))?;
+                        // A red batch verdict fires on_red once, before
+                        // whatever the run decides to do about it.
+                        if !ran.green()
+                            && !ran.refused()
+                            && !ran.cancelled
+                            && ran.infra_blocked.is_empty()
+                        {
+                            self.fire_hook(
+                                "on_red",
+                                &head.candidate.prs,
+                                serde_json::json!({
+                                    "failing": ran
+                                        .reproduced()
+                                        .iter()
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>(),
+                                    "logs": [ran.log.display().to_string()],
+                                    "head": head.candidate.tip,
+                                }),
+                            );
+                        }
                         // Admission refusal, its retries used up (see `refused_again`): defer.
                         // Never land, never search for a culprit, never eject.
                         let outcome = if ran.refused() {
@@ -5457,6 +5523,15 @@ impl<'a> Runner<'a> {
         std::fs::write(&report, text)
             .map_err(|error| format!("cannot write {}: {error}", report.display()))?;
         self.event("eject", &format!("#{pr} ({kind}){class_note}: {reason}"));
+        self.fire_hook(
+            "on_eject",
+            &[pr],
+            serde_json::json!({
+                "reason": reason,
+                "kind": kind,
+                "failing": failed.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            }),
+        );
         // Failed results from the deciding validations, where recorded.
         let deciding_failed: Vec<TestResult> = {
             let report = lock(&self.report);
@@ -5512,7 +5587,18 @@ impl<'a> Runner<'a> {
         flaky: BTreeSet<TestId>,
         note: &str,
     ) -> Result<(), String> {
+        let old_base = lock(&self.base).clone();
         *lock(&self.base) = tip.to_owned();
+        if old_base != tip {
+            self.fire_hook(
+                "on_base_moved",
+                prs,
+                serde_json::json!({"old_base": old_base, "new_base": tip}),
+            );
+        }
+        for pr in prs {
+            self.fire_hook("on_land", &[*pr], serde_json::json!({"landed_sha": tip}));
+        }
         // A landed change's kept validation (if any) is spent.
         if !self.simulating() {
             if let Ok(mut kept) = self.state.kept_validations() {

@@ -415,7 +415,7 @@ pub fn apply_except(
         }
         let outcome = perform(state, config, &entry);
         if let Err(error) = &outcome {
-            refuse(state, &entry, error)?;
+            refuse(state, config, &entry, error)?;
         }
         std::fs::remove_file(&path)
             .map_err(|error| format!("cannot remove {}: {error}", path.display()))?;
@@ -476,7 +476,7 @@ fn perform(state: &State, config: &Config, entry: &Entry) -> Result<String, Stri
 }
 
 /// Keep a refused request under `intake/refused/`, and say so in its change's history.
-fn refuse(state: &State, entry: &Entry, error: &str) -> Result<(), String> {
+fn refuse(state: &State, config: &Config, entry: &Entry, error: &str) -> Result<(), String> {
     let mut kept = entry.clone();
     kept.refused_at = now();
     kept.error = error.to_owned();
@@ -494,6 +494,30 @@ fn refuse(state: &State, entry: &Entry, error: &str) -> Result<(), String> {
             ),
         );
         state.save_item(&item)?;
+    }
+    if config.hooks.any() {
+        let (shepherd, head) = state
+            .item(entry.request.pr())
+            .ok()
+            .flatten()
+            .map(|item| (item.shepherd, item.head))
+            .unwrap_or_default();
+        crate::hooks::fire(
+            &state.root,
+            &config.hooks,
+            "on_intake_refused",
+            serde_json::json!({
+                "pr": entry.request.pr(),
+                "shepherd": shepherd,
+                "head": head,
+                "reason": error,
+                "detail": format!(
+                    "{} recorded at {} was not applied",
+                    entry.request.describe(),
+                    entry.recorded_at
+                ),
+            }),
+        );
     }
     Ok(())
 }

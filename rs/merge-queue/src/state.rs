@@ -467,6 +467,10 @@ impl PrecheckConfig {
     }
 }
 
+fn is_default_hooks(hooks: &HooksConfig) -> bool {
+    hooks == &HooksConfig::default()
+}
+
 fn is_default_precheck(value: &PrecheckConfig) -> bool {
     *value == PrecheckConfig::default()
 }
@@ -911,6 +915,83 @@ pub struct NotifyConfig {
     pub registry: String,
 }
 
+/// Event hooks (5891): shell commands fired, fire-and-forget, with a
+/// `merge-queue-hook/v1` JSON payload on stdin when something happens.
+/// An empty command turns that event off; every field absent is off, so
+/// a config that does not set `hooks` still loads on older builds.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HooksConfig {
+    /// A red batch verdict.
+    pub on_red: String,
+    /// A change was ejected.
+    pub on_eject: String,
+    /// A GREEN_FLAKY hold for a ruling.
+    pub on_held: String,
+    /// A change landed.
+    pub on_land: String,
+    /// The base moved.
+    pub on_base_moved: String,
+    /// An intake request was refused.
+    pub on_intake_refused: String,
+    /// A change was escalated to its owner.
+    pub on_escalated: String,
+    /// Seconds one hook may run before it is killed (0 means 30).
+    #[serde(default)]
+    pub timeout_secs: u64,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            on_red: String::new(),
+            on_eject: String::new(),
+            on_held: String::new(),
+            on_land: String::new(),
+            on_base_moved: String::new(),
+            on_intake_refused: String::new(),
+            on_escalated: String::new(),
+            timeout_secs: 30,
+        }
+    }
+}
+
+impl HooksConfig {
+    /// The command for `event`, when one is configured.
+    pub fn command_for(&self, event: &str) -> Option<&str> {
+        let command = match event {
+            "on_red" => &self.on_red,
+            "on_eject" => &self.on_eject,
+            "on_held" => &self.on_held,
+            "on_land" => &self.on_land,
+            "on_base_moved" => &self.on_base_moved,
+            "on_intake_refused" => &self.on_intake_refused,
+            "on_escalated" => &self.on_escalated,
+            _ => return None,
+        };
+        if command.is_empty() {
+            None
+        } else {
+            Some(command)
+        }
+    }
+
+    /// Whether any hook is configured (the common default-off case).
+    pub fn any(&self) -> bool {
+        [
+            &self.on_red,
+            &self.on_eject,
+            &self.on_held,
+            &self.on_land,
+            &self.on_base_moved,
+            &self.on_intake_refused,
+            &self.on_escalated,
+        ]
+        .iter()
+        .any(|command| !command.is_empty())
+    }
+}
+
 /// Identity for commits the queue creates.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1069,6 +1150,9 @@ pub struct Config {
     pub precheck: PrecheckConfig,
     /// Push-notification configuration (state-change messages via agentctl).
     pub notify: NotifyConfig,
+    /// Event hooks (5891). Omitted from config.json when off.
+    #[serde(default, skip_serializing_if = "is_default_hooks")]
+    pub hooks: HooksConfig,
     /// Top-level fields this build does not know, captured verbatim so a
     /// newer config loads (and round-trips) on an older binary. See the
     /// struct-level note.
@@ -1118,6 +1202,7 @@ impl Default for Config {
             land: LandConfig::default(),
             precheck: PrecheckConfig::default(),
             notify: NotifyConfig::default(),
+            hooks: HooksConfig::default(),
             unknown_fields: std::collections::BTreeMap::new(),
         }
     }

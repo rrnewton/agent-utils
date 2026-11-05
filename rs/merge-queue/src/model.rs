@@ -105,6 +105,12 @@ pub struct Item {
     /// to `submitted_by`; a resubmission without a name keeps the old one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub notify: String,
+    /// Agent name that shepherds this change (drives it to landing),
+    /// carried in every event-hook payload for the item; separate from
+    /// `notify` (who gets reports). Set at submit, changeable with
+    /// `merge-queue shepherd`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub shepherd: String,
     /// Notification delivery for the current transition (dedup + retry bound).
     #[serde(default, skip_serializing_if = "NotifyDelivery::is_empty")]
     pub notify_delivery: NotifyDelivery,

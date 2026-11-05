@@ -418,6 +418,7 @@ pub fn reconcile(
             priority: entry.priority,
             by: entry.by,
             notify,
+            shepherd: String::new(),
             title: entry.title,
             after: entry.after,
             solo: entry.solo,

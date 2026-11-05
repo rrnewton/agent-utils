@@ -925,6 +925,12 @@ enum Command {
         /// next to --by; resubmitting without it keeps the recorded name.
         #[arg(long, value_name = "NAME", default_value = "")]
         notify: String,
+        /// Agent name shepherding this change (drives it to landing):
+        /// carried in every event-hook payload for it, separate from
+        /// --notify. Resubmitting without it keeps the recorded name;
+        /// change it later with `merge-queue shepherd`.
+        #[arg(long, value_name = "NAME", default_value = "")]
+        shepherd: String,
         /// Queue the head without the configured precheck (`precheck.command`), for a refusal
         /// that is wrong. Recorded in the change's history.
         #[arg(long)]
@@ -971,6 +977,18 @@ enum Command {
         /// Change numbers.
         #[arg(required = true)]
         prs: Vec<i64>,
+    },
+    /// Set (or, with --clear, remove) the shepherd of a change: the agent
+    /// driving it to landing, named in every event-hook payload for it.
+    Shepherd {
+        /// Change number.
+        pr: i64,
+        /// Shepherd agent name.
+        #[arg(value_name = "NAME", required_unless_present = "clear")]
+        name: Option<String>,
+        /// Remove the shepherd instead of setting one.
+        #[arg(long, conflicts_with = "name")]
+        clear: bool,
     },
     /// Accept the GREEN_FLAKY passes of a held batch as a ruling: a run lands exactly the
     /// commit that was validated if the base has not moved since, and otherwise validates the
@@ -1753,6 +1771,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             requires,
             policy,
             notify,
+            shepherd,
             skip_precheck,
         } => {
             let config = state.config()?;
@@ -1771,6 +1790,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 priority,
                 by,
                 notify,
+                shepherd,
                 title,
                 after,
                 solo,
@@ -2004,6 +2024,36 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 ops::retry(&state, pr)?;
                 println!("#{pr} is back in the queue");
             }
+            Ok(0)
+        }
+        Command::Shepherd { pr, name, clear } => {
+            let _config = state.config()?;
+            let _lock = state.lock()?;
+            let mut item = state
+                .item(pr)?
+                .ok_or_else(|| format!("#{pr} is not in the queue"))?;
+            item.shepherd = if clear {
+                String::new()
+            } else {
+                name.unwrap_or_default()
+            };
+            item.log(
+                "shepherd",
+                if item.shepherd.is_empty() {
+                    "shepherd cleared".to_owned()
+                } else {
+                    format!("shepherd is now {}", item.shepherd)
+                },
+            );
+            state.save_item(&item)?;
+            println!(
+                "#{pr} shepherd: {}",
+                if item.shepherd.is_empty() {
+                    "(none)"
+                } else {
+                    &item.shepherd
+                }
+            );
             Ok(0)
         }
         Command::AcceptFlaky { prs, by, reason } => {

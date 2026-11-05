@@ -503,6 +503,41 @@ the notification sweep still runs each cycle for the transitions that are real (
 refusals). A queue whose `land.driver` is `none` refuses live cycles with a remedy naming
 `--shadow`; `serve --shadow` is that remedy.
 
+## Event hooks
+
+For push-based, low-latency reactions — including when the notified agent is gone or in a
+long turn — `hooks` in `config.json` names a shell command per event. Each is called with a
+versioned JSON payload on stdin (`$MQ_HOOK_EVENT` and `$MQ_HOOK_PR` in the environment),
+fire-and-forget: a bounded worker pool runs hooks with a per-hook timeout
+(`hooks.timeout_secs`, default 30), the queue never waits on one and never fails because of
+one, and every finished hook is logged to `<state>/hooks.jsonl` with its exit status,
+duration, and stdout/stderr tails. The existing `--notify` delivery is unchanged.
+
+| Field | Event |
+|---|---|
+| `on_red` | A red batch verdict (PRs, heads, failing nodes, log paths). |
+| `on_eject` | A change was ejected. |
+| `on_held` | A GREEN_FLAKY hold for a ruling. |
+| `on_land` | A change landed (with `landed_sha`). |
+| `on_base_moved` | The base moved (`old_base`, `new_base`). |
+| `on_intake_refused` | An intake request recorded while the writer lock was busy was refused. |
+| `on_escalated` | A change was escalated to its owner. |
+
+Every field absent (or empty) is off. The payload is `merge-queue-hook/v1`:
+
+```json
+{"schema":"merge-queue-hook/v1","event":"on_land","at":"...","pr":1,
+ "prs":[1],"head":"<sha>","shepherd":"alice","notify":"alice",
+ "landed_sha":"<sha>","old_base":"<sha>","new_base":"<sha>",
+ "failing":["tests/a"],"logs":[".../run.log"],"culprit":"tests/a",
+ "reason":"...","detail":"..."}
+```
+
+Fields that do not apply to an event are empty. A per-item `shepherd` — the agent driving a
+change to landing, set with `submit --shepherd NAME`, changed with
+`merge-queue shepherd PR NAME` (or `--clear`) — is carried in every payload for that item,
+separate from `notify` (who gets reports).
+
 ## Notifications
 
 A change submitted with `--notify NAME` (or a ready-file `notify=NAME`) gets exactly one push message per state change — `landed`, `ejected`, `refusal-deferred`, `withdrawn` — from the `serve` daemon:
