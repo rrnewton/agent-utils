@@ -105,7 +105,7 @@ export {
   shownNode,
   tagNameOf,
 } from "../view/dom/index.ts";
-export { SCREENS, createActionMenu, createChannelPick, createChipsOverComposer, createHighlightCopy, createKeyDispatch, createKeyHints, createPromptsTray, createReplySight, createRowShortcuts, createScreenKeys, createScreens, createScrollKeys, createShellNotices, createUndoOffer, createUndoStamps, modHeld, pageStep, swallow, typedKey } from "../view/shell/index.ts";
+export { SCREENS, createActionMenu, createChannelPick, createChipsOverComposer, createComposeKeys, createHighlightCopy, createKeyDispatch, createKeyHints, createPromptsTray, createReplySight, createRowShortcuts, createScreenKeys, createScreens, createScrollKeys, createShellNotices, createUndoOffer, createUndoStamps, modHeld, pageStep, swallow, typedKey } from "../view/shell/index.ts";
 export {
   COMPOSER_FIELDS,
   COMPOSER_GROW_BOXES,

@@ -825,3 +825,88 @@ test("`#624 voice-page-modularity`: the search, Settings, Help, Back and Escape 
   state.allFocus = false;
   assert.deepStrictEqual(run(() => keys.onEscape({}, target)), [false], "Escape with nothing to do did something");
 });
+
+test("`#624 voice-page-modularity`: m and Ctrl+S find the box to write in, stay in one on screen, and ↑ in the empty channel box selects the newest message", () => {
+  const { createComposeKeys } = VIEW_SHELL;
+  const log = [];
+  const node = (id, extra = {}) => ({ id, nodeType: 1, hidden: false, parentNode: null, value: "",
+    focus: (options) => log.push(`focus ${id}${options && options.preventScroll ? " quietly" : ""}`), scrollIntoView: () => {}, ...extra });
+  const nodes = {};
+  for (const id of ["reply-text", "compose-text", "channel-compose-text", "side-tools", "scroll-tools"]) nodes[id] = node(id);
+  const sideBox = node("side-compose-text");
+  const chip = node("chip", { parentNode: nodes["side-tools"] });
+  const state = { screen: "main", view: "discord", reply: false, channel: true, threadList: false, mainRows: false, behind: false, side: false, rows: ["r1", "r2"] };
+  const keys = createComposeKeys({
+    byId: (id) => (state.side && id === "channel-compose-text" ? sideBox : nodes[id]),
+    leftById: (id) => nodes[id],
+    screen: () => state.screen,
+    view: () => state.view,
+    closeSettings: () => { log.push("close settings"); state.screen = "main"; },
+    replyOnScreen: () => state.reply,
+    channelOnScreen: () => state.channel,
+    threadListOnScreen: () => state.threadList,
+    threadListBack: () => { log.push("thread list back"); state.threadList = false; },
+    mainRowsOnScreen: () => state.mainRows,
+    behindThreadList: () => state.behind,
+    inColumnGone: () => false,
+    isComposer: (held) => Boolean(held && /compose-text$/.test(held.id)),
+    inSide: () => state.side,
+    activeColumn: () => (state.side ? "side" : "main"),
+    mainColumn: () => "main",
+    inColumn: (column, act) => { log.push(`in ${column}`); const was = state.side; state.side = column === "side"; try { return act(); } finally { state.side = was; } },
+    channelPane: () => "channel pane",
+    sidePane: () => "side pane",
+    paneFor: (held) => (held === sideBox ? "side pane" : null),
+    paneColumn: (pane) => (pane === "side pane" ? "side" : "main"),
+    paneRows: (pane) => state.rows.map((id) => `${pane} ${id}`),
+    selectRow: (pane, row, ...rest) => log.push(`select ${row}${rest.length ? " +" : ""}`),
+  });
+  const was = globalThis.document;
+  const run = (act) => { log.length = 0; return [act(), ...log]; };
+  globalThis.document = { activeElement: null };
+  try {
+    assert.deepStrictEqual(run(() => keys.composeFromKeyboard()), [true, "focus channel-compose-text quietly"]);
+    state.reply = true;
+    assert.deepStrictEqual(run(() => keys.composeFromKeyboard()), [true, "focus reply-text"], "an open reply was not where writing went");
+    state.reply = false;
+    state.view = "voice";
+    assert.deepStrictEqual(run(() => keys.composeFromKeyboard()), [true, "focus compose-text"], "the call's view did not write in the agent's box");
+    nodes["compose-text"].hidden = true;
+    assert.deepStrictEqual(run(() => keys.composeFromKeyboard()), [false]);
+    state.view = "discord";
+    state.behind = true;
+    assert.deepStrictEqual(run(() => keys.composeFromKeyboard()), [false], "a box behind the thread list took the focus");
+    state.behind = false;
+    state.side = true;
+    sideBox.hidden = true;
+    assert.deepStrictEqual(run(() => keys.composeFromKeyboard()), [true, "in main", "focus channel-compose-text quietly"], "a column with no box did not go to Main's");
+    sideBox.hidden = false;
+    state.side = false;
+    state.screen = "help";
+    state.threadList = true;
+    assert.deepStrictEqual(run(() => keys.writeFromKeyboard()), [true, "close settings", "thread list back", "in main", "focus channel-compose-text quietly"],
+      "Ctrl+S from Help over the thread list did not leave both for the box");
+    state.threadList = true;
+    state.mainRows = true;
+    assert.deepStrictEqual(run(() => keys.writeFromKeyboard()), [true, "in main", "focus channel-compose-text quietly"], "the thread list with Main channel's box was left");
+    state.threadList = false;
+    state.mainRows = false;
+    globalThis.document.activeElement = nodes["channel-compose-text"];
+    assert.deepStrictEqual(run(() => keys.writeFromKeyboard()), [true], "Ctrl+S in a box on screen moved the focus");
+    globalThis.document.activeElement = chip;
+    assert.deepStrictEqual(run(() => keys.writeFromKeyboard()), [true, "in side", "focus side-compose-text quietly"], "the right column's chips did not write in its box");
+    state.side = true;
+    globalThis.document.activeElement = null;
+    assert.deepStrictEqual(run(() => keys.writeFromKeyboard()), [true, "in side", "focus side-compose-text quietly"], "with the focus nowhere, the column the keys moved last was not chosen");
+    state.side = false;
+    assert.deepStrictEqual(run(() => keys.newestFromComposer(nodes["channel-compose-text"])), [true, "select channel pane r2"], "↑ did not select the newest message, or passed a scroll choice");
+    nodes["channel-compose-text"].value = "words";
+    assert.deepStrictEqual(run(() => keys.newestFromComposer(nodes["channel-compose-text"])), [false], "↑ in a box with words was taken");
+    nodes["channel-compose-text"].value = "";
+    state.rows = [];
+    assert.deepStrictEqual(run(() => keys.newestFromComposer(nodes["channel-compose-text"])), [false]);
+    assert.deepStrictEqual(run(() => keys.newestFromComposer(nodes["reply-text"])), [false], "↑ in another box was taken");
+  } finally {
+    globalThis.document = was;
+  }
+});

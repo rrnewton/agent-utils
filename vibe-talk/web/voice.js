@@ -7751,103 +7751,38 @@ function undoFromKeyboard() {
 }
 
 /**
- * m (`#538 c-key-copy`; c before): the box to write in: the channel's (a thread's, in a thread), the reply's on Reply, or on the
- * call's view the agent's, under the transcript (`#241 voice-composer`). Going to the agent's box
- * opens nothing: a conversation starts only when something is sent from it.
+ * The keys to the message box: m and Ctrl+S (Cmd+S) take the reader to the box to write in, and ↑ in the
+ * channel's empty box selects the newest message. One owner in web/src/view/shell/composekeys.ts (`#624
+ * voice-page-modularity`); the page destructures its keys under their old names.
  *
- * `#403 composer-key-global`. In two columns it is the box of the column being worked on, which the
- * key chose (`paneFor`), and the right column on its thread cards has none, so the box there is Main's.
- * `#410 inline-reply-editor`. A reply open anywhere is the one box drawn, the columns' own hidden, so it
- * is where writing goes from either column.
+ * @type {import("./src/view/shell/index.ts").ComposeKeys}
  */
-function composeFromKeyboard() {
-  // `#410 inline-reply-editor`. A reply open anywhere is the one box drawn: it is where writing goes,
-  // from either column.
-  if (replyOnScreen()) {
-    leftEl("reply-text").focus();
-    return true;
-  }
-  if (screens.screen() === "main" && screens.view() === "voice") {
-    const agent = leftEl("compose-text");
-    if (!shownNode(agent)) return false;
-    // Its own focus listener brings the whole box into view (`keepComposerInView`).
-    agent.focus();
-    return true;
-  }
-  const box = el("channel-compose-text");
-  if (!channelOnScreen() || behindThreadList(box)) return false;
-  if (!shownNode(box)) return columnWork.side() ? inColumn(columns.main, composeFromKeyboard) : false;
-  // The box is at the foot of the list, and writing in it is going there: as far as shows it.
-  focusMinimally(box);
-  return true;
-}
-
-/**
- * Ctrl+S (Cmd+S), and Ctrl+Enter (Cmd+Enter) outside a text box: the message box, ready to type in,
- * from anywhere. `#248 composer-key`. The owner: "When I'm using keyboard, I want to jump to text
- * entry and start typing. Google chat uses Cmd-s for that and I'm ok with that. Or maybe Cmd-enter
- * could jump to it if it's not highlighted (or send message if it is highlighted with non-zero chars
- * in it)."
- *
- * The box is the one c chooses (`composeFromKeyboard`): the channel's, the thread's the reader is in
- * (on the right, in two columns, when the keys are there), the reply's on Reply, or the agent's on
- * the call's view. Settings and Help are left first, as their Back leaves them, because the box is on
- * the screen they cover. Returns whether it did anything; the bindings that call it keep the
- * browser's own default for the chord shut either way.
- *
- * `#403 composer-key-global`. The owner, in two columns: "when a message in the right column is
- * highlighted and focus is elsewhere. But if focus was in the left column it worked. It seemed
- * selective. It should be globally applicable." The rule, which Help states: in two columns the box
- * of the column the focus is in; with the focus in neither (the bar, the page itself) the box of the
- * column holding the selection, which is the one the keys moved last (`paneFor`); and Main's where
- * that column has none, as on the thread cards. The thread list is left first too, for the view it
- * was chosen from, because it covers the column whose box it is; and the column is asked again once
- * whatever covered it has gone. In a message box on screen it stays, a reply open in that column or
- * not; on a column's chips, outside its scroller, it is that column's box. Ctrl+S is heard before any
- * element's own listener (`everywhere`).
- *
- * `#422 composer-key-stay`. The owner, 2026-10-22: "when I press Cmd-S even if I have Main messages view
- * on, it jumps to a DIFFERENT view ... I would want to keep my view and just enter the messages here."
- * The rule in every view: the chord never changes the view when the view on screen has a box. Main, All,
- * a thread and two columns always have one. The thread list has one while Main channel puts the main
- * channel's box at the foot of its cards (`#419`), or while a reply is open among them (`#410`): it is
- * left only where it has neither. Settings and Help are screens over the view, not views, and are left.
- */
-function writeFromKeyboard() {
-  if (screens.screen() === "settings" || screens.screen() === "help") closeSettings();
-  if (threadListOnScreen() && !threadListHasBox()) threadListBack();
-  const held = document.activeElement;
-  // Already in a message box on screen: it stays there, even beside a reply open in its column.
-  if (isComposer(held) && shownNode(held) && !behindThreadList(held) && !inColumnGone(held)) return true;
-  /** @type {KeyPane | null} */
-  let pane = null;
-  if (screens.screen() === "main") {
-    // The chips over a column's foot are outside its scroller and still that column's.
-    if (held && nodeWithin(leftEl("side-tools"), held)) pane = sidePane;
-    else if (held && nodeWithin(leftEl("scroll-tools"), held)) pane = channelPane;
-    else pane = paneFor(held);
-  }
-  return inColumn(pane ? paneColumn(pane) : columnWork.active(), composeFromKeyboard);
-}
-
-/**
- * Whether the thread list on screen holds a message box of its own (`#422 composer-key-stay`): the main
- * channel's at the foot of the cards while Main channel is on (`placeMainCard`), or a reply open among them.
- */
-function threadListHasBox() {
-  return threadListOnScreen() && (replyOnScreen() || mainRowsOnScreen());
-}
-
-/** ↑ in the box of the channel while it is empty: the newest message selected, as a preference of Slack has it. */
-function newestFromComposer(target) {
-  // The box of the column the key is in: the thread's on the right, in two columns. `#229`.
-  if (!target || target !== el("channel-compose-text") || String(target.value || "") !== "") return false;
-  const pane = columnWork.side() ? sidePane : channelPane;
-  const rows = paneRows(pane);
-  if (rows.length === 0) return false;
-  selectRow(pane, rows[rows.length - 1]);
-  return true;
-}
+const composeKeys = createComposeKeys({
+  byId: (id) => el(id),
+  leftById: (id) => leftEl(id),
+  screen: () => screens.screen(),
+  view: () => screens.view(),
+  closeSettings: () => closeSettings(),
+  replyOnScreen: () => replyOnScreen(),
+  channelOnScreen: () => channelOnScreen(),
+  threadListOnScreen: () => threadListOnScreen(),
+  threadListBack: () => threadListBack(),
+  mainRowsOnScreen: () => mainRowsOnScreen(),
+  behindThreadList: (node) => behindThreadList(node),
+  inColumnGone: (node) => inColumnGone(node),
+  isComposer: (node) => isComposer(node),
+  inSide: () => columnWork.side(),
+  activeColumn: () => columnWork.active(),
+  mainColumn: () => columns.main,
+  inColumn: (column, act) => inColumn(column, act),
+  channelPane: () => channelPane,
+  sidePane: () => sidePane,
+  paneFor: (node) => paneFor(node),
+  paneColumn: (pane) => paneColumn(pane),
+  paneRows: (pane) => paneRows(pane),
+  selectRow: (pane, row) => selectRow(pane, row),
+});
+const { composeFromKeyboard, writeFromKeyboard, newestFromComposer } = composeKeys;
 
 /** Alt+↓ and Alt+↑ (Option on a Mac): the next or previous channel, in the order of the picker. */
 function stepChannel(event) {

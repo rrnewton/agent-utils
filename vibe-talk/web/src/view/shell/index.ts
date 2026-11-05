@@ -31,3 +31,5 @@ export { SCROLL_KEYS, createScrollKeys, pageStep } from "./scrollkeys.ts";
 export type { ScrollKeyEvent, ScrollKeys, ScrollKeysDependencies, ScrolledPane } from "./scrollkeys.ts";
 export { createScreenKeys } from "./screenkeys.ts";
 export type { KeyPlace, ScreenKeys, ScreenKeysDependencies } from "./screenkeys.ts";
+export { createComposeKeys } from "./composekeys.ts";
+export type { ComposeKeys, ComposeKeysDependencies } from "./composekeys.ts";
