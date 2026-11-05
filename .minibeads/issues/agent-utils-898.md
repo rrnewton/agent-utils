@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-image-remove-own-bind: remove a slot born in the worktrees image despite its own bind mount'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-validate
 created_at: 2026-11-05T16:33:33.682649528+00:00
-updated_at: 2026-11-05T16:33:33.682649528+00:00
+updated_at: 2026-11-05T23:32:19.000000000+00:00
+closed_at: 2026-11-05T23:32:19.000000000+00:00
 ---
 
 # Description
@@ -35,3 +36,7 @@ Reported by the lead on 2026-11-05 at 11:33 AM ET (P2). The worktrees-image lane
 Seen once, possibly unrelated: removing a validation probe slot refused with "validation-run authority is unverifiable ... cannot enumerate user-systemd state: Failed to get property ControlGroup ... Remote peer disconnected". It looks like a transient user-systemd bus error. If it recurs, consider retrying that read once before refusing.
 
 Raised to P1 by the lead on 2026-11-05 at 12:38 PM ET. With the worktrees-image mode on in that harness, every new slot is born in the image, so every finished lane's slot is now unremovable (a second slot refused the same way). mu-validate may take it right after #894, or before it if #898 is smaller; its call. Until then, finished image slots stay in place, unreclaimed.
+
+# Resolution
+
+Landed on main as f94ec1d9 (implementation f8a6fcd7 plus docstring fix). The bind record now keeps each slot's subvolume and mount ID; the process-use census ignores exactly the recorded bind's mount line (target, device and subvolume root all match), so an image-born slot's own bind is not an occupant while a foreign mount at the same path or under the slot still refuses. The path fence relocates the bind (umount, rename, re-bind at the fenced path) and final removal unbinds and deletes the subvolume; a failed unmount leaves slot, record and subvolume intact for a retry. Full gate on 6c889403 was green (validate OK).
