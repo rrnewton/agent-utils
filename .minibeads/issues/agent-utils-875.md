@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-census-exiting-pid: a PID exiting mid-census is re-probed instead of refused'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-validate
 created_at: 2026-11-05T08:49:54.496573472+00:00
-updated_at: 2026-11-05T08:49:54.496573472+00:00
+updated_at: 2026-11-05T10:57:54.319512936+00:00
+closed_at: 2026-11-05T10:57:54.319512826+00:00
 ---
 
 # Description
