@@ -912,14 +912,37 @@ Its screen is read in the layout above even when its program draws it
 differently. A screen whose every row starts one or more columns in, with turns
 labelled `You: ` and `Agent: ` (as agentterm draws them), loses that margin,
 its input frame at the bottom and any box down its right edge; a `You: ` row is
-read as a prompt row and the wrapped rows of an `Agent: ` row as its text. On
-such a screen a tag that shares its row with other text still counts: in
-`Agent: <CHAT_REPLY_046>` the label is dropped, text after an opening tag on its
-row is the reply's first line, text before a closing tag its last, text after
-a closing tag is dropped, and a row holding both tags is a whole reply. Rows
-are joined where the pane wrapped them at a word boundary. A block under an
-unknown ID, one with no closing tag, and a closing tag with no block are each
-reported to the agent, as on any screen. On every screen, the rows of the
+read as a prompt row and the wrapped rows of an `Agent: ` row as its text, and
+rows are joined where the pane wrapped them at a word boundary.
+
+On every screen, and in an agentcloud session's history (#852
+unknown-tui-bridge), a tag that shares its row with other text counts as a
+marker where it stands as one. An opening tag counts while no block is open (or
+on a bullet row at the left edge, which starts a new message), when it starts
+the text of a message, of a paragraph, of a row after a finished sentence, or
+follows a lead that ends with a colon, such as `Agent: <CHAT_REPLY_046>` or
+`Here is my answer: <CHAT_REPLY_046>`. A closing tag counts when it closes the
+open block of its ID, or, with no block open, when it ends a finished sentence
+at the end of its row. Text before such an opening tag is dropped, text after
+it on its row is the reply's first line, text before a closing tag its last,
+text after a closing tag is dropped, and a row holding both tags is a whole
+reply. A tag elsewhere, such as one in the middle of a sentence (`my reply under
+<CHAT_REPLY_046> did not go out`), in a backtick code span, a code fence or a
+tool call, is quoted, not a marker. So an example written after a colon, such as
+`Wrong: <CHAT_REPLY_046>Done.</CHAT_REPLY_046>`, is read as a reply: wrap an
+example tag in backticks. A block posts only under the ID of a request of this
+bridge that is still open; blocks of a closed or retired request, which stay
+on screen after it closes, are never posted and are not reported either. A
+block under an unknown ID, one with no
+closing tag, and a closing tag with no block are each reported to the agent. So
+is a tag of an open request written with a character missing or extra, such as
+`<CHAT_REPLY_046` with no closing bracket, `< CHAT_REPLY_046 >`,
+`&lt;CHAT_REPLY_046&gt;`, `[CHAT_REPLY_046]` or a lowercase name: its row is
+reported once, its block is not sent, and the notice asks for each tag exactly
+as the request names it, or for the reply through `agentctl chat reply ID
+--file FILE`. A name with no bracket beside it is how a tag is mentioned, and is
+not reported; nor is `CHAT_REPLY_046>`, which is how the bridge's own quotation
+of a tag reads once a pane drops its leading `‹`. On every screen, the rows of the
 bridge's own request prompt that name the tags (its `reply: <CHAT_REPLY_ID>`
 header field and its `Reply between a line ...` instruction) are never read as
 tags, and every notice about a reply that did not go out ends by naming
@@ -1628,15 +1651,16 @@ the capture, once a recovery scan shows the first row of its message or 64 such
 characters of it, as it can when rows move back down the screen.
 
 A recovery scan also reports a reply block of an open request whose opening or
-closing tag shared its row with other text. A marker counts only alone on its
-row, so such a tag neither opens nor closes a block, and the reply it was meant
+closing tag shared its row with other text where it does not stand as a marker
+(see above), so it neither opens nor closes a block, and the reply it was meant
 to mark is not sent. Two shapes are reported. In the first, while no block is
-open, an opening tag shares its row with other text, such as
-`<CHAT_REPLY_001>Done.`, and a closing tag of the same ID follows it, on that
+open, an opening tag follows prose in its row, such as
+`So <CHAT_REPLY_001>Done.`, and a closing tag of the same ID follows it, on that
 row or a later one, alone on its row or not, as in
-`Reply: <CHAT_REPLY_001>Done.</CHAT_REPLY_001>`. In the second, a block that an
+`Then <CHAT_REPLY_001>Done.</CHAT_REPLY_001>`. In the second, a block that an
 opening marker line began holds a closing tag of its ID in a row with other
-text, such as `Done.</CHAT_REPLY_001>`, and ends with no closing marker line. A
+text where it cannot close the block, such as a row of a tool call's command,
+and ends with no closing marker line. A
 single tag in a row with other text is not reported, since that is how prose or
 a tool call quotes a tag. An opening tag is read for its closing tag until a
 prompt row, a tool output row, a bullet row that starts left of the text of the

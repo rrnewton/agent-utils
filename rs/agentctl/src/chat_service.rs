@@ -17983,11 +17983,16 @@ esac
             .expect("reply ID in the prompt")
             .to_owned();
         let (opening, closing) = (format!("<CHAT_REPLY_{id}>"), format!("</CHAT_REPLY_{id}>"));
-        let tail = "remaining reply text. ".repeat(8);
+        // The opening tag follows prose, and no full stop ends the text before the closing tag,
+        // so neither tag is read as a marker (#852 unknown-tui-bridge).
+        let tail = "remaining reply text ".repeat(8);
         let screens = [
-            format!("⏺ Working.\n❯ question\n⏺ {opening}First line.\n  {tail}{closing}\n❯\u{a0}\n"),
             format!(
-                "⏺ Working.\n❯ question\n⏺ {opening}First line.\n  {tail}\n  {closing}\n❯\u{a0}\n"
+                "⏺ Working.\n❯ question\n⏺ So {opening}First line.\n  {tail}{closing}\n❯\u{a0}\n"
+            ),
+            format!(
+                "⏺ Working.\n❯ question\n⏺ So {opening}First line.\n  {tail}\n  {closing}\n\
+❯\u{a0}\n"
             ),
             format!("  {tail}\n  {closing}\n❯\u{a0}\n"),
         ];
