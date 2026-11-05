@@ -1011,9 +1011,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The three further #885 cases (forward recovery after completed
     # hooks, an abort removing a clean initialized submodule, and an
     # exact create recovering before a validation-batch seal) are mapped.
-    assert len(all_tests) == 2143
+    # The #912 dead-actor journal case (an unrelated mutation recovers a
+    # provably dead actor's absent-row journal; a live actor refuses) is mapped.
+    assert len(all_tests) == 2144
     assert len(ordinary) == 339
-    assert len(mapped) == 1804
+    assert len(mapped) == 1805
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

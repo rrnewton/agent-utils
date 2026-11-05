@@ -25831,11 +25831,126 @@ def _pending_journal_for_path(
     return matches[0] if matches else None
 
 
+def _journal_actor_identities(raw: Mapping[str, object]) -> list[ProcessIdentity]:
+    identities: list[ProcessIdentity] = []
+    try:
+        if raw.get("kind") == "create":
+            for field in ("owner", "coordinator_lease"):
+                identity = _identity_from_obj(raw.get(field), f"create journal.{field}")
+                if identity is not None:
+                    identities.append(identity)
+        elif raw.get("kind") == "import-existing":
+            record = _record_from_obj(raw.get("record"), "import journal.record")
+            if record.owner is not None:
+                identities.append(record.owner)
+        elif isinstance(raw.get("actor"), Mapping):
+            identity = _identity_from_obj(raw.get("actor"), "journal.actor")
+            if identity is not None:
+                identities.append(identity)
+    except (Refusal, StateError, KeyError, TypeError, ValueError):
+        return []
+    return identities
+
+
+def _cgroup_wrkslots_member(cgroup_path: str) -> bool | None:
+    try:
+        if _read_process_cgroup(Path("/proc/self")) == cgroup_path:
+            # The invoking mutation itself is a wrkslots process in this
+            # cgroup, so membership here cannot prove the actor survives;
+            # a shared cgroup is cohabitation, not identity.
+            return False
+    except Refusal:
+        pass
+    procs = Path("/sys/fs/cgroup") / cgroup_path.lstrip("/") / "cgroup.procs"
+    try:
+        members = procs.read_text(encoding="ascii").split()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    for member in members:
+        try:
+            cmdline = Path(f"/proc/{member}/cmdline").read_bytes()
+        except OSError:
+            continue
+        if b"wrkslots" in cmdline:
+            return True
+    return False
+
+
+def _journal_actor_proven_dead(raw: Mapping[str, object]) -> tuple[bool, str]:
+    identities = _journal_actor_identities(raw)
+    if not identities:
+        return False, "the journal records no actor process generation"
+    reasons: list[str] = []
+    for identity in identities:
+        state, reason = _process_state(identity)
+        if state != "dead":
+            return False, f"actor PID {identity.pid} is {state}: {reason}"
+        member = _cgroup_wrkslots_member(identity.cgroup_path)
+        if member is None:
+            return False, f"actor cgroup {identity.cgroup_path} cannot be inspected"
+        if member:
+            return False, f"a wrkslots process remains in actor cgroup {identity.cgroup_path}"
+        reasons.append(f"actor PID {identity.pid} is dead: {reason}")
+    return True, "; ".join(reasons) + "; no wrkslots process remains in its cgroup"
+
+
+def _recover_dead_actor_journals(config: Config) -> None:
+    """Recover an absent-row journal whose actor is provably dead (#912).
+
+    Called under a mutation lock. Only the absent-row kinds are recovered
+    here: their recovery needs no extra operator input and, like
+    ``wrkslots recover``, re-validates every row it retires. Any other
+    journal, a live or indeterminate actor, or a failed recovery is left
+    in place for the caller's ordinary refusal.
+    """
+    for path in _outstanding_journals(config):
+        try:
+            _loaded, raw = _load_journal(config, selected_path=path)
+        except (Refusal, StateError):
+            continue
+        if raw.get("kind") not in {
+            "recover-absent-validate-rows",
+            "recover-absent-agent-row",
+        }:
+            continue
+        proven, reason = _journal_actor_proven_dead(raw)
+        if not proven:
+            continue
+        try:
+            coordinator = _read_process_identity(os.getpid())
+            if raw.get("kind") == "recover-absent-validate-rows":
+                _recover_absent_validate_rows(config, path, raw, coordinator)
+            else:
+                _recover_absent_agent_row(config, path, raw, coordinator)
+        except (Refusal, StateError) as exc:
+            print(
+                f"wrkslots: left the dead actor's journal {path.name} in place: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        print(
+            f"wrkslots: recovered the dead actor's journal {path.name}; {reason}",
+            file=sys.stderr,
+        )
+
+
 def _assert_no_journal(config: Config) -> None:
+    _recover_dead_actor_journals(config)
     journals = _outstanding_journals(config)
     if journals:
+        detail = ""
+        try:
+            _loaded, raw = _load_journal(config, selected_path=journals[0])
+            _proven, reason = _journal_actor_proven_dead(raw)
+            detail = (
+                f" (kind {raw.get('kind')!r}, slot {raw.get('slot')!r}: {reason})"
+            )
+        except (Refusal, StateError):
+            detail = ""
         raise Refusal(
-            f"interrupted mutation recorded in {journals[0]}; run 'wrkslots recover' first"
+            f"interrupted mutation recorded in {journals[0]}; run 'wrkslots recover' first{detail}"
         )
 
 
@@ -26970,6 +27085,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         # with every sealed path before this create writes anything.
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         _recover_orphaned_validate_batch_seal(config)
+        _recover_dead_actor_journals(config)
         states, archives, absent_batch_paths, absent_batch_slots = (
             _validate_global_state_beside_absent_batch(config)
         )

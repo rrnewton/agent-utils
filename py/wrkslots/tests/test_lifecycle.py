@@ -47397,6 +47397,41 @@ def test_create_and_classification_proceed_beside_an_interrupted_absent_validate
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
+def test_dead_actor_absent_journal_is_recovered_by_an_unrelated_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#912: a provably dead actor's journal never blocks unrelated mutations."""
+    project, _input_path, config = _absent_batch_refused_after_its_archives(
+        tmp_path, monkeypatch
+    )
+    made = create(project, slot="fresh-h", agent="agent-fresh-h", branch="agent/fresh-h")
+    assert made.returncode == 0, made.stderr
+    journal = control_directory(project) / "ACTIVE.testhost.journal"
+    hold = [
+        "--project-root", str(project), "hold", "fresh-h", "--reason", "keep",
+    ]
+    capsys.readouterr()
+    # The journal's actor is this live test process: the mutation refuses,
+    # naming the actor and the recover command.
+    assert wrkslots.main(hold) != 0
+    refused = capsys.readouterr().err
+    assert "interrupted mutation recorded in" in refused
+    assert "recover-absent-validate-rows" in refused
+    assert journal.is_file()
+    # Kill the actor on paper: its recorded pid no longer names a live
+    # process, and no wrkslots process remains in its cgroup.
+    raw = json.loads(journal.read_text(encoding="utf-8"))
+    raw["actor"] = {**raw["actor"], "pid": 2_147_483_647}
+    wrkslots._write_journal(config, raw)  # type: ignore[arg-type]
+    assert wrkslots.main(hold) == 0, capsys.readouterr().err
+    recovered = capsys.readouterr().err
+    assert "recovered the dead actor's journal" in recovered
+    assert not journal.exists()
+    assert [row["slot"] for row in active_slots(project) if isinstance(row, dict)] == [
+        "fresh-h"
+    ]
+
+
 def test_doctor_reports_beside_an_interrupted_absent_validate_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
