@@ -1,10 +1,11 @@
 ---
 title: 'fixture-outlives-kill: test_launch_bridge_killed_first''s chat run must die with its test'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-05T00:25:31.112006848+00:00
-updated_at: 2026-11-05T00:25:31.112006848+00:00
+updated_at: 2026-11-05T01:50:37.654397380+00:00
+closed_at: 2026-11-05T01:50:37.654397249+00:00
 ---
 
 # Description
