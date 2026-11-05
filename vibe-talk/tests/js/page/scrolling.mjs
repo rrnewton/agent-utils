@@ -2511,10 +2511,9 @@ test("a desk's dock growing keeps a reader on the newest turn there, and moves n
   // THE CONTROL: nothing keeps the reader. The growth leaves them above the newest turn — further than
   // the slack, so this is the defect and not a rounding — and everything else comes out the same,
   // the return from Settings included: what the page does there, it did before this.
-  const control = await run(brokenScript(
-    "    if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) {\n      area.scrollTop = area.scrollHeight;\n    }\n",
-    ""
-  ));
+  const control = await run(await brokenModule([{ file: "src/view/channel/listkeepers.ts",
+    find: "      if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) {\n        area.scrollTop = area.scrollHeight;\n      }\n",
+    replace: "" }]));
   assert.ok(GROWTH > BOTTOM_SLACK_PX, "the premise: a second row is more than the slack");
   assert.deepStrictEqual(control, { ...real, newest: false });
 });
@@ -3492,9 +3491,9 @@ test("`#281 view-keys` x `#280 scroll-stability`: Ctrl+1 to Ctrl+4 show each vie
   assert.deepStrictEqual(placedEarly, { ...real, listFoot: false });
   // The right column's reader kept on its foot in two columns only: a card growing under a reader at the
   // foot of the thread list leaves them above it.
-  const twoOnly = await run(brokenScript(
-    "if (!sideColumnUp() || screens.screen() !== \"main\" || screens.view() !== \"discord\") return false;",
-    "if (!layoutShown.columns() || screens.screen() !== \"main\" || screens.view() !== \"discord\") return false;"));
+  const twoOnly = await run(await brokenModule([{ file: "src/view/channel/listkeepers.ts",
+    find: "if (!sideColumnUp() || screens.screen() !== \"main\" || screens.view() !== \"discord\") return false;",
+    replace: "if (!layoutShown.columns() || screens.screen() !== \"main\" || screens.view() !== \"discord\") return false;" }]));
   assert.deepStrictEqual(twoOnly, { ...real, cardGrewFoot: false });
 });
 
@@ -3562,11 +3561,11 @@ test("`#281 view-keys` x `#280 scroll-stability`: the dock growing under the car
   // THE CONTROL: the keeper for a thread on the right only, as before. The dock growing leaves the cards
   // above their foot, in the thread list and beside Main — further than the slack, so this is the defect and
   // not a rounding — and the reader up the cards and the window losing height come out the same.
-  const threadOnly = await run(brokenScript(
-    "    if (sideColumnUp() && screens.view() === \"discord\" && columns.side.mode === \"list\") {\n" +
-    "      if (!cardsDrawn.opening() && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) followFoot(area);\n" +
-    "      return;\n    }\n",
-    ""));
+  const threadOnly = await run(await brokenModule([{ file: "src/view/channel/listkeepers.ts",
+    find: "      if (sideColumnUp() && screens.view() === \"discord\" && columns.side.mode === \"list\") {\n" +
+      "        if (!cardsDrawn.opening() && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) followFoot(area);\n" +
+      "        return;\n      }\n",
+    replace: "" }]));
   assert.ok(GROWTH > BOTTOM_SLACK_PX, "the premise: a second row is more than the slack");
   assert.deepStrictEqual(threadOnly, { ...real, listFoot: false, nearFoot: false, twoFoot: false });
 });
@@ -3731,8 +3730,8 @@ test("`#338 column-overscroll` x `#280 scroll-stability`: THE LAST CARD SHRINKIN
 
   // THE CONTROLS. The foot keeper not holding the reader in the room: the room is fitted only after, and the
   // card is left where the browser's clamp dropped it, the room now longer than where the reader is.
-  const unheld = await run(brokenScript("    holdOverscrollReader(area);\n    const was = footing;\n",
-    "    const was = footing;\n"));
+  const unheld = await run(await brokenModule([{ file: "src/view/channel/listkeepers.ts", find: "      holdOverscrollReader(area);\n      const was = footing;\n",
+    replace: "      const was = footing;\n" }]));
   assert.deepStrictEqual(unheld, { ...real, held: 2 * LINE_PX, atEnd: false });
   // The room kept whatever the list's length: blank room left under two cards that do not scroll.
   const kept = await run(await brokenModule([{ file: "src/view/channel/footroom.ts",

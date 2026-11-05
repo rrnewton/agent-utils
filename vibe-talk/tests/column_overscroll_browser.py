@@ -274,12 +274,15 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# The rooms past the right column's foot, moved from voice.js into a module (`#624 voice-page-modularity`).
+# The rooms past the right column's foot, and the keepers of the lists' readers, moved from voice.js into modules
+# (`#624 voice-page-modularity`).
 FOOT_ROOMS = "src/view/channel/footroom.ts"
+LIST_KEEPERS = "src/view/channel/listkeepers.ts"
 
 # Each negative control: its name, the file of the page it changes, the texts it takes out and what it puts in
-# their place, and the checks (by their tags) one of which must be the one that fails.
-Control = tuple[str, str, tuple[tuple[str, str], ...], tuple[str, ...]]
+# their place, and the checks (by their tags) one of which must be the one that fails. A patch naming a file of its
+# own, as (file, text, instead), changes that file instead.
+Control = tuple[str, str, tuple[tuple[str, ...], ...], tuple[str, ...]]
 CONTROLS: tuple[Control, ...] = (
     ("no room drawn", "voice.css",
      (("  #side-scroll > #side-overscroll {\n    display: block;\n  }\n", ""),), ("WHEEL",)),
@@ -293,7 +296,7 @@ CONTROLS: tuple[Control, ...] = (
     ("the last card's change of size neither fitted to nor held", "voice.js",
      (("  fitOverscroll(pane.scroller());\n  pane.scroller().scrollTop += row.getBoundingClientRect().top - before;\n",
        "  pane.scroller().scrollTop += row.getBoundingClientRect().top - before;\n"),
-      ("    holdOverscrollReader(area);\n    const was = footing;\n", "    const was = footing;\n")),
+      (LIST_KEEPERS, "      holdOverscrollReader(area);\n      const was = footing;\n", "      const was = footing;\n")),
      ("HIGHLIGHT",)),
     ("the search not what the room was opened over", "voice.js",
      (("inColumn(columns.side, () => [channelContextKey(), pinsView().only, searchKey()])",
@@ -332,7 +335,8 @@ def main() -> int:
             # Built from patched sources exactly as the page is (`#624 voice-page-modularity`): each
             # text must occur once, or the control is refused rather than run unchanged.
             fixture.WEB_ROOT = page_sources.variant(root, Path(copies) / f"control-{at}",
-                                                    [(file, part, instead) for part, instead in patches])
+                                                    [(patch[0], patch[1], patch[2]) if len(patch) == 3 else (file, patch[0], patch[1])
+                                                     for patch in patches])
             failed = ""
             try:
                 walk(playwright.chromium, args, f"control-{at}", *CONTROL_SIZE[1:], rest_ms, probe=tags)

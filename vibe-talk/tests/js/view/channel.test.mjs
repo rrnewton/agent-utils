@@ -975,3 +975,164 @@ test("`#624 voice-page-modularity`: watching the lists answers a scroll at once,
     "a browser with no ResizeObserver lost the scroll listener, or a second watcher was asked for after the first was refused");
   bare.unmount();
 });
+
+test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line as the dock grows, keep the right column's reader on its foot only where nothing else holds it, measure the arrows once per burst, and stop", () => {
+  const { mountListKeepers, createUnderLists } = CHANNEL_VIEW;
+  const log = [];
+  const box = (id, extra = {}) => ({ id, clientHeight: 500, clientWidth: 400, scrollTop: 100, scrollHeight: 2000, children: [], listeners: [],
+    addEventListener(type, listener, options) { this.listeners.push({ type, listener, options }); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); }, ...extra });
+  const main = box("scroll-area");
+  const sideLog = box("side-log");
+  const overscroll = box("side-overscroll");
+  const overextend = box("side-overextend");
+  const side = box("side-scroll", { children: [sideLog, overscroll, overextend] });
+  const log2 = box("discord-log");
+  const els = { "scroll-area": main, "discord-log": log2 };
+  const lefts = { "side-scroll": side, "side-log": sideLog, "side-overscroll": overscroll, "side-overextend": overextend };
+  const watchers = [];
+  const timers = [];
+  const state = { sizes: true, screen: "main", view: "discord", dock: 50, bottom: new Set(), quick: false, landing: false, filter: false,
+    writing: false, written: false, sideUp: true, showing: true, mode: "thread", opening: false, columns: true, walk: false, held: null };
+  const columns = { main: { name: "main", mode: "main" }, side: { name: "side", get mode() { return state.mode; } } };
+  const was = globalThis.setTimeout;
+  globalThis.setTimeout = (act) => { timers.push(act); return timers.length; };
+  try {
+    const keepers = mountListKeepers({
+      canWatchSizes: () => state.sizes,
+      sizeWatcher: (report) => { const watcher = { report, watched: [], stopped: false, observe(target) { this.watched.push(target.id); }, disconnect() { this.stopped = true; } }; watchers.push(watcher); return watcher; },
+      el: (id) => els[id],
+      leftEl: (id) => lefts[id],
+      screens: { screen: () => state.screen, view: () => state.view },
+      underLists: createUnderLists(),
+      cardsDrawn: { opening: () => state.opening },
+      columns,
+      layoutShown: { columns: () => state.columns },
+      bottomSlackPx: 24,
+      heightUnderLists: () => state.dock,
+      quickReplyHolds: () => state.quick,
+      placeQuickReply: () => log.push("quick reply placed"),
+      entryLandingHolds: () => state.landing,
+      entryState: () => ({ landing: { row: "landing-row", first: "landing-first" } }),
+      placeEntryLanding: (row, first) => log.push(`landing ${row} ${first}`),
+      keepFilterHold: () => state.filter,
+      heldFilterRow: () => state.held,
+      searchWalkAnchored: () => state.walk,
+      voiceCall: () => ({ writingToAgent: () => state.writing, keepComposerInView: () => log.push("call box kept") }),
+      keepWrittenBox: (area) => { if (state.written) log.push(`box kept ${area.id}`); return state.written; },
+      atBottom: (area, slack) => { log.push(`at bottom? ${area.id} ${slack}`); return state.bottom.has(area.id); },
+      followFoot: (area) => log.push(`follow ${area.id}`),
+      sideColumnUp: () => state.sideUp,
+      sideShowing: () => state.showing,
+      inColumn: (column, act) => { log.push(`in ${column.name}`); return act(); },
+      fitOverextend: (area) => log.push(`fit room ${area.id}`),
+      holdOverscrollReader: (area) => log.push(`hold ${area.id}`),
+      channelContextKey: () => "c1",
+      pinsView: () => ({ only: false }),
+      measureReplyArrows: () => log.push("arrows"),
+    });
+    assert.deepStrictEqual(watchers.map((one) => one.watched), [["scroll-area"], ["side-scroll"], ["side-log"], ["discord-log"], ["side-log"]],
+      "a list went unwatched, or the right column's own rooms were watched");
+    const [mainDock, sideDock, footKeeper, arrows, sideArrows] = watchers;
+    const run = (act) => { log.length = 0; act(); return [...log]; };
+    // Main's list: the first report notes; the dock growing under a reader at the foot keeps them on it.
+    assert.deepStrictEqual(run(() => mainDock.report()), []);
+    state.dock = 92;
+    state.bottom = new Set(["scroll-area"]);
+    main.scrollTop = 100;
+    assert.deepStrictEqual(run(() => mainDock.report()), ["at bottom? scroll-area 66"]);
+    assert.equal(main.scrollTop, 2000, "a reader on the newest line was left above it as the dock grew");
+    state.dock = 130;
+    state.bottom = new Set();
+    main.scrollTop = 100;
+    assert.deepStrictEqual(run(() => mainDock.report()), ["at bottom? scroll-area 62"]);
+    assert.equal(main.scrollTop, 100, "a reader up the list was moved");
+    for (const [hold, said] of [["quick", "quick reply placed"], ["landing", "landing landing-row landing-first"]]) {
+      state[hold] = true;
+      state.dock += 10;
+      assert.deepStrictEqual(run(() => mainDock.report()), [said], `the dock keeper did not leave ${hold} to its own rule`);
+      state[hold] = false;
+    }
+    state.filter = true;
+    state.dock += 10;
+    assert.deepStrictEqual(run(() => mainDock.report()), [], "a filter's hold was moved");
+    state.filter = false;
+    state.writing = true;
+    main.clientHeight = 300;
+    assert.deepStrictEqual(run(() => mainDock.report()), ["call box kept"], "the call's box was not kept in view as the list shrank");
+    state.writing = false;
+    state.written = true;
+    assert.deepStrictEqual(run(() => mainDock.report()), ["box kept scroll-area"]);
+    state.written = false;
+    state.screen = "settings";
+    state.dock += 40;
+    assert.deepStrictEqual(run(() => mainDock.report()), [], "growth off the main screen was followed");
+    state.screen = "main";
+    // The right column under the same dock: the cards follow their foot unless they are opening; a thread, in its column.
+    assert.deepStrictEqual(run(() => sideDock.report()), ["in side"], "the right column's first report did more than note");
+    state.dock += 30;
+    state.mode = "list";
+    state.bottom = new Set(["side-scroll"]);
+    assert.deepStrictEqual(run(() => sideDock.report()), ["at bottom? side-scroll 54", "follow side-scroll"]);
+    state.opening = true;
+    state.dock += 30;
+    assert.deepStrictEqual(run(() => sideDock.report()), [], "the cards followed their foot while opening");
+    state.opening = false;
+    state.mode = "thread";
+    state.dock += 30;
+    assert.deepStrictEqual(run(() => sideDock.report()), ["in side", "at bottom? side-scroll 54", "follow side-scroll"]);
+    state.landing = true;
+    state.dock += 30;
+    assert.deepStrictEqual(run(() => sideDock.report()), ["in side", "landing landing-row landing-first"]);
+    state.landing = false;
+    state.showing = false;
+    state.dock += 30;
+    assert.deepStrictEqual(run(() => sideDock.report()), [], "a column not showing was kept");
+    state.showing = true;
+    state.screen = "help";
+    state.dock += 30;
+    sideDock.report();
+    state.screen = "main";
+    state.bottom = new Set(["side-scroll"]);
+    assert.deepStrictEqual(run(() => sideDock.report()), ["in side", "at bottom? side-scroll 54", "follow side-scroll"],
+      "growth while another screen was up was not reckoned from the column as the reader left it");
+    // The right column's foot keeper: a reader on the newest line, the column the same size and showing the same, is kept on it.
+    const scrolled = () => { for (const one of side.listeners.filter((each) => each.type === "scroll")) one.listener(); };
+    assert.deepStrictEqual(side.listeners.map((one) => [one.type, one.options]), [["scroll", { passive: true }]]);
+    state.bottom = new Set(["side-scroll"]);
+    footKeeper.report();
+    scrolled();
+    state.bottom = new Set();
+    assert.deepStrictEqual(run(() => footKeeper.report()), ["fit room side-scroll", "hold side-scroll", "in side", "at bottom? side-scroll 1", "in side", "follow side-scroll", "at bottom? side-scroll undefined"]);
+    scrolled();
+    state.bottom = new Set(["side-scroll"]);
+    footKeeper.report();
+    side.clientWidth = 300;
+    state.bottom = new Set();
+    assert.ok(!run(() => footKeeper.report()).includes("follow side-scroll"), "a resize of the column was taken for its content changing");
+    state.bottom = new Set(["side-scroll"]);
+    footKeeper.report();
+    state.walk = true;
+    state.bottom = new Set();
+    assert.ok(!run(() => footKeeper.report()).includes("follow side-scroll"), "a reader the search's walk holds was taken to the foot");
+    state.walk = false;
+    // The arrows: one measure per burst, after the task; the right column's only while it shows, in its column.
+    arrows.report();
+    arrows.report();
+    sideArrows.report();
+    assert.equal(timers.length, 2, "a burst asked for more than one measure");
+    assert.deepStrictEqual(run(() => { for (const act of timers.splice(0)) act(); }), ["arrows", "in side", "arrows"]);
+    state.showing = false;
+    sideArrows.report();
+    assert.deepStrictEqual(run(() => { for (const act of timers.splice(0)) act(); }), [], "the right column's arrows were measured while it was not showing");
+    keepers.unmount();
+    assert.deepStrictEqual([side.listeners.length, watchers.every((one) => one.stopped)], [0, true], "a listener or a watcher outlived unmount");
+    // Without a ResizeObserver: nothing watched, and no scroll listener for the foot keeper either.
+    state.sizes = false;
+    watchers.length = 0;
+    mountListKeepers({ canWatchSizes: () => false, sizeWatcher: () => assert.fail("a watcher was made"), el: (id) => els[id], leftEl: (id) => lefts[id] });
+    assert.deepStrictEqual([watchers.length, side.listeners.length], [0, 0]);
+  } finally {
+    globalThis.setTimeout = was;
+  }
+});

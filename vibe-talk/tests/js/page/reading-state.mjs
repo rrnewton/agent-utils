@@ -1488,8 +1488,9 @@ test("...and the dock and the chips changing as the thread opens leave the first
   assert.equal(real.newestKept, true, "a reader who went down to the newest line was not kept on it");
 
   // THE CONTROLS: either observer reading the landing as a reader on the newest line.
-  const dockOnly = await run(brokenScript(
-    "    if (entryLandingHolds()) {\n      placeEntryLanding(entryState().landing.row, entryState().landing.first);\n      return;\n    }\n", ""));
+  const dockOnly = await run(await brokenModule([{ file: "src/view/channel/listkeepers.ts",
+    find: "      if (entryLandingHolds()) {\n        placeEntryLanding(entryState().landing.row, entryState().landing.first);\n        return;\n      }\n",
+    replace: "" }]));
   assert.deepStrictEqual(dockOnly, { ...real, afterDock: false, afterChips: false });
   const chipsOnly = await run(brokenScript(
     "const landed = screens.screen() === \"main\" && screens.view() === \"discord\" && entryLandingHolds();",
