@@ -39253,7 +39253,10 @@ def _recover_validate_batch_seal_journal(
                 continue
             errors.append(
                 f"sealed target {slot} is absent while its ACTIVE row remains "
-                f"(the seal's coordinator is {actor_state}: {actor_reason})"
+                f"(the seal's coordinator is {actor_state}: {actor_reason}); "
+                f"remedy: rerun 'wrkslots recover --slot {slot} "
+                "--coordinator-pid <coordinator-pid>' so that slot's paired "
+                "finish is recovered before the seal"
             )
             unresolved.append(
                 _private_cleanup_target_to_obj(config, slot, generation, target)
@@ -44653,6 +44656,8 @@ def _abort_create(
     slot_type: str,
     plan: Sequence[PlannedCheckout],
     recorded_created: Sequence[Checkout],
+    *,
+    journal_payload: Mapping[str, object] | None = None,
 ) -> None:
     slot_path = _slot_directory(config, slot, slot_type)
     vcs = _GitVcs()
@@ -44850,9 +44855,14 @@ def _abort_create(
         except OSError as exc:
             raise Refusal(f"cannot remove aborted slot directory {slot_path}: {exc}") from exc
         _fsync_directory(slot_path.parent)
+    # #885 item 6: when the journal file itself is gone, the payload the
+    # caller recovered from append-only history makes the create
+    # terminal; only re-read the file when no payload was supplied.
     _clear_journal(
         config,
-        _as_mapping(_read_json(journal_path, "create journal"), "create journal"),
+        journal_payload
+        if journal_payload is not None
+        else _as_mapping(_read_json(journal_path, "create journal"), "create journal"),
         journal_path=journal_path,
     )
     print(f"aborted incomplete create slot={slot}; removed provisional worktrees and branches")
@@ -45126,7 +45136,9 @@ def _recover_create(
         print(f"recovered create: active state was durable; cleared journal for {slot}")
         return
     if abort_create:
-        _abort_create(config, path, slot, slot_type, plan, recorded_created)
+        _abort_create(
+            config, path, slot, slot_type, plan, recorded_created, journal_payload=raw
+        )
         return
     if task_scope is not None:
         # Refuse before provisioning or hooks run for an owner whose scope has

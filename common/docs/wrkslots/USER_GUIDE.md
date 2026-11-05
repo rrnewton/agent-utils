@@ -11,6 +11,11 @@ slots. New-slot source repositories stay outside both directories. The recovery-
 an existing source worktree inside managed storage solely to prove a stranded checkout's Git common
 directory; it does not make that path valid for provisioning. `ACTIVE.*` and `ARCHIVED.*` are
 readable compatibility views derived from `EVENTS.*`; do not edit any of them or a journal by hand.
+If a create journal file is gone while the append-only history still names it (for example after
+a hand repair moved it aside), do not recreate it by hand: run
+`wrkslots recover --slot SLOT --abort-create --coordinator-pid <coordinator-pid>` to make that
+interrupted create terminal from the recorded history, which removes its unchanged provisional
+worktrees and branches and leaves no registry row; later creates then classify cleanly again.
 
 Each checkout record carries its source repository, branch, starting commit, configured remote,
 remote identity, landed ref, current commit, and remote containment evidence. Each slot records its

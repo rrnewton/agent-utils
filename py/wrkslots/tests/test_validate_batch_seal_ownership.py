@@ -359,6 +359,8 @@ def test_seal_whose_target_was_reaped_does_not_deadlock_absent_row_recovery(
         assert recovered.returncode == 3, recovered.stderr
         assert "is absent while its ACTIVE row remains" in recovered.stderr
         assert "the seal's coordinator is live" in recovered.stderr
+        # #885 item 8: the refusal names the scoped recovery to run.
+        assert "recover --slot target" in recovered.stderr
         assert seal.read_bytes() == sealed
         assert [row.slot for row in wrkslots._load_active(config).slots] == ["target"]
         return

@@ -1013,9 +1013,12 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # exact create recovering before a validation-batch seal) are mapped.
     # The #912 dead-actor journal case (an unrelated mutation recovers a
     # provably dead actor's absent-row journal; a live actor refuses) is mapped.
-    assert len(all_tests) == 2144
+    # The two remaining #885 cases (an unscoped recovery resolving an
+    # absent sealed target, and an abort making a missing create journal
+    # terminal) are mapped.
+    assert len(all_tests) == 2146
     assert len(ordinary) == 339
-    assert len(mapped) == 1805
+    assert len(mapped) == 1807
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

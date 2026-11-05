@@ -12319,6 +12319,61 @@ def test_exact_create_recovers_before_a_validation_batch_seal(
     assert recovered_seals
 
 
+def test_unscoped_recover_resolves_an_absent_sealed_target_like_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #885 item 8: after the path fence, the sealed target's original
+    # path is absent while its ACTIVE row remains; unscoped recovery
+    # must resolve the paired finish the way --slot target does.
+    project, _repository, _remote = make_project(tmp_path)
+    stub_validate_batch_censuses(monkeypatch)
+    fenced = interrupt_scoped_private_finish(
+        project, monkeypatch, "after-path-fence"
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    target = wrkslots._slot_directory(config, "target", "validate")
+    assert not target.exists()
+    assert fenced.is_dir()
+    assert len(active_slots(project)) == 1
+
+    assert recover_scoped_target(project) == 0
+
+    assert active_slots(project) == []
+    assert not fenced.exists()
+    assert not finish_journal_path(project, "target").exists()
+    assert not wrkslots._validate_batch_seal_journal_path(config).exists()
+
+
+def test_abort_create_makes_a_missing_journal_terminal(tmp_path: Path) -> None:
+    # #885 item 6: the journal file was moved aside by a hand repair, but
+    # append-only history still names it; abort must still make the
+    # interrupted create terminal instead of refusing as missing.
+    project, journal = _orphaned_ownerless_create(tmp_path)
+    target = checkout(project)
+    assert target.is_dir()
+    journal.unlink()
+    assert not journal.exists()
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode == 0, aborted.stderr
+    assert active_slots(project) == []
+    assert not target.exists()
+    repository = project / "repo"
+    assert str(target) not in git(repository, "worktree", "list", "--porcelain").stdout
+    config = wrkslots._load_config(str(project), "testhost")
+    states, archives = wrkslots._validate_global_state(config)
+    assert wrkslots._classify_create_journals(config, states, archives) == ()
+
+
 def test_create_recovery_refuses_task_scope_that_does_not_match_owner(
     tmp_path: Path,
 ) -> None:
