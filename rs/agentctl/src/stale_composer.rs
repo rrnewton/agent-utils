@@ -161,6 +161,15 @@ pub trait ComposerPane {
     fn terminal(&self) -> &dyn PromptTerminal;
     /// The Herdr pane identifier.
     fn pane_id(&self) -> &str;
+    /// Submit the draft with Enter when agentctl itself typed it, a paste a sender left unsent,
+    /// rather than clear it (#884 pane-lock-held-on-unobserved-paste): `Some(Ok(evidence))`
+    /// when it was submitted, `Some(Err(reason))` when it was ours and the Enter failed, `None`
+    /// when it is not agentctl's or that cannot be told. Called under [`Self::lock`]. The
+    /// default cannot tell.
+    fn flush_own_draft(&self, harness: &str) -> Option<Result<String, String>> {
+        let _ = harness;
+        None
+    }
 }
 
 /// What one [`StaleComposer::step`] did.
@@ -173,6 +182,9 @@ pub enum Step {
     /// The draft is due, but was not cleared at this step; the reason says why. A later step
     /// tries again.
     Held(String),
+    /// The draft was a prompt agentctl typed, left unsent; it was submitted with Enter, never
+    /// cleared. The evidence says how the submission was proved.
+    Flushed(String),
     /// The draft was saved and cleared, and the composer proved empty.
     Cleared {
         /// The private file that holds the draft.
@@ -336,6 +348,31 @@ impl StaleComposer {
             ));
             return Step::Held("the composer changed just before the draft was due".to_owned());
         }
+        // A draft agentctl typed is a message on its way, not the owner's text: send it.
+        match pane.flush_own_draft(&observation.harness) {
+            Some(Ok(evidence)) => {
+                drop(lock);
+                self.watched = None;
+                log(format!(
+                    "agentctl: stale composer: pane {} draft ({}) is a prompt agentctl typed; \
+                     submitted it with Enter instead of clearing it: {evidence}",
+                    pane.pane_id(),
+                    describe(&watched.text)
+                ));
+                return Step::Flushed(evidence);
+            }
+            Some(Err(error)) => {
+                drop(lock);
+                self.restart(now);
+                let detail = format!(
+                    "the draft is a prompt agentctl typed, but Enter did not submit it, so \
+                     nothing was cleared: {error}"
+                );
+                log(format!("agentctl: stale composer: {detail}"));
+                return Step::Failed(detail);
+            }
+            None => {}
+        }
         let backup = match write_backup(&self.backup_directory, &watched.text) {
             Ok(path) => path,
             Err(error) => {
@@ -483,6 +520,8 @@ pub struct HerdrComposerPane<'a> {
     runtime: &'a dyn AgentRuntime,
     take_lock: bool,
     expect_terminal: Option<String>,
+    /// The agent's queue, whose typed-prompt records tell a draft agentctl typed.
+    typed_queue: Option<PathBuf>,
 }
 
 impl<'a> HerdrComposerPane<'a> {
@@ -503,7 +542,16 @@ impl<'a> HerdrComposerPane<'a> {
             runtime,
             take_lock,
             expect_terminal,
+            typed_queue: None,
         }
+    }
+
+    /// Tell a draft agentctl typed by the typed-prompt records of the agent queue `queue`, and
+    /// submit such a draft instead of clearing it ([`ComposerPane::flush_own_draft`]).
+    #[must_use]
+    pub fn with_typed_queue(mut self, queue: PathBuf) -> Self {
+        self.typed_queue = Some(queue);
+        self
     }
 }
 
@@ -548,6 +596,18 @@ impl ComposerPane for HerdrComposerPane<'_> {
 
     fn pane_id(&self) -> &str {
         &self.pane_id
+    }
+
+    fn flush_own_draft(&self, harness: &str) -> Option<Result<String, String>> {
+        let queue = self.typed_queue.as_deref()?;
+        if !submission::verified(harness) {
+            return None;
+        }
+        match submission::recover_typed_draft(self, &self.pane_id, harness, queue, self.runtime) {
+            Ok(Some(evidence)) => Some(Ok(evidence)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error.to_string())),
+        }
     }
 }
 
@@ -628,6 +688,8 @@ mod tests {
         screen: FakeScreen,
         status: Mutex<String>,
         locks: AtomicU64,
+        /// The agent queue whose typed-prompt records tell agentctl's own drafts.
+        typed_queue: Option<PathBuf>,
     }
 
     impl FakePane {
@@ -638,6 +700,7 @@ mod tests {
                 screen,
                 status: Mutex::new("idle".to_owned()),
                 locks: AtomicU64::new(0),
+                typed_queue: None,
             }
         }
         fn composer(&self) -> String {
@@ -668,6 +731,20 @@ mod tests {
         }
         fn pane_id(&self) -> &str {
             "w1:p1"
+        }
+        fn flush_own_draft(&self, harness: &str) -> Option<Result<String, String>> {
+            let queue = self.typed_queue.as_deref()?;
+            match submission::recover_typed_draft(
+                &self.screen,
+                "w1:p1",
+                harness,
+                queue,
+                &Clock::default(),
+            ) {
+                Ok(Some(evidence)) => Some(Ok(evidence)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error.to_string())),
+            }
         }
     }
 
@@ -820,6 +897,42 @@ mod tests {
             "{:?}",
             harness.logged
         );
+    }
+
+    /// #884 pane-lock-held-on-unobserved-paste: a draft agentctl typed and never got sent (a
+    /// paste set aside as possibly submitted that was still in the composer) is a message on
+    /// its way: it is submitted with Enter, not saved and deleted.
+    #[test]
+    fn a_draft_agentctl_typed_is_submitted_not_cleared() {
+        let owner = "[from Ada via chat · reply: <r3>]\nwhat is the deploy status?";
+        let mut pane = FakePane::new("");
+        pane.screen.leave_draft(owner);
+        let mut harness = Harness::new("own-draft");
+        let queue = harness.directory.0.join("queue");
+        fs::create_dir_all(queue.join("failed")).unwrap();
+        crate::agent::atomic_json(
+            &queue.join("failed/owner.json"),
+            &serde_json::json!({"id": "owner", "text": owner, "delivery_state": "failed",
+                                "inflight_at": std::time::UNIX_EPOCH.elapsed().unwrap().as_secs_f64()}),
+        )
+        .unwrap();
+        pane.typed_queue = Some(queue);
+        assert_eq!(harness.step(&pane, 0), Step::Watching);
+        let step = harness.step(&pane, 30);
+        assert!(
+            matches!(step, Step::Flushed(_)),
+            "{step:?} {:?}",
+            harness.logged
+        );
+        let screen = pane.screen.state();
+        assert_eq!(screen.submitted, [owner]);
+        assert!(screen.composer.is_empty());
+        drop(screen);
+        assert!(
+            harness.backups().is_empty(),
+            "nothing was saved and deleted"
+        );
+        assert!(harness.transport.posted.is_empty(), "no clear notice");
     }
 
     #[test]

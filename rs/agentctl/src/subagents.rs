@@ -31,7 +31,7 @@ use crate::client::{
     CustomProcessIdentity, HerdrClient, Pane, PaneShellProof, ProcessLiveness,
 };
 use crate::error::{AdapterError, AdapterErrorKind};
-use crate::submission::{GuardedInput, GuardedPrompt, Submission, SubmitTimeouts};
+use crate::submission::{GuardedInput, GuardedPrompt, Submission};
 
 mod cloud;
 mod control;
@@ -1690,12 +1690,13 @@ impl ManagedApi for HerdrClient {
                 &runtime.audit_id(),
                 "verified",
                 || {
+                    // A short stage under the pane's locks, as the direct path (#884).
                     crate::submission::submit_verified(
                         &GuardedPrompt(terminal),
                         pane,
                         &harness,
                         text,
-                        SubmitTimeouts::default(),
+                        crate::submission::in_lock_timeouts(),
                         runtime,
                     )
                 },
@@ -1726,7 +1727,7 @@ impl ManagedApi for HerdrClient {
             pane,
             harness,
             text,
-            SubmitTimeouts::default(),
+            crate::submission::in_lock_timeouts(),
             runtime,
         )
     }

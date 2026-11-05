@@ -5,7 +5,7 @@ priority: 0
 issue_type: bug
 assignee: cl-start
 created_at: 2026-11-05T11:29:26.054636742+00:00
-updated_at: 2026-11-05T11:29:26.054636742+00:00
+updated_at: 2026-11-05T11:55:49.000000000+00:00
 ---
 
 # Description
@@ -44,3 +44,22 @@ Two follow-on defects lose or damage messages:
 # Notes
 
 Reported by the lead on 2026-11-05 at 06:27 AM ET (P0; the owner is affected). Assigned to cl-start, at the top of its queue.
+
+## Resolution
+
+[opus 5.5] cl-start, 2026-11-05. Items 1-3 are delivered; item 4 is mitigated, not diagnosed; item 5 is not in this repository. The issue stays open for item 4.
+
+1. No sender waits for its paste under the locks. `prompt_guarded`, `submit_guarded` and the queue drain's verified submission all use `submission::in_lock_timeouts()`: a 10 s stage window and no late-paste grace. A paste that has not shown by then is refused as `stranded_prompt: late_paste`, with what the composer showed. The drain keeps the prompt pending (`stranded_at`, `typed_as`) and returns, releasing the queue lock, the host-wide target lock and the pane admission lock. Later passes press Enter on the paste once it shows, never typing it again. A pass that still sees an empty composer 300 s after the first refusal reports `late_paste_lost`; the drain clears the stranded marks and types the prompt again in the same pass. The old in-lock 60 s + 240 s wait and the verified-late re-admit are gone. A pane admission flock that times out is now `not_staged` ("nothing was typed"), not `unavailable`.
+2. A delivery cancelled before anything was typed (`paste_started_at` absent) is `NotStaged`: the prompt stays pending and is tried again, never quarantined as possibly submitted.
+3. The chat bridge's stale-composer clear first asks whether agentctl typed the draft, using the same matcher as draft recovery (`submission::recover_typed_draft` over the agent's queue records). If agentctl did, it presses Enter on the draft (`Step::Flushed`): no backup is written and no notice is posted.
+4. On a stranded retry, a composer holding a single paste placeholder (`[Pasted text #N +k lines]`, whatever its number or size) counts as our paste and gets Enter only. A fresh delivery still refuses an unknown placeholder. Why the paste went unmatched on the consumer host is still unknown: `admissions.jsonl` holds no screens. The refusal now records the composer evidence, so the next occurrence will show it.
+5. The delivery-alarm entry 5c8a12ea is deployment state on the consumer host, not in this repository.
+
+Tests:
+- `agent::tests::an_unobserved_paste_releases_the_locks_within_seconds_and_the_next_pass_submits_it`: the submission takes at most 5 s of clock time under the locks, and the prompt is typed once.
+- `agent::tests::a_delivery_cancelled_before_typing_stays_pending_and_is_retried`.
+- `submission::tests::an_unobserved_paste_under_the_locks_is_reported_stranded_within_seconds`.
+- `a_stranded_retry_never_types_again_while_the_paste_may_still_show`.
+- `a_stranded_retry_reports_the_paste_lost_after_the_late_paste_window`.
+- `a_stranded_retry_submits_its_paste_drawn_as_a_placeholder_of_another_size`.
+- `stale_composer::tests::a_draft_agentctl_typed_is_submitted_not_cleared`.

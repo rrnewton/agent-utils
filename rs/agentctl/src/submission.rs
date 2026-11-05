@@ -44,6 +44,33 @@ pub const STAGE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const STAGE_GRACE: Duration = Duration::from_secs(240);
 /// Poll interval during the late-paste grace.
 pub const STAGE_POLL_SLOW: Duration = Duration::from_secs(2);
+/// How long a queue drain waits, holding the pane's locks, for its paste to show (#884
+/// pane-lock-held-on-unobserved-paste). Every other sender to the pane waits behind those
+/// locks, so a paste not drawn by then is reported stranded and the locks are released; a
+/// later pass presses Enter on it once it shows ([`STAGE_TIMEOUT`] plus [`STAGE_GRACE`] after
+/// it was typed), or types the prompt again once that window has passed with no sign of it.
+pub const STAGE_IN_LOCK: Duration = Duration::from_secs(10);
+
+/// The deadlines of a verified submission made while a queue drain holds the pane's locks:
+/// [`STAGE_IN_LOCK`] for the paste, and no late-paste grace under the locks.
+#[must_use]
+pub fn in_lock_timeouts() -> SubmitTimeouts {
+    SubmitTimeouts {
+        stage: STAGE_IN_LOCK,
+        stage_grace: Duration::ZERO,
+        ..SubmitTimeouts::default()
+    }
+}
+
+/// The start of the refusal a stranded retry gives once the late-paste window passed with no
+/// sign of the earlier paste: it was lost, and the drain types the prompt again.
+pub const LATE_PASTE_LOST: &str = "late_paste_lost";
+
+/// Whether `detail` is the refusal of a stranded retry whose earlier paste was lost.
+#[must_use]
+pub fn is_late_paste_lost(detail: &str) -> bool {
+    detail.starts_with(&format!("{LATE_PASTE_LOST}:"))
+}
 /// Maximum time spent retrying the submission key and waiting for corroboration.
 pub const SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Maximum time spent waiting, before typing anything, for a recognisable composer.
@@ -796,6 +823,41 @@ fn composer_is_this_text(view: &ComposerView, text: &str) -> bool {
     false
 }
 
+/// Whether `view`'s composer holds one paste placeholder and nothing else solid: on a stranded
+/// retry, that is the paste an earlier pass typed, drawn collapsed (#884).
+fn holds_one_placeholder_only(view: &ComposerView) -> bool {
+    if paste_placeholders(&view.composer) != 1 {
+        return false;
+    }
+    let mut rest = view.composer_solid.clone();
+    while let Some(start) = rest.find("[Pasted ") {
+        let Some(end) = rest[start..].find(']') else {
+            break;
+        };
+        rest.replace_range(start..=start + end, "");
+    }
+    rest.trim().is_empty()
+}
+
+/// What a composer showed, for a refusal: its first 160 characters on one line, or that no
+/// composer could be read.
+fn composer_evidence(view: Option<&ComposerView>) -> String {
+    match view {
+        None => "no recognisable composer".to_owned(),
+        Some(view) => {
+            let line = view
+                .composer
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if line.is_empty() {
+                return "an empty composer".to_owned();
+            }
+            format!("{:?}", line.chars().take(160).collect::<String>())
+        }
+    }
+}
+
 /// Whether `view`'s composer holds only our paste (no human interleave).
 fn composer_holds_only_ours(view: &ComposerView, text: &str, placeholders_before: usize) -> bool {
     let solid = squash(&view.composer_solid);
@@ -1091,7 +1153,8 @@ pub fn submit_verified(
             // Enter only, never re-type. Bare Enter on our text submits it
             // once; on an empty composer it would be harmless.
             if composer_draft(&before).is_some()
-                && composer_is_this_text(&before, text)
+                && (composer_is_this_text(&before, text)
+                    || (runtime.stranded_retry() && holds_one_placeholder_only(&before)))
                 && !blocked(harness, &screen)
             {
                 let key = submit_key(harness, &before, runtime);
@@ -1198,6 +1261,27 @@ pub fn submit_verified(
         }
         runtime.sleep(POLL);
     };
+    // A prompt an earlier pass typed but never saw drawn (#884): never typed again while its
+    // paste may still show; reported lost once the whole late-paste window has passed.
+    if runtime.stranded_retry() && composer_draft(&before).is_none() {
+        let waited = runtime
+            .stranded_since()
+            .map(|since| (unix_seconds() - since).max(0.0));
+        let window = (STAGE_TIMEOUT + STAGE_GRACE).as_secs_f64();
+        if waited.is_some_and(|waited| waited >= window) {
+            return refuse(format!(
+                "{LATE_PASTE_LOST}: pane {pane_id}: the paste an earlier pass typed never showed \
+                 in the {harness} composer in {window:.0}s; it was lost, and the prompt is typed \
+                 again"
+            ));
+        }
+        return refuse(format!(
+            "{}: late_paste: pane {pane_id}: the paste an earlier pass typed has not shown in \
+             the {harness} composer yet ({:.0}s); waiting for it, never typing it again",
+            crate::unknown_harness::STRANDED_PROMPT_KIND,
+            waited.unwrap_or(0.0)
+        ));
+    }
     let mut shown = ShownBefore {
         queue_marker: queue_marker(&screen).is_some(),
         // A screen that cannot tell, such as one that shows the paste hint in place of the status
@@ -1292,11 +1376,17 @@ pub fn submit_verified(
         let now = runtime.monotonic();
         if now >= grace_deadline {
             if timeouts.stage_grace.is_zero() {
-                // The caller polls for the late render outside every lock
-                // and re-admits to press Enter; nothing is stranded here.
+                // Reported stranded: the drain keeps the prompt pending and releases every
+                // lock, and a later pass presses Enter on it once it shows (#884). What the
+                // composer showed is kept, so a paste drawn in a form the match misses can be
+                // told from one never drawn.
                 return Ok(Submission::NotStaged(format!(
-                    "late_paste: pane {pane_id}: pasted prompt was not observed in the                      {harness} composer within {:.1}s; no submission key was sent",
-                    timeouts.stage.as_secs_f64()
+                    "{}: late_paste: pane {pane_id}: pasted prompt was not observed in the \
+                     {harness} composer within {:.1}s; no submission key was sent; the composer \
+                     showed {}",
+                    crate::unknown_harness::STRANDED_PROMPT_KIND,
+                    timeouts.stage.as_secs_f64(),
+                    composer_evidence(view.as_ref())
                 )));
             }
             return Err(AdapterError::unavailable(format!(
@@ -2008,6 +2098,8 @@ mod tests {
         queue: Option<std::path::PathBuf>,
         /// The follow-up key a drain passes when it types into a working pane.
         followup: Option<&'static str>,
+        /// When an earlier pass left the prompt stranded, for a stranded retry (#884).
+        stranded_since: Option<f64>,
     }
 
     impl AgentRuntime for Clock {
@@ -2036,6 +2128,14 @@ mod tests {
 
         fn followup_key(&self) -> Option<&'static str> {
             self.followup
+        }
+
+        fn stranded_retry(&self) -> bool {
+            self.stranded_since.is_some()
+        }
+
+        fn stranded_since(&self) -> Option<f64> {
+            self.stranded_since
         }
     }
 
@@ -3326,24 +3426,101 @@ mod tests {
     }
 
     #[test]
-    fn lost_paste_with_no_grace_releases_the_caller_at_the_stage_window() {
-        // P0: a paste that never renders must not hold the admission (or
-        // any) lock for the whole grace: with no grace the caller gets a
-        // retryable late_paste refusal at the stage window, no Enter sent.
+    fn an_unobserved_paste_under_the_locks_is_reported_stranded_within_seconds() {
+        // #884 pane-lock-held-on-unobserved-paste: a paste that does not render must not hold
+        // the pane's locks for the late-paste grace; the caller gets a stranded refusal at the
+        // short in-lock stage window, no Enter sent, and what the composer showed.
         let screen = FakeScreen::new("claude", true);
         screen.state().paste_visible_after_reads = u32::MAX;
-        let timeouts = SubmitTimeouts {
-            stage_grace: Duration::ZERO,
-            ..SubmitTimeouts::default()
-        };
-        let (outcome, elapsed) = submit_with(&screen, "lost paste never drawn", timeouts);
+        let (outcome, elapsed) = submit_with(&screen, "lost paste never drawn", in_lock_timeouts());
         let reason = refusal(outcome);
-        assert!(reason.starts_with("late_paste:"), "{reason}");
         assert!(
-            elapsed <= STAGE_TIMEOUT + Duration::from_secs(1),
+            crate::unknown_harness::is_stranded_prompt(&reason),
+            "{reason}"
+        );
+        assert!(reason.contains("late_paste:"), "{reason}");
+        assert!(reason.contains("the composer showed"), "{reason}");
+        assert!(
+            elapsed <= STAGE_IN_LOCK + Duration::from_secs(1),
             "{elapsed:?}"
         );
         assert!(screen.state().keys.is_empty());
+        assert_eq!(screen.state().pastes.len(), 1);
+    }
+
+    fn stranded_clock(seconds_ago: f64) -> Clock {
+        Clock {
+            stranded_since: Some(unix_seconds() - seconds_ago),
+            ..Clock::default()
+        }
+    }
+
+    #[test]
+    fn a_stranded_retry_never_types_again_while_the_paste_may_still_show() {
+        let screen = FakeScreen::new("claude", false);
+        let clock = stranded_clock(30.0);
+        let outcome = submit_verified(
+            &screen,
+            "w1:p1",
+            "claude",
+            "the stranded prompt",
+            in_lock_timeouts(),
+            &clock,
+        );
+        let reason = refusal(outcome);
+        assert!(
+            crate::unknown_harness::is_stranded_prompt(&reason),
+            "{reason}"
+        );
+        assert!(screen.state().pastes.is_empty(), "nothing typed again");
+        assert!(screen.state().keys.is_empty());
+    }
+
+    #[test]
+    fn a_stranded_retry_reports_the_paste_lost_after_the_late_paste_window() {
+        let screen = FakeScreen::new("claude", false);
+        let clock = stranded_clock((STAGE_TIMEOUT + STAGE_GRACE).as_secs_f64() + 5.0);
+        let outcome = submit_verified(
+            &screen,
+            "w1:p1",
+            "claude",
+            "the lost prompt",
+            in_lock_timeouts(),
+            &clock,
+        );
+        let reason = refusal(outcome);
+        assert!(is_late_paste_lost(&reason), "{reason}");
+        assert!(screen.state().pastes.is_empty());
+    }
+
+    #[test]
+    fn a_stranded_retry_submits_its_paste_drawn_as_a_placeholder_of_another_size() {
+        // The paste shows collapsed, with a line count the size check does not expect (the
+        // composer wraps it): on a stranded retry a lone placeholder is that paste, pressed
+        // with Enter once, never typed again.
+        let screen = FakeScreen::new("claude", false);
+        screen.state().composer = "[Pasted text #2 +9 lines]".to_owned();
+        let clock = stranded_clock(40.0);
+        let outcome = submit_verified(
+            &screen,
+            "w1:p1",
+            "claude",
+            "line one\nline two\nline three",
+            in_lock_timeouts(),
+            &clock,
+        );
+        let receipt = receipt(outcome);
+        assert_eq!(receipt.evidence, "stranded prompt flushed with Enter");
+        assert!(screen.state().pastes.is_empty());
+        assert_eq!(screen.state().keys, ["Enter"]);
+        // Not on a fresh delivery: a placeholder of another size is someone else's draft.
+        let fresh = FakeScreen::new("claude", false);
+        fresh.state().composer = "[Pasted text #2 +9 lines]".to_owned();
+        let reason = refusal(submit(&fresh, "line one\nline two\nline three"));
+        assert!(
+            reason.contains("already holds unsubmitted text"),
+            "{reason}"
+        );
     }
 
     #[test]

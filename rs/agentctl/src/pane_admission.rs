@@ -126,8 +126,10 @@ impl PaneAdmission {
                 Ok(()) => break,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if std::time::Instant::now() >= lock_deadline {
-                        return Err(AdapterError::unavailable(format!(
-                            "pane admission flock timed out after {lock_timeout:?}: {e}"
+                        // Nothing was typed: the prompt stays pending (#884).
+                        return Err(AdapterError::not_staged(format!(
+                            "pane admission flock timed out after {lock_timeout:?}: {e}; \
+                             nothing was typed"
                         )));
                     }
                     std::thread::sleep(Duration::from_millis(50));

@@ -7611,13 +7611,18 @@ fn stale_composer_step<A: ManagedApi + ?Sized>(
                     Ok(true) => info.terminal_id.clone(),
                     _ => None,
                 };
-                Some(HerdrComposerPane::new(
-                    client,
-                    info.pane_id,
-                    runtime,
-                    true,
-                    expect_terminal,
-                ))
+                let pane =
+                    HerdrComposerPane::new(client, info.pane_id, runtime, true, expect_terminal);
+                // A draft agentctl typed is submitted, never cleared (#884).
+                Some(
+                    match agent_queue::registry::directory(
+                        manager.registry(),
+                        &state.config().agent_name,
+                    ) {
+                        Ok(directory) => pane.with_typed_queue(directory.join("queue")),
+                        Err(_) => pane,
+                    },
+                )
             }
             Err(error) => {
                 held(
@@ -7643,7 +7648,7 @@ fn stale_composer_step<A: ManagedApi + ?Sized>(
             held(run, reason);
             false
         }
-        crate::stale_composer::Step::Cleared { .. } => {
+        crate::stale_composer::Step::Cleared { .. } | crate::stale_composer::Step::Flushed(_) => {
             run.last_held = None;
             true
         }

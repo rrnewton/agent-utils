@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 
 use crate::client::{AgentPaneInfo, HerdrClient, Pane};
 use crate::error::{AdapterError, AdapterErrorKind, EXIT_BUSY, EXIT_TIMEOUT};
-use crate::submission::{PromptTerminal, Submission, SubmitTimeouts};
+use crate::submission::{PromptTerminal, Submission};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -492,61 +492,26 @@ impl AgentApi for HerdrClient {
                 client: self,
                 runtime,
             };
-            let timeouts = SubmitTimeouts {
-                stage_grace: Duration::ZERO,
-                ..SubmitTimeouts::default()
-            };
-            let outcome = crate::pane_admission::admit(
+            // Inside the pane's locks only for a short stage window (#884
+            // pane-lock-held-on-unobserved-paste): a paste not drawn by then is reported
+            // stranded, the drain releases every lock, and a later pass presses Enter on it
+            // once it shows, or types it again only once it is surely lost.
+            return crate::pane_admission::admit(
                 pane_id,
                 &sender_or(runtime, "agentctl"),
                 &runtime.audit_id(),
                 "verified",
                 || {
                     crate::submission::submit_verified(
-                        &terminal, pane_id, &harness, text, timeouts, runtime,
+                        &terminal,
+                        pane_id,
+                        &harness,
+                        text,
+                        crate::submission::in_lock_timeouts(),
+                        runtime,
                     )
                 },
-            )?;
-            // Late paste: the admission lock is released. Poll for the
-            // late render outside every lock, then re-admit; the retry
-            // finds its own stranded paste and presses Enter only.
-            if let Submission::NotStaged(reason) = &outcome {
-                if reason.starts_with("late_paste:") && !runtime.cancelled() {
-                    let deadline = runtime
-                        .monotonic()
-                        .saturating_add(crate::submission::STAGE_GRACE);
-                    loop {
-                        runtime.sleep(crate::submission::STAGE_POLL_SLOW);
-                        if runtime.cancelled() || runtime.monotonic() >= deadline {
-                            return Ok(outcome);
-                        }
-                        let Ok(screen) = terminal.read_screen(pane_id) else {
-                            continue;
-                        };
-                        let appeared = crate::submission::composer_view(&harness, &screen)
-                            .is_some_and(|view| crate::submission::composer_draft(&view).is_some());
-                        if appeared {
-                            return crate::pane_admission::admit(
-                                pane_id,
-                                &sender_or(runtime, "agentctl"),
-                                &runtime.audit_id(),
-                                "verified-late",
-                                || {
-                                    crate::submission::submit_verified(
-                                        &terminal,
-                                        pane_id,
-                                        &harness,
-                                        text,
-                                        SubmitTimeouts::default(),
-                                        runtime,
-                                    )
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-            return Ok(outcome);
+            );
         }
         runtime.input_started();
         crate::pane_admission::admit(
@@ -799,6 +764,18 @@ pub trait AgentRuntime {
     fn stranded_retry(&self) -> bool {
         false
     }
+    /// When an earlier pass left the prompt stranded (its record's `stranded_at`, Unix seconds),
+    /// for a submission to tell a paste still due to be drawn from one that was lost (#884
+    /// pane-lock-held-on-unobserved-paste). The default knows none.
+    fn stranded_since(&self) -> Option<f64> {
+        None
+    }
+    /// Whether this delivery has typed anything into the pane yet, when the runtime tracks it:
+    /// a failure before the first input leaves the prompt safely pending, never possibly
+    /// submitted (#884). The default does not know.
+    fn typed_anything(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// A runtime that behaves as `inner` and names the queue a drain delivers from: see
@@ -811,6 +788,9 @@ struct QueueRuntime<'a> {
 impl AgentRuntime for QueueRuntime<'_> {
     fn stranded_retry(&self) -> bool {
         self.inner.stranded_retry()
+    }
+    fn stranded_since(&self) -> Option<f64> {
+        self.inner.stranded_since()
     }
     fn paste_drawn_as(&self, label: &str) {
         self.inner.paste_drawn_as(label);
@@ -869,6 +849,9 @@ impl AgentRuntime for WithdrawUnacceptedRuntime<'_> {
     fn stranded_retry(&self) -> bool {
         self.inner.stranded_retry()
     }
+    fn stranded_since(&self) -> Option<f64> {
+        self.inner.stranded_since()
+    }
     fn paste_drawn_as(&self, label: &str) {
         self.inner.paste_drawn_as(label);
     }
@@ -918,6 +901,9 @@ impl AgentRuntime for WithdrawUnacceptedRuntime<'_> {
 impl AgentRuntime for WithdrawingRuntime<'_> {
     fn stranded_retry(&self) -> bool {
         self.inner.stranded_retry()
+    }
+    fn stranded_since(&self) -> Option<f64> {
+        self.inner.stranded_since()
     }
     fn paste_drawn_as(&self, label: &str) {
         self.inner.paste_drawn_as(label);
@@ -985,6 +971,19 @@ struct PasteTrackingRuntime<'a> {
 impl AgentRuntime for PasteTrackingRuntime<'_> {
     fn stranded_retry(&self) -> bool {
         self.stranded || self.inner.stranded_retry()
+    }
+    fn stranded_since(&self) -> Option<f64> {
+        if self.stranded {
+            return self
+                .document
+                .borrow()
+                .get("stranded_at")
+                .and_then(Value::as_f64);
+        }
+        self.inner.stranded_since()
+    }
+    fn typed_anything(&self) -> Option<bool> {
+        Some(self.document.borrow().contains_key("paste_started_at"))
     }
     fn paste_drawn_as(&self, label: &str) {
         *self.paste_label.borrow_mut() = Some(label.to_owned());
@@ -2424,8 +2423,15 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     // A stranded prompt also stays pending, keeping the text it was typed as
                     // for the next pass to flush.
                     document.remove("possibly_submitted");
+                    let paste_lost = crate::submission::is_late_paste_lost(&detail);
                     if crate::unknown_harness::is_stranded_prompt(&detail) {
                         note_stranded(&mut document, &identifier, &typed, &detail);
+                    } else if paste_lost {
+                        // An earlier pass's paste never showed in the whole late-paste window:
+                        // it was lost, so this pass types the prompt afresh.
+                        document.remove("stranded_at");
+                        document.remove("stranded_passes");
+                        document.remove("typed_as");
                     } else if !stranded {
                         document.remove("typed_as");
                     }
@@ -2438,6 +2444,9 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));
                     atomic_json(&inflight_path, &Value::Object(document))?;
                     transition(&inflight_path, &path)?;
+                    if paste_lost && !runtime.cancelled() {
+                        continue 'retry;
+                    }
                     // An unreadable composer typed nothing, so probe it again
                     // after a bounded backoff within this drain (see
                     // COMPOSER_RETRY_DELAYS) instead of waiting for a later
@@ -3418,6 +3427,18 @@ fn deliver_one<A: AgentApi + ?Sized>(
                 )),
                 probable_misroute: true,
             })
+        }
+        // Cancelled before the first input (a sender whose deadline ran out while it waited
+        // behind another): nothing reached the pane, so the prompt stays pending and is tried
+        // again, never set aside as possibly submitted (#884 pane-lock-held-on-unobserved-paste).
+        Err(error)
+            if error.kind() == AdapterErrorKind::Cancelled
+                && runtime.typed_anything() == Some(false) =>
+        {
+            return Ok(Delivered::NotStaged(format!(
+                "pane {}: delivery was cancelled before anything was typed: {error}",
+                info.pane_id
+            )))
         }
         Err(error) => {
             return Err(AgentError::delivery(format!(
@@ -4416,6 +4437,10 @@ mod tests {
         codex_ready_from_screen: bool,
         readiness_checks: usize,
         misroute_submit: bool,
+        /// The submission is cancelled before it types anything.
+        cancel_submit: bool,
+        /// How long each screen-driven submission took on the runtime's clock.
+        submit_spent: Vec<Duration>,
         verify_muse: bool,
         working_proves_printed: bool,
     }
@@ -4579,24 +4604,37 @@ mod tests {
                     "prompt reached the wrong program",
                 ));
             }
+            if self.state.lock().expect("fake state").cancel_submit {
+                return Err(AdapterError::cancelled("control command was cancelled"));
+            }
             match &self.screen {
                 // Mirrors the production override: the composer is driven directly, for the
                 // harness the screen draws.
                 Some(screen) => {
                     // Read before the call: the screen's lock must not be held while it types.
                     let harness = screen.state().harness;
-                    crate::submission::submit_verified(
+                    let started = runtime.monotonic();
+                    let submission = crate::submission::submit_verified(
                         screen,
                         pane_id,
                         harness,
                         text,
+                        // No late-paste grace under the locks, as in production (#884).
                         crate::submission::SubmitTimeouts {
                             stage: Duration::from_secs(3),
+                            stage_grace: Duration::ZERO,
                             submit: Duration::from_secs(5),
                             ..crate::submission::SubmitTimeouts::default()
                         },
                         runtime,
-                    )
+                    );
+                    let spent = runtime.monotonic().saturating_sub(started);
+                    self.state
+                        .lock()
+                        .expect("fake state")
+                        .submit_spent
+                        .push(spent);
+                    submission
                 }
                 None => {
                     self.run_with_runtime(pane_id, text, runtime)?;
@@ -5125,6 +5163,107 @@ mod tests {
             2,
             "the stranded prompt was never typed again: {pastes:?}"
         );
+    }
+
+    /// #884 pane-lock-held-on-unobserved-paste: a paste Claude never draws is reported stranded
+    /// within the short in-lock stage, so the drain lets go of every lock in seconds, not after
+    /// the five-minute late-paste window. The next pass submits the paste once it shows, with
+    /// Enter alone, and never types it again.
+    #[test]
+    fn an_unobserved_paste_releases_the_locks_within_seconds_and_the_next_pass_submits_it() {
+        let directory = TestDirectory::new("unobserved-paste");
+        // A busy Claude: an empty composer on an idle pane is a paste that will never draw.
+        let screen = crate::submission::fake::FakeScreen::new("claude", true);
+        screen.state().paste_visible_after_reads = u32::MAX;
+        let fake = FakeAgent::with_screen(screen);
+        let text = "the owner is waiting for this one";
+        enqueue(directory.path(), text, Some("owner")).unwrap();
+        let options = || DrainOptions {
+            ready_timeout: Duration::ZERO,
+            ..DrainOptions::default()
+        };
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            options(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Pending, "{result:?}");
+        assert!(result.quarantined.is_empty(), "{result:?}");
+        assert!(result.delivered.is_empty());
+        // Only the submission runs under the pane's locks; waiting to take them is not holding.
+        let held = fake.state.lock().expect("fake state").submit_spent.clone();
+        assert!(
+            matches!(held.as_slice(), [spent] if *spent <= Duration::from_secs(5)),
+            "the locks were held for {held:?}"
+        );
+        let document = read_private_json(&directory.path().join("inbox/owner.json")).unwrap();
+        assert_eq!(document["delivery_state"], "pending");
+        assert!(document["stranded_at"].is_f64(), "{document}");
+        assert!(document.get("possibly_submitted").is_none(), "{document}");
+
+        // The paste shows up late. The next pass presses Enter on it and types nothing.
+        fake.screen
+            .as_ref()
+            .unwrap()
+            .state()
+            .paste_visible_after_reads = 0;
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            options(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.delivered, ["owner"], "{result:?}");
+        let screen = fake.screen.as_ref().unwrap().state();
+        assert_eq!(screen.pastes, [text], "typed exactly once");
+        assert_eq!(screen.queued, [text], "queued behind the running turn");
+    }
+
+    /// #884 pane-lock-held-on-unobserved-paste: a sender cancelled before it typed anything (it
+    /// gave up waiting behind another sender) left nothing in the pane, so its prompt stays
+    /// pending and the next pass delivers it, never set aside as possibly submitted.
+    #[test]
+    fn a_delivery_cancelled_before_typing_stays_pending_and_is_retried() {
+        let directory = TestDirectory::new("cancelled-before-typing");
+        let fake =
+            FakeAgent::with_screen(crate::submission::fake::FakeScreen::new("claude", false));
+        fake.state.lock().expect("fake state").cancel_submit = true;
+        enqueue(directory.path(), "retry me", Some("waiter")).unwrap();
+        let options = || DrainOptions {
+            ready_timeout: Duration::ZERO,
+            ..DrainOptions::default()
+        };
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            options(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Pending, "{result:?}");
+        assert!(result.quarantined.is_empty(), "{result:?}");
+        assert!(result.cancelled.is_empty(), "{result:?}");
+        let document = read_private_json(&directory.path().join("inbox/waiter.json")).unwrap();
+        assert_eq!(document["delivery_state"], "pending", "{document}");
+        assert!(document.get("possibly_submitted").is_none(), "{document}");
+
+        fake.state.lock().expect("fake state").cancel_submit = false;
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            options(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.delivered, ["waiter"], "{result:?}");
+        assert_eq!(fake.screen.as_ref().unwrap().state().pastes, ["retry me"]);
     }
 
     #[test]

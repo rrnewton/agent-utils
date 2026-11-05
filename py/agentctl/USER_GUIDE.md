@@ -2213,6 +2213,14 @@ prompt and checks readiness under the locks, then releases them and checks
 again every half second until the pane is ready or the smaller of
 `--ready-timeout` and the deadline has passed, so `stop`, the chat bridge and
 other senders are never kept waiting behind it.
+Likewise a typed prompt whose paste a verified harness (Claude Code, Codex,
+Muse) has not drawn within 10 seconds is not waited for under the locks: it is
+reported `stranded_prompt` (`late_paste`, with what the composer showed),
+stays pending, and the locks are released. Later passes press Enter on it once
+it shows, never typing it again; one that has not shown 5 minutes after it was
+typed counts as lost and is typed again. A sender cancelled before it typed
+anything (its deadline ran out behind another sender, say) leaves its prompt
+pending to be tried again, never set aside as possibly submitted.
 
 ```json
 {"send_deadline_seconds": 300}

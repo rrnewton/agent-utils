@@ -2029,7 +2029,11 @@ draft starts the wait again, as does a scan that finds no such request. When
 the draft is due, nothing happens while herdr reports the agent other than
 `idle` or `done` or its screen shows or may show a running turn. Otherwise
 `run` takes the pane's delivery lock, which every agentctl sender takes while
-it types, reads the composer again, and goes on only if the draft is the same:
+it types, reads the composer again, and goes on only if the draft is the same.
+A draft agentctl typed itself (a prompt set aside as possibly submitted that is
+still sitting there, matched by the agent queue's records as a delivery's draft
+recovery matches it) is a message on its way, not a person's text: `run`
+submits it with Enter instead, and nothing below happens. Any other draft:
 
 1. It writes the draft to a new file of mode 0600 in `composer-backups/` in
    the state directory (created with mode 0700), named by the UTC time.
