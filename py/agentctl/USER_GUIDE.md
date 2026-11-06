@@ -1933,7 +1933,14 @@ alone, with these rules:
   `│>` that is neither `send a message to …` nor `write here to steer during
   this turn` is a draft. A delivery is refused with the same wording as any
   other harness (`composer already holds unsubmitted text`), unless the draft is
-  this very prompt left by an earlier pass, which gets Enter. The chat bridge's
+  this very prompt left by an earlier pass, which gets Enter. One draft is not
+  a person's: agentterm takes a late answer to its own colour queries as
+  typed keys, so its composer can fill with `]10;rgb:dcdc/dcdc/dcdc\]11;…\`.
+  An idle composer that holds only such terminal replies (colour, cursor
+  position, status and device attribute reports) is cleared with Ctrl+C,
+  agentterm's "clear the input line", and must read back empty before the
+  paste. If any other text sits beside them, nothing is cleared and the
+  delivery is refused as above. The chat bridge's
   `--stale-composer-clear-after` does not clear an agentterm draft yet.
 - **Never into a menu**: no key is sent while the bottom of the screen shows
   numbered options `1.`, `2.` … with a cursor glyph or highlight on one of them,

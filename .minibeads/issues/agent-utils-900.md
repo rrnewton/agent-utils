@@ -31,3 +31,20 @@ The agentterm client queries the terminal's foreground and background colours. H
 # Notes
 
 Found by the coordinator on 2026-11-05 at 12:36 PM ET while confirming the #896 interim route end to end. The lead set it to P2 (the owner wants agentterm first-class). Assigned to cl-start with the #852 agentterm work, after #896 and #897.
+
+## Progress (cl-start, 2026-11-05)
+
+[opus 5.5] Cause, from a probe and agentterm's source:
+- Herdr is not holding anything back. A raw-mode probe in a Herdr pane asked for the OSC 10/11 colours every 5 s, and each answer came back within the same 10 ms as one 50-byte `ESC]10;rgb:dcdc/dcdc/dcdc ESC\ ESC]11;rgb:0000/0000/0000 ESC\`.
+- agentterm re-asks every 5 s while focused, and on focus-in and resize. It drops an answer only while it still awaits one: a 3-second window, `REPLY_WINDOW` in its `src/render/background.rs`.
+- An answer read later goes to key handling: `ESC ]` arrives as Alt+`]`, the body as characters, `ESC \` as Alt+`\`. The composer fills with exactly the text the session received: `]10;rgb:dcdc/dcdc/dcdc\]11;…\`.
+- Herdr's paste is clean. The replies were already sitting in the composer, and the paste plus Enter submitted them together.
+- The root fix is agentterm's: drop late colour answers, or stop treating them as typed text. That needs a report to agentterm's owners.
+
+agentctl change:
+- Before pasting into an idle agentterm composer, agentctl checks whether it holds nothing but terminal replies: OSC 10/11/12/4 colour replies, cursor-position reports, status reports and device attributes, with the row breaks of a wrapped composer ignored.
+- If so, it presses Ctrl+C, agentterm's documented "clear the input line", and the composer must read back empty within 3 s before the paste. If it does not, the delivery is refused and nothing is typed.
+- Any other text beside the replies is a person's draft: nothing is cleared, and the delivery is refused as before.
+- Tests: accumulated replies are cleared and the message is submitted alone; typed text beside replies is kept and the paste refused; a clear that does not take refuses the paste.
+
+Remaining: the live check (one message to an agentterm target; its session history must begin with the message header). That goes through the lead.

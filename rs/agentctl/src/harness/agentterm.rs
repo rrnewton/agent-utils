@@ -101,6 +101,84 @@ pub fn frame(screen: &str) -> Option<Frame> {
     })
 }
 
+/// Whether a composer `draft` holds nothing but terminal query replies (#900
+/// agentterm-paste-escape-replies). agentterm asks its terminal for the default colours every few
+/// seconds and drops an answer only while it still awaits it; an answer that comes later reaches
+/// key handling, `ESC ]` as Alt+`]`, the body as characters and `ESC \` as Alt+`\`, so the
+/// composer fills with `]10;rgb:dcdc/dcdc/dcdc\]11;rgb:0000/0000/0000\`. Colour replies (OSC 10,
+/// 11, 12 and 4) and cursor-position, status and device-attribute reports count; the row breaks
+/// of a wrapped composer are ignored. Anything else, a single typed character included, makes the
+/// draft a person's.
+#[must_use]
+pub fn only_query_replies(draft: &str) -> bool {
+    let joined: String = draft.split('\n').map(str::trim).collect();
+    let mut rest = joined.as_str();
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        let next = if let Some(body) = rest.strip_prefix(']') {
+            colour_reply(body)
+        } else if let Some(body) = rest.strip_prefix('[') {
+            report(body)
+        } else {
+            None
+        };
+        let Some(next) = next else {
+            return false;
+        };
+        rest = next;
+    }
+    true
+}
+
+/// `text` after a run of `min..=max` characters that satisfy `class`.
+fn run(text: &str, min: usize, max: usize, class: fn(char) -> bool) -> Option<&str> {
+    let len = text.find(|c: char| !class(c)).unwrap_or(text.len());
+    (min..=max).contains(&len).then(|| &text[len..])
+}
+
+/// What follows one OSC colour reply's body after its `]`: `10;`, `11;`, `12;` or `4;N;`, then
+/// `rgb:H/H/H`, `rgba:H/H/H/H` or `#HEX`, then perhaps the `\` of its terminator.
+fn colour_reply(body: &str) -> Option<&str> {
+    let hex = |c: char| c.is_ascii_hexdigit();
+    let value = ["10;", "11;", "12;"]
+        .iter()
+        .find_map(|slot| body.strip_prefix(slot))
+        .or_else(|| {
+            let index = run(body.strip_prefix("4;")?, 1, 3, |c| c.is_ascii_digit())?;
+            index.strip_prefix(';')
+        })?;
+    let rest = if let Some(hash) = value.strip_prefix('#') {
+        run(hash, 3, 12, hex)?
+    } else {
+        let (channels, spec) = match value.strip_prefix("rgba:") {
+            Some(spec) => (4, spec),
+            None => (3, value.strip_prefix("rgb:")?),
+        };
+        let mut rest = run(spec, 1, 4, hex)?;
+        for _ in 1..channels {
+            rest = run(rest.strip_prefix('/')?, 1, 4, hex)?;
+        }
+        rest
+    };
+    Some(rest.strip_prefix('\\').unwrap_or(rest))
+}
+
+/// What follows one CSI report's body after its `[`: a cursor position `ROW;COLR`, device
+/// attributes `?…c` or `>…c`, or a status `Nn`.
+fn report(body: &str) -> Option<&str> {
+    let digit = |c: char| c.is_ascii_digit();
+    if let Some(attributes) = body.strip_prefix(['?', '>']) {
+        return run(attributes, 0, 64, |c| c.is_ascii_digit() || c == ';')?.strip_prefix('c');
+    }
+    if let Some(status) = run(body, 1, 1, digit).and_then(|rest| rest.strip_prefix('n')) {
+        return Some(status);
+    }
+    let column = run(body, 1, 4, digit)?.strip_prefix(';')?;
+    run(column, 1, 4, digit)?.strip_prefix('R')
+}
+
 /// How many letters and digits from the start of a prompt identify it in a `You:` turn.
 const TURN_PROBE: usize = 64;
 
@@ -234,6 +312,32 @@ pub(crate) mod tests {
         // A side panel's top border is no input frame: it has no composer row under it.
         assert_eq!(frame(" text ╭ nodes ────╮\n more │attached │\n"), None);
     }
+    #[test]
+    fn leaked_query_replies_are_told_from_anything_a_person_typed() {
+        // #900: what a late colour answer leaves in the composer, wrapped over two rows.
+        let pair = r"]10;rgb:dcdc/dcdc/dcdc\]11;rgb:0000/0000/0000\";
+        assert!(only_query_replies(pair));
+        assert!(only_query_replies(&format!(
+            "{}\n{}",
+            pair.repeat(3),
+            pair.repeat(2)
+        )));
+        assert!(only_query_replies(
+            r"]4;1;#cd0000\[12;1R[?62;22c[0n]11;rgb:ff/ff/ff"
+        ));
+        for typed in [
+            "",
+            "hello",
+            &format!("{pair} hello"),
+            &format!("please {pair}"),
+            "]10;rgb:dcdc",
+            "]10;red\\",
+            "[12;1Rx",
+        ] {
+            assert!(!only_query_replies(typed), "{typed:?}");
+        }
+    }
+
     #[test]
     fn a_submitted_turn_shows_the_prompt_and_the_composer_never_does() {
         // #852 D: evidence is a `You:` turn in the conversation, never the composer.

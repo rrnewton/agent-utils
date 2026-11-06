@@ -50,6 +50,10 @@ pub const FIRST_RETRY: Duration = Duration::from_secs(1);
 pub const MAX_RETRY: Duration = Duration::from_secs(4);
 /// How long a changed screen must hold still to count as settled.
 const SETTLE: Duration = Duration::from_millis(500);
+/// The key agentterm documents as "clear the input line".
+const CLEAR_COMPOSER_KEY: &str = "ctrl+c";
+/// How long a cleared agentterm composer may take to read back empty.
+const CLEAR_WAIT: Duration = Duration::from_secs(3);
 /// How long a screen that never showed the paste is watched after its one Enter.
 const UNDRAWN_WATCH: Duration = Duration::from_secs(4);
 /// The kind that opens the refusal of a prompt that stayed at the bottom of the screen through
@@ -199,6 +203,10 @@ pub fn submit(
             "pane {pane_id} shows a menu or dialog ({line:?}); nothing was typed"
         ));
     }
+    let before = match clear_leaked_replies(terminal, pane_id, before, runtime) {
+        Ok(screen) => screen,
+        Err(reason) => return refuse(reason),
+    };
     if let Some(reason) = agentterm_refusal(pane_id, &before, text, runtime) {
         return refuse(reason);
     }
@@ -426,6 +434,59 @@ fn agentterm_refusal(
     ))
 }
 
+/// Clear an idle agentterm composer that holds nothing but terminal query replies (#900
+/// agentterm-paste-escape-replies), so the paste is not submitted behind them: Ctrl+C, which
+/// agentterm documents as "clear the input line", then the composer must read back empty. A
+/// composer holding anything else is returned untouched, and [`agentterm_refusal`] reports it.
+/// `Err` is the refusal when the composer does not read back empty; nothing was typed.
+fn clear_leaked_replies(
+    terminal: &dyn PromptTerminal,
+    pane_id: &str,
+    screen: String,
+    runtime: &dyn AgentRuntime,
+) -> std::result::Result<String, String> {
+    use crate::harness::agentterm::{self, FrameState};
+    let leaked = agentterm::frame(&screen).is_some_and(|frame| {
+        frame.state == FrameState::Idle
+            && frame
+                .draft
+                .as_deref()
+                .is_some_and(agentterm::only_query_replies)
+    });
+    if !leaked || runtime.stranded_retry() {
+        return Ok(screen);
+    }
+    terminal
+        .send_keys(pane_id, CLEAR_COMPOSER_KEY)
+        .map_err(|error| {
+            format!(
+                "pane {pane_id}: agentterm's composer holds only leaked terminal replies, and \
+                 the key that clears it failed: {error}; nothing was typed"
+            )
+        })?;
+    let deadline = runtime.monotonic().saturating_add(CLEAR_WAIT);
+    loop {
+        let now = terminal.read_screen(pane_id).map_err(|error| {
+            format!(
+                "pane {pane_id}: screen read failed after clearing leaked terminal replies: \
+                 {error}; nothing was typed"
+            )
+        })?;
+        if agentterm::frame(&now)
+            .is_some_and(|frame| frame.state == FrameState::Idle && frame.draft.is_none())
+        {
+            return Ok(now);
+        }
+        if runtime.monotonic() >= deadline || runtime.cancelled() {
+            return Err(format!(
+                "pane {pane_id}: agentterm's composer held only leaked terminal replies, and it \
+                 did not read back empty after {CLEAR_COMPOSER_KEY}; nothing was typed"
+            ));
+        }
+        runtime.sleep(POLL);
+    }
+}
+
 /// Poll after the paste until it shows, was consumed, or the stage deadline passes.
 fn wait_staged(
     terminal: &dyn PromptTerminal,
@@ -611,6 +672,8 @@ pub(crate) mod fake {
         pub agentterm: Option<String>,
         /// Enter takes the input but nothing shows it: no transcript row.
         pub swallow: bool,
+        /// agentterm's Ctrl+C leaves the composer as it was.
+        pub ignore_clear: bool,
         /// Every prompt the TUI took, in order.
         pub submitted: Vec<String>,
         /// Every key and paste received.
@@ -722,6 +785,9 @@ pub(crate) mod fake {
         fn send_keys(&self, _pane_id: &str, keys: &str) -> Result<()> {
             let mut state = self.state();
             state.inputs.push(format!("key:{keys}"));
+            if keys == "ctrl+c" && state.agentterm.is_some() && !state.ignore_clear {
+                state.input.clear();
+            }
             if keys == "Enter" {
                 if state.drop_enters > 0 {
                     state.drop_enters -= 1;
@@ -816,6 +882,60 @@ mod tests {
         };
         assert!(reason.contains("\"reconnecting\""), "{reason}");
         assert!(tui.state().inputs.is_empty(), "nothing was typed");
+    }
+
+    /// What late colour answers leave in agentterm's composer, wrapped over two rows (#900).
+    fn leaked_replies() -> String {
+        let pair = r"]10;rgb:dcdc/dcdc/dcdc\]11;rgb:0000/0000/0000\";
+        format!("{}\n{}", pair.repeat(20), pair.repeat(20))
+    }
+
+    #[test]
+    fn leaked_terminal_replies_are_cleared_and_the_message_goes_alone() {
+        // #900 agentterm-paste-escape-replies.
+        let tui = FakeTui::new();
+        tui.state().agentterm = Some("idle".to_owned());
+        tui.state().input = leaked_replies();
+        let outcome = run(&tui).unwrap();
+        assert!(matches!(outcome, Submission::Verified(_)), "{outcome:?}");
+        assert_eq!(tui.state().submitted, vec![PROMPT.to_owned()]);
+        let inputs = tui.state().inputs.clone();
+        assert_eq!(inputs.first().map(String::as_str), Some("key:ctrl+c"));
+        assert_eq!(pastes(&tui), 1);
+    }
+
+    #[test]
+    fn typed_text_beside_leaked_replies_is_kept_and_the_paste_refused() {
+        let tui = FakeTui::new();
+        tui.state().agentterm = Some("idle".to_owned());
+        let draft = format!("the owner typed this {}", leaked_replies());
+        tui.state().input = draft.clone();
+        let Submission::NotStaged(reason) = run(&tui).unwrap() else {
+            panic!("expected a refusal");
+        };
+        assert!(reason.contains("composer already holds"), "{reason}");
+        assert!(
+            tui.state().inputs.is_empty(),
+            "nothing was typed or cleared"
+        );
+        assert_eq!(tui.state().input, draft);
+    }
+
+    #[test]
+    fn leaked_replies_that_do_not_clear_refuse_the_paste() {
+        let tui = FakeTui::new();
+        {
+            let mut state = tui.state();
+            state.agentterm = Some("idle".to_owned());
+            state.input = leaked_replies();
+            state.ignore_clear = true;
+        }
+        let Submission::NotStaged(reason) = run(&tui).unwrap() else {
+            panic!("expected a refusal");
+        };
+        assert!(reason.contains("did not read back empty"), "{reason}");
+        assert_eq!(tui.state().inputs, vec!["key:ctrl+c".to_owned()]);
+        assert!(tui.state().submitted.is_empty());
     }
 
     #[test]
