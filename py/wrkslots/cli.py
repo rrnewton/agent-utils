@@ -23841,6 +23841,7 @@ def _salvage_agent_slot(
     """
 
     candidates: list[tuple[Checkout, Path, bool, _CheckoutDrift | None, bool]] = []
+    self_sourced_names: set[str] = set()
     for checkout in record.checkouts:
         path = _stored_path(config, checkout.path, "checkout path")
         drift = _observe_checkout_drift(vcs, checkout, path) if archive_drifted else None
@@ -23857,14 +23858,18 @@ def _salvage_agent_slot(
         for submodule, submodule_path in _submodule_salvage_checkouts(
             config, checkout, vcs
         ):
+            self_sourced = _checkout_is_self_sourced(
+                config, submodule, submodule_path, vcs
+            )
+            if self_sourced:
+                self_sourced_names.add(submodule.name)
             candidates.append(
                 (
                     submodule,
                     submodule_path,
                     True,
                     None,
-                    drift is not None
-                    or _checkout_is_self_sourced(config, submodule, submodule_path, vcs),
+                    drift is not None or self_sourced,
                 )
             )
         if owner_proven_dead:
@@ -23927,6 +23932,15 @@ def _salvage_agent_slot(
                 )
             )
             continue
+        if checkout.name in self_sourced_names and facts.dirty:
+            # A clean self-sourced submodule is remote-verified or bundled
+            # (#871); uncommitted work in one has no source checkout left
+            # to judge it against, so it is refused, as before.
+            raise Refusal(
+                f"submodule {checkout.name} has uncommitted changes and its "
+                "source no longer declares it; preserve the slot and commit "
+                "or publish that work by hand"
+            )
         receipts.append(
             _salvage_one_checkout(
                 config,

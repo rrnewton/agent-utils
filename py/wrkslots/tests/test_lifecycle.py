@@ -58621,6 +58621,51 @@ def test_remove_bundles_nested_submodule_the_primary_dropped_when_unpublished(
     assert _bundle_reaches(tmp_path, receipt, local_head, "restored-dropped-leaf.git")
 
 
+def test_remove_refuses_a_dirty_submodule_the_primary_dropped(tmp_path: Path) -> None:
+    """#871: a dirty self-sourced submodule is refused, not bundled."""
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    (leaf / "leaf.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    removed = remove(project)
+
+    assert removed.returncode != 0
+    assert "has uncommitted changes" in removed.stderr
+    assert tree.is_dir()
+    assert (leaf / "leaf.txt").read_text(encoding="utf-8") == "uncommitted\n"
+
+
+def test_remove_remote_check_ignores_a_global_instead_of_rewrite(tmp_path: Path) -> None:
+    """#871: publication is proven at the recorded URL, ignoring user rewrites."""
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    real_remote = git(leaf, "config", "--get", "remote.origin.url").stdout.strip()
+    mirror = tmp_path / "stale-mirror.git"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(mirror)],
+        check=True, capture_output=True, text=True,
+    )
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_text(
+        f'[url "{mirror}"]\n\tinsteadOf = {real_remote}\n', encoding="utf-8"
+    )
+
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"GIT_CONFIG_GLOBAL": str(global_config)},
+    )
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    receipt = _drift_receipts(project)["product/component/leaf"]
+    assert receipt["evidence"] == "remote-verified"
+    assert receipt["containing_remote_refs"]
+
+
 def test_remove_skips_an_uninitialised_nested_submodule(tmp_path: Path) -> None:
     project, tree, component, _leaf = _slot_with_primary_dropped_leaf(tmp_path)
     git(
