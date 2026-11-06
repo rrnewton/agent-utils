@@ -1386,17 +1386,17 @@ def graph_structure_violations(cfg: DagConfig) -> list[str]:
                 )
             seen.add(artifact.name)
     for step in cfg.steps:
-        for dep in step.artifact_deps:
-            producer = by_tag.get(dep.step)
+        for artifact_dep in step.artifact_deps:
+            producer = by_tag.get(artifact_dep.step)
             if producer is None:
                 bad.append(
-                    f"step {step.tag}: artifact dependency names step '{dep.step}', "
+                    f"step {step.tag}: artifact dependency names step '{artifact_dep.step}', "
                     "which no step declares"
                 )
-            elif all(a.name != dep.artifact for a in producer.publishes):
+            elif all(a.name != artifact_dep.artifact for a in producer.publishes):
                 bad.append(
                     f"step {step.tag}: artifact dependency names artifact "
-                    f"'{dep.artifact}' of step '{dep.step}', which that step does not publish"
+                    f"'{artifact_dep.artifact}' of step '{artifact_dep.step}', which that step does not publish"
                 )
     return bad
 
