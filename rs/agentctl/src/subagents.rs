@@ -14515,6 +14515,7 @@ pub(crate) mod tests {
                     custom_dies_after_report: AtomicBool::new(false),
                     custom_fails_after_identity: AtomicBool::new(false),
                     custom_at_idle_shell: AtomicBool::new(true),
+                    exit_to_shell: AtomicBool::new(false),
                     no_agent_kind: AtomicBool::new(false),
                     foreign_shell_identity: Mutex::new(Fake::foreign_shell_identity()),
                     foreign_shell_path: Mutex::new(PathBuf::from("/bin/bash")),
@@ -14962,6 +14963,8 @@ pub(crate) mod tests {
         custom_dies_after_report: AtomicBool,
         custom_fails_after_identity: AtomicBool,
         custom_at_idle_shell: AtomicBool,
+        /// A `/exit` run returns the pane to its shell (restart tests).
+        exit_to_shell: AtomicBool,
         /// Herdr reports no agent kind for any pane, as for a TUI it has no manifest for.
         no_agent_kind: AtomicBool,
         foreign_shell_identity: Mutex<CustomProcessIdentity>,
@@ -15391,7 +15394,11 @@ pub(crate) mod tests {
             }
             .to_owned())
         }
-        fn run(&self, _: &str, text: &str) -> AdapterResult<()> {
+        fn run(&self, pane: &str, text: &str) -> AdapterResult<()> {
+            if self.exit_to_shell.load(Ordering::Relaxed) && text == "/exit" {
+                self.dead_panes.lock().unwrap().insert(pane.to_owned());
+                self.custom_alive.store(false, Ordering::Relaxed);
+            }
             if let Some(hook) = self.on_run.lock().unwrap().as_ref() {
                 hook(text);
             }

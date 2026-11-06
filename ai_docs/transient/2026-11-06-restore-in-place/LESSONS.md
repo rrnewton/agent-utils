@@ -37,10 +37,22 @@ item 5 restore-in-place. Based on the harness repo's `bin/restart-inplace`
 11. Wait for idle twice, seconds apart (status flaps); never restart with
     queued input in flight. Test: flapping status delays, queue blocks.
 12. Finished lanes are stopped, not restarted; R2 skips them with a reason.
-13. (Ours) A restart kills session-only crons and background validation
+13. Internal subagents die with the harness too. A lane declared
+    RESTART-READY while its internal subagent was still running, so its
+    restart had to be deferred. RESTART-READY means no background commands
+    AND no running internal subagents; R1 checks for them where the harness
+    lets it (child processes / task state) and waits.
+14. A Muse lane with a running watch task (Muse-internal) keeps the
+    pane "working", so wait-for-idle never fires. RESTART-READY must
+    include stopping watch tasks, and R1 reports "waiting on a watch
+    task" rather than timing out silently.
+15. Model API outages kill turns mid-way; a lane that crashed out of its
+    turn never says RESTART-READY itself. R2 treats a lane that is idle
+    after a failed turn (no background work) as restartable, with a nudge.
+16. (Ours) A restart kills session-only crons and background validation
     gates: the RESTART-READY note must list every background job, monitor,
     and cron to re-arm, and the restarted lane re-arms before new work.
-14. (Ours) Manual recovery kept colliding on registry identity: Herdr
+17. (Ours) Manual recovery kept colliding on registry identity: Herdr
     name, pane census, and foreground argv disagreed after reboot; the
     argv-derived session (#947) and pane_id+terminal_id lookup are the
     tie-breakers, with any reported session staying authoritative.

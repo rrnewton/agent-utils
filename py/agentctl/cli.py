@@ -226,6 +226,19 @@ def parser() -> argparse.ArgumentParser:
     revive.add_argument("--startup-timeout", type=_ascii_float, default=30.0, metavar="SECONDS",
         help="replacement harness startup deadline, greater than 0 and at most 300 seconds (default: 30)")
 
+    restart = command("restart", "Restart a live agent in its own pane with its recorded session: exit the harness "
+        "gracefully at an idle turn boundary, relaunch in the same pane/tab resuming its session, re-pin it, restore "
+        "its Herdr name, transfer its slot ownership, and queue a re-arm notice (background shells, monitors and "
+        "session crons do not survive). Refuses with nothing changed when the session is unknown or contradicts "
+        "the running argv, when input is queued, or on a background-task exit dialog.",
+        "agentctl restart reviewer --when-idle", named=True)
+    restart.add_argument("--when-idle", action="store_true",
+        help="wait until the agent finishes its turn and is idle with nothing queued, instead of refusing")
+    restart.add_argument("--wait-idle", type=_ascii_float, default=3600.0, metavar="SECONDS",
+        help="how long --when-idle may wait, greater than 0 and at most 3600 seconds (default: 3600)")
+    restart.add_argument("--startup-timeout", type=_ascii_float, default=30.0, metavar="SECONDS",
+        help="replacement harness startup deadline, greater than 0 and at most 300 seconds (default: 30)")
+
     promote = command("promote", "Mark a launch_failed record running when its harness is in fact live: Herdr reports "
         "the launched harness in the recorded pane, tab, workspace and cwd, the Herdr agent name still points there, and "
         "the harness is the pane's only foreground process. Pins that process and terminal; never touches the tab, pane, "
@@ -566,6 +579,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 75 if result["blocked"] and not args.dry_run else 0
             result = sessions.revive(name, dry_run=args.dry_run, expected_token=args.expected_token,
                                      startup_timeout=args.startup_timeout)
+        elif args.command == "restart":
+            result = sessions.restart(name, when_idle=args.when_idle, wait_timeout=args.wait_idle,
+                                      startup_timeout=args.startup_timeout)
         elif args.command == "promote":
             result = sessions.promote(name, expected_token=args.expected_token)
         elif args.command == "anchor":

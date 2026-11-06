@@ -3048,6 +3048,15 @@ class ManagedAgents:
         return revive(self, name, dry_run=dry_run, expected_token=expected_token,
                       startup_timeout=startup_timeout)
 
+    def restart(
+        self, name: str, *, when_idle: bool = False,
+        wait_timeout: float = 3600.0, startup_timeout: float = 30.0,
+    ) -> dict[str, object]:
+        """Restart one live agent in its own pane with its recorded session."""
+        from agentctl.revive import restart
+        return restart(self, name, when_idle=when_idle, wait_timeout=wait_timeout,
+                       startup_timeout=startup_timeout)
+
     def revive_all(
         self, *, dry_run: bool = False, startup_timeout: float = 30.0,
     ) -> dict[str, object]:

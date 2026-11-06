@@ -208,6 +208,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl revive reviewer\n  agentctl revive --all --dry-run\n  agentctl revive reviewer --expected-token TOKEN\n  agentctl revive reviewer --abandon-candidate\n\nA live or unverifiable harness is never relaunched. Recovery opens a fresh tab, verifies the\nresumed runtime, archives the complete old generation, then closes only its proved stale pane.\nThe launch spec (`launch_spec` in status) is what ran: start writes it, adopt and anchor read it\nfrom the pinned process's command line. A record without one is rebuilt from its launch policy\nand profile. An adopted agent needs a spec, and its old pane is left open; the replacement is\nowned. An interrupted revive reserves the name until the same command finishes publication or\ncleanup. When its candidate is proved dead (its pane gone, or holding only an idle shell), the next\nrevive marks the attempt failed, keeps it under REGISTRY/.revives/.abandoned/ with the evidence, and\nlaunches again; --abandon-candidate does so for a candidate that cannot be proved either way, never\nfor one whose harness runs. Headless workers and remote agentcloud sessions are refused."
     )]
     Revive(Revive),
+    /// Restart a live agent in its own pane with its recorded session
+    #[command(
+        after_help = "Example: agentctl restart reviewer --when-idle\n\nExits the harness gracefully at an idle turn boundary, relaunches it in the same pane/tab resuming its recorded session, re-pins it, restores its Herdr name, transfers its wrkslots slot ownership, and queues a re-arm notice (background shells, monitors and session crons do not survive a restart). Refuses with nothing changed when the session is unknown or contradicts the running argv, when input is queued, or when the harness shows a background-task exit dialog."
+    )]
+    Restart(Restart),
     /// List registered agents with live status or an explicit probe error
     #[command(after_help = "Example: agentctl list --registry .agentctl")]
     List,
@@ -1013,6 +1018,21 @@ struct Revive {
     /// Mark an interrupted revive's candidate failed even when agentctl cannot prove it dead, then launch again; refused while a harness process runs for the candidate. A candidate proved dead (its pane gone, or holding only an idle shell) is abandoned without this flag. The attempt is kept under REGISTRY/.revives/.abandoned/ with the evidence. Applies only to a named revive
     #[arg(long, requires = "name", conflicts_with_all = ["archived", "fresh"])]
     abandon_candidate: bool,
+    /// Startup-readiness deadline in seconds, greater than 0 and at most 300 (default: 30)
+    #[arg(long, default_value = "30", value_parser = startup_seconds, value_name = "SECONDS")]
+    startup_timeout: f64,
+}
+
+#[derive(Args)]
+struct Restart {
+    #[command(flatten)]
+    agent: Named,
+    /// Wait until the agent finishes its turn and is idle with nothing queued, instead of refusing
+    #[arg(long)]
+    when_idle: bool,
+    /// How long --when-idle may wait in seconds, greater than 0 and at most 3600 (default: 3600)
+    #[arg(long, default_value = "3600", value_name = "SECONDS")]
+    wait_idle: f64,
     /// Startup-readiness deadline in seconds, greater than 0 and at most 300 (default: 30)
     #[arg(long, default_value = "30", value_parser = startup_seconds, value_name = "SECONDS")]
     startup_timeout: f64,
@@ -4265,6 +4285,16 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 };
             write_json(&result).map_err(Failure::Output)?;
             return Ok(code);
+        }
+        Commands::Restart(value) => {
+            let result = manager.restart(
+                &value.agent.name,
+                value.when_idle,
+                Duration::from_secs_f64(value.wait_idle),
+                Duration::from_secs_f64(value.startup_timeout),
+            )?;
+            manager.bring_coordinator_tab_forward(&value.agent.name, tab_socket);
+            result
         }
         Commands::List => json!(manager.list()?),
         Commands::Status(value) => manager.status(&value.name)?,

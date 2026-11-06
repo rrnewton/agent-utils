@@ -995,6 +995,137 @@ def revive(manager: ManagedAgents, name: str, *, dry_run: bool = False, expected
         return _complete(manager, journal)
 
 
+def restart(manager: ManagedAgents, name: str, *, when_idle: bool = False,
+            wait_timeout: float = 3600.0, startup_timeout: float = 30.0) -> dict[str, object]:
+    """Restart one live agent in its own pane (R1 restart-when-idle): wait
+    for an idle turn with nothing queued, exit the harness gracefully, then
+    revive in the same pane with the recorded session. Refuses with no
+    state changed when the session is unknown or contradicts the running
+    argv, when queued input is in flight, or when Claude's background-task
+    exit dialog appears.
+    """
+    _name(name)
+    record = manager._load(name)
+    if record.pane_id is None:
+        raise AgentDeliveryError(f"agent {name!r} has no recorded pane to restart in")
+    if record.harness not in ("muse", "claude", "codex"):
+        raise AgentDeliveryError(f"restart supports Muse, Claude, and Codex, not {record.harness!r}")
+    recorded = (
+        (None if record.native_session is None else record.native_session["value"])
+        or record.session_value or record.resume
+    )
+    derived: str | None = None
+    foreground = getattr(manager.client, "foreground_session", None)
+    if foreground is not None:
+        try:
+            derived = foreground(record.pane_id, record.harness)
+        except Exception:
+            derived = None
+    if recorded is not None and derived is not None and recorded != derived:
+        raise AgentDeliveryError(
+            f"running argv resumes {derived!r}, which contradicts the recorded session "
+            f"{recorded!r}; refusing to restart")
+    session = recorded if recorded is not None else derived
+    if session is None:
+        raise AgentDeliveryError(f"no recorded or running session for {name!r}; refusing to restart without one")
+    identity = record.custom_process_identity
+    alive = identity is not None and manager.client.process_liveness(identity) == "alive"
+    if not alive:
+        try:
+            alive = manager.client.pane_info(record.pane_id).agent == record.harness
+        except Exception:
+            alive = False
+
+    def idle() -> bool:
+        pending_dir = Path(manager._queue(name)) / "pending"
+        queued = pending_dir.is_dir() and any(pending_dir.iterdir())
+        if queued:
+            return False
+        try:
+            return manager.client.pane_info(cast(str, record.pane_id)).status in ("idle", "done")
+        except Exception:
+            return False
+
+    if alive:
+        deadline = time.monotonic() + wait_timeout
+        if not idle() and not when_idle:
+            raise AgentDeliveryError(f"{name!r} is not idle with an empty queue; rerun with --when-idle to wait")
+        while not idle():
+            if time.monotonic() >= deadline:
+                raise AgentDeliveryError(f"{name!r} did not become idle; nothing was restarted")
+            time.sleep(0.25)
+        time.sleep(3)
+        if not idle():
+            raise AgentDeliveryError(f"{name!r} did not stay idle; nothing was restarted")
+        manager.client.send_text(record.pane_id, "/exit")
+        manager.client.send_keys(record.pane_id, "Enter")
+        time.sleep(0.5)
+        screen = manager.client.read(record.pane_id, source="visible", lines=200)
+        if "Exit and stop tasks" in screen:
+            try:
+                manager.client.send_keys(record.pane_id, "Escape")
+            except Exception:
+                pass
+            raise AgentDeliveryError(
+                f"{name!r} has background tasks (its exit dialog appeared); finish or stop "
+                "them, note what to re-arm, then restart")
+        shelled = False
+        for attempt in range(2):
+            shell_deadline = time.monotonic() + (15 if attempt == 0 else 60)
+            while time.monotonic() < shell_deadline:
+                if manager.client.pane_is_idle_shell(record.pane_id):
+                    shelled = True
+                    break
+                time.sleep(0.25)
+            if shelled:
+                break
+            manager.client.send_keys(record.pane_id, "C-c")
+            time.sleep(1)
+            manager.client.send_keys(record.pane_id, "C-c")
+        if not shelled:
+            raise AgentDeliveryError(f"{name!r} did not exit to a bare shell; it was not restarted")
+    old_pid = None if identity is None else identity.pid
+    result = manager.revive(name, expected_token=record.token, startup_timeout=startup_timeout)
+    new = manager._load(name)
+    renamed = False
+    try:
+        manager.client.rename_agent(cast(str, new.pane_id), name)
+        renamed = True
+    except Exception:
+        renamed = False
+    slot: object = None
+    if new.slot is not None:
+        rebind = getattr(manager, "rebind_slot", None)
+        if rebind is None:
+            slot = {"owed": "this edition cannot transfer slot ownership; run `agentctl rebind-slot`"}
+        else:
+            try:
+                rebind(name)
+                slot = "transferred"
+            except Exception as error:
+                slot = {"owed": str(error)}
+    notice = (
+        f"You were restarted in place (same pane, session {session}). Background shells, "
+        "monitors, internal subagents, and session-only crons did NOT survive: re-arm what your restart note "
+        f"listed. Your slot ownership was {'transferred to the new process' if slot == 'transferred' else 'not transferred; check the restart report'}."
+    )
+    notified = False
+    try:
+        manager.send(name, notice, message_id=f"restart-{session[:8]}")
+        notified = True
+    except Exception:
+        notified = False
+    new_identity = new.custom_process_identity or new.harness_identity
+    return {
+        "name": name, "action": "restarted", "pane_id": new.pane_id,
+        "previous_pane_id": record.pane_id,
+        "harness_pid": None if new_identity is None else new_identity.pid,
+        "previous_harness_pid": old_pid, "session": session,
+        "token": result.get("token"), "renamed": renamed,
+        "slot_owner": slot, "notified": notified,
+    }
+
+
 def revive_all(manager: ManagedAgents, *, dry_run: bool = False, startup_timeout: float = 30.0) -> dict[str, object]:
     """Plan or recover all names, retaining individual refusals in the result."""
     if not math.isfinite(startup_timeout) or not 0 < startup_timeout <= 300:

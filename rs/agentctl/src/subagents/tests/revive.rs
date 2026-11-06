@@ -89,6 +89,46 @@ fn files(path: &Path) -> FileSnapshot {
 }
 
 #[test]
+fn restart_exits_and_revives_in_the_same_pane() {
+    let (fixture, mut old) = recoverable("muse", false);
+    old.session_agent = Some("muse".to_owned());
+    old.session_value = Some("sess-1".to_owned());
+    fixture.manager().save(&old).unwrap();
+    let pane = old.pane_id.clone().unwrap();
+    // Undo the kill: the harness is live and idle in its recorded pane.
+    fixture.client.dead_panes.lock().unwrap().remove(&pane);
+    fixture.client.started.store(true, Ordering::Relaxed);
+    fixture.client.custom_alive.store(true, Ordering::Relaxed);
+    // The harness exits on /exit, returning the pane to its shell.
+    fixture.client.exit_to_shell.store(true, Ordering::Relaxed);
+    let result = fixture
+        .manager()
+        .restart("worker", false, Duration::from_secs(30), TIMEOUT)
+        .unwrap();
+    assert_eq!(result["action"], "restarted");
+    assert_eq!(result["pane_id"], pane);
+    assert_eq!(result["previous_pane_id"], pane);
+    let new = fixture.manager().load("worker").unwrap();
+    assert_ne!(new.token, old.token);
+    assert_eq!(new.pane_id.as_deref(), Some(pane.as_str()));
+}
+
+#[test]
+fn restart_refuses_an_unknown_session_without_touching_the_pane() {
+    let (fixture, mut old) = recoverable("muse", false);
+    old.native_session = None;
+    old.session_value = None;
+    old.resume = None;
+    fixture.manager().save(&old).unwrap();
+    let before = files(&fixture.root.join("registry"));
+    assert!(fixture
+        .manager()
+        .restart("worker", false, Duration::from_secs(5), TIMEOUT)
+        .is_err());
+    assert_eq!(files(&fixture.root.join("registry")), before);
+}
+
+#[test]
 fn revive_resumes_without_reports_using_independent_process_and_terminal_anchors() {
     let (fixture, old) = recoverable("claude", false);
     let native = old.native_session.clone().unwrap();

@@ -2129,6 +2129,186 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         self.revive_with(agent_name, dry_run, expected_token, startup_timeout, false)
     }
 
+    /// Restart one live agent in its own pane (R1 restart-when-idle): wait
+    /// for an idle turn with nothing queued, exit the harness gracefully,
+    /// then revive in the same pane with the recorded session. Refuses with
+    /// no state changed when the session is unknown or contradicts the
+    /// running argv, when queued input is in flight, or when Claude's
+    /// background-task exit dialog appears.
+    pub fn restart(
+        &self,
+        agent_name: &str,
+        when_idle: bool,
+        wait_timeout: Duration,
+        startup_timeout: Duration,
+    ) -> Result<Value> {
+        let record = self.load(agent_name)?;
+        let Some(pane) = record.pane_id.clone() else {
+            return Err(fail(format!(
+                "agent '{agent_name}' has no recorded pane to restart in"
+            )));
+        };
+        if !matches!(record.harness.as_str(), "muse" | "claude" | "codex") {
+            return Err(fail(format!(
+                "restart supports Muse, Claude, and Codex, not {:?}",
+                record.harness
+            )));
+        }
+        let recorded = record
+            .native_session
+            .as_ref()
+            .map(|native| native.value.clone())
+            .or_else(|| record.session_value.clone())
+            .or_else(|| record.resume.clone());
+        let derived = self
+            .client
+            .foreground_session(&pane, &record.harness)
+            .ok()
+            .flatten();
+        let session = match (recorded, derived) {
+            (Some(a), Some(b)) if a != b => {
+                return Err(fail(format!(
+                    "running argv resumes {b:?}, which contradicts the recorded session {a:?}; refusing to restart"
+                )));
+            }
+            (Some(a), _) => a,
+            (None, Some(b)) => b,
+            (None, None) => {
+                return Err(fail(format!(
+                    "no recorded or running session for '{agent_name}'; refusing to restart without one"
+                )));
+            }
+        };
+        let identity = if record.anchors_with_harness_identity() {
+            record.harness_anchor().cloned()
+        } else {
+            record.custom_process_identity.clone()
+        };
+        let alive = identity
+            .as_ref()
+            .is_some_and(|id| self.client.process_liveness(id) == ProcessLiveness::Alive)
+            || self
+                .client
+                .pane_info(&pane)
+                .is_ok_and(|info| info.agent.as_deref() == Some(&record.harness));
+        if alive {
+            let deadline = std::time::Instant::now() + wait_timeout;
+            let idle = |this: &Self| -> bool {
+                this.pending_prompts(agent_name)
+                    .is_ok_and(|pending| pending.is_empty())
+                    && this
+                        .client
+                        .pane_info(&pane)
+                        .is_ok_and(|info| matches!(info.status.as_str(), "idle" | "done"))
+            };
+            if !idle(self) && !when_idle {
+                return Err(fail(format!(
+                    "'{agent_name}' is not idle with an empty queue; rerun with --when-idle to wait"
+                )));
+            }
+            while !idle(self) {
+                if std::time::Instant::now() >= deadline {
+                    return Err(fail(format!(
+                        "'{agent_name}' did not become idle within {wait_timeout:?}; nothing was restarted"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            // Idle twice, seconds apart: Herdr status flaps.
+            std::thread::sleep(Duration::from_secs(3));
+            if !idle(self) {
+                return Err(fail(format!(
+                    "'{agent_name}' did not stay idle; nothing was restarted"
+                )));
+            }
+            self.client.run(&pane, "/exit")?;
+            std::thread::sleep(Duration::from_millis(500));
+            let screen = self
+                .client
+                .read(&pane, "visible", Some(200))
+                .unwrap_or_default();
+            if screen.contains("Exit and stop tasks") {
+                let _ = self.client.send_keys(&pane, "Escape");
+                return Err(fail(format!(
+                    "'{agent_name}' has background tasks (its exit dialog appeared); finish or stop them, note what to re-arm, then restart"
+                )));
+            }
+            let shell_deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let mut shelled = false;
+            while std::time::Instant::now() < shell_deadline {
+                if self.client.pane_is_idle_shell(&pane)? {
+                    shelled = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            if !shelled {
+                let _ = self.client.send_keys(&pane, "C-c");
+                std::thread::sleep(Duration::from_secs(1));
+                let _ = self.client.send_keys(&pane, "C-c");
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                while std::time::Instant::now() < deadline {
+                    if self.client.pane_is_idle_shell(&pane)? {
+                        shelled = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+            if !shelled {
+                return Err(fail(format!(
+                    "'{agent_name}' did not exit to a bare shell; it was not restarted"
+                )));
+            }
+        }
+        let old_pid = identity.as_ref().map(|id| id.pid);
+        let result = self.revive(agent_name, false, Some(&record.token), startup_timeout)?;
+        let new_record = self.load(agent_name)?;
+        let new_pane = new_record.pane_id.clone().unwrap_or_default();
+        let renamed = self
+            .client
+            .rename_agent(&new_pane, agent_name)
+            .map(|()| true)
+            .unwrap_or(false);
+        let slot = if new_record.slot.is_some() {
+            match self.rebind_slot(agent_name) {
+                Ok(_) => json!("transferred"),
+                Err(error) => json!({"owed": error.to_string()}),
+            }
+        } else {
+            Value::Null
+        };
+        let notice = format!(
+            "You were restarted in place (same pane, session {session}). Background shells, monitors, internal subagents, and session-only crons did NOT survive: re-arm what your restart note listed. Your slot ownership was {}.",
+            if slot == json!("transferred") { "transferred to the new process" } else { "not transferred; check the restart report" }
+        );
+        let notified = self
+            .send_identified(
+                agent_name,
+                &notice,
+                DrainOptions {
+                    ready_timeout: Duration::from_secs(60),
+                    ..DrainOptions::default()
+                },
+                Some(&format!("restart-{}", &session[..8.min(session.len())])),
+            )
+            .map(|_| true)
+            .unwrap_or(false);
+        Ok(json!({
+            "name": agent_name,
+            "action": "restarted",
+            "pane_id": new_pane,
+            "previous_pane_id": pane,
+            "harness_pid": new_record.custom_process_identity.as_ref().or(new_record.harness_identity.as_ref()).map(|id| id.pid),
+            "previous_harness_pid": old_pid,
+            "session": session,
+            "token": result["token"],
+            "renamed": renamed,
+            "slot_owner": slot,
+            "notified": notified,
+        }))
+    }
+
     /// [`Self::revive`], and with `abandon_candidate` (`revive --abandon-candidate`, #899) an
     /// interrupted revive whose candidate cannot be proved alive or dead is marked failed too,
     /// unless a harness process runs for it. A candidate proved dead is abandoned either way.
