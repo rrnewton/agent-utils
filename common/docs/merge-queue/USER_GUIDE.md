@@ -661,8 +661,13 @@ not healthy, plus a heartbeat-freshness health check. Edit its paths, then
 Stopping or restarting the daemon cancels the validations in flight, and the daemon that replaces
 it validates those batches again from scratch: a restart in the middle of a long validation
 throws that validation away. When validations run detached from their launcher (as their own
-service units, say), the cancelled one may even keep running to its end with nobody reading its
-verdict. A drain avoids both. The running daemon finishes the validations already in flight and
+service units, say), the cancelled one would otherwise keep running with nobody reading its
+verdict, holding its validate slot: cancelling a donor job that the *local* donor is running
+also stops that job's `validate-merge-queue-*` unit (by unit name, from the queue side and
+from the donor's own next renewal), and a daemon that was killed outright leaves orphans the
+next `serve` stops at start, before it admits any new work, logging each one. The stopping
+daemon's exit log names any local validation unit it still leaves running. A drain avoids
+the wasted work entirely. The running daemon finishes the validations already in flight and
 acts on their verdicts (a green batch lands), starts no new validation (no new batch, no
 culprit-search probe, no rerun), and exits 0 once no run is in progress. The changes it did not
 decide stay queued, and nothing is ejected for the drain. A red batch whose culprit search, or

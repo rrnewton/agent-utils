@@ -1314,10 +1314,41 @@ impl Store {
         if matches!(job.state, JobState::Done | JobState::Cancelled) {
             return Ok(false);
         }
+        // A job leased to a donor on THIS host may have a local validation
+        // unit running for it (the donor's validator started one, e.g. a
+        // transient systemd user service): cancelling the job must stop
+        // that unit too, or it holds its validate slot with nobody able to
+        // stop it once the queue and the donor move on.
+        let local_lease = job
+            .lease
+            .as_ref()
+            .filter(|lease| lease.host == host_name())
+            .cloned();
+        let commit = job.commit.clone();
         job.state = JobState::Cancelled;
         job.lease = None;
         job.history.push(format!("{}: cancelled: {reason}", now()));
         self.write(&job)?;
+        if local_lease.is_some() {
+            let (stopped, left) = stop_local_validation_units(id, &commit);
+            if !stopped.is_empty() || !left.is_empty() {
+                let mut job = self.read(id)?;
+                for unit in &stopped {
+                    job.history.push(format!(
+                        "{}: stopped local validation unit {unit} for this cancelled job",
+                        now()
+                    ));
+                }
+                for unit in &left {
+                    job.history.push(format!(
+                        "{}: local validation unit {unit} still running after a stop for \
+                         this cancelled job",
+                        now()
+                    ));
+                }
+                self.write(&job)?;
+            }
+        }
         Ok(true)
     }
 
@@ -2018,6 +2049,126 @@ pub struct DonorOptions {
     pub cap_file: Option<PathBuf>,
 }
 
+/// Whether a local validation unit name belongs to `job_id`/`commit`: the
+/// unit name carries the job id, one of its dash-separated segments of at
+/// least 8 characters (the hash segment a unit is named after), or the
+/// commit's first 12 characters. Pure, so it can be tested without systemd.
+pub fn unit_matches_job(unit: &str, job_id: &str, commit: &str) -> bool {
+    if unit.contains(job_id) {
+        return true;
+    }
+    if commit.len() >= 12 && unit.contains(&commit[..12]) {
+        return true;
+    }
+    job_id
+        .split('-')
+        .filter(|segment| segment.len() >= 8)
+        .any(|segment| unit.contains(segment))
+}
+
+/// Parse `systemctl --user list-units --plain --no-legend` output into
+/// `(unit, active)` pairs for validation units only.
+fn parse_validation_units(text: &str) -> Vec<(String, bool)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let unit = fields.next()?;
+            if !unit.starts_with("validate-merge-queue-") || !unit.ends_with(".service") {
+                return None;
+            }
+            let _load = fields.next()?;
+            let active = fields.next()? == "active";
+            Some((unit.to_owned(), active))
+        })
+        .collect()
+}
+
+/// The local validation units systemd knows about, or none where systemd
+/// (or a user bus) is unavailable: absence is not an error, just nothing
+/// this host can stop.
+fn local_validation_units() -> Vec<(String, bool)> {
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "list-units",
+            "validate-merge-queue-*",
+            "--all",
+            "--no-legend",
+            "--plain",
+        ])
+        .stdin(Stdio::null())
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            parse_validation_units(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Stop every active local validation unit belonging to a job, by unit
+/// name (never by pattern kill): returns `(stopped, still_active)`. A unit
+/// that ignores the stop is reported, not hidden. Where no unit matches,
+/// both lists are empty.
+pub fn stop_local_validation_units(job_id: &str, commit: &str) -> (Vec<String>, Vec<String>) {
+    let targets: Vec<String> = local_validation_units()
+        .into_iter()
+        .filter(|(unit, active)| *active && unit_matches_job(unit, job_id, commit))
+        .map(|(unit, _)| unit)
+        .collect();
+    if targets.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    for unit in &targets {
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", "--no-block", unit])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    // A stop is asynchronous: give the units a moment, then say honestly
+    // which are still active.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let still: Vec<String> = local_validation_units()
+        .into_iter()
+        .filter(|(unit, active)| *active && targets.contains(unit))
+        .map(|(unit, _)| unit)
+        .collect();
+    let stopped: Vec<String> = targets
+        .iter()
+        .filter(|unit| !still.contains(unit))
+        .cloned()
+        .collect();
+    (stopped, still)
+}
+
+/// Local validation units still running for cancelled jobs, as
+/// `(unit, job_id)`: what a serve start must stop before admitting new
+/// work, and what a serve exit must name if it leaves any behind.
+pub fn orphaned_local_units(store: &Store) -> Vec<(String, String)> {
+    let Ok(jobs) = store.jobs() else {
+        return Vec::new();
+    };
+    let cancelled: Vec<&Job> = jobs
+        .iter()
+        .filter(|job| job.state == JobState::Cancelled)
+        .collect();
+    if cancelled.is_empty() {
+        return Vec::new();
+    }
+    local_validation_units()
+        .into_iter()
+        .filter(|(_, active)| *active)
+        .filter_map(|(unit, _)| {
+            cancelled
+                .iter()
+                .find(|job| unit_matches_job(&unit, &job.id, &job.commit))
+                .map(|job| (unit, job.id.clone()))
+        })
+        .collect()
+}
+
 fn host_name() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|name| name.trim().to_owned())
@@ -2395,10 +2546,32 @@ impl Worker<'_> {
                 );
                 self.release(&job, &token, &reason, false);
             }
-            Err(Unreported::Lost(reason)) => eprintln!(
-                "merge-queue donor {}: stopped {}: {reason}",
-                self.options.name, job.id
-            ),
+            Err(Unreported::Lost(reason)) => {
+                // The queue cancelled this job (the serve is stopping, or
+                // the candidate was discarded): the runner's process group
+                // is already stopped, but a validation unit the validator
+                // started on this host (a transient systemd service) is not
+                // in that group, so stop it by name here too.
+                let (stopped, left) = stop_local_validation_units(&job.id, &job.commit);
+                for unit in &stopped {
+                    eprintln!(
+                        "merge-queue donor {}: stopped local validation unit {unit} for \
+                         cancelled job {}",
+                        self.options.name, job.id
+                    );
+                }
+                for unit in &left {
+                    eprintln!(
+                        "merge-queue donor {}: local validation unit {unit} for cancelled \
+                         job {} is still running after a stop",
+                        self.options.name, job.id
+                    );
+                }
+                eprintln!(
+                    "merge-queue donor {}: stopped {}: {reason}",
+                    self.options.name, job.id
+                );
+            }
         }
     }
 
@@ -3418,6 +3591,46 @@ mod unit {
             Err(error) => error,
         };
         assert!(error.contains("malformed"), "{error}");
+    }
+
+    #[test]
+    fn a_validation_unit_matches_its_job_by_segment_or_commit() {
+        let job = "20261106T080445125-d4fb770cd67a-4fa58f2c";
+        let commit = "d4fb770cd67a1234567890abcdef1234567890abcd";
+        assert!(unit_matches_job(
+            "validate-merge-queue-d4fb770cd67a-1793953926667353745.service",
+            job,
+            commit
+        ));
+        assert!(unit_matches_job(
+            "validate-merge-queue-20261106T080445125-d4fb770cd67a-4fa58f2c.service",
+            job,
+            commit
+        ));
+        assert!(!unit_matches_job(
+            "validate-merge-queue-0123456789ab-1793953926667353745.service",
+            job,
+            commit
+        ));
+        assert!(!unit_matches_job("other.service", job, commit));
+        let units = parse_validation_units(
+            "validate-merge-queue-abc123456789-x.service loaded active running job\n\
+             validate-merge-queue-def123456789-y.service loaded inactive dead job\n\
+             merge-queue-serve.service loaded active running serve\n",
+        );
+        assert_eq!(
+            units,
+            vec![
+                (
+                    "validate-merge-queue-abc123456789-x.service".to_owned(),
+                    true
+                ),
+                (
+                    "validate-merge-queue-def123456789-y.service".to_owned(),
+                    false
+                ),
+            ]
+        );
     }
 
     #[test]

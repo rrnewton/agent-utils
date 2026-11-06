@@ -1351,6 +1351,31 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
             );
         }
     }
+    // Orphaned local validation units: a previous daemon (or donor) that
+    // was killed left units running for jobs that are now cancelled. Stop
+    // them before this daemon admits any new work, and log each one.
+    {
+        let store = crate::donor::Store::new(&state.root);
+        for (_unit, job) in crate::donor::orphaned_local_units(&store) {
+            let commit = store
+                .get(&job)
+                .map(|record| record.commit)
+                .unwrap_or_default();
+            let (stopped, left) = crate::donor::stop_local_validation_units(&job, &commit);
+            for unit in &stopped {
+                eprintln!(
+                    "merge-queue serve: stopped orphaned local validation unit {unit} \
+                     (job {job} is cancelled)"
+                );
+            }
+            for unit in &left {
+                eprintln!(
+                    "merge-queue serve: orphaned local validation unit {unit} (job {job} \
+                     is cancelled) is still running after a stop"
+                );
+            }
+        }
+    }
     let git = ops::repo(state, &config)?;
     let window = options.depth.unwrap_or(config.depth).max(1);
     let mut heartbeat = Heartbeat::new(std::process::id(), window, options.shadow);
@@ -1623,6 +1648,18 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
         }
     }
 
+    // Name any local validation unit this daemon leaves running for a
+    // cancelled job: the next daemon stops orphans at start, but the
+    // operator should see here that one survived this stop.
+    {
+        let store = crate::donor::Store::new(&state.root);
+        for (unit, job) in crate::donor::orphaned_local_units(&store) {
+            eprintln!(
+                "merge-queue serve: leaving local validation unit {unit} running \
+                 (job {job} is cancelled); the next serve stops it before admitting work"
+            );
+        }
+    }
     heartbeat.state = "stopped".to_owned();
     heartbeat.touch();
     let _ = write_heartbeat(state, &heartbeat);
