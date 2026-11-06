@@ -2547,7 +2547,7 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
                 "hygiene",
                 "registry",
                 false,
-                &error.to_string(),
+                error.to_string(),
                 Value::Null,
             )];
         }

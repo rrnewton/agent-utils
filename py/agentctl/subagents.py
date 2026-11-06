@@ -4062,12 +4062,12 @@ class ManagedAgents:
         """
         try:
             record = self._load(name)
+            if record.pane_id is None:
+                return
+            identity = record.custom_process_identity or record.harness_identity
+            if identity is None or self.client.process_liveness(identity) == "alive":
+                return
         except Exception:
-            return
-        if record.pane_id is None:
-            return
-        identity = record.custom_process_identity or record.harness_identity
-        if identity is None or self.client.process_liveness(identity) == "alive":
             return
         try:
             info = self.client.pane_info(record.pane_id)
