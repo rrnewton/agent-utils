@@ -4769,6 +4769,7 @@ impl<'a> Runner<'a> {
         &self,
         tip: &str,
         busy: &BTreeSet<i64>,
+        in_flight: &BTreeSet<i64>,
         max_batch: usize,
         pending: &mut VecDeque<Vec<i64>>,
     ) -> Result<(), String> {
@@ -4790,6 +4791,33 @@ impl<'a> Runner<'a> {
             .copied()
             .filter(|pr| !released.contains(pr) && !retried.contains(pr))
             .collect();
+        // A withdrawal of a change with no running validation applies at
+        // this cycle point, even when the run set the change aside (held
+        // for a ruling, say): it is not in flight, so nothing is wasted.
+        for pr in crate::intake::pending_withdrawals(self.state) {
+            if !in_flight.contains(&pr) {
+                busy.remove(&pr);
+            }
+        }
+        // A submit at a NEW head for a change this run set aside (ejected,
+        // most often) applies at this intake point too: the exclusion was
+        // for the old head, never for the change. A submit at the same
+        // excluded head keeps waiting (status names why). In-flight
+        // changes are untouched: their validation finishes first.
+        let mut resubmitted: BTreeSet<i64> = BTreeSet::new();
+        for (pr, head) in crate::intake::pending_submissions(self.state) {
+            if head.is_empty() || !busy.contains(&pr) || in_flight.contains(&pr) {
+                continue;
+            }
+            let excluded_head = lock(&self.items)
+                .get(&pr)
+                .map(|item| item.head.clone())
+                .unwrap_or_default();
+            if !excluded_head.is_empty() && head != excluded_head {
+                busy.remove(&pr);
+                resubmitted.insert(pr);
+            }
+        }
         let applied = match crate::intake::apply_except(self.state, &self.config, writer, &busy) {
             Ok(applied) => applied,
             Err(error) => {
@@ -4824,6 +4852,28 @@ impl<'a> Runner<'a> {
             self.event("intake", &line);
             lock(&self.report).intake.push(line);
         }
+        // Applied withdrawals and new-head resubmissions end the change's
+        // exclusion for this run: what was set aside was the old head, or a
+        // change that is no longer in the queue at all.
+        for one in &applied {
+            if one.outcome.is_err() {
+                continue;
+            }
+            if one.request.starts_with("withdraw") {
+                lock(&self.excluded).remove(&one.pr);
+            }
+            if resubmitted.contains(&one.pr) && one.request.starts_with("submit") {
+                lock(&self.excluded).remove(&one.pr);
+                self.event(
+                    "resubmit",
+                    &format!(
+                        "#{pr}: resubmitted at a new head; the stale exclusion for its old \
+                         head is dropped and it is planned again in this run",
+                        pr = one.pr
+                    ),
+                );
+            }
+        }
         if let Err(error) = self.plan_intake(tip, busy, max_batch, pending) {
             self.event(
                 "plan-intake",
@@ -4834,6 +4884,29 @@ impl<'a> Runner<'a> {
             );
         }
         Ok(())
+    }
+
+    /// Whether a waiting request would apply at once even though its change
+    /// is in `busy`: a withdrawal of a change with no running validation, or
+    /// a submit at a new head for a set-aside change that is not in flight
+    /// (see [`Self::take_intake`]).
+    fn intake_unblocks(&self, busy: &BTreeSet<i64>, in_flight: &BTreeSet<i64>) -> bool {
+        if crate::intake::pending_withdrawals(self.state)
+            .iter()
+            .any(|pr| busy.contains(pr) && !in_flight.contains(pr))
+        {
+            return true;
+        }
+        crate::intake::pending_submissions(self.state)
+            .into_iter()
+            .any(|(pr, head)| {
+                !head.is_empty()
+                    && busy.contains(&pr)
+                    && !in_flight.contains(&pr)
+                    && lock(&self.items)
+                        .get(&pr)
+                        .is_some_and(|item| !item.head.is_empty() && item.head != head)
+            })
     }
 
     /// The changes this run holds until their owner's `retry` (escalated, or held for a ruling)
@@ -5050,6 +5123,9 @@ impl<'a> Runner<'a> {
             let mut full_loaded = false;
             let mut deferred_this_run: BTreeSet<i64> = BTreeSet::new();
             let mut refused_stop = String::new();
+            // A held head's stop reason, kept while disjoint roots behind it
+            // finish landing in this same run (see the Deferred arm below).
+            let mut held_stop = String::new();
             // Historical per-change green rates, for value-ordered aborts.
             let rates = if self.config.value_ordering {
                 crate::decisions::change_rates(&self.state.root)
@@ -5183,12 +5259,18 @@ impl<'a> Runner<'a> {
                         for pr in self.retried_holds() {
                             busy.remove(&pr);
                         }
-                        if crate::intake::has_pending_except(self.state, &busy) {
+                        let in_flight: BTreeSet<i64> = flights
+                            .iter()
+                            .flat_map(|flight| flight.candidate.prs.iter().copied())
+                            .collect();
+                        if crate::intake::has_pending_except(self.state, &busy)
+                            || self.intake_unblocks(&busy, &in_flight)
+                        {
                             let tip = match stack_top(&flights) {
                                 Some(last) => last.candidate.tip.clone(),
                                 None => self.current_base()?,
                             };
-                            self.take_intake(&tip, &busy, max_batch, pending)?;
+                            self.take_intake(&tip, &busy, &in_flight, max_batch, pending)?;
                             // A ruling taken in just now is acted on at once, not at the end
                             // of the run, when other batches may have moved the base.
                             let rulings = self.accepted_rulings(&busy);
@@ -5583,6 +5665,9 @@ impl<'a> Runner<'a> {
                                 "{}: no new batch started; the undecided changes stay queued",
                                 crate::drain::DRAINED
                             ));
+                        }
+                        if !held_stop.is_empty() {
+                            return Ok(held_stop.clone());
                         }
                         return Ok(refused_stop.clone());
                     }
@@ -6062,12 +6147,35 @@ impl<'a> Runner<'a> {
                                     discard(&mut flights, &rx, pending);
                                 }
                             }
-                            BatchOutcome::Deferred(reason, _prs) => {
-                                // Already recorded as deferred; the changes stay queued
-                                // (not requeued into this run, which would spin without
-                                // backoff). Later batches were discarded above and stay
-                                // in `pending` for the next run.
-                                return Ok(reason);
+                            BatchOutcome::Deferred(reason, prs) => {
+                                // Already recorded as deferred; the held changes stay
+                                // queued (not requeued into this run, which would spin
+                                // without backoff). A held front item does not block
+                                // the disjoint roots behind it: `discard` kept them,
+                                // and they land in this run as if the held item were
+                                // absent (a change `--after` it was built on its tree
+                                // and was discarded with the stack, so it still
+                                // waits). Only when no root is left does the run end.
+                                if flights.is_empty() {
+                                    return Ok(reason);
+                                }
+                                let roots: Vec<i64> = flights
+                                    .iter()
+                                    .filter(|flight| flight.rooted)
+                                    .flat_map(|flight| flight.candidate.prs.iter().copied())
+                                    .collect();
+                                self.event(
+                                    "held-front",
+                                    &format!(
+                                        "landing blocked behind {} (held): {}; disjoint \
+                                         root(s) {} behind it land in this run as if it \
+                                         were absent",
+                                        list(&prs),
+                                        reason,
+                                        list(&roots)
+                                    ),
+                                );
+                                held_stop = reason;
                             }
                             BatchOutcome::RefusedDeferred(reason) => {
                                 // Already recorded as deferred; the changes stay queued

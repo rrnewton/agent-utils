@@ -414,6 +414,151 @@ fn a_decidable_root_becomes_the_stack_head_for_refills() {
     );
 }
 
+/// A held (INFRA-BLOCKED, not validating further) front item must not block
+/// the greens behind it: the disjoint root built on the base lands in the
+/// same run, and the stacked change behind the held item is rebuilt without
+/// it and lands too. The run still ends on the held item's stop reason.
+#[test]
+fn a_held_front_item_does_not_block_the_greens_behind_it() {
+    let fx = Fixture::new("held-front-root");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    // Candidates containing change 1's test file are INFRA-BLOCKED (the host
+    // refused every measurement); everything else passes.
+    let validator = r#"if [ -f tests/a ]; then echo "INFRA-BLOCKED: a"; exit 6; fi; for t in $(ls tests); do printf '{"id":"%s","outcome":"pass"}\n' "$t" >> "$MQ_RESULTS"; done; exit 0"#;
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        validator,
+    ]);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    let out = fx.mq(&["run", "--depth", "3", "--max-batch", "1"]);
+    // Exit 3: the run still ends on the held item's stop reason.
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let report = latest_report(&fx);
+    // The held change is neither landed nor ejected; the greens behind it
+    // landed in this same run.
+    assert_eq!(status(&fx, 1), "queued");
+    assert_eq!(status(&fx, 2), "landed", "{report}");
+    assert_eq!(status(&fx, 3), "landed", "{report}");
+    assert!(
+        report["stopped"]
+            .as_str()
+            .is_some_and(|stop| stop.contains("INFRA-BLOCKED")),
+        "{report}"
+    );
+    let runs = fx.queue().join(".git/merge-queue/runs");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(runs)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join("events.jsonl").is_file())
+        .collect();
+    dirs.sort();
+    let events = std::fs::read_to_string(dirs.pop().unwrap().join("events.jsonl")).unwrap();
+    assert!(
+        events.contains("landing blocked behind #1 (held)"),
+        "{events}"
+    );
+}
+
+/// A withdrawal of a change held earlier in the same run (no running
+/// validation for it) applies at the next intake point while another
+/// validation is still in flight, and the run continues behind it.
+#[test]
+fn withdrawing_a_held_change_applies_while_another_validation_is_in_flight() {
+    let fx = Fixture::new("held-front-withdraw");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    let started = fx.root.join("started");
+    let gates = fx.root.join("gates");
+    std::fs::create_dir_all(&gates).unwrap();
+    // Gated like `gated_setup`, except candidates carrying change 1's file
+    // are INFRA-BLOCKED once their gate opens.
+    let validator = format!(
+        r#"set=$(ls tests | tr '\n' _); echo "$set" >> '{started}'
+i=0; while [ ! -e '{gates}'/"$set" ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done
+[ -e '{gates}'/"$set" ] || exit 1
+if [ -f tests/a ]; then echo "INFRA-BLOCKED: a"; exit 6; fi
+for t in $(ls tests); do printf '{{"id":"%s","outcome":"pass"}}\n' "$t" >> "$MQ_RESULTS"; done
+exit 0"#,
+        started = started.display(),
+        gates = gates.display()
+    );
+    let script = fx.root.join("validator.sh");
+    std::fs::write(&script, &validator).unwrap();
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        &format!("sh '{}'", script.display()),
+    ]);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    let mut daemon = Daemon::start(&fx);
+    wait_for("the window to fill", &started, |lines| lines.len() >= 3);
+    // Change 1 comes back INFRA-BLOCKED and is held; the root (change 3)
+    // keeps validating behind it.
+    open(&gates, "a_t0_");
+    let start = Instant::now();
+    let mut withdrawn = false;
+    // Record the withdrawal once the hold is visible on the item.
+    while start.elapsed() < Duration::from_secs(30) {
+        let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+        let held = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["pr"] == 1 && item["hold_verdict"] == "INFRA-BLOCKED");
+        if held {
+            let out = fx.mq_ok(&["withdraw", "1"]);
+            assert!(out.contains("recorded"), "{out}");
+            withdrawn = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(withdrawn, "change 1 was never held");
+    // The withdrawal applies while change 3's validation is still gated:
+    // change 1 must not wait for the run's end.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(30) {
+        if status(&fx, 1) == "withdrawn" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        status(&fx, 1),
+        "withdrawn",
+        "the withdrawal must apply at the next cycle point, not the run's end"
+    );
+    assert_eq!(status(&fx, 3), "queued", "change 3 is still in flight");
+    open(&gates, "c_t0_");
+    open(&gates, "b_c_t0_");
+    assert_eq!(daemon.exit_code(Duration::from_secs(90)), Some(0));
+    assert_eq!(status(&fx, 2), "landed");
+    assert_eq!(status(&fx, 3), "landed");
+}
+
 #[test]
 fn a_disjoint_root_is_cancelled_the_moment_the_head_lands() {
     let (fx, started, gates) = gated_setup("disjoint-root-green-head");

@@ -140,6 +140,8 @@ pub struct Entry {
 /// What applying one request did.
 #[derive(Clone, Debug)]
 pub struct Applied {
+    /// The change the request is about.
+    pub pr: i64,
     /// `submit #N` and the like (or the file name, when the record is unreadable).
     pub request: String,
     /// When it was recorded.
@@ -190,6 +192,12 @@ pub struct Pending {
     pub last_recorded_at: String,
     /// How many identical requests were recorded in a row.
     pub requests: usize,
+    /// Why this request is still waiting, when that can be told from the
+    /// queue's records alone (for example a resubmission at the head a run
+    /// ejected, which no run may rebuild). Empty when it will simply apply
+    /// at the next intake point.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub wait: String,
 }
 
 impl Pending {
@@ -210,8 +218,13 @@ impl Pending {
         } else {
             String::new()
         };
+        let wait = if self.wait.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", self.wait)
+        };
         format!(
-            "#{} {PENDING_INTAKE}: {what} since {}{repeats}",
+            "#{} {PENDING_INTAKE}: {what} since {}{repeats}{wait}",
             self.pr, self.recorded_at
         )
     }
@@ -332,6 +345,27 @@ pub fn has_pending(state: &State) -> bool {
     files(&pending_dir(state)).is_ok_and(|files| !files.is_empty())
 }
 
+/// Waiting submissions as `(change, head it names)`: the submission's own
+/// head when it names one, else the head its ref resolved to when the
+/// request was recorded. A run compares this with the head it set a change
+/// aside at: a different head may apply at once, the same head may not.
+pub fn pending_submissions(state: &State) -> Vec<(i64, String)> {
+    pending_entries(state)
+        .into_iter()
+        .filter_map(|entry| match &entry.request {
+            Request::Submit(submission) => Some((
+                submission.pr,
+                if submission.head.is_empty() {
+                    entry.seen_head.clone()
+                } else {
+                    submission.head.clone()
+                },
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Changes a waiting request withdraws. A run reads this before it lands anything: a change
 /// withdrawn while its batch validated is not landed.
 pub fn pending_withdrawals(state: &State) -> BTreeSet<i64> {
@@ -398,6 +432,7 @@ pub fn apply_except(
                 std::fs::rename(&path, &kept)
                     .map_err(|e| format!("cannot move {} aside: {e}", path.display()))?;
                 applied.push(Applied {
+                    pr: 0,
                     request: name.to_string_lossy().into_owned(),
                     recorded_at: String::new(),
                     outcome: Err(error),
@@ -431,6 +466,7 @@ pub fn apply_except(
             .map_err(|error| format!("cannot remove {}: {error}", path.display()))?;
         last.insert(pr, (entry.request.clone(), applied.len(), 0));
         applied.push(Applied {
+            pr,
             request: entry.request.describe(),
             recorded_at: entry.recorded_at.clone(),
             outcome,
@@ -612,10 +648,31 @@ pub fn pending(state: &State) -> Vec<Pending> {
                 recorded_at: entry.recorded_at.clone(),
                 last_recorded_at: entry.recorded_at.clone(),
                 requests: 1,
+                wait: String::new(),
             },
         ));
     }
-    out.into_iter().map(|(_, pending)| pending).collect()
+    let mut pendings: Vec<Pending> = out.into_iter().map(|(_, pending)| pending).collect();
+    // A resubmission at exactly the head a change was ejected at can never
+    // be rebuilt by a run that set it aside: say so, with the ejected head,
+    // instead of leaving the wait unexplained. A submission at a different
+    // head applies at the next intake point and needs no reason.
+    for pending in &mut pendings {
+        if pending.op != "submit" {
+            continue;
+        }
+        if let Ok(Some(item)) = state.item(pending.pr) {
+            if item.status == crate::model::ItemStatus::Ejected
+                && (pending.head.is_empty() || pending.head == item.head)
+            {
+                pending.wait = format!(
+                    "waits for the run end: excluded this run (ejected at {})",
+                    short(&item.head)
+                );
+            }
+        }
+    }
+    pendings
 }
 
 /// Waiting and refused requests, for `status` (no lock).

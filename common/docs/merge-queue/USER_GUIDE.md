@@ -348,6 +348,20 @@ seconds under `run`.
   requests for two hours: it then finishes the batches in flight and ends, so the next run
   reloads the configuration and the validator's tools. The run report lists what the run
   applied under `intake`.
+- Two more requests apply at the next intake point even though the run set their change
+  aside. A `withdraw` of a change with no running validation (held for a ruling, say)
+  applies at once and the run goes on without it. And a `submit` at a *new* head for a
+  change the run ejected or set aside applies at once too: the exclusion was for the old
+  head, so the stale exclusion is dropped and the new head is planned on top of the
+  batches in flight, in the same run. A `submit` at the *same* head the run ejected keeps
+  waiting for the run to end, and its `pending-intake` line says why: `waits for the run
+  end: excluded this run (ejected at <head>)`.
+- A held front item (held for a ruling, not validating) does not block the greens behind
+  it: batches built on the base itself that do not depend on it land in the same run as if
+  it were absent, and the run logs `landing blocked behind #N (held): ...`. Changes built
+  on the held item's tree, and changes submitted `--after` it, still wait for it. `status`
+  names the block (`landing blocked behind #N (held LABEL until T): K green waiting
+  (#M, ...)`) when a kept green sits behind a held change.
 
 - `submit` first checks, without writing to the repository the run is using, that the head
   resolves (`git ls-remote`), and that it matches `--sha` when one is given. A head that does

@@ -350,3 +350,95 @@ fn a_change_a_failing_batch_sends_back_is_planned_again_with_a_request_taken_in_
     let files = git(&fx.remote(), &["ls-tree", "--name-only", "main", "tests/"]);
     assert_eq!(files, "tests/b\ntests/c\ntests/t0", "{files}");
 }
+
+/// An ejected change resubmitted at a NEW head while another batch is still
+/// in flight applies at the run's next intake point: the stale exclusion
+/// for the old head is dropped, the new head is planned on top of the
+/// in-flight batch, and it lands in the same run.
+#[test]
+fn an_ejected_change_resubmitted_at_a_new_head_is_validated_in_the_same_run() {
+    let (fx, started, gates) = setup("intake-resubmit-new-head");
+    fx.branch("a", &[("tests/a", "FAIL\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    let mut daemon = Daemon::start(&fx);
+    wait_for("both batches to validate", Duration::from_secs(30), || {
+        started_lines(&started).len() == 2
+    });
+    // Change 1 fails and is ejected; change 2 (stacked on it) stays gated.
+    open(&gates, 1);
+    open(&gates, 2);
+    wait_for("change 1 to be ejected", Duration::from_secs(60), || {
+        status(&fx, 1) == "ejected"
+    });
+    // Resubmit change 1 at a fixed head while change 2 is still in flight.
+    fx.branch("a2", &[("tests/a", "ok\n")]);
+    let out = fx.mq_ok(&["submit", "1", "--head", "a2"]);
+    assert!(out.contains("recorded #1"), "{out}");
+    // It validates again beside change 2 in this same run.
+    wait_for(
+        "change 1 to validate at its new head",
+        Duration::from_secs(60),
+        || started_lines(&started).len() >= 3,
+    );
+    open(&gates, 3);
+    assert_eq!(daemon.exit_code(Duration::from_secs(90)), Some(0));
+    let reports = reports(&fx);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(status(&fx, 1), "landed");
+    assert_eq!(status(&fx, 2), "landed");
+    let intake = reports[0]["intake"].as_array().unwrap();
+    assert!(
+        intake
+            .iter()
+            .any(|line| line.as_str().unwrap().starts_with("applied submit #1")),
+        "{intake:?}"
+    );
+}
+
+/// A resubmission at the SAME head a run ejected keeps waiting for the run
+/// to end, and the pending request says why.
+#[test]
+fn a_resubmission_at_the_ejected_head_waits_and_status_names_why() {
+    let (fx, started, gates) = setup("intake-resubmit-same-head");
+    fx.branch("a", &[("tests/a", "FAIL\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    // Two files, so change 2's rebuilt candidate (3 files) has a gate of
+    // its own, distinct from change 1's (2 files).
+    fx.branch("b", &[("tests/b", "ok\n"), ("tests/b2", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    let mut daemon = Daemon::start(&fx);
+    wait_for("both batches to validate", Duration::from_secs(30), || {
+        started_lines(&started).len() == 2
+    });
+    open(&gates, 1);
+    open(&gates, 2);
+    wait_for("change 1 to be ejected", Duration::from_secs(60), || {
+        status(&fx, 1) == "ejected"
+    });
+    // Change 2, stacked on the ejected batch, is rebuilt without it and
+    // validates again; wait for that rebuild so the count is stable.
+    wait_for(
+        "change 2 to be rebuilt without change 1",
+        Duration::from_secs(60),
+        || started_lines(&started).iter().any(|line| line == "b b2 t0"),
+    );
+    let out = fx.mq_ok(&["submit", "1", "--head", "a"]);
+    assert!(out.contains("recorded #1"), "{out}");
+    // Nothing new validates for change 1 while the run goes on, and the
+    // pending request names the reason.
+    let before = started_lines(&started).len();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(started_lines(&started).len(), before);
+    let list = fx.mq_ok(&["list", "--json"]);
+    assert!(
+        list.contains("waits for the run end: excluded this run (ejected at"),
+        "{list}"
+    );
+    open(&gates, 3);
+    assert_eq!(daemon.exit_code(Duration::from_secs(90)), Some(0));
+    // Applied at the run's end: queued again for the next run.
+    assert_eq!(status(&fx, 1), "queued");
+    assert_eq!(status(&fx, 2), "landed");
+}

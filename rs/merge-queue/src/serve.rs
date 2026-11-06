@@ -1720,6 +1720,11 @@ pub struct StatusReport {
     /// A drain request on file (`merge-queue drain-for-upgrade`), whichever daemon it names.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drain: Option<crate::drain::Request>,
+    /// "landing blocked behind #N (held LABEL until T): K green waiting
+    /// (#M, ...)" lines: a held front item, and kept greens behind it that
+    /// land without it. Empty when nothing is held ahead of a green.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub held_block: Vec<String>,
     /// Queued changes held because a change they must land after (`--after`) is ejected,
     /// withdrawn or not in the queue (see [`crate::model::Waiting`]).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1848,6 +1853,49 @@ pub fn collect_status(state: &State, stale_after_secs: u64) -> Result<StatusRepo
         ),
     };
     let shadow = heartbeat.as_ref().is_some_and(|h| h.shadow);
+    // A held front item and the kept greens behind it: greens validated on
+    // the current base land without the held item, so name the block and
+    // the waiting greens instead of leaving the queue looking stuck.
+    let held_block: Vec<String> = {
+        let at = crate::model::now();
+        let kept: Vec<i64> = state
+            .kept_validations()
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|entry| entry.prs())
+            .collect();
+        let mut ordered: Vec<&crate::model::Item> = items
+            .iter()
+            .filter(|item| item.status == ItemStatus::Queued)
+            .collect();
+        ordered.sort_by(|a, b| a.submitted_at.cmp(&b.submitted_at).then(a.pr.cmp(&b.pr)));
+        let mut lines = Vec::new();
+        for (index, item) in ordered.iter().enumerate() {
+            if !item.is_flaky_held_at(&at) {
+                continue;
+            }
+            let greens: Vec<i64> = ordered[index + 1..]
+                .iter()
+                .map(|behind| behind.pr)
+                .filter(|pr| kept.contains(pr))
+                .collect();
+            if !greens.is_empty() {
+                lines.push(format!(
+                    "landing blocked behind #{} (held {} until {}): {} green waiting ({})",
+                    item.pr,
+                    item.hold_label(),
+                    item.flaky_hold_until,
+                    greens.len(),
+                    greens
+                        .iter()
+                        .map(|pr| format!("#{pr}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        lines
+    };
     Ok(StatusReport {
         state_dir: state.root.clone(),
         daemon,
@@ -1866,6 +1914,7 @@ pub fn collect_status(state: &State, stale_after_secs: u64) -> Result<StatusRepo
         working_secs,
         intake: crate::intake::summary(state),
         drain: crate::drain::read(state),
+        held_block,
         waiting: crate::model::waiting_changes(&items),
         items_error,
         remedy,
@@ -1991,6 +2040,9 @@ pub fn render_status(report: &StatusReport) -> String {
             for waiting in &change.waiting_on {
                 out.push_str(&format!("  #{} held: {}\n", change.pr, waiting.describe()));
             }
+        }
+        for line in &report.held_block {
+            out.push_str(&format!("  {line}\n"));
         }
     } else {
         out.push_str(&format!(
