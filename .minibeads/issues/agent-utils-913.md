@@ -1,11 +1,12 @@
 ---
 title: 'unknown-harness-pins-foreground: --harness unknown pins the pane''s actual foreground program, not a process named unknown'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: '014: mu-orc'
 created_at: 2026-11-06T00:18:43.898584952+00:00
-updated_at: 2026-11-06T00:18:43.898584952+00:00
+updated_at: 2026-11-06T04:05:00.000000000+00:00
+closed_at: 2026-11-06T04:05:00.000000000+00:00
 ---
 
 # Description
@@ -28,3 +29,7 @@ With `--harness unknown`, agentctl pins a process literally named "unknown". `re
 # Notes
 
 Owner request 168, relayed by the lead on 2026-11-05 at 7:57 PM ET (P1, small). A lane on the lead host found the root cause in a trial and will do the fix, starting once that host can create a slot again (waiting on the #898 recovery fix). It touches the same area as #852 D (unknown and agentterm pane evidence, cl-start), so coordinate there.
+
+## Resolution
+
+Landed as e2fec210 ("agentctl: pin the actual foreground program for unknown harness"), with make validate green. It changes rs/agentctl/src/term.rs and client.rs, and adds tmux_lifecycle.rs tests.
