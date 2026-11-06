@@ -1123,6 +1123,13 @@ pub struct Config {
     pub union_paths: Vec<String>,
     /// Generated files regenerated on the candidate instead of blocking it.
     pub regenerate: RegenerateConfig,
+    /// Generated-file path patterns declared at the top level (globs, as in
+    /// `regenerate.paths`): an alternative spelling for queues whose config
+    /// names the derived files directly. On load they are merged into
+    /// `regenerate.paths`, so every conflict check sees one set. Omitted from
+    /// `config.json` while empty, so an older config still loads unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_paths: Vec<String>,
     /// Exact-commit rule: never carry a validation result to a different commit. A remainder
     /// after an ejection reruns the batch's whole selection, and a tree lands only with green
     /// coverage of its selection recorded at that exact commit.
@@ -1231,6 +1238,7 @@ impl Default for Config {
             probe_parallelism: 0,
             union_paths: Vec::new(),
             regenerate: RegenerateConfig::default(),
+            generated_paths: Vec::new(),
             exact_sha: false,
             exact_merge_allowed: false,
             trust_base: false,
@@ -1484,6 +1492,15 @@ impl State {
                 self.config_path().display(),
                 config.schema
             ));
+        }
+        // Top-level `generated_paths` is the same declaration as
+        // `regenerate.paths`: fold it in so conflict checks, planning and
+        // regeneration all see one set of generated files.
+        let mut config = config;
+        for pattern in config.generated_paths.clone() {
+            if !config.regenerate.paths.contains(&pattern) {
+                config.regenerate.paths.push(pattern);
+            }
         }
         Ok(config)
     }

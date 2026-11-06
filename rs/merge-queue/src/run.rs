@@ -3042,6 +3042,16 @@ impl<'a> Runner<'a> {
                 wt.rev_parse("HEAD")?
             };
             let notes = prefixed_lines(&output.stdout, "merge-queue-note:");
+            if !conflicted.is_empty() {
+                self.event(
+                    "regenerated-conflict",
+                    &format!(
+                        "#{pr}: conflict only in generated paths ({}); settled on the target's side and regenerated at {}",
+                        conflicted.join(", "),
+                        short(&commit)
+                    ),
+                );
+            }
             self.event(
                 "regenerate",
                 &format!(

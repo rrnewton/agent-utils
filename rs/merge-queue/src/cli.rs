@@ -1352,6 +1352,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Dry-run composition of one change onto the current base: report which
+    /// conflicts the queue would settle by regenerating declared generated
+    /// paths and which need a human (read-only; an `--exact` change is never
+    /// rewritten, so all of its conflicts need a human).
+    Compose {
+        /// Change number to check against the current base.
+        #[arg(long, value_name = "PR")]
+        check: i64,
+        /// Print the verdict as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Order and chunk queued changes into batches against the current base (read-only).
     Plan {
         /// Override the configured maximum batch size.
@@ -2626,6 +2638,26 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 );
                 for request in &pending {
                     println!("{}", request.line());
+                }
+            }
+            Ok(0)
+        }
+        Command::Compose { check, json } => {
+            let config = state.config()?;
+            let verdict = ops::compose_check(&state, &config, check)?;
+            if json {
+                let text = serde_json::to_string_pretty(&verdict).map_err(|e| e.to_string())?;
+                println!("{text}");
+            } else {
+                println!("#{}: {}", verdict.pr, verdict.verdict);
+                if !verdict.auto_regenerated.is_empty() {
+                    println!(
+                        "  would auto-regenerate: {}",
+                        verdict.auto_regenerated.join(", ")
+                    );
+                }
+                if !verdict.needs_human.is_empty() {
+                    println!("  needs a human: {}", verdict.needs_human.join(", "));
                 }
             }
             Ok(0)

@@ -822,6 +822,80 @@ fn peripheral_limit(config: &Config, max_batch: usize) -> usize {
     }
 }
 
+/// Dry-run verdict for `merge-queue compose --check`: which of one change's
+/// conflicts against the current base the queue would settle by regeneration
+/// and which need a human. Read-only: nothing is queued, built or landed.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ComposeCheck {
+    /// Change number checked.
+    pub pr: i64,
+    /// Base commit the check ran against.
+    pub base: String,
+    /// Head commit checked.
+    pub head: String,
+    /// Whether the change must land exactly as submitted (never rewritten).
+    pub exact: bool,
+    /// Conflicting paths the queue would settle on the base side and regenerate.
+    pub auto_regenerated: Vec<String>,
+    /// Conflicting paths a human must resolve (includes every conflict of an
+    /// exact change, which is never rewritten).
+    pub needs_human: Vec<String>,
+    /// One-line verdict: `clean`, `would auto-regenerate` or `needs a human`.
+    pub verdict: String,
+}
+
+/// Check one queued change against the current base without changing anything:
+/// partition its merge conflicts into generated paths (auto-regenerated when a
+/// regenerate command is configured, and never for an `--exact` change) and
+/// hand-written paths (always a human's job).
+pub fn compose_check(state: &State, config: &Config, pr: i64) -> Result<ComposeCheck, String> {
+    let item = state
+        .item(pr)?
+        .ok_or_else(|| format!("#{pr} is not in the queue"))?;
+    let git = repo(state, config)?;
+    let (base_sha, current) = refresh(&git, config, &[(pr, item.head_ref.clone())])?;
+    let head = current
+        .get(&pr)
+        .cloned()
+        .flatten()
+        .ok_or_else(|| format!("#{pr}'s head {} no longer resolves", item.head_ref))?;
+    let conflicts = git.merge_conflicts(&base_sha, &head)?;
+    let mut auto_regenerated = Vec::new();
+    let mut needs_human = Vec::new();
+    for path in &conflicts {
+        if !item.exact && config.regenerate.covers(path) {
+            auto_regenerated.push(path.clone());
+        } else {
+            needs_human.push(path.clone());
+        }
+    }
+    let verdict = if conflicts.is_empty() {
+        "clean: no conflicts against the base".to_owned()
+    } else if needs_human.is_empty() {
+        format!(
+            "would auto-regenerate: {} conflict(s) confined to generated paths",
+            auto_regenerated.len()
+        )
+    } else if item.exact {
+        "needs a human: an exact change is never rewritten, so its conflicts are not auto-regenerated"
+            .to_owned()
+    } else {
+        format!(
+            "needs a human: {} conflicting path(s) outside the generated set",
+            needs_human.len()
+        )
+    };
+    Ok(ComposeCheck {
+        pr,
+        base: base_sha,
+        head,
+        exact: item.exact,
+        auto_regenerated,
+        needs_human,
+        verdict,
+    })
+}
+
 /// Refresh the base and every queued head, probe them, and build a plan.
 pub fn plan(state: &State, config: &Config, max_batch: usize) -> Result<Plan, String> {
     let items = state.items()?;

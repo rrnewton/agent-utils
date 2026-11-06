@@ -960,6 +960,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `union_paths` | `[]` | Attribute patterns merged with Git's union driver (see "Union merges"). |
 | `priority` | absent | `{label, ci_paths}`: the priority label (absent or empty: `mq-priority`; `-`: off) and the CI path patterns for label suggestions. Left out of the file while both are defaults. See "Priority changes". |
 | `regenerate` | empty | `{paths, command, when}`; see "Generated files". |
+| `generated_paths` | `[]` | Top-level spelling of `regenerate.paths` (globs naming the derived files); merged into `regenerate.paths` on load. Left out of the file while empty. |
 | `exact_sha` | `false` | The exact-commit rule. |
 | `exact_merge_allowed` | `false` | Operator-asserted exception: exact merge commits may land even when the base branch's rules require linear history. Set only while an owner-granted ruleset exception is in place (init `--exact-merge-allowed`). Left out of the file while false. |
 | `trust_base` | `false` | Skip probing the base in culprit searches. |
@@ -2069,6 +2070,12 @@ Some repositories commit files generated from sources, such as a validation grap
 JSON or a static table compiled to code. Two changes that each regenerated such a file conflict
 on it, even when their sources combine cleanly. If those files cause most of a backlog's rebases,
 list them with `--regen-path` and give the command that rebuilds them with `--regen-command`.
+The same set can be declared in `config.json` as the top-level `generated_paths` list of globs;
+it is merged into `regenerate.paths` when the configuration loads. `merge-queue compose --check <PR>`
+is a read-only dry run against the current base: it lists which of the change's conflicts would be
+auto-regenerated and which need a human (every conflict of an `--exact` change needs a human, because
+an exact change is never rewritten). Each auto-regenerated conflict is recorded as a
+`regenerated-conflict` run event naming the paths.
 
 - **Planning.** A conflict confined to generated files is not a conflict. The plan batches those
   changes together instead of holding all but one.
