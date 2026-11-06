@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-insteadof-diagnosis: a fetch through a rewritten URL that fails names the rewrite and the cause'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-wrkslots
 created_at: 2026-11-05T10:57:10.530106531+00:00
 updated_at: 2026-11-05T10:57:10.530106531+00:00
+closed_at: 2026-11-06T19:18:43.000000000+00:00
 ---
 
 # Description
@@ -39,3 +40,7 @@ This is related to the insteadOf pitfall noted in #871.
 Reported by the lead on 2026-11-05 at 06:00 AM ET, from a consumer team (P2). The consumer team has already worked around it. Assigned to mu-salvage after #871.
 
 Moved from mu-salvage to the new Muse ultra wrkslots lane mu-wrkslots on 2026-11-05 at 5:50 PM ET (the owner lifted the Muse lane cap; the lead asked for a dedicated wrkslots lane).
+
+## Resolution
+
+Landed in the mu-wrkslots stack at 84585684. A failed post-provision fetch now names the original URL, the insteadOf rule and its config file, the rewrite target, and the cause (missing commit or dead core.worktree), probed under a temporary GIT_CONFIG_GLOBAL.

@@ -1,11 +1,12 @@
 ---
 title: 'dagrun-runtime-skip: report steps SKIPPED with a named reason when a host capability is truly unavailable'
-status: open
+status: closed
 priority: 3
 issue_type: feature
 assignee: mu-wrkslots
 created_at: 2026-11-05T04:40:00.000000000+00:00
 updated_at: 2026-11-05T04:40:00.000000000+00:00
+closed_at: 2026-11-06T19:18:43.000000000+00:00
 ---
 
 # Description
@@ -37,3 +38,7 @@ Option (B), chosen in the #865 discussion:
 Filed from #865 gate-node-provision (coordinator decision (C), 2026-11-05): land the with-node22 wrapping now, keep the provisioning failure as a named FAIL on `setup.node22`, and track the runtime skip here. #866 is latency-tests-cpu-budget, so this takes #867. Queue position: after #864 wrkslots-unlisted-module-salvage. Assigned to mu-validate.
 
 Moved from mu-validate to the new Muse ultra wrkslots lane mu-wrkslots on 2026-11-05 at 5:50 PM ET (the owner lifted the Muse lane cap; the lead asked for a dedicated wrkslots lane).
+
+## Resolution
+
+Landed in the mu-wrkslots stack at 84585684. Both dagrun editions accept `--skip TAG=REASON` (repeatable): not spawned, journaled SKIPPED with the exact reason, dependents dependency-skipped, unknown tags/empty reasons refused before any step runs, verdict PARTIAL never a plain pass; validate.py attempts Node 22 provisioning first and only then runtime-skips setup.node22. The 24 h ledger drop is a follow-up readout, not code.

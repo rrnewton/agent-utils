@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-shard-mount-namespace: wrkslots shards fail in full gates on mount namespace indeterminate for a live PID'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-wrkslots
 created_at: 2026-11-05T18:04:37.530921232+00:00
 updated_at: 2026-11-05T18:04:37.530921232+00:00
+closed_at: 2026-11-06T19:18:43.000000000+00:00
 ---
 
 # Description
@@ -35,3 +36,7 @@ Named in the #827 readout of 2026-11-05. Coordinator noted the mode on 2026-11-0
 Filed by mu-validate on 2026-11-05 from the #827 gate-flake readout (local number 901); renumbered to 906 on landing by the coordinator, since 901 was taken on main.
 
 Moved from mu-validate to the new Muse ultra wrkslots lane mu-wrkslots on 2026-11-05 at 5:50 PM ET (the owner lifted the Muse lane cap; the lead asked for a dedicated wrkslots lane).
+
+## Resolution
+
+Landed in the mu-wrkslots stack at 84585684. Classification: the recurring case is a PID whose mount link is already released (exiting namespace init, now proven directly in the re-probe without the generation stat) or a genuinely live unreadable PID; the former is proven, the latter still refused with the re-probe window named (4 re-probes over 150 ms).

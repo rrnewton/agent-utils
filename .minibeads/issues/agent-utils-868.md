@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-remote-url-equivalence: treat ssh and https spellings of the same repository as an unchanged remote'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-wrkslots
 created_at: 2026-11-05T04:24:40.989072520+00:00
 updated_at: 2026-11-05T04:24:40.989072520+00:00
+closed_at: 2026-11-06T19:18:43.000000000+00:00
 ---
 
 # Description
@@ -38,3 +39,7 @@ Cause: the slot record keeps only `remote_url_sha256`, a hash of the raw URL str
 Requested by the lead on 2026-11-04. Assigned to mu-validate after #864 (the same wrkslots salvage area); reassign to whichever lane frees first.
 
 Moved from mu-validate to the new Muse ultra wrkslots lane mu-wrkslots on 2026-11-05 at 5:50 PM ET (the owner lifted the Muse lane cap; the lead asked for a dedicated wrkslots lane).
+
+## Resolution
+
+Landed in the mu-wrkslots stack at 84585684. ssh/https/scp respellings of the same host and path are accepted at the URL-changed refusal sites (recorded digest hashed against generated spellings), with a respelling note in remove output; local paths, file://, plain http, and different host/owner/repo still refuse. Covered by the spelling unit matrix; a network end-to-end is not fixture-feasible since the spellings name unreachable hosts by construction.

@@ -1,11 +1,12 @@
 ---
 title: 'package-contract-census-drift: the lifecycle partition check stops pinning test counts'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-wrkslots
 created_at: 2026-11-05T08:49:54.492822744+00:00
 updated_at: 2026-11-05T08:49:54.492822744+00:00
+closed_at: 2026-11-06T19:18:43.000000000+00:00
 ---
 
 # Description
@@ -34,3 +35,7 @@ The check's real purpose is that every lifecycle test lands in exactly one parti
 From mu-validate's #827 readout preview (2026-11-05). Assigned to mu-validate after #873.
 
 Moved from mu-validate to the new Muse ultra wrkslots lane mu-wrkslots on 2026-11-05 at 5:50 PM ET (the owner lifted the Muse lane cap; the lead asked for a dedicated wrkslots lane).
+
+## Resolution
+
+Landed in the mu-wrkslots stack at 84585684. The lifecycle partition check keeps its disjoint/complete/subset assertions with failures naming the tests, and no longer pins exact totals or the per-addition comment inventory; correctly marked tests need no edit there.

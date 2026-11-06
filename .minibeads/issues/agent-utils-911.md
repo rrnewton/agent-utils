@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-root-owned-artefacts: removal handles root-owned build files inside a slot'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-wrkslots
 created_at: 2026-11-05T22:24:35.082939149+00:00
 updated_at: 2026-11-05T22:24:35.082939149+00:00
+closed_at: 2026-11-06T19:18:43.000000000+00:00
 ---
 
 # Description
@@ -29,3 +30,7 @@ Choose one, and document it:
 # Notes
 
 Reported by the lead on 2026-11-05 at 5:24 PM ET, from a consumer team's manual reclaim. Assigned to the dedicated wrkslots lane.
+
+## Resolution
+
+Landed in the mu-wrkslots stack at 84585684. Design (a): before Git removes the checkouts of a fenced slot, entries not owned by the invoking user are deleted through one `sudo -n rm -rf` scoped to the slot, parents resolved inside it, symlinks never followed, each path logged; documented in the user guide; tested with a fake privileged helper.

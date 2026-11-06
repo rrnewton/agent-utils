@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-unlisted-module-salvage: recurse into nested module repos and verify big bundles outside the lock'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-wrkslots
 created_at: 2026-11-05T04:10:15.603371028+00:00
 updated_at: 2026-11-05T04:10:15.603371028+00:00
+closed_at: 2026-11-06T19:18:43.000000000+00:00
 ---
 
 # Description
@@ -58,3 +59,7 @@ Requested by the lead on 2026-11-04 at 11:04 PM ET. Assigned to mu-validate, que
 Gap 4 (a nested checkout with zero tracked files) was added on 2026-11-04 at the lead's request; it is the same salvage path.
 
 Moved from mu-validate to the new Muse ultra wrkslots lane mu-wrkslots on 2026-11-05 at 5:50 PM ET (the owner lifted the Muse lane cap; the lead asked for a dedicated wrkslots lane).
+
+## Resolution
+
+Landed in the mu-wrkslots stack at 84585684 (gate-fixes head; real base f08298e5). Recursive nested module-repository salvage, bundle creation/fsck before the registry lock via prefetch, detached-HEAD unlisted salvage, and the zero-file `git add -u` skip, each with fixture tests. The retry on the original four production slots remains a coordinator/lead follow-up with the hosts' logs.
