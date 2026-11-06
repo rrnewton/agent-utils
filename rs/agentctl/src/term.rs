@@ -933,6 +933,21 @@ fn proved_argv(expected: &CustomProcessIdentity) -> Option<Vec<String>> {
     (!argv.is_empty() && argv.iter().all(|item| !item.is_empty())).then_some(argv)
 }
 
+/// The process to pin for a harness driven by the generic rules
+/// (`--harness unknown`, #913): the one program leading the pane's
+/// foreground process group. The leader itself is the pin when every
+/// other foreground process descends from it; a group with unrelated
+/// members (a pipeline, two jobs) has no single leader and pins
+/// nothing. The shell alone is not a harness.
+fn unknown_leader_pid(state: &TmuxPaneProcesses, processes: &[TmuxProc]) -> Option<u64> {
+    if state.foreground_pgid == state.shell_pid {
+        return None;
+    }
+    let root = choose_candidate(&state.foreground, processes)?;
+    (root == state.foreground_pgid || !state.foreground.contains(&state.foreground_pgid))
+        .then_some(root)
+}
+
 /// The pinned harness process in one pane state, when it can be pinned.
 ///
 /// Candidates are chosen within the strongest match class present, so a
@@ -946,6 +961,29 @@ fn harness_candidate(
     kind: &str,
     program: Option<&TmuxProgram>,
 ) -> Result<Option<CustomProcessIdentity>> {
+    // An unknown harness has no program to match by name or image: pin
+    // the actual foreground leader, whatever it is (#913). An explicit
+    // AGENTCTL_UNKNOWN_BIN override still narrows this to that exact
+    // program through the matched path below.
+    if crate::unknown_harness::is_unknown(kind) && program.is_none() {
+        let Some(pid) = unknown_leader_pid(state, processes) else {
+            return Ok(None);
+        };
+        let Ok(observed) = live_custom_process(pid) else {
+            return Ok(None);
+        };
+        if observed.process_group_id != state.foreground_pgid {
+            return Ok(None);
+        }
+        let identity = observed.identity;
+        let Ok(confirmed) = live_custom_process(pid) else {
+            return Ok(None);
+        };
+        if confirmed.identity != identity || proved_argv(&identity).is_none() {
+            return Ok(None);
+        }
+        return Ok(Some(identity));
+    }
     let argv_of: HashMap<u64, &[String]> = processes
         .iter()
         .map(|entry| (entry.pid, entry.argv.as_slice()))
@@ -1653,6 +1691,51 @@ mod tests {
         assert_eq!(choose_candidate(&[202, 200, 201], &processes), Some(200));
         // Two unrelated candidates cannot be pinned.
         assert_eq!(choose_candidate(&[201, 202], &processes), None);
+    }
+
+    #[test]
+    fn unknown_leader_pins_the_actual_foreground_program() {
+        let state = |foreground_pgid: u64, foreground: Vec<u64>| TmuxPaneProcesses {
+            shell_pid: 100,
+            foreground_pgid,
+            foreground,
+            descendants: HashSet::new(),
+        };
+        // The shell alone in the foreground is not a harness.
+        let processes = vec![tproc(100, 1, 100, 100)];
+        assert_eq!(unknown_leader_pid(&state(100, vec![100]), &processes), None);
+        // One program leading the group pins, whatever its name or image.
+        let processes = vec![tproc(100, 1, 100, 200), tproc(200, 100, 200, 200)];
+        assert_eq!(
+            unknown_leader_pid(&state(200, vec![200]), &processes),
+            Some(200)
+        );
+        // Helpers the leader spawned do not displace it.
+        let processes = vec![
+            tproc(100, 1, 100, 200),
+            tproc(200, 100, 200, 200),
+            tproc(201, 200, 200, 200),
+        ];
+        assert_eq!(
+            unknown_leader_pid(&state(200, vec![200, 201]), &processes),
+            Some(200)
+        );
+        // A pipeline has two unrelated leaders: nothing pins.
+        let processes = vec![
+            tproc(100, 1, 100, 200),
+            tproc(200, 100, 200, 200),
+            tproc(201, 100, 200, 200),
+        ];
+        assert_eq!(
+            unknown_leader_pid(&state(200, vec![200, 201]), &processes),
+            None
+        );
+        // A surviving child of a dead leader is the group's root.
+        let processes = vec![tproc(100, 1, 100, 200), tproc(201, 200, 200, 200)];
+        assert_eq!(
+            unknown_leader_pid(&state(200, vec![201]), &processes),
+            Some(201)
+        );
     }
 
     #[test]

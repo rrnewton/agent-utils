@@ -1827,6 +1827,11 @@ impl HerdrClient {
             // Do not consult the installation pathname here. An upgrade may have atomically
             // replaced it while this still-running process retains the recorded image inode.
             self.recorded_custom_harness_observed(pane_id, identity, cancelled)?
+        } else if crate::unknown_harness::is_unknown(kind) {
+            // An unknown harness has no installation path to resolve:
+            // the pane's foreground leader is its identity (#913).
+            self.harness_identity_with_cancellation(pane_id, kind, cancelled)?
+                .is_some()
         } else {
             // Records without a durable process tuple retain strict current-path
             // check; never interpret a missing identity as a wildcard for a deleted executable.

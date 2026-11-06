@@ -110,6 +110,21 @@ impl Fixture {
             .expect("run agentctl")
     }
 
+    fn agentctl_without_unknown_bin(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("--registry")
+            .arg(&self.registry)
+            .args(["--term-backend", "tmux", "--tmux-socket", &self.socket])
+            .args(args)
+            .env_remove("AGENTCTL_UNKNOWN_BIN")
+            .env_remove("AGENTCTL_TERM_BACKEND")
+            .env_remove("HERDR_WORKSPACE_ID")
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .output()
+            .expect("run agentctl")
+    }
+
     fn agentctl_json(&self, args: &[&str]) -> Value {
         let output = self.agentctl(args);
         assert!(
@@ -462,4 +477,201 @@ fn tmux_backend_runs_the_full_agent_lifecycle() {
         .unwrap()
         .iter()
         .all(|owner| owner["name"] == "worker"));
+}
+
+/// #913: an unrecognised TUI adopts under `--harness unknown` with no
+/// AGENTCTL_UNKNOWN_BIN: the record pins the pane's actual foreground
+/// program (path plus process generation), so a different program later
+/// started in the same pane never counts as the same agent alive.
+#[test]
+fn tmux_unknown_harness_pins_actual_foreground_program() {
+    let Some(fixture) = Fixture::new() else {
+        eprintln!("tmux or python3 not installed; skipping");
+        return;
+    };
+    let work = fixture.work.display().to_string();
+    // A fake TUI whose name matches no harness kind and no fixed
+    // install location.
+    let fake_tui = fixture.root.join("bin/fake-tui");
+    fs::write(&fake_tui, FAKE_CLAUDE).unwrap();
+    fs::set_permissions(&fake_tui, fs::Permissions::from_mode(0o700)).unwrap();
+    let other_tui = fixture.root.join("bin/fake-other");
+    fs::write(&other_tui, FAKE_CLAUDE).unwrap();
+    fs::set_permissions(&other_tui, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let created = fixture.tmux(&[
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-s",
+        "unknown-manual",
+        "-c",
+        &work,
+    ]);
+    assert!(created.status.success());
+    let pane = String::from_utf8_lossy(&created.stdout).trim().to_owned();
+    let launch = fake_tui.display().to_string();
+    assert!(fixture
+        .tmux(&["send-keys", "-t", &pane, "-l", "--", &launch])
+        .status
+        .success());
+    assert!(fixture
+        .tmux(&["send-keys", "-t", &pane, "Enter"])
+        .status
+        .success());
+    fixture.wait_for("fake-tui screen", Duration::from_secs(30), || {
+        let output = fixture.tmux(&["capture-pane", "-p", "-t", &pane]);
+        String::from_utf8_lossy(&output.stdout).contains("fake harness ready")
+    });
+
+    // Adopt with no AGENTCTL_UNKNOWN_BIN anywhere in the environment.
+    let output = fixture.agentctl_without_unknown_bin(&[
+        "adopt",
+        "unknown-agent",
+        "--pane",
+        &pane,
+        "--workspace",
+        "unknown-manual",
+        "--cwd",
+        &work,
+        "--harness",
+        "unknown",
+    ]);
+    assert!(
+        output.status.success(),
+        "adopt unknown failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let adopted: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(adopted["adapter"], "tmux-foreign");
+    assert_eq!(adopted["harness"], "unknown");
+    let pinned_pid = adopted["harness_identity"]["pid"]
+        .as_u64()
+        .expect("pinned foreground pid");
+    assert!(pinned_pid > 0);
+    // The pin is the actual program: its /proc cmdline names fake-tui,
+    // and the recorded launch spec holds the same executable.
+    let cmdline = fs::read_to_string(format!("/proc/{pinned_pid}/cmdline")).expect("cmdline");
+    assert!(
+        cmdline.contains(&fake_tui.display().to_string()),
+        "pinned pid {pinned_pid} is not the fake-tui: {cmdline:?}"
+    );
+    // The recorded launch names the actual program: a script TUI's
+    // kernel image is its interpreter, so the script path is in argv.
+    let launch_argv = adopted["launch_spec"]["argv"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    assert!(
+        launch_argv.contains(&fake_tui.display().to_string())
+            || adopted["launch_spec"]["executable"] == json!(fake_tui.display().to_string()),
+        "launch spec does not name the fake-tui: {:#}",
+        adopted["launch_spec"]
+    );
+
+    // It takes work through the generic submission path.
+    let sent =
+        fixture.agentctl_without_unknown_bin(&["send", "unknown-agent", "hello unknown world"]);
+    assert!(
+        sent.status.success(),
+        "send: {}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    let sent_json: Value = serde_json::from_slice(&sent.stdout).unwrap();
+    assert_eq!(sent_json["outcome"], "delivered");
+
+    // Replacement: kill the pinned program and start a different one
+    // in the same pane. It must never count as the adopted agent
+    // alive, and a send must not be delivered to it.
+    let cmdline = fs::read_to_string(format!("/proc/{pinned_pid}/cmdline")).expect("cmdline");
+    assert!(cmdline.contains(&fake_tui.display().to_string()));
+    assert!(Command::new("kill")
+        .arg(pinned_pid.to_string())
+        .status()
+        .unwrap()
+        .success());
+    let pane_command = |fixture: &Fixture| {
+        let output = fixture.tmux(&[
+            "list-panes",
+            "-t",
+            "unknown-manual",
+            "-F",
+            "#{pane_current_command}",
+        ]);
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    fixture.wait_for(
+        "pane shell after fake-tui death",
+        Duration::from_secs(30),
+        || pane_command(&fixture) == "bash",
+    );
+    let launch_other = other_tui.display().to_string();
+    assert!(fixture
+        .tmux(&["send-keys", "-t", &pane, "-l", "--", &launch_other])
+        .status
+        .success());
+    assert!(fixture
+        .tmux(&["send-keys", "-t", &pane, "Enter"])
+        .status
+        .success());
+    fixture.wait_for(
+        "replacement program running",
+        Duration::from_secs(30),
+        || pane_command(&fixture) != "bash",
+    );
+    let status = fixture.agentctl_without_unknown_bin(&["status", "unknown-agent"]);
+    if status.status.success() {
+        let status_json: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_ne!(
+            status_json["agent_status"], "idle",
+            "replacement program counted as the adopted agent: {status_json:#}"
+        );
+    }
+    let sent = fixture.agentctl_without_unknown_bin(&[
+        "send",
+        "unknown-agent",
+        "must not reach the replacement",
+        "--ready-timeout",
+        "5",
+    ]);
+    let delivered = sent.status.success()
+        && serde_json::from_slice::<Value>(&sent.stdout)
+            .is_ok_and(|value| value["outcome"] == "delivered");
+    assert!(!delivered, "send reached the replacement program");
+
+    // Stop requires the recorded idle shell: exit the replacement
+    // first (its own die-now prompt), then stop unregisters without
+    // closing the foreign pane.
+    assert!(fixture
+        .tmux(&["send-keys", "-t", &pane, "-l", "--", "die-now"])
+        .status
+        .success());
+    assert!(fixture
+        .tmux(&["send-keys", "-t", &pane, "Enter"])
+        .status
+        .success());
+    fixture.wait_for(
+        "pane shell after replacement exit",
+        Duration::from_secs(30),
+        || pane_command(&fixture) == "bash",
+    );
+    let stopped = fixture.agentctl_without_unknown_bin(&["stop", "unknown-agent"]);
+    assert!(
+        stopped.status.success(),
+        "stop: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(fixture
+        .tmux(&["kill-session", "-t", "unknown-manual"])
+        .status
+        .success());
 }
