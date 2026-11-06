@@ -263,6 +263,30 @@ fn retire_stale_pins_live_muse_candidate_by_its_resumed_argv() {
 }
 
 #[test]
+fn retire_stale_needs_no_pin_for_a_candidate_pane_holding_only_a_shell() {
+    // B8: an orphan candidate pane (bare bash, no harness) cannot satisfy a
+    // session pin; retire must proceed without replacement pins.
+    let (fixture, old, mut options, bytes) = pending_revive();
+    let operation = fixture.root.join("registry/.revives").join(&old.token);
+    let candidate_path = operation.join("new/agent.json");
+    let mut candidate = agent::read_private_json(&candidate_path).unwrap();
+    candidate["pane_id"] = json!("replacement");
+    agent::atomic_json(&candidate_path, &candidate).unwrap();
+    *fixture.client.panes.lock().unwrap() = vec![Fake::pane("replacement")];
+    *fixture.client.session_override.lock().unwrap() = Some((None, None));
+    fixture.client.custom_alive.store(false, Ordering::Relaxed);
+    fixture
+        .client
+        .custom_at_idle_shell
+        .store(true, Ordering::Relaxed);
+    options.expected_revive_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
+    fixture
+        .manager()
+        .retire_stale_registration("worker", &options)
+        .unwrap();
+}
+
+#[test]
 fn retiring_an_old_generation_never_archives_a_new_registration() {
     let fixture = Fixture::new();
     fixture.start(None);

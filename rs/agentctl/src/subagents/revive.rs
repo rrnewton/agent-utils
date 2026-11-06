@@ -3317,9 +3317,16 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             }
             if let Some(pane) = candidate.pane_id.as_deref() {
                 let live = self.client.panes()?.iter().any(|row| row.pane_id == pane);
-                if live {
+                // A pane holding only an idle shell has no harness to
+                // preserve, so no session pin can (or must) name it; only a
+                // candidate with a live harness needs the explicit pin.
+                let dead_shell =
+                    live && matches!(self.check_candidate(&candidate)?, CandidateCheck::Dead(_));
+                if live && !dead_shell {
                     if options.replacement_pane.as_deref() != Some(pane) {
-                        return Err(fail("revive candidate pane is live; explicitly pin --replacement-pane and --replacement-session to preserve it"));
+                        return Err(fail(format!(
+                            "revive candidate pane {pane} is live; explicitly pin --replacement-pane {pane} and --replacement-session to preserve it"
+                        )));
                     }
                     let session = options
                         .replacement_session
