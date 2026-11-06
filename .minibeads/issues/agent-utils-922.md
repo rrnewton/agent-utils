@@ -1,11 +1,12 @@
 ---
 title: 'merge-queue-exact-merge-head: land a submitted merge commit with both parents intact'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: cl-sync
 created_at: 2026-11-06T03:35:00.000000000+00:00
-updated_at: 2026-11-06T03:35:00.000000000+00:00
+updated_at: 2026-11-06T04:30:00.000000000+00:00
+closed_at: 2026-11-06T04:30:00.000000000+00:00
 ---
 
 # Description
@@ -37,3 +38,13 @@ The push landing driver itself is fine: it fast-forwards the base to `candidate.
 # Notes
 
 Reported 2026-11-05 10:30 PM ET by the lead coordinator as URGENT. It blocks a consumer's release import, whose release lane wrote the spec above from the code. In code and docs, refer to the consumer generically.
+
+## Resolution
+
+Landed as b179350a (gated as 0ce99c78: 27/27 merge-queue steps; rust.merge-queue.test 463 cases, 0 failed).
+- `submit --exact` (alias `--preserve-merge`) sets the existing `Item.exact`; `Submission` gains a serde-defaulted `exact` field, and the Item JSON is unchanged.
+- A merge whose first parent is the base lands unchanged, with both parents.
+- It is refused as not-fast-forward after the base moves.
+- Without `--exact`, a merge head is still replayed.
+- All three acceptance tests are in rs/merge-queue/tests/cli_peers.rs.
+- Follow-up: #924 merge-queue-conflict-scan-large-range.
