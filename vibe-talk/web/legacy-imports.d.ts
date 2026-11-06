@@ -445,7 +445,7 @@ declare const mountNoiseRules: LegacyImports["mountNoiseRules"];
 declare const mountCannedPrompts: LegacyImports["mountCannedPrompts"];
 declare const CANNED_PROMPTS: LegacyImports["CANNED_PROMPTS"];
 declare const mountMicrophoneSettings: LegacyImports["mountMicrophoneSettings"];
-declare const MIC_TOGGLES: LegacyImports["MIC_TOGGLES"];
+declare const mountSettingsSwitches: LegacyImports["mountSettingsSwitches"];
 declare const mountAudioDevices: LegacyImports["mountAudioDevices"];
 declare const mountOwnReadApply: LegacyImports["mountOwnReadApply"];
 declare const mountSettingsReadouts: LegacyImports["mountSettingsReadouts"];

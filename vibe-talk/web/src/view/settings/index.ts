@@ -37,6 +37,8 @@ export { CANNED_PROMPTS, PROMPTS_KEY, mountCannedPrompts } from "./canned.ts";
 export type { CannedPrompt, CannedPromptsDependencies, CannedPromptsEditor } from "./canned.ts";
 export { MIC_SETTINGS_KEY, MIC_TOGGLES, mountMicrophoneSettings } from "./microphone.ts";
 export type { MicrophoneSettings, MicrophoneSettingsDependencies, MicrophoneSettingsEditor } from "./microphone.ts";
+export { mountSettingsSwitches } from "./switches.ts";
+export type { SettingsSwitches, SettingsSwitchesDependencies } from "./switches.ts";
 export { mountAudioDevices } from "./audio.ts";
 export type { AudioDevicePreferences, AudioDevicesDependencies, AudioDevicesEditor } from "./audio.ts";
 export { mountOwnReadApply } from "./ownread.ts";

@@ -30567,76 +30567,50 @@ window.addEventListener("hashchange", () => {
   devicePairing.opened(code);
 });
 
-// The checkboxes are the live truth `start()` reads, so they are what gets restored on load.
-const restoredMicSettings = microphoneSettings.stored();
-for (const [id, key] of MIC_TOGGLES) {
-  /** @type {HTMLInputElement} */ (el(id)).checked = restoredMicSettings[key];
-  el(id).addEventListener("change", microphoneSettings.changed);
-}
-
-// `#619 voice-bluetooth-output`. The device selects carry the live truth, as the toggles do.
-audioDevices.refresh();
-el("audio-input-device").addEventListener("change", audioDevices.changed);
-el("audio-output-device").addEventListener("change", audioDevices.changed);
-el("audio-route-toggle").addEventListener("change", audioDevices.renderRoute);
-if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === "function") {
-  navigator.mediaDevices.addEventListener("devicechange", () => {
-    audioDevices.refresh();
-    audioDevices.renderRoute();
-  });
-}
-
-// `#58 control-bar`. Where the reader last put the bar, restored before the first screen is drawn
-// — the select carries the live truth, exactly as the microphone checkboxes do.
-el("bar-placement").value = barPlacement.stored();
-el("bar-placement").addEventListener("change", () => barPlacement.changed());
-
-// `#481 slack-app-deep-link`. Where this device opens Slack links, as the bar's placement is.
-el("slack-open-in").value = storedSlackOpen();
-el("slack-open-in").addEventListener("change", settingsReadouts.slackOpenChanged);
-
-// `#44 live-push`, extended by `#126 read-new-selector`. TWO controls over one value: the button
-// on the bar, where the reader is when a message arrives, and the select in Settings, where there
-// is room to say what the three modes mean. Both go through `chooseReadNew`, which writes the key
-// and redraws the other one.
-//
-// The bar button CYCLES rather than choosing, because it has room for a word and not for a list —
-// least-to-most talking, wrapping back to off, so the whole range is reachable with taps and
-// without a menu.
-el("read-new").addEventListener("click", () => {
-  chooseReadNew(RELAY_MODES[(RELAY_MODES.indexOf(relayMode()) + 1) % RELAY_MODES.length]);
-});
-el("relay-to-agent").addEventListener("change", () => {
-  chooseReadNew(el("relay-to-agent").value);
-});
-// Stated once at load rather than left to the first use: the mode comes out of storage, so the
-// markup cannot be the one that says what it is.
-renderReadNew();
-renderLiveState();
-
-// `#46 conversation-replay`. Off unless asked for, and restored the same way: a control that
-// re-sends earlier conversation content to a paid vendor on every call must not come back on by
-// itself.
-el("resume-toggle").checked = resumeWanted();
-el("resume-toggle").addEventListener("change", () => {
-  // `#331 resume-on-websocket`. Disabled where this server cannot resume, so nothing can change it
-  // there; and were something to, the choice is not taken from a switch that is not in force.
-  if (!callResume.allowed()) {
+// Settings' switches and choices, each restored as kept before it is heard, since the controls carry the live truth
+// `start()` and the rest read: the microphone's checkboxes, the audio devices (`#619 voice-bluetooth-output`), where
+// the bar sits (`#58 control-bar`), where Slack links open (`#481 slack-app-deep-link`), the read-new button and
+// select (`#44 live-push`, `#126 read-new-selector`), and resuming (`#46 conversation-replay`). One owner in
+// web/src/view/settings/switches.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its `unmount`
+// waits for the ordered boot's teardown.
+mountSettingsSwitches({
+  lookup: (id) => el(id),
+  storedMicSettings: () => microphoneSettings.stored(),
+  micSettingsChanged: () => microphoneSettings.changed(),
+  refreshAudioDevices: () => audioDevices.refresh(),
+  audioDevicesChanged: () => audioDevices.changed(),
+  renderAudioRoute: () => audioDevices.renderRoute(),
+  mediaDevices: () => navigator.mediaDevices,
+  storedBarPlacement: () => barPlacement.stored(),
+  barPlacementChanged: () => barPlacement.changed(),
+  storedSlackOpen: () => storedSlackOpen(),
+  slackOpenChanged: () => settingsReadouts.slackOpenChanged(),
+  // Least-to-most talking, wrapping back to off, so the whole range is reachable with taps and without a menu.
+  cycleReadNew: () => chooseReadNew(RELAY_MODES[(RELAY_MODES.indexOf(relayMode()) + 1) % RELAY_MODES.length]),
+  chooseReadNew: (mode) => chooseReadNew(mode),
+  renderReadNew: () => renderReadNew(),
+  renderLiveState: () => renderLiveState(),
+  resumeWanted: () => resumeWanted(),
+  resumeToggled: () => {
+    // `#331 resume-on-websocket`. Disabled where this server cannot resume, so nothing can change it
+    // there; and were something to, the choice is not taken from a switch that is not in force.
+    if (!callResume.allowed()) {
+      renderResumeState();
+      return;
+    }
+    const on = el("resume-toggle").checked;
+    persistResume(on);
+    // Deliberately NOT clearing the last outcome (`callResume.last()`): everything the screen says
+    // about resuming is already gated on the switch, so an outcome from before it was flipped cannot
+    // be read out under it.
+    // Clearing here as well would be a second place that decides the same thing.
     renderResumeState();
-    return;
-  }
-  const on = el("resume-toggle").checked;
-  persistResume(on);
-  // Deliberately NOT clearing the last outcome (`callResume.last()`): everything the screen says
-  // about resuming is already gated on the switch, so an outcome from before it was flipped cannot
-  // be read out under it.
-  // Clearing here as well would be a second place that decides the same thing.
-  renderResumeState();
-  setStatus(
-    on
-      ? "The next call will be told what was already said."
-      : "The next call will start the agent from nothing."
-  );
+    setStatus(
+      on
+        ? "The next call will be told what was already said."
+        : "The next call will start the agent from nothing."
+    );
+  },
 });
 
 // The column the reader last chose, restored before anything is drawn into it. Applied

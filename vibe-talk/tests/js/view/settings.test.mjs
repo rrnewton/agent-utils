@@ -212,3 +212,73 @@ test("`#624 voice-page-modularity`: the screen's sliders, steps, reload and grip
   controls.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
+
+test("`#624 voice-page-modularity`: Settings' switches and choices are restored as kept before they are heard, in the page's order, reach what each names, and come down again", () => {
+  const { mountSettingsSwitches } = VIEW_SETTINGS;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, value: "", checked: undefined, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type) => nodes[id].listeners.filter((one) => one.type === type).forEach((one) => one.listener({ type }));
+  const said = (name, answer) => (...args) => { log.push(`${name}${args.length ? ` ${args.join(" ")}` : ""}`); return answer; };
+  const media = target("media");
+  const switches = mountSettingsSwitches({
+    lookup: (id) => target(id),
+    storedMicSettings: said("stored mic", { echoCancellation: false, noiseSuppression: true, autoGainControl: false }),
+    micSettingsChanged: said("mic changed"),
+    refreshAudioDevices: said("refresh devices"),
+    audioDevicesChanged: said("devices changed"),
+    renderAudioRoute: said("say route"),
+    mediaDevices: () => media,
+    storedBarPlacement: said("stored bar", "top"),
+    barPlacementChanged: said("bar changed"),
+    storedSlackOpen: said("stored slack", "app"),
+    slackOpenChanged: said("slack changed"),
+    cycleReadNew: said("cycle read new"),
+    chooseReadNew: said("choose read new"),
+    renderReadNew: said("say read new"),
+    renderLiveState: said("say live"),
+    resumeWanted: said("stored resume", true),
+    resumeToggled: said("resume toggled"),
+  });
+  assert.deepStrictEqual(log, ["stored mic", "listen mic-echo-cancellation change", "listen mic-noise-suppression change", "listen mic-auto-gain change",
+    "refresh devices", "listen audio-input-device change", "listen audio-output-device change", "listen audio-route-toggle change", "listen media devicechange",
+    "stored bar", "listen bar-placement change", "stored slack", "listen slack-open-in change", "listen read-new click", "listen relay-to-agent change",
+    "say read new", "say live", "stored resume", "listen resume-toggle change"], "a control was restored or heard out of the page's order");
+  assert.deepStrictEqual(["mic-echo-cancellation", "mic-noise-suppression", "mic-auto-gain"].map((id) => nodes[id].checked), [false, true, false]);
+  assert.deepStrictEqual([nodes["bar-placement"].value, nodes["slack-open-in"].value, nodes["resume-toggle"].checked], ["top", "app", true],
+    "a choice was not restored as kept");
+  log.length = 0;
+  fire("mic-noise-suppression", "change");
+  fire("audio-input-device", "change");
+  fire("audio-output-device", "change");
+  fire("audio-route-toggle", "change");
+  fire("media", "devicechange");
+  fire("bar-placement", "change");
+  fire("slack-open-in", "change");
+  fire("read-new", "click");
+  // The select names its mode as it is when it changes.
+  nodes["relay-to-agent"].value = "gist";
+  fire("relay-to-agent", "change");
+  fire("resume-toggle", "change");
+  assert.deepStrictEqual(log, ["mic changed", "devices changed", "devices changed", "say route", "refresh devices", "say route", "bar changed",
+    "slack changed", "cycle read new", "choose read new gist", "resume toggled"]);
+  switches.unmount();
+  assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+});
+
+test("`#624 voice-page-modularity`: Settings' switches mount where the browser has no media devices to listen to", () => {
+  const { mountSettingsSwitches } = VIEW_SETTINGS;
+  const heard = [];
+  const node = () => ({ value: "", addEventListener: (type) => heard.push(type), removeEventListener() {} });
+  const nothing = () => undefined;
+  mountSettingsSwitches({
+    lookup: node, storedMicSettings: () => ({ echoCancellation: true, noiseSuppression: true, autoGainControl: true }),
+    micSettingsChanged: nothing, refreshAudioDevices: nothing, audioDevicesChanged: nothing, renderAudioRoute: nothing,
+    mediaDevices: () => undefined, storedBarPlacement: () => "bottom", barPlacementChanged: nothing, storedSlackOpen: () => "browser",
+    slackOpenChanged: nothing, cycleReadNew: nothing, chooseReadNew: nothing, renderReadNew: nothing, renderLiveState: nothing,
+    resumeWanted: () => false, resumeToggled: nothing,
+  });
+  assert.ok(!heard.includes("devicechange"), "a device change was listened for with no media devices");
+});
