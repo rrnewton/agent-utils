@@ -43,6 +43,7 @@ declare const createKeySelection: LegacyImports["createKeySelection"];
 declare const createKeymap: LegacyImports["createKeymap"];
 declare const createReadCollapse: LegacyImports["createReadCollapse"];
 declare const mountKeyListeners: LegacyImports["mountKeyListeners"];
+declare const mountPageListeners: LegacyImports["mountPageListeners"];
 declare const createKeyTiming: LegacyImports["createKeyTiming"];
 declare const keyTimingLine: LegacyImports["keyTimingLine"];
 declare const KEYS_MESSAGE: LegacyImports["KEYS_MESSAGE"];

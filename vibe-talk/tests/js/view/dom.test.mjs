@@ -2180,6 +2180,57 @@ test("`#624 voice-page-modularity`: the keys' and the selection's listeners moun
   }
 });
 
+test("`#624 voice-page-modularity`: the page's listeners word a time, say its day ahead of the row, and write the place down before the turn when the page hides or goes, in the page's order, and unmount every one", () => {
+  const { mountPageListeners } = VIEW_SHELL;
+  const log = [];
+  const target = (name) => {
+    const listeners = [];
+    return { name, listeners,
+      addEventListener: (type, listener, options) => { listeners.push({ type, listener, options }); log.push(`listen ${name} ${type}${options && options.capture ? " capture" : ""}`); },
+      removeEventListener: (type, listener, options) => {
+        const at = listeners.findIndex((one) => one.type === type && one.listener === listener && Boolean(one.options && one.options.capture) === Boolean(options && options.capture));
+        if (at >= 0) listeners.splice(at, 1);
+      } };
+  };
+  const doc = target("document");
+  const win = target("window");
+  const fire = (on, type, event = {}, capture = false) => {
+    for (const one of on.listeners.filter((each) => each.type === type && Boolean(each.options && each.options.capture) === capture)) one.listener(event);
+  };
+  let hidden = false;
+  const was = [globalThis.document, globalThis.window];
+  globalThis.document = doc;
+  globalThis.window = win;
+  try {
+    const mounted = mountPageListeners({
+      wordDayTitle: (event) => log.push(`word ${event.target}`),
+      onTimeTap: (event) => log.push(`tap ${event.target}`),
+      onTimeKey: (event) => log.push(`key ${event.key}`),
+      hidden: () => hidden,
+      rememberUiState: () => log.push("remember the place"),
+      saveUnsettledTurns: () => log.push("save the turn"),
+    });
+    assert.deepStrictEqual(log, ["listen document pointerover", "listen document focusin", "listen document click capture", "listen document keydown capture",
+      "listen document visibilitychange", "listen window pagehide", "listen document visibilitychange", "listen window pagehide"],
+      "the listeners were not mounted in the page's order");
+    log.length = 0;
+    fire(doc, "pointerover", { target: "time" });
+    fire(doc, "focusin", { target: "edited" });
+    fire(doc, "click", { target: "time" }, true);
+    fire(doc, "keydown", { key: "Enter" }, true);
+    // Shown again: nothing is written down.
+    fire(doc, "visibilitychange");
+    hidden = true;
+    fire(doc, "visibilitychange");
+    fire(win, "pagehide");
+    assert.deepStrictEqual(log, ["word time", "word edited", "tap time", "key Enter", "remember the place", "save the turn", "remember the place", "save the turn"]);
+    mounted.unmount();
+    assert.deepStrictEqual([doc, win].map((one) => one.listeners.length), [0, 0], "a listener was left mounted");
+  } finally {
+    [globalThis.document, globalThis.window] = was;
+  }
+});
+
 test("`#624 voice-page-modularity`: a mount's listening adds each listener with its options and takes every one down once", () => {
   const { createListening } = VIEW_DOM;
   const calls = [];

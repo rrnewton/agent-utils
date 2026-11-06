@@ -3772,7 +3772,7 @@ test("A ROW'S TIME SAYS ITS DAY ON HOVER: yesterday's says Yesterday, and the wo
     assert.equal(rowWithId(page, "601").getAttribute("title"), null, "a hover over the row titled the row");
 
     // The negative control: without the rewording on hover, the morning after still says Today.
-    const stale = newPage(new Map(), brokenScript('document.addEventListener("pointerover", freshenDayTitle);', ""));
+    const stale = newPage(new Map(), brokenScript("wordDayTitle: (event) => freshenDayTitle(event),", "wordDayTitle: () => {},"));
     await signIn(stale);
     await showDiscord(stale, [message({ id: "602", content: "from this morning", timestamp: morning.toISOString() })]);
     const kept = rowWithId(stale, "602").descendants().find((node) => node.className === "msg-time");

@@ -30787,30 +30787,23 @@ if (window.visualViewport && typeof window.visualViewport.addEventListener === "
 }
 // A list scrolled under the selection carries the words, and the chip goes with them.
 document.addEventListener("scroll", () => { if (quoteOwner.held()) placeSelectionChip(); }, { capture: true, passive: true });
-// `#260 timestamp-hover`. A message's time says its day on hover, worded as the pointer arrives.
-document.addEventListener("pointerover", freshenDayTitle);
-// `#479 message-time-full-date`. The same wording as the focus reaches a time, and its day said
-// on a tap on it or Enter on the keys, captured ahead of the row's own press.
-document.addEventListener("focusin", freshenDayTitle);
-document.addEventListener("click", onTimeTap, true);
-document.addEventListener("keydown", onTimeKey, true);
-// `#189 restore-ui-state`. The last moments a phone promises this page before it may reclaim it —
-// hidden, or being unloaded — are when the reader's place is written down. Hidden comes first on
-// a phone, and is the one an installed app reliably gets before it is killed.
-const rememberUiState = () => {
-  holdChannelPlace();
-  saveUiState();
-};
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") rememberUiState();
+// The page's own listeners at the document and the window: a message's time worded as the pointer or the focus
+// reaches it (`#260 timestamp-hover`) and its day said on a tap or Enter, captured ahead of the row's own press
+// (`#479 message-time-full-date`); and the last moments a phone promises this page before it may reclaim it,
+// hidden or being unloaded, when the reader's place (`#189 restore-ui-state`) and then a turn still being said
+// (`#330 voice-long-turn-drop`) are written down. One owner in web/src/view/shell/pagelisteners.ts (`#624
+// voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's teardown.
+mountPageListeners({
+  wordDayTitle: (event) => freshenDayTitle(event),
+  onTimeTap: (event) => onTimeTap(event),
+  onTimeKey: (event) => onTimeKey(event),
+  hidden: () => document.visibilityState === "hidden",
+  rememberUiState: () => {
+    holdChannelPlace();
+    saveUiState();
+  },
+  saveUnsettledTurns: () => voiceCall().saveUnsettledTurns(),
 });
-window.addEventListener("pagehide", rememberUiState);
-// `#330 voice-long-turn-drop`. ...and when a turn still being said is written down, so a phone that
-// kills the app from the background does not take a long answer with it.
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") voiceCall().saveUnsettledTurns();
-});
-window.addEventListener("pagehide", () => voiceCall().saveUnsettledTurns());
 
 /** Take the pace popover down. Safe to call when it is already down. */
 function closeSpeedPopover() {
