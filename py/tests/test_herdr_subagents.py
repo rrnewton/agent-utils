@@ -38,6 +38,7 @@ class FakeManagedClient:
         self.environments: list[tuple[str, ...]] = []
         self.launch_shell_lines: list[tuple[str, str]] = []
         self.closed: list[str] = []
+        self.ended: list[CustomProcessIdentity] = []
         self.submitted: list[str] = []
         self.panes_calls = 0
         self.pane_info_calls = 0
@@ -320,6 +321,10 @@ class FakeManagedClient:
         tab = next(pane.tab_id for pane in self.presentations if pane.pane_id == pane_id)
         self.closed.append(tab)
         self.presentations = [pane for pane in self.presentations if pane.pane_id != pane_id]
+
+    def end_harness(self, identity: CustomProcessIdentity, timeout: float) -> bool:
+        self.ended.append(identity)
+        return True
 
     def focus_pane(self, pane_id: str) -> None:
         assert pane_id in self.infos
@@ -1624,6 +1629,23 @@ def test_muse_process_identity_is_saved_before_trust_failure_and_permits_stop(
     assert failed.pane_reported_by_agentctl is False
     assert failed.custom_process_identity == fake.custom_identity
     assert manager.stop("failed")["pane_closed"] is True
+
+
+def test_stop_asks_a_muse_lane_to_exit_before_closing_its_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Closing the pane kills Muse mid-session, and its next resume warns that the previous
+    # run ended abnormally; stop asks the pinned process tree to exit first.
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    stopped = manager.stop("worker")
+    assert stopped["pane_closed"] is True
+    assert stopped["harness_exited"] is True
+    assert fake.ended == [fake.custom_identity]
+
+    manager.start("plain", cwd=str(tmp_path), harness="claude")
+    assert "harness_exited" not in manager.stop("plain")
+    assert fake.ended == [fake.custom_identity]
 
 
 def test_unreported_starting_muse_without_identity_is_not_assumed_to_own_idle_shell(

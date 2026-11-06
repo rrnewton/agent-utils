@@ -1,11 +1,12 @@
 ---
 title: 'revive-repeat-incomplete: repeated stop/revive ends incomplete and the printed recovery refuses'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-sync
-created_at: 2026-11-06T03:45:00.000000000+00:00
-updated_at: 2026-11-06T03:45:00.000000000+00:00
+created_at: 2026-11-06T03:45:00+00:00
+updated_at: 2026-11-06T12:42:29.919501359+00:00
+closed_at: 2026-11-06T12:42:29.919501209+00:00
 ---
 
 # Description
@@ -36,3 +37,14 @@ A missing native session id is a separate problem (#916 muse-native-session-id).
 # Notes
 
 Reported 2026-11-05 10:40 PM ET by the lead coordinator, from a consumer's revive benchmark; the exact failure text is in that benchmark's report.
+
+## Resolution
+
+The incomplete revives came from readiness, not from leftover state. A launching Muse counted as ready only while the visible rows still showed its `Muse Code 1.4.x` header. A resume reprints the whole conversation, and each one after an unclean end adds a warning, so by the third consecutive revive the header had scrolled off while Muse sat idle: the launch failed and the revive ended incomplete. The printed rerun then refused because the failed candidate had never been anchored (no terminal anchor, since anchoring follows readiness).
+
+- A launching Muse is ready at an idle editor without its header while its pinned process verifies on the same poll. #946 agentctl-muse-resume-readiness landed the same readiness change first; this keeps its test of a screen after three resumes.
+- Rerunning `agentctl revive NAME`, as printed, anchors a launch-failed candidate whose harness still runs in the candidate's own pane, and finishes.
+- `stop` asks a Muse lane's process tree to exit (SIGTERM, runtime first) before closing its pane, so Muse records a clean `session_end`; checked live: closing the pane left no `session_end` and the next resume warned "ended abnormally"; SIGTERM to the runtime wrote `exit_reason: clean`. A TERM to the pinned wrapper alone orphaned the runtime, which `restart_with_resume` did; it now ends the whole tree too.
+- Tests: five stop/revive cycles each for Claude, Codex and Muse; stop asks Muse to exit; an incomplete revive recovered by running the printed command verbatim (Claude and Muse); a Muse screen after three resumes with its header scrolled off.
+
+Open: the benchmark's Codex start-to-ready waits of about 309 s and 485 s, as seen through `agentctl status`, were not reproduced (Herdr 0.9.5 reads Codex idle from its title here). They need that host's Codex screen at the time; file a new issue with it if they recur.

@@ -205,6 +205,72 @@ pub(crate) fn live_custom_process(pid: u64) -> Result<LiveCustomProcess> {
     agent_queue::identity::observe(pid).map_err(identity_error)
 }
 
+/// SIGTERM the pinned process `identity` and every process under it, deepest first, then wait
+/// up to `timeout` for all of them to exit; returns whether they did. A wrapper that only
+/// launches the real runtime (as Muse's does) would otherwise die alone and orphan it, so the
+/// runtime is asked first, and the pinned process once the runtime has gone or half the time
+/// has passed. Nothing is signalled unless `identity` is still the live process pinned.
+pub(crate) fn end_process_tree(identity: &CustomProcessIdentity, timeout: Duration) -> bool {
+    if !live_custom_process(identity.pid).is_ok_and(|observed| observed.identity == *identity) {
+        return false;
+    }
+    let children = process_children_map();
+    let mut tree = vec![identity.pid];
+    let mut index = 0;
+    while index < tree.len() {
+        for pid in children.get(&tree[index]).into_iter().flatten() {
+            if !tree.contains(pid) {
+                tree.push(*pid);
+            }
+        }
+        index += 1;
+    }
+    let alive = |pid: u64| {
+        // SAFETY: signal 0 only probes that the process exists.
+        i32::try_from(pid).is_ok_and(|pid| unsafe { libc::kill(pid, 0) } == 0)
+    };
+    let terminate = |pid: u64| {
+        if let Ok(pid) = i32::try_from(pid) {
+            // SAFETY: SIGTERM to a process of the pinned harness's own tree.
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+    };
+    let descendants = &tree[1..];
+    for pid in descendants.iter().rev() {
+        terminate(*pid);
+    }
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut pinned_asked = descendants.is_empty();
+    if pinned_asked {
+        terminate(identity.pid);
+    }
+    loop {
+        if !pinned_asked
+            && (descendants.iter().all(|pid| !alive(*pid)) || start.elapsed() >= timeout / 2)
+        {
+            // The pinned process is still the one pinned only while its start time matches.
+            if live_custom_process(identity.pid)
+                .is_ok_and(|observed| observed.identity == *identity)
+            {
+                terminate(identity.pid);
+            }
+            pinned_asked = true;
+        }
+        let pinned_alive =
+            live_custom_process(identity.pid).is_ok_and(|observed| observed.identity == *identity);
+        if !pinned_alive && descendants.iter().all(|pid| !alive(*pid)) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn supported_shell_name(path: &Path) -> bool {
     let Some(mut name) = path.file_name().and_then(|value| value.to_str()) else {
         return false;

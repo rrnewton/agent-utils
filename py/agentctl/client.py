@@ -1733,6 +1733,58 @@ class HerdrClient:
                 f"custom harness {kind!r} is not the foreground process in pane {pane_id}"
             )
 
+    def end_harness(self, identity: CustomProcessIdentity, timeout: float) -> bool:
+        """SIGTERM the pinned process and every process under it, deepest first, and wait.
+
+        A wrapper that only launches the real runtime (as Muse's does) would otherwise die
+        alone and orphan it, so the runtime is asked first, and the pinned process once the
+        runtime has gone or half the time has passed. Returns whether they all exited within
+        ``timeout`` seconds. Nothing is signalled unless ``identity`` is still the live process.
+        """
+        def pinned_alive() -> bool:
+            observed = self._process_identity(identity.pid)
+            return observed is not None and observed[0] == identity
+
+        def alive(pid: int) -> bool:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return False
+            return True
+
+        def terminate(pid: int) -> None:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+        if not pinned_alive():
+            return False
+        children = self._process_children_map()
+        tree = [identity.pid]
+        for parent in tree:
+            tree.extend(child for child in children.get(parent, ()) if child not in tree)
+        descendants = tree[1:]
+        for pid in reversed(descendants):
+            terminate(pid)
+        start = time.monotonic()
+        pinned_asked = not descendants
+        if pinned_asked:
+            terminate(identity.pid)
+        while True:
+            if not pinned_asked and (
+                not any(alive(pid) for pid in descendants)
+                or time.monotonic() - start >= timeout / 2
+            ):
+                if pinned_alive():
+                    terminate(identity.pid)
+                pinned_asked = True
+            if not pinned_alive() and not any(alive(pid) for pid in descendants):
+                return True
+            if time.monotonic() - start >= timeout:
+                return False
+            time.sleep(0.1)
+
     def pane_is_idle_shell(self, pane_id: str) -> bool:
         """Prove the pane has returned to Herdr's original shell process group."""
         return self.pane_idle_shell_identity(pane_id) is not None

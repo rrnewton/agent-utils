@@ -615,6 +615,9 @@ const MAX_FORMER_NAMES: usize = 4096;
 /// written under an earlier rule (none, or a launcher-capable one) do not count.
 const ANCHOR_RULE: u32 = 2;
 
+/// How long `stop` waits for a Muse runtime it asked to exit before closing its pane.
+const HARNESS_END_GRACE: Duration = Duration::from_secs(10);
+
 fn valid_name_history(history: &[NameHistoryEntry]) -> bool {
     let mut journals = BTreeSet::new();
     history.len() <= MAX_NAME_HISTORY
@@ -1096,6 +1099,18 @@ pub trait ManagedApi: AgentApi {
         Err(crate::error::AdapterError::unavailable(
             "idle shell verification is unavailable",
         ))
+    }
+    /// End the pinned harness process `identity` and every process under it with SIGTERM,
+    /// the runtime first, and wait up to `timeout` for them to exit (#920
+    /// revive-repeat-incomplete): a runtime that records its own shutdown, as Muse's does,
+    /// then records a clean one, where closing its pane kills it mid-session. Returns whether
+    /// they all exited. Signals nothing unless `identity` is still the process pinned.
+    fn end_harness(
+        &self,
+        identity: &CustomProcessIdentity,
+        timeout: Duration,
+    ) -> crate::error::Result<bool> {
+        Ok(crate::client::end_process_tree(identity, timeout))
     }
     /// Capture the exact process generation of the shell Herdr owns for a pane.
     fn pane_shell_identity(&self, _pane: &str) -> crate::error::Result<CustomProcessIdentity> {
@@ -11166,26 +11181,13 @@ its drain would also type, so it was not queued",
             .clone()
             .or_else(|| record.resume.clone())
             .or_else(|| record.observed_session_value().map(str::to_owned));
-        // SAFETY: kill(2) with SIGTERM; pid is the pinned harness child.
-        if unsafe { libc::kill(identity.pid as i32, libc::SIGTERM) } != 0 {
+        // The whole tree, runtime first: a TERM to a wrapper alone (Muse's) orphans the
+        // runtime, which then keeps the session while the relaunch resumes it (#920).
+        if !self.client.end_harness(identity, Duration::from_secs(15))? {
             return Err(fail(format!(
-                "agent {agent_name}: SIGTERM to harness pid {} failed",
+                "agent {agent_name}: harness pid {} and its processes did not exit within 15s of SIGTERM; no relaunch",
                 identity.pid
             )));
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            // SAFETY: signal 0 probes existence only.
-            if unsafe { libc::kill(identity.pid as i32, 0) } != 0 {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(fail(format!(
-                    "agent {agent_name}: harness pid {} did not exit within 15s of SIGTERM; no relaunch",
-                    identity.pid
-                )));
-            }
-            std::thread::sleep(Duration::from_millis(200));
         }
         let adapter = crate::harness::adapter(&record.harness).ok_or_else(|| {
             fail(format!(
@@ -14250,6 +14252,7 @@ its drain would also type, so it was not queued",
             }
         }
         let (archive, destination) = self.archive_destination(&record)?;
+        let mut harness_ended = None;
         if !owned.is_empty() {
             if owned.len() != 1
                 || Some(&owned[0].pane_id) != record.pane_id.as_ref()
@@ -14272,6 +14275,21 @@ its drain would also type, so it was not queued",
             self.checked_or_launch_failed(&record, pane_id)?;
             record.lifecycle = "stopping".to_owned();
             self.save(&record)?;
+            // Muse records whether its session ended cleanly, and closing the pane kills it
+            // mid-session: its next resume then reports the previous run ended abnormally.
+            // Ask it to exit first; the pane close below ends whatever is left (#920).
+            if record.harness == "muse" {
+                if let Some(identity) = record
+                    .harness_anchor()
+                    .or(record.custom_process_identity.as_ref())
+                {
+                    harness_ended = Some(
+                        self.client
+                            .end_harness(identity, HARNESS_END_GRACE)
+                            .unwrap_or(false),
+                    );
+                }
+            }
             // A human can add a pane after the membership snapshot. Target the recorded
             // pane, never the whole tab; a newly added sibling must remain untouched.
             self.client.close_pane(pane_id)?;
@@ -14288,9 +14306,11 @@ its drain would also type, so it was not queued",
                     .all(|pane| Some(&pane.tab_id) != record.tab_id.as_ref())
             })
         };
-        Ok(
-            json!({"name":agent_name,"archive":destination,"pane_closed":!owned.is_empty(),"tab_closed":tab_closed}),
-        )
+        let mut stopped = json!({"name":agent_name,"archive":destination,"pane_closed":!owned.is_empty(),"tab_closed":tab_closed});
+        if let Some(ended) = harness_ended {
+            stopped["harness_exited"] = json!(ended);
+        }
+        Ok(stopped)
     }
 }
 
@@ -14506,6 +14526,8 @@ pub(crate) mod tests {
                     hold_reads: Mutex::new(None),
                     held_reads: AtomicU64::new(0),
                     on_run: Mutex::new(None),
+                    ended: Mutex::new(Vec::new()),
+                    fail_ready_once: AtomicBool::new(false),
                 },
                 root,
                 registry_name: "registry",
@@ -14998,6 +15020,10 @@ pub(crate) mod tests {
         /// Called with each text written with `run`, just before it is recorded in `runs`.
         #[allow(clippy::type_complexity)]
         pub(crate) on_run: Mutex<Option<Box<dyn Fn(&str) + Send>>>,
+        /// The pinned processes `end_harness` was asked to end.
+        pub(crate) ended: Mutex<Vec<u64>>,
+        /// Fail the readiness of the next harness start, after the harness started in its pane.
+        pub(crate) fail_ready_once: AtomicBool,
     }
     /// How a read that [`Fake::hold_reads`] holds ends.
     #[derive(Clone)]
@@ -15943,6 +15969,9 @@ pub(crate) mod tests {
             }
             self.started.store(true, Ordering::Relaxed);
             self.dead_panes.lock().unwrap().remove(pane);
+            if self.fail_ready_once.swap(false, Ordering::Relaxed) {
+                return Err(AdapterError::unavailable("injected readiness failure"));
+            }
             Ok(())
         }
         fn start_pane_agent(
@@ -15973,6 +16002,12 @@ pub(crate) mod tests {
                     .insert(pane.to_owned(), identity.clone());
             }
             persist_identity(identity)?;
+            if self.fail_ready_once.swap(false, Ordering::Relaxed) {
+                self.custom_reported.store(true, Ordering::Relaxed);
+                return Err(AdapterError::unavailable(
+                    "custom harness \"muse\" did not reach a verified idle composer",
+                ));
+            }
             if self.custom_fails_after_identity.load(Ordering::Relaxed) {
                 let record =
                     agent::read_private_json(&self.root.join("registry/agents/worker/agent.json"))
@@ -16017,6 +16052,14 @@ pub(crate) mod tests {
         fn pane_is_idle_shell(&self, _: &str) -> AdapterResult<bool> {
             Ok(!self.custom_alive.load(Ordering::Relaxed)
                 && self.custom_at_idle_shell.load(Ordering::Relaxed))
+        }
+        fn end_harness(
+            &self,
+            identity: &CustomProcessIdentity,
+            _: Duration,
+        ) -> AdapterResult<bool> {
+            self.ended.lock().unwrap().push(identity.pid);
+            Ok(true)
         }
         fn pane_shell_identity(&self, _: &str) -> AdapterResult<CustomProcessIdentity> {
             let mut identity = self.foreign_shell_identity.lock().unwrap().clone();

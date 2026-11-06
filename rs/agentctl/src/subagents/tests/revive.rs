@@ -2241,3 +2241,137 @@ fn a_codex_lane_whose_rollout_appears_with_its_brief_records_it_after_delivery()
         .expect("captured once the brief was delivered");
     assert_eq!(native.value, thread);
 }
+
+// --- Repeated stop and revive (#920 revive-repeat-incomplete) -----------------------------------
+
+/// Start `worker` under `harness` (Herdr reporting its native session), then stop it and
+/// revive it from the archive `cycles` times; every cycle must complete.
+fn stop_revive_cycles(harness: &str, cycles: usize) -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture
+        .manager()
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                harness: harness.to_owned(),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let first = fixture.manager().load("worker").unwrap();
+    let conversation = first.native_session.clone().unwrap().value;
+    for cycle in 1..=cycles {
+        let record = fixture.manager().load("worker").unwrap();
+        let stopped = fixture.manager().stop("worker").unwrap();
+        assert!(
+            stopped["archive"].is_string(),
+            "{harness} cycle {cycle}: {stopped}"
+        );
+        kill_owned(&fixture, &record);
+        let revived = fixture
+            .manager()
+            .revive_archived("worker", false, None, TIMEOUT)
+            .unwrap_or_else(|error| panic!("{harness} cycle {cycle}: {error}"));
+        assert_eq!(
+            revived["revived"], true,
+            "{harness} cycle {cycle}: {revived}"
+        );
+        let now = fixture.manager().load("worker").unwrap();
+        assert_eq!(now.lifecycle, "running", "{harness} cycle {cycle}");
+        assert_eq!(
+            now.native_session
+                .as_ref()
+                .map(|native| native.value.as_str()),
+            Some(conversation.as_str()),
+            "{harness} cycle {cycle} resumed another conversation"
+        );
+        assert!(
+            !fixture
+                .root
+                .join("registry/.revives")
+                .join(format!("{}.json", record.token))
+                .exists(),
+            "{harness} cycle {cycle} left its revive journal"
+        );
+    }
+    fixture
+}
+
+#[test]
+fn five_stop_and_revive_cycles_complete_for_every_harness_that_revives() {
+    for harness in ["claude", "codex", "muse"] {
+        let fixture = stop_revive_cycles(harness, 5);
+        let ended = fixture.client.ended.lock().unwrap().len();
+        // Only Muse is asked to exit before its pane closes: it records whether it ended cleanly.
+        assert_eq!(ended, if harness == "muse" { 5 } else { 0 }, "{harness}");
+    }
+}
+
+#[test]
+fn stop_asks_a_muse_lane_to_exit_before_closing_its_pane() {
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture
+        .manager()
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                harness: "muse".to_owned(),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let record = fixture.manager().load("worker").unwrap();
+    let pinned = record.custom_process_identity.clone().unwrap();
+    let stopped = fixture.manager().stop("worker").unwrap();
+    assert_eq!(stopped["harness_exited"], true, "{stopped}");
+    assert_eq!(*fixture.client.ended.lock().unwrap(), [pinned.pid]);
+    assert_eq!(
+        *fixture.client.closed.lock().unwrap(),
+        [record.pane_id.unwrap()]
+    );
+}
+
+#[test]
+fn an_incomplete_revive_recovers_by_running_the_printed_command_as_printed() {
+    for harness in ["claude", "muse"] {
+        let (fixture, old) = recoverable(harness, true);
+        fixture
+            .client
+            .fail_ready_once
+            .store(true, Ordering::Relaxed);
+        let error = fixture
+            .manager()
+            .revive("worker", false, None, TIMEOUT)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("incomplete"), "{harness}: {error}");
+        // The printed recovery: a command line in backquotes, run exactly as printed.
+        let printed = error
+            .split('`')
+            .nth(1)
+            .unwrap_or_else(|| panic!("{harness}: no command printed in {error}"));
+        let words: Vec<&str> = printed.split_whitespace().collect();
+        assert_eq!(words[..2], ["agentctl", "revive"], "{harness}: {printed}");
+        assert_eq!(words[2], "worker", "{harness}: {printed}");
+        let token = words
+            .iter()
+            .position(|word| *word == "--expected-token")
+            .map(|index| words[index + 1]);
+        let revived = fixture
+            .manager()
+            .revive("worker", false, token, TIMEOUT)
+            .unwrap_or_else(|error| panic!("{harness}: `{printed}` refused: {error}"));
+        assert_eq!(revived["revived"], true, "{harness}: {revived}");
+        assert_eq!(revived["previous_token"], old.token, "{harness}");
+    }
+}

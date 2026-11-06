@@ -2685,6 +2685,56 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         Ok(record)
     }
 
+    /// Anchor a launch-failed revive candidate whose harness still runs in the candidate's own
+    /// pane, as `launch` anchors one that passed its readiness check: the pinned custom process
+    /// must still be the pane's foreground program, or a native harness Herdr reports there is
+    /// pinned now. Returns whether the candidate is anchored; nothing changes otherwise.
+    fn reanchor_failed_candidate(&self, candidate: &mut AgentRecord) -> Result<bool> {
+        let Some(pane) = candidate.pane_id.clone() else {
+            return Ok(false);
+        };
+        let Ok(info) = self.client.pane_info(&pane) else {
+            return Ok(false);
+        };
+        if Some(&info.workspace_id) != candidate.workspace_id.as_ref() || info.terminal_id.is_none()
+        {
+            return Ok(false);
+        }
+        // The conversation the pane reports, as `launch` records it, and only the requested one.
+        let mut reported = candidate.clone();
+        if reported.capture_native_session(&info).is_err() {
+            return Ok(false);
+        }
+        reported.session_agent.clone_from(&info.session_agent);
+        reported.session_value.clone_from(&info.session_value);
+        if candidate.anchors_with_harness_identity() {
+            if info.agent.as_deref() != Some(candidate.harness.as_str()) {
+                return Ok(false);
+            }
+            let mut anchored = reported;
+            if self.anchor_fresh(&mut anchored, info.terminal_id).is_err()
+                || anchored.harness_anchor().is_none()
+            {
+                return Ok(false);
+            }
+            *candidate = anchored;
+            return Ok(true);
+        }
+        let Some(identity) = candidate.custom_process_identity.clone() else {
+            return Ok(false);
+        };
+        if self
+            .client
+            .verify_custom_harness(&pane, &candidate.harness, Some(&identity))
+            .is_err()
+        {
+            return Ok(false);
+        }
+        reported.terminal_id = info.terminal_id;
+        *candidate = reported;
+        Ok(true)
+    }
+
     fn finish_revive(&self, journal: &mut Journal, old: &AgentRecord) -> Result<Value> {
         let (_, stopped) = stopped_artifact(&self.registry, journal)?;
         let mut active_path = self.directory(&journal.name)?;
@@ -2717,6 +2767,22 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 || candidate.token != journal.new_token
             {
                 return Err(fail("staged revive generation changed"));
+            }
+            // A launch whose readiness check failed after its harness started (#920: a Muse
+            // idle at its editor whose header had scrolled off) leaves a candidate with no
+            // terminal anchor, so it could never be verified. When the harness still runs in
+            // the candidate's own pane, anchor it now as the launch would have.
+            if candidate.lifecycle == "launch_failed"
+                && candidate.terminal_id.is_none()
+                && self.reanchor_failed_candidate(&mut candidate)?
+            {
+                candidate.storage_directory = Some(StorageDirectory {
+                    path: stage_path.clone(),
+                    device: staged.device,
+                    inode: staged.inode,
+                });
+                self.save(&candidate)?;
+                staged_bytes = artifact_bytes(&staged, "agent.json")?;
             }
             self.verify_candidate(&candidate, old, &journal.proof).map_err(|_| fail(format!(
                 "interrupted revive candidate is not independently verified; refusing another launch; no automatic relaunch; journal and diagnostics retained at {}; use `agentctl revive {} --dry-run` and `agentctl revive {}`; if the candidate never started, `agentctl revive {} --abandon-candidate` marks it failed and launches again (refused while a harness runs for it)",

@@ -78,6 +78,8 @@ _MAX_FORMER_NAMES = 4096
 #: The harness pinning rule: the harness must be the pane's only foreground process.
 #: Anchors written under an earlier rule (none, or a launcher-capable one) do not count.
 ANCHOR_RULE = 2
+#: Seconds ``stop`` waits for a Muse runtime it asked to exit before closing its pane.
+_HARNESS_END_GRACE = 10.0
 _KIND = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _BRACKETED_PASTE_START = "\x1b[200~"
@@ -5655,6 +5657,7 @@ class ManagedAgents:
             if len(owned) != 1 or owned[0].pane_id != record.pane_id or owned[0].workspace_id != record.workspace_id:
                 raise AgentDeliveryError("refusing to close a tab whose pane ownership changed")
         archive, destination = self._archive_destination(record)
+        harness_ended: bool | None = None
         if owned:
             if (record.adapter in ("herdr-pane", "herdr-relay") or record.lifecycle == "running"
                     or self.client.pane_info(owned[0].pane_id).agent is not None):
@@ -5675,6 +5678,12 @@ class ManagedAgents:
             record.lifecycle = "stopping"
             self._save(record)
             assert record.pane_id is not None
+            # Muse records whether its session ended cleanly, and closing the pane kills it
+            # mid-session: its next resume then reports the previous run ended abnormally.
+            # Ask it to exit first; the pane close below ends whatever is left.
+            identity = record.harness_anchor or record.custom_process_identity
+            if record.harness == "muse" and identity is not None:
+                harness_ended = self.client.end_harness(identity, _HARNESS_END_GRACE)
             self.client.close_pane(record.pane_id)
             try:
                 tab_closed = not any(pane.tab_id == record.tab_id for pane in self.client.panes())
@@ -5683,7 +5692,13 @@ class ManagedAgents:
         record.lifecycle = "stopped"
         self._save(record)
         self._move_to_archive(name, destination, archive)
-        return {"name": name, "archive": str(destination), "pane_closed": bool(owned), "tab_closed": tab_closed}
+        stopped: dict[str, object] = {
+            "name": name, "archive": str(destination), "pane_closed": bool(owned),
+            "tab_closed": tab_closed,
+        }
+        if harness_ended is not None:
+            stopped["harness_exited"] = harness_ended
+        return stopped
 
     def _closed_foreign_target(self, record: AgentRecord) -> tuple[str, str] | None:
         """The doctor finding and Herdr's refusal when Herdr positively reports the

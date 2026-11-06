@@ -741,6 +741,44 @@ mod tests {
     }
 
     #[test]
+    fn a_muse_resumed_three_times_is_ready_without_its_scrolled_off_header() {
+        // The third consecutive revive of one session: the conversation is reprinted and each
+        // unclean end added a warning, so the header is no longer among the visible rows.
+        let mut rows = Vec::new();
+        for turn in 0..12 {
+            rows.push(format!("❯ question {turn}"));
+            rows.push(format!("◆ answer {turn}"));
+        }
+        for _ in 0..3 {
+            rows.push(
+                "  warning: the previous run of this session ended abnormally (no clean shutdown was recorded)"
+                    .to_owned(),
+            );
+        }
+        let screen = format!(
+            "{}\n────────────────\n❯\n────────────────\n  model · xhigh · /work/project · YOLO\n",
+            rows.join("\n")
+        );
+        assert!(
+            !muse_idle_composer(&screen),
+            "a screen alone never proves Muse without its header"
+        );
+        assert!(
+            muse_verified_process_idle_composer(&screen),
+            "the pinned process stands in for the header"
+        );
+        // A turn still running is never ready, verified or not.
+        let working = screen.replace(
+            "\n────────────────\n❯",
+            "\n◇ Thinking (3s · esc to interrupt)\n────────────────\n❯",
+        );
+        assert!(!muse_verified_process_idle_composer(&working));
+        // With the header on screen it is ready as before.
+        let fresh = format!("  Muse Code 1.4.15\n{screen}");
+        assert!(muse_idle_composer(&fresh));
+    }
+
+    #[test]
     fn muse_launch_overrides_footer_is_an_idle_composer() {
         // Captured 2026-10-19 from a live Muse launched with extra harness
         // arguments (`--approval-mode never` among them): the status footer

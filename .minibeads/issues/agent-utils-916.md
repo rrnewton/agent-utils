@@ -1,11 +1,12 @@
 ---
 title: 'muse-native-session-id: agentctl start and adopt capture a Muse lane''s native session id'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-sync
 created_at: 2026-11-06T01:31:20.342697754+00:00
-updated_at: 2026-11-06T01:31:20.342697754+00:00
+updated_at: 2026-11-06T12:42:09.633275081+00:00
+closed_at: 2026-11-06T12:42:09.633274951+00:00
 ---
 
 # Description

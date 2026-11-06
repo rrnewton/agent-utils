@@ -1,11 +1,12 @@
 ---
 title: 'codex-ready-detection: Codex status never goes idle, so revive waits out its startup timeout'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-sync
-created_at: 2026-11-06T03:45:00.000000000+00:00
-updated_at: 2026-11-06T03:45:00.000000000+00:00
+created_at: 2026-11-06T03:45:00+00:00
+updated_at: 2026-11-06T12:42:09.644502414+00:00
+closed_at: 2026-11-06T12:42:09.644502263+00:00
 ---
 
 # Description
