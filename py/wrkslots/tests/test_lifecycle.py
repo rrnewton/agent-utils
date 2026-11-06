@@ -1932,10 +1932,14 @@ def prepare_validation_removal_proof(
             "validation-service-result-schema_version: historical schema "
             f"{schema_version} is readable but has no current authority"
         )
-    elif schema_version == 5 or record.get("kind") == "frozen-validate":
+    elif schema_version >= 5 or record.get("kind") == "frozen-validate":
         record["detail"] = None
     else:
         record.pop("detail", None)
+    if schema_version >= 7:
+        record["diagnostic_failed_tests"] = 0
+    if schema_version >= 8:
+        record["skipped_tests"] = 0
     if registered_checkout:
         record["wrkslots_slot"] = slot
         record["wrkslots_generation"] = generation
@@ -1955,6 +1959,8 @@ def prepare_validation_removal_proof(
         "executed_nodes": 1,
         "executed_tests": 1,
         "passed_tests": 1,
+        "diagnostic_failed_tests": 0,
+        "skipped_tests": 0,
         "scorecard_writeback": {"status": "completed"},
     }
     schema_fields = schema_value.get("fields")
@@ -2127,6 +2133,21 @@ def validation_service_result_schema(schema_version: int = 4) -> dict[str, objec
             "executed_tests",
             "passed_tests",
             "diagnostic_failed_tests",
+            "scorecard_writeback",
+        ],
+        8: [
+            "schema_version",
+            "commit",
+            "profile",
+            "selection_mode",
+            "final_validate_status",
+            "detail",
+            "exit_code",
+            "executed_nodes",
+            "executed_tests",
+            "passed_tests",
+            "diagnostic_failed_tests",
+            "skipped_tests",
             "scorecard_writeback",
         ],
     }[schema_version]
@@ -18234,6 +18255,60 @@ def test_validate_remove_refuses_boolean_aliases_in_typed_evidence(
     assert message in capsys.readouterr().err
     assert slot_path.is_dir()
     assert active_slots(project)
+
+
+def test_validation_service_result_schema_8_is_accepted() -> None:
+    producer = json.dumps(
+        validation_service_result_schema(8), indent=2, sort_keys=True
+    ).encode()
+    fields = wrkslots._validation_service_result_schema(producer, 8)
+    assert fields == wrkslots._VALIDATION_SERVICE_RESULT_FIELDS[8]
+    assert "skipped_tests" in fields
+    payload = json.dumps(
+        {
+            "schema_version": 8,
+            "commit": "a" * 40,
+            "profile": "full",
+            "selection_mode": "full",
+            "final_validate_status": "PASSED",
+            "detail": None,
+            "exit_code": 0,
+            "executed_nodes": 1,
+            "executed_tests": 1,
+            "passed_tests": 1,
+            "diagnostic_failed_tests": 0,
+            "skipped_tests": 0,
+            "scorecard_writeback": {"status": "completed"},
+            "test_cases": [{"id": "t", "outcome": "pass", "duration_s": None}],
+        }
+    ).encode()
+    projection = wrkslots._validation_service_result_projection(
+        payload, schema=8, schema_fields=fields, expected_commit="a" * 40
+    )
+    assert projection["final_validate_status"] == "PASSED"
+    assert projection["skipped_tests"] == 0
+
+
+@pytest.mark.ordinary_environment
+def test_validate_remove_accepts_schema_8_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=8)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
+    stub_validate_batch_censuses(monkeypatch)
+    rc = wrkslots.main(
+        [
+            "--project-root", str(project), "remove", "slot01",
+            "--coordinator-authorized", "--coordinator-pid", str(os.getpid()),
+            "--expected-generation", "1",
+            "--validation-proof-manifest", manifest.relative_to(project).as_posix(),
+            "--completed-record", artifacts["run-record"].relative_to(project).as_posix(),
+        ]
+    )
+    assert rc == 0, capsys.readouterr().err
+    assert not slot_path.exists()
 
 
 def test_validation_service_result_projection_refuses_passed_without_counts() -> None:
@@ -48597,26 +48672,44 @@ def test_an_unrelated_retained_handle_over_one_mib_does_not_refuse_the_census(
 def test_retained_handle_enumeration_is_bounded_before_sorting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bound: str
 ) -> None:
-    project, _repository, _remote = make_project(tmp_path)
+    # The count/byte bounds now apply to the matched set for a requested
+    # row, not to the whole handle directory; the time bound still covers
+    # the whole enumeration.
+    project, repository, _remote = make_project(tmp_path)
     config = wrkslots._load_config(str(project), "testhost")
     handles = project / "ignored" / "validate" / "runs"
     handles.mkdir(parents=True, exist_ok=True)
-    (handles / "one.json").write_text("{}", encoding="utf-8")
-    if bound == "count":
-        (handles / "two.json").write_text("{}", encoding="utf-8")
-        monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_COUNT_LIMIT", 1)
-        message = rf"file-count census bound of 1 \*\.json files in {re.escape(str(handles))}$"
-    elif bound == "bytes":
-        monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_BYTES_LIMIT", 1)
-        message = rf"0 MiB census bound in {re.escape(str(handles))}$"
-    else:
+    if bound == "deadline":
+        (handles / "one.json").write_text("{}", encoding="utf-8")
         ticks = iter((0.0, 2.0))
         monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_CENSUS_SECONDS", 1.0)
         monkeypatch.setattr(time, "monotonic", lambda: next(ticks))
-        message = "time bound"
+        with pytest.raises(wrkslots.Refusal, match="time bound"):
+            wrkslots._retained_handles_for_absent_rows(config, ())
+        return
+    record = prepare_absent_validate_row(
+        project, repository, slot="gone", agent="validate-a"
+    )
+    paths = wrkslots._absent_validate_row_paths(config, record)
+    rows = ((record, paths),)
+    if bound == "count":
+        for name in ("one", "two"):
+            (handles / f"{name}.json").write_text(
+                json.dumps({"checkout": str(paths[-1]), "unit": f"{name}.service"}),
+                encoding="utf-8",
+            )
+        monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_COUNT_LIMIT", 1)
+        message = rf"file-count census bound of 1 \*\.json files in {re.escape(str(handles))}$"
+    else:
+        (handles / "one.json").write_text(
+            json.dumps({"checkout": str(paths[-1]), "unit": "one.service"}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_BYTES_LIMIT", 1)
+        message = rf"0 MiB census bound in {re.escape(str(handles))}$"
 
     with pytest.raises(wrkslots.Refusal, match=message):
-        wrkslots._retained_handles_for_absent_rows(config, ())
+        wrkslots._retained_handles_for_absent_rows(config, rows)
 
 
 def test_absent_validate_recovery_refuses_row_mutation_after_journal(
@@ -52573,6 +52666,8 @@ def prepare_current_incomplete_frozen_checkout(
     })
     if schema_version >= 7:
         value["diagnostic_failed_tests"] = None
+    if schema_version >= 8:
+        value["skipped_tests"] = None
     value.pop("scorecard_handoff")
     value.pop("scorecard_writeback_files")
     record.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
@@ -52586,6 +52681,8 @@ def prepare_current_incomplete_frozen_checkout(
     }
     if schema_version >= 7:
         sidecar_value["diagnostic_failed_tests"] = None
+    if schema_version >= 8:
+        sidecar_value["skipped_tests"] = None
     sidecar.write_text(json.dumps(sidecar_value, sort_keys=True) + "\n", encoding="utf-8")
     stub_canonical_frozen_record_parser(monkeypatch, label="current incomplete fixture")
     stub_validate_batch_censuses(monkeypatch)
@@ -52659,7 +52756,7 @@ def test_current_incomplete_frozen_retains_evidence_and_allows_stable_source_wor
 
 
 @pytest.mark.ordinary_environment
-@pytest.mark.parametrize("schema_version", (6, 7))
+@pytest.mark.parametrize("schema_version", (6, 7, 8))
 def test_current_incomplete_frozen_accepts_later_service_result_schemas(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str], schema_version: int,

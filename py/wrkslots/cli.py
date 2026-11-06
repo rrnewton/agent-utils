@@ -190,6 +190,26 @@ _VALIDATION_SERVICE_RESULT_FIELDS = {
         "diagnostic_failed_tests",
         "scorecard_writeback",
     ),
+    # Schema 8 (the originating validator's current producer) adds
+    # ``skipped_tests`` to the declared fields.  Its sidecars also carry a
+    # ``test_cases`` list that the producer schema does not declare; the
+    # projection accepts that one extra field without projecting it, since
+    # no run-record field holds it.
+    8: (
+        "schema_version",
+        "commit",
+        "profile",
+        "selection_mode",
+        "final_validate_status",
+        "detail",
+        "exit_code",
+        "executed_nodes",
+        "executed_tests",
+        "passed_tests",
+        "diagnostic_failed_tests",
+        "skipped_tests",
+        "scorecard_writeback",
+    ),
 }
 _VALIDATION_RESULT_OUTCOMES = {
     "PASSED": ("success", 0),
@@ -652,22 +672,23 @@ HISTORICAL_ACTIVE_STATUSES = frozenset(
 )
 HISTORICAL_TASK_NOT_RECORDED = "no task recorded in worktree-state.json"
 HISTORICAL_PURPOSE_NOT_RECORDED = "no purpose recorded in worktree-state.json"
-# The retained validation handle census reads every ``*.json`` file under
-# ``ignored/validate/runs`` in full, so these bounds limit its work, not
-# which handles it judges: reaching one refuses the recovery, and below them
-# every handle is still read, parsed and matched.  The time bound is the one
-# that tracks cost; the count and byte bounds are backstops against a
-# pathological directory, sized from measurement so that ordinary growth
-# does not reach them first.  On 2026-10-21 a production host held 4,117
-# such files (3,073 run records totalling 20,893,804 bytes and 1,044
-# service-result sidecars totalling 532,609 bytes), growing by about 50
-# files and 0.5 MB a day, and one census over them took 0.43 seconds at load
-# average 110.  The former 4,096-file bound, crossed that day, then refused
-# every absent-row recovery on that host.  At that rate 65,536
-# files take about 3.4 years and 256 MiB about 16 months, and a census of
-# either would take about 7 or 5 seconds, inside the 30-second time bound.
+# The retained validation handle census reads every ``*.json`` file
+# under ``ignored/validate/runs``; a service-result sidecar that claims
+# no checkout is not a run handle and is neither parsed nor counted, so
+# the time bound limits its work.  The
+# count and byte bounds are backstops against a pathological matched set:
+# they apply only to handles that name a requested row, not to the whole
+# directory.  A whole-directory bound refused every removal on a host
+# whose retained finished handles and sidecars together exceeded it,
+# although only a handful named the slots being removed.  Finished
+# handles for other rows therefore never block a removal; a matched set
+# over either bound still refuses, as does any handle whose use of a
+# requested row is unknown or ambiguous.
 _RETAINED_HANDLE_COUNT_LIMIT = 65536
 _RETAINED_HANDLE_BYTES_LIMIT = 256 * 1024 * 1024
+# Hard ceiling for reading one handle file, independent of the matched-set
+# census bound above.
+_RETAINED_HANDLE_FILE_BYTES_LIMIT = 256 * 1024 * 1024
 _RETAINED_HANDLE_CENSUS_SECONDS = 30.0
 # A retained handle whose change time is this close to the start of the
 # census that read it can be rewritten, bytes, size and times alike, within
@@ -2756,7 +2777,7 @@ def _validation_removal_record_fields(
     if (
         not isinstance(schema, int)
         or isinstance(schema, bool)
-        or schema not in {1, 2, 3, 4, 5, 6, 7}
+        or schema not in {1, 2, 3, 4, 5, 6, 7, 8}
     ):
         raise Refusal(
             "validation removal run-record has no supported service-result identity"
@@ -2942,7 +2963,19 @@ def _validation_service_result_projection(
     service_result = _strict_json_object(
         contents, "validation removal service-result"
     )
-    if set(service_result) != set(schema_fields):
+    # Schema 8 sidecars carry an undeclared ``test_cases`` list (see
+    # ``_VALIDATION_SERVICE_RESULT_FIELDS``); it is not projected onto the
+    # run-record, so it may be present or absent without changing the
+    # declared-field check.
+    allowed_fields = set(schema_fields)
+    if schema >= 8:
+        allowed_fields.add("test_cases")
+        test_cases = service_result.get("test_cases")
+        if test_cases is not None and not isinstance(test_cases, list):
+            raise Refusal(
+                "validation removal service-result test_cases must be a list or null"
+            )
+    if not set(schema_fields) <= set(service_result) <= allowed_fields:
         raise Refusal(
             "validation removal service-result fields do not match the producer schema"
         )
@@ -3045,6 +3078,16 @@ def _validation_service_result_projection(
                 "validation removal service-result PASSED counts disagree"
             )
         projection["passed_tests"] = passed_tests
+    if schema >= 8:
+        skipped_tests = _validation_optional_count(
+            service_result.get("skipped_tests"),
+            "validation removal service-result skipped_tests",
+        )
+        if (executed_tests is None) != (skipped_tests is None):
+            raise Refusal(
+                "validation removal service-result test counts are incomplete"
+            )
+        projection["skipped_tests"] = skipped_tests
     if schema == 5:
         detail = service_result.get("detail")
         if detail is not None:
@@ -47874,7 +47917,7 @@ def _current_validation_result_is_terminal(
         passed_tests is None or passed_tests != executed_tests
     ):
         return False
-    if schema in {5, 6, 7}:
+    if schema in {5, 6, 7, 8}:
         if "detail" not in record:
             return False
         detail = record.get("detail")
@@ -47994,12 +48037,12 @@ def _validation_record_is_terminal(
     if schema is not None and (
         not isinstance(schema, int)
         or isinstance(schema, bool)
-        or schema not in {1, 2, 3, 4, 5, 6, 7}
+        or schema not in {1, 2, 3, 4, 5, 6, 7, 8}
     ):
         return False
     if schema in {1, 2}:
         expected_exit = None
-    elif schema in {4, 5, 6, 7} and isinstance(status, str):
+    elif schema in {4, 5, 6, 7, 8} and isinstance(status, str):
         return _current_validation_result_is_terminal(
             record, schema=schema, status=status
         )
@@ -48086,7 +48129,7 @@ def _current_frozen_service_result(record: Mapping[str, object]) -> bool:
     schema = record.get("service_result_schema")
     return bool(
         type(schema) is int
-        and schema in {4, 5, 6, 7}
+        and schema in {4, 5, 6, 7, 8}
         and record.get("result_source") == "validation-service-result"
         and record.get("state") == "completed"
         and _validation_record_is_terminal(record, target_kind="frozen-checkout")
@@ -48207,7 +48250,7 @@ def _current_incomplete_frozen_result(record: Mapping[str, object]) -> bool:
     # schema-6/7 no-result handle classify could-not-classify and
     # block every launch host-wide (2026-11-02, vspeed dc85ec16).
     schema = record.get("service_result_schema")
-    if type(schema) is not int or schema not in {5, 6, 7}:
+    if type(schema) is not int or schema not in {5, 6, 7, 8}:
         return False
     expected: dict[str, object] = {
         "result_source": "validation-service-result",
@@ -48406,7 +48449,7 @@ def _current_incomplete_frozen_retention(
         )
         evidence.append((path, contents, identity))
     schema = record.get("service_result_schema")
-    if type(schema) is not int or isinstance(schema, bool) or schema not in {5, 6, 7}:
+    if type(schema) is not int or isinstance(schema, bool) or schema not in {5, 6, 7, 8}:
         raise Refusal("current frozen validation has no supported service-result schema")
     projection = _validation_service_result_projection(
         evidence[2][1], schema=schema,
@@ -57474,7 +57517,8 @@ def _retained_handles_for_absent_rows(
         record.slot: [] for record, _paths in rows
     }
     handle_paths: list[Path] = []
-    total_bytes = 0
+    matched_paths: set[Path] = set()
+    matched_bytes = 0
     if time.monotonic() >= deadline:
         raise Refusal("retained validation handle census exceeded its time bound")
     # The clocks are read before the first handle and after the last, so a
@@ -57502,24 +57546,10 @@ def _retained_handles_for_absent_rows(
                         )
                     if not directory_entry.name.endswith(".json"):
                         continue
-                    if len(handle_paths) >= _RETAINED_HANDLE_COUNT_LIMIT:
-                        raise Refusal(
-                            "retained validation handles exceed the file-count census "
-                            f"bound of {_RETAINED_HANDLE_COUNT_LIMIT} *.json files in "
-                            f"{handles}"
-                        )
                     metadata = directory_entry.stat(follow_symlinks=False)
                     path = handles / directory_entry.name
                     if not stat.S_ISREG(metadata.st_mode):
                         raise Refusal(f"retained validation handle is unsafe: {path}")
-                    # Only the census as a whole is bounded.  A per-handle cap
-                    # of 1 MiB refused every absent-row recovery on the host
-                    # because one unrelated run record was 1,303,247 bytes,
-                    # while all 2,546 records together were 12,705,397 bytes
-                    # (2026-10-04).
-                    total_bytes += metadata.st_size
-                    if total_bytes > _RETAINED_HANDLE_BYTES_LIMIT:
-                        raise Refusal(_retained_handle_bytes_refusal(handles))
                     handle_paths.append(path)
         except Refusal:
             raise
@@ -57532,11 +57562,15 @@ def _retained_handles_for_absent_rows(
     handle_paths.sort()
     if time.monotonic() >= deadline:
         raise Refusal("retained validation handle enumeration exceeded its time bound")
-    total_bytes = 0
     for path in handle_paths:
         try:
             contents, read = _read_regular_file_identity(
-                path, "retained validation handle", _RETAINED_HANDLE_BYTES_LIMIT
+                path,
+                "retained validation handle",
+                max(
+                    _RETAINED_HANDLE_BYTES_LIMIT,
+                    _RETAINED_HANDLE_FILE_BYTES_LIMIT,
+                ),
             )
             # The times come from the path after the read, so a rewrite
             # that leaves the bytes, inode and size alike still differs.
@@ -57553,13 +57587,25 @@ def _retained_handles_for_absent_rows(
                 after.st_mtime_ns,
                 after.st_ctime_ns,
             )
-            total_bytes += len(contents)
-            if total_bytes > _RETAINED_HANDLE_BYTES_LIMIT:
-                raise Refusal(_retained_handle_bytes_refusal(handles))
             if time.monotonic() >= deadline:
                 raise Refusal(
                     "retained validation handle census exceeded its time bound"
                 )
+            # A service-result sidecar is not a run handle (the canonical
+            # handle is ``<unit>.json``; see
+            # ``_validation_removal_record_path``), and its declared
+            # fields carry no checkout.  A sidecar whose bytes claim no
+            # checkout is therefore not counted or parsed further: its
+            # size let finished evidence for other rows block every
+            # removal.  A sidecar that does claim a checkout (for example
+            # a hardlink to a run record under a sidecar name) falls
+            # through to the full strict parse and unit check below,
+            # where that ambiguous claim refuses.
+            if path.name.endswith(_VALIDATION_SERVICE_RESULT_SUFFIX) and (
+                b'"checkout"' not in contents
+                and b'"source_checkout"' not in contents
+            ):
+                continue
             # A duplicated field has no single meaning, and a permissive
             # decoder keeps the last value: an appended ``"process_identity":
             # null`` would hide a live run process, and an appended
@@ -57592,6 +57638,19 @@ def _retained_handles_for_absent_rows(
                 raise Refusal("retained validation handle census exceeded its time bound")
         if not related:
             continue
+        # Only handles naming a requested row count toward the census
+        # bounds; finished handles for other rows never block a removal.
+        if path not in matched_paths:
+            matched_paths.add(path)
+            matched_bytes += len(contents)
+            if len(matched_paths) > _RETAINED_HANDLE_COUNT_LIMIT:
+                raise Refusal(
+                    "retained validation handles exceed the file-count census "
+                    f"bound of {_RETAINED_HANDLE_COUNT_LIMIT} *.json files in "
+                    f"{handles}"
+                )
+            if matched_bytes > _RETAINED_HANDLE_BYTES_LIMIT:
+                raise Refusal(_retained_handle_bytes_refusal(handles))
         unit = value.get("unit")
         if (
             not isinstance(unit, str)
@@ -59683,16 +59742,64 @@ def _same_uid_batched_path_matches(
     return tuple(matches), tuple(indeterminate.values())
 
 
-# The same-UID census's closing inventory is bounded by this many process
-# inventories in one operation, each followed by a scan of only the generations
-# it adds.  Measured 2026-10-19 on a shared development host running 1,136
-# processes of one user: 0 to 2 new same-user generations appeared in 50 to
-# 200 ms, and 2 to 16 in one second; one inventory took 0.40 s and a whole
-# census, closing inventory included, 2.7 to 3.6 s.  An inventory usually adds
-# nothing by the second or third; eight leaves room for a burst of builds.
+# A same-UID census round that adds only generations proven unrelated to
+# its targets closes it (see ``_capture_same_uid_process_path_census``);
+# this bounds the rounds that stay not-proven, each followed by a scan of
+# only the generations it adds.
 _SAME_UID_CENSUS_INVENTORIES = 8
 # Scans discarded for thread-group or path motion, as before: three.
 _SAME_UID_CENSUS_DISCARDED_SCANS = 3
+
+
+def _same_uid_target_naming_matches(
+    processes: Sequence[_AbsentProcessObservation],
+    targets: Mapping[Path, str],
+    budget: _ReadOnlyCommandBudget,
+) -> tuple[tuple[int, str, str, str], ...]:
+    """Matches where a process's argv or environ names a target path.
+
+    A process whose command line or environment names the (fenced) target
+    can reach it by name even while its cwd and descriptors are outside
+    it, so naming makes it relevant to closure (it is not by itself
+    proven use: a held reference is what ``assert_slot_unused`` refuses
+    on).  Most
+    processes never mention a target: a byte search for each target
+    string rejects them without token-parsing their argv/environ, and
+    only a byte hit is token-parsed (path-aware, so a sibling path that
+    merely shares a prefix does not match).
+    """
+
+    matches: list[tuple[int, str, str, str]] = []
+    for process in processes:
+        budget.remaining_seconds()
+        for kind, filename in (("argv", "cmdline"), ("environ", "environ")):
+            path = Path("/proc") / str(process.pid) / filename
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                continue
+            for target, slot in targets.items():
+                target_text = str(target)
+                if target_text.encode() not in raw:
+                    continue
+                for token in raw.split(b"\0"):
+                    if not token:
+                        continue
+                    text = token.decode("utf-8", errors="surrogateescape")
+                    candidates = [text, text.partition("=")[2]]
+                    expanded = [
+                        part
+                        for candidate in candidates
+                        for part in candidate.split(":")
+                    ]
+                    if any(
+                        candidate == target_text
+                        or candidate.startswith(target_text + "/")
+                        for candidate in expanded
+                    ):
+                        matches.append((process.pid, slot, kind, text))
+                        break
+    return tuple(dict.fromkeys(matches))
 
 
 def _scan_same_uid_generations(
@@ -59700,20 +59807,27 @@ def _scan_same_uid_generations(
     targets: Mapping[Path, str],
     budget: _ReadOnlyCommandBudget,
     found: dict[tuple[int, str, str, str], None],
-) -> tuple[_AbsentProcessObservation, ...]:
-    """Run every observer over ``processes``; return the generations it scanned.
+) -> tuple[tuple[_AbsentProcessObservation, ...], tuple[_AbsentProcessObservation, ...]]:
+    """Run every observer over ``processes``.
 
-    Positive matches go into ``found`` even when motion then discards the scan.
-    A generation that has exited or whose PID another process took is omitted:
-    it holds nothing, and the closing inventory meets any successor.
+    Returns the generations it scanned and those among them that are not
+    proven unrelated to the targets: they matched a held reference or a
+    mount, their argv or environ names a target, they received no
+    complete scan (replaced or terminal before it), or their generation
+    was no longer current when the scan ended (they may have forked a
+    holder that only the next inventory can meet).  Positive matches go
+    into ``found`` even when motion then discards the scan.
     """
 
+    before_found = set(found)
+    inputs = tuple(processes)
     processes = _preflight_process_observations(
         processes, budget, replaced_generations_are_gone=True
     )
     direct: tuple[tuple[int, str, str, str], ...] = ()
     privileged: list[tuple[int, str, str, str]] = []
     mounts: tuple[tuple[int, str, str, str], ...] = ()
+    naming: tuple[tuple[int, str, str, str], ...] = ()
     try:
         direct, indeterminate = _same_uid_batched_path_matches(
             processes, targets, budget
@@ -59723,12 +59837,29 @@ def _scan_same_uid_generations(
         # Reject volatile path motion before spending the shared mountinfo
         # input budget. An accepted scan still completes every observer.
         mounts = _absent_validate_mount_matches(processes, targets, budget)
+        naming = _same_uid_target_naming_matches(processes, targets, budget)
         _recheck_thread_group_observations(processes, budget)
     except _ProcessEvidenceChanged as exc:
         found.update(dict.fromkeys((*exc.found, *mounts, *direct, *privileged)))
         raise
     found.update(dict.fromkeys((*mounts, *direct, *privileged)))
-    return processes
+    matched_pids = {
+        *(pid for pid, *_rest in set(found) - before_found),
+        *(pid for pid, *_rest in naming),
+    }
+    scanned_set = set(processes)
+    relevant: list[_AbsentProcessObservation] = []
+    for process in inputs:
+        if process.pid in matched_pids or process not in scanned_set:
+            relevant.append(process)
+            continue
+        try:
+            current = _process_generation_is_current(process)
+        except (Refusal, OSError, ValueError):
+            current = False
+        if not current:
+            relevant.append(process)
+    return processes, tuple(relevant)
 
 
 def _capture_same_uid_process_path_census(
@@ -59736,37 +59867,60 @@ def _capture_same_uid_process_path_census(
     *,
     budget: _ReadOnlyCommandBudget,
 ) -> _ProcessPathCensus:
-    """Prove which same-UID process generations use ``slot_paths``, up to one closing inventory.
+    """Prove which same-UID process generations use ``slot_paths``.
 
-    Threat model: cooperative processes of this filesystem UID, after the caller
-    has fenced the paths so that no process can newly reach them by name.  Such
-    a process can then hold a path only through what it already held (a working
-    directory or root, an open descriptor, a mapping, a mount) or what it
-    inherits from a holder by fork or clone.  A holder can fork after any one
-    snapshot of /proc, hand that reference to its child, and exit; a census
-    that probed only its snapshot would never see the child.
+    Threat model: cooperative processes of this filesystem UID, after the
+    caller has fenced the paths so that no process can newly reach them
+    by name (the fenced name carries a random component, and its parent
+    is private).  Such a process can then touch a path only through what
+    it already held (a working directory or root, an open descriptor, a
+    mapping, a mount), through argv or environ naming it, or through
+    what it inherits from a holder by fork or clone.  A holder can fork
+    after any one snapshot of /proc, hand that reference to its child,
+    and exit; a census that probed only its snapshot would never see the
+    child.
 
-    So the census enumerates /proc, scans every generation it has not scanned
-    yet, and enumerates again, until an inventory taken after every scan adds
-    no generation: that inventory is the acceptance boundary.  Each process
-    live there received a complete scan that found nothing, or its match is
-    reported, and a process born later descends from one of them, scanned
-    before it was born.  Generations are exact (pid, start_ticks) identities,
-    so a process that took an exited process's PID is a new generation and is
-    scanned alone; an exited or replaced generation needs no further evidence,
-    and ordinary churn never restarts the host-wide scan.  Positive matches
-    accumulate across rounds and discarded scans and are never erased; a match
-    whose generation changed while it was read refuses outright.  Inventories
-    are bounded (_SAME_UID_CENSUS_INVENTORIES), as is the time (``budget``):
-    a host where new generations keep appearing refuses rather than accepting.
+    Closure is therefore target-scoped, not host-wide.  The census scans
+    every new generation, and a round is *proven* when every generation
+    it added is proven unrelated: each was still current when its scan
+    ended, with cwd and root outside the targets, no open descriptor,
+    mapping or mount naming one, and no argv or environ naming one.
+    Such a process holds no reference its children could inherit, and
+    it cannot learn the fenced name afterwards.  Two proven rounds in a
+    row close the census: the second is a final re-scan, taken after the
+    first round's scans, of the generations the next inventory adds --
+    a process that started in a target while an earlier round was being
+    scanned is listed there and scanned before the census can close.
+    Births after that final round descend from proven processes (they
+    inherit no reference) or cannot learn the fenced name, and callers
+    run this census after fencing and immediately before their removal
+    lock and destructive phase.  A generation that matched, received no
+    complete scan, or was no longer current when its scan ended is not
+    proven: it may have forked a holder, so the census takes another
+    inventory and scans the generations that inventory adds, following
+    the not-proven set until it is matched or proven.  A host-wide
+    census that instead required an inventory adding no generation at
+    all almost never closed on a busy shared host -- every inventory
+    added the births of unrelated builds and test runs -- however
+    finished the target was.
 
-    Outside this model, and not detected: a holder that passes a descriptor
-    over a Unix socket (SCM_RIGHTS) or by pidfd_getfd to a process already
-    scanned and closes its own copy before its own scan; a thread of a live
-    leader that left its process's file table or file-system context with
-    unshare(CLONE_FILES or CLONE_FS); a process that takes this filesystem UID
-    only after the closing inventory; and processes of other UIDs, which the
-    all-process census covers.
+    Rounds that stay not-proven are bounded
+    (``_SAME_UID_CENSUS_INVENTORIES``), as is the time (``budget``): a
+    target whose holders keep forking new holders refuses rather than
+    accepting.  Generations are exact (pid, start_ticks) identities, so
+    a process that took an exited process's PID is a new generation and
+    is scanned alone.  Positive matches accumulate across rounds and
+    discarded scans and are never erased; a match whose generation
+    changed while it was read refuses outright.
+
+    Outside this model, and not detected: a holder that passes a
+    descriptor over a Unix socket (SCM_RIGHTS) or by pidfd_getfd to a
+    process already proven unrelated and closes its own copy before its
+    own scan; a thread of a live leader that left its process's file
+    table or file-system context with unshare(CLONE_FILES or CLONE_FS);
+    a process that takes this filesystem UID only after the closing
+    round; and processes of other UIDs, which the all-process census
+    covers.
     """
 
     targets = {path: str(path) for path in slot_paths}
@@ -59776,8 +59930,10 @@ def _capture_same_uid_process_path_census(
     scanned: list[_AbsentProcessObservation] = []
     found: dict[tuple[int, str, str, str], None] = {}
     discarded = 0
-    unscanned: tuple[_AbsentProcessObservation, ...] = ()
-    for _inventory in range(_SAME_UID_CENSUS_INVENTORIES):
+    relevant: tuple[_AbsentProcessObservation, ...] = ()
+    relevant_rounds = 0
+    proven_rounds = 0
+    while True:
         budget.remaining_seconds()
         try:
             inventory = _same_uid_process_observations(budget)
@@ -59790,9 +59946,10 @@ def _capture_same_uid_process_path_census(
                 return _ProcessPathCensus(
                     tuple(scanned), tuple(found), owner_cgroup_complete=False
                 )
-            scanned.extend(
-                _scan_same_uid_generations(unscanned, targets, budget, found)
+            scanned_round, relevant = _scan_same_uid_generations(
+                unscanned, targets, budget, found
             )
+            scanned.extend(scanned_round)
         except _ProcessEvidenceChanged:
             discarded += 1
             if discarded < _SAME_UID_CENSUS_DISCARDED_SCANS:
@@ -59801,13 +59958,24 @@ def _capture_same_uid_process_path_census(
                 "same-UID process evidence changed during three liveness attempts"
             )
         handled.update((process.pid, process.start_ticks) for process in unscanned)
-    sample = ", ".join(str(process.pid) for process in unscanned[:5])
-    raise Refusal(
-        f"same-UID process census did not close: each of {_SAME_UID_CENSUS_INVENTORIES} "
-        "process inventories found generations no earlier scan had covered "
-        f"(most recently {len(unscanned)}, PIDs {sample}); retry when fewer "
-        "processes are starting"
-    )
+        if not relevant:
+            proven_rounds += 1
+            if proven_rounds >= 2:
+                return _ProcessPathCensus(
+                    tuple(scanned), tuple(found), owner_cgroup_complete=False
+                )
+            continue
+        proven_rounds = 0
+        relevant_rounds += 1
+        if relevant_rounds >= _SAME_UID_CENSUS_INVENTORIES:
+            sample = ", ".join(str(process.pid) for process in relevant[:5])
+            raise Refusal(
+                f"same-UID process census did not close: each of "
+                f"{_SAME_UID_CENSUS_INVENTORIES} process inventories found "
+                "generations that may still use the target and no earlier "
+                f"scan had covered (most recently {len(relevant)}, PIDs "
+                f"{sample}); retry when fewer processes are starting"
+            )
 
 
 @dataclasses.dataclass(frozen=True)

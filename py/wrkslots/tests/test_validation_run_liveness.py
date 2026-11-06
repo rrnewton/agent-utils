@@ -1310,6 +1310,103 @@ def test_the_retained_handle_census_checks_its_bound_before_each_row_identity(
     assert read == [tree]
 
 
+def _fill_large_unrelated_handle_directory(project: Path) -> None:
+    handles = project / "ignored" / "validate" / "runs"
+    handles.mkdir(parents=True, exist_ok=True)
+    unrelated = str(project / "worktrees" / "validate" / "unrelated")
+    for index in range(40):
+        name = f"validate-unrelated-{index:04d}"
+        (handles / f"{name}.json").write_text(
+            json.dumps(
+                {"checkout": unrelated, "unit": f"{name}.service", "pad": "x" * 200}
+            ),
+            encoding="utf-8",
+        )
+        (handles / f"{name}.service-result.json").write_text(
+            json.dumps({"schema_version": 8, "test_cases": [{"id": "t" * 200}]}),
+            encoding="utf-8",
+        )
+
+
+def test_large_unrelated_handle_directory_does_not_block_finished_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, tree = _prepare(
+        tmp_path, monkeypatch, agent_liveness="dead", units=(_unit(),)
+    )
+    _write_run_handle(project, tree)
+    _fill_large_unrelated_handle_directory(project)
+    monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_BYTES_LIMIT", 4096)
+    monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_COUNT_LIMIT", 10)
+
+    assert _remove_completed(project) == 0, capsys.readouterr().err
+    assert not tree.exists()
+
+
+def test_large_unrelated_directory_still_refuses_a_live_target_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, tree = _prepare(
+        tmp_path,
+        monkeypatch,
+        agent_liveness="dead",
+        units=(_unit(ActiveState="active", SubState="running"),),
+    )
+    _write_run_handle(project, tree)
+    _fill_large_unrelated_handle_directory(project)
+    monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_BYTES_LIMIT", 4096)
+    monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_COUNT_LIMIT", 10)
+
+    assert _remove_completed(project) != 0
+    assert "may still use slot slot01" in capsys.readouterr().err
+    _assert_retained(project, tree)
+
+
+def test_large_unrelated_directory_still_refuses_an_ambiguous_target_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, tree = _prepare(
+        tmp_path, monkeypatch, agent_liveness="dead", units=(_unit(),)
+    )
+    handle = _write_run_handle(project, tree)
+    # The handle names this checkout but its unit identity does not match
+    # its file name, so its use of the slot is ambiguous.
+    handle.write_text(
+        json.dumps({"checkout": str(tree), "unit": "other.service"}),
+        encoding="utf-8",
+    )
+    _fill_large_unrelated_handle_directory(project)
+    monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_BYTES_LIMIT", 4096)
+
+    assert _remove_completed(project) != 0
+    assert "unverifiable for slot slot01" in capsys.readouterr().err
+    _assert_retained(project, tree)
+
+
+def test_matched_handle_set_over_the_census_bound_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    handle = _write_run_handle(project, tree)
+    handle.write_text(
+        json.dumps(
+            {"checkout": str(tree), "unit": RUN_UNIT, "pad": "x" * 5000}
+        ),
+        encoding="utf-8",
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    rows = [(record, (tree,)) for record in wrkslots._load_active(config).slots]
+    monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_BYTES_LIMIT", 4096)
+    with pytest.raises(wrkslots.Refusal, match="census bound"):
+        wrkslots._retained_handles_for_absent_rows(config, rows)
+
+
 def test_judging_rows_against_no_units_checks_the_time_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

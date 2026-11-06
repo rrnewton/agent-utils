@@ -6,7 +6,11 @@ child, and exit before its own entries are read.  The child is in no
 snapshot the census took, so a census that probes only its snapshot reports
 the checkout unused.  The census therefore lists /proc again after scanning
 and scans every process generation, an exact (pid, start_ticks) identity,
-that the listing adds, until a listing adds nothing.
+that the listing adds.  Closure is target-scoped: two consecutive rounds
+whose added generations are all proven unrelated (no held reference, and
+no argv or environ naming the target) close it, so unrelated churn on a
+busy host does not keep it open, while a generation that matched or was
+not completely scanned is followed to the generations it may have forked.
 
 Most tests here drive the census over a small scripted host: ``_Host`` holds
 the live generations and which of them hold the slot, and events fire at
@@ -186,9 +190,11 @@ def test_replaced_pids_never_restart_the_host_wide_scan(
 ) -> None:
     """A PID reused by an unrelated process is a new generation, scanned alone.
 
-    One PID is replaced after each of three listings.  A census that
-    discarded its attempt on each replacement refused after three; this one
-    omits each replaced generation and scans each newcomer once.
+    One PID is replaced after the first listing.  A census that discarded
+    its attempt on each replacement refused after three; this one omits
+    the replaced generation, scans its newcomer alone in the next round,
+    and then closes: the newcomers a busy host keeps producing are proven
+    unrelated, so later replacements do not reopen the census.
     """
 
     host = _Host(slot, (100, 7), (101, 7), (102, 7), (103, 7))
@@ -207,14 +213,10 @@ def test_replaced_pids_never_restart_the_host_wide_scan(
         ((101, 7), (102, 7), (103, 7)),
         ((100, 12),),
         ((101, 12),),
-        ((102, 12),),
     ]
-    assert host.inventories[-1] == ((100, 12), (101, 12), (102, 12), (103, 7))
-    assert len(host.inventories) == 5
+    assert len(host.inventories) == 3
     assert census.matches == ()
-    assert [(item.pid, item.start_ticks) for item in census.processes] == [
-        (101, 7), (102, 7), (103, 7), (100, 12), (101, 12), (102, 12),
-    ]
+    census.assert_slot_unused(slot, None, ignore_current_process=False)
 
 
 def test_a_newcomer_on_a_replaced_pid_is_scanned_for_use(
@@ -334,17 +336,21 @@ def test_unrelated_births_converge(
 
     census = _census(host)
 
-    assert host.scans == [(first,), (second,), (third,)]
-    assert len(host.inventories) == 4
-    assert host.inventories[-1] == (first, second, third)
+    assert host.scans == [(first,), (second,)]
+    assert len(host.inventories) == 2
     assert census.matches == ()
     census.assert_slot_unused(slot, None, ignore_current_process=False)
 
 
-def test_endless_births_refuse_within_the_bound(
+def test_endless_unrelated_births_do_not_block_closure(
     monkeypatch: pytest.MonkeyPatch, slot: Path,
 ) -> None:
-    """Every listing finds a newcomer, so no listing ever closes the census."""
+    """A busy host: every listing adds an unrelated newcomer, and it closes.
+
+    Each newcomer is proven unrelated (it holds nothing and names
+    nothing), so two proven rounds close the census even though births
+    would have continued for every further listing.
+    """
 
     host = _Host(slot, (100, 7))
     for listing in range(1, 40):
@@ -355,12 +361,117 @@ def test_endless_births_refuse_within_the_bound(
         host.after_inventory[listing] = birth
     _scripted(monkeypatch, host)
 
-    with pytest.raises(cli.Refusal, match="same-UID process census did not close") as refused:
+    census = _census(host)
+
+    assert len(host.inventories) == 2
+    assert census.matches == ()
+    census.assert_slot_unused(slot, None, ignore_current_process=False)
+
+
+def test_endless_holder_births_refuse_within_the_bound(
+    monkeypatch: pytest.MonkeyPatch, slot: Path,
+) -> None:
+    """Every listing hands the target to a new holder, so it never closes."""
+
+    current = [(100, 7)]
+    host = _Host(slot, current[0], holders=[current[0]])
+    for listing in range(1, 40):
+
+        def handoff(listing: int = listing) -> None:
+            child = (1000 + listing, 1000 + listing)
+            host.fork(current[0], child, parent_exits=True)
+            current[0] = child
+
+        host.after_inventory[listing] = handoff
+    _scripted(monkeypatch, host)
+
+    with pytest.raises(cli.Refusal, match="same-UID process census did not close"):
         _census(host)
 
     assert len(host.inventories) == cli._SAME_UID_CENSUS_INVENTORIES
-    assert len(host.scans) == cli._SAME_UID_CENSUS_INVENTORIES
-    assert "PIDs 1007" in str(refused.value)
+
+
+def test_a_holder_born_after_the_first_listing_still_refuses(
+    monkeypatch: pytest.MonkeyPatch, slot: Path,
+) -> None:
+    """A process that starts in the target (an open descriptor to it, in
+    the scripted host's link evidence) after the first listing is scanned
+    in the final re-scan round and keeps the slot."""
+
+    newcomer = (200, 9)
+    host = _Host(slot, (100, 7))
+
+    def spawn_holder() -> None:
+        host.spawn(newcomer)
+        host.holders.add(newcomer)
+
+    host.after_inventory[1] = spawn_holder
+    _scripted(monkeypatch, host)
+
+    census = _census(host)
+
+    assert _holders(census) == {newcomer[0]}
+    with pytest.raises(cli.Refusal, match=rf"live process {newcomer[0]} uses slot "):
+        census.assert_slot_unused(slot, None, ignore_current_process=False)
+
+
+def test_naming_matches_read_argv_and_environ_from_proc(slot: Path) -> None:
+    """The real argv/environ reader finds a target named by a live process."""
+
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            "import time; time.sleep(60)",
+            str(slot),
+        ],
+        env={**os.environ, "TARGET_CHECKOUT": str(slot / "repo")},
+    )
+    try:
+        ticks = cli._process_start_ticks(Path("/proc") / str(child.pid))
+        assert ticks is not None
+        process = cli._AbsentProcessObservation(child.pid, ticks, "", "mnt:[1]")
+        matches = cli._same_uid_target_naming_matches(
+            (process,), {slot: str(slot)}, _budget()
+        )
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+    kinds = {kind for _pid, _slot, kind, _detail in matches}
+    assert kinds == {"argv", "environ"}
+
+
+def test_a_process_naming_the_target_in_argv_is_not_proven_unrelated(
+    monkeypatch: pytest.MonkeyPatch, slot: Path,
+) -> None:
+    """Argv naming the target keeps a round open, without proving use.
+
+    The naming newcomer appears in the second listing: it is relevant,
+    so the census takes a further inventory instead of closing on the
+    first proven round.  Naming alone holds no reference, so with no
+    held reference the census still reports the slot unused.
+    """
+
+    naming = (200, 9)
+    host = _Host(slot, (100, 7))
+    host.after_inventory[1] = lambda: host.spawn(naming)
+    _scripted(monkeypatch, host)
+    monkeypatch.setattr(
+        cli,
+        "_same_uid_target_naming_matches",
+        lambda processes, _targets, _budget: tuple(
+            (process.pid, str(slot), "argv", f"tool --checkout={slot}")
+            for process in processes
+            if (process.pid, process.start_ticks) == naming
+        ),
+    )
+
+    census = _census(host)
+
+    assert len(host.inventories) == 3
+    assert census.matches == ()
+    census.assert_slot_unused(slot, None, ignore_current_process=False)
 
 
 def test_persistent_motion_still_refuses_after_three_scans(
