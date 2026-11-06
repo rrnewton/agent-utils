@@ -745,32 +745,37 @@ fn paste_placeholders(text: &str) -> usize {
     count
 }
 
-/// The `+k` line counts Claude Code can report for a paste of `text`.
+/// The exact `+k` line counts Claude Code can report for a paste of `text`:
+/// the counts the composer flush and the stale-draft matcher share (#884
+/// follow-up busy-evidence).
 ///
-/// Claude Code counts logical lines, so screen wrap never changes the count.
+/// Claude Code counts logical lines, so screen wrap never changes the count
+/// (a real busy pane drew a 5-newline paste whose lines wrap as `+5 lines`).
 /// A trailing newline ends the last line instead of starting a new one, and
-/// renderers differ on whether they count it, so both counts are accepted;
-/// any other size is a different paste.
-fn expected_line_counts(text: &str) -> Vec<usize> {
+/// builds differ on whether they count lines or line breaks, so the line
+/// count, the break count and lines-minus-one are all accepted; any other
+/// size is a different paste.
+pub(crate) fn expected_line_counts(text: &str) -> Vec<usize> {
+    let lines = text.lines().count();
     let newlines = text.matches('\n').count();
-    let logical = text.lines().count().saturating_sub(1);
-    if logical == newlines {
-        vec![newlines]
-    } else {
-        vec![logical, newlines]
-    }
+    let mut counts = vec![lines.saturating_sub(1), newlines, lines];
+    counts.sort_unstable();
+    counts.dedup();
+    counts
 }
 
 /// Whether the `+k lines` count of a paste placeholder can be the count
-/// Claude Code reports for `text`.
+/// Claude Code reports for `text`, for a placeholder that appeared in
+/// response to our own paste (see [`placeholder_is_ours`]).
 ///
-/// Without wrapping, the count is the logical line count (see
-/// [`expected_line_counts`]). Claude Code also counts wrapped rows: a long
-/// logical line drawn across several terminal rows adds to the count, by an
-/// amount that depends on the pane's width. A wrapped count therefore lies
-/// between the logical line count and the character count; a count outside
-/// that range, however recently the placeholder appeared, is another paste.
-fn paste_line_count_matches(text: &str, count: usize) -> bool {
+/// On top of the exact counts ([`expected_line_counts`]), a narrow pane
+/// counts wrapped rows: a long logical line drawn across several terminal
+/// rows adds to the count, by an amount that depends on the pane's width, so
+/// a wrapped count lies between the logical line count and the character
+/// count. That range is too weak to attribute a chip already sitting in the
+/// composer (any prompt of a similar size qualifies), so the baseline flush
+/// and the stale-draft matcher use the exact counts only.
+pub(crate) fn paste_line_count_matches(text: &str, count: usize) -> bool {
     if expected_line_counts(text).contains(&count) {
         return true;
     }
@@ -877,7 +882,12 @@ fn composer_is_this_text(view: &ComposerView, text: &str) -> bool {
     if !solid.is_empty() && (solid == wanted || (solid.len() >= 16 && wanted.contains(&solid))) {
         return true;
     }
-    // Placeholder forms: line count or char count of this text.
+    // Placeholder forms: line count or char count of this text. The line
+    // count uses the shared exact counts ([`expected_line_counts`], lines
+    // variant included), so a chip drawn [Pasted text #264 +3 lines] for a
+    // 3-line notice is this text here too, not only on a fresh delivery
+    // (#884 follow-up busy-evidence). Wrapped-row counts are not accepted
+    // here: they would attribute a foreign chip of a similar size.
     let region = &view.composer;
     if let Some(start) = region.find("[Pasted text #") {
         if let Some(end) = region[start..].find(']') {
@@ -2805,6 +2815,31 @@ mod tests {
         let receipt = receipt(submit(&screen, text));
         assert_eq!(receipt.key_presses, 1);
         assert_eq!(screen.state().submitted, [text]);
+    }
+
+    #[test]
+    fn a_lone_chip_counted_as_its_line_count_is_flushed_with_a_bare_enter_on_any_attempt() {
+        // #884 follow-up busy-evidence (b): a previous pass left our paste in
+        // the composer as one collapsed chip, drawn [Pasted text #264 +3
+        // lines] for a 3-line notice (the build counts lines, not line
+        // breaks). Even a fresh, non-stranded attempt recognises it through
+        // the shared line-count matcher and presses one bare Enter; it never
+        // types the text again. Screen shape from a real busy Claude Code
+        // pane (chip in the composer, paste-hint footer).
+        let text = "watcher notice line one is long enough to wrap across the pane\n\
+                    - second line of the notice also long enough to wrap around\n\
+                    read the reply and give the agent its next task or stop it";
+        let replay = Replay::new(
+            claude_screen(&["• earlier"], "[Pasted text #264 +3 lines]", PASTE_STATUS),
+            claude_screen(&["• earlier"], "[Pasted text #264 +3 lines]", PASTE_STATUS),
+            claude_screen(&["• earlier"], "", IDLE_STATUS),
+        );
+        let clock = Clock::default();
+        let outcome = submit_verified(&replay, "w1:p1", "claude", text, in_lock_timeouts(), &clock);
+        let receipt = receipt(outcome);
+        assert_eq!(receipt.key_presses, 1, "{receipt:?}");
+        assert!(replay.pastes.lock().unwrap().is_empty(), "never retyped");
+        assert_eq!(replay.keys.lock().unwrap().as_slice(), ["Enter"]);
     }
 
     #[test]

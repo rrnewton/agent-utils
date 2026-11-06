@@ -31,13 +31,14 @@
 //!
 //! A harness draws a long paste as one placeholder, which shows only the paste's size: Muse and
 //! Codex draw `[Pasted Content N chars]`, Claude Code (and Codex for a paste of many lines)
-//! `[Pasted text #K +M lines]`. A person's paste of the same size is not rare among many long
-//! prompts, so such a draft matches only the very last prompt typed, of exactly that size,
-//! within [`PLACEHOLDER_LOOKBACK`], a shorter window than [`TEXT_LOOKBACK`] for a draft whose
-//! text shows. The numbered form is stronger: `#K` is the harness's paste counter, and a
-//! history recall draws a recalled prompt as a new paste with a new number, so a draft whose
-//! label exactly matches the last delivery's recorded `paste_label` is agentctl's own however
-//! that delivery was recorded, `processed/` included (#808 agentctl-stranded-draft). A
+//! `[Pasted text #K +M lines]`. A character-count draft matches only the very last prompt
+//! typed, of exactly that size, within [`PLACEHOLDER_LOOKBACK`], a shorter window than
+//! [`TEXT_LOOKBACK`] for a draft whose text shows. A numbered draft matches, among the last
+//! [`RECENT_DELIVERIES`] prompts, the one holding its exact recorded `paste_label` (#808),
+//! or, when a record holds no label (its paste never showed in the composer, as on a busy
+//! pane), one whose size the one shared line-count matcher accepts; looking only at the
+//! latest delivery stranded an older delivery's chip behind every later prompt (#884
+//! follow-up busy-evidence). A
 //! composer holding several returned prompts at once — concatenated placeholders, or a
 //! placeholder beside the literal start of another delivery — is agentctl's when every piece
 //! matches a different recent delivery that way (#825 agentctl-stranded-multi-paste); any
@@ -80,9 +81,10 @@ pub(crate) enum Draft {
     /// length in characters shows.
     Placeholder(usize),
     /// `[Pasted text #K +M lines]`, Claude Code's (and Codex's) placeholder for a paste of many
-    /// lines, without its blanks. `K` numbers the harness's pastes, so the label names one paste:
-    /// it matches only the prompt whose record holds the same label as its `paste_label`, the
-    /// placeholder agentctl saw drawn for it when it typed it.
+    /// lines, without its blanks. It matches a recent prompt agentctl typed whose recorded
+    /// `paste_label` is this label, or, when the record holds no label, whose size the
+    /// shared line-count matcher accepts for the label's `+M` count (#884 follow-up
+    /// busy-evidence).
     PastedLines(String),
 }
 
@@ -285,17 +287,23 @@ fn placeholder_matches_q(
     draft: &Draft,
     text: &str,
     document: &Map<String, Value>,
-    quarantined: bool,
+    _quarantined: bool,
 ) -> bool {
     match draft {
         Draft::Text(_) => false,
         Draft::Placeholder(length) => paste_length(text) == *length,
         Draft::PastedLines(label) => {
+            // The exact recorded label is the strongest proof (#808): a
+            // record holding a different label names a different paste. A
+            // record holding no label (its paste was never drawn in the
+            // composer, as on a busy pane) vouches by size through the one
+            // shared line-count matcher, among the recent deliveries, not
+            // only the latest (#884 follow-up busy-evidence).
             document.get("paste_label").and_then(Value::as_str) == Some(label.as_str())
-                || (quarantined
-                    && document.get("paste_label").is_none()
-                    && pasted_line_count(label)
-                        .is_some_and(|m| text.lines().count().saturating_sub(1) == m))
+                || (document.get("paste_label").is_none()
+                    && pasted_line_count(label).is_some_and(|m| {
+                        crate::submission::expected_line_counts(text).contains(&m)
+                    }))
         }
     }
 }
@@ -350,7 +358,11 @@ pub(crate) fn find(
 ) -> Option<TypedPrompt> {
     let (lookback, deliveries) = match draft {
         Draft::Text(_) => (TEXT_LOOKBACK, RECENT_DELIVERIES),
-        Draft::Placeholder(_) | Draft::PastedLines(_) => (PLACEHOLDER_LOOKBACK, 1),
+        // A numbered chip may be an older delivery's paste returned to the
+        // composer, not only the latest one's (#884 follow-up busy-evidence);
+        // a bare character count still vouches only for the very last (#720).
+        Draft::PastedLines(_) => (PLACEHOLDER_LOOKBACK, RECENT_DELIVERIES),
+        Draft::Placeholder(_) => (PLACEHOLDER_LOOKBACK, 1),
     };
     // The records of the latest deliveries, latest first: a batch's members share one
     // `inflight_at`, so they count as one delivery.
@@ -393,13 +405,12 @@ pub(crate) fn find(
                         || (text_matches(rows, text)
                             && (vouching == Vouching::Recent || quarantined))
                 }
-                // A numbered paste placeholder matches only the record
-                // holding that exact label: the number is the harness's own
-                // paste counter, which a history recall cannot reproduce (a
-                // recalled prompt is drawn as a new paste with a new
-                // number), so it attributes the draft however the delivery
-                // was recorded (#808). A character-count placeholder carries
-                // no such proof and keeps the rule above.
+                // A numbered paste placeholder matches a record holding
+                // that exact label (#808), or a recent record holding no
+                // label whose size the shared line-count matcher accepts
+                // for its count (#884 follow-up busy-evidence). A
+                // character-count placeholder carries no such proof and
+                // keeps the rule above.
                 Draft::PastedLines(_) => placeholder_matches_q(draft, text, document, quarantined),
                 _ => {
                     placeholder_matches(draft, text, document)
@@ -553,8 +564,9 @@ fn composite_match(records: &[Record], rows: &str, vouching: Vouching) -> Option
                         record.2.get("paste_label").and_then(Value::as_str) == Some(label.as_str())
                             || (quarantined
                                 && record.2.get("paste_label").is_none()
-                                && pasted_line_count(label)
-                                    .is_some_and(|m| text.lines().count().saturating_sub(1) == m))
+                                && pasted_line_count(label).is_some_and(|m| {
+                                    crate::submission::expected_line_counts(text).contains(&m)
+                                }))
                     }
                     Segment::Chars(length) => {
                         paste_length(text) == *length
@@ -940,7 +952,11 @@ message number {index:02}"
     }
 
     #[test]
-    fn a_claude_paste_placeholder_vouches_only_for_the_last_prompt_drawn_with_that_number() {
+    fn a_claude_paste_placeholder_matches_a_recent_prompt_of_its_size() {
+        // #884 follow-up busy-evidence: the exact recorded label still names
+        // its own delivery among the recent ones (not only the latest), and
+        // a record holding no label vouches by the shared line-count size.
+        // A chip of a size no recent prompt has is a person's paste.
         let directory = Scratch::new("lines");
         let queue = directory.0.as_path();
         let text = format!("{HEADER}\none\ntwo\nthree\nfour");
@@ -968,15 +984,16 @@ message number {index:02}"
             .map(|found| found.id),
             Some("last".to_owned())
         );
-        // An older paste, a person's paste of the same size (another number), and a record that
-        // holds no label at all never vouch for a placeholder.
+        // The older delivery's exact label is still found among the recent
+        // deliveries; a number no record holds, while every record holds a
+        // label, names a different paste.
         assert!(find(
             queue,
             &draft("[Pasted text #3 +4 lines]"),
             Vouching::Recent,
             now
         )
-        .is_none());
+        .is_some());
         assert!(find(
             queue,
             &draft("[Pasted text #5 +4 lines]"),
@@ -984,6 +1001,7 @@ message number {index:02}"
             now
         )
         .is_none());
+        // A record holding no label vouches by size too.
         record(
             queue,
             "processed",
@@ -996,11 +1014,52 @@ message number {index:02}"
             Vouching::Recent,
             now
         )
+        .is_some());
+        // A size no recent prompt has is not ours.
+        assert!(find(
+            queue,
+            &draft("[Pasted text #9 +999 lines]"),
+            Vouching::Recent,
+            now
+        )
         .is_none());
         assert_eq!(
             draft("[Pasted text #4 +4 lines]").describe(),
             "a pasted 5 lines",
             "never the text"
+        );
+    }
+
+    #[test]
+    fn a_renumbered_chip_matches_an_older_delivery_not_only_the_latest() {
+        // The stranded watcher chip is rarely the latest delivery: later
+        // prompts piled up behind it. Its size matches the older delivery.
+        let directory = Scratch::new("lines-older");
+        let queue = directory.0.as_path();
+        let older_text = format!("{HEADER}\nshort notice");
+        let latest_text = format!("{HEADER}\none\ntwo\nthree\nfour");
+        record(
+            queue,
+            "failed",
+            "older",
+            &json!({"text": older_text, "inflight_at": 1.0}),
+        );
+        record(
+            queue,
+            "processed",
+            "latest",
+            &json!({"text": latest_text, "inflight_at": 2.0, "paste_label": "[Pastedtext#9+4lines]"}),
+        );
+        let now = SystemTime::now();
+        assert_eq!(
+            find(
+                queue,
+                &Draft::from_composer("[Pasted text #264 +1 lines]"),
+                Vouching::Unproven,
+                now
+            )
+            .map(|found| found.id),
+            Some("older".to_owned())
         );
     }
 
@@ -1033,10 +1092,18 @@ message number {index:02}"
             .map(|found| found.id),
             Some("stranded".to_owned())
         );
-        // A different paste number is a person's paste, never ours.
+        // A different paste number, while the record holds its label, is a
+        // person's paste, never ours; so is a size we never typed.
         assert!(find(
             queue,
             &Draft::from_composer("[Pasted text #179 +4 lines]"),
+            Vouching::Unproven,
+            now
+        )
+        .is_none());
+        assert!(find(
+            queue,
+            &Draft::from_composer("[Pasted text #179 +999 lines]"),
             Vouching::Unproven,
             now
         )
