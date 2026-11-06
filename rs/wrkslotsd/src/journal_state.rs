@@ -3375,7 +3375,10 @@ pub(crate) fn validated_journals(
             "recovery journal.kind",
         )?
         .to_owned();
-        if !matches!(kind.as_str(), "create" | "import-existing" | "finish") {
+        if !matches!(
+            kind.as_str(),
+            "create" | "import-existing" | "finish" | "ownerless-agent-remove"
+        ) {
             return Err(format!("unsupported cache recovery journal kind '{kind}'"));
         }
         let slot = validate_name(

@@ -1074,6 +1074,34 @@ fn journal_cache_checkouts(cfg: &Cfg, journal: &ValidatedJournal) -> Result<Vec<
         .ok_or_else(|| "cache recovery journal must be a JSON object".to_string())?;
     let kind = raw.get("kind").and_then(Value::as_str).unwrap_or_default();
     let slot = journal.slot.as_str();
+    if kind == "ownerless-agent-remove" {
+        // The journal's target is a standalone worktree, not a registry
+        // slot: report it as its own cache slot so one pending journal
+        // does not make the whole audit unreadable (#950).
+        let authorization = raw
+            .get("authorization")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "ownerless agent journal has no authorization".to_string())?;
+        let path = authorization
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "ownerless agent authorization has no path".to_string())?;
+        let repository_raw = authorization
+            .get("repository")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "ownerless agent authorization has no repository".to_string())?;
+        let (_relative, repository) = stored_repository_path(cfg, repository_raw)?;
+        let destination = cfg.root.join(path);
+        let mut present = Vec::new();
+        if destination.symlink_metadata().is_ok() {
+            present.push(JournalCheckout {
+                name: slot.to_string(),
+                destination,
+                repository,
+            });
+        }
+        return Ok(present);
+    }
     let (slot_type, mut checkouts, layout): (String, Vec<(String, String, String)>, String) =
         if kind == "create" {
             let slot_type = raw

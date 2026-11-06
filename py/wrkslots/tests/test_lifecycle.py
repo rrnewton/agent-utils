@@ -45906,6 +45906,59 @@ def test_recover_ownerless_agent_worktree_salvages_dirty_tree_without_owner(
     assert git(remote, "show", f"{salvage_commit}:uncommitted.txt").stdout == "preserve me\n"
 
 
+def test_generic_recover_resumes_ownerless_agent_remove_through_host_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#950: generic recover uses the captured recovery processes, not ancestry."""
+    project, repository, _remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    write_pre_handoff_ownerless_agent_journal(project, target, head, remote_digest)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    coordinator_process, proof_fd = start_host_context_coordinator()
+    try:
+        coordinator = wrkslots._read_process_identity(coordinator_process.pid)
+        set_host_context_handoff(monkeypatch, coordinator, proof_fd)
+        recovered = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(coordinator_process.pid),
+            ]
+        )
+    finally:
+        coordinator_process.terminate()
+        coordinator_process.wait(timeout=10)
+        os.close(proof_fd)
+    assert recovered == 0
+    assert not target.exists()
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+
+
+def test_audit_json_lists_an_ownerless_agent_remove_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#950: one pending ownerless-agent-remove journal does not break audit."""
+    project, repository, _remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    write_pre_handoff_ownerless_agent_journal(project, target, head, remote_digest)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    capsys.readouterr()
+
+    assert (
+        wrkslots.main(
+            ["--project-root", str(project), "audit", "--format", "json"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    row = next(item for item in payload["slots"] if item["slot"] == "ownerless")
+    assert row["owner_state"] == "ownerless-agent-remove-journal"
+
+
 def test_ownerless_salvage_refuses_url_changed_after_candidate_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

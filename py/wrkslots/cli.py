@@ -31855,7 +31855,7 @@ def _validated_cache_journal(
         _as_str(raw.get("slot"), "cache recovery journal.slot"), "slot"
     )
     kind = _as_str(raw.get("kind"), "cache recovery journal.kind")
-    if kind not in {"create", "import-existing", "finish"}:
+    if kind not in {"create", "import-existing", "finish", "ownerless-agent-remove"}:
         raise StateError(f"unsupported cache recovery journal kind {kind!r}")
     return _ValidatedCacheJournal(path, raw, machine, slot)
 
@@ -31902,6 +31902,31 @@ def _cache_slot_for_validated_journal(
             raise StateError("finish journal cache record names an unknown removed checkout")
         checkouts = tuple(
             checkout for checkout in record.checkouts if checkout.name not in removed
+        )
+    elif kind == "ownerless-agent-remove":
+        # The journal's target is a standalone worktree, not a registry
+        # slot: report it as its own cache slot so one pending journal
+        # does not make the whole audit unreadable (#950).
+        authorization, target, _fenced, active, _repository, _salvage = (
+            _ownerless_agent_journal_inputs(config, raw)
+        )
+        slot_type = "agent"
+        ownerless_checkout = Checkout(
+            name=target.name,
+            path=authorization.path,
+            repository=authorization.repository,
+            branch=authorization.branch or "",
+            start_point=authorization.head,
+            remote=authorization.remote,
+            remote_url_sha256=authorization.remote_url_sha256,
+            landed_ref=_landed_ref_for_remote(config, authorization.remote),
+            head=authorization.head,
+        )
+        return CacheSlot(
+            slot=slot,
+            machine=selected_machine,
+            checkouts=(ownerless_checkout,) if active is not None else (),
+            state=f"{kind}-journal",
         )
     else:
         raise StateError(f"unsupported cache recovery journal kind {kind!r}")
@@ -51623,10 +51648,12 @@ def _recover_ownerless_agent(
     path: Path,
     raw: Mapping[str, object],
     coordinator: ProcessIdentity,
+    *,
+    processes: _RecoveryProcesses | None = None,
 ) -> None:
     if path != _journal_path(config):
         raise StateError("ownerless agent journal filename is invalid")
-    _assert_caller_process(coordinator, "coordinator")
+    _assert_recovery_processes(coordinator, processes)
     authorization, target, fenced, active, repository, salvage = (
         _ownerless_agent_journal_inputs(config, raw)
     )
@@ -64611,7 +64638,9 @@ def _cmd_recover(
                 raise Refusal(
                     "--retry-running-hook and --abort-create apply only to create journals"
                 )
-            _recover_ownerless_agent(config, path, raw, coordinator)
+            _recover_ownerless_agent(
+                config, path, raw, coordinator, processes=processes
+            )
         elif kind == _OWNERLESS_CLONE_KIND:
             if args.retry_running_hook or args.abort_create:
                 raise Refusal(
