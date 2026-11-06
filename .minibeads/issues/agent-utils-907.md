@@ -1,11 +1,12 @@
 ---
 title: 'gate-blackout-window: gate.py refuses to start a gate inside a configured per-host blackout window'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 assignee: mu-validate
 created_at: 2026-11-05T18:19:37.637194904+00:00
-updated_at: 2026-11-05T18:19:37.637194904+00:00
+updated_at: 2026-11-06T09:50:00.000000000+00:00
+closed_at: 2026-11-06T09:50:00.000000000+00:00
 ---
 
 # Description
@@ -29,3 +30,14 @@ The gate host is shared. Another team runs a heavy nightly job on it from 01:00 
 # Notes
 
 Requested by the lead on 2026-11-05 at 1:19 PM ET (P2, small), after a neighbouring team on the shared gate host asked for quiet hours during its nightly run. Assigned to mu-validate (gate tooling, #827) after #898. Until it lands, lanes have been told not to start gates between 00:15 and 04:00 ET.
+
+## Resolution
+
+Landed in ef70a2f0 (49938f01 plus the fix-forward ef70a2f0).
+- Windows are read from ~/.local/etc/agent-utils/gate.toml ($GATE_BLACKOUT_CONFIG or --blackout-config).
+- A start inside a window exits 78, naming the window, the reason and the next allowed start.
+- --ignore-blackout is recorded in the ledger.
+- Queued tickets wait out a window, and a malformed config refuses every start (exit 2).
+- The nested-gate check requires a live parent ticket.
+
+Gate: green except the known-red package-contract step from cf760db4 and a shard-0 test that passed alone. The per-host config is installed on one host for 00:15-04:00 ET.
