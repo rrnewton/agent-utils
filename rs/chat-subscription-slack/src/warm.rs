@@ -62,7 +62,7 @@ use crate::diag::Diagnostics;
 use crate::ids::{self, AppId};
 use crate::transport::{
     bounded, EventStream, ListQuery, ListedMessage, Outcome, PostMessage, SlackTransport,
-    SubscribeSpec, TextFormat, TransportError,
+    SubscribeSpec, TextFormat, TransportError, UpdateMessage,
 };
 
 /// Wire version of the socket protocol.
@@ -431,6 +431,21 @@ impl SlackTransport for WarmTransport {
             }
             WarmPost::Failed(error) => Err(error),
         }
+    }
+
+    fn update_message(&mut self, update: &UpdateMessage<'_>) -> Result<(), TransportError> {
+        // No warm spare is held for an edit (#981): a fresh client run does it, as for a post
+        // with no spare ready.
+        self.inner.update_message(update)
+    }
+
+    fn delete_message(
+        &mut self,
+        app_id: &AppId,
+        channel_id: &str,
+        message_ts: &str,
+    ) -> Result<(), TransportError> {
+        self.inner.delete_message(app_id, channel_id, message_ts)
     }
 
     fn add_reaction(

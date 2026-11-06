@@ -1214,3 +1214,81 @@ fn refused_blocks_fall_back_to_the_text_alone_instead_of_losing_the_reply() {
     assert_eq!(posts[0].text, "*Report*\n\nbody");
     assert_eq!(posts[0].blocks, None);
 }
+
+/// #981 chat-bridge-alarm-coalesce: the helper rewrites a posted message in place and
+/// deletes one, each naming the exact message in its receipt; a rewrite that would need
+/// chunks is refused as not applied so the bridge deletes and reposts instead.
+#[test]
+fn an_update_rewrites_in_place_and_a_delete_removes_the_message() {
+    let ledger = ledger("update-delete");
+    let config = config(&ledger, Some(APP));
+    let fake = FakeTransport::new();
+    let message = format!("{CHANNEL}/messages/1792000801.000100");
+    let updated = run(
+        &config,
+        &fake,
+        &json!({
+            "version": 1, "id": ID, "action": "update", "channel_id": CHANNEL,
+            "message_id": message, "text": "still held, now for 10 min",
+        }),
+        1_000,
+    );
+    assert_eq!(updated["ok"], json!(true), "{updated}");
+    assert_eq!(updated["action"], json!("update"));
+    assert_eq!(updated["receipt"]["message_id"], json!(message));
+    {
+        let state = fake.state();
+        assert_eq!(state.posts.len(), 0, "an edit posts nothing new");
+        assert_eq!(state.updates.len(), 1);
+        assert_eq!(state.updates[0].message_ts, "1792000801.000100");
+        assert_eq!(state.updates[0].text, "still held, now for 10 min");
+        assert_eq!(state.updates[0].channel_id, CHANNEL);
+    }
+    let deleted = run(
+        &config,
+        &fake,
+        &json!({
+            "version": 1, "id": ID2, "action": "delete", "channel_id": CHANNEL,
+            "message_id": message,
+        }),
+        1_000,
+    );
+    assert_eq!(deleted["ok"], json!(true), "{deleted}");
+    assert_eq!(deleted["receipt"]["message_id"], json!(message));
+    {
+        let state = fake.state();
+        assert_eq!(state.deletes.len(), 1);
+        assert_eq!(state.deletes[0].message_ts, "1792000801.000100");
+    }
+    // Another channel's message, an empty body and an over-long body are all refused
+    // before any transport write.
+    for request in [
+        json!({
+            "version": 1, "id": ID, "action": "update", "channel_id": CHANNEL,
+            "message_id": "C0OTHER99/messages/1792000801.000100", "text": "x",
+        }),
+        json!({
+            "version": 1, "id": ID, "action": "update", "channel_id": CHANNEL,
+            "message_id": message, "text": "  ",
+        }),
+        json!({
+            "version": 1, "id": ID, "action": "update", "channel_id": CHANNEL,
+            "message_id": message, "text": "x".repeat(1_001),
+        }),
+        json!({
+            "version": 1, "id": ID, "action": "delete", "channel_id": CHANNEL,
+            "message_id": "not-a-resource",
+        }),
+    ] {
+        let response = run(&config, &fake, &request, 1_000);
+        assert_eq!(response["ok"], json!(false), "{response}");
+        assert_eq!(
+            response["error"]["outcome"],
+            json!("not_applied"),
+            "{response}"
+        );
+    }
+    let state = fake.state();
+    assert_eq!(state.updates.len(), 1, "refusals wrote nothing");
+    assert_eq!(state.deletes.len(), 1, "refusals wrote nothing");
+}

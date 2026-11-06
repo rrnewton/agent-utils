@@ -30,10 +30,10 @@ use crate::agent::{AgentError, AgentRuntime, DrainOptions, QueueMessageState};
 use crate::chat_events::{self, PaneEvent, PaneEventStream, PaneEventWake};
 use crate::chat_runtime::{
     self, AckResult, BridgeConfiguration, BridgeState, ChatRuntimeError, CommandOutboundTransport,
-    CoordinatorDeliveryResult, DeliveryAlarm, DeliveryEntry, OutboundCancellation, OutboundFailure,
-    PromptCommands, ReplyRoute, ReplyRouteEntry, ReplyStoreOutcome, ReplySubmission,
-    ReplyTransport, RequestPhase, RootMessageSubmission, RootMessageTransport, SlackFormat,
-    SNAPSHOT_LINES,
+    CoordinatorDeliveryResult, DeleteMessageSubmission, DeliveryAlarm, DeliveryEntry,
+    OutboundCancellation, OutboundFailure, PromptCommands, ReplyRoute, ReplyRouteEntry,
+    ReplyStoreOutcome, ReplySubmission, ReplyTransport, RequestPhase, RootMessageSubmission,
+    RootMessageTransport, SlackFormat, UpdateMessageSubmission, SNAPSHOT_LINES,
 };
 use crate::client::HerdrClient;
 use crate::error::AdapterErrorKind;
@@ -7640,7 +7640,8 @@ fn read_alarm_silence(state: &BridgeState) -> Option<owner_alarm::Silence> {
 }
 
 /// Post the owner alarm's `notices` to the bridge's first channel, each where it says: at the
-/// top level, or in its episode's thread. A repeat whose thread the provider refuses is posted
+/// top level, in its episode's thread, or by replacing its episode's one visible warning
+/// (#981 chat-bridge-alarm-coalesce). A repeat whose thread the provider refuses is posted
 /// at the top level instead, and starts the thread the next repeats go to.
 fn post_alarm_notices(
     alarm: &mut owner_alarm::OwnerAlarm,
@@ -7666,6 +7667,21 @@ fn post_alarm_notices(
         return;
     };
     for notice in notices {
+        if let owner_alarm::Place::Replace {
+            message_id,
+            thread_id,
+        } = &notice.place
+        {
+            replace_alarm_notice(
+                alarm,
+                transport,
+                channel,
+                &notice.text,
+                message_id,
+                thread_id.as_deref(),
+            );
+            continue;
+        }
         let request_id = match chat_runtime::random_operation_uuid() {
             Ok(id) => id,
             Err(error) => {
@@ -7728,6 +7744,173 @@ fn post_alarm_notices(
                 notice.text
             )),
         }
+    }
+}
+
+/// Whether `failure` proves the provider did not apply the operation and repeating the
+/// identical operation cannot succeed.
+fn permanently_refused(failure: &OutboundFailure) -> bool {
+    failure.outcome == chat_runtime::OutboundOutcome::NotApplied && !failure.retryable
+}
+
+/// Post `text` as the replacement for the episode's one visible warning `message_id` (#981
+/// chat-bridge-alarm-coalesce): rewritten in place where the transport can edit (Slack
+/// `chat.update`, through the helper's `update` action); deleted and reposted where it can
+/// only delete; posted in the warning's thread where it can do neither, which is the #830
+/// behaviour. An edit or delete whose outcome is unknown is left for the next repeat rather
+/// than risk a second visible warning.
+fn replace_alarm_notice(
+    alarm: &mut owner_alarm::OwnerAlarm,
+    transport: &mut dyn RootMessageTransport,
+    channel: &str,
+    text: &str,
+    message_id: &str,
+    thread_id: Option<&str>,
+) {
+    let request_id = match chat_runtime::random_operation_uuid() {
+        Ok(id) => id,
+        Err(error) => {
+            service_log(format_args!(
+                "agentctl: owner alarm not updated: {error}: {text}"
+            ));
+            return;
+        }
+    };
+    let update = UpdateMessageSubmission {
+        channel_id: channel,
+        message_id,
+        body: text,
+        request_id: &request_id,
+    };
+    if let Err(error) = chat_runtime::validate_update_message_submission(&update) {
+        service_log(format_args!(
+            "agentctl: owner alarm update refused: {error}: {text}"
+        ));
+        return;
+    }
+    match transport.update_message(update) {
+        Ok(updated) => service_log(format_args!(
+            "agentctl: owner alarm updated in place in {channel} as {updated}: {text}"
+        )),
+        Err(failure) if permanently_refused(&failure) => {
+            replace_alarm_by_repost(alarm, transport, channel, text, message_id, thread_id);
+        }
+        Err(failure) => service_log(format_args!(
+            "agentctl: owner alarm not updated ({failure}); the next repeat tries again: {text}"
+        )),
+    }
+}
+
+/// The delete-and-repost half of [`replace_alarm_notice`]: the transport cannot edit the
+/// episode's warning, so the old one is removed and `text` posted at the top level as the
+/// episode's new one visible warning. A transport that cannot delete either keeps the #830
+/// behaviour of a reply in the warning's thread.
+fn replace_alarm_by_repost(
+    alarm: &mut owner_alarm::OwnerAlarm,
+    transport: &mut dyn RootMessageTransport,
+    channel: &str,
+    text: &str,
+    message_id: &str,
+    thread_id: Option<&str>,
+) {
+    let request_id = match chat_runtime::random_operation_uuid() {
+        Ok(id) => id,
+        Err(error) => {
+            service_log(format_args!(
+                "agentctl: owner alarm not replaced: {error}: {text}"
+            ));
+            return;
+        }
+    };
+    let delete = DeleteMessageSubmission {
+        channel_id: channel,
+        message_id,
+        request_id: &request_id,
+    };
+    if let Err(error) = chat_runtime::validate_delete_message_submission(&delete) {
+        service_log(format_args!(
+            "agentctl: owner alarm delete refused: {error}: {text}"
+        ));
+        return;
+    }
+    match transport.delete_message(delete) {
+        Ok(_) => {
+            let request_id = match chat_runtime::random_operation_uuid() {
+                Ok(id) => id,
+                Err(error) => {
+                    service_log(format_args!(
+                        "agentctl: owner alarm not reposted: {error}: {text}"
+                    ));
+                    return;
+                }
+            };
+            let submission = RootMessageSubmission {
+                channel_id: channel,
+                body: text,
+                request_id: &request_id,
+            };
+            match transport.publish_root(submission) {
+                Ok(message) => {
+                    service_log(format_args!(
+                        "agentctl: owner alarm replaced in {channel} as {message}: {text}"
+                    ));
+                    // While the episode lives, its warning is the replacement; once it has
+                    // ended (the resolved line) there is nothing to record it on.
+                    alarm.root_posted(
+                        &message,
+                        crate::chat_trace::trace_thread_id(channel, &message),
+                    );
+                }
+                Err(error) => service_log(format_args!(
+                    "agentctl: owner alarm not reposted: {error}: {text}"
+                )),
+            }
+        }
+        Err(failure) if permanently_refused(&failure) => {
+            // Neither edit nor delete: a reply in the warning's thread, as before #981.
+            let Some(thread) = thread_id else {
+                service_log(format_args!(
+                    "agentctl: owner alarm not replaced (the transport can neither edit nor \
+                     delete it, and it has no thread): {text}"
+                ));
+                return;
+            };
+            let request_id = match chat_runtime::random_operation_uuid() {
+                Ok(id) => id,
+                Err(error) => {
+                    service_log(format_args!(
+                        "agentctl: owner alarm not posted: {error}: {text}"
+                    ));
+                    return;
+                }
+            };
+            let submission = RootMessageSubmission {
+                channel_id: channel,
+                body: text,
+                request_id: &request_id,
+            };
+            match transport.publish_in_thread(submission.clone(), thread) {
+                Ok(message) => service_log(format_args!(
+                    "agentctl: owner alarm posted to {channel} as {message}: {text}"
+                )),
+                Err(failure) if permanently_refused(&failure) => {
+                    match transport.publish_root(submission) {
+                        Ok(message) => service_log(format_args!(
+                            "agentctl: owner alarm posted to {channel} as {message}: {text}"
+                        )),
+                        Err(error) => service_log(format_args!(
+                            "agentctl: owner alarm not posted: {error}: {text}"
+                        )),
+                    }
+                }
+                Err(error) => service_log(format_args!(
+                    "agentctl: owner alarm not posted: {error}: {text}"
+                )),
+            }
+        }
+        Err(failure) => service_log(format_args!(
+            "agentctl: owner alarm not replaced ({failure}); the next repeat tries again: {text}"
+        )),
     }
 }
 
@@ -16458,6 +16641,12 @@ esac
         /// Replies posted in a thread, as (thread, body), when `threads` is set.
         threaded: Vec<(String, String)>,
         threads: bool,
+        /// In-place rewrites, as (message, body), when `updatable` is set (#981).
+        updates: Vec<(String, String)>,
+        updatable: bool,
+        /// Deletions, as message ids, when `deletable` is set (#981).
+        deletes: Vec<String>,
+        deletable: bool,
     }
 
     impl RootMessageTransport for RecordingRoots {
@@ -16468,6 +16657,39 @@ esac
             self.posts
                 .push((submission.channel_id.to_owned(), submission.body.to_owned()));
             Ok(format!("spaces/example/messages/post-{}", self.posts.len()))
+        }
+
+        fn update_message(
+            &mut self,
+            submission: UpdateMessageSubmission<'_>,
+        ) -> std::result::Result<String, OutboundFailure> {
+            if !self.updatable {
+                return Err(OutboundFailure {
+                    code: "message_update_unsupported".to_owned(),
+                    detail: "no edits here".to_owned(),
+                    outcome: chat_runtime::OutboundOutcome::NotApplied,
+                    retryable: false,
+                });
+            }
+            self.updates
+                .push((submission.message_id.to_owned(), submission.body.to_owned()));
+            Ok(submission.message_id.to_owned())
+        }
+
+        fn delete_message(
+            &mut self,
+            submission: DeleteMessageSubmission<'_>,
+        ) -> std::result::Result<String, OutboundFailure> {
+            if !self.deletable {
+                return Err(OutboundFailure {
+                    code: "message_delete_unsupported".to_owned(),
+                    detail: "no deletes here".to_owned(),
+                    outcome: chat_runtime::OutboundOutcome::NotApplied,
+                    retryable: false,
+                });
+            }
+            self.deletes.push(submission.message_id.to_owned());
+            Ok(submission.message_id.to_owned())
         }
 
         fn publish_in_thread(
@@ -16768,7 +16990,15 @@ esac
         assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
         assert_eq!(roots.threaded.len(), 1, "{:?}", roots.threaded);
         assert_eq!(roots.threaded[0].0, thread);
-        assert!(roots.threaded[0].1.contains("Still: 1 of your messages"));
+        // This transport can neither edit nor delete (#981), so the repeat keeps the #830
+        // behaviour of a reply in the thread.
+        assert!(
+            roots.threaded[0]
+                .1
+                .contains("1 of your messages to coordinator has not reached it"),
+            "{}",
+            roots.threaded[0].1
+        );
         // Acknowledged: silent, and the request is still queued.
         let acked = alarm(&root, &AlarmAction::Ack, false).expect("ack");
         assert!(acked.contains("\"outcome\":\"acknowledged\""), "{acked}");
@@ -16799,18 +17029,169 @@ esac
             Some(&mut roots),
             false,
         );
-        assert_eq!(
-            roots.threaded.last().expect("resumed"),
-            &(
-                thread.to_owned(),
-                "[chat-bridge] Your messages to coordinator are being delivered again.".to_owned()
-            )
+        let (resumed_thread, resumed_text) = roots.threaded.last().expect("resumed");
+        assert_eq!(resumed_thread, thread);
+        assert!(
+            resumed_text.starts_with("[chat-bridge] Resolved ")
+                && resumed_text.contains(" ET: ")
+                && resumed_text
+                    .ends_with("your messages to coordinator are being delivered again."),
+            "{resumed_text}"
         );
         assert_eq!(alarm_status(&root)["episode"], Value::Null);
         assert!(
             alarm(&root, &AlarmAction::Ack, false).is_err(),
             "nothing held"
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// #981 chat-bridge-alarm-coalesce: on a transport that can edit, an episode's repeats
+    /// rewrite its one visible warning in place, across a restart, and delivery resuming
+    /// rewrites that same message to the resolved line. Nothing else is ever posted.
+    #[test]
+    fn the_owner_alarm_rewrites_its_one_warning_in_place_across_a_restart() {
+        let (state, key, root) = state_with_request();
+        let reason = "request remains pending: the Muse editor holds a draft that agentctl did \
+                      not type (12 characters on 1 row(s))";
+        state
+            .put_delivery_phase(&key, RequestPhase::Pending, Some(reason))
+            .expect("pending");
+        let mut watch = DeliveryWatch::new(DeliveryTiming {
+            retry_interval: Duration::from_secs(3_600),
+            stall_after: Duration::ZERO,
+            stall_repeat: Duration::from_secs(3_600),
+        });
+        let mut routes = RouteCache::new(Vec::new());
+        let mut roots = RecordingRoots {
+            threads: true,
+            updatable: true,
+            ..RecordingRoots::default()
+        };
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        let mut owner = Some(owner_alarm::OwnerAlarm::new(Duration::ZERO));
+        owner_alarm_step(
+            owner.as_mut(),
+            &watch.entries,
+            &state,
+            Some(&mut roots),
+            false,
+        );
+        assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
+        assert!(roots.updates.is_empty(), "{:?}", roots.updates);
+        // A restarted bridge reads the episode back and rewrites the same message.
+        let mut owner = Some(owner_alarm::OwnerAlarm::new(Duration::ZERO));
+        owner_alarm_step(
+            owner.as_mut(),
+            &watch.entries,
+            &state,
+            Some(&mut roots),
+            false,
+        );
+        assert_eq!(roots.posts.len(), 1, "no second post: {:?}", roots.posts);
+        assert!(roots.threaded.is_empty(), "{:?}", roots.threaded);
+        assert_eq!(roots.updates.len(), 1, "{:?}", roots.updates);
+        assert_eq!(roots.updates[0].0, "spaces/example/messages/post-1");
+        assert!(
+            roots.updates[0].1.starts_with("[chat-bridge WARNING]"),
+            "{}",
+            roots.updates[0].1
+        );
+        assert_eq!(
+            alarm_status(&root)["episode"]["root_message_id"],
+            "spaces/example/messages/post-1"
+        );
+        state
+            .put_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("delivered");
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        owner_alarm_step(
+            owner.as_mut(),
+            &watch.entries,
+            &state,
+            Some(&mut roots),
+            false,
+        );
+        assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
+        assert_eq!(roots.updates.len(), 2, "{:?}", roots.updates);
+        assert_eq!(roots.updates[1].0, "spaces/example/messages/post-1");
+        assert!(
+            roots.updates[1].1.starts_with("[chat-bridge] Resolved ")
+                && roots.updates[1].1.contains(" ET: "),
+            "{}",
+            roots.updates[1].1
+        );
+        assert_eq!(alarm_status(&root)["episode"], Value::Null);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// #981 chat-bridge-alarm-coalesce: on a transport that can delete but not edit, each
+    /// repeat deletes the episode's warning and posts its replacement, and the saved episode
+    /// follows the replacement, so exactly one warning is visible at a time.
+    #[test]
+    fn the_owner_alarm_deletes_and_reposts_when_it_cannot_edit() {
+        let (state, key, root) = state_with_request();
+        let reason = "request remains pending: the Muse editor holds a draft that agentctl did \
+                      not type (12 characters on 1 row(s))";
+        state
+            .put_delivery_phase(&key, RequestPhase::Pending, Some(reason))
+            .expect("pending");
+        let mut watch = DeliveryWatch::new(DeliveryTiming {
+            retry_interval: Duration::from_secs(3_600),
+            stall_after: Duration::ZERO,
+            stall_repeat: Duration::from_secs(3_600),
+        });
+        let mut routes = RouteCache::new(Vec::new());
+        let mut roots = RecordingRoots {
+            deletable: true,
+            ..RecordingRoots::default()
+        };
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        let mut owner = Some(owner_alarm::OwnerAlarm::new(Duration::ZERO));
+        owner_alarm_step(
+            owner.as_mut(),
+            &watch.entries,
+            &state,
+            Some(&mut roots),
+            false,
+        );
+        assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
+        owner_alarm_step(
+            owner.as_mut(),
+            &watch.entries,
+            &state,
+            Some(&mut roots),
+            false,
+        );
+        assert_eq!(
+            roots.deletes,
+            ["spaces/example/messages/post-1"],
+            "{:?}",
+            roots.deletes
+        );
+        assert_eq!(roots.posts.len(), 2, "{:?}", roots.posts);
+        assert_eq!(
+            alarm_status(&root)["episode"]["root_message_id"],
+            "spaces/example/messages/post-2"
+        );
+        // The next repeat replaces the replacement, not the original.
+        owner_alarm_step(
+            owner.as_mut(),
+            &watch.entries,
+            &state,
+            Some(&mut roots),
+            false,
+        );
+        assert_eq!(
+            roots.deletes,
+            [
+                "spaces/example/messages/post-1",
+                "spaces/example/messages/post-2"
+            ],
+            "{:?}",
+            roots.deletes
+        );
+        assert_eq!(roots.posts.len(), 3, "{:?}", roots.posts);
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -16854,8 +17235,8 @@ esac
         assert!(
             body.starts_with(
                 "[chat-bridge WARNING] 1 of your messages to coordinator has not reached it, the \
-                 oldest sent 0 min ago (\"request\"). Why: request remains pending:"
-            ),
+                 oldest sent 0 min ago ("
+            ) && body.contains(" ET, \"request\"). Why: request remains pending:"),
             "{body}"
         );
         assert!(body.contains("submit or clear it there"), "{body}");
@@ -16870,9 +17251,11 @@ esac
             Some(&mut roots),
             false,
         );
-        assert_eq!(
-            roots.posts[1].1,
-            "[chat-bridge] Your messages to coordinator are being delivered again."
+        assert!(
+            roots.posts[1].1.starts_with("[chat-bridge] Resolved ")
+                && roots.posts[1].1.contains(" ET: "),
+            "{}",
+            roots.posts[1].1
         );
         // With the alarm off, nothing is posted.
         owner_alarm_step(None, &watch.entries, &state, Some(&mut roots), false);

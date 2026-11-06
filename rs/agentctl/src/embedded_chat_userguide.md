@@ -2440,7 +2440,7 @@ DURATION` (default `5m`; `off` turns it off; units as for
 message to the first configured channel through the outbound helper:
 
 ```text
-[chat-bridge WARNING] 2 of your messages to coord have not reached it, the oldest sent 6 min ago ("are you there?"). Why: request remains pending: pane w1:p2 did not become idle/done within 0s; last status=staged. Text that agentctl did not type is in coord's input box, so it is left alone; submit or clear it there, and delivery resumes. The next reminder comes in this thread in 5 min unless they are delivered; `agentctl chat alarm ack` silences it until the held messages or the reason change.
+[chat-bridge WARNING] 2 of your messages to coord have not reached it, the oldest sent 6 min ago (09:14 ET, "are you there?"). Why: request remains pending: pane w1:p2 did not become idle/done within 0s; last status=staged. Text that agentctl did not type is in coord's input box, so it is left alone; submit or clear it there, and delivery resumes. This notice is updated in place in 5 min unless they are delivered; `agentctl chat alarm ack` silences it until the held messages or the reason change.
 ```
 
 The reason is the one the oldest waiting request's last attempt recorded (cut
@@ -2451,19 +2451,26 @@ been made yet) is no fault and is not counted: a Claude Code coordinator run
 without `--deliver-while-working` takes no prompt during a turn.
 
 The warning backs off rather than repeating the same post every DURATION (#830
-chat-bridge-warning-backoff). The first warning of an episode is a top-level
-post; each repeat, which opens with `Still:`, is a reply in its thread, after 1,
-3, 6 and 12 times DURATION and then every 36 times it (5, 15, 30 and 60 minutes,
-then every 3 hours, by default). The backoff starts again, still in the same
-thread, when the held requests change or the kind of reason does (text the
-agent did not type, an unsent draft, refused input, a status disagreement, a
-missing pane, anything else). When none waits any more, one line in the thread
-says `[chat-bridge] Your messages to coord are being delivered again.`; a later
-failure starts a new episode with a new top-level warning. A provider that
-cannot post in a thread gets the repeat at the top level, which then starts the
-thread. The episode, with its first warning's message, is saved in
-`owner-alarm.json` in the state directory, so a restarted bridge carries on in
-the same thread instead of warning at the top level again.
+chat-bridge-warning-backoff), and the repeats coalesce in place (#981
+chat-bridge-alarm-coalesce): an episode has at most one visible warning. The
+first warning of an episode is a top-level post; each repeat rewrites that one
+message with the current count, age (in ET), reason and fix, after 1, 3, 6 and
+12 times DURATION and then every 36 times it (5, 15, 30 and 60 minutes, then
+every 3 hours, by default). The rewrite is an edit where the helper supports it
+(Slack `chat.update`, the outbound `update` action); where it cannot edit but
+can delete, the old warning is deleted and the replacement posted; a helper
+that can do neither keeps the repeats as replies in the first warning's
+thread, and one without threads posts at the top level. The backoff starts
+again, on the same message, when the held requests change or the kind of
+reason does (text the agent did not type, an unsent draft, refused input, a
+status disagreement, a missing pane, anything else). When none waits any more,
+the same message is rewritten to `[chat-bridge] Resolved HH:MM ET: your
+messages to coord are being delivered again.` — kept, not deleted, so the
+channel keeps a one-line record of the episode and its end. A later failure
+starts a new episode with a new top-level warning. The episode, with its
+warning's message, is saved in `owner-alarm.json` in the state directory, so a
+restarted bridge keeps replacing the same message instead of warning at the
+top level again.
 
 `agentctl chat alarm` shows the episode (`--json`: schema
 `agentctl-chat-alarm/v1`). `chat alarm ack` silences it until the held requests

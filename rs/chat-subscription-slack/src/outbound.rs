@@ -5,6 +5,8 @@
 //!
 //! ```json
 //! {"version":1,"id":"<uuid>","action":"send","channel_id":"C…","thread_id":"C…/threads/<ts>","text":"…"}
+//! {"version":1,"id":"<uuid>","action":"update","channel_id":"C…","message_id":"C…/messages/<ts>","text":"…"}
+//! {"version":1,"id":"<uuid>","action":"delete","channel_id":"C…","message_id":"C…/messages/<ts>"}
 //! {"version":1,"id":"<uuid>","action":"ensure_reaction","channel_id":"C…","message_id":"C…/messages/<ts>","emoji":"🤖"}
 //! {"version":1,"id":"<uuid>","action":"ensure_rejection","channel_id":"C…","message_id":"C…/messages/<ts>","sender_id":"U…","emoji":"❌"}
 //! {"version":1,"id":"<uuid>","action":"resolve_sender","channel_id":"C…","query":"<unixname|email|ID>"}
@@ -79,7 +81,7 @@ use crate::diag::Diagnostics;
 use crate::ids::{self, AppId};
 use crate::transport::{
     bounded, ListQuery, Outcome, PostMessage, SlackTransport, TextFormat, TransportError,
-    WebApiTransport,
+    UpdateMessage, WebApiTransport,
 };
 
 mod rejections;
@@ -560,6 +562,16 @@ enum Request {
         sender_id: String,
         emoji: String,
     },
+    Update {
+        channel_id: String,
+        message_ts: String,
+        text: String,
+        slack_format: Option<TextFormat>,
+    },
+    Delete {
+        channel_id: String,
+        message_ts: String,
+    },
     ResolveSender {
         channel_id: String,
         query: String,
@@ -661,6 +673,63 @@ fn parse_request(object: &Map<String, Value>, action: &str) -> Result<Request, R
                 metadata,
             })
         }
+        "update" => {
+            let required = ["version", "id", "action", "channel_id", "message_id", "text"];
+            if !required.iter().all(|key| object.contains_key(*key))
+                || !object
+                    .keys()
+                    .all(|key| required.contains(&key.as_str()) || key == "slack_format")
+            {
+                return Err(invalid("an update request has exactly version, id, action, channel_id, message_id and text, plus an optional slack_format"));
+            }
+            let slack_format = match object.get("slack_format") {
+                None => None,
+                Some(Value::String(value)) => Some(parse_slack_format(value).ok_or_else(|| {
+                    invalid("slack_format must be markdown or converted")
+                })?),
+                Some(_) => return Err(invalid("slack_format must be a string")),
+            };
+            let channel_id =
+                text("channel_id").ok_or_else(|| invalid("channel_id must be a string"))?;
+            let message =
+                text("message_id").ok_or_else(|| invalid("message_id must be a string"))?;
+            let (channel, ts) = ids::parse_resource(&message, "messages")
+                .ok_or_else(|| invalid("message_id is not <channel>/messages/<ts>"))?;
+            if channel != channel_id {
+                return Err(invalid("message_id belongs to another channel"));
+            }
+            let body = text("text").ok_or_else(|| invalid("text must be a string"))?;
+            if body.trim().is_empty() {
+                return Err(invalid("text is empty"));
+            }
+            Ok(Request::Update {
+                channel_id,
+                message_ts: ts.to_owned(),
+                text: body,
+                slack_format,
+            })
+        }
+        "delete" => {
+            if !exact_keys(
+                object,
+                &["version", "id", "action", "channel_id", "message_id"],
+            ) {
+                return Err(invalid("a delete request has exactly version, id, action, channel_id and message_id"));
+            }
+            let channel_id =
+                text("channel_id").ok_or_else(|| invalid("channel_id must be a string"))?;
+            let message =
+                text("message_id").ok_or_else(|| invalid("message_id must be a string"))?;
+            let (channel, ts) = ids::parse_resource(&message, "messages")
+                .ok_or_else(|| invalid("message_id is not <channel>/messages/<ts>"))?;
+            if channel != channel_id {
+                return Err(invalid("message_id belongs to another channel"));
+            }
+            Ok(Request::Delete {
+                channel_id,
+                message_ts: ts.to_owned(),
+            })
+        }
         "ensure_reaction" => {
             if !exact_keys(
                 object,
@@ -758,7 +827,7 @@ fn parse_request(object: &Map<String, Value>, action: &str) -> Result<Request, R
             })
         }
         _ => Err(invalid(
-            "action must be send, ensure_reaction, ensure_rejection, resolve_sender or list_members",
+            "action must be send, update, delete, ensure_reaction, ensure_rejection, resolve_sender or list_members",
         )),
     }
 }
@@ -797,7 +866,13 @@ pub fn handle_request(
         .filter(|action| {
             matches!(
                 *action,
-                "send" | "ensure_reaction" | "ensure_rejection" | "resolve_sender" | "list_members"
+                "send"
+                    | "update"
+                    | "delete"
+                    | "ensure_reaction"
+                    | "ensure_rejection"
+                    | "resolve_sender"
+                    | "list_members"
             )
         });
     let (Some(id), Some(action)) = (id, action) else {
@@ -844,6 +919,8 @@ pub fn handle_request(
     };
     let channel = match &request {
         Request::Send { channel_id, .. }
+        | Request::Update { channel_id, .. }
+        | Request::Delete { channel_id, .. }
         | Request::Reaction { channel_id, .. }
         | Request::Rejection { channel_id, .. }
         | Request::ResolveSender { channel_id, .. }
@@ -907,6 +984,58 @@ pub fn handle_request(
             &diagnostics,
         )
         .map(|message_id| json!({"message_id": message_id})),
+        Request::Update {
+            channel_id,
+            message_ts,
+            text,
+            slack_format,
+        } => {
+            // An edit replaces one message, so it is never chunked: a body that would need
+            // chunks is refused as not applied, and the caller deletes and reposts instead
+            // (#981 chat-bridge-alarm-coalesce).
+            let format = slack_format.unwrap_or(config.format);
+            let converted;
+            let (body, wire_format) = match format {
+                TextFormat::Converted => {
+                    converted = crate::mrkdwn::convert_markdown(&text);
+                    (converted.as_str(), TextFormat::SlackMrkdwn)
+                }
+                other => (text.as_str(), other),
+            };
+            if body.len() > config.max_chunk_bytes.min(SLACK_MAX_BODY_BYTES) {
+                Err(Refusal::not_applied(
+                    "message_too_long",
+                    "the replacement body does not fit in one message; delete and repost instead",
+                    false,
+                ))
+            } else {
+                transport
+                    .update_message(&UpdateMessage {
+                        app_id,
+                        channel_id: &channel_id,
+                        message_ts: &message_ts,
+                        text: body,
+                        format: wire_format,
+                    })
+                    .map(|()| {
+                        json!({"message_id": ids::message_resource(&channel_id, &message_ts)})
+                    })
+                    .map_err(|error| {
+                        diagnostics.log(&format!("update {id} failed: {error}"));
+                        Refusal::from(error)
+                    })
+            }
+        }
+        Request::Delete {
+            channel_id,
+            message_ts,
+        } => transport
+            .delete_message(app_id, &channel_id, &message_ts)
+            .map(|()| json!({"message_id": ids::message_resource(&channel_id, &message_ts)}))
+            .map_err(|error| {
+                diagnostics.log(&format!("delete {id} failed: {error}"));
+                Refusal::from(error)
+            }),
         Request::Reaction {
             channel_id,
             message_ts,

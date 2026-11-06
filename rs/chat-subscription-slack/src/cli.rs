@@ -6,6 +6,8 @@
 //! | --- | --- |
 //! | inbound stream | `slack.conversation tail --channel-id=C… --event-types=message.created --include-iris-seq-id --output=json --heartbeats --catchup=…` |
 //! | post | `slack.message send --channel-id=C… --markdown=file://- [--blocks=file://…] [--metadata=file://…] [--thread-ts=…] [--as=A…] --output=json` |
+//! | rewrite | `slack.message update --channel-id=C… --message-ts=… --markdown=file://- [--as=A…] --output=json` |
+//! | delete | `slack.message delete --channel-id=C… --message-ts=… [--as=A…] --output=json` |
 //! | reaction | `slack.reaction add --channel-id=C… --message-ts=… --name=… [--as=A…] --output=json` |
 //! | listing | `slack.message list --channel-id=C… [--thread-ts=…] --oldest=… [--as=A…] --output=json` |
 //! | rescan listing | `slack.message list --channel-id=C… [--thread-ts=…] --oldest=… [--page-token=…] --limit=20 --columns=… --content-format=mrkdwn --output=json` |
@@ -45,7 +47,7 @@ use crate::ids::{self, AppId};
 use crate::transport::{
     Catchup, EventStream, ListQuery, ListedMessage, PostMessage, ScanPage, ScanQuery,
     ScannedMessage, SlackMessage, SlackTransport, StreamCancel, StreamRecord, StreamWait,
-    SubscribeSpec, TextFormat, TransportError,
+    SubscribeSpec, TextFormat, TransportError, UpdateMessage,
 };
 
 /// Largest accepted stream line; longer lines are dropped with a notice.
@@ -1271,6 +1273,47 @@ pub(crate) fn post_arguments(
     arguments
 }
 
+/// The `slack.message update` arguments of one in-place rewrite (#981
+/// chat-bridge-alarm-coalesce), mirroring [`post_arguments`]: the body travels on standard
+/// input (`file://-`), never in a process argument list.
+#[must_use]
+pub fn update_arguments(
+    app: Option<String>,
+    channel_id: &str,
+    message_ts: &str,
+    format: TextFormat,
+) -> Vec<String> {
+    let body_flag = match format {
+        TextFormat::Markdown => "--markdown=file://-",
+        TextFormat::Text => "--text=file://-",
+        TextFormat::SlackMrkdwn | TextFormat::Converted => "--slack-mrkdwn=file://-",
+    };
+    let mut arguments = vec![
+        "slack.message".to_owned(),
+        "update".to_owned(),
+        format!("--channel-id={channel_id}"),
+        format!("--message-ts={message_ts}"),
+        body_flag.to_owned(),
+    ];
+    arguments.extend(app);
+    arguments.push("--output=json".to_owned());
+    arguments
+}
+
+/// The `slack.message delete` arguments of one deletion (#981 chat-bridge-alarm-coalesce).
+#[must_use]
+pub fn delete_arguments(app: Option<String>, channel_id: &str, message_ts: &str) -> Vec<String> {
+    let mut arguments = vec![
+        "slack.message".to_owned(),
+        "delete".to_owned(),
+        format!("--channel-id={channel_id}"),
+        format!("--message-ts={message_ts}"),
+    ];
+    arguments.extend(app);
+    arguments.push("--output=json".to_owned());
+    arguments
+}
+
 /// The result of one finished post: the new message's `ts`, or the failure.
 pub(crate) fn post_outcome(completed: &Completed) -> Result<String, TransportError> {
     if !completed.status.success() {
@@ -1432,6 +1475,72 @@ impl SlackTransport for CliTransport {
             .run(&arguments, Some(body))
             .map_err(|failure| run_failure(failure, true))?;
         post_outcome(&completed)
+    }
+
+    fn update_message(&mut self, update: &UpdateMessage<'_>) -> Result<(), TransportError> {
+        let arguments = update_arguments(
+            self.options.identity.app_argument(update.app_id),
+            update.channel_id,
+            update.message_ts,
+            update.format,
+        );
+        let converted;
+        let body: &[u8] = if update.format == TextFormat::Converted {
+            converted = crate::mrkdwn::convert_markdown(update.text);
+            converted.as_bytes()
+        } else {
+            update.text.as_bytes()
+        };
+        let completed = self
+            .run(&arguments, Some(body))
+            .map_err(|failure| run_failure(failure, true))?;
+        if !completed.status.success() {
+            return Err(exit_failure(&completed, true));
+        }
+        if let Some(value) = first_json_value(&completed.stdout) {
+            if value.get("status").and_then(Value::as_str) == Some("error") {
+                return Err(exit_failure(&completed, true));
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_message(
+        &mut self,
+        app_id: &AppId,
+        channel_id: &str,
+        message_ts: &str,
+    ) -> Result<(), TransportError> {
+        let arguments = delete_arguments(
+            self.options.identity.app_argument(app_id),
+            channel_id,
+            message_ts,
+        );
+        let completed = self
+            .run(&arguments, None)
+            .map_err(|failure| run_failure(failure, true))?;
+        if !completed.status.success() {
+            let error = exit_failure(&completed, true);
+            // Already gone is the state the caller wants (#981): a retried delete succeeds.
+            if error
+                .detail
+                .to_ascii_lowercase()
+                .contains("message_not_found")
+                || error
+                    .detail
+                    .to_ascii_lowercase()
+                    .contains("message not found")
+            {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        if let Some(value) = first_json_value(&completed.stdout) {
+            if value.get("status").and_then(Value::as_str) == Some("error") {
+                return Err(exit_failure(&completed, true));
+            }
+        }
+        Ok(())
     }
 
     fn add_reaction(

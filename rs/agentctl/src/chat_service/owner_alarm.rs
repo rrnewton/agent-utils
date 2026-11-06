@@ -18,15 +18,29 @@
 //!
 //! The repeats back off (#830 chat-bridge-warning-backoff): on 2026-11-03 the owner was told the
 //! same thing every 5 minutes for over 4 hours. One episode of held requests gets one top-level
-//! warning; each repeat is a reply in its thread, after 1, 3, 6 and 12 times the alarm's
+//! warning; each repeat was a reply in its thread, after 1, 3, 6 and 12 times the alarm's
 //! duration, then every 36 times it (5, 15, 30 and 60 minutes, then every 3 hours, by default).
 //! The backoff starts again when the held requests or the kind of reason change, and a new
 //! top-level warning comes only after delivery resumed and then failed again. The episode is
 //! saved in `owner-alarm.json`, so a restarted bridge carries on in the same thread. `chat alarm
 //! ack` silences the warning until the held requests or the reason change, and `chat alarm
 //! snooze` until a time; neither touches the requests, which are still delivered when they can
-//! be. A later "replace message" operation can rewrite the episode's first warning in place:
-//! its message is saved with the episode.
+//! be.
+//!
+//! The repeats coalesce in place (#981 chat-bridge-alarm-coalesce): an episode has at most one
+//! visible warning. The first warning is posted at the top level and its message is saved with
+//! the episode; each repeat rewrites that message with the current count, age, reason and fix,
+//! and when delivery resumes the same message is rewritten to a short resolved line naming the
+//! ET time. Rewriting is an edit where the transport supports it (Slack `chat.update`, through
+//! the outbound helper's `update` action); where it cannot edit but can delete, the old warning
+//! is deleted and the replacement posted; a transport that can do neither keeps the #830
+//! behaviour of replies in the first warning's thread, and one without threads posts at the top
+//! level. The resolved line is kept rather than deleted so the channel keeps a one-line record
+//! that the episode happened and when it ended; deleting it would also race a reader who is
+//! looking at, or replying to, the warning. The other `[chat-bridge WARNING]` posters were
+//! checked for the same stacking: the capture-miss warnings in `reply_source` and the
+//! stale-composer notice each post once per event, and the watcher's notices already replace
+//! their unread predecessor, so this episode warning is the only repeating one.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -59,11 +73,18 @@ const REASON_CHARS: usize = 600;
 pub(crate) enum Place {
     /// At the top of the channel, on its own.
     TopLevel,
-    /// At the top of the channel, as the first warning of the episode: the repeats go to its
-    /// thread, so its message is given back with [`OwnerAlarm::root_posted`].
+    /// At the top of the channel, as the first warning of the episode: the repeats replace it
+    /// in place, so its message is given back with [`OwnerAlarm::root_posted`].
     EpisodeRoot,
-    /// As a reply in this thread, the episode's.
+    /// As a reply in this thread, the episode's: the fallback for a transport that can neither
+    /// rewrite nor delete the episode's warning (#981 chat-bridge-alarm-coalesce).
     Thread(String),
+    /// By rewriting this already-posted message in place (#981 chat-bridge-alarm-coalesce):
+    /// the episode's one visible warning, whose thread a fallback reply goes to.
+    Replace {
+        message_id: String,
+        thread_id: Option<String>,
+    },
 }
 
 /// One notice and where to post it.
@@ -326,11 +347,21 @@ impl OwnerAlarm {
         if held.is_empty() {
             if let Some(episode) = self.episode.take() {
                 if episode.posts > 0 {
+                    let place = match (episode.root_message_id, episode.thread_id) {
+                        (Some(message_id), thread_id) => Place::Replace {
+                            message_id,
+                            thread_id,
+                        },
+                        (None, Some(thread)) => Place::Thread(thread),
+                        (None, None) => Place::TopLevel,
+                    };
                     notices.push(Notice {
                         text: format!(
-                            "[chat-bridge] Your messages to {agent} are being delivered again."
+                            "[chat-bridge] Resolved {}: your messages to {agent} are being \
+                             delivered again.",
+                            crate::chat_trace::et_clock((now_millis / 1_000) as f64)
                         ),
-                        place: episode.thread_id.map_or(Place::TopLevel, Place::Thread),
+                        place,
                     });
                 }
             }
@@ -388,17 +419,26 @@ impl OwnerAlarm {
         } else {
             (format!("{} of your messages", held.len()), "have")
         };
-        let (place, again) = match episode.thread_id.clone() {
-            Some(thread) => (Place::Thread(thread), "Still: "),
-            None => (Place::EpisodeRoot, ""),
+        let place = match episode.root_message_id.clone() {
+            Some(message_id) => Place::Replace {
+                message_id,
+                thread_id: episode.thread_id.clone(),
+            },
+            None => Place::EpisodeRoot,
         };
+        let oldest_admitted = held
+            .iter()
+            .map(|entry| entry.admitted_at_millis)
+            .min()
+            .unwrap_or(now_millis);
         notices.push(Notice {
             text: format!(
-                "{WARNING}{again}{count} to {agent} {verb} not reached it, the oldest sent {} min \
-                 ago (\"{}\"). Why: {}. {}The next reminder comes in this thread in {} min unless \
+                "{WARNING}{count} to {agent} {verb} not reached it, the oldest sent {} min \
+                 ago ({}, \"{}\"). Why: {}. {}This notice is updated in place in {} min unless \
                  they are delivered; `agentctl chat alarm ack` silences it until the held messages \
                  or the reason change.",
                 minutes(oldest),
+                crate::chat_trace::et_clock((oldest_admitted / 1_000) as f64),
                 held[0].excerpt,
                 cut(reason, REASON_CHARS),
                 hint(agent, reason),
@@ -479,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn a_held_request_raises_the_alarm_which_repeats_in_its_thread_until_delivery_resumes() {
+    fn a_held_request_raises_the_alarm_which_replaces_its_warning_until_delivery_resumes() {
         let mut alarm = OwnerAlarm::new(DEFAULT_AFTER);
         let mut entries = vec![
             entry("a", RequestPhase::Pending, 100, DRAFT),
@@ -492,29 +532,49 @@ mod tests {
         assert_eq!(
             notices[0].text,
             "[chat-bridge WARNING] 1 of your messages to coord5 has not reached it, the oldest \
-             sent 5 min ago (\"message a\"). Why: request remains pending: pane wJ:pGY: the Muse \
-             editor holds a draft that agentctl did not type (41 characters on 1 row(s)); a \
-             person may be typing it. Text that agentctl did not type is in coord5's input box, \
-             so it is left alone; submit or clear it there, and delivery resumes. The next \
-             reminder comes in this thread in 5 min unless they are delivered; `agentctl chat \
+             sent 5 min ago (20:40 ET, \"message a\"). Why: request remains pending: pane wJ:pGY: \
+             the Muse editor holds a draft that agentctl did not type (41 characters on 1 \
+             row(s)); a person may be typing it. Text that agentctl did not type is in coord5's \
+             input box, so it is left alone; submit or clear it there, and delivery resumes. \
+             This notice is updated in place in 5 min unless they are delivered; `agentctl chat \
              alarm ack` silences it until the held messages or the reason change."
         );
         assert!(due(&mut alarm, &entries, minute(109)).is_empty());
         let again = due(&mut alarm, &entries, minute(110));
         assert_eq!(again.len(), 1, "the alarm repeats");
-        assert_eq!(again[0].place, Place::Thread("C1/threads/1.5".to_owned()));
+        // #981: a repeat rewrites the episode's one visible warning, it does not add a message.
+        assert_eq!(
+            again[0].place,
+            Place::Replace {
+                message_id: "C1/messages/1.5".to_owned(),
+                thread_id: Some("C1/threads/1.5".to_owned()),
+            }
+        );
         assert!(again[0].text.starts_with(
-            "[chat-bridge WARNING] Still: 1 of your messages to coord5 has not reached it, the \
-             oldest sent 10 min ago"
+            "[chat-bridge WARNING] 1 of your messages to coord5 has not reached it, the \
+             oldest sent 10 min ago (20:40 ET"
         ));
-        assert!(again[0].text.contains("in 15 min"), "{}", again[0].text);
+        assert!(
+            again[0].text.contains("updated in place in 15 min"),
+            "{}",
+            again[0].text
+        );
         entries[0].phase = RequestPhase::Delivered;
         let resumed = due(&mut alarm, &entries, minute(111));
         assert_eq!(
             texts(&resumed),
-            ["[chat-bridge] Your messages to coord5 are being delivered again."]
+            [
+                "[chat-bridge] Resolved 20:51 ET: your messages to coord5 are being delivered \
+              again."
+            ]
         );
-        assert_eq!(resumed[0].place, Place::Thread("C1/threads/1.5".to_owned()));
+        assert_eq!(
+            resumed[0].place,
+            Place::Replace {
+                message_id: "C1/messages/1.5".to_owned(),
+                thread_id: Some("C1/threads/1.5".to_owned()),
+            }
+        );
         assert!(due(&mut alarm, &entries, minute(130)).is_empty());
         assert!(alarm.episode().is_none());
     }
@@ -544,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn a_change_of_held_requests_or_reason_restarts_the_backoff_in_the_same_thread() {
+    fn a_change_of_held_requests_or_reason_restarts_the_backoff_on_the_same_message() {
         let mut alarm = OwnerAlarm::new(DEFAULT_AFTER);
         let mut entries = vec![entry("a", RequestPhase::Pending, 0, DRAFT)];
         for at in [5, 10, 25] {
@@ -555,14 +615,17 @@ mod tests {
             );
         }
         // Next due at 55, but a message held from minute 31 starts the backoff again: due 5 min
-        // after the last warning, so at once, in the same thread.
+        // after the last warning, so at once, on the same message.
         entries.push(entry("b", RequestPhase::Pending, 26, DRAFT));
         assert!(due(&mut alarm, &entries, minute(30)).is_empty());
         let restarted = due(&mut alarm, &entries, minute(31));
         assert_eq!(restarted.len(), 1);
         assert_eq!(
             restarted[0].place,
-            Place::Thread("C1/threads/1.5".to_owned())
+            Place::Replace {
+                message_id: "C1/messages/1.5".to_owned(),
+                thread_id: Some("C1/threads/1.5".to_owned()),
+            }
         );
         assert!(
             restarted[0].text.contains("in 5 min"),
@@ -605,11 +668,17 @@ mod tests {
                 .due(&entries, "coord5", minute(at), false, &acked)
                 .is_empty());
         }
-        // The episode is kept, so a new held message warns again, in its thread.
+        // The episode is kept, so a new held message warns again, on the same message.
         entries.push(entry("b", RequestPhase::Pending, 100, DRAFT));
         let notices = alarm.due(&entries, "coord5", minute(120), false, &acked);
         assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0].place, Place::Thread("C1/threads/1.5".to_owned()));
+        assert_eq!(
+            notices[0].place,
+            Place::Replace {
+                message_id: "C1/messages/1.5".to_owned(),
+                thread_id: Some("C1/threads/1.5".to_owned()),
+            }
+        );
         let snoozed = Silence {
             snoozed_until_millis: Some(minute(300)),
             ..Silence::default()

@@ -18,7 +18,7 @@ use crate::ids::AppId;
 use crate::transport::{
     EventStream, ListQuery, ListedMessage, PostMessage, ScanPage, ScanQuery, ScannedMessage,
     SlackMessage, SlackTransport, StreamCancel, StreamRecord, StreamWait, SubscribeSpec,
-    TextFormat, TransportError,
+    TextFormat, TransportError, UpdateMessage,
 };
 
 /// One scripted stream step.
@@ -58,6 +58,32 @@ pub struct FakePost {
     pub ts: String,
 }
 
+/// One recorded in-place rewrite (#981 chat-bridge-alarm-coalesce).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeUpdate {
+    /// App the rewrite acted as.
+    pub app_id: String,
+    /// Conversation ID.
+    pub channel_id: String,
+    /// Message ts rewritten.
+    pub message_ts: String,
+    /// Replacement body.
+    pub text: String,
+    /// Body format.
+    pub format: TextFormat,
+}
+
+/// One recorded deletion (#981 chat-bridge-alarm-coalesce).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeDelete {
+    /// App the deletion acted as.
+    pub app_id: String,
+    /// Conversation ID.
+    pub channel_id: String,
+    /// Message ts deleted.
+    pub message_ts: String,
+}
+
 /// One recorded reaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FakeReaction {
@@ -91,6 +117,14 @@ pub struct FakeState {
     pub opened: Vec<SubscribeSpec>,
     /// Every successful post, including ones whose response was lost.
     pub posts: Vec<FakePost>,
+    /// Every in-place rewrite (#981 chat-bridge-alarm-coalesce).
+    pub updates: Vec<FakeUpdate>,
+    /// Every deletion (#981 chat-bridge-alarm-coalesce).
+    pub deletes: Vec<FakeDelete>,
+    /// Injected errors for the next rewrites.
+    pub update_failures: VecDeque<TransportError>,
+    /// Injected errors for the next deletions.
+    pub delete_failures: VecDeque<TransportError>,
     /// Every reaction added.
     pub reactions: Vec<FakeReaction>,
     /// Authoritative sender classifications; an absent sender is not confirmed human.
@@ -154,6 +188,16 @@ impl FakeTransport {
     /// Queue an outcome for the next post.
     pub fn push_post_failure(&self, failure: FakePostFailure) {
         self.state().post_failures.push_back(failure);
+    }
+
+    /// Queue an error for the next rewrite (#981 chat-bridge-alarm-coalesce).
+    pub fn push_update_failure(&self, error: TransportError) {
+        self.state().update_failures.push_back(error);
+    }
+
+    /// Queue an error for the next deletion (#981 chat-bridge-alarm-coalesce).
+    pub fn push_delete_failure(&self, error: TransportError) {
+        self.state().delete_failures.push_back(error);
     }
 
     /// Add a message the rescan listing will see.
@@ -363,6 +407,39 @@ impl SlackTransport for FakeTransport {
             ));
         }
         Ok(ts)
+    }
+
+    fn update_message(&mut self, update: &UpdateMessage<'_>) -> Result<(), TransportError> {
+        let mut state = self.state();
+        if let Some(error) = state.update_failures.pop_front() {
+            return Err(error);
+        }
+        state.updates.push(FakeUpdate {
+            app_id: update.app_id.as_str().to_owned(),
+            channel_id: update.channel_id.to_owned(),
+            message_ts: update.message_ts.to_owned(),
+            text: update.text.to_owned(),
+            format: update.format,
+        });
+        Ok(())
+    }
+
+    fn delete_message(
+        &mut self,
+        app_id: &AppId,
+        channel_id: &str,
+        message_ts: &str,
+    ) -> Result<(), TransportError> {
+        let mut state = self.state();
+        if let Some(error) = state.delete_failures.pop_front() {
+            return Err(error);
+        }
+        state.deletes.push(FakeDelete {
+            app_id: app_id.as_str().to_owned(),
+            channel_id: channel_id.to_owned(),
+            message_ts: message_ts.to_owned(),
+        });
+        Ok(())
     }
 
     fn sender_is_human(&mut self, app_id: &AppId, sender_id: &str) -> Result<bool, TransportError> {

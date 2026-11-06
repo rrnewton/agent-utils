@@ -3858,6 +3858,31 @@ pub struct RootMessageSubmission<'a> {
     pub request_id: &'a str,
 }
 
+/// One in-place rewrite of a message the bridge posted earlier (#981
+/// chat-bridge-alarm-coalesce): the replacement body for `message_id`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateMessageSubmission<'a> {
+    /// Exact provider channel or space resource the message belongs to.
+    pub channel_id: &'a str,
+    /// Exact provider message resource to rewrite.
+    pub message_id: &'a str,
+    /// Validated nonempty replacement body.
+    pub body: &'a str,
+    /// Caller-selected stable idempotency key.
+    pub request_id: &'a str,
+}
+
+/// One removal of a message the bridge posted earlier (#981 chat-bridge-alarm-coalesce).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeleteMessageSubmission<'a> {
+    /// Exact provider channel or space resource the message belongs to.
+    pub channel_id: &'a str,
+    /// Exact provider message resource to remove.
+    pub message_id: &'a str,
+    /// Caller-selected stable idempotency key.
+    pub request_id: &'a str,
+}
+
 /// Provider-neutral root-message transport, separate from threaded reply delivery.
 pub trait RootMessageTransport {
     /// Post or reconcile one root message, returning its immutable provider message identifier.
@@ -3878,6 +3903,39 @@ pub trait RootMessageTransport {
         Err(OutboundFailure {
             code: "thread_unsupported".to_owned(),
             detail: "this transport cannot post in a thread".to_owned(),
+            outcome: OutboundOutcome::NotApplied,
+            retryable: false,
+        })
+    }
+
+    /// Rewrite `submission.message_id` in place with `submission.body`, returning its provider
+    /// message identifier (#981 chat-bridge-alarm-coalesce). A transport that cannot edit
+    /// refuses as not applied and not retryable, and the caller deletes and reposts instead;
+    /// a transport that cannot do either keeps the caller's older behaviour.
+    fn update_message(
+        &mut self,
+        submission: UpdateMessageSubmission<'_>,
+    ) -> std::result::Result<String, OutboundFailure> {
+        let _ = submission;
+        Err(OutboundFailure {
+            code: "message_update_unsupported".to_owned(),
+            detail: "this transport cannot rewrite a posted message in place".to_owned(),
+            outcome: OutboundOutcome::NotApplied,
+            retryable: false,
+        })
+    }
+
+    /// Remove `submission.message_id`, returning its provider message identifier (#981
+    /// chat-bridge-alarm-coalesce). Removing a message that is already gone succeeds. A
+    /// transport that cannot delete refuses as not applied and not retryable.
+    fn delete_message(
+        &mut self,
+        submission: DeleteMessageSubmission<'_>,
+    ) -> std::result::Result<String, OutboundFailure> {
+        let _ = submission;
+        Err(OutboundFailure {
+            code: "message_delete_unsupported".to_owned(),
+            detail: "this transport cannot delete a posted message".to_owned(),
             outcome: OutboundOutcome::NotApplied,
             retryable: false,
         })
@@ -4503,6 +4561,25 @@ impl RootMessageTransport for CommandOutboundTransport {
             },
         )
     }
+
+    fn update_message(
+        &mut self,
+        submission: UpdateMessageSubmission<'_>,
+    ) -> std::result::Result<String, OutboundFailure> {
+        let format = self.slack_format_for(submission.channel_id);
+        let request = encode_update_message_request(&submission, format)?;
+        let response = self.exchange(&request)?;
+        decode_update_message_response(&response, &submission)
+    }
+
+    fn delete_message(
+        &mut self,
+        submission: DeleteMessageSubmission<'_>,
+    ) -> std::result::Result<String, OutboundFailure> {
+        let request = encode_delete_message_request(&submission)?;
+        let response = self.exchange(&request)?;
+        decode_delete_message_response(&response, &submission)
+    }
 }
 
 impl ReactionTransport for CommandOutboundTransport {
@@ -4806,6 +4883,121 @@ pub fn encode_rejection_request(
         "sender_id": submission.sender_id,
         "emoji": submission.emoji,
     }))
+}
+
+#[derive(Serialize)]
+struct UpdateWireRequest<'a> {
+    version: u32,
+    id: &'a str,
+    action: &'static str,
+    channel_id: &'a str,
+    message_id: &'a str,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slack_format: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct DeleteWireRequest<'a> {
+    version: u32,
+    id: &'a str,
+    action: &'static str,
+    channel_id: &'a str,
+    message_id: &'a str,
+}
+
+/// Encode one v1 in-place rewrite request (#981 chat-bridge-alarm-coalesce) as a
+/// newline-delimited strict JSON frame.
+pub fn encode_update_message_request(
+    submission: &UpdateMessageSubmission<'_>,
+    format: Option<SlackFormat>,
+) -> std::result::Result<Vec<u8>, OutboundFailure> {
+    validate_update_message_submission(submission)?;
+    encode_wire_request(&UpdateWireRequest {
+        version: 1,
+        id: submission.request_id,
+        action: "update",
+        channel_id: submission.channel_id,
+        message_id: submission.message_id,
+        text: submission.body,
+        slack_format: format.map(SlackFormat::name),
+    })
+}
+
+/// Encode one v1 message-removal request (#981 chat-bridge-alarm-coalesce) as a
+/// newline-delimited strict JSON frame.
+pub fn encode_delete_message_request(
+    submission: &DeleteMessageSubmission<'_>,
+) -> std::result::Result<Vec<u8>, OutboundFailure> {
+    validate_delete_message_submission(submission)?;
+    encode_wire_request(&DeleteWireRequest {
+        version: 1,
+        id: submission.request_id,
+        action: "delete",
+        channel_id: submission.channel_id,
+        message_id: submission.message_id,
+    })
+}
+
+/// Decode and bind one strict v1 update response to the exact message it rewrote.
+pub fn decode_update_message_response(
+    payload: &[u8],
+    submission: &UpdateMessageSubmission<'_>,
+) -> std::result::Result<String, OutboundFailure> {
+    validate_update_message_submission(submission)?;
+    decode_bound_message_response(payload, submission, "update")
+}
+
+/// Decode and bind one strict v1 delete response to the exact message it removed.
+pub fn decode_delete_message_response(
+    payload: &[u8],
+    submission: &DeleteMessageSubmission<'_>,
+) -> std::result::Result<String, OutboundFailure> {
+    validate_delete_message_submission(submission)?;
+    match decode_wire_response(payload, submission.request_id, "delete")? {
+        WireReceipt::Send(receipt) if receipt.message_id == submission.message_id => {
+            Ok(receipt.message_id)
+        }
+        _ => Err(OutboundFailure::protocol(
+            "delete response does not name the exact requested message",
+        )),
+    }
+}
+
+fn decode_bound_message_response(
+    payload: &[u8],
+    submission: &UpdateMessageSubmission<'_>,
+    action: &str,
+) -> std::result::Result<String, OutboundFailure> {
+    match decode_wire_response(payload, submission.request_id, action)? {
+        WireReceipt::Send(receipt) if receipt.message_id == submission.message_id => {
+            Ok(receipt.message_id)
+        }
+        _ => Err(OutboundFailure::protocol(
+            "message response does not name the exact requested message",
+        )),
+    }
+}
+
+/// Validate one in-place rewrite submission before any helper launch.
+pub fn validate_update_message_submission(
+    submission: &UpdateMessageSubmission<'_>,
+) -> std::result::Result<(), OutboundFailure> {
+    validate_outbound_message(
+        submission.channel_id,
+        submission.body,
+        submission.request_id,
+    )?;
+    validate_resource(submission.message_id, "message")
+}
+
+/// Validate one message-removal submission before any helper launch.
+pub fn validate_delete_message_submission(
+    submission: &DeleteMessageSubmission<'_>,
+) -> std::result::Result<(), OutboundFailure> {
+    validate_operation_uuid(submission.request_id)?;
+    validate_resource(submission.channel_id, "channel")?;
+    validate_resource(submission.message_id, "message")
 }
 
 /// Decode and bind one strict v1 send response to its exact requested authority.
@@ -38634,6 +38826,66 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 already_present: true,
             }
         );
+    }
+
+    #[test]
+    fn outbound_wire_binds_update_and_delete_to_the_exact_message() {
+        // #981 chat-bridge-alarm-coalesce: a rewrite or removal names one message, and its
+        // receipt must name that same message under the same UUID and action.
+        let update = UpdateMessageSubmission {
+            channel_id: "spaces/example",
+            message_id: "spaces/example/messages/root",
+            body: "still held",
+            request_id: "123e4567-e89b-42d3-a456-426614174010",
+        };
+        let encoded = encode_update_message_request(&update, None).expect("encode update");
+        assert!(encoded.ends_with(b"\n"));
+        let document: Value = serde_json::from_slice(&encoded).expect("request JSON");
+        assert_eq!(
+            document,
+            serde_json::json!({
+                "version": 1,
+                "id": update.request_id,
+                "action": "update",
+                "channel_id": update.channel_id,
+                "message_id": update.message_id,
+                "text": update.body,
+            })
+        );
+        let response = br#"{"version":1,"id":"123e4567-e89b-42d3-a456-426614174010","action":"update","ok":true,"receipt":{"message_id":"spaces/example/messages/root"}}"#;
+        assert_eq!(
+            decode_update_message_response(response, &update).expect("decode update"),
+            "spaces/example/messages/root"
+        );
+        let other = br#"{"version":1,"id":"123e4567-e89b-42d3-a456-426614174010","action":"update","ok":true,"receipt":{"message_id":"spaces/example/messages/other"}}"#;
+        assert!(decode_update_message_response(other, &update).is_err());
+        let delete = DeleteMessageSubmission {
+            channel_id: "spaces/example",
+            message_id: "spaces/example/messages/root",
+            request_id: "123e4567-e89b-42d3-a456-426614174011",
+        };
+        let encoded = encode_delete_message_request(&delete).expect("encode delete");
+        let document: Value = serde_json::from_slice(&encoded).expect("request JSON");
+        assert_eq!(
+            document,
+            serde_json::json!({
+                "version": 1,
+                "id": delete.request_id,
+                "action": "delete",
+                "channel_id": delete.channel_id,
+                "message_id": delete.message_id,
+            })
+        );
+        let response = br#"{"version":1,"id":"123e4567-e89b-42d3-a456-426614174011","action":"delete","ok":true,"receipt":{"message_id":"spaces/example/messages/root"}}"#;
+        assert_eq!(
+            decode_delete_message_response(response, &delete).expect("decode delete"),
+            "spaces/example/messages/root"
+        );
+        // An older helper that does not know the action refuses it as not applied.
+        let refused = br#"{"version":1,"id":"123e4567-e89b-42d3-a456-426614174011","action":"delete","ok":false,"error":{"code":"request_invalid","detail":"unknown action","outcome":"not_applied","retryable":false}}"#;
+        let failure = decode_delete_message_response(refused, &delete).expect_err("refused");
+        assert_eq!(failure.outcome, OutboundOutcome::NotApplied);
+        assert!(!failure.retryable);
     }
 
     #[test]

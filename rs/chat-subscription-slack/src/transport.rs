@@ -181,6 +181,21 @@ pub struct PostMessage<'a> {
     pub metadata: Option<&'a str>,
 }
 
+/// One in-place rewrite of a posted message (#981 chat-bridge-alarm-coalesce).
+#[derive(Clone, Copy, Debug)]
+pub struct UpdateMessage<'a> {
+    /// The app the rewrite acts as.
+    pub app_id: &'a AppId,
+    /// Conversation ID.
+    pub channel_id: &'a str,
+    /// Message `ts` to rewrite.
+    pub message_ts: &'a str,
+    /// Replacement body.
+    pub text: &'a str,
+    /// Body format.
+    pub format: TextFormat,
+}
+
 /// One message from a history or thread listing.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ListedMessage {
@@ -351,6 +366,41 @@ pub trait SlackTransport: Send {
     ///
     /// Returns [`TransportError`]; [`Outcome::Unknown`] when the post may have happened.
     fn post_message(&mut self, post: &PostMessage<'_>) -> Result<String, TransportError>;
+
+    /// Rewrite one posted message in place (#981 chat-bridge-alarm-coalesce; Slack
+    /// `chat.update`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`]. Transports without an edit operation refuse as not
+    /// applied, and the caller deletes and reposts instead.
+    fn update_message(&mut self, _update: &UpdateMessage<'_>) -> Result<(), TransportError> {
+        Err(TransportError::not_applied(
+            "update_unsupported",
+            "this transport cannot rewrite a posted message in place",
+            false,
+        ))
+    }
+
+    /// Delete one posted message (#981 chat-bridge-alarm-coalesce; Slack `chat.delete`).
+    /// Deleting a message that is already gone succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`]. Transports without a delete operation refuse as not
+    /// applied.
+    fn delete_message(
+        &mut self,
+        _app_id: &AppId,
+        _channel_id: &str,
+        _message_ts: &str,
+    ) -> Result<(), TransportError> {
+        Err(TransportError::not_applied(
+            "delete_unsupported",
+            "this transport cannot delete a posted message",
+            false,
+        ))
+    }
 
     /// Add a reaction as the given app. Returns `true` when it was already present.
     ///
