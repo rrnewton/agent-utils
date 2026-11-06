@@ -18,6 +18,8 @@ use serde_json::{json, Value};
 
 const FAKE_CLAUDE: &str = include_str!("fixtures/fake_claude.txt");
 
+static FIXTURE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn executable(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -59,7 +61,15 @@ impl Fixture {
                 .unwrap_or_else(|error| panic!("create {}: {error}", directory.display()));
         }
         let fake = bin.join("claude");
-        let socket = format!("agentctl-tmux-test-{}", std::process::id());
+        // Every fixture owns its own tmux server (#923): a socket named
+        // only by pid is shared by every test in this binary, so one
+        // test's teardown kill-server used to kill another test's
+        // server mid-flight, and a leaked server pinned its slot.
+        let socket = format!(
+            "agentctl-tmux-test-{}-{}",
+            std::process::id(),
+            FIXTURE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        );
         // The started agent itself starts a child on the "spawn-child"
         // prompt, which is how created_by/managed_by get proved on this
         // backend. The command is baked into the fake (not passed with
@@ -84,6 +94,20 @@ impl Fixture {
         )
         .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        // Start this fixture's server now, from the fixture's temp root
+        // (outside any slot): a tmux server keeps the cwd of whoever
+        // first spawns it, and a server started from inside a slot pins
+        // that slot for as long as it lives (#923).
+        let started = Command::new(&tmux)
+            .args(["-L", &socket, "start-server"])
+            .current_dir(&root)
+            .output()
+            .expect("start tmux server");
+        assert!(
+            started.status.success(),
+            "start tmux server: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
         Some(Self {
             registry,
             root,
@@ -157,11 +181,71 @@ impl Fixture {
     }
 }
 
+/// The socket file tmux creates for a `-L` name: `$TMUX_TMPDIR` or
+/// `/tmp`, under `tmux-<uid>`.
+fn tmux_socket_path(socket: &str) -> PathBuf {
+    let uid = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:"))
+                .and_then(|fields| fields.split_whitespace().next().map(str::to_owned))
+        })
+        .unwrap_or_else(|| "0".to_string());
+    let base = std::env::var_os("TMUX_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join(format!("tmux-{uid}")).join(socket)
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
+        // Kill this fixture's own server and remove its socket, on
+        // success, failure and panic unwind alike (#923).
         let _ = self.tmux(&["kill-server"]);
+        let _ = fs::remove_file(tmux_socket_path(&self.socket));
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn tmux_server_dies_with_its_fixture_even_on_panic() {
+    // #923: a fixture's private tmux server and socket must not
+    // outlive the test, including when the test panics mid-way.
+    let Some(fixture) = Fixture::new() else {
+        eprintln!("tmux or python3 not installed; skipping");
+        return;
+    };
+    let work = fixture.work.display().to_string();
+    let created = fixture.tmux(&["new-session", "-d", "-s", "guard-probe", "-c", &work]);
+    assert!(created.status.success(), "new-session failed");
+    assert!(
+        fixture.tmux(&["list-sessions"]).status.success(),
+        "server running before the panic"
+    );
+    let socket = fixture.socket.clone();
+    let tmux = fixture.tmux.clone();
+    let root = fixture.root.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _fixture = fixture;
+        panic!("forced panic to prove the tmux guard cleans up");
+    }));
+    assert!(result.is_err(), "the forced panic was caught");
+    let listed = Command::new(&tmux)
+        .args(["-L", &socket, "list-sessions"])
+        .output()
+        .expect("list sessions after panic");
+    assert!(
+        !listed.status.success(),
+        "tmux server {socket} outlived its test"
+    );
+    assert!(
+        !tmux_socket_path(&socket).exists(),
+        "tmux socket {} left behind",
+        tmux_socket_path(&socket).display()
+    );
+    assert!(!root.exists(), "fixture root removed by drop");
 }
 
 #[test]
