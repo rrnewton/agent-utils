@@ -120,6 +120,14 @@ class Transport:
         raise AssertionError("unexpected transport action")
 
 
+#: No-progress bound for Rig.until's event wait: the wait is event-driven
+#: (each completion is handled and staged before waiting again), so this
+#: bound only trips when the runtime stops producing completions at all.
+#: It must exceed how long a descheduled worker can hold a completion
+#: under gate load; the failure it guards (a wedged runtime) is unchanged.
+_EVENT_WAIT_S = 30
+
+
 class Rig:
     def __init__(self, state: Path, *, outbound_mode: str = "enabled") -> None:
         self.state = state
@@ -159,7 +167,7 @@ class Rig:
     def until(self, predicate: Callable[[], bool]) -> None:
         while not predicate():
             try:
-                notice = self.runtime.events.get(timeout=5)
+                notice = self.runtime.events.get(timeout=_EVENT_WAIT_S)
             except queue.Empty:
                 pytest.fail(f"runtime produced no completion; remaining jobs: {self.runtime.jobs}")
             self.runtime._handle(notice)

@@ -617,6 +617,13 @@ def test_context_reset_clears_session_before_the_next_codex_turn(fake_runner_sta
     assert "=== CONTEXT RESET ===" in lib.transcript_path(name).read_text()
 
 
+#: Outer bound for waits whose completion is the runner exiting after a
+#: stop: the product's own harness cleanup budget (KILL_WAIT_S, 10 s) plus
+#: watcher join and exit bookkeeping. The waits poll observable events, so
+#: this bound only trips when progress has actually stopped.
+_STOP_EXIT_TIMEOUT_S = 30
+
+
 def _wait_for(path: Path, process: subprocess.Popen[str], timeout: float = 8) -> None:
     deadline = time.monotonic() + timeout
     while not path.exists() and process.poll() is None and time.monotonic() < deadline:
@@ -678,23 +685,23 @@ def test_stop_busy_runner_terminates_owned_harness_group(fake_runner_state: Path
     started: dict[int, str | None] = {}
     try:
         ready = Path(str(executable) + ".ready")
-        _wait_for(ready, runner)
+        _wait_for(ready, runner, timeout=_STOP_EXIT_TIMEOUT_S)
         pids = json.loads(ready.read_text())
         started = {pid: lib.pid_start_time(pid) for pid in pids}
-        _wait_for(lib.agent_dir(rec.name) / "active-harness.json", runner)
+        _wait_for(lib.agent_dir(rec.name) / "active-harness.json", runner, timeout=_STOP_EXIT_TIMEOUT_S)
         if stop == "signal":
             runner.terminate()
         else:
             assert lib.terminate_runner(lib.read_registry()[rec.name], grace=0)
-        runner.communicate(timeout=5)
-        deadline = time.monotonic() + 3
+        runner.communicate(timeout=_STOP_EXIT_TIMEOUT_S)
+        deadline = time.monotonic() + 15
         while any(_process_running(pid) for pid in pids) and time.monotonic() < deadline:
             time.sleep(0.02)
         assert not any(_process_running(pid) for pid in pids)
     finally:
         if runner.poll() is None:
             runner.kill()
-        runner.communicate(timeout=5)
+        runner.communicate(timeout=_STOP_EXIT_TIMEOUT_S)
         for pid, starttime in started.items():
             _kill_started(pid, starttime)
 
