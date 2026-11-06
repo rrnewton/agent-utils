@@ -82,8 +82,12 @@ elif args[:2] == ['pane', 'read']:
     state['mutate_after_read'] = None
 elif args[:2] == ['agent', 'start']:
     state['starts'] += 1
+    state['start_timeout'] = args[args.index('--timeout') + 1]
     state['pane'] = state['launched_pane']
     path.write_text(json.dumps(state))
+    if state.get('startup_waits'):
+        import time
+        time.sleep(int(state['start_timeout']) / 1000)
     print(state['startup']['stdout'], end='')
     print(state['startup']['stderr'], end='', file=sys.stderr)
     raise SystemExit(state['startup']['status'])
@@ -411,6 +415,43 @@ fn herdr_093_timeout_waits_a_grace_period_for_the_composer() {
     let frame = frame_of(&herdr);
     assert_eq!(frame["starts"], 1);
     assert_eq!(frame["renames"], serde_json::json!([["pane", "worker"]]));
+}
+
+/// Herdr waits for an idle prompt a resuming Codex may never show, and spends the whole
+/// startup timeout doing so (#921 codex-ready-detection): its wait is capped, and agentctl's
+/// own screen check proves the launch ready long before the deadline.
+#[test]
+fn a_codex_launch_is_ready_once_its_screen_is_without_waiting_out_herdrs_timeout() {
+    let herdr = FakeExecutable::new("{}");
+    let executable = fs::canonicalize("/bin/sleep").unwrap();
+    let process = spawn_test_process(&executable);
+    let mut frame = configure_start(&herdr, process.0.id(), &executable, CODEX_0164_IDLE);
+    frame["named"] = Value::Null;
+    frame["startup_waits"] = Value::Bool(true);
+    fs::write(herdr.root.join("frame.json"), frame.to_string()).unwrap();
+    let started = std::time::Instant::now();
+    let result =
+        herdr
+            .client()
+            .start_agent("worker", "codex", "pane", &[], Duration::from_secs(120));
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "waited {:?} for a ready screen",
+        started.elapsed()
+    );
+    let frame = frame_of(&herdr);
+    assert_eq!(frame["starts"], 1);
+    assert_eq!(
+        frame["start_timeout"], "400",
+        "Herdr's own wait is capped for Codex"
+    );
+    // Other harnesses keep Herdr's wait for the whole startup timeout.
+    configure_start(&herdr, process.0.id(), &executable, CODEX_0164_IDLE);
+    let _ = herdr
+        .client()
+        .start_agent("worker", "claude", "pane", &[], Duration::from_secs(2));
+    assert_eq!(frame_of(&herdr)["start_timeout"], "2000");
 }
 
 /// A start that does time out says what Herdr and the screen showed.

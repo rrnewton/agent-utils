@@ -847,4 +847,22 @@ mod tests {
         let screen = include_str!("../../testdata/codex/v0164-idle-composer.ansi");
         assert!(idle_composer(screen), "{screen:?}");
     }
+
+    #[test]
+    fn v0164_screens_read_idle_working_and_starting_as_they_are() {
+        // Captured from Codex v0.164.0 under Herdr 0.9.5 (#921 codex-ready-detection), names and
+        // paths made neutral: a resumed session idle after two turns, the same session mid-turn
+        // (a running tool and its timer), and the shell while Codex is still starting.
+        let idle = include_str!("../../testdata/codex/v0164-resumed-idle.ansi");
+        let working = include_str!("../../testdata/codex/v0164-working.ansi");
+        let starting = include_str!("../../testdata/codex/v0164-starting.ansi");
+        assert!(idle_composer(idle), "{idle:?}");
+        assert_eq!(Codex.settle_herdr_state("unknown", idle), Some("idle"));
+        for (name, screen) in [("working", working), ("starting", starting)] {
+            assert!(!idle_composer(screen), "{name}: {screen:?}");
+            assert_eq!(Codex.settle_herdr_state("unknown", screen), None, "{name}");
+        }
+        // Herdr's own verdict stands whenever it has one.
+        assert_eq!(Codex.settle_herdr_state("working", idle), None);
+    }
 }

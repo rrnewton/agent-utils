@@ -911,9 +911,20 @@ fn missing_pane(error: &AdapterError) -> bool {
 /// How often a refused launch looks at its pane again.
 const SHELL_READINESS_POLL: Duration = Duration::from_millis(250);
 
-/// The longest a Codex launch is watched for readiness after Herdr's own startup wait timed
-/// out (never longer than the startup timeout itself).
+/// The least a Codex launch is watched for readiness after Herdr's own startup wait timed out
+/// (never longer than the startup timeout itself). It is watched until the startup deadline.
 const CODEX_STARTUP_GRACE: Duration = Duration::from_secs(15);
+
+/// The longest Herdr's own readiness wait runs for a Codex launch (#921
+/// codex-ready-detection). Herdr waits for an idle prompt, which a Codex resuming an active
+/// goal never shows (it starts working at once), and which an older detection manifest may
+/// never recognise; it then waits out the whole startup timeout before agentctl looks. After
+/// this long agentctl's own verified screen check takes over for the rest of the deadline.
+const CODEX_HERDR_READY_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(400)
+} else {
+    Duration::from_secs(15)
+};
 
 /// How often that watch looks at the pane again.
 const CODEX_STARTUP_POLL: Duration = Duration::from_millis(500);
@@ -1262,6 +1273,11 @@ impl HerdrClient {
         } else {
             None
         };
+        let herdr_timeout = if kind == "codex" {
+            timeout.min(CODEX_HERDR_READY_WAIT)
+        } else {
+            timeout
+        };
         let mut args = strings(&[
             "agent",
             "start",
@@ -1272,7 +1288,10 @@ impl HerdrClient {
             pane_id,
             "--timeout",
         ]);
-        args.extend([timeout.as_millis().max(1).to_string(), "--".to_owned()]);
+        args.extend([
+            herdr_timeout.as_millis().max(1).to_string(),
+            "--".to_owned(),
+        ]);
         args.extend_from_slice(arguments);
         // A fresh pane's login shell can still hold its terminal for longer than Herdr's own
         // short readiness retry, so `agent start` is refused with `agent_pane_busy`. Herdr
@@ -1281,7 +1300,7 @@ impl HerdrClient {
         let deadline = Instant::now() + timeout;
         let mut pinned_terminal = None;
         let result = loop {
-            let result = self.invoke_with_timeout(&args, timeout + CONTROL_TIMEOUT)?;
+            let result = self.invoke_with_timeout(&args, herdr_timeout + CONTROL_TIMEOUT)?;
             if !agent_pane_busy(&result) {
                 break result;
             }
@@ -1306,7 +1325,9 @@ impl HerdrClient {
                         name,
                         initial,
                         resumed,
-                        timeout.min(CODEX_STARTUP_GRACE),
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .max(timeout.min(CODEX_STARTUP_GRACE)),
                     )
                 })
             {

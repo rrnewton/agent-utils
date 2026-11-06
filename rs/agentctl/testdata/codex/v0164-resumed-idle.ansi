@@ -1,0 +1,38 @@
+  [0m[38;2;99;168;248m>_ [0m[1mOpenAI Codex[0m[2m (v0.164.0)[0m
+     [0m[2m~/work/project[0m
+
+[0m[2m  To get started, describe a task or try one of these commands:[0m
+
+  /init[0m[2m - create an AGENTS.md file with instructions for Codex[0m
+  /status[0m[2m - show current session configuration[0m
+  /permissions[0m[2m - choose what Codex is allowed to do[0m
+  /model[0m[2m - choose what model and reasoning effort to use[0m
+  /review[0m[2m - review any changes and find issues[0m
+
+[0m[2m• [0mDaybreak is on for new turns.
+
+
+[0m[1m[2m[48;2;40;40;40m› [0m[48;2;40;40;40mReply with just the word ok.                                                                                                                                  [0m
+
+
+[0m[2m• [0mok
+
+[0m[2m  Worked for 1s • 9:11 PM[0m
+
+
+[0m[1m[2m[48;2;40;40;40m› [0m[48;2;40;40;40mRun the shell command: sleep 12 ; then reply with the word done.                                                                                              [0m
+
+
+[0m[2m• [0mI’ll run [0m[38;2;166;227;161msleep 12[0m.
+
+[0m[1m[38;5;2m•[0m [0m[1mRan[0m [0m[38;2;137;180;250msleep[0m[38;2;205;214;244m 12[0m
+[0m[2m  └ (no output)[0m
+
+[0m[2m• [0mdone
+
+[0m[2m  Worked for 17s • 9:12 PM[0m
+ 
+[0m[48;2;30;30;30m                                                                                                                                                                [0m
+[0m[1m[48;2;30;30;30m›[0m[48;2;30;30;30m [0m[2m[48;2;30;30;30mAsk Codex to do anything[0m[48;2;30;30;30m                                                                                                                                      [0m
+[0m[48;2;30;30;30m                                                                                                                                                                [0m
+  [0m[38;2;246;226;183mgpt-model low[0m[38;2;132;132;132m · [0m[38;2;171;223;167m~/work/project[0m[38;2;132;132;132m · [0m[38;2;245;224;220mReply with ok                                                                           [0m[38;2;132;132;132m⚠ [0m[38;2;196;167;103m1 warning[0m[38;2;132;132;132m · [0m[1m[38;2;220;220;220mf2[0m[38;2;132;132;132m to view[0m
