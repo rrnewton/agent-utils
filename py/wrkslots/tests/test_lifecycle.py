@@ -12266,6 +12266,40 @@ def test_abort_create_removes_a_clean_initialized_submodule(tmp_path: Path) -> N
     assert str(target) not in git(repository, "worktree", "list", "--porcelain").stdout
 
 
+def test_recover_repopulates_an_unpopulated_submodule_checkout(tmp_path: Path) -> None:
+    """#881: recover repopulates a wholesale-unpopulated checkout, then verifies."""
+    project, _journal, leaf = _interrupted_create_with_populated_submodules(tmp_path)
+    git(leaf, "rm", "-rfq", ".")
+    assert not (leaf / "leaf.txt").exists()
+
+    recovered = command(
+        project, "recover", "--coordinator-pid", str(os.getpid()), "--slot", "slot01"
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert "repopulated unpopulated checkout" in recovered.stderr
+    assert (leaf / "leaf.txt").is_file()
+    assert git(leaf, "status", "--porcelain").stdout == ""
+    assert len(active_slots(project)) == 1
+
+
+def test_recover_refuses_authored_changes_in_a_submodule_checkout(tmp_path: Path) -> None:
+    """#881: authored work is never reset; it is named and reported instead."""
+    project, journal, leaf = _interrupted_create_with_populated_submodules(tmp_path)
+    (leaf / "leaf.txt").write_text("authored\n", encoding="utf-8")
+
+    recovered = command(
+        project, "recover", "--coordinator-pid", str(os.getpid()), "--slot", "slot01"
+    )
+
+    assert recovered.returncode != 0
+    assert "not clean after creation" in recovered.stderr
+    assert "product/component/leaf" in recovered.stderr
+    assert (leaf / "leaf.txt").read_text(encoding="utf-8") == "authored\n"
+    assert active_slots(project) == []
+    assert journal.is_file()
+
+
 def test_exact_create_recovers_before_a_validation_batch_seal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

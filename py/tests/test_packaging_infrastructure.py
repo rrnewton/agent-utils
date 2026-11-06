@@ -1028,9 +1028,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # checkout, and prefetch bundling before the lock) are mapped.
     # The #911 case (a privileged delete of root-owned entries stays
     # inside the slot and never follows a symlink out of it) is mapped.
-    assert len(all_tests) == 2156
+    # The two #881 cases (recover repopulates a wholesale-unpopulated
+    # submodule checkout; authored changes are refused, never reset) are mapped.
+    assert len(all_tests) == 2158
     assert len(ordinary) == 339
-    assert len(mapped) == 1817
+    assert len(mapped) == 1819
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

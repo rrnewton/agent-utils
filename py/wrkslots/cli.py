@@ -27613,6 +27613,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             checkouts=tuple(created),
             task_scope=task_scope,
         )
+        _verify_created_checkouts(config, record, vcs)
         state = _append_record(state, record)
         _write_active_state(
             config,
@@ -45522,6 +45523,92 @@ def _abort_create(
     print(f"aborted incomplete create slot={slot}; removed provisional worktrees and branches")
 
 
+def _verify_created_checkouts(
+    config: Config, record: ActiveRecord, vcs: _GitVcs
+) -> None:
+    """Verify every checkout of a just-created slot before success (#881).
+
+    Each checkout, submodules included recursively, must have a resolving
+    HEAD, a populated worktree, and a clean status (apart from cache paths
+    and a handoff note). A checkout whose index and worktree disagree with
+    HEAD wholesale -- every tracked file missing, nothing else changed --
+    is the mark of an interrupted checkout in a worktree this creation
+    owns and holds no authored work: repopulate it from HEAD and verify
+    again. Anything else (authored changes, partial deletions) refuses,
+    naming the checkout and the missing/staged-deleted counts; success is
+    never reported for an unverified slot.
+    """
+
+    def check(name: str, path: Path) -> None:
+        try:
+            vcs.head(path)
+        except Refusal as exc:
+            raise Refusal(
+                f"checkout {name} HEAD does not resolve: {exc}; "
+                "preserve the slot and repair the checkout by hand"
+            ) from exc
+        status = vcs.status(
+            path, _cache_globs_for(config, name), include_ignored=False
+        )
+        lines = [
+            line
+            for line in status.splitlines()
+            if line and "HANDOFF" not in line
+        ]
+        if not lines:
+            return
+        tracked = [
+            line
+            for line in vcs._run(
+                path, ["ls-tree", "-r", "--name-only", "-z", "HEAD"]
+            ).stdout.split("\0")
+            if line
+        ]
+        missing = [item for item in tracked if not (path / item).exists()]
+        staged_deleted = sum(
+            1 for line in lines if len(line) > 1 and line[0] == "1" and line[2] == "D"
+        )
+        deletions_only = all(
+            line.startswith("1 ") and set(line[2:4]) <= {"D", "."} for line in lines
+        )
+        if deletions_only and tracked and len(missing) == len(tracked):
+            vcs._run(path, ["reset", "--hard", "HEAD"])
+            print(
+                f"wrkslots: repopulated unpopulated checkout {name} from HEAD",
+                file=sys.stderr,
+            )
+            status = vcs.status(
+                path, _cache_globs_for(config, name), include_ignored=False
+            )
+            lines = [
+                line
+                for line in status.splitlines()
+                if line and "HANDOFF" not in line
+            ]
+            if not lines:
+                return
+        raise Refusal(
+            f"checkout {name} is not clean after creation: "
+            f"{len(missing)} missing file(s), {staged_deleted} staged deletion(s), "
+            f"{len(lines)} changed path(s) in {path}; it was not reset, because "
+            "the changes may be authored work; inspect it and repair or remove "
+            "the slot by hand"
+        )
+
+    for checkout in record.checkouts:
+        path = _stored_path(config, checkout.path, "checkout path")
+        # Deepest first: repopulating a submodule also cleans the gitlink
+        # change its parent would otherwise report.
+        repositories = [(checkout.name, path)] + [
+            (f"{checkout.name}/{relative}", path / relative)
+            for relative in vcs.initialized_submodules(path)
+        ]
+        for name, repository_path in sorted(
+            repositories, key=lambda item: len(item[1].parts), reverse=True
+        ):
+            check(name, repository_path)
+
+
 def _recover_create(
     config: Config,
     path: Path,
@@ -45786,6 +45873,7 @@ def _recover_create(
                 raise Refusal(
                     f"create recovery found changed HEAD for {checkout.name}; preserve it for inspection"
                 )
+        _verify_created_checkouts(config, existing_record, _GitVcs())
         _clear_journal(config, raw, journal_path=path)
         print(f"recovered create: active state was durable; cleared journal for {slot}")
         return
@@ -45900,6 +45988,7 @@ def _recover_create(
     )
     if record.task_scope is not None:
         _verify_task_scope_before_publication(record.task_scope, _CREATE_SCOPE_REMEDY)
+    _verify_created_checkouts(config, record, vcs)
     _write_active_state(
         config,
         _append_record(state, record),
