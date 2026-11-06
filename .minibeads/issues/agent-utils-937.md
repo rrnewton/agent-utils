@@ -1,11 +1,12 @@
 ---
 title: 'merge-queue-keep-stale-roots-requeued-root-reason: requeued stale root cancel reason names requeue and attempt history'
-status: in_progress
+status: closed
 priority: 3
 issue_type: task
 assignee: mu-mqdonor
 created_at: 2026-11-06T12:54:29.573626602+00:00
-updated_at: 2026-11-06T12:54:33.445586601+00:00
+updated_at: 2026-11-06T19:32:58.710473178+00:00
+closed_at: 2026-11-06T19:32:58.710472938+00:00
 claimed_at: 2026-11-06T12:54:33.445586601+00:00
 claimed_until: 2026-11-08T12:54:33.445495644+00:00
 ---
