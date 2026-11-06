@@ -1092,6 +1092,14 @@ enum Command {
         /// green.
         #[arg(long)]
         prioritized: bool,
+        /// Land the head exactly as submitted, never replayed: a merge commit keeps both
+        /// parents, so the history it merges becomes an ancestor of the base. The head must be
+        /// a fast-forward of the base: linear on top of it, or a merge whose first parent IS
+        /// the base. When the base moves first, the change is refused (not-fast-forward):
+        /// rebuild it on the new base and resubmit. Lands in a batch of its own; the queue never
+        /// rewrites it (pins, recount, regeneration). Stays set on resubmission.
+        #[arg(long, visible_alias = "preserve-merge")]
+        exact: bool,
         /// Who is submitting (agent or person).
         #[arg(long, default_value = "")]
         by: String,
@@ -2005,6 +2013,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             after,
             solo,
             prioritized,
+            exact,
             by,
             title,
             tested_with,
@@ -2040,6 +2049,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 after,
                 solo,
                 prioritized,
+                exact,
                 claim,
                 source: String::new(),
                 requires: requires

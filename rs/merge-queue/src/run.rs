@@ -2470,7 +2470,7 @@ impl<'a> Runner<'a> {
                 continue;
             }
             let item = &items[pr];
-            if item.exact && !self.git.fast_forwards(&tip, &item.head)? {
+            if item.exact && !self.git.lands_exactly(&tip, &item.head)? {
                 skipped.insert(*pr);
                 conflicts.push((*pr, "not-fast-forward", short(&tip).to_owned()));
                 continue;
@@ -2479,18 +2479,24 @@ impl<'a> Runner<'a> {
             exclude.extend(exclude_heads.iter().map(String::as_str));
             let carried: Vec<String> = exclude.iter().map(|head| (*head).to_owned()).collect();
             let message = format!("Merge #{pr} ({})", item.head_ref);
-            let combined = self.git.combine_with(
-                self.config.combine,
-                &tip,
-                &item.head,
-                &exclude,
-                &message,
-                &|path| {
-                    regen.covers(path)
-                        || (recount && path == crate::recount::PIN_PATH)
-                        || self.config.pin_site(path)
-                },
-            )?;
+            // An exact change is its own candidate, unchanged: never replayed (a rebase drops a
+            // merge's second parent) and never wrapped in a merge the queue made.
+            let combined = if item.exact {
+                Combined::Clean(item.head.clone())
+            } else {
+                self.git.combine_with(
+                    self.config.combine,
+                    &tip,
+                    &item.head,
+                    &exclude,
+                    &message,
+                    &|path| {
+                        regen.covers(path)
+                            || (recount && path == crate::recount::PIN_PATH)
+                            || self.config.pin_site(path)
+                    },
+                )?
+            };
             let (next, mut conflicted) = match combined {
                 Combined::Clean(next) => (next, Vec::new()),
                 Combined::NeedsRegen(next, paths) => (next, paths),
@@ -2599,6 +2605,16 @@ impl<'a> Runner<'a> {
                     base: self.change_base(&tip, &item.head, &carried)?,
                 };
                 match self.regenerate(&next, *pr, &conflicted, Some(&change))? {
+                    // An exact change is never rewritten: regeneration must leave it as it is.
+                    Ok(done) if item.exact && done != next => {
+                        skipped.insert(*pr);
+                        conflicts.push((
+                            *pr,
+                            "exact-regen",
+                            format!("regeneration rewrites it (to {})", short(&done)),
+                        ));
+                        continue;
+                    }
                     Ok(done) => done,
                     Err((kind, why)) => {
                         // Before blaming this change, check that the generator works on the
@@ -3122,7 +3138,11 @@ impl<'a> Runner<'a> {
                     short(parent)
                 ),
                 "not-fast-forward" => format!(
-                    "must land as its own commits (another repository requires its exact head), but it is not on top of {detail}{context}; rebase it and update what requires it"
+                    "must land exactly as submitted (an exact change: submitted --exact, or another repository requires its exact head), but it is not on top of {detail}{context}: neither linear on it nor a merge whose first parent is it; rebuild it on {detail}, revalidate, and resubmit (and update anything that requires it)"
+                ),
+                "exact-regen" => format!(
+                    "must land exactly as submitted (an exact change), but onto {}{context} {detail}; regenerate in the change itself and resubmit",
+                    short(parent)
                 ),
                 "regen-build-failed" => format!(
                     "the combined tree onto {}{context} does not build the generator, so its generated files cannot be regenerated (the change is stale against the base or breaks the generator's sources): {detail}",

@@ -173,6 +173,10 @@ pub struct Submission {
     pub solo: bool,
     /// A priority change: planned ahead of all other work, validated alone.
     pub prioritized: bool,
+    /// Land the head exactly as submitted (`submit --exact`): a merge keeps both parents, and
+    /// the change is never replayed. Sets the item's `exact`, which then stays set.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub exact: bool,
     /// Submitter's validation claim.
     pub claim: Option<ValidationClaim>,
     /// `sync` source that produced this submission; empty for a direct `submit`.
@@ -296,7 +300,7 @@ fn submit_resolved(
         solo: submission.solo,
         prioritized: submission.prioritized,
         claim: submission.claim,
-        exact: existing.as_ref().is_some_and(|old| old.exact),
+        exact: submission.exact || existing.as_ref().is_some_and(|old| old.exact),
         requires: submission.requires,
         source: submission.source,
         close_pending: false,
@@ -381,6 +385,9 @@ fn submit_resolved(
         ),
         None => format!("head {current}; no submitter validation claim"),
     };
+    if submission.exact {
+        detail.push_str("; exact: lands as submitted, never replayed");
+    }
     if !submission.recorded_at.is_empty() {
         detail.push_str(&format!(
             "; recorded at {} while another writer held the queue",

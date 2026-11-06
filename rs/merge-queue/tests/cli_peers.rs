@@ -273,3 +273,140 @@ fn a_mark_exact_whose_head_moved_is_refused_and_noted() {
         "{history:?}"
     );
 }
+
+/// Push branch `name`: a merge, made on `main` as the remote has it now, of another history
+/// (unrelated, with its own test file). Returns the merge and the other history's tip.
+fn import_merge(fx: &Fixture, name: &str) -> (String, String) {
+    let dev = fx.dev();
+    git(&dev, &["fetch", "-q", "origin"]);
+    git(
+        &dev,
+        &["checkout", "-q", "--orphan", &format!("{name}-other")],
+    );
+    git(&dev, &["rm", "-rfq", "."]);
+    fx.write("imported/README", "another history\n");
+    fx.write("tests/imported", "ok\n");
+    fx.commit_all("another history");
+    let other = git(&dev, &["rev-parse", "HEAD"]);
+    git(&dev, &["checkout", "-q", "-B", name, "origin/main"]);
+    git(
+        &dev,
+        &[
+            "merge",
+            "-q",
+            "--allow-unrelated-histories",
+            "-m",
+            "import another history",
+            &other,
+        ],
+    );
+    git(
+        &dev,
+        &["push", "-q", "-f", "origin", &format!("HEAD:{name}")],
+    );
+    let merge = git(&dev, &["rev-parse", "HEAD"]);
+    git(&dev, &["checkout", "-q", "main"]);
+    (merge, other)
+}
+
+#[test]
+fn an_exact_merge_on_the_base_lands_with_its_own_id_and_both_parents() {
+    let fx = seeded("exact-merge");
+    init(&fx, &[]);
+    let help = fx.mq_ok(&["submit", "--help"]);
+    assert!(
+        help.contains("--exact") && help.contains("preserve-merge"),
+        "{help}"
+    );
+    let base = fx.remote_main();
+    let (merge, other) = import_merge(&fx, "import");
+    fx.mq_ok(&["submit", "5", "--head", "import", "--exact"]);
+    // Recorded on the item, so every later command (a restarted daemon too) sees it.
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--json"])).unwrap();
+    assert_eq!(items[0]["exact"], true, "{items}");
+
+    let r: Value = serde_json::from_str(&fx.mq_ok(&["run", "--json"])).unwrap();
+    assert_eq!(r["landed"][0]["prs"], serde_json::json!([5]), "{r}");
+    assert_eq!(
+        fx.remote_main(),
+        merge,
+        "the merge landed as itself, not a copy"
+    );
+    let remote = fx.remote();
+    assert_eq!(git(&remote, &["rev-parse", "main^1"]), base);
+    assert_eq!(git(&remote, &["rev-parse", "main^2"]), other);
+    git(&remote, &["merge-base", "--is-ancestor", &other, "main"]);
+    assert_eq!(status(&fx, 5), "landed");
+}
+
+#[test]
+fn an_exact_merge_is_ejected_not_replayed_once_the_base_moves() {
+    let fx = seeded("exact-merge-stale");
+    init(&fx, &[]);
+    let (merge, other) = import_merge(&fx, "import");
+    // The alias, and a base that moves on before the merge lands.
+    fx.mq_ok(&["submit", "6", "--head", "import", "--preserve-merge"]);
+    fx.write("unrelated", "x\n");
+    fx.commit_all("unrelated");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    let moved = fx.remote_main();
+
+    let r: Value = serde_json::from_str(&fx.mq_ok(&["run", "--json"])).unwrap();
+    assert!(r["landed"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(fx.remote_main(), moved, "nothing landed");
+    assert_eq!(status(&fx, 6), "ejected");
+    let remote = fx.remote();
+    // Nothing of the other history was replayed onto the base.
+    assert_eq!(
+        git(&remote, &["ls-tree", "--name-only", "main", "imported"]),
+        ""
+    );
+    let reachable = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&remote)
+        .args(["merge-base", "--is-ancestor", &other, "main"])
+        .status()
+        .unwrap();
+    assert!(!reachable.success());
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    let history = items[0]["history"].to_string();
+    assert!(history.contains("not on top of"), "{history}");
+    assert_ne!(fx.remote_main(), merge);
+}
+
+#[test]
+fn a_merge_head_without_exact_is_still_replayed_as_its_own_commits() {
+    let fx = seeded("merge-replayed");
+    init(&fx, &[]);
+    let dev = fx.dev();
+    let side = fx.branch("side", &[("tests/side", "ok\n")]);
+    git(&dev, &["checkout", "-q", "-B", "merged", "main"]);
+    fx.write("tests/merged", "ok\n");
+    fx.commit_all("merged: own change");
+    git(&dev, &["merge", "-q", "--no-ff", "-m", "merge side", &side]);
+    git(&dev, &["push", "-q", "-f", "origin", "HEAD:merged"]);
+    let merge = git(&dev, &["rev-parse", "HEAD"]);
+    git(&dev, &["checkout", "-q", "main"]);
+    let base = fx.remote_main();
+    fx.mq_ok(&["submit", "7", "--head", "merged"]);
+
+    let r: Value = serde_json::from_str(&fx.mq_ok(&["run", "--json"])).unwrap();
+    assert_eq!(r["landed"][0]["prs"], serde_json::json!([7]), "{r}");
+    let remote = fx.remote();
+    assert_ne!(fx.remote_main(), merge, "replayed, so new commits");
+    assert_eq!(
+        git(&remote, &["rev-list", "--merges", &format!("{base}..main")]),
+        "",
+        "replayed linear, as before: no merge commit lands"
+    );
+    assert_eq!(
+        git(&remote, &["rev-list", "--count", &format!("{base}..main")]),
+        "2"
+    );
+    for test in ["tests/side", "tests/merged"] {
+        assert_eq!(
+            git(&remote, &["ls-tree", "--name-only", "main", test]),
+            test
+        );
+    }
+}

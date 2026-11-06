@@ -810,6 +810,27 @@ impl Git {
         Ok(self.run(&["rev-list", "--merges", &range])?.is_empty())
     }
 
+    /// Whether `head` is a merge commit made directly on `onto`: `onto` is an ancestor of
+    /// `head` and is its first parent. Landing it unchanged is then a fast-forward that keeps
+    /// both parents, so the history it merges becomes an ancestor of the base. An `onto` that
+    /// is merely some ancestor is not enough: the merge was made, and validated, on another
+    /// base.
+    pub fn fast_forwards_exact_merge(&self, onto: &str, head: &str) -> Result<bool, String> {
+        if !self.is_ancestor(onto, head)? {
+            return Ok(false);
+        }
+        let parents = self.run(&["rev-list", "--parents", "-n", "1", head])?;
+        let parents: Vec<&str> = parents.split_whitespace().skip(1).collect();
+        Ok(parents.len() > 1 && parents[0] == self.rev_parse(onto)?)
+    }
+
+    /// Whether an exact change (one that must land as submitted, never replayed) can land at
+    /// `head` on `onto`: a linear fast-forward ([`Git::fast_forwards`]) or a merge made
+    /// directly on `onto` ([`Git::fast_forwards_exact_merge`]).
+    pub fn lands_exactly(&self, onto: &str, head: &str) -> Result<bool, String> {
+        Ok(self.fast_forwards(onto, head)? || self.fast_forwards_exact_merge(onto, head)?)
+    }
+
     /// [`Git::combine`], letting conflicts confined to regenerable paths through as
     /// [`Combined::NeedsRegen`]. In rebase mode a change already on `onto` with linear history
     /// keeps its own commits, as `git rebase` would.
@@ -1075,6 +1096,50 @@ mod unit {
             vec!["a.txt".to_owned()]
         );
         assert!(git.merge_conflicts(&a, &b).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_exact_merge_fast_forwards_only_from_its_own_first_parent() {
+        let tmp = TempDir::new("git-exact-merge");
+        let git = init(&tmp.0);
+        let base = git.rev_parse("main").unwrap();
+        // Another history, unrelated to main, merged directly on the base.
+        testrepo::git(&tmp.0, &["checkout", "-q", "--orphan", "other"]);
+        testrepo::git(&tmp.0, &["rm", "-rfq", "."]);
+        write(&tmp.0, "other.txt", "other\n");
+        testrepo::git(&tmp.0, &["add", "-A"]);
+        testrepo::git(&tmp.0, &["commit", "-q", "-m", "other history"]);
+        let other = git.rev_parse("other").unwrap();
+        testrepo::git(&tmp.0, &["checkout", "-q", "main"]);
+        testrepo::git(
+            &tmp.0,
+            &[
+                "merge",
+                "-q",
+                "--allow-unrelated-histories",
+                "-m",
+                "import",
+                "other",
+            ],
+        );
+        let merge = git.rev_parse("main").unwrap();
+        testrepo::git(&tmp.0, &["reset", "-q", "--hard", &base]);
+        assert!(
+            !git.fast_forwards(&base, &merge).unwrap(),
+            "a merge is not linear"
+        );
+        assert!(git.fast_forwards_exact_merge(&base, &merge).unwrap());
+        assert!(git.lands_exactly(&base, &merge).unwrap());
+        // Its second parent is an ancestor, not its first: not an exact merge onto it.
+        assert!(!git.fast_forwards_exact_merge(&other, &merge).unwrap());
+        // The base moved on: the merge was made on an older base.
+        let moved = branch(&tmp.0, "moved", "main", &[("m.txt", "m\n")]);
+        assert!(!git.fast_forwards_exact_merge(&moved, &merge).unwrap());
+        assert!(!git.lands_exactly(&moved, &merge).unwrap());
+        // A linear change on the base is no merge, but still lands exactly.
+        let linear = branch(&tmp.0, "linear", "main", &[("l.txt", "l\n")]);
+        assert!(!git.fast_forwards_exact_merge(&base, &linear).unwrap());
+        assert!(git.lands_exactly(&base, &linear).unwrap());
     }
 
     #[test]

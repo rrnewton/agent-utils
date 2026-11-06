@@ -431,6 +431,7 @@ pub fn reconcile(
             after: entry.after,
             solo: entry.solo,
             prioritized: entry.prioritized,
+            exact: false,
             claim: None,
             source: tag.clone(),
             requires: Vec::new(),
