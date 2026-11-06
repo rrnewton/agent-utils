@@ -58735,6 +58735,43 @@ def test_tearing_down_pidns_is_counted_not_narrated_unless_verbose(
     wrkslots._VERBOSE_DIAGNOSTICS.set(False)
 
 
+def test_mount_namespace_reprobe_proves_a_tearing_down_init(tmp_path: Path) -> None:
+    """#906: a PID whose mount link is absent but is a tearing-down init is proven."""
+    pid_dir = tmp_path / "4242"
+    pid_dir.mkdir()
+    (pid_dir / "wchan").write_text("zap_pid_ns_processes", encoding="ascii")
+    (pid_dir / "status").write_text(
+        "Name:\texec_test\nNSpid:\t4242\t1\nThreads:\t1\n", encoding="utf-8"
+    )
+    (pid_dir / "stat").write_bytes(
+        b"4242 (exec_test) S 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 12345"
+    )
+    generation = wrkslots._ProcessStat(start_ticks=12345, flags=4194560, state="S")
+
+    namespace, threads = wrkslots._mount_namespace_reprobed(pid_dir, generation)
+
+    assert namespace is None
+    assert threads == []
+
+
+def test_mount_namespace_reprobe_refusal_names_the_window(tmp_path: Path) -> None:
+    """#906: a live-but-unreadable PID's refusal names the re-probe window."""
+    pid_dir = tmp_path / "4243"
+    pid_dir.mkdir()
+    (pid_dir / "wchan").write_text("0", encoding="ascii")
+    (pid_dir / "status").write_text(
+        "Name:\tworker\nNSpid:\t4243\nThreads:\t2\n", encoding="utf-8"
+    )
+    (pid_dir / "stat").write_bytes(
+        b"4243 (worker) S 1 4243 4243 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 2 0 12346"
+    )
+    (pid_dir / "fd").mkdir()
+    generation = wrkslots._ProcessStat(start_ticks=12346, flags=4194560, state="S")
+
+    with pytest.raises(wrkslots.Refusal, match="re-probes over 150 ms"):
+        wrkslots._mount_namespace_reprobed(pid_dir, generation)
+
+
 def test_remove_skips_an_uninitialised_nested_submodule(tmp_path: Path) -> None:
     project, tree, component, _leaf = _slot_with_primary_dropped_leaf(tmp_path)
     git(

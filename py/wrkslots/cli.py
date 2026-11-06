@@ -58070,11 +58070,23 @@ def _mount_namespace_reprobed(
             continue
         if namespace is not None:
             return namespace, None
+        # A tearing-down namespace init proves itself directly from /proc,
+        # without the generation stat that a concurrent exit can race (#906).
+        if _process_is_exiting_namespace_init(pid_dir):
+            return None, []
         exited = _proven_exited_thread_entries(pid_dir, generation, released_context=True)
         if exited is not None:
             return None, exited
+        window_ms = round(
+            _MOUNT_NAMESPACE_REPROBE_ATTEMPTS
+            * _MOUNT_NAMESPACE_REPROBE_DELAY_SECONDS
+            * 1000
+        )
         last_refusal = Refusal(
-            f"mount namespace is indeterminate for live PID {pid_dir.name}"
+            f"mount namespace is indeterminate for live PID {pid_dir.name} "
+            f"after {_MOUNT_NAMESPACE_REPROBE_ATTEMPTS + 1} re-probes over "
+            f"{window_ms} ms: its mount-namespace link stayed absent but the "
+            "process was not proven exited in that window"
         )
     assert last_refusal is not None
     raise last_refusal
