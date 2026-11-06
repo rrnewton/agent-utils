@@ -341,12 +341,15 @@ impl ClaudeIdleSource for ClaudeAgents {
         if info.agent.as_deref() != Some("claude") {
             // Another known harness (Codex, Muse) has no `agents --json` to ask: its pane's
             // Herdr status, which the caller has already required to read idle or done and
-            // to show no running turn, is its answer. An unknown kind cannot be asked.
+            // to show no running turn, is its answer. An agentcloud session's status is its own
+            // history's (#902). An unknown kind cannot be asked.
             return Ok(match info.agent.as_deref() {
-                Some("codex" | "muse") if matches!(info.status.as_str(), "idle" | "done") => {
+                Some("codex" | "muse" | "agentcloud")
+                    if matches!(info.status.as_str(), "idle" | "done") =>
+                {
                     ClaudeState::Idle
                 }
-                Some("codex" | "muse") => ClaudeState::Busy(info.status.clone()),
+                Some("codex" | "muse" | "agentcloud") => ClaudeState::Busy(info.status.clone()),
                 _ => ClaudeState::NotClaude,
             });
         }
@@ -1086,6 +1089,16 @@ sends that reply once the pane shows it",
         ask: Ask,
         frame: Option<&crate::harness::agentterm::FrameState>,
     ) -> bool {
+        // An agentcloud session whose history could not be read is not guessed idle (#902).
+        if info.agent.as_deref() == Some("agentcloud") && info.status == "unknown" {
+            self.wait_because(Some(
+                "the coordinator's agentcloud session history is unreadable, so whether it is \
+                 idle is unknown and it is not reminded"
+                    .to_owned(),
+            ));
+            self.period.end();
+            return false;
+        }
         if !self.herdr_idle(info, turn) {
             return false;
         }
@@ -1340,6 +1353,33 @@ mod tests {
             .waiting
             .as_deref()
             .is_some_and(|reason| reason.contains("cannot ask about")));
+    }
+
+    #[test]
+    fn an_agentcloud_coordinator_is_reminded_by_its_session_history() {
+        // #902 cloud-coordinator-reminders: the status of a cloud coordinator is its session
+        // history's. It is named agentcloud, never an unrecognized harness, and with that
+        // history unreadable it is never guessed idle.
+        let mut reminders = ReplyReminders::with_source(
+            Duration::from_secs(10),
+            Box::new(ClaudeAgents::new(
+                std::path::PathBuf::from("/nonexistent/claude"),
+                std::path::PathBuf::from("/nonexistent/proc"),
+            )),
+        );
+        let turn = TurnEvidence::default();
+        let stop = StopState::default();
+        let mut info = pane("agentcloud", "cloud-pane");
+        assert_eq!(harness_display_name(&info), "agentcloud");
+        assert!(reminders.idle(&info, &turn, &stop, Ask::First, None));
+        assert_eq!(reminders.waiting, None);
+        info.status = "working".to_owned();
+        assert!(!reminders.idle(&info, &turn, &stop, Ask::Again, None));
+        info.status = "unknown".to_owned();
+        assert!(!reminders.idle(&info, &turn, &stop, Ask::Again, None));
+        let reason = reminders.waiting.clone().unwrap_or_default();
+        assert!(reason.contains("history is unreadable"), "{reason}");
+        assert!(!reason.contains("unrecognized"), "{reason}");
     }
 
     /// A stand-in for Claude Code that gives its answers in turn, the last first, and is idle

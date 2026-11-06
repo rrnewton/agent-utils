@@ -27,3 +27,26 @@ A coordinator running in an agentcloud session gets reply reminders and idle/wor
 # Notes
 
 Requested by the lead on 2026-11-05 at 06:34 AM ET (P2, cl-start after #884 and the reply-policy work, now folded into #896). The request was lost in the #884 pane-lock window (the coordinator's failed/ queue, possibly_submitted), then recovered and filed at 12:50 PM ET. Assigned to cl-start after #896 and #897. Related: #852 D (an agentcloud record through its agentterm view) and #900.
+
+## Progress (cl-start, 2026-11-06)
+
+[opus 5.5] Cause: the chat bridge reads a cloud coordinator's pane facts from `cloud_pane_info`, which reported no harness (`agent: None`) and took its status from the lagged `agentcloudctl list`. Reminders then named "an unrecognized harness" and never reminded it.
+
+Change:
+- `cloud_pane_info` now names the harness `agentcloud` and reads the turn from the session's own journal: `agentcloudctl history --raw --type run_started,run_finished,user_input,input_applied --last 200`.
+  - `working`: a `run_started` has no `run_finished` for its run.
+  - `waiting`: an input journaled after the last finished run is not applied yet.
+  - `idle`: otherwise.
+  - `unknown`: the history cannot be read. Nothing is guessed from the pane.
+- Reply reminders treat `agentcloud` like Codex and Muse: idle only when that status says idle.
+- On `unknown`, reminders log that they wait because the history is unreadable, and the coordinator is not reminded.
+- The reply method was already right: since #896, replies come from the session history, so the prompt keeps its fenced reply block.
+
+Tests:
+- The turn read from recorded run and input events.
+- The cloud pane facts, including `unknown` with history failing, and that the history call filters by those event types.
+- Reminders for an agentcloud coordinator: named agentcloud, idle, working, and unknown (waits, never "unrecognized").
+
+Not changed: `agentctl status` for a cloud agent still uses the fleet listing.
+
+Remaining: the live check through the lead.

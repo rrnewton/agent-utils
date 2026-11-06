@@ -2535,7 +2535,14 @@ seconds, or at once when the service is stopped. Any state other than `idle`,
 such as `busy`, counts as working. A Codex or Muse pane is idle when its Herdr
 status says so. A pane driven by the generic rules (`--harness unknown`) that
 shows agentterm's input frame is idle when the frame reads `idle`, and working
-under `working M:SS` or any other label (#852 unknown-tui-bridge). Any other
+under `working M:SS` or any other label (#852 unknown-tui-bridge). An
+agentcloud coordinator is read from its session's own history (`agentcloudctl
+history --type run_started,run_finished,user_input,input_applied`), never
+from its agentterm pane (#902 cloud-coordinator-reminders). It is working
+while a run has started and not finished, waiting while an input journaled
+after the last finished run is not applied yet, and idle otherwise. While that
+history cannot be read, its state is `unknown`: it is not reminded, and the
+service logs that it waits for that reason. Any other
 pane, such as one of another TUI driven by the generic rules, is never
 reminded, and the service logs once that it waits for that reason, as it does
 when Claude Code lists no session in the pane. An idle period begins at

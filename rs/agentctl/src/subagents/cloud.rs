@@ -604,6 +604,61 @@ pub(super) fn reply_text_from_history(jsonl: &str) -> String {
     blocks.join("\n")
 }
 
+/// The journal event kinds that say whether a session's turn runs (#902
+/// cloud-coordinator-reminders), as `agentcloudctl history --type` takes them.
+const TURN_EVENTS: &str = "run_started,run_finished,user_input,input_applied";
+/// How many of the newest [`TURN_EVENTS`] are read.
+const TURN_EVENTS_READ: &str = "200";
+
+/// Whether an agentcloud session is `working`, `waiting` or `idle`, by its journal
+/// (`agentcloudctl history --raw`, one wire frame per line, oldest first): `working` while a
+/// `run_started` has no `run_finished` for its run, `waiting` while an input journaled after the
+/// last finished run is not applied yet (a first prompt on a node still being provisioned), and
+/// `idle` otherwise.
+fn turn_from_history(raw: &str) -> &'static str {
+    let mut open = BTreeSet::new();
+    let mut unapplied = BTreeSet::new();
+    let mut finished_at = 0;
+    for frame in raw
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        let seq = frame["seq"].as_u64();
+        let event = &frame["event"];
+        match event["type"].as_str() {
+            Some("run_started") => {
+                if let Some(run) = frame["ctx"]["run"].as_u64().or(seq) {
+                    open.insert(run);
+                }
+            }
+            Some("run_finished") => {
+                if let Some(run) = event["run"].as_u64() {
+                    open.remove(&run);
+                }
+                finished_at = finished_at.max(seq.unwrap_or(0));
+            }
+            Some("user_input") => {
+                if let Some(seq) = seq {
+                    unapplied.insert(seq);
+                }
+            }
+            Some("input_applied") => {
+                if let Some(input) = event["input"].as_u64() {
+                    unapplied.remove(&input);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !open.is_empty() {
+        "working"
+    } else if unapplied.iter().any(|input| *input > finished_at) {
+        "waiting"
+    } else {
+        "idle"
+    }
+}
+
 /// A fleet-listing activity word such as `waiting`; never a session identity.
 fn valid_activity(value: &str) -> bool {
     (1..=32).contains(&value.len())
@@ -2112,6 +2167,21 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     /// place of Herdr's harness detection (the pane runs `agentterm`, which
     /// Herdr never reports as a harness). Only the identity fields the
     /// bridge compares are promised; `agent` stays `None`.
+    /// [`turn_from_history`] for cloud `record`'s session, or why its history is unreadable.
+    fn cloud_turn(&self, record: &AgentRecord) -> Result<&'static str> {
+        let session = self.cloud_session_of(record)?;
+        let endpoint = self.cloud_endpoint(record)?;
+        let raw = self.session_history(
+            session,
+            Some(&endpoint),
+            &["--raw", "--type", TURN_EVENTS, "--last", TURN_EVENTS_READ],
+        )?;
+        Ok(turn_from_history(&raw))
+    }
+
+    /// The pane facts of cloud `record` for the chat bridge (#902 cloud-coordinator-reminders):
+    /// its recorded agentterm pane, harness `agentcloud`, and the turn its session's own history
+    /// shows, `unknown` when that history is unreadable, never a guess from the pane.
     pub(super) fn cloud_pane_info(&self, record: &AgentRecord) -> Result<AgentPaneInfo> {
         let pane_id = record.pane_id.clone().ok_or_else(|| {
             fail(format!(
@@ -2120,14 +2190,13 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 self.agentctl_command(&["status", &record.name])
             ))
         })?;
-        let status = self.cloud_status_record(record, &mut FleetCache::new())?;
-        let agent_status = status["agent_status"].as_str().unwrap_or("unknown");
+        let status = self.cloud_turn(record).unwrap_or("unknown");
         Ok(AgentPaneInfo {
             pane_id,
             workspace_id: record.workspace_id.clone().unwrap_or_default(),
             cwd: record.cwd.clone(),
-            agent: None,
-            status: agent_status.to_owned(),
+            agent: Some(CLOUD_HARNESS.to_owned()),
+            status: status.to_owned(),
             session_agent: Some(record.name.clone()),
             session_value: record.session_value.clone(),
             scroll: None,
@@ -3506,6 +3575,91 @@ exit 0
             Some("sub-worker")
         );
         assert_eq!(manager.agent_for_cloud_session("no-such-session"), None);
+    }
+
+    #[test]
+    fn a_session_turn_is_read_from_its_run_and_input_events() {
+        // #902 cloud-coordinator-reminders.
+        let frame = |seq: u64, event: Value, run: Option<u64>| {
+            let mut frame = json!({"frame": "durable", "seq": seq, "event": event});
+            if let Some(run) = run {
+                frame["ctx"] = json!({"run": run});
+            }
+            frame.to_string()
+        };
+        let input = frame(2, json!({"type": "user_input", "text": "hi"}), None);
+        let started = frame(10, json!({"type": "run_started"}), Some(10));
+        let applied = frame(11, json!({"type": "input_applied", "input": 2}), Some(10));
+        let finished = frame(
+            781,
+            json!({"type": "run_finished", "run": 10, "outcome": {"outcome": "completed"}}),
+            Some(10),
+        );
+        let lines = |frames: &[&String]| {
+            frames
+                .iter()
+                .map(|frame| {
+                    format!(
+                        "{frame}
+"
+                    )
+                })
+                .collect::<String>()
+        };
+        assert_eq!(turn_from_history(""), "idle");
+        assert_eq!(turn_from_history(&lines(&[&input])), "waiting");
+        assert_eq!(
+            turn_from_history(&lines(&[&input, &started, &applied])),
+            "working"
+        );
+        assert_eq!(
+            turn_from_history(&lines(&[&input, &started, &applied, &finished])),
+            "idle"
+        );
+        // An input never applied before a run that has since finished does not hold the
+        // session waiting; one journaled after it does.
+        assert_eq!(turn_from_history(&lines(&[&input, &finished])), "idle");
+        let later = frame(790, json!({"type": "user_input", "text": "next"}), None);
+        assert_eq!(turn_from_history(&lines(&[&finished, &later])), "waiting");
+    }
+
+    #[test]
+    fn a_cloud_coordinators_pane_facts_come_from_its_session_history() {
+        // #902: harness agentcloud, the turn from history, and `unknown`, never a guess, when
+        // history is unreadable.
+        let fixture = Fixture::new();
+        fixture.list_row(false);
+        fixture.start(None).unwrap();
+        let manager = fixture.manager();
+        fixture.respond(
+            "history",
+            Some(&format!(
+                "{}
+",
+                json!({"frame": "durable", "seq": 10, "event": {"type": "run_started"}, "ctx": {"run": 10}})
+            )),
+            None,
+            None,
+        );
+        let info = manager.pane_info("sub-worker").unwrap();
+        assert_eq!(info.agent.as_deref(), Some("agentcloud"));
+        assert_eq!(info.status, "working");
+        let call = fixture
+            .calls()
+            .into_iter()
+            .rfind(|call| call[0] == "history")
+            .unwrap();
+        assert!(call.contains(&TURN_EVENTS.to_owned()), "{call:?}");
+        fixture.respond(
+            "history",
+            None,
+            Some(
+                "history unavailable
+",
+            ),
+            Some(1),
+        );
+        assert_eq!(manager.pane_info("sub-worker").unwrap().status, "unknown");
     }
 
     #[test]
