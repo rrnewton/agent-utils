@@ -2129,6 +2129,87 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         self.revive_with(agent_name, dry_run, expected_token, startup_timeout, false)
     }
 
+    /// Wait for an idle turn with nothing queued, exit the harness in
+    /// `pane` gracefully, and prove the bare shell. Shared by restart
+    /// and the gentle shutdown.
+    fn exit_to_shell(
+        &self,
+        agent_name: &str,
+        pane: &str,
+        when_idle: bool,
+        wait_timeout: Duration,
+    ) -> Result<()> {
+        let deadline = std::time::Instant::now() + wait_timeout;
+        let idle = |this: &Self| -> bool {
+            this.pending_prompts(agent_name)
+                .is_ok_and(|pending| pending.is_empty())
+                && this
+                    .client
+                    .pane_info(&pane)
+                    .is_ok_and(|info| matches!(info.status.as_str(), "idle" | "done"))
+        };
+        if !idle(self) && !when_idle {
+            return Err(fail(format!(
+                "'{agent_name}' is not idle with an empty queue; rerun with --when-idle to wait"
+            )));
+        }
+        while !idle(self) {
+            if std::time::Instant::now() >= deadline {
+                return Err(fail(format!(
+                    "'{agent_name}' did not become idle within {wait_timeout:?}; nothing was exited"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        // Idle twice, seconds apart: Herdr status flaps.
+        std::thread::sleep(Duration::from_secs(3));
+        if !idle(self) {
+            return Err(fail(format!(
+                "'{agent_name}' did not stay idle; nothing was exited"
+            )));
+        }
+        self.client.run(&pane, "/exit")?;
+        std::thread::sleep(Duration::from_millis(500));
+        let screen = self
+            .client
+            .read(&pane, "visible", Some(200))
+            .unwrap_or_default();
+        if screen.contains("Exit and stop tasks") {
+            let _ = self.client.send_keys(&pane, "Escape");
+            return Err(fail(format!(
+                "'{agent_name}' has background tasks (its exit dialog appeared); finish or stop them, note what to re-arm, then restart"
+            )));
+        }
+        let shell_deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut shelled = false;
+        while std::time::Instant::now() < shell_deadline {
+            if self.client.pane_is_idle_shell(&pane)? {
+                shelled = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        if !shelled {
+            let _ = self.client.send_keys(&pane, "C-c");
+            std::thread::sleep(Duration::from_secs(1));
+            let _ = self.client.send_keys(&pane, "C-c");
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
+                if self.client.pane_is_idle_shell(&pane)? {
+                    shelled = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+        if !shelled {
+            return Err(fail(format!(
+                "'{agent_name}' did not exit to a bare shell; it did not exit"
+            )));
+        }
+        Ok(())
+    }
+
     /// Restart one live agent in its own pane (R1 restart-when-idle): wait
     /// for an idle turn with nothing queued, exit the harness gracefully,
     /// then revive in the same pane with the recorded session. Refuses with
@@ -2143,6 +2224,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         startup_timeout: Duration,
     ) -> Result<Value> {
         let record = self.load(agent_name)?;
+        if record.agentcloud.is_some() {
+            return self.restart_cloud(agent_name);
+        }
         let Some(pane) = record.pane_id.clone() else {
             return Err(fail(format!(
                 "agent '{agent_name}' has no recorded pane to restart in"
@@ -2192,74 +2276,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 .pane_info(&pane)
                 .is_ok_and(|info| info.agent.as_deref() == Some(&record.harness));
         if alive {
-            let deadline = std::time::Instant::now() + wait_timeout;
-            let idle = |this: &Self| -> bool {
-                this.pending_prompts(agent_name)
-                    .is_ok_and(|pending| pending.is_empty())
-                    && this
-                        .client
-                        .pane_info(&pane)
-                        .is_ok_and(|info| matches!(info.status.as_str(), "idle" | "done"))
-            };
-            if !idle(self) && !when_idle {
-                return Err(fail(format!(
-                    "'{agent_name}' is not idle with an empty queue; rerun with --when-idle to wait"
-                )));
-            }
-            while !idle(self) {
-                if std::time::Instant::now() >= deadline {
-                    return Err(fail(format!(
-                        "'{agent_name}' did not become idle within {wait_timeout:?}; nothing was restarted"
-                    )));
-                }
-                std::thread::sleep(Duration::from_millis(250));
-            }
-            // Idle twice, seconds apart: Herdr status flaps.
-            std::thread::sleep(Duration::from_secs(3));
-            if !idle(self) {
-                return Err(fail(format!(
-                    "'{agent_name}' did not stay idle; nothing was restarted"
-                )));
-            }
-            self.client.run(&pane, "/exit")?;
-            std::thread::sleep(Duration::from_millis(500));
-            let screen = self
-                .client
-                .read(&pane, "visible", Some(200))
-                .unwrap_or_default();
-            if screen.contains("Exit and stop tasks") {
-                let _ = self.client.send_keys(&pane, "Escape");
-                return Err(fail(format!(
-                    "'{agent_name}' has background tasks (its exit dialog appeared); finish or stop them, note what to re-arm, then restart"
-                )));
-            }
-            let shell_deadline = std::time::Instant::now() + Duration::from_secs(15);
-            let mut shelled = false;
-            while std::time::Instant::now() < shell_deadline {
-                if self.client.pane_is_idle_shell(&pane)? {
-                    shelled = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(250));
-            }
-            if !shelled {
-                let _ = self.client.send_keys(&pane, "C-c");
-                std::thread::sleep(Duration::from_secs(1));
-                let _ = self.client.send_keys(&pane, "C-c");
-                let deadline = std::time::Instant::now() + Duration::from_secs(60);
-                while std::time::Instant::now() < deadline {
-                    if self.client.pane_is_idle_shell(&pane)? {
-                        shelled = true;
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-            }
-            if !shelled {
-                return Err(fail(format!(
-                    "'{agent_name}' did not exit to a bare shell; it was not restarted"
-                )));
-            }
+            self.exit_to_shell(agent_name, &pane, when_idle, wait_timeout)?;
         }
         let old_pid = identity.as_ref().map(|id| id.pid);
         let result = self.revive(agent_name, false, Some(&record.token), startup_timeout)?;
@@ -2345,6 +2362,48 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "notified": notified,
             "peers": peers,
         }))
+    }
+
+    /// Exit every running agent at an idle turn boundary and record what
+    /// restore needs to bring the identical layout back (R3 gentle
+    /// shutdown): per lane, its pane and recorded session. The caller is
+    /// never exited; run this from an external helper.
+    pub fn shutdown_team(&self, caller: &str, wait_timeout: Duration) -> Result<Value> {
+        let names = crate::subagents::control::restore_agent_names(&self.registry);
+        let mut rows = Vec::new();
+        for name in &names {
+            if name == caller {
+                rows.push(json!({"name": name, "action": "skipped", "reason": "the caller is never exited"}));
+                continue;
+            }
+            let record = match self.load(name) {
+                Ok(record) => record,
+                Err(error) => {
+                    rows.push(
+                        json!({"name": name, "action": "failed", "reason": error.to_string()}),
+                    );
+                    continue;
+                }
+            };
+            if record.lifecycle != "running" || record.agentcloud.is_some() {
+                continue;
+            }
+            let session = record
+                .native_session
+                .as_ref()
+                .map(|native| native.value.clone())
+                .or_else(|| record.session_value.clone())
+                .or_else(|| record.resume.clone());
+            let Some(pane) = record.pane_id.clone() else {
+                rows.push(json!({"name": name, "action": "failed", "reason": "no recorded pane", "session": session}));
+                continue;
+            };
+            match self.exit_to_shell(name, &pane, true, wait_timeout) {
+                Ok(()) => rows.push(json!({"name": name, "action": "exited", "pane_id": record.pane_id, "session": session})),
+                Err(error) => rows.push(json!({"name": name, "action": "failed", "reason": error.to_string(), "pane_id": record.pane_id, "session": session})),
+            }
+        }
+        Ok(json!({"caller": caller, "agents": rows}))
     }
 
     /// Restart every agent managed by `caller`, workers first and never the

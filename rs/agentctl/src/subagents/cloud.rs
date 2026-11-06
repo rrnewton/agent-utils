@@ -2458,6 +2458,49 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     }
 }
 
+impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
+    /// Restart an agentcloud agent in place (R3): halt its session, resume
+    /// it from the same session id, and keep the record and pane. Refuses
+    /// when no session was recorded.
+    pub fn restart_cloud(&self, agent_name: &str) -> Result<Value> {
+        let mut record = self.load(agent_name)?;
+        let Some(session) = record.session_value.clone() else {
+            return Err(fail(format!(
+                "no agentcloud session recorded for '{agent_name}'; refusing to restart without one"
+            )));
+        };
+        let endpoint = self.persist_endpoint(&mut record)?;
+        let executable = resolve_tool(&self.cloud_tools.agentcloudctl, "--agentcloudctl-bin")?;
+        for verb in ["halt", "resume"] {
+            let run = run_tool(
+                &executable,
+                &with_endpoint(
+                    vec![verb.to_owned(), "--session".to_owned(), session.clone()],
+                    &endpoint,
+                ),
+                control_timeout(),
+                self.child_session(),
+            )?;
+            if run.code != Some(0) {
+                return Err(fail(format!(
+                    "agentcloud {verb} failed for '{agent_name}': {}; the record was kept",
+                    failure(verb, &run)
+                )));
+            }
+        }
+        if let Some(cloud) = record.agentcloud.as_mut() {
+            cloud.halted = false;
+        }
+        self.save(&record)?;
+        Ok(json!({
+            "name": agent_name,
+            "action": "restarted",
+            "session": session,
+            "pane_id": record.pane_id,
+        }))
+    }
+}
+
 fn push_value(arguments: &mut Vec<String>, flag: &str, value: Option<&str>) {
     if let Some(value) = value {
         arguments.extend([flag.to_owned(), value.to_owned()]);

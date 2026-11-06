@@ -213,6 +213,11 @@ enum Commands {
         after_help = "Example: agentctl restart reviewer --when-idle\n\nExits the harness gracefully at an idle turn boundary, relaunches it in the same pane/tab resuming its recorded session, re-pins it, restores its Herdr name, transfers its wrkslots slot ownership, and queues a re-arm notice (background shells, monitors and session crons do not survive a restart). Refuses with nothing changed when the session is unknown or contradicts the running argv, when input is queued, or when the harness shows a background-task exit dialog."
     )]
     Restart(Restart),
+    /// Exit every running agent at an idle turn boundary, recording sessions and panes for restore
+    #[command(
+        after_help = "Example: agentctl shutdown --wait 600\n\nGentle Herdr-server shutdown: every running local agent is exited at an idle turn boundary (never the caller), and the report records each lane's pane and session so `agentctl restore` can bring the identical layout back. Run it from an external helper, not from a session it would exit."
+    )]
+    Shutdown(Shutdown),
     /// List registered agents with live status or an explicit probe error
     #[command(after_help = "Example: agentctl list --registry .agentctl")]
     List,
@@ -1044,6 +1049,13 @@ struct Restart {
     /// Startup-readiness deadline in seconds, greater than 0 and at most 300 (default: 30)
     #[arg(long, default_value = "30", value_parser = startup_seconds, value_name = "SECONDS")]
     startup_timeout: f64,
+}
+
+#[derive(Args)]
+struct Shutdown {
+    /// How long each agent may take to become idle in seconds (default: 600)
+    #[arg(long, default_value = "600", value_name = "SECONDS")]
+    wait: f64,
 }
 
 #[derive(Args)]
@@ -4328,6 +4340,10 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 manager.bring_coordinator_tab_forward(name, tab_socket);
                 result
             }
+        }
+        Commands::Shutdown(value) => {
+            let caller = std::env::var("AGENTCTL_AGENT").unwrap_or_default();
+            manager.shutdown_team(&caller, Duration::from_secs_f64(value.wait))?
         }
         Commands::List => json!(manager.list()?),
         Commands::Status(value) => manager.status(&value.name)?,
