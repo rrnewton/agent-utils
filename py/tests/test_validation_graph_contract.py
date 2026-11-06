@@ -8,6 +8,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from types import ModuleType
@@ -884,6 +885,74 @@ def test_the_keep_going_flag_reaches_the_graph_run(
     assert validate.main(["--all", "--keep-going"]) == 1
     assert validate.main(["--all"]) == 1
     assert seen == [True, False]
+
+
+# ---- `#941 gate-pytest-basetemp-leak`: each run owns its pytest temp root ----------------------
+
+
+def test_each_run_owns_a_pytest_temp_root_and_removes_it_read_only_parts_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    validate = _validate_module()
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    monkeypatch.setattr(validate.tempfile, "tempdir", str(temp))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))  # no host settings file
+    roots: list[Path] = []
+
+    def fake_run(*_args: object, pytest_root: Path | None = None, **_kw: object) -> int:
+        assert pytest_root is not None and pytest_root.is_dir()
+        assert pytest_root.parent == temp
+        assert pytest_root.name.startswith(f"{validate.PYTEST_ROOT_PREFIX}{os.getpid()}-")
+        # What a permissions test leaves in its basetemp: a directory nobody may enter.
+        locked = pytest_root / "pytest-of-user" / "pytest-0" / "test_x0" / "locked"
+        locked.mkdir(parents=True)
+        (locked / "file").write_text("x", encoding="utf-8")
+        locked.chmod(0)
+        roots.append(pytest_root)
+        return 1
+
+    monkeypatch.setattr(validate, "run", fake_run)
+    assert validate.main(["--all"]) == 1
+    assert validate.main(["--all"]) == 1
+    first, second = roots
+    assert first != second, "concurrent or successive runs never share a root"
+    assert not first.exists() and not second.exists()
+    assert list(temp.iterdir()) == []
+
+
+def test_the_graph_runs_with_the_pytest_temp_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    validate = _validate_module()
+    environments: list[dict[str, str]] = []
+
+    def capture(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        env = kwargs.get("env")
+        assert isinstance(env, dict)
+        environments.append(env)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(validate.subprocess, "run", capture)
+    assert validate.run(frozenset(), frozenset(), all_contract=True, pytest_root=tmp_path) == 0
+    assert environments[0][validate.PYTEST_TEMPROOT_ENV] == str(tmp_path)
+
+
+def test_a_stale_root_of_a_dead_run_is_swept_and_live_or_fresh_ones_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    validate = _validate_module()
+    monkeypatch.setattr(validate.tempfile, "tempdir", str(tmp_path))
+    old = time.time() - validate.STALE_PYTEST_ROOT_SECONDS - 60
+    dead = tmp_path / f"{validate.PYTEST_ROOT_PREFIX}999999999-abc"
+    live = tmp_path / f"{validate.PYTEST_ROOT_PREFIX}{os.getpid()}-abc"
+    fresh = tmp_path / f"{validate.PYTEST_ROOT_PREFIX}999999998-abc"
+    for root in (dead, live, fresh):
+        (root / "pytest-of-user").mkdir(parents=True)
+    for root in (dead, live):
+        os.utime(root, (old, old))
+    assert validate.sweep_stale_pytest_roots() == [dead]
+    assert not dead.exists() and live.exists() and fresh.exists()
 
 
 def _workflow(name: str) -> dict[str, object]:

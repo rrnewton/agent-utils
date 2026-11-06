@@ -41,20 +41,35 @@ environment wins. Each run prints the file and the keys it set, never their valu
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shlex
+import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
+from types import FrameType
 from typing import NamedTuple
 
 import case_timings
 from run_component_tests import Manifest, components_for_paths, load_manifest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+#: The variable pytest reads for the root of its numbered temp directories (#941
+#: gate-pytest-basetemp-leak). Without it every pytest process numbers its own basetemp under
+#: the shared ``/tmp/pytest-of-USER``, where its keep-three retention never catches up.
+PYTEST_TEMPROOT_ENV = "PYTEST_DEBUG_TEMPROOT"
+#: Prefix of one validation run's private pytest temp root, in the system temp directory.
+PYTEST_ROOT_PREFIX = "validate-pytest-"
+#: How long a root a killed run left behind must stand untouched before a later run removes it.
+STALE_PYTEST_ROOT_SECONDS = 24 * 3600
 
 
 DOCS = "docs"
@@ -787,6 +802,7 @@ def run(
     host: Mapping[str, str] | None = None,
     keep_going: bool = False,
     gate_exclusive_phases: tuple[list[str], list[str]] | None = None,
+    pytest_root: Path | None = None,
 ) -> int:
     """Execute one flattened dagrun graph for the selected contract.
 
@@ -798,6 +814,8 @@ def run(
     failure. `#362 ci-failure-masking`. Steps labelled `gate-exclusive` run after the
     main phase, one at a time under one fresh `gate.py --exclusive` admission, so no
     other gate's steps — and none of their own siblings — share the host with them.
+    With `pytest_root`, every pytest process in the graph keeps its temp directories there
+    (``pytest_temp_root``).
     """
 
     cpu_count = os.cpu_count() or 1
@@ -824,6 +842,8 @@ def run(
     env.update(host or {})
     if coverage_dir is not None:
         env[CROSS_COVERAGE_ENV] = str(coverage_dir)
+    if pytest_root is not None:
+        env[PYTEST_TEMPROOT_ENV] = str(pytest_root)
     if timing_dir is not None:
         env[case_timings.TIMING_DIR_ENV] = str(timing_dir)
         # An ambient nested marker would classify the whole run as an
@@ -890,6 +910,87 @@ def run(
     if result != 0:
         print("\nvalidate: FAILED in flattened validation DAG", file=sys.stderr)
     return result
+
+
+def _restore_owner_access(path: Path) -> None:
+    """Make a test-written tree removable without following its symlinks."""
+    if path.is_symlink() or not path.exists():
+        return
+    path.chmod(path.stat().st_mode | stat.S_IRWXU)
+    if path.is_dir():
+        for child in path.iterdir():
+            _restore_owner_access(child)
+
+
+def remove_test_tree(path: Path) -> None:
+    """Remove a tree tests wrote, including parts a permissions test made read-only."""
+    if not path.exists():
+        return
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        _restore_owner_access(path)
+        shutil.rmtree(path)
+
+
+def sweep_stale_pytest_roots(now: float | None = None) -> list[Path]:
+    """Remove the pytest temp roots killed runs left behind; returns what was removed.
+
+    A root is stale once it is this user's, has stood untouched for
+    ``STALE_PYTEST_ROOT_SECONDS``, and the process its name records is gone. A live run's
+    root is never touched, whatever its age.
+    """
+    moment = time.time() if now is None else now
+    removed: list[Path] = []
+    for path in sorted(Path(tempfile.gettempdir()).glob(f"{PYTEST_ROOT_PREFIX}*")):
+        try:
+            metadata = path.lstat()
+        except OSError:
+            continue
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or moment - metadata.st_mtime < STALE_PYTEST_ROOT_SECONDS
+        ):
+            continue
+        owner = path.name[len(PYTEST_ROOT_PREFIX):].split("-", 1)[0]
+        if owner.isdigit() and Path("/proc", owner).exists():
+            continue
+        try:
+            remove_test_tree(path)
+        except OSError as error:
+            print(f"validate: could not remove stale pytest root {path}: {error}", file=sys.stderr)
+            continue
+        removed.append(path)
+    return removed
+
+
+@contextlib.contextmanager
+def pytest_temp_root() -> Iterator[Path]:
+    """A private root for one run's pytest temp directories, removed when the run ends.
+
+    `#941 gate-pytest-basetemp-leak`. Every pytest process of the run, shards and nested
+    sessions alike, numbers its basetemp under ``ROOT/pytest-of-USER`` (pytest's numbering
+    and locking keep concurrent processes apart), so no run numbers, prunes or deletes
+    another's. The root goes when the run ends, passed or failed, including directories a
+    test made read-only. A SIGTERM ends the run through the same cleanup; a root that a
+    harder kill left behind is removed by a later run once it is stale.
+    """
+    sweep_stale_pytest_roots()
+    root = Path(tempfile.mkdtemp(prefix=f"{PYTEST_ROOT_PREFIX}{os.getpid()}-"))
+
+    def terminate(signum: int, _frame: FrameType | None) -> None:
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield root
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        try:
+            remove_test_tree(root)
+        except OSError as error:
+            print(f"validate: could not remove pytest root {root}: {error}", file=sys.stderr)
 
 
 def report(
@@ -1792,6 +1893,7 @@ def main(argv: list[str] | None = None) -> int:
     with (
         tempfile.TemporaryDirectory(prefix="validate-cross-coverage-") as coverage,
         tempfile.TemporaryDirectory(prefix="validate-case-timings-") as timings,
+        pytest_temp_root() as pytest_root,
     ):
         code = run(
             selected,
@@ -1802,6 +1904,7 @@ def main(argv: list[str] | None = None) -> int:
             host=host,
             keep_going=args.keep_going,
             gate_exclusive_phases=phases if phases[1] else None,
+            pytest_root=pytest_root,
         )
         if code != 0:
             return code
