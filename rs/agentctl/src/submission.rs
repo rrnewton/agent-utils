@@ -1555,22 +1555,14 @@ pub fn submit_verified(
             // grace rather than stranding the paste; Enter needs a view.
             prev_tail = Some(bottom_region(&screen));
         }
-        // A lost paste on an idle pane with a visibly empty composer
-        // will not render late: end the grace at the first stage window.
-        if runtime.monotonic() >= stage_deadline {
-            if let Some(view) = &view {
-                if composer_draft(view).is_none()
-                    && running_turn(&screen) == Some(false)
-                    && !static_tail_holds(&screen, text)
-                {
-                    return Err(AdapterError::unavailable(format!(
-                        "pane {pane_id}: pasted prompt was not observed in the {harness} composer within \
-                         {:.1}s and the composer is empty; no submission key was sent",
-                        timeouts.stage.as_secs_f64()
-                    )));
-                }
-            }
-        }
+        // No early give-up on an idle pane with a visibly empty composer:
+        // a paste to an idle or done Claude Code pane can render after the
+        // in-lock stage window, and giving up here quarantines the prompt as
+        // possibly submitted while its paste is still on its way, stranding
+        // it in the composer with no later pass able to flush it. Idle panes
+        // therefore take the same path as busy ones: the grace deadline
+        // below reports the paste stranded (never typed again, flushed by a
+        // later pass once it shows) instead of an unknown outcome.
         let now = runtime.monotonic();
         if now >= grace_deadline {
             if timeouts.stage_grace.is_zero() {
@@ -3864,6 +3856,31 @@ mod tests {
         );
         assert!(reason.contains("late_paste:"), "{reason}");
         assert!(reason.contains("the composer showed"), "{reason}");
+        assert!(
+            elapsed <= STAGE_IN_LOCK + Duration::from_secs(1),
+            "{elapsed:?}"
+        );
+        assert!(screen.state().keys.is_empty());
+        assert_eq!(screen.state().pastes.len(), 1);
+    }
+
+    #[test]
+    fn an_unobserved_paste_on_an_idle_pane_under_the_locks_is_reported_stranded() {
+        // A paste to an idle or done Claude Code pane can render after the
+        // in-lock stage window (its composer is verifiably empty at the
+        // deadline). It is reported stranded like a busy pane's, so the
+        // prompt stays pending and a later pass flushes the paste once it
+        // shows; it is never quarantined as possibly submitted.
+        let screen = FakeScreen::new("claude", false);
+        screen.state().paste_visible_after_reads = u32::MAX;
+        let (outcome, elapsed) =
+            submit_with(&screen, "late paste on an idle pane", in_lock_timeouts());
+        let reason = refusal(outcome);
+        assert!(
+            crate::unknown_harness::is_stranded_prompt(&reason),
+            "{reason}"
+        );
+        assert!(reason.contains("late_paste:"), "{reason}");
         assert!(
             elapsed <= STAGE_IN_LOCK + Duration::from_secs(1),
             "{elapsed:?}"

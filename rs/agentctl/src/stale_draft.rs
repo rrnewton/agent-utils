@@ -13,8 +13,9 @@
 //! as the harness draws it, the text of one of the last [`RECENT_DELIVERIES`] prompts this
 //! agent's queue records as typed (in `processed/` or `failed/`; `inflight/` holds the prompt
 //! being delivered now, and a prompt quarantined as typed into the wrong program never counts),
-//! or several of them in the order they were typed, and each must open with a sender header (or
-//! be a batch of queued messages, which do). Only such a draft is submitted. Any other draft may
+//! or several of them in the order they were typed, and each must open with a sender header, be
+//! one of agentctl's own `[agentctl ...]` notices (which are queued without one), or be a batch
+//! of queued messages, which do. Only such a draft is submitted. Any other draft may
 //! be a person typing, so it is never submitted or cleared, only reported. A prompt a harness
 //! puts back comes back soon after it was typed, and every later delivery is refused while it is
 //! there, so it is among the last few; an older prompt a person recalled into the editor with
@@ -223,11 +224,14 @@ fn without_sent_fields(compacted: &str) -> String {
     out
 }
 
-/// Whether a recorded prompt is one agentctl framed: its first line is a sender header, or it is
+/// Whether a recorded prompt is one agentctl framed: its first line is a sender header, one of
+/// agentctl's own notices (the `[agentctl watch-agents]`, `[agentctl restore]` and
+/// `[agentctl watch]` prompts the suite queues without a sender header), or it is
 /// a batch of queued messages, each of which opens with one.
 fn framed(text: &str) -> bool {
     let first = text.lines().next().unwrap_or_default();
     crate::sender_header::parse(first).is_some()
+        || first.starts_with("[agentctl ")
         || first
             .strip_suffix(" queued messages:")
             .is_some_and(|count| {
@@ -895,6 +899,40 @@ message number {index:02}"
         assert!(find(queue, &Draft::Text(text.clone()), Vouching::Recent, later).is_some());
         let much_later = now + TEXT_LOOKBACK + Duration::from_secs(60);
         assert!(find(queue, &Draft::Text(text), Vouching::Recent, much_later).is_none());
+    }
+
+    #[test]
+    fn an_agentctl_notice_typed_recently_is_found() {
+        // The suite's own notices are queued without a sender header; a
+        // quarantined one still vouches for its draft, so a late paste of a
+        // notice stranded in the composer is flushed instead of wedging
+        // every later prompt behind an unattributed draft.
+        let directory = Scratch::new("notice");
+        let queue = directory.0.as_path();
+        let text = "[agentctl watch-agents] probe finished its turn:\n- probe: finished its turn with a verdict (DONE: ok)\nRead its reply, then give it its next task or stop it.";
+        record(
+            queue,
+            "failed",
+            "agent-watch-probe-0003",
+            &json!({"text": text, "inflight_at": 1_793_515_539.158}),
+        );
+        let now = SystemTime::now();
+        let found = find(
+            queue,
+            &Draft::Text(text.to_owned()),
+            Vouching::Unproven,
+            now,
+        )
+        .expect("notice found");
+        assert_eq!(found.id, "agent-watch-probe-0003");
+        // A draft that merely opens like a notice agentctl never queued is not.
+        assert!(find(
+            queue,
+            &Draft::Text("[agentctl watch-agents] a notice nobody sent".into()),
+            Vouching::Unproven,
+            now
+        )
+        .is_none());
     }
 
     #[test]
