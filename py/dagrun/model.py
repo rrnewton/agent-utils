@@ -423,7 +423,7 @@ class Step:
         """Return every step tag this step waits on: completion ``deps``
         first, then artifact producers from ``artifact_deps``. The one
         edge list for graph walks (cycle checks, transitive closure,
-        selection), mirroring the Rust build."""
+        selection), mirroring the other edition's build."""
         return tuple(self.deps) + tuple(dep.step for dep in self.artifact_deps)
 
     def effective_result_manifests(self) -> tuple[DagManifest, ...]:
