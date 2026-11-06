@@ -34,12 +34,12 @@
 //! Codex draw `[Pasted Content N chars]`, Claude Code (and Codex for a paste of many lines)
 //! `[Pasted text #K +M lines]`. A character-count draft matches only the very last prompt
 //! typed, of exactly that size, within [`PLACEHOLDER_LOOKBACK`], a shorter window than
-//! [`TEXT_LOOKBACK`] for a draft whose text shows. A numbered draft matches, among the last
-//! [`RECENT_DELIVERIES`] prompts, the one holding its exact recorded `paste_label` (#808),
+//! [`TEXT_LOOKBACK`] for a draft whose text shows. A numbered draft matches, among every
+//! record in its lookback, the one holding its exact recorded `paste_label` (#808),
 //! or, when a record holds no label (its paste never showed in the composer, as on a busy
 //! pane), one whose size the one shared line-count matcher accepts; looking only at the
-//! latest delivery stranded an older delivery's chip behind every later prompt (#884
-//! follow-up busy-evidence). A
+//! latest few deliveries stranded an older delivery's chip behind every later prompt on
+//! a busy pane, whose dozens of deliveries an hour evict it within minutes. A
 //! composer holding several returned prompts at once — concatenated placeholders, or a
 //! placeholder beside the literal start of another delivery — is agentctl's when every piece
 //! matches a different recent delivery that way (#825 agentctl-stranded-multi-paste); any
@@ -415,9 +415,13 @@ pub(crate) fn find(
     let (lookback, deliveries) = match draft {
         Draft::Text(_) => (TEXT_LOOKBACK, RECENT_DELIVERIES),
         // A numbered chip may be an older delivery's paste returned to the
-        // composer, not only the latest one's (#884 follow-up busy-evidence);
-        // a bare character count still vouches only for the very last (#720).
-        Draft::PastedLines(_) => (PLACEHOLDER_LOOKBACK, RECENT_DELIVERIES),
+        // composer, not only the latest one's (#884 follow-up busy-evidence).
+        // On a busy pane dozens of deliveries an hour evict it from the
+        // newest few within minutes, so a numbered chip searches every
+        // record in its lookback (capped by MAX_RECORDS): its paste number
+        // or exact line count still has to match. A bare character count
+        // still vouches only for the very last (#720).
+        Draft::PastedLines(_) => (PLACEHOLDER_LOOKBACK, MAX_RECORDS),
         Draft::Placeholder(_) => (PLACEHOLDER_LOOKBACK, 1),
     };
     // The records of the latest deliveries, latest first: a batch's members share one
@@ -986,6 +990,43 @@ message number {index:02}"
             &Draft::Text("[agentctl watch-agents] a notice nobody sent".into()),
             Vouching::Unproven,
             now
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_numbered_chip_is_found_beyond_the_newest_deliveries() {
+        // Busy pane: dozens of deliveries an hour evict the chip's record
+        // from the newest few within minutes. Its paste number was never
+        // recorded (the paste never showed during its own stage window),
+        // so only its exact line count can vouch — over the whole lookback.
+        let directory = Scratch::new("chip-evicted");
+        let queue = directory.0.as_path();
+        let owner = "[from lane-a via agentctl · reply: agentctl send lane-a]\none\ntwo\nthree\nfour\nfive\nsix\nseven\neight";
+        record(
+            queue,
+            "processed",
+            "chip-owner",
+            &json!({"text": owner, "inflight_at": 1_793_515_000.0}),
+        );
+        for index in 0..6 {
+            record(
+                queue,
+                "processed",
+                &format!("newer-{index}"),
+                &json!({"text": format!("[from lane-b via agentctl · reply: agentctl send lane-b]\nnewer {index}"), "inflight_at": 1_793_516_000.0 + index as f64}),
+            );
+        }
+        let draft = Draft::from_composer("[Pasted text #216 +8 lines]");
+        let found = find(queue, &draft, Vouching::Unproven, SystemTime::now())
+            .expect("evicted chip owner found");
+        assert_eq!(found.id, "chip-owner");
+        // A chip whose size no typed record matches is still foreign.
+        assert!(find(
+            queue,
+            &Draft::from_composer("[Pasted text #217 +40 lines]"),
+            Vouching::Unproven,
+            SystemTime::now()
         )
         .is_none());
     }
