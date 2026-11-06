@@ -389,7 +389,7 @@ enum CoordinatorCommand {
 }
 
 #[derive(Args)]
-#[command(group(clap::ArgGroup::new("manager").args(["by", "clear"])))]
+#[command(group(clap::ArgGroup::new("manager").args(["by", "clear", "pin", "unpin"])))]
 struct Manage {
     #[command(flatten)]
     agent: Named,
@@ -399,6 +399,12 @@ struct Manage {
     /// Remove the manager; the agent then answers to the designated coordinator
     #[arg(long)]
     clear: bool,
+    /// Record the agent as pinned, a persistent lane (#917 chat-bang-commands)
+    #[arg(long)]
+    pin: bool,
+    /// Remove the explicit pinned flag; the derived classification applies again
+    #[arg(long)]
+    unpin: bool,
 }
 
 #[derive(Args)]
@@ -1221,6 +1227,9 @@ struct Start {
     /// Record no created_by or managed_by edge naming the calling agent (default: record them when the caller is a registered agent of this registry; a profile's "record_edges": false does the same)
     #[arg(long)]
     no_edges: bool,
+    /// Record the agent as pinned, a persistent lane (default: the profile's "pinned", else unpinned) (#917 chat-bang-commands)
+    #[arg(long)]
+    pinned: bool,
     /// Seconds to wait for harness startup, greater than zero and at most 300; also bounds the wait for the new tab's shell when Herdr refuses the launch as agent_pane_busy. When Herdr's own wait for a Codex harness times out, agentctl keeps checking the pane for an idle composer for up to the same time again (at most 15 seconds more); a start that still fails reports Herdr's agent kind and status, whether the name was applied, and the last screen rows
     #[arg(long, default_value = "30", value_parser = startup_seconds)]
     startup_timeout: f64,
@@ -3801,95 +3810,104 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             .filter_map(|(present, flag)| present.then_some(flag))
             .collect::<Vec<_>>();
             let mut record_edges = !value.no_edges;
-            let (harness, mode, model, reasoning_effort, harness_args, environment, cloud) =
-                if let Some(profile_name) = value.profile.as_deref() {
-                    let mut overlaps = Vec::new();
-                    if value.mode.is_some() {
-                        overlaps.push("--mode");
-                    }
-                    if value.harness.is_some() {
-                        overlaps.push("--harness");
-                    }
-                    if value.model.is_some() {
-                        overlaps.push("--model");
-                    }
-                    if value.reasoning_effort.is_some() {
-                        overlaps.push("--reasoning-effort");
-                    }
-                    if !value.harness_args.is_empty() {
-                        overlaps.push("--harness-arg");
-                    }
-                    if !value.environment.is_empty() {
-                        overlaps.push("--env");
-                    }
-                    overlaps.extend_from_slice(&cloud_flags);
-                    if !overlaps.is_empty() {
+            let (
+                harness,
+                mode,
+                model,
+                reasoning_effort,
+                harness_args,
+                environment,
+                cloud,
+                profile_pinned,
+            ) = if let Some(profile_name) = value.profile.as_deref() {
+                let mut overlaps = Vec::new();
+                if value.mode.is_some() {
+                    overlaps.push("--mode");
+                }
+                if value.harness.is_some() {
+                    overlaps.push("--harness");
+                }
+                if value.model.is_some() {
+                    overlaps.push("--model");
+                }
+                if value.reasoning_effort.is_some() {
+                    overlaps.push("--reasoning-effort");
+                }
+                if !value.harness_args.is_empty() {
+                    overlaps.push("--harness-arg");
+                }
+                if !value.environment.is_empty() {
+                    overlaps.push("--env");
+                }
+                overlaps.extend_from_slice(&cloud_flags);
+                if !overlaps.is_empty() {
+                    return Err(Failure::Usage(format!(
+                        "--profile conflicts with explicit launch settings: {}",
+                        overlaps.join(", ")
+                    )));
+                }
+                let root = crate::profiles::configuration_root(&value.cwd, &args.registry, false)?;
+                let (_, profiles) = crate::profiles::load_profiles(&root, false)?;
+                let profile = profiles.get(profile_name).ok_or_else(|| {
+                    Failure::Usage(format!(
+                        "unknown profile {profile_name:?}; run agentctl profiles --cwd {}",
+                        value.cwd.display()
+                    ))
+                })?;
+                if profile.record_edges == Some(false) {
+                    record_edges = false;
+                }
+                (
+                    profile.harness.clone(),
+                    profile.mode.clone(),
+                    profile.model.clone(),
+                    profile.reasoning_effort.clone(),
+                    profile.argv.clone(),
+                    profile.environment.clone(),
+                    profile.cloud.clone(),
+                    profile.pinned,
+                )
+            } else {
+                let harness = value.harness.unwrap_or_else(|| "codex".to_owned());
+                let cloud = if harness == "agentcloud" {
+                    Some(CloudLaunch {
+                        unknown: Default::default(),
+                        harness: value.cloud_harness,
+                        provision: value.provision,
+                        envspec: value.envspec,
+                        purpose: value.purpose,
+                        workspace: value.cloud_workspace,
+                        node_id: value.node_id,
+                        title: value.cloud_title,
+                    })
+                } else {
+                    if !cloud_flags.is_empty() {
                         return Err(Failure::Usage(format!(
-                            "--profile conflicts with explicit launch settings: {}",
-                            overlaps.join(", ")
+                            "{} apply only with --harness agentcloud",
+                            cloud_flags.join(", ")
                         )));
                     }
-                    let root =
-                        crate::profiles::configuration_root(&value.cwd, &args.registry, false)?;
-                    let (_, profiles) = crate::profiles::load_profiles(&root, false)?;
-                    let profile = profiles.get(profile_name).ok_or_else(|| {
-                        Failure::Usage(format!(
-                            "unknown profile {profile_name:?}; run agentctl profiles --cwd {}",
-                            value.cwd.display()
-                        ))
-                    })?;
-                    if profile.record_edges == Some(false) {
-                        record_edges = false;
-                    }
-                    (
-                        profile.harness.clone(),
-                        profile.mode.clone(),
-                        profile.model.clone(),
-                        profile.reasoning_effort.clone(),
-                        profile.argv.clone(),
-                        profile.environment.clone(),
-                        profile.cloud.clone(),
-                    )
-                } else {
-                    let harness = value.harness.unwrap_or_else(|| "codex".to_owned());
-                    let cloud = if harness == "agentcloud" {
-                        Some(CloudLaunch {
-                            unknown: Default::default(),
-                            harness: value.cloud_harness,
-                            provision: value.provision,
-                            envspec: value.envspec,
-                            purpose: value.purpose,
-                            workspace: value.cloud_workspace,
-                            node_id: value.node_id,
-                            title: value.cloud_title,
-                        })
-                    } else {
-                        if !cloud_flags.is_empty() {
-                            return Err(Failure::Usage(format!(
-                                "{} apply only with --harness agentcloud",
-                                cloud_flags.join(", ")
-                            )));
-                        }
-                        crate::profiles::validate_raw_harness_arguments(
-                            "launch",
-                            &harness,
-                            &value.harness_args,
-                            value.model.is_some(),
-                            value.reasoning_effort.is_some(),
-                            value.resume.is_some(),
-                        )?;
-                        None
-                    };
-                    (
-                        harness,
-                        value.mode.unwrap_or_else(|| "interactive".to_owned()),
-                        value.model,
-                        value.reasoning_effort,
-                        value.harness_args,
-                        value.environment,
-                        cloud,
-                    )
+                    crate::profiles::validate_raw_harness_arguments(
+                        "launch",
+                        &harness,
+                        &value.harness_args,
+                        value.model.is_some(),
+                        value.reasoning_effort.is_some(),
+                        value.resume.is_some(),
+                    )?;
+                    None
                 };
+                (
+                    harness,
+                    value.mode.unwrap_or_else(|| "interactive".to_owned()),
+                    value.model,
+                    value.reasoning_effort,
+                    value.harness_args,
+                    value.environment,
+                    cloud,
+                    None,
+                )
+            };
             if mode == "headless" && harness == "claude" && value.profile.is_none() {
                 let brief = match value.file {
                     Some(path) => Some(
@@ -3978,6 +3996,11 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     cloud,
                     slot,
                     record_edges,
+                    pinned: if value.pinned {
+                        Some(true)
+                    } else {
+                        profile_pinned
+                    },
                 };
                 let started = if let Some(effort) = reasoning_effort.as_deref() {
                     manager.start_with_reasoning_effort(
@@ -4024,10 +4047,12 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         },
         Commands::Manage(value) => manager.manage(
             &value.agent.name,
-            match (value.by, value.clear) {
-                (Some(manager), _) => ManageAction::By(manager),
-                (None, true) => ManageAction::Clear,
-                (None, false) => ManageAction::Caller,
+            match (value.by, value.clear, value.pin, value.unpin) {
+                (_, _, true, _) => ManageAction::Pin,
+                (_, _, _, true) => ManageAction::Unpin,
+                (Some(manager), _, _, _) => ManageAction::By(manager),
+                (None, true, _, _) => ManageAction::Clear,
+                (None, false, _, _) => ManageAction::Caller,
             },
         )?,
         Commands::Tree(value) => {

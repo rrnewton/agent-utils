@@ -367,11 +367,15 @@ fn the_tree_hangs_every_agent_under_its_manager_and_the_rest_under_the_coordinat
     assert_eq!(lieutenant["children"][0]["name"], "worker");
     assert_eq!(lieutenant["children"][0]["harness_pid"], Value::Null);
     assert_eq!(roots[0]["children"][1]["control"], "unmanaged");
+    assert_eq!(roots[0]["pinned"], true);
+    assert_eq!(roots[0]["pinned_source"], "coordinator");
+    assert_eq!(lieutenant["pinned"], true);
+    assert_eq!(lieutenant["pinned_source"], "manager");
     let text = render_tree(&tree);
     assert_eq!(
         text,
-        "coordinator (designated coordinator; running)\n\
-         ├── lieutenant (running)\n\
+        "coordinator (designated coordinator; running; pinned)\n\
+         ├── lieutenant (running; pinned)\n\
          │   └── worker (running)\n\
          └── loner (running; no manager recorded)\n"
     );

@@ -5304,6 +5304,16 @@ where
                         admission.rejection_saves.dropped,
                     ));
                 }
+                if !admission.bang_posts.is_empty() {
+                    match state.flush_bang_posts() {
+                        Ok(sent) => log(format_args!(
+                            "agentctl: chat bang: posted {sent} deterministic answer(s)"
+                        )),
+                        Err(error) => log(format_args!(
+                            "agentctl: chat bang: answer post failed, will retry: {error}"
+                        )),
+                    }
+                }
                 send_notice(
                     notices,
                     ProviderNotice::Batch(admission.new_request_keys),

@@ -34,6 +34,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::agent::{self, DrainOptions, QueueMessageState};
 use crate::subagents::{ManagedAgents, ManagedApi};
 
+mod bang;
 mod grants;
 mod held_replies;
 mod observe;
@@ -5529,6 +5530,19 @@ pub struct RelayDispatch {
     pub receipt_posted: bool,
 }
 
+/// One deterministic `!` answer waiting to be posted (#917 chat-bang-commands).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BangPost {
+    /// Deterministic outbound operation ID (see `bang::bang_operation_id`).
+    pub operation_id: String,
+    /// Provider channel to post in.
+    pub channel_id: String,
+    /// Thread to post in (the command message's thread).
+    pub thread_id: String,
+    /// Exact answer text.
+    pub body: String,
+}
+
 /// One bounded result of durably admitting an upstream acknowledgement unit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchAdmission {
@@ -5536,6 +5550,8 @@ pub struct BatchAdmission {
     pub new_request_keys: Vec<String>,
     /// Relay posts dispatched to their configured command (never requests).
     pub relay_dispatches: Vec<RelayDispatch>,
+    /// Deterministic `!` answers admitted in this batch, pending posting.
+    pub bang_posts: Vec<BangPost>,
     /// Independent, best-effort rejection feedback. Its errors never prevent cursor admission.
     pub rejection_saves: RejectionSaves,
     /// Whether any retained gap still requires request/response reconciliation.
@@ -5548,7 +5564,9 @@ pub struct BatchAdmission {
     batch_fingerprint: String,
 }
 
-/// Result of consuming exactly one item from an ordered subscription.
+/// Result of consuming exactly one item from an ordered subscription. One admission is
+/// produced per batch and consumed at once, never collected, so its size is not boxed.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConsumedItem {
     /// Provider liveness advanced without a durable cursor change.
@@ -6083,6 +6101,7 @@ impl BridgeState {
         for (directory, label) in [
             (root.join("requests"), "chat request directory"),
             (root.join("replies"), "chat reply directory"),
+            (root.join("bang-posts"), "chat bang post directory"),
             (
                 root.join("commit-receipts"),
                 "chat commit receipt directory",
@@ -6164,6 +6183,7 @@ impl BridgeState {
                 root.join("retirement-receipts"),
                 "chat retirement receipt directory",
             ),
+            (root.join("bang-posts"), "chat bang post directory"),
         ] {
             if fs::symlink_metadata(&directory).is_err() {
                 agent::create_private_directory(&directory, label, false, true)?;
@@ -8216,6 +8236,7 @@ impl BridgeState {
         let mut candidate_messages = BTreeMap::new();
         let mut rejection_candidates = Vec::new();
         let mut relay_dispatches: Vec<RelayDispatch> = Vec::new();
+        let mut bang_candidates: Vec<BangPost> = Vec::new();
         let mut request_bytes = 0_u64;
 
         for event in batch.events() {
@@ -8340,6 +8361,48 @@ impl BridgeState {
                             &source.sender_id,
                         ));
                         continue;
+                    }
+                    // Owner-only `!` commands (#917 chat-bang-commands): answered by the
+                    // bridge itself, never typed into a pane. With outbound off there is
+                    // no way to answer, so the text falls through to ordinary admission.
+                    if self.config.outbound_enabled {
+                        if let Some(command) = bang::parse_bang(message.text()) {
+                            let body = if permanent_owner {
+                                match &command {
+                                    bang::Bang::Help => bang::HELP_TEXT.to_owned(),
+                                    bang::Bang::Who(name) => {
+                                        let snapshot =
+                                            self.latency_registry.as_deref().map_or_else(
+                                                || bang::BangSnapshot {
+                                                    coordinator: None,
+                                                    host: "this host".to_owned(),
+                                                    agents: Vec::new(),
+                                                },
+                                                bang::snapshot,
+                                            );
+                                        match name {
+                                            Some(name) => bang::render_who_one(&snapshot, name),
+                                            None => bang::render_who(&snapshot),
+                                        }
+                                    }
+                                }
+                            } else {
+                                "That command is owner-only: `!` commands are handled by the \
+                                 bridge for the bridge's owners, and this message was not \
+                                 delivered to an agent."
+                                    .to_owned()
+                            };
+                            bang_candidates.push(BangPost {
+                                operation_id: bang::bang_operation_id(
+                                    &source.channel_id,
+                                    &source.message_id,
+                                ),
+                                channel_id: source.channel_id.clone(),
+                                thread_id: source.thread_id.clone(),
+                                body,
+                            });
+                            continue;
+                        }
                     }
                     if self
                         .ignored_text_prefixes
@@ -8505,6 +8568,25 @@ impl BridgeState {
             write_document(&self.request_path(&record.key), record)?;
             self.admission_boundary()?;
         }
+        let mut bang_posts: Vec<BangPost> = Vec::new();
+        for post in &bang_candidates {
+            let path = self.bang_post_path(&post.operation_id);
+            if fs::symlink_metadata(&path).is_err() {
+                if let Some(parent) = path.parent() {
+                    agent::create_private_directory(
+                        parent,
+                        "chat bang post directory",
+                        true,
+                        true,
+                    )?;
+                }
+                write_document(&path, post)?;
+            }
+            bang_posts.push(post.clone());
+        }
+        if !bang_posts.is_empty() {
+            agent::sync_directory(&self.root.join("bang-posts"))?;
+        }
         if !new_records.is_empty() {
             agent::sync_directory(&self.root.join("requests"))?;
             self.admission_boundary()?;
@@ -8557,6 +8639,7 @@ impl BridgeState {
         Ok(BatchAdmission {
             new_request_keys: new_records,
             relay_dispatches,
+            bang_posts,
             rejection_saves,
             reconciliation_required: checkpoint.reconciliation_required,
             host_batch_sequence,
@@ -14019,6 +14102,62 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
 
     fn request_path(&self, key: &str) -> PathBuf {
         self.root.join("requests").join(format!("{key}.json"))
+    }
+
+    fn bang_post_path(&self, operation_id: &str) -> PathBuf {
+        self.root
+            .join("bang-posts")
+            .join(format!("{operation_id}.json"))
+    }
+
+    /// Post every pending deterministic `!` answer (#917), oldest first, deleting each file
+    /// once the provider accepts it. The operation ID is deterministic, so a crash between
+    /// the post and the delete replays as the same operation, never a duplicate.
+    pub fn send_pending_bang_posts(
+        &self,
+        transport: &mut dyn ReplyTransport,
+    ) -> std::result::Result<usize, String> {
+        let directory = self.root.join("bang-posts");
+        let mut paths: Vec<PathBuf> = match fs::read_dir(&directory) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .collect(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.to_string()),
+        };
+        paths.sort();
+        let mut sent = 0_usize;
+        for path in paths {
+            let post: BangPost = read_document(&path, 65_536)
+                .map_err(|error| format!("pending bang post {}: {error}", path.display()))?;
+            let submission = ReplySubmission {
+                channel_id: &post.channel_id,
+                thread_id: &post.thread_id,
+                body: &post.body,
+                request_id: &post.operation_id,
+            };
+            transport
+                .send(submission)
+                .map_err(|error| format!("bang post {}: {error}", post.operation_id))?;
+            fs::remove_file(&path).map_err(|error| error.to_string())?;
+            sent += 1;
+        }
+        if sent > 0 {
+            let _ = agent::sync_directory(&directory);
+        }
+        Ok(sent)
+    }
+
+    /// [`Self::send_pending_bang_posts`] with this state's configured outbound transport;
+    /// `Ok(0)` when no helper is configured (posts stay pending).
+    pub fn flush_bang_posts(&self) -> std::result::Result<usize, String> {
+        match self.outbound_transport() {
+            Ok(Some(mut transport)) => self.send_pending_bang_posts(&mut transport),
+            Ok(None) => Ok(0),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     fn reply_artifact_keys(&self) -> Result<BTreeSet<String>> {
@@ -21152,6 +21291,108 @@ pub(crate) mod tests {
             ]))
             .is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn bang_batch(text: &str, sender: &str) -> DeliveryBatch {
+        let message = InboundMessage::new(
+            ChannelId::new("spaces/example").expect("channel"),
+            MessageId::new("spaces/example/messages/bang1").expect("message"),
+            ThreadId::new("spaces/example/threads/bang1").expect("thread"),
+            SenderId::new(sender).expect("sender"),
+            text,
+            "2026-09-21T12:00:00Z",
+            false,
+        )
+        .expect("normalized message");
+        DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor-bang").expect("cursor"),
+            DeliveryId::new("delivery-bang").expect("delivery"),
+            vec![CommittableEvent::message_created(message)],
+        )
+        .expect("bang delivery")
+    }
+
+    #[test]
+    fn bang_help_is_answered_by_the_bridge_and_never_admitted() {
+        let root = temporary("bang-help");
+        let state = BridgeState::initialize(&root, config()).unwrap();
+        let admission = state
+            .admit_batch(&bang_batch("!help", "users/owner"))
+            .unwrap();
+        assert!(admission.new_request_keys.is_empty());
+        assert_eq!(admission.bang_posts.len(), 1);
+        assert!(admission.bang_posts[0].body.contains("!who"));
+        assert_eq!(state.request_keys().unwrap().len(), 0);
+        assert!(root.join("bang-posts").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bang_from_a_grant_holder_is_refused_and_never_admitted() {
+        let root = temporary("bang-grant");
+        let state = BridgeState::initialize(&root, config()).unwrap();
+        state
+            .grant_senders(
+                &["users/grantee".to_owned()],
+                std::time::Duration::from_secs(3600),
+                None,
+            )
+            .unwrap();
+        let admission = state
+            .admit_batch(&bang_batch("!who", "users/grantee"))
+            .unwrap();
+        assert!(admission.new_request_keys.is_empty());
+        assert_eq!(admission.bang_posts.len(), 1);
+        assert!(admission.bang_posts[0].body.contains("owner-only"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bang_who_renders_the_registry_tree() {
+        // Registry fixture: coordinator coordb, lieutenant managing worker, one pinned worker.
+        let registry = temporary("bang-registry");
+        fs::create_dir_all(registry.join("agents")).unwrap();
+        let write_agent = |name: &str, record: Value| {
+            let dir = registry.join("agents").join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("agent.json"), record.to_string()).unwrap();
+        };
+        write_agent(
+            "coordb",
+            json!({"name":"coordb","token":"t-coord","lifecycle":"running","harness":"claude","model":"opus"}),
+        );
+        write_agent(
+            "lieutenant",
+            json!({"name":"lieutenant","token":"t-lt","lifecycle":"running","harness":"claude",
+                    "managed_by":{"agent":"coordb","registry":registry.display().to_string(),"token":"t-coord","proof":"assigned"}}),
+        );
+        write_agent(
+            "worker",
+            json!({"name":"worker","token":"t-w","lifecycle":"running","harness":"muse","model":"watermelon",
+                    "managed_by":{"agent":"lieutenant","registry":registry.display().to_string(),"token":"t-lt","proof":"assigned"}}),
+        );
+        write_agent(
+            "pinned-one",
+            json!({"name":"pinned-one","token":"t-p","lifecycle":"stopped","harness":"codex","pinned":true,
+                    "managed_by":{"agent":"coordb","registry":registry.display().to_string(),"token":"t-coord","proof":"assigned"}}),
+        );
+        fs::write(
+            registry.join("coordinator.json"),
+            json!({"schema":"agentctl-coordinator/v1","name":"coordb","token":"t-coord","set_at":0}).to_string(),
+        )
+        .unwrap();
+        let snapshot = bang::snapshot(&registry);
+        let who = bang::render_who(&snapshot);
+        assert!(who.contains("coordb"), "{who}");
+        assert!(who.contains("lieutenant"), "{who}");
+        assert!(who.contains("worker"), "{who}");
+        assert!(who.contains("Pinned"), "{who}");
+        let one = bang::render_who_one(&snapshot, "worker");
+        assert!(one.contains("managed by: lieutenant"), "{one}");
+        let missing = bang::render_who_one(&snapshot, "worke");
+        assert!(missing.contains("Near matches: worker"), "{missing}");
+        fs::remove_dir_all(registry).unwrap();
     }
 
     #[test]

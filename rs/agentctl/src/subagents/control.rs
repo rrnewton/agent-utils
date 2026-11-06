@@ -22,6 +22,8 @@ pub(crate) const DESIGNATION_SCHEMA: &str = "agentctl-coordinator/v1";
 const DESIGNATION_LOCK: &str = ".coordinator.lock";
 pub(crate) const CREATED_BY: &str = "created_by";
 pub(crate) const MANAGED_BY: &str = "managed_by";
+/// Record key for the explicit pinned (persistent lane) flag (#917 chat-bang-commands).
+pub(crate) const PINNED: &str = "pinned";
 const FORMER_TOKENS: &str = "former_tokens";
 /// Earlier tokens a record keeps; older generations' edges are treated as stale.
 const FORMER_TOKENS_MAX: usize = 32;
@@ -539,6 +541,55 @@ pub enum ManageAction {
     By(String),
     /// Remove the controller; the agent then answers to the designated coordinator.
     Clear,
+    /// Record the agent as pinned, a persistent lane (#917 chat-bang-commands).
+    Pin,
+    /// Remove the explicit pinned flag; the derived classification applies again.
+    Unpin,
+}
+
+/// Whether `record` counts as pinned for `!who` and `tree` (#917): the explicit flag wins;
+/// otherwise the designated coordinator, an agent in `restore.json` `agents[]`, or an agent
+/// that manages another agent counts as pinned. Returns the value and its source.
+pub(crate) fn pinned_classification(
+    record: &AgentRecord,
+    designated: Option<&str>,
+    restore_agents: &BTreeSet<String>,
+    has_children: bool,
+) -> (bool, &'static str) {
+    if let Some(value) = record.pinned_explicit() {
+        return (value, "explicit");
+    }
+    if Some(record.name.as_str()) == designated {
+        return (true, "coordinator");
+    }
+    if restore_agents.contains(&record.name) {
+        return (true, "restore");
+    }
+    if has_children {
+        return (true, "manager");
+    }
+    (false, "none")
+}
+
+/// The agent names `restore.json` lists as desired state, or none when it cannot be read.
+pub(crate) fn restore_agent_names(registry: &Path) -> BTreeSet<String> {
+    let Ok(text) = fs::read_to_string(registry.join("restore.json")) else {
+        return BTreeSet::new();
+    };
+    let Ok(document) = serde_json::from_str::<Value>(&text) else {
+        return BTreeSet::new();
+    };
+    document
+        .get("agents")
+        .and_then(Value::as_array)
+        .map(|agents| {
+            agents
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl AgentRecord {
@@ -578,6 +629,41 @@ impl AgentRecord {
             None => {
                 map.remove(key);
             }
+        }
+    }
+
+    /// The explicit pinned flag (#917 chat-bang-commands): `Some` when the record carries a
+    /// `pinned` key, from the flat record or a nested row's extensions.
+    pub(super) fn pinned_explicit(&self) -> Option<bool> {
+        let value = match &self.nested {
+            Some(nested) => nested.extensions().get(PINNED),
+            None => self.extra.get(PINNED),
+        }?;
+        value.as_bool()
+    }
+
+    /// Store or clear the explicit pinned flag.
+    pub(super) fn set_pinned(&mut self, pinned: Option<bool>) {
+        match &mut self.nested {
+            Some(nested) => {
+                let map = nested.extensions_mut();
+                match pinned {
+                    Some(value) => {
+                        map.insert(PINNED.to_owned(), json!(value));
+                    }
+                    None => {
+                        map.remove(PINNED);
+                    }
+                }
+            }
+            None => match pinned {
+                Some(value) => {
+                    self.extra.insert(PINNED.to_owned(), json!(value));
+                }
+                None => {
+                    self.extra.remove(PINNED);
+                }
+            },
         }
     }
 
@@ -1390,7 +1476,24 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
 
     /// Change who controls `agent_name`.
     pub fn manage(&self, agent_name: &str, action: ManageAction) -> Result<Value> {
+        if matches!(action, ManageAction::Pin | ManageAction::Unpin) {
+            let _lock = self.lock(agent_name)?;
+            let mut record = self.load(agent_name)?;
+            let previous = record.pinned_explicit();
+            record.set_pinned(match action {
+                ManageAction::Pin => Some(true),
+                _ => None,
+            });
+            self.save(&record)?;
+            return Ok(json!({
+                "name": record.name,
+                "token": record.token,
+                "pinned": record.pinned_explicit(),
+                "previous": previous,
+            }));
+        }
         let edge = match &action {
+            ManageAction::Pin | ManageAction::Unpin => unreachable!("pin handled above"),
             ManageAction::Clear => None,
             ManageAction::Caller => Some(self.caller_edge().ok_or_else(|| {
                 fail(
@@ -1495,6 +1598,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 }
             }
         }
+        let restore_agents = restore_agent_names(&self.registry);
         fn build(
             name: &str,
             records: &[AgentRecord],
@@ -1502,13 +1606,27 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             notes: &BTreeMap<String, &'static str>,
             designated: Option<&str>,
             boot: Option<&str>,
+            restore_agents: &BTreeSet<String>,
         ) -> Value {
             let record = records.iter().find(|record| record.name == name);
             let children: Vec<Value> = parents
                 .iter()
                 .filter(|(_, parent)| parent.as_deref() == Some(name))
-                .map(|(child, _)| build(child, records, parents, notes, designated, boot))
+                .map(|(child, _)| {
+                    build(
+                        child,
+                        records,
+                        parents,
+                        notes,
+                        designated,
+                        boot,
+                        restore_agents,
+                    )
+                })
                 .collect();
+            let (pinned, pinned_source) = record.map_or((false, "none"), |record| {
+                pinned_classification(record, designated, restore_agents, !children.is_empty())
+            });
             json!({
                 "name": name,
                 "token": record.map(|record| record.token.clone()),
@@ -1519,6 +1637,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "created_by": record.and_then(|record| record.edge(CREATED_BY)),
                 "managed_by": record.and_then(|record| record.edge(MANAGED_BY)),
                 "harness_pid": record.and_then(|record| record.current_harness_pid(boot)),
+                "pinned": pinned,
+                "pinned_source": pinned_source,
                 "children": children,
             })
         }
@@ -1533,6 +1653,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                     &notes,
                     designated.as_deref(),
                     boot.as_deref(),
+                    &restore_agents,
                 )
             })
             .collect();
@@ -1556,6 +1677,9 @@ pub fn render_tree(tree: &Value) -> String {
         let mut facts = vec![node["lifecycle"].as_str().unwrap_or("unknown").to_owned()];
         if node["coordinator"] == true {
             facts.insert(0, "designated coordinator".to_owned());
+        }
+        if node["pinned"] == true {
+            facts.push("pinned".to_owned());
         }
         match node["control"].as_str() {
             Some("unmanaged") if !top => facts.push("no manager recorded".to_owned()),

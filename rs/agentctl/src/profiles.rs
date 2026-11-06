@@ -39,6 +39,8 @@ pub(crate) struct LaunchProfile {
     pub(crate) cloud: Option<CloudLaunch>,
     /// `false` turns off the `created_by` and `managed_by` edges `start` records.
     pub(crate) record_edges: Option<bool>,
+    /// `true` records the agent as pinned (a persistent lane) at `start` (#917 chat-bang-commands).
+    pub(crate) pinned: Option<bool>,
 }
 
 /// The roles a launch profile may give its agents (#897 chat-latency-stamps).
@@ -215,6 +217,8 @@ struct RawProfile {
     agentcloud: Option<CloudLaunch>,
     #[serde(default)]
     record_edges: Option<bool>,
+    #[serde(default)]
+    pinned: Option<bool>,
     /// The agent's role, one of [`ROLES`], and its protocol, one of [`PROTOCOLS`]: checked here,
     /// and read from the file by the chat bridge's latency stamps (#897).
     #[serde(default)]
@@ -1068,6 +1072,7 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
         environment,
         cloud: raw.agentcloud,
         record_edges: raw.record_edges,
+        pinned: raw.pinned,
     })
 }
 

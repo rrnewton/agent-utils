@@ -525,6 +525,7 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
                 cloud: None,
                 slot: None,
                 record_edges: true,
+                pinned: None,
             };
             write_json(&manager.start(name, cwd, options)?)?;
         }
