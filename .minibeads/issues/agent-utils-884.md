@@ -1,6 +1,6 @@
 ---
 title: 'pane-lock-held-on-unobserved-paste: no sender holds the pane lock while waiting for its paste'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: '014: cl-enter'
@@ -69,3 +69,11 @@ Tests:
 New evidence from the lead, 2026-11-05 at 1:12 PM ET: a consumer team's pane had 5 stranded "[Pasted text #NNNN +18 lines]" composers today (8:50, 8:55, 10:52, 12:45 and 13:07 ET). The 12:45 and 13:04 cases came from senders still on the old 300 s path (a pinned pre-a5bdddf0 agentctl, now being updated). The root problem remains: Claude Code collapses a long paste to a placeholder, so the composer match fails on the first attempt. The two item 4 acceptance criteria above were added for this.
 
 Item 4 moved to the lead team's Claude lane cl-enter (014) on 2026-11-05 at 1:13 PM ET. Items 1-3 were delivered by cl-start. cl-enter rebases onto main after #896 lands before editing the shared delivery code.
+
+## Resolution
+
+[opus 5.5] Closed 2026-11-05 at 8:40 PM ET. Items 1-3 were delivered by cl-start (a5bdddf0). Item 4 was delivered by the lead team's cl-enter in three commits:
+- 46e81a3b: a fresh delivery recognises its own collapsed paste placeholder; a lost paste is never retyped; no head-of-line block.
+- fa30a2c0: busy-pane deliveries are recorded as "queued".
+- ca7e0c4b: stop-after-paste presses a bare Enter, and restart re-pends and flushes our own paste.
+Item 5 is deployment state only, not repository work. Unverified at closing: whether the digest and watcher lines that kept stranding in the coordinator's composer on this host (four times today, even on 46e81a3b) stop with fa30a2c0/ca7e0c4b deployed; that is checked after the next deploy, and a recurrence will be a new issue.
