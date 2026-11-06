@@ -1,10 +1,11 @@
 ---
 title: 'chat-bridge-alarm-coalesce: coalesce repeating chat-bridge alarm notices in place'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-06T21:15:40.000000000+00:00
-updated_at: 2026-11-06T21:15:40.000000000+00:00
+updated_at: 2026-11-06T22:04:41.000000000+00:00
+closed_at: 2026-11-06T22:04:41.000000000+00:00
 ---
 
 # Description
@@ -41,3 +42,8 @@ Requirements:
 5. Tests, full gate (make validate), then land on agent-utils main.
 
 [opus 5] filed by mu-alarm from the owner's report.
+
+Landed on agent-utils main as 21aa52153f9141d02291b0a20a035197360dfcda
+(commits e8c6cb40 + 21aa5215 after replay onto ec72d63a). make validate
+exit 0 on the gated tree; the renumber from 980 touched only this file
+and the issue number in comments, so the gate stands for the code.
