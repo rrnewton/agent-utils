@@ -1,11 +1,12 @@
 ---
 title: 'merge-queue-donor-refusal-not-host-fault: COULD_NOT_RUN refusal is not a host fault unless the donor probe also fails'
-status: in_progress
+status: closed
 priority: 1
 issue_type: task
 assignee: mu-mqdonor
 created_at: 2026-11-06T12:54:29.564570813+00:00
-updated_at: 2026-11-06T12:54:33.437014818+00:00
+updated_at: 2026-11-06T13:53:47.644149544+00:00
+closed_at: 2026-11-06T13:53:47.644149164+00:00
 claimed_at: 2026-11-06T12:54:33.437014818+00:00
 claimed_until: 2026-11-08T12:54:33.436898223+00:00
 ---
