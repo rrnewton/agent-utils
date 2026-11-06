@@ -1,10 +1,11 @@
 ---
 title: 'canonical-tab-order: a canonical tab order in every agentctl-managed workspace, repaired continuously'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-06T20:52:32.232396844+00:00
-updated_at: 2026-11-06T20:52:32.232396844+00:00
+updated_at: 2026-11-06T21:59:33.819668679+00:00
+closed_at: 2026-11-06T21:59:33.819668599+00:00
 ---
 
 # Description

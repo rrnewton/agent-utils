@@ -113,6 +113,14 @@ fn default_herdr_wait() -> u64 {
     300
 }
 
+fn default_bare_shell_grace() -> u64 {
+    600
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// `<registry>/restore.json`. An unknown top-level key is warned about and ignored rather than
 /// refused (see [`RestoreConfig::load`]), so a key a newer agentctl adds never stops an older one
 /// restoring the registry; keys inside `also_registered` and `timers` entries stay strict.
@@ -166,6 +174,14 @@ pub struct RestoreConfig {
     /// timer/service user unit pairs (#743).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scheduled: Vec<ScheduledUnit>,
+    /// Seconds an unclaimed bare shell may idle before the watch closes it
+    /// (agent-utils-976 workspace-hygiene; default 600).
+    #[serde(default = "default_bare_shell_grace")]
+    pub bare_shell_grace_seconds: u64,
+    /// Whether the watch closes idle bare shells at all (default true;
+    /// hand-opened shells are included when true).
+    #[serde(default = "default_true")]
+    pub close_bare_shells: bool,
     /// Top-level keys this build does not know, named in a warning and otherwise ignored.
     #[serde(flatten)]
     pub(crate) unknown: UnknownKeys,
@@ -273,6 +289,8 @@ impl RestoreConfig {
             herdr_unit: None,
             timers: Vec::new(),
             scheduled: Vec::new(),
+            bare_shell_grace_seconds: default_bare_shell_grace(),
+            close_bare_shells: default_true(),
             unknown: UnknownKeys::default(),
         }
     }
@@ -2510,6 +2528,146 @@ fn alert<A: ManagedApi + ?Sized>(
 /// Run the watch: one pass with `once`, otherwise one pass per interval until termination is
 /// requested (`Host::terminated`), when it answers the last pass's health. A pass in progress
 /// finishes, its waits cut short; no other starts (#909 watch-sigterm-stop).
+/// One hygiene pass: canonical tab order in managed workspaces, and
+/// closing unclaimed bare shells idle past the grace period. Returns
+/// findings; every close is logged with pane, tab, cwd, and why.
+fn hygiene_pass<A: ManagedApi + ?Sized>(
+    client: &A,
+    registry: &Path,
+    config: &RestoreConfig,
+    host: &dyn Host,
+    bare_since: &mut BTreeMap<String, f64>,
+    closed: &mut Vec<Value>,
+) -> Vec<Value> {
+    let findings = Vec::new();
+    let manager = match crate::subagents::ManagedAgents::new(client, registry) {
+        Ok(manager) => manager,
+        Err(error) => {
+            return vec![finding(
+                "hygiene",
+                "registry",
+                false,
+                &error.to_string(),
+                Value::Null,
+            )];
+        }
+    };
+    let names = registered_names(registry).unwrap_or_default();
+    let mut claimed: BTreeMap<String, (String, Option<String>, Option<String>)> = BTreeMap::new();
+    for name in &names {
+        if let Ok(status) = manager.status(name) {
+            if let Some(pane) = status["pane_id"].as_str() {
+                claimed.insert(
+                    pane.to_owned(),
+                    (
+                        name.clone(),
+                        status["tab_id"].as_str().map(str::to_owned),
+                        status["profile"].as_str().map(str::to_owned),
+                    ),
+                );
+            }
+        }
+    }
+    let Ok(panes) = client.panes() else {
+        return findings;
+    };
+    let managed_workspaces: std::collections::BTreeSet<String> = panes
+        .iter()
+        .filter(|pane| claimed.contains_key(&pane.pane_id))
+        .map(|pane| pane.workspace_id.clone())
+        .collect();
+    // Canonical tab order, through the Herdr socket when reachable.
+    if let Some(socket) = crate::tab_order::socket_path().filter(|path| path.exists()) {
+        for workspace in &managed_workspaces {
+            let Ok(order) = crate::tab_order::list_tabs(&socket, workspace) else {
+                continue;
+            };
+            let labels = client.tab_labels(workspace).unwrap_or_default();
+            let entries: Vec<(String, String, u8)> = order
+                .iter()
+                .map(|tab| {
+                    let lane = claimed
+                        .values()
+                        .find(|(_, lane_tab, _)| lane_tab.as_deref() == Some(tab.as_str()));
+                    match lane {
+                        Some((name, _, profile)) => {
+                            let front = Some(name.as_str()) == config.coordinator.as_deref()
+                                || crate::tab_order::is_coordinator_profile(profile.as_deref())
+                                || profile
+                                    .as_deref()
+                                    .is_some_and(|p| p == "liaison" || p.ends_with("-liaison"));
+                            (
+                                tab.clone(),
+                                name.clone(),
+                                if front {
+                                    crate::tab_order::ROLE_FRONT
+                                } else {
+                                    crate::tab_order::ROLE_LANE
+                                },
+                            )
+                        }
+                        None => (
+                            tab.clone(),
+                            labels.get(tab).cloned().unwrap_or_default(),
+                            crate::tab_order::ROLE_UNMANAGED,
+                        ),
+                    }
+                })
+                .collect();
+            let desired = crate::tab_order::canonical_tabs(&entries);
+            let mut current = order;
+            for (index, tab) in desired.iter().enumerate() {
+                if current.get(index) != Some(tab) {
+                    if crate::tab_order::move_tab(&socket, tab, index).is_ok() {
+                        current.remove(
+                            current
+                                .iter()
+                                .position(|candidate| candidate == tab)
+                                .unwrap(),
+                        );
+                        current.insert(index, tab.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Bare shells: only in managed workspaces, only when unclaimed.
+    let now = host.now();
+    let mut seen: std::collections::BTreeSet<String> = Default::default();
+    for pane in &panes {
+        if claimed.contains_key(&pane.pane_id) || !managed_workspaces.contains(&pane.workspace_id) {
+            continue;
+        }
+        if !client.pane_is_idle_shell(&pane.pane_id).unwrap_or(false) {
+            continue;
+        }
+        seen.insert(pane.pane_id.clone());
+        let since = *bare_since.entry(pane.pane_id.clone()).or_insert(now);
+        if config.close_bare_shells && now - since >= config.bare_shell_grace_seconds as f64 {
+            let info = client.pane_info(&pane.pane_id).ok();
+            if client.close_pane(&pane.pane_id).is_ok() {
+                let row = json!({
+                    "pane_id": pane.pane_id,
+                    "tab_id": pane.tab_id,
+                    "cwd": info.as_ref().map(|info| info.cwd.clone()),
+                    "why": format!("bare shell idle {}s past {}s grace with no registered agent",
+                                   now - since, config.bare_shell_grace_seconds),
+                    "closed_at": now,
+                });
+                eprintln!(
+                    "agentctl watch: closed bare shell {} ({})",
+                    pane.pane_id, row["why"]
+                );
+                closed.push(row);
+                bare_since.remove(&pane.pane_id);
+            }
+        }
+    }
+    bare_since.retain(|pane, _| seen.contains(pane));
+    findings
+}
+
+/// Watch the team's boot health until terminated, writing `health.json`.
 pub fn watch<A: ManagedApi + ?Sized>(
     client: &A,
     registry: &Path,
@@ -2523,6 +2681,12 @@ pub fn watch<A: ManagedApi + ?Sized>(
         .and_then(read_report)
         .and_then(|previous| serde_json::from_value(previous["alerted"].clone()).ok())
         .unwrap_or_default();
+    let mut bare_since: BTreeMap<String, f64> = path
+        .as_deref()
+        .and_then(read_report)
+        .and_then(|previous| serde_json::from_value(previous["bare_shell_since"].clone()).ok())
+        .unwrap_or_default();
+    let mut closed_bare_shells: Vec<Value> = Vec::new();
     let mut pass: u64 = 0;
     loop {
         // Every wrkslots command loads the whole slot registry, so slot images are checked on
@@ -2532,7 +2696,21 @@ pub fn watch<A: ManagedApi + ?Sized>(
             ..options.clone()
         };
         pass += 1;
-        let findings = watch_once(client, registry, host, config, &pass_options);
+        let mut findings = watch_once(client, registry, host, config, &pass_options);
+        // Workspace hygiene + canonical tab order (agent-utils-976/979):
+        // close unclaimed bare shells idle past the grace period, and keep
+        // managed workspaces' tabs in canonical order. Best-effort; a
+        // failure is a finding, never a watch failure.
+        if !pass_options.check_only {
+            findings.extend(hygiene_pass(
+                client,
+                registry,
+                config,
+                host,
+                &mut bare_since,
+                &mut closed_bare_shells,
+            ));
+        }
         let notice = if options.check_only {
             json!({"sent": false, "reason": "check only"})
         } else {
@@ -2567,6 +2745,8 @@ pub fn watch<A: ManagedApi + ?Sized>(
             "findings": findings,
             "notice": notice,
             "alerted": alerted,
+            "bare_shell_since": bare_since,
+            "closed_bare_shells": closed_bare_shells,
         });
         if let Some(path) = path.as_deref() {
             if let Err(error) = write_report(path, &health) {

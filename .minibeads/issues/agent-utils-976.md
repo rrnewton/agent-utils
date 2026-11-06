@@ -1,10 +1,11 @@
 ---
 title: 'workspace-hygiene: agentctl watch closes idle bare shells with no registered agent'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-06T20:49:36.084384729+00:00
-updated_at: 2026-11-06T20:49:36.084384729+00:00
+updated_at: 2026-11-06T21:59:33.819517552+00:00
+closed_at: 2026-11-06T21:59:33.819517422+00:00
 ---
 
 # Description

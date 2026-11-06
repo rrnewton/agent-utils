@@ -128,6 +128,58 @@ fn request(socket: &Path, method: &str, params: Value) -> Result<Value, String> 
     }
 }
 
+/// Tab roles in canonical order (agent-utils-979 canonical-tab-order):
+/// liaison/coordinators first, then managed lanes, then unmanaged tabs.
+pub const ROLE_FRONT: u8 = 0;
+/// A managed lane's tab.
+pub const ROLE_LANE: u8 = 1;
+/// A tab no registered agent claims.
+pub const ROLE_UNMANAGED: u8 = 2;
+
+/// The canonical order of `tabs` (`(tab_id, sort_name, role)`): by role,
+/// then by name, stable within equal keys. Idempotent by construction.
+#[must_use]
+pub fn canonical_tabs(tabs: &[(String, String, u8)]) -> Vec<String> {
+    let mut indexed: Vec<(usize, &(String, String, u8))> = tabs.iter().enumerate().collect();
+    indexed.sort_by(|(left_index, left), (right_index, right)| {
+        (left.2, left.1.as_str(), *left_index).cmp(&(right.2, right.1.as_str(), *right_index))
+    });
+    indexed
+        .into_iter()
+        .map(|(_, (tab, _, _))| tab.clone())
+        .collect()
+}
+
+/// List `workspace`'s tab IDs in shown order through the Herdr socket.
+///
+/// # Errors
+///
+/// The socket cannot be reached or Herdr refused the request.
+pub fn list_tabs(socket: &Path, workspace: &str) -> Result<Vec<String>, String> {
+    let listed = request(socket, "tab.list", json!({"workspace_id": workspace}))?;
+    Ok(listed["tabs"]
+        .as_array()
+        .ok_or("tab.list: the reply lists no tabs")?
+        .iter()
+        .filter(|entry| entry["workspace_id"] == json!(workspace))
+        .filter_map(|entry| Some(entry["tab_id"].as_str()?.to_owned()))
+        .collect())
+}
+
+/// Move `tab` to `index` through the Herdr socket.
+///
+/// # Errors
+///
+/// The socket cannot be reached or Herdr refused the request.
+pub fn move_tab(socket: &Path, tab: &str, index: usize) -> Result<(), String> {
+    request(
+        socket,
+        "tab.move",
+        json!({"tab_id": tab, "insert_index": index}),
+    )?;
+    Ok(())
+}
+
 /// Move `tab` of `workspace` just after the coordinators already at its front, through the
 /// Herdr socket at `socket`. Returns the index it moved to, or `None` when it was already in
 /// place.
@@ -181,6 +233,24 @@ mod tests {
         assert!(is_compiled(&std::env::current_exe().unwrap()));
         assert_eq!(resolve(&script), Some(script.clone()));
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn canonical_tabs_put_front_then_lanes_by_name_then_unmanaged() {
+        let entry = |tab: &str, name: &str, role: u8| (tab.to_owned(), name.to_owned(), role);
+        let tabs = vec![
+            entry("t3", "shell", ROLE_UNMANAGED),
+            entry("t2", "worker-b", ROLE_LANE),
+            entry("t1", "coord", ROLE_FRONT),
+            entry("t4", "worker-a", ROLE_LANE),
+        ];
+        let want = vec!["t1".to_owned(), "t4".to_owned(), "t2".to_owned(), "t3".to_owned()];
+        assert_eq!(canonical_tabs(&tabs), want);
+        let ordered = canonical_tabs(&tabs)
+            .into_iter()
+            .map(|tab| tabs.iter().find(|entry| entry.0 == tab).unwrap().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(canonical_tabs(&ordered), want);
     }
 
     #[test]
