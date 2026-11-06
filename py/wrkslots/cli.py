@@ -11523,6 +11523,15 @@ _VERIFIED_SALVAGE_BUNDLES: contextvars.ContextVar[
     set[tuple[str, str, int]] | None
 ] = contextvars.ContextVar("wrkslots_verified_salvage_bundles", default=None)
 
+#: Tearing-down PID-namespace inits met by a census (#908): counted, not
+#: narrated per PID, unless verbose diagnostics are on for this command.
+_TEARING_DOWN_PIDNS: contextvars.ContextVar[list[str] | None] = (
+    contextvars.ContextVar("wrkslots_tearing_down_pidns", default=None)
+)
+_VERBOSE_DIAGNOSTICS: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "wrkslots_verbose_diagnostics", default=False
+)
+
 
 @dataclasses.dataclass(frozen=True)
 class _SalvageFactsEvidence:
@@ -38213,6 +38222,9 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
+    _VERBOSE_DIAGNOSTICS.set(bool(getattr(args, "verbose", False)))
+    tearing_down: list[str] = []
+    _TEARING_DOWN_PIDNS.set(tearing_down)
     config = _load_config(args.project_root, args.machine)
     with _locked(
         config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock
@@ -38271,6 +38283,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
             )
             for record in visible_records
         ]
+    if tearing_down and not _VERBOSE_DIAGNOSTICS.get():
+        print(
+            f"wrkslots: {len(tearing_down)} tearing-down PID namespaces ignored",
+            file=sys.stderr,
+        )
     if args.format == "json":
         print(
             json.dumps(
@@ -57758,12 +57775,17 @@ def _process_is_exiting_namespace_init(pid_dir: Path) -> bool:
         return False
     names = [line.split(":", 1)[1].strip() for line in status.split("\n")
              if line.startswith("Name:")]
-    print(
-        f"wrkslots: PID {pid_dir.name} ({names[0] if names else '?'}) is a PID-namespace "
-        "init being torn down (wchan zap_pid_ns_processes; cwd, root and mount namespace "
-        "already released), so it cannot hold a checkout; not counted as an occupant",
-        file=sys.stderr,
-    )
+    label = f"PID {pid_dir.name} ({names[0] if names else '?'})"
+    collected = _TEARING_DOWN_PIDNS.get()
+    if collected is not None:
+        collected.append(label)
+    if collected is None or _VERBOSE_DIAGNOSTICS.get():
+        print(
+            f"wrkslots: {label} is a PID-namespace "
+            "init being torn down (wchan zap_pid_ns_processes; cwd, root and mount namespace "
+            "already released), so it cannot hold a checkout; not counted as an occupant",
+            file=sys.stderr,
+        )
     return True
 
 
@@ -65035,6 +65057,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="read every ACTIVE machine shard instead of only the selected machine",
     )
     status.add_argument("--slot", metavar="SLOT", help="limit output to this slot name")
+    status.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show per-PID diagnostics (default: tearing-down PID namespaces are counted in one summary line)",
+    )
     status.add_argument(
         "--format",
         choices=("human", "json"),

@@ -58710,6 +58710,31 @@ def test_remote_url_spellings_still_refuse_other_repositories(
     assert not wrkslots._recorded_remote_names_same_repository(recorded_sha, authority)
 
 
+def test_tearing_down_pidns_is_counted_not_narrated_unless_verbose(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#908: a tearing-down PID-namespace init is summarised, not narrated per PID."""
+    pid_dir = tmp_path / "4242"
+    pid_dir.mkdir()
+    (pid_dir / "wchan").write_text("zap_pid_ns_processes", encoding="ascii")
+    (pid_dir / "status").write_text(
+        "Name:\texec_test\nNSpid:\t4242\t1\nThreads:\t1\n", encoding="utf-8"
+    )
+    collected: list[str] = []
+    wrkslots._TEARING_DOWN_PIDNS.set(collected)
+    wrkslots._VERBOSE_DIAGNOSTICS.set(False)
+    assert wrkslots._process_is_exiting_namespace_init(pid_dir) is True
+    assert collected == ["PID 4242 (exec_test)"]
+    assert capsys.readouterr().err == ""
+    wrkslots._VERBOSE_DIAGNOSTICS.set(True)
+    assert wrkslots._process_is_exiting_namespace_init(pid_dir) is True
+    assert "PID 4242 (exec_test) is a PID-namespace init being torn down" in (
+        capsys.readouterr().err
+    )
+    wrkslots._TEARING_DOWN_PIDNS.set(None)
+    wrkslots._VERBOSE_DIAGNOSTICS.set(False)
+
+
 def test_remove_skips_an_uninitialised_nested_submodule(tmp_path: Path) -> None:
     project, tree, component, _leaf = _slot_with_primary_dropped_leaf(tmp_path)
     git(
