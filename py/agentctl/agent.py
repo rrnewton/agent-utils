@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dataclass_replace
 
 from agentctl.client import AgentPaneInfo, HerdrClient
 from agentctl.errors import (
@@ -269,9 +269,23 @@ def resolve_target(client: HerdrClient, target: Target) -> AgentPaneInfo:
         matches: list[str] = []
         for pane in client.panes():
             info = client.pane_info(pane.pane_id)
-            if info.session_value == target.session_value and (
-                target.session_agent is None or info.session_agent == target.session_agent
-            ):
+            # A pane that reports no session can still be the target when its
+            # foreground harness argv resumes the session (#947); a reported
+            # session stays authoritative and is never overridden by argv.
+            derived: str | None = None
+            if info.session_value is None and target.session_agent is not None:
+                foreground = getattr(client, "foreground_session", None)
+                if foreground is not None:
+                    try:
+                        derived = foreground(pane.pane_id, target.session_agent)
+                    except Exception:
+                        derived = None
+            effective = info.session_value if info.session_value is not None else derived
+            agent_matches = target.session_agent is None or (
+                info.session_agent == target.session_agent
+                or (info.session_value is None and effective == target.session_value)
+            )
+            if effective == target.session_value and agent_matches:
                 matches.append(pane.pane_id)
         if len(matches) != 1:
             raise AgentDeliveryError(
@@ -285,6 +299,20 @@ def resolve_target(client: HerdrClient, target: Target) -> AgentPaneInfo:
     if pane_id is None:
         raise AgentDeliveryError("target needs --pane or a stable session value")
     info = client.pane_info(pane_id)
+    # Validate against the argv-derived session when the pane reports none
+    # (#947); the returned info keeps Herdr's reported fields untouched.
+    if info.session_value is None and target.session_agent is not None:
+        foreground = getattr(client, "foreground_session", None)
+        derived_value: str | None = None
+        if foreground is not None:
+            try:
+                derived_value = foreground(pane_id, target.session_agent)
+            except Exception:
+                derived_value = None
+        if derived_value is not None:
+            _validate(client, _dataclass_replace(
+                info, session_agent=target.session_agent, session_value=derived_value), target)
+            return info
     _validate(client, info, target)
     return info
 

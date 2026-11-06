@@ -591,6 +591,29 @@ class PaneShellProof:
     executable_path: str
 
 
+def _argv_session(harness: str, argv: Sequence[str]) -> str | None:
+    """The session one harness argument vector resumes, or ``None`` when it does
+    not name exactly one: Muse `... resume <id>`, Claude `--resume <id>` (or
+    `--resume=<id>`), Codex leading `resume <id>` (#947).
+    """
+    def usable(value: str) -> bool:
+        return bool(value) and not value.startswith("-")
+
+    found: list[str] = []
+    if harness == "muse":
+        found = [b for a, b in zip(argv, argv[1:]) if a == "resume" and usable(b)]
+    elif harness == "claude":
+        for index, value in enumerate(argv):
+            if value == "--resume" and index + 1 < len(argv) and usable(argv[index + 1]):
+                found.append(argv[index + 1])
+            elif value.startswith("--resume=") and usable(value[len("--resume="):]):
+                found.append(value[len("--resume="):])
+    elif harness == "codex":
+        if len(argv) >= 3 and argv[1] == "resume" and usable(argv[2]):
+            found = [argv[2]]
+    return found[0] if len(found) == 1 else None
+
+
 @dataclass(frozen=True)
 class AgentPaneInfo:
     """Identity and readiness fields for one interactive-agent pane."""
@@ -2427,6 +2450,23 @@ class HerdrClient:
             return path
         except (TypeError, ValueError) as exc:
             raise HerdrUnavailable(f"invalid Herdr server status: {exc}") from exc
+
+    def foreground_session(self, pane_id: str, harness: str) -> str | None:
+        """The session the pane's single foreground `harness` process resumes in
+        its argv, when exactly one such process names exactly one (#947).
+        """
+        sessions: list[str] = []
+        for entry in self.process_info(pane_id).foreground:
+            cmdline = entry[2] if len(entry) > 2 else ""
+            argv0 = entry[3] if len(entry) > 3 else ""
+            name = os.path.basename(argv0).removesuffix(" (deleted)")
+            if name != harness:
+                continue
+            argv = cmdline.split() if cmdline else ([argv0] if argv0 else [])
+            value = _argv_session(harness, argv)
+            if value is not None:
+                sessions.append(value)
+        return sessions[0] if len(sessions) == 1 else None
 
     def process_info(self, pane_id: str) -> ProcessInfo:
         """The pane's live shell pid and foreground process group — the readiness signal.

@@ -339,6 +339,26 @@ pub trait AgentApi: Send + Sync {
     ) -> crate::error::Result<bool> {
         Ok(false)
     }
+    /// The session a pane's foreground harness argv resumes, when the pane
+    /// reports no session of its own (#947): a resumed Muse names its
+    /// session only in `muse ... resume <id>`, which Herdr does not report.
+    /// The default cannot tell.
+    fn foreground_session(
+        &self,
+        _pane_id: &str,
+        _session_agent: &str,
+    ) -> crate::error::Result<Option<String>> {
+        Ok(None)
+    }
+    /// Cancellation-aware [`AgentApi::foreground_session`].
+    fn foreground_session_with_runtime(
+        &self,
+        pane_id: &str,
+        session_agent: &str,
+        _runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<Option<String>> {
+        self.foreground_session(pane_id, session_agent)
+    }
     /// Whether this client types a follow-up into a working Muse pane only through Muse's
     /// verified editor path (#505 agentctl-muse-followup). A client that would fall back to
     /// Herdr's native prompt, with no empty-editor proof, leaves a working Muse waiting.
@@ -411,6 +431,25 @@ impl AgentApi for HerdrClient {
 
     fn pane_info(&self, pane_id: &str) -> crate::error::Result<AgentPaneInfo> {
         HerdrClient::pane_info(self, pane_id)
+    }
+
+    fn foreground_session(
+        &self,
+        pane_id: &str,
+        session_agent: &str,
+    ) -> crate::error::Result<Option<String>> {
+        HerdrClient::foreground_session(self, pane_id, session_agent)
+    }
+
+    fn foreground_session_with_runtime(
+        &self,
+        pane_id: &str,
+        session_agent: &str,
+        runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<Option<String>> {
+        HerdrClient::foreground_session_with_cancellation(self, pane_id, session_agent, &|| {
+            runtime.cancelled()
+        })
     }
 
     fn codex_idle_ready_with_runtime(
@@ -1449,12 +1488,25 @@ pub(crate) fn resolve_target_with_runtime<A: AgentApi + ?Sized>(
             let info = client
                 .pane_info_with_runtime(&pane.pane_id, runtime)
                 .map_err(client_error)?;
-            if info.session_value.as_deref() == Some(session_value)
-                && target
-                    .session_agent
-                    .as_deref()
-                    .is_none_or(|agent| info.session_agent.as_deref() == Some(agent))
-            {
+            // A pane that reports no session can still be the target when its
+            // foreground harness argv resumes the session (#947); a reported
+            // session stays authoritative and is never overridden by argv.
+            let derived_value = if info.session_value.is_none() {
+                target.session_agent.as_deref().and_then(|agent| {
+                    client
+                        .foreground_session_with_runtime(&pane.pane_id, agent, runtime)
+                        .ok()
+                        .flatten()
+                })
+            } else {
+                None
+            };
+            let effective = info.session_value.as_deref().or(derived_value.as_deref());
+            let agent_matches = target.session_agent.as_deref().is_none_or(|agent| {
+                info.session_agent.as_deref() == Some(agent)
+                    || (info.session_value.is_none() && effective == Some(session_value))
+            });
+            if effective == Some(session_value) && agent_matches {
                 matches.push(pane.pane_id);
             }
         }
@@ -1477,6 +1529,21 @@ pub(crate) fn resolve_target_with_runtime<A: AgentApi + ?Sized>(
     let info = client
         .pane_info_with_runtime(&pane_id, runtime)
         .map_err(client_error)?;
+    // Validate against the argv-derived session when the pane reports none
+    // (#947); the returned info keeps Herdr's reported fields untouched.
+    if info.session_value.is_none() {
+        if let Some(agent) = target.session_agent.as_deref() {
+            if let Ok(Some(value)) =
+                client.foreground_session_with_runtime(&pane_id, agent, runtime)
+            {
+                let mut validated = info.clone();
+                validated.session_agent = Some(agent.to_owned());
+                validated.session_value = Some(value);
+                validate_target_with_runtime(client, &validated, target, runtime)?;
+                return Ok(info);
+            }
+        }
+    }
     validate_target_with_runtime(client, &info, target, runtime)?;
     Ok(info)
 }
@@ -4532,6 +4599,8 @@ mod tests {
 
     #[derive(Default)]
     struct FakeState {
+        /// Sessions a pane's foreground argv resumes, by pane (#947 test fake).
+        foreground_sessions: BTreeMap<String, String>,
         /// What a read of the visible screen returns when the fake draws no composer.
         visible: Option<String>,
         infos: BTreeMap<String, AgentPaneInfo>,
@@ -4633,6 +4702,20 @@ mod tests {
     }
 
     impl AgentApi for FakeAgent {
+        fn foreground_session(
+            &self,
+            pane_id: &str,
+            _session_agent: &str,
+        ) -> crate::error::Result<Option<String>> {
+            Ok(self
+                .state
+                .lock()
+                .unwrap()
+                .foreground_sessions
+                .get(pane_id)
+                .cloned())
+        }
+
         fn verifies_muse_followups(&self) -> bool {
             self.state.lock().unwrap().verify_muse
         }
@@ -5769,6 +5852,41 @@ mod tests {
         contradiction.pane_id = Some("w1:p9".to_owned());
         let error = resolve_target(&fake, &contradiction).unwrap_err();
         assert!(error.to_string().contains("expected exact pane"));
+    }
+
+    #[test]
+    fn session_resolution_uses_foreground_argv_when_no_session_is_reported() {
+        // #947: a resumed Muse reports no session; its foreground argv
+        // (`muse ... resume S`) is the only place the session is named.
+        let fake = FakeAgent::new(&["idle"]);
+        {
+            let mut state = fake.state.lock().unwrap();
+            let info = state.infos.get_mut("w1:p1").unwrap();
+            info.agent = Some("muse".to_owned());
+            info.session_agent = None;
+            info.session_value = None;
+            state
+                .foreground_sessions
+                .insert("w1:p1".to_owned(), "session-1".to_owned());
+        }
+        let mut wanted = target();
+        wanted.session_agent = Some("muse".to_owned());
+        wanted.expected_agent = Some("muse".to_owned());
+        assert_eq!(resolve_target(&fake, &wanted).unwrap().pane_id, "w1:p1");
+        // A different resumed session still finds no pane.
+        wanted.session_value = Some("other".to_owned());
+        let error = resolve_target(&fake, &wanted).unwrap_err();
+        assert!(error.to_string().contains("found 0"), "{error}");
+        // A reported session stays authoritative over the argv-derived one.
+        {
+            let mut state = fake.state.lock().unwrap();
+            let info = state.infos.get_mut("w1:p1").unwrap();
+            info.session_agent = Some("muse".to_owned());
+            info.session_value = Some("reported".to_owned());
+        }
+        wanted.session_value = Some("session-1".to_owned());
+        let error = resolve_target(&fake, &wanted).unwrap_err();
+        assert!(error.to_string().contains("found 0"), "{error}");
     }
 
     /// A runtime that keeps `FakeRuntime`'s clock and notes each prompt reported printed, with

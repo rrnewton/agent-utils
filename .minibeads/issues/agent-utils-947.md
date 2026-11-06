@@ -1,10 +1,11 @@
 ---
 title: 'agentctl-revive-candidate-unpinnable: the session-to-pane resolver misses a resumed Muse pane'
-status: open
+status: closed
 priority: 1
 issue_type: bug
-created_at: 2026-11-06T18:16:13.000000000+00:00
-updated_at: 2026-11-06T18:16:13.000000000+00:00
+created_at: 2026-11-06T18:16:13+00:00
+updated_at: 2026-11-06T20:35:46.223679989+00:00
+closed_at: 2026-11-06T20:35:46.223679629+00:00
 ---
 
 # Description

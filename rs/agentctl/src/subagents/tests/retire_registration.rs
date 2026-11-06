@@ -208,6 +208,61 @@ fn retire_stale_pins_live_candidate_and_resumes_after_journal_archival() {
 }
 
 #[test]
+fn retire_stale_pins_live_muse_candidate_by_its_resumed_argv() {
+    // #947: Herdr reports no session for a resumed Muse; the replacement
+    // pane is found through its foreground `muse ... resume S` argv.
+    let (fixture, old, mut options, bytes) = pending_revive();
+    let operation = fixture.root.join("registry/.revives").join(&old.token);
+    let candidate_path = operation.join("new/agent.json");
+    let mut candidate = agent::read_private_json(&candidate_path).unwrap();
+    candidate["pane_id"] = json!("replacement");
+    candidate["harness"] = json!("muse");
+    candidate["launch_spec"] = json!(null);
+    candidate["native_session"] = json!(null);
+    candidate["session_agent"] = json!(null);
+    candidate["session_value"] = json!(null);
+    candidate["resume"] = json!(null);
+    agent::atomic_json(&candidate_path, &candidate).unwrap();
+    *fixture.client.panes.lock().unwrap() = vec![Fake::pane("replacement")];
+    fixture.client.started.store(true, Ordering::Relaxed);
+    fixture
+        .client
+        .launches
+        .lock()
+        .unwrap()
+        .insert("replacement".to_owned(), ("muse".to_owned(), Vec::new()));
+    *fixture.client.session_override.lock().unwrap() = Some((None, None));
+    fixture
+        .client
+        .harness_pids
+        .lock()
+        .unwrap()
+        .insert("replacement".to_owned(), 777);
+    fixture.client.command_lines.lock().unwrap().insert(
+        777,
+        vec![
+            "/usr/local/bin/muse".to_owned(),
+            "--model".to_owned(),
+            "m".to_owned(),
+            "resume".to_owned(),
+            "verified-live-session".to_owned(),
+        ],
+    );
+    options.expected_revive_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
+    options.replacement_pane = Some("replacement".into());
+    options.replacement_session = Some("wrong-session".into());
+    assert!(fixture
+        .manager()
+        .retire_stale_registration("worker", &options)
+        .is_err());
+    options.replacement_session = Some("verified-live-session".into());
+    fixture
+        .manager()
+        .retire_stale_registration("worker", &options)
+        .unwrap();
+}
+
+#[test]
 fn retiring_an_old_generation_never_archives_a_new_registration() {
     let fixture = Fixture::new();
     fixture.start(None);

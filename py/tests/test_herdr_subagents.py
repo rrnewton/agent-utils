@@ -151,6 +151,14 @@ class FakeManagedClient:
     def process_command_line(self, expected: CustomProcessIdentity) -> tuple[str, ...] | None:
         return self.command_lines.get(expected.pid)
 
+    def foreground_session(self, pane_id: str, harness: str) -> str | None:
+        if self.infos[pane_id].agent != harness:
+            return None
+        pid = self.harness_pids.get(pane_id)
+        argv = () if pid is None else self.command_lines.get(pid, ())
+        from agentctl.client import _argv_session
+        return _argv_session(harness, list(argv))
+
     def verify_harness_identity(self, pane_id: str, expected: CustomProcessIdentity) -> bool:
         return (pane_id in self.infos and self.infos[pane_id].agent is not None
                 and self.harness_pids.get(pane_id) == expected.pid)
@@ -2125,6 +2133,28 @@ def test_queued_goals_keep_confirmation_authority_across_restart(tmp_path: Path,
     with pytest.raises(AgentPossiblySubmitted):
         restarted.send("worker", "/goal second objective")
     assert confirmations == ["Enter", "Enter"]
+
+
+def test_session_resolution_uses_foreground_argv_when_no_session_is_reported() -> None:
+    # #947: a resumed Muse reports no session; its foreground argv
+    # (`muse ... resume S`) is the only place the session is named.
+    from agentctl import agent
+    fake = FakeManagedClient()
+    fake.create_tab(workspace_id="w1", label="worker", cwd="/work")
+    pane = fake.presentations[-1].pane_id
+    fake.infos[pane] = replace(fake.infos[pane], agent="muse", session_agent=None, session_value=None)
+    fake.harness_pids[pane] = 300
+    fake.command_lines[300] = ("/usr/local/bin/muse", "--model", "m", "resume", "session-1")
+    target = agent.Target(pane_id=pane, session_agent="muse",
+                          session_value="session-1", expected_agent="muse")
+    assert agent.resolve_target(fake, target).pane_id == pane  # type: ignore[arg-type]
+    wrong = agent.Target(pane_id=pane, session_agent="muse",
+                         session_value="other", expected_agent="muse")
+    with pytest.raises(AgentDeliveryError, match="found 0"):
+        agent.resolve_target(fake, wrong)  # type: ignore[arg-type]
+    fake.infos[pane] = replace(fake.infos[pane], session_agent="muse", session_value="reported")
+    with pytest.raises(AgentDeliveryError, match="found 0"):
+        agent.resolve_target(fake, target)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("field,value", [("goal_message_id", "../../outside"), ("goal_messages", {"../outside": "task"})])

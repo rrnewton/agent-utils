@@ -15177,6 +15177,37 @@ pub(crate) mod tests {
         }
     }
     impl AgentApi for Fake {
+        fn foreground_session(
+            &self,
+            pane_id: &str,
+            session_agent: &str,
+        ) -> AdapterResult<Option<String>> {
+            // Mirror Herdr: read the session from the foreground argv the
+            // test registered for the pane's harness pid (#947). A dead pane
+            // holds only its shell, so it names no session.
+            if self.dead_panes.lock().unwrap().contains(pane_id) {
+                return Ok(None);
+            }
+            let pid = self
+                .harness_pids
+                .lock()
+                .unwrap()
+                .get(pane_id)
+                .copied()
+                .or_else(|| {
+                    self.custom_processes
+                        .lock()
+                        .unwrap()
+                        .get(pane_id)
+                        .map(|identity| identity.pid)
+                });
+            let Some(pid) = pid else {
+                return Ok(None);
+            };
+            let argv = self.command_lines.lock().unwrap().get(&pid).cloned();
+            Ok(argv.and_then(|argv| crate::client::argv_session(session_agent, &argv)))
+        }
+
         fn codex_idle_ready_with_runtime(
             &self,
             info: &AgentPaneInfo,

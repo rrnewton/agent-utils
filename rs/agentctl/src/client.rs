@@ -87,6 +87,46 @@ fn foreground_argv0(process: &Map<String, Value>) -> Result<Option<&str>> {
     Ok(Some(value))
 }
 
+/// The session one harness argument vector resumes, or `None` when it does
+/// not name exactly one: Muse `... resume <id>`, Claude `--resume <id>` (or
+/// `--resume=<id>`), Codex leading `resume <id>` (#947).
+pub(crate) fn argv_session(harness: &str, argv: &[String]) -> Option<String> {
+    let usable = |value: &str| !value.is_empty() && !value.starts_with('-');
+    let found: Vec<&str> = match harness {
+        "muse" => argv
+            .windows(2)
+            .filter(|pair| pair[0] == "resume" && usable(&pair[1]))
+            .map(|pair| pair[1].as_str())
+            .collect(),
+        "claude" => argv
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| {
+                if value == "--resume" {
+                    argv.get(index + 1)
+                        .map(String::as_str)
+                        .filter(|v| usable(v))
+                } else {
+                    value.strip_prefix("--resume=").filter(|v| usable(v))
+                }
+            })
+            .collect(),
+        "codex" => {
+            if argv.len() >= 3 && argv[1] == "resume" && usable(&argv[2]) {
+                vec![argv[2].as_str()]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    };
+    if found.len() == 1 {
+        Some(found[0].to_owned())
+    } else {
+        None
+    }
+}
+
 fn foreground_process_entries(values: &[Value]) -> Result<Vec<Map<String, Value>>> {
     let processes = object_entries(values, "foreground process")?;
     for process in &processes {
@@ -1717,6 +1757,51 @@ impl HerdrClient {
             foreground_process_group_id,
             foreground_process_entries(processes)?,
         ))
+    }
+
+    /// The session the pane's single foreground `harness` process resumes in
+    /// its argv, when exactly one such process names exactly one (#947).
+    pub fn foreground_session(&self, pane_id: &str, harness: &str) -> Result<Option<String>> {
+        self.foreground_session_with_cancellation(pane_id, harness, &|| false)
+    }
+
+    pub(crate) fn foreground_session_with_cancellation(
+        &self,
+        pane_id: &str,
+        harness: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<String>> {
+        let (_, processes) = self.foreground_processes(pane_id, cancelled)?;
+        let mut sessions = Vec::new();
+        for process in &processes {
+            let Some(argv0) = foreground_argv0(process)? else {
+                continue;
+            };
+            let name = Path::new(argv0)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if name.strip_suffix(" (deleted)").unwrap_or(name) != harness {
+                continue;
+            }
+            let Some(argv) = process.get("argv") else {
+                continue;
+            };
+            let argv: Vec<String> = match argv {
+                Value::Array(values) => values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+                _ => continue,
+            };
+            sessions.extend(argv_session(harness, &argv));
+        }
+        Ok(if sessions.len() == 1 {
+            Some(sessions.remove(0))
+        } else {
+            None
+        })
     }
 
     fn custom_harness_observed(
