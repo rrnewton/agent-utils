@@ -19,8 +19,27 @@ use std::time::{Duration, Instant};
 /// How long a stop may take.
 const STOP_LIMIT: Duration = Duration::from_secs(5);
 
+/// Spawned children must not outlive the test process (#923).
+fn die_with_parent(command: &mut Command) {
+    // SAFETY: prctl in the forked child before exec is
+    // async-signal-safe; the child is killed when its creating
+    // thread's process dies, by whatever means.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 struct Scratch {
     root: PathBuf,
+    /// Process-group leaders of every child this scratch spawned, so
+    /// Drop can kill them even when the owning test panics before its
+    /// own terminate call (#923).
+    child_groups: std::cell::RefCell<Vec<i32>>,
 }
 
 impl Scratch {
@@ -46,7 +65,15 @@ impl Scratch {
         )
         .expect("write stand-in herdr");
         fs::set_permissions(&herdr, fs::Permissions::from_mode(0o700)).expect("herdr mode");
-        Self { root }
+        Self {
+            root,
+            child_groups: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    fn register_child(&self, child: &Child) {
+        let pid = i32::try_from(child.id()).expect("pid fits");
+        self.child_groups.borrow_mut().push(pid);
     }
 
     /// Register one running agent, so that a pass asks Herdr about it.
@@ -83,7 +110,9 @@ impl Scratch {
 
     fn watch(&self) -> Child {
         let home = self.root.join("home");
-        Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentctl"));
+        die_with_parent(&mut command);
+        let child = command
             .current_dir(&self.root)
             .env("HOME", &home)
             .env("AGENTCTL_HOME", home.join(".agentctl"))
@@ -103,7 +132,9 @@ impl Scratch {
             .stderr(fs::File::create(self.root.join("stderr")).expect("stderr file"))
             .process_group(0)
             .spawn()
-            .expect("start watch-agents")
+            .expect("start watch-agents");
+        self.register_child(&child);
+        child
     }
 
     fn stderr(&self) -> String {
@@ -113,6 +144,14 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        // Reap every spawned child's process group, including on a
+        // panicking test that never reached its terminate call (#923);
+        // children also carry PR_SET_PDEATHSIG for a killed binary.
+        for pid in self.child_groups.borrow().iter() {
+            // SAFETY: killpg takes scalar arguments; each group is led
+            // by a child this scratch spawned in its own group.
+            unsafe { libc::killpg(*pid, libc::SIGKILL) };
+        }
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -154,6 +193,38 @@ fn terminate(child: &mut Child, limit: Duration) -> (Duration, Option<ExitStatus
 
 fn calls(root: &Path) -> String {
     fs::read_to_string(root.join("calls")).unwrap_or_default()
+}
+
+#[test]
+fn watch_child_group_is_reaped_when_the_test_panics() {
+    // #923: a panicking test never reaches terminate(), so Scratch's
+    // Drop must kill the spawned watcher's whole process group.
+    let scratch = Scratch::new("panic-reap");
+    scratch.register_agent();
+    let child = scratch.watch();
+    let pid = i32::try_from(child.id()).expect("pid fits");
+    assert!(
+        wait_for(Duration::from_secs(60), || !calls(&scratch.root).is_empty()),
+        "the pass never started: {}",
+        scratch.stderr()
+    );
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _scratch = scratch;
+        let _child = child;
+        panic!("forced panic to prove Scratch reaps its children");
+    }));
+    assert!(result.is_err(), "the forced panic was caught");
+    assert!(
+        wait_for(Duration::from_secs(5), || {
+            // Reap the dropped handle's zombie, then probe the group:
+            // SAFETY: both calls take only scalar arguments.
+            let mut status = 0;
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            let gone = unsafe { libc::killpg(pid, 0) };
+            gone != 0
+        }),
+        "watch process group {pid} outlived its test"
+    );
 }
 
 #[test]
@@ -216,7 +287,9 @@ fn watch_agents_abandons_a_pass_stuck_in_herdr_within_seconds_of_sigterm() {
 /// answers, or one that fails at once, so a pass finishes in moments.
 fn restore_watch(scratch: &Scratch, herdr: &Path) -> Child {
     let home = scratch.root.join("home");
-    Command::new(env!("CARGO_BIN_EXE_agentctl"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentctl"));
+    die_with_parent(&mut command);
+    let child = command
         .current_dir(&scratch.root)
         .env("HOME", &home)
         .env("AGENTCTL_HOME", home.join(".agentctl"))
@@ -236,7 +309,9 @@ fn restore_watch(scratch: &Scratch, herdr: &Path) -> Child {
         .stderr(fs::File::create(scratch.root.join("stderr")).expect("stderr file"))
         .process_group(0)
         .spawn()
-        .expect("start watch")
+        .expect("start watch");
+    scratch.register_child(&child);
+    child
 }
 
 #[test]
