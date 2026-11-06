@@ -1,13 +1,14 @@
 ---
 title: 'voice-page-linked-highlight: a deep-linked message keeps a prominent highlight until dismissed'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: cl-refactor
 labels:
 - vibe-talk
 created_at: 2026-11-05T15:24:27.277072395+00:00
-updated_at: 2026-11-05T15:24:27.277072395+00:00
+updated_at: 2026-11-06T09:40:00.000000000+00:00
+closed_at: 2026-11-06T09:40:00.000000000+00:00
 ---
 
 # Description
@@ -36,3 +37,7 @@ It is an owner-approved exception between #624 voice-page-modularity batches.
 # Notes
 
 Relayed by the lead on 2026-11-05 (owner reply 162). Assigned to cl-refactor after #889. Durable host-independent link formats are a separate, undecided owner topic; no link format change here.
+
+## Resolution
+
+Landed as 2bfb792e ("vibe-talk: keep the linked message marked until the reader puts it out"), gated as 5d7d3dc1 on cf760db4 after #892 parts 1 and 2: 130/131 steps passed. The one failure was python.repository-infrastructure.package-contract, red on main from cf760db4's dagrun docstring, and this change touches no py/dagrun files. It reaches users with the next vibe-talk deploy.
