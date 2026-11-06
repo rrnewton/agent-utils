@@ -1,11 +1,12 @@
 ---
 title: 'voice-page-reply-parent-arrow: replies and quote-replies lose the blue jump-to-parent arrow, especially in threads'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-refactor
 created_at: 2026-11-06T13:15:00.000000000+00:00
-updated_at: 2026-11-06T13:15:00.000000000+00:00
+updated_at: 2026-11-06T18:13:00.000000000+00:00
+closed_at: 2026-11-06T18:13:00.000000000+00:00
 ---
 
 # Description
@@ -29,3 +30,9 @@ The vibe-talk page used to show a blue arrow on a reply or quote-reply that jump
 # Notes
 
 Assigned to cl-refactor ahead of #624 batch 65, because that lane owns the page code during the refactor.
+
+## Resolution
+
+Landed as 7c3a284a and deployed with the next vibe-talk deploy. Slack keeps no reply pointer of its own, so the server now keeps one in two places: the op-key metadata payload, which carries reply_to and is read back with the post, and a durable store table, reply_pointers (schema v24, ids only, at most 50,000, purged with the rest), which is the source of truth because the metadata only survives in a 7-day cache. Covered by tests: a reply and a quote-reply, in the channel and inside a thread, end to end with and without metadata and across a restart.
+
+Unverified: older replies are not backfilled. Replies posted before the deploy have no pointer and still show no arrow; a thread-root and quote-text backfill was offered to the owner as a follow-up.
