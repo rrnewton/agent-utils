@@ -756,10 +756,18 @@ fn stopped_artifact(registry: &Path, journal: &Journal) -> Result<(AgentRecord, 
 /// Only the inode is compared: `st_dev` is not stable for the same filesystem
 /// across a reboot or remount (btrfs assigns anonymous device numbers per
 /// mount), so a journal written before a reboot otherwise never matches the
-/// directory it pinned and every revive in the registry is refused. The
-/// journal comparisons that use this helper also pin the generation token
-/// and the SHA-256 of the record bytes, so an inode collision on a different
-/// filesystem cannot stand in for the pinned generation.
+/// directory it pinned and every revive in the registry is refused.
+///
+/// Dropping the device is safe against a different directory reusing the
+/// inode because the inode only locates the directory; it does not identify
+/// the generation. Every comparison through this helper also requires the
+/// pinned generation token, and, where the journal recorded one, the exact
+/// record bytes or their SHA-256 (the remaining sites check the digest in
+/// the same refusal). A reused inode on another filesystem would therefore
+/// also have to hold a record carrying the pinned token and digest, which
+/// is the pinned generation itself, not a stand-in for it. Checks within a
+/// single run keep comparing device and inode together, where the device
+/// cannot have changed.
 fn same_journal_directory(inode: u64, journal_inode: u64) -> bool {
     inode == journal_inode
 }
@@ -2570,16 +2578,14 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let active = optional_record_at(&self.directory(&journal.name)?, &journal.name)?;
         if !active.is_some_and(|(pinned, record, _)| {
             record.token == journal.old_token
-                && (pinned.device, pinned.inode)
-                    == (journal.old_directory_device, journal.old_directory_inode)
+                && same_journal_directory(pinned.inode, journal.old_directory_inode)
         }) {
             return Ok(None);
         }
         let stage_path = operation_directory(&self.registry, journal).join("new");
         let (pinned, candidate, _) = read_record_at(&stage_path, &journal.name)?;
         if candidate.token != journal.new_token
-            || (pinned.device, pinned.inode)
-                != (journal.new_directory_device, journal.new_directory_inode)
+            || !same_journal_directory(pinned.inode, journal.new_directory_inode)
         {
             return Err(fail("staged revive generation changed"));
         }
@@ -3163,10 +3169,13 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let operation = root.join(&record.token);
         let candidate = operation.join("new");
         if candidate.exists() {
-            let (pin, candidate, _) = read_record_at(&candidate, &record.name)?;
+            let (pin, candidate, bytes) = read_record_at(&candidate, &record.name)?;
             if candidate.token != journal.new_token
                 || !same_journal_directory(pin.inode, journal.new_directory_inode)
-                || pin.inode != journal.new_directory_inode
+                || journal
+                    .ready_record_sha256
+                    .as_ref()
+                    .is_some_and(|expected| expected != &digest(&bytes))
             {
                 return Err(fail("revive candidate generation or directory changed"));
             }

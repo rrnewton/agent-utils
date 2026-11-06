@@ -645,6 +645,59 @@ fn revive_pending_dry_run_detects_replaced_old_directory_and_unstopped_archive()
 }
 
 #[test]
+fn revive_journal_survives_device_change_but_still_pins_inode_and_sha() {
+    // #305 revive-device-pin: a journal written before a reboot names the
+    // pre-reboot anonymous device (btrfs renumbers per mount). Rewriting only
+    // the journal devices simulates that remount: the revive must proceed,
+    // while a changed inode or record SHA must still refuse.
+    for drift in ["device", "inode", "sha"] {
+        let (fixture, old) = recoverable("claude", false);
+        super::super::revive::fail_once("ready");
+        assert!(fixture
+            .manager()
+            .revive("worker", false, None, TIMEOUT)
+            .is_err());
+        let path = journal_path(&fixture, &old);
+        let mut journal = agent::read_private_json(&path).unwrap();
+        match drift {
+            "device" => {
+                for key in ["old_directory_device", "new_directory_device"] {
+                    journal[key] = json!(journal[key].as_u64().unwrap() + 100_000);
+                }
+            }
+            "inode" => {
+                journal["new_directory_inode"] =
+                    json!(journal["new_directory_inode"].as_u64().unwrap() + 1);
+            }
+            _ => {
+                journal["old_record_sha256"] = json!("0".repeat(64));
+            }
+        }
+        agent::atomic_json(&path, &journal).unwrap();
+        if drift == "device" {
+            assert_eq!(
+                fixture
+                    .manager()
+                    .revive("worker", false, None, TIMEOUT)
+                    .unwrap()["revived"],
+                true,
+                "{drift}"
+            );
+            assert!(!path.exists(), "{drift}");
+        } else {
+            assert!(
+                fixture
+                    .manager()
+                    .revive("worker", false, None, TIMEOUT)
+                    .is_err(),
+                "{drift}"
+            );
+            assert!(path.exists(), "{drift}");
+        }
+    }
+}
+
+#[test]
 fn revive_pending_journal_refuses_symlink_or_hardlink_authority() {
     for link in ["symlink", "hardlink"] {
         let (fixture, old) = recoverable("claude", false);
