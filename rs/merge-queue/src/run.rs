@@ -5213,6 +5213,10 @@ impl<'a> Runner<'a> {
             let mut full_loaded = false;
             let mut deferred_this_run: BTreeSet<i64> = BTreeSet::new();
             let mut refused_stop = String::new();
+            // A new root's base choice deferred while another root is green
+            // but not yet landed: when the defer began, and for which green
+            // root (see the fill loop). Bounded at 60 s.
+            let mut root_defer: Option<(Instant, Vec<i64>)> = None;
             // A held head's stop reason, kept while disjoint roots behind it
             // finish landing in this same run (see the Deferred arm below).
             let mut held_stop = String::new();
@@ -5618,6 +5622,70 @@ impl<'a> Runner<'a> {
                             None
                         };
                         let rooted = stale_stack.is_none() && rooted;
+                        // A new root built on the base now goes stale the
+                        // moment another root that is already green lands:
+                        // its whole validation is thrown away and rebuilt.
+                        // When such a green root is in flight but not yet
+                        // landed, defer this root's base choice until the
+                        // pending landing completes — bounded at 60 s, then
+                        // fall back to building on the current base as
+                        // before (option (b); stacking on the green tip was
+                        // not chosen: that candidate may itself go stale,
+                        // and its stacked dependants then rebuild anyway).
+                        if rooted {
+                            let green_pending: Option<Vec<i64>> = flights
+                                .iter()
+                                .filter(|flight| flight.rooted)
+                                .find(|flight| {
+                                    flight.result.as_ref().is_some_and(|result| {
+                                        result.as_ref().is_ok_and(|(_, ran)| ran.green())
+                                    })
+                                })
+                                .map(|flight| flight.candidate.prs.clone());
+                            match green_pending {
+                                Some(green_prs) => {
+                                    let deferring = match &root_defer {
+                                        None => {
+                                            root_defer = Some((Instant::now(), green_prs.clone()));
+                                            self.event(
+                                                "root-near-landing",
+                                                &format!(
+                                                    "planning {} as a root on the current base \
+                                                     waits for green root {} to land first \
+                                                     (up to 60s); its base choice is deferred",
+                                                    list(&prs),
+                                                    list(&green_prs)
+                                                ),
+                                            );
+                                            true
+                                        }
+                                        Some((since, _))
+                                            if since.elapsed() < Duration::from_secs(60) =>
+                                        {
+                                            true
+                                        }
+                                        Some(_) => false,
+                                    };
+                                    if deferring {
+                                        // Put the batch back and let the
+                                        // loop reach its decision phase.
+                                        pending.push_front(prs);
+                                        break;
+                                    }
+                                    self.event(
+                                        "root-near-landing",
+                                        &format!(
+                                            "green root {} still unlanded after 60s; building \
+                                             {} as a root on the current base as before",
+                                            list(&green_prs),
+                                            list(&prs)
+                                        ),
+                                    );
+                                    root_defer = None;
+                                }
+                                None => root_defer = None,
+                            }
+                        }
                         // Below the batch pass-rate gate, batches are one
                         // change wide whatever the plan made of them: the
                         // rest go back to the front as singles, in order.

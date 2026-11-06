@@ -1684,6 +1684,12 @@ The base moves only to a commit whose exact tree passed validation (the bors rul
    `disjoint-root-promoted` event): batches refilling the window build on its tip, so when it
    lands they land straight after it instead of going stale on the base. `disable_disjoint_root` turns it off, and
    `disjoint_root_min_red_percent` only starts one when the recent red rate makes a red head likely.
+   A *new* root is not built on a base that is about to move: while another root in the window
+   is already green but has not landed yet, the new root's base choice is deferred until that
+   pending landing completes (a `root-near-landing` event), bounded at 60 s — after that it is
+   built on the current base as before, so a landing that never completes cannot stall the
+   window. The new root then validates once, on the post-landing base, instead of validating
+   on the old base and being rebuilt from scratch when the green root lands.
    Green batches land in order, as soon as every batch ahead of them has landed, and the
    next batch starts at once on top of the last one in flight.
 2. **AIMD.** The window starts at `depth`, grows by one per landed batch up to `max_depth`, and

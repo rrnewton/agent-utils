@@ -414,6 +414,93 @@ fn a_decidable_root_becomes_the_stack_head_for_refills() {
     );
 }
 
+/// A new change planned as a root while another root is already green but
+/// not yet landed must not be built on the about-to-move base: its base
+/// choice is deferred (bounded) until the pending landing completes, so
+/// it validates once, on the post-landing base.
+#[test]
+fn a_new_root_waits_for_a_green_root_to_land_before_choosing_its_base() {
+    let (fx, started, gates) = gated_setup("root-near-landing");
+    // Two root slots, so a second root can be planned while the first is
+    // still in flight.
+    let config_path = fx.queue().join(".git/merge-queue/config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["roots"] = serde_json::json!(2);
+    std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    fx.branch("a", &[("tests/a", "FAIL\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    let mut daemon = Daemon::start(&fx);
+    wait_for("both batches to validate", &started, |lines| {
+        lines.len() >= 2
+    });
+    assert_eq!(started_lines(&started)[..2], ["a_t0_", "b_t0_"]);
+    // Change 2's root comes back green but cannot land yet: change 1,
+    // which it jumped over, is undecided.
+    open(&gates, "b_t0_");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(status(&fx, 2), "queued");
+    // Two new changes arrive: the first would be planned as a second root
+    // on the current base, but that base is about to move when the green
+    // root lands, so its base choice is deferred instead.
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    fx.branch("d", &[("tests/d", "ok\n")]);
+    fx.mq_ok(&["submit", "4", "--head", "d"]);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        started_lines(&started).len(),
+        2,
+        "no new root may be built on the about-to-move base"
+    );
+    // Change 1 is decided (red, ejected): the green root lands, and only
+    // then are the new roots built, on the post-landing base.
+    open(&gates, "t0_");
+    open(&gates, "a_t0_");
+    wait_for("the new batches to validate", &started, |lines| {
+        lines.iter().any(|line| line.contains('c')) && lines.iter().any(|line| line.contains('d'))
+    });
+    // Every candidate shape the new batches may take, stacked or rooted.
+    for set in [
+        "b_c_t0_",
+        "b_d_t0_",
+        "b_c_d_t0_",
+        "c_d_t0_",
+        "c_t0_",
+        "d_t0_",
+    ] {
+        open(&gates, set);
+    }
+    assert_eq!(daemon.exit_code(Duration::from_secs(120)), Some(0));
+    let report = latest_report(&fx);
+    assert_eq!(status(&fx, 1), "ejected", "{report}");
+    assert_eq!(status(&fx, 2), "landed", "{report}");
+    assert_eq!(status(&fx, 3), "landed", "{report}");
+    assert_eq!(status(&fx, 4), "landed", "{report}");
+    // Change 3 validated exactly once, and not on the run's starting base.
+    let runs3 = batch_validations(&report, 3);
+    assert_eq!(runs3.len(), 1, "{report}");
+    assert_ne!(
+        runs3[0]["parent"], report["base_start"],
+        "change 3 must be built on the post-landing base: {report}"
+    );
+    let runs = fx.queue().join(".git/merge-queue/runs");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(runs)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join("events.jsonl").is_file())
+        .collect();
+    dirs.sort();
+    let events = std::fs::read_to_string(dirs.pop().unwrap().join("events.jsonl")).unwrap();
+    assert!(
+        events.contains("root-near-landing") && events.contains("waits for green root #2"),
+        "{events}"
+    );
+}
+
 /// A held (INFRA-BLOCKED, not validating further) front item must not block
 /// the greens behind it: the disjoint root built on the base lands in the
 /// same run, and the stacked change behind the held item is rebuilt without
