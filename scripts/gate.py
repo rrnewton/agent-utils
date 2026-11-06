@@ -24,10 +24,31 @@ inside an admitted run (validate.py's gate-exclusive phase) releases the
 parent's slot before queueing: the parent is blocked on that call, so holding
 its slot would deadlock, and the nested call must still wait for — and block —
 every other gate as a fresh exclusive ticket.
+
+Per-host blackout windows (#907): a gate must not START inside a configured
+window (the shared gate host has a neighbour's nightly job). Windows come
+from a per-host file that is never synced between hosts
+(default ~/.local/etc/agent-utils/gate.toml, override $GATE_BLACKOUT_CONFIG):
+
+    [[blackout]]
+    start = "00:15"
+    end = "04:00"
+    timezone = "America/New_York"
+    reason = "neighbour nightly job"
+
+With no file there is no blackout; a malformed file refuses every start with
+a clear error. A start inside a window is refused (exit 78) naming the
+window, its reason and the next allowed start; --ignore-blackout overrides
+and is recorded in the ledger. A ticket queued before a window begins keeps
+its place and is granted only when the window ends (a nested gate invoked by
+an already-running gate therefore waits rather than refusing). Running
+gates are never touched. $GATE_BLACKOUT_NOW (ISO 8601) overrides the clock
+for tests.
 """
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime as dt
 import fcntl
 import json
@@ -36,9 +57,11 @@ import re
 import subprocess
 import sys
 import time
+import tomllib
 import uuid
 from collections import Counter
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_DIR = Path("/tmp/dev-agent-utils-gate-admission")
 
@@ -54,6 +77,136 @@ _VERDICT = re.compile(r"validate: (OK|PARTIAL|FAILED)")
 
 def state_dir() -> Path:
     return Path(os.environ.get("GATE_ADMISSION_DIR") or DEFAULT_DIR)
+
+
+#: Exit status for a start refused by a blackout window (#907).
+BLACKOUT_EXIT = 78
+
+DEFAULT_BLACKOUT_CONFIG = Path("~/.local/etc/agent-utils/gate.toml")
+
+
+def blackout_config_path(explicit: str | None = None) -> Path:
+    return Path(
+        explicit
+        or os.environ.get("GATE_BLACKOUT_CONFIG")
+        or DEFAULT_BLACKOUT_CONFIG
+    ).expanduser()
+
+
+class BlackoutConfigError(RuntimeError):
+    """The blackout config exists but cannot be used as written."""
+
+
+@dataclasses.dataclass(frozen=True)
+class BlackoutWindow:
+    """One daily no-start window in its own time zone; end may pass midnight."""
+
+    start: dt.time
+    end: dt.time
+    tz: ZoneInfo
+    reason: str = ""
+
+    def active_at(self, instant: dt.datetime) -> bool:
+        local = instant.astimezone(self.tz).time()
+        if self.start < self.end:
+            return self.start <= local < self.end
+        return local >= self.start or local < self.end
+
+    def next_start_after(self, instant: dt.datetime) -> dt.datetime:
+        """The first moment at or after ``instant`` when a start is allowed."""
+
+        if not self.active_at(instant):
+            return instant
+        local = instant.astimezone(self.tz)
+        end_date = local.date()
+        if self.start >= self.end and local.time() >= self.start:
+            end_date += dt.timedelta(days=1)
+        return dt.datetime.combine(end_date, self.end, tzinfo=self.tz)
+
+    def describe(self) -> str:
+        return (
+            f"{self.start:%H:%M}-{self.end:%H:%M} {self.tz}"
+            + (f" ({self.reason})" if self.reason else "")
+        )
+
+
+def _parse_hhmm(value: object, path: Path, field: str) -> dt.time:
+    if not isinstance(value, str) or not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", value):
+        raise BlackoutConfigError(
+            f"gate blackout config {path}: {field} must be an \"HH:MM\" time, not {value!r}"
+        )
+    return dt.time(int(value[:2]), int(value[3:]))
+
+
+def load_blackout_windows(explicit: str | None = None) -> tuple[BlackoutWindow, ...]:
+    """The configured windows; no file means no blackout, a bad file is an error."""
+
+    path = blackout_config_path(explicit)
+    if not path.is_file():
+        return ()
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise BlackoutConfigError(f"gate blackout config {path} is unreadable: {exc}") from exc
+    if not isinstance(raw, dict) or set(raw) - {"blackout"}:
+        raise BlackoutConfigError(
+            f"gate blackout config {path}: only [[blackout]] tables are allowed"
+        )
+    entries = raw.get("blackout", [])
+    if not isinstance(entries, list):
+        raise BlackoutConfigError(f"gate blackout config {path}: blackout must be a list of tables")
+    windows: list[BlackoutWindow] = []
+    for index, entry in enumerate(entries):
+        label = f"blackout #{index + 1}"
+        if not isinstance(entry, dict) or not set(entry) <= {"start", "end", "timezone", "reason"}:
+            raise BlackoutConfigError(
+                f"gate blackout config {path}: {label} may only set start, end, timezone, reason"
+            )
+        start = _parse_hhmm(entry.get("start"), path, f"{label} start")
+        end = _parse_hhmm(entry.get("end"), path, f"{label} end")
+        if start == end:
+            raise BlackoutConfigError(
+                f"gate blackout config {path}: {label} start and end are equal ({start:%H:%M})"
+            )
+        tz_name = entry.get("timezone")
+        if not isinstance(tz_name, str) or not tz_name:
+            raise BlackoutConfigError(
+                f"gate blackout config {path}: {label} timezone must name a zone"
+            )
+        try:
+            tz = ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise BlackoutConfigError(
+                f"gate blackout config {path}: {label} timezone {tz_name!r} is unknown"
+            ) from exc
+        reason = entry.get("reason", "")
+        if not isinstance(reason, str):
+            raise BlackoutConfigError(
+                f"gate blackout config {path}: {label} reason must be a string"
+            )
+        windows.append(BlackoutWindow(start, end, tz, reason))
+    return tuple(windows)
+
+
+def blackout_now() -> dt.datetime:
+    """Now, or the $GATE_BLACKOUT_NOW test override (ISO 8601)."""
+
+    raw = os.environ.get("GATE_BLACKOUT_NOW")
+    if not raw:
+        return dt.datetime.now(dt.timezone.utc)
+    try:
+        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise BlackoutConfigError(f"GATE_BLACKOUT_NOW is not an ISO 8601 time: {raw!r}") from exc
+    if parsed.tzinfo is None:
+        raise BlackoutConfigError(f"GATE_BLACKOUT_NOW must carry a time zone: {raw!r}")
+    return parsed
+
+
+def active_blackout(
+    windows: tuple[BlackoutWindow, ...], instant: dt.datetime
+) -> BlackoutWindow | None:
+    return next((window for window in windows if window.active_at(instant)), None)
 
 
 def ledger_path(explicit: str | None = None) -> Path:
@@ -210,7 +363,29 @@ class Admission:
         return out
 
 
+def _refuse_blackout(window: BlackoutWindow, instant: dt.datetime) -> int:
+    nxt = window.next_start_after(instant).astimezone(window.tz)
+    print(
+        f"gate: blackout {window.describe()}: no gate may start now; "
+        f"next allowed start {nxt:%Y-%m-%d %H:%M %Z}; "
+        "rerun then, or pass --ignore-blackout to override (recorded)",
+        flush=True,
+    )
+    return BLACKOUT_EXIT
+
+
 def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
+    try:
+        windows = load_blackout_windows(getattr(args, "blackout_config", None))
+        now = blackout_now()
+    except BlackoutConfigError as exc:
+        print(f"gate: {exc}", flush=True)
+        return 2
+    ignore = bool(getattr(args, "ignore_blackout", False))
+    parent_run = os.environ.get("GATE_ADMISSION_RUN_ID")
+    active = active_blackout(windows, now)
+    if active is not None and not ignore and not parent_run:
+        return _refuse_blackout(active, now)
     adm = Admission(state_dir(), args.slots)
     # A gate invoked from inside an admitted gate (validate.py running its
     # gate-exclusive steps) must not queue behind its own parent: the parent
@@ -218,18 +393,34 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     # the parent's slot first; this call then queues as a fresh top-level
     # ticket, so an exclusive phase still waits for every other gate and
     # blocks new ones, with no deadlock.
-    parent_run = os.environ.get("GATE_ADMISSION_RUN_ID")
     if parent_run:
         adm.finish(parent_run)
     run_id, _ = adm.enqueue(args.cls, command)
     queued_at = time.time()
     last_pos = -1
-    while not adm.try_grant(run_id, args.cls):
+    blackout_noted: BlackoutWindow | None = None
+    while True:
         if args.wait_timeout and time.time() - queued_at > args.wait_timeout:
             adm.finish(run_id)
             (state_dir() / "queue" / f"{run_id}.json").unlink(missing_ok=True)
             print(f"gate: gave up after {time.time() - queued_at:.0f}s in queue", flush=True)
             return 75
+        # A ticket queued before a window begins keeps its place but is not
+        # granted during the window: the grant is the start (#907).
+        current = None if ignore else active_blackout(windows, blackout_now())
+        if current is not None:
+            if blackout_noted is not current:
+                nxt = current.next_start_after(blackout_now()).astimezone(current.tz)
+                print(
+                    f"gate: queued ticket waits out blackout {current.describe()}; "
+                    f"starts resume {nxt:%Y-%m-%d %H:%M %Z}",
+                    flush=True,
+                )
+                blackout_noted = current
+            time.sleep(1.0)
+            continue
+        if adm.try_grant(run_id, args.cls):
+            break
         pos, running = adm.position(run_id)
         if pos != last_pos:
             print(f"gate: queued at position {pos} ({running} running, class={args.cls})", flush=True)
@@ -311,6 +502,7 @@ def _record_ledger(
             "rerun_passed": (rc == 0) if kind == "exclusive-rerun" else None,
             "verdict": verdict,
             "exit_code": rc,
+            "blackout_ignored": bool(getattr(args, "ignore_blackout", False)),
             "log_path": None,
         }
         path = ledger_path(getattr(args, "ledger", None))
@@ -390,12 +582,33 @@ def show_stats(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    parser = argparse.ArgumentParser(prog="gate", description="Gate admission: counting slots plus an exclusive class.")
+    parser = argparse.ArgumentParser(
+        prog="gate",
+        description="Gate admission: counting slots plus an exclusive class.",
+        epilog=(
+            "Blackout windows (#907): no gate starts inside a window from the per-host "
+            "config (default ~/.local/etc/agent-utils/gate.toml, override with "
+            "$GATE_BLACKOUT_CONFIG or --blackout-config). Format, one or more tables:\n"
+            '  [[blackout]]\n  start = "00:15"\n  end = "04:00"\n'
+            '  timezone = "America/New_York"\n  reason = "neighbour nightly job"\n'
+            "An end at or before the start crosses midnight. With no file there is no "
+            "blackout; a malformed file refuses every start (exit 2). A start inside a "
+            "window is refused with exit 78, naming the next allowed start; a ticket "
+            "queued before a window waits it out. --ignore-blackout overrides a window "
+            "and is recorded in the ledger. $GATE_BLACKOUT_NOW (ISO 8601) overrides "
+            "the clock for tests."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--slots", type=int, default=int(os.environ.get("GATE_SLOTS", "2")),
                         help="concurrent shared gates (default 2, or $GATE_SLOTS)")
     parser.add_argument("--exclusive", dest="cls", action="store_const", const="exclusive", default="shared",
                         help="run alone: wait for an empty box and block new admissions")
     parser.add_argument("--wait-timeout", type=float, default=0.0, help="give up queueing after N seconds (0 = wait forever)")
+    parser.add_argument("--blackout-config", default=None,
+                        help="blackout config path (default $GATE_BLACKOUT_CONFIG or ~/.local/etc/agent-utils/gate.toml)")
+    parser.add_argument("--ignore-blackout", action="store_true",
+                        help="start even inside a blackout window; the override is recorded in the ledger")
     parser.add_argument("--ledger", default=None,
                         help="durable ledger path (default ~/.local/state/agent-utils/gate-ledger.jsonl, or $GATE_LEDGER)")
     if argv[:1] == ["status"]:

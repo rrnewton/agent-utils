@@ -136,6 +136,103 @@ def test_status_reports_finished_runs(tmp_path: Path) -> None:
     assert "1 finished in 24h" in status.stdout
 
 
+_BLACKOUT = """\
+[[blackout]]
+start = "00:15"
+end = "04:00"
+timezone = "America/New_York"
+reason = "neighbour nightly job"
+"""
+
+_INSIDE = "2026-11-06T06:30:00+00:00"  # 01:30 EST, inside 00:15-04:00
+_OUTSIDE = "2026-11-06T12:00:00+00:00"  # 07:00 EST, outside
+
+
+def _blackout_env(tmp_path: Path, config_text: str | None, now: str) -> dict[str, str]:
+    env = _env(tmp_path)
+    config = tmp_path / "gate.toml"
+    if config_text is not None:
+        config.write_text(config_text, encoding="utf-8")
+    env["GATE_BLACKOUT_CONFIG"] = str(config)
+    env["GATE_BLACKOUT_NOW"] = now
+    return env
+
+
+def _run_gate(tmp_path: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
+    del tmp_path
+    return subprocess.run(
+        [PY, str(GATE), *args, "--", PY, "-c", "pass"],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+
+
+def test_blackout_refuses_a_start_inside_the_window(tmp_path: Path) -> None:
+    result = _run_gate(tmp_path, _blackout_env(tmp_path, _BLACKOUT, _INSIDE))
+    assert result.returncode == 78, result.stdout
+    assert "00:15-04:00 America/New_York" in result.stdout
+    assert "neighbour nightly job" in result.stdout
+    assert "next allowed start 2026-11-06 04:00 EST" in result.stdout
+
+
+def test_blackout_allows_a_start_outside_the_window(tmp_path: Path) -> None:
+    result = _run_gate(tmp_path, _blackout_env(tmp_path, _BLACKOUT, _OUTSIDE))
+    assert result.returncode == 0, result.stdout
+
+
+def test_blackout_window_crossing_midnight(tmp_path: Path) -> None:
+    config = _BLACKOUT.replace('start = "00:15"', 'start = "23:00"').replace(
+        'end = "04:00"', 'end = "02:00"'
+    )
+    # 2026-11-06T04:30Z is 23:30 EST on Nov 5: inside a 23:00-02:00 window.
+    result = _run_gate(tmp_path, _blackout_env(tmp_path, config, "2026-11-06T04:30:00+00:00"))
+    assert result.returncode == 78, result.stdout
+    assert "next allowed start 2026-11-06 02:00 EST" in result.stdout
+    # 2026-11-06T08:00Z is 03:00 EST: outside it.
+    result = _run_gate(tmp_path, _blackout_env(tmp_path, config, "2026-11-06T08:00:00+00:00"))
+    assert result.returncode == 0, result.stdout
+
+
+def test_ignore_blackout_starts_and_is_recorded_in_the_ledger(tmp_path: Path) -> None:
+    env = _blackout_env(tmp_path, _BLACKOUT, _INSIDE)
+    result = _run_gate(tmp_path, env, "--ignore-blackout")
+    assert result.returncode == 0, result.stdout
+    import json as _json
+
+    rows = [_json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
+    assert rows[-1]["blackout_ignored"] is True
+    plain = _run_gate(tmp_path, _blackout_env(tmp_path, _BLACKOUT, _OUTSIDE))
+    assert plain.returncode == 0, plain.stdout
+    rows = [_json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
+    assert rows[-1]["blackout_ignored"] is False
+
+
+def test_no_blackout_config_means_no_blackout(tmp_path: Path) -> None:
+    result = _run_gate(tmp_path, _blackout_env(tmp_path, None, _INSIDE))
+    assert result.returncode == 0, result.stdout
+
+
+def test_malformed_blackout_config_refuses_with_a_clear_error(tmp_path: Path) -> None:
+    for text in (
+        "this is not toml = =",
+        '[[blackout]]\nstart = "25:00"\nend = "04:00"\ntimezone = "America/New_York"\n',
+        '[[blackout]]\nstart = "00:15"\nend = "04:00"\ntimezone = "Nowhere/Special"\n',
+        '[[blackout]]\nstart = "00:15"\nstart = "00:16"\nend = "04:00"\ntimezone = "America/New_York"\n',
+    ):
+        result = _run_gate(tmp_path, _blackout_env(tmp_path, text, _OUTSIDE))
+        assert result.returncode == 2, (text, result.stdout)
+        assert "gate blackout config" in result.stdout
+
+
+def test_blackout_help_documents_config_and_flag(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [PY, str(GATE), "--help"], env=_env(tmp_path), capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0
+    assert "~/.local/etc/agent-utils/gate.toml" in result.stdout
+    assert "[[blackout]]" in result.stdout
+    assert "--ignore-blackout" in result.stdout
+
+
 def test_a_dead_queue_ticket_never_blocks_admission(tmp_path: Path) -> None:
     state = tmp_path / "admission" / "queue"
     state.mkdir(parents=True)
