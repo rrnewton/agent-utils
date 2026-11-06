@@ -1,6 +1,6 @@
 ---
 title: 'unknown-tui-bridge: unrecognised TUIs fall back to the unknown harness, agentterm is recognised, and the bridge captures their replies'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: cl-start
@@ -68,6 +68,24 @@ P1, owner via the lead (2026-11-04 17:36-17:41 ET). Assigned to cl-start after #
     - the fake TUI with a swallowed input, an agentterm view with no turn, and a prompt stranded in the composer;
     - process discovery, and history matching by text;
     - an adopted unknown pane viewing a session: uncertain, then delivered from history, then replies captured from history.
-- Remaining: B (the auto-fallback to unknown, better refusal text, reminders by the agentterm frame).
+- B (cl-start, 2026-11-05):
+  - `adopt --harness NAME` for a NAME agentctl has no adapter for (such as `agentterm`), in a pane where Herdr reports no agent, adopts the program with `--harness unknown` and says so in the result's `note`, instead of refusing. A harness agentctl knows is never swapped: a pane where Herdr does not see it is still refused.
+  - `chat repoint` to an agent in whose pane Herdr detects no harness now names the way out: `agentctl adopt NAME --pane ID --harness unknown`, then repoint to that name. An unknown-harness agent is already a valid repoint target, and since #896 its prompts are command-only.
+  - `start` still does not launch an unknown TUI, and points at `adopt`: there is no launch command to run for a program agentctl has no adapter for.
+  - Reply reminders for a pane driven by the generic rules read agentterm's input frame: `idle` is idle; `working` or any other label is busy. Before, such a pane was never reminded ("unrecognized harness"). Any other unknown TUI is still not reminded. The frame is read through the manager, so the pane-info struct is unchanged.
+  - Tests: the adopt fallback with its note, a known harness still refused, and reminders by the frame (idle, working, another label, no frame).
+
+## Resolution
+
+[opus 5.5] cl-start, 2026-11-05. Delivered in parts:
+- P0 and P0b: tags, prompt rows, routing notices.
+- C (`b55a437b`): agentterm read by its input frame.
+- D (`5b0a0f6c`): unknown-pane receipts need evidence; an agentterm view of an agentcloud session uses that session's history for evidence and replies.
+- B (this change): the adopt fallback, the repoint refusal text, reminders by the frame.
+
+Not done:
+- **The stale-composer clear for an agentterm draft.** agentterm's clearing keys are unverified, so a draft is refused, never cleared.
+- **The colour-reply noise in agentterm pastes.** That is #900.
+- **A consumer-side live check of D** goes through the lead.
 
 D scope set by the lead on 2026-11-05 at 1:04 PM ET: #896 left unknown-pane receipts unchanged to keep an interim agentterm target working, so evidence for unknown panes and agentterm-on-cloud history capture land here. Queued right after #896 and #897.

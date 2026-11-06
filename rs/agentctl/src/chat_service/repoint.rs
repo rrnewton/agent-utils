@@ -102,8 +102,10 @@ pub fn validate_target<A: ManagedApi + ?Sized>(
     match info.agent.as_deref() {
         Some(_) => Ok(Some(info.pane_id)),
         None => Err(format!(
-            "Herdr detects no agent harness in {agent}'s pane {}; start the agent there first",
-            info.pane_id
+            "Herdr detects no agent harness in {agent}'s pane {}: start the agent there first, or, \
+             if a program agentctl has no adapter for runs there (such as agentterm), register it \
+             with `agentctl adopt NAME --pane {} --harness unknown` and repoint to that name",
+            info.pane_id, info.pane_id
         )),
     }
 }

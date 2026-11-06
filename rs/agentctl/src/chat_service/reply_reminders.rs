@@ -853,7 +853,8 @@ seen working and is idle again, or for {}s if it is not seen working",
             self.herdr_idle(&info, turn);
             return Ok(check);
         }
-        if !self.idle(&info, turn, stop, Ask::First) {
+        let frame = manager.agentterm_frame(agent_name);
+        if !self.idle(&info, turn, stop, Ask::First, frame.as_ref()) {
             return Ok(check);
         }
         let idle_since = self.period.idle(now);
@@ -919,7 +920,9 @@ seen working and is idle again, or for {}s if it is not seen working",
         let Some(info) = self.lookup(manager, agent_name, &runtime, stop, turn)? else {
             return Ok(check);
         };
-        if !self.idle(&info, turn, stop, Ask::Again) || self.period.since_millis != Some(idle_since)
+        let frame = manager.agentterm_frame(agent_name);
+        if !self.idle(&info, turn, stop, Ask::Again, frame.as_ref())
+            || self.period.since_millis != Some(idle_since)
         {
             return Ok(check);
         }
@@ -1081,6 +1084,7 @@ sends that reply once the pane shows it",
         turn: &TurnEvidence,
         stop: &StopState,
         ask: Ask,
+        frame: Option<&crate::harness::agentterm::FrameState>,
     ) -> bool {
         if !self.herdr_idle(info, turn) {
             return false;
@@ -1089,7 +1093,20 @@ sends that reply once the pane shows it",
             return false;
         }
         let asked = Instant::now();
-        let answer = self.source.state(info, &|| stop.is_stopped());
+        // A pane driven by the generic rules that shows agentterm's input frame says itself
+        // whether its session is idle (#852 unknown-tui-bridge).
+        let answer = match (info.agent.as_deref(), frame) {
+            (Some(crate::unknown_harness::HARNESS), Some(state)) => Ok(match state {
+                crate::harness::agentterm::FrameState::Idle => ClaudeState::Idle,
+                crate::harness::agentterm::FrameState::Working => {
+                    ClaudeState::Busy("working".to_owned())
+                }
+                crate::harness::agentterm::FrameState::Other(label) => {
+                    ClaudeState::Busy(label.clone())
+                }
+            }),
+            _ => self.source.state(info, &|| stop.is_stopped()),
+        };
         let slow = asked.elapsed() > CLAUDE_SLOW_ANSWER;
         let wait = Instant::now() + self.idle;
         self.claude_wait = slow.then_some(wait);
@@ -1285,6 +1302,44 @@ mod tests {
             .as_ref()
             .is_some_and(|hold| hold.until.saturating_duration_since(Instant::now())
                 > Duration::from_millis(60)));
+    }
+
+    #[test]
+    fn an_agentterm_pane_is_reminded_by_what_its_input_frame_says() {
+        // #852 unknown-tui-bridge: a pane driven by the generic rules has no harness to ask; one
+        // that shows agentterm's input frame says itself whether its session is idle. Without a
+        // frame, reminders still wait. The source (Claude Code) is never asked for such a pane.
+        use crate::harness::agentterm::FrameState;
+        let mut reminders = ReplyReminders::with_source(
+            Duration::from_secs(10),
+            Box::new(Answers(std::sync::Mutex::new(vec![Err(
+                "the source must not be asked".to_owned(),
+            )]))),
+        );
+        let info = pane(crate::unknown_harness::HARNESS, "w:coordinator");
+        let turn = TurnEvidence::default();
+        let stop = StopState::default();
+        assert!(reminders.idle(&info, &turn, &stop, Ask::First, Some(&FrameState::Idle)));
+        assert!(!reminders.idle(&info, &turn, &stop, Ask::Again, Some(&FrameState::Working)));
+        assert!(!reminders.idle(
+            &info,
+            &turn,
+            &stop,
+            Ask::Again,
+            Some(&FrameState::Other("reconnecting".to_owned()))
+        ));
+        // A pane of another TUI driven by the generic rules: the source answers, as before.
+        let mut reminders = ReplyReminders::with_source(
+            Duration::from_secs(10),
+            Box::new(Answers(std::sync::Mutex::new(vec![Ok(
+                ClaudeState::NotClaude,
+            )]))),
+        );
+        assert!(!reminders.idle(&info, &turn, &stop, Ask::First, None));
+        assert!(reminders
+            .waiting
+            .as_deref()
+            .is_some_and(|reason| reason.contains("cannot ask about")));
     }
 
     /// A stand-in for Claude Code that gives its answers in turn, the last first, and is idle

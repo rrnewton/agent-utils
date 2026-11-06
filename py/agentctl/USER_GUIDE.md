@@ -1867,9 +1867,13 @@ outside this same-user cleanup boundary.
 ### Adopt a TUI agentctl does not know: `--harness unknown` (Rust edition, #850 unknown-harness-mode)
 
 Herdr reports a terminal program it has no manifest for (an ORC minimal TUI, a
-readline loop, a new coding agent) as no agent kind with status `unknown`, so
-`adopt --harness orc` is refused: no agent kind is reported, and agentctl has no adapter
-for `orc`. Adopt it in best-effort mode instead:
+readline loop, a new coding agent) as no agent kind with status `unknown`.
+`adopt --harness orc` names a harness agentctl has no adapter for, so when Herdr
+reports no agent in the pane it adopts the program in this best-effort mode
+anyway, records `unknown` as its harness, and says so in the result's `note`
+(#852 unknown-tui-bridge). A harness agentctl does know (`claude`, `codex`,
+`muse` ...) is never swapped: a pane where Herdr does not see it is refused. To
+ask for this mode outright:
 
 ```sh
 agentctl adopt orc-lead --pane w1:p7 --workspace project \

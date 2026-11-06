@@ -2499,10 +2499,13 @@ executable `--claude-bin PATH` names (default `claude`, looked up on `PATH`),
 and takes the session whose process has the pane's ID in `HERDR_PANE_ID` in its
 environment, the lowest process ID if several do. Each run is killed after 10
 seconds, or at once when the service is stopped. Any state other than `idle`,
-such as `busy`, counts as working. A pane that herdr does not report as running
-Claude Code, such as a Codex pane, is never reminded, and the service logs once
-that it waits for that reason, as it does when Claude Code lists no session in
-the pane. An idle period begins at
+such as `busy`, counts as working. A Codex or Muse pane is idle when its Herdr
+status says so. A pane driven by the generic rules (`--harness unknown`) that
+shows agentterm's input frame is idle when the frame reads `idle`, and working
+under `working M:SS` or any other label (#852 unknown-tui-bridge). Any other
+pane, such as one of another TUI driven by the generic rules, is never
+reminded, and the service logs once that it waits for that reason, as it does
+when Claude Code lists no session in the pane. An idle period begins at
 the first check that finds the agent idle and ends at the first that does not.
 A request is due once the agent has been idle for DURATION both since its idle
 period began and since the request's prompt was typed. Idle time is counted

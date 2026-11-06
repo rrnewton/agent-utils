@@ -8833,7 +8833,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     /// Register an identity-checked live Herdr agent without owning its runtime.
-    pub fn adopt(&self, agent_name: &str, options: AdoptOptions) -> Result<Value> {
+    pub fn adopt(&self, agent_name: &str, mut options: AdoptOptions) -> Result<Value> {
         name(agent_name)?;
         if options.pane_id.is_empty() || options.pane_id.contains('\0') {
             return Err(fail("adopt needs a nonempty pane id without NUL"));
@@ -8855,6 +8855,24 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         }
         harness_arguments(&options.harness, None, None, &[])?;
+        // A TUI agentctl has no adapter for, in a pane where Herdr recognises no agent, is driven
+        // by the generic rules, with a note, rather than refused (#852 unknown-tui-bridge). A
+        // harness agentctl knows is never swapped: a mismatch there is still refused below.
+        let fallback = (crate::harness::adapter(&options.harness).is_none()
+            && !crate::unknown_harness::is_unknown(&options.harness)
+            && self
+                .client
+                .pane_info(&options.pane_id)
+                .is_ok_and(|info| info.agent.is_none()))
+        .then(|| {
+            let note = format!(
+                "agentctl has no adapter for {:?} and Herdr recognises no agent in pane {}, so \
+                 it was adopted with --harness unknown and is driven by generic screen rules",
+                options.harness, options.pane_id
+            );
+            options.harness = crate::unknown_harness::HARNESS.to_owned();
+            note
+        });
         let generic = crate::unknown_harness::is_unknown(&options.harness);
         // A harness driven by the generic rules has no kind Herdr reports; its pinned foreground
         // process is its identity instead.
@@ -9228,7 +9246,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             Ok(result)
         });
         match final_status {
-            Ok(result) => Ok(result),
+            Ok(mut result) => {
+                if let Some(note) = fallback {
+                    result["note"] = Value::String(note);
+                }
+                Ok(result)
+            }
             Err(error) => match self.archive_failed_adoption(&mut record, &error.to_string()) {
                 Ok(destination) => Err(fail(format!(
                     "adoption failed final verification and was not registered; diagnostic record archived at {}: {error}",
@@ -10694,6 +10717,20 @@ its drain would also type, so it was not queued",
             Err(error) => error,
         };
         take_back_unsent(&queue, message_id, error)
+    }
+
+    /// What agentterm's input frame says in `agent_name`'s pane, for an agent driven by the
+    /// generic rules whose pane shows one (#852 unknown-tui-bridge): reply reminders read its
+    /// idleness there. `None` for any other agent, or when the pane cannot be read.
+    pub(crate) fn agentterm_frame(
+        &self,
+        agent_name: &str,
+    ) -> Option<crate::harness::agentterm::FrameState> {
+        let record = self.load(agent_name).ok()?;
+        if !crate::unknown_harness::is_unknown(&record.harness) {
+            return None;
+        }
+        crate::harness::agentterm::frame(&self.turn_screen(&record).ok()?).map(|frame| frame.state)
     }
 
     /// Read the visible screen of the agent's recorded pane.
@@ -17506,15 +17543,43 @@ fi
     }
 
     #[test]
-    fn adopting_an_unrecognised_tui_under_its_own_name_points_at_the_unknown_harness() {
+    fn adopting_an_unrecognised_tui_under_its_own_name_falls_back_to_the_unknown_harness() {
+        // #852 unknown-tui-bridge: no adapter for the name, no agent Herdr recognises: driven by
+        // the generic rules, with a note, instead of refused.
         let fixture = Fixture::new();
         fixture.prepare_foreign();
-        // Herdr recognises no agent in the pane.
-        fixture.client.started.store(false, Ordering::Relaxed);
+        // Herdr reports no agent kind in the pane, and no native session.
+        fixture.client.no_agent_kind.store(true, Ordering::Relaxed);
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
         let mut options = fixture.adopt_options();
-        options.harness = "orc".to_owned();
-        let error = fixture.manager().adopt("foreign", options).unwrap_err();
-        assert!(error.to_string().contains("--harness unknown"), "{error}");
+        options.harness = "agentterm".to_owned();
+        let adopted = fixture.manager().adopt("foreign", options).unwrap();
+        assert!(
+            adopted["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("no adapter for \"agentterm\"")
+                    && note.contains("--harness unknown")),
+            "{adopted}"
+        );
+        assert_eq!(
+            fixture.manager().load("foreign").unwrap().harness,
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn adopting_a_known_harness_herdr_does_not_see_is_still_refused() {
+        // A harness agentctl knows is never swapped for the generic rules.
+        let fixture = Fixture::new();
+        fixture.prepare_foreign();
+        fixture.client.no_agent_kind.store(true, Ordering::Relaxed);
+        let mut options = fixture.adopt_options();
+        options.harness = "codex".to_owned();
+        assert!(fixture.manager().adopt("foreign", options).is_err());
+        assert!(fixture.manager().load("foreign").is_err());
     }
 
     #[test]
