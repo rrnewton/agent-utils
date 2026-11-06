@@ -6,12 +6,20 @@
 Description=Restore the agentctl coordinator team after boot
 Requires=herdr-server.service
 After=herdr-server.service
+# A refused restore (exit 75, temporary failure) retries a bounded number of
+# times instead of giving up for the boot (#7 boot-restore-retry).
+StartLimitIntervalSec=1800
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
 ExecStart=@AGENTCTL@ --registry @REGISTRY@ --herdr-bin @HERDR@ restore --boot
 # Reviving each agent can take its startup deadline plus the configured delay between agents.
 TimeoutStartSec=1800
+Restart=on-failure
+RestartSec=60
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=default.target

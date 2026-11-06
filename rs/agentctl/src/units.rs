@@ -663,6 +663,10 @@ mod tests {
             "ExecStart=/opt/agentctl/bin/agentctl --registry /home/owner/project/.agentctl --herdr-bin /home/owner/bin/herdr restore --boot"
         ));
         assert!(files[1].1.contains("After=herdr-server.service"));
+        // A refused boot restore retries bounded and logs to the journal.
+        assert!(files[1].1.contains("Restart=on-failure"));
+        assert!(files[1].1.contains("StartLimitBurst=5"));
+        assert!(files[1].1.contains("StandardError=journal"));
         assert!(files[2].1.contains("watch\n"));
         assert!(!files[2].1.contains("After=herdr-server.service"));
         assert!(files[3].1.contains("After=herdr-server.service"));
