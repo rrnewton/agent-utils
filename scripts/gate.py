@@ -19,6 +19,11 @@ repository (default /tmp/dev-agent-utils-gate-admission, override with
 $GATE_ADMISSION_DIR); tickets and runs are files, reaped when their pid dies,
 so a killed lane never holds a slot forever.
 
+When a run finishes and has released its slot, it prunes this checkout's cargo
+target dirs of builds nothing can reuse, under cargo's own locks, and reports
+the bytes before and after (#940; `scripts/gate.py prune --help`). --no-prune or
+GATE_PRUNE_TARGETS=off skips that.
+
 An admitted run's children see $GATE_ADMISSION_RUN_ID. A gate invoked from
 inside an admitted run (validate.py's gate-exclusive phase) releases the
 parent's slot before queueing: the parent is blocked on that call, so holding
@@ -54,6 +59,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -442,6 +448,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     passed_steps: set[str] = set()
     failed_steps: set[str] = set()
     verdict_word: str | None = None
+    last_line = ""
     try:
         proc = subprocess.Popen(
             command,
@@ -455,6 +462,8 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         assert proc.stdout is not None
         for line in proc.stdout:
             sys.stdout.write(line)
+            if line.strip():
+                last_line = line
             match = _FAILED_STEP.search(line)
             if match:
                 failed_steps.add(match.group(1))
@@ -472,8 +481,15 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
                     "queued_at": queued_at, "started_at": started,
                     "finished_at": finished, "wait_s": round(waited, 2),
                     "run_s": round(finished - started, 2), "exit_code": rc})
+        # After the slot is released, so no other gate waits on it (#940). A
+        # nested gate leaves it to its parent, which is still building.
+        pruned = None if nested or getattr(args, "no_prune", False) else _prune_after_gate()
+        if pruned is not None and last_line:
+            # The run's verdict stays the log's last line (`tail -1 LOG`).
+            sys.stdout.write(last_line if last_line.endswith("\n") else last_line + "\n")
+            sys.stdout.flush()
         _record_ledger(args, command, started, finished, rc,
-                       passed_steps, failed_steps, verdict_word)
+                       passed_steps, failed_steps, verdict_word, pruned)
     return rc
 
 
@@ -486,6 +502,7 @@ def _record_ledger(
     passed_steps: set[str],
     failed_steps: set[str],
     verdict_word: str | None,
+    pruned: dict[str, int] | None = None,
 ) -> None:
     """Append one durable ledger line for the finished run (#827). Best effort:
     a ledger failure must never change the gate's own result."""
@@ -513,6 +530,8 @@ def _record_ledger(
             "exit_code": rc,
             "blackout_ignored": bool(getattr(args, "ignore_blackout", False)),
             "log_path": None,
+            "target_bytes_before": (pruned or {}).get("target_bytes_before"),
+            "target_bytes_after": (pruned or {}).get("target_bytes_after"),
         }
         path = ledger_path(getattr(args, "ledger", None))
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -589,6 +608,367 @@ def show_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------- cargo target pruning (#940)
+#
+# Every slot keeps its own cargo targets, and they grow with every build: a test
+# binary, rlib or incremental cache built for a configuration nothing builds any
+# more stays on disk under its old hash forever. After each gate, prune what no
+# current build can reuse, under cargo's own locks.
+#
+# The slot filesystems are mounted noatime, so a read leaves no trace, and cargo
+# rewrites nothing for a fresh unit: a file's age says when it was BUILT, not
+# whether it is still used. So the unit, not the file, is the grain, and use is
+# read off cargo's fingerprint graph. Each unit has .fingerprint/<pkg>-<hash>/
+# holding its fingerprint (16 hex digits, the u64 little-endian) and a JSON
+# record whose "deps" name each dependency's fingerprint, which links the units
+# into a graph. A unit nothing depends on is a root (a test binary, a binary, an
+# example, a lone library). Roots that are the same target in the same
+# configuration (target, profile and mode, features, compile kind, flags) and
+# differ only in what they were linked against are builds of one target at
+# different times, or alternatives two cargo commands need (one package seen
+# through two feature unifications). The newest is kept. Older ones are kept too
+# when built within the keep window of the newest with the same compiler, since
+# two commands that both still run rebuild their variants within minutes of each
+# other. Every unit a kept root reaches is kept, so a dependency built once and
+# never touched since lives as long as something uses it, however old its files.
+# Everything else goes: its deps/, build/, examples/ and .fingerprint/ entries.
+# Units built in the last hour are always kept, whatever the graph says.
+#
+# Incremental caches never decide freshness (cargo does not consult them), so
+# dropping one costs at most a slower next compile of that crate, never a
+# rebuild of a fresh unit. Per crate name the newest is kept, and the others go
+# once untouched for the keep window.
+#
+# Safety while cargo runs in the same slot: a target dir is pruned only while
+# this process holds cargo's own locks on every profile dir in it, taken without
+# waiting. A busy target dir is skipped and reported; a cargo starting meanwhile
+# blocks for the few seconds the prune takes. A fingerprint record that does not
+# parse skips its target dir rather than guess. A finished gate prunes only its
+# own checkout's target dirs; `gate prune` only reports unless given --apply,
+# and reaches another checkout only with --other-checkouts.
+
+PRUNE_KEEP_HOURS = 24.0
+PRUNE_RECENT_SECONDS = 3600.0
+_CARGO_LOCKS = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
+_UNIT_ENTRY = re.compile(r"-([0-9a-f]{16})(?:\.|$)")
+_UNIT_DIRS = ("deps", "build", "examples", ".fingerprint")
+
+
+def _is_target_root(path: Path) -> bool:
+    return (path / ".rustc_info.json").is_file() or (path / "CACHEDIR.TAG").is_file()
+
+
+def target_dirs(top: Path) -> dict[Path, list[Path]]:
+    """Cargo target dirs at or below *top* (rs/target holds nested ones such as
+    rs/target/validation-tests), each with its profile dirs. A profile dir holds
+    .fingerprint and sits in its target dir, or one level down in a --target
+    triple dir."""
+
+    found: dict[Path, list[Path]] = {}
+    top_depth = len(top.parts)
+    for dirpath, dirs, _files in os.walk(top):
+        here = Path(dirpath)
+        if ".fingerprint" in dirs:
+            parent = here.parent
+            root = parent if _is_target_root(parent) or parent == top else parent.parent
+            found.setdefault(root, []).append(here)
+            dirs.clear()
+        elif len(here.parts) - top_depth >= 4:
+            dirs.clear()
+    return {root: sorted(profiles) for root, profiles in sorted(found.items())}
+
+
+def _tree_bytes(path: Path) -> int:
+    total = 0
+    for dirpath, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def _lock_profiles(profiles: list[Path]) -> list[int] | None:
+    """Cargo's locks on every profile dir, all or nothing, never waiting."""
+
+    held: list[int] = []
+    for profile in profiles:
+        for name in _CARGO_LOCKS:
+            path = profile / name
+            if not path.exists():
+                continue
+            try:
+                fd = os.open(path, os.O_RDWR)
+            except OSError:
+                _unlock(held)
+                return None
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                _unlock(held)
+                return None
+            held.append(fd)
+    return held
+
+
+def _unlock(held: list[int]) -> None:
+    for fd in held:
+        os.close(fd)
+
+
+@dataclasses.dataclass
+class _Unit:
+    profile: Path
+    name: str
+    mtime: float
+    record: dict[str, object] | None = None
+    stems: tuple[str, ...] = ()
+    fingerprints: frozenset[int] = frozenset()
+
+
+class _UnreadableFingerprint(Exception):
+    pass
+
+
+def _load_unit(profile: Path, unit_dir: Path) -> _Unit:
+    records = sorted(unit_dir.glob("*.json"))
+    if not records:
+        # Cargo empties a unit's fingerprint when it starts rebuilding it, so an
+        # empty one is a build that failed or was killed: cargo rebuilds it anyway.
+        return _Unit(profile, unit_dir.name, unit_dir.stat().st_mtime)
+    try:
+        record = json.loads(records[0].read_text())
+    except (OSError, ValueError) as exc:
+        raise _UnreadableFingerprint(f"{records[0]}: {exc}") from exc
+    if not isinstance(record, dict) or not isinstance(record.get("deps"), list):
+        raise _UnreadableFingerprint(f"{records[0]}: no deps list")
+    fingerprints: set[int] = set()
+    for path in records:
+        try:
+            fingerprints.add(int.from_bytes(bytes.fromhex(path.with_suffix("").read_text().strip()), "little"))
+        except (OSError, ValueError):
+            pass
+    return _Unit(profile, unit_dir.name, max(p.stat().st_mtime for p in records), record,
+                 tuple(p.stem for p in records), frozenset(fingerprints))
+
+
+def _dep_fingerprints(unit: _Unit) -> list[int]:
+    assert unit.record is not None
+    deps = unit.record["deps"]
+    assert isinstance(deps, list)
+    try:
+        return [int(dep[3]) for dep in deps]
+    except (TypeError, ValueError, IndexError) as exc:
+        raise _UnreadableFingerprint(f"{unit.profile / '.fingerprint' / unit.name}: deps {exc}") from exc
+
+
+def _dead_units(units: list[_Unit], now: float, keep_s: float) -> list[_Unit]:
+    by_fingerprint: dict[int, list[int]] = {}
+    for index, unit in enumerate(units):
+        for value in unit.fingerprints:
+            by_fingerprint.setdefault(value, []).append(index)
+    edges: dict[int, set[int]] = {}
+    depended_on: set[int] = set()
+    for index, unit in enumerate(units):
+        if unit.record is None:
+            continue
+        targets = {t for value in _dep_fingerprints(unit) for t in by_fingerprint.get(value, [])}
+        edges[index] = targets
+        depended_on |= targets
+    groups: dict[tuple[object, ...], list[int]] = {}
+    for index, unit in enumerate(units):
+        if unit.record is None or index in depended_on:
+            continue
+        r = unit.record
+        key = (unit.profile, unit.stems, r.get("features"), r.get("target"), r.get("profile"),
+               r.get("compile_kind"), json.dumps(r.get("rustflags")), r.get("config"))
+        groups.setdefault(key, []).append(index)
+    keep = [i for i, unit in enumerate(units) if now - unit.mtime < PRUNE_RECENT_SECONDS]
+    for members in groups.values():
+        newest = units[max(members, key=lambda i: units[i].mtime)]
+        assert newest.record is not None
+        for i in members:
+            unit = units[i]
+            assert unit.record is not None
+            if (unit is newest or (unit.record.get("rustc") == newest.record.get("rustc")
+                                   and newest.mtime - unit.mtime <= keep_s)):
+                keep.append(i)
+    live: set[int] = set()
+    while keep:
+        index = keep.pop()
+        if index not in live:
+            live.add(index)
+            keep.extend(edges.get(index, ()))
+    return [unit for i, unit in enumerate(units) if i not in live]
+
+
+def _stale_incremental(profiles: list[Path], now: float, keep_s: float) -> list[Path]:
+    stale: list[Path] = []
+    for profile in profiles:
+        crates: dict[str, list[tuple[float, Path]]] = {}
+        incremental = profile / "incremental"
+        if not incremental.is_dir():
+            continue
+        for path in incremental.iterdir():
+            if path.is_dir() and not path.is_symlink():
+                crates.setdefault(path.name.rsplit("-", 1)[0], []).append((path.stat().st_mtime, path))
+        for dirs in crates.values():
+            dirs.sort()
+            stale += [path for mtime, path in dirs[:-1] if now - mtime > keep_s]
+    return stale
+
+
+@dataclasses.dataclass
+class PruneResult:
+    root: Path
+    units: int = 0
+    incremental: int = 0
+    freed: int = 0
+    skipped: str | None = None
+
+
+def _remove(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def prune_target_root(root: Path, profiles: list[Path], *, now: float | None = None,
+                      keep_hours: float = PRUNE_KEEP_HOURS, dry_run: bool = False) -> PruneResult:
+    """Prune one cargo target dir under cargo's locks; see the section comment."""
+
+    now = time.time() if now is None else now
+    keep_s = keep_hours * 3600.0
+    result = PruneResult(root)
+    held = [] if dry_run else _lock_profiles(profiles)
+    if held is None:
+        result.skipped = "cargo is using it"
+        return result
+    try:
+        try:
+            units = [_load_unit(p, d) for p in profiles for d in (p / ".fingerprint").iterdir() if d.is_dir()]
+            dead = _dead_units(units, now, keep_s)
+        except _UnreadableFingerprint as exc:
+            result.skipped = f"unreadable fingerprint {exc}"
+            return result
+        doomed: list[Path] = []
+        for profile in profiles:
+            hashes = {u.name.rsplit("-", 1)[-1] for u in dead if u.profile == profile}
+            if not hashes:
+                continue
+            for sub in _UNIT_DIRS:
+                folder = profile / sub
+                if folder.is_dir():
+                    for entry in folder.iterdir():
+                        match = _UNIT_ENTRY.search(entry.name)
+                        if match and match.group(1) in hashes:
+                            doomed.append(entry)
+        incremental = _stale_incremental(profiles, now, keep_s)
+        result.units, result.incremental = len(dead), len(incremental)
+        for path in doomed + incremental:
+            result.freed += _tree_bytes(path) if path.is_dir() and not path.is_symlink() else path.lstat().st_blocks * 512
+            if not dry_run:
+                _remove(path)
+    finally:
+        _unlock(held)
+    return result
+
+
+def default_prune_dirs() -> list[Path]:
+    """This checkout's own cargo target dirs, and never another's;
+    $GATE_PRUNE_TARGETS=off disables the prune."""
+
+    if os.environ.get("GATE_PRUNE_TARGETS", "").strip().lower() in {"0", "off", "no", "false"}:
+        return []
+    repo = Path(__file__).resolve().parent.parent
+    return [repo / "rs" / "target", repo / "vibe-talk" / "target"]
+
+
+def _gib(n: int) -> str:
+    return f"{n / 2**30:.2f} GiB"
+
+
+def prune_targets(tops: list[Path], *, keep_hours: float = PRUNE_KEEP_HOURS, dry_run: bool = False,
+                  prefix: str = "gate") -> tuple[int, int]:
+    """Prune every target dir under *tops*, print one line per top, and return
+    the bytes under them before and after."""
+
+    before_total = after_total = 0
+    for top in tops:
+        if not top.is_dir():
+            continue
+        before = _tree_bytes(top)
+        results = [prune_target_root(root, profiles, keep_hours=keep_hours, dry_run=dry_run)
+                   for root, profiles in target_dirs(top).items()]
+        after = before - sum(r.freed for r in results) if dry_run else _tree_bytes(top)
+        before_total += before
+        after_total += after
+        verb = "would prune" if dry_run else "pruned"
+        line = (f"{prefix}: cargo target {top}: {_gib(before)} -> {_gib(after)} ({verb} "
+                f"{sum(r.units for r in results)} stale unit(s) and "
+                f"{sum(r.incremental for r in results)} incremental cache(s), {_gib(sum(r.freed for r in results))})")
+        skipped = [f"{r.root.relative_to(top) if r.root != top else '.'}: {r.skipped}" for r in results if r.skipped]
+        if skipped:
+            line += "; skipped " + "; ".join(skipped)
+        print(line, flush=True)
+    return before_total, after_total
+
+
+def _prune_after_gate() -> dict[str, int] | None:
+    """Best effort: a prune failure must never change the gate's own result."""
+
+    try:
+        tops = default_prune_dirs()
+        if not tops:
+            return None
+        before, after = prune_targets(tops)
+        return {"target_bytes_before": before, "target_bytes_after": after}
+    except Exception as exc:
+        print(f"gate: cargo target prune failed: {exc}", flush=True)
+        return None
+
+
+def run_prune(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="gate prune",
+        description=(
+            "Prune cargo build artifacts no current build can reuse: older builds of a target, "
+            "and everything only they used, plus idle incremental caches. A gate prunes its own "
+            "checkout's target dirs when it finishes; this command reports, and with --apply "
+            "removes, by hand. Target dirs cargo is using are skipped."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  scripts/gate.py prune                  # report for this checkout\n"
+            "  scripts/gate.py prune --apply          # prune this checkout\n"
+            "  scripts/gate.py prune --other-checkouts ../other/rs/target   # report for another"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("dirs", nargs="*", type=Path,
+                        help="cargo target dirs, nested ones included "
+                             "(default: this checkout's rs/target and vibe-talk/target)")
+    parser.add_argument("--apply", action="store_true",
+                        help="remove what the report lists (default: report only, taking no locks)")
+    parser.add_argument("--other-checkouts", action="store_true",
+                        help="allow dirs outside this checkout, such as another slot's (refused without it)")
+    parser.add_argument("--keep-hours", type=float, default=PRUNE_KEEP_HOURS,
+                        help=f"keep an older build of a target built within this many hours of the newest, "
+                             f"and incremental caches used within it (default {PRUNE_KEEP_HOURS:g})")
+    args = parser.parse_args(argv)
+    repo = Path(__file__).resolve().parent.parent
+    tops = [d.resolve() for d in args.dirs] or [repo / "rs" / "target", repo / "vibe-talk" / "target"]
+    outside = [d for d in tops if not d.is_relative_to(repo)]
+    if outside and not args.other_checkouts:
+        parser.error(f"outside this checkout ({repo}): {', '.join(map(str, outside))}; "
+                     "pass --other-checkouts to include them")
+    prune_targets(tops, keep_hours=args.keep_hours, dry_run=not args.apply, prefix="gate prune")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
@@ -620,8 +1000,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="start even inside a blackout window; the override is recorded in the ledger")
     parser.add_argument("--ledger", default=None,
                         help="durable ledger path (default ~/.local/state/agent-utils/gate-ledger.jsonl, or $GATE_LEDGER)")
+    parser.add_argument("--no-prune", action="store_true",
+                        help="skip the cargo target prune a finished run does (also $GATE_PRUNE_TARGETS=off; "
+                             "see `gate prune --help`)")
     if argv[:1] == ["status"]:
         return show_status(parser.parse_args([]))
+    if argv[:1] == ["prune"]:
+        return run_prune(argv[1:])
     if argv[:1] == ["stats"]:
         stats_parser = argparse.ArgumentParser(prog="gate stats")
         stats_parser.add_argument("--since", default=None,
