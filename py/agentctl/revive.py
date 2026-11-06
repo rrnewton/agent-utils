@@ -179,6 +179,30 @@ def candidate_records(manager: ManagedAgents) -> list[AgentRecord]:
     return records
 
 
+def _discover_muse_session(record: AgentRecord) -> str | None:
+    """Newest Muse session whose `session.jsonl` head mentions the record's
+    cwd; the session id is its directory name (the session-index.db facts).
+    """
+    if record.harness != "muse":
+        return None
+    root = Path.home() / ".local" / "share" / "muse" / "sessions"
+    best: tuple[float, str] | None = None
+    for path in root.rglob("session.jsonl"):
+        try:
+            head = path.read_bytes()[:65536].decode("utf-8", "replace")
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if record.cwd not in head:
+            continue
+        session = path.parent.name
+        if not session or "\0" in session:
+            continue
+        if best is None or mtime > best[0]:
+            best = (mtime, session)
+    return None if best is None else best[1]
+
+
 def _conversation(record: AgentRecord) -> str:
     if record._session_source != "asserted" and (
             (record.session_agent is None) != (record.session_value is None)
@@ -188,6 +212,10 @@ def _conversation(record: AgentRecord) -> str:
         None if record.native_session is None else record.native_session["value"], record.resume,
         record.session_value if record._session_source != "asserted" else None,
     ) if value is not None]
+    if not values:
+        discovered = _discover_muse_session(record)
+        if discovered is not None:
+            values = [discovered]
     if not values or any(not value or "\0" in value for value in values):
         raise AgentDeliveryError("record has no usable native conversation; supply its reported ID when starting a replacement")
     if len(set(values)) != 1:

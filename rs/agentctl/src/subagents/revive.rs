@@ -180,6 +180,61 @@ pub(super) fn discover_claude_session(
         .map(|transcript| NativeSession::new("claude", &transcript.session, "observed"))
 }
 
+/// Discover a Muse session for `record`: newest `session.jsonl` under
+/// `~/.local/share/muse/sessions/` whose head mentions the record's cwd;
+/// the session id is its directory name. The session-index.db SQLite
+/// database is the index of the same facts; the files are read directly.
+pub(super) fn discover_muse_session(record: &AgentRecord) -> Option<NativeSession> {
+    if record.harness != "muse" {
+        return None;
+    }
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        let root = crate::harness::home()?.join(".local/share/muse/sessions");
+        let mut best: Option<(std::time::SystemTime, String)> = None;
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.file_name().and_then(|name| name.to_str()) != Some("session.jsonl") {
+                    continue;
+                }
+                let Ok(bytes) = fs::read(&path) else { continue };
+                let head = String::from_utf8_lossy(&bytes[..bytes.len().min(65536)]);
+                if !head.contains(&record.cwd) {
+                    continue;
+                }
+                let Some(id) = path
+                    .parent()
+                    .and_then(|dir| dir.file_name())
+                    .and_then(|name| name.to_str())
+                    .filter(|id| valid_metadata_text(id))
+                else {
+                    continue;
+                };
+                let Ok(mtime) = entry.metadata().and_then(|meta| meta.modified()) else {
+                    continue;
+                };
+                if best.as_ref().is_none_or(|(when, _)| mtime > *when) {
+                    best = Some((mtime, id.to_owned()));
+                }
+            }
+        }
+        best.map(|(_, id)| NativeSession::new("muse", &id, "observed"))
+    }
+}
+
 /// Discover a Codex session for `record` (#741): newest `rollout-*-<thread>.jsonl` under
 /// `$CODEX_HOME/sessions` (default `~/.codex/sessions`) whose head mentions the record's cwd.
 pub(super) fn discover_codex_session(record: &AgentRecord) -> Option<NativeSession> {
@@ -872,6 +927,7 @@ fn conversation(record: &AgentRecord) -> Result<NativeSession> {
             })
         })
         .or_else(|| discover_claude_session(&claude_config_roots(), record))
+        .or_else(|| discover_muse_session(record))
         .or_else(|| discover_codex_session(record))
         .ok_or_else(|| {
             match record
@@ -1567,6 +1623,78 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                                 return Err(fail(
                                     "missing pane presentation changed during recovery proof",
                                 ));
+                            }
+                            // Item 5 slice 2: a Herdr auto-restored tab is a
+                            // new pane in the recorded cwd whose tab still
+                            // names this lane. When exactly one such orphan
+                            // idle shell exists, revive in it instead of
+                            // opening a new tab. A pending journal's own
+                            // candidate is never an orphan: skip the search
+                            // while a journal for this name exists.
+                            let journal_pending = journals(&self.registry)
+                                .is_ok_and(|all| all.iter().any(|j| j.name == record.name));
+                            let mut orphans = Vec::new();
+                            if !journal_pending {
+                                for candidate in &repeated {
+                                    if self
+                                        .client
+                                        .pane_idle_shell_identity(&candidate.pane_id)
+                                        .ok()
+                                        .flatten()
+                                        .is_none()
+                                    {
+                                        continue;
+                                    }
+                                    let Ok(info) = self.client.pane_info(&candidate.pane_id) else {
+                                        continue;
+                                    };
+                                    if !same_directory(&info.cwd, &record.cwd) {
+                                        continue;
+                                    }
+                                    let labelled = self
+                                        .client
+                                        .tab_label(&candidate.tab_id)
+                                        .is_ok_and(|label| label == record.name);
+                                    if !labelled {
+                                        continue;
+                                    }
+                                    if self
+                                        .claim_owner(
+                                            &candidate.pane_id,
+                                            info.terminal_id.as_deref(),
+                                            Some(&record.name),
+                                        )
+                                        .ok()
+                                        .flatten()
+                                        .is_some()
+                                    {
+                                        continue;
+                                    }
+                                    orphans.push((candidate.clone(), info));
+                                }
+                            }
+                            if let [(candidate, info)] = orphans.as_slice() {
+                                if let Ok(Some(shell)) =
+                                    self.client.pane_idle_shell_identity(&candidate.pane_id)
+                                {
+                                    return Ok(Some(Proof {
+                                        unknown: Default::default(),
+                                        kind: "idle_shell".to_owned(),
+                                        pane_id: candidate.pane_id.clone(),
+                                        tab_id: candidate.tab_id.clone(),
+                                        workspace_id: candidate.workspace_id.clone(),
+                                        cwd: info.cwd.clone(),
+                                        terminal_id: info.terminal_id.clone(),
+                                        reported_agent: info.agent.clone(),
+                                        reported_session_agent: info.session_agent.clone(),
+                                        reported_session_value: info.session_value.clone(),
+                                        shell: Some(shell.identity),
+                                        shell_executable: shell
+                                            .executable_path
+                                            .to_str()
+                                            .map(str::to_owned),
+                                    }));
+                                }
                             }
                             Ok(Some(Proof {
                                 unknown: Default::default(),
