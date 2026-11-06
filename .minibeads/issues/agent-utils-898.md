@@ -37,7 +37,7 @@ Seen once, possibly unrelated: removing a validation probe slot refused with "va
 
 Raised to P1 by the lead on 2026-11-05 at 12:38 PM ET. With the worktrees-image mode on in that harness, every new slot is born in the image, so every finished lane's slot is now unremovable (a second slot refused the same way). mu-validate may take it right after #894, or before it if #898 is smaller; its call. Until then, finished image slots stay in place, unreclaimed.
 
-# Resolution
+## Resolution
 
 Landed on main as f94ec1d9 (implementation f8a6fcd7 plus docstring fix). The bind record now keeps each slot's subvolume and mount ID; the process-use census ignores exactly the recorded bind's mount line (target, device and subvolume root all match), so an image-born slot's own bind is not an occupant while a foreign mount at the same path or under the slot still refuses. The path fence relocates the bind (umount, rename, re-bind at the fenced path) and final removal unbinds and deletes the subvolume; a failed unmount leaves slot, record and subvolume intact for a retry. Full gate on 6c889403 was green (validate OK).
 
