@@ -8754,10 +8754,33 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             // it gets as long as it has to start working.
             let readback = Some(options.delivery.working_timeout);
             self.send_record(&record, &brief, options.delivery, None, readback)?;
+            // Codex writes its conversation's rollout only once it has a first prompt, so a
+            // session the launch could not see may be held now (#916).
+            if record.native_session.is_none()
+                && !record.extra.contains_key(revive::NATIVE_SESSION_UNKNOWN)
+            {
+                if let Some(warning) = revive::capture_held_session(&mut record) {
+                    eprintln!("agentctl: warning: {warning}");
+                }
+                if record.native_session.is_some()
+                    || record.extra.contains_key(revive::NATIVE_SESSION_UNKNOWN)
+                {
+                    self.save(&record)?;
+                }
+            }
         }
         let mut status = self.status(agent_name)?;
         if let Some(slot_owner) = slot_owner {
             status["slot_owner"] = slot_owner;
+        }
+        if let Some(reason) = record
+            .extra
+            .get(revive::NATIVE_SESSION_UNKNOWN)
+            .and_then(|note| note["reason"].as_str())
+        {
+            status["native_session_warning"] = Value::String(format!(
+                "native conversation unknown: {reason}; name it with `agentctl bind-session {agent_name} <id>`"
+            ));
         }
         Ok(status)
     }
@@ -9214,6 +9237,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if options.record_edges {
             record.set_edge(control::MANAGED_BY, self.caller_edge().as_ref());
         }
+        // A harness that names its conversation only by the files it holds (#916).
+        let native_warning = revive::capture_held_session(&mut record);
+        if let Some(warning) = &native_warning {
+            eprintln!("agentctl: warning: {warning}");
+        }
         record.launch_spec = self.captured_launch_spec(
             &record,
             record.harness_identity.as_ref(),
@@ -9256,6 +9284,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             Ok(mut result) => {
                 if let Some(note) = fallback {
                     result["note"] = Value::String(note);
+                }
+                if let Some(warning) = native_warning {
+                    result["native_session_warning"] = Value::String(warning);
                 }
                 Ok(result)
             }
@@ -9421,6 +9452,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
         }
         self.anchor_fresh(record, terminal_id)?;
+        // A harness that names its conversation only by the files it holds (#916).
+        if let Some(warning) = revive::capture_held_session(record) {
+            eprintln!("agentctl: warning: {warning}");
+        }
         record.lifecycle = "running".to_owned();
         self.save(record)?;
         let final_info = match self
@@ -12262,6 +12297,7 @@ its drain would also type, so it was not queued",
             record.native_session =
                 Some(NativeSession::new(&record.harness, session_id, "asserted"));
         }
+        record.extra.remove(revive::NATIVE_SESSION_UNKNOWN);
         if let Some(command) = goal_command {
             record.goal_command = Some(command.to_vec());
         }

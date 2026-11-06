@@ -1714,3 +1714,273 @@ fn revive_reuses_the_recorded_slot_without_allocation_or_rebinding() {
     );
     assert_eq!(fixture.client.environments.lock().unwrap().len(), 2);
 }
+
+// --- Native ids captured at start and adopt (#916 muse-native-session-id) -----------------------
+
+/// Pretend the agent's processes hold these files open until the guard drops.
+struct PretendHeld;
+
+impl Drop for PretendHeld {
+    fn drop(&mut self) {
+        crate::subagents::revive::HELD_FILES.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+#[must_use]
+fn pretend_held(files: Vec<PathBuf>) -> PretendHeld {
+    crate::subagents::revive::HELD_FILES.with(|cell| *cell.borrow_mut() = Some(files));
+    PretendHeld
+}
+
+/// What a fake Muse writes when it starts: `<data>/muse/sessions/2026/11/06/<id>/` with the
+/// `.session.lock` its runtime holds (`pid=`, `host=`). Returns the lock.
+fn fake_muse_session(fixture: &Fixture, id: &str) -> PathBuf {
+    let dir = fixture.root.join("data/muse/sessions/2026/11/06").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("session.jsonl"), "").unwrap();
+    let lock = dir.join(".session.lock");
+    fs::write(&lock, "pid=4242\nhost=localhost\n").unwrap();
+    lock
+}
+
+/// A fixture whose Herdr reports no native session, as it reports none for Muse or Codex.
+fn unreported() -> Fixture {
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture
+        .client
+        .report_session
+        .store(false, Ordering::Relaxed);
+    fixture
+}
+
+fn start_worker(fixture: &Fixture, harness: &str) -> Value {
+    fixture
+        .manager()
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                harness: harness.to_owned(),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap()
+}
+
+/// Stop `worker` (which archives it), then revive it from the archive.
+fn stop_and_revive_archived(fixture: &Fixture) -> crate::subagents::Result<Value> {
+    let record = fixture.manager().load("worker").unwrap();
+    let stopped = fixture.manager().stop("worker").unwrap();
+    assert!(stopped["archive"].is_string(), "{stopped}");
+    kill_owned(fixture, &record);
+    fixture
+        .manager()
+        .revive_archived("worker", false, None, TIMEOUT)
+}
+
+#[test]
+fn a_muse_lane_records_the_session_its_runtime_holds_and_revives_from_the_archive_without_a_bind() {
+    let fixture = unreported();
+    let id = "01a1ab0f-0a3c-73c1-8056-ee5296bc1574";
+    let lock = fake_muse_session(&fixture, id);
+    // A sub-agent's session the runtime also holds is not the lane's own.
+    let sub = fixture
+        .root
+        .join("data/muse/sessions/2026/11/06")
+        .join(id)
+        .join("subagent/child/.session.lock");
+    fs::create_dir_all(sub.parent().unwrap()).unwrap();
+    fs::write(&sub, "pid=4242\n").unwrap();
+    let held = pretend_held(vec![lock, sub, fixture.root.join("data/muse/cron.db")]);
+    let status = start_worker(&fixture, "muse");
+    assert!(status.get("native_session_warning").is_none(), "{status}");
+    let record = fixture.manager().load("worker").unwrap();
+    let native = record.native_session.clone().expect("captured at start");
+    assert_eq!((native.agent.as_str(), native.value.as_str()), ("muse", id));
+    assert_eq!(native.source, "observed");
+    assert_eq!(
+        record.session_value, None,
+        "Herdr reported none; nothing claims it did"
+    );
+    drop(held);
+
+    let revived = stop_and_revive_archived(&fixture).unwrap();
+    assert_eq!(revived["revived"], true, "{revived}");
+    let new = fixture.manager().load("worker").unwrap();
+    assert_eq!(new.arguments, ["resume", id]);
+}
+
+#[test]
+fn a_muse_lane_holding_two_sessions_is_recorded_as_unknown_and_says_so() {
+    let fixture = unreported();
+    let first = fake_muse_session(&fixture, "11111111-1111-1111-1111-111111111111");
+    let second = fake_muse_session(&fixture, "22222222-2222-2222-2222-222222222222");
+    let _held = pretend_held(vec![first, second]);
+    let status = start_worker(&fixture, "muse");
+    let warning = status["native_session_warning"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(warning.contains("2 muse sessions"), "{status}");
+    assert!(warning.contains("bind-session worker"), "{warning}");
+    let record = fixture.manager().load("worker").unwrap();
+    assert!(record.native_session.is_none(), "one of two was guessed");
+    let note = &record.extra[crate::subagents::revive::NATIVE_SESSION_UNKNOWN];
+    assert_eq!(
+        note["candidates"],
+        json!([
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222"
+        ])
+    );
+
+    let refused = stop_and_revive_archived(&fixture).unwrap_err().to_string();
+    assert!(refused.contains("no native conversation ID"), "{refused}");
+    assert!(refused.contains("does not guess"), "{refused}");
+}
+
+#[test]
+fn a_codex_lane_records_its_main_thread_rollout_and_revives_from_the_archive() {
+    let fixture = unreported();
+    let sessions = fixture.root.join("codex/sessions/2026/11/06");
+    fs::create_dir_all(&sessions).unwrap();
+    let thread = "01a19d09-4d93-70c0-b001-2f419851ddf2";
+    let main = sessions.join(format!("rollout-2026-11-06T00-00-00-{thread}.jsonl"));
+    fs::write(
+        &main,
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\",\"session_id\":\"{thread}\",\"source\":\"cli\"}}}}\n"
+        ),
+    )
+    .unwrap();
+    // A sub-agent thread's rollout, held by the same process, is not the lane's conversation.
+    let child =
+        sessions.join("rollout-2026-11-06T00-00-09-01a1ab92-3fc4-7b13-b906-ac1289ce1f14.jsonl");
+    fs::write(
+        &child,
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"01a1ab92-3fc4-7b13-b906-ac1289ce1f14\",\"session_id\":\"{thread}\",\"parent_thread_id\":\"{thread}\",\"source\":{{\"subagent\":{{}}}}}}}}\n"
+        ),
+    )
+    .unwrap();
+    let held = pretend_held(vec![main, child]);
+    start_worker(&fixture, "codex");
+    let native = fixture
+        .manager()
+        .load("worker")
+        .unwrap()
+        .native_session
+        .expect("captured at start");
+    assert_eq!(
+        (native.agent.as_str(), native.value.as_str()),
+        ("codex", thread)
+    );
+    drop(held);
+
+    let revived = stop_and_revive_archived(&fixture).unwrap();
+    assert_eq!(revived["revived"], true, "{revived}");
+    let new = fixture.manager().load("worker").unwrap();
+    assert_eq!(new.arguments[..2], ["resume", thread]);
+}
+
+#[test]
+fn a_claude_lane_carries_the_id_it_was_launched_with_and_revives_from_the_archive() {
+    let fixture = unreported();
+    start_worker(&fixture, "claude");
+    let record = fixture.manager().load("worker").unwrap();
+    let native = record.native_session.clone().expect("assigned at launch");
+    assert_eq!(native.source, "asserted");
+    assert_eq!(record.arguments, ["--session-id", &native.value]);
+
+    let revived = stop_and_revive_archived(&fixture).unwrap();
+    assert_eq!(revived["revived"], true, "{revived}");
+    let new = fixture.manager().load("worker").unwrap();
+    assert_eq!(new.arguments, ["--resume", &native.value]);
+}
+
+#[test]
+fn adopting_a_muse_or_codex_lane_records_the_session_it_holds() {
+    for harness in ["muse", "codex"] {
+        let fixture = unreported();
+        let held = match harness {
+            "muse" => fake_muse_session(&fixture, "33333333-3333-3333-3333-333333333333"),
+            _ => {
+                let dir = fixture.root.join("codex/sessions/2026/11/06");
+                fs::create_dir_all(&dir).unwrap();
+                let path = dir
+                    .join("rollout-2026-11-06T00-00-00-33333333-3333-3333-3333-333333333333.jsonl");
+                fs::write(
+                    &path,
+                    "{\"type\":\"session_meta\",\"payload\":{\"id\":\"33333333-3333-3333-3333-333333333333\",\"source\":\"cli\"}}\n",
+                )
+                .unwrap();
+                path
+            }
+        };
+        let _held = pretend_held(vec![held]);
+        fixture.prepare_foreign();
+        // The pane runs the harness being adopted.
+        fixture
+            .client
+            .launches
+            .lock()
+            .unwrap()
+            .insert("owned".to_owned(), (harness.to_owned(), Vec::new()));
+        let mut options = fixture.adopt_options();
+        options.harness = harness.to_owned();
+        let adopted = fixture.manager().adopt("foreign", options).unwrap();
+        assert!(adopted.get("native_session_warning").is_none(), "{adopted}");
+        let native = fixture
+            .manager()
+            .load("foreign")
+            .unwrap()
+            .native_session
+            .expect("captured at adopt");
+        assert_eq!(
+            (native.agent.as_str(), native.value.as_str()),
+            (harness, "33333333-3333-3333-3333-333333333333")
+        );
+    }
+}
+
+#[test]
+fn a_codex_lane_whose_rollout_appears_with_its_brief_records_it_after_delivery() {
+    // Codex writes its rollout only once it has a first prompt: nothing is held at launch.
+    let fixture = unreported();
+    let dir = fixture.root.join("codex/sessions/2026/11/06");
+    fs::create_dir_all(&dir).unwrap();
+    let thread = "44444444-4444-4444-4444-444444444444";
+    let rollout = dir.join(format!("rollout-2026-11-06T00-00-00-{thread}.jsonl"));
+    fs::write(
+        &rollout,
+        format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\",\"source\":\"cli\"}}}}\n"),
+    )
+    .unwrap();
+    let _held = pretend_held(Vec::new());
+    *fixture.client.on_run.lock().unwrap() = Some(Box::new(move |_| {
+        crate::subagents::revive::HELD_FILES
+            .with(|cell| *cell.borrow_mut() = Some(vec![rollout.clone()]));
+    }));
+    fixture
+        .manager()
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                harness: "codex".to_owned(),
+                brief: Some("first task".to_owned()),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let native = fixture
+        .manager()
+        .load("worker")
+        .unwrap()
+        .native_session
+        .expect("captured once the brief was delivered");
+    assert_eq!(native.value, thread);
+}

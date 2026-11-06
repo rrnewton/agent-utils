@@ -170,6 +170,22 @@ impl HarnessAdapter for Codex {
         read_transcript(lines, activity);
     }
 
+    /// The main-thread rollouts the process holds open (sub-agent threads excepted): each
+    /// one's thread id.
+    fn held_sessions(&self, held: &[PathBuf]) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for id in held
+            .iter()
+            .filter(|path| rollout_name(path) && path.to_string_lossy().contains("/sessions/"))
+            .filter_map(|path| main_thread_id(path))
+        {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
     /// The other rollouts the process holds open: its sub-agent threads.
     fn related_transcripts(
         &self,
@@ -516,24 +532,24 @@ fn rollout_name(path: &Path) -> bool {
 
 /// Whether the rollout's first entry, its `session_meta`, names no parent thread.
 fn main_thread(path: &Path) -> bool {
+    main_thread_id(path).is_some()
+}
+
+/// The thread id of a main-thread rollout: its `session_meta` names no parent thread.
+fn main_thread_id(path: &Path) -> Option<String> {
     use std::io::{BufRead, BufReader, Read};
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
+    let file = std::fs::File::open(path).ok()?;
     let mut first = Vec::new();
-    if BufReader::new(file.take(1 << 20))
+    BufReader::new(file.take(1 << 20))
         .read_until(b'\n', &mut first)
-        .is_err()
-    {
-        return false;
-    }
-    let Ok(entry) = serde_json::from_slice::<serde_json::Value>(&first) else {
-        return false;
-    };
+        .ok()?;
+    let entry = serde_json::from_slice::<serde_json::Value>(&first).ok()?;
     let payload = &entry["payload"];
-    entry["type"] == "session_meta"
+    (entry["type"] == "session_meta"
         && payload["parent_thread_id"].is_null()
-        && payload["source"]["subagent"].is_null()
+        && payload["source"]["subagent"].is_null())
+    .then(|| payload["id"].as_str().map(str::to_owned))
+    .flatten()
 }
 
 /// The text of the first JavaScript string literal after `key:` in `source`, unescaped.

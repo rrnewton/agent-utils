@@ -203,6 +203,13 @@ pub trait HarnessAdapter: Sync {
     }
     /// What the transcript's complete lines `lines`, oldest first, say the agent is doing.
     fn read_transcript(&self, _lines: &[&[u8]], _activity: &mut transcript::Activity) {}
+    /// The native conversation ids of the agent's own sessions among `held`, the files its
+    /// process and their descendants hold open, each once, in the order found (#916
+    /// muse-native-session-id). Exactly one names the agent's conversation; several are more
+    /// than anything can choose between. Empty for a harness whose id comes another way.
+    fn held_sessions(&self, _held: &[PathBuf]) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Every adapter, in the order the cross-harness tables list their phrases.

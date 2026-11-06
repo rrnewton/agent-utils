@@ -4,7 +4,7 @@
 //! [`crate::harness_tui::muse`]; this module names them.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{FollowupPolicy, HarnessAdapter, ScreenMarkers};
 
@@ -108,6 +108,21 @@ impl HarnessAdapter for Muse {
         read_transcript(lines, activity);
     }
 
+    /// The sessions the runtime holds locked, sub-agents' excepted: each one's directory name.
+    fn held_sessions(&self, held: &[PathBuf]) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for id in held
+            .iter()
+            .filter(|path| own_session_lock(path))
+            .filter_map(|lock| lock.parent()?.file_name()?.to_str())
+        {
+            if !ids.iter().any(|seen| seen == id) {
+                ids.push(id.to_owned());
+            }
+        }
+        ids
+    }
+
     /// The sub-agent sessions the runtime holds locked.
     fn related_transcripts(
         &self,
@@ -138,12 +153,7 @@ fn transcript_path(hints: &super::transcript::Hints<'_>) -> Option<PathBuf> {
     let held: Vec<PathBuf> = hints
         .open_files()
         .into_iter()
-        .filter(|path| {
-            let text = path.to_string_lossy();
-            path.file_name().is_some_and(|name| name == ".session.lock")
-                && text.contains("/muse/sessions/")
-                && !text.contains("/subagent/")
-        })
+        .filter(|path| own_session_lock(path))
         .filter_map(|lock| Some(lock.parent()?.join("session.jsonl")))
         .filter(|path| path.is_file())
         .collect();
@@ -171,6 +181,15 @@ fn transcript_path(hints: &super::transcript::Hints<'_>) -> Option<PathBuf> {
         (entry.file_name().is_some_and(|name| name == session) && journal.is_file())
             .then_some(journal)
     })
+}
+
+/// Whether `path` is the lock of a Muse session of the agent's own: `.session.lock` under
+/// `muse/sessions/`, not a sub-agent's session under `subagent/`.
+fn own_session_lock(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    path.file_name().is_some_and(|name| name == ".session.lock")
+        && text.contains("/muse/sessions/")
+        && !text.contains("/subagent/")
 }
 
 /// Every record a journal line holds: the line itself when it is a record, and the records its

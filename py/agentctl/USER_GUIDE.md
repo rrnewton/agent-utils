@@ -2674,6 +2674,19 @@ a known conversation ID, and a working goal RPC interface. If the ID was not
 reported automatically, use `bind-session` with the ID reported by that exact
 agent. A shared working directory is not sufficient evidence of identity.
 
+Herdr reports no conversation ID for Muse or Codex, so `start` and `adopt`
+read it from the session files the agent's own processes hold open: the
+`.session.lock` of its Muse session directory (sub-agents' sessions excepted),
+or the main-thread rollout of its Codex thread (sub-agent threads excepted).
+Codex writes that rollout only once it has a first prompt, so `start` looks
+again after delivering a startup brief. The record keeps it as `observed`, so `revive` (and `revive --archived`)
+resume that conversation with no `bind-session`. A Claude Code lane already
+carries the ID agentctl launched it with. When the processes hold several
+such sessions, agentctl does not choose: the record keeps no ID, says why
+under `native_session_unknown`, `start` and `adopt` print a warning and add a
+`native_session_warning` to their output, and `revive` refuses with that
+reason until `bind-session` names the right one.
+
 `goal`, `bind-session`, and `drain` apply to the native interactive adapter.
 Headless turn runners expose their supported operations in `agentctl status`;
 they do not acquire native goal RPC support by using Herdr for presentation.

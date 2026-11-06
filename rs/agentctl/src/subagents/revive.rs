@@ -11,6 +11,111 @@ thread_local! {
     /// The Claude Code configuration directories a test pretends exist.
     pub(super) static CLAUDE_CONFIG_ROOTS: std::cell::RefCell<Option<Vec<PathBuf>>> =
         const { std::cell::RefCell::new(None) };
+    /// The files a test pretends an agent's processes hold open.
+    pub(super) static HELD_FILES: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Where a record says why its native conversation is unknown (#916 muse-native-session-id).
+pub(super) const NATIVE_SESSION_UNKNOWN: &str = "native_session_unknown";
+
+/// The files the pinned process of `record`, and its descendants, hold open: none when the
+/// record pins no process or the process is no longer the one pinned.
+fn held_files(record: &AgentRecord) -> Vec<PathBuf> {
+    // Tests never read the host's own processes: only what a test pretends.
+    #[cfg(test)]
+    return {
+        let _ = record;
+        HELD_FILES
+            .with(|files| files.borrow().clone())
+            .unwrap_or_default()
+    };
+    #[cfg(not(test))]
+    {
+        let Some(identity) = record
+            .harness_anchor()
+            .or(record.custom_process_identity.as_ref())
+        else {
+            return Vec::new();
+        };
+        let same = || {
+            crate::client::live_custom_process(identity.pid)
+                .is_ok_and(|observed| observed.identity == *identity)
+        };
+        let Ok(pid) = u32::try_from(identity.pid) else {
+            return Vec::new();
+        };
+        if !same() {
+            return Vec::new();
+        }
+        let files = crate::harness::transcript::Hints {
+            session: None,
+            cwd: None,
+            home: None,
+            pid: Some(pid),
+            proc: Some(&crate::work_state::LinuxProc),
+        }
+        .open_files();
+        // A pid reused while the descriptors were read would name another program's files.
+        if same() {
+            files
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// Record the native conversation a just-started or just-adopted agent holds open, when the
+/// record names none (#916 muse-native-session-id). Muse and Codex name their conversation by
+/// the session files their runtime holds (Claude Code's is assigned at launch). One held
+/// session is recorded as observed; several are never guessed between: the record keeps no
+/// id and says why under [`NATIVE_SESSION_UNKNOWN`]. Returns what to tell the operator then.
+pub(super) fn capture_held_session(record: &mut AgentRecord) -> Option<String> {
+    if record.native_session.is_some() || !matches!(record.harness.as_str(), "muse" | "codex") {
+        return None;
+    }
+    let adapter = crate::harness::adapter(&record.harness)?;
+    // A runtime opens its session within a second or so of starting; a just-started one is
+    // given a few seconds to (tests pretend, so they never wait).
+    let tries = if cfg!(test) { 1 } else { 6 };
+    let mut ids = Vec::new();
+    for attempt in 0..tries {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        ids = adapter.held_sessions(&held_files(record));
+        ids.retain(|id| valid_metadata_text(id));
+        if !ids.is_empty() {
+            break;
+        }
+    }
+    match ids.as_slice() {
+        [] => None,
+        [id] => {
+            let native = NativeSession::new(&record.harness, id, "observed");
+            if native.valid_for(record) {
+                record.native_session = Some(native);
+                record.extra.remove(NATIVE_SESSION_UNKNOWN);
+            }
+            None
+        }
+        _ => {
+            let reason = format!(
+                "its processes hold {} {} sessions ({}), and agentctl does not guess which one is its own",
+                ids.len(),
+                record.harness,
+                ids.join(", ")
+            );
+            record.extra.insert(
+                NATIVE_SESSION_UNKNOWN.to_owned(),
+                json!({"reason": reason, "candidates": ids}),
+            );
+            Some(format!(
+                "native conversation of {} is unknown: {reason}; name it with `agentctl bind-session {} <id>`",
+                record.name, record.name
+            ))
+        }
+    }
 }
 
 /// Where Claude Code may keep transcripts: `$CLAUDE_CONFIG_DIR`, then `~/.claude`.
@@ -734,7 +839,19 @@ fn conversation(record: &AgentRecord) -> Result<NativeSession> {
         })
         .or_else(|| discover_claude_session(&claude_config_roots(), record))
         .or_else(|| discover_codex_session(record))
-        .ok_or_else(|| fail("record has no native conversation ID"))?;
+        .ok_or_else(|| {
+            match record
+                .extra
+                .get(NATIVE_SESSION_UNKNOWN)
+                .and_then(|note| note["reason"].as_str())
+            {
+                Some(reason) => fail(format!(
+                    "record has no native conversation ID: {reason}; name it with `agentctl bind-session {} <id>`",
+                    record.name
+                )),
+                None => fail("record has no native conversation ID"),
+            }
+        })?;
     if !native.valid_for(record) {
         return Err(fail("record has contradictory native conversation IDs"));
     }
