@@ -1073,6 +1073,124 @@ fn sticky_v2_reset_readmits_sig_only_envelopes() {
 }
 
 #[test]
+fn slack_linkified_signed_keys_and_literal_markup_body_round_trip() {
+    // #919: Slack linkifies phone-, email- and URL-shaped string values
+    // inside the mirrored code block. An old mirror's post is restored
+    // only when the restored envelope reproduces the signed bytes, and
+    // the new mirror keeps a body that literally contains Slack markup
+    // intact.
+    const SHARED: &str = "USHAREDBOT";
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{SHARED}=sim@host-b"));
+    let (_, sim_public) =
+        agent_teams::relay::ensure_signing_key(&world.state, "sim", "host-b").expect("sim key");
+    agent_teams::relay::trust_key(&world.state, "sim", "host-b", &sim_public, "test")
+        .expect("trust sim");
+
+    let signed = |id: &str, seq: i64, key: &str, body: &str| {
+        let mut envelope = agent_teams::envelope::build_envelope(
+            id,
+            key,
+            "sim",
+            "host-b",
+            seq,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            None,
+            &[],
+            false,
+            agent_teams::timeutil::now_unix_ms(),
+            agent_teams::timeutil::now_unix_ms() + 7_200_000,
+            None,
+            body,
+        );
+        agent_teams::relay::sign_envelope(&world.state, &mut envelope).expect("sign");
+        envelope
+    };
+    let old_post = |envelope: &serde_json::Value, mangled_key: &str| {
+        let mut stored = envelope.clone();
+        stored["key"] = serde_json::json!(mangled_key);
+        format!(
+            "{}\n{}\n```agent-teams-envelope\n{}\n```\n",
+            agent_teams::envelope::team_tag(envelope),
+            envelope["body"].as_str().unwrap_or_default(),
+            serde_json::to_string(&stored).expect("stored json")
+        )
+    };
+
+    let cases = [
+        (
+            "tm-sim-9190000000000001",
+            "917-918-20261105",
+            "<tel:917-918-20261105|917-918-20261105>",
+            "phone key",
+        ),
+        (
+            "tm-sim-9190000000000002",
+            "person@example.com",
+            "<mailto:person@example.com|person@example.com>",
+            "email key",
+        ),
+        (
+            "tm-sim-9190000000000003",
+            "https://example.com/a-b-123",
+            "<https://example.com/a-b-123|https://example.com/a-b-123>",
+            "url key",
+        ),
+    ];
+    for (seq, (id, key, mangled, body)) in cases.iter().enumerate() {
+        let envelope = signed(id, i64::try_from(seq + 1).unwrap(), key, body);
+        let outcome = world.relay_in(SHARED, &old_post(&envelope, mangled));
+        assert_eq!(outcome["outcome"], "accepted", "{body}: {outcome}");
+        assert!(world.ledger_has("tools", id), "{body} delivered");
+        // The new mirror leaves nothing linkable in the fence, and its
+        // post still parses to the identical signed envelope.
+        let new_post = agent_teams::relay::render_post(&envelope);
+        let fence = new_post
+            .split("```agent-teams-envelope")
+            .nth(1)
+            .expect("fence");
+        assert!(
+            !fence.contains(key),
+            "{body} key linkable in fence: {fence}"
+        );
+        assert_eq!(
+            agent_teams::relay::parse_post(&new_post).expect("parse new post"),
+            agent_teams::relay::RelayPost::Envelope(envelope.clone()),
+            "{body} new post parses identically"
+        );
+    }
+
+    let literal = "explaining <tel:917-918-20261105|917-918-20261105> exactly";
+    let envelope = signed("tm-sim-9190000000000004", 4, "literal-body", literal);
+    let post = agent_teams::relay::render_post(&envelope);
+    let fence = post.split("```agent-teams-envelope").nth(1).expect("fence");
+    assert!(
+        !fence.contains("<tel:917-918-20261105|917-918-20261105>"),
+        "new fence keeps literal markup escaped: {fence}"
+    );
+    let outcome = world.relay_in(SHARED, &post);
+    assert_eq!(outcome["outcome"], "accepted", "literal body: {outcome}");
+    assert!(
+        world
+            .hook_inbox_texts("tools")
+            .iter()
+            .any(|text| text.contains(literal)),
+        "literal body delivered exactly: {:?}",
+        world.hook_inbox_texts("tools")
+    );
+    assert!(
+        agent_teams::relay::alarms(&world.state)
+            .iter()
+            .all(|alarm| alarm["state"] != "open"),
+        "no alarm from Slack-shaped values: {:?}",
+        agent_teams::relay::alarms(&world.state)
+    );
+}
+
+#[test]
 fn slack_mangled_own_announce_is_ignored_not_stranger() {
     // Exact live shape: Slack strips the fence info string, leaving a bare
     // ``` fence around the announce JSON. Our own announce must loop back
@@ -2137,8 +2255,8 @@ fn refused_message_is_not_mirrored() {
 fn long_mirror_post_is_never_split_and_dismiss_clears_unparseable() {
     // #763: a long body used to make a relay post the outbound helper
     // split at 4,000 bytes after conversion; the first chunk had no fence
-    // and alarmed as a stranger. This body fits in one envelope (~2.9 KB)
-    // but its visible copy must be truncated to stay under the cap.
+    // and alarmed as a stranger. This body fits in one envelope but its
+    // visible copy must be truncated to stay under the cap.
     let world = World::new();
     world.write_teams(MIRROR_TEAMS_LOCAL);
     let post = world.root.join("bin/post.sh");

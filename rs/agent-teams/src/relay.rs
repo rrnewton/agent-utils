@@ -133,18 +133,103 @@ fn sanitize_preview(body: &str) -> String {
 
 /// Serialize an envelope for the fence with the characters Slack acts
 /// on inside string values JSON-escaped (`.`, `:`, `@`, `<`, `>`, `&`
-/// become `\uXXXX`). Slack auto-links bare domain-like tokens (a file
-/// named `cli.rs`, a URL, an email) even inside a code block, rewriting
-/// the body so its hash fails; the escaped form parses to the identical
-/// envelope, so hash and signature still verify, and Slack sees nothing
-/// to link (#794). Costs 5 extra bytes per escaped character, which the
-/// post-size measurement includes because it measures this fence.
+/// and `|` become `\uXXXX`). Slack auto-links bare domain-like tokens
+/// (a file named `cli.rs`, a URL, an email) even inside a code block,
+/// rewriting the body so its hash fails; the escaped form parses to
+/// the identical envelope, so hash and signature still verify, and
+/// Slack sees nothing to link (#794). Digits and `-` are escaped only
+/// in a linkable token -- a whitespace-delimited token made only of
+/// digits and hyphens (with an optional leading `+`) and carrying at
+/// least seven digits, which is what a phone number or a bare date is
+/// made of -- because escaping every digit in timestamps and hex
+/// signatures would grow a signed fence by over a kilobyte and push
+/// ordinary envelopes past the post cap for no linkable gain (#919).
+/// Costs 5 extra bytes per escaped character, which the post-size
+/// measurement includes because it measures this fence.
 pub fn fence_json(envelope: &Value) -> String {
     let raw = envelope.to_string();
+    let chars: Vec<char> = raw.chars().collect();
+    // Whether each digit/`-` sits in a linkable token, computed in
+    // one pass over each JSON string's raw characters. A backslash
+    // escape or the closing quote ends a token.
+    let mut linkable = vec![false; chars.len()];
+    let mut in_string = false;
+    let mut escaped = false;
+    fn finish_token(
+        token_start: &mut Option<usize>,
+        token_digits: &mut usize,
+        token_phone: &mut bool,
+        end: usize,
+        chars: &[char],
+        linkable: &mut [bool],
+    ) {
+        if let Some(start) = token_start.take() {
+            if *token_phone && *token_digits >= 7 {
+                for index in start..end {
+                    if chars[index].is_ascii_digit() || chars[index] == '-' {
+                        linkable[index] = true;
+                    }
+                }
+            }
+        }
+        *token_digits = 0;
+        *token_phone = true;
+    }
+    let mut token_start: Option<usize> = None;
+    let mut token_digits = 0usize;
+    let mut token_phone = true;
+    for (index, &ch) in chars.iter().enumerate() {
+        if in_string && !escaped && ch != '"' && ch != '\\' {
+            if ch.is_whitespace() {
+                finish_token(
+                    &mut token_start,
+                    &mut token_digits,
+                    &mut token_phone,
+                    index,
+                    &chars,
+                    &mut linkable,
+                );
+                continue;
+            }
+            if token_start.is_none() {
+                token_start = Some(index);
+                token_digits = 0;
+                token_phone = true;
+            }
+            token_digits += usize::from(ch.is_ascii_digit());
+            token_phone = token_phone
+                && (ch.is_ascii_digit() || ch == '-' || (ch == '+' && token_start == Some(index)));
+            continue;
+        }
+        finish_token(
+            &mut token_start,
+            &mut token_digits,
+            &mut token_phone,
+            index,
+            &chars,
+            &mut linkable,
+        );
+        if escaped {
+            escaped = false;
+        } else if in_string && ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            in_string = !in_string;
+        }
+    }
+    finish_token(
+        &mut token_start,
+        &mut token_digits,
+        &mut token_phone,
+        chars.len(),
+        &chars,
+        &mut linkable,
+    );
+
     let mut out = String::with_capacity(raw.len());
     let mut in_string = false;
     let mut escaped = false;
-    for ch in raw.chars() {
+    for (index, &ch) in chars.iter().enumerate() {
         if in_string && !escaped {
             match ch {
                 '"' => {
@@ -161,6 +246,9 @@ pub fn fence_json(envelope: &Value) -> String {
                 '<' => out.push_str("\\u003c"),
                 '>' => out.push_str("\\u003e"),
                 '&' => out.push_str("\\u0026"),
+                '|' => out.push_str("\\u007c"),
+                '-' if linkable[index] => out.push_str("\\u002d"),
+                '0'..='9' if linkable[index] => out.push_str(&format!("\\u003{}", ch)),
                 _ => out.push(ch),
             }
             continue;
@@ -199,6 +287,7 @@ pub fn undo_slack_link_markup(text: &str) -> String {
             if url == format!("http://{label}")
                 || url == format!("https://{label}")
                 || url == format!("mailto:{label}")
+                || url == format!("tel:{label}")
                 || url == label
             {
                 Some(label.to_string())
@@ -207,8 +296,10 @@ pub fn undo_slack_link_markup(text: &str) -> String {
             }
         } else if inner.starts_with("http://") || inner.starts_with("https://") {
             Some(inner.to_string())
+        } else if let Some(address) = inner.strip_prefix("mailto:") {
+            Some(address.to_string())
         } else {
-            inner.strip_prefix("mailto:").map(str::to_string)
+            inner.strip_prefix("tel:").map(str::to_string)
         };
         match replacement {
             Some(text) => out.push_str(&text),
@@ -218,6 +309,45 @@ pub fn undo_slack_link_markup(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+fn undo_slack_link_markup_value(value: &mut Value) {
+    match value {
+        Value::String(text) => *text = undo_slack_link_markup(text),
+        Value::Array(items) => items.iter_mut().for_each(undo_slack_link_markup_value),
+        Value::Object(fields) => fields.values_mut().for_each(undo_slack_link_markup_value),
+        _ => {}
+    }
+}
+
+/// Restore Slack's link rewriting in an envelope only when the result
+/// reproduces the exact signed bytes (#919). A changed body is proven
+/// by its hash; any other changed field requires the envelope signature
+/// to verify, so literal markup in a body is never guessed away.
+fn restored_slack_envelope(envelope: &Value) -> Option<Value> {
+    let mut candidate = envelope.clone();
+    undo_slack_link_markup_value(&mut candidate);
+    if candidate == *envelope || check_envelope(&candidate).is_err() {
+        return None;
+    }
+    let mut body_only = envelope.clone();
+    body_only["body"] = candidate["body"].clone();
+    if envelope.get("relay").is_some() {
+        verify_envelope(&candidate).then_some(candidate)
+    } else if body_only == candidate {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn restore_slack_post(parsed: RelayPost) -> RelayPost {
+    match parsed {
+        RelayPost::Envelope(ref envelope) => restored_slack_envelope(envelope)
+            .map(RelayPost::Envelope)
+            .unwrap_or(parsed),
+        other => other,
+    }
 }
 
 /// The size a rendered post occupies after the publisher's escaping:
@@ -348,14 +478,22 @@ pub fn parse_post(text: &str) -> Result<RelayPost, String> {
     match raw {
         // An envelope whose body hash fails raw was probably escaped by
         // the provider; the escaped form is authoritative in that case.
+        // Slack link markup is restored first, but only where the result
+        // reproduces the exact signed bytes (#919).
         Ok(RelayPost::Envelope(ref envelope)) if check_envelope(envelope).is_err() => {
+            if let Some(restored) = restored_slack_envelope(envelope) {
+                return Ok(RelayPost::Envelope(restored));
+            }
             match parse_post_clean(&strip_provider_notes(&unescape_provider_text(text))) {
-                Ok(unescaped) => Ok(unescaped),
+                Ok(unescaped) => Ok(restore_slack_post(unescaped)),
                 Err(_) => raw,
             }
         }
-        other => other
-            .or_else(|_| parse_post_clean(&strip_provider_notes(&unescape_provider_text(text)))),
+        Ok(parsed) => Ok(restore_slack_post(parsed)),
+        other => other.or_else(|_| {
+            parse_post_clean(&strip_provider_notes(&unescape_provider_text(text)))
+                .map(restore_slack_post)
+        }),
     }
 }
 
@@ -3452,7 +3590,10 @@ mod tests {
     #[test]
     fn post_size_is_measured_after_escaping() {
         // #763 review: the live converted-mode split limit is 4_000 bytes
-        // after mrkdwn escaping, so `&` counts as 5 bytes, not 1.
+        // after mrkdwn escaping, so `&` counts as 5 bytes, not 1. The
+        // #919 escapes linkable digit runs in string values as well,
+        // which grows the fence itself; the fixture still sits just
+        // under the cap only when that escaped size is measured.
         let envelope = crate::envelope::build_envelope(
             "tm-esc",
             "k",
