@@ -58527,6 +58527,104 @@ def test_remove_skips_an_uninitialised_nested_submodule(tmp_path: Path) -> None:
     assert not tree.exists()
 
 
+def test_remove_bundles_nested_module_repositories_without_worktrees(
+    tmp_path: Path,
+) -> None:
+    """#864: module repositories at depth, with no populated worktree, are bundled."""
+    project, tree, component, _component_head = _drifted_slot_with_submodules(tmp_path)
+    leaf = component / "leaf"
+    git(leaf, "checkout", "-q", "-b", "local-work")
+    local_head = commit_local(leaf, "local.txt", "leaf only\n", "leaf only")
+    git(
+        tree,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "deinit",
+        "-f",
+        "component",
+    )
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    receipts = _drift_receipts(project)
+    assert _bundle_reaches(
+        tmp_path, receipts["product/component/leaf"], local_head, "restored-nested.git"
+    )
+
+
+def test_archive_drifted_checkouts_salvages_unlisted_submodule_on_a_detached_head(
+    tmp_path: Path,
+) -> None:
+    """#864: a detached superproject HEAD does not disable unlisted salvage."""
+    project, tree, component, _component_head = _drifted_slot_with_submodules(tmp_path)
+    git(component, "checkout", "-q", "-b", "local-work")
+    local_head = commit_local(component, "local.txt", "submodule work\n", "submodule only")
+    git(tree, "rm", "-q", "--cached", "component")
+    git(tree, "commit", "-q", "-m", "drop the component gitlink")
+    git(tree, "checkout", "-q", "--detach", "HEAD")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    assert _bundle_reaches(
+        tmp_path,
+        _drift_receipts(project)["product/component"],
+        local_head,
+        "restored-detached.git",
+    )
+
+
+def test_archive_drifted_checkouts_with_a_zero_file_nested_checkout(
+    tmp_path: Path,
+) -> None:
+    """#864: drift archiving skips `git add -u` where a checkout tracks no files."""
+    project, tree, component, _component_head = _drifted_slot_with_submodules(tmp_path)
+    leaf = component / "leaf"
+    git(leaf, "checkout", "-q", "--orphan", "empty-base")
+    git(leaf, "rm", "-rfq", ".")
+    git(leaf, "commit", "-q", "--allow-empty", "-m", "initialize review base")
+    git(tree, "checkout", "-q", "-b", "codex/other")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+
+
+def test_prefetch_bundles_an_unlisted_submodule_before_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#864: bundle creation and fsck for an unlisted module happen pre-lock."""
+    project, tree, component, _component_head = _drifted_slot_with_submodules(tmp_path)
+    git(tree, "checkout", "-q", "-b", "codex/other")
+    git(component, "checkout", "-q", "-b", "local-work")
+    commit_local(component, "local.txt", "submodule work\n", "submodule only")
+    git(tree, "rm", "-q", "--cached", "component")
+    git(tree, "commit", "-q", "-m", "drop the component gitlink")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    config = wrkslots._load_config(str(project), "testhost")
+    archive_root = wrkslots._default_salvage_archive_root(config)
+    assert not list(archive_root.rglob("*.bundle"))
+
+    wrkslots._prefetch_remote_containment(config, "slot01", archive_drifted=True)
+
+    assert list(archive_root.rglob("*.bundle"))
+    removed = _remove_archiving(project, "--archive-drifted-checkouts")
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+
+
 def test_archive_drifted_checkouts_refuses_an_unlisted_submodule_for_a_live_owner(
     tmp_path: Path,
 ) -> None:

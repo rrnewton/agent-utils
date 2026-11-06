@@ -22067,6 +22067,10 @@ def _assert_no_unkept_repository_state(
             git_directory,
             salvage_unlisted=salvage_unlisted_modules,
         )
+    if (path / "HEAD").is_file() and (path / "objects").is_dir():
+        # A module repository with no populated worktree (#864) has no
+        # worktree files to list; its history is kept through its tips.
+        return
     # Listing untracked files stops at an embedded repository and names it
     # with a trailing slash; salvage would record it only as a gitlink.
     untracked = vcs._run(
@@ -22398,6 +22402,10 @@ def _index_state_trees(
     the real index is never written.
     """
 
+    if (path / "HEAD").is_file() and (path / "objects").is_dir():
+        # A module repository with no populated worktree (#864) has no
+        # index or worktree state beyond what its refs already name.
+        return ()
     index = _git_path(vcs, path, "index")
     if not os.path.lexists(index):
         return ()
@@ -22416,12 +22424,19 @@ def _index_state_trees(
             path, ["write-tree"], env_overrides={"GIT_INDEX_FILE": str(staged_copy)}
         ).stdout.strip()
         env = {"GIT_INDEX_FILE": str(worktree_copy), **_FAITHFUL_ADD_ENV}
-        vcs._run(
-            path,
-            ["add", "-u", "--", *pathspecs],
-            env_overrides=env,
-            config=_FAITHFUL_ADD_CONFIG,
+        # A checkout whose commit has an empty tree tracks no files, and
+        # `git add -u -- .` dies there with "pathspec '.' did not match";
+        # there is nothing to stage from the worktree either (#864).
+        tracks_files = bool(
+            vcs._run(path, ["ls-files", "-z"], env_overrides=env).stdout.strip()
         )
+        if tracks_files:
+            vcs._run(
+                path,
+                ["add", "-u", "--", *pathspecs],
+                env_overrides=env,
+                config=_FAITHFUL_ADD_CONFIG,
+            )
         untracked = vcs._run(
             path,
             ["ls-files", "--others", "--exclude-standard", "-z", "--", *pathspecs],
@@ -22437,12 +22452,13 @@ def _index_state_trees(
             )
         # Entries copied from the real index keep the blobs that conversion
         # made when they were staged; read every tracked file again as bytes.
-        vcs._run(
-            path,
-            ["add", "--renormalize", "--", *pathspecs],
-            env_overrides=env,
-            config=_FAITHFUL_ADD_CONFIG,
-        )
+        if tracks_files:
+            vcs._run(
+                path,
+                ["add", "--renormalize", "--", *pathspecs],
+                env_overrides=env,
+                config=_FAITHFUL_ADD_CONFIG,
+            )
         worktree_tree = vcs._run(path, ["write-tree"], env_overrides=env).stdout.strip()
     for tree in (staged_tree, worktree_tree):
         if not SHA_RE.fullmatch(tree):
@@ -22629,6 +22645,26 @@ def _salvage_candidate_facts(
 
     path = path_override or _stored_path(config, checkout.path, "checkout path")
     _relative, repository = _stored_repository_path(config, checkout.repository)
+    if (path / "HEAD").is_file() and (path / "objects").is_dir():
+        # The candidate is a module repository itself, whose worktree was
+        # never populated (#864): there is no worktree state to stage, and
+        # its history is kept through its HEAD and private tips.
+        head = vcs.head(path)
+        remote_authority = vcs.remote_authority(path, checkout.remote)
+        if remote_authority.sha256 != checkout.remote_url_sha256:
+            raise Refusal(
+                f"checkout {checkout.name} remote {checkout.remote} URL changed; restore the "
+                "recorded remote before reclaim so salvage cannot be sent elsewhere"
+            )
+        return _SalvageCandidate(
+            head=head,
+            status_digest=hashlib.sha256(b"").hexdigest(),
+            commit=head,
+            dirty=False,
+            remote_authority=remote_authority,
+            network_authority=None,
+            shallow=None,
+        )
     if verify_repository_membership:
         head = vcs.verify_existing_worktree(repository, path)
     else:
@@ -22730,7 +22766,10 @@ def _salvage_candidate_facts(
 
         vcs._run(path, ["read-tree", "HEAD"], env_overrides=env)
         pathspecs = _salvage_pathspecs(config, checkout.name)
-        add(["add", "-u", "--", *pathspecs])
+        # Skip the update when the checkout tracks no files: `git add -u`
+        # with the '.' pathspec dies on an empty tree (#864).
+        if vcs._run(path, ["ls-files", "-z"], env_overrides=env).stdout.strip():
+            add(["add", "-u", "--", *pathspecs])
         untracked = vcs._run(
             path,
             [
@@ -23201,6 +23240,70 @@ def _unlisted_submodule_checkouts(
                     head=head,
                 ),
                 worktree,
+            )
+        )
+    return tuple(result)
+
+
+def _nested_module_repository_checkouts(
+    config: Config, checkout: Checkout, vcs: _GitVcs, checkout_path: Path
+) -> tuple[tuple[Checkout, Path], ...]:
+    """Return module repositories at any nesting depth with no populated worktree (#864).
+
+    Walks ``modules/`` inside the checkout's Git directory, and ``modules/``
+    inside every module repository found there, at any depth. A repository
+    whose worktree is populated is already a listed or unlisted candidate;
+    one without a worktree would otherwise be deleted unseen, so it becomes
+    a salvage candidate in its own right, recorded by its nesting path.
+    """
+
+    git_directory = Path(
+        vcs._run(checkout_path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
+    )
+    modules_root = git_directory / "modules"
+    if not modules_root.is_dir():
+        return ()
+    remote = config.default_remote
+    result: list[tuple[Checkout, Path]] = []
+    for root, directories, files in os.walk(modules_root, followlinks=False):
+        current = Path(root)
+        if "HEAD" not in files or not (current / "objects").is_dir():
+            continue
+        directories[:] = [name for name in directories if name == "modules"]
+        parts = [
+            part
+            for part in current.relative_to(modules_root).parts
+            if part != "modules"
+        ]
+        if not parts:
+            continue
+        relative = Path(*parts)
+        if _submodule_worktree_populated(checkout_path / relative):
+            continue
+        # Git refuses every command in a module repository whose recorded
+        # worktree has gone; an empty directory at that path (removed with
+        # the slot) lets its history be read and bundled.
+        (checkout_path / relative).mkdir(parents=True, exist_ok=True)
+        try:
+            head = vcs.head(current)
+            authority = vcs.remote_authority(current, remote)
+            repository = current.relative_to(config.root).as_posix()
+        except (Refusal, ValueError):
+            continue
+        result.append(
+            (
+                Checkout(
+                    name=f"{checkout.name}/{relative.as_posix()}",
+                    path=(Path(checkout.path) / relative).as_posix(),
+                    repository=repository,
+                    branch="",
+                    start_point=head,
+                    remote=remote,
+                    remote_url_sha256=authority.sha256,
+                    landed_ref=_landed_ref_for_remote(config, remote),
+                    head=head,
+                ),
+                current,
             )
         )
     return tuple(result)
@@ -23772,6 +23875,13 @@ def _salvage_agent_slot(
                 config, checkout, vcs, path
             ):
                 candidates.append((unlisted, unlisted_path, True, None, True))
+            for nested_repo, nested_repo_path in _nested_module_repository_checkouts(
+                config, checkout, vcs, path
+            ):
+                if nested_repo.name not in {item[0].name for item in candidates}:
+                    candidates.append(
+                        (nested_repo, nested_repo_path, True, None, True)
+                    )
     prepared = [
         (
             checkout,
@@ -24014,6 +24124,16 @@ def _assert_salvage_still_matches(
             if unlisted.name in by_name:
                 unlisted_names.add(unlisted.name)
                 targets.append((unlisted, unlisted_path, True, drift is not None))
+        for nested_repo, nested_repo_path in _nested_module_repository_checkouts(
+            config, checkout, vcs, path
+        ):
+            if nested_repo.name in by_name and nested_repo.name not in {
+                target[0].name for target in targets
+            }:
+                unlisted_names.add(nested_repo.name)
+                targets.append(
+                    (nested_repo, nested_repo_path, True, drift is not None)
+                )
     expected_names = {checkout.name for checkout, _path, _detached, _drift in targets}
     if (
         set(by_name) != expected_names
@@ -40948,17 +41068,46 @@ def _prefetch_remote_containment(
                 archive_drifted
                 and _observe_checkout_drift(vcs, checkout, path) is not None
             )
-            candidates: list[tuple[Checkout, Path, bool, bool]] = [
-                (checkout, path, False, drifted)
+            candidates: list[tuple[Checkout, Path, bool, bool, bool]] = [
+                (checkout, path, False, drifted, False)
             ]
             candidates.extend(
-                (submodule, submodule_path, True, False)
+                (
+                    submodule,
+                    submodule_path,
+                    True,
+                    False,
+                    _checkout_is_self_sourced(config, submodule, submodule_path, vcs),
+                )
                 for submodule, submodule_path in _submodule_salvage_checkouts(
                     config, checkout, vcs
                 )
             )
-            for candidate, candidate_path, detached, candidate_drifted in candidates:
-                keep_private_state = drifted
+            # A proven-dead owner's unlisted and nested module repositories
+            # are bundled by the removal under the lock; making and
+            # fsck-verifying those bundles here, before the lock, keeps a
+            # large bundle's verification out of the item budget (#864).
+            candidates.extend(
+                (unlisted, unlisted_path, True, False, True)
+                for unlisted, unlisted_path in _unlisted_submodule_checkouts(
+                    config, checkout, vcs, path
+                )
+            )
+            candidates.extend(
+                (nested_repo, nested_repo_path, True, False, True)
+                for nested_repo, nested_repo_path in _nested_module_repository_checkouts(
+                    config, checkout, vcs, path
+                )
+                if nested_repo.name not in {item[0].name for item in candidates}
+            )
+            for (
+                candidate,
+                candidate_path,
+                detached,
+                candidate_drifted,
+                extra_never_push,
+            ) in candidates:
+                keep_private_state = drifted or extra_never_push
                 prepared.append(
                     (
                         candidate,
@@ -40974,9 +41123,10 @@ def _prefetch_remote_containment(
                             allow_shallow=detached,
                             accept_drift=candidate_drifted,
                             keep_private_state=keep_private_state,
+                            salvage_unlisted_modules=not detached,
                         ),
                         candidate_drifted,
-                        drifted,
+                        drifted or extra_never_push,
                     )
                 )
     except Refusal:

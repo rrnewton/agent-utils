@@ -1023,9 +1023,12 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The three #910 cases (a nested submodule the primary dropped is
     # remote-verified, bundled when unpublished, and skipped when
     # uninitialised) are mapped.
-    assert len(all_tests) == 2151
+    # The four #864 cases (nested module repositories without worktrees
+    # bundled, unlisted salvage on a detached HEAD, a zero-file nested
+    # checkout, and prefetch bundling before the lock) are mapped.
+    assert len(all_tests) == 2155
     assert len(ordinary) == 339
-    assert len(mapped) == 1812
+    assert len(mapped) == 1816
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
