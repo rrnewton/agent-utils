@@ -4093,13 +4093,53 @@ impl<'a> Runner<'a> {
             if flights.iter().any(|flight| {
                 flight.rooted && flight.candidate.parent != base && self.root_unstarted(flight)
             }) {
-                self.cancel_rooted_where(
-                    flights,
-                    rx,
-                    pending,
-                    "the base moved from the commit it was built on before any donor started it",
-                    &|flight| flight.candidate.parent != base && self.root_unstarted(flight),
-                );
+                // The reason names what actually happened to the job: a
+                // never-started one gets the old text, a requeued one (a
+                // donor started it, it came back could-not-run or its lease
+                // expired) names the requeue and its attempt history, which
+                // is also written onto the job's own record.
+                let stale: Vec<&Flight> = flights
+                    .iter()
+                    .filter(|flight| {
+                        flight.rooted
+                            && flight.candidate.parent != base
+                            && self.root_unstarted(flight)
+                    })
+                    .collect();
+                let reason = stale
+                    .first()
+                    .map(|flight| self.stale_root_reason(flight))
+                    .unwrap_or_else(|| {
+                        "the base moved from the commit it was built on before any donor \
+                         started it"
+                            .to_owned()
+                    });
+                if let Some(donors) = self
+                    .donors
+                    .as_ref()
+                    .filter(|donors| donors.mode == crate::state::Offload::Decide)
+                {
+                    if let Ok(jobs) = donors.store.jobs() {
+                        for flight in &stale {
+                            for job in jobs.iter().filter(|job| {
+                                job.commit == flight.candidate.tip
+                                    && !job.compare_only
+                                    && job.state != crate::donor::JobState::Cancelled
+                            }) {
+                                let _ = donors.store.note_history(
+                                    &job.id,
+                                    &format!(
+                                        "cancelled as a stale root on a moved base: {}",
+                                        job.attempt_summary()
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                self.cancel_rooted_where(flights, rx, pending, &reason, &|flight| {
+                    flight.candidate.parent != base && self.root_unstarted(flight)
+                });
             }
             return;
         }
@@ -4114,6 +4154,46 @@ impl<'a> Runner<'a> {
                 "the base moved from the commit it was built on",
             );
         }
+    }
+
+    /// Why a stale rooted `flight` is being cancelled, from its donor
+    /// jobs' records: the old "before any donor started it" only when no
+    /// donor ever started it; for a job queued again after attempts, the
+    /// reason names the requeue and the attempt history (counts of
+    /// could-not-run receipts and expired leases, and the donors).
+    fn stale_root_reason(&self, flight: &Flight) -> String {
+        let never = "the base moved from the commit it was built on before any donor \
+                     started it"
+            .to_owned();
+        let Some(donors) = self
+            .donors
+            .as_ref()
+            .filter(|donors| donors.mode == crate::state::Offload::Decide)
+        else {
+            return never;
+        };
+        let Ok(jobs) = donors.store.jobs() else {
+            return never;
+        };
+        let mut summaries: Vec<String> = jobs
+            .iter()
+            .filter(|job| {
+                job.commit == flight.candidate.tip
+                    && !job.compare_only
+                    && job.state != crate::donor::JobState::Cancelled
+            })
+            .filter(|job| job.was_started())
+            .map(|job| job.attempt_summary())
+            .collect();
+        if summaries.is_empty() {
+            return never;
+        }
+        summaries.sort();
+        summaries.dedup();
+        format!(
+            "the base moved while its job was requeued after could-not-run ({})",
+            summaries.join("; ")
+        )
     }
 
     /// Whether no donor has started validating rooted `flight`: its donor job is still

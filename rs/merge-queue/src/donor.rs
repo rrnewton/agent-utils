@@ -242,6 +242,52 @@ impl Job {
     pub fn compared_after_landing(&self) -> bool {
         self.comparison.is_some() && self.candidate_gone.is_some()
     }
+
+    /// Whether any donor has ever started this job: it was claimed at
+    /// least once (attempts, or a lease or receipt in its history), even
+    /// if it is queued again now after a could-not-run refusal or an
+    /// expired lease. A job merely published and never claimed has not
+    /// started, whatever its current state says.
+    pub fn was_started(&self) -> bool {
+        self.attempts > 0
+            || self.lease.is_some()
+            || self.receipt.is_some()
+            || self
+                .history
+                .iter()
+                .any(|line| line.contains(": leased to "))
+    }
+
+    /// The job's attempt history in one line — how many claims, how they
+    /// ended, and which donors held it — for a cancellation reason or a
+    /// decision record, so a requeued job never reads as never-started.
+    pub fn attempt_summary(&self) -> String {
+        let expired = self
+            .history
+            .iter()
+            .filter(|line| line.contains("expired;"))
+            .count();
+        let mut donors: Vec<&str> = Vec::new();
+        for line in &self.history {
+            if let Some((_, rest)) = line.split_once(": leased to ") {
+                let donor = rest.split(" on ").next().unwrap_or_default();
+                if !donor.is_empty() && !donors.contains(&donor) {
+                    donors.push(donor);
+                }
+            }
+        }
+        format!(
+            "{} attempt(s): {} could-not-run, {} lease(s) expired{}",
+            self.attempts,
+            self.could_not_run.len(),
+            expired,
+            if donors.is_empty() {
+                String::new()
+            } else {
+                format!("; leased to {}", donors.join(", "))
+            }
+        )
+    }
 }
 
 impl Receipt {
@@ -1298,6 +1344,20 @@ impl Store {
         self.note_receipt(&receipt.donor.name.clone());
         self.clear_host_fault(&receipt.donor.name.clone());
         job.receipt = Some(receipt);
+        self.write(&job)
+    }
+
+    /// Append a note to a live job's history (its decision record): used
+    /// when the queue acts on a job for reasons its own history does not
+    /// already tell — a stale-root cancellation naming the attempt
+    /// history, say. Finished jobs are left alone.
+    pub fn note_history(&self, id: &str, note: &str) -> Result<(), String> {
+        let _lock = self.lock()?;
+        let mut job = self.read(id)?;
+        if matches!(job.state, JobState::Done | JobState::Cancelled) {
+            return Ok(());
+        }
+        job.history.push(format!("{}: {note}", now()));
         self.write(&job)
     }
 
@@ -3591,6 +3651,48 @@ mod unit {
             Err(error) => error,
         };
         assert!(error.contains("malformed"), "{error}");
+    }
+
+    #[test]
+    fn a_requeued_job_counts_as_started_and_summarizes_its_attempts() {
+        let store = Store::new(&temp("attempt-summary"));
+        let job = publish(&store, "c1");
+        let fresh = store.read(&job.id).unwrap();
+        assert!(!fresh.was_started(), "{fresh:?}");
+        assert!(fresh
+            .attempt_summary()
+            .starts_with("0 attempt(s): 0 could-not-run, 0"));
+        // Claim, refuse (could-not-run), claim again: queued again, but a
+        // donor has started it twice, and the summary says so.
+        for _ in 0..2 {
+            let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+            let token = claimed.lease.as_ref().unwrap().token.clone();
+            store
+                .report(
+                    &claimed.id,
+                    &token,
+                    refused_receipt(&claimed, "d1", "some output\nCOULD_NOT_RUN"),
+                )
+                .unwrap_err();
+        }
+        let after = store.read(&job.id).unwrap();
+        assert_eq!(after.state, JobState::Queued);
+        assert!(after.was_started(), "{after:?}");
+        assert_eq!(
+            after.attempt_summary(),
+            "2 attempt(s): 2 could-not-run, 0 lease(s) expired; leased to d1",
+            "{after:?}"
+        );
+        // The queue can write the summary onto the job's own record.
+        store
+            .note_history(&job.id, "cancelled as a stale root: 2 attempt(s)")
+            .unwrap();
+        assert!(store
+            .read(&job.id)
+            .unwrap()
+            .history
+            .join("\n")
+            .contains("cancelled as a stale root: 2 attempt(s)"));
     }
 
     #[test]

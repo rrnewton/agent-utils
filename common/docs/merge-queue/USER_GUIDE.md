@@ -1762,7 +1762,14 @@ With `roots` at least the window, every slot may hold a base-rooted batch, each 
 everything in flight. `keep_stale_roots` lets a stale root finish instead of cancelling it: a
 green one is requeued at the front of the queue (ahead of never-validated changes, which have
 no pass prediction) with `green at <base>` in its history, and a red single change is ejected
-as the culprit it is, since the base it ran on was green. Below an 80% recent pass rate nothing
+as the culprit it is, since the base it ran on was green. A stale root whose job is queued
+again after attempts (a could-not-run refusal, an expired lease) is still cancelled, but the
+reason names the requeue and the attempt history — `the base moved while its job was
+requeued after could-not-run (3 attempt(s): 2 could-not-run, 1 lease(s) expired; leased to
+...)` — never "before any donor started it"; that text is kept only for a job no donor ever
+claimed (attempts = 0, no lease or receipt in its history). The same attempt summary is
+written onto the donor job's own record, so the decision history keeps which hosts ran it
+and how each attempt ended. Below an 80% recent pass rate nothing
 stacks and every batch is one change wide; at or above it, batches widen to `max_batch` and
 build on the stack top as usual. Every field absent is today's behaviour exactly.
 
