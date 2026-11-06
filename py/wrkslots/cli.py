@@ -39428,6 +39428,47 @@ def _git_removal_finished_at_image_root(
     return not _git_registers_checkout(config, checkout, path, vcs)
 
 
+def _git_removal_finished_at_bind_root(
+    config: Config,
+    slot: str,
+    checkout: Checkout,
+    path: Path,
+    vcs: _GitVcs,
+) -> bool:
+    """Whether Git already removed ``checkout`` whose root is the slot's bind mount.
+
+    The worktrees-image twin of the image-root case above: a flat checkout
+    at the recorded bind's mount point loses its contents and registration
+    to `git worktree remove`, which then fails only on rmdir of the mount
+    point, and the interrupted removal never journaled the removal. That is
+    recognised only while the mount at ``path`` is the slot's recorded
+    subvolume in the current mount table, the root is completely empty, and
+    Git lists the checkout at neither its fenced nor its canonical path.
+    Anything else keeps the ordinary repair-and-refuse path, and deleting
+    the subvolume later still refuses content it holds.
+    """
+
+    if path.is_symlink() or not path.is_dir():
+        return False
+    try:
+        records = worktreesimage.load_bind_records(config.control)
+        table = slotimage.mount_table()
+    except (worktreesimage.WorktreesImageError, slotimage.ImageError, Refusal):
+        return False
+    bind = records.get(slot)
+    if bind is None:
+        return False
+    entry = next((item for item in table if item.mount_point == path), None)
+    if entry is None or entry.root != f"/{bind.subvolume}":
+        return False
+    try:
+        if next(path.iterdir(), None) is not None:
+            return False
+    except OSError as exc:
+        raise Refusal(f"cannot inspect bind-backed checkout root {path}: {exc}") from exc
+    return not _git_registers_checkout(config, checkout, path, vcs)
+
+
 def _drop_rebound_canonical_bind(
     config: Config, slot: str, original: Path, fenced: Path
 ) -> bool:
@@ -39573,6 +39614,8 @@ def _begin_or_resume_path_fence(
             continue
         if _git_removal_finished_at_image_root(config, record, checkout, path, vcs):
             continue
+        if _git_removal_finished_at_bind_root(config, record.slot, checkout, path, vcs):
+            continue
         if path.exists() or path.is_symlink():
             _repair_registration_at_slot(config, record, checkout, fenced, vcs)
     journal["phase"] = "fenced"
@@ -39663,8 +39706,14 @@ def _finish_remove_paths(
         _moved, path = _checkout_at_slot(config, record, checkout, fenced_slot)
         if path.is_symlink():
             raise Refusal(f"interrupted fenced checkout became a symlink: {path}")
-        if path.exists() and not _git_removal_finished_at_image_root(
-            config, record, checkout, path, vcs
+        if (
+            path.exists()
+            and not _git_removal_finished_at_image_root(
+                config, record, checkout, path, vcs
+            )
+            and not _git_removal_finished_at_bind_root(
+                config, record.slot, checkout, path, vcs
+            )
         ):
             present.append(checkout)
             continue

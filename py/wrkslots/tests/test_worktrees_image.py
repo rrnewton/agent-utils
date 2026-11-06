@@ -323,6 +323,129 @@ def test_drop_rebound_canonical_bind(
     assert canonical.is_dir()
 
 
+def test_finish_recognises_an_empty_fenced_bind_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Exactly the lead host's stuck mqfix state: the first remove's git
+    # step emptied the flat checkout at the fenced bind root and dropped
+    # its registration, then died on the mount-point rmdir, so the journal
+    # still sits in the fence phase with nothing removed. Recovery must
+    # recognise the removal as finished, not demand a .git to repair.
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "bind-test")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "bind-test@example.invalid")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "bind-test")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "bind-test@example.invalid")
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "init"], cwd=tmp_path, check=True
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    fenced = config.worktrees / (".s1.fenced.1." + "d" * 32)
+    fenced.mkdir(parents=True)
+    worktreesimage.save_bind_records(
+        control,
+        {"s1": worktreesimage.BindRecord(subvolume="s1", mount_id=5, target=str(fenced))},
+    )
+    monkeypatch.setattr(
+        slotimage,
+        "mount_table",
+        lambda: [
+            slotimage.MountEntry(
+                mount_point=fenced, fstype="btrfs", source="/dev/loop2",
+                device="0:99", root="/s1",
+            )
+        ],
+    )
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    identity = cli.ProcessIdentity(
+        pid=123, start_ticks=456, boot_id="boot", host_id="host", cgroup_path="/"
+    )
+    checkout = cli.Checkout(
+        name="repo",
+        path="worktrees/slots/s1",
+        repository=".",
+        branch="main",
+        start_point=head,
+        remote="origin",
+        remote_url_sha256="0" * 64,
+        landed_ref="refs/remotes/origin/main",
+        head=head,
+    )
+    record = cli.ActiveRecord(
+        slot="s1",
+        agent="worker-a",
+        task="t1",
+        purpose="probe",
+        slot_type="agent",
+        machine="testhost",
+        generation=1,
+        created_at="2026-11-05T00:00:00+00:00",
+        heartbeat_at="2026-11-05T00:00:00+00:00",
+        heartbeat_ttl_seconds=600,
+        owner=None,
+        coordinator_lease=identity,
+        coordinator_recovery_note=None,
+        handoff=None,
+        checkouts=(checkout,),
+        layout="flat",
+    )
+    journal: dict[str, object] = {
+        "schema": cli.SCHEMA,
+        "kind": "finish",
+        "machine": "testhost",
+        "slot": "s1",
+        "phase": "fenced",
+        "fenced": fenced.relative_to(tmp_path).as_posix(),
+        "removed": [],
+        "salvage": [],
+    }
+    journal_path = control / "ACTIVE.testhost.journal"
+    cli._atomic_write_json(
+        cli._active_path(config),
+        cli._active_to_obj(cli.ActiveState(machine="testhost", revision=0, slots=(record,))),
+    )
+    cli._atomic_write_json(
+        cli._archive_path(config),
+        cli._archive_to_obj(cli.ArchiveState(machine="testhost", revision=0, records=())),
+    )
+    finish = cli._FinishContext(mode="remove", actor="coordinator")
+    result = cli._finish_remove_paths(
+        config, record, journal, cli._GitVcs(), finish, journal_path=journal_path
+    )
+    assert result["removed"] == ["repo"]
+    assert result["phase"] == "removed"
+    assert not fenced.exists()
+    assert not (mount_dir / "s1").exists()
+    assert worktreesimage.load_binds(control) == {}
+
+    # Safety: the same empty root is refused while Git still registers the
+    # checkout, or while the mount there is not the recorded subvolume.
+    fenced.mkdir(parents=True)
+    (mount_dir / "s1").mkdir(parents=True)
+    worktreesimage.save_bind_records(
+        control,
+        {"s1": worktreesimage.BindRecord(subvolume="s1", mount_id=5, target=str(fenced))},
+    )
+    vcs = cli._GitVcs()
+    assert cli._git_removal_finished_at_bind_root(config, "s1", checkout, fenced, vcs)
+    (fenced / "leftover").write_text("x", encoding="utf-8")
+    assert not cli._git_removal_finished_at_bind_root(config, "s1", checkout, fenced, vcs)
+    (fenced / "leftover").unlink()
+    subprocess.run(
+        ["git", "worktree", "add", str(fenced), "-b", "again"],
+        cwd=tmp_path, check=True, capture_output=True, text=True,
+    )
+    assert not cli._git_removal_finished_at_bind_root(config, "s1", checkout, fenced, vcs)
+
+
 def test_remove_worktree_accepts_the_recorded_bind_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
