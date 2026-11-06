@@ -682,9 +682,9 @@ through its route; an operator uses only `status`.
 
 | Verb | What it does |
 |---|---|
-| `run --queue CMD --clone DIR --name NAME [--jobs N]` | Claim jobs through the route, validate each exact candidate in a worktree of `DIR`, report receipts. Options: `--remote` (default `origin`; fetched for the base), `--poll-secs` (default 5), `--work DIR` (default `merge-queue-donor/` in the clone's Git directory), `--mismatch-backoff-secs` (default 300), `--until-idle`. SIGINT/SIGTERM gives running jobs back and exits. |
+| `run --queue CMD --clone DIR --name NAME [--jobs N]` | Claim jobs through the route, validate each exact candidate in a worktree of `DIR`, report receipts. Options: `--remote` (default `origin`; fetched for the base), `--poll-secs` (default 5), `--work DIR` (default `merge-queue-donor/` in the clone's Git directory), `--mismatch-backoff-secs` (default 300), `--until-idle`, `--cap-file PATH` (read before every claim: a whole number N caps `--jobs` at N, 0 drains, claiming nothing and never exiting under `--until-idle`, and an absent or malformed file means `--jobs`; running jobs are never touched, and each change is logged). SIGINT/SIGTERM gives running jobs back and exits. |
 | `status [--json]` | Jobs by state, leases (never their tokens), and in `compare` mode how many receipts matched the local verdict. |
-| `claim --donor NAME [--host H] [--jobs N]` | Lease the oldest job this donor may take; prints `{"job": ...}` (with the token) or `{"job": null}`. |
+| `claim --donor NAME [--host H] [--jobs N] [--drain]` | Lease the oldest job this donor may take; prints `{"job": ...}` (with the token) or `{"job": null}`. The cap it claims under (0 with `--drain`, which leases nothing) is kept for `donor status`. |
 | `renew --job ID` | Token on stdin. Prints `{"renewal": "continue", ...}` or `{"renewal": "stop", "reason": ...}`. |
 | `bundle --job ID` | Token on stdin. Writes the candidate's git bundle to stdout. |
 | `report --job ID` | `{"token", "receipt"}` on stdin. Exits 1 with the reason when the receipt is refused. |

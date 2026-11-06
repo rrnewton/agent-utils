@@ -395,6 +395,12 @@ enum DonorCommand {
         /// Exit once no job is running and none is available (scripts and tests).
         #[arg(long)]
         until_idle: bool,
+        /// A file holding the most jobs to run at once, read before every claim, so the cap
+        /// changes without a restart: N caps --jobs at N, 0 drains (nothing is claimed, and
+        /// --until-idle does not exit), absent or malformed means --jobs. Running jobs are
+        /// never touched. Each change is logged, and `donor status` shows the cap.
+        #[arg(long, value_name = "PATH")]
+        cap_file: Option<PathBuf>,
     },
     /// Queue host: lease the oldest job this donor may take; prints `{"job": ...}` (the job
     /// carries the lease token) or `{"job": null}`.
@@ -412,6 +418,10 @@ enum DonorCommand {
         /// clear the fault so this claim may lease again.
         #[arg(long)]
         probe_passed: bool,
+        /// The donor is draining (its cap file says 0): record that for `donor status` and
+        /// lease nothing.
+        #[arg(long)]
+        drain: bool,
     },
     /// Queue host: extend a lease (token on stdin); prints continue or stop.
     Renew {
@@ -544,12 +554,30 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             host,
             jobs,
             probe_passed,
+            drain,
         } => {
             if probe_passed {
                 store.note_probe_pass(&donor);
             }
             let cap = config.donors.max_jobs_per_donor;
-            let jobs = if cap > 0 { jobs.min(cap) } else { jobs };
+            let jobs = if drain {
+                0
+            } else if cap > 0 {
+                jobs.min(cap)
+            } else {
+                jobs
+            };
+            // The cap this donor claims under, for `donor status` (#918 donor-cap-file).
+            if let Err(error) = store.note_donor_cap(&donor, jobs, crate::donor::unix_seconds()) {
+                eprintln!("merge-queue donor claim: cannot note {donor}'s cap: {error}");
+            }
+            if drain {
+                print_json_reply(
+                    &serde_json::to_value(&crate::donor::Claimed { job: None })
+                        .map_err(|error| error.to_string())?,
+                )?;
+                return Ok(0);
+            }
             // Answer the tool identity now, so a job published before a tool moved is offered
             // under the tools this host would validate with (see `Store::current_tools`).
             let mut store = store;
@@ -564,8 +592,8 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             // Freshness before setup: never hand out a job whose candidate no longer
             // contains the current base. It is cancelled as stale here, not refused by
             // the donor after its expensive setup, and costs the donor no strike.
-            // Kept stale roots are exempt under `keep_stale_roots`: their run still
-            // wants the verdict, so they are neither cancelled nor handed out as stale.
+            // Under `keep_stale_roots`, a stale root a donor already holds is exempt: its run
+            // still wants the verdict. A queued one is swept like any other (#915).
             {
                 let git = crate::git::Git::new(&config.repo);
                 if let Ok((base, _)) = crate::ops::refresh(&git, &config, &[]) {
@@ -655,6 +683,15 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
                 count(crate::donor::JobState::Done),
                 count(crate::donor::JobState::Cancelled)
             );
+            // Each donor's cap as its last claim gave it (#918 donor-cap-file).
+            let now = crate::donor::unix_seconds();
+            for (donor, jobs, seen) in store.donor_cap_list() {
+                println!(
+                    "donor {donor}: cap {jobs}{} (last claim {}s ago)",
+                    if jobs == 0 { " (draining)" } else { "" },
+                    now.saturating_sub(seen)
+                );
+            }
             for alert in store.give_back_alerts(config.donors.give_back_alert())? {
                 println!("{alert}");
             }
@@ -1715,6 +1752,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     work,
                     mismatch_backoff_secs,
                     until_idle,
+                    cap_file,
                 },
         } => {
             let queue = shell_words::split(&queue)
@@ -1737,6 +1775,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 work,
                 mismatch_backoff: std::time::Duration::from_secs(mismatch_backoff_secs),
                 until_idle,
+                cap_file,
             });
         }
         _ => {}

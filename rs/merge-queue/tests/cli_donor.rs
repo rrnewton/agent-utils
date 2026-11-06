@@ -1890,3 +1890,212 @@ fn kept_stale_roots_keep_only_running_roots_and_rebuild_unstarted_ones_on_the_ne
         "{second}"
     );
 }
+
+// --- a donor's cap, changed without a restart (#918 donor-cap-file) -----------------------------
+
+/// Start `donor run --until-idle` for `name` from `clone` with `--jobs jobs --cap-file cap`, its
+/// standard error into `log`.
+fn capped_donor(
+    fx: &Fixture,
+    clone: &Path,
+    name: &str,
+    jobs: usize,
+    cap: &Path,
+    log: &Path,
+) -> Child {
+    let route = route(fx);
+    let (clone, cap, jobs) = (
+        clone.display().to_string(),
+        cap.display().to_string(),
+        jobs.to_string(),
+    );
+    command(
+        &fx.root,
+        &[
+            "donor",
+            "run",
+            "--queue",
+            &route,
+            "--clone",
+            &clone,
+            "--name",
+            name,
+            "--poll-secs",
+            "1",
+            "--until-idle",
+            "--jobs",
+            &jobs,
+            "--cap-file",
+            &cap,
+        ],
+        &[],
+    )
+    .stdout(Stdio::null())
+    .stderr(std::fs::File::create(log).unwrap())
+    .spawn()
+    .unwrap()
+}
+
+/// A queue of three stacked candidates, each validated slowly enough to watch, validated only by
+/// donors.
+fn three_slow_changes(fx: &Fixture, seconds: u32) {
+    let runner = format!("sleep {seconds}; exit 0");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        &runner,
+        "--offload",
+        "decide",
+    ]);
+    set_config(fx, |config| {
+        config["depth"] = serde_json::json!(3);
+        config["max_batch"] = serde_json::json!(1);
+        // Three stacked candidates, no root beside them: what lands is what the donors ran.
+        config["disable_disjoint_root"] = serde_json::json!(true);
+    });
+    for (n, name) in ["a", "b", "c"].iter().enumerate() {
+        fx.branch(name, &[(&format!("{name}.txt"), "x\n")]);
+        fx.mq_ok(&["submit", &(n + 1).to_string(), "--head", name]);
+    }
+}
+
+fn leased(fx: &Fixture) -> usize {
+    jobs(fx)
+        .iter()
+        .filter(|job| job["state"] == "leased")
+        .count()
+}
+
+#[test]
+fn lowering_a_donors_cap_mid_run_holds_it_there_without_touching_running_jobs() {
+    let fx = Fixture::new("donor-cap-lower");
+    three_slow_changes(&fx, 4);
+    let clone = donor_clone(&fx, "donor-host");
+    let cap = fx.root.join("donor-cap");
+    let log = fx.root.join("donor.log");
+    let run = spawn_run(&fx, &[]);
+    wait_for("three published jobs", Duration::from_secs(60), || {
+        jobs(&fx).len() >= 3
+    });
+    let mut donor = capped_donor(&fx, &clone, "d1", 2, &cap, &log);
+    wait_for("two jobs running", Duration::from_secs(60), || {
+        leased(&fx) == 2
+    });
+    std::fs::write(&cap, "1\n").unwrap();
+    // From the moment one of the two has reported, never more than one at once.
+    let mut down = false;
+    let mut most = 0;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while jobs(&fx)
+        .iter()
+        .any(|job| job["state"] != "done" && job["state"] != "cancelled")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the run never finished: {:?}",
+            jobs(&fx)
+        );
+        let now = leased(&fx);
+        if now <= 1 {
+            down = true;
+        }
+        if down {
+            most = most.max(now);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (code, report, stderr) = finish(run);
+    let _ = donor.wait();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        report["landed"].as_array().map(Vec::len),
+        Some(3),
+        "{report}"
+    );
+    assert_eq!(most, 1, "the donor ran more jobs than its cap");
+    let said = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        said.contains(&format!("cap now 1 (was 2) from {}", cap.display())),
+        "{said}"
+    );
+    // No running job was given back: every job a donor took, it took once and reported.
+    for job in jobs(&fx) {
+        assert!(job["attempts"].as_u64() <= Some(1), "{job}");
+        if job["state"] == "done" {
+            assert_eq!(job["attempts"], 1, "{job}");
+        }
+        assert!(!job["history"].to_string().contains("gave"), "{job}");
+    }
+    assert!(
+        fx.mq_ok(&["donor", "status"]).contains("donor d1: cap 1"),
+        "status shows no cap"
+    );
+}
+
+#[test]
+fn a_cap_of_zero_drains_without_exiting_and_clearing_it_resumes_and_a_malformed_cap_is_ignored() {
+    let fx = Fixture::new("donor-cap-drain");
+    three_slow_changes(&fx, 3);
+    let clone = donor_clone(&fx, "donor-host");
+    let cap = fx.root.join("donor-cap");
+    let log = fx.root.join("donor.log");
+    // Malformed: --jobs stands, and the donor says why.
+    std::fs::write(&cap, "lots\n").unwrap();
+    let run = spawn_run(&fx, &[]);
+    wait_for("three published jobs", Duration::from_secs(60), || {
+        jobs(&fx).len() >= 3
+    });
+    let mut donor = capped_donor(&fx, &clone, "d1", 1, &cap, &log);
+    wait_for("one job running", Duration::from_secs(60), || {
+        leased(&fx) == 1
+    });
+    // Drain with a job in flight: it finishes and reports; nothing more is claimed, and the
+    // donor stays, though --until-idle would otherwise end it with nothing running.
+    std::fs::write(&cap, "0").unwrap();
+    wait_for("the running job reported", Duration::from_secs(60), || {
+        jobs(&fx).iter().any(|job| job["state"] == "done") && leased(&fx) == 0
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(leased(&fx), 0, "a draining donor claimed: {:?}", jobs(&fx));
+    assert!(
+        jobs(&fx).iter().any(|job| job["state"] == "queued"),
+        "the premise is work left: {:?}",
+        jobs(&fx)
+    );
+    assert!(
+        donor.try_wait().unwrap().is_none(),
+        "a draining donor exited"
+    );
+    assert!(
+        fx.mq_ok(&["donor", "status"])
+            .contains("donor d1: cap 0 (draining)"),
+        "{}",
+        fx.mq_ok(&["donor", "status"])
+    );
+    // Cleared: --jobs again on the next poll, and the rest is validated.
+    std::fs::remove_file(&cap).unwrap();
+    let (code, report, stderr) = finish(run);
+    let status = donor.wait().unwrap();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(status.success());
+    assert_eq!(
+        report["landed"].as_array().map(Vec::len),
+        Some(3),
+        "{report}"
+    );
+    let said = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        said.contains("ignoring cap file") && said.contains("\"lots\""),
+        "{said}"
+    );
+    assert!(said.contains("cap now 0 (was 1)"), "{said}");
+    assert!(said.contains("cap now 1 (was 0)"), "{said}");
+    for job in jobs(&fx) {
+        assert!(
+            job["attempts"].as_u64() <= Some(1),
+            "a job was given back: {job}"
+        );
+    }
+}

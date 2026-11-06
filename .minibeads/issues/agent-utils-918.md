@@ -1,11 +1,12 @@
 ---
 title: 'donor-cap-file: change a merge-queue donor''s job cap without a restart'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: cl-sync
 created_at: 2026-11-06T01:32:43.607675868+00:00
-updated_at: 2026-11-06T01:32:43.607675868+00:00
+updated_at: 2026-11-06T03:25:37.756546340+00:00
+closed_at: 2026-11-06T03:25:37.756546170+00:00
 ---
 
 # Description
@@ -32,3 +33,19 @@ Acceptable alternatives: a queue-side `donor cap --donor NAME N|clear`, persiste
 # Notes
 
 Requested by the lead on 2026-11-05 at 9:18 PM ET (P1-ish), approved by a consumer team's lead. It pairs with #915 (the same donor code in rs/merge-queue), so it goes to the same lane: cl-sync, after #915. The lead's merge-queue lane owns that crate; keep its configuration working.
+
+## Resolution
+
+[opus 5.5 cl-sync] Option 1, `donor run --cap-file PATH`, re-read before every claim:
+- A whole number N caps `--jobs` at N.
+- 0 drains: nothing is claimed, and `--until-idle` does not exit.
+- An absent or malformed file means `--jobs`. A malformed value is logged once.
+- Running jobs are never touched, and SIGTERM is unchanged.
+- Each change is logged once: "cap now N (was M) from PATH". The donor's "took" line names its cap.
+
+`donor status` (text) shows each donor's cap and when it last claimed, from one fixed map file, `donor-caps.json`, that the queue writes at each claim. It is rewritten only when a cap changes or its last note is a minute old. A draining donor says so with the new `donor claim --drain`, which leases nothing. An older queue refuses that flag, which leases nothing either. `donor status --json` is unchanged.
+
+Tests:
+- Unit: the cap-file reader and the caps map.
+- Integration, lowering the cap: from 2 to 1 with two jobs running, never more than one at once after the first report, no job given back, and the status shows cap 1.
+- Integration, draining: cap 0 with a job in flight; it reports, nothing more is claimed, and the donor stays. Clearing the file resumes. A malformed value is ignored with a log line.

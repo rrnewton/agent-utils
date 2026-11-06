@@ -409,6 +409,40 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
+/// Where the queue keeps each donor's last claimed cap (#918 donor-cap-file).
+const DONOR_CAPS_FILE: &str = "donor-caps.json";
+
+/// How often an unchanged cap is noted again, so `donor status` can say when a donor was last seen.
+const DONOR_CAP_REFRESH_SECS: u64 = 60;
+
+/// What a donor's cap file says (#918 donor-cap-file): `Ok(None)` when there is no file,
+/// `Ok(Some(n))` for a whole number of jobs, `Err(text)` for anything else.
+pub fn read_cap_file(path: &Path) -> Result<Option<usize>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => text
+            .trim()
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| text.trim().to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("unreadable: {error}")),
+    }
+}
+
+/// The cap a donor started with `--jobs jobs` claims under, given what its cap file says: the
+/// file's number where it is lower, else `jobs`; a missing or malformed file leaves `jobs`.
+pub fn effective_cap(jobs: usize, file: &Result<Option<usize>, String>) -> usize {
+    match file {
+        Ok(Some(cap)) => (*cap).min(jobs),
+        _ => jobs,
+    }
+}
+
+/// The wall clock in Unix seconds, for what the CLI notes and shows of donors.
+pub fn unix_seconds() -> u64 {
+    unix_now()
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1515,6 +1549,52 @@ impl Store {
         write_private(&self.dir.join("host-faults.json"), text.as_bytes())
     }
 
+    /// Each donor's job cap as its last claim gave it, and when (#918 donor-cap-file): one
+    /// map in one fixed file, `donor-caps.json`, read by `donor status`.
+    fn donor_caps(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        std::fs::read_to_string(self.dir.join(DONOR_CAPS_FILE))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// Note that `donor` claimed with cap `jobs` (0: draining) at `at`. Written when the cap
+    /// changed, or when the last note is older than [`DONOR_CAP_REFRESH_SECS`], so a donor
+    /// claiming every few seconds does not rewrite the file every time.
+    pub fn note_donor_cap(&self, donor: &str, jobs: usize, at: u64) -> Result<(), String> {
+        let _lock = self.lock()?;
+        let mut caps = self.donor_caps();
+        let unchanged = caps.get(donor).is_some_and(|seen| {
+            seen["jobs"].as_u64() == Some(jobs as u64)
+                && at.saturating_sub(seen["seen_unix"].as_u64().unwrap_or(0))
+                    < DONOR_CAP_REFRESH_SECS
+        });
+        if unchanged {
+            return Ok(());
+        }
+        caps.insert(
+            donor.to_owned(),
+            serde_json::json!({"jobs": jobs, "seen_unix": at}),
+        );
+        let text =
+            serde_json::to_string(&caps).map_err(|error| format!("cannot encode: {error}"))?;
+        write_private(&self.dir.join(DONOR_CAPS_FILE), text.as_bytes())
+    }
+
+    /// Every donor's last claimed cap and when it was seen (Unix seconds), by name.
+    pub fn donor_cap_list(&self) -> Vec<(String, usize, u64)> {
+        self.donor_caps()
+            .into_iter()
+            .map(|(donor, seen)| {
+                (
+                    donor,
+                    usize::try_from(seen["jobs"].as_u64().unwrap_or(0)).unwrap_or(0),
+                    seen["seen_unix"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect()
+    }
+
     /// Host faults by donor name, for status and the serve heartbeat.
     pub fn host_fault_list(&self) -> Vec<(String, String, String)> {
         self.host_faults()
@@ -1941,6 +2021,9 @@ pub struct DonorOptions {
     pub mismatch_backoff: std::time::Duration,
     /// Exit once no job is running and none is available (scripts and tests).
     pub until_idle: bool,
+    /// A file holding the most jobs to run at once, read before each claim; lower than `jobs`
+    /// it caps them, 0 drains (#918 donor-cap-file). Running jobs are never touched.
+    pub cap_file: Option<PathBuf>,
 }
 
 fn host_name() -> String {
@@ -2585,11 +2668,21 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
     };
     let backoff: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     let active = AtomicUsize::new(0);
-    let jobs_text = jobs.to_string();
+    // The cap the donor claims under now, from its cap file (#918 donor-cap-file), and the
+    // malformed text last said of the file, so each change and each new bad value is logged once.
+    let mut cap = jobs;
+    let mut bad_cap: Option<String> = None;
     eprintln!(
-        "merge-queue donor {}: on {}, up to {jobs} job(s), clone {}, merge-queue {}",
+        "merge-queue donor {}: on {}, up to {jobs} job(s){}, clone {}, merge-queue {}",
         options.name,
         worker.host,
+        options
+            .cap_file
+            .as_ref()
+            .map_or_else(String::new, |path| format!(
+                " (capped by {})",
+                path.display()
+            )),
         options.clone.display(),
         revision.as_ref().map_or_else(String::new, |r| r.describe())
     );
@@ -2638,8 +2731,58 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
                     }
                 }
             };
+            if let Some(path) = options.cap_file.as_deref() {
+                let file = read_cap_file(path);
+                match &file {
+                    Err(text) if bad_cap.as_deref() != Some(text.as_str()) => {
+                        eprintln!(
+                            "merge-queue donor {}: ignoring cap file {}: {text:?} is not a whole \
+                             number of jobs; claiming under --jobs {jobs}",
+                            options.name,
+                            path.display()
+                        );
+                        bad_cap = Some(text.clone());
+                    }
+                    Err(_) => {}
+                    Ok(_) => bad_cap = None,
+                }
+                let now = effective_cap(jobs, &file);
+                if now != cap {
+                    eprintln!(
+                        "merge-queue donor {}: cap now {now} (was {cap}) from {}{}",
+                        options.name,
+                        path.display(),
+                        if now == 0 {
+                            "; draining: running jobs finish, nothing more is claimed"
+                        } else {
+                            ""
+                        }
+                    );
+                    cap = now;
+                }
+            }
+            let cap_text = cap.to_string();
             let mut claimed = false;
-            if !host_paused && !backing_off && active.load(Ordering::SeqCst) < jobs {
+            // Draining: lease nothing, but say so to the queue, so its `donor status` shows the
+            // cap. A queue too old to know `--drain` refuses the claim, which leases nothing too.
+            if cap == 0 && !host_paused {
+                let args = [
+                    "donor",
+                    "claim",
+                    "--donor",
+                    &options.name,
+                    "--host",
+                    &worker.host,
+                    "--drain",
+                ];
+                if let Err(error) = route.call(&args, b"", ROUTE_TIMEOUT) {
+                    eprintln!(
+                        "merge-queue donor {}: drain note failed: {error}",
+                        options.name
+                    );
+                }
+            }
+            if !host_paused && !backing_off && active.load(Ordering::SeqCst) < cap {
                 let probe_passed = worker.probe_passed.swap(false, Ordering::SeqCst);
                 let mut args: Vec<&str> = vec![
                     "donor",
@@ -2649,7 +2792,7 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
                     "--host",
                     &worker.host,
                     "--jobs",
-                    &jobs_text,
+                    &cap_text,
                 ];
                 if probe_passed {
                     args.push("--probe-passed");
@@ -2660,7 +2803,7 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
                         claimed = true;
                         active.fetch_add(1, Ordering::SeqCst);
                         eprintln!(
-                            "merge-queue donor {}: took {} ({})",
+                            "merge-queue donor {}: took {} ({}), cap {cap}",
                             options.name, job.id, job.commit
                         );
                         let (worker, backoff, active) = (&worker, &backoff, &active);
@@ -2675,7 +2818,8 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
                     }
                 }
             }
-            if options.until_idle && !claimed && active.load(Ordering::SeqCst) == 0 {
+            // A draining donor (cap 0) stays: it is idle by choice, not for want of work.
+            if options.until_idle && !claimed && active.load(Ordering::SeqCst) == 0 && cap > 0 {
                 break;
             }
             if claimed {
@@ -3255,6 +3399,67 @@ mod unit {
             store.read(&leased_root.id).unwrap().state,
             JobState::Cancelled
         );
+    }
+
+    #[test]
+    fn a_cap_file_caps_jobs_drains_at_zero_and_is_ignored_when_absent_or_malformed() {
+        // #918 donor-cap-file.
+        let dir = temp("cap-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cap");
+        assert_eq!(read_cap_file(&path), Ok(None), "no file");
+        assert_eq!(effective_cap(4, &read_cap_file(&path)), 4);
+        for (text, file, cap) in [
+            ("2\n", Ok(Some(2)), 2),
+            (" 0 ", Ok(Some(0)), 0),
+            ("9", Ok(Some(9)), 4),
+            ("two", Err("two".to_owned()), 4),
+            ("-1", Err("-1".to_owned()), 4),
+            ("", Err(String::new()), 4),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(read_cap_file(&path), file, "{text:?}");
+            assert_eq!(effective_cap(4, &read_cap_file(&path)), cap, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_queue_keeps_each_donors_last_cap_in_one_file() {
+        // #918 donor-cap-file: one map in one fixed file, rewritten when a cap changes or
+        // its last note is a minute old, never once per claim.
+        let store = Store::new(&temp("donor-caps"));
+        store.note_donor_cap("d1", 2, 1000).unwrap();
+        store.note_donor_cap("d2", 0, 1000).unwrap();
+        assert_eq!(
+            store.donor_cap_list(),
+            vec![("d1".to_owned(), 2, 1000), ("d2".to_owned(), 0, 1000)]
+        );
+        store.note_donor_cap("d1", 2, 1030).unwrap();
+        assert_eq!(
+            store.donor_cap_list()[0],
+            ("d1".to_owned(), 2, 1000),
+            "rewritten for nothing"
+        );
+        store
+            .note_donor_cap("d1", 2, 1000 + DONOR_CAP_REFRESH_SECS)
+            .unwrap();
+        assert_eq!(
+            store.donor_cap_list()[0].2,
+            1000 + DONOR_CAP_REFRESH_SECS,
+            "never seen again"
+        );
+        store.note_donor_cap("d1", 1, 1061).unwrap();
+        assert_eq!(
+            store.donor_cap_list()[0],
+            ("d1".to_owned(), 1, 1061),
+            "a change was not noted"
+        );
+        let files: Vec<String> = std::fs::read_dir(&store.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("cap"))
+            .collect();
+        assert_eq!(files, vec![DONOR_CAPS_FILE.to_owned()]);
     }
 
     #[test]
