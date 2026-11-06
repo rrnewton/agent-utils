@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-remove-lock-scope: remove holds the run-population lock only for state transitions, not deletion I/O'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-validate
 created_at: 2026-11-05T15:46:39.396859633+00:00
-updated_at: 2026-11-05T15:46:39.396859633+00:00
+updated_at: 2026-11-06T09:30:00.000000000+00:00
+closed_at: 2026-11-06T09:30:00.000000000+00:00
 ---
 
 # Description
@@ -39,3 +40,7 @@ More data from the same consumer team, via the lead on 2026-11-05 at 11:39 AM ET
 - Another slot refused because the pre-salvage remote check needed a GitHub credential while the git_credential pacing bucket was full ("credential helper ... told us to quit").
 
 The last two acceptance items were added for these.
+
+## Resolution
+
+Landed in 48117c1c, three commits replayed from 712ec2e5 onto cf760db4: remove holds the registry lock only for state transitions; the lock test is parked inside the tree deletion; the batch item budget resumes across the out-of-lock deletion. Gate: full gate on 8237e74e green except load-hit wrkslots shard-2/3 (both passed alone) and the then-red base dagrun steps; clippy rerun exclusive on 712ec2e5 passed. The cf760db4 rebase overlapped none of these files. The shard-5 OOM (#883) is waived.
