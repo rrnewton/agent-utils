@@ -4044,8 +4044,49 @@ class ManagedAgents:
                 })
         return rows
 
+    def _auto_repin_resumed(self, name: str) -> None:
+        """Re-pin a hand-restarted harness without an operator (R1b): only when
+        the recorded pane and terminal still match and the foreground argv
+        resumes the record's own session. Anything else keeps refusing.
+        """
+        try:
+            record = self._load(name)
+        except Exception:
+            return
+        if record.pane_id is None:
+            return
+        identity = record.custom_process_identity or record.harness_identity
+        if identity is None or self.client.process_liveness(identity) == "alive":
+            return
+        try:
+            info = self.client.pane_info(record.pane_id)
+        except Exception:
+            return
+        if record.terminal_id is not None and info.terminal_id != record.terminal_id:
+            return
+        recorded = (
+            (None if record.native_session is None else record.native_session["value"])
+            or record.session_value or record.resume
+        )
+        if recorded is None:
+            return
+        foreground = getattr(self.client, "foreground_session", None)
+        if foreground is None:
+            return
+        try:
+            derived = foreground(record.pane_id, record.harness)
+        except Exception:
+            return
+        if derived != recorded:
+            return
+        try:
+            self.anchor(name, replace=True, session=recorded)
+        except Exception:
+            pass
+
     def send(self, name: str, text: str, *, message_id: str | None = None, expected_token: str | None = None, **options: object) -> agent.QueueResult:
         """Serialize against stop, then use the existing durable submission transport."""
+        self._auto_repin_resumed(name)
         with self._lock(name):
             record = self._load_expected(name, expected_token)
             self._require_automation(record)

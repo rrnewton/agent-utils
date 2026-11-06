@@ -6223,6 +6223,59 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// own readiness checks. The send ends when its prompt is typed, set aside or quarantined, or
     /// with exit 75 and the prompt pending once its readiness budget runs out. `priority` types
     /// only this prompt, as an urgent send does.
+    /// Re-pin a hand-restarted harness without an operator (R1b): only when
+    /// the recorded pane and terminal still match and the foreground argv
+    /// resumes the record's own session. Anything else keeps refusing.
+    fn auto_repin_resumed(&self, agent_name: &str) {
+        let Ok(record) = self.load(agent_name) else {
+            return;
+        };
+        let Some(pane) = record.pane_id.clone() else {
+            return;
+        };
+        let identity = if record.anchors_with_harness_identity() {
+            record.harness_anchor().cloned()
+        } else {
+            record.custom_process_identity.clone()
+        };
+        let Some(identity) = identity else {
+            return;
+        };
+        if self.client.process_liveness(&identity) == ProcessLiveness::Alive {
+            return;
+        }
+        let Ok(info) = self.client.pane_info(&pane) else {
+            return;
+        };
+        if record
+            .terminal_id
+            .as_deref()
+            .is_some_and(|terminal| Some(terminal) != info.terminal_id.as_deref())
+        {
+            return;
+        }
+        let recorded = record
+            .native_session
+            .as_ref()
+            .map(|native| native.value.clone())
+            .or_else(|| record.session_value.clone())
+            .or_else(|| record.resume.clone());
+        let Some(recorded) = recorded else {
+            return;
+        };
+        if self
+            .client
+            .foreground_session(&pane, &record.harness)
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some(&recorded)
+        {
+            return;
+        }
+        let _ = self.anchor(agent_name, true, Some(&recorded));
+    }
+
     fn send_holding_no_lock_while_waiting(
         &self,
         agent_name: &str,
@@ -6231,6 +6284,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         message_id: Option<&str>,
         priority: bool,
     ) -> Result<QueueResult> {
+        self.auto_repin_resumed(agent_name);
         // As `drain`: termination ends the send's waits (#734 chat-status-disagreement).
         agent::install_termination_handler();
         let started = Instant::now();

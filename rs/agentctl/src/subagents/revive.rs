@@ -2270,6 +2270,43 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .rename_agent(&new_pane, agent_name)
             .map(|()| true)
             .unwrap_or(false);
+        // Other registries can pin the same pane under another name (R1b);
+        // re-pin each record that names this pane with the same proof.
+        let mut peers = Vec::new();
+        let config_path = self.registry.join("restore.json");
+        if let Ok(bytes) = fs::read(&config_path) {
+            if let Ok(config) = serde_json::from_slice::<crate::restore::RestoreConfig>(&bytes) {
+                for entry in &config.also_registered {
+                    let peer = Self::new(self.client, Path::new(&entry.registry));
+                    if let Ok(peer) = peer {
+                        if let Ok(peer_record) = peer.load(&entry.name) {
+                            if peer_record.pane_id.as_deref() == Some(new_pane.as_str()) {
+                                peer.auto_repin_resumed(&entry.name);
+                                let repinned = peer
+                                    .load(&entry.name)
+                                    .map(|after| {
+                                        let identity = if after.anchors_with_harness_identity() {
+                                            after.harness_anchor().cloned()
+                                        } else {
+                                            after.custom_process_identity.clone()
+                                        };
+                                        identity.is_some_and(|id| {
+                                            self.client.process_liveness(&id)
+                                                == ProcessLiveness::Alive
+                                        })
+                                    })
+                                    .unwrap_or(false);
+                                peers.push(json!({
+                                    "registry": entry.registry,
+                                    "name": entry.name,
+                                    "repinned": repinned,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let slot = if new_record.slot.is_some() {
             match self.rebind_slot(agent_name) {
                 Ok(_) => json!("transferred"),
@@ -2306,6 +2343,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "renamed": renamed,
             "slot_owner": slot,
             "notified": notified,
+            "peers": peers,
         }))
     }
 
