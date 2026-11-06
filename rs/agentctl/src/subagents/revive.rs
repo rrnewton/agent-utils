@@ -2284,7 +2284,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 .is_ok_and(|pending| pending.is_empty())
                 && this
                     .client
-                    .pane_info(&pane)
+                    .pane_info(pane)
                     .is_ok_and(|info| matches!(info.status.as_str(), "idle" | "done"))
         };
         if !idle(self) && !when_idle {
@@ -2307,19 +2307,19 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "'{agent_name}' did not stay idle; nothing was exited"
             )));
         }
-        self.client.run(&pane, "/exit")?;
+        self.client.run(pane, "/exit")?;
         std::thread::sleep(Duration::from_millis(500));
         let screen = self
             .client
-            .read(&pane, "visible", Some(200))
+            .read(pane, "visible", Some(200))
             .unwrap_or_default();
         if screen.contains("Exit and stop tasks") {
             if stop_background_tasks {
                 // The operator confirmed the listed tasks are stale:
                 // accept the dialog's stop-tasks choice and continue.
-                let _ = self.client.send_keys(&pane, "Enter");
+                let _ = self.client.send_keys(pane, "Enter");
             } else {
-                let _ = self.client.send_keys(&pane, "Escape");
+                let _ = self.client.send_keys(pane, "Escape");
                 return Err(fail(format!(
                     "'{agent_name}' has background tasks (its exit dialog appeared); finish or stop them, note what to re-arm, then restart (or pass --stop-background-tasks when the agent confirms they are stale)"
                 )));
@@ -2328,29 +2328,29 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let shell_deadline = std::time::Instant::now() + Duration::from_secs(15);
         let mut shelled = false;
         while std::time::Instant::now() < shell_deadline {
-            if self.client.pane_is_idle_shell(&pane)? {
+            if self.client.pane_is_idle_shell(pane)? {
                 shelled = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(250));
         }
         if !shelled {
-            let _ = self.client.send_keys(&pane, "ctrl+c");
+            let _ = self.client.send_keys(pane, "ctrl+c");
             std::thread::sleep(Duration::from_secs(1));
             let screen = self
                 .client
-                .read(&pane, "visible", Some(200))
+                .read(pane, "visible", Some(200))
                 .unwrap_or_default();
             if screen.contains("Local work is still active") {
-                let _ = self.client.send_keys(&pane, "Escape");
+                let _ = self.client.send_keys(pane, "Escape");
                 return Err(fail(format!(
                     "'{agent_name}' has scheduled tasks or a paused goal (its exit dialog appeared); record the cron lines and goal text to restore after resume, then restart"
                 )));
             }
-            let _ = self.client.send_keys(&pane, "ctrl+c");
+            let _ = self.client.send_keys(pane, "ctrl+c");
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
             while std::time::Instant::now() < deadline {
-                if self.client.pane_is_idle_shell(&pane)? {
+                if self.client.pane_is_idle_shell(pane)? {
                     shelled = true;
                     break;
                 }

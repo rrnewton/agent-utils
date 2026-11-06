@@ -2617,16 +2617,16 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
             let desired = crate::tab_order::canonical_tabs(&entries);
             let mut current = order;
             for (index, tab) in desired.iter().enumerate() {
-                if current.get(index) != Some(tab) {
-                    if crate::tab_order::move_tab(&socket, tab, index).is_ok() {
-                        current.remove(
-                            current
-                                .iter()
-                                .position(|candidate| candidate == tab)
-                                .unwrap(),
-                        );
-                        current.insert(index, tab.clone());
-                    }
+                if current.get(index) != Some(tab)
+                    && crate::tab_order::move_tab(&socket, tab, index).is_ok()
+                {
+                    current.remove(
+                        current
+                            .iter()
+                            .position(|candidate| candidate == tab)
+                            .unwrap(),
+                    );
+                    current.insert(index, tab.clone());
                 }
             }
         }
