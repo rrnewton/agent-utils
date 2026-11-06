@@ -3671,7 +3671,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn a_paste_taken_straight_into_the_queued_messages_is_delivered_without_a_key() {
         // #884 follow-up busy-evidence (a), from a real busy Claude Code
         // pane: the paste never stages in the composer; the prompt appears
