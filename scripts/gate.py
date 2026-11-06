@@ -57,11 +57,15 @@ import re
 import subprocess
 import sys
 import time
-import tomllib
 import uuid
 from collections import Counter
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # Python 3.10: the tomli package provides the same API
+    import tomli as tomllib
 
 DEFAULT_DIR = Path("/tmp/dev-agent-utils-gate-admission")
 
@@ -383,8 +387,13 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         return 2
     ignore = bool(getattr(args, "ignore_blackout", False))
     parent_run = os.environ.get("GATE_ADMISSION_RUN_ID")
+    # A genuine nested gate (validate.py's exclusive phase) names a parent
+    # run that holds a ticket in this same admission directory; the variable
+    # alone also leaks into unrelated children of a running gate (tests,
+    # shells), and those are fresh starts the blackout still refuses.
+    nested = bool(parent_run) and (state_dir() / "runs" / f"{parent_run}.json").is_file()
     active = active_blackout(windows, now)
-    if active is not None and not ignore and not parent_run:
+    if active is not None and not ignore and not nested:
         return _refuse_blackout(active, now)
     adm = Admission(state_dir(), args.slots)
     # A gate invoked from inside an admitted gate (validate.py running its

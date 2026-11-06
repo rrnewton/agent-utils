@@ -150,6 +150,7 @@ _OUTSIDE = "2026-11-06T12:00:00+00:00"  # 07:00 EST, outside
 
 def _blackout_env(tmp_path: Path, config_text: str | None, now: str) -> dict[str, str]:
     env = _env(tmp_path)
+    env.pop("GATE_ADMISSION_RUN_ID", None)  # a fresh start, not a nested gate
     config = tmp_path / "gate.toml"
     if config_text is not None:
         config.write_text(config_text, encoding="utf-8")
