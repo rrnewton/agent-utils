@@ -840,6 +840,12 @@ fn closer() -> &'static Mutex<Closer> {
     CLOSER.get_or_init(Mutex::default)
 }
 
+/// Wake the closer from outside a run (the serve loop, so `close_pending`
+/// changes drain even with no label sync and no landing in progress).
+pub fn wake_closer(state: &State, config: &Config) {
+    close_beside(state, config);
+}
+
 /// Wake the closer, starting it when it is not running. A wake while it runs makes it look
 /// again once it is done, so a change marked during a pass is not left behind.
 fn close_beside(state: &State, config: &Config) {

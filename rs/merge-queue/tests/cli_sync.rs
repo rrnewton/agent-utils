@@ -13,6 +13,7 @@ case "$1 $2" in
   "pr close")
     if [ -e "$GH_FAIL_CLOSE" ]; then rm -f "$GH_FAIL_CLOSE"; echo "close failed" >&2; exit 1; fi
     if [ -e "$GH_FAIL_CLOSES" ]; then echo "close failed" >&2; exit 1; fi
+    if [ -e "$GH_FAIL_CLOSE_PR" ] && [ "$3" = "$(cat "$GH_FAIL_CLOSE_PR")" ]; then echo "close failed for $3" >&2; exit 1; fi
     # A close that cannot finish until a file appears (at most 20 s).
     if [ -n "$GH_CLOSE_AFTER" ]; then
       n=0
@@ -33,6 +34,8 @@ struct Gh {
     fail_close: String,
     /// Fails every close while it exists.
     fail_closes: String,
+    /// File whose contents are the pull-request number whose close always fails.
+    fail_close_pr: String,
 }
 
 fn stub(fx: &Fixture) -> Gh {
@@ -48,6 +51,7 @@ fn stub(fx: &Fixture) -> Gh {
         list: fx.root.join("gh-list.json").display().to_string(),
         fail_close: fx.root.join("gh-fail-close").display().to_string(),
         fail_closes: fx.root.join("gh-fail-closes").display().to_string(),
+        fail_close_pr: fx.root.join("gh-fail-close-pr").display().to_string(),
     }
 }
 
@@ -143,6 +147,7 @@ fn env(gh: &Gh) -> Vec<(&str, &str)> {
         ("GH_LIST", gh.list.as_str()),
         ("GH_FAIL_CLOSE", gh.fail_close.as_str()),
         ("GH_FAIL_CLOSES", gh.fail_closes.as_str()),
+        ("GH_FAIL_CLOSE_PR", gh.fail_close_pr.as_str()),
     ]
 }
 
@@ -389,10 +394,110 @@ fn landed_pull_requests_whose_close_fails_are_closed_by_the_next_sync() {
     assert!(item(&all, 1).get("close_pending").is_none());
     assert!(item(&all, 2).get("close_pending").is_none());
     let log = std::fs::read_to_string(&gh.log).unwrap();
-    // The closer stops at the first close that fails, oldest first: #2 was first tried by the
-    // sync.
-    assert_eq!(log.matches("pr close 2 --repo o/n").count(), 1, "{log}");
+    // A failed close no longer stops the pass: during the run the closer tried
+    // both, and the sync tried both again.
+    assert_eq!(log.matches("pr close 2 --repo o/n").count(), 2, "{log}");
     assert!(log.contains("Landed by merge-queue in "));
+}
+
+/// One pull request whose close keeps failing must not block the next one:
+/// the other still closes, the failure is loud (it names the pull request
+/// and the hosting error), and the failing one stays close-pending.
+#[test]
+fn a_close_that_keeps_failing_does_not_block_the_next_close() {
+    let fx = Fixture::new("sync-close-one-fails");
+    let gh = stub(&fx);
+    init_closing(&fx, &gh, RUNNER);
+    let h1 = pull_request(&fx, 1, &[("tests/a", "ok\n")]);
+    let h2 = pull_request(&fx, 2, &[("tests/b", "ok\n")]);
+    std::fs::write(
+        &gh.list,
+        listing(&[(1, &h1, false, &[]), (2, &h2, false, &[])]),
+    )
+    .unwrap();
+    sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
+    std::fs::write(&gh.fail_closes, "").unwrap();
+    let out = fx.mq_env(&["run", "--json"], &env(&gh));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::remove_file(&gh.fail_closes).unwrap();
+    // From now on only #1's close fails.
+    std::fs::write(&gh.fail_close_pr, "1").unwrap();
+    let out = fx.mq_env(&["sync", "--all-open", "--limit", "100"], &env(&gh));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        !out.status.success(),
+        "the sync must surface the failed close: {stderr}"
+    );
+    assert!(stderr.contains("close-failed"), "{stderr}");
+    assert!(stderr.contains("#1"), "{stderr}");
+    assert!(stderr.contains("close failed for 1"), "{stderr}");
+    let all = items(&fx);
+    assert_eq!(item(&all, 1)["close_pending"], true, "{all}");
+    assert!(item(&all, 2).get("close_pending").is_none(), "{all}");
+    let log = std::fs::read_to_string(&gh.log).unwrap();
+    assert!(log.contains("pr close 1 --repo o/n"), "{log}");
+    assert!(log.contains("pr close 2 --repo o/n"), "{log}");
+}
+
+/// A serve with no label sync still drains close-pending changes on its
+/// own, within a minute of starting, with no landing in progress.
+#[test]
+fn serve_drains_close_pending_without_a_sync() {
+    let fx = Fixture::new("serve-close-drain");
+    let gh = stub(&fx);
+    init_closing(&fx, &gh, RUNNER);
+    let h1 = pull_request(&fx, 1, &[("tests/a", "ok\n")]);
+    std::fs::write(&gh.list, listing(&[(1, &h1, false, &[])])).unwrap();
+    sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
+    std::fs::write(&gh.fail_closes, "").unwrap();
+    let out = fx.mq_env(&["run", "--json"], &env(&gh));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(item(&items(&fx), 1)["close_pending"], true);
+    std::fs::remove_file(&gh.fail_closes).unwrap();
+    // No sync, no new landing: the serve itself retries the close.
+    let mut serve = {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_merge-queue"));
+        command
+            .args(["serve", "--poll-ms", "50", "--base-poll-secs", "1"])
+            .current_dir(fx.queue())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("TESTTMP", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        for (key, value) in env(&gh) {
+            command.env(key, value);
+        }
+        command.env_remove("MERGE_QUEUE_STATE");
+        command.spawn().expect("spawn serve")
+    };
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(30)
+        && item(&items(&fx), 1).get("close_pending").is_some()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    serve.kill().unwrap();
+    serve.wait().unwrap();
+    let all = items(&fx);
+    assert!(
+        item(&all, 1).get("close_pending").is_none(),
+        "{all}; gh log: {}",
+        std::fs::read_to_string(&gh.log).unwrap_or_default()
+    );
+    let history = item(&all, 1)["history"].to_string();
+    assert!(
+        history.contains("pull request closed after landing"),
+        "{history}"
+    );
 }
 
 /// Like [`RUNNER`], and leaves `$MARKS/<test>` for every test it runs.

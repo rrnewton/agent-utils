@@ -1210,10 +1210,13 @@ impl LabelSync {
                 )?,
             };
             if config.land.close_prs {
-                crate::sync::close_postponed(&state, &config)?;
+                // Record successful closes even when another close failed,
+                // then surface the failure.
+                let closing = crate::sync::close_postponed(&state, &config);
                 if let Ok(lock) = state.lock() {
                     report.closed = crate::sync::record_closed(&state, &lock)?;
                 }
+                closing?;
             }
             report.api_remaining =
                 crate::github::Hosting::new(&config.github, &state.root, config.net_timeout())
@@ -1420,6 +1423,10 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
     let mut label_sync: Option<LabelSync> = None;
     // The busy-lock error the heartbeat shows, until the daemon gets the lock or has no work.
     let mut busy_error = String::new();
+    // When the closer was last woken for close-pending changes (see the
+    // per-cycle drain below); throttled so an idle daemon does not scan
+    // for closes every poll.
+    let mut last_close_wake: Option<Instant> = None;
 
     'outer: loop {
         if shutdown_requested() {
@@ -1622,6 +1629,31 @@ pub fn serve(state: &State, options: &ServeOptions) -> Result<i32, String> {
                 if before == last_fingerprint {
                     last_fingerprint = items_fingerprint(state);
                 }
+            }
+        }
+
+        // Drain closes beside the run even with no label sync and no
+        // landing in progress: a landed change marked close-pending is
+        // retried here (throttled to once a minute), within the API
+        // budget, instead of waiting for the next landing or sync that
+        // may never come. Recording needs the writer lock; a busy lock
+        // skips this cycle's recording, as for notifications.
+        if config.land.close_prs {
+            if last_close_wake.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
+                last_close_wake = Some(Instant::now());
+                if state.items().is_ok_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| item.status == ItemStatus::Landed && item.close_pending)
+                }) {
+                    crate::run::wake_closer(state, &config);
+                }
+            }
+            // Recording is a directory listing when nothing closed: cheap
+            // enough every cycle, so a close the closer just made is
+            // recorded on the next cycle, not after the next wake.
+            if let Ok(lock) = state.lock() {
+                record_closed(state, &lock);
             }
         }
 

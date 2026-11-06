@@ -344,8 +344,12 @@ pub fn sync(
     let mut report = reconcile(state, config, source, listing, apply, notifier)?;
     if let Some(lock) = lock {
         if config.land.close_prs && hosting.is_some() {
-            close_postponed(state, config)?;
+            // Record the closes that succeeded even when another close
+            // failed, then surface the failure: the items must not stay
+            // close-pending for a close that already happened.
+            let closing = close_postponed(state, config);
             report.closed = record_closed(state, lock)?;
+            closing?;
         }
     }
     report.api_remaining = hosting.map(|h| h.budget.remaining());
@@ -527,12 +531,18 @@ fn closed_dir(state: &State) -> PathBuf {
     state.root.join("closed")
 }
 
-/// Close the landed pull requests whose close the request budget postponed, oldest first,
-/// stopping at the first that fails (the budget is likely spent). The API calls can wait on the
-/// budget, so this takes no writer lock: each close is noted under `<state>/closed/` for
-/// [`record_closed`], and a change noted there is not closed again.
+/// Close the landed pull requests whose close the request budget postponed, oldest first.
+/// A close that fails does not stop the pass and is never swallowed: it is logged with its
+/// pull request and the hosting error, the rest still close, and the pass returns the first
+/// failure so callers surface it too. (Stopping at the first failure let one permanently
+/// failing close — a deleted head branch, a number that is not a pull request — block every
+/// later close forever, silently.) The API calls can wait on the budget, so this takes no
+/// writer lock: each close is noted under `<state>/closed/` for [`record_closed`], and a
+/// change noted there is not closed again. A failure charged against an exhausted budget
+/// records no API call, so trying the rest costs nothing.
 pub fn close_postponed(state: &State, config: &Config) -> Result<(), String> {
     let hosting = Hosting::new(&config.github, &state.root, config.net_timeout())?;
+    let mut failures: Vec<String> = Vec::new();
     for item in state.items()? {
         if item.status != ItemStatus::Landed || !item.close_pending {
             continue;
@@ -543,10 +553,27 @@ pub fn close_postponed(state: &State, config: &Config) -> Result<(), String> {
         }
         match hosting.close(item.pr, &close_comment(&item.landed_as)) {
             Ok(()) => crate::state::write_json(&note, &item.pr)?,
-            Err(_) => break,
+            Err(error) => {
+                eprintln!(
+                    "merge-queue: close-failed: pull request #{} (landed as {}) not closed: \
+                     {error}; it stays close-pending and will be retried",
+                    item.pr,
+                    crate::plan::short(&item.landed_as)
+                );
+                failures.push(format!("#{}: {error}", item.pr));
+            }
         }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} landed pull request(s) not closed ({}); first: {}",
+            failures.len(),
+            failures.join("; "),
+            failures[0]
+        ))
+    }
 }
 
 /// Record on their items the closes [`close_postponed`] noted, under the writer lock the caller

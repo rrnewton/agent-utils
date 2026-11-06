@@ -1,11 +1,12 @@
 ---
 title: 'merge-queue-root-near-landing: a new root planned while another root is green but unlanded should not go stale'
-status: in_progress
+status: closed
 priority: 1
 issue_type: task
 assignee: mu-mqdonor
 created_at: 2026-11-06T19:35:46.404619718+00:00
-updated_at: 2026-11-06T19:35:49.652156455+00:00
+updated_at: 2026-11-06T20:01:38.106636994+00:00
+closed_at: 2026-11-06T20:01:38.106636843+00:00
 claimed_at: 2026-11-06T19:35:49.652156455+00:00
 claimed_until: 2026-11-08T19:35:49.652059179+00:00
 ---
