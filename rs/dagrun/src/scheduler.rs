@@ -1638,6 +1638,7 @@ struct Runner {
     steps: Arc<HashMap<String, Step>>,
     order: Vec<String>,
     intentional_skips: Vec<(String, crate::model::IntentionalSkipReason)>,
+    runtime_skips: Vec<(String, String)>,
     /// Maximum number of DAG steps that may be active at once.
     max_steps: i64,
     keep_going: bool,
@@ -1791,6 +1792,7 @@ impl Runner {
             steps: Arc::new(steps),
             order,
             intentional_skips,
+            runtime_skips: Vec::new(),
             max_steps: max_steps.max(1),
             keep_going,
             verbosity,
@@ -1852,12 +1854,14 @@ impl Runner {
                     || sh.done.contains_key(tag)
                     || sh.running.contains(tag)
                     || step.skip_reason.is_some()
+                    || self.runtime_skips.iter().any(|(t, _)| t == tag)
                 {
                     continue;
                 }
                 for d in &step.deps {
                     let dep_failed = sh.done.get(d).map(|o| !o.ok).unwrap_or(false);
-                    if dep_failed || sk.contains(d) {
+                    let dep_runtime_skipped = self.runtime_skips.iter().any(|(t, _)| t == d);
+                    if dep_failed || dep_runtime_skipped || sk.contains(d) {
                         sk.insert(tag.clone());
                         changed = true;
                         break;
@@ -2005,6 +2009,18 @@ impl Runner {
                 if !step.publishes.is_empty() {
                     let _ = std::fs::create_dir_all(dir.join(step.tag()));
                 }
+            }
+        }
+        for (tag, reason) in &self.runtime_skips {
+            emit(&format!("[{tag}] SKIPPED reason=runtime-skip: {reason}"));
+            if let Some(evidence) = &self.evidence {
+                evidence.record(
+                    "step_skip",
+                    &[
+                        ("step", tag.clone()),
+                        ("reason", format!("runtime-skip: {reason}")),
+                    ],
+                );
             }
         }
         for (tag, reason) in &self.intentional_skips {
@@ -2219,7 +2235,7 @@ impl Runner {
                     && (sh.stop
                         || sh.done.len()
                             + skipped.len()
-                            + self.intentional_skips.len()
+                            + self.intentional_skips.len() + self.runtime_skips.len()
                             + blocked_by_family.len()
                             >= self.steps.len())
                 {
@@ -2235,6 +2251,7 @@ impl Runner {
                             || sh.running.contains(tag)
                             || skipped.contains(tag)
                             || step.skip_reason.is_some()
+                            || self.runtime_skips.iter().any(|(t, _)| t == tag)
                         {
                             continue;
                         }
@@ -2333,7 +2350,7 @@ impl Runner {
                     // configured caps.
                     let accounted = sh.done.len()
                         + skipped.len()
-                        + self.intentional_skips.len()
+                        + self.intentional_skips.len() + self.runtime_skips.len()
                         + blocked_by_family.len();
                     let remaining = self.steps.len().saturating_sub(accounted);
                     let waiting_on_shared_resource = self
@@ -2473,6 +2490,7 @@ impl Runner {
                     .intentional_skips
                     .iter()
                     .map(|(tag, _)| tag.as_str())
+                    .chain(self.runtime_skips.iter().map(|(tag, _)| tag.as_str()))
                     .collect();
                 let not_launched = self
                     .order
@@ -2536,6 +2554,7 @@ impl Runner {
             .intentional_skips
             .iter()
             .map(|(tag, _)| tag.as_str())
+            .chain(self.runtime_skips.iter().map(|(tag, _)| tag.as_str()))
             .collect();
         let mut not_launched: Vec<String> = self
             .order
@@ -2557,6 +2576,7 @@ impl Runner {
             skipped,
             not_launched,
             intentional_skips: self.intentional_skips.clone(),
+            runtime_skips: self.runtime_skips.clone(),
             step_profile_rows: sh.step_profile_rows.clone(),
             step_timeseries_rows: sh.step_timeseries_rows.clone(),
             run_timed_out: sh.run_timed_out,
@@ -5126,6 +5146,7 @@ pub fn run_dag_boxed_deadline_limited_with_cpu(
         run_cpu_budget,
         resource_caps_path,
         None,
+        Vec::new(),
     )
 }
 
@@ -5154,6 +5175,7 @@ pub fn run_dag_boxed_deadline_limited_with_resource_caps(
         None,
         resource_caps_path,
         None,
+        Vec::new(),
     )
 }
 
@@ -5172,6 +5194,7 @@ pub(crate) fn run_dag_boxed_deadline_limited_with_resource_caps_and_timeseries(
     run_timeout_s: Option<i64>,
     resource_caps_path: Option<PathBuf>,
     profile_timeseries_interval: Option<Duration>,
+    runtime_skips: Vec<(String, String)>,
 ) -> RunResult {
     run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
         cfg,
@@ -5185,6 +5208,7 @@ pub(crate) fn run_dag_boxed_deadline_limited_with_resource_caps_and_timeseries(
         None,
         resource_caps_path,
         profile_timeseries_interval,
+        runtime_skips,
     )
 }
 
@@ -5211,6 +5235,7 @@ pub(crate) fn run_dag_boxed_limited_with_timeseries(
         None,
         None,
         profile_timeseries_interval,
+        Vec::new(),
     )
 }
 
@@ -5227,6 +5252,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
     run_cpu_budget: Option<RunCpuBudget>,
     resource_caps_path: Option<PathBuf>,
     profile_timeseries_interval: Option<Duration>,
+    runtime_skips: Vec<(String, String)>,
 ) -> RunResult {
     if let Some(interval) = profile_timeseries_interval {
         if !(Duration::from_millis(50)..=Duration::from_secs(10)).contains(&interval) {
@@ -5260,6 +5286,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
             skipped: Vec::new(),
             not_launched: Vec::new(),
             intentional_skips: Vec::new(),
+            runtime_skips: Vec::new(),
             step_profile_rows: Vec::new(),
             step_timeseries_rows: Vec::new(),
             run_timed_out: false,
@@ -5277,6 +5304,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
             skipped: Vec::new(),
             not_launched: Vec::new(),
             intentional_skips: Vec::new(),
+            runtime_skips: Vec::new(),
             step_profile_rows: Vec::new(),
             step_timeseries_rows: Vec::new(),
             run_timed_out: false,
@@ -5299,6 +5327,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
             skipped: Vec::new(),
             not_launched: Vec::new(),
             intentional_skips: Vec::new(),
+            runtime_skips: Vec::new(),
             step_profile_rows: Vec::new(),
             step_timeseries_rows: Vec::new(),
             run_timed_out: false,
@@ -5329,6 +5358,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
             // either. Same shape as the two refusal paths above it.
             not_launched: Vec::new(),
             intentional_skips: Vec::new(),
+            runtime_skips: Vec::new(),
             step_profile_rows: Vec::new(),
             step_timeseries_rows: Vec::new(),
             run_timed_out: false,
@@ -5359,6 +5389,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
                 skipped: Vec::new(),
                 not_launched: Vec::new(),
                 intentional_skips: Vec::new(),
+            runtime_skips: Vec::new(),
                 step_profile_rows: Vec::new(),
                 step_timeseries_rows: Vec::new(),
                 run_timed_out: false,
@@ -5399,6 +5430,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
                     skipped: Vec::new(),
                     not_launched: Vec::new(),
                     intentional_skips: Vec::new(),
+            runtime_skips: Vec::new(),
                     step_profile_rows: Vec::new(),
                     step_timeseries_rows: Vec::new(),
                     run_timed_out: false,
@@ -5416,7 +5448,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
             coordinator.path().display()
         );
     }
-    let runner = Runner::new(
+    let mut runner = Runner::new(
         cfg,
         max_steps,
         max_cpus,
@@ -5429,6 +5461,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
         resource_coordinator,
         profile_timeseries_interval,
     );
+    runner.runtime_skips = runtime_skips;
     // ANNOUNCE THE EVIDENCE PATH ONCE, AT THE START. A durable log nobody can find is not
     // evidence; and printing it only on failure is printing it only where the run still had a
     // chance to print something. Stated up front, it is on the console even for a run that is
@@ -7479,6 +7512,58 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
                 .collect::<Vec<_>>(),
             vec!["g.nonempty"]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_skip_never_spawns_and_dependents_dependency_skip() {
+        // #867: a runtime-skipped step is not spawned, its dependent is
+        // dependency-skipped, and the result carries the reason.
+        let dir = std::env::temp_dir().join(format!("dagrun-rt-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let forbidden = dir.join("forbidden");
+        let cfg = DagConfig {
+            steps: vec![
+                step(
+                    "setup",
+                    "node22",
+                    &format!("touch {}", forbidden.display()),
+                    &[],
+                    0.0,
+                    &[],
+                ),
+                step("browser", "page", "true", &["setup.node22"], 0.0, &[]),
+                step("other", "unit", "true", &[], 0.0, &[]),
+            ],
+            ..Default::default()
+        };
+        let res = run_dag_boxed_deadline_limited_with_resource_caps_and_timeseries(
+            &cfg,
+            2,
+            2,
+            false,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![(
+                "setup.node22".to_string(),
+                "host node v16 < 20; Node 22 not provisioned".to_string(),
+            )],
+        );
+        assert!(res.ok);
+        assert!(!forbidden.exists());
+        assert_eq!(
+            res.runtime_skips,
+            vec![(
+                "setup.node22".to_string(),
+                "host node v16 < 20; Node 22 not provisioned".to_string(),
+            )]
+        );
+        assert_eq!(res.skipped, vec!["browser.page".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -2115,6 +2115,9 @@ pub struct RunResult {
     pub not_launched: Vec<String>,
     /// `(tag, stable reason)` for nodes deliberately omitted before process spawn.
     pub intentional_skips: Vec<(String, IntentionalSkipReason)>,
+    /// `(tag, reason)` for nodes skipped at runtime by the caller (--skip, #867):
+    /// not spawned, never counted as passed, and the run is not a clean pass.
+    pub runtime_skips: Vec<(String, String)>,
     /// Per-step measurement rows (column -> value) to forward to a metrics sink; empty when no
     /// cgroup manager supplied per-step metrics.
     pub step_profile_rows: Vec<BTreeMap<String, String>>,

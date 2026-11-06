@@ -728,6 +728,54 @@ def case_timing_report(
     )
 
 
+def _node22_runtime_skips(chosen_tags: set[str]) -> list[str]:
+    """--skip arguments for setup.node22 when Node 22 cannot be provisioned (#867).
+
+    Provisioning is attempted first (it is cheap when already installed);
+    only a failed attempt on a host whose own node is too old (or absent)
+    turns the setup step into a runtime skip with the reason named, so its
+    dependents dependency-skip instead of failing the gate.
+    """
+
+    if "setup.node22" not in chosen_tags:
+        return []
+    try:
+        provisioned = subprocess.run(
+            [str(REPO_ROOT / "scripts" / "provision-node22")],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        provisioned = None
+        provision_detail = str(exc)
+    if provisioned is not None and provisioned.returncode == 0:
+        return []
+    if provisioned is not None:
+        lines = (provisioned.stderr or provisioned.stdout).strip().splitlines()
+        provision_detail = lines[-1] if lines else f"exit {provisioned.returncode}"
+    try:
+        host_node = subprocess.run(
+            ["node", "--version"], capture_output=True, text=True, timeout=30
+        ).stdout.strip()
+    except OSError:
+        host_node = ""
+    major = None
+    if host_node.startswith("v"):
+        try:
+            major = int(host_node[1:].split(".")[0])
+        except ValueError:
+            major = None
+    if major is not None and major >= 20:
+        return []
+    reason = (
+        f"host node {host_node or 'missing'} < 20; Node 22 not provisioned "
+        f"({provision_detail})"
+    )
+    print(f"validate: runtime-skip setup.node22: {reason}")
+    return [f"setup.node22={reason}"]
+
+
 def run(
     selected: frozenset[str],
     components: frozenset[str],
@@ -803,6 +851,8 @@ def run(
             labels = {GROUP_LABELS[group] for group in selected}
             labels.update(f"component-{name}" for name in components)
             command.extend(("--labels", ",".join(sorted(labels))))
+        for skip in _node22_runtime_skips(set(main_tags)):
+            command.extend(("--skip", skip))
         if keep_going:
             command.append("--keep-going")
         command.extend(shlex.split(extra))

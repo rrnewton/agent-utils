@@ -1036,8 +1036,45 @@ def test_run_selected_runs_full_dependency_ancestry_in_order() -> None:
         assert order.read_text(encoding="utf-8") == "build\ntest\npackage\n"
         assert (
             "3 passed, 0 failed, 0 aborted, 0 intentionally skipped, "
-            "0 dependency-skipped, 0 not launched"
+            "0 runtime-skipped, 0 dependency-skipped, 0 not launched"
         ) in err
+
+
+def test_run_skip_skips_at_runtime_with_reason() -> None:
+    """#867: --skip TAG=REASON does not spawn, dep-skips dependents, verdict PARTIAL."""
+    dag = (
+        '{"steps": ['
+        '{"group": "setup", "job": "node22", "cmd": "exit 9"},'
+        '{"group": "browser", "job": "page", "cmd": "true", "deps": ["setup.node22"]},'
+        '{"group": "other", "job": "unit", "cmd": "true"}'
+        "]}"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(dag, encoding="utf-8")
+        rc, out, err = _capture(
+            [
+                "run", "--dag", str(path),
+                "--skip", "setup.node22=host node v16 < 20; Node 22 not provisioned",
+                "-q", _ACF,
+            ]
+        )
+        assert rc == 0
+        err = out + err
+        assert "[setup.node22] SKIPPED reason=runtime-skip:" in err
+        assert "PARTIAL" in err
+        assert "1 runtime-skipped, 1 dependency-skipped" in err
+        assert "runtime-skipped setup.node22: host node v16" in err
+        rc, _, err = _capture(
+            ["run", "--dag", str(path), "--skip", "unknown.tag=x", "-q", _ACF]
+        )
+        assert rc == 2
+        assert "unknown step tag" in err
+        rc, _, err = _capture(
+            ["run", "--dag", str(path), "--skip", "setup.node22=", "-q", _ACF]
+        )
+        assert rc == 2
+        assert "non-empty reason" in err
 
 
 def test_run_selected_multiple_steps() -> None:
@@ -1058,7 +1095,7 @@ def test_run_selected_multiple_steps() -> None:
         assert rc == 0
         assert (
             "2 passed, 0 failed, 0 aborted, 0 intentionally skipped, "
-            "0 dependency-skipped, 0 not launched"
+            "0 runtime-skipped, 0 dependency-skipped, 0 not launched"
         ) in err
 
 
@@ -1078,7 +1115,7 @@ def test_run_labels_select_a_union_and_include_dependencies() -> None:
         assert rc == 0
         assert (
             "3 passed, 0 failed, 0 aborted, 0 intentionally skipped, "
-            "0 dependency-skipped, 0 not launched"
+            "0 runtime-skipped, 0 dependency-skipped, 0 not launched"
         ) in err
 
         rc, _, err = _capture(["run", "--dag", str(path), "--labels", "test.unit", "-q", _ACF])
@@ -1153,7 +1190,7 @@ def test_run_selected_can_ignore_dependencies() -> None:
         assert rc == 0
         assert (
             "1 passed, 0 failed, 0 aborted, 0 intentionally skipped, "
-            "0 dependency-skipped, 0 not launched"
+            "0 runtime-skipped, 0 dependency-skipped, 0 not launched"
         ) in err
 
 

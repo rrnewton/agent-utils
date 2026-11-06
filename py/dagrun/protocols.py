@@ -419,6 +419,10 @@ class RunResult:
     #: mistaken for passing work by a consumer that only counts outcomes.
     not_launched: tuple[str, ...] = ()
     intentional_skips: tuple[tuple[str, IntentionalSkipReason], ...] = ()
+    #: Steps skipped at runtime by the caller (--skip TAG=REASON, #867): not
+    #: spawned, never counted as passed, and their presence means the run is
+    #: not a clean pass even when everything else passes.
+    runtime_skips: tuple[tuple[str, str], ...] = ()
     step_profile_rows: tuple[Mapping[str, object], ...] = field(default_factory=tuple)
     #: The WHOLE RUN hit its outer wall budget and was cut short. Distinct from a step's own
     #: ``timed_out``: no single node necessarily misbehaved, the combination did. A consumer that

@@ -699,6 +699,7 @@ class Runner:
         order: Sequence[str] | None = None,
         run_timeout_s: int | None = None,
         profile_timeseries_interval_s: float | None = None,
+        runtime_skips: Mapping[str, str] | None = None,
     ) -> None: ...
 
     @overload
@@ -715,6 +716,7 @@ class Runner:
         order: Sequence[str] | None = None,
         run_timeout_s: int | None = None,
         profile_timeseries_interval_s: float | None = None,
+        runtime_skips: Mapping[str, str] | None = None,
     ) -> None: ...
 
     @overload
@@ -731,6 +733,7 @@ class Runner:
         order: Sequence[str] | None = None,
         run_timeout_s: int | None = None,
         profile_timeseries_interval_s: float | None = None,
+        runtime_skips: Mapping[str, str] | None = None,
     ) -> None: ...
 
     def __init__(
@@ -746,6 +749,7 @@ class Runner:
         order: Sequence[str] | None = None,
         run_timeout_s: int | None = None,
         profile_timeseries_interval_s: float | None = None,
+        runtime_skips: Mapping[str, str] | None = None,
     ) -> None:
         if profile_timeseries_interval_s is not None and not (
             MIN_PROFILE_TIMESERIES_INTERVAL_S
@@ -783,6 +787,24 @@ class Runner:
             if step.skip_reason is not None
         )
         self.intentional_skip_tags = {tag for tag, _reason in self.intentional_skips}
+        self.runtime_skips: tuple[tuple[str, str], ...] = ()
+        self.runtime_skip_tags: set[str] = set()
+        if runtime_skips:
+            unknown = sorted(tag for tag in runtime_skips if tag not in self.steps)
+            if unknown:
+                raise ValueError(
+                    f"--skip names unknown step tag(s): {', '.join(unknown)}"
+                )
+            for tag, reason in runtime_skips.items():
+                if not reason or not reason.strip():
+                    raise ValueError(f"--skip for {tag!r} needs a non-empty reason")
+            self.runtime_skips = tuple(
+                (step.tag, runtime_skips[step.tag])
+                for step in self.cfg.steps
+                if step.tag in runtime_skips
+            )
+            self.runtime_skip_tags = {tag for tag, _r in self.runtime_skips}
+            self.intentional_skip_tags |= self.runtime_skip_tags
         # Dispatch order. When the caller supplies an explicit `order` (e.g. a critical-path
         # planner's), use it verbatim; otherwise default to LONGEST-processing-time first (LPT
         # makespan heuristic): sort by the static duration hint DESCENDING. The sort is STABLE, so
@@ -1139,7 +1161,11 @@ class Runner:
                 ):
                     continue
                 for d in step.deps:
-                    if (d in self.done and not self.done[d].ok) or d in sk:
+                    if (
+                        (d in self.done and not self.done[d].ok)
+                        or d in sk
+                        or d in self.runtime_skip_tags
+                    ):
                         sk.add(tag)
                         changed = True
                         break
@@ -1307,6 +1333,18 @@ class Runner:
                 self.evidence.record(
                     "step_skip", [("step", tag), ("reason", reason.value)]
                 )
+        for skipped_tag, skipped_reason in self.runtime_skips:
+            self._emit(
+                f"[{skipped_tag}] SKIPPED reason=runtime-skip: {skipped_reason}"
+            )
+            if self.evidence is not None:
+                self.evidence.record(
+                    "step_skip",
+                    [
+                        ("step", skipped_tag),
+                        ("reason", f"runtime-skip: {skipped_reason}"),
+                    ],
+                )
         if self.evidence is not None:
             print(
                 f"[scheduler] per-step logs + test-boundary journal: "
@@ -1416,7 +1454,7 @@ class Runner:
                         self.stop
                         or len(self.done)
                         + len(skipped)
-                        + len(self.intentional_skips)
+                        + len(self.intentional_skips) + len(self.runtime_skips)
                         + len(blocked_by_family)
                         >= len(self.steps)
                     )
@@ -1465,7 +1503,7 @@ class Runner:
                     accounted = (
                         len(self.done)
                         + len(skipped)
-                        + len(self.intentional_skips)
+                        + len(self.intentional_skips) + len(self.runtime_skips)
                         + len(blocked_by_family)
                     )
                     remaining = max(0, len(self.steps) - accounted)
@@ -2438,6 +2476,7 @@ class Runner:
             skipped=skipped,
             not_launched=not_launched,
             intentional_skips=self.intentional_skips,
+            runtime_skips=self.runtime_skips,
             step_profile_rows=tuple(self.step_profile_rows),
             step_timeseries_rows=tuple(self.step_timeseries_rows),
             run_timed_out=self.run_timed_out,
@@ -2516,6 +2555,7 @@ def run_dag_limited(
     order: Sequence[str] | None = None,
     run_timeout_s: int | None = None,
     profile_timeseries_interval_s: float | None = None,
+    runtime_skips: Mapping[str, str] | None = None,
 ) -> RunResult:
     """Type signature accepting the canonical per-step-width keyword."""
 
@@ -2536,6 +2576,7 @@ def run_dag_limited(
     order: Sequence[str] | None = None,
     run_timeout_s: int | None = None,
     profile_timeseries_interval_s: float | None = None,
+    runtime_skips: Mapping[str, str] | None = None,
 ) -> RunResult:
     """Type signature accepting matching canonical and compatibility keywords."""
 
@@ -2556,6 +2597,7 @@ def run_dag_limited(
     order: Sequence[str] | None = None,
     run_timeout_s: int | None = None,
     profile_timeseries_interval_s: float | None = None,
+    runtime_skips: Mapping[str, str] | None = None,
 ) -> RunResult:
     """Type signature accepting the compatibility per-step-width keyword."""
 
@@ -2575,6 +2617,7 @@ def run_dag_limited(
     order: Sequence[str] | None = None,
     run_timeout_s: int | None = None,
     profile_timeseries_interval_s: float | None = None,
+    runtime_skips: Mapping[str, str] | None = None,
 ) -> RunResult:
     """Run a DAG with independent active-step and per-step CPU-width limits.
 
@@ -2709,6 +2752,7 @@ def run_dag_limited(
         order=order,
         run_timeout_s=run_timeout_s,
         profile_timeseries_interval_s=profile_timeseries_interval_s,
+        runtime_skips=runtime_skips,
     )
     window: RunWindow = sink.start_run_window()
     ok = runner.run()

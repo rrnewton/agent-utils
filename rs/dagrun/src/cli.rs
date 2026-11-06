@@ -446,6 +446,10 @@ fn run_help(c: &Palette) -> String {
                 "run the named step(s) and every dependency they require",
             ),
             (
+                "--skip TAG=REASON",
+                "skip the named step at runtime with the given reason (repeatable): not spawned, reported SKIPPED with the reason, dependents dependency-skipped, run not a clean pass; unknown tags and empty reasons refused before any step runs",
+            ),
+            (
                 "--labels LABEL[,LABEL...]",
                 "run every step carrying any named label and every dependency they require; labels are independent of group.job tags",
             ),
@@ -1233,6 +1237,7 @@ struct RunArgs {
     cores: Option<i64>,
     max_mem: Option<String>,
     selected: Option<String>,
+    skip: Vec<String>,
     labels: Option<String>,
     ignore_selected_deps: bool,
     passthrough_args: Option<String>,
@@ -1304,6 +1309,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         cores: None,
         max_mem: None,
         selected: None,
+        skip: Vec::new(),
         labels: None,
         ignore_selected_deps: false,
         passthrough_args: None,
@@ -1384,6 +1390,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             }
             "--max-mem" => a.max_mem = Some(take_value(inline, &mut i)?),
             "--selected" => a.selected = Some(take_value(inline, &mut i)?),
+            "--skip" => a.skip.push(take_value(inline, &mut i)?),
             "--labels" => a.labels = Some(take_value(inline, &mut i)?),
             "--ignore-selected-deps" => {
                 if inline.is_some() {
@@ -4982,6 +4989,38 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         Some(manager) if manager.enabled()
     ));
 
+    let mut runtime_skips: Vec<(String, String)> = Vec::new();
+    for raw_skip in &a.skip {
+        let Some((tag, reason)) = raw_skip.split_once('=') else {
+            eprintln!("{PROG}: run: --skip needs TAG=REASON with a non-empty reason, got {raw_skip:?}");
+            return 2;
+        };
+        if tag.trim().is_empty() || reason.trim().is_empty() {
+            eprintln!("{PROG}: run: --skip needs TAG=REASON with a non-empty reason, got {raw_skip:?}");
+            return 2;
+        }
+        if runtime_skips.iter().any(|(t, _)| t == tag) {
+            eprintln!("{PROG}: run: --skip for {tag:?} given twice");
+            return 2;
+        }
+        runtime_skips.push((tag.to_string(), reason.trim().to_string()));
+    }
+    if !runtime_skips.is_empty() {
+        let known: std::collections::HashSet<String> =
+            cfg.steps.iter().map(|step| step.tag()).collect();
+        let unknown: Vec<&str> = runtime_skips
+            .iter()
+            .map(|(tag, _)| tag.as_str())
+            .filter(|tag| !known.contains(*tag))
+            .collect();
+        if !unknown.is_empty() {
+            eprintln!(
+                "{PROG}: run: --skip names unknown step tag(s): {}",
+                unknown.join(", ")
+            );
+            return 2;
+        }
+    }
     let result = run_dag_boxed_deadline_limited_with_resource_caps_and_timeseries(
         cfg,
         max_steps,
@@ -4993,6 +5032,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         a.run_timeout,
         resource_caps_path,
         a.profile_timeseries,
+        runtime_skips,
     );
     let passed = result.outcomes.iter().filter(|o| o.ok).count();
     let failed = result
@@ -5001,18 +5041,24 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         .filter(|o| !o.ok && !o.aborted)
         .count();
     let aborted = result.outcomes.iter().filter(|o| o.aborted).count();
-    let verdict = if result.ok {
-        c.green("PASS")
-    } else {
+    let verdict = if !result.ok {
         c.red("FAIL")
+    } else if !result.runtime_skips.is_empty() {
+        c.yellow("PARTIAL")
+    } else {
+        c.green("PASS")
     };
     eprintln!(
-        "{PROG}: {verdict} - {passed} passed, {failed} failed, {aborted} aborted, {} intentionally skipped, {} dependency-skipped, {} not launched in {:.1}s",
+        "{PROG}: {verdict} - {passed} passed, {failed} failed, {aborted} aborted, {} intentionally skipped, {} runtime-skipped, {} dependency-skipped, {} not launched in {:.1}s",
         result.intentional_skips.len(),
+        result.runtime_skips.len(),
         result.skipped.len(),
         result.not_launched.len(),
         result.wall_s
     );
+    for (tag, reason) in &result.runtime_skips {
+        eprintln!("{PROG}: runtime-skipped {tag}: {reason}");
+    }
     if !result.not_launched.is_empty() {
         eprintln!("{PROG}: not launched: {}", result.not_launched.join(", "));
     }

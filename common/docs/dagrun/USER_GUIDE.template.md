@@ -726,6 +726,13 @@ dagrun run --dag pipeline.yaml --labels quick,super
 Unknown labels are refused. `--labels` and `--selected` cannot be combined;
 use labels for declared subsets and tags for individual-step selection.
 
+`--skip TAG=REASON` (repeatable) skips a step at runtime with a caller-supplied reason, for a
+host capability the caller has already proved unavailable (for example an unprovisionable
+toolchain). The step is not spawned, is reported `SKIPPED` with the exact reason in the summary
+and the journal, its dependents are dependency-skipped, and the run's verdict is `PARTIAL`,
+never a plain clean pass. Unknown tags and empty reasons are refused before any step runs.
+This is distinct from a step's authored `skip_reason`, which is a closed load-time vocabulary.
+
 When all prerequisite outputs are already present and must not be rebuilt,
 `--ignore-selected-deps` runs only the named tags and drops dependency edges to steps outside the
 selection:

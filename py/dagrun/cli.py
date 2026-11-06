@@ -533,6 +533,17 @@ def build_parser() -> argparse.ArgumentParser:
         "'group.job' tags). Errors if a named tag does not exist.",
     )
     run_p.add_argument(
+        "--skip",
+        metavar="TAG=REASON",
+        action="append",
+        default=[],
+        help="skip the named step at runtime with the given reason (repeatable): the step "
+        "is not spawned, is reported SKIPPED with the reason in the summary and journal, its "
+        "dependents are dependency-skipped, and the run is not reported as a clean pass. "
+        "For a host capability the caller proved unavailable; unknown tags and empty "
+        "reasons are refused before any step runs.",
+    )
+    run_p.add_argument(
         "--labels",
         metavar="LABEL[,LABEL...]",
         default=None,
@@ -4224,6 +4235,30 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
             return 2
     selected_subgraph = len(cfg.steps) < source_step_count
 
+    runtime_skips: dict[str, str] = {}
+    for raw_skip in ns.skip or []:
+        tag, separator, reason = raw_skip.partition("=")
+        if not separator or not tag.strip() or not reason.strip():
+            print(
+                f"{PROG}: run: --skip needs TAG=REASON with a non-empty reason, "
+                f"got {raw_skip!r}",
+                file=sys.stderr,
+            )
+            return 2
+        if tag in runtime_skips:
+            print(f"{PROG}: run: --skip for {tag!r} given twice", file=sys.stderr)
+            return 2
+        runtime_skips[tag] = reason.strip()
+    if runtime_skips:
+        known = cfg.by_tag()
+        unknown = sorted(tag for tag in runtime_skips if tag not in known)
+        if unknown:
+            print(
+                f"{PROG}: run: --skip names unknown step tag(s): {', '.join(unknown)}",
+                file=sys.stderr,
+            )
+            return 2
+
     # Feature: --args — forward extra args into the selected step(s) that declare the {args}
     # placeholder (scope a step down to specific test case(s)). Applied BEFORE --stress so the
     # scoped command is what gets duplicated.
@@ -4524,18 +4559,28 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         order=list(plan.order),
         run_timeout_s=_effective_run_timeout(ns),
         profile_timeseries_interval_s=profile_timeseries_interval_s,
+        runtime_skips=runtime_skips or None,
     )
     passed = sum(1 for o in result.outcomes if o.ok)
     failed = sum(1 for o in result.outcomes if not o.ok and not o.aborted)
     aborted = sum(1 for o in result.outcomes if o.aborted)
-    verdict = c.green("PASS") if result.ok else c.red("FAIL")
+    if not result.ok:
+        verdict = c.red("FAIL")
+    elif result.runtime_skips:
+        # A run with runtime skips is never a plain clean pass (#867).
+        verdict = c.yellow("PARTIAL")
+    else:
+        verdict = c.green("PASS")
     print(
         f"{PROG}: {verdict} - {passed} passed, {failed} failed, {aborted} aborted, "
         f"{len(result.intentional_skips)} intentionally skipped, "
+        f"{len(result.runtime_skips)} runtime-skipped, "
         f"{len(result.skipped)} dependency-skipped, "
         f"{len(result.not_launched)} not launched in {result.wall_s:.1f}s",
         file=sys.stderr,
     )
+    for tag, reason in result.runtime_skips:
+        print(f"{PROG}: runtime-skipped {tag}: {reason}", file=sys.stderr)
     if result.not_launched:
         print(f"{PROG}: not launched: {', '.join(result.not_launched)}", file=sys.stderr)
     if perf_dir is not None:
