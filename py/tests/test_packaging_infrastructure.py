@@ -842,200 +842,26 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     mapped = _collect_lifecycle_tests("not ordinary_environment")
     mapped_root = _collect_lifecycle_tests("mapped_root_namespace")
 
-    assert ordinary.isdisjoint(mapped)
-    assert ordinary | mapped == all_tests
-    # The seven setup-hooks tests of 3bae67a3, 1df79bf9 and db6cdf8b are in the
-    # mapped partition. Of the three exited-representative census tests, the
-    # two cases of the stubbed one are mapped and the real-process one is
-    # ordinary.
-    # The retained-handle size test is mapped.
-    # The five retire-pending --include-expired-unhanded tests (a dead owner
-    # retired without a handoff, an unread handoff skipped with an action, live
-    # and unverifiable liveness retained, a held slot retained, and an
-    # attestable unregistered agent reported as an action) are mapped.
-    # Of the eight batch-of-one remove tests, the image-backed one is ordinary
-    # and the other seven are mapped.
-    # The two image-backed remove-agent-batch use-check tests are ordinary.
-    # The three relocate-repository tests (one success case and two refusal
-    # cases) are mapped.
-    # The two strict-replay stranding tests (a repository relocated twice, and
-    # an archived slot's deleted repository) are mapped.
-    # The 25 validation-run liveness tests of the wrkslots liveness series
-    # (merged at 8648bab6) are mapped.
-    # The two clean-caches tests of 96d9f268 (unpacked Cargo package sources and
-    # unmarked wildcard matches are kept; a nested Git repository under an
-    # unmarked match is still refused) are mapped.
-    # The user-systemd per-listing bound regression test of
-    # https://github.com/rrnewton/agent-utils/issues/235 is mapped.
-    # The 14 frozen-validation-parser cases of 88039882, 7ae34255 and 73cdf9c4
-    # are 8 ordinary and 6 mapped, all parametrized cases of tests named above.
-    # The 38 result-recorded frozen removal cases (one removal, one
-    # classification, one direct refusal, 23 refused gates, ten journal
-    # resumptions, and two incomplete-result retentions) are ordinary.
-    # The twelve salvage cases of https://github.com/rrnewton/agent-utils/issues/237
-    # (two removals of a submodule cloned from its source's module directory,
-    # one removal of a submodule cloned from another local mirror, one alias
-    # refusal, the lock-free publication check, the archive made before the
-    # lock, the rewritten-branch check, and five recorded-remote-digest
-    # cases) are mapped.
-    # The seven salvage cases of its lock-hold follow-up (the existing archive
-    # checked before the lock, submodule facts derived before the lock, a file
-    # written and index flags set after that check, one clean published
-    # shallow submodule, and two refused shallow submodules) are mapped.
-    # The five interrupted absent-validate-batch cases of 6c16e882 (an overlap
-    # the batch does not name, a batch slot not reused, creation and
-    # classification beside the batch, and two host-context resumptions) are
-    # mapped.
-    # The three absent-batch cases of 844c2b85 (a batch-named row that changed,
-    # a batch-named row whose archive is not the batch recovery, and a
-    # host-context absent-agent-row resumption) are mapped.
-    # The three read-handoff absent-slot cases of
-    # https://github.com/rrnewton/agent-utils/issues/244 (a sidecar read that
-    # lets recovery archive the row, and refusals without a sidecar and with a
-    # fenced sibling) are mapped.
-    # The two lockless-reader cases of 5258942d (a reader that waits out an
-    # absent batch between its archive and its ACTIVE delete, and an overlap
-    # that survives the locked reread or that a lock holder reports) are mapped.
-    # The batch maps-filter ceiling case of 8eb8de0f (four selected trees fit
-    # where one allowance would not) is mapped.
-    # The 39 dead-owner archiving cases are mapped. remove
-    # --archive-drifted-checkouts: three drift kinds removed after a verified
-    # bundle; four commits that only worktree-private history reaches (the
-    # HEAD reflog, a refs/rewritten ref, a reflog entry's old object,
-    # ORIG_HEAD) kept; two index states of the checkout kept; a published
-    # submodule, a submodule's private branch and a commit only a stale
-    # remote-tracking ref of the submodule names, all kept local; an unlisted
-    # submodule repository salvaged for a proven-dead owner and refused for a
-    # live one; recovery
-    # refusing new submodule history; refusals for an embedded untracked repository, a content filter, a live
-    # registered liveness answer, a live consenting owner, a live releasing
-    # owner, a bundle that cannot be made, and a checkout changed after
-    # archiving; one journal recovery and one receipt-parser case. remove
-    # --archive-nested-cache-repositories: a Cargo-style checkout, every
-    # commit object kept, three index-only or force-added states kept, files
-    # hidden by unpublished ignore rules kept, six refused unkeepable
-    # repositories, a failed bundle, one journal recovery and one
-    # evidence-parser case.
-    # The two no-checkout-source submodule cases of 1cb3493d (one removal, one
-    # refusal) are mapped.
-    # The 10 archive-flag cases of the round-4 review (a custom pseudoref, an
-    # unreferenced submodule commit, a commit an outside mirror holds, a mirror
-    # inside the slot, two mirrors removal deletes, a mirror vanishing before a
-    # batch deletes, exact bytes, and two .git/info/attributes refusals) are mapped.
-    # The two doctor-beside-an-absent-validate-batch cases of ccf4788d (a report
-    # beside the batch, and a refused overlap the batch does not name) are mapped.
-    # The 22 orphan-retire cases of #341 wrkslots-orphan-retire, which
-    # test_lifecycle.py collects from orphan_retire_cases.py (13 removal,
-    # refusal and recovery cases with the real agentctl probe and nine verdict
-    # parser cases), are mapped.
-    # The 7 agent-name cases collected from the same module (create, adopt and
-    # transfer-owner refusing a name the session tooling cannot use, and the
-    # never-started attested removal of a slot recorded under one, with its
-    # refusals) are mapped.
-    # The 5 Git-repair isolation cases of #350 wrkslots-foreign-mount-ns, which
-    # test_lifecycle.py collects from foreign_mount_ns_cases.py (three repairs of
-    # one moved checkout, a removal and a rolled-back fence beside an emptied
-    # sibling), are mapped.
-    # Its 29 loop-identity cases there (image identity, unmount, grow and
-    # remount decisions against a fake /sys and udev, the census of copied
-    # mounts and stale attachments, the root helper's reuse decisions, stray
-    # Git pointers and the discard flag) are mapped, except the one real
-    # second mount through sudo -n, which is ordinary.
-    # Its 4 cases of a removal whose Git removal already finished (the journal
-    # names the checkout, or a mounted image root was left empty before it
-    # could; and the two negative controls) are mapped.
-    # Its 5 stale-copy discard cases (recover --discard-stale-image-copy and its
-    # refusals, a recorded decision honoured only for its own removal, devices
-    # and roots, the binding parser, and a decision kept through the fence)
-    # are mapped.
-    # Its 6 cases of a discard that sees work in the stale copy wherever it is
-    # reached (by device, by mount-point entry, through remove and recover, and
-    # again in the discarding census) are mapped.
-    # Its 3 cases of a discard that never mounts an image through the stale
-    # copy (a fence that cannot release it, a rolled-back fence, and destroy's
-    # phase) are mapped.
-    # The 10 guard false-positive cases of 2026-10-19 (the liveness slot path,
-    # a read legacy handoff gone with its directory and its present-directory
-    # refusal, unhold of absent storage and its present-slot refusal, a
-    # withdrawn prepared journal, an ownerless absent row audit, a nested
-    # registered worktree, transient user-systemd scopes, and a modified
-    # tracked flat handoff) are mapped.
-    # The two partial-clone containment cases of dev-hermit dh-6a8rf (a
-    # blobless clone's search and recheck fetch commits only, and promisor
-    # object-store detection) are mapped.
-    # The retained-handle census case of dev-hermit dh-9qy9v (more files than
-    # the former 4,096-file bound still bind their row) is mapped.
-    # The 3 nested-repository repair cases of 2026-10-20 (an unabsorbed Git
-    # directory moving with a fenced slot, its core.worktree refusal, and a
-    # missing .git) are mapped.
-    # The 6 retirement and supersede-handoff cases of e01780af (a held slot
-    # never attempted, live-owned slots attempted only when owner-consented,
-    # a supersede that rebinds a live lane and voids the queue entry, and its
-    # three refusals) are mapped; the one case it replaced was mapped too,
-    # so the mapped partition grows by five net.
-    # The live-lane exhausted-cache audit case (mirroring 33582924) is mapped.
-    # The mixed-slot clean-caches case of 36027c35 (one nested-Git cache
-    # skipped in the bulk sweep while the slot's other caches are pruned) is
-    # mapped.
-    # The unpopulated nested submodule enumeration case (a listed gitlink
-    # whose worktree is absent, or whose .git file names a gitdir the tree
-    # does not carry, is omitted from the initialized listing while a
-    # populated submodule is still listed) is mapped.
-    # The fenced linked-worktree enumeration case (a populated submodule
-    # whose gitdir still names the pre-rename worktree) is mapped.
-    # The two later-schema frozen COULD_NOT_RUN cases of 47aa56e7 (service-result
-    # schemas 6 and 7) are ordinary.
-    # The three absent-validate-row recovery cases for
-    # https://github.com/rrnewton/agent-utils/issues/297 (a stranded replay
-    # past a refusing census, a clean-caches dry run, and clean-caches
-    # beside a stranded batch) are mapped.
-    # The agent-remove case whose nested .gitmodules indents an option
-    # line with spaces under a tab-indented sibling is mapped
-    # (https://github.com/rrnewton/agent-utils/issues/298).
-    # The two absent cargo-home recovery cases of #872 (finalize as
-    # absent, and a missing authorization flag still refused) are mapped.
-    # The two #872 (a) classify cases (an interrupted cargo-home removal
-    # does not block a different validate slot, but still blocks its own)
-    # are mapped.
-    # The #876 foreign-shard case (retirement and cleanup skip a row
-    # recorded by another machine, and a direct foreign append is refused)
-    # is mapped.
-    # The #873 default-read case (audit, classify-create-journals and
-    # clean-caches ignore a foreign shard unless --all-machines) is mapped.
-    # The two #885 cases (an owner-less orphaned create does not block an
-    # unrelated create, and the coordinator aborts it) are mapped.
-    # The #878 legacy-validate agreement case (audit and
-    # recover-absent-validate-rows share one owner predicate) is mapped.
-    # The #879 agreement case (status and audit share one liveness
-    # answer per row) is mapped.
-    # The two #894 remove-lock-scope cases (a fenced deletion that holds
-    # no registry lock while it runs, with a second removal fencing
-    # meanwhile, and a remover killed after the fence finished by
-    # recover) are mapped.
-    # The three further #885 cases (forward recovery after completed
-    # hooks, an abort removing a clean initialized submodule, and an
-    # exact create recovering before a validation-batch seal) are mapped.
-    # The #912 dead-actor journal case (an unrelated mutation recovers a
-    # provably dead actor's absent-row journal; a live actor refuses) is mapped.
-    # The two remaining #885 cases (an unscoped recovery resolving an
-    # absent sealed target, and an abort making a missing create journal
-    # terminal) are mapped.
-    # The three #910 cases (a nested submodule the primary dropped is
-    # remote-verified, bundled when unpublished, and skipped when
-    # uninitialised) are mapped.
-    # The four #864 cases (nested module repositories without worktrees
-    # bundled, unlisted salvage on a detached HEAD, a zero-file nested
-    # checkout, and prefetch bundling before the lock) are mapped.
-    # The #911 case (a privileged delete of root-owned entries stays
-    # inside the slot and never follows a symlink out of it) is mapped.
-    # The two #881 cases (recover repopulates a wholesale-unpopulated
-    # submodule checkout; authored changes are refused, never reset) are mapped.
-    # The three #882 cases (an insteadOf diagnosis naming the missing
-    # commit, one naming a dead core.worktree, and silence without a
-    # rewrite) are mapped.
-    assert len(all_tests) == 2161
-    assert len(ordinary) == 339
-    assert len(mapped) == 1822
+    both = ordinary & mapped
+    assert not both, (
+        "lifecycle tests marked for both partitions: " + ", ".join(sorted(both))
+    )
+    unpartitioned = all_tests - (ordinary | mapped)
+    assert not unpartitioned, (
+        "lifecycle tests in no partition: " + ", ".join(sorted(unpartitioned))
+    )
+    outside = mapped_root - mapped
+    assert not outside, (
+        "mapped_root lifecycle tests outside the mapped partition: "
+        + ", ".join(sorted(outside))
+    )
+    # The check's purpose is partition discipline, not a census: every
+    # lifecycle test lands in exactly one partition, and mapped_root stays
+    # inside mapped. Totals are deliberately not pinned (#874): a correctly
+    # marked new test needs no edit here. A floor keeps an empty collection
+    # (a broken mark expression) from passing vacuously.
+    assert len(all_tests) >= 2000
+    assert len(mapped_root) >= 2
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
