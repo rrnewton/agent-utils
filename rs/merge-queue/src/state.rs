@@ -1127,6 +1127,13 @@ pub struct Config {
     /// after an ejection reruns the batch's whole selection, and a tree lands only with green
     /// coverage of its selection recorded at that exact commit.
     pub exact_sha: bool,
+    /// Operator-asserted exception: exact merge commits may land even when
+    /// the base branch's rules require linear history. Set only while an
+    /// owner-granted ruleset exception is in place; off by default, when
+    /// `submit --exact` of a merge commit is refused if the branch rules
+    /// forbid merge commits. An older binary refuses a config that names it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exact_merge_allowed: bool,
     /// Treat the base as green for culprit searches (skip probing it). Sound when only this
     /// queue lands on the base, always as exactly validated commits; a broken base would then
     /// be blamed on the first change of a red batch.
@@ -1225,6 +1232,7 @@ impl Default for Config {
             union_paths: Vec::new(),
             regenerate: RegenerateConfig::default(),
             exact_sha: false,
+            exact_merge_allowed: false,
             trust_base: false,
             require_approval_at_head: false,
             recount_pins: false,

@@ -824,6 +824,11 @@ enum Command {
         /// green coverage recorded at that exact commit.
         #[arg(long)]
         exact_sha: bool,
+        /// Operator-asserted exception: exact merge commits may land even when the base
+        /// branch's rules require linear history. Set only while an owner-granted
+        /// ruleset exception is in place.
+        #[arg(long)]
+        exact_merge_allowed: bool,
         /// Treat the base as green in culprit searches (skip probing it). Sound when only this
         /// queue lands, always exactly validated commits.
         #[arg(long)]
@@ -1799,6 +1804,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             regen_build,
             regen_when,
             exact_sha,
+            exact_merge_allowed,
             trust_base,
             classify,
             identity_name,
@@ -1916,6 +1922,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     when: regen_when,
                 },
                 exact_sha,
+                exact_merge_allowed,
                 trust_base,
                 require_approval_at_head,
                 recount_pins,

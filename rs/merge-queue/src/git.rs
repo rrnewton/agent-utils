@@ -824,6 +824,12 @@ impl Git {
         Ok(parents.len() > 1 && parents[0] == self.rev_parse(onto)?)
     }
 
+    /// Whether `head` is a merge commit (two or more parents).
+    pub fn is_merge(&self, head: &str) -> Result<bool, String> {
+        let parents = self.run(&["rev-list", "--parents", "-n", "1", head])?;
+        Ok(parents.split_whitespace().count() > 2)
+    }
+
     /// Whether an exact change (one that must land as submitted, never replayed) can land at
     /// `head` on `onto`: a linear fast-forward ([`Git::fast_forwards`]) or a merge made
     /// directly on `onto` ([`Git::fast_forwards_exact_merge`]).

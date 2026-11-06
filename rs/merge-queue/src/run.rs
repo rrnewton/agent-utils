@@ -544,6 +544,9 @@ enum BatchOutcome {
     /// Like [`BatchOutcome::Deferred`] for an admission refusal, but the run goes on: the
     /// batches behind it are rebuilt on the base and refill the window in this run.
     RefusedDeferred(String),
+    /// The candidate's changes were ejected at landing (a permanent push
+    /// rule violation): nothing landed, the run goes on without them.
+    Ejected(Vec<i64>),
 }
 
 /// Worktree slots for concurrent validations, reused between candidates.
@@ -1718,6 +1721,9 @@ impl<'a> Runner<'a> {
                     );
                     self.state.save_kept_validations(&kept)?;
                 }
+                BatchOutcome::Ejected(_) => {
+                    self.state.save_kept_validations(&kept)?;
+                }
                 BatchOutcome::Stop(reason, _)
                 | BatchOutcome::Deferred(reason, _)
                 | BatchOutcome::RefusedDeferred(reason) => {
@@ -1911,6 +1917,14 @@ impl<'a> Runner<'a> {
                 }
                 BatchOutcome::BaseMoved(_) => {
                     self.return_ruled(&accepted, "the base moved while it was landing")?;
+                }
+                BatchOutcome::Ejected(_) => {
+                    self.log_ruling(
+                        ACCEPT_FLAKY,
+                        &accepted,
+                        "ejected",
+                        "push rule violation at landing",
+                    );
                 }
                 BatchOutcome::Stop(reason, _)
                 | BatchOutcome::Deferred(reason, _)
@@ -4088,6 +4102,12 @@ impl<'a> Runner<'a> {
                 &format!("held reruns not resumed: {error}"),
             );
         }
+        // Exact merges the branch rules forbid are held before any
+        // validation is spent on them (submitted before the check existed,
+        // or with rules that changed since submission).
+        if let Err(error) = self.hold_exact_forbidden() {
+            self.event("exact", &format!("exact rule check failed: {error}"));
+        }
         if self.options.with_peers {
             if let Err(error) = self.run_peers() {
                 self.event("peers", &format!("could not drain peers: {error}"));
@@ -5846,6 +5866,18 @@ impl<'a> Runner<'a> {
                                 }
                                 return Ok(reason);
                             }
+                            BatchOutcome::Ejected(prs) => {
+                                // Permanent at landing: already ejected in
+                                // `land`. Batches built on its tree are
+                                // rebuilt on the base; disjoint flights and
+                                // the run itself are unaffected.
+                                for pr in &prs {
+                                    self.drop_dependents(*pr, pending);
+                                }
+                                if head.stacked {
+                                    discard(&mut flights, &rx, pending);
+                                }
+                            }
                             BatchOutcome::Deferred(reason, _prs) => {
                                 // Already recorded as deferred; the changes stay queued
                                 // (not requeued into this run, which would spin without
@@ -6265,6 +6297,25 @@ impl<'a> Runner<'a> {
                             );
                         } else if now != candidate.parent {
                             return Ok(BatchOutcome::BaseMoved(candidate.prs.clone()));
+                        } else if classify_push(&error) == PushFailure::Permanent {
+                            // A repository rule forbids this candidate: one
+                            // attempt, no retry in this or any later run.
+                            // Eject it quoting the rule; other flights and
+                            // the run itself are unaffected.
+                            let rule = push_rule_line(&error)
+                                .unwrap_or_else(|| "repository rule violations".to_owned());
+                            let reason = format!(
+                                "push declined due to repository rule violations: {rule} \
+                                 (attempt {attempt}, not retried: the rule is permanent for this candidate)"
+                            );
+                            self.event(
+                                "push-rule-violation",
+                                &format!("{}: {reason}", list(&candidate.prs)),
+                            );
+                            for pr in &candidate.prs {
+                                self.eject(*pr, "push-rule-violation", &reason, &[])?;
+                            }
+                            return Ok(BatchOutcome::Ejected(candidate.prs.clone()));
                         } else if transient_push_error(&error) && attempt <= retries {
                             let delay = self.config.land.push_retry_backoff()
                                 * (1u32 << (attempt - 1).min(16));
@@ -6898,6 +6949,51 @@ impl<'a> Runner<'a> {
 
     /// Hold `prs` for their owner with `reason` (escalated, as after the deferral bound), with
     /// an alarm. Shadow runs record it in the shadow ledger.
+    /// Hold exact merge changes the branch rules forbid, before validating
+    /// them (see `ops::check_exact_merge`). Unreadable rules only warn.
+    fn hold_exact_forbidden(&self) -> Result<(), String> {
+        if self.simulating() || self.config.exact_merge_allowed {
+            return Ok(());
+        }
+        let exact: Vec<(i64, String)> = lock(&self.items)
+            .values()
+            .filter(|item| item.status == ItemStatus::Queued && item.exact)
+            .map(|item| (item.pr, item.head.clone()))
+            .collect();
+        if exact.is_empty() {
+            return Ok(());
+        }
+        // One rules reading per run, shared by every exact change.
+        let mut rule: Option<Option<String>> = None;
+        for (pr, head) in exact {
+            let merge = self.git.is_merge(&head).unwrap_or_default();
+            if !merge {
+                continue;
+            }
+            let verdict = rule.get_or_insert_with(|| {
+                match crate::github::Hosting::new(
+                    &self.config.github,
+                    &self.state.root,
+                    self.config.net_timeout(),
+                ) {
+                    Ok(hosting) => hosting
+                        .linear_history_rule(&self.config.base)
+                        .ok()
+                        .flatten(),
+                    Err(_) => None,
+                }
+            });
+            if let Some(rule) = verdict {
+                let reason = format!(
+                    "{rule} forbids merge commits on {}; #{pr} is an exact merge, held before validation",
+                    self.config.base
+                );
+                self.hold_for_owner(&[pr], &reason)?;
+            }
+        }
+        Ok(())
+    }
+
     fn hold_for_owner(&self, prs: &[i64], reason: &str) -> Result<(), String> {
         if !self.simulating() {
             let mut items = lock(&self.items);

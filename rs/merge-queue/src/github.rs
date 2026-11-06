@@ -355,6 +355,37 @@ impl ListedPr {
     }
 }
 
+/// The linear-history rule in a branch-rules answer (`gh api
+/// repos/{repo}/rules/branches/{base}`), naming its ruleset when the answer
+/// does: `required_linear_history` anywhere in the JSON, since ruleset and
+/// branch-protection shapes nest it differently.
+pub fn find_linear_history_rule(value: &serde_json::Value) -> Option<String> {
+    fn walk(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("type").and_then(|t| t.as_str()) == Some("required_linear_history") {
+                    return Some(match map.get("ruleset_id").and_then(|id| id.as_u64()) {
+                        Some(id) => format!(
+                            "required_linear_history (ruleset {id}): this branch must not contain merge commits"
+                        ),
+                        None => {
+                            "required_linear_history: this branch must not contain merge commits"
+                                .to_owned()
+                        }
+                    });
+                }
+                map.values().find_map(walk)
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(walk),
+            serde_json::Value::String(text) if text == "required_linear_history" => Some(
+                "required_linear_history: this branch must not contain merge commits".to_owned(),
+            ),
+            _ => None,
+        }
+    }
+    walk(value)
+}
+
 impl Hosting {
     /// A client for `config`, charging the budget file under `state_root` unless the
     /// configuration names a shared one; each call is killed and fails after `timeout`.
@@ -450,6 +481,25 @@ impl Hosting {
         };
         let text = self.run(cost, &args)?;
         serde_json::from_str(&text).map_err(|error| format!("unexpected pr list output: {error}"))
+    }
+
+    /// Whether `base`'s effective branch rules require linear history
+    /// (rulesets or branch protection forbidding merge commits): the rule
+    /// naming it, when they do. One `gh api` call (the unified rules
+    /// endpoint); an unreadable answer is an error the caller warns about.
+    pub fn linear_history_rule(&self, base: &str) -> Result<Option<String>, String> {
+        let args: Vec<String> = [
+            "api",
+            &format!("repos/{}/rules/branches/{base}", self.config.repo),
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let text = self.run(1, &args)?;
+        Ok(find_linear_history_rule(
+            &serde_json::from_str(&text)
+                .map_err(|error| format!("unexpected branch-rules output: {error}"))?,
+        ))
     }
 
     /// Close a landed pull request with a pointer to the commit that contains it.
@@ -646,6 +696,22 @@ mod unit {
             review("APPROVED", &head, "reviewer-a", "MEMBER")
         ));
         assert!(pr.approved_at_head());
+    }
+
+    #[test]
+    fn linear_history_rule_is_found_in_rules_answers() {
+        let ruleset: serde_json::Value =
+            serde_json::from_str(r#"[{"type":"required_linear_history","ruleset_id":20307165}]"#)
+                .unwrap();
+        assert_eq!(
+            find_linear_history_rule(&ruleset).as_deref(),
+            Some(
+                "required_linear_history (ruleset 20307165): this branch must not contain merge commits"
+            )
+        );
+        let nested: serde_json::Value =
+            serde_json::from_str(r#"{"rules":[{"type":"pull_request"}]}"#).unwrap();
+        assert_eq!(find_linear_history_rule(&nested), None);
     }
 
     #[test]

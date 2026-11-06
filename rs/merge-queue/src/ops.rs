@@ -193,6 +193,43 @@ pub struct Submission {
     pub recorded_at: String,
 }
 
+/// Whether an exact merge commit at `head` may land on the configured base:
+/// the branch rules forbid it (the rule naming why), they allow it, or they
+/// could not be read (a warning the caller shows; never a refusal).
+pub enum ExactMerge {
+    /// Merge commits may land (no linear-history rule, or the operator's
+    /// `exact_merge_allowed` exception).
+    Allowed,
+    /// The branch rules require linear history: the rule naming it.
+    Forbidden(String),
+    /// The rules could not be read: why, for a warning.
+    Warn(String),
+}
+
+/// [`ExactMerge`] for `head` on `config`'s base (see `submit --exact`).
+pub fn check_exact_merge(config: &Config, state: &State, git: &Git, head: &str) -> ExactMerge {
+    if config.exact_merge_allowed {
+        return ExactMerge::Allowed;
+    }
+    match git.is_merge(head) {
+        Ok(false) => return ExactMerge::Allowed,
+        Ok(true) => {}
+        Err(error) => return ExactMerge::Warn(format!("merge check failed: {error}")),
+    }
+    let hosting =
+        match crate::github::Hosting::new(&config.github, &state.root, config.net_timeout()) {
+            Ok(hosting) => hosting,
+            Err(error) => {
+                return ExactMerge::Warn(format!("branch rules not read: {error}"));
+            }
+        };
+    match hosting.linear_history_rule(&config.base) {
+        Ok(Some(rule)) => ExactMerge::Forbidden(rule),
+        Ok(None) => ExactMerge::Allowed,
+        Err(error) => ExactMerge::Warn(format!("branch rules not read: {error}")),
+    }
+}
+
 /// Submit (or resubmit) a change. Returns the stored item.
 pub fn submit(state: &State, config: &Config, submission: Submission) -> Result<Item, String> {
     submit_many(state, config, vec![submission])?
@@ -253,6 +290,26 @@ fn submit_resolved(
         ));
     }
     let existing = state.item(submission.pr)?;
+    // An exact merge the branch rules forbid is refused here, before any
+    // validation is spent on it; unreadable rules only warn (in the detail).
+    let mut exact_warn = String::new();
+    if submission.exact {
+        match check_exact_merge(config, state, git, &current) {
+            ExactMerge::Forbidden(rule) => {
+                return Err(format!(
+                    "#{}: submit --exact refused: {} forbids merge commits on {}; \
+                     rebase the change, or set exact_merge_allowed only while an \
+                     owner-granted ruleset exception is in place",
+                    submission.pr, rule, config.base
+                ));
+            }
+            ExactMerge::Warn(why) => {
+                eprintln!("merge-queue: warn: exact merge: {why}");
+                exact_warn = why;
+            }
+            ExactMerge::Allowed => {}
+        }
+    }
     // A notification name is a subscription: a resubmission that does not
     // name one keeps the recorded name and its delivery record.
     let notify = if submission.notify.is_empty() {
@@ -387,6 +444,9 @@ fn submit_resolved(
     };
     if submission.exact {
         detail.push_str("; exact: lands as submitted, never replayed");
+        if !exact_warn.is_empty() {
+            detail.push_str(&format!("; warn: exact merge: {exact_warn}"));
+        }
     }
     if !submission.recorded_at.is_empty() {
         detail.push_str(&format!(
