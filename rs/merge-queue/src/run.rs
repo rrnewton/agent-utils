@@ -821,8 +821,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// limit for it: closed in the loop, the four changes of one landing held every batch for up to
 /// 20 minutes while other clients had spent the budget. A landing marks its changes
 /// `close_pending` and wakes the closer, which closes them with no lock held
-/// ([`crate::sync::close_postponed`], which stops at the first close that fails and leaves the
-/// rest to the next wake or the label sync); the run records the closes at its batch
+/// ([`crate::sync::close_postponed`], which decides done from one batched
+/// state read, caps closes per pass, and backs off a close that keeps
+/// failing); the run records the closes at its batch
 /// boundaries ([`crate::sync::record_closed`]). One closer per process, so two runs in one
 /// process never close a change twice.
 #[derive(Default)]

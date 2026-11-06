@@ -9,11 +9,16 @@ use support::{git, Fixture};
 const STUB_GH: &str = r#"#!/bin/sh
 echo "$*" >> "$GH_LOG"
 case "$1 $2" in
-  "pr list") cat "$GH_LIST" ;;
+  "pr list")
+    case "$*" in
+      *"--state all"*) if [ -e "$GH_STATE_LIST" ]; then cat "$GH_STATE_LIST"; else cat "$GH_LIST"; fi ;;
+      *) cat "$GH_LIST" ;;
+    esac ;;
   "pr close")
     if [ -e "$GH_FAIL_CLOSE" ]; then rm -f "$GH_FAIL_CLOSE"; echo "close failed" >&2; exit 1; fi
     if [ -e "$GH_FAIL_CLOSES" ]; then echo "close failed" >&2; exit 1; fi
     if [ -e "$GH_FAIL_CLOSE_PR" ] && [ "$3" = "$(cat "$GH_FAIL_CLOSE_PR")" ]; then echo "close failed for $3" >&2; exit 1; fi
+    if [ -e "$GH_ALREADY_MERGED_PR" ] && [ "$3" = "$(cat "$GH_ALREADY_MERGED_PR")" ]; then echo "can't be closed because it was already merged" >&2; exit 1; fi
     # A close that cannot finish until a file appears (at most 20 s).
     if [ -n "$GH_CLOSE_AFTER" ]; then
       n=0
@@ -30,12 +35,17 @@ struct Gh {
     stub: String,
     log: String,
     list: String,
+    /// Batched state read (`pr list --state all`) answers from this file.
+    state_list: String,
     /// Fails the next close.
     fail_close: String,
     /// Fails every close while it exists.
     fail_closes: String,
     /// File whose contents are the pull-request number whose close always fails.
     fail_close_pr: String,
+    /// File whose contents are the pull-request number whose close answers
+    /// "already merged".
+    already_merged_pr: String,
 }
 
 fn stub(fx: &Fixture) -> Gh {
@@ -49,9 +59,11 @@ fn stub(fx: &Fixture) -> Gh {
         stub: stub.display().to_string(),
         log: fx.root.join("gh.log").display().to_string(),
         list: fx.root.join("gh-list.json").display().to_string(),
+        state_list: fx.root.join("gh-state-list.json").display().to_string(),
         fail_close: fx.root.join("gh-fail-close").display().to_string(),
         fail_closes: fx.root.join("gh-fail-closes").display().to_string(),
         fail_close_pr: fx.root.join("gh-fail-close-pr").display().to_string(),
+        already_merged_pr: fx.root.join("gh-already-merged-pr").display().to_string(),
     }
 }
 
@@ -145,9 +157,11 @@ fn env(gh: &Gh) -> Vec<(&str, &str)> {
     vec![
         ("GH_LOG", gh.log.as_str()),
         ("GH_LIST", gh.list.as_str()),
+        ("GH_STATE_LIST", gh.state_list.as_str()),
         ("GH_FAIL_CLOSE", gh.fail_close.as_str()),
         ("GH_FAIL_CLOSES", gh.fail_closes.as_str()),
         ("GH_FAIL_CLOSE_PR", gh.fail_close_pr.as_str()),
+        ("GH_ALREADY_MERGED_PR", gh.already_merged_pr.as_str()),
     ]
 }
 
@@ -341,9 +355,15 @@ fn the_configured_priority_label_puts_a_change_at_the_front_and_resubmits_on_cha
 }
 
 fn init_closing(fx: &Fixture, gh: &Gh, runner: &str) {
+    init_closing_cap(fx, gh, runner, 0);
+}
+
+/// Like [`init_closing`], with `--close-max-per-cycle` (0 keeps the default).
+fn init_closing_cap(fx: &Fixture, gh: &Gh, runner: &str, cap: usize) {
     fx.write("tests/t0", "ok\n");
     fx.commit_all("seed");
     git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    let cap = cap.to_string();
     fx.mq_ok(&[
         "init",
         "--github-repo",
@@ -351,6 +371,8 @@ fn init_closing(fx: &Fixture, gh: &Gh, runner: &str) {
         "--gh",
         &gh.stub,
         "--close-prs",
+        "--close-max-per-cycle",
+        &cap,
         "--validator",
         "command",
         "--validator-run",
@@ -360,11 +382,39 @@ fn init_closing(fx: &Fixture, gh: &Gh, runner: &str) {
     ]);
 }
 
+/// The batched state-read answer: `(number, state)` pairs as `gh` reports them.
+fn state_listing(entries: &[(i64, &str)]) -> String {
+    let prs: Vec<Value> = entries
+        .iter()
+        .map(|(number, state)| serde_json::json!({"number": number, "state": state}))
+        .collect();
+    serde_json::to_string(&prs).unwrap()
+}
+
+/// Simulate the close backoff window having passed (the tests run seconds
+/// after the failure that started it; production waits it out).
+fn expire_close_backoff(fx: &Fixture) {
+    let dir = fx.queue().join(".git/merge-queue/close-retry");
+    if dir.is_dir() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let mut value: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            value["next_retry_unix"] = serde_json::json!(0);
+            std::fs::write(&path, value.to_string()).unwrap();
+        }
+    }
+}
+
+fn gh_log(gh: &Gh) -> String {
+    std::fs::read_to_string(&gh.log).unwrap_or_default()
+}
+
 #[test]
 fn landed_pull_requests_whose_close_fails_are_closed_by_the_next_sync() {
     let fx = Fixture::new("sync-close");
     let gh = stub(&fx);
-    init_closing(&fx, &gh, RUNNER);
+    init_closing_cap(&fx, &gh, RUNNER, 10);
     let h1 = pull_request(&fx, 1, &[("tests/a", "ok\n")]);
     let h2 = pull_request(&fx, 2, &[("tests/b", "ok\n")]);
     std::fs::write(
@@ -388,6 +438,7 @@ fn landed_pull_requests_whose_close_fails_are_closed_by_the_next_sync() {
         assert_eq!(item(&all, pr)["close_pending"], true);
     }
     std::fs::remove_file(&gh.fail_closes).unwrap();
+    expire_close_backoff(&fx);
     let r = sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
     assert_eq!(r["closed"], serde_json::json!([1, 2]));
     let all = items(&fx);
@@ -407,7 +458,7 @@ fn landed_pull_requests_whose_close_fails_are_closed_by_the_next_sync() {
 fn a_close_that_keeps_failing_does_not_block_the_next_close() {
     let fx = Fixture::new("sync-close-one-fails");
     let gh = stub(&fx);
-    init_closing(&fx, &gh, RUNNER);
+    init_closing_cap(&fx, &gh, RUNNER, 10);
     let h1 = pull_request(&fx, 1, &[("tests/a", "ok\n")]);
     let h2 = pull_request(&fx, 2, &[("tests/b", "ok\n")]);
     std::fs::write(
@@ -424,6 +475,7 @@ fn a_close_that_keeps_failing_does_not_block_the_next_close() {
         String::from_utf8_lossy(&out.stderr)
     );
     std::fs::remove_file(&gh.fail_closes).unwrap();
+    expire_close_backoff(&fx);
     // From now on only #1's close fails.
     std::fs::write(&gh.fail_close_pr, "1").unwrap();
     let out = fx.mq_env(&["sync", "--all-open", "--limit", "100"], &env(&gh));
@@ -462,6 +514,7 @@ fn serve_drains_close_pending_without_a_sync() {
     );
     assert_eq!(item(&items(&fx), 1)["close_pending"], true);
     std::fs::remove_file(&gh.fail_closes).unwrap();
+    expire_close_backoff(&fx);
     // No sync, no new landing: the serve itself retries the close.
     let mut serve = {
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_merge-queue"));
@@ -498,6 +551,177 @@ fn serve_drains_close_pending_without_a_sync() {
         history.contains("pull request closed after landing"),
         "{history}"
     );
+}
+
+/// Land one pull request with its close failing, leaving it close-pending
+/// with the backoff window expired, ready for a drain under test control.
+fn land_close_pending(fx: &Fixture, gh: &Gh, prs: &[i64]) {
+    let mut entries = Vec::new();
+    for pr in prs {
+        let head = pull_request(fx, *pr, &[(&format!("tests/p{pr}"), "ok\n")]);
+        entries.push((*pr, head));
+    }
+    let listed: Vec<(i64, &str, bool, &[&str])> = entries
+        .iter()
+        .map(|(pr, head)| (*pr, head.as_str(), false, &[][..]))
+        .collect();
+    std::fs::write(&gh.list, listing(&listed)).unwrap();
+    sync_json(fx, gh, &["--all-open", "--limit", "100"]);
+    std::fs::write(&gh.fail_closes, "").unwrap();
+    let out = fx.mq_env(&["run", "--json"], &env(gh));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::remove_file(&gh.fail_closes).unwrap();
+    expire_close_backoff(fx);
+    for pr in prs {
+        assert_eq!(item(&items(fx), *pr)["close_pending"], true);
+    }
+}
+
+/// MERGED and CLOSED pull requests are done from the one batched state
+/// read: no close is attempted for either, each is recorded with its
+/// reason, and the whole drain spends exactly one hosting call.
+#[test]
+fn already_merged_and_closed_need_no_close() {
+    let fx = Fixture::new("sync-close-already-done");
+    let gh = stub(&fx);
+    init_closing_cap(&fx, &gh, RUNNER, 10);
+    land_close_pending(&fx, &gh, &[1, 2]);
+    std::fs::write(
+        &gh.state_list,
+        state_listing(&[(1, "CLOSED"), (2, "MERGED")]),
+    )
+    .unwrap();
+    let before = gh_log(&gh).lines().count();
+    let r = sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
+    assert_eq!(r["closed"], serde_json::json!([1, 2]), "{r}");
+    let all = items(&fx);
+    assert!(item(&all, 1).get("close_pending").is_none(), "{all}");
+    assert!(item(&all, 2).get("close_pending").is_none(), "{all}");
+    assert!(
+        item(&all, 1)["history"]
+            .to_string()
+            .contains("already closed"),
+        "{all}"
+    );
+    assert!(
+        item(&all, 2)["history"]
+            .to_string()
+            .contains("already merged on GitHub; nothing to close"),
+        "{all}"
+    );
+    // The drain was the sync's own list call plus one batched state read;
+    // no per-pull-request read and no close for either pull request.
+    let log = gh_log(&gh);
+    let drain: Vec<&str> = log.lines().skip(before).collect();
+    assert_eq!(
+        drain
+            .iter()
+            .filter(|line| line.contains("--state all"))
+            .count(),
+        1,
+        "{drain:?}"
+    );
+    assert!(
+        drain.iter().all(|line| !line.starts_with("pr close")),
+        "{drain:?}"
+    );
+    assert!(
+        drain.iter().all(|line| !line.starts_with("pr view")),
+        "{drain:?}"
+    );
+}
+
+/// The state read says OPEN but the close itself answers "already
+/// merged" (the merge raced the read): still done, not a failure.
+#[test]
+fn an_already_merged_answer_to_the_close_is_done() {
+    let fx = Fixture::new("sync-close-merged-race");
+    let gh = stub(&fx);
+    init_closing_cap(&fx, &gh, RUNNER, 10);
+    land_close_pending(&fx, &gh, &[1]);
+    std::fs::write(&gh.state_list, state_listing(&[(1, "OPEN")])).unwrap();
+    std::fs::write(&gh.already_merged_pr, "1").unwrap();
+    let r = sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
+    assert_eq!(r["closed"], serde_json::json!([1]), "{r}");
+    let all = items(&fx);
+    assert!(item(&all, 1).get("close_pending").is_none(), "{all}");
+    assert!(
+        item(&all, 1)["history"]
+            .to_string()
+            .contains("already merged"),
+        "{all}"
+    );
+    assert!(gh_log(&gh).contains("pr close 1 --repo o/n"));
+}
+
+/// A close that keeps failing for another reason is not retried on the
+/// next cycle: it backs off (no hosting call at all), stays
+/// close-pending, and is tried again once the window has passed.
+#[test]
+fn a_persistent_close_failure_backs_off() {
+    let fx = Fixture::new("sync-close-backoff");
+    let gh = stub(&fx);
+    init_closing_cap(&fx, &gh, RUNNER, 10);
+    land_close_pending(&fx, &gh, &[1]);
+    std::fs::write(&gh.state_list, state_listing(&[(1, "OPEN")])).unwrap();
+    std::fs::write(&gh.fail_close_pr, "1").unwrap();
+    let out = fx.mq_env(&["sync", "--all-open", "--limit", "100"], &env(&gh));
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("close-failed"), "{stderr}");
+    assert!(stderr.contains("#1"), "{stderr}");
+    assert!(stderr.contains("close failed for 1"), "{stderr}");
+    assert_eq!(item(&items(&fx), 1)["close_pending"], true);
+    let closes = gh_log(&gh).matches("pr close 1 ").count();
+    let reads = gh_log(&gh).matches("--state all").count();
+    // The very next cycle spends nothing on this pull request.
+    let out = fx.mq_env(&["sync", "--all-open", "--limit", "100"], &env(&gh));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(gh_log(&gh).matches("pr close 1 ").count(), closes);
+    assert_eq!(gh_log(&gh).matches("--state all").count(), reads);
+    assert_eq!(item(&items(&fx), 1)["close_pending"], true);
+    // Once the window has passed the close is tried again (and fails again).
+    expire_close_backoff(&fx);
+    let out = fx.mq_env(&["sync", "--all-open", "--limit", "100"], &env(&gh));
+    assert!(!out.status.success());
+    assert_eq!(gh_log(&gh).matches("pr close 1 ").count(), closes + 1);
+}
+
+/// At most `--close-max-per-cycle` closes per cycle (default 1): one
+/// batched state read plus one close, the rest wait for later cycles,
+/// so the closer cannot hold the host's whole hosting budget.
+#[test]
+fn the_closer_caps_closes_per_cycle() {
+    let fx = Fixture::new("sync-close-cap");
+    let gh = stub(&fx);
+    init_closing(&fx, &gh, RUNNER);
+    land_close_pending(&fx, &gh, &[1, 2, 3]);
+    std::fs::write(
+        &gh.state_list,
+        state_listing(&[(1, "OPEN"), (2, "OPEN"), (3, "OPEN")]),
+    )
+    .unwrap();
+    for closed in [vec![1], vec![2], vec![3]] {
+        let before = gh_log(&gh);
+        let r = sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
+        assert_eq!(r["closed"], serde_json::json!(closed), "{r}");
+        let log = gh_log(&gh);
+        let drain = &log[before.len()..];
+        assert_eq!(drain.matches("pr close ").count(), 1, "{drain}");
+        assert_eq!(drain.matches("--state all").count(), 1, "{drain}");
+    }
+    let all = items(&fx);
+    for pr in [1, 2, 3] {
+        assert!(item(&all, pr).get("close_pending").is_none(), "{all}");
+    }
 }
 
 /// Like [`RUNNER`], and leaves `$MARKS/<test>` for every test it runs.

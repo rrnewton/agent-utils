@@ -649,6 +649,13 @@ pub struct LandConfig {
     /// with a comment naming the commit that contains it. Closes the budget cannot afford yet
     /// are retried by `sync`.
     pub close_prs: bool,
+    /// Most closes the closer attempts per cycle (one `sync` pass, one
+    /// closer pass): a cycle also spends one batched state read, so this
+    /// bounds the closer's share of the host's hosting calls. 0 means
+    /// [`DEFAULT_CLOSE_MAX_PER_CYCLE`]. State-done pull requests
+    /// (MERGED/CLOSED) cost no close and do not count against it.
+    #[serde(default)]
+    pub close_max_per_cycle: usize,
     /// Extra attempts for a `push` landing after a transient remote-side rejection (one that
     /// is not a non-fast-forward: a remote fault, a 5xx, a dropped connection). 0 means
     /// [`DEFAULT_PUSH_MAX_RETRIES`]. A non-fast-forward is never retried here: it goes down
@@ -662,7 +669,21 @@ pub struct LandConfig {
     pub push_retry_backoff_secs: u64,
 }
 
+/// Default most closes per closer cycle: one batched state read plus one
+/// close per cycle drains a backlog without holding a paced host's whole
+/// hosting budget (one call per 30 s there, a cycle about a minute).
+pub const DEFAULT_CLOSE_MAX_PER_CYCLE: usize = 1;
+
 impl LandConfig {
+    /// Resolved most closes the closer attempts per cycle.
+    pub fn close_max_per_cycle(&self) -> usize {
+        if self.close_max_per_cycle == 0 {
+            DEFAULT_CLOSE_MAX_PER_CYCLE
+        } else {
+            self.close_max_per_cycle
+        }
+    }
+
     /// Resolved extra push attempts after a transient rejection.
     pub fn push_retries(&self) -> usize {
         if self.push_max_retries == 0 {

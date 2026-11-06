@@ -145,6 +145,51 @@ impl Budget {
     }
 }
 
+/// One pull request's state as the batched state read reports it
+/// (`OPEN`, `CLOSED`, or `MERGED`; empty when the answer carried none,
+/// which the closer treats as unknown, not as done).
+#[derive(Clone, Debug, Deserialize)]
+pub struct PrState {
+    /// Number.
+    pub number: i64,
+    /// State (`OPEN`, `CLOSED`, `MERGED`), empty when unreported.
+    #[serde(default)]
+    pub state: String,
+}
+
+impl PrState {
+    /// Whether the pull request is already merged.
+    pub fn merged(&self) -> bool {
+        self.state.eq_ignore_ascii_case("MERGED")
+    }
+
+    /// Whether the pull request is already closed (without merging).
+    pub fn closed(&self) -> bool {
+        self.state.eq_ignore_ascii_case("CLOSED")
+    }
+
+    /// Whether the pull request is known to be still open. An unreported
+    /// state is not open: it is unknown, and the closer falls back to a
+    /// close attempt rather than deciding from no evidence.
+    pub fn open(&self) -> bool {
+        self.state.eq_ignore_ascii_case("OPEN")
+    }
+}
+
+/// Whether a hosting error says the pull request was already merged
+/// (the hosting tool refuses to close a merged pull request). Only a
+/// race fallback: the closer decides done from the batched state read,
+/// and this covers the state changing between that read and the close.
+pub fn error_is_already_merged(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("already merged")
+}
+
+/// Whether a hosting error says the pull request was already closed.
+pub fn error_is_already_closed(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("already closed") && !error_is_already_merged(error)
+}
+
 /// A budgeted client for the hosting service's command-line tool.
 #[derive(Clone, Debug)]
 pub struct Hosting {
@@ -502,6 +547,34 @@ impl Hosting {
         ))
     }
 
+    /// States of pull requests in any state, read in one batched list call
+    /// (`pr list --state all --json number,state`, charged one request per
+    /// hundred results requested). The closer decides from this read, never
+    /// from a close attempt, and never with a per-pull-request call: on a
+    /// host whose hosting calls go through a paced wrapper, one call per
+    /// pull request per cycle would hold the host's whole write budget.
+    pub fn pr_states(&self, limit: u32) -> Result<Vec<PrState>, String> {
+        let args: Vec<String> = [
+            "pr",
+            "list",
+            "--repo",
+            &self.config.repo,
+            "--state",
+            "all",
+            "--limit",
+            &limit.max(1).to_string(),
+            "--json",
+            "number,state",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let pages = limit.max(1).div_ceil(100);
+        let text = self.run(pages, &args)?;
+        serde_json::from_str(&text)
+            .map_err(|error| format!("unexpected pr state list output: {error}"))
+    }
+
     /// Close a landed pull request with a pointer to the commit that contains it.
     pub fn close(&self, pr: i64, comment: &str) -> Result<(), String> {
         let args: Vec<String> = [
@@ -736,6 +809,22 @@ mod unit {
         );
         assert_eq!(resolve_gh_command(&[], None), vec!["gh".to_owned()]);
         assert_eq!(resolve_gh_command(&[], Some("  ")), vec!["gh".to_owned()]);
+    }
+
+    #[test]
+    fn already_done_classifiers_read_the_hosting_wording() {
+        // The exact consumer wording (title and owner redacted here).
+        let merged = "gh pr close 1290 --repo o/n --comment Landed failed: \
+                      X Pull request o/n#1290 (a title) can't be closed because it was already merged";
+        assert!(error_is_already_merged(merged));
+        assert!(!error_is_already_closed(merged));
+        assert!(error_is_already_closed("pull request was already closed"));
+        assert!(!error_is_already_merged("close failed"));
+        assert!(!error_is_already_closed("close failed"));
+        let state: PrState = serde_json::from_str(r#"{"number":7,"state":"MERGED"}"#).unwrap();
+        assert!(state.merged() && !state.closed() && !state.open());
+        let unknown: PrState = serde_json::from_str(r#"{"number":7}"#).unwrap();
+        assert!(!unknown.merged() && !unknown.closed() && !unknown.open());
     }
 
     #[test]

@@ -961,6 +961,13 @@ enum Command {
         /// (budgeted; postponed closes are retried by `sync`).
         #[arg(long)]
         close_prs: bool,
+        /// Most closes the closer attempts per cycle (0 = 1): one batched
+        /// state read plus at most this many closes per cycle bounds the
+        /// closer's share of the host's hosting calls. Pull requests the
+        /// state read shows MERGED or CLOSED are done without a close and
+        /// do not count against it.
+        #[arg(long, default_value_t = 0, value_name = "N")]
+        close_max_per_cycle: usize,
         /// Command prefix for network Git operations, e.g. `--net-wrapper with-proxy`.
         /// Repeat for multiple words.
         #[arg(long, value_name = "WORD", allow_hyphen_values = true)]
@@ -1906,6 +1913,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             require_approval_at_head,
             recount_pins,
             close_prs,
+            close_max_per_cycle,
             net_wrapper,
             net_timeout_secs,
             precheck,
@@ -2127,6 +2135,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     command: land_command,
                     allow_batches,
                     close_prs,
+                    close_max_per_cycle,
                     push_max_retries,
                     push_retry_backoff_secs,
                 },

@@ -15,9 +15,10 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pr_landing_planner::priority::{LabelPriority, PriorityProvider, DEFAULT_LABEL_PATTERN};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::github::Hosting;
 use crate::model::ItemStatus;
@@ -531,34 +532,232 @@ fn closed_dir(state: &State) -> PathBuf {
     state.root.join("closed")
 }
 
+/// What a close note under `<state>/closed/` records: the pull request and
+/// how its close finished, so [`record_closed`] can say so on the item.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CloseNote {
+    /// Pull-request number (older notes hold the bare number; both parse).
+    pr: i64,
+    /// `closed`, `already-merged`, or `already-closed`.
+    #[serde(default)]
+    outcome: String,
+}
+
+/// A close that keeps failing: attempts so far and when the next is due,
+/// stored lock-free beside the close notes (the closer holds no lock).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct CloseRetry {
+    /// Failed attempts so far.
+    attempts: u32,
+    /// Unix seconds before which the close is not retried.
+    next_retry_unix: u64,
+    /// Most recent hosting error, for the operator.
+    #[serde(default)]
+    last_error: String,
+}
+
+fn close_retry_dir(state: &State) -> PathBuf {
+    state.root.join("close-retry")
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// Delay before retrying a close after `attempts` failures (1-based):
+/// a minute, doubling per failure, capped at an hour, so a permanently
+/// failing close stops spending hosting calls every minute.
+pub fn close_retry_delay(attempts: u32) -> Duration {
+    let shift = attempts.saturating_sub(1).min(6);
+    Duration::from_secs((60u64 << shift).min(3600))
+}
+
+fn read_close_retry(state: &State, pr: i64) -> Option<CloseRetry> {
+    let path = close_retry_dir(state).join(format!("{pr}.json"));
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Record one failed close and return the delay before the next attempt.
+fn record_close_failure(state: &State, pr: i64, error: &str) -> Result<Duration, String> {
+    let mut retry = read_close_retry(state, pr).unwrap_or_default();
+    retry.attempts = retry.attempts.saturating_add(1);
+    let delay = close_retry_delay(retry.attempts);
+    retry.next_retry_unix = now_unix().saturating_add(delay.as_secs());
+    retry.last_error = error.to_owned();
+    crate::state::write_json(&close_retry_dir(state).join(format!("{pr}.json")), &retry)?;
+    Ok(delay)
+}
+
+fn clear_close_retry(state: &State, pr: i64) {
+    let _ = std::fs::remove_file(close_retry_dir(state).join(format!("{pr}.json")));
+}
+
+fn note_close(state: &State, pr: i64, outcome: &str) -> Result<(), String> {
+    crate::state::write_json(
+        &closed_dir(state).join(format!("{pr}.json")),
+        &CloseNote {
+            pr,
+            outcome: outcome.to_owned(),
+        },
+    )
+}
+
+/// Read a close note's outcome, tolerating the older bare-number notes.
+fn close_note_outcome(state: &State, pr: i64) -> String {
+    let path = closed_dir(state).join(format!("{pr}.json"));
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(note) = serde_json::from_str::<CloseNote>(&text) {
+            if !note.outcome.is_empty() {
+                return note.outcome;
+            }
+        }
+    }
+    "closed".to_owned()
+}
+
 /// Close the landed pull requests whose close the request budget postponed, oldest first.
-/// A close that fails does not stop the pass and is never swallowed: it is logged with its
-/// pull request and the hosting error, the rest still close, and the pass returns the first
-/// failure so callers surface it too. (Stopping at the first failure let one permanently
-/// failing close — a deleted head branch, a number that is not a pull request — block every
-/// later close forever, silently.) The API calls can wait on the budget, so this takes no
-/// writer lock: each close is noted under `<state>/closed/` for [`record_closed`], and a
-/// change noted there is not closed again. A failure charged against an exhausted budget
-/// records no API call, so trying the rest costs nothing.
+///
+/// Done is decided from one batched state read per pass
+/// ([`Hosting::pr_states`]), never from a close attempt and never with a
+/// per-pull-request call: a pull request the read shows MERGED or CLOSED
+/// is noted done (one log line, no close call), because the hosting tool
+/// refuses to close a merged pull request, so retrying its close would
+/// fail every pass forever. A close the read leaves for us is attempted
+/// at most `land.close_max_per_cycle` times per pass, so the closer
+/// cannot starve the queue's other hosting work; the hosting tool's
+/// "already merged" error on a close that raced the read is likewise
+/// done. Any other failure is logged with its pull request and the
+/// hosting error, does not stop the pass, and backs off exponentially
+/// (a minute, doubling, capped at an hour) instead of retrying every
+/// pass: the backoff lives beside the close notes, so this takes no
+/// writer lock, as before — each finished close is noted under
+/// `<state>/closed/` for [`record_closed`], and a change noted there is
+/// not closed again. The pass returns the first failure so callers
+/// surface it too.
 pub fn close_postponed(state: &State, config: &Config) -> Result<(), String> {
     let hosting = Hosting::new(&config.github, &state.root, config.net_timeout())?;
-    let mut failures: Vec<String> = Vec::new();
-    for item in state.items()? {
-        if item.status != ItemStatus::Landed || !item.close_pending {
-            continue;
-        }
-        let note = closed_dir(state).join(format!("{}.json", item.pr));
-        if note.exists() {
-            continue;
-        }
-        match hosting.close(item.pr, &close_comment(&item.landed_as)) {
-            Ok(()) => crate::state::write_json(&note, &item.pr)?,
-            Err(error) => {
+    let pending: Vec<_> = state
+        .items()?
+        .into_iter()
+        .filter(|item| item.status == ItemStatus::Landed && item.close_pending)
+        .filter(|item| !closed_dir(state).join(format!("{}.json", item.pr)).exists())
+        .collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    // Every pending close is in its backoff window: no hosting call is due.
+    if pending.iter().all(|item| backing_off(state, item.pr)) {
+        return Ok(());
+    }
+    // One batched read for every pending pull request. A failed read
+    // decides nothing: every pending close backs off and the pass fails,
+    // rather than guessing done from close attempts.
+    let limit = (pending.len() as u32).max(100);
+    let states: BTreeMap<i64, String> = match hosting.pr_states(limit) {
+        Ok(listed) => listed
+            .into_iter()
+            .map(|entry| (entry.number, entry.state))
+            .collect(),
+        Err(error) => {
+            let mut failures = Vec::new();
+            for item in &pending {
+                if backing_off(state, item.pr) {
+                    continue;
+                }
+                let _ = record_close_failure(state, item.pr, &error);
                 eprintln!(
                     "merge-queue: close-failed: pull request #{} (landed as {}) not closed: \
                      {error}; it stays close-pending and will be retried",
                     item.pr,
                     crate::plan::short(&item.landed_as)
+                );
+                failures.push(format!("#{}: {error}", item.pr));
+            }
+            return if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} landed pull request(s) not closed ({}); first: {}",
+                    failures.len(),
+                    failures.join("; "),
+                    failures[0]
+                ))
+            };
+        }
+    };
+    let max_closes = config.land.close_max_per_cycle();
+    let mut closes = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for item in &pending {
+        let state_name = states.get(&item.pr).map_or("", String::as_str);
+        if state_name.eq_ignore_ascii_case("MERGED") {
+            note_close(state, item.pr, "already-merged")?;
+            clear_close_retry(state, item.pr);
+            eprintln!(
+                "merge-queue: pull request #{} (landed as {}) already merged on GitHub; \
+                 nothing to close",
+                item.pr,
+                crate::plan::short(&item.landed_as)
+            );
+            continue;
+        }
+        if state_name.eq_ignore_ascii_case("CLOSED") {
+            note_close(state, item.pr, "already-closed")?;
+            clear_close_retry(state, item.pr);
+            eprintln!(
+                "merge-queue: pull request #{} (landed as {}) already closed on GitHub; \
+                 nothing to close",
+                item.pr,
+                crate::plan::short(&item.landed_as)
+            );
+            continue;
+        }
+        // Still open (or the read said nothing about it, in which case a
+        // close attempt is the old fallback and its error decides).
+        if backing_off(state, item.pr) {
+            continue;
+        }
+        if closes >= max_closes {
+            continue;
+        }
+        closes += 1;
+        match hosting.close(item.pr, &close_comment(&item.landed_as)) {
+            Ok(()) => {
+                note_close(state, item.pr, "closed")?;
+                clear_close_retry(state, item.pr);
+            }
+            Err(error) if crate::github::error_is_already_merged(&error) => {
+                note_close(state, item.pr, "already-merged")?;
+                clear_close_retry(state, item.pr);
+                eprintln!(
+                    "merge-queue: pull request #{} (landed as {}) already merged on GitHub; \
+                     nothing to close",
+                    item.pr,
+                    crate::plan::short(&item.landed_as)
+                );
+            }
+            Err(error) if crate::github::error_is_already_closed(&error) => {
+                note_close(state, item.pr, "already-closed")?;
+                clear_close_retry(state, item.pr);
+                eprintln!(
+                    "merge-queue: pull request #{} (landed as {}) already closed on GitHub; \
+                     nothing to close",
+                    item.pr,
+                    crate::plan::short(&item.landed_as)
+                );
+            }
+            Err(error) => {
+                let delay = record_close_failure(state, item.pr, &error)?;
+                eprintln!(
+                    "merge-queue: close-failed: pull request #{} (landed as {}) not closed: \
+                     {error}; it stays close-pending and will be retried in about {}s",
+                    item.pr,
+                    crate::plan::short(&item.landed_as),
+                    delay.as_secs()
                 );
                 failures.push(format!("#{}: {error}", item.pr));
             }
@@ -574,6 +773,11 @@ pub fn close_postponed(state: &State, config: &Config) -> Result<(), String> {
             failures[0]
         ))
     }
+}
+
+/// Whether `pr`'s close is in its backoff window (no hosting call is due).
+fn backing_off(state: &State, pr: i64) -> bool {
+    read_close_retry(state, pr).is_some_and(|retry| retry.next_retry_unix > now_unix())
 }
 
 /// Record on their items the closes [`close_postponed`] noted, under the writer lock the caller
@@ -602,7 +806,12 @@ pub fn record_closed(state: &State, _lock: &Lock) -> Result<Vec<i64>, String> {
         if let Some(mut item) = state.item(pr)? {
             if item.status == ItemStatus::Landed && item.close_pending {
                 item.close_pending = false;
-                item.log("closed", "pull request closed after landing");
+                let detail = match close_note_outcome(state, pr).as_str() {
+                    "already-merged" => "pull request already merged on GitHub; nothing to close",
+                    "already-closed" => "pull request already closed on GitHub; nothing to close",
+                    _ => "pull request closed after landing",
+                };
+                item.log("closed", detail);
                 state.save_item(&item)?;
                 recorded.push(pr);
             }
@@ -622,6 +831,16 @@ pub fn close_comment(landed: &str) -> String {
 #[cfg(test)]
 mod unit {
     use super::*;
+
+    #[test]
+    fn close_retry_delay_doubles_to_an_hourly_cap() {
+        assert_eq!(close_retry_delay(1), Duration::from_secs(60));
+        assert_eq!(close_retry_delay(2), Duration::from_secs(120));
+        assert_eq!(close_retry_delay(3), Duration::from_secs(240));
+        assert_eq!(close_retry_delay(6), Duration::from_secs(1920));
+        assert_eq!(close_retry_delay(7), Duration::from_secs(3600));
+        assert_eq!(close_retry_delay(30), Duration::from_secs(3600));
+    }
 
     #[test]
     fn ready_file_lines() {
