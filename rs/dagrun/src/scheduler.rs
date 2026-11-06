@@ -2235,7 +2235,8 @@ impl Runner {
                     && (sh.stop
                         || sh.done.len()
                             + skipped.len()
-                            + self.intentional_skips.len() + self.runtime_skips.len()
+                            + self.intentional_skips.len()
+                            + self.runtime_skips.len()
                             + blocked_by_family.len()
                             >= self.steps.len())
                 {
@@ -2350,7 +2351,8 @@ impl Runner {
                     // configured caps.
                     let accounted = sh.done.len()
                         + skipped.len()
-                        + self.intentional_skips.len() + self.runtime_skips.len()
+                        + self.intentional_skips.len()
+                        + self.runtime_skips.len()
                         + blocked_by_family.len();
                     let remaining = self.steps.len().saturating_sub(accounted);
                     let waiting_on_shared_resource = self
@@ -5389,7 +5391,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
                 skipped: Vec::new(),
                 not_launched: Vec::new(),
                 intentional_skips: Vec::new(),
-            runtime_skips: Vec::new(),
+                runtime_skips: Vec::new(),
                 step_profile_rows: Vec::new(),
                 step_timeseries_rows: Vec::new(),
                 run_timed_out: false,
@@ -5430,7 +5432,7 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
                     skipped: Vec::new(),
                     not_launched: Vec::new(),
                     intentional_skips: Vec::new(),
-            runtime_skips: Vec::new(),
+                    runtime_skips: Vec::new(),
                     step_profile_rows: Vec::new(),
                     step_timeseries_rows: Vec::new(),
                     run_timed_out: false,

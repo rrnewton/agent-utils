@@ -4992,11 +4992,15 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     let mut runtime_skips: Vec<(String, String)> = Vec::new();
     for raw_skip in &a.skip {
         let Some((tag, reason)) = raw_skip.split_once('=') else {
-            eprintln!("{PROG}: run: --skip needs TAG=REASON with a non-empty reason, got {raw_skip:?}");
+            eprintln!(
+                "{PROG}: run: --skip needs TAG=REASON with a non-empty reason, got {raw_skip:?}"
+            );
             return 2;
         };
         if tag.trim().is_empty() || reason.trim().is_empty() {
-            eprintln!("{PROG}: run: --skip needs TAG=REASON with a non-empty reason, got {raw_skip:?}");
+            eprintln!(
+                "{PROG}: run: --skip needs TAG=REASON with a non-empty reason, got {raw_skip:?}"
+            );
             return 2;
         }
         if runtime_skips.iter().any(|(t, _)| t == tag) {

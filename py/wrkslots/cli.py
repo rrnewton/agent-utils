@@ -23571,8 +23571,13 @@ def _recorded_remote_names_same_repository(
 def _checkout_remote_unchanged(
     vcs: _GitVcs, path: Path, checkout: Checkout
 ) -> bool:
+    authority_fn = getattr(vcs, "remote_authority", None)
+    if authority_fn is None:
+        # A test-double VCS may offer only the digest; exact comparison
+        # is all it can support.
+        return vcs.remote_url_sha256(path, checkout.remote) == checkout.remote_url_sha256
     return _recorded_remote_names_same_repository(
-        checkout.remote_url_sha256, vcs.remote_authority(path, checkout.remote)
+        checkout.remote_url_sha256, authority_fn(path, checkout.remote)
     )
 
 
@@ -45758,10 +45763,13 @@ def _verify_created_checkouts(
         status = vcs.status(
             path, _cache_globs_for(config, name), include_ignored=False
         )
+        # Untracked files are a provisioning outcome (a post-provision
+        # hook may write them); only changes to tracked files can mean
+        # an unpopulated checkout or authored work at risk.
         lines = [
             line
             for line in status.splitlines()
-            if line and "HANDOFF" not in line
+            if line and "HANDOFF" not in line and not line.startswith("? ")
         ]
         if not lines:
             return
@@ -45791,7 +45799,7 @@ def _verify_created_checkouts(
             lines = [
                 line
                 for line in status.splitlines()
-                if line and "HANDOFF" not in line
+                if line and "HANDOFF" not in line and not line.startswith("? ")
             ]
             if not lines:
                 return

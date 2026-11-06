@@ -58682,9 +58682,9 @@ def test_remote_url_spellings_accept_equivalent_transports(
     """#868: ssh and https spellings of one repository are the same remote."""
     authority = wrkslots._RemoteAuthority(
         url=current,
-        sha256=wrkslots.hashlib.sha256(current.encode()).hexdigest(),
+        sha256=hashlib.sha256(current.encode()).hexdigest(),
     )
-    recorded_sha = wrkslots.hashlib.sha256(recorded.encode()).hexdigest()
+    recorded_sha = hashlib.sha256(recorded.encode()).hexdigest()
     assert wrkslots._recorded_remote_names_same_repository(recorded_sha, authority)
 
 
@@ -58704,9 +58704,9 @@ def test_remote_url_spellings_still_refuse_other_repositories(
 ) -> None:
     authority = wrkslots._RemoteAuthority(
         url=current,
-        sha256=wrkslots.hashlib.sha256(current.encode()).hexdigest(),
+        sha256=hashlib.sha256(current.encode()).hexdigest(),
     )
-    recorded_sha = wrkslots.hashlib.sha256(recorded.encode()).hexdigest()
+    recorded_sha = hashlib.sha256(recorded.encode()).hexdigest()
     assert not wrkslots._recorded_remote_names_same_repository(recorded_sha, authority)
 
 
@@ -58905,8 +58905,8 @@ def test_privileged_delete_of_root_owned_entries_stays_inside_the_slot(
     def fake_scan(_root: Path) -> list[Path]:
         return [artefact]
 
-    def fake_delete(paths: object) -> None:
-        selected = list(paths)  # type: ignore[arg-type]
+    def fake_delete(paths: Sequence[Path]) -> None:
+        selected = list(paths)
         calls.append(selected)
         for path in selected:
             path.unlink()

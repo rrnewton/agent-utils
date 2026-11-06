@@ -208,7 +208,8 @@ _AMBIENT_CASE_CONTROL_ENV = frozenset(
 
 _COUNTS_RE = re.compile(
     r"(\d+) passed, (\d+) failed, (\d+) aborted, "
-    r"(\d+) intentionally skipped, (\d+) dependency-skipped, (\d+) not launched"
+    r"(\d+) intentionally skipped, (?:\d+ runtime-skipped, )?"
+    r"(\d+) dependency-skipped, (\d+) not launched"
 )
 _SIZING_RE = re.compile(
     r"-> modeled memory ceiling (\d+) active steps "
