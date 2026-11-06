@@ -132,6 +132,7 @@
         "py/tests/test_absent_is_not_zero.py",
         "py/tests/test_admission.py",
         "py/tests/test_analyze.py",
+        "py/tests/test_artifact_ready.py",
         "py/tests/test_attribution.py",
         "py/tests/test_box_subcommand.py",
         "py/tests/test_build_job_cap.py",

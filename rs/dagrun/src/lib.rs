@@ -88,11 +88,11 @@ pub use model::{
     env_with_inner_jobs, preferred_inner_jobs, render_jobs_flag, resolve_jobs_env,
     resolved_wall_timeout, result_manifest_owner, step_classification, step_failure_reason,
     step_width_is_resizable, undeclared_resource_demands, validate_cmdtype_config,
-    validate_jobs_env_config, write_domain_violations, CmdType, DagConfig, DagManifest,
-    ResourceHint, ResultManifest, RunResult, Step, StepClass, StepOutcome,
-    StructuredTestResultsManifest, WriteDomainGuarantee, WriteDomainPolicy, DAGRUN_EXTRA_ARGS_ENV,
-    DAG_CONFIG_FIELDS, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT, JOBS_ENV_ENV,
-    STRUCTURED_TEST_RESULTS_KIND, WALL_CPU_BACKSTOP_FACTOR,
+    validate_jobs_env_config, write_domain_violations, ArtifactDep, CmdType, DagConfig,
+    DagManifest, PublishedArtifact, ResourceHint, ResultManifest, RunResult, Step, StepClass,
+    StepOutcome, StructuredTestResultsManifest, WriteDomainGuarantee, WriteDomainPolicy,
+    ARTIFACT_READY_DIR_ENV, DAGRUN_EXTRA_ARGS_ENV, DAG_CONFIG_FIELDS, DEFAULT_JOBS_FLAG,
+    DEFAULT_STEP_TIMEOUT, JOBS_ENV_ENV, STRUCTURED_TEST_RESULTS_KIND, WALL_CPU_BACKSTOP_FACTOR,
 };
 pub use perflog::{
     append_step_profiles, append_step_timeseries, PerfWindow, STEP_TIMESERIES_COLUMNS,

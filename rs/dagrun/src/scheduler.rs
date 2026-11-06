@@ -530,6 +530,11 @@ struct Shared {
     /// is published; otherwise the ready loop can launch it a second time in the narrow
     /// retire-then-publish window. See [`retire`].
     retired: HashSet<String>,
+    /// `(producer tag, artifact name)` pairs whose ready signal has been observed.
+    artifact_signalled: HashSet<(String, String)>,
+    /// `(producer tag, artifact name)` pairs already warned about as undeclared,
+    /// so the warning is reported once rather than on every poll.
+    artifact_warned: HashSet<(String, String)>,
 }
 
 /// Signal a process group without consulting `PATH`.
@@ -880,6 +885,66 @@ fn deps_ok(sh: &Shared, step: &Step) -> bool {
     step.deps
         .iter()
         .all(|d| sh.done.get(d).map(|o| o.ok).unwrap_or(false))
+}
+
+/// Whether every artifact dependency of `step` has been signalled.
+fn artifact_deps_ok(sh: &Shared, step: &Step) -> bool {
+    step.artifact_deps.iter().all(|d| {
+        sh.artifact_signalled
+            .contains(&(d.step.clone(), d.artifact.clone()))
+    })
+}
+
+/// Names of `step`'s declared artifacts whose signal file exists under `dir/<tag>`.
+///
+/// The final (renamed) path is the signal; a lingering `.tmp` file is not.
+fn signalled_artifacts(dir: &std::path::Path, step: &Step) -> HashSet<String> {
+    let mut found = HashSet::new();
+    let subdir = dir.join(&step.tag());
+    let Ok(entries) = std::fs::read_dir(&subdir) else {
+        return found;
+    };
+    let declared: HashSet<&str> = step.publishes.iter().map(|a| a.name.as_str()).collect();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if declared.contains(name.as_str()) {
+            found.insert(name);
+        }
+    }
+    found
+}
+
+/// Cancel every dependent released on `producer`'s signal after it failed.
+///
+/// Running dependents are process-group killed like a failed dependency;
+/// dependents that already finished keep no credit: their outcome is
+/// discarded and the run fails with the producer named as the cause.
+fn cancel_artifact_dependents(
+    sh: &mut Shared,
+    cgroups: &BoxedCgroups,
+    producer: &str,
+    dependents: &[String],
+) {
+    let mut cut: Vec<(String, u32, Option<String>)> = Vec::new();
+    for dep in dependents {
+        if let Some(outcome) = sh.done.get_mut(dep) {
+            if outcome.ok {
+                outcome.ok = false;
+                outcome.reason = format!(
+                    "ARTIFACT PRODUCER FAILED: producer {producer} failed after signalling; dependent result discarded"
+                );
+            }
+        }
+        if sh.running.contains(dep) {
+            sh.aborted
+                .entry(dep.clone())
+                .or_insert(AbortCause::PeerFailure);
+            if let Some(pid) = sh.running_pids.get(dep) {
+                cut.push((dep.clone(), *pid, sh.running_nonces.get(dep).cloned()));
+            }
+        }
+    }
+    reap_many(cgroups, &cut);
 }
 
 fn deps_known(sh: &Shared, step: &Step) -> bool {
@@ -1610,6 +1675,13 @@ struct Runner {
     resource_coordinator: Option<ResourceCoordinator>,
     /// Opt-in interval for exact cgroup CPU/thread samples.
     profile_timeseries_interval: Option<Duration>,
+    /// Per-run artifact-ready signal directory, when any step publishes.
+    ///
+    /// Created at run start and removed at run end; signals are per-run
+    /// state and never cross runs.
+    artifact_dir: Option<std::path::PathBuf>,
+    /// Producer tag -> tags of dependents released on its artifacts.
+    artifact_dependents: HashMap<String, Vec<String>>,
     shared: Arc<Mutex<Shared>>,
     /// TEST-ONLY: run this instead of the guarded supervisor body, on the supervisor's own thread.
     ///
@@ -1694,6 +1766,27 @@ impl Runner {
                     .map(|family| (tag.clone(), family.clone()))
             })
             .collect();
+        let mut artifact_dependents: HashMap<String, Vec<String>> = HashMap::new();
+        for step in capped.steps.iter() {
+            for dep in &step.artifact_deps {
+                artifact_dependents
+                    .entry(dep.step.clone())
+                    .or_default()
+                    .push(step.tag());
+            }
+        }
+        let artifact_dir = if capped.steps.iter().any(|s| !s.publishes.is_empty()) {
+            Some(std::env::temp_dir().join(format!(
+                    "dagrun-artifacts-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                )))
+        } else {
+            None
+        };
         Runner {
             steps: Arc::new(steps),
             order,
@@ -1716,6 +1809,8 @@ impl Runner {
             evidence: RunEvidence::open(default_log_dir()).map(Arc::new),
             resource_coordinator,
             profile_timeseries_interval,
+            artifact_dir,
+            artifact_dependents,
             shared: Arc::new(Mutex::new(Shared {
                 done: HashMap::new(),
                 running: HashSet::new(),
@@ -1737,6 +1832,8 @@ impl Runner {
                 max_concurrent_steps: 0,
                 counted_processes: HashSet::new(),
                 retired: HashSet::new(),
+                artifact_signalled: HashSet::new(),
+                artifact_warned: HashSet::new(),
             })),
             #[cfg(test)]
             supervisor_override: None,
@@ -1766,9 +1863,82 @@ impl Runner {
                         break;
                     }
                 }
+                if sk.contains(tag) {
+                    continue;
+                }
+                // Artifact edges skip the same way: a producer that failed
+                // (including the missing-signal contract failure) can never
+                // release this dependent.
+                for d in &step.artifact_deps {
+                    let dep_failed = sh.done.get(&d.step).map(|o| !o.ok).unwrap_or(false);
+                    if dep_failed || sk.contains(&d.step) {
+                        sk.insert(tag.clone());
+                        changed = true;
+                        break;
+                    }
+                }
             }
         }
         sk
+    }
+
+    /// Poll the artifact-ready directory once, recording new signals.
+    ///
+    /// Called on the ready-set sweep (50 ms), so release latency is one
+    /// sweep. The producer keeps its slot and resources: a signal only
+    /// makes dependents eligible under the ordinary admission rules.
+    fn scan_artifacts(&self, sh: &mut Shared, wall_start: Instant) {
+        let Some(dir) = &self.artifact_dir else {
+            return;
+        };
+        for step in self.steps.values() {
+            if step.publishes.is_empty() {
+                continue;
+            }
+            let tag = step.tag();
+            let subdir = dir.join(&tag);
+            let Ok(entries) = std::fs::read_dir(&subdir) else {
+                continue;
+            };
+            let declared: HashSet<&str> = step.publishes.iter().map(|a| a.name.as_str()).collect();
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".tmp") || name.contains(".tmp") {
+                    continue;
+                }
+                let key = (tag.clone(), name.clone());
+                if declared.contains(name.as_str()) {
+                    if sh.artifact_signalled.insert(key) {
+                        let offset = wall_start.elapsed().as_secs_f64();
+                        emit(&format!("[{tag}] ◈ ARTIFACT READY {name} (+{offset:.1}s)"));
+                        if let Some(e) = &self.evidence {
+                            e.record(
+                                "artifact_ready",
+                                &[
+                                    ("step", tag.clone()),
+                                    ("artifact", name.clone()),
+                                    ("offset_s", format!("{offset:.3}")),
+                                ],
+                            );
+                        }
+                    }
+                } else if sh.artifact_warned.insert(key) {
+                    emit(&format!(
+                        "[{tag}] ⚠ ARTIFACT SIGNAL IGNORED: undeclared artifact '{name}'"
+                    ));
+                    if let Some(e) = &self.evidence {
+                        e.record(
+                            "artifact_signal_warning",
+                            &[
+                                ("step", tag.clone()),
+                                ("artifact", name.clone()),
+                                ("kind", "undeclared".to_string()),
+                            ],
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Give an outcome to every supervisor thread that ENDED without publishing one.
@@ -1829,6 +1999,14 @@ impl Runner {
         // while a finished local step no longer waits for that timeout to expire.
         let (scheduler_wake, scheduler_wake_rx) = std::sync::mpsc::sync_channel(1);
         let wall_start = Instant::now();
+        if let Some(dir) = &self.artifact_dir {
+            let _ = std::fs::create_dir_all(dir);
+            for step in self.steps.values() {
+                if !step.publishes.is_empty() {
+                    let _ = std::fs::create_dir_all(dir.join(step.tag()));
+                }
+            }
+        }
         for (tag, reason) in &self.intentional_skips {
             emit(&format!("[{tag}] SKIPPED reason={}", reason.value()));
             if let Some(evidence) = &self.evidence {
@@ -1972,6 +2150,7 @@ impl Runner {
                     }
                     reap_many(&self.cgroups, &cut);
                 }
+                self.scan_artifacts(&mut sh, wall_start);
                 let skipped = self.skipped(&sh);
                 // After eager-exit has tripped, ONE class of step may still start: a diagnostic
                 // for a failure that has actually happened. Sparing an already-running diagnostic
@@ -2000,6 +2179,7 @@ impl Runner {
                                 && startable_after_stop(&sh, tag)
                                 && deps_known(&sh, step)
                                 && deps_ok(&sh, step)
+                                && artifact_deps_ok(&sh, step)
                         })
                         .cloned()
                         .collect();
@@ -2017,6 +2197,7 @@ impl Runner {
                         && startable_after_stop(&sh, tag)
                         && deps_known(&sh, &self.steps[tag])
                         && deps_ok(&sh, &self.steps[tag])
+                        && artifact_deps_ok(&sh, &self.steps[tag])
                 });
                 let blocked_by_family: HashSet<String> = self
                     .order
@@ -2064,6 +2245,9 @@ impl Runner {
                             continue;
                         }
                         if !deps_ok(&sh, &step) {
+                            continue;
+                        }
+                        if !artifact_deps_ok(&sh, &step) {
                             continue;
                         }
                         if sh.running.len() as i64 >= self.max_steps {
@@ -2226,6 +2410,12 @@ impl Runner {
                     keep_going,
                 };
                 let swept_step = step.clone();
+                let artifact_ready_dir = self.artifact_dir.clone();
+                let artifact_dependents = self
+                    .artifact_dependents
+                    .get(&step.tag())
+                    .cloned()
+                    .unwrap_or_default();
                 #[cfg(test)]
                 let supervisor_override = self.supervisor_override.clone();
                 handles.push((
@@ -2258,6 +2448,8 @@ impl Runner {
                                 profile_timeseries_interval,
                                 run_origin: wall_start,
                                 resource_reservation,
+                                artifact_ready_dir,
+                                artifact_dependents,
                             });
                         });
                         let _ = scheduler_wake.try_send(());
@@ -2311,6 +2503,9 @@ impl Runner {
         }
         if let Some(coordinator) = &self.resource_coordinator {
             coordinator.clear_pending();
+        }
+        if let Some(dir) = &self.artifact_dir {
+            let _ = std::fs::remove_dir_all(dir);
         }
         // NORMAL-exit backstop: reap any step cgroup that still has live procs (a setsid orphan a
         // step left behind lives there). Does NOT stop the outer scope, so a green run stays green.
@@ -3209,6 +3404,10 @@ struct StepCtx {
     /// Kept alive for exactly the child step's lifetime. Waiting occurred before `run_step`, so
     /// it is deliberately excluded from the step's wall and CPU budgets.
     resource_reservation: Result<Option<crate::resource_caps::Reservation>, String>,
+    /// Per-run artifact-ready signal directory, when any step publishes.
+    artifact_ready_dir: Option<std::path::PathBuf>,
+    /// Tags of dependents released on this step's artifacts.
+    artifact_dependents: Vec<String>,
 }
 
 /// Tear down one step's whole process tree: SIGTERM grace, then `cgroup.kill`/SIGKILL.
@@ -3480,6 +3679,8 @@ fn run_step(ctx: StepCtx) {
         profile_timeseries_interval,
         run_origin,
         resource_reservation,
+        artifact_ready_dir,
+        artifact_dependents,
     } = ctx;
     let tag = step.tag();
     let _resource_reservation = match resource_reservation {
@@ -3650,6 +3851,10 @@ fn run_step(ctx: StepCtx) {
     // which outer node launched a nested scheduler; DAGRUN_STEP remains the ownership token.
     cmd.env(OUTER_RUN_ENV, &tag);
     cmd.env(STEP_NONCE_ENV, &nonce);
+    cmd.env_remove(crate::model::ARTIFACT_READY_DIR_ENV);
+    if let Some(dir) = &artifact_ready_dir {
+        cmd.env(crate::model::ARTIFACT_READY_DIR_ENV, dir.as_path());
+    }
     cmd.env_remove(TEST_COUNTS_PATH_ENV);
     if let Some(path) = &test_counts_path {
         cmd.env(TEST_COUNTS_PATH_ENV, path.as_path());
@@ -4361,7 +4566,7 @@ fn run_step(ctx: StepCtx) {
             .filter(|result| result.is_diagnostic_failure())
             .count()
     });
-    let (abort_cause, reason) = {
+    let (abort_cause, reason, outcome_ok) = {
         let mut sh = lock_shared(&shared);
         retire(&mut sh, &step);
         sh.step_profile_rows.push(row);
@@ -4440,19 +4645,57 @@ fn run_step(ctx: StepCtx) {
             outcome.reason = reason;
         }
         outcome.test_results = test_counts.results;
+        // Artifact-ready contract, judged at producer exit with a final
+        // filesystem scan (the poll may not have swept since the signal).
+        let mut missing_signal_failure = false;
+        if !step.publishes.is_empty() && !was_aborted {
+            if let Some(dir) = &artifact_ready_dir {
+                let found = signalled_artifacts(dir, &step);
+                for name in &found {
+                    sh.artifact_signalled.insert((tag.clone(), name.clone()));
+                }
+                if outcome.ok {
+                    let missing: Vec<String> = step
+                        .publishes
+                        .iter()
+                        .map(|a| a.name.clone())
+                        .filter(|name| !found.contains(name))
+                        .collect();
+                    if !missing.is_empty() {
+                        outcome.ok = false;
+                        outcome.reason = format!(
+                            "ARTIFACT NOT SIGNALLED: step {tag} exited 0 without signalling declared artifact(s): {}",
+                            missing.join(", ")
+                        );
+                        missing_signal_failure = true;
+                    }
+                }
+            }
+        }
         let reason = outcome.reason.clone();
+        let outcome_ok = outcome.ok;
         sh.done.insert(tag.clone(), outcome);
         sh.running.remove(&tag);
-        if !was_aborted && !ok {
+        if !was_aborted && !outcome_ok && !step.publishes.is_empty() {
+            // A failed producer invalidates everything released on its
+            // signal, even under keep_going: running dependents are killed
+            // and finished dependents keep no credit.
+            cancel_artifact_dependents(&mut sh, &cgroups, &tag, &artifact_dependents);
+        }
+        if !was_aborted && (!ok || missing_signal_failure) {
             // A REAL failure. Eager-exit (default) stops launching NEW steps and reaps every
             // step still running so a fast failure does not wait for a slow in-flight build.
             // keep_going records the failure but leaves scheduling open: independent ready steps
             // continue, while dependency-failure closure skips only true dependents.
             trip_fail_fast(&mut sh, &cgroups, keep_going, &tag);
         }
-        (abort_cause, reason)
+        (abort_cause, reason, outcome_ok)
     };
     let was_aborted = abort_cause.is_some();
+    // The terminal verdict follows the published outcome, so a producer
+    // converted by the missing-signal contract reports as failed in the
+    // journal and console exactly like an ordinary failure.
+    let ok = outcome_ok;
 
     // Emit the terminal status OUTSIDE the lock.
     if abort_cause == Some(AbortCause::RunCpuAccountingLost) {
@@ -6706,6 +6949,8 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
             write_domain_guarantee: None,
             explains: Vec::new(),
             fail_fast_family: None,
+            publishes: Vec::new(),
+            artifact_deps: Vec::new(),
         }
     }
 

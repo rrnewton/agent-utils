@@ -1678,6 +1678,8 @@ mod tests {
             write_domain_guarantee: None,
             explains: Vec::new(),
             fail_fast_family: None,
+            publishes: Vec::new(),
+            artifact_deps: Vec::new(),
         }
     }
 

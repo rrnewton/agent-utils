@@ -1164,6 +1164,17 @@ Output:
         "quickstart", allow_abbrev=False, help="print a self-contained getting-started guide",
         description="print a self-contained getting-started guide",
     )
+    artifact_ready_p = sub.add_parser(
+        "artifact-ready",
+        allow_abbrev=False,
+        help="signal one declared artifact ready (inside a running step)",
+        description="signal one declared artifact ready (inside a running step)",
+    )
+    artifact_ready_p.add_argument(
+        "artifact_name",
+        metavar="NAME",
+        help="the declared artifact name to signal ready",
+    )
     sub.add_parser(
         "capabilities",
         allow_abbrev=False,
@@ -1171,6 +1182,46 @@ Output:
         description="print the machine-readable enforcement-capability manifest",
     )
     return parser
+
+
+def _cmd_artifact_ready(ns: argparse.Namespace) -> int:
+    """Signal one declared artifact ready from inside a running step.
+
+    The file protocol is the contract; this is optional sugar. Uses
+    ``DAGRUN_ARTIFACT_READY_DIR`` plus the step's own tag from
+    ``DAGRUN_OUTER_RUN``; writes ``<dir>/<tag>/<name>.tmp`` then atomically
+    renames it into place.
+    """
+    name = ns.artifact_name
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        print(f"{PROG} artifact-ready: error: invalid artifact name {name!r}", file=sys.stderr)
+        return 2
+    directory = os.environ.get("DAGRUN_ARTIFACT_READY_DIR")
+    if not directory:
+        print(
+            f"{PROG} artifact-ready: error: DAGRUN_ARTIFACT_READY_DIR is not set "
+            "(this command only works inside a dagrun step)",
+            file=sys.stderr,
+        )
+        return 2
+    tag = os.environ.get("DAGRUN_OUTER_RUN")
+    if not tag:
+        print(
+            f"{PROG} artifact-ready: error: DAGRUN_OUTER_RUN is not set "
+            "(this command only works inside a dagrun step)",
+            file=sys.stderr,
+        )
+        return 2
+    subdir = Path(directory) / tag
+    try:
+        subdir.mkdir(parents=True, exist_ok=True)
+        tmp = subdir / f"{name}.tmp-{os.getpid()}"
+        tmp.write_bytes(b"")
+        tmp.rename(subdir / name)
+    except OSError as exc:
+        print(f"{PROG} artifact-ready: error: cannot publish signal {name}: {exc}", file=sys.stderr)
+        return 2
+    return 0
 
 
 def _load(dag_arg: str) -> DagConfig:
@@ -4528,6 +4579,8 @@ def _main(argv: Sequence[str] | None = None) -> int:
     if command == "quickstart":
         print(_quickstart(c))
         return 0
+    if command == "artifact-ready":
+        return _cmd_artifact_ready(ns)
     if command == "capabilities":
         # Machine-readable enforcement manifest, DERIVED from the guard registry rather than
         # typed out: byte-identical to the Rust build and cross-checked, so an enforcement guard

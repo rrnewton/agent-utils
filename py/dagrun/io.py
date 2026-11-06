@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from yaml.nodes import ScalarNode
 
 from dagrun.model import (
+    ArtifactDep,
+    PublishedArtifact,
     DEFAULT_JOBS_FLAG,
     STRUCTURED_TEST_RESULTS_KIND,
     STRUCTURED_TEST_RESULTS_PATH_ENV,
@@ -595,6 +597,11 @@ def _rewrite_step(entry: object, namespace: str) -> object:
     family = rewritten.get("fail_fast_family")
     if isinstance(family, str) and family.strip():
         rewritten["fail_fast_family"] = _qualify(namespace, family)
+    artifact_deps = rewritten.get("artifact_deps")
+    if isinstance(artifact_deps, list):
+        for dep in artifact_deps:
+            if isinstance(dep, dict) and isinstance(dep.get("step"), str):
+                dep["step"] = _qualify(namespace, dep["step"])
     declarations = rewritten.get("result_manifests")
     if isinstance(declarations, list):
         for declaration in declarations:
@@ -914,6 +921,7 @@ def _refuse_uncarried_config_keys(doc: Mapping[str, object]) -> None:
 #: with no timeout, no dependency, no environment, and nothing anywhere reports it.
 STEP_KEYS: frozenset[str] = frozenset(
     {
+        "artifact_deps",
         "group",
         "job",
         "desc",
@@ -933,6 +941,7 @@ STEP_KEYS: frozenset[str] = frozenset(
         "priority",
         "jobs_flag",
         "jobs_env",
+        "publishes",
         "skip_reason",
         "write_domains",
         "write_domain_guarantee",
@@ -1054,6 +1063,50 @@ def _result_manifests_from(value: object, where: str) -> list[ResultManifest] | 
             raise DagJsonError(f"{where}: duplicate selector at index {index}")
         manifests.append(manifest)
     return manifests
+
+#: Every key a ``publishes[]`` entry may carry. Closed like the step object.
+PUBLISHES_KEYS: frozenset[str] = frozenset({"name", "path"})
+#: Every key an ``artifact_deps[]`` entry may carry. Closed like the step object.
+ARTIFACT_DEPS_KEYS: frozenset[str] = frozenset({"step", "artifact"})
+
+
+def _publishes_from(value: object, where: str) -> list[PublishedArtifact]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise DagJsonError(f"{where}: must be a list of published artifacts or null")
+    out: list[PublishedArtifact] = []
+    for index, item in enumerate(value):
+        item_where = f"{where}[{index}]"
+        obj = _as_obj(item, item_where)
+        _refuse_unknown_keys(obj, PUBLISHES_KEYS, item_where)
+        out.append(
+            PublishedArtifact(
+                name=_req_str(obj, "name", item_where),
+                path=_opt_str_or_none(obj, "path"),
+            )
+        )
+    return out
+
+
+def _artifact_deps_from(value: object, where: str) -> list[ArtifactDep]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise DagJsonError(f"{where}: must be a list of artifact dependencies or null")
+    out: list[ArtifactDep] = []
+    for index, item in enumerate(value):
+        item_where = f"{where}[{index}]"
+        obj = _as_obj(item, item_where)
+        _refuse_unknown_keys(obj, ARTIFACT_DEPS_KEYS, item_where)
+        out.append(
+            ArtifactDep(
+                step=_req_str(obj, "step", item_where),
+                artifact=_req_str(obj, "artifact", item_where),
+            )
+        )
+    return out
+
 
 #: Every key the top-level ``write_domain_policy`` object may carry. Closed: a misspelled
 #: ``require_explicit`` turns a fail-closed policy into no policy at all, silently.
@@ -1225,6 +1278,10 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 skip_reason=skip_reason,
                 explains=_opt_str_list(sm, "explains"),
                 fail_fast_family=fail_fast_family,
+                publishes=_publishes_from(sm.get("publishes"), f"{where}.publishes"),
+                artifact_deps=_artifact_deps_from(
+                    sm.get("artifact_deps"), f"{where}.artifact_deps"
+                ),
                 write_domains=_present_str_list(sm, "write_domains"),
                 write_domain_guarantee=(
                     None
@@ -1394,6 +1451,19 @@ def _step_to_json(step: Step) -> dict[str, object]:
         obj["explains"] = list(step.explains)
     if step.fail_fast_family is not None:
         obj["fail_fast_family"] = step.fail_fast_family
+    if step.publishes:
+        obj["publishes"] = [
+            (
+                {"name": artifact.name, "path": artifact.path}
+                if artifact.path is not None
+                else {"name": artifact.name}
+            )
+            for artifact in step.publishes
+        ]
+    if step.artifact_deps:
+        obj["artifact_deps"] = [
+            {"step": dep.step, "artifact": dep.artifact} for dep in step.artifact_deps
+        ]
     if step.write_domains is not None:
         obj["write_domains"] = list(step.write_domains)
     if step.write_domain_guarantee is not None:

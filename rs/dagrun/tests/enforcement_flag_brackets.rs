@@ -123,6 +123,8 @@ fn one_step(cmd: &str, timeout: i64, cpu_timeout: i64) -> DagConfig {
         write_domain_guarantee: None,
         explains: Vec::new(),
         fail_fast_family: None,
+        publishes: Vec::new(),
+        artifact_deps: Vec::new(),
     };
     DagConfig {
         steps: vec![step],

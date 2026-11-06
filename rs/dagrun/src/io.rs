@@ -30,9 +30,9 @@ use serde_json::Value;
 
 use crate::model::{
     graph_structure_violations, resolve_jobs_env, validate_cmdtype_config, write_domain_violations,
-    CmdType, DagConfig, DagManifest, IntentionalSkipReason, ResourceHint, ResultManifest, Step,
-    StepClass, StructuredTestResultsManifest, WriteDomainGuarantee, WriteDomainPolicy,
-    DEFAULT_JOBS_FLAG, STRUCTURED_TEST_RESULTS_KIND,
+    ArtifactDep, CmdType, DagConfig, DagManifest, IntentionalSkipReason, PublishedArtifact,
+    ResourceHint, ResultManifest, Step, StepClass, StructuredTestResultsManifest,
+    WriteDomainGuarantee, WriteDomainPolicy, DEFAULT_JOBS_FLAG, STRUCTURED_TEST_RESULTS_KIND,
 };
 use crate::test_results::{
     CLASSIFIED_RESULTS_SCHEMA, CURRENT_SCHEMA, DIAGNOSTIC_RESULTS_SCHEMA, SKIPPED_RESULTS_SCHEMA,
@@ -153,7 +153,8 @@ fn err(msg: impl Into<String>) -> DagJsonError {
 /// `cmds`, `timeouts`, `env_vars`, `description` vs `desc`. Silently ignored, the instruction is
 /// simply not carried out and the document still says it was: the step runs with no timeout, no
 /// dependency, no environment, and nothing anywhere reports it.
-const STEP_KEYS: [&str; 27] = [
+const STEP_KEYS: [&str; 29] = [
+    "artifact_deps",
     "cmd",
     "cmdtype",
     "cpu_timeout",
@@ -174,6 +175,7 @@ const STEP_KEYS: [&str; 27] = [
     "labels",
     "networkonly",
     "priority",
+    "publishes",
     "skip_reason",
     "timeout",
     "write_domain_guarantee",
@@ -467,6 +469,67 @@ fn result_manifests_from(
         manifests.push(manifest);
     }
     Ok(Some(manifests))
+}
+
+/// Every key a `publishes[]` entry may carry. Closed like the step object.
+const PUBLISHES_KEYS: [&str; 2] = ["name", "path"];
+/// Every key an `artifact_deps[]` entry may carry. Closed like the step object.
+const ARTIFACT_DEPS_KEYS: [&str; 2] = ["artifact", "step"];
+
+fn publishes_from(
+    value: Option<&Value>,
+    where_: &str,
+) -> Result<Vec<PublishedArtifact>, DagJsonError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let Value::Array(values) = value else {
+        return Err(err(format!(
+            "{where_}: must be a list of published artifacts or null"
+        )));
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for (index, item) in values.iter().enumerate() {
+        let item_where = format!("{where_}[{index}]");
+        let object = as_obj(item, &item_where)?;
+        refuse_unknown_keys(object, &PUBLISHES_KEYS, &item_where)?;
+        out.push(PublishedArtifact {
+            name: req_str(object, "name", &item_where)?,
+            path: opt_str_or_none(object, "path")?,
+        });
+    }
+    Ok(out)
+}
+
+fn artifact_deps_from(
+    value: Option<&Value>,
+    where_: &str,
+) -> Result<Vec<ArtifactDep>, DagJsonError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let Value::Array(values) = value else {
+        return Err(err(format!(
+            "{where_}: must be a list of artifact dependencies or null"
+        )));
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for (index, item) in values.iter().enumerate() {
+        let item_where = format!("{where_}[{index}]");
+        let object = as_obj(item, &item_where)?;
+        refuse_unknown_keys(object, &ARTIFACT_DEPS_KEYS, &item_where)?;
+        out.push(ArtifactDep {
+            step: req_str(object, "step", &item_where)?,
+            artifact: req_str(object, "artifact", &item_where)?,
+        });
+    }
+    Ok(out)
 }
 
 fn opt_int_or_none(
@@ -840,6 +903,13 @@ fn rewrite_step(mut value: Value, namespace: &str) -> Value {
     rewrite_string_field(object, "group", namespace);
     rewrite_string_list(object, "deps", namespace);
     rewrite_string_list(object, "explains", namespace);
+    if let Some(Value::Array(deps)) = object.get_mut("artifact_deps") {
+        for dep in deps {
+            if let Some(dep_object) = dep.as_object_mut() {
+                rewrite_string_field(dep_object, "step", namespace);
+            }
+        }
+    }
     if object
         .get("fail_fast_family")
         .and_then(Value::as_str)
@@ -1469,6 +1539,11 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             },
             explains: opt_str_list(sm, "explains")?,
             fail_fast_family,
+            publishes: publishes_from(sm.get("publishes"), &format!("{where_}.publishes"))?,
+            artifact_deps: artifact_deps_from(
+                sm.get("artifact_deps"),
+                &format!("{where_}.artifact_deps"),
+            )?,
         });
     }
     refuse_unusable_explains(&steps)?;
@@ -1827,6 +1902,57 @@ fn emit_manifest_list(s: &mut String, manifests: &[ResultManifest], base: usize)
     s.push(']');
 }
 
+fn emit_publishes(s: &mut String, list: &[PublishedArtifact], base: usize) {
+    if list.is_empty() {
+        s.push_str("[]");
+        return;
+    }
+    s.push_str("[\n");
+    for (index, artifact) in list.iter().enumerate() {
+        s.push_str(&" ".repeat(base + 2));
+        let key = " ".repeat(base + 4);
+        s.push_str("{\n");
+        s.push_str(&key);
+        match &artifact.path {
+            Some(path) => {
+                s.push_str(&format!("\"name\": {},\n", json_str(&artifact.name)));
+                s.push_str(&key);
+                s.push_str(&format!("\"path\": {}\n", json_str(path)));
+            }
+            None => {
+                s.push_str(&format!("\"name\": {}\n", json_str(&artifact.name)));
+            }
+        }
+        s.push_str(&" ".repeat(base + 2));
+        s.push('}');
+        s.push_str(if index + 1 < list.len() { ",\n" } else { "\n" });
+    }
+    s.push_str(&" ".repeat(base));
+    s.push(']');
+}
+
+fn emit_artifact_deps(s: &mut String, list: &[ArtifactDep], base: usize) {
+    if list.is_empty() {
+        s.push_str("[]");
+        return;
+    }
+    s.push_str("[\n");
+    for (index, dep) in list.iter().enumerate() {
+        s.push_str(&" ".repeat(base + 2));
+        let key = " ".repeat(base + 4);
+        s.push_str("{\n");
+        s.push_str(&key);
+        s.push_str(&format!("\"step\": {},\n", json_str(&dep.step)));
+        s.push_str(&key);
+        s.push_str(&format!("\"artifact\": {}\n", json_str(&dep.artifact)));
+        s.push_str(&" ".repeat(base + 2));
+        s.push('}');
+        s.push_str(if index + 1 < list.len() { ",\n" } else { "\n" });
+    }
+    s.push_str(&" ".repeat(base));
+    s.push(']');
+}
+
 fn emit_hint(s: &mut String, hint: &ResourceHint, base: usize) {
     // base is the indent of the enclosing key; the object's fields sit at base+2.
     let key = " ".repeat(base + 2);
@@ -1977,8 +2103,15 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     // that does not use the relationship keeps a byte-identical document.
     let has_explains = !step.explains.is_empty();
     let has_fail_fast_family = step.fail_fast_family.is_some();
+    let has_publishes = !step.publishes.is_empty();
+    let has_artifact_deps = !step.artifact_deps.is_empty();
     let has_write_domains = step.write_domains.is_some() || step.write_domain_guarantee.is_some();
-    if has_explains || has_fail_fast_family || has_write_domains {
+    let has_tail = has_explains
+        || has_fail_fast_family
+        || has_publishes
+        || has_artifact_deps
+        || has_write_domains;
+    if has_tail {
         s.push_str(",\n");
     } else {
         s.push('\n');
@@ -1987,7 +2120,7 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
         s.push_str(&key);
         s.push_str("\"explains\": ");
         emit_str_list(s, &step.explains, base + 2);
-        if has_fail_fast_family || has_write_domains {
+        if has_fail_fast_family || has_publishes || has_artifact_deps || has_write_domains {
             s.push_str(",\n");
         } else {
             s.push('\n');
@@ -1996,6 +2129,26 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     if let Some(family) = &step.fail_fast_family {
         s.push_str(&key);
         s.push_str(&format!("\"fail_fast_family\": {}", json_str(family)));
+        if has_publishes || has_artifact_deps || has_write_domains {
+            s.push_str(",\n");
+        } else {
+            s.push('\n');
+        }
+    }
+    if has_publishes {
+        s.push_str(&key);
+        s.push_str("\"publishes\": ");
+        emit_publishes(s, &step.publishes, base + 2);
+        if has_artifact_deps || has_write_domains {
+            s.push_str(",\n");
+        } else {
+            s.push('\n');
+        }
+    }
+    if has_artifact_deps {
+        s.push_str(&key);
+        s.push_str("\"artifact_deps\": ");
+        emit_artifact_deps(s, &step.artifact_deps, base + 2);
         if has_write_domains {
             s.push_str(",\n");
         } else {

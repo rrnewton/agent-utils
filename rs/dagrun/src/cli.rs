@@ -203,6 +203,52 @@ fn help_text(c: &Palette) -> String {
     )
 }
 
+/// Signal artifact `name` ready for the calling step.
+///
+/// Uses `DAGRUN_ARTIFACT_READY_DIR` plus the step's own tag from
+/// `DAGRUN_OUTER_RUN`; writes `<dir>/<tag>/<name>.tmp` then atomically
+/// renames it into place, exactly the documented file protocol.
+fn artifact_ready(name: &str) -> i32 {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+        eprintln!("{PROG} artifact-ready: error: invalid artifact name {name:?}");
+        return 2;
+    }
+    let Ok(dir) = std::env::var(crate::model::ARTIFACT_READY_DIR_ENV) else {
+        eprintln!(
+            "{PROG} artifact-ready: error: {} is not set (this command only works inside a dagrun step)",
+            crate::model::ARTIFACT_READY_DIR_ENV
+        );
+        return 2;
+    };
+    let Ok(tag) = std::env::var("DAGRUN_OUTER_RUN") else {
+        eprintln!(
+            "{PROG} artifact-ready: error: DAGRUN_OUTER_RUN is not set (this command only works inside a dagrun step)"
+        );
+        return 2;
+    };
+    let subdir = std::path::Path::new(&dir).join(&tag);
+    if let Err(e) = std::fs::create_dir_all(&subdir) {
+        eprintln!(
+            "{PROG} artifact-ready: error: cannot create {}: {e}",
+            subdir.display()
+        );
+        return 2;
+    }
+    let tmp = subdir.join(format!("{name}.tmp-{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, b"") {
+        eprintln!(
+            "{PROG} artifact-ready: error: cannot write {}: {e}",
+            tmp.display()
+        );
+        return 2;
+    }
+    if let Err(e) = std::fs::rename(&tmp, subdir.join(name)) {
+        eprintln!("{PROG} artifact-ready: error: cannot publish signal {name}: {e}");
+        return 2;
+    }
+    0
+}
+
 fn quickstart(c: &Palette) -> String {
     let h = |s: &str| c.bold(s);
     let k = |s: &str| c.cyan(s);
@@ -996,6 +1042,8 @@ fn box_config(
             write_domain_guarantee: None,
             explains: Vec::new(),
             fail_fast_family: None,
+            publishes: Vec::new(),
+            artifact_deps: Vec::new(),
         }],
         // cpu.max for the boxed command. Set on the CONFIG rather than as preferred_inner_jobs,
         // because the latter appends a `-j K` flag to the command -- correct for a build, wrong
@@ -5182,6 +5230,15 @@ fn run_inner(argv: &[String]) -> i32 {
         "quickstart" => {
             println!("{}", quickstart(&c));
             0
+        }
+        "artifact-ready" => {
+            // Signal one declared artifact ready from inside a running step.
+            // The file protocol is the contract; this is optional sugar.
+            if rest.len() != 1 {
+                eprintln!("{PROG} artifact-ready: error: exactly one artifact NAME is required");
+                return 2;
+            }
+            artifact_ready(&rest[0])
         }
         "capabilities" => {
             // Machine-readable enforcement manifest, DERIVED from the guard registry rather than

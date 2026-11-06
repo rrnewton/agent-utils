@@ -287,6 +287,70 @@ parallelism, and a shared domain is not silently converted into one global
 mutex. External writers remain outside the scheduler; an immutable publication
 barrier shields consumers without pretending those writers were serialized.
 
+### Release dependents early: artifact-ready signals
+
+Dependencies are completion-based by default: a dependent starts only after
+the producer process exits. A step whose useful outputs are ready long before
+it exits may instead declare named artifacts it publishes mid-run, and a
+dependent may depend on one such artifact. The scheduler releases the
+dependent when the artifact signal appears, while the producer keeps running
+in its box.
+
+```yaml
+steps:
+  - group: build
+    job: workspace_compile
+    cmd: ./compile-and-test-libs
+    publishes:
+      - {name: app-bin, path: target/app}
+  - group: e2e
+    job: manifest_compat
+    cmd: ./run-e2e
+    artifact_deps:
+      - {step: build.workspace_compile, artifact: app-bin}
+```
+
+`publishes[].path` is advisory documentation; the signal, not filesystem
+polling of `path`, is the release condition, because a path can exist
+half-written and only the producer knows when it is complete and immutable.
+
+The runner creates a per-run directory, passes it to every step as
+`DAGRUN_ARTIFACT_READY_DIR`, and the producer signals by atomically renaming
+`<dir>/<step-tag>/<name>.tmp` to `<dir>/<step-tag>/<name>` (contents ignored;
+they may carry a sha256 line for the consumer's own check). The scheduler
+polls that directory on its ready-set sweep and treats the rename as the
+release event. `dagrun artifact-ready <name>` does the same rename from
+inside a step; the file protocol is the contract, so any language can signal.
+
+A step with both `deps` and `artifact_deps` needs all of them. Listing a step
+in both keeps the exit requirement for that edge. At load, every
+`artifact_deps` entry must name an existing step and an artifact that step
+declares in `publishes`, and cycles through mixed edges are refused like
+dependency cycles.
+
+Failure semantics are fail-closed:
+
+- If the producer later fails (non-zero exit, or killed by its wall/CPU/memory
+  bounds) after signalling, every dependent released on that signal is
+  cancelled (process-group kill), a dependent that already finished keeps no
+  credit, and the run fails with the producer named as the cause — even when
+  the dependent's own exit was 0.
+- If the producer exits 0 without signalling a declared artifact, the producer
+  step itself fails (contract violation, named in the report), dependents
+  never start, and the run fails.
+- Signalling an undeclared name is ignored for scheduling and reported as a
+  step warning; a second signal for the same artifact is ignored the same way.
+  Neither releases anything.
+
+The signal frees nothing: the producer keeps its outer slot, its `resources`
+demand, its memory baseline, and its wall/CPU bounds until it exits. Released
+dependents are admitted under the ordinary rules (outer width, `resource_caps`,
+memory model), so peak concurrency can exceed completion-only scheduling only
+within those same caps. Step timing is unchanged (start = process start,
+end = process exit); each signal is recorded in the journal as an
+`artifact_ready` event with its offset from run start. Signals are per-run
+state and never cross runs.
+
 ## Inspect, convert, and visualize
 
 ```sh

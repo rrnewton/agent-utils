@@ -271,6 +271,33 @@ class StructuredTestResultsManifest:
 
 ResultManifest = DagManifest | StructuredTestResultsManifest
 
+#: Environment variable naming the per-run artifact-ready signal directory.
+#: The runner creates one directory per run, passes it to every step, and a
+#: producer signals readiness by atomically renaming
+#: ``<dir>/<step-tag>/<name>.tmp`` to ``<dir>/<step-tag>/<name>``. Following
+#: the ``DAGRUN_TEST_COUNTS_PATH`` precedent: runner-owned, never inherited.
+ARTIFACT_READY_DIR_ENV = "DAGRUN_ARTIFACT_READY_DIR"
+
+
+@dataclass(frozen=True)
+class PublishedArtifact:
+    """One named artifact a step publishes mid-run via the artifact-ready signal.
+
+    ``path`` is advisory documentation for reviewers and tooling; the signal,
+    not filesystem polling of ``path``, is the release condition.
+    """
+
+    name: str
+    path: str | None = None
+
+
+@dataclass(frozen=True)
+class ArtifactDep:
+    """One artifact dependency: release the consumer when ``step`` signals ``artifact``."""
+
+    step: str
+    artifact: str
+
 
 @dataclass
 class Step:
@@ -367,6 +394,15 @@ class Step:
     # Structured test evidence is not represented by a fabricated manifest cell.
     # Kept after every established field so existing positional Step(...) calls stay compatible.
     result_manifests: list[ResultManifest] | None = None
+    # Named artifacts this step publishes mid-run via the artifact-ready
+    # signal. Empty preserves completion-only dependencies exactly. A step
+    # that declares an artifact and exits 0 without signalling it has
+    # violated its contract: the step fails and the run fails (fail closed).
+    publishes: list[PublishedArtifact] = field(default_factory=list)
+    # Artifact dependencies releasing this step before the producer exits.
+    # Every entry must hold in addition to ``deps``; listing a step in both
+    # keeps the exit requirement for that edge.
+    artifact_deps: list[ArtifactDep] = field(default_factory=list)
 
     def explains_a_failure_in(self, failed: Container[str]) -> bool:
         """Whether this step is exempt from eager-exit given the set of tags that FAILED.
@@ -1300,7 +1336,12 @@ def graph_structure_violations(cfg: DagConfig) -> list[str]:
             colour[tag] = GREY
             path.append(tag)
             stack.append((tag, True))
-            for dep in sorted(set(by_tag[tag].deps)):
+            # Mixed edges: completion deps plus artifact producers. A cycle
+            # through either kind can never be satisfied, so both are walked.
+            mixed = set(by_tag[tag].deps) | {
+                dep.step for dep in by_tag[tag].artifact_deps
+            }
+            for dep in sorted(mixed):
                 if dep in by_tag and colour.get(dep) != BLACK:
                     stack.append((dep, False))
 
@@ -1319,6 +1360,44 @@ def graph_structure_violations(cfg: DagConfig) -> list[str]:
             step.structured_test_results_manifest()
         except ValueError as error:
             bad.append(str(error))
+
+    # Artifact-ready declarations. Every artifact dependency must name a
+    # step that exists and an artifact that step declares it publishes;
+    # anything else can never be signalled, so the dependent would wait
+    # forever. Duplicate or unusable publish names are refused for the
+    # same reason: the signal file ``<dir>/<step>/<name>`` must name exactly
+    # one declared artifact.
+    for step in cfg.steps:
+        seen: set[str] = set()
+        for artifact in step.publishes:
+            if (
+                not artifact.name
+                or "/" in artifact.name
+                or "\\" in artifact.name
+                or artifact.name in (".", "..")
+            ):
+                bad.append(
+                    f"step {step.tag}: artifact name '{artifact.name}' is invalid "
+                    "(must be non-empty and contain no path separator)"
+                )
+            if artifact.name in seen:
+                bad.append(
+                    f"step {step.tag}: publishes artifact '{artifact.name}' more than once"
+                )
+            seen.add(artifact.name)
+    for step in cfg.steps:
+        for dep in step.artifact_deps:
+            producer = by_tag.get(dep.step)
+            if producer is None:
+                bad.append(
+                    f"step {step.tag}: artifact dependency names step '{dep.step}', "
+                    "which no step declares"
+                )
+            elif all(a.name != dep.artifact for a in producer.publishes):
+                bad.append(
+                    f"step {step.tag}: artifact dependency names artifact "
+                    f"'{dep.artifact}' of step '{dep.step}', which that step does not publish"
+                )
     return bad
 
 

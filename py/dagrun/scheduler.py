@@ -45,6 +45,7 @@ from dagrun.cgroup import (
     delegated_cgroup_root,
 )
 from dagrun.model import (
+    ARTIFACT_READY_DIR_ENV,
     ABORTED_BY_PEER_FAILURE_REASON,
     ABORTED_BY_RUN_BUDGET_REASON,
     DagConfig,
@@ -848,12 +849,86 @@ class Runner:
         # the offsets are measured from the execution, not from construction. Monotonic, not
         # wall clock: a clock step mid-run must not make one step appear to precede another.
         self.run_origin_monotonic = time.monotonic()
+        # Artifact-ready signal state: per-run directory (created in run()),
+        # observed signals, and producer -> dependent tags.
+        self.artifact_dir: str | None = None
+        self.artifact_signalled: set[tuple[str, str]] = set()
+        self.artifact_warned: set[tuple[str, str]] = set()
+        self.artifact_dependents: dict[str, list[str]] = {}
+        for step in self.cfg.steps:
+            for dep in step.artifact_deps:
+                self.artifact_dependents.setdefault(dep.step, []).append(step.tag)
+        if any(step.publishes for step in self.cfg.steps):
+            import tempfile
+
+            self.artifact_dir = tempfile.mkdtemp(prefix="dagrun-artifacts-")
 
     # -- gating helpers (mirror validate.py Runner._deps_ok / _deps_known / _res_free) --
 
     def _deps_ok(self, step: Step) -> bool:
         """True when EVERY dep has a done, successful outcome."""
         return all(d in self.done and self.done[d].ok for d in step.deps)
+
+    def _artifact_deps_ok(self, step: Step) -> bool:
+        """True when every artifact dependency has been signalled."""
+        return all(
+            (dep.step, dep.artifact) in self.artifact_signalled
+            for dep in step.artifact_deps
+        )
+
+    def _scan_artifacts(self) -> None:
+        """Poll the artifact-ready directory once, recording new signals.
+
+        Caller holds the lock. Called on the ready-set sweep, so release
+        latency is one sweep. The producer keeps its slot and resources:
+        a signal only makes dependents eligible under ordinary admission.
+        """
+        if self.artifact_dir is None:
+            return
+        import os as _os
+
+        for step in self.cfg.steps:
+            if not step.publishes:
+                continue
+            subdir = _os.path.join(self.artifact_dir, step.tag)
+            try:
+                names = _os.listdir(subdir)
+            except OSError:
+                continue
+            declared = {a.name for a in step.publishes}
+            for name in names:
+                if ".tmp" in name:
+                    continue
+                key = (step.tag, name)
+                if name in declared:
+                    if key not in self.artifact_signalled:
+                        self.artifact_signalled.add(key)
+                        offset = time.monotonic() - self.run_origin_monotonic
+                        print(f"[{step.tag}] \u25c8 ARTIFACT READY {name} (+{offset:.1f}s)")
+                        if self.evidence is not None:
+                            self.evidence.record(
+                                "artifact_ready",
+                                [
+                                    ("step", step.tag),
+                                    ("artifact", name),
+                                    ("offset_s", f"{offset:.3f}"),
+                                ],
+                            )
+                elif key not in self.artifact_warned:
+                    self.artifact_warned.add(key)
+                    print(
+                        f"[{step.tag}] \u26a0 ARTIFACT SIGNAL IGNORED: "
+                        f"undeclared artifact '{name}'"
+                    )
+                    if self.evidence is not None:
+                        self.evidence.record(
+                            "artifact_signal_warning",
+                            [
+                                ("step", step.tag),
+                                ("artifact", name),
+                                ("kind", "undeclared"),
+                            ],
+                        )
 
     def _deps_known(self, step: Step) -> bool:
         """True when every dep has reached a terminal outcome (regardless of success)."""
@@ -978,6 +1053,43 @@ class Runner:
             self.cgroups,
         )
 
+    def _signalled_artifacts(self, step: Step) -> set[str]:
+        """Declared artifacts whose signal file exists under the run dir."""
+        if self.artifact_dir is None:
+            return set()
+        try:
+            names = os.listdir(os.path.join(self.artifact_dir, step.tag))
+        except OSError:
+            return set()
+        declared = {a.name for a in step.publishes}
+        return {name for name in names if name in declared}
+
+    def _cancel_artifact_dependents(self, producer: str) -> None:
+        """Cancel dependents released on ``producer``'s signal after it failed.
+
+        Caller holds the lock. Running dependents are process-group killed
+        like a failed dependency; finished dependents keep no credit.
+        """
+        cut: list[tuple[subprocess.Popen[bytes], str, str | None]] = []
+        for dep in self.artifact_dependents.get(producer, []):
+            outcome = self.done.get(dep)
+            if outcome is not None and outcome.ok:
+                self.done[dep] = replace(
+                    outcome,
+                    ok=False,
+                    reason=(
+                        f"ARTIFACT PRODUCER FAILED: producer {producer} failed "
+                        "after signalling; dependent result discarded"
+                    ),
+                )
+            if dep in self.running:
+                self.aborted.setdefault(dep, _AbortCause.PEER_FAILURE)
+                proc = self.running_procs.get(dep)
+                if proc is not None:
+                    cut.append((proc, dep, self.running_nonces.get(dep)))
+        if cut:
+            reap_many(tuple(cut), self.cgroups)
+
     def _genuinely_failed(self) -> set[str]:
         """Tags whose own run FAILED, excluding steps that were merely cancelled.
 
@@ -1028,6 +1140,18 @@ class Runner:
                     continue
                 for d in step.deps:
                     if (d in self.done and not self.done[d].ok) or d in sk:
+                        sk.add(tag)
+                        changed = True
+                        break
+                if tag in sk:
+                    continue
+                # Artifact edges skip the same way: a producer that failed
+                # (including the missing-signal contract failure) can never
+                # release this dependent.
+                for dep in step.artifact_deps:
+                    if (dep.step in self.done and not self.done[dep.step].ok) or (
+                        dep.step in sk
+                    ):
                         sk.add(tag)
                         changed = True
                         break
@@ -1171,6 +1295,12 @@ class Runner:
         threads: list[tuple[threading.Thread, Step]] = []
         wall_start = time.time()
         self.run_origin_monotonic = time.monotonic()
+        if self.artifact_dir is not None:
+            for step in self.cfg.steps:
+                if step.publishes:
+                    os.makedirs(
+                        os.path.join(self.artifact_dir, step.tag), exist_ok=True
+                    )
         for tag, reason in self.intentional_skips:
             self._emit(f"[{tag}] SKIPPED reason={reason.value}")
             if self.evidence is not None:
@@ -1233,6 +1363,7 @@ class Runner:
                         ),
                         self.cgroups,
                     )
+                self._scan_artifacts()
                 skipped = self._skipped()
                 # After eager-exit has tripped, ONE class of step may still start: a diagnostic
                 # for a failure that has actually happened. Sparing an already-running diagnostic
@@ -1269,6 +1400,7 @@ class Runner:
                     and _startable_after_stop(tag)
                     and self._deps_known(self.steps[tag])
                     and self._deps_ok(self.steps[tag])
+                    and self._artifact_deps_ok(self.steps[tag])
                 ]
                 blocked_by_family = [
                     tag
@@ -1307,6 +1439,8 @@ class Runner:
                             continue  # deps not resolved yet
                         if not self._deps_ok(step):
                             continue  # a dep failed -> handled as skip next pass
+                        if not self._artifact_deps_ok(step):
+                            continue  # producer has not signalled yet
                         if len(self.running) >= self.max_steps:
                             break
                         if not self._res_free(step):
@@ -1402,6 +1536,10 @@ class Runner:
                 self.evidence.record(
                     "step_skip", [("step", tag), ("reason", "not_launched")]
                 )
+        if self.artifact_dir is not None:
+            import shutil
+
+            shutil.rmtree(self.artifact_dir, ignore_errors=True)
         self.wall = time.time() - wall_start
         return not self.failed
 
@@ -1516,6 +1654,9 @@ class Runner:
         # channel. The step tag identifies which outer node launched a nested scheduler; the
         # DAGRUN_STEP nonce remains dedicated to process-tree ownership and teardown.
         env[OUTER_RUN_ENV] = step.tag
+        env.pop(ARTIFACT_READY_DIR_ENV, None)
+        if self.artifact_dir is not None:
+            env[ARTIFACT_READY_DIR_ENV] = self.artifact_dir
         nonce = mint_step_nonce()
         env[STEP_NONCE_ENV] = nonce
         cpu_count = effective_cpu_count(step, self.cfg.default_step_cpu_count)
@@ -2136,9 +2277,36 @@ class Runner:
                     cpu_timeout_platform=self.cfg.cpu_timeout_platform,
                     detail_write_failure=(),
                 )
+            # Artifact-ready contract, judged at producer exit with a
+            # final filesystem scan (the poll may not have swept since
+            # the signal).
+            missing_signal_failure = False
+            if step.publishes and not was_aborted:
+                found = self._signalled_artifacts(step)
+                for name in found:
+                    self.artifact_signalled.add((step.tag, name))
+                if outcome.ok:
+                    missing = [
+                        a.name for a in step.publishes if a.name not in found
+                    ]
+                    if missing:
+                        outcome = replace(
+                            outcome,
+                            ok=False,
+                            reason=(
+                                f"ARTIFACT NOT SIGNALLED: step {step.tag} exited 0 "
+                                "without signalling declared artifact(s): "
+                                + ", ".join(missing)
+                            ),
+                        )
+                        missing_signal_failure = True
             self.done[step.tag] = outcome
             self.running.discard(step.tag)
-            if not was_aborted and not ok:
+            if not was_aborted and not outcome.ok and step.publishes:
+                # A failed producer invalidates everything released on
+                # its signal, even under keep_going.
+                self._cancel_artifact_dependents(step.tag)
+            if not was_aborted and (not ok or missing_signal_failure):
                 # A REAL failure. The run is failed either way; what differs is COVERAGE.
                 #
                 # EAGER-EXIT (default): stop launching NEW steps AND reap every step still running
@@ -2219,7 +2387,7 @@ class Runner:
             counts = sink.counts()
             fields = [
                 ("step", step.tag),
-                ("ok", ok),
+                ("ok", outcome.ok),
                 ("aborted", str(outcome.aborted).lower()),
                 ("timed_out", str(timed_out).lower()),
                 ("cpu_timed_out", str(cpu_timed_out).lower()),

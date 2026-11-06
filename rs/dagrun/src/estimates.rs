@@ -2883,6 +2883,8 @@ mod tests {
             write_domain_guarantee: None,
             explains: Vec::new(),
             fail_fast_family: None,
+            publishes: Vec::new(),
+            artifact_deps: Vec::new(),
         }
     }
 
@@ -4060,6 +4062,8 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,8,5.0,0,True,False,0,1000
             write_domain_guarantee: None,
             explains: Vec::new(),
             fail_fast_family: None,
+            publishes: Vec::new(),
+            artifact_deps: Vec::new(),
         };
         let cfg = DagConfig {
             steps: vec![mk("m", "prep", &[], 2.0), heavy],

@@ -778,6 +778,8 @@ mod tests {
             write_domain_guarantee: None,
             explains: Vec::new(),
             fail_fast_family: None,
+            publishes: Vec::new(),
+            artifact_deps: Vec::new(),
         }
     }
 
@@ -966,6 +968,8 @@ mod tests {
             write_domain_guarantee: None,
             explains: Vec::new(),
             fail_fast_family: None,
+            publishes: Vec::new(),
+            artifact_deps: Vec::new(),
         };
         assert_eq!(step_mem_cap_bytes(&s, 1.25, None), Some(9 * GIB));
     }
@@ -1005,6 +1009,8 @@ mod tests {
             write_domain_guarantee: None,
             explains: Vec::new(),
             fail_fast_family: None,
+            publishes: Vec::new(),
+            artifact_deps: Vec::new(),
         };
         assert_eq!(step_mem_cap_for_inner_jobs(&step, Some(8), 1.0), 3 * GIB);
         assert_eq!(step_mem_cap_for_inner_jobs(&step, Some(4), 1.0), 3 * GIB);

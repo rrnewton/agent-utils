@@ -420,6 +420,35 @@ impl From<DagManifest> for ResultManifest {
     }
 }
 
+/// Environment variable naming the per-run artifact-ready signal directory.
+///
+/// The runner creates one directory per run, passes it to every step, and a
+/// producer signals readiness by atomically renaming
+/// `<dir>/<step-tag>/<name>.tmp` to `<dir>/<step-tag>/<name>`. Following the
+/// `DAGRUN_TEST_COUNTS_PATH` precedent: runner-owned, never inherited.
+pub const ARTIFACT_READY_DIR_ENV: &str = "DAGRUN_ARTIFACT_READY_DIR";
+
+/// One named artifact a step publishes mid-run via the artifact-ready signal.
+///
+/// `path` is advisory documentation for reviewers and tooling; the signal,
+/// not filesystem polling of `path`, is the release condition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedArtifact {
+    /// Artifact name, unique within the producing step.
+    pub name: String,
+    /// Advisory filesystem path of the artifact, when declared.
+    pub path: Option<String>,
+}
+
+/// One artifact dependency: release the consumer when `step` signals `artifact`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactDep {
+    /// Tag (`"group.job"`) of the producing step.
+    pub step: String,
+    /// Artifact name the producer declares in its `publishes`.
+    pub artifact: String,
+}
+
 /// One node in the DAG: a shell command plus its dependencies and resource hint.
 #[derive(Debug, Clone)]
 pub struct Step {
@@ -516,6 +545,17 @@ pub struct Step {
     /// existing global eager-exit behavior so an existing graph cannot silently become a
     /// keep-going run merely because the runner learned this field.
     pub fail_fast_family: Option<String>,
+    /// Named artifacts this step publishes mid-run via the artifact-ready signal.
+    ///
+    /// Empty preserves completion-only dependencies exactly. A step that
+    /// declares an artifact and exits 0 without signalling it has violated
+    /// its contract: the step fails and the run fails (fail closed).
+    pub publishes: Vec<PublishedArtifact>,
+    /// Artifact dependencies releasing this step before the producer exits.
+    ///
+    /// Every entry must hold in addition to `deps`; listing a step in both
+    /// keeps the exit requirement for that edge.
+    pub artifact_deps: Vec<ArtifactDep>,
 }
 
 impl Step {
@@ -1675,7 +1715,10 @@ pub fn graph_structure_violations(cfg: &DagConfig) -> Vec<String> {
             colour.insert(tag, Colour::Grey);
             path.push(tag);
             stack.push((tag, true));
-            let deps: BTreeSet<&str> = by_tag[tag].deps.iter().map(|s| s.as_str()).collect();
+            // Mixed edges: completion deps plus artifact producers. A cycle
+            // through either kind can never be satisfied, so both are walked.
+            let mut deps: BTreeSet<&str> = by_tag[tag].deps.iter().map(|s| s.as_str()).collect();
+            deps.extend(by_tag[tag].artifact_deps.iter().map(|d| d.step.as_str()));
             for dep in deps {
                 if by_tag.contains_key(dep) && colour.get(dep) != Some(&Colour::Black) {
                     stack.push((dep, false));
@@ -1704,6 +1747,62 @@ pub fn graph_structure_violations(cfg: &DagConfig) -> Vec<String> {
     for step in &cfg.steps {
         if let Err(error) = step.structured_test_results_manifest() {
             bad.push(error);
+        }
+    }
+
+    // Artifact-ready declarations. Every artifact dependency must name a
+    // step that exists and an artifact that step declares it publishes;
+    // anything else can never be signalled, so the dependent would wait
+    // forever. Duplicate or unusable publish names are refused for the
+    // same reason: the signal file `<dir>/<step>/<name>` must name exactly
+    // one declared artifact.
+    for step in &cfg.steps {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for artifact in &step.publishes {
+            if artifact.name.is_empty()
+                || artifact.name.contains('/')
+                || artifact.name.contains('\\')
+                || artifact.name == "."
+                || artifact.name == ".."
+            {
+                bad.push(format!(
+                    "step {}: artifact name '{}' is invalid (must be non-empty and contain no path separator)",
+                    step.tag(),
+                    artifact.name
+                ));
+            }
+            if !seen.insert(artifact.name.as_str()) {
+                bad.push(format!(
+                    "step {}: publishes artifact '{}' more than once",
+                    step.tag(),
+                    artifact.name
+                ));
+            }
+        }
+    }
+    for step in &cfg.steps {
+        for dep in &step.artifact_deps {
+            match by_tag.get(dep.step.as_str()) {
+                None => bad.push(format!(
+                    "step {}: artifact dependency names step '{}', which no step declares",
+                    step.tag(),
+                    dep.step
+                )),
+                Some(producer) => {
+                    if !producer
+                        .publishes
+                        .iter()
+                        .any(|artifact| artifact.name == dep.artifact)
+                    {
+                        bad.push(format!(
+                            "step {}: artifact dependency names artifact '{}' of step '{}', which that step does not publish",
+                            step.tag(),
+                            dep.artifact,
+                            dep.step
+                        ));
+                    }
+                }
+            }
         }
     }
     bad
@@ -2082,6 +2181,8 @@ mod tests {
             write_domain_guarantee: None,
             explains: Vec::new(),
             fail_fast_family: None,
+            publishes: Vec::new(),
+            artifact_deps: Vec::new(),
         };
         assert_eq!(step_classification(&step), StepClass::LatencyBound);
     }
@@ -2114,6 +2215,8 @@ mod tests {
             write_domain_guarantee: None,
             explains: Vec::new(),
             fail_fast_family: None,
+            publishes: Vec::new(),
+            artifact_deps: Vec::new(),
         }
     }
 
@@ -2589,6 +2692,8 @@ mod cpu_timeout_multiplier_tests {
             write_domain_guarantee: None,
             explains: Vec::new(),
             fail_fast_family: None,
+            publishes: Vec::new(),
+            artifact_deps: Vec::new(),
         }
     }
 
@@ -2766,6 +2871,8 @@ mod carry_tests {
             write_domain_guarantee: None,
             explains: Vec::new(),
             fail_fast_family: None,
+            publishes: Vec::new(),
+            artifact_deps: Vec::new(),
         }
     }
 
