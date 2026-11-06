@@ -1509,6 +1509,12 @@ Cross-user process evidence uses passwordless `sudo -n` with fixed root-owned `f
 binaries and refuses if that read-only census is unavailable or incomplete. Use `--format json` when
 another tool needs the typed per-row outcome.
 
+Root-owned build output inside a slot (left by builds run in a root-isolation box) does not block
+removal: before deleting the checkouts, `wrkslots remove` deletes each entry not owned by the
+invoking user with one `sudo -n rm -rf` scoped to the fenced slot directory. Every candidate is
+checked, after resolving its parent, to lie under that directory; anything outside is refused, a
+symlink is deleted as the link itself and never followed, and each deleted path is logged.
+
 ## Relocate a moved source repository
 
 A checkout's recorded repository path is its Git evidence. When the source repository moves, for

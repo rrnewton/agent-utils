@@ -58625,6 +58625,49 @@ def test_prefetch_bundles_an_unlisted_submodule_before_the_lock(
     assert not tree.exists()
 
 
+def test_privileged_delete_of_root_owned_entries_stays_inside_the_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#911 (a): root-owned entries are deleted scoped to the slot; links are not followed."""
+    slot = tmp_path / "slot01"
+    artefact = slot / "product" / "target" / "debug" / "incremental" / "blob.o"
+    artefact.parent.mkdir(parents=True)
+    artefact.write_bytes(b"root owned\n")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep me\n", encoding="utf-8")
+    link = slot / "product" / "escape"
+    link.symlink_to(outside)
+    calls: list[list[Path]] = []
+
+    def fake_scan(_root: Path) -> list[Path]:
+        return [artefact]
+
+    def fake_delete(paths: object) -> None:
+        selected = list(paths)  # type: ignore[arg-type]
+        calls.append(selected)
+        for path in selected:
+            path.unlink()
+
+    monkeypatch.setattr(wrkslots, "_root_owned_entries", fake_scan)
+    monkeypatch.setattr(wrkslots, "_run_privileged_delete", fake_delete)
+    deleted = wrkslots._delete_root_owned_within_slot(slot)
+    assert deleted == [artefact]
+    assert calls == [[artefact]]
+    assert not artefact.exists()
+    assert outside.read_text(encoding="utf-8") == "keep me\n"
+    assert link.is_symlink()
+    assert "deleted root-owned entry" in capsys.readouterr().err
+
+    def outside_scan(_root: Path) -> list[Path]:
+        return [outside]
+
+    monkeypatch.setattr(wrkslots, "_root_owned_entries", outside_scan)
+    with pytest.raises(wrkslots.Refusal, match="outside the slot"):
+        wrkslots._delete_root_owned_within_slot(slot)
+    assert outside.exists()
+    assert calls == [[artefact]]
+
+
 def test_archive_drifted_checkouts_refuses_an_unlisted_submodule_for_a_live_owner(
     tmp_path: Path,
 ) -> None:

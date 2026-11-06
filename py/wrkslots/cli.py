@@ -38474,6 +38474,85 @@ def _repair_registration_at_slot(
     return path
 
 
+def _root_owned_entries(root: Path) -> list[Path]:
+    """Topmost entries under ``root`` not owned by this user (#911).
+
+    Symlinks are judged by their own link, never followed: a link inside
+    the slot that points outside it is at most the link that is deleted,
+    never its target.
+    """
+
+    entries: list[Path] = []
+    for current, directories, files in os.walk(root, followlinks=False):
+        kept: list[str] = []
+        for name in directories:
+            entry = Path(current) / name
+            try:
+                owned = entry.lstat().st_uid == os.geteuid()
+            except OSError:
+                owned = True
+            if owned:
+                kept.append(name)
+            else:
+                entries.append(entry)
+        directories[:] = kept
+        for name in files:
+            entry = Path(current) / name
+            try:
+                if entry.lstat().st_uid != os.geteuid():
+                    entries.append(entry)
+            except OSError:
+                continue
+    return entries
+
+
+def _run_privileged_delete(paths: Sequence[Path]) -> None:
+    """Delete ``paths`` as root through one scoped ``sudo -n`` command."""
+
+    executable = Path("/usr/bin/rm")
+    if not executable.is_file():
+        executable = Path("/bin/rm")
+    returncode, _stdout, stderr = _run_root_owned_command(
+        executable, ["-rf", "--", *(str(path) for path in paths)]
+    )
+    if returncode != 0:
+        raise Refusal(
+            "privileged delete of root-owned slot entries failed: "
+            + stderr.decode("utf-8", errors="replace").strip()
+        )
+
+
+def _delete_root_owned_within_slot(slot_root: Path) -> list[Path]:
+    """Privileged-delete root-owned entries inside one slot (#911, design (a)).
+
+    Every candidate is checked, after resolving its parent, to lie under
+    the slot's own resolved directory; anything outside is refused before
+    any deletion runs, and a symlink is passed as the link itself so its
+    target is never followed. Each deleted path is logged.
+    """
+
+    entries = _root_owned_entries(slot_root)
+    if not entries:
+        return []
+    resolved_root = slot_root.resolve()
+    for entry in entries:
+        resolved_parent = entry.parent.resolve()
+        if resolved_parent != resolved_root and resolved_root not in resolved_parent.parents:
+            raise Refusal(
+                f"root-owned entry {entry} is outside the slot directory "
+                f"{slot_root}; refusing a privileged delete outside the slot"
+            )
+    _run_privileged_delete(entries)
+    for entry in entries:
+        if os.path.lexists(entry):
+            raise Refusal(f"privileged delete left root-owned entry in place: {entry}")
+        print(
+            f"wrkslots: deleted root-owned entry {entry} with sudo -n rm",
+            file=sys.stderr,
+        )
+    return entries
+
+
 def _remove_fenced_directory(config: Config, fenced_slot: Path) -> None:
     if fenced_slot.exists():
         image = _slot_image_at(config, fenced_slot)
@@ -40379,6 +40458,11 @@ def _finish_remove_paths(
                             "run 'wrkslots recover'"
                         ) from rollback
                 raise
+    if remaining:
+        # Root-owned build output inside the slot (left by a root-isolation
+        # box) cannot be deleted by this user; delete it, scoped to this
+        # fenced slot, before Git tries to remove the checkouts (#911).
+        _delete_root_owned_within_slot(fenced_slot)
     for checkout in remaining:
         if private_fence_identity is not None and (
             _private_cleanup_fence_identity(config, fenced_slot)
