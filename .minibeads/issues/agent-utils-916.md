@@ -26,4 +26,4 @@ updated_at: 2026-11-06T01:31:20.342697754+00:00
 
 # Notes
 
-Requested by the lead on 2026-11-05 at 9:02 PM ET (P1), from a consumer team. Assigned to cl-sync, after #915.
+Requested by the lead on 2026-11-05 at 9:02 PM ET (P1), from a consumer team. Assigned to cl-sync, after #915 and #918.
