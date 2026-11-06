@@ -117,6 +117,7 @@ export {
   createOnScreenKeyboard,
   focusAtEnd,
   isComposer,
+  mountQuickReplyListeners,
   watchBoxInsertions as watchInsertions,
   wireNewlineKey,
 } from "../view/composer/index.ts";

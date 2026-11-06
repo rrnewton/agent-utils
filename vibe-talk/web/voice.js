@@ -30730,63 +30730,39 @@ mountKeyListeners({
 });
 // `#280 scroll-stability`. The mouse leaving the window drops the wait before a glide between the columns.
 document.documentElement.addEventListener("pointerleave", onPointerLeavePage);
-// `#267 quote-reply`. Words selected in one message make its Reply a Quote reply.
-document.addEventListener("selectionchange", noteQuoteSelection);
-// `#726 vt-selection-chip`. Pressed without taking the selection or the focus from the words it quotes.
-leftEl("selection-chip").addEventListener("mousedown", (event) => event.preventDefault());
-leftEl("selection-chip").addEventListener("click", pressSelectionChip);
-// `#819 voice-page-quoted-reply-and-draft-chip`. Its twin in the paused read's strip, pressed the same way.
-leftEl("read-steer-quote").addEventListener("mousedown", (event) => event.preventDefault());
-leftEl("read-steer-quote").addEventListener("click", pressSelectionChip);
-// `#727 vt-selection-quick-reply`. The floating box: its keys, Send and Cancel, a tap outside (which puts
-// what was written back under its message: `putDownQuickReply`), and the list the reader moves letting it go.
-el("quick-reply-send").addEventListener("click", () => guardQuietly(sendQuickReply)());
-el("quick-reply-cancel").addEventListener("click", () => cancelQuickReply());
-el("quick-reply-discard-yes").addEventListener("click", () => answerQuickReplyDiscard(true));
-// `#846 draft-chip-honest`. Esc on the question is Esc on the box: it closes, its words kept, and goes no further.
-for (const id of ["quick-reply-discard-yes", "quick-reply-discard-no"]) {
-  el(id).addEventListener("keydown", (event) => {
-    if (!event || event.key !== "Escape" || event.isComposing) return;
-    swallow(event);
-    if (typeof event.stopPropagation === "function") event.stopPropagation();
-    closeQuickReply();
-  });
-}
-el("quick-reply-discard-no").addEventListener("click", () => answerQuickReplyDiscard(false));
-el("quick-reply-text").addEventListener("keydown", (event) => {
-  if (event && event.key === "Escape") {
-    event.preventDefault();
-    event.stopPropagation();
-    closeQuickReply();
-    return undefined;
-  }
-  return onComposerKey(event, guardQuietly(sendQuickReply), el("quick-reply-text"));
+// The quoted words' and the quick-reply box's listeners: words selected in one message make its Reply a Quote reply
+// (`#267 quote-reply`); the selection chip and its twin in the paused read's strip, pressed without taking the
+// selection or the focus from the words they quote (`#726 vt-selection-chip`, `#819
+// voice-page-quoted-reply-and-draft-chip`); the floating box (`#727 vt-selection-quick-reply`): its keys, Send and
+// Cancel and its question (`#846 draft-chip-honest`), its microphone (`#829 voice-page-dictation-polish`), the Draft
+// chip and React (`#821 voice-page-read-aloud-react`), a tap outside (which puts what was written back under its
+// message: `putDownQuickReply`), and the lists and the window that move it. One owner in
+// web/src/view/composer/quickreply.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its
+// `unmount` waits for the ordered boot's teardown.
+mountQuickReplyListeners({
+  byId: (id) => el(id),
+  leftById: (id) => leftEl(id),
+  noteQuoteSelection: () => noteQuoteSelection(),
+  pressSelectionChip: () => pressSelectionChip(),
+  sendQuickReply: () => guardQuietly(sendQuickReply)(),
+  cancelQuickReply: () => cancelQuickReply(),
+  answerQuickReplyDiscard: (discard) => answerQuickReplyDiscard(discard),
+  closeQuickReply: () => closeQuickReply(),
+  onBoxKey: (event) => onComposerKey(event, guardQuietly(sendQuickReply), el("quick-reply-text")),
+  watchBoxInsertions: (box) => watchBoxInsertions(box),
+  noteQuickReplyInput: () => quoteOwner.noteQuickReplyInput(),
+  showKeyboard: () => dictation.showKeyboard(),
+  stopDictation: () => dictation.stop(),
+  pressDraftChip: () => guardQuietly(pressDraftChip)(),
+  reactToHeldSentence: () => readAloudOwner().reactToHeldSentence(),
+  quickReplyOpen: () => quoteOwner.quickReplyOpen(),
+  putDownQuickReply: () => putDownQuickReply(),
+  quickReplyListMoved: (target) => quickReplyListMoved(target),
+  visualViewport: () => window.visualViewport || null,
+  placeQuickReply: () => placeQuickReply(),
+  selectionHeld: () => Boolean(quoteOwner.held()),
+  placeSelectionChip: () => placeSelectionChip(),
 });
-watchBoxInsertions(el("quick-reply-text"));
-// `#819 voice-page-quoted-reply-and-draft-chip`. Kept on the device as it is written, dictation included.
-el("quick-reply-text").addEventListener("input", () => quoteOwner.noteQuickReplyInput());
-// `#829 voice-page-dictation-polish`. A tap in the box while it listens asks for the keyboard back; a tap on
-// the microphone badge stops listening, the focus staying in the box.
-el("quick-reply-text").addEventListener("pointerdown", () => dictation.showKeyboard());
-el("quick-reply-mic").addEventListener("mousedown", (event) => event.preventDefault());
-el("quick-reply-mic").addEventListener("click", () => dictation.stop());
-leftEl("draft-chip").addEventListener("click", () => guardQuietly(pressDraftChip)());
-// `#821 voice-page-read-aloud-react`. React, in the paused read's strip.
-el("read-react").addEventListener("click", () => readAloudOwner().reactToHeldSentence());
-document.addEventListener("pointerdown", (event) => {
-  if (!quoteOwner.quickReplyOpen()) return;
-  const target = /** @type {any} */ (event && event.target);
-  if (target && (nodeWithin(el("quick-reply"), target) || nodeWithin(leftEl("selection-chip"), target) ||
-    nodeWithin(leftEl("read-steer-quote"), target) || nodeWithin(leftEl("draft-chip"), target) ||
-    nodeWithin(leftEl("read-react"), target))) return;
-  putDownQuickReply();
-}, { capture: true });
-document.addEventListener("scroll", (event) => quickReplyListMoved(event && event.target), { capture: true, passive: true });
-if (window.visualViewport && typeof window.visualViewport.addEventListener === "function") {
-  window.visualViewport.addEventListener("resize", () => placeQuickReply());
-}
-// A list scrolled under the selection carries the words, and the chip goes with them.
-document.addEventListener("scroll", () => { if (quoteOwner.held()) placeSelectionChip(); }, { capture: true, passive: true });
 // The page's own listeners at the document and the window: a message's time worded as the pointer or the focus
 // reaches it (`#260 timestamp-hover`) and its day said on a tap or Enter, captured ahead of the row's own press
 // (`#479 message-time-full-date`); and the last moments a phone promises this page before it may reclaim it,

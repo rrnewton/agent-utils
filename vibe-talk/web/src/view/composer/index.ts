@@ -19,3 +19,5 @@ export { KEYBOARD_FIT_PARTS, KEYBOARD_MIN_PX, KEYBOARD_MIN_SHARE, KEYBOARD_SETTL
 export type { OnScreenKeyboard, OnScreenKeyboardDependencies } from "./keyboard.ts";
 export { DICTATION_LISTENING, DICTATION_UNAVAILABLE, createDictation } from "./dictation.ts";
 export type { Dictation, DictationDependencies, Recognition, RecognitionResultEvent } from "./dictation.ts";
+export { mountQuickReplyListeners } from "./quickreply.ts";
+export type { QuickReplyListeners, QuickReplyListenersDependencies } from "./quickreply.ts";

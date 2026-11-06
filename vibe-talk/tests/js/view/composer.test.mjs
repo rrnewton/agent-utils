@@ -238,3 +238,107 @@ test("`#829 voice-page-dictation-polish`: the keyboard stays down while dictatio
   assert.equal(refused.start(), false);
   assert.equal(mode(), null, "a start that failed left the keyboard down");
 });
+
+test("`#624 voice-page-modularity`: the quoted words' and the quick-reply box's listeners mount in the page's order, reach what each names, and come down again", () => {
+  const { mountQuickReplyListeners } = VIEW_COMPOSER;
+  const log = [];
+  const nodes = {};
+  const target = (name, parentNode = null) => (nodes[name] ||= { name, parentNode, listeners: [],
+    addEventListener(type, listener, options) {
+      this.listeners.push({ type, listener, options });
+      log.push(`listen ${name} ${type}${options && options.capture ? " capture" : ""}${options && options.passive ? " passive" : ""}`);
+    },
+    removeEventListener(type, listener, options) {
+      this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener ||
+        Boolean(one.options && one.options.capture) !== Boolean(options && options.capture));
+    } });
+  const fire = (name, type, event = {}) => nodes[name].listeners.filter((one) => one.type === type).map((one) => one.listener(event));
+  const doc = target("document");
+  const viewport = target("viewport");
+  const event = (fields = {}) => ({ ...fields, preventDefault() { log.push(`prevent ${fields.key || fields.n}`); },
+    stopPropagation() { log.push(`stop ${fields.key || fields.n}`); } });
+  let open = true;
+  let held = false;
+  const was = globalThis.document;
+  globalThis.document = doc;
+  try {
+    const mounted = mountQuickReplyListeners({
+      byId: (id) => target(id),
+      // The left column's own elements, kept apart from the page's: two columns can hold two of a name.
+      leftById: (id) => target(`left:${id}`),
+      noteQuoteSelection: (...args) => log.push(`note selection ${args.length}`),
+      pressSelectionChip: (...args) => log.push(`chip ${args.length}`),
+      sendQuickReply: (...args) => { log.push(`send ${args.length}`); return "sent"; },
+      cancelQuickReply: () => log.push("cancel"),
+      answerQuickReplyDiscard: (discard) => log.push(`discard ${discard}`),
+      closeQuickReply: () => log.push("close"),
+      onBoxKey: (key) => { log.push(`box key ${key.key}`); return "composer"; },
+      watchBoxInsertions: (box) => log.push(`watch ${box.name}`),
+      noteQuickReplyInput: () => log.push("input"),
+      showKeyboard: () => log.push("keyboard"),
+      stopDictation: () => log.push("stop dictation"),
+      pressDraftChip: () => log.push("draft chip"),
+      reactToHeldSentence: () => log.push("react"),
+      quickReplyOpen: () => open,
+      putDownQuickReply: () => log.push("put down"),
+      quickReplyListMoved: (moved) => log.push(`list moved ${moved}`),
+      visualViewport: () => viewport,
+      placeQuickReply: () => log.push("place box"),
+      selectionHeld: () => held,
+      placeSelectionChip: () => log.push("place chip"),
+    });
+    assert.deepStrictEqual(log, ["listen document selectionchange",
+      "listen left:selection-chip mousedown", "listen left:selection-chip click", "listen left:read-steer-quote mousedown", "listen left:read-steer-quote click",
+      "listen quick-reply-send click", "listen quick-reply-cancel click", "listen quick-reply-discard-yes click",
+      "listen quick-reply-discard-yes keydown", "listen quick-reply-discard-no keydown", "listen quick-reply-discard-no click",
+      "listen quick-reply-text keydown", "watch quick-reply-text", "listen quick-reply-text input", "listen quick-reply-text pointerdown",
+      "listen quick-reply-mic mousedown", "listen quick-reply-mic click", "listen left:draft-chip click", "listen read-react click",
+      "listen document pointerdown capture", "listen document scroll capture passive", "listen viewport resize",
+      "listen document scroll capture passive"], "a listener was added out of the page's order");
+    log.length = 0;
+    fire("document", "selectionchange", event({ n: 1 }));
+    fire("left:selection-chip", "mousedown", event({ n: 2 }));
+    fire("left:read-steer-quote", "click", event({ n: 3 }));
+    fire("quick-reply-send", "click", event({ n: 4 }));
+    fire("quick-reply-cancel", "click");
+    fire("quick-reply-discard-yes", "click");
+    fire("quick-reply-discard-no", "click");
+    // Esc on the question closes the box and goes no further; another key, or Esc mid-composition, is not its.
+    fire("quick-reply-discard-no", "keydown", event({ key: "Escape" }));
+    fire("quick-reply-discard-yes", "keydown", event({ key: "Enter" }));
+    fire("quick-reply-discard-yes", "keydown", event({ key: "Escape", isComposing: true }));
+    assert.deepStrictEqual(fire("quick-reply-text", "keydown", event({ key: "Escape" })), [undefined]);
+    assert.deepStrictEqual(fire("quick-reply-text", "keydown", event({ key: "Enter" })), ["composer"], "the box's key did not answer what the message boxes' keys answer");
+    fire("quick-reply-text", "input");
+    fire("quick-reply-text", "pointerdown");
+    fire("quick-reply-mic", "mousedown", event({ n: 5 }));
+    fire("quick-reply-mic", "click");
+    fire("left:draft-chip", "click");
+    fire("read-react", "click");
+    assert.deepStrictEqual(log, ["note selection 0", "prevent 2", "chip 0", "send 0", "cancel", "discard true", "discard false",
+      "prevent Escape", "stop Escape", "close", "prevent Escape", "stop Escape", "close", "box key Enter", "input", "keyboard",
+      "prevent 5", "stop dictation", "draft chip", "react"]);
+    log.length = 0;
+    // A tap outside puts the box down; one inside it or on any chip that opens it does not, nor any tap while it is
+    // shut. The chips are the left column's, React's included, though its press is heard on the page's own.
+    const inside = target("send-label", target("quick-reply"));
+    fire("document", "pointerdown", { target: inside });
+    for (const chip of ["selection-chip", "read-steer-quote", "draft-chip", "read-react"]) {
+      fire("document", "pointerdown", { target: target(`${chip}-label`, target(`left:${chip}`)) });
+    }
+    assert.deepStrictEqual(log, [], "a tap in the box or on a chip put it down");
+    fire("document", "pointerdown", { target: nodes["read-react"] });
+    fire("document", "pointerdown", { target: target("elsewhere") });
+    open = false;
+    fire("document", "pointerdown", { target: target("elsewhere") });
+    fire("document", "scroll", { target: "channel" });
+    fire("viewport", "resize");
+    held = true;
+    fire("document", "scroll", { target: "side" });
+    assert.deepStrictEqual(log, ["put down", "put down", "list moved channel", "place box", "list moved side", "place chip"]);
+    mounted.unmount();
+    assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+  } finally {
+    globalThis.document = was;
+  }
+});
