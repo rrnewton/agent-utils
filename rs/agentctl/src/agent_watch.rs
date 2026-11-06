@@ -5895,7 +5895,11 @@ mod tests {
         assert!(bytes1 > bytes0, "the changed write is counted in bytes");
         write_json_file(&path, &json!({"agents": {}})).expect("changed write");
         let (_, rewritten2, skipped2) = write_counts();
-        assert_eq!(rewritten2, rewritten1 + 1, "a real change rewrites exactly once");
+        assert_eq!(
+            rewritten2,
+            rewritten1 + 1,
+            "a real change rewrites exactly once"
+        );
         assert_eq!(skipped2, skipped1, "a real change is not a skip");
         fs::remove_dir_all(&directory).expect("cleanup");
     }

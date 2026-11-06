@@ -4036,9 +4036,8 @@ fn lock_current_file(
                     .and_then(|modified| SystemTime::now().duration_since(modified).ok())
                     .is_some_and(|age| age < TARGET_LOCK_MTIME_REFRESH);
                 if !fresh {
-                    file.set_modified(SystemTime::now()).map_err(|error| {
-                        io_error(&format!("mark {purpose} used"), path, error)
-                    })?;
+                    file.set_modified(SystemTime::now())
+                        .map_err(|error| io_error(&format!("mark {purpose} used"), path, error))?;
                 }
                 return Ok(file);
             }
