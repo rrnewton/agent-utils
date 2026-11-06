@@ -689,6 +689,21 @@ def test_cross_cutting_python_contracts_follow_every_observed_input() -> None:
         "python.repository-infrastructure.cross-environment": (
             "test_cross_env_is_hermetic.py"
         ),
+        "python.repository-infrastructure.cross-environment-b": (
+            "test_cross_env_is_hermetic.py"
+        ),
+        "python.repository-infrastructure.cross-environment-c": (
+            "test_cross_env_is_hermetic.py"
+        ),
+        "python.repository-infrastructure.cross-environment-d": (
+            "test_cross_env_is_hermetic.py"
+        ),
+        "python.repository-infrastructure.cross-environment-e": (
+            "test_cross_env_is_hermetic.py"
+        ),
+        "python.repository-infrastructure.cross-environment-f": (
+            "test_cross_env_is_hermetic.py"
+        ),
         "python.repository-infrastructure.cross-skip-accounting": (
             "test_cross_skip_accounting.py"
         ),
@@ -723,6 +738,11 @@ def test_cross_cutting_python_contracts_follow_every_observed_input() -> None:
     cross_harness = _selected_tags_for_paths(["cross/agentctl_differential.py"])
     assert {
         "python.repository-infrastructure.cross-environment",
+        "python.repository-infrastructure.cross-environment-b",
+        "python.repository-infrastructure.cross-environment-c",
+        "python.repository-infrastructure.cross-environment-d",
+        "python.repository-infrastructure.cross-environment-e",
+        "python.repository-infrastructure.cross-environment-f",
         "python.repository-infrastructure.validation-graph",
     } <= cross_harness
     assert "python.repository-infrastructure.cross-skip-accounting" in _selected_tags_for_paths(
