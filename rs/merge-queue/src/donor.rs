@@ -1342,9 +1342,12 @@ impl Store {
     /// base): it can never land as published, so offering it again only burns a donor's
     /// setup time on a stale-base refusal. A stale job is not a donor failure: no
     /// could-not-run strike is recorded. `contains(commit)` answers whether that candidate
-    /// contains `base`. With `keep_stale_roots`, a rooted job is exempt however stale:
-    /// its run still wants the verdict (green requeues the batch, red decides it), so
-    /// only genuinely stale non-root jobs are cancelled. Returns the cancelled ids.
+    /// contains `base`. With `keep_stale_roots`, a rooted job a donor already holds is
+    /// exempt however stale: its run still wants the verdict (green requeues the batch,
+    /// red decides it). A queued rooted job is swept like any other: no donor has paid
+    /// for it, and dispatched on the old base it is refused by a validator that insists
+    /// on a fresh base and could not land as built anyway (#915
+    /// merge-queue-keep-running-roots-only). Returns the cancelled ids.
     pub fn sweep_stale(
         &self,
         base: &str,
@@ -1359,7 +1362,7 @@ impl Store {
             .jobs()?
             .into_iter()
             .filter(|job| matches!(job.state, JobState::Queued | JobState::Leased))
-            .filter(|job| !(keep_stale_roots && job.rooted))
+            .filter(|job| !(keep_stale_roots && job.rooted && job.state == JobState::Leased))
             .filter(|job| !contains(&job.commit))
             .map(|job| job.id)
             .collect();
@@ -3221,32 +3224,35 @@ mod unit {
     }
 
     #[test]
-    fn the_sweep_keeps_rooted_jobs_only_under_keep_stale_roots() {
-        // Queued and leased roots alike survive while the flag is on; a
-        // non-root stale job is still swept, and with the flag off a root
-        // is swept like anything else.
+    fn the_sweep_keeps_only_leased_rooted_jobs_under_keep_stale_roots() {
+        // #915 merge-queue-keep-running-roots-only. A rooted job a donor holds
+        // survives while the flag is on: its validation is paid for and its
+        // verdict still decides the batch. A queued rooted job is swept like a
+        // non-root stale job: no donor has started it, and on the old base it
+        // cannot land as built. With the flag off a root is swept like anything
+        // else.
         let store = Store::new(&temp("stale-sweep-roots"));
-        let queued_root = publish_rooted(&store, "c1", true);
-        let leased_root = publish_rooted(&store, "c2", true);
+        let leased_root = publish_rooted(&store, "c1", true);
+        let queued_root = publish_rooted(&store, "c2", true);
         let plain = publish(&store, "c3");
         let claimed = store.claim("d1", "h1", 1).unwrap().expect("oldest job");
-        assert_eq!(claimed.id, queued_root.id);
-        // Lease the second root too, so both root states are covered.
-        let claimed = store.claim("d2", "h1", 1).unwrap().expect("next job");
         assert_eq!(claimed.id, leased_root.id);
         let cancelled = store
             .sweep_stale("base99", &|commit| commit == "fresh", true)
             .unwrap();
-        assert_eq!(cancelled, vec![plain.id.clone()]);
-        assert_eq!(store.read(&queued_root.id).unwrap().state, JobState::Leased);
+        assert_eq!(cancelled, vec![queued_root.id.clone(), plain.id.clone()]);
         assert_eq!(store.read(&leased_root.id).unwrap().state, JobState::Leased);
-        assert_eq!(store.read(&plain.id).unwrap().state, JobState::Cancelled);
+        for swept in [&queued_root, &plain] {
+            let job = store.read(&swept.id).unwrap();
+            assert_eq!(job.state, JobState::Cancelled);
+            assert!(job.could_not_run.is_empty(), "stale is not a donor failure");
+        }
         let cancelled = store
             .sweep_stale("base99", &|commit| commit == "fresh", false)
             .unwrap();
-        assert_eq!(cancelled.len(), 2, "{cancelled:?}");
+        assert_eq!(cancelled, vec![leased_root.id.clone()]);
         assert_eq!(
-            store.read(&queued_root.id).unwrap().state,
+            store.read(&leased_root.id).unwrap().state,
             JobState::Cancelled
         );
     }

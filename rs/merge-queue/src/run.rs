@@ -3787,10 +3787,22 @@ impl<'a> Runner<'a> {
         pending: &mut VecDeque<Vec<i64>>,
         why: &str,
     ) {
+        self.cancel_rooted_where(flights, rx, pending, why, &|_| true);
+    }
+
+    /// [`Runner::cancel_rooted`] for the rooted flights `which` picks; the rest stay.
+    fn cancel_rooted_where(
+        &self,
+        flights: &mut VecDeque<Flight>,
+        rx: &mpsc::Receiver<(u64, JobResult)>,
+        pending: &mut VecDeque<Vec<i64>>,
+        why: &str,
+        which: &dyn Fn(&Flight) -> bool,
+    ) {
         let mut kept: VecDeque<Flight> = VecDeque::new();
         let mut cancelled: Vec<Flight> = Vec::new();
         while let Some(flight) = flights.pop_front() {
-            if flight.rooted {
+            if flight.rooted && which(&flight) {
                 cancelled.push(flight);
             } else {
                 kept.push_back(flight);
@@ -3847,13 +3859,28 @@ impl<'a> Runner<'a> {
         rx: &mpsc::Receiver<(u64, JobResult)>,
         pending: &mut VecDeque<Vec<i64>>,
     ) {
-        // Kept stale roots finish and are decided (green: requeued at the
-        // front for a rebuild; red: decided as usual) instead of being
-        // cancelled the moment the base moves.
+        let base = lock(&self.base).clone();
+        // Kept stale roots that a donor is already running finish and are
+        // decided (green: requeued at the front for a rebuild; red: decided as
+        // usual) instead of being cancelled the moment the base moves. One no
+        // donor has started is cancelled as without the flag, with no strike:
+        // dispatched on the old base, a validator that insists on a fresh base
+        // refuses it every time, and even a green could not land as built
+        // (#915 merge-queue-keep-running-roots-only).
         if self.config.keep_stale_roots {
+            if flights.iter().any(|flight| {
+                flight.rooted && flight.candidate.parent != base && self.root_unstarted(flight)
+            }) {
+                self.cancel_rooted_where(
+                    flights,
+                    rx,
+                    pending,
+                    "the base moved from the commit it was built on before any donor started it",
+                    &|flight| flight.candidate.parent != base && self.root_unstarted(flight),
+                );
+            }
             return;
         }
-        let base = lock(&self.base).clone();
         if flights
             .iter()
             .any(|flight| flight.rooted && flight.candidate.parent != base)
@@ -3865,6 +3892,32 @@ impl<'a> Runner<'a> {
                 "the base moved from the commit it was built on",
             );
         }
+    }
+
+    /// Whether no donor has started validating rooted `flight`: its donor job is still
+    /// queued, or not yet published. Validated on this host, or by donors that only
+    /// compare, a flight started when it was dispatched (#915
+    /// merge-queue-keep-running-roots-only).
+    fn root_unstarted(&self, flight: &Flight) -> bool {
+        if flight.result.is_some() {
+            return false;
+        }
+        let Some(donors) = self
+            .donors
+            .as_ref()
+            .filter(|donors| donors.mode == crate::state::Offload::Decide)
+        else {
+            return false;
+        };
+        // Every deciding job published for its candidate, settled or not: one a donor
+        // has leased, or has finished, has started; none published yet has not.
+        let Ok(jobs) = donors.store.jobs() else {
+            return false;
+        };
+        jobs.iter()
+            .filter(|job| job.commit == flight.candidate.tip && !job.compare_only)
+            .filter(|job| job.state != crate::donor::JobState::Cancelled)
+            .all(|job| job.state == crate::donor::JobState::Queued)
     }
 
     /// Promote a rooted flight that has become decidable (every batch it
@@ -5708,6 +5761,9 @@ impl<'a> Runner<'a> {
                                 pending,
                                 &format!("{} landed and moved the base", list(&head_prs)),
                             );
+                        } else if lock(&self.base).as_str() != base_before.as_str() {
+                            // Kept stale roots: only those no donor has started.
+                            self.cancel_stale_rooted(&mut flights, &rx, pending);
                         }
                     }
                 }

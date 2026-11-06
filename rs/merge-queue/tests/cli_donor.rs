@@ -1681,5 +1681,212 @@ fn kept_stale_roots_keep_their_donor_jobs_and_decide_after_a_landing() {
         .iter()
         .find(|item| item["pr"] == 3)
         .expect("change 3 listed");
-    assert!(third["history"].to_string().contains("green at"), "{third}");
+    // Change 3's root either had a donor when the base moved, and was kept: green at the old
+    // base and requeued; or no donor had started it, and its job was cancelled unclaimed and
+    // the change rebuilt (#915 merge-queue-keep-running-roots-only). Which, the donors' timing
+    // decides.
+    let changes = [("tests/a", 1), ("tests/b", 2), ("tests/c", 3)];
+    let all = jobs(&fx);
+    let first_c = all
+        .iter()
+        .filter(|job| change_of(&fx, job, &changes) == Some(3))
+        .min_by_key(|job| job["id"].as_str().unwrap().to_owned())
+        .expect("a job for change 3");
+    if first_c["state"] == "cancelled" {
+        assert_eq!(
+            first_c["attempts"], 0,
+            "a stale root no donor had started was claimed: {first_c}"
+        );
+    } else {
+        assert!(third["history"].to_string().contains("green at"), "{third}");
+    }
+}
+
+/// Which change of `changes` the donor job `job` validates: the one whose test file its
+/// candidate adds to its parent (one change per batch, so earlier landings are in the parent).
+/// None for a job that validates no change's candidate (a rerun on the base itself).
+fn change_of(fx: &Fixture, job: &Value, changes: &[(&str, i64)]) -> Option<i64> {
+    let commit = job["commit"].as_str().unwrap();
+    let added = git(
+        &fx.queue(),
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            &format!("{commit}^"),
+            commit,
+        ],
+    );
+    changes
+        .iter()
+        .find(|(file, _)| added.lines().any(|line| line.trim() == *file))
+        .map(|(_, pr)| *pr)
+}
+
+/// Rewrite donor job `id`'s state as a donor holding (or no longer holding) its lease would.
+fn set_lease(fx: &Fixture, id: &str, held: bool) {
+    let path = job_path(fx, id);
+    let mut job: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    if held {
+        job["state"] = Value::String("leased".to_owned());
+        job["lease"] = serde_json::json!({
+            "donor": "holder", "host": "elsewhere", "token": "held-by-the-test",
+            "claimed_unix": 0, "expires_unix": u64::MAX / 2,
+        });
+    } else {
+        job["state"] = Value::String("queued".to_owned());
+        job["lease"] = Value::Null;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&job).unwrap()).unwrap();
+}
+
+#[test]
+fn kept_stale_roots_keep_only_running_roots_and_rebuild_unstarted_ones_on_the_new_base() {
+    // #915 merge-queue-keep-running-roots-only. Three disjoint roots on one base B0, all
+    // validated by donors. a is quick and lands, moving the base to B1; b is still running on
+    // a donor; c's job is still queued, started by nobody. Under keep_stale_roots, b is kept
+    // and decided (green at B0, requeued at the front and rebuilt), while c's job is cancelled
+    // at the move with no could-not-run strike and its change rebuilt on B1: no donor ever
+    // claims the B0 candidate. Before this, c's job was kept too, and the next donor validated
+    // a tree whose base was no longer main; a validator that insists on a fresh base refused
+    // it every time, holding a donor slot each time.
+    let fx = Fixture::new("donor-kept-running-roots");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    // b's validation takes a while, so it is still running when a lands.
+    let runner = r#"if [ -f tests/b ]; then sleep 8; fi; for t in $(ls tests); do printf '{"id":"%s","outcome":"pass"}\n' "$t" >> "$MQ_RESULTS"; done; exit 0"#;
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        runner,
+        "--offload",
+        "decide",
+    ]);
+    set_config(&fx, |config| {
+        config["depth"] = serde_json::json!(3);
+        config["roots"] = serde_json::json!(3);
+        config["keep_stale_roots"] = serde_json::json!(true);
+        config["max_batch"] = serde_json::json!(1);
+    });
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    let run = spawn_run(&fx, &[]);
+    wait_for("three published root jobs", Duration::from_secs(60), || {
+        jobs(&fx).len() >= 3
+    });
+    let changes = [("tests/a", 1), ("tests/b", 2), ("tests/c", 3)];
+    let first = jobs(&fx);
+    let job_of = |pr: i64| {
+        first
+            .iter()
+            .find(|job| change_of(&fx, job, &changes) == Some(pr))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let (job_a, job_b, job_c) = (job_of(1), job_of(2), job_of(3));
+    // c's job is held out of reach while the two donors take a and b, then given back: queued,
+    // with no lease, as a job no donor has started. Each donor then waits 30 s before asking
+    // for more, long past a's landing.
+    set_lease(&fx, &job_c, true);
+    let clones = [
+        donor_clone(&fx, "donor-host-1"),
+        donor_clone(&fx, "donor-host-2"),
+    ];
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let (code, report, stderr) = std::thread::scope(|scope| {
+        for (n, clone) in clones.iter().enumerate() {
+            let (fx, done) = (&fx, &done);
+            scope.spawn(move || {
+                let name = format!("d{}", n + 1);
+                let clone_text = clone.display().to_string();
+                let route = route(fx);
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = command(
+                        &fx.root,
+                        &[
+                            "donor",
+                            "run",
+                            "--queue",
+                            &route,
+                            "--clone",
+                            &clone_text,
+                            "--name",
+                            &name,
+                            "--poll-secs",
+                            "30",
+                            "--until-idle",
+                        ],
+                        &[],
+                    )
+                    .output();
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            });
+        }
+        wait_for(
+            "both donors running a and b",
+            Duration::from_secs(60),
+            || {
+                let now = jobs(&fx);
+                [&job_a, &job_b].iter().all(|id| {
+                    now.iter()
+                        .any(|job| job["id"] == id.as_str() && job["state"] != "queued")
+                })
+            },
+        );
+        set_lease(&fx, &job_c, false);
+        let outcome = finish(run);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        outcome
+    });
+    assert_eq!(code, Some(0), "{stderr}");
+    for pr in [1, 2, 3] {
+        assert_eq!(item_status(&fx, pr), "landed", "change {pr}: {report}");
+    }
+    let after = jobs(&fx);
+    let record = |id: &str| after.iter().find(|job| job["id"] == id).unwrap().clone();
+    // The unstarted root: cancelled, never claimed by a donor, no strike against anything.
+    let c = record(&job_c);
+    assert_eq!(c["state"], "cancelled", "{c}");
+    assert_eq!(c["attempts"], 0, "a donor claimed the stale candidate: {c}");
+    assert!(
+        c["could_not_run"]
+            .as_array()
+            .is_none_or(|strikes| strikes.is_empty()),
+        "{c}"
+    );
+    // ...and its change rebuilt on the new base: a second job for change 3, another candidate.
+    let rebuilt: Vec<&Value> = after
+        .iter()
+        .filter(|job| job["id"] != job_c.as_str() && change_of(&fx, job, &changes) == Some(3))
+        .collect();
+    assert!(
+        rebuilt.iter().any(|job| job["state"] == "done"),
+        "change 3 was not validated again on the new base: {after:?}"
+    );
+    // The running root: kept through the move, its job done, green at B0 and requeued.
+    assert_eq!(record(&job_b)["state"], "done", "{}", record(&job_b));
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    let second = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["pr"] == 2)
+        .expect("change 2 listed");
+    assert!(
+        second["history"].to_string().contains("green at"),
+        "{second}"
+    );
 }
