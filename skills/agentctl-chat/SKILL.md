@@ -173,6 +173,17 @@ Run the command as printed and look at the file it reports saving, typically
 an image you can read, before you answer. If the download fails, say so in your
 reply rather than guessing what the file showed.
 
+## Bound threads: the owner talking to you directly
+
+The owner can open a Slack thread bound to you with `!@your-name <message>`
+(the bridge's `!who` lists the agents). A request from a bound thread looks
+like any other chat request, except its prompt always gives only the
+`agentctl chat reply` command, with the explicit `--bridge-state` form: the
+bridge does not read your screen or transcript, so printed marker lines
+reach nobody. Reply with that command, once per reply, and confirm with
+`agentctl chat sent`. The bridge told your parent coordinator once that the
+owner is talking to you directly; work the thread as your own.
+
 ## Do not
 
 - Do not use another chat tool or the provider's API to answer a bridged

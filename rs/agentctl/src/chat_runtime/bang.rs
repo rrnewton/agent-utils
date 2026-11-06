@@ -19,6 +19,7 @@ pub(crate) const HELP_TEXT: &str = "Owner commands (handled by the bridge, never
 !who — the sub-agents of this coordinator: the managed-by tree, Pinned (persistent lanes) first, then Ephemeral\n\
 !who NAME — one agent in detail\n\
 !@NAME <message> — open a new thread bound to NAME and send it <message>; later messages in that thread go to NAME\n\
+!end — in a bound thread, end the binding; later messages there go to the coordinator\n\
 Talk to the coordinator by writing normally.";
 
 /// The outbound operation ID for one bridge-posted `!` answer: deterministic from the
@@ -51,6 +52,8 @@ pub(crate) enum Bang {
     Who(Option<String>),
     /// `!@NAME` or `!@NAME <message>`: open a thread bound to that agent.
     At(String, Option<String>),
+    /// `!end`: end this thread's binding.
+    End,
 }
 
 /// One Slack thread bound to an agent (#917). Stored in `thread-bindings.json`.
@@ -128,6 +131,12 @@ pub(crate) fn parse_bang(text: &str) -> Option<Bang> {
         return Some(Bang::Help);
     }
     match first {
+        Some("!end") => {
+            if words.next().is_some() {
+                return Some(Bang::Help);
+            }
+            Some(Bang::End)
+        }
         Some("!who") => {
             let name = words.next().map(str::to_owned);
             if words.next().is_some() {
@@ -608,6 +617,8 @@ mod tests {
             Some(Bang::At("worker".to_owned(), None))
         );
         assert_eq!(parse_bang("!@Bad Name hi"), Some(Bang::Help));
+        assert_eq!(parse_bang("!end"), Some(Bang::End));
+        assert_eq!(parse_bang("!end now"), Some(Bang::Help));
     }
 
     #[test]

@@ -8261,6 +8261,7 @@ impl BridgeState {
         let mut relay_dispatches: Vec<RelayDispatch> = Vec::new();
         let mut bang_candidates: Vec<BangPost> = Vec::new();
         let mut binding_candidates: Vec<bang::ThreadBinding> = Vec::new();
+        let mut binding_endings: Vec<String> = Vec::new();
         let existing_bindings = self.thread_bindings()?;
         let mut request_bytes = 0_u64;
 
@@ -8443,6 +8444,29 @@ impl BridgeState {
                                 continue;
                             }
                             match &command {
+                                bang::Bang::End => {
+                                    let body = match &bound_target {
+                                        Some((agent, _)) => {
+                                            binding_endings.push(source.thread_id.clone());
+                                            format!(
+                                                "Binding to {agent} ended. Messages in this thread now go to the coordinator."
+                                            )
+                                        }
+                                        None => "This thread is not bound to an agent. \
+                                                 Open one with !@NAME <message>."
+                                            .to_owned(),
+                                    };
+                                    bang_candidates.push(BangPost {
+                                        operation_id: bang::bang_operation_id(
+                                            &source.channel_id,
+                                            &source.message_id,
+                                        ),
+                                        channel_id: source.channel_id.clone(),
+                                        thread_id: source.thread_id.clone(),
+                                        body,
+                                    });
+                                    continue;
+                                }
                                 bang::Bang::Help => {
                                     bang_candidates.push(BangPost {
                                         operation_id: bang::bang_operation_id(
@@ -8735,7 +8759,7 @@ impl BridgeState {
         if !bang_posts.is_empty() {
             agent::sync_directory(&self.root.join("bang-posts"))?;
         }
-        if !binding_candidates.is_empty() {
+        if !binding_candidates.is_empty() || !binding_endings.is_empty() {
             let mut merged = existing_bindings.clone();
             for binding in &binding_candidates {
                 if !merged
@@ -8743,6 +8767,14 @@ impl BridgeState {
                     .any(|b| b.thread_id == binding.thread_id && b.is_active())
                 {
                     merged.push(binding.clone());
+                }
+            }
+            for thread_id in &binding_endings {
+                for binding in &mut merged {
+                    if &binding.thread_id == thread_id && binding.is_active() {
+                        binding.state = "ended".to_owned();
+                        binding.ended_reason = Some("owner-end".to_owned());
+                    }
                 }
             }
             self.save_thread_bindings(&merged)?;
@@ -14380,6 +14412,39 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             }
         }
         self.save_thread_bindings(&bindings)
+    }
+
+    /// Queue one deterministic `!` answer for posting, if not already queued.
+    pub fn queue_bang_post(&self, post: &BangPost) -> Result<()> {
+        let path = self.bang_post_path(&post.operation_id);
+        if fs::symlink_metadata(&path).is_err() {
+            if let Some(parent) = path.parent() {
+                agent::create_private_directory(parent, "chat bang post directory", true, true)?;
+            }
+            write_document(&path, post)?;
+        }
+        Ok(())
+    }
+
+    /// End one active binding and queue the thread notice for it (#917 auto-unbind).
+    pub fn end_binding(&self, thread_id: &str, reason: &str, notice: BangPost) -> Result<bool> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut bindings = self.thread_bindings()?;
+        let mut ended = false;
+        for binding in &mut bindings {
+            if binding.thread_id == thread_id && binding.is_active() {
+                binding.state = "ended".to_owned();
+                binding.ended_reason = Some(reason.to_owned());
+                ended = true;
+            }
+        }
+        if ended {
+            self.save_thread_bindings(&bindings)?;
+            self.queue_bang_post(&notice)?;
+        }
+        Ok(ended)
     }
 
     /// Bindings whose parent has not been told yet.
@@ -21784,6 +21849,119 @@ pub(crate) mod tests {
         assert!(admission.new_request_keys.is_empty());
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(registry).unwrap();
+    }
+
+    #[test]
+    fn bang_end_unbinds_and_later_messages_go_to_the_coordinator() {
+        let registry = bang_registry("bang-end-registry");
+        let root = temporary("bang-end");
+        let state = BridgeState::initialize(&root, config())
+            .unwrap()
+            .with_latency_profile(Some(registry.clone()), false);
+        state
+            .admit_batch(&bang_batch("!@worker hello", "users/owner"))
+            .unwrap();
+        let ended = state
+            .admit_batch(&bang_batch_at(
+                2,
+                "bang2",
+                "bang1",
+                "!end",
+                "users/owner",
+                true,
+            ))
+            .unwrap();
+        assert!(ended.new_request_keys.is_empty());
+        assert!(ended.bang_posts[0].body.contains("ended"));
+        let bindings = state.thread_bindings().unwrap();
+        assert_eq!(bindings[0].state, "ended");
+        assert_eq!(bindings[0].ended_reason.as_deref(), Some("owner-end"));
+        // A later message in the thread is an ordinary coordinator request again.
+        let after = state
+            .admit_batch(&bang_batch_at(
+                3,
+                "bang3",
+                "bang1",
+                "hello again",
+                "users/owner",
+                true,
+            ))
+            .unwrap();
+        assert_eq!(after.new_request_keys.len(), 1);
+        let record = state.read_request(&after.new_request_keys[0]).unwrap();
+        assert_eq!(record.target_agent, None);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(registry).unwrap();
+    }
+
+    #[test]
+    fn bang_reply_posts_into_the_bound_thread_and_auto_unbind_ends_it() {
+        let registry = bang_registry("bang-reply-registry");
+        let root = temporary("bang-reply");
+        let state = BridgeState::initialize(&root, config())
+            .unwrap()
+            .with_latency_profile(Some(registry.clone()), false);
+        let admission = state
+            .admit_batch(&bang_batch("!@worker hello worker", "users/owner"))
+            .unwrap();
+        let key = admission.new_request_keys[0].clone();
+        let delivery = FakeDelivery::default();
+        deliver_request_with(&state, &delivery, &key, DrainOptions::default()).unwrap();
+        // The bound agent answers with `chat reply` (submit_reply), as its prompt says.
+        let route = state.next_reply_route(&key).unwrap().expect("open route");
+        state
+            .submit_reply(&key, &route.identifier, "the gate is green")
+            .unwrap();
+        let mut transport = FakeReplyTransport::default();
+        state.publish_one(&key, &mut transport).unwrap();
+        assert_eq!(transport.submissions.len(), 1);
+        assert_eq!(transport.submissions[0].1, "spaces/example/threads/bang1");
+        assert!(transport.submissions[0].2.contains("the gate is green"));
+        // Deterministic answers (the Bound ack) flush through the same transport.
+        let mut transport = FakeReplyTransport::default();
+        assert!(state.send_pending_bang_posts(&mut transport).unwrap() > 0);
+        assert!(transport
+            .submissions
+            .iter()
+            .all(|s| s.1 == "spaces/example/threads/bang1"));
+        // Auto-unbind ends it once, with one notice in the thread.
+        let notice = BangPost {
+            operation_id: bang::bang_operation_id("spaces/example", "auto-unbind"),
+            channel_id: "spaces/example".to_owned(),
+            thread_id: "spaces/example/threads/bang1".to_owned(),
+            body: "Binding to worker ended: the agent stopped.".to_owned(),
+        };
+        assert!(state
+            .end_binding(
+                "spaces/example/threads/bang1",
+                "agent-stopped",
+                notice.clone()
+            )
+            .unwrap());
+        assert!(!state
+            .end_binding("spaces/example/threads/bang1", "agent-stopped", notice)
+            .unwrap());
+        assert_eq!(state.thread_bindings().unwrap()[0].state, "ended");
+        let mut transport = FakeReplyTransport::default();
+        state.send_pending_bang_posts(&mut transport).unwrap();
+        assert!(transport
+            .submissions
+            .iter()
+            .any(|s| s.2.contains("agent stopped")));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(registry).unwrap();
+    }
+
+    #[test]
+    fn bang_end_in_an_unbound_thread_answers_without_binding() {
+        let root = temporary("bang-end-unbound");
+        let state = BridgeState::initialize(&root, config()).unwrap();
+        let admission = state
+            .admit_batch(&bang_batch("!end", "users/owner"))
+            .unwrap();
+        assert!(admission.new_request_keys.is_empty());
+        assert!(admission.bang_posts[0].body.contains("not bound"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

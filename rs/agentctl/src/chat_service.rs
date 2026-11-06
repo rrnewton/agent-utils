@@ -6274,6 +6274,69 @@ fn send_parent_notices<A: ManagedApi + ?Sized>(
     }
 }
 
+/// End bindings whose agent has stopped, been replaced, or vanished (#917 auto-unbind),
+/// following a rename by token. One notice is queued into each ended thread.
+fn end_dead_bindings<A: ManagedApi + ?Sized>(state: &BridgeState, manager: &ManagedAgents<'_, A>) {
+    let Ok(bindings) = state.thread_bindings() else {
+        return;
+    };
+    if bindings.iter().all(|binding| !binding.is_active()) {
+        return;
+    }
+    let snapshot = chat_runtime::bang::snapshot(manager.registry());
+    for binding in bindings.iter().filter(|binding| binding.is_active()) {
+        let agent = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.name == binding.agent_name)
+            .or_else(|| {
+                snapshot.agents.iter().find(|agent| {
+                    agent.token == binding.agent_token
+                        || agent.former_tokens.contains(&binding.agent_token)
+                })
+            });
+        let alive = agent.is_some_and(|agent| {
+            (agent.token == binding.agent_token
+                || agent.former_tokens.contains(&binding.agent_token))
+                && matches!(agent.lifecycle.as_str(), "running" | "starting")
+        });
+        if alive {
+            continue;
+        }
+        let body = format!(
+            "Binding to {} ended: the agent stopped. Messages in this thread now go to the coordinator.",
+            binding.agent_name
+        );
+        let notice = chat_runtime::BangPost {
+            operation_id: chat_runtime::relay_receipt_operation_id(
+                &binding.channel_id,
+                &binding.thread_id,
+                &binding.root_message_id,
+                &body,
+            ),
+            channel_id: binding.channel_id.clone(),
+            thread_id: binding.thread_id.clone(),
+            body,
+        };
+        match state.end_binding(&binding.thread_id, "agent-stopped", notice) {
+            Ok(true) => service_log(format_args!(
+                "agentctl: chat bang: unbound thread {} ({} stopped)",
+                binding.thread_id, binding.agent_name
+            )),
+            Ok(false) => {}
+            Err(error) => service_log(format_args!(
+                "agentctl: chat bang: auto-unbind of {} failed: {error}",
+                binding.thread_id
+            )),
+        }
+    }
+    if let Err(error) = state.flush_bang_posts() {
+        service_log(format_args!(
+            "agentctl: chat bang: unbind notice post failed, will retry: {error}"
+        ));
+    }
+}
+
 /// One run of the owner loop, from its startup recovery until a stop or a failure. `chat run`
 /// starts another after a transient failure: see [`run_owner_loop`].
 #[allow(clippy::too_many_arguments)]
@@ -6436,6 +6499,7 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
             take_reply_wakes(state, reply_wakes, &mut direct_keys, overflowed);
         }
         send_parent_notices(state, manager);
+        end_dead_bindings(state, manager);
         let recover = direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst);
         // A rescan tries every prompt waiting to be typed, so a due scan retries none of its own
         // when one runs. Nor does it while the status the loop last learned from Herdr is other

@@ -236,6 +236,39 @@ the exact version, UUID and action and sets `ok:true`; errors use the existing
 refuse, including when pagination, permissions or a deadline prevent a complete
 listing. These operations read the provider and create no outbound post intent.
 
+### Owner commands: talking to sub-agents (`!help`, `!who`, `!@NAME`, `!end`)
+
+A message that starts with `!` from a permanent owner is a command for the
+bridge itself. It is never admitted as a request and never typed into any
+pane. (A temporary grant holder who sends one gets a deterministic
+owner-only refusal, also with nothing delivered. With outbound replies off
+there is no way to answer, so `!` text is admitted normally instead.)
+
+- `!help` posts the command list in a thread under the message.
+- `!who` posts the managed-by tree of the registry's designated
+  coordinator: Pinned agents (persistent lanes) first, then Ephemeral,
+  each with its name, harness and model, lifecycle, and the bridge host.
+  An agent is pinned when its record says so (`agentctl manage NAME
+  --pin`, `agentctl start --pinned`, or a profile's `"pinned": true`);
+  without that, the designated coordinator, agents listed in
+  `restore.json`, and agents that manage others count as pinned.
+  `!who NAME` posts one agent in detail; an unknown name answers with
+  near matches plus the full list.
+- `!@NAME <message>` opens a new thread bound to NAME and sends it
+  `<message>`. Later owner messages in that thread are requests for NAME,
+  delivered to its pane or queue with the usual admission and receipt
+  rules; because the bridge reads only its own target's screen and
+  transcript, a bound agent replies with the explicit `agentctl chat
+  reply` command its prompt prints. Replies post back into the thread.
+  A bare `!@NAME` binds without sending anything. The bridge tells NAME's
+  parent (its manager, else the designated coordinator) exactly once per
+  bound thread, with the `agentctl read NAME` and `agentctl chat thread`
+  commands for catching up. Bindings live in `thread-bindings.json` in
+  the bridge state directory.
+- `!end`, in a bound thread, ends the binding; later messages there are
+  ordinary requests to the bridge's own target again. A binding also ends
+  on its own when the agent stops, is replaced, or vanishes.
+
 ### Reactions
 
 The bridge marks each accepted request's chat message in two stages. The
