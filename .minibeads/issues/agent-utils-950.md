@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-recover-ownerless-agent-remove: generic recover and audit refuse an ownerless-agent-remove journal'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-wrkslots
 created_at: 2026-11-06T18:34:21.000000000+00:00
 updated_at: 2026-11-06T18:34:21.000000000+00:00
+closed_at: 2026-11-06T23:20:00.000000000+00:00
 ---
 
 # Description
@@ -30,3 +31,7 @@ Two refusals for the `ownerless-agent-remove` recovery journal kind, both seen o
 # Notes
 
 Reported 2026-11-06 by the lead coordinator from a consumer's coordinator. Queued for mu-wrkslots after its pending #864 stack.
+
+## Resolution
+
+Landed as c38b6417. Generic recover passes the captured _RecoveryProcesses to _recover_ownerless_agent (checked with _assert_recovery_processes, as the other kinds); the kind-specific command keeps working unchanged. Audit's cache-journal reader, in both editions, accepts ownerless-agent-remove and reports its standalone target as its own cache slot. Tests: generic recover through the host-context handoff, and audit --format json listing the journal.
