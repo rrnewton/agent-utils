@@ -58666,6 +58666,50 @@ def test_remove_remote_check_ignores_a_global_instead_of_rewrite(tmp_path: Path)
     assert receipt["containing_remote_refs"]
 
 
+@pytest.mark.parametrize(
+    "recorded,current",
+    [
+        ("git@git.example.com:Owner/Repo.git", "https://git.example.com/Owner/Repo"),
+        ("https://git.example.com/Owner/Repo", "git@git.example.com:Owner/Repo.git"),
+        ("ssh://git@git.example.com/Owner/Repo.git", "https://GIT.EXAMPLE.COM/Owner/Repo/"),
+        ("ssh://git.example.com/Owner/Repo", "git@git.example.com:Owner/Repo.git"),
+        ("git@github.com:Owner/Repo.git", "https://github.com/Owner/Repo"),
+    ],
+)
+def test_remote_url_spellings_accept_equivalent_transports(
+    recorded: str, current: str
+) -> None:
+    """#868: ssh and https spellings of one repository are the same remote."""
+    authority = wrkslots._RemoteAuthority(
+        url=current,
+        sha256=wrkslots.hashlib.sha256(current.encode()).hexdigest(),
+    )
+    recorded_sha = wrkslots.hashlib.sha256(recorded.encode()).hexdigest()
+    assert wrkslots._recorded_remote_names_same_repository(recorded_sha, authority)
+
+
+@pytest.mark.parametrize(
+    "recorded,current",
+    [
+        ("git@git.example.com:Owner/Repo.git", "https://git.example.com/Other/Repo"),
+        ("git@git.example.com:Owner/Repo.git", "https://git.example.com/Owner/Other"),
+        ("git@git.example.com:Owner/Repo.git", "https://other.example.com/Owner/Repo"),
+        ("git@git.example.com:Owner/Repo.git", "/srv/git/Owner/Repo"),
+        ("git@git.example.com:Owner/Repo.git", "file:///srv/git/Owner/Repo"),
+        ("git@git.example.com:Owner/Repo.git", "http://git.example.com/Owner/Repo"),
+    ],
+)
+def test_remote_url_spellings_still_refuse_other_repositories(
+    recorded: str, current: str
+) -> None:
+    authority = wrkslots._RemoteAuthority(
+        url=current,
+        sha256=wrkslots.hashlib.sha256(current.encode()).hexdigest(),
+    )
+    recorded_sha = wrkslots.hashlib.sha256(recorded.encode()).hexdigest()
+    assert not wrkslots._recorded_remote_names_same_repository(recorded_sha, authority)
+
+
 def test_remove_skips_an_uninitialised_nested_submodule(tmp_path: Path) -> None:
     project, tree, component, _leaf = _slot_with_primary_dropped_leaf(tmp_path)
     git(

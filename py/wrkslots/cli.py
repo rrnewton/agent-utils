@@ -21014,7 +21014,9 @@ def _assert_checkout_safe(
             "out of commits (use write-handoff)"
         )
     remote_authority = vcs.remote_authority(path, checkout.remote)
-    if remote_authority.sha256 != checkout.remote_url_sha256:
+    if not _recorded_remote_names_same_repository(
+        checkout.remote_url_sha256, remote_authority
+    ):
         raise Refusal(
             f"checkout {checkout.name} remote {checkout.remote} URL changed; "
             "preserve the checkout for inspection"
@@ -22651,7 +22653,9 @@ def _salvage_candidate_facts(
         # its history is kept through its HEAD and private tips.
         head = vcs.head(path)
         remote_authority = vcs.remote_authority(path, checkout.remote)
-        if remote_authority.sha256 != checkout.remote_url_sha256:
+        if not _recorded_remote_names_same_repository(
+            checkout.remote_url_sha256, remote_authority
+        ):
             raise Refusal(
                 f"checkout {checkout.name} remote {checkout.remote} URL changed; restore the "
                 "recorded remote before reclaim so salvage cannot be sent elsewhere"
@@ -22705,7 +22709,9 @@ def _salvage_candidate_facts(
         _cache_globs_for(config, checkout.name),
     )
     remote_authority = vcs.remote_authority(path, checkout.remote)
-    if not accept_drift and remote_authority.sha256 != checkout.remote_url_sha256:
+    if not accept_drift and not _recorded_remote_names_same_repository(
+        checkout.remote_url_sha256, remote_authority
+    ):
         raise Refusal(
             f"checkout {checkout.name} remote {checkout.remote} URL changed; restore the "
             "recorded remote before reclaim so salvage cannot be sent elsewhere"
@@ -23474,15 +23480,70 @@ def _github_url_spellings(url: str) -> tuple[str, ...]:
     return ()
 
 
+def _remote_url_spellings(url: str) -> tuple[str, ...]:
+    """Equivalent transport spellings of one repository URL, for any host (#868).
+
+    scp-style ssh, `ssh://` with or without a user, and https, each with
+    and without a trailing `.git` or `/`, the host compared
+    case-insensitively. Anything else (a different scheme, a local path,
+    a `file://` URL, a plain http URL) has no equivalent spellings.
+    """
+
+    user: str | None = None
+    host = ""
+    port: str | None = None
+    path = ""
+    scp = re.fullmatch(r"(?P<user>[^@/:]+)@(?P<host>[^/:]+):(?P<path>.+)", url)
+    if scp is not None:
+        user, host, path = scp.group("user"), scp.group("host"), scp.group("path")
+    else:
+        parsed = re.fullmatch(
+            r"(?P<scheme>ssh|https)://(?:(?P<user>[^@/]+)@)?(?P<host>[^/:]+)"
+            r"(?::(?P<port>[0-9]+))?/(?P<path>.+)",
+            url,
+        )
+        if parsed is None:
+            return ()
+        user, host, port, path = (
+            parsed.group("user"),
+            parsed.group("host"),
+            parsed.group("port"),
+            parsed.group("path"),
+        )
+    hosts = {host, host.lower(), host.upper()}
+    base = path.rstrip("/")
+    if base.endswith(".git"):
+        base = base[: -len(".git")]
+    if not base or base.endswith("/"):
+        return ()
+    users = {user or "git", "git"}
+    spellings: list[str] = []
+    for host in hosts:
+        for suffix in ("", ".git"):
+            if port is None:
+                for name in users:
+                    spellings.append(f"{name}@{host}:{base}{suffix}")
+            ssh_port = "" if port in (None, "22") else f":{port}"
+            https_port = "" if port in (None, "443", "22") else f":{port}"
+            for name in users:
+                spellings.append(f"ssh://{name}@{host}{ssh_port}/{base}{suffix}")
+                spellings.append(f"ssh://{name}@{host}{ssh_port}/{base}{suffix}/")
+            spellings.append(f"ssh://{host}{ssh_port}/{base}{suffix}")
+            spellings.append(f"https://{host}{https_port}/{base}{suffix}")
+            spellings.append(f"https://{host}{https_port}/{base}{suffix}/")
+    return tuple(dict.fromkeys(spellings))
+
+
 def _recorded_remote_names_same_repository(
     recorded_sha256: str, authority: _RemoteAuthority
 ) -> bool:
     """Whether a recorded remote URL digest names the repository ``authority`` names.
 
-    True for the exact URL, or when the digest is that of another GitHub
-    transport spelling of the same owner/repo (_same_repository_remote), as
-    when a source repository's remote moved from git@github.com: to https://.
-    Only the digest was recorded, so each spelling is hashed and compared.
+    True for the exact URL, or when the digest is that of another
+    transport spelling of the same host and path (_remote_url_spellings,
+    plus the GitHub case variants), as when a source repository's remote
+    moved from ssh to https. Only the digest was recorded, so each
+    spelling is hashed and compared. Anything else is still a change.
     """
 
     if authority.sha256 == recorded_sha256:
@@ -23491,7 +23552,18 @@ def _recorded_remote_names_same_repository(
         hmac.compare_digest(
             hashlib.sha256(spelling.encode("utf-8")).hexdigest(), recorded_sha256
         )
-        for spelling in _github_url_spellings(authority.url)
+        for spelling in (
+            *_remote_url_spellings(authority.url),
+            *_github_url_spellings(authority.url),
+        )
+    )
+
+
+def _checkout_remote_unchanged(
+    vcs: _GitVcs, path: Path, checkout: Checkout
+) -> bool:
+    return _recorded_remote_names_same_repository(
+        checkout.remote_url_sha256, vcs.remote_authority(path, checkout.remote)
     )
 
 
@@ -23847,12 +23919,20 @@ def _salvage_agent_slot(
         drift = _observe_checkout_drift(vcs, checkout, path) if archive_drifted else None
         if drift is not None and drift_refusal is not None:
             raise _drifted_checkout_refusal(checkout, drift, drift_refusal)
-        if drift is None and (
-            vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256
-        ):
+        if drift is None and not _checkout_remote_unchanged(vcs, path, checkout):
             raise Refusal(
                 f"checkout {checkout.name} remote {checkout.remote} URL changed; restore the "
                 "recorded remote before reclaim so salvage cannot be sent elsewhere"
+            )
+        if (
+            drift is None
+            and vcs.remote_url_sha256(path, checkout.remote)
+            != checkout.remote_url_sha256
+        ):
+            print(
+                f"wrkslots: checkout {checkout.name} origin URL respelled; "
+                "same repository, accepted",
+                file=sys.stderr,
             )
         candidates.append((checkout, path, False, drift, drift is not None))
         for submodule, submodule_path in _submodule_salvage_checkouts(
@@ -24047,7 +24127,7 @@ def _salvage_ownerless_worktree(
     path_override: Path | None = None,
 ) -> tuple[dict[str, object], ...]:
     path = path_override or _stored_path(config, checkout.path, "ownerless checkout path")
-    if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+    if not _checkout_remote_unchanged(vcs, path, checkout):
         raise Refusal(
             f"checkout {checkout.name} remote {checkout.remote} changed during salvage"
         )
@@ -24117,7 +24197,7 @@ def _assert_salvage_still_matches(
         drift = _checkout_drift_from_receipt(by_name.get(checkout.name))
         if drift is not None:
             _assert_checkout_drift_unchanged(vcs, checkout, path, drift)
-        elif vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+        elif not _checkout_remote_unchanged(vcs, path, checkout):
             raise Refusal(
                 f"checkout {checkout.name} remote {checkout.remote} URL changed after "
                 "salvage; preserve it and rerun remove"
@@ -25881,9 +25961,7 @@ def _reclaim_preconditions(
                 )
             vcs.assert_ordinary_history(path)
             vcs.assert_ordinary_index(path)
-        if drift is None and (
-            vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256
-        ):
+        if drift is None and not _checkout_remote_unchanged(vcs, path, checkout):
             raise Refusal(
                 f"checkout {checkout.name} remote {checkout.remote} URL changed; "
                 "restore the recorded remote before reclaim"
@@ -36608,10 +36686,7 @@ def _audit_record(
                 # remote authority first; otherwise it can advertise
                 # DELETABLE only for remove to refuse before salvage.
                 _submodule_salvage_checkouts(config, checkout, selected_vcs)
-            if (
-                selected_vcs.remote_url_sha256(path, checkout.remote)
-                != checkout.remote_url_sha256
-            ):
+            if not _checkout_remote_unchanged(selected_vcs, path, checkout):
                 raise Refusal(f"checkout {checkout.name} remote URL changed")
     except Refusal as exc:
         reasons.append(str(exc))
@@ -37775,7 +37850,9 @@ def _cmd_unpushed(args: argparse.Namespace) -> int:
                         f"{checkout.branch}, found {branch}; preserve it for inspection"
                     )
                 remote_authority = vcs.remote_authority(path, checkout.remote)
-                if remote_authority.sha256 != checkout.remote_url_sha256:
+                if not _recorded_remote_names_same_repository(
+                    checkout.remote_url_sha256, remote_authority
+                ):
                     raise Refusal(
                         f"checkout {checkout.name} remote {checkout.remote} URL changed"
                     )
@@ -51267,7 +51344,7 @@ def _assert_ownerless_salvage_still_matches(
     vcs: _GitVcs,
     path: Path,
 ) -> None:
-    if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+    if not _checkout_remote_unchanged(vcs, path, checkout):
         raise Refusal("ownerless worktree remote changed after salvage; preserve it")
     candidates = [(checkout, path, False)]
     candidates.extend(
