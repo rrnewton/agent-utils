@@ -10,8 +10,9 @@
 
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -19,6 +20,21 @@ use serde_json::{json, Value};
 const FAKE_CLAUDE: &str = include_str!("fixtures/fake_claude.txt");
 
 static FIXTURE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Fixture children must not outlive the test process (#923).
+fn die_with_parent(command: &mut Command) {
+    // SAFETY: prctl in the forked child before exec is
+    // async-signal-safe; the child is killed when its creating thread's
+    // process dies, by whatever means.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
 
 fn executable(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -108,6 +124,25 @@ impl Fixture {
             "start tmux server: {}",
             String::from_utf8_lossy(&started.stderr)
         );
+        // A watchdog in its own process group kills this server when
+        // the test process dies by any means -- including a SIGKILL
+        // that never runs Drop, which is how servers used to leak for
+        // hours (#923). It exits right after that one cleanup.
+        let watchdog = format!(
+            "while kill -0 {} 2>/dev/null; do sleep 1; done; \
+             {} -L {} kill-server 2>/dev/null; rm -f {}",
+            std::process::id(),
+            tmux.display(),
+            socket,
+            tmux_socket_path(&socket).display()
+        );
+        let _ = Command::new("/bin/sh")
+            .args(["-c", &watchdog])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
         Some(Self {
             registry,
             root,
@@ -120,7 +155,9 @@ impl Fixture {
     }
 
     fn agentctl(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentctl"));
+        die_with_parent(&mut command);
+        command
             .arg("--registry")
             .arg(&self.registry)
             .args(["--term-backend", "tmux", "--tmux-socket", &self.socket])
@@ -135,7 +172,9 @@ impl Fixture {
     }
 
     fn agentctl_without_unknown_bin(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentctl"));
+        die_with_parent(&mut command);
+        command
             .arg("--registry")
             .arg(&self.registry)
             .args(["--term-backend", "tmux", "--tmux-socket", &self.socket])
@@ -162,7 +201,9 @@ impl Fixture {
     }
 
     fn tmux(&self, args: &[&str]) -> Output {
-        Command::new(&self.tmux)
+        let mut command = Command::new(&self.tmux);
+        die_with_parent(&mut command);
+        command
             .args(["-L", &self.socket])
             .args(args)
             .output()
