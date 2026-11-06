@@ -241,6 +241,35 @@ pub(super) fn argv_conversation(harness: &str, argv: &[String]) -> Result<Option
     Ok(values.into_iter().next())
 }
 
+/// The session a hand-resumed process proves: `actual` must be the recorded
+/// arguments with exactly one resume selector appended (`resume <id>` for
+/// Muse, `--resume <id>` for Claude). Anything else is an unrelated process.
+pub(super) fn resumed_session(
+    harness: &str,
+    recorded: &[String],
+    actual: &[String],
+) -> Result<String> {
+    let refusal = || fail("foreground process is not the recorded harness resumed");
+    let (_, recorded_rest) = split(harness, recorded)?;
+    let (sessions, actual_rest) = split(harness, actual)?;
+    let distinct: BTreeSet<_> = sessions.iter().collect();
+    if actual_rest != recorded_rest || distinct.len() != 1 {
+        return Err(refusal());
+    }
+    let id = sessions.into_iter().next().unwrap();
+    let tail = actual.len() >= 2 && actual[actual.len() - 1] == id;
+    let tail = tail
+        && match harness {
+            "muse" => actual[actual.len() - 2] == "resume",
+            "claude" => actual[actual.len() - 2] == "--resume",
+            _ => false,
+        };
+    if !tail || !valid_metadata_text(&id) {
+        return Err(refusal());
+    }
+    Ok(id)
+}
+
 /// The recorded arguments with every selector replaced by one explicit resume.
 pub(super) fn replay_arguments(
     harness: &str,

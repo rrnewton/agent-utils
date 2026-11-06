@@ -225,6 +225,28 @@ def argv_conversation(harness: str, argv: Sequence[str]) -> str | None:
     return values[0] if values else None
 
 
+def resumed_session(harness: str, recorded: Sequence[str], actual: Sequence[str]) -> str:
+    """The session a hand-resumed process proves: ``actual`` must be the recorded
+    arguments with exactly one resume selector appended (`resume <id>` for
+    Muse, `--resume <id>` for Claude). Anything else is an unrelated process.
+    """
+    refusal = "foreground process is not the recorded harness resumed"
+    _recorded_values, recorded_rest = _split(harness, recorded)
+    sessions, actual_rest = _split(harness, actual)
+    if actual_rest != recorded_rest or len(set(sessions)) != 1:
+        raise AgentDeliveryError(refusal)
+    value = sessions[0]
+    tail = (
+        len(actual) >= 2
+        and actual[-1] == value
+        and ((harness == "muse" and actual[-2] == "resume")
+             or (harness == "claude" and actual[-2] == "--resume"))
+    )
+    if not tail or not _text(value):
+        raise AgentDeliveryError(refusal)
+    return value
+
+
 def replay_arguments(harness: str, argv: Sequence[str], conversation: str) -> tuple[str, ...]:
     """The recorded arguments with every selector replaced by one explicit resume."""
     if not _text(conversation):

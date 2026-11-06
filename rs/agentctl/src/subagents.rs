@@ -7366,7 +7366,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         // Anchors live only in flat schema-1 records, so a nested row is rewritten in that form.
         let migrated_from = record.migrate_nested_to_flat();
         if matches!(record.adapter.as_str(), "herdr-pane" | "herdr-relay") {
-            return self.anchor_custom_spec(record, session, migrated_from);
+            return self.anchor_custom_spec(record, replace, session, migrated_from);
         }
         if !record.anchors_with_harness_identity() {
             return Err(fail(
@@ -7469,6 +7469,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     fn anchor_custom_spec(
         &self,
         mut record: AgentRecord,
+        replace: bool,
         session: Option<&str>,
         migrated_from: Option<String>,
     ) -> Result<Value> {
@@ -7489,10 +7490,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         let _pane_lock = self.pane_lock(&pane)?;
         if self.client.process_liveness(&identity) != ProcessLiveness::Alive {
-            return Err(fail(format!(
-                "the {} process pinned at launch of '{}' is not provably alive; revive it instead",
-                record.harness, record.name
-            )));
+            if !replace {
+                return Err(fail(format!(
+                    "the {} process pinned at launch of '{}' is not provably alive; revive it instead",
+                    record.harness, record.name
+                )));
+            }
+            return self.anchor_resumed_custom(record, session, migrated_from, pane, identity);
         }
         let label = match record.workspace_id.as_deref() {
             Some(workspace) => self.client.workspace_label(workspace).ok(),
@@ -7520,6 +7524,178 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             "harness_pid": identity.pid,
             "replaced": false,
             "previous": {"terminal_id": record.terminal_id, "harness_pid": identity.pid},
+            "migrated_from": migrated_from,
+            "launch_spec_source": "anchor",
+        }))
+    }
+
+    /// Re-pin a custom pane to the Muse or Claude process an operator resumed
+    /// by hand in the recorded pane after a reboot (`anchor --replace`). The
+    /// candidate must be the pane's foreground (or relay) process, in the
+    /// recorded cwd, running the recorded launch argv plus one appended
+    /// resume selector; that session becomes the native session. Anything
+    /// else stays refused, as does a dead pin without `--replace`.
+    fn anchor_resumed_custom(
+        &self,
+        mut record: AgentRecord,
+        session: Option<&str>,
+        migrated_from: Option<String>,
+        pane: String,
+        old: CustomProcessIdentity,
+    ) -> Result<Value> {
+        let refusal = |detail: &str| {
+            fail(format!(
+                "cannot re-pin '{}' to a resumed process: {detail}; revive it instead",
+                record.name
+            ))
+        };
+        if !matches!(record.harness.as_str(), "muse" | "claude") {
+            return Err(refusal(
+                "only a resumed Muse or Claude process can be pinned",
+            ));
+        }
+        let info = self.client.pane_info(&pane)?;
+        if !same_directory(&info.cwd, &record.cwd)
+            || record
+                .workspace_id
+                .as_deref()
+                .is_some_and(|workspace| workspace != info.workspace_id)
+            || record
+                .tab_id
+                .as_deref()
+                .zip(info.tab_id.as_deref())
+                .is_some_and(|(recorded, live)| recorded != live)
+        {
+            return Err(refusal(
+                "the pane is not in the recorded cwd, tab, or workspace",
+            ));
+        }
+        let discover = |this: &Self| -> Result<Option<CustomProcessIdentity>> {
+            let found = if record.adapter == "herdr-relay" {
+                this.client.relay_process(&pane)
+            } else {
+                this.client.harness_identity(&pane, &record.harness)
+            };
+            found.map_err(|error| fail(error.to_string()))
+        };
+        let Some(candidate) = discover(self)? else {
+            return Err(refusal("no foreground harness process can be pinned"));
+        };
+        if candidate == old || self.client.process_liveness(&candidate) != ProcessLiveness::Alive {
+            return Err(refusal("the foreground process is not provably alive"));
+        }
+        let Some(argv) = self.client.process_command_line(&candidate) else {
+            return Err(refusal(
+                "the foreground process command line cannot be read",
+            ));
+        };
+        if argv.is_empty() || !launch_spec::program_matches(&record.harness, Some(&argv[0])) {
+            return Err(refusal(
+                "the foreground program is not the recorded harness",
+            ));
+        }
+        let recorded: Vec<String> = record
+            .launch_spec
+            .as_ref()
+            .and_then(|spec| spec["argv"].as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|values| !values.is_empty())
+            .unwrap_or_else(|| record.arguments.clone());
+        if recorded.is_empty() {
+            return Err(refusal(
+                "the record holds no launch argv to compare against",
+            ));
+        }
+        let id = launch_spec::resumed_session(&record.harness, &recorded, &argv[1..])
+            .map_err(|_| refusal("the foreground argv is not the recorded argv resumed"))?;
+        let known = [
+            session,
+            record
+                .native_session
+                .as_ref()
+                .map(|native| native.value.as_str()),
+            record.session_value.as_deref(),
+            record.resume.as_deref(),
+        ];
+        if known.iter().flatten().any(|value| *value != id) {
+            return Err(refusal(
+                "the resumed session contradicts the recorded session",
+            ));
+        }
+        // Re-prove the same generation before recording it.
+        if discover(self)?.as_ref() != Some(&candidate)
+            || self.client.process_command_line(&candidate).as_ref() != Some(&argv)
+            || self.client.process_liveness(&candidate) != ProcessLiveness::Alive
+        {
+            return Err(refusal(
+                "the foreground process changed while it was checked",
+            ));
+        }
+        if let Some(owner) =
+            self.claim_owner(&pane, info.terminal_id.as_deref(), Some(&record.name))?
+        {
+            return Err(fail(format!(
+                "pane {pane} is already registered as '{owner}'"
+            )));
+        }
+        let label = match record.workspace_id.as_deref() {
+            Some(workspace) => self.client.workspace_label(workspace).ok(),
+            None => None,
+        };
+        let spec = launch_spec::build(launch_spec::SpecFields {
+            source: "anchor",
+            captured_at: unix_seconds(),
+            harness: &record.harness,
+            executable: Some(&argv[0]),
+            argv: &argv[1..],
+            cwd: &record.cwd,
+            profile: record.profile.as_deref(),
+            environment_names: &record.environment_names,
+            slot: record.slot.as_deref(),
+            slot_project: record.slot_project.as_deref(),
+            slot_isolation: record.slot_isolation.as_deref(),
+            workspace_label: label.as_deref(),
+            native_session: Some((&id, "argv")),
+        })?;
+        let previous = json!({
+            "terminal_id": record.terminal_id,
+            "harness_pid": old.pid,
+        });
+        record_reanchor(
+            &mut record,
+            (
+                Some(pane.clone()),
+                previous["terminal_id"].as_str().map(str::to_owned),
+                previous["harness_pid"].as_u64(),
+            ),
+            (
+                Some(pane.clone()),
+                info.terminal_id.clone(),
+                Some(candidate.pid),
+            ),
+            "restart-same-pane",
+        );
+        record.terminal_id = info.terminal_id;
+        record.custom_process_identity = Some(candidate.clone());
+        record.native_session = Some(NativeSession::new(&record.harness, &id, "observed"));
+        if record.lifecycle == "launch_failed" {
+            record.lifecycle = "running".to_owned();
+            record.error = None;
+        }
+        record.launch_spec = Some(spec);
+        self.save(&record)?;
+        Ok(json!({
+            "name": record.name,
+            "pane_id": pane,
+            "terminal_id": record.terminal_id,
+            "harness_pid": candidate.pid,
+            "replaced": true,
+            "previous": previous,
             "migrated_from": migrated_from,
             "launch_spec_source": "anchor",
         }))

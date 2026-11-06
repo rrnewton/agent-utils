@@ -5827,7 +5827,7 @@ class ManagedAgents:
                     record._nested_storage = None
                     record._session_source = None
                 if record.adapter in ("herdr-pane", "herdr-relay"):
-                    return self._anchor_custom_spec(record, session, migrated_from)
+                    return self._anchor_custom_spec(record, replace, session, migrated_from)
                 if record.adapter not in ("herdr", "herdr-foreign"):
                     raise AgentDeliveryError(
                         "anchor applies to native, adopted, and custom-pane Herdr agents"
@@ -5923,7 +5923,7 @@ class ManagedAgents:
             return result
 
     def _anchor_custom_spec(
-        self, record: AgentRecord, session: str | None, migrated_from: object,
+        self, record: AgentRecord, replace: bool, session: str | None, migrated_from: object,
     ) -> dict[str, object]:
         """Record the launch spec of a custom pane from the process pinned at its launch.
 
@@ -5940,10 +5940,12 @@ class ManagedAgents:
             raise AgentDeliveryError(f"agent {record.name!r} is {record.lifecycle}, not running")
         with self._pane_lock(record.pane_id):
             if self.client.process_liveness(identity) != "alive":
-                raise AgentDeliveryError(
-                    f"the {record.harness} process pinned at launch of {record.name!r} is not "
-                    "provably alive; revive it instead"
-                )
+                if not replace:
+                    raise AgentDeliveryError(
+                        f"the {record.harness} process pinned at launch of {record.name!r} is not "
+                        "provably alive; revive it instead"
+                    )
+                return self._anchor_resumed_custom(record, session, migrated_from, identity)
             label: str | None = None
             if record.workspace_id is not None:
                 try:
@@ -5967,6 +5969,102 @@ class ManagedAgents:
                 "previous": {"terminal_id": record.terminal_id, "harness_pid": identity.pid},
                 "migrated_from": migrated_from, "launch_spec_source": "anchor",
             }
+
+    def _anchor_resumed_custom(
+        self, record: AgentRecord, session: str | None, migrated_from: object,
+        old: CustomProcessIdentity,
+    ) -> dict[str, object]:
+        """Re-pin a custom pane to the Muse or Claude process an operator resumed
+        by hand in the recorded pane after a reboot (`anchor --replace`). The
+        candidate must be the pane's foreground (or relay) process, in the
+        recorded cwd, running the recorded launch argv plus one appended
+        resume selector; that session becomes the native session. Anything
+        else stays refused, as does a dead pin without `--replace`.
+        """
+        def refusal(detail: str) -> AgentDeliveryError:
+            return AgentDeliveryError(
+                f"cannot re-pin {record.name!r} to a resumed process: {detail}; revive it instead"
+            )
+
+        if record.harness not in ("muse", "claude"):
+            raise refusal("only a resumed Muse or Claude process can be pinned")
+        assert record.pane_id is not None
+        info = self.client.pane_info(record.pane_id)
+        if (
+            os.path.realpath(info.cwd) != os.path.realpath(record.cwd)
+            or (record.workspace_id is not None and record.workspace_id != info.workspace_id)
+            or (record.tab_id is not None and info.tab_id is not None and record.tab_id != info.tab_id)
+        ):
+            raise refusal("the pane is not in the recorded cwd, tab, or workspace")
+
+        def discover() -> CustomProcessIdentity | None:
+            if record.adapter == "herdr-relay":
+                return self.client.relay_process(record.pane_id)  # type: ignore[arg-type]
+            return self.client.harness_identity(record.pane_id, record.harness)  # type: ignore[arg-type]
+
+        candidate = discover()
+        if candidate is None or candidate == old or self.client.process_liveness(candidate) != "alive":
+            raise refusal("the foreground process is not provably alive")
+        argv = self.client.process_command_line(candidate)
+        if not argv or not launch_spec.program_matches(record.harness, argv[0]):
+            raise refusal("the foreground program is not the recorded harness")
+        recorded: list[str] = []
+        if record.launch_spec is not None:
+            spec_argv = record.launch_spec.get("argv")
+            if isinstance(spec_argv, list):
+                recorded = [value for value in spec_argv if isinstance(value, str)]
+        if not recorded:
+            recorded = list(record.arguments)
+        if not recorded:
+            raise refusal("the record holds no launch argv to compare against")
+        try:
+            value = launch_spec.resumed_session(record.harness, recorded, list(argv[1:]))
+        except AgentDeliveryError:
+            raise refusal("the foreground argv is not the recorded argv resumed") from None
+        known = [
+            session,
+            None if record.native_session is None else record.native_session["value"],
+            record.session_value,
+            record.resume,
+        ]
+        if any(item is not None and item != value for item in known):
+            raise refusal("the resumed session contradicts the recorded session")
+        if (
+            discover() != candidate
+            or self.client.process_command_line(candidate) != argv
+            or self.client.process_liveness(candidate) != "alive"
+        ):
+            raise refusal("the foreground process changed while it was checked")
+        owner = self._claim_owner(record.pane_id, info.terminal_id, exclude=record.name)
+        if owner is not None:
+            raise AgentDeliveryError(f"pane {record.pane_id} is already registered as {owner!r}")
+        label: str | None = None
+        if record.workspace_id is not None:
+            try:
+                label = self.client.workspace_label(record.workspace_id)
+            except HerdrRunError:
+                label = None
+        spec = launch_spec.build(
+            source="anchor", captured_at=time.time(), harness=record.harness,
+            executable=argv[0], argv=argv[1:], cwd=record.cwd, profile=record.profile,
+            environment_names=record.environment_names, slot=record.slot,
+            slot_project=record.slot_project, slot_isolation=record.slot_isolation,
+            workspace_label=label, native_session=(value, "argv"),
+        )
+        previous = {"terminal_id": record.terminal_id, "harness_pid": old.pid}
+        record.terminal_id = info.terminal_id
+        record.custom_process_identity = candidate
+        record.native_session = _native_session(record.harness, value, "observed")
+        if record.lifecycle == "launch_failed":
+            record.lifecycle, record.error = "running", None
+        record.set_launch_spec(spec)
+        self._save(record)
+        return {
+            "name": record.name, "pane_id": record.pane_id,
+            "terminal_id": record.terminal_id, "harness_pid": candidate.pid,
+            "replaced": True, "previous": previous,
+            "migrated_from": migrated_from, "launch_spec_source": "anchor",
+        }
 
     def rename(self, old: str, new: str) -> dict[str, object]:
         """Rename a live agent: registry entry, Herdr agent name and tab label together."""

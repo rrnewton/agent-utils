@@ -381,6 +381,114 @@ fn a_relay_launch_records_its_spec_and_anchor_backfills_one_from_the_pinned_proc
 }
 
 #[test]
+fn anchor_replace_pins_a_hand_resumed_muse_and_refuses_unrelated_processes() {
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                harness: "muse".to_owned(),
+                harness_args: vec!["--model".to_owned(), "m".to_owned()],
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let record = fixture.manager().load("worker").unwrap();
+    let pane = record.pane_id.clone().unwrap();
+    // The launch pin is gone after a reboot: no live custom process is recorded.
+    fixture
+        .client
+        .custom_processes
+        .lock()
+        .unwrap()
+        .remove(&pane);
+    let session = record
+        .native_session
+        .as_ref()
+        .map(|native| native.value.clone())
+        .or_else(|| record.session_value.clone())
+        .unwrap_or_else(|| "sess-1".to_owned());
+    let mut resumed = vec!["/usr/local/bin/muse".to_owned()];
+    resumed.extend(record.arguments.iter().cloned());
+    resumed.extend(["resume".to_owned(), session.clone()]);
+    fixture
+        .client
+        .command_lines
+        .lock()
+        .unwrap()
+        .insert(300, resumed.clone());
+    let error = fixture.manager().anchor("worker", false, None).unwrap_err();
+    assert!(error.to_string().contains("not provably alive"), "{error}");
+    // An unrelated foreground argv is refused even with --replace.
+    fixture
+        .client
+        .command_lines
+        .lock()
+        .unwrap()
+        .insert(300, vec!["/usr/bin/node".to_owned(), "app.js".to_owned()]);
+    assert!(fixture.manager().anchor("worker", true, None).is_err());
+    fixture
+        .client
+        .command_lines
+        .lock()
+        .unwrap()
+        .insert(300, resumed);
+    let result = fixture.manager().anchor("worker", true, None).unwrap();
+    assert_eq!(result["replaced"], true);
+    assert_eq!(result["harness_pid"], 300);
+    let saved = fixture.manager().load("worker").unwrap();
+    assert_eq!(saved.custom_process_identity.unwrap().pid, 300);
+    let native = saved.native_session.unwrap();
+    assert_eq!(native.value, session);
+    assert_eq!(native.source, "observed");
+    let mut expected = record.arguments.clone();
+    expected.extend(["resume".to_owned(), session]);
+    assert_eq!(saved.launch_spec.unwrap()["argv"], json!(expected));
+}
+
+#[test]
+fn anchor_replace_pins_a_hand_resumed_claude_behind_a_relay() {
+    let (fixture, mut record) = relay_worker_of("claude");
+    // Simulate the reboot: the launch pin names a dead generation.
+    let mut dead = record.custom_process_identity.clone().unwrap();
+    dead.pid = 9999;
+    record.custom_process_identity = Some(dead.clone());
+    record.native_session = None;
+    record.session_value = None;
+    record.resume = None;
+    fixture.manager().save(&record).unwrap();
+    let pane = record.pane_id.clone().unwrap();
+    let mut candidate = dead.clone();
+    candidate.pid = 4242;
+    fixture
+        .client
+        .custom_processes
+        .lock()
+        .unwrap()
+        .insert(pane.clone(), candidate);
+    let mut resumed = vec!["/usr/local/bin/claude".to_owned()];
+    resumed.extend(record.arguments.iter().cloned());
+    let recorded_session = record.launch_spec.as_ref().unwrap()["native_session"]["value"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    resumed.extend(["--resume".to_owned(), recorded_session.clone()]);
+    fixture
+        .client
+        .command_lines
+        .lock()
+        .unwrap()
+        .insert(4242, resumed);
+    let result = fixture.manager().anchor("worker", true, None).unwrap();
+    assert_eq!(result["replaced"], true);
+    let saved = fixture.manager().load("worker").unwrap();
+    assert_eq!(saved.custom_process_identity.unwrap().pid, 4242);
+    assert_eq!(saved.native_session.unwrap().value, recorded_session);
+}
+
+#[test]
 fn promote_marks_a_failed_relay_launch_running_when_its_pinned_harness_runs() {
     let (fixture, mut record) = relay_worker();
     record.lifecycle = "launch_failed".to_owned();

@@ -409,6 +409,35 @@ def test_a_relay_launch_records_its_spec_and_anchor_backfills_one_from_the_pinne
         sessions.anchor("worker")
 
 
+def test_anchor_replace_pins_a_hand_resumed_claude_behind_a_relay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, identity = relay_worker(tmp_path, monkeypatch, harness="claude")
+    record = sessions.get("worker")
+    assert record.launch_spec is not None
+    native = record.launch_spec["native_session"]
+    assert isinstance(native, dict)
+    recorded_session = native["value"]
+    record.custom_process_identity = replace(identity, pid=9999)
+    record.native_session = None
+    record.session_value = None
+    record.resume = None
+    sessions._save(record)
+    monkeypatch.setattr(fake, "process_liveness",
+                        lambda expected: "alive" if expected == identity else "unknown", raising=False)
+    monkeypatch.setattr(fake, "relay_process", lambda pane: identity, raising=False)
+    fake.command_lines[identity.pid] = (
+        "/usr/local/bin/claude", *record.arguments, "--resume", recorded_session,
+    )
+    with pytest.raises(AgentDeliveryError, match="not provably alive"):
+        sessions.anchor("worker")
+    result = sessions.anchor("worker", replace=True)
+    assert result["replaced"] is True
+    saved = sessions.get("worker")
+    assert saved.custom_process_identity == identity
+    assert saved.native_session is not None and saved.native_session["value"] == recorded_session
+
+
 def test_promote_marks_a_failed_relay_launch_running_when_its_pinned_harness_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
