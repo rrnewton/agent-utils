@@ -477,6 +477,21 @@ def test_node_tap_file_is_loaded_and_plan_checked(tmp_path: Path) -> None:
     assert any("TAP plan is 4" in problem for problem in report.problems)
 
 
+def test_leftover_test_binaries_finds_a_running_artifact(tmp_path: Path) -> None:
+    # #923: the end-of-suite check names a test binary that is still
+    # running, and goes quiet once it is gone.
+    sleeper = tmp_path / "agentctl-fake-test-binary"
+    shutil.copy("/bin/sleep", sleeper)
+    process = subprocess.Popen([sleeper, "60"])
+    try:
+        artifacts = [("agentctl", "fake", str(sleeper))]
+        assert case_timings._leftover_test_binaries(artifacts)
+    finally:
+        process.kill()
+        process.wait()
+    assert case_timings._leftover_test_binaries(artifacts) == []
+
+
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is required")
 def test_run_cargo_against_a_real_crate(tmp_path: Path) -> None:
     crate = tmp_path / "probe"

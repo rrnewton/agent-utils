@@ -679,6 +679,33 @@ def _tag_created_target_parent(cargo_args: Sequence[str]) -> None:
     os.replace(handle.name, parent / "CACHEDIR.TAG")
 
 
+def _leftover_test_binaries(artifacts: Sequence[tuple[str, str, str]]) -> list[str]:
+    """Test binaries from this run that are still running (#923).
+
+    A test binary that outlives its suite -- orphaned to init when the
+    suite was killed, or hung with its signals blocked -- pins the
+    slot it was started in. Zombies have no readable exe, so only live
+    processes match.
+    """
+
+    executables = {os.path.realpath(executable) for _, _, executable in artifacts}
+    if not executables:
+        return []
+    leftovers: list[str] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            exe = os.readlink(entry / "exe")
+        except OSError:
+            continue
+        if exe.endswith(" (deleted)"):
+            exe = exe[: -len(" (deleted)")]
+        if os.path.realpath(exe) in executables:
+            leftovers.append(f"{exe} (pid {entry.name})")
+    return sorted(leftovers)
+
+
 def _run_cargo(argv: Sequence[str], *, gate: str | None) -> int:
     """Run ``cargo test`` with per-case timings; see the module docstring.
 
@@ -847,6 +874,12 @@ def _run_cargo(argv: Sequence[str], *, gate: str | None) -> int:
             cases.append(
                 CaseRecord("libtest", resolved_gate, f"doc::{doc_name}", outcome, None)
             )
+    for leftover in _leftover_test_binaries(artifacts):
+        print(
+            f"case-timings run-cargo: test binary still running after the suite: {leftover}",
+            file=sys.stderr,
+        )
+        status = 1
     for failure in failures:
         print(failure, file=sys.stderr)
     passed = sum(1 for case in cases if case.outcome == "pass")
