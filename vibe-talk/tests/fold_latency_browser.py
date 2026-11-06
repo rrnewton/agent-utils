@@ -11,7 +11,9 @@ unpacked in the Threads view (Unpack all):
 
 * Shift+O: four presses 60 ms apart on the last reply fold the four last replies, each folded in the frame
   after its key; each press's handler (the keydown task on the main thread, from the window's capture
-  to the end of its dispatch) under `--cpu-ms` at the median and twice that at most, and from the key
+  to the end of its dispatch) under `--cpu-ms` at the median and twice that for the second largest
+  press (one press may be descheduled mid-handler on a loaded host; sustained work lifts them all,
+  #905), and from the key
   to the next frame drawn under the wall budget at the median. The budgets follow the owner's rule
   (#866): the main-thread (CPU) budget bites at ~1.5x the measured solo median, and the wall budget
   is forgiving at 8x the CPU budget, derived unless `--frame-ms` overrides it. Handler time is the
@@ -257,6 +259,15 @@ def judge(desk: Desk, args: argparse.Namespace, what: str, handler: list[float],
     frame_ms = args.frame_ms if args.frame_ms > 0 else 8 * cpu_ms
     factor = load_factor(desk.page, args)
     work = [ms / factor for ms in handler]
+    # The per-press ceiling is the second largest of the four, not the largest
+    # (#905): one press can be descheduled by the OS mid-handler on a loaded
+    # host — measured 170 ms of wall for the same ~14 ms of work its sibling
+    # presses did — and no calibration factor can divide that stall away,
+    # because the calibration workload is descheduled the same way only on
+    # average. Sustained main-thread work, the regression this budget exists
+    # to catch, lifts every press: the median still bites at the budget and
+    # the second largest at twice it.
+    trimmed_max = sorted(work)[-2] if len(work) >= 2 else (work[0] if work else 0.0)
     longtasks = desk.page.evaluate("() => window.__longtasks || 0")
     said = (f"{what}: handlers {', '.join(f'{ms:.0f}' for ms in handler)} ms "
             f"({', '.join(f'{ms:.0f}' for ms in work)} work-equivalent at load x{factor:.1f}), key to frame "
@@ -265,7 +276,7 @@ def judge(desk: Desk, args: argparse.Namespace, what: str, handler: list[float],
     if not args.report_only:
         desk.check(len(handler) == 4, f"{what}: not four presses heard: {said}")
         desk.check(all(id in seen for id in ids), f"{what}: not every press drew its row: {said}")
-        desk.check(statistics.median(work) <= cpu_ms and max(work) <= 2 * cpu_ms,
+        desk.check(statistics.median(work) <= cpu_ms and trimmed_max <= 2 * cpu_ms,
                    f"{what}: over the {cpu_ms:.0f} ms main-thread budget: {said}")
         desk.check(statistics.median(frame) <= frame_ms, f"{what}: the frames came late: {said}")
     return said

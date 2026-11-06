@@ -35,3 +35,36 @@ Give the scroll-stability walk (a scrollTop-driven walk with no keys, which move
 Named in the #827 readout of 2026-11-05. #866 latency-tests-cpu-budget is closed; this is the remaining load sensitivity it did not remove.
 
 Filed by mu-validate on 2026-11-05 from the #827 gate-flake readout (local number 900); renumbered to 905 on landing by the coordinator, since 900 was taken on main.
+
+# Design decision and measurement (mu-validate, 2026-11-06)
+
+Load method (reproducible, bounded): the test and `stress --cpu 6` share one
+`systemd-run --user --scope -p CPUQuota=200%` scope, so the browser's own
+processes contend for two cores regardless of the host's 316; each run is
+minutes, the generator dies with the scope, and nothing is pinned. Plain
+`stress --cpu 96` on this host does NOT reproduce anything (the calibration
+factor stays x1.0: 96 spinners do not saturate 316 cores), which is why the
+gate failures at "load 80-119" need a contended slice, not a load number.
+
+Fold (reproduced, then fixed): under that contention the fold check failed
+intermittently with `e` handlers `170, 14, 15, 15 ms` (49 work-equivalent at
+load x3.4) against the 21 ms budget. The 170 ms is one press descheduled by
+the OS mid-handler for ~14 ms of work identical to its sibling presses; the
+median passed and the per-press maximum (2x budget) failed. No calibration
+factor can divide a single deschedule away. Choice, per the design's first
+option kept tight rather than relaxed: the per-press ceiling is now the
+second largest of the four presses at 2x the CPU budget, with the median
+still biting at the budget. Sustained main-thread work lifts every press, so
+a real regression still fails both statistics. After the change, 10/10
+consecutive fold runs pass under the same contention (before: 1 of 3
+failed), idle behaviour is unchanged, and a deliberate regression (80 ms of
+busy work injected into every O/e keydown of a copied page) still fails with
+handlers 92-96 ms against the 21 ms budget.
+
+Scroll-stability: measured under the same scope. Its judgements are
+positions within a pixel, not times, and since #866 they already gate on
+observed stability with forgiving wall deadlines (`settled()`), so the same
+treatment there is: no change. It passed 4/4 runs under the contended scope
+on unchanged code while the fold fix above was being verified beside it;
+the remaining consecutive runs for the acceptance count follow in the gate
+record.
