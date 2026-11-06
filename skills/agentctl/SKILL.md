@@ -143,3 +143,15 @@ doing anything. Never resubmit a possibly-submitted prompt automatically.
 
 `agentctl stop NAME` retires only the exact owned runtime after identity checks.
 Do not remove registry files or panes by hand to work around a refusal.
+
+## Restart a session in place
+
+`agentctl restart NAME --when-idle` restarts a live agent in its own pane
+with its recorded session (same pane, tab, name, queue, and slot; slot
+ownership is transferred to the new process). Before restarting, have the
+agent finish or stop its background shells, monitors, internal subagents,
+and session crons and note what to re-arm: none of them survive, and the
+restarted agent gets a re-arm notice. `agentctl restart --team
+--when-idle` restarts every agent you manage, workers first, never
+yourself; a coordinator that must restart itself needs an external helper
+(another agent or a systemd-run unit) to run its own restart.

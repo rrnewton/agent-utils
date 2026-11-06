@@ -1126,6 +1126,60 @@ def restart(manager: ManagedAgents, name: str, *, when_idle: bool = False,
     }
 
 
+def restart_team(manager: ManagedAgents, caller: str, *, when_idle: bool = False,
+                 wait_timeout: float = 3600.0, startup_timeout: float = 30.0) -> dict[str, object]:
+    """Restart every agent managed by `caller`, workers first and never the
+    caller itself (R2 team restart). Finished lanes are skipped.
+    """
+    # Workers first: walk each record's managed_by edge to the caller.
+    def depth_below(name: str) -> int | None:
+        depth = 0
+        seen: set[str] = set()
+        current = name
+        while current != caller:
+            if current in seen or depth > 32:
+                return None
+            seen.add(current)
+            try:
+                document = json.loads((manager._directory(current) / "agent.json").read_text())
+                edge = document.get("managed_by")
+            except Exception:
+                return None
+            if edge is None:
+                return None
+            current = str(edge.get("agent") or "")
+            if not current:
+                return None
+            depth += 1
+        return depth if name != caller else None
+
+    team = sorted(
+        (name for name in manager._registered_names() if depth_below(name) is not None),
+        key=lambda name: (-(depth_below(name) or 0), name),
+    )
+    rows: list[dict[str, object]] = []
+    for name in team:
+        try:
+            record = manager._load(name)
+        except Exception as error:
+            rows.append({"name": name, "action": "failed", "reason": str(error)})
+            continue
+        if record.lifecycle != "running":
+            rows.append({"name": name, "action": "skipped",
+                         "reason": f"lifecycle is {record.lifecycle}, not running; finished lanes are stopped, not restarted"})
+            continue
+        try:
+            result = manager.restart(name, when_idle=when_idle, wait_timeout=wait_timeout,
+                                     startup_timeout=startup_timeout)
+            rows.append({"name": name, "action": "restarted",
+                         "pane_id": result.get("pane_id"), "session": result.get("session")})
+        except Exception as error:
+            rows.append({"name": name, "action": "failed", "reason": str(error)})
+    return {"caller": caller,
+            "restarted": sum(1 for row in rows if row["action"] == "restarted"),
+            "agents": rows}
+
+
 def revive_all(manager: ManagedAgents, *, dry_run: bool = False, startup_timeout: float = 30.0) -> dict[str, object]:
     """Plan or recover all names, retaining individual refusals in the result."""
     if not math.isfinite(startup_timeout) or not 0 < startup_timeout <= 300:

@@ -1025,8 +1025,16 @@ struct Revive {
 
 #[derive(Args)]
 struct Restart {
-    #[command(flatten)]
-    agent: Named,
+    /// Registered name to restart; required unless --team
+    #[arg(
+        value_name = "NAME",
+        required_unless_present = "team",
+        conflicts_with = "team"
+    )]
+    name: Option<String>,
+    /// Restart every agent managed by the caller (AGENTCTL_AGENT, else the designated coordinator), workers first, never the caller
+    #[arg(long)]
+    team: bool,
     /// Wait until the agent finishes its turn and is idle with nothing queued, instead of refusing
     #[arg(long)]
     when_idle: bool,
@@ -4287,14 +4295,39 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             return Ok(code);
         }
         Commands::Restart(value) => {
-            let result = manager.restart(
-                &value.agent.name,
-                value.when_idle,
-                Duration::from_secs_f64(value.wait_idle),
-                Duration::from_secs_f64(value.startup_timeout),
-            )?;
-            manager.bring_coordinator_tab_forward(&value.agent.name, tab_socket);
-            result
+            if value.team {
+                let caller = std::env::var("AGENTCTL_AGENT")
+                    .ok()
+                    .filter(|caller| !caller.is_empty())
+                    .or_else(|| {
+                        manager
+                            .control_view()
+                            .ok()
+                            .and_then(|(_, designated, _)| designated)
+                    })
+                    .ok_or_else(|| {
+                        Failure::Usage(
+                            "restart --team needs AGENTCTL_AGENT or a designated coordinator"
+                                .to_owned(),
+                        )
+                    })?;
+                manager.restart_team(
+                    &caller,
+                    value.when_idle,
+                    Duration::from_secs_f64(value.wait_idle),
+                    Duration::from_secs_f64(value.startup_timeout),
+                )?
+            } else {
+                let name = value.name.as_deref().expect("clap requires NAME or --team");
+                let result = manager.restart(
+                    name,
+                    value.when_idle,
+                    Duration::from_secs_f64(value.wait_idle),
+                    Duration::from_secs_f64(value.startup_timeout),
+                )?;
+                manager.bring_coordinator_tab_forward(name, tab_socket);
+                result
+            }
         }
         Commands::List => json!(manager.list()?),
         Commands::Status(value) => manager.status(&value.name)?,

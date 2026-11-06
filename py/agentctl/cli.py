@@ -231,7 +231,10 @@ def parser() -> argparse.ArgumentParser:
         "its Herdr name, transfer its slot ownership, and queue a re-arm notice (background shells, monitors and "
         "session crons do not survive). Refuses with nothing changed when the session is unknown or contradicts "
         "the running argv, when input is queued, or on a background-task exit dialog.",
-        "agentctl restart reviewer --when-idle", named=True)
+        "agentctl restart reviewer --when-idle", named=False)
+    restart.add_argument("name", nargs="?", metavar="NAME", help="registered session name; required unless --team is used")
+    restart.add_argument("--team", action="store_true",
+        help="restart every agent managed by the caller (AGENTCTL_AGENT, else the designated coordinator), workers first, never the caller")
     restart.add_argument("--when-idle", action="store_true",
         help="wait until the agent finishes its turn and is idle with nothing queued, instead of refusing")
     restart.add_argument("--wait-idle", type=_ascii_float, default=3600.0, metavar="SECONDS",
@@ -580,8 +583,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = sessions.revive(name, dry_run=args.dry_run, expected_token=args.expected_token,
                                      startup_timeout=args.startup_timeout)
         elif args.command == "restart":
-            result = sessions.restart(name, when_idle=args.when_idle, wait_timeout=args.wait_idle,
-                                      startup_timeout=args.startup_timeout)
+            if args.team:
+                import os as _os
+                caller = _os.environ.get("AGENTCTL_AGENT") or ""
+                if not caller:
+                    raise ValueError("restart --team needs AGENTCTL_AGENT or a designated coordinator")
+                result = sessions.restart_team(caller, when_idle=args.when_idle, wait_timeout=args.wait_idle,
+                                               startup_timeout=args.startup_timeout)
+            else:
+                result = sessions.restart(name, when_idle=args.when_idle, wait_timeout=args.wait_idle,
+                                          startup_timeout=args.startup_timeout)
         elif args.command == "promote":
             result = sessions.promote(name, expected_token=args.expected_token)
         elif args.command == "anchor":

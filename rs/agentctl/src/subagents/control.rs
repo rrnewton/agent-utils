@@ -875,6 +875,32 @@ pub(crate) fn tree_order(
     ordered.into_iter().map(|(_, name)| name).collect()
 }
 
+/// Every agent managed, at any depth, by `caller`, workers first (deepest
+/// first, then name). The caller itself is never included (R2 team restart).
+pub(crate) fn descendants(nodes: &[ControlNode], registry: &Path, caller: &str) -> Vec<String> {
+    let depth_below = |name: &str| -> Option<usize> {
+        let mut depth = 0;
+        let mut seen = BTreeSet::new();
+        let mut current = nodes.iter().find(|node| node.name == name)?;
+        while current.name != caller {
+            if !seen.insert(current.name.clone()) || depth > MAX_DEPTH {
+                return None;
+            }
+            depth += 1;
+            current = tree_parent(nodes, registry, current)?;
+        }
+        (name != caller).then_some(depth)
+    };
+    let mut found: Vec<(usize, String)> = nodes
+        .iter()
+        .filter_map(|node| depth_below(&node.name).map(|depth| (depth, node.name.clone())))
+        .collect();
+    found.sort_by(|(left_depth, left), (right_depth, right)| {
+        right_depth.cmp(left_depth).then_with(|| left.cmp(right))
+    });
+    found.into_iter().map(|(_, name)| name).collect()
+}
+
 fn read_designation(registry: &Path) -> Result<Option<Designation>> {
     let path = registry.join(DESIGNATION_FILE);
     match fs::symlink_metadata(&path) {

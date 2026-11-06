@@ -2347,6 +2347,52 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         }))
     }
 
+    /// Restart every agent managed by `caller`, workers first and never the
+    /// caller itself (R2 team restart). Finished lanes are skipped, not
+    /// restarted; each lane reports restarted / skipped / failed with why.
+    pub fn restart_team(
+        &self,
+        caller: &str,
+        when_idle: bool,
+        wait_timeout: Duration,
+        startup_timeout: Duration,
+    ) -> Result<Value> {
+        let (nodes, _, registry) = self.control_view()?;
+        let team = crate::subagents::control::descendants(&nodes, &registry, caller);
+        let mut rows = Vec::new();
+        for name in &team {
+            let record = match self.load(name) {
+                Ok(record) => record,
+                Err(error) => {
+                    rows.push(
+                        json!({"name": name, "action": "failed", "reason": error.to_string()}),
+                    );
+                    continue;
+                }
+            };
+            if record.lifecycle != "running" {
+                rows.push(json!({
+                    "name": name, "action": "skipped",
+                    "reason": format!("lifecycle is {}, not running; finished lanes are stopped, not restarted", record.lifecycle),
+                }));
+                continue;
+            }
+            match self.restart(name, when_idle, wait_timeout, startup_timeout) {
+                Ok(result) => rows.push(json!({
+                    "name": name, "action": "restarted",
+                    "pane_id": result["pane_id"], "session": result["session"],
+                })),
+                Err(error) => rows
+                    .push(json!({"name": name, "action": "failed", "reason": error.to_string()})),
+            }
+        }
+        Ok(json!({
+            "caller": caller,
+            "restarted": rows.iter().filter(|row| row["action"] == "restarted").count(),
+            "agents": rows,
+        }))
+    }
+
     /// [`Self::revive`], and with `abandon_candidate` (`revive --abandon-candidate`, #899) an
     /// interrupted revive whose candidate cannot be proved alive or dead is marked failed too,
     /// unless a harness process runs for it. A candidate proved dead is abandoned either way.
