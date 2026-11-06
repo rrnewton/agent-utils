@@ -1,11 +1,12 @@
 ---
 title: 'browser-latency-load-sensitivity: vibe-talk browser latency budgets still miss under host load after the CPU-budget rework'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-validate
 created_at: 2026-11-05T18:04:37.530921232+00:00
-updated_at: 2026-11-05T18:04:37.530921232+00:00
+updated_at: 2026-11-06T11:40:00.000000000+00:00
+closed_at: 2026-11-06T11:40:00.000000000+00:00
 ---
 
 # Description
@@ -68,3 +69,7 @@ treatment there is: no change. It passed 10/10 consecutive runs under the
 contended scope on unchanged code (four batches: 1 + 3 + 3 + 3), and the
 fold check passed 10/10 consecutive runs under the same scope after its
 fix, with idle runs unchanged (handlers 11-26 ms at load x1.0, as before).
+
+## Resolution
+
+Landed as f605b64e: the fold check's per-press ceiling is the second-largest press at 2x the budget, and the median is unchanged. The acceptance record above was measured under bounded contention. The full gate was green.
