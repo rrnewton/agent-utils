@@ -1026,25 +1026,34 @@ An **item record** (`items/<pr>.json`) has these fields:
   heartbeat's `last error` (absent or `0`: `3`). An accepted receipt from the donor resets
   its run.
 - `host_fault_escalate_after`: consecutive probe-pass/launch-refuse cycles after which a
-  donor's host fault escalates (absent or `0`: `5`); see "Host-scope could-not-run" below.
+  donor's host fault escalates (absent or `0`: `5`); see "Could-not-run is not a host fault
+  by itself" below.
 
-**Host-scope could-not-run.** A validator that cannot run at all on its host (a wedged
-worktree allocator, say) prints `MQ_COULD_NOT_RUN_SCOPE: host <reason>` with its exit-75
-refusal; `job <reason>` (or no line) keeps today's per-job strikes. A host-scope refusal
-costs the job no strike and never cancels it: the job is queued again, the history says
-`host could not run: <reason>`, the donor is recorded faulted and leased nothing, and
-`donor status` plus the serve heartbeat show an `ERROR:` line for it. The donor pauses
-claiming, probes its validator with `MQ_PROBE=1` (admission checks only, exit 0 = ready,
-back-off 30 s doubling to 10 min), and resumes with a probe-passed claim that clears the
-fault; an admitted receipt clears it too. Validators that never print the line get a
-backstop: could-not-run for two different jobs in a row with the same last output line
-counts as a host fault, and both strikes come off. While every eligible donor is faulted,
-a decide-mode run keeps waiting instead of spending its claim timeout; with any eligible
-donor known but healthy, the normal claim timeout applies even if it never claims.
+**Could-not-run is not a host fault by itself.** A validator prints
+`MQ_COULD_NOT_RUN_SCOPE: host <reason>` with its exit-75 refusal when it cannot run at all
+on its host (a wedged worktree allocator, say); `job <reason>` (or no line) is
+candidate-specific. Either way the refusal alone never faults the host: the job is queued
+again, the receipt is counted (`max_could_not_run` bounds one job, and one donor is left
+out of a job it refused that many times), and the donor probes its validator right after
+with `MQ_PROBE=1` (admission checks only, exit 0 = ready). A passing probe means the host
+is healthy — the refusal was candidate-specific — and the donor keeps leasing. Only a
+failing probe records a host fault: the donor is then leased nothing, and `donor status`
+plus the serve heartbeat show `donor <name> faulted since <t>: <reason>; last probe <t>
+<result>`. An admission refusal that says the validate lock or box is busy (slots full, a
+queue position, lease contention) is never a host fault and is never probed. While faulted
+the donor re-probes on its own schedule — after 60 s, doubling to at most 5 min — whether
+or not a host-pause file exists, counting one probe cycle per probe, so a fault never sits
+at zero probes forever. A passing re-probe (or an admitted validation) clears the fault.
+Operators can clear one without leasing anything with `merge-queue donor clear-fault
+--donor <name> --probe-passed` (run it where the queue state lives, after the donor's
+probe passed); unlike `donor claim --probe-passed` it leases no job. While every eligible
+donor is faulted, a decide-mode run keeps waiting instead of spending its claim timeout;
+with any eligible donor known but healthy, the normal claim timeout applies even if it
+never claims.
 
-A probe pass followed by a launch refusal is a flap cycle, not a recovery: the donor's
-probe back-off keeps doubling (30 s to 10 min) across such cycles instead of resetting,
-and only an admitted validation resets it. After `host_fault_escalate_after` consecutive
+A probe pass followed by a launch refusal whose own probe then fails is a flap cycle,
+not a recovery: the donor's probe back-off keeps doubling (60 s to 5 min) across such
+cycles instead of resetting, and only an admitted validation resets it. After `host_fault_escalate_after` consecutive
 cycles (5 by default) the fault escalates: `donor status` and the serve heartbeat raise an
 `ERROR:` for it, and the donor stays paused until an admitted validation clears it — a
 probe pass then only arms one trial claim, it no longer clears the fault.

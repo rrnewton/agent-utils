@@ -3915,11 +3915,25 @@ impl<'a> Runner<'a> {
                     if waiting_since.elapsed() > claim_timeout
                         && donors.store.every_eligible_donor_faulted(&record)
                     {
+                        let faults = donors
+                            .store
+                            .host_fault_details()
+                            .into_iter()
+                            .map(|(donor, reason, since, at, result)| {
+                                format!(
+                                    "donor {donor} faulted since {since}: {reason}; \
+                                     last probe {at} {result}"
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ");
                         self.event(
                             "donor",
                             &format!(
-                                "v{id}: still waiting for job {published}: donor(s) \
-                                 paused for a host fault"
+                                "v{id}: ALARM: job {published} has gone unleased for \
+                                 {}s while every eligible donor is faulted ({faults}); \
+                                 published jobs stay queued until a probe passes",
+                                waiting_since.elapsed().as_secs()
                             ),
                         );
                         waiting_since = Instant::now();

@@ -64,6 +64,28 @@ pub fn could_not_run_scope(log_text: &str) -> Option<(bool, String)> {
     None
 }
 
+/// Whether a refusal's output says admission was busy rather than unable: the
+/// validate lock or box had no slot, a queue position, or lease contention.
+/// Such a refusal is never a host fault and never a candidate fault: the job
+/// is queued again with backoff. Matched case-insensitively on the refusal's
+/// own words, so a validator that wants this treatment says so plainly.
+pub fn could_not_run_busy(log_text: &str) -> bool {
+    let lower = log_text.to_lowercase();
+    [
+        "busy",
+        "slots full",
+        "slot full",
+        "no slot",
+        "no free slot",
+        "queue position",
+        "lease contention",
+        "all slots",
+        "capacity full",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 /// Environment variable set to `1` when a donor probes its validator after a host-scope
 /// refusal: admission checks only, exit 0 means ready to validate again.
 pub const PROBE_ENV: &str = "MQ_PROBE";

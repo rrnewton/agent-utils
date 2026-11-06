@@ -996,27 +996,32 @@ fn run_cycle(
             };
             // A donor that keeps giving jobs back with the same reason is an ERROR the
             // health tick must see, even though no single give-back is a queue failure.
-            let give_back =
-                state.config().ok().and_then(|config| {
-                    let store = crate::donor::Store::new(&state.root);
-                    let mut alerts = store
-                        .give_back_alerts(config.donors.give_back_alert())
-                        .unwrap_or_default();
-                    alerts.extend(store.host_fault_list().into_iter().map(
-                        |(donor, reason, since)| {
-                            format!(
-                                "ERROR: donor {donor}: host cannot validate: {reason} \
-                             (since {since})"
-                            )
-                        },
-                    ));
-                    alerts.extend(store.host_fault_escalations());
-                    if alerts.is_empty() {
-                        None
-                    } else {
-                        Some(alerts.join("; "))
-                    }
-                });
+            let give_back = state.config().ok().and_then(|config| {
+                let store = crate::donor::Store::new(&state.root);
+                let mut alerts = store
+                    .give_back_alerts(config.donors.give_back_alert())
+                    .unwrap_or_default();
+                alerts.extend(store.host_fault_details().into_iter().map(
+                    |(donor, reason, since, last_probe_at, last_probe)| {
+                        format!(
+                            "ERROR: donor {donor} faulted since {since}: {reason}; \
+                                 last probe {} {}",
+                            if last_probe_at.is_empty() {
+                                "never"
+                            } else {
+                                &last_probe_at
+                            },
+                            last_probe
+                        )
+                    },
+                ));
+                alerts.extend(store.host_fault_escalations());
+                if alerts.is_empty() {
+                    None
+                } else {
+                    Some(alerts.join("; "))
+                }
+            });
             if let Some(alert) = &give_back {
                 eprintln!("merge-queue serve: {alert}");
             }

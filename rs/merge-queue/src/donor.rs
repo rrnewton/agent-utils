@@ -1182,71 +1182,28 @@ impl Store {
                     format!(", last output: {last}")
                 }
             );
-            // Host scope: the host cannot validate at all. No strike, no bound, no
-            // verdict: the job goes back and the donor is leased nothing until it
-            // reports an admitted validation or claims after a passing probe.
+            // A could-not-run refusal for one candidate is not, by itself, a
+            // host fault: it depends on the candidate's commits as often as
+            // on the host. The job is queued again and counted below; the
+            // donor probes its validator (MQ_PROBE=1) right after this
+            // refusal, and only a failing probe records a host fault (see
+            // `Store::record_host_fault`, called by the donor when its probe
+            // fails). A busy admission refusal (validate lock or box busy,
+            // slots full, queue position, lease contention) is never a host
+            // fault either, and is counted the same way so a persistently
+            // refused candidate is still bounded.
+            // One narrow exception: a host-scope refusal on the launch right
+            // after a probe pass is a flap cycle (the validator claims the
+            // host cannot run, yet its probe just passed). That records the
+            // fault queue-side so consecutive cycles escalate; it costs the
+            // job no strike. A first host-scope refusal is probed first (see
+            // above) and faults nothing here.
             if let Some((true, reason)) = crate::validate::could_not_run_scope(&receipt.log_tail) {
-                job.lease = None;
-                job.state = if job.candidate_gone.is_some() {
-                    JobState::Cancelled
-                } else {
-                    JobState::Queued
-                };
-                job.history.push(format!(
-                    "{}: host could not run: {reason} ({} on {}); no verdict, no strike",
-                    now(),
-                    receipt.donor.name,
-                    receipt.donor.host
-                ));
-                self.note_host_fault(&receipt.donor.name, &reason);
-                let fault_reason = reason.clone();
-                self.write(&job)?;
-                return Err(format!(
-                    "host could not run ({fault_reason}); no verdict, no strike, \
-                     the donor is paused"
-                ));
-            }
-            // Backstop for validators that never print the scope line: could-not-run
-            // for two different jobs in a row with the same last line is a host
-            // fault. Both strikes come off and the donor is paused as above.
-            let marked_job_scope = crate::validate::could_not_run_scope(&receipt.log_tail)
-                .is_some_and(|(host, _)| !host);
-            if !marked_job_scope {
-                let donor_key = receipt.donor.name.clone();
-                let mut pending: std::collections::BTreeMap<String, serde_json::Value> =
-                    std::fs::read_to_string(self.dir.join("could-not-run-pending.json"))
-                        .ok()
-                        .and_then(|text| serde_json::from_str(&text).ok())
-                        .unwrap_or_default();
-                let (pending_job, pending_line) = pending
-                    .get(&donor_key)
-                    .map(|entry| {
-                        (
-                            entry["job"].as_str().unwrap_or_default().to_owned(),
-                            entry["line"].as_str().unwrap_or_default().to_owned(),
-                        )
-                    })
-                    .unwrap_or_default();
-                if !pending_job.is_empty() && pending_job != job.id && pending_line == last {
-                    if let Ok(mut previous) = self.read(&pending_job) {
-                        previous
-                            .could_not_run
-                            .retain(|entry| !entry.starts_with(&format!("{donor_key}: ")));
-                        previous.history.push(format!(
-                            "{}: host could not run (backstop: same refusal as {}); \
-                             strikes removed",
-                            now(),
-                            job.id
-                        ));
-                        let _ = self.write(&previous);
-                    }
-                    pending.remove(&donor_key);
-                    if let Ok(text) = serde_json::to_string(&pending) {
-                        let _ = write_private(
-                            &self.dir.join("could-not-run-pending.json"),
-                            text.as_bytes(),
-                        );
-                    }
+                let flap_passed = self
+                    .host_flap()
+                    .get(&receipt.donor.name)
+                    .is_some_and(|entry| entry["probe_passed"].as_bool() == Some(true));
+                if flap_passed {
                     job.lease = None;
                     job.state = if job.candidate_gone.is_some() {
                         JobState::Cancelled
@@ -1254,32 +1211,21 @@ impl Store {
                         JobState::Queued
                     };
                     job.history.push(format!(
-                        "{}: host could not run (backstop: {} on {} refused two \
-                         different jobs in a row: {last}); no verdict, no strike",
+                        "{}: host could not run after a passing probe: {reason} ({} on {}); \
+                         no verdict, no strike",
                         now(),
                         receipt.donor.name,
                         receipt.donor.host
                     ));
-                    self.note_host_fault(
-                        &receipt.donor.name,
-                        &format!("unclassified host refusal: {last}"),
-                    );
+                    self.note_host_fault(&receipt.donor.name, &reason);
                     self.write(&job)?;
-                    return Err(
-                        "host could not run (backstop: two different jobs refused in a \
-                         row with the same last line); no verdict, no strike, the donor \
-                         is paused"
-                            .to_owned(),
-                    );
-                }
-                pending.insert(donor_key, serde_json::json!({"job": job.id, "line": last}));
-                if let Ok(text) = serde_json::to_string(&pending) {
-                    let _ = write_private(
-                        &self.dir.join("could-not-run-pending.json"),
-                        text.as_bytes(),
-                    );
+                    return Err(format!(
+                        "host could not run after a passing probe ({reason}); no verdict, \
+                         no strike, the donor is paused"
+                    ));
                 }
             }
+            let busy = crate::validate::could_not_run_busy(&receipt.log_tail);
             job.could_not_run
                 .push(format!("{}: {detail}", receipt.donor.name));
             let by_this_donor = job
@@ -1320,6 +1266,9 @@ impl Store {
                     "; {} could not run it {by_this_donor} times and will not get it again",
                     lease.donor
                 ));
+            }
+            if busy {
+                note.push_str("; busy admission refusal: never a host fault");
             }
             job.history.push(note);
             self.write(&job)?;
@@ -1597,6 +1546,18 @@ impl Store {
 
     /// Host faults by donor name, for status and the serve heartbeat.
     pub fn host_fault_list(&self) -> Vec<(String, String, String)> {
+        self.host_fault_details()
+            .into_iter()
+            .map(|(donor, reason, since, _, _)| (donor, reason, since))
+            .collect()
+    }
+
+    /// Host faults with their last probe, by donor name:
+    /// `(donor, reason, since, last_probe_at, last_probe_result)`, where the
+    /// result is `passed`, `failed`, or empty when never probed. Status and
+    /// the serve heartbeat render this as "donor X faulted since T: reason;
+    /// last probe T result", so a fault sitting at zero probes is visible.
+    pub fn host_fault_details(&self) -> Vec<(String, String, String, String, String)> {
         self.host_faults()
             .into_iter()
             .map(|(donor, fault)| {
@@ -1604,9 +1565,40 @@ impl Store {
                     donor,
                     fault["reason"].as_str().unwrap_or_default().to_owned(),
                     fault["since"].as_str().unwrap_or_default().to_owned(),
+                    fault["last_probe_at"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    fault["last_probe"].as_str().unwrap_or_default().to_owned(),
                 )
             })
             .collect()
+    }
+
+    /// Record a host fault for `donor` because its probe (MQ_PROBE=1), run
+    /// right after a could-not-run refusal, also failed. This is the only
+    /// refusal-driven way a fault is recorded: a refusal alone never faults
+    /// a host (see `Store::report`). Counts as one failed probe.
+    pub fn record_host_fault(&self, donor: &str, reason: &str) {
+        self.note_host_fault(donor, reason);
+        self.record_probe_result(donor, false);
+    }
+
+    /// Note the outcome of a fault re-probe: a pass clears an ordinary fault
+    /// (an escalated one only arms a trial claim, as `note_probe_pass`), a
+    /// failure keeps it and counts one more probe cycle, so a fault never
+    /// sits at cycles=0 forever.
+    pub fn record_probe_result(&self, donor: &str, passed: bool) {
+        let mut faults = self.host_faults();
+        if let Some(entry) = faults.get_mut(donor) {
+            entry["last_probe_at"] = serde_json::json!(now());
+            entry["last_probe"] = serde_json::json!(if passed { "passed" } else { "failed" });
+            entry["probes"] = serde_json::json!(entry["probes"].as_u64().unwrap_or_default() + 1);
+            let _ = self.save_host_faults(&faults);
+        }
+        if passed {
+            self.note_probe_pass(donor);
+        }
     }
 
     /// Escalated host faults as `ERROR:` lines, for donor status and the serve
@@ -1742,9 +1734,9 @@ impl Store {
         };
         let _ = self.save_host_flap(&flap);
         let mut faults = self.host_faults();
-        let entry = faults
-            .entry(donor.to_owned())
-            .or_insert_with(|| serde_json::json!({"reason": reason, "since": now()}));
+        let entry = faults.entry(donor.to_owned()).or_insert_with(|| {
+            serde_json::json!({"reason": reason, "since": now(), "probes": 0, "last_probe": "", "last_probe_at": ""})
+        });
         entry["reason"] = serde_json::json!(reason);
         entry["cycles"] = serde_json::json!(cycles);
         entry["escalated"] =
@@ -2087,12 +2079,29 @@ struct Worker<'a> {
     /// refusal keeps doubling it (30 s to 10 min) instead of resetting to
     /// 30 s; only an admitted validation resets it.
     next_host_delay: Mutex<std::time::Duration>,
+    /// The last validator this donor ran, kept so a queue-side host fault
+    /// with no local host-pause file can still be re-probed on schedule.
+    last_validator: Mutex<Option<crate::state::ValidatorConfig>>,
+    /// When the next no-pause fault re-probe is due, and its current delay.
+    next_fault_probe: Mutex<std::time::Instant>,
+    fault_probe_current: Mutex<std::time::Duration>,
 }
 
 /// The probe back-off after a pause whose current delay is `delay`: doubled,
 /// capped at ten minutes.
 fn doubled_probe_delay(delay: std::time::Duration) -> std::time::Duration {
     (delay * 2).min(std::time::Duration::from_secs(600))
+}
+
+/// First fault re-probe delay, and the cap it backs off to: a faulted donor
+/// re-probes after 60 s, doubling to at most 5 min, whether or not a
+/// host-pause file exists.
+pub const FAULT_PROBE_FIRST_SECS: u64 = 60;
+/// Cap for the fault re-probe back-off.
+pub const FAULT_PROBE_MAX_SECS: u64 = 300;
+
+fn fault_probe_delay(delay: std::time::Duration) -> std::time::Duration {
+    (delay * 2).min(std::time::Duration::from_secs(FAULT_PROBE_MAX_SECS))
 }
 
 /// A donor paused after a host-scope could-not-run refusal.
@@ -2443,6 +2452,10 @@ impl Worker<'_> {
                 job.id
             );
         }
+        *self
+            .last_validator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job.validator.clone());
         let digest = validator_digest(&job.validator).map_err(Unreported::Declined)?;
         if digest != job.tool.validator_digest {
             return Err(Unreported::Declined(format!(
@@ -2551,14 +2564,50 @@ impl Worker<'_> {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Some(std::time::Instant::now() + self.options.mismatch_backoff);
-                // A host-scope refusal pauses claiming entirely: probe the validator
-                // (MQ_PROBE=1) until it admits work again.
-                if let Some((true, reason)) = crate::validate::could_not_run_scope(&log_text) {
+                // A could-not-run refusal for one candidate is not a host
+                // fault by itself: probe the validator (MQ_PROBE=1) right
+                // after it. A passing probe means the host is healthy and
+                // the refusal was candidate-specific: keep leasing. Only a
+                // failing probe records a host fault (queue-side, via the
+                // `donor host-fault` route) and pauses claiming. A busy
+                // admission refusal is never probed and never a fault.
+                let host_scope =
+                    crate::validate::could_not_run_scope(&log_text).is_some_and(|(host, _)| host);
+                let probe_failed = !crate::validate::could_not_run_busy(&log_text)
+                    && !self.probe_host_validator(&job.validator);
+                if probe_failed || host_scope {
+                    let reason = crate::validate::could_not_run_scope(&log_text)
+                        .map(|(_, reason)| reason)
+                        .unwrap_or_else(|| {
+                            "validator refused (COULD_NOT_RUN) and the probe failed".to_owned()
+                        });
                     let since = now();
                     eprintln!(
-                        "merge-queue donor {}: host cannot validate: {reason};                          pausing claims and probing",
+                        "merge-queue donor {}: host cannot validate: {reason}; pausing claims and probing",
                         self.options.name
                     );
+                    // A failing probe records the fault; a host-scope refusal
+                    // after a passing probe is recorded queue-side as a flap
+                    // cycle when the receipt lands, so it is not sent here.
+                    if probe_failed {
+                        if let Err(error) = self.route.call(
+                            &[
+                                "donor",
+                                "host-fault",
+                                "--donor",
+                                &self.options.name,
+                                "--reason",
+                                &reason,
+                            ],
+                            b"",
+                            ROUTE_TIMEOUT,
+                        ) {
+                            eprintln!(
+                                "merge-queue donor {}: cannot record the host fault: {error}",
+                                self.options.name
+                            );
+                        }
+                    }
                     // The pause delay is the running back-off, not a fresh
                     // 30 s: a launch refusal right after a probe pass keeps
                     // doubling it (see `next_host_delay`).
@@ -2587,7 +2636,7 @@ impl Worker<'_> {
                     .next_host_delay
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    std::time::Duration::from_secs(30);
+                    std::time::Duration::from_secs(FAULT_PROBE_FIRST_SECS);
             }
             let body = serde_json::to_vec(&Report {
                 token: token.to_owned(),
@@ -2654,9 +2703,10 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
             None
         }
     };
-    let restored_delay = restored_pause
-        .as_ref()
-        .map_or(std::time::Duration::from_secs(30), |pause| pause.delay);
+    let restored_delay = restored_pause.as_ref().map_or(
+        std::time::Duration::from_secs(FAULT_PROBE_FIRST_SECS),
+        |pause| pause.delay,
+    );
     let worker = Worker {
         options,
         route: &route,
@@ -2665,6 +2715,11 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
         host_pause: Mutex::new(restored_pause),
         probe_passed: AtomicBool::new(false),
         next_host_delay: Mutex::new(restored_delay),
+        last_validator: Mutex::new(None),
+        next_fault_probe: Mutex::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(FAULT_PROBE_FIRST_SECS),
+        ),
+        fault_probe_current: Mutex::new(std::time::Duration::from_secs(FAULT_PROBE_FIRST_SECS)),
     };
     let backoff: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     let active = AtomicUsize::new(0);
@@ -2721,16 +2776,122 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
                                 doubled_probe_delay(state.delay);
                             *pause = None;
                             let _ = std::fs::remove_file(options.work.join("host-pause.json"));
+                            let _ = route.call(
+                                &[
+                                    "donor",
+                                    "clear-fault",
+                                    "--donor",
+                                    &options.name,
+                                    "--probe-passed",
+                                ],
+                                b"",
+                                ROUTE_TIMEOUT,
+                            );
                             worker.probe_passed.store(true, Ordering::SeqCst);
                             false
                         } else {
-                            state.delay = doubled_probe_delay(state.delay);
+                            state.delay = fault_probe_delay(state.delay);
                             state.next = std::time::Instant::now() + state.delay;
+                            let _ = route.call(
+                                &[
+                                    "donor",
+                                    "host-fault",
+                                    "--donor",
+                                    &options.name,
+                                    "--reason",
+                                    &state.reason.clone(),
+                                ],
+                                b"",
+                                ROUTE_TIMEOUT,
+                            );
                             true
                         }
                     }
                 }
             };
+            // A queue-side host fault with no local host-pause file must not
+            // deadlock: re-probe on the fault schedule (60 s backing off to
+            // 5 min) using the last validator this donor ran, and clear the
+            // fault through the route that never leases when a probe passes.
+            if !host_paused {
+                let due = {
+                    let next = worker
+                        .next_fault_probe
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    std::time::Instant::now() >= *next
+                };
+                if due {
+                    let faulted = route
+                        .call(
+                            &["donor", "fault", "--donor", &options.name],
+                            b"",
+                            ROUTE_TIMEOUT,
+                        )
+                        .and_then(|out| Route::parse_reply::<serde_json::Value>(&out))
+                        .map(|reply| !reply["fault"].is_null())
+                        .unwrap_or(false);
+                    let validator = worker
+                        .last_validator
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    if faulted {
+                        if let Some(cfg) = validator {
+                            if worker.probe_host_validator(&cfg) {
+                                eprintln!(
+                                    "merge-queue donor {}: fault re-probe passed with no host pause; clearing the fault",
+                                    options.name
+                                );
+                                let _ = route.call(
+                                    &[
+                                        "donor",
+                                        "clear-fault",
+                                        "--donor",
+                                        &options.name,
+                                        "--probe-passed",
+                                    ],
+                                    b"",
+                                    ROUTE_TIMEOUT,
+                                );
+                                worker.probe_passed.store(true, Ordering::SeqCst);
+                                *worker
+                                    .fault_probe_current
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    std::time::Duration::from_secs(FAULT_PROBE_FIRST_SECS);
+                            } else {
+                                let _ = route.call(
+                                    &[
+                                        "donor",
+                                        "host-fault",
+                                        "--donor",
+                                        &options.name,
+                                        "--reason",
+                                        "fault re-probe failed",
+                                    ],
+                                    b"",
+                                    ROUTE_TIMEOUT,
+                                );
+                                let mut delay = worker
+                                    .fault_probe_current
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                *delay = fault_probe_delay(*delay);
+                            }
+                        }
+                    }
+                    let delay = *worker
+                        .fault_probe_current
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *worker
+                        .next_fault_probe
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        std::time::Instant::now() + delay;
+                }
+            }
             if let Some(path) = options.cap_file.as_deref() {
                 let file = read_cap_file(path);
                 match &file {
@@ -3029,48 +3190,61 @@ mod unit {
     }
 
     #[test]
-    fn host_scope_refusals_cost_no_strike_and_pause_the_donor() {
-        let store = Store::new(&temp("host-scope"));
-        for _ in 0..3 {
-            // Each round the donor talks its way back in (a probe pass, say) and
-            // refuses host-wide again: never a strike, always a pause.
-            store.clear_host_fault("d1");
-            publish(&store, "c1");
-            let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
-            let token = claimed.lease.as_ref().unwrap().token.clone();
-            let error = store
-                .report(
-                    &claimed.id,
-                    &token,
-                    refused_receipt(
-                        &claimed,
-                        "d1",
-                        "MQ_COULD_NOT_RUN_SCOPE: host wrkslots wedged\nCOULD_NOT_RUN",
-                    ),
-                )
-                .unwrap_err();
-            assert!(error.contains("host could not run"), "{error}");
-            let after = store.read(&claimed.id).unwrap();
-            assert_eq!(after.state, JobState::Queued, "{after:?}");
-            assert!(after.could_not_run.is_empty(), "{after:?}");
-            assert!(
-                after
-                    .history
-                    .join("\n")
-                    .contains("host could not run: wrkslots wedged"),
-                "{after:?}"
-            );
-            // Give the lease back for the next round without a claim (the donor is
-            // now paused queue-side); simulate by cancelling the lease record.
-            let mut job = store.read(&claimed.id).unwrap();
-            job.state = JobState::Cancelled;
-            store.write(&job).unwrap();
-        }
-        // The faulted donor is leased nothing; a probe-passed claim clears it.
+    fn a_refusal_alone_is_not_a_host_fault_and_a_failing_probe_is() {
+        let mut store = Store::new(&temp("host-scope"));
+        store.could_not_run_limit = 99;
+        publish(&store, "c1");
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        let error = store
+            .report(
+                &claimed.id,
+                &token,
+                refused_receipt(
+                    &claimed,
+                    "d1",
+                    "MQ_COULD_NOT_RUN_SCOPE: host wrkslots wedged\nCOULD_NOT_RUN",
+                ),
+            )
+            .unwrap_err();
+        assert!(error.contains("queued again"), "{error}");
+        let after = store.read(&claimed.id).unwrap();
+        assert_eq!(after.state, JobState::Queued, "{after:?}");
+        assert_eq!(after.could_not_run.len(), 1, "{after:?}");
+        // No fault: the donor is leased other jobs at once.
+        assert!(store.host_fault_list().is_empty());
         publish(&store, "c2");
-        assert!(store.claim("d1", "h1", 1).unwrap().is_none());
-        store.clear_host_fault("d1");
         assert!(store.claim("d1", "h1", 1).unwrap().is_some());
+        // Only a failing probe right after the refusal records the fault.
+        store.record_host_fault("d1", "wrkslots wedged");
+        assert_eq!(store.host_fault_list().len(), 1);
+        let details = store.host_fault_details();
+        assert_eq!(details[0].4, "failed", "{details:?}");
+        assert!(store.claim("d1", "h1", 1).unwrap().is_none());
+        // A passing re-probe clears it, with no lease taken by the clearing.
+        store.record_probe_result("d1", true);
+        assert!(store.host_fault_list().is_empty());
+        // A busy admission refusal is never a host fault.
+        let claimed = store.claim("d1", "h1", 3).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        store
+            .report(
+                &claimed.id,
+                &token,
+                refused_receipt(
+                    &claimed,
+                    "d1",
+                    "validate lock busy: slots full\nCOULD_NOT_RUN",
+                ),
+            )
+            .unwrap_err();
+        assert!(store.host_fault_list().is_empty());
+        assert!(store
+            .read(&claimed.id)
+            .unwrap()
+            .history
+            .join("\n")
+            .contains("busy admission refusal: never a host fault"));
     }
 
     #[test]
@@ -3097,6 +3271,7 @@ mod unit {
                 ),
             )
             .unwrap_err();
+        store.record_host_fault("d1", "wedged");
         let waiting = store.read(&claimed.id).unwrap();
         assert!(store.every_eligible_donor_faulted(&waiting));
 
@@ -3123,6 +3298,7 @@ mod unit {
                 ),
             )
             .unwrap_err();
+        store.record_host_fault("d1", "wedged");
         let waiting = store.read(&claimed.id).unwrap();
         assert!(!store.every_eligible_donor_faulted(&waiting));
     }
@@ -3131,6 +3307,7 @@ mod unit {
     fn probe_pass_launch_refuse_cycles_escalate_until_an_admitted_validation() {
         let mut store = Store::new(&temp("host-flap"));
         store.host_fault_escalate_after = 3;
+        store.could_not_run_limit = 99;
         let host_refuse = |store: &Store| {
             let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
             let token = claimed.lease.as_ref().unwrap().token.clone();
@@ -3145,6 +3322,8 @@ mod unit {
                     ),
                 )
                 .unwrap_err();
+            // The probe run right after the refusal failed too.
+            store.record_host_fault("d1", "wedged");
         };
         publish(&store, "c1");
         host_refuse(&store);
@@ -3242,6 +3421,30 @@ mod unit {
     }
 
     #[test]
+    fn fault_probe_schedule_starts_at_sixty_seconds_and_caps_at_five_minutes() {
+        let mut delay = std::time::Duration::from_secs(FAULT_PROBE_FIRST_SECS);
+        for want in [120, 240, 300, 300] {
+            delay = fault_probe_delay(delay);
+            assert_eq!(delay, std::time::Duration::from_secs(want));
+        }
+        // A fault recorded from a failed probe counts probes, so it never
+        // sits at zero probes: details name the last probe and its result.
+        let store = Store::new(&temp("fault-probes"));
+        store.record_host_fault("d1", "wedged");
+        store.record_probe_result("d1", false);
+        let details = store.host_fault_details();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].1, "wedged");
+        assert_eq!(details[0].4, "failed");
+        assert!(!details[0].3.is_empty(), "{details:?}");
+        let faults: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(store.dir.join("host-faults.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(faults["d1"]["probes"], 2, "{faults}");
+    }
+
+    #[test]
     fn probe_backoff_doubles_to_ten_minutes_and_admission_resets_it() {
         let mut delay = std::time::Duration::from_secs(30);
         for want in [60, 120, 240, 480, 600, 600] {
@@ -3251,7 +3454,7 @@ mod unit {
     }
 
     #[test]
-    fn unclassified_refusals_for_two_different_jobs_become_a_host_fault() {
+    fn unclassified_refusals_for_two_different_jobs_are_not_a_host_fault() {
         let store = Store::new(&temp("host-backstop"));
         let first = publish(&store, "c1");
         let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
@@ -3264,17 +3467,7 @@ mod unit {
             )
             .unwrap_err();
         assert_eq!(store.read(&first.id).unwrap().could_not_run.len(), 1);
-        // The queue re-offers the first job to others; d1 takes a different one and
-        // refuses with the same last line: both strikes come off.
         let second = publish(&store, "c2");
-        let donor_job = store
-            .jobs()
-            .unwrap()
-            .into_iter()
-            .find(|job| job.id == second.id)
-            .unwrap();
-        let _ = donor_job;
-        // Claim as d1 repeatedly until it holds the second job (the first may come first).
         let mut held = None;
         for _ in 0..3 {
             if let Some(job) = store.claim("d1", "h1", 3).unwrap() {
@@ -3286,19 +3479,20 @@ mod unit {
         }
         let held = held.expect("d1 holds the second job");
         let token = held.lease.as_ref().unwrap().token.clone();
-        let error = store
+        store
             .report(
                 &held.id,
                 &token,
                 refused_receipt(&held, "d1", "other\nwedge line"),
             )
             .unwrap_err();
-        assert!(error.contains("backstop"), "{error}");
-        assert!(store.read(&first.id).unwrap().could_not_run.is_empty());
-        assert!(store.read(&second.id).unwrap().could_not_run.is_empty());
+        // Both refusals are counted, neither faults the host, and the donor
+        // may lease again: only a failing probe faults a host.
+        assert_eq!(store.read(&first.id).unwrap().could_not_run.len(), 1);
+        assert_eq!(store.read(&second.id).unwrap().could_not_run.len(), 1);
         assert_eq!(store.read(&second.id).unwrap().state, JobState::Queued);
-        assert_eq!(store.host_fault_list().len(), 1);
-        assert!(store.claim("d1", "h1", 1).unwrap().is_none());
+        assert!(store.host_fault_list().is_empty());
+        assert!(store.claim("d1", "h1", 5).unwrap().is_some());
     }
 
     #[test]

@@ -943,7 +943,7 @@ fn a_could_not_run_receipt_is_no_verdict_and_requeues_with_an_alarm() {
         "--validator",
         "command",
         "--validator-run",
-        r#"if [ -n "$DONOR" ]; then echo COULD_NOT_RUN; exit 75; fi; exit 0"#,
+        r#"if [ -n "$MQ_PROBE" ]; then exit 0; fi; if [ -n "$DONOR" ]; then echo COULD_NOT_RUN; exit 75; fi; exit 0"#,
         "--offload",
         "decide",
     ]);
@@ -987,7 +987,7 @@ fn could_not_run_receipts_are_bounded_and_the_batch_is_refused() {
         "--validator",
         "command",
         "--validator-run",
-        r#"if [ -n "$DONOR" ]; then echo COULD_NOT_RUN; exit 75; fi; exit 0"#,
+        r#"if [ -n "$MQ_PROBE" ]; then exit 0; fi; if [ -n "$DONOR" ]; then echo COULD_NOT_RUN; exit 75; fi; exit 0"#,
         "--offload",
         "decide",
         "--refusal-max-retries",
@@ -1165,7 +1165,11 @@ fn a_restarted_donor_resumes_probing_and_clears_its_host_fault() {
         "the pause must persist the validator to probe after a restart: {pause}"
     );
     assert_eq!(host_faults(&fx)["d1"]["reason"], "wedged");
-    assert_eq!(probe_count(&fx), 0, "no probe before the restart");
+    assert_eq!(
+        probe_count(&fx),
+        1,
+        "the donor probes right after the refusal, before any restart"
+    );
 
     // Restart (a new donor process, same work dir) with the host fixed.
     std::fs::write(fx.root.join("probe-ok"), "").unwrap();
@@ -1273,6 +1277,7 @@ fn a_legacy_host_pause_is_logged_and_does_not_crash_the_donor() {
     .unwrap();
     std::fs::write(fx.root.join("probe-ok"), "").unwrap();
     std::fs::write(fx.root.join("validation-ok"), "").unwrap();
+    let probes_before = probe_count(&fx);
     let out = donor(&fx, &clone, "d1", &[]);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(out.status.success(), "{stderr}");
@@ -1280,7 +1285,11 @@ fn a_legacy_host_pause_is_logged_and_does_not_crash_the_donor() {
         stderr.contains("cannot resume probing"),
         "startup must log why a validator-less pause cannot resume probing: {stderr}"
     );
-    assert_eq!(probe_count(&fx), 0, "no validator snapshot, no probe");
+    assert_eq!(
+        probe_count(&fx),
+        probes_before,
+        "no validator snapshot, no probe"
+    );
     assert!(
         host_faults(&fx).get("d1").is_some(),
         "the queue fault stays until a probe pass or admitted validation"
@@ -1295,7 +1304,7 @@ fn compare_mode_counts_a_could_not_run_receipt_and_compares_nothing() {
         "--validator",
         "command",
         "--validator-run",
-        r#"if [ -n "$DONOR" ]; then echo COULD_NOT_RUN; exit 75; fi; sleep 8"#,
+        r#"if [ -n "$MQ_PROBE" ]; then exit 0; fi; if [ -n "$DONOR" ]; then echo COULD_NOT_RUN; exit 75; fi; sleep 8"#,
         "--offload",
         "compare",
     ]);

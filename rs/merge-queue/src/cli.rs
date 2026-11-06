@@ -423,6 +423,38 @@ enum DonorCommand {
         #[arg(long)]
         drain: bool,
     },
+    /// Queue host: clear a donor's host fault without leasing anything. With
+    /// --probe-passed the donor's probe (MQ_PROBE=1) just passed: an ordinary
+    /// fault is cleared, an escalated one arms one trial claim instead. This
+    /// is the operator's clear-fault route; unlike `donor claim
+    /// --probe-passed` it never leases a job to the caller.
+    ClearFault {
+        /// Donor name.
+        #[arg(long)]
+        donor: String,
+        /// The donor's validator probe passed.
+        #[arg(long)]
+        probe_passed: bool,
+    },
+    /// Queue host: record a donor's host fault (its probe failed right after
+    /// a could-not-run refusal). Used by `donor run`; operators clear with
+    /// `donor clear-fault`.
+    HostFault {
+        /// Donor name.
+        #[arg(long)]
+        donor: String,
+        /// Why the host cannot validate.
+        #[arg(long, default_value = "host probe failed")]
+        reason: String,
+    },
+    /// Queue host: print a donor's host fault as JSON (`{"fault": ...}` or
+    /// `{"fault": null}`), for a donor re-probing a fault it holds no local
+    /// host-pause file for.
+    Fault {
+        /// Donor name.
+        #[arg(long)]
+        donor: String,
+    },
     /// Queue host: extend a lease (token on stdin); prints continue or stop.
     Renew {
         /// Job id.
@@ -619,6 +651,39 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             )?;
             Ok(0)
         }
+        DonorCommand::ClearFault {
+            donor,
+            probe_passed,
+        } => {
+            if probe_passed {
+                store.record_probe_result(&donor, true);
+            } else {
+                store.clear_host_fault(&donor);
+            }
+            print_json_reply(&serde_json::json!({"cleared": donor, "leased": null}))?;
+            Ok(0)
+        }
+        DonorCommand::HostFault { donor, reason } => {
+            store.record_host_fault(&donor, &reason);
+            print_json_reply(&serde_json::json!({"faulted": donor}))?;
+            Ok(0)
+        }
+        DonorCommand::Fault { donor } => {
+            let fault = store
+                .host_fault_details()
+                .into_iter()
+                .find(|(name, ..)| *name == donor)
+                .map(|(_, reason, since, last_probe_at, last_probe)| {
+                    serde_json::json!({
+                        "reason": reason,
+                        "since": since,
+                        "last_probe_at": last_probe_at,
+                        "last_probe": last_probe,
+                    })
+                });
+            print_json_reply(&serde_json::json!({"fault": fault}))?;
+            Ok(0)
+        }
         DonorCommand::Renew { job } => {
             let renewal = store.renew(&job, &read_token()?)?;
             print_json_reply(&serde_json::to_value(&renewal).map_err(|error| error.to_string())?)?;
@@ -695,10 +760,21 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             for alert in store.give_back_alerts(config.donors.give_back_alert())? {
                 println!("{alert}");
             }
-            for (donor, reason, since) in store.host_fault_list() {
+            for (donor, reason, since, last_probe_at, last_probe) in store.host_fault_details() {
                 println!(
-                    "ERROR: donor {donor}: host cannot validate: {reason} (since {since}); \
-                     it is leased nothing until an admitted validation or a passing probe"
+                    "ERROR: donor {donor} faulted since {since}: {reason}; last probe {} {}; \
+                     it is leased nothing until an admitted validation or a passing probe \
+                     (clear with `merge-queue donor clear-fault --donor {donor} --probe-passed`)",
+                    if last_probe_at.is_empty() {
+                        "never"
+                    } else {
+                        &last_probe_at
+                    },
+                    if last_probe.is_empty() {
+                        ""
+                    } else {
+                        &last_probe
+                    },
                 );
             }
             for alert in store.host_fault_escalations() {
