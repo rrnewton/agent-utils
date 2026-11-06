@@ -1,11 +1,12 @@
 ---
 title: 'cloud-coordinator-reminders: reply reminders and idle detection for agentcloud-session coordinators come from session history'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 assignee: cl-start
 created_at: 2026-11-05T17:42:01.282299906+00:00
-updated_at: 2026-11-05T17:42:01.282299906+00:00
+updated_at: 2026-11-06T14:45:00.000000000+00:00
+closed_at: 2026-11-06T14:45:00.000000000+00:00
 ---
 
 # Description
@@ -50,3 +51,7 @@ Tests:
 Not changed: `agentctl status` for a cloud agent still uses the fleet listing.
 
 Remaining: the live check through the lead.
+
+## Resolution
+
+Landed in de02b9f3's stack: a cloud coordinator's pane facts name agentcloud and read working, waiting or idle from its session history (unknown when unreadable); reminders wait on unknown and never say unrecognized. Gate: the full gate passed on the pre-rebase stack (f1226d35 on a7087281). The rebase onto ab1d7b16 overlapped agent_watch.rs and failed_digest.rs; targeted agent_watch, failed_digest and revive tests (202) and clippy passed on the rebased tree.

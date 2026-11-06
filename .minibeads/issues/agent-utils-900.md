@@ -1,11 +1,12 @@
 ---
 title: 'agentterm-paste-escape-replies: a paste into an agentterm pane carries no accumulated terminal query replies'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: cl-start
 created_at: 2026-11-05T17:36:49.214870009+00:00
-updated_at: 2026-11-05T17:36:49.214870009+00:00
+updated_at: 2026-11-06T14:45:00.000000000+00:00
+closed_at: 2026-11-06T14:45:00.000000000+00:00
 ---
 
 # Description
@@ -48,3 +49,7 @@ agentctl change:
 - Tests: accumulated replies are cleared and the message is submitted alone; typed text beside replies is kept and the paste refused; a clear that does not take refuses the paste.
 
 Remaining: the live check (one message to an agentterm target; its session history must begin with the message header). That goes through the lead.
+
+## Resolution
+
+Landed in de02b9f3's stack: an idle agentterm composer holding only leaked terminal query replies is cleared (Ctrl+C, read back empty) before the paste; anything else is still refused. Gate: the full gate passed on the pre-rebase stack (f1226d35 on a7087281). The rebase onto ab1d7b16 overlapped agent_watch.rs and failed_digest.rs; targeted agent_watch, failed_digest and revive tests (202) and clippy passed on the rebased tree.

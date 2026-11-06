@@ -1,11 +1,12 @@
 ---
 title: 'revive-abandon-dead-candidate: an interrupted revive whose candidate died no longer wedges the agent'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: cl-start
 created_at: 2026-11-05T17:13:09.823347188+00:00
-updated_at: 2026-11-05T17:13:09.823347188+00:00
+updated_at: 2026-11-06T14:45:00.000000000+00:00
+closed_at: 2026-11-06T14:45:00.000000000+00:00
 ---
 
 # Description
@@ -72,3 +73,7 @@ Queue criterion answered (coordinator and lead, 2026-11-06): **archived, not rep
 Opt-in replay is #925 revive-replay-queue (P3, unassigned).
 
 Remaining: the live check on the wedged consumer record, through the lead.
+
+## Resolution
+
+Landed in de02b9f3's stack: a revive candidate whose pane is gone or holds only an idle shell is abandoned automatically and relaunched; an unproven one needs revive --abandon-candidate; a live one is never abandoned; evidence goes under .revives/.abandoned/. The criterion 'queued prompts delivered after the revive' is answered as archived, not replayed, and reported to senders: both editions list archived_prompts and file them as failed, and agent-teams receipts give the revive's reason. Opt-in replay is #925. Gate: the full gate passed on the pre-rebase stack (f1226d35 on a7087281). The rebase onto ab1d7b16 overlapped agent_watch.rs and failed_digest.rs; targeted agent_watch, failed_digest and revive tests (202) and clippy passed on the rebased tree.

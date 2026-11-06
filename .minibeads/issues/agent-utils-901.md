@@ -1,11 +1,12 @@
 ---
 title: 'watch-standing-agents: standing agents may rest idle without a verdict and without idle notices'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 assignee: cl-start
 created_at: 2026-11-05T17:42:01.278507659+00:00
-updated_at: 2026-11-05T17:42:01.278507659+00:00
+updated_at: 2026-11-06T14:45:00.000000000+00:00
+closed_at: 2026-11-06T14:45:00.000000000+00:00
 ---
 
 # Description
@@ -44,3 +45,7 @@ Tests:
 - The flag survives revive, shows in status, and `--no-standing` clears it.
 
 Not done: `agentctl requests` does not list standing agents separately; its rows are requests, not agents.
+
+## Resolution
+
+Landed in de02b9f3's stack: agentctl set NAME --standing|--no-standing (Rust; Python refuses it like manage), plus watch-agents --standing NAME; standing agents get no idle-no-verdict notice, each pass reports a standing list, and the flag survives revive and restore. Gate: the full gate passed on the pre-rebase stack (f1226d35 on a7087281). The rebase onto ab1d7b16 overlapped agent_watch.rs and failed_digest.rs; targeted agent_watch, failed_digest and revive tests (202) and clippy passed on the rebased tree.
