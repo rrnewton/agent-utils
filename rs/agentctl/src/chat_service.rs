@@ -6227,6 +6227,53 @@ fn owner_loop<A: ManagedApi + ?Sized>(
     )
 }
 
+/// Tell each bound thread's parent once (#917): the agent's manager, else the designated
+/// coordinator (never the bridge's own target merely for being the target, and never the
+/// bound agent itself). The deterministic queue ID plus the durable notified flag make
+/// this exactly one queued notice per thread across restarts.
+fn send_parent_notices<A: ManagedApi + ?Sized>(
+    state: &BridgeState,
+    manager: &ManagedAgents<'_, A>,
+) {
+    let Ok(pending) = state.pending_parent_notices() else {
+        return;
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let snapshot = chat_runtime::bang::snapshot(manager.registry());
+    for binding in pending {
+        let parent = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.name == binding.agent_name)
+            .and_then(|agent| agent.managed_by.as_ref().map(|(name, _)| name.clone()))
+            .or_else(|| snapshot.coordinator.clone());
+        let Some(parent) = parent else { continue };
+        if parent == binding.agent_name {
+            if state.mark_parent_notified(&binding.thread_id).is_err() {
+                continue;
+            }
+            continue;
+        }
+        let body = chat_runtime::bang::parent_notice_body(&binding, state.state_root());
+        match manager.send_identified(
+            &parent,
+            &body,
+            DrainOptions::default(),
+            Some(&binding.parent_notice_id),
+        ) {
+            Ok(_) => {
+                let _ = state.mark_parent_notified(&binding.thread_id);
+            }
+            Err(error) => service_log(format_args!(
+                "agentctl: chat bang: parent notice for {} to {parent} failed, will retry: {error}",
+                binding.agent_name
+            )),
+        }
+    }
+}
+
 /// One run of the owner loop, from its startup recovery until a stop or a failure. `chat run`
 /// starts another after a transient failure: see [`run_owner_loop`].
 #[allow(clippy::too_many_arguments)]
@@ -6388,6 +6435,7 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
             take_provider_notices(notices, stop, &mut direct_keys, overflowed)?;
             take_reply_wakes(state, reply_wakes, &mut direct_keys, overflowed);
         }
+        send_parent_notices(state, manager);
         let recover = direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst);
         // A rescan tries every prompt waiting to be typed, so a due scan retries none of its own
         // when one runs. Nor does it while the status the loop last learned from Herdr is other

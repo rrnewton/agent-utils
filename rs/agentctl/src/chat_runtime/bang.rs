@@ -1,13 +1,16 @@
 //! Owner-only `!` commands the chat bridge answers itself (#917 chat-bang-commands).
 //!
 //! A message whose text starts with `!` from a permanent owner is never typed into an
-//! agent's pane. Step 1 answers `!help` and `!who`; thread binding (`!@NAME`, `!end`)
-//! arrives in later steps. The registry is read as plain `agent.json` documents, the same
-//! evidence `agentctl tree` renders, so the bridge needs no Herdr client to answer.
+//! agent's pane. The bridge answers `!help` and `!who` itself, and `!@NAME` opens a
+//! Slack thread bound to that agent: later owner messages in the thread are admitted
+//! as requests for that agent, not for the bridge's own target. The registry is read
+//! as plain `agent.json` documents, the same evidence `agentctl tree` renders, so the
+//! bridge needs no Herdr client to answer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The help text every `!help` (and every unrecognised `!` command) posts.
@@ -15,6 +18,7 @@ pub(crate) const HELP_TEXT: &str = "Owner commands (handled by the bridge, never
 !help — this list\n\
 !who — the sub-agents of this coordinator: the managed-by tree, Pinned (persistent lanes) first, then Ephemeral\n\
 !who NAME — one agent in detail\n\
+!@NAME <message> — open a new thread bound to NAME and send it <message>; later messages in that thread go to NAME\n\
 Talk to the coordinator by writing normally.";
 
 /// The outbound operation ID for one bridge-posted `!` answer: deterministic from the
@@ -45,6 +49,63 @@ pub(crate) enum Bang {
     Help,
     /// `!who` or `!who NAME`.
     Who(Option<String>),
+    /// `!@NAME` or `!@NAME <message>`: open a thread bound to that agent.
+    At(String, Option<String>),
+}
+
+/// One Slack thread bound to an agent (#917). Stored in `thread-bindings.json`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ThreadBinding {
+    /// Provider channel the thread lives in.
+    pub channel_id: String,
+    /// Provider thread ID (the `!@` message's own thread).
+    pub thread_id: String,
+    /// Bound agent's registered name when bound.
+    pub agent_name: String,
+    /// Bound agent's generation token when bound.
+    pub agent_token: String,
+    /// The `!@` message that opened the thread.
+    pub root_message_id: String,
+    /// When the binding opened, Unix milliseconds.
+    pub opened_at_millis: u64,
+    /// `active` or `ended`.
+    pub state: String,
+    /// Why it ended, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_reason: Option<String>,
+    /// Deterministic agentctl queue ID of the parent notice.
+    pub parent_notice_id: String,
+    /// Whether the parent notice has been queued.
+    pub parent_notified: bool,
+}
+
+impl ThreadBinding {
+    /// Whether owner messages in this thread route to the bound agent.
+    pub fn is_active(&self) -> bool {
+        self.state == "active"
+    }
+}
+
+/// The parent notice for one new bound thread (#917): sent once, by queue ID.
+pub(crate) fn parent_notice_body(binding: &ThreadBinding, bridge_state_dir: &Path) -> String {
+    format!(
+        "[chat-bridge] The owner is talking directly to {} in a bound Slack thread.\n\
+         You are not in that loop. Catch up any time:\n  agentctl read {}\n  \
+         agentctl chat thread --bridge-state {} --thread {}\n\
+         This notice is sent once per bound thread.",
+        binding.agent_name,
+        binding.agent_name,
+        bridge_state_dir.display(),
+        binding.thread_id,
+    )
+}
+
+/// The deterministic queue ID of `binding`'s parent notice.
+pub(crate) fn parent_notice_id(thread_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(thread_id.as_bytes());
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("chat-bind-{hex}")
 }
 
 /// Parse `text` as a `!` command, or `None` when it is an ordinary message. Only a `!` as
@@ -55,7 +116,18 @@ pub(crate) fn parse_bang(text: &str) -> Option<Bang> {
         return None;
     }
     let mut words = trimmed.split_whitespace();
-    match words.next() {
+    let first = words.next();
+    if let Some(at) = first.and_then(|word| word.strip_prefix("!@")) {
+        if agent_queue::registry::is_agent_name(at) {
+            let message = trimmed[first.map_or(0, str::len)..].trim_start().to_owned();
+            return Some(Bang::At(
+                at.to_owned(),
+                (!message.is_empty()).then_some(message),
+            ));
+        }
+        return Some(Bang::Help);
+    }
+    match first {
         Some("!who") => {
             let name = words.next().map(str::to_owned);
             if words.next().is_some() {
@@ -524,6 +596,18 @@ mod tests {
         assert_eq!(parse_bang("!who Bad Name"), Some(Bang::Help));
         assert_eq!(parse_bang("hello !who"), None);
         assert_eq!(parse_bang(" !who"), None);
+        assert_eq!(
+            parse_bang("!@worker hello\nthere"),
+            Some(Bang::At(
+                "worker".to_owned(),
+                Some("hello\nthere".to_owned())
+            ))
+        );
+        assert_eq!(
+            parse_bang("!@worker"),
+            Some(Bang::At("worker".to_owned(), None))
+        );
+        assert_eq!(parse_bang("!@Bad Name hi"), Some(Bang::Help));
     }
 
     #[test]

@@ -34,7 +34,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::agent::{self, DrainOptions, QueueMessageState};
 use crate::subagents::{ManagedAgents, ManagedApi};
 
-mod bang;
+pub(crate) mod bang;
 mod grants;
 mod held_replies;
 mod observe;
@@ -2830,6 +2830,13 @@ struct RequestRecord {
     /// An operator's settlement of an uncertain delivery (`chat settle`, #784).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     settlement: Option<RequestSettlement>,
+    /// The agent this request is delivered to when it is not the bridge's own target: a
+    /// bound thread's agent (#917 chat-bang-commands). Absent means the bridge target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_agent: Option<String>,
+    /// The bound agent's generation token when `target_agent` was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_token: Option<String>,
     /// Keys a newer agentctl added, kept when this record is written back (#809
     /// chat-bridge-json-forward-compat).
     #[serde(flatten)]
@@ -2950,9 +2957,18 @@ impl RequestRecord {
             latency_adapter: None,
             latency_folded_at: None,
             settlement: None,
+            target_agent: None,
+            target_token: None,
             key,
             message: source,
         })
+    }
+
+    /// The agent this request is delivered to: its bound agent, else the bridge's target.
+    fn agent_for(&self, bridge_agent: &str) -> String {
+        self.target_agent
+            .clone()
+            .unwrap_or_else(|| bridge_agent.to_owned())
     }
 
     fn validate(&self, path_key: &str) -> Result<()> {
@@ -5552,6 +5568,8 @@ pub struct BatchAdmission {
     pub relay_dispatches: Vec<RelayDispatch>,
     /// Deterministic `!` answers admitted in this batch, pending posting.
     pub bang_posts: Vec<BangPost>,
+    /// Thread bindings opened in this batch (#917).
+    pub new_bindings: Vec<bang::ThreadBinding>,
     /// Independent, best-effort rejection feedback. Its errors never prevent cursor admission.
     pub rejection_saves: RejectionSaves,
     /// Whether any retained gap still requires request/response reconciliation.
@@ -6386,10 +6404,10 @@ impl BridgeState {
     /// coordinator designation. The role is `coordinator` for the designated coordinator, else
     /// the profile's `role`, else `worker`; the protocol is the profile's, else `unknown`. Every
     /// other field a source does not give is `unknown`. Never fails delivery.
-    pub(crate) fn delivery_stamp_now(&self) -> DeliveryStamp {
+    pub(crate) fn delivery_stamp_for(&self, agent: &str) -> DeliveryStamp {
         use crate::chat_latency::UNKNOWN;
+        let agent = agent.to_owned();
         let text = |value: &Value| value.as_str().map(str::to_owned);
-        let agent = self.config.agent_name.clone();
         let registry = self.latency_registry.as_deref();
         let read = |path: PathBuf| -> Option<Value> {
             serde_json::from_slice(&std::fs::read(path).ok()?).ok()
@@ -6711,6 +6729,11 @@ impl BridgeState {
     /// Borrow the immutable authority configuration.
     pub fn config(&self) -> &BridgeConfiguration {
         &self.config
+    }
+
+    /// The bridge state directory.
+    pub fn state_root(&self) -> &Path {
+        &self.root
     }
 
     /// Pin and open the configured one-shot outbound helper, when present, telling the event
@@ -8237,12 +8260,24 @@ impl BridgeState {
         let mut rejection_candidates = Vec::new();
         let mut relay_dispatches: Vec<RelayDispatch> = Vec::new();
         let mut bang_candidates: Vec<BangPost> = Vec::new();
+        let mut binding_candidates: Vec<bang::ThreadBinding> = Vec::new();
+        let existing_bindings = self.thread_bindings()?;
         let mut request_bytes = 0_u64;
 
         for event in batch.events() {
             match event {
                 CommittableEvent::MessageCreated(message) => {
-                    let source = SavedMessage::from_inbound(message);
+                    let mut source = SavedMessage::from_inbound(message);
+                    // A `!@NAME <msg>` opener's request carries only <msg> (#917): the
+                    // effective message is computed here so replay dedup sees one text.
+                    if self.config.outbound_enabled
+                        && self.config.allowed_senders.contains(&source.sender_id)
+                    {
+                        if let Some(bang::Bang::At(_, Some(msg))) = bang::parse_bang(&source.text) {
+                            source.text = msg;
+                            source.thread_reply = true;
+                        }
+                    }
                     let key = message_key(&source)?;
                     if let Some(existing) = candidate_messages.get(&key) {
                         if existing != &source {
@@ -8365,43 +8400,152 @@ impl BridgeState {
                     // Owner-only `!` commands (#917 chat-bang-commands): answered by the
                     // bridge itself, never typed into a pane. With outbound off there is
                     // no way to answer, so the text falls through to ordinary admission.
+                    let mut bound_target: Option<(String, String)> = None;
+                    if self.config.outbound_enabled && permanent_owner {
+                        if let Some(binding) = existing_bindings
+                            .iter()
+                            .chain(binding_candidates.iter())
+                            .find(|binding| {
+                                binding.channel_id == source.channel_id
+                                    && binding.thread_id == source.thread_id
+                                    && binding.is_active()
+                            })
+                        {
+                            bound_target =
+                                Some((binding.agent_name.clone(), binding.agent_token.clone()));
+                        }
+                    }
                     if self.config.outbound_enabled {
                         if let Some(command) = bang::parse_bang(message.text()) {
-                            let body = if permanent_owner {
-                                match &command {
-                                    bang::Bang::Help => bang::HELP_TEXT.to_owned(),
-                                    bang::Bang::Who(name) => {
-                                        let snapshot =
-                                            self.latency_registry.as_deref().map_or_else(
-                                                || bang::BangSnapshot {
-                                                    coordinator: None,
-                                                    host: "this host".to_owned(),
-                                                    agents: Vec::new(),
-                                                },
-                                                bang::snapshot,
-                                            );
-                                        match name {
+                            let snapshot = || {
+                                self.latency_registry.as_deref().map_or_else(
+                                    || bang::BangSnapshot {
+                                        coordinator: None,
+                                        host: "this host".to_owned(),
+                                        agents: Vec::new(),
+                                    },
+                                    bang::snapshot,
+                                )
+                            };
+                            if !permanent_owner {
+                                bang_candidates.push(BangPost {
+                                    operation_id: bang::bang_operation_id(
+                                        &source.channel_id,
+                                        &source.message_id,
+                                    ),
+                                    channel_id: source.channel_id.clone(),
+                                    thread_id: source.thread_id.clone(),
+                                    body: "That command is owner-only: `!` commands are \
+                                           handled by the bridge for the bridge's owners, \
+                                           and this message was not delivered to an agent."
+                                        .to_owned(),
+                                });
+                                continue;
+                            }
+                            match &command {
+                                bang::Bang::Help => {
+                                    bang_candidates.push(BangPost {
+                                        operation_id: bang::bang_operation_id(
+                                            &source.channel_id,
+                                            &source.message_id,
+                                        ),
+                                        channel_id: source.channel_id.clone(),
+                                        thread_id: source.thread_id.clone(),
+                                        body: bang::HELP_TEXT.to_owned(),
+                                    });
+                                    continue;
+                                }
+                                bang::Bang::Who(name) => {
+                                    let snapshot = snapshot();
+                                    bang_candidates.push(BangPost {
+                                        operation_id: bang::bang_operation_id(
+                                            &source.channel_id,
+                                            &source.message_id,
+                                        ),
+                                        channel_id: source.channel_id.clone(),
+                                        thread_id: source.thread_id.clone(),
+                                        body: match name {
                                             Some(name) => bang::render_who_one(&snapshot, name),
                                             None => bang::render_who(&snapshot),
-                                        }
-                                    }
+                                        },
+                                    });
+                                    continue;
                                 }
-                            } else {
-                                "That command is owner-only: `!` commands are handled by the \
-                                 bridge for the bridge's owners, and this message was not \
-                                 delivered to an agent."
-                                    .to_owned()
-                            };
-                            bang_candidates.push(BangPost {
-                                operation_id: bang::bang_operation_id(
-                                    &source.channel_id,
-                                    &source.message_id,
-                                ),
-                                channel_id: source.channel_id.clone(),
-                                thread_id: source.thread_id.clone(),
-                                body,
-                            });
-                            continue;
+                                bang::Bang::At(name, first) => {
+                                    let snapshot = snapshot();
+                                    let agent =
+                                        snapshot.agents.iter().find(|agent| &agent.name == name);
+                                    let Some(agent) = agent else {
+                                        bang_candidates.push(BangPost {
+                                            operation_id: bang::bang_operation_id(
+                                                &source.channel_id,
+                                                &source.message_id,
+                                            ),
+                                            channel_id: source.channel_id.clone(),
+                                            thread_id: source.thread_id.clone(),
+                                            body: bang::render_who_one(&snapshot, name),
+                                        });
+                                        continue;
+                                    };
+                                    if !matches!(agent.lifecycle.as_str(), "running" | "starting") {
+                                        bang_candidates.push(BangPost {
+                                            operation_id: bang::bang_operation_id(
+                                                &source.channel_id,
+                                                &source.message_id,
+                                            ),
+                                            channel_id: source.channel_id.clone(),
+                                            thread_id: source.thread_id.clone(),
+                                            body: format!(
+                                                "{name} is {} and cannot be bound; start or revive it, then try again.\n{}",
+                                                agent.lifecycle,
+                                                bang::render_who(&snapshot)
+                                            ),
+                                        });
+                                        continue;
+                                    }
+                                    let already = existing_bindings
+                                        .iter()
+                                        .any(|b| b.thread_id == source.thread_id && b.is_active());
+                                    if !already {
+                                        let binding = bang::ThreadBinding {
+                                            channel_id: source.channel_id.clone(),
+                                            thread_id: source.thread_id.clone(),
+                                            agent_name: agent.name.clone(),
+                                            agent_token: agent.token.clone(),
+                                            root_message_id: source.message_id.clone(),
+                                            opened_at_millis: unix_millis(),
+                                            state: "active".to_owned(),
+                                            ended_reason: None,
+                                            parent_notice_id: bang::parent_notice_id(
+                                                &source.thread_id,
+                                            ),
+                                            parent_notified: false,
+                                        };
+                                        binding_candidates.push(binding);
+                                        let ack = format!(
+                                            "Bound to {}. Messages in this thread go to it; it replies here. Its parent has been told once.",
+                                            agent.name
+                                        );
+                                        bang_candidates.push(BangPost {
+                                            operation_id: relay_receipt_operation_id(
+                                                &source.channel_id,
+                                                &source.thread_id,
+                                                &source.message_id,
+                                                &ack,
+                                            ),
+                                            channel_id: source.channel_id.clone(),
+                                            thread_id: source.thread_id.clone(),
+                                            body: ack,
+                                        });
+                                    }
+                                    bound_target = Some((agent.name.clone(), agent.token.clone()));
+                                    if first.is_none() {
+                                        continue;
+                                    }
+                                    // With a first message, fall through: its request was
+                                    // already given the effective text above.
+                                }
+                            }
                         }
                     }
                     if self
@@ -8418,6 +8562,10 @@ impl BridgeState {
                     }
                     let mut record =
                         RequestRecord::from_saved_message(source, self.config.ack_emoji())?;
+                    if let Some((agent, token)) = &bound_target {
+                        record.target_agent = Some(agent.clone());
+                        record.target_token = Some(token.clone());
+                    }
                     record.admitted_at_millis = admitted_at_millis;
                     record.sender_grant = if permanent_owner { None } else { sender_grant };
                     record.admitted_host_batch_sequence = Some(host_batch_sequence);
@@ -8587,6 +8735,18 @@ impl BridgeState {
         if !bang_posts.is_empty() {
             agent::sync_directory(&self.root.join("bang-posts"))?;
         }
+        if !binding_candidates.is_empty() {
+            let mut merged = existing_bindings.clone();
+            for binding in &binding_candidates {
+                if !merged
+                    .iter()
+                    .any(|b| b.thread_id == binding.thread_id && b.is_active())
+                {
+                    merged.push(binding.clone());
+                }
+            }
+            self.save_thread_bindings(&merged)?;
+        }
         if !new_records.is_empty() {
             agent::sync_directory(&self.root.join("requests"))?;
             self.admission_boundary()?;
@@ -8640,6 +8800,7 @@ impl BridgeState {
             new_request_keys: new_records,
             relay_dispatches,
             bang_posts,
+            new_bindings: binding_candidates,
             rejection_saves,
             reconciliation_required: checkpoint.reconciliation_required,
             host_batch_sequence,
@@ -10228,15 +10389,30 @@ adding one to the last number in both lines for each later reply.",
         let executable = || env::current_exe();
         // Decided for this delivery, from the target served now (#896): a target whose replies
         // the bridge does not read from a transcript or session history gets the command only.
-        let (command_only, reply_path_reason) = self.reply_mode();
+        // A bound thread's agent (#917) always replies by command: the bridge reads only its
+        // own target's screen and transcript, never a bound agent's.
+        let bound = record.target_agent.is_some();
+        let (command_only, reply_path_reason) = if bound {
+            (true, "bound thread: replies by the chat reply command")
+        } else {
+            self.reply_mode()
+        };
         self.record_reply_path(command_only, reply_path_reason);
-        let command = (self.offer_reply_command || command_only)
-            .then(|| self.reply_command(executable(), key, &reply_id))
-            .flatten();
-        let short_command = command
-            .as_ref()
-            .filter(|_| self.prompt_commands.discoverable)
-            .and_then(|_| self.short_reply_command(executable(), &reply_id));
+        let command = if bound {
+            self.explicit_reply_command(key, &reply_id)
+        } else {
+            (self.offer_reply_command || command_only)
+                .then(|| self.reply_command(executable(), key, &reply_id))
+                .flatten()
+        };
+        let short_command = if bound {
+            None
+        } else {
+            command
+                .as_ref()
+                .filter(|_| self.prompt_commands.discoverable)
+                .and_then(|_| self.short_reply_command(executable(), &reply_id))
+        };
         let mut footer = Vec::new();
         if message.thread_reply {
             if let Some(thread) =
@@ -13847,7 +14023,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         record.phase = phase;
         if submitting {
             // Decided again for every attempt, as its prompt is (#896).
-            let command_only = self.reply_mode().0;
+            let command_only = record.target_agent.is_some() || self.reply_mode().0;
             record.reply_mode = Some(if command_only { "command" } else { "blocks" }.to_owned());
         }
         if submitting && record.delivery_started_at_millis.is_none() {
@@ -13864,7 +14040,8 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 record.latency_adapter = Some(adapter);
             }
             if record.stamp.is_none() {
-                record.stamp = Some(self.delivery_stamp_now());
+                let agent = record.agent_for(&self.config.agent_name);
+                record.stamp = Some(self.delivery_stamp_for(&agent));
             }
             // Still blocked up to delivery when the last error said so.
             let blocked_to_the_end = record
@@ -14148,6 +14325,70 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             let _ = agent::sync_directory(&directory);
         }
         Ok(sent)
+    }
+
+    /// Every thread binding (#917), oldest first; an absent file is no bindings.
+    pub fn thread_bindings(&self) -> Result<Vec<bang::ThreadBinding>> {
+        let path = self.root.join("thread-bindings.json");
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let document: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                    ChatRuntimeError::invalid(format!("thread bindings: {error}"))
+                })?;
+                let bindings = document
+                    .get("bindings")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new()));
+                serde_json::from_value(bindings)
+                    .map_err(|error| ChatRuntimeError::invalid(format!("thread bindings: {error}")))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(ChatRuntimeError::Io(error)),
+        }
+    }
+
+    /// Replace the thread bindings durably. Callers hold the state lock.
+    pub fn save_thread_bindings(&self, bindings: &[bang::ThreadBinding]) -> Result<()> {
+        write_document(
+            &self.root.join("thread-bindings.json"),
+            &json!({"schema": "agentctl-chat-bindings/v1", "bindings": bindings}),
+        )
+    }
+
+    /// The active binding for one thread, if any.
+    pub fn active_binding(
+        &self,
+        channel_id: &str,
+        thread_id: &str,
+    ) -> Result<Option<bang::ThreadBinding>> {
+        Ok(self.thread_bindings()?.into_iter().find(|binding| {
+            binding.channel_id == channel_id
+                && binding.thread_id == thread_id
+                && binding.is_active()
+        }))
+    }
+
+    /// Record that `binding`'s parent notice has been queued, exactly once.
+    pub fn mark_parent_notified(&self, thread_id: &str) -> Result<()> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut bindings = self.thread_bindings()?;
+        for binding in &mut bindings {
+            if binding.thread_id == thread_id {
+                binding.parent_notified = true;
+            }
+        }
+        self.save_thread_bindings(&bindings)
+    }
+
+    /// Bindings whose parent has not been told yet.
+    pub fn pending_parent_notices(&self) -> Result<Vec<bang::ThreadBinding>> {
+        Ok(self
+            .thread_bindings()?
+            .into_iter()
+            .filter(|binding| binding.is_active() && !binding.parent_notified)
+            .collect())
     }
 
     /// [`Self::send_pending_bang_posts`] with this state's configured outbound transport;
@@ -15772,7 +16013,8 @@ pub(crate) fn deliver_request_with(
         RequestPhase::Submitting => {}
     }
 
-    let agent_name = &state.config.agent_name;
+    let agent_name = record.agent_for(&state.config.agent_name);
+    let agent_name = &agent_name;
     let message_id = &record.delivery_message_id;
     let observed = match delivery.message_state(agent_name, message_id) {
         Ok(observed) => observed,
@@ -15951,7 +16193,8 @@ fn resolve_uncertain_delivery(
         reply_to_goal_command(state, delivery, record, None);
         return Ok(CoordinatorDeliveryResult::Delivered);
     }
-    let agent_name = &state.config.agent_name;
+    let agent_name = record.agent_for(&state.config.agent_name);
+    let agent_name = &agent_name;
     match delivery.message_state(agent_name, &record.delivery_message_id) {
         Ok(Some(QueueMessageState::Processed)) => {
             state.note_started(delivery, &record.delivery_message_id);
@@ -16036,7 +16279,8 @@ fn reply_to_goal_command(
     if !state.config.outbound_enabled {
         return;
     }
-    let agent_name = &state.config.agent_name;
+    let agent_name = record.agent_for(&state.config.agent_name);
+    let agent_name = &agent_name;
     let (answer, error) = delivery.goal_outcome(agent_name, &record.delivery_message_id);
     let body = match failure {
         Some(detail) => {
@@ -19870,6 +20114,7 @@ pub(crate) mod tests {
     struct FakeDelivery {
         queue_state: Mutex<Option<QueueMessageState>>,
         submitted_prompts: Mutex<Vec<String>>,
+        submitted_agents: Mutex<Vec<String>>,
         drains: Mutex<u64>,
         submit_error: Mutex<Option<String>>,
         /// What a read of the pane returns before a prompt is written.
@@ -19900,11 +20145,15 @@ pub(crate) mod tests {
 
         fn submit(
             &self,
-            _agent_name: &str,
+            agent_name: &str,
             prompt: &str,
             _message_id: &str,
             _options: DrainOptions,
         ) -> std::result::Result<(), String> {
+            self.submitted_agents
+                .lock()
+                .expect("agent lock")
+                .push(agent_name.to_owned());
             self.submitted_prompts
                 .lock()
                 .expect("prompt lock")
@@ -21294,23 +21543,64 @@ pub(crate) mod tests {
     }
 
     fn bang_batch(text: &str, sender: &str) -> DeliveryBatch {
+        bang_batch_at(1, "bang1", "bang1", text, sender, false)
+    }
+
+    fn bang_batch_at(
+        sequence: u64,
+        id: &str,
+        thread: &str,
+        text: &str,
+        sender: &str,
+        thread_reply: bool,
+    ) -> DeliveryBatch {
         let message = InboundMessage::new(
             ChannelId::new("spaces/example").expect("channel"),
-            MessageId::new("spaces/example/messages/bang1").expect("message"),
-            ThreadId::new("spaces/example/threads/bang1").expect("thread"),
+            MessageId::new(format!("spaces/example/messages/{id}")).expect("message"),
+            ThreadId::new(format!("spaces/example/threads/{thread}")).expect("thread"),
             SenderId::new(sender).expect("sender"),
             text,
             "2026-09-21T12:00:00Z",
-            false,
+            thread_reply,
         )
         .expect("normalized message");
         DeliveryBatch::new(
-            EventSequence::new(1).expect("sequence"),
-            ProviderCursor::new("cursor-bang").expect("cursor"),
-            DeliveryId::new("delivery-bang").expect("delivery"),
+            EventSequence::new(sequence).expect("sequence"),
+            ProviderCursor::new(format!("cursor-{id}")).expect("cursor"),
+            DeliveryId::new(format!("delivery-{id}")).expect("delivery"),
             vec![CommittableEvent::message_created(message)],
         )
         .expect("bang delivery")
+    }
+
+    fn bang_registry(name: &str) -> PathBuf {
+        let registry = temporary(name);
+        fs::create_dir_all(registry.join("agents")).unwrap();
+        let write_agent = |agent: &str, record: Value| {
+            let dir = registry.join("agents").join(agent);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("agent.json"), record.to_string()).unwrap();
+        };
+        write_agent(
+            "coordb",
+            json!({"name":"coordb","token":"t-coord","lifecycle":"running","harness":"claude","model":"opus"}),
+        );
+        write_agent(
+            "worker",
+            json!({"name":"worker","token":"t-w","lifecycle":"running","harness":"muse","model":"watermelon",
+                    "managed_by":{"agent":"coordb","registry":registry.display().to_string(),"token":"t-coord","proof":"assigned"}}),
+        );
+        write_agent(
+            "pinned-one",
+            json!({"name":"pinned-one","token":"t-p","lifecycle":"stopped","harness":"codex","pinned":true,
+                    "managed_by":{"agent":"coordb","registry":registry.display().to_string(),"token":"t-coord","proof":"assigned"}}),
+        );
+        fs::write(
+            registry.join("coordinator.json"),
+            json!({"schema":"agentctl-coordinator/v1","name":"coordb","token":"t-coord","set_at":0}).to_string(),
+        )
+        .unwrap();
+        registry
     }
 
     #[test]
@@ -21392,6 +21682,107 @@ pub(crate) mod tests {
         assert!(one.contains("managed by: lieutenant"), "{one}");
         let missing = bang::render_who_one(&snapshot, "worke");
         assert!(missing.contains("Near matches: worker"), "{missing}");
+        fs::remove_dir_all(registry).unwrap();
+    }
+
+    #[test]
+    fn bang_at_opens_a_binding_and_targets_the_first_request() {
+        let registry = bang_registry("bang-at-registry");
+        let root = temporary("bang-at");
+        let state = BridgeState::initialize(&root, config())
+            .unwrap()
+            .with_latency_profile(Some(registry.clone()), false);
+        let admission = state
+            .admit_batch(&bang_batch("!@worker hello worker", "users/owner"))
+            .unwrap();
+        assert_eq!(admission.new_bindings.len(), 1);
+        assert_eq!(admission.new_bindings[0].agent_name, "worker");
+        assert_eq!(admission.new_request_keys.len(), 1);
+        assert!(admission
+            .bang_posts
+            .iter()
+            .any(|post| post.body.contains("Bound to worker")));
+        let record = state.read_request(&admission.new_request_keys[0]).unwrap();
+        assert_eq!(record.target_agent.as_deref(), Some("worker"));
+        assert_eq!(record.message.text, "hello worker");
+        assert_eq!(state.thread_bindings().unwrap().len(), 1);
+        assert_eq!(state.pending_parent_notices().unwrap().len(), 1);
+        // The bound prompt asks for the reply command, explicitly, never markers.
+        let prompt = state.prompt(&record.key, "").unwrap();
+        assert!(prompt.contains("chat reply --bridge-state"), "{prompt}");
+        assert!(!prompt.contains("Reply between a line"), "{prompt}");
+        // Delivery goes to the bound agent, not the bridge's own target.
+        let delivery = FakeDelivery::default();
+        assert_eq!(
+            deliver_request_with(&state, &delivery, &record.key, DrainOptions::default()).unwrap(),
+            CoordinatorDeliveryResult::Delivered
+        );
+        assert_eq!(
+            *delivery.submitted_agents.lock().unwrap(),
+            ["worker".to_owned()]
+        );
+        // A follow-up in the thread routes to the same agent, with no new binding.
+        let follow = state
+            .admit_batch(&bang_batch_at(
+                2,
+                "bang2",
+                "bang1",
+                "follow up",
+                "users/owner",
+                true,
+            ))
+            .unwrap();
+        assert!(follow.new_bindings.is_empty());
+        assert_eq!(follow.new_request_keys.len(), 1);
+        let record = state.read_request(&follow.new_request_keys[0]).unwrap();
+        assert_eq!(record.target_agent.as_deref(), Some("worker"));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(registry).unwrap();
+    }
+
+    #[test]
+    fn bang_at_unknown_or_stopped_binds_nothing() {
+        let registry = bang_registry("bang-at-bad-registry");
+        let root = temporary("bang-at-bad");
+        let state = BridgeState::initialize(&root, config())
+            .unwrap()
+            .with_latency_profile(Some(registry.clone()), false);
+        let unknown = state
+            .admit_batch(&bang_batch("!@nope hi", "users/owner"))
+            .unwrap();
+        assert!(unknown.new_request_keys.is_empty());
+        assert!(unknown.new_bindings.is_empty());
+        assert!(unknown.bang_posts[0].body.contains("No agent named"));
+        let stopped = state
+            .admit_batch(&bang_batch_at(
+                2,
+                "bang2",
+                "bang2",
+                "!@pinned-one hi",
+                "users/owner",
+                false,
+            ))
+            .unwrap();
+        assert!(stopped.new_bindings.is_empty());
+        assert!(stopped.bang_posts[0].body.contains("cannot be bound"));
+        assert!(state.thread_bindings().unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(registry).unwrap();
+    }
+
+    #[test]
+    fn bang_at_bare_opens_a_thread_without_delivering() {
+        let registry = bang_registry("bang-at-bare-registry");
+        let root = temporary("bang-at-bare");
+        let state = BridgeState::initialize(&root, config())
+            .unwrap()
+            .with_latency_profile(Some(registry.clone()), false);
+        let admission = state
+            .admit_batch(&bang_batch("!@worker", "users/owner"))
+            .unwrap();
+        assert_eq!(admission.new_bindings.len(), 1);
+        assert!(admission.new_request_keys.is_empty());
+        fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(registry).unwrap();
     }
 
