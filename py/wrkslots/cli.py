@@ -11062,6 +11062,9 @@ class RegistryStorageFindings:
     #: ``slot_type:slot`` for a Git-registered path inside the managed root with
     #: no active row, excluding the slot the command named -- that one raises.
     registrations: tuple[str, ...] = ()
+    #: Details of ``git-registration-without-row`` findings for the target slot
+    #: that a caller explicitly tolerated (transfer-owner: nested worktrees).
+    target_git_registrations: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -11080,6 +11083,7 @@ def _assert_registry_storage_consistent(
     allow_unregistered_migration_slots: bool = False,
     target_slot: str | None = None,
     scope_to_target: bool = False,
+    tolerate_target_git_registrations: bool = False,
 ) -> RegistryStorageFindings:
     scope_to_target = scope_to_target or target_slot is not None
     records = [record for state in states for record in state.slots]
@@ -11194,6 +11198,7 @@ def _assert_registry_storage_consistent(
     # an unattributable finding cannot be proven unrelated. Everything else is
     # collected and reported BY NAME by the caller.
     retained_registrations: list[str] = []
+    target_git_registrations: list[str] = []
     for finding in registration_findings:
         key = (
             f"{finding.slot_type}:{finding.slot}"
@@ -11209,6 +11214,13 @@ def _assert_registry_storage_consistent(
         if is_migration_directory and (
             allow_unregistered_migration_slots or is_allowed_target
         ):
+            continue
+        if (
+            tolerate_target_git_registrations
+            and finding.slot is not None
+            and finding.slot == target_slot
+        ):
+            target_git_registrations.append(finding.detail)
             continue
         if (
             scope_to_target
@@ -11260,6 +11272,7 @@ def _assert_registry_storage_consistent(
         tuple(unexpected),
         tuple(sorted(stale)),
         tuple(sorted(set(retained_registrations))),
+        tuple(target_git_registrations),
     )
 
 
@@ -11272,7 +11285,8 @@ def _assert_command_registry_storage(
     migration_operation: bool = False,
     target_slot: str | None = None,
     scope_to_target: bool = False,
-) -> None:
+    tolerate_target_git_registrations: bool = False,
+) -> RegistryStorageFindings:
     allow = bool(
         migration_operation
         or getattr(args, "allow_existing_unregistered_worktrees", False)
@@ -11290,6 +11304,7 @@ def _assert_command_registry_storage(
         allow_unregistered_migration_slots=allow,
         target_slot=target_slot,
         scope_to_target=scope_to_target or target_slot is not None,
+        tolerate_target_git_registrations=tolerate_target_git_registrations,
     )
     unexpected = findings.unexpected
     if findings.stale:
@@ -11341,6 +11356,7 @@ def _assert_command_registry_storage(
             "because the directory may hold the only reference to unpushed work",
             file=sys.stderr,
         )
+    return findings
 
 
 def _global_rows(
@@ -29175,10 +29191,24 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
     After a reboot, or after any death of an agent that is then resumed, the slot still
     names the dead process generation. The successor must either be in the caller's
     process ancestry (the agent transfers its own slot) or run inside the slot's own box,
-    which only a process wrkslots boxed to this slot can do. A live, released, or
-    indeterminate recorded owner is refused.
+    which only a process wrkslots boxed to this slot can do. A live or indeterminate
+    recorded owner is refused. Unregistered nested linked worktrees inside the slot
+    warn and do not refuse: ownership does not touch them and removal still refuses
+    them. A released generation is refused for a plain transfer; a coordinator may
+    rebind it with ``--reopen --coordinator-authorized``, which starts a new
+    generation and records who authorized it.
     """
 
+    reopen = bool(getattr(args, "reopen", False))
+    coordinator = None
+    reason = str(getattr(args, "reason", "") or "")
+    if reopen:
+        _require_coordinator_authorized(args, "released generation reopen")
+        if getattr(args, "coordinator_pid", None) is None:
+            raise Refusal("transfer-owner --reopen requires --coordinator-pid")
+        if not reason.strip():
+            raise Refusal("transfer-owner --reopen requires a non-empty --reason")
+        coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
@@ -29188,35 +29218,51 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, archives = _validate_global_state(config)
-        _assert_command_registry_storage(config, states, args)
+        findings = _assert_command_registry_storage(
+            config, states, args, tolerate_target_git_registrations=True
+        )
+        nested = findings.target_git_registrations
         before = _global_rows(states, archives)
         state = _load_active(config)
         record = _find_record(state, args.slot)
         _expected_generation(record, args.expected_generation)
-        if record.agent != args.agent:
+        if not reopen and record.agent != args.agent:
             raise Refusal(
                 f"ownership mismatch for slot {args.slot}: expected {record.agent}, got {args.agent}"
             )
-        if record.owner == successor:
+        if not reopen and record.owner == successor:
             print(
                 f"already owned slot={record.slot} agent={record.agent} "
                 f"generation={record.generation} owner_pid={successor.pid}"
             )
             return 0
         previous_state, detail = _process_state(record.owner)
-        if record.owner is not None and previous_state != "dead":
-            raise Refusal(
-                f"slot {record.slot} owner is {previous_state}: {detail}; transfer-owner "
-                "only replaces an owner that is provably dead"
-            )
         released, void_reason = _owner_release_state(
             config, record, _load_events(config, record.machine)
         )
-        if released is not None and void_reason is None:
-            raise Refusal(
-                f"slot {record.slot} generation {record.generation} was released by its owner; "
-                "a released generation is waiting for removal and is not transferred"
-            )
+        released_in_effect = released is not None and void_reason is None
+        if reopen:
+            if not released_in_effect:
+                raise Refusal(
+                    f"slot {record.slot} generation {record.generation} is not a released "
+                    "generation in effect; use plain 'wrkslots transfer-owner' without "
+                    "--reopen for a dead-owner transfer"
+                )
+        else:
+            if record.owner is not None and previous_state != "dead":
+                raise Refusal(
+                    f"slot {record.slot} owner is {previous_state}: {detail}; transfer-owner "
+                    "only replaces an owner that is provably dead"
+                )
+            if released_in_effect:
+                raise Refusal(
+                    f"slot {record.slot} generation {record.generation} was released by its owner; "
+                    "a released generation is waiting for removal and is not transferred. "
+                    f"remedy: a coordinator may rebind it with 'wrkslots transfer-owner "
+                    f"{record.slot} --agent <agent> --owner-pid <pid> "
+                    f"--expected-generation {record.generation} --reopen "
+                    "--coordinator-authorized --coordinator-pid <pid> --reason <why>'"
+                )
         try:
             _assert_caller_process(successor, "owner")
             basis = "caller-ancestry"
@@ -29229,18 +29275,45 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
             basis = "slot-box"
         if _read_process_identity(successor.pid) != successor:
             raise Refusal("owner process generation changed during transfer-owner")
-        transferred = dataclasses.replace(record, owner=successor, heartbeat_at=_utc_now())
-        _write_active_state(
-            config,
-            _replace_record(state, transferred),
-            action="owner-transferred",
-            slot=transferred.slot,
-            evidence={
+        if reopen:
+            assert coordinator is not None and released is not None
+            transferred = dataclasses.replace(
+                record,
+                agent=args.agent,
+                owner=successor,
+                generation=record.generation + 1,
+                heartbeat_at=_utc_now(),
+            )
+            evidence: dict[str, object] = {
                 "owner": _identity_to_obj(successor),
                 "previous_owner": None if record.owner is None else _identity_to_obj(record.owner),
                 "previous_owner_state": previous_state,
                 "basis": basis,
-            },
+                "previous_agent": record.agent,
+                "previous_generation": record.generation,
+                "coordinator": _identity_to_obj(coordinator),
+                "coordinator_authorized": True,
+                "reason": reason.strip(),
+                "release_sequence": released.sequence,
+            }
+            action = "owner-reopened"
+        else:
+            transferred = dataclasses.replace(record, owner=successor, heartbeat_at=_utc_now())
+            evidence = {
+                "owner": _identity_to_obj(successor),
+                "previous_owner": None if record.owner is None else _identity_to_obj(record.owner),
+                "previous_owner_state": previous_state,
+                "basis": basis,
+            }
+            action = "owner-transferred"
+        if nested:
+            evidence["unregistered_nested_worktrees"] = list(nested)
+        _write_active_state(
+            config,
+            _replace_record(state, transferred),
+            action=action,
+            slot=transferred.slot,
+            evidence=evidence,
         )
         after_states, after_archives = _validate_global_state(config)
         _assert_only_slot_changed(
@@ -29248,11 +29321,26 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
             _global_rows(after_states, after_archives),
             args.slot,
         )
-    print(
-        f"transferred slot={transferred.slot} agent={transferred.agent} "
-        f"generation={transferred.generation} owner_pid={successor.pid} basis={basis} "
-        f"previous={previous_state}"
-    )
+    if nested:
+        for detail in nested:
+            print(
+                f"WARNING: unregistered nested worktree retained during transfer-owner: "
+                f"{detail}. state: RETAINED -- ownership did not touch it and removal "
+                "still refuses it",
+                file=sys.stderr,
+            )
+    if reopen:
+        print(
+            f"reopened slot={transferred.slot} agent={transferred.agent} "
+            f"generation={transferred.generation} owner_pid={successor.pid} basis={basis} "
+            f"previous={previous_state}"
+        )
+    else:
+        print(
+            f"transferred slot={transferred.slot} agent={transferred.agent} "
+            f"generation={transferred.generation} owner_pid={successor.pid} basis={basis} "
+            f"previous={previous_state}"
+        )
     return 0
 
 
@@ -66270,15 +66358,20 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "its owner process died (for example across a reboot, where 'agentctl restore' "
             "calls this with the revived harness). Refuses unless the recorded owner is "
             "provably dead (its boot ended, or its PID exited or was reused) or none is "
-            "recorded, the generation was not released, and the successor is in the invoking "
-            "process ancestry or runs inside this slot's own box. Changes nothing else: "
-            "generation, checkouts, holds and handoffs stay as they were."
+            "recorded, and the successor is in the invoking process ancestry or runs inside "
+            "this slot's own box. Unregistered nested linked worktrees inside the slot are "
+            "listed as warnings and do not refuse; removal still refuses them. A released "
+            "generation is not transferred plainly: a coordinator may rebind it with "
+            "--reopen --coordinator-authorized --coordinator-pid <pid> --reason <why>, which "
+            "starts a new generation, may rename the agent, and records who authorized it. "
+            "Otherwise generation, checkouts, holds and handoffs stay as they were."
         ),
         formatter_class=_HelpFormatter,
     )
     transfer.add_argument("slot", help="active slot whose owner died")
     transfer.add_argument(
-        "--agent", required=True, metavar="AGENT", help="agent name already recorded on the slot"
+        "--agent", required=True, metavar="AGENT",
+        help="agent name already recorded on the slot (with --reopen: live agent to record)",
     )
     transfer.add_argument(
         "--owner-pid", type=int, required=True, metavar="PID", help="live successor PID to bind"
@@ -66289,6 +66382,24 @@ usage or audit gate unknown, 3 fail-closed refusal.
         required=True,
         metavar="N",
         help="current slot generation; refuses stale callers",
+    )
+    transfer.add_argument(
+        "--reopen", action="store_true",
+        help="coordinator-authorized rebind of a released, unremoved generation (requires "
+        "--coordinator-authorized, --coordinator-pid and --reason); starts a new generation",
+    )
+    transfer.add_argument(
+        "--coordinator-pid", type=int, metavar="PID",
+        help="live coordinator PID recorded with a --reopen rebind",
+    )
+    transfer.add_argument(
+        "--coordinator-authorized", action="store_true",
+        help="record that the coordinator authorized this --reopen rebind (required with --reopen)",
+    )
+    transfer.add_argument(
+        "--reason", metavar="TEXT",
+        help="why the coordinator rebinds a released generation; recorded in the event log "
+        "(required with --reopen)",
     )
     transfer.set_defaults(handler=_cmd_transfer_owner)
 

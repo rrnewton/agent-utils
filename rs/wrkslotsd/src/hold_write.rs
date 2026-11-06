@@ -156,6 +156,36 @@ pub(crate) fn refuse_target_storage(root: Option<&Path>, slot: &str) -> Result<(
     Ok(())
 }
 
+/// Like `refuse_target_storage`, but `git-registration-without-row`
+/// findings for the target slot are collected as warnings instead of
+/// refusing: transfer-owner tolerates unregistered nested worktrees.
+pub(crate) fn refuse_target_storage_except_nested(
+    root: Option<&Path>,
+    slot: &str,
+) -> Result<Vec<String>> {
+    let mut warnings: Vec<String> = Vec::new();
+    for value in [parse_storage(root)?, parse_storage_git(root)?] {
+        if let Some(findings) = value.get("findings").and_then(Value::as_array) {
+            for finding in findings {
+                if finding.get("slot").and_then(Value::as_str) == Some(slot) {
+                    let detail = finding
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if finding.get("kind").and_then(Value::as_str)
+                        == Some("git-registration-without-row")
+                    {
+                        warnings.push(detail.to_string());
+                    } else {
+                        return Err(detail.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Ok(warnings)
+}
+
 pub(crate) struct ConfigLock {
     _file: std::fs::File,
 }

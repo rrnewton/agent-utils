@@ -489,7 +489,7 @@ pub(crate) enum Command {
     TransferOwner {
         /// Active slot whose owner died
         slot: String,
-        /// Agent name already recorded on the slot
+        /// Agent name already recorded on the slot (with --reopen: live agent to record)
         #[arg(long, value_name = "NAME")]
         agent: String,
         /// Live successor PID to bind
@@ -498,6 +498,18 @@ pub(crate) enum Command {
         /// Current slot generation; refuses stale callers
         #[arg(long, value_name = "N")]
         expected_generation: i64,
+        /// Coordinator-authorized rebind of a released, unremoved generation; starts a new generation
+        #[arg(long)]
+        reopen: bool,
+        /// Live coordinator PID recorded with a --reopen rebind
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: Option<i64>,
+        /// Record that the coordinator authorized this --reopen rebind (required with --reopen)
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Why the coordinator rebinds a released generation; recorded in the event log (required with --reopen)
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
@@ -1849,6 +1861,10 @@ pub fn run() -> u8 {
             agent,
             owner_pid,
             expected_generation,
+            reopen,
+            coordinator_pid,
+            coordinator_authorized,
+            reason,
             root,
             machine,
         } => {
@@ -1859,6 +1875,10 @@ pub fn run() -> u8 {
                 &agent,
                 owner_pid,
                 expected_generation,
+                reopen,
+                coordinator_pid,
+                coordinator_authorized,
+                reason.as_deref(),
             ) {
                 Ok(value) => {
                     println!(

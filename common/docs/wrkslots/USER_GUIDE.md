@@ -806,9 +806,23 @@ released with `release`. The successor must be in the invoking process ancestry 
 transfers its own slot), or run inside this slot's own box: a control group under the slice `run`
 and `shell-command` create for the slot (`wrkslots-LABEL.slice`, or `PREFIX-wrkslots-LABEL.slice`
 at any depth, where LABEL is the systemd-escaped slot name). The second form lets a supervisor such
-as `agentctl restore` transfer a slot to a harness it revived inside that slot's box. A live,
-indeterminate or released owner is refused. Only the owner and heartbeat change, recorded as an
+as `agentctl restore` transfer a slot to a harness it revived inside that slot's box. A live or
+indeterminate owner is refused. Only the owner and heartbeat change, recorded as an
 `owner-transferred` active-state event that names the previous owner, its state, and the basis.
+
+Unregistered nested linked worktrees inside the slot (for example under a checkout's `ignored/`)
+do not refuse a transfer: they are listed as warnings in the output and in the event, ownership
+does not touch them, and removal still refuses them. A released, unremoved generation is not
+transferred plainly; a coordinator may rebind it to a live lane, which starts a new generation,
+may rename the agent, and records who authorized it:
+
+```sh
+wrkslots transfer-owner kvm-20261012 --agent kvm --owner-pid 4242 --expected-generation 1 \
+  --reopen --coordinator-authorized --coordinator-pid 1234 --reason "lane resumed after restart"
+```
+
+Without `--coordinator-authorized` that rebind refuses. It is recorded as an `owner-reopened`
+event naming the coordinator, the reason, and the previous agent and generation.
 
 `agentctl restore` uses `hold` with the reason `reboot: agent NAME waits for agentctl restore` for
 the slot of every running agent after it detects a restart, transfers the slot to the agent's

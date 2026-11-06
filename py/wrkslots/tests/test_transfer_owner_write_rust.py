@@ -155,7 +155,10 @@ def _pair(tmp_path: Path, owner: dict[str, object] | None) -> tuple[Path, Path]:
     return _fixture(tmp_path / "rust", owner), _fixture(tmp_path / "oracle", owner)
 
 
-def _rust(root: Path, owner_pid: int, *, fixture: bool = True) -> subprocess.CompletedProcess[str]:
+def _rust(
+    root: Path, owner_pid: int, *, fixture: bool = True,
+    extra: tuple[str, ...] = (), generation: str = "1",
+) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     if fixture:
         env["WRKSLOTSD_FIXTURE_WRITER"] = "1"
@@ -165,7 +168,7 @@ def _rust(root: Path, owner_pid: int, *, fixture: bool = True) -> subprocess.Com
         [
             str(rust_wrkslotsd()), "transfer-owner", "slot-a",
             "--agent", "agent-slot-a", "--owner-pid", str(owner_pid),
-            "--expected-generation", "1", "--root", str(root),
+            "--expected-generation", generation, "--root", str(root), *extra,
         ],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,
     )
@@ -364,6 +367,61 @@ def test_transfer_released_generation_refuses(tmp_path: Path) -> None:
     result = _rust(rust_root, os.getpid())
     assert result.returncode == 1
     assert "was released by its owner" in result.stderr
+
+
+def test_rust_transfer_warns_and_proceeds_with_unregistered_nested_worktrees(
+    tmp_path: Path,
+) -> None:
+    rust_root = _fixture(tmp_path / "rust", _dead_identity())
+    upstream = tmp_path / "rust" / "upstream-repo"
+    checkout = rust_root / "worktrees" / "slot-a" / "repo"
+    nested = checkout / "ignored" / "nested-a"
+    nested.parent.mkdir(parents=True)
+    _git(upstream, "worktree", "add", "-q", "--detach", str(nested), "HEAD")
+    (nested / "dirty.txt").write_text("live work\n", encoding="utf-8")
+    result = _rust(rust_root, os.getpid())
+    assert result.returncode == 0, result.stderr
+    assert "nested-a" in result.stderr
+    outcome = json.loads(result.stdout)
+    assert "nested-a" in str(outcome["unregistered_nested_worktrees"])
+    assert _active(rust_root)["slots"][0]["owner"]["pid"] == os.getpid()
+
+
+def test_rust_released_generation_rebinds_only_with_coordinator_authorization(
+    tmp_path: Path,
+) -> None:
+    rust_root = _fixture(tmp_path / "rust", None)
+    _release_with_dying_owner(rust_root, tmp_path / "rust-src")
+    plain = _rust(rust_root, os.getpid())
+    assert plain.returncode == 1 and "was released by its owner" in plain.stderr
+    assert "--reopen" in plain.stderr
+    unauthorized = _rust(
+        rust_root, os.getpid(),
+        extra=("--reopen", "--coordinator-pid", str(os.getpid()),
+               "--reason", "lane resumed after restart"),
+    )
+    assert unauthorized.returncode == 1, unauthorized.stderr
+    reopened = _rust(
+        rust_root, os.getpid(),
+        extra=("--reopen", "--coordinator-authorized",
+               "--coordinator-pid", str(os.getpid()),
+               "--reason", "lane resumed after restart"),
+    )
+    assert reopened.returncode == 0, reopened.stderr
+    outcome = json.loads(reopened.stdout)
+    assert outcome["reopened"] is True and outcome["generation"] == 2
+    record = _active(rust_root)["slots"][0]
+    assert record["generation"] == 2 and record["owner"]["pid"] == os.getpid()
+    reopened_events = [
+        event for event in _events(rust_root)
+        if event["kind"] == "active-state-recorded"
+        and event["payload"].get("action") == "owner-reopened"
+    ]
+    assert reopened_events
+    evidence = reopened_events[-1]["payload"]["evidence"]
+    assert evidence["coordinator_authorized"] is True
+    assert evidence["reason"] == "lane resumed after restart"
+    assert evidence["previous_generation"] == 1
 
 
 def test_transfer_refuses_without_fixture_attestation(tmp_path: Path) -> None:
