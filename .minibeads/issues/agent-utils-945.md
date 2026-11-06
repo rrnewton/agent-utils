@@ -1,12 +1,13 @@
 ---
 title: 'merge-queue-regenerate-conflicts: resolve conflicts confined to declared generated paths by regenerating them'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - merge-queue
 created_at: 2026-11-06T14:09:26.584874758+00:00
-updated_at: 2026-11-06T14:25:36.006714516+00:00
+updated_at: 2026-11-06T14:41:18.941444929+00:00
+closed_at: 2026-11-06T14:41:18.941444538+00:00
 ---
 
 # Description
