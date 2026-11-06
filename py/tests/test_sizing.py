@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from dagrun.model import DagConfig, ResourceHint, Step, StepClass
+from dagrun.model import ArtifactDep, DagConfig, ResourceHint, Step, StepClass
 from dagrun.sizing import (
     PER_BUILD_JOB_MEM_BYTES,
     derive_build_jobs,
@@ -68,6 +68,23 @@ def test_transitive_deps() -> None:
     deps = transitive_deps(list(_cfg().steps))
     assert deps["g.B"] == {"g.A"}
     assert deps["g.A"] == set()
+
+
+def test_transitive_deps_follow_artifact_edges() -> None:
+    steps = list(_cfg().steps)
+    steps.append(
+        Step(
+            "g",
+            "E",
+            "",
+            "true",
+            deps=["g.B"],
+            artifact_deps=[ArtifactDep(step="g.C", artifact="app-bin")],
+        )
+    )
+    deps = transitive_deps(steps)
+    # The artifact producer g.C joins g.E's closure alongside g.B -> g.A.
+    assert deps["g.E"] == {"g.A", "g.B", "g.C"}
 
 
 def test_step_mem_cap_hard_override_wins() -> None:

@@ -419,6 +419,13 @@ class Step:
         """Return the stable ``group.job`` identifier for this step."""
         return f"{self.group}.{self.job}"
 
+    def dependency_tags(self) -> tuple[str, ...]:
+        """Return every step tag this step waits on: completion ``deps``
+        first, then artifact producers from ``artifact_deps``. The one
+        edge list for graph walks (cycle checks, transitive closure,
+        selection), mirroring the Rust build."""
+        return tuple(self.deps) + tuple(dep.step for dep in self.artifact_deps)
+
     def effective_result_manifests(self) -> tuple[DagManifest, ...]:
         """Return authoritative selectors, falling back to the singular declaration."""
 
@@ -1338,9 +1345,7 @@ def graph_structure_violations(cfg: DagConfig) -> list[str]:
             stack.append((tag, True))
             # Mixed edges: completion deps plus artifact producers. A cycle
             # through either kind can never be satisfied, so both are walked.
-            mixed = set(by_tag[tag].deps) | {
-                dep.step for dep in by_tag[tag].artifact_deps
-            }
+            mixed = set(by_tag[tag].dependency_tags())
             for dep in sorted(mixed):
                 if dep in by_tag and colour.get(dep) != BLACK:
                     stack.append((dep, False))

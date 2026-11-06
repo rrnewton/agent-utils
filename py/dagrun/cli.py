@@ -1725,7 +1725,13 @@ def _select_steps(
             selected.update(dependencies[tag])
     new_steps = tuple(
         (
-            dataclasses.replace(step, deps=[dep for dep in step.deps if dep in selected])
+            dataclasses.replace(
+                step,
+                deps=[dep for dep in step.deps if dep in selected],
+                artifact_deps=[
+                    dep for dep in step.artifact_deps if dep.step in selected
+                ],
+            )
             if ignore_selected_deps
             else step
         )
@@ -1827,6 +1833,10 @@ def _expand_stress(cfg: DagConfig, n: int) -> DagConfig:
                     step,
                     job=f"{step.job}{suffix}",
                     deps=[f"{dep}{suffix}" for dep in step.deps],
+                    artifact_deps=[
+                        dataclasses.replace(dep, step=f"{dep.step}{suffix}")
+                        for dep in step.artifact_deps
+                    ],
                     hint=dataclasses.replace(step.hint, resources={}),
                     # Zero-padded to the same width as the job suffix, so a path built from
                     # the index sorts in copy order like the tags do. Every copy runs the

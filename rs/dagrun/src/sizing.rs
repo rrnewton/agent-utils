@@ -101,8 +101,13 @@ pub(crate) fn step_mem_cap_for_inner_jobs_optional(
 ///
 /// This cannot overflow the call stack on a reverse-topological chain thousands of nodes deep.
 pub fn transitive_deps(steps: &[Step]) -> HashMap<String, HashSet<String>> {
-    let direct: HashMap<String, Vec<String>> =
-        steps.iter().map(|s| (s.tag(), s.deps.clone())).collect();
+    // Mixed edges: an artifact producer is a transitive dependency of its
+    // consumer (the producer must run and signal), exactly as model
+    // validation walks it; see Step::dependency_tags.
+    let direct: HashMap<String, Vec<String>> = steps
+        .iter()
+        .map(|s| (s.tag(), s.dependency_tags().map(str::to_string).collect()))
+        .collect();
     let mut result: HashMap<String, HashSet<String>> = HashMap::new();
     for step in steps {
         let tag = step.tag();
@@ -882,6 +887,24 @@ mod tests {
         let deps = transitive_deps(&cfg().steps);
         assert_eq!(deps["g.B"], HashSet::from(["g.A".to_string()]));
         assert!(deps["g.A"].is_empty());
+    }
+
+    #[test]
+    fn transitive_deps_follow_artifact_edges() {
+        let mut consumer = step("g", "E", None, &["g.B"], false);
+        consumer.artifact_deps = vec![crate::model::ArtifactDep {
+            step: "g.C".into(),
+            artifact: "app-bin".into(),
+        }];
+        let mut steps = cfg().steps;
+        steps.push(consumer);
+        let deps = transitive_deps(&steps);
+        // The artifact producer g.C joins g.E's closure alongside the
+        // completion chain g.B -> g.A.
+        assert_eq!(
+            deps["g.E"],
+            HashSet::from(["g.A".to_string(), "g.B".to_string(), "g.C".to_string()])
+        );
     }
 
     #[test]

@@ -150,7 +150,7 @@ def transitive_deps(steps: Sequence[Step]) -> dict[str, set[str]]:
     Each root uses an explicit input-ordered DFS stack. This remains deterministic for reverse-
     topological graphs thousands of nodes deep and cannot hit Python's recursion limit.
     """
-    direct = {step.tag: tuple(step.deps) for step in steps}
+    direct = {step.tag: step.dependency_tags() for step in steps}
     result: dict[str, set[str]] = {}
     for tag in direct:
         deps: set[str] = set()

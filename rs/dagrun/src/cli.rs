@@ -2601,6 +2601,8 @@ pub fn select_steps_by_tags(
             let mut step = s.clone();
             if ignore_selected_deps {
                 step.deps.retain(|dep| selected.contains(dep));
+                step.artifact_deps
+                    .retain(|dep| selected.contains(&dep.step));
             }
             step
         })
@@ -2710,6 +2712,9 @@ fn expand_stress(cfg: &DagConfig, n: i64) -> DagConfig {
                 .iter()
                 .map(|dependency| format!("{dependency}{suffix}"))
                 .collect();
+            for dep in &mut step.artifact_deps {
+                dep.step = format!("{}{suffix}", dep.step);
+            }
             step.hint.resources.clear();
             steps.push(step);
         }
@@ -6046,6 +6051,40 @@ mod tests {
         );
         assert_eq!(selected.steps[0].deps, ["test.unit"]);
         assert_eq!(selected.steps[1].deps, ["build.app"]);
+    }
+
+    #[test]
+    fn selected_step_includes_its_artifact_producer() {
+        let cfg = dag_from_json(
+            r#"{"steps":[
+                {"group":"e2e","job":"run","cmd":"true",
+                 "artifact_deps":[{"step":"build.app","artifact":"app-bin"}]},
+                {"group":"build","job":"app","cmd":"true",
+                 "publishes":[{"name":"app-bin","path":"target/app"}]},
+                {"group":"other","job":"unrelated","cmd":"true"}
+            ]}"#,
+        )
+        .unwrap();
+
+        // The artifact producer is a required dependency even though the
+        // consumer does not list it in deps: without it the selection
+        // would name a step that is not there.
+        let selected = select_steps_by_tags(&cfg, &["e2e.run".to_string()], false).unwrap();
+        assert_eq!(
+            selected.steps.iter().map(Step::tag).collect::<Vec<_>>(),
+            ["e2e.run", "build.app"]
+        );
+        // Untagged selection is unchanged: the producer alone selects
+        // neither its consumer nor the unrelated step.
+        let producer_only = select_steps_by_tags(&cfg, &["build.app".to_string()], false).unwrap();
+        assert_eq!(
+            producer_only
+                .steps
+                .iter()
+                .map(Step::tag)
+                .collect::<Vec<_>>(),
+            ["build.app"]
+        );
     }
 
     #[test]

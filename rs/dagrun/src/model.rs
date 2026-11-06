@@ -564,6 +564,18 @@ impl Step {
         format!("{}.{}", self.group, self.job)
     }
 
+    /// Every step tag this step waits on: completion `deps` first, then
+    /// artifact producers from `artifact_deps`. This is the one edge
+    /// iterator for graph walks (cycle checks, transitive closure,
+    /// selection), so an artifact edge can never be walked by validation
+    /// and missed by selection, or the reverse.
+    pub fn dependency_tags(&self) -> impl Iterator<Item = &str> {
+        self.deps
+            .iter()
+            .map(String::as_str)
+            .chain(self.artifact_deps.iter().map(|dep| dep.step.as_str()))
+    }
+
     /// The manifest-cell selectors declared by this step, preserving the singular fallback.
     pub fn effective_result_manifests(&self) -> Cow<'_, [DagManifest]> {
         match self.result_manifests.as_deref() {
@@ -1717,8 +1729,7 @@ pub fn graph_structure_violations(cfg: &DagConfig) -> Vec<String> {
             stack.push((tag, true));
             // Mixed edges: completion deps plus artifact producers. A cycle
             // through either kind can never be satisfied, so both are walked.
-            let mut deps: BTreeSet<&str> = by_tag[tag].deps.iter().map(|s| s.as_str()).collect();
-            deps.extend(by_tag[tag].artifact_deps.iter().map(|d| d.step.as_str()));
+            let deps: BTreeSet<&str> = by_tag[tag].dependency_tags().collect();
             for dep in deps {
                 if by_tag.contains_key(dep) && colour.get(dep) != Some(&Colour::Black) {
                     stack.push((dep, false));
