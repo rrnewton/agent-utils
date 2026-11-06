@@ -1,11 +1,12 @@
 ---
 title: 'merge-queue-close-replayed-pr: a failing close silently blocks every later close, and close_pending never drains without a sync'
-status: in_progress
+status: closed
 priority: 2
 issue_type: task
 assignee: mu-mqdonor
 created_at: 2026-11-06T20:01:38.109614209+00:00
-updated_at: 2026-11-06T20:01:57.174616914+00:00
+updated_at: 2026-11-06T20:38:45.676144787+00:00
+closed_at: 2026-11-06T20:38:45.676144406+00:00
 claimed_at: 2026-11-06T20:01:57.174616914+00:00
 claimed_until: 2026-11-08T20:01:57.174516123+00:00
 ---
