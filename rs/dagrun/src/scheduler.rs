@@ -900,7 +900,7 @@ fn artifact_deps_ok(sh: &Shared, step: &Step) -> bool {
 /// The final (renamed) path is the signal; a lingering `.tmp` file is not.
 fn signalled_artifacts(dir: &std::path::Path, step: &Step) -> HashSet<String> {
     let mut found = HashSet::new();
-    let subdir = dir.join(&step.tag());
+    let subdir = dir.join(step.tag());
     let Ok(entries) = std::fs::read_dir(&subdir) else {
         return found;
     };
