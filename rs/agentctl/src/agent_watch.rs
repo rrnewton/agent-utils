@@ -3831,6 +3831,7 @@ fn held_kind(reason: &str) -> Option<&'static str> {
     } else if reason.contains("did not type")
         || reason.contains("last status=staged")
         || reason.contains("unsent draft")
+        || reason.contains("composer already holds unsubmitted text")
     {
         Some("draft")
     } else {
@@ -4009,7 +4010,10 @@ fn report_held_queues(
 fn owner_wait_hint(agent: &str, reason: &str) -> String {
     // An idle Muse whose editor holds a draft reads `staged`; agentctl submits a draft it typed
     // itself before it gives up, so one still there is not its own.
-    if reason.contains("did not type") || reason.contains("last status=staged") {
+    if reason.contains("did not type")
+        || reason.contains("last status=staged")
+        || reason.contains("composer already holds unsubmitted text")
+    {
         format!(
             "A person's draft (or one agentctl cannot recognise) is in {agent}'s editor; submit or \
              clear it in the pane (`agentctl attach {agent}`), and delivery resumes. "
@@ -5994,6 +5998,39 @@ mod tests {
         probe.oldest_seconds = 900;
         watch_agents_once(&mut probe, &mut notifier, &mut state, 8_200.0, &options);
         assert_eq!(notifier.sent.len(), 6);
+    }
+
+    #[test]
+    fn a_queue_held_by_a_composer_draft_is_told_to_the_fallback() {
+        // The incident's verbatim refusal: a typed digest left in the
+        // coordinator's composer refused every later delivery. Past the
+        // stale threshold that is a held queue of kind draft, told to the
+        // fallback (never the held coordinator itself).
+        let mut options = options();
+        options.notice_fallback = vec!["liaison".to_owned()];
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let mut probe = HeldProbe {
+            agent: "coordinator".to_owned(),
+            oldest_seconds: 660,
+            blocked: Some(
+                "pane wV:pM composer already holds unsubmitted text \"may have arrived: tm-1\"; \
+                 refusing to append to it; nothing was typed"
+                    .to_owned(),
+            ),
+            senders: vec![sender("01c", "cl-start", "agentctl")],
+        };
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_360.0, &options);
+        let row = &report["held"][0];
+        assert_eq!(row["kind"], "draft", "{report}");
+        assert_eq!(row["notice_to"], "liaison", "{report}");
+        assert!(
+            notifier.sent.iter().any(|(to, text, _)| to == "liaison"
+                && text.contains("messages to coordinator are held")),
+            "{:?}",
+            notifier.sent
+        );
+        assert!(notifier.sent.iter().all(|(to, _, _)| to != "coordinator"));
     }
 
     #[test]

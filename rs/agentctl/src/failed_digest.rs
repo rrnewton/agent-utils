@@ -513,7 +513,9 @@ fn queue_digest_locked(root: &Path, now: f64) -> Result<Option<String>, String> 
         |id| {
             json!({
                 "id": id,
-                "text": text,
+                // Agentctl's own framing, so a digest typed into a composer
+                // is attributable there and flushable with one Enter.
+                "text": format!("[agentctl failed-digest]\n{text}"),
                 DIGEST_FLAG: true,
                 "failed_ids": named,
                 "queued_at": now,
@@ -534,10 +536,13 @@ fn queue_digest_locked(root: &Path, now: f64) -> Result<Option<String>, String> 
 
 /// Best-effort delivery, at most once: take an unconfirmed digest item
 /// out of circulation after its one attempt. A pending digest is
-/// withdrawn; one a drain filed to `failed/` is set aside in `cancelled/`
-/// instead (a digest is never a failed message and is never retried or
-/// retyped). An in-flight digest is left for the drain's recovery, which
-/// sets digest items aside the same way. Returns whether it acted.
+/// withdrawn — unless it is stranded, meaning its paste was typed and may
+/// still show: then it stays pending so a later pass flushes it with one
+/// Enter (never retyped) instead of deleting its only record. One a drain
+/// filed to `failed/` is set aside in `cancelled/` instead (a digest is
+/// never a failed message). An in-flight digest is left for the drain's
+/// recovery, which sets digest items aside the same way. Returns whether
+/// it acted.
 ///
 /// # Errors
 ///
@@ -546,6 +551,22 @@ pub fn discard_unconfirmed(root: &Path, id: &str) -> Result<bool, String> {
     use agent_queue::queue::MessageState;
     match agent_queue::queue::message_state(root, id).map_err(|e| e.to_string())? {
         Some(MessageState::Pending) => {
+            // A stranded pending digest was typed: leave it pending so the
+            // stranded path can flush it Enter-only. Withdrawing would
+            // delete the only record that can attribute its draft.
+            for lane in [agent_queue::queue::INBOX, agent_queue::queue::INBOX_V2] {
+                let path = root.join(lane).join(format!("{id}.json"));
+                let Ok(raw) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                let stranded = serde_json::from_str::<Value>(&raw)
+                    .ok()
+                    .is_some_and(|doc| doc.get("stranded_at").is_some());
+                if stranded {
+                    return Ok(false);
+                }
+                break;
+            }
             agent_queue::queue::withdraw(root, id, &agent_queue::fsio::Blocking)
                 .map_err(|e| e.to_string())
         }
@@ -772,6 +793,16 @@ mod tests {
         let first = queue_digest_at(&root, 1_000.0).unwrap().expect("queued");
         assert!(first.starts_with(DIGEST_ID_PREFIX), "{first}");
         assert!(root.join("inbox").join(format!("{first}.json")).is_file());
+        let queued: Value = serde_json::from_str(
+            &fs::read_to_string(root.join("inbox").join(format!("{first}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            queued["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("[agentctl failed-digest]\n")),
+            "{queued}"
+        );
         assert!(
             queue_digest_at(&root, 1_000.0).unwrap().is_none(),
             "once per entry"
@@ -938,6 +969,27 @@ mod tests {
         assert!(
             agent_queue::queue::validate_existing_queue(&root).is_ok(),
             "queue stays reachable after a set-aside"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stranded_pending_digest_is_not_withdrawn() {
+        // Its paste was typed and may still show: deleting the record
+        // would leave the draft unattributable in the composer forever.
+        let root = temp_root("stranded-discard");
+        agent_queue::queue::prepare(&root).unwrap();
+        enable_since(&root, 1);
+        write_failed(&root, "msg-1", "real one", "cancelled", 900);
+        let id = queue_digest_at(&root, 1_000.0).unwrap().expect("digest");
+        let path = root.join("inbox").join(format!("{id}.json"));
+        let mut item: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        item["stranded_at"] = json!(1_000.0);
+        fs::write(&path, item.to_string()).unwrap();
+        assert!(!discard_unconfirmed(&root, &id).unwrap(), "left pending");
+        assert_eq!(
+            agent_queue::queue::message_state(&root, &id).unwrap(),
+            Some(agent_queue::queue::MessageState::Pending)
         );
         let _ = fs::remove_dir_all(&root);
     }

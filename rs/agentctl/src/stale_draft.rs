@@ -321,6 +321,58 @@ fn typed_texts(document: &Map<String, Value>) -> Vec<&str> {
         .collect()
 }
 
+/// Whether `document` at `path` is a failed-queue digest item agentctl itself
+/// queued (`failed_digest` flag, or a `failed-digest-` identifier). A digest a
+/// drain set aside in `cancelled/` after an unconfirmed attempt is still
+/// agentctl's text: if that attempt typed it into the composer, it must be
+/// flushable there, never a wedge. Normal cancelled prompts are not digests
+/// and keep the foreign-draft rule.
+fn digest_record(path: &Path, document: &Map<String, Value>) -> bool {
+    document.get(crate::failed_digest::DIGEST_FLAG) == Some(&Value::Bool(true))
+        || document
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with(crate::failed_digest::DIGEST_ID_PREFIX))
+        || path.file_stem().is_some_and(|stem| {
+            stem.to_string_lossy()
+                .starts_with(crate::failed_digest::DIGEST_ID_PREFIX)
+        })
+}
+
+/// Digest records a drain set aside in `queue/cancelled`, changed within
+/// `lookback` of `now`. Only digests are read there (see [`digest_record`]).
+fn recent_cancelled_digests(queue: &Path, now: SystemTime, lookback: Duration) -> Vec<Record> {
+    let Ok(entries) = fs::read_dir(queue.join("cancelled")) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(SystemTime, Record)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        if now.duration_since(modified).unwrap_or_default() > lookback {
+            continue;
+        }
+        let Ok(Value::Object(document)) = crate::agent::read_private_json(&path) else {
+            continue;
+        };
+        if !digest_record(&path, &document) {
+            continue;
+        }
+        let Some(at) = document.get("inflight_at").and_then(Value::as_f64) else {
+            continue;
+        };
+        found.push((modified, (at, path, document)));
+    }
+    found.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    found.truncate(MAX_RECORDS);
+    found.into_iter().map(|(_, record)| record).collect()
+}
+
 /// The records in `queue`'s typed phases changed within `lookback` of `now`, at most
 /// [`MAX_RECORDS`] of them, most recently changed first.
 fn recent_records(queue: &Path, now: SystemTime, lookback: Duration) -> Vec<PathBuf> {
@@ -383,18 +435,21 @@ pub(crate) fn find(
             _ => None,
         })
         .collect();
+    records.extend(recent_cancelled_digests(queue, now, lookback));
     records.sort_by(|left, right| right.0.total_cmp(&left.0));
     let mut times: Vec<f64> = records.iter().map(|record| record.0).collect();
     times.dedup();
     let &oldest = times.get(deliveries - 1).or(times.last())?;
     records.retain(|record| record.0 >= oldest);
     for (_, path, document) in &records {
-        let quarantined = path
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|phase| phase == "failed");
+        let digest = digest_record(path, document);
+        let quarantined = digest
+            || path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|phase| phase == "failed");
         let matched = typed_texts(document).into_iter().any(|text| {
-            if !framed(text) {
+            if !framed(text) && !digest {
                 return false;
             }
             match draft {
@@ -929,6 +984,45 @@ message number {index:02}"
         assert!(find(
             queue,
             &Draft::Text("[agentctl watch-agents] a notice nobody sent".into()),
+            Vouching::Unproven,
+            now
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_cancelled_digest_is_found_but_a_cancelled_prompt_is_not() {
+        // A failed-queue digest a drain typed and then set aside in
+        // cancelled/ after an unconfirmed attempt is still agentctl's text:
+        // its draft must flush with one Enter instead of wedging the pane.
+        // A normal cancelled prompt keeps the foreign-draft rule.
+        let directory = Scratch::new("digest-cancelled");
+        let queue = directory.0.as_path();
+        let text = "may have arrived: tm-probe-1 somebody the body line";
+        record(
+            queue,
+            "cancelled",
+            "failed-digest-probe-1",
+            &json!({"id": "failed-digest-probe-1", "text": text, "failed_digest": true, "inflight_at": 1_793_515_539.158}),
+        );
+        record(
+            queue,
+            "cancelled",
+            "plain-cancelled",
+            &json!({"text": "a cancelled prompt with no header", "inflight_at": 1_793_515_540.158}),
+        );
+        let now = SystemTime::now();
+        let found = find(
+            queue,
+            &Draft::Text(text.to_owned()),
+            Vouching::Unproven,
+            now,
+        )
+        .expect("cancelled digest found");
+        assert_eq!(found.id, "failed-digest-probe-1");
+        assert!(find(
+            queue,
+            &Draft::Text("a cancelled prompt with no header".into()),
             Vouching::Unproven,
             now
         )
