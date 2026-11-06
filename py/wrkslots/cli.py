@@ -26944,6 +26944,102 @@ def _create_journal_payload(
     return value
 
 
+def _instead_of_diagnosis(
+    checkout_path: Path,
+    remote: str = "origin",
+    *,
+    needed_commit: str | None = None,
+    output: str = "",
+) -> str | None:
+    """Explain a fetch failure caused by a user `insteadOf` rewrite (#882).
+
+    Returns None when the remote's configured URL is not rewritten. The
+    user's real Git configuration decides this, so these probes run with
+    the invoking environment, not wrkslots' isolated one. The result
+    names the original URL, the rewrite rule and its config file, the
+    target, and the specific cause where it can be found: a commit the
+    target lacks, or a target whose `core.worktree` does not exist.
+    """
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_") or key.startswith("GIT_CONFIG")
+    }
+    env.update({"LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0"})
+
+    def git(arguments: Sequence[str], repository: Path | None = checkout_path) -> str | None:
+        command = ["git"]
+        if repository is not None:
+            command.extend(("-C", str(repository)))
+        command.extend(arguments)
+        try:
+            completed = subprocess.run(
+                command, capture_output=True, text=True, check=False, env=env, timeout=30
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return completed.stdout.strip() if completed.returncode == 0 else None
+
+    raw_url = git(["config", "--get", f"remote.{remote}.url"])
+    effective_url = git(["remote", "get-url", remote])
+    if not raw_url or not effective_url or raw_url == effective_url:
+        return None
+    rule = "an url.*.insteadOf rule"
+    listed = git(["config", "--show-origin", "--get-regexp", r"^url\..*\.insteadof$"])
+    if listed:
+        best: tuple[int, str] | None = None
+        for line in listed.splitlines():
+            origin, _tab, rest = line.partition("\t")
+            key, _space, value = rest.partition(" ")
+            if not value or not raw_url.startswith(value):
+                continue
+            if best is None or len(value) > best[0]:
+                best = (len(value), f"{key} (in {origin.removeprefix('file:')})")
+        if best is not None:
+            rule = best[1]
+    causes: list[str] = []
+    target = Path(effective_url)
+    git_dir: Path | None = None
+    if target.is_dir():
+        if (target / "HEAD").is_file():
+            git_dir = target
+        elif (target / ".git").is_dir():
+            git_dir = target / ".git"
+    if git_dir is not None:
+        try:
+            completed = subprocess.run(
+                ["git", f"--git-dir={git_dir}", "config", "--get", "core.worktree"],
+                capture_output=True, text=True, check=False, env=env, timeout=30,
+            )
+            worktree = completed.stdout.strip() if completed.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired):
+            worktree = None
+        if worktree and not Path(worktree).exists():
+            causes.append(f"its core.worktree {worktree} does not exist")
+    commit = needed_commit
+    if commit is None:
+        found = re.search(r"\b[0-9a-f]{40}\b", output)
+        commit = found.group(0) if found else git(["rev-parse", "HEAD"])
+    if commit and git_dir is not None:
+        try:
+            completed = subprocess.run(
+                ["git", f"--git-dir={git_dir}", "cat-file", "-e", f"{commit}^{{commit}}"],
+                capture_output=True, text=True, check=False, env=env, timeout=30,
+            )
+            present = completed.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            present = False
+        if not present:
+            causes.append(f"it lacks commit {commit}")
+    diagnosis = (
+        f"the {remote} URL {raw_url} was rewritten by {rule} to {effective_url}"
+    )
+    if causes:
+        diagnosis += ": " + "; ".join(causes)
+    return diagnosis
+
+
 def _run_post_provision_hooks(
     config: Config,
     created: Sequence[Checkout],
@@ -27012,10 +27108,14 @@ def _run_post_provision_hooks(
             if completed.stderr:
                 print("post-provision hook stderr:", file=sys.stderr)
                 print(completed.stderr, end="" if completed.stderr.endswith("\n") else "\n", file=sys.stderr)
+            diagnosis = _instead_of_diagnosis(
+                path, output=completed.stderr + "\n" + completed.stdout
+            )
             raise Refusal(
                 f"post-provision hook {hook_index + 1} for checkout {checkout.name} "
                 f"failed with rc {completed.returncode}; slot was left for inspection "
                 f"with journal {journal_path}. Fix the cause and run 'wrkslots recover'"
+                + (f"; {diagnosis}" if diagnosis else "")
             )
         journal["hook_progress"] = step + 1
         journal["hook_failure"] = None

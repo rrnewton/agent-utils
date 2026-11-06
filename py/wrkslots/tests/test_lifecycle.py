@@ -12300,6 +12300,84 @@ def test_recover_refuses_authored_changes_in_a_submodule_checkout(tmp_path: Path
     assert journal.is_file()
 
 
+def test_instead_of_diagnosis_names_the_rewrite_and_the_missing_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#882: a rewritten fetch names the rule, its file, the target, and the missing object."""
+    remote = _bare_upstream(tmp_path, "upstream", {"seed.txt": "seed\n"})
+    mirror = tmp_path / "mirror.git"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(mirror)],
+        check=True, capture_output=True, text=True,
+    )
+    work = tmp_path / "work"
+    subprocess.run(
+        ["git", "clone", str(remote), str(work)],
+        check=True, capture_output=True, text=True,
+    )
+    head = git(work, "rev-parse", "HEAD").stdout.strip()
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_text(
+        f'[url "{mirror}"]\n\tinsteadOf = {remote}\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+
+    diagnosis = wrkslots._instead_of_diagnosis(work, "origin")
+
+    assert diagnosis is not None
+    assert f"the origin URL {remote} was rewritten by" in diagnosis
+    assert "insteadof" in diagnosis.lower()
+    assert str(global_config) in diagnosis
+    assert str(mirror) in diagnosis
+    assert f"it lacks commit {head}" in diagnosis
+
+
+def test_instead_of_diagnosis_names_a_dead_core_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#882: a mirror whose core.worktree is gone is named as the cause."""
+    remote = _bare_upstream(tmp_path, "upstream2", {"seed.txt": "seed\n"})
+    mirror = tmp_path / "mirror"
+    subprocess.run(
+        ["git", "clone", str(remote), str(mirror)],
+        check=True, capture_output=True, text=True,
+    )
+    gone = tmp_path / "gone"
+    git(mirror, "config", "core.worktree", str(gone))
+    work = tmp_path / "work2"
+    subprocess.run(
+        ["git", "clone", str(remote), str(work)],
+        check=True, capture_output=True, text=True,
+    )
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_text(
+        f'[url "{mirror}"]\n\tinsteadOf = {remote}\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+
+    diagnosis = wrkslots._instead_of_diagnosis(work, "origin")
+
+    assert diagnosis is not None
+    assert str(mirror) in diagnosis
+    assert f"its core.worktree {gone} does not exist" in diagnosis
+
+
+def test_instead_of_diagnosis_is_quiet_without_a_rewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote = _bare_upstream(tmp_path, "upstream3", {"seed.txt": "seed\n"})
+    work = tmp_path / "work3"
+    subprocess.run(
+        ["git", "clone", str(remote), str(work)],
+        check=True, capture_output=True, text=True,
+    )
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_text("", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+
+    assert wrkslots._instead_of_diagnosis(work, "origin") is None
+
+
 def test_exact_create_recovers_before_a_validation_batch_seal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

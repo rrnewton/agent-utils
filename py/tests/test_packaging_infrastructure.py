@@ -1030,9 +1030,12 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # inside the slot and never follows a symlink out of it) is mapped.
     # The two #881 cases (recover repopulates a wholesale-unpopulated
     # submodule checkout; authored changes are refused, never reset) are mapped.
-    assert len(all_tests) == 2158
+    # The three #882 cases (an insteadOf diagnosis naming the missing
+    # commit, one naming a dead core.worktree, and silence without a
+    # rewrite) are mapped.
+    assert len(all_tests) == 2161
     assert len(ordinary) == 339
-    assert len(mapped) == 1819
+    assert len(mapped) == 1822
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
