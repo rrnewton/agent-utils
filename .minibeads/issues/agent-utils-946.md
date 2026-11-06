@@ -1,10 +1,11 @@
 ---
 title: 'agentctl-muse-resume-readiness: start --resume and revive of a Muse lane fail readiness although Muse resumed to an idle composer'
-status: open
+status: closed
 priority: 1
 issue_type: bug
-created_at: 2026-11-06T18:16:13.000000000+00:00
-updated_at: 2026-11-06T18:16:13.000000000+00:00
+created_at: 2026-11-06T18:16:13+00:00
+updated_at: 2026-11-06T19:39:25.443300745+00:00
+closed_at: 2026-11-06T19:39:25.443300614+00:00
 ---
 
 # Description

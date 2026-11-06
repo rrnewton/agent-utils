@@ -281,6 +281,35 @@ def test_a_paste_muse_wraps_inside_a_word_or_a_path_is_still_the_exact_editor() 
         frame("❯ break/at/odd/\n  places"), "break/at/odd/placez")
 
 
+def test_resumed_headerless_frame_with_startup_warnings_is_idle() -> None:
+    # #946: a resumed Muse scrolls its header off screen and prints the
+    # abnormal-end and effort-fallback warnings; the pinned-process proof
+    # must still read the idle composer, including when a benign startup
+    # line lands in the footer region.
+    screen = (
+        "◆ prior answer\n"
+        "warning: the previous run of this session ended abnormally around "
+        "2026-11-06 10:09 UTC-08:00 (no clean shutdown was recorded). It was resumed\n"
+        "cleanly.\n"
+        "reasoning effort ultra is not available (gate ultra_reasoning_effort is "
+        "closed); using xhigh\n"
+        "────────────────\n❯\n"
+        "────────────────\n"
+        "  watermelon-full-preview · xhigh · /work/project · YOLO\n"
+        "Skills: 82 loaded · 1 warning · 3 details hidden (ctrl+o to expand)\n"
+    )
+    assert not client_module.muse_idle_composer(screen)
+    assert muse_verified_process_idle_composer(screen)
+    busy = screen.replace(
+        "◆ prior answer\n", "◆ prior answer\n◇ Thinking (3s · esc to interrupt)\n")
+    assert not muse_verified_process_idle_composer(busy)
+    assert not muse_verified_process_idle_composer(screen.replace("❯\n", "❯ draft\n"))
+    doubled = screen.replace(
+        "Skills: 82 loaded",
+        "other · xhigh · /work/project · YOLO\nSkills: 82 loaded")
+    assert not muse_verified_process_idle_composer(doubled)
+
+
 def test_muse_launch_overrides_footer_is_an_idle_composer() -> None:
     # Captured 2026-10-19 from a live Muse launched with extra harness
     # arguments (--approval-mode never among them): the footer reports

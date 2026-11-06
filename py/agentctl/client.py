@@ -344,6 +344,15 @@ def _muse_status_mode(line: str) -> str | None:
     stripped = line.strip()
     if stripped.startswith(("├", "└", "│")) or "↓ to select" in stripped:
         return None
+    # Startup lines Muse prints on a resumed session that can land in the
+    # footer region while the frame draws are not status footers (#946).
+    if (
+        (stripped.startswith("Skills:") and " loaded ·" in stripped)
+        or stripped.startswith("warning: the previous run of this session ended abnormally")
+        or (stripped.startswith("reasoning effort ")
+            and " is not available" in stripped and "; using " in stripped)
+    ):
+        return None
     footer, _notice = _muse_split_notice(stripped)
     fields = [field.strip() for field in footer.split("·")]
     if len(fields) < 3 or not all(fields):
@@ -1993,7 +2002,10 @@ class HerdrClient:
                 )
             # An arrow alone is also used by choice dialogs. Muse's idle screen couples its
             # composer marker with exactly one status footer, whatever its mode says.
-            ready = muse_idle_composer(screen)
+            # The process generation is pinned and re-verified around every
+            # read, so the headerless verified-process proof applies: a
+            # resumed Muse scrolls its version header off screen (#946).
+            ready = muse_verified_process_idle_composer(screen)
             if ready:
                 break
             self._sleep(min(0.05, max(0.0, deadline - time.monotonic())))

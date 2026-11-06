@@ -1944,7 +1944,10 @@ impl HerdrClient {
                     "{kind} workspace trust prompt requires human attention; no input was submitted"
                 )));
             }
-            ready = muse_idle_composer(&screen);
+            // The process generation is pinned and re-verified around every
+            // read, so the headerless verified-process proof applies: a
+            // resumed Muse scrolls its version header off screen (#946).
+            ready = muse_verified_process_idle_composer(&screen);
             if ready {
                 break;
             }

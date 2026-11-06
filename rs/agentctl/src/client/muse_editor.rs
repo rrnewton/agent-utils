@@ -154,9 +154,23 @@ const PANEL_HEADER_HINT: &str = "↓ to select";
 /// its tree rows (`└ ◇ counter ·3  shared · Run the shell command ...`), whose `·` fields would
 /// otherwise make a second footer and hide the editor for as long as a sub-agent runs (#678
 /// muse-bridge-latency).
+/// Startup lines Muse prints on a resumed session that can land in the
+/// footer region while the frame draws. They are not status footers, so they
+/// must not count as a second footer authority (#946).
+fn is_benign_startup_line(line: &str) -> bool {
+    (line.starts_with("Skills:") && line.contains(" loaded ·"))
+        || line.starts_with("warning: the previous run of this session ended abnormally")
+        || (line.starts_with("reasoning effort ")
+            && line.contains(" is not available")
+            && line.contains("; using "))
+}
+
 fn muse_status_mode(line: &str) -> Option<String> {
     let line = strip(line);
     if line.starts_with(PANEL_ROW_GLYPHS) || line.contains(PANEL_HEADER_HINT) {
+        return None;
+    }
+    if is_benign_startup_line(line) {
         return None;
     }
     let (footer, _) = split_notice(line);
@@ -693,6 +707,37 @@ mod tests {
         assert!(!muse_auto_review_idle_composer(&ambiguous));
         let choice = screen.replace("❯\n", "❯ Yes, continue\n  No, exit\n");
         assert!(!muse_idle_composer(&choice));
+    }
+
+    #[test]
+    fn resumed_headerless_frame_with_startup_warnings_is_idle() {
+        // #946: a resumed Muse scrolls its header off screen and prints the
+        // abnormal-end and effort-fallback warnings; the pinned-process proof
+        // must still read the idle composer, including when a benign startup
+        // line lands in the footer region.
+        let screen = "◆ prior answer\n\
+                      warning: the previous run of this session ended abnormally around \
+                      2026-11-06 10:09 UTC-08:00 (no clean shutdown was recorded). It was resumed\n\
+                      cleanly.\n\
+                      reasoning effort ultra is not available (gate ultra_reasoning_effort is \
+                      closed); using xhigh\n\
+                      ────────────────\n❯\n────────────────\n  \
+                      watermelon-full-preview · xhigh · /work/project · YOLO\n\
+                      Skills: 82 loaded · 1 warning · 3 details hidden (ctrl+o to expand)\n";
+        assert!(!muse_idle_composer(screen));
+        assert!(muse_verified_process_idle_composer(screen));
+        let busy = screen.replace(
+            "◆ prior answer\n",
+            "◆ prior answer\n◇ Thinking (3s · esc to interrupt)\n",
+        );
+        assert!(!muse_verified_process_idle_composer(&busy));
+        let draft = screen.replace("❯\n", "❯ draft\n");
+        assert!(!muse_verified_process_idle_composer(&draft));
+        let doubled = screen.replace(
+            "Skills: 82 loaded",
+            "other · xhigh · /work/project · YOLO\nSkills: 82 loaded",
+        );
+        assert!(!muse_verified_process_idle_composer(&doubled));
     }
 
     #[test]
