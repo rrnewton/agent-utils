@@ -1,11 +1,12 @@
 ---
 title: 'merge-queue-resubmit-at-new-head: a submit at a new head for an excluded change applies at the next intake point'
-status: in_progress
+status: closed
 priority: 1
 issue_type: task
 assignee: mu-mqdonor
 created_at: 2026-11-06T13:00:23.885811025+00:00
-updated_at: 2026-11-06T13:00:26.606757613+00:00
+updated_at: 2026-11-06T14:15:36.139751154+00:00
+closed_at: 2026-11-06T14:15:36.139750914+00:00
 claimed_at: 2026-11-06T13:00:26.606757613+00:00
 claimed_until: 2026-11-08T13:00:26.606604082+00:00
 ---
