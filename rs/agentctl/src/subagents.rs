@@ -8516,6 +8516,35 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(json!(self.load(agent_name)?))
     }
 
+    /// Un-bind a session captured for `record` when a live record already
+    /// binds it (#928 native-session-collision): several lanes sharing a
+    /// cwd or a process tree can hold the same session file, and the
+    /// first capture must not let every later one record the same
+    /// conversation. The record is left unknown, naming the other
+    /// record, so an operator can bind its real session explicitly.
+    fn guard_duplicate_capture(&self, record: &mut AgentRecord) -> Option<String> {
+        let native = record.native_session.clone()?;
+        let owner = self
+            .identity_owner(&native.agent, &native.value, Some(&record.name))
+            .ok()??;
+        if owner.lifecycle != "running" {
+            return None;
+        }
+        record.native_session = None;
+        let reason = format!(
+            "the {} session it holds ({}) is already bound to live record {:?}",
+            native.agent, native.value, owner.name
+        );
+        record.extra.insert(
+            revive::NATIVE_SESSION_UNKNOWN.to_owned(),
+            json!({"reason": reason, "candidates": [native.value]}),
+        );
+        Some(format!(
+            "native conversation of {} is unknown: {reason}; name it with `agentctl bind-session {} <id>`",
+            record.name, record.name
+        ))
+    }
+
     fn identity_owner(
         &self,
         session_agent: &str,
@@ -8951,6 +8980,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 && !record.extra.contains_key(revive::NATIVE_SESSION_UNKNOWN)
             {
                 if let Some(warning) = revive::capture_held_session(&mut record) {
+                    eprintln!("agentctl: warning: {warning}");
+                }
+                if let Some(warning) = self.guard_duplicate_capture(&mut record) {
                     eprintln!("agentctl: warning: {warning}");
                 }
                 if record.native_session.is_some()
@@ -9430,6 +9462,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         // A harness that names its conversation only by the files it holds (#916).
         let native_warning = revive::capture_held_session(&mut record);
+        let native_warning = self.guard_duplicate_capture(&mut record).or(native_warning);
         if let Some(warning) = &native_warning {
             eprintln!("agentctl: warning: {warning}");
         }
@@ -9644,7 +9677,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         self.anchor_fresh(record, terminal_id)?;
         // A harness that names its conversation only by the files it holds (#916).
-        if let Some(warning) = revive::capture_held_session(record) {
+        let capture_warning = revive::capture_held_session(record);
+        if let Some(warning) = self.guard_duplicate_capture(record).or(capture_warning) {
             eprintln!("agentctl: warning: {warning}");
         }
         record.lifecycle = "running".to_owned();
@@ -12430,7 +12464,22 @@ its drain would also type, so it was not queued",
             return Err(fail("goal command must be a nonempty argument vector"));
         }
         let mut record = self.load(agent_name)?;
-        let info = self.checked(&record)?;
+        // A dead record -- its pane or workspace is positively gone --
+        // can still be bound offline: naming its real session is the
+        // repair route for a record revive cannot discover safely
+        // (#928). The live-pane assertions below are skipped then;
+        // the already-bound and registered-owner refusals still hold.
+        let info = match self.checked(&record) {
+            Ok(info) => Some(info),
+            Err(error)
+                if missing_target(&error).is_some()
+                    || crate::client::herdr_error_code(&error.to_string()).as_deref()
+                        == Some("agent_not_found") =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
         let recovery_session = record
             .native_session
             .as_ref()
@@ -12438,7 +12487,7 @@ its drain would also type, so it was not queued",
         for existing in [
             &record.goal_session_id,
             &record.session_value,
-            &info.session_value,
+            &info.as_ref().and_then(|info| info.session_value.clone()),
             &record.resume,
             &recovery_session,
         ]
@@ -12457,7 +12506,13 @@ its drain would also type, so it was not queued",
         }
         let mut reported = Vec::new();
         for pane in self.client.panes()? {
-            let live = self.client.pane_info(&pane.pane_id)?;
+            // A positively missing pane (the dead record's own, on an
+            // offline bind) reports nothing; other failures refuse.
+            let live = match self.client.pane_info(&pane.pane_id) {
+                Ok(live) => live,
+                Err(error) if missing_target(&error).is_some() => continue,
+                Err(error) => return Err(fail(error.to_string())),
+            };
             if live.session_agent.as_deref() == Some(&record.harness)
                 && live.session_value.as_deref() == Some(session_id)
             {

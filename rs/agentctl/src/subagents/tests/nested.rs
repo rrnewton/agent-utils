@@ -279,6 +279,37 @@ fn v3_bind_session_persists_one_asserted_native_authority() {
 }
 
 #[test]
+fn bind_session_repairs_a_dead_record_offline() {
+    // #928: a killed lane's pane is positively gone, so the live-pane
+    // check cannot run; naming its real session must still work, as
+    // the repair route for a record revive cannot discover safely.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let nested = as_v3(nested_v2_record(&stored(&fixture)), Value::Null);
+    store(&fixture, &nested);
+    fixture
+        .client
+        .report_session
+        .store(false, Ordering::Relaxed);
+    let record = fixture.manager().load("worker").unwrap();
+    fixture
+        .client
+        .herdr_closed
+        .lock()
+        .unwrap()
+        .insert(record.pane_id.clone().unwrap());
+    let bound = fixture
+        .manager()
+        .bind_session("worker", "manual-session", None)
+        .expect("offline bind on a dead record");
+    assert_eq!(bound["source"], "explicit");
+    assert_eq!(
+        stored(&fixture)["native_session"]["value"],
+        "manual-session"
+    );
+}
+
+#[test]
 fn v2_bind_session_keeps_only_the_asserted_goal_session() {
     let fixture = Fixture::new();
     fixture.start(None);

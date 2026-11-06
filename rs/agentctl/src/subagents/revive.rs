@@ -1487,8 +1487,17 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             self.identity_owner(&native.agent, &native.value, Some(&record.name))?
         {
             return Err(fail(format!(
-                "native session is already registered as {:?}",
-                owner.name
+                "native session is already registered as {:?}; it was {} for {:?}, \
+                 so revive will not bind it twice (#928). Name this record's own \
+                 session with `agentctl bind-session {} <id>` and revive again",
+                owner.name,
+                if native.source == "observed" {
+                    "discovered, not recorded"
+                } else {
+                    "recorded"
+                },
+                record.name,
+                record.name
             )));
         }
         Ok(LaunchPlan {

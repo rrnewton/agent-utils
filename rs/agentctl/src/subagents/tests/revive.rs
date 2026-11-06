@@ -2072,6 +2072,45 @@ fn a_muse_lane_records_the_session_its_runtime_holds_and_revives_from_the_archiv
 }
 
 #[test]
+fn a_second_lane_holding_the_same_session_is_recorded_as_unknown_naming_the_first() {
+    // #928: two lanes whose runtimes hold the same session file must
+    // not both record it; the second is left unknown, naming the live
+    // record that already binds it.
+    let fixture = unreported();
+    let id = "33333333-3333-3333-3333-333333333333";
+    let lock = fake_muse_session(&fixture, id);
+    let _held = pretend_held(vec![lock]);
+    let first = start_worker(&fixture, "muse");
+    assert!(first.get("native_session_warning").is_none(), "{first}");
+    let second = fixture
+        .manager()
+        .start(
+            "other",
+            &fixture.root,
+            StartOptions {
+                harness: "muse".to_owned(),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let warning = second["native_session_warning"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(warning.contains("\"worker\""), "{second}");
+    assert!(warning.contains("bind-session other"), "{warning}");
+    let record = fixture.manager().load("other").unwrap();
+    assert!(record.native_session.is_none(), "duplicate was recorded");
+    let unknown = &record.extra["native_session_unknown"];
+    assert!(
+        unknown["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("\"worker\""),
+        "{unknown}"
+    );
+}
+
+#[test]
 fn a_muse_lane_holding_two_sessions_is_recorded_as_unknown_and_says_so() {
     let fixture = unreported();
     let first = fake_muse_session(&fixture, "11111111-1111-1111-1111-111111111111");
