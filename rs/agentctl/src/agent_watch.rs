@@ -4351,11 +4351,11 @@ fn load_state(path: &Path) -> WatchState {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
-/// What this watch thread has spent publishing JSON files, for the watch
-/// report's `write_churn` counters (#932): device writes are dominated by
-/// rewrites of files whose content mostly did not change, so identical
-/// rewrites are now skipped and counted here beside the ones that did happen.
-/// Thread-local: one watcher runs per process, and unit tests get their own.
+// What this watch thread has spent publishing JSON files, for the watch
+// report's `write_churn` counters (#932): device writes are dominated by
+// rewrites of files whose content mostly did not change, so identical
+// rewrites are now skipped and counted here beside the ones that did happen.
+// Thread-local: one watcher runs per process, and unit tests get their own.
 thread_local! {
     pub(crate) static WRITE_BYTES: AtomicU64 = const { AtomicU64::new(0) };
     pub(crate) static FILES_REWRITTEN: AtomicU64 = const { AtomicU64::new(0) };
