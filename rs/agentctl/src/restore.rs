@@ -1728,6 +1728,87 @@ pub fn restore<A: ManagedApi + ?Sized>(
         }
         report["agents"] = json!(agents);
     }
+    // Per-lane disposition in the owner's words, plus tab hygiene on the
+    // Herdr auto-restored shells (item 5 restore-in-place): a lane that came
+    // back in its recorded pane is resumed-in-place, one left alone is
+    // parked, one that could not come back failed. An orphan bare shell
+    // whose tab names a parked lane is labelled "parked: NAME"; one that
+    // duplicates a revived lane's tab is closed. Registered panes and
+    // running programs are never touched.
+    if !options.dry_run {
+        if let Some(rows) = report["agents"].as_array_mut() {
+            for row in rows.iter_mut() {
+                let disposition = match row["action"].as_str().unwrap_or_default() {
+                    "revived" | "promoted" => "resumed-in-place",
+                    "revived-fresh" => "resumed-fresh",
+                    "excluded" | "skipped" => "parked",
+                    _ => "failed",
+                };
+                row["disposition"] = json!(disposition);
+            }
+        }
+        let mut tidy = Vec::new();
+        if let Ok(panes) = client.panes() {
+            let claimed: std::collections::BTreeSet<String> = names
+                .iter()
+                .filter_map(|name| manager.status(name).ok())
+                .filter_map(|status| status["pane_id"].as_str().map(str::to_owned))
+                .collect();
+            let cwd_of = |name: &str| {
+                manager
+                    .status(name)
+                    .ok()
+                    .and_then(|s| s["cwd"].as_str().map(str::to_owned))
+            };
+            let pane_of = |name: &str| {
+                manager
+                    .status(name)
+                    .ok()
+                    .and_then(|s| s["pane_id"].as_str().map(str::to_owned))
+            };
+            for pane in panes {
+                if claimed.contains(&pane.pane_id) {
+                    continue;
+                }
+                if !client.pane_is_idle_shell(&pane.pane_id).unwrap_or(false) {
+                    continue;
+                }
+                let Ok(info) = client.pane_info(&pane.pane_id) else {
+                    continue;
+                };
+                let label = info
+                    .tab_id
+                    .as_deref()
+                    .and_then(|tab| client.tab_label(tab).ok())
+                    .unwrap_or_default();
+                if label.starts_with("parked:") {
+                    continue;
+                }
+                let parked_lane = names.iter().find(|name| {
+                    label == **name && cwd_of(name).as_deref() == Some(info.cwd.as_str())
+                });
+                if let (Some(name), Some(tab)) = (parked_lane, info.tab_id.as_deref()) {
+                    if client.rename_tab(tab, &format!("parked: {name}")).is_ok() {
+                        tidy.push(json!({
+                            "pane_id": pane.pane_id, "tab_id": tab, "cwd": info.cwd,
+                            "action": "labelled-parked", "lane": name,
+                        }));
+                    }
+                    continue;
+                }
+                let duplicate = names.iter().find(|name| {
+                    label == **name && pane_of(name).is_some_and(|pane| claimed.contains(&pane))
+                });
+                if duplicate.is_some() && client.close_pane(&pane.pane_id).is_ok() {
+                    tidy.push(json!({
+                        "pane_id": pane.pane_id, "tab_id": info.tab_id, "cwd": info.cwd,
+                        "action": "closed-duplicate", "lane": duplicate,
+                    }));
+                }
+            }
+        }
+        report["tidy"] = json!(tidy);
+    }
     let mut units = Vec::new();
     for unit in &config.units {
         if options.dry_run {

@@ -163,6 +163,11 @@ fn restore_remounts_first_revives_then_starts_units_and_is_idempotent() {
     );
     assert_eq!(report["agents"][0]["name"], "lane");
     assert_eq!(report["agents"][0]["action"], "revived", "{report}");
+    assert_eq!(
+        report["agents"][0]["disposition"], "resumed-in-place",
+        "{report}"
+    );
+    assert!(report["tidy"].is_array(), "{report}");
     assert_ne!(report["agents"][0]["pane_id"], json!(old.pane_id));
     assert_eq!(report["units"][0]["action"], "started");
     assert_eq!(report["complete"], true);
