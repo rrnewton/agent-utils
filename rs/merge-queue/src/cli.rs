@@ -932,6 +932,13 @@ enum Command {
         /// the change (the red run is the verdict) or `hold` it for its owner.
         #[arg(long, default_value = "eject", value_parser = ["eject", "hold"])]
         red_without_probe: String,
+        /// A red run that recorded no test result at all (no result lines, no verdict
+        /// lines, nothing ran): `could-not-run` treats it as a refusal (no strike,
+        /// requeued at the same head, counted against --max-deferrals) or `red`
+        /// (the default) keeps it as a red verdict, named as a red with no recorded
+        /// test result when it ejects.
+        #[arg(long, default_value = "red", value_parser = ["could-not-run", "red"])]
+        empty_red: String,
         /// Ask the runner to stop each candidate validation at its first red step
         /// (`$MQ_FAIL_FAST=1`; never for the complete run on the base). Steps it skips must be
         /// reported as `skip`.
@@ -1792,6 +1799,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             batch_min_pass_percent,
             max_deferrals,
             red_without_probe,
+            empty_red,
             fail_fast,
             peripheral_command,
             peripheral_timeout_secs,
@@ -1946,6 +1954,11 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                         String::new()
                     } else {
                         red_without_probe
+                    },
+                    empty_red: if empty_red == "red" {
+                        String::new()
+                    } else {
+                        empty_red
                     },
                     fail_fast,
                     disable_early_red: false,

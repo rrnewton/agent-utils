@@ -38,6 +38,10 @@ pub const CANNOT_EXECUTE: &str = "the validator could not execute";
 /// Marker printed by an admission wrapper when it refuses to run validation at all.
 pub const REFUSAL_MARKER: &str = "COULD_NOT_RUN";
 
+/// Name for a red run that recorded no test result at all, used wherever a failed-test
+/// list would otherwise be empty (never `failed-tests:` with nothing after it).
+pub const NO_RECORDED_RESULT: &str = "red with no recorded test result";
+
 /// Scope line a validator prints with a refusal: `MQ_COULD_NOT_RUN_SCOPE: host <reason>`
 /// or `MQ_COULD_NOT_RUN_SCOPE: job <reason>`. A host-scope refusal is the host's fault,
 /// never the change's: it costs the job no strike. No line means job scope.
@@ -152,6 +156,29 @@ pub fn rerun_exempt(exit: Option<i32>, log_text: &str) -> Vec<TestId> {
 /// INFRA-BLOCKED run (exit 6). A run killed without an exit status is not counted.
 fn red_exit(exit: Option<i32>) -> bool {
     matches!(exit, Some(code) if code != 0 && code != REFUSAL_EXIT && code != INFRA_BLOCKED_EXIT)
+}
+
+/// Whether a finished run is a red with no recorded test result: red, not cancelled or
+/// refused, and its result set is empty (no result lines, no verdict lines, nothing
+/// ran). For an `all` selection that is an empty map; for a test selection the exit-only
+/// synthesis records only `Error`/`Missing` under `unattributed`, which is equally no
+/// recorded result. A run that reported passes, skips or a named failure recorded
+/// something, so it is not empty.
+pub fn is_empty_red(
+    exit: Option<i32>,
+    cancelled: bool,
+    refused: bool,
+    results: &TestResults,
+) -> bool {
+    if cancelled || refused || !red_exit(exit) {
+        return false;
+    }
+    results.results.is_empty()
+        || (results.unattributed
+            && results
+                .results
+                .values()
+                .all(|outcome| matches!(outcome, Outcome::Error | Outcome::Missing)))
 }
 
 /// A red run whose results name no failed test has lost its attribution, since a results file
@@ -298,6 +325,12 @@ impl Ran {
         !self.cancelled && !self.refused && self.exit == Some(0) && self.results.green()
     }
 
+    /// Whether this run is a red that recorded no test result at all (see [`is_empty_red`]):
+    /// nothing ran, so it can name no culprit.
+    pub fn is_empty_red(&self) -> bool {
+        is_empty_red(self.exit, self.cancelled, self.refused, &self.results)
+    }
+
     /// Whether this run reproduces a failure, for a culprit search: some test actually failed
     /// or errored, or the runner exited non-zero. Tests that were merely unreported do not
     /// count (they may not exist at that commit). A refusal never reproduces a failure.
@@ -349,9 +382,10 @@ impl Ran {
     }
 
     /// Honest probe observation: `Missing`/`Skip`-only (or empty) results
-    /// are `Unknown`, never a pass.
+    /// are `Unknown`, never a pass. An empty red (no recorded test result)
+    /// observed nothing, so it is `Unknown` too: it can name no culprit.
     pub fn probe_observation(&self) -> ProbeObservation {
-        if self.cancelled || self.refused {
+        if self.cancelled || self.refused || self.is_empty_red() {
             return ProbeObservation::Unknown;
         }
         if self.reproduces() {
@@ -1043,11 +1077,25 @@ impl Validator for CommandValidator {
         let log_text = std::fs::read_to_string(&log).unwrap_or_default();
         let cannot_execute =
             cannot_execute(&self.0, &argv, &finished, &log_text, reported_failures);
-        let refused = cannot_execute.is_some()
+        let mut refused = cannot_execute.is_some()
             || (!cancelled && is_refusal(exit, &log_text, reported_failures));
+        // With `validator.empty_red = could-not-run`, a red that recorded no test
+        // result is a refusal on the existing could-not-run path: nothing ran, so
+        // there is no verdict against the change.
+        let mut empty_refused = false;
+        if !refused
+            && self.0.empty_red_could_not_run()
+            && is_empty_red(exit, cancelled, false, &results)
+        {
+            refused = true;
+            empty_refused = true;
+        }
         if refused {
-            // Validation did not run: keep no test verdict from this attempt.
+            // Validation did not run: keep no test verdict from this attempt. An
+            // empty-red refusal keeps the unattributed flag so its reason can be
+            // named (see `refusal_detail` in `run`).
             results = TestResults::default();
+            results.unattributed = empty_refused;
         } else if !cancelled && !reported_failures && !results.unattributed && red_exit(exit) {
             name_the_failures_of_a_red_run(&mut results, &log_text);
         }
@@ -1366,10 +1414,19 @@ impl Validator for DagrunValidator {
         let log_text = std::fs::read_to_string(&log).unwrap_or_default();
         let cannot_execute =
             cannot_execute(&self.0, &argv, &finished, &log_text, reported_failures);
-        let refused = cannot_execute.is_some()
+        let mut refused = cannot_execute.is_some()
             || (!cancelled && is_refusal(exit, &log_text, reported_failures));
+        let mut empty_refused = false;
+        if !refused
+            && self.0.empty_red_could_not_run()
+            && is_empty_red(exit, cancelled, false, &results)
+        {
+            refused = true;
+            empty_refused = true;
+        }
         if refused {
             results = TestResults::default();
+            results.unattributed = empty_refused;
         }
         Ok(Ran {
             results,
@@ -1537,6 +1594,53 @@ mod unit {
             )
             .unwrap()
             .green());
+    }
+
+    #[test]
+    fn empty_red_is_could_not_run_only_when_configured() {
+        let tmp = TempDir::new("validate-empty-red");
+        // Default (`red`): an empty red is a red with no recorded result, and
+        // as a probe it observes nothing.
+        let ran = from_config(&config("exit 1"))
+            .unwrap()
+            .run(
+                &tmp.0,
+                &Selection::All,
+                &tmp.0.join("red"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(ran.is_empty_red() && !ran.refused() && !ran.green());
+        assert!(ran.failed().is_empty());
+        assert_eq!(ran.probe_observation(), ProbeObservation::Unknown);
+        // `could-not-run`: the same run is a refusal on the existing path.
+        let mut cfg = config("exit 1");
+        cfg.empty_red = "could-not-run".into();
+        let ran = from_config(&cfg)
+            .unwrap()
+            .run(
+                &tmp.0,
+                &Selection::All,
+                &tmp.0.join("cnr"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(ran.refused() && !ran.green() && ran.failed().is_empty());
+        // A red that recorded a failure is red under both settings.
+        let mut cfg = config(r#"echo '{"id":"a","outcome":"fail"}' >> "$MQ_RESULTS"; exit 1"#);
+        cfg.empty_red = "could-not-run".into();
+        let ran = from_config(&cfg)
+            .unwrap()
+            .run(
+                &tmp.0,
+                &Selection::All,
+                &tmp.0.join("named"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(!ran.refused() && !ran.is_empty_red());
+        assert_eq!(ran.failed(), [TestId::step("a")].into());
+        assert_eq!(ran.probe_observation(), ProbeObservation::Fail);
     }
 
     #[test]

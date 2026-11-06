@@ -889,9 +889,27 @@ fn refusal_detail(ran: &Ran) -> String {
     if let Some(why) = &ran.cannot_execute {
         return why.clone();
     }
+    // An empty-red refusal (see `validator.empty_red`) keeps the unattributed flag
+    // on its cleared results: name what actually happened, not a COULD_NOT_RUN exit.
+    if ran.refused && ran.results.unattributed && ran.exit != Some(crate::validate::REFUSAL_EXIT) {
+        return match ran.exit {
+            Some(code) => format!("{} (exit {code})", crate::validate::NO_RECORDED_RESULT),
+            None => crate::validate::NO_RECORDED_RESULT.to_owned(),
+        };
+    }
     match ran.exit {
         Some(code) => format!("exit {code} ({})", crate::validate::REFUSAL_MARKER),
         None => format!("no exit status ({})", crate::validate::REFUSAL_MARKER),
+    }
+}
+
+/// Failed tests as a label for a reason: the IDs, or the empty-red name when there
+/// are none, so a reason never reads as a failed-test list with nothing in it.
+fn failed_label(tests: &[TestId]) -> String {
+    if tests.is_empty() {
+        crate::validate::NO_RECORDED_RESULT.to_owned()
+    } else {
+        ids(tests)
     }
 }
 
@@ -4441,19 +4459,26 @@ impl<'a> Runner<'a> {
                 if let Some(item) = lock(&self.items).get_mut(&pr) {
                     item.clear_hold();
                 }
-                self.eject(
-                    pr,
-                    "failed-tests",
-                    &format!(
+                let suspect_reason = if failed.is_empty() {
+                    format!(
+                        "{} with #{pr} at {} and failed again on a rerun of that commit \
+                         beside the run (seen twice; {}; log {})",
+                        crate::validate::NO_RECORDED_RESULT,
+                        short(&commit),
+                        verdict.detail,
+                        verdict.log
+                    )
+                } else {
+                    format!(
                         "{} fail with #{pr} at {} and failed again on a rerun of that commit \
                          beside the run (seen twice; {}; log {})",
                         ids(&failed),
                         short(&commit),
                         verdict.detail,
                         verdict.log
-                    ),
-                    &failed,
-                )?;
+                    )
+                };
+                self.eject(pr, "failed-tests", &suspect_reason, &failed)?;
             } else {
                 let passed = verdict.outcome == crate::suspect::PASS;
                 let note = {
@@ -5536,6 +5561,27 @@ impl<'a> Runner<'a> {
                                 "validation refused for {} ({detail}); stays queued, retry after {retry_after}",
                                 list(&head.candidate.prs)
                             ))
+                        } else if self.config.validator.empty_red_could_not_run()
+                            && ran.is_empty_red()
+                        {
+                            // A red that recorded no test result, on the could-not-run
+                            // path for the runs that reach here unconverted (donor
+                            // receipts): no strike, requeued at the same head, counted
+                            // against the deferral bound like any refusal.
+                            let detail = match ran.exit {
+                                Some(code) => {
+                                    format!("{} (exit {code})", crate::validate::NO_RECORDED_RESULT)
+                                }
+                                None => crate::validate::NO_RECORDED_RESULT.to_owned(),
+                            };
+                            discard(&mut flights, &rx, pending);
+                            let (retry_after, _) =
+                                self.defer_refusal(&head.candidate.prs, &detail)?;
+                            deferred_this_run.extend(head.candidate.prs.iter().copied());
+                            BatchOutcome::RefusedDeferred(format!(
+                                "validation refused for {} ({detail}); stays queued, retry after {retry_after}",
+                                list(&head.candidate.prs)
+                            ))
                         } else if !ran.infra_blocked.is_empty() {
                             // The host refused every measurement of some tests on the
                             // run and its rerun (INFRA-BLOCKED): no result, so neither
@@ -5798,6 +5844,22 @@ impl<'a> Runner<'a> {
     fn eject(&self, pr: i64, kind: &str, reason: &str, failed: &[TestId]) -> Result<(), String> {
         // Whatever led here may rest on a process the stop killed: never eject after a stop.
         crate::interrupt::check(&format!("ejecting #{pr} ({kind})"))?;
+        // Never eject with an empty failed set unnamed: a failed-tests ejection with
+        // no failed test names the empty red instead of an empty list.
+        let reason_owned;
+        let reason = if kind == "failed-tests"
+            && failed.is_empty()
+            && !reason.contains(crate::validate::NO_RECORDED_RESULT)
+        {
+            reason_owned = if reason.trim().is_empty() {
+                crate::validate::NO_RECORDED_RESULT.to_owned()
+            } else {
+                format!("{}: {}", crate::validate::NO_RECORDED_RESULT, reason.trim())
+            };
+            reason_owned.as_str()
+        } else {
+            reason
+        };
         lock(&self.excluded).insert(pr);
         // A class with evidence reads it from the logs of this run's validations that saw
         // these tests fail.
@@ -6436,6 +6498,24 @@ impl<'a> Runner<'a> {
         vid: usize,
         pending: &mut VecDeque<Vec<i64>>,
     ) -> Result<BatchOutcome, String> {
+        // An unconverted empty red (a donor receipt) on the could-not-run path
+        // defers here as in the batch decision: it can name no culprit.
+        if self.config.validator.empty_red_could_not_run() && ran.is_empty_red() {
+            let detail = match ran.exit {
+                Some(code) => {
+                    format!("{} (exit {code})", crate::validate::NO_RECORDED_RESULT)
+                }
+                None => crate::validate::NO_RECORDED_RESULT.to_owned(),
+            };
+            let (retry_after, _) = self.defer_refusal(&candidate.prs, &detail)?;
+            return Ok(BatchOutcome::Deferred(
+                format!(
+                    "validation refused for {} ({detail}); stays queued, retry after {retry_after}",
+                    list(&candidate.prs)
+                ),
+                candidate.prs.clone(),
+            ));
+        }
         let mut seen_failed = ran.failed();
         // Without per-test attribution the only focus available is the batch's own selection.
         let mut focus = if ran.results.unattributed {
@@ -6482,7 +6562,7 @@ impl<'a> Runner<'a> {
                         format!(
                             "the base {} itself fails {} ({confirmation}); fix the base first",
                             short(&current.parent),
-                            ids(&tests.into_iter().collect::<Vec<_>>())
+                            failed_label(&tests.into_iter().collect::<Vec<_>>())
                         ),
                         current.prs.clone(),
                     ));
@@ -6557,15 +6637,27 @@ impl<'a> Runner<'a> {
                 } => {
                     flaky.extend(flaked);
                     let culprit = current.prs[index];
-                    let reason = format!(
-                        "{} fail with #{culprit} on top of {} ({confirmation}) and pass without it",
-                        ids(&failed.iter().cloned().collect::<Vec<_>>()),
-                        if index == 0 {
-                            format!("the base {}", short(&current.parent))
-                        } else {
-                            list(&current.prs[..index])
-                        }
-                    );
+                    let reason = if failed.is_empty() {
+                        format!(
+                            "{} with #{culprit} on top of {} ({confirmation}) and pass without it",
+                            crate::validate::NO_RECORDED_RESULT,
+                            if index == 0 {
+                                format!("the base {}", short(&current.parent))
+                            } else {
+                                list(&current.prs[..index])
+                            }
+                        )
+                    } else {
+                        format!(
+                            "{} fail with #{culprit} on top of {} ({confirmation}) and pass without it",
+                            ids(&failed.iter().cloned().collect::<Vec<_>>()),
+                            if index == 0 {
+                                format!("the base {}", short(&current.parent))
+                            } else {
+                                list(&current.prs[..index])
+                            }
+                        )
+                    };
                     // Before removing it, learn what else the culprit's change affects.
                     // Both prefixes are regenerated on demand: `select` runs in a
                     // checkout of the first and may read generated files.
@@ -6711,11 +6803,19 @@ impl<'a> Runner<'a> {
         );
         let failed_ids = failed.iter().cloned().collect::<Vec<_>>();
         if let [pr] = current.prs[..] {
-            let reason = format!(
-                "{} failed in the validation of #{pr} on top of {}; {skipped}",
-                ids(&failed_ids),
-                short(&current.parent)
-            );
+            let reason = if failed_ids.is_empty() {
+                format!(
+                    "{} in the validation of #{pr} on top of {}; {skipped}",
+                    crate::validate::NO_RECORDED_RESULT,
+                    short(&current.parent)
+                )
+            } else {
+                format!(
+                    "{} failed in the validation of #{pr} on top of {}; {skipped}",
+                    ids(&failed_ids),
+                    short(&current.parent)
+                )
+            };
             self.event("narrowing-skipped", &reason);
             if self.config.validator.hold_red_without_probe() {
                 self.hold_for_owner(&[pr], &reason)?;
@@ -6731,8 +6831,13 @@ impl<'a> Runner<'a> {
         self.event(
             "narrowing-skipped",
             &format!(
-                "{} failed in {}; {skipped}; validating each change on its own",
-                ids(&failed_ids),
+                "{} {} {}; {skipped}; validating each change on its own",
+                failed_label(&failed_ids),
+                if failed_ids.is_empty() {
+                    "in"
+                } else {
+                    "failed in"
+                },
                 list(&current.prs)
             ),
         );
@@ -6933,10 +7038,20 @@ impl<'a> Runner<'a> {
                     ProbeObservation::Pass => entry.passes += 1,
                     ProbeObservation::Unknown => {
                         entry.unknowns += 1;
-                        return Ok(Culprit::Inconclusive(format!(
-                            "probe at prefix {i} of {} observed only missing/skipped tests (no pass, no reproduced failure)",
-                            candidate.prs.len()
-                        )));
+                        return Ok(Culprit::Inconclusive(if ran.is_empty_red() {
+                            format!(
+                                "probe at prefix {i} of {} was a {} (exit {}): it can name no culprit",
+                                candidate.prs.len(),
+                                crate::validate::NO_RECORDED_RESULT,
+                                ran.exit
+                                    .map_or("none".to_owned(), |code| code.to_string())
+                            )
+                        } else {
+                            format!(
+                                "probe at prefix {i} of {} observed only missing/skipped tests (no pass, no reproduced failure)",
+                                candidate.prs.len()
+                            )
+                        }));
                     }
                 }
             }
@@ -7629,6 +7744,11 @@ pub fn render_report(report: &RunReport) -> String {
             format!("refused (retry later){counts}{unattributed}")
         } else if v.green() {
             format!("green{counts}{unattributed}")
+        } else if v.failed_results().is_empty() {
+            format!(
+                "red{counts}{unattributed}: {}",
+                crate::validate::NO_RECORDED_RESULT
+            )
         } else if v.classes.is_empty() {
             format!(
                 "red{counts}{unattributed}: {}",

@@ -123,6 +123,13 @@ pub struct ValidatorConfig {
     /// change to its owner instead).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub red_without_probe: String,
+    /// What a red run that recorded no test result at all (no result lines, no verdict
+    /// lines, nothing ran) does: `could-not-run` (empty-red is a refusal: no strike,
+    /// requeued at the same head, counted against `max_deferrals`) or `red` (empty or
+    /// `red`, the default: the red is the verdict, named as a red with no recorded test
+    /// result when it ejects). An older binary refuses a config that names this field.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub empty_red: String,
     /// Ask the runner to stop a candidate validation at its first red step: `$MQ_FAIL_FAST` is
     /// `1` for every validation this host runs except the complete run on the base (`widen`).
     /// The runner reports the steps it skipped as `skip`, never `pass`, so a remainder reruns
@@ -594,6 +601,13 @@ impl ValidatorConfig {
     /// Whether a red run whose probe cannot run holds the change instead of ejecting it.
     pub fn hold_red_without_probe(&self) -> bool {
         self.red_without_probe == "hold"
+    }
+
+    /// Whether a red run that recorded no test result is a could-not-run refusal
+    /// (`validator.empty_red` is `could-not-run`) instead of a red verdict. Empty or
+    /// `red` keeps the red verdict.
+    pub fn empty_red_could_not_run(&self) -> bool {
+        self.empty_red == "could-not-run"
     }
 
     /// Whether GREEN_FLAKY results land by policy (`validator.green_flaky`

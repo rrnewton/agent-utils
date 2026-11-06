@@ -141,6 +141,7 @@ This command creates the state directory and writes `config.json`.
 | `--green-flaky-hold-secs SECS` | `7200` | How long a change is held for a ruling after a GREEN_FLAKY or INFRA-BLOCKED result (see "Held for a ruling") before it is re-queued for a fresh validation. |
 | `--green-flaky MODE` | `hold` | What a GREEN_FLAKY result does when its retried tests are not all on the known-flaky list: `hold` it for a ruling, or `land` it at once with the retried tests recorded (`validator.green_flaky` in the config; absent means `hold`, and an older binary refuses a config that names it). INFRA-BLOCKED always holds. |
 | `--red-without-probe MODE` | `eject` | What a red validation that names failed tests does when its follow-up probe cannot run: `eject` the change (the red run is the verdict) or `hold` it for its owner. |
+| `--empty-red MODE` | `red` | What a red run that recorded no test result at all (no result lines, no verdict lines, nothing ran) does: `could-not-run` treats it as a refusal (no strike, requeued at the same head, counted against `--max-deferrals`), or `red` (the default) keeps it as a red verdict, named as a red with no recorded test result when it ejects. See "A red with no recorded test result". |
 | `--fail-fast` | off | Ask the runner to stop each candidate validation at its first red step: `$MQ_FAIL_FAST` is `1` for every validation except the complete run on the base (see "Fail-fast runs"). |
 | `--peripheral-command CMD` | off | Consumer hook marking changes peripheral (see the `peripheral` fields). |
 | `--peripheral-timeout-secs N` | `30` | Seconds one classifier call may run before the change counts as binary-touching. |
@@ -984,6 +985,10 @@ An **item record** (`items/<pr>.json`) has these fields:
 - `max_deferrals`: deferrals before a change is escalated to its owner (absent or `0`: `3`).
 - `red_without_probe`: `hold` holds a red change whose probe cannot run for its owner; absent
   (the default) ejects it.
+- `empty_red`: `could-not-run` treats a red run that recorded no test result at all as a
+  could-not-run refusal (see "A red with no recorded test result"); absent or `red` (the
+  default) keeps it as a red verdict. A binary older than this field refuses a config that
+  has it.
 - `fail_fast`: `true` sets `$MQ_FAIL_FAST=1` for candidate validations (see "Fail-fast runs");
   absent (the default) means off. A binary older than this field refuses a config that has it.
 - `disable_early_red`: `true` turns off the early-red watch (see "Early red (streamed
@@ -1188,6 +1193,27 @@ it as `escalated`, and no run builds it into a candidate. Its `--notify` recipie
 heartbeat's `last_error`). `merge-queue retry PR` returns it once the cause is fixed. A new head
 starts the count again. Shadow runs write no item records, so they count in
 `<state>/shadow-refusals.json` and hold escalated changes the same way.
+
+**A red with no recorded test result.** A `command` validation that writes nothing to
+`$MQ_RESULTS` and prints no verdict lines recorded no test result: nothing ran, so its exit
+status is the only signal and its failed set is empty. What that red means is set by
+`validator.empty_red` (`init --empty-red`):
+
+- `could-not-run`: the red is treated as a could-not-run refusal on the existing bounded
+  path (see "Admission refusals" and "Bounded retry"). It costs the change no strike, is
+  requeued at the same head, and counts against `validator.max_deferrals`; a change that
+  really breaks the harness before any test still escalates to its owner at the bound and
+  is never retried forever. A consuming queue whose harness can crash before any test
+  starts sets this.
+- `red` (the default, also when the field is absent): existing queues keep their
+  behaviour — the red is the verdict — except that an ejection with an empty failed set is
+  never named as an empty failed-test list. Its reason, event and report say
+  `red with no recorded test result` instead.
+
+Either way, a red that did record results (a named failure, or passes beside it) ejects
+normally under both settings, and a culprit-search probe that is an empty red observes
+nothing: it is inconclusive and can name no culprit, so bisection within a multi-change
+batch is unaffected by it.
 
 **A red run is a verdict even when its probe cannot run.** After a red validation the queue
 probes the failed tests on prefixes of the batch, to name the culprit change and to tell a flaky
