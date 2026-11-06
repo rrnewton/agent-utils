@@ -34,3 +34,41 @@ The revive journal (`.agentctl/.revives/<id>/`) still holds the interrupted atte
 # Notes
 
 Reported by the lead on 2026-11-05 at 12:12 PM ET, from a consumer team's coordinator (P2, ranked after #896). The wedged record and its journal are kept as evidence in that team's registry on this host. They are read-only for us; ask through the lead for any test against them. Assigned to cl-start after #896 and #897.
+
+## Progress (cl-start, 2026-11-06)
+
+[opus 5.5] Implemented in `revive`. Before finishing a revive interrupted while launching (journal phase `launching`, nothing published, the old generation still the active record), agentctl checks the staged candidate on its own:
+- **Live:** its pinned harness process is alive, or Herdr reports an agent in its pane. The revive verifies and publishes it as before.
+- **Dead:** its pane is gone, or the pane holds only an idle shell with no child process (the same idle-shell proof revive uses for stale panes). The attempt is marked failed automatically, and the same command launches again.
+- **Unproven:** anything else, including a candidate that recorded no pane. A harness started before the pane was recorded cannot be checked, so the launch-once latch stands. The refusal now names `agentctl revive NAME --abandon-candidate`, which marks the attempt failed and relaunches. It is refused while the candidate is live, naming the process or pane.
+
+Where the evidence goes:
+- Marking failed moves the journal and the operation directory, whole, into `REGISTRY/.revives/.abandoned/OLDTOKEN-SECONDS/`.
+- Beside them, `abandoned.json` records the name, both tokens, the phase, the evidence and `explicit`.
+- The revive result carries the same record as `abandoned_candidate`.
+- The `.abandoned` directory's leading dot keeps it out of both editions' journal scans.
+- `--dry-run` shows the plan: `revive` with the evidence, or `blocked`.
+
+Restore revives through the same code, so it abandons a proved-dead candidate too.
+
+Tests:
+- A candidate pane closed, and one left with an idle shell: auto-abandoned with evidence, then launched.
+- A live candidate: `--abandon-candidate` and its dry run both refuse, and nothing changes.
+- No pane recorded: refused, naming the flag; the flag relaunches it; the old queue is archived exactly as in any revive.
+- `--abandon-candidate` with nothing interrupted is refused.
+
+Queue criterion answered (coordinator and lead, 2026-11-06): **archived, not replayed, and reported to senders**. Replaying a stale queue after a dead candidate risks duplicate or out-of-date prompts. Every revive, abandoned candidate or not, now does the following:
+- It archives the old queue as before.
+- It names each undelivered prompt (inbox, in flight or failed) in the result's `archived_prompts`, with its ID, sender, first line and lane.
+- It records each one in the new generation's `failed/`, with the reason `archived by revive, not delivered` and the archived path.
+- So a sender asking after it reads failed, never delivered, and the failed-queue digest names it to the revived agent. Nothing types it.
+- The test checks the result row, `message_state` reading Failed, the digest entry, and that nothing was typed.
+- Sender side:
+  - A chat bridge asks `message_state` and reads Failed (tested in agentctl).
+  - An agent-teams team message handed to that queue settles from `accepted` to `possibly_submitted` when its receipt is read. The ledger's queue path is the agent's queue, which the revived generation now holds.
+  - Because of the existing #904 notice, the sender is told it may not have arrived. Its detail is now the revive's reason (`archived by revive, not delivered ...`) instead of the generic quarantine text.
+  - Tested in agent-teams' model harness. The state stays `possibly_submitted` because the ledger has no "not delivered" terminal state; adding one would be separate ledger work.
+
+Opt-in replay is #925 revive-replay-queue (P3, unassigned).
+
+Remaining: the live check on the wedged consumer record, through the lead.

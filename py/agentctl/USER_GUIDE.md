@@ -860,7 +860,14 @@ one-pane tab are closed after publication; a revived adopted agent's old pane
 is left open, because it was never agentctl's to close, and the replacement is
 an owned agent. Old queued prompts and goal delivery
 receipts are never replayed into the replacement; the recorded goal text remains
-available for the coordinator to inspect and assign deliberately.
+available for the coordinator to inspect and assign deliberately. No queued
+prompt goes silently, though (#899). The revive's result lists every prompt the
+old queue held undelivered under `archived_prompts`: waiting, in flight or
+failed, each with its ID, sender, first line and lane. Each is also recorded in
+the new generation's `failed/` with the reason `archived by revive, not
+delivered`. So a sender that asks after it (a chat bridge, `agentctl prompts`)
+reads it as failed, never delivered, and the failed-queue digest names it to
+the revived agent. No drain types it.
 
 An interrupted revive reserves the name and both generations. Rerun the same
 command to finish publication or stale-tab cleanup; it never starts a second
@@ -869,6 +876,27 @@ anchors were saved, recovery remains blocked and identifies the retained
 candidate record and terminal for inspection. `--dry-run` does not change
 records, locks, tabs, or processes. Batch recovery skips live and non-running
 records, continues past blocked names, and exits 75 if any name remains blocked.
+
+A revive interrupted while launching can leave a candidate whose harness never
+came up, for example killed under load (#899 revive-abandon-dead-candidate).
+Before finishing such a revive, agentctl checks the candidate on its own:
+- **Live:** its pinned harness process is alive, or Herdr sees an agent in its
+  pane. The revive goes on to verify and publish it as above.
+- **Dead:** its pane is gone, or holds only an idle shell with no child
+  process. The attempt is marked failed and agentctl launches again, in the
+  same command. A pane left holding a shell stays open.
+- **Unproven:** anything else, including a candidate that recorded no pane,
+  since a harness started before the pane was recorded cannot be checked. The
+  revive refuses, as before, and names the way out:
+  `agentctl revive NAME --abandon-candidate` (Rust edition) marks the attempt
+  failed and launches again. It is refused while the candidate's harness is
+  live.
+
+An abandoned attempt keeps its journal and operation directory under
+`REGISTRY/.revives/.abandoned/TOKEN-SECONDS/`, beside `abandoned.json`, which
+records the evidence and whether the operator asked. The revive's result
+carries the same record as `abandoned_candidate`. The old generation is
+untouched until the new launch, which archives its queue as any revive does.
 
 `agentctl revive NAME --fresh` (Rust edition) starts a new conversation instead
 of resuming the recorded one: the replay launches Claude Code with

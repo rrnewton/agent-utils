@@ -748,7 +748,8 @@ pub fn fence(
 /// Fold the agentctl queue's terminal state for an accepted entry back
 /// into the ledger: `processed` becomes `delivered`, `cancelled` becomes
 /// the set-aside reason's terminal state, and `failed` becomes
-/// `possibly_submitted`. This is how a sender's receipt ever leaves
+/// `possibly_submitted` (its detail the queue's reason when a revive archived
+/// the item untyped). This is how a sender's receipt ever leaves
 /// `accepted` (gap 2): `accept` ends at hand-over, but typing finishes
 /// later and usually in a different process - our `drain-one`, the
 /// coordinator's bridge, or any `agentctl send` that drains the queue on
@@ -801,9 +802,19 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
                 )
             }
         }
+        // A revive that archived the item untyped says so in the queue's failed record (#899
+        // revive-abandon-dead-candidate): the sender learns it was never delivered.
         Some(MessageState::Failed) => (
             "possibly_submitted",
-            "queue quarantined the item as possibly submitted; settle with resolve".to_string(),
+            fs::read_to_string(queue_dir.join("failed").join(format!("{id}.json.error")))
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|sidecar| sidecar.get("error")?.as_str().map(str::to_owned))
+                .filter(|reason| reason.starts_with("archived by revive"))
+                .unwrap_or_else(|| {
+                    "queue quarantined the item as possibly submitted; settle with resolve"
+                        .to_string()
+                }),
         ),
         _ => {
             unlock(lock);

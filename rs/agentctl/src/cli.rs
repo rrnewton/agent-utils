@@ -205,7 +205,7 @@ enum Commands {
     Stop(Stop),
     /// Relaunch a dead local agent by replaying its recorded launch spec and conversation, preserving its old queue in the archive
     #[command(
-        after_help = "Examples:\n  agentctl revive reviewer\n  agentctl revive --all --dry-run\n  agentctl revive reviewer --expected-token TOKEN\n\nA live or unverifiable harness is never relaunched. Recovery opens a fresh tab, verifies the\nresumed runtime, archives the complete old generation, then closes only its proved stale pane.\nThe launch spec (`launch_spec` in status) is what ran: start writes it, adopt and anchor read it\nfrom the pinned process's command line. A record without one is rebuilt from its launch policy\nand profile. An adopted agent needs a spec, and its old pane is left open; the replacement is\nowned. An interrupted revive reserves the name until the same command finishes publication or\ncleanup. Headless workers and remote agentcloud sessions are refused."
+        after_help = "Examples:\n  agentctl revive reviewer\n  agentctl revive --all --dry-run\n  agentctl revive reviewer --expected-token TOKEN\n  agentctl revive reviewer --abandon-candidate\n\nA live or unverifiable harness is never relaunched. Recovery opens a fresh tab, verifies the\nresumed runtime, archives the complete old generation, then closes only its proved stale pane.\nThe launch spec (`launch_spec` in status) is what ran: start writes it, adopt and anchor read it\nfrom the pinned process's command line. A record without one is rebuilt from its launch policy\nand profile. An adopted agent needs a spec, and its old pane is left open; the replacement is\nowned. An interrupted revive reserves the name until the same command finishes publication or\ncleanup. When its candidate is proved dead (its pane gone, or holding only an idle shell), the next\nrevive marks the attempt failed, keeps it under REGISTRY/.revives/.abandoned/ with the evidence, and\nlaunches again; --abandon-candidate does so for a candidate that cannot be proved either way, never\nfor one whose harness runs. Headless workers and remote agentcloud sessions are refused."
     )]
     Revive(Revive),
     /// List registered agents with live status or an explicit probe error
@@ -1010,6 +1010,9 @@ struct Revive {
     /// Revive a record that `stop` archived: restore the newest archived generation, then revive it. Applies only to a named revive
     #[arg(long, requires = "name")]
     archived: bool,
+    /// Mark an interrupted revive's candidate failed even when agentctl cannot prove it dead, then launch again; refused while a harness process runs for the candidate. A candidate proved dead (its pane gone, or holding only an idle shell) is abandoned without this flag. The attempt is kept under REGISTRY/.revives/.abandoned/ with the evidence. Applies only to a named revive
+    #[arg(long, requires = "name", conflicts_with_all = ["archived", "fresh"])]
+    abandon_candidate: bool,
     /// Startup-readiness deadline in seconds, greater than 0 and at most 300 (default: 30)
     #[arg(long, default_value = "30", value_parser = startup_seconds, value_name = "SECONDS")]
     startup_timeout: f64,
@@ -4234,11 +4237,12 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     .mark_fresh_revive(name, "the operator asked for a fresh revive (--fresh)")?;
                 manager.revive(name, false, value.expected_token.as_deref(), timeout)?
             } else {
-                manager.revive(
+                manager.revive_with(
                     value.name.as_deref().expect("clap requires NAME or --all"),
                     value.dry_run,
                     value.expected_token.as_deref(),
                     timeout,
+                    value.abandon_candidate,
                 )?
             };
             if !value.dry_run {

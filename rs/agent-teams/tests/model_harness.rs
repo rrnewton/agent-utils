@@ -1166,6 +1166,29 @@ fn reconcile_folds_queue_terminal_state_into_the_ledger() {
         "tm-sim-8888888888888888",
         &reason
     ));
+
+    // #899: a revive archives the old queue untyped and records each undelivered item in the new
+    // queue's failed/ with its reason. The sender's receipt leaves `accepted` for
+    // possibly_submitted, never delivered, and names the revive.
+    let archived = "tm-sim-9999999999999999";
+    deliver(archived, 4);
+    move_item(archived, "failed");
+    let reason = "archived by revive, not delivered: the old generation's queue was archived and \
+                  is never replayed; the prompt is kept at /archive/queue/inbox/x.json";
+    std::fs::write(
+        queue_dir
+            .join("failed")
+            .join(format!("{archived}.json.error")),
+        json!({"error": reason, "failed_at": 1.0}).to_string(),
+    )
+    .expect("sidecar");
+    assert_eq!(
+        reconcile_queue_delivery(&state, "tools", archived).as_deref(),
+        Some("possibly_submitted")
+    );
+    let answer = receipt(&state, "tools", archived);
+    assert_eq!(answer["state"], "possibly_submitted", "{answer}");
+    assert_eq!(answer["detail"], reason, "{answer}");
     let _ = std::fs::remove_dir_all(&state);
 }
 

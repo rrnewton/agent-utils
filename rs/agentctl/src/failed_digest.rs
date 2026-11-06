@@ -80,7 +80,7 @@ pub fn may_have_arrived(error: &str) -> bool {
     error.contains("without visible submission evidence") || error.contains("left the composer")
 }
 
-fn sender_of(document: &serde_json::Map<String, Value>, text: &str) -> String {
+pub(crate) fn sender_of(document: &serde_json::Map<String, Value>, text: &str) -> String {
     for key in ["sender", "from"] {
         if let Some(sender) = document.get(key).and_then(Value::as_str) {
             if !sender.trim().is_empty() {
@@ -107,7 +107,7 @@ fn is_header_line(line: &str) -> bool {
         || line.starts_with("[reply:")
 }
 
-fn first_line_of(text: &str) -> String {
+pub(crate) fn first_line_of(text: &str) -> String {
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || is_header_line(line) {

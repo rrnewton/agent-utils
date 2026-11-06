@@ -629,6 +629,21 @@ fn optional_record_at(
     }
 }
 
+/// Where abandoned revive attempts are kept as evidence, one directory each (#899
+/// revive-abandon-dead-candidate). Its leading dot keeps it out of the journal scan.
+const ABANDONED: &str = ".abandoned";
+
+/// What an interrupted revive's candidate shows when checked independently (#899).
+#[derive(Debug)]
+enum CandidateCheck {
+    /// No harness can be running for it; the evidence says why.
+    Dead(String),
+    /// A harness process runs for it; the evidence names it.
+    Live(String),
+    /// Neither can be proved.
+    Unproven(String),
+}
+
 fn operation_directory(registry: &Path, journal: &Journal) -> PathBuf {
     registry.join(".revives").join(&journal.old_token)
 }
@@ -1812,8 +1827,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                     return Err(fail("ready revive candidate lifecycle changed"));
                 }
                 self.verify_candidate(candidate, old, &journal.proof).map_err(|error| fail(format!(
-                    "retained revive candidate cannot be verified: {error}; inspect {} and its recorded terminal; no automatic relaunch; use `agentctl revive {} --dry-run` and `agentctl revive {}`",
-                    stage_path.join("agent.json").display(), journal.name, journal.name
+                    "retained revive candidate cannot be verified: {error}; inspect {} and its recorded terminal; no automatic relaunch; use `agentctl revive {} --dry-run` and `agentctl revive {}`; if the candidate never started, `agentctl revive {} --abandon-candidate` marks it failed and launches again (refused while a harness runs for it)",
+                    stage_path.join("agent.json").display(), journal.name, journal.name, journal.name
                 )))?;
             }
             let current = self.revive_proof(old)?;
@@ -2086,6 +2101,48 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         expected_token: Option<&str>,
         startup_timeout: Duration,
     ) -> Result<Value> {
+        self.revive_with(agent_name, dry_run, expected_token, startup_timeout, false)
+    }
+
+    /// [`Self::revive`], and with `abandon_candidate` (`revive --abandon-candidate`, #899) an
+    /// interrupted revive whose candidate cannot be proved alive or dead is marked failed too,
+    /// unless a harness process runs for it. A candidate proved dead is abandoned either way.
+    ///
+    /// A revive archives the old queue and never replays it, but no prompt goes silently: the
+    /// result's `archived_prompts` names every one it left undelivered, and each is recorded as
+    /// failed in the new generation's queue ([`Self::report_archived_prompts`]).
+    pub fn revive_with(
+        &self,
+        agent_name: &str,
+        dry_run: bool,
+        expected_token: Option<&str>,
+        startup_timeout: Duration,
+        abandon_candidate: bool,
+    ) -> Result<Value> {
+        let mut result = self.revive_once(
+            agent_name,
+            dry_run,
+            expected_token,
+            startup_timeout,
+            abandon_candidate,
+        )?;
+        if let Some(archive) = result["archive"].as_str().filter(|_| !dry_run) {
+            match self.report_archived_prompts(agent_name, Path::new(archive)) {
+                Ok(reported) => result["archived_prompts"] = reported,
+                Err(error) => result["archived_prompts_error"] = json!(error.to_string()),
+            }
+        }
+        Ok(result)
+    }
+
+    fn revive_once(
+        &self,
+        agent_name: &str,
+        dry_run: bool,
+        expected_token: Option<&str>,
+        startup_timeout: Duration,
+        abandon_candidate: bool,
+    ) -> Result<Value> {
         name(agent_name)?;
         if startup_timeout.is_zero() || startup_timeout > Duration::from_secs(300) {
             return Err(fail("startup timeout must be between 0 and 300 seconds"));
@@ -2104,7 +2161,42 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 }
                 let (mut old, stopped) = stopped_artifact(&self.registry, &journal)?;
                 old.lifecycle = "running".to_owned();
+                if let Some(check) = self.abandonable(&journal)? {
+                    let mut plan = match (check, abandon_candidate) {
+                        (CandidateCheck::Dead(evidence), _)
+                        | (CandidateCheck::Unproven(evidence), true) => self.revive_plan_document(
+                            &old,
+                            "revive",
+                            &format!(
+                                "the interrupted revive's candidate is abandoned ({evidence}): \
+                                 the attempt is kept as evidence and the agent launches again"
+                            ),
+                        ),
+                        (CandidateCheck::Live(evidence), true) => self.revive_plan_document(
+                            &old,
+                            "blocked",
+                            &format!(
+                                "the interrupted revive's candidate is not abandoned: {evidence}"
+                            ),
+                        ),
+                        _ => self.pending_revive_plan(&journal, &old, &stopped),
+                    };
+                    plan["transaction_phase"] = json!(journal.phase);
+                    return Ok(plan);
+                }
+                if abandon_candidate {
+                    return Err(fail(format!(
+                        "the interrupted revive of {agent_name:?} is past launching ({}); it has \
+                         no candidate to abandon",
+                        journal.phase
+                    )));
+                }
                 return Ok(self.pending_revive_plan(&journal, &old, &stopped));
+            }
+            if abandon_candidate {
+                return Err(fail(format!(
+                    "agent {agent_name:?} has no interrupted revive candidate to abandon"
+                )));
             }
             let record = self.read_record(agent_name)?;
             if expected_token.is_some_and(|value| value != record.token) {
@@ -2153,9 +2245,45 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                     .join("archive")
                     .join(format!("{}-{}", journal.name, journal.old_token))
             };
-            let _queue = queue_locks_at(&old_path)?;
-            let _pane = self.pane_lock(&journal.proof.pane_id)?;
-            return self.finish_revive(&mut journal, &old);
+            let queue = queue_locks_at(&old_path)?;
+            let pane = self.pane_lock(&journal.proof.pane_id)?;
+            let abandoned = match self.abandonable(&journal)? {
+                Some(CandidateCheck::Dead(evidence)) => {
+                    Some(self.abandon_revive(&journal, &evidence, abandon_candidate)?)
+                }
+                Some(CandidateCheck::Unproven(evidence)) if abandon_candidate => {
+                    Some(self.abandon_revive(&journal, &evidence, true)?)
+                }
+                Some(CandidateCheck::Live(evidence)) if abandon_candidate => {
+                    return Err(fail(format!(
+                        "the interrupted revive candidate of {agent_name:?} is not abandoned: \
+                         {evidence}; `agentctl revive {agent_name}` verifies and publishes a live \
+                         candidate"
+                    )));
+                }
+                None if abandon_candidate => {
+                    return Err(fail(format!(
+                        "the interrupted revive of {agent_name:?} is past launching ({}); it has \
+                         no candidate to abandon",
+                        journal.phase
+                    )));
+                }
+                _ => None,
+            };
+            let Some(abandoned) = abandoned else {
+                return self.finish_revive(&mut journal, &old);
+            };
+            // The attempt is out of the way: revive again from the start, under fresh locks.
+            drop((pane, queue, _identity, _name));
+            let mut result =
+                self.revive_once(agent_name, false, expected_token, startup_timeout, false)?;
+            result["abandoned_candidate"] = abandoned;
+            return Ok(result);
+        }
+        if abandon_candidate {
+            return Err(fail(format!(
+                "agent {agent_name:?} has no interrupted revive candidate to abandon"
+            )));
         }
         let record = self.read_record(agent_name)?;
         if expected_token.is_some_and(|value| value != record.token) {
@@ -2347,6 +2475,202 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         self.finish_revive(&mut journal, &record)
     }
 
+    /// Name and record the prompts a revive archived without delivering them (#899): every item
+    /// left in the archived queue's inbox, in flight, or failed. Each is copied into the new
+    /// generation's `failed/` with the reason, unless it is already there, so a sender asking
+    /// after it reads failed, never delivered, the failed-queue digest names it, and no drain
+    /// ever types it. Returns one row per prompt: its ID, sender, first line and old lane.
+    fn report_archived_prompts(&self, agent_name: &str, archive: &Path) -> Result<Value> {
+        use agent_queue::queue::QueueDirectories;
+        let old = QueueDirectories::new(&archive.join("queue"));
+        let failed = QueueDirectories::new(&self.queue(agent_name)?).failed;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| fail(error.to_string()))?
+            .as_secs_f64();
+        let mut reported = Vec::new();
+        for (lane, directory) in [
+            ("inbox", &old.inbox),
+            ("inbox.v2", &old.inbox_v2),
+            ("inflight", &old.inflight),
+            ("failed", &old.failed),
+        ] {
+            let Ok(entries) = fs::read_dir(directory) else {
+                continue;
+            };
+            let mut paths: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "json")
+                })
+                .collect();
+            paths.sort();
+            for path in paths {
+                let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
+                let Ok(document) = agent_queue::queue::load_message(&path) else {
+                    continue;
+                };
+                if id.starts_with(crate::failed_digest::DIGEST_ID_PREFIX)
+                    || document.get(crate::failed_digest::DIGEST_FLAG) == Some(&Value::Bool(true))
+                {
+                    continue;
+                }
+                let text = document.get("text").and_then(Value::as_str).unwrap_or("");
+                let target = failed.join(format!("{id}.json"));
+                if !target.exists() {
+                    agent::create_private_directory(
+                        &failed,
+                        "revived queue failed lane",
+                        true,
+                        false,
+                    )?;
+                    agent::atomic_json(&target, &Value::Object(document.clone()))?;
+                    agent::atomic_json(
+                        &PathBuf::from(format!("{}.error", target.display())),
+                        &json!({
+                            "error": format!(
+                                "archived by revive, not delivered: the old generation's queue \
+                                 was archived and is never replayed; the prompt is kept at {}",
+                                path.display()
+                            ),
+                            "failed_at": now,
+                        }),
+                    )?;
+                }
+                reported.push(json!({
+                    "id": id,
+                    "sender": crate::failed_digest::sender_of(&document, text),
+                    "first_line": crate::failed_digest::first_line_of(text),
+                    "lane": lane,
+                }));
+            }
+        }
+        Ok(json!(reported))
+    }
+
+    /// The independent check of `journal`'s candidate (#899), or `None` when the attempt is past
+    /// launching or its old generation is no longer the active record: only a revive interrupted
+    /// while launching, before anything was published, can be abandoned.
+    fn abandonable(&self, journal: &Journal) -> Result<Option<CandidateCheck>> {
+        if journal.phase != "launching" || journal.ready_record_sha256.is_some() {
+            return Ok(None);
+        }
+        let active = optional_record_at(&self.directory(&journal.name)?, &journal.name)?;
+        if !active.is_some_and(|(pinned, record, _)| {
+            record.token == journal.old_token
+                && (pinned.device, pinned.inode)
+                    == (journal.old_directory_device, journal.old_directory_inode)
+        }) {
+            return Ok(None);
+        }
+        let stage_path = operation_directory(&self.registry, journal).join("new");
+        let (pinned, candidate, _) = read_record_at(&stage_path, &journal.name)?;
+        if candidate.token != journal.new_token
+            || (pinned.device, pinned.inode)
+                != (journal.new_directory_device, journal.new_directory_inode)
+        {
+            return Err(fail("staged revive generation changed"));
+        }
+        self.check_candidate(&candidate).map(Some)
+    }
+
+    /// Whether a harness can be running for `candidate`: its pinned process alive, or Herdr
+    /// seeing an agent in its pane, is live; its pane gone, or holding only an idle shell with
+    /// no child process, is dead; anything else is unproven, including a candidate that recorded
+    /// no pane, since a harness it started before recording one cannot be checked.
+    fn check_candidate(&self, candidate: &AgentRecord) -> Result<CandidateCheck> {
+        let identity = if candidate.anchors_with_harness_identity() {
+            candidate.harness_anchor()
+        } else {
+            candidate.custom_process_identity.as_ref()
+        };
+        if let Some(identity) = identity {
+            if self.client.process_liveness(identity) == ProcessLiveness::Alive {
+                return Ok(CandidateCheck::Live(format!(
+                    "its {} process {} is alive",
+                    candidate.harness, identity.pid
+                )));
+            }
+        }
+        let Some(pane) = candidate.pane_id.as_deref() else {
+            return Ok(CandidateCheck::Unproven(
+                "the candidate recorded no pane, so a harness it may have started cannot be \
+                 checked"
+                    .to_owned(),
+            ));
+        };
+        if !self.client.panes()?.iter().any(|row| row.pane_id == pane) {
+            return Ok(CandidateCheck::Dead(format!("its pane {pane} is gone")));
+        }
+        if let Some(kind) = self.client.pane_info(pane).ok().and_then(|info| info.agent) {
+            return Ok(CandidateCheck::Live(format!(
+                "Herdr reports {kind} running in its pane {pane}"
+            )));
+        }
+        if self.client.pane_is_idle_shell(pane)? {
+            return Ok(CandidateCheck::Dead(format!(
+                "its pane {pane} holds only an idle shell with no child process, so no harness \
+                 runs there; the pane is left open"
+            )));
+        }
+        Ok(CandidateCheck::Unproven(format!(
+            "its pane {pane} runs a process agentctl cannot identify as a harness or an idle shell"
+        )))
+    }
+
+    /// Mark `journal`'s attempt failed (#899): its journal and operation directory move, whole,
+    /// into `.revives/.abandoned/TOKEN-SECONDS/` beside `abandoned.json`, which records the
+    /// evidence and whether the operator asked (`explicit`). The old generation and its queue
+    /// are untouched, so the next revive launches as if the attempt had never begun.
+    fn abandon_revive(&self, journal: &Journal, evidence: &str, explicit: bool) -> Result<Value> {
+        let root = self.registry.join(".revives");
+        let parent = root.join(ABANDONED);
+        agent::create_private_directory(&parent, "abandoned revive directory", false, false)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| fail(error.to_string()))?;
+        let destination = parent.join(format!("{}-{}", journal.old_token, now.as_secs()));
+        agent::create_private_directory(&destination, "abandoned revive attempt", false, false)?;
+        let mut record = json!({
+            "name": journal.name,
+            "old_token": journal.old_token,
+            "new_token": journal.new_token,
+            "phase": journal.phase,
+            "started_at": journal.started_at,
+            "abandoned_at": now.as_secs_f64(),
+            "explicit": explicit,
+            "evidence": evidence,
+        });
+        agent::atomic_json(&destination.join("abandoned.json"), &record)?;
+        let moved = |from: PathBuf, to: PathBuf| {
+            fs::rename(&from, &to).map_err(|error| {
+                fail(format!(
+                    "cannot move {} into {}: {error}",
+                    from.display(),
+                    to.display()
+                ))
+            })
+        };
+        // The journal goes first: if the second move fails, the operation directory is left as
+        // orphaned set-up, which the next revive inspects before it launches.
+        moved(
+            root.join(format!("{}.json", journal.old_token)),
+            destination.join("journal.json"),
+        )?;
+        moved(
+            operation_directory(&self.registry, journal),
+            destination.join("operation"),
+        )?;
+        agent::sync_directory(&destination)?;
+        agent::sync_directory(&root)?;
+        record["kept_at"] = json!(destination);
+        Ok(record)
+    }
+
     fn finish_revive(&self, journal: &mut Journal, old: &AgentRecord) -> Result<Value> {
         let (_, stopped) = stopped_artifact(&self.registry, journal)?;
         let mut active_path = self.directory(&journal.name)?;
@@ -2382,8 +2706,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 return Err(fail("staged revive generation changed"));
             }
             self.verify_candidate(&candidate, old, &journal.proof).map_err(|_| fail(format!(
-                "interrupted revive candidate is not independently verified; refusing another launch; no automatic relaunch; journal and diagnostics retained at {}; use `agentctl revive {} --dry-run` and `agentctl revive {}`",
-                stage_path.join("agent.json").display(), journal.name, journal.name
+                "interrupted revive candidate is not independently verified; refusing another launch; no automatic relaunch; journal and diagnostics retained at {}; use `agentctl revive {} --dry-run` and `agentctl revive {}`; if the candidate never started, `agentctl revive {} --abandon-candidate` marks it failed and launches again (refused while a harness runs for it)",
+                stage_path.join("agent.json").display(), journal.name, journal.name, journal.name
             )))?;
             if candidate.lifecycle != "running" {
                 if journal.ready_record_sha256.is_some() {

@@ -1775,9 +1775,24 @@ def _revive_interop(harness: Harness, report: Report) -> None:
                     and candidate.get("profile") == "recovery" and candidate.get("model") == "recovery-model"
                     and candidate.get("cwd") == str(root) and candidate.get("resume") == "session-1"
                     and candidate.get("goal") == "finish the recorded task" and candidate.get("paused") is True
-                    and candidate.get("revived_from") == old_token
-                    and not (record_path.parent / "queue").exists(),
-                    "published candidate bytes, saved task, policy or absence of a new queue changed",
+                    and candidate.get("revived_from") == old_token,
+                    "published candidate bytes, saved task or policy changed",
+                )
+                # The old queue is archived, never replayed, but no undelivered prompt goes
+                # silently: each is named in the result and failed in the new queue (#899).
+                new_queue = record_path.parent / "queue"
+                reported = sorted(
+                    path.relative_to(new_queue).as_posix() for path in new_queue.rglob("*") if path.is_file()
+                ) if new_queue.exists() else []
+                rows = result.get("archived_prompts") if isinstance(result, dict) else None
+                named = [row.get("id") for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+                report.require(
+                    label + "/archived-prompts-reported",
+                    reported == [f"failed/{name}.json{suffix}"
+                                 for name in ("interrupted", "pending-work", "uncertain")
+                                 for suffix in ("", ".error")]
+                    and named == ["pending-work", "interrupted", "uncertain"],
+                    f"undelivered old prompts were not reported failed in the new queue: {reported!r} {named!r}",
                 )
             finally:
                 for process in processes:

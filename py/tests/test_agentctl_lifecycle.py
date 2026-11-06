@@ -1748,7 +1748,13 @@ def test_revive_resumes_exact_conversation_and_archives_without_replaying(
     assert new._unknown["future_metadata"] == {"preserve": True} and new._unknown["revived_from"] == old.token
     assert new.pane_id != old.pane_id and fake.closed == [old.tab_id]
     assert len(fake.launched) == 2 and fake.submitted == [] and fake.keys_sent == []
-    assert not (manager._directory("worker") / "queue").exists()
+    # Archived, never replayed, but reported: the undelivered prompt is named and failed in the
+    # new queue, so its sender reads it as not delivered (#899).
+    new_queue = manager._directory("worker") / "queue"
+    assert sorted(path.name for path in new_queue.rglob("*") if path.is_file()) == [
+        "pending-task.json", "pending-task.json.error"]
+    assert "archived by revive" in json.loads((new_queue / "failed/pending-task.json.error").read_text())["error"]
+    assert [row["id"] for row in cast(list[dict[str, object]], result["archived_prompts"])] == ["pending-task"]
     for path, content in old_files.items():
         if path != "agent.json":
             assert (archive / path).read_bytes() == content

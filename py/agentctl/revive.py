@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import cast
 
-from agentctl import agent, launch_spec, registry_layout
+from agentctl import agent, launch_spec, registry_layout, sender_header
 from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, herdr_error_code
 from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable, RecoveryAction, _with_recovery
 from agentctl.profiles import configuration_root, load_profiles, reasoning_arguments, validate_structured_harness_argument_conflicts
@@ -778,7 +778,82 @@ def _complete_locked(manager: ManagedAgents, journal: dict[str, object]) -> dict
     result = manager._status_record(candidate)
     result.update({"revived": True, "previous_token": original.token, "archive": str(archive),
                    "pane_closed": pane_closed, "tab_closed": pane_closed or current_proof["kind"] == "missing"})
+    try:
+        result["archived_prompts"] = _report_archived_prompts(manager, name, archive)
+    except OSError as exc:
+        result["archived_prompts_error"] = str(exc)
     return result
+
+
+#: Queue lanes whose items a revive archives undelivered, in the order they are reported.
+_UNDELIVERED_LANES = ("inbox", "inbox.v2", "inflight", "failed")
+#: Longest first line one archived prompt's report row carries.
+_FIRST_LINE_CHARS = 80
+
+
+def _is_header_line(line: str) -> bool:
+    return (sender_header.parse(line) is not None or line.startswith("[from ")
+            or line.startswith("[team message:") or line.startswith("[reply:"))
+
+
+def _prompt_sender(document: dict[str, object], text: str) -> str:
+    for key in ("sender", "from"):
+        value = document.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    lines = text.splitlines()
+    header = sender_header.parse(lines[0].strip()) if lines else None
+    return header.sender if header is not None else "unknown"
+
+
+def _prompt_first_line(text: str) -> str:
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or _is_header_line(line):
+            continue
+        return line if len(line) <= _FIRST_LINE_CHARS else line[:_FIRST_LINE_CHARS - 1] + "…"
+    return ""
+
+
+def _report_archived_prompts(manager: ManagedAgents, name: str, archive: Path) -> list[dict[str, object]]:
+    """Name and record the prompts a revive archived without delivering them.
+
+    Every item left in the archived queue's inbox, in flight, or failed is copied into the new
+    generation's ``failed/`` with the reason, unless it is already there, so a sender asking after
+    it reads failed, never delivered, and no drain ever types it. One row per prompt: its ID,
+    sender, first line and old lane.
+    """
+    failed = manager._directory(name) / "queue" / "failed"
+    reported: list[dict[str, object]] = []
+    now = time.time()
+    for lane in _UNDELIVERED_LANES:
+        directory = archive / "queue" / lane
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.json")):
+            identifier = path.stem
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            text = document.get("text") if isinstance(document, dict) else None
+            if not isinstance(document, dict) or not isinstance(text, str) or not text:
+                continue
+            if identifier.startswith("failed-digest-") or document.get("failed_digest") is True:
+                continue
+            target = failed / f"{identifier}.json"
+            if not os.path.lexists(target):
+                for private in (failed.parent, failed):
+                    private.mkdir(mode=0o700, exist_ok=True)
+                agent._atomic_json(str(target), cast(dict[str, object], document))
+                agent._atomic_json(f"{target}.error", {
+                    "error": ("archived by revive, not delivered: the old generation's queue was archived "
+                              f"and is never replayed; the prompt is kept at {path}"),
+                    "failed_at": now,
+                })
+            reported.append({"id": identifier, "sender": _prompt_sender(document, text),
+                             "first_line": _prompt_first_line(text), "lane": lane})
+    return reported
 
 
 def _preserve_unlaunched_setup(

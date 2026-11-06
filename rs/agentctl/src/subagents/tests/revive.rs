@@ -1024,6 +1024,183 @@ fn revive_resumes_each_crash_boundary_without_allocating_again() {
     }
 }
 
+/// A revive interrupted after its candidate launched, and the candidate's staged record.
+fn interrupted_after_launch(harness: &str) -> (Fixture, AgentRecord, AgentRecord) {
+    let (fixture, old) = recoverable(harness, false);
+    super::super::revive::fail_once("launched");
+    assert!(fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .is_err());
+    let path = stage_path(&fixture, &old);
+    let (_, candidate, _) = super::super::revive::read_record_at(&path, "worker").unwrap();
+    assert!(candidate.pane_id.is_some());
+    (fixture, old, candidate)
+}
+
+/// The one abandoned attempt kept for `old`, and its `abandoned.json`.
+fn abandoned_attempt(fixture: &Fixture, old: &AgentRecord) -> (PathBuf, Value) {
+    let parent = fixture.root.join("registry/.revives/.abandoned");
+    let entries: Vec<PathBuf> = fs::read_dir(&parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let kept = entries[0].clone();
+    assert!(kept
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with(&old.token));
+    assert!(kept.join("journal.json").is_file());
+    assert!(kept.join("operation/new/agent.json").is_file());
+    let evidence = agent::read_private_json(&kept.join("abandoned.json")).unwrap();
+    (kept, evidence)
+}
+
+#[test]
+fn a_dead_candidate_is_abandoned_with_its_evidence_and_the_agent_launches_again() {
+    // #899 revive-abandon-dead-candidate: a candidate pane that was closed, and one left holding
+    // only an idle shell, are both proof that no harness runs; the next revive marks the attempt
+    // failed by itself and launches.
+    for closed in [true, false] {
+        let (fixture, old, candidate) = interrupted_after_launch("claude");
+        let pane = candidate.pane_id.clone().unwrap();
+        fixture
+            .client
+            .dead_panes
+            .lock()
+            .unwrap()
+            .insert(pane.clone());
+        if closed {
+            fixture
+                .client
+                .panes
+                .lock()
+                .unwrap()
+                .retain(|row| row.pane_id != pane);
+        }
+        let plan = fixture
+            .manager()
+            .revive("worker", true, None, TIMEOUT)
+            .unwrap();
+        assert_eq!(plan["action"], "revive", "{plan}");
+        let result = fixture
+            .manager()
+            .revive("worker", false, None, TIMEOUT)
+            .unwrap();
+        let wanted = if closed { "is gone" } else { "idle shell" };
+        let evidence = result["abandoned_candidate"]["evidence"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(evidence.contains(wanted), "{result}");
+        let (_, kept) = abandoned_attempt(&fixture, &old);
+        assert_eq!(kept["evidence"], evidence);
+        assert_eq!(kept["explicit"], false);
+        assert_eq!(kept["new_token"], json!(candidate.token));
+        assert!(!journal_path(&fixture, &old).exists());
+        let new = fixture.manager().load("worker").unwrap();
+        assert_ne!(new.token, old.token);
+        assert_ne!(new.token, candidate.token);
+        assert_eq!(new.lifecycle, "running");
+        assert_eq!(fixture.client.environments.lock().unwrap().len(), 3);
+    }
+}
+
+#[test]
+fn a_candidate_with_a_live_harness_is_never_abandoned() {
+    let (fixture, old, candidate) = interrupted_after_launch("claude");
+    let before = files(&fixture.root.join("registry"));
+    let plan = fixture
+        .manager()
+        .revive_with("worker", true, None, TIMEOUT, true)
+        .unwrap();
+    assert_eq!(plan["action"], "blocked", "{plan}");
+    let error = fixture
+        .manager()
+        .revive_with("worker", false, None, TIMEOUT, true)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("is not abandoned"), "{error}");
+    let pane = candidate.pane_id.unwrap();
+    assert!(
+        error.contains(&pane) || error.contains("process"),
+        "{error}"
+    );
+    assert_eq!(files(&fixture.root.join("registry")), before);
+    assert!(journal_path(&fixture, &old).exists());
+    assert_eq!(fixture.client.environments.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn an_unprovable_candidate_is_abandoned_only_when_the_operator_asks() {
+    // Interrupted before the candidate recorded a pane: a harness it may have started cannot be
+    // checked, so revive refuses and names --abandon-candidate, which then relaunches. The old
+    // queue goes to the archive exactly as in any revive, and its undelivered prompt is reported:
+    // named in the result and failed in the new queue, never typed.
+    let (fixture, old) = recoverable("claude", false);
+    let queue = fixture.root.join("registry/agents/worker/queue/inbox");
+    agent::create_private_directory(&queue, "test queue lane", true, false).unwrap();
+    agent::atomic_json(
+        &queue.join("m-1.json"),
+        &json!({"id": "m-1", "text": "[from lane-a via agentctl · reply: agentctl send lane-a]\nplease run the gate"}),
+    )
+    .unwrap();
+    let queued = files(&queue);
+    super::super::revive::fail_once("launching");
+    assert!(fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .is_err());
+    let error = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("refusing another launch"), "{error}");
+    assert!(error.contains("--abandon-candidate"), "{error}");
+    let result = fixture
+        .manager()
+        .revive_with("worker", false, None, TIMEOUT, true)
+        .unwrap();
+    assert!(result["abandoned_candidate"]["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("recorded no pane"));
+    let (_, kept) = abandoned_attempt(&fixture, &old);
+    assert_eq!(kept["explicit"], true);
+    let archive = PathBuf::from(result["archive"].as_str().unwrap());
+    assert_eq!(files(&archive.join("queue/inbox")), queued);
+    assert_eq!(
+        fixture.manager().load("worker").unwrap().lifecycle,
+        "running"
+    );
+    assert_eq!(
+        result["archived_prompts"],
+        json!([{"id": "m-1", "sender": "lane-a", "first_line": "please run the gate", "lane": "inbox"}]),
+        "{result}"
+    );
+    assert_eq!(
+        fixture.manager().message_state("worker", "m-1").unwrap(),
+        Some(crate::agent::QueueMessageState::Failed)
+    );
+    let failed = crate::failed_digest::failed_entries(&fixture.manager().queue("worker").unwrap());
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(failed[0].error.contains("archived by revive"), "{failed:?}");
+    assert!(
+        fixture.client.runs.lock().unwrap().is_empty(),
+        "never typed"
+    );
+    // With nothing interrupted, there is nothing to abandon.
+    assert!(fixture
+        .manager()
+        .revive_with("worker", false, None, TIMEOUT, true)
+        .unwrap_err()
+        .to_string()
+        .contains("no interrupted revive candidate"));
+}
+
 #[test]
 fn revive_launch_once_latch_refuses_unanchored_interruption_and_gates_ordinary_controls() {
     let (fixture, old) = recoverable("claude", false);
