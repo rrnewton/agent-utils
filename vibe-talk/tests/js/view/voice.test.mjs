@@ -210,3 +210,37 @@ test("`#624 voice-page-modularity`: the read-aloud controls reach the act each n
   controls.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
+
+test("`#624 voice-page-modularity`: the call's controls reach the act each names in the page's order, answer what it answers, and come down again", () => {
+  const { mountCallControls } = VIEW_VOICE;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type, event = {}) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener(event));
+  const controls = mountCallControls({
+    byId: (id) => target(id),
+    onTalk: (...args) => { log.push(`talk ${args.length}`); return "talked"; },
+    hangUp: (...args) => { log.push(`hang up ${args.length}`); return "hung up"; },
+    haltAutoplay: (...args) => log.push(`halt ${args.length}`),
+    clearView: (...args) => { log.push(`clear ${args.length}`); return "cleared"; },
+    forgetConversations: (...args) => { log.push(`forget ${args.length}`); return "forgotten"; },
+    toggleSpeaker: (...args) => { log.push(`speaker ${args.length}`); return "speaker"; },
+    retryStart: (...args) => { log.push(`retry ${args.length}`); return "retried"; },
+  });
+  assert.deepStrictEqual(log, ["listen talk click", "listen hang-up click", "listen hang-up click", "listen clear-view click",
+    "listen forget-conversations click", "listen speaker click", "listen retry-start click"], "a listener was added out of the page's order");
+  log.length = 0;
+  assert.deepStrictEqual(fire("talk", "click", { n: 1 }), ["talked"], "Talk did not answer what the call's own Talk answers");
+  // Hang up ends the call, and then the going on of a read (`#886 voice-page-autoplay`).
+  // (The halt answers the log's length, as the stand-in's push does.)
+  assert.deepStrictEqual(fire("hang-up", "click", { n: 2 }), ["hung up", 3]);
+  assert.deepStrictEqual(fire("clear-view", "click", { n: 3 }), ["cleared"]);
+  assert.deepStrictEqual(fire("forget-conversations", "click", { n: 4 }), ["forgotten"]);
+  assert.deepStrictEqual(fire("speaker", "click", { n: 5 }), ["speaker"]);
+  assert.deepStrictEqual(fire("retry-start", "click", { n: 6 }), ["retried"]);
+  assert.deepStrictEqual(log, ["talk 0", "hang up 0", "halt 0", "clear 0", "forget 0", "speaker 0", "retry 0"], "an act was handed the event, which none of the page's takes");
+  controls.unmount();
+  assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+});

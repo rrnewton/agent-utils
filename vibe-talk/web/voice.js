@@ -30812,7 +30812,6 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("pagehide", () => voiceCall().saveUnsettledTurns());
 
-el("talk").addEventListener("click", voiceCall().onTalk);
 /** Take the pace popover down. Safe to call when it is already down. */
 function closeSpeedPopover() {
   el("speed-popover").hidden = true;
@@ -30945,14 +30944,22 @@ function setReadingMode(on) {
   voiceCall().renderControls();
   renderChannelRows();
 }
-el("hang-up").addEventListener("click", voiceCall().stop);
-// `#886 voice-page-autoplay`. Hang up ends the going on: a read in progress, heard to its end, reads nothing after it.
-el("hang-up").addEventListener("click", () =>
-  autoplay.halt(readAloudOwner().nowPlaying !== null ? readAloudOwner().nowPlaying.id : readAloudOwner().pendingRead));
-el("clear-view").addEventListener("click", voiceTranscript().onClear);
-// `guardQuietly`, not `guard`: erasing a stored record must never be able to hang up a live call.
-el("forget-conversations").addEventListener("click", guardQuietly(voiceTranscript().forgetConversations));
-el("speaker").addEventListener("click", () => voiceCall().setSpeakerOff(!voiceCall().session.speakerOff));
+// The call's controls: Talk, Hang up, the speaker, clearing the view, forgetting the stored conversations, and a
+// failed start tried again. One owner in web/src/view/voice/callcontrols.ts (`#624 voice-page-modularity`), mounted
+// here, in the page's order; its `unmount` waits for the ordered boot's teardown.
+mountCallControls({
+  byId: (id) => el(id),
+  onTalk: () => voiceCall().onTalk(),
+  hangUp: () => voiceCall().stop(),
+  // `#886 voice-page-autoplay`. Hang up ends the going on: a read in progress, heard to its end, reads nothing after it.
+  haltAutoplay: () =>
+    autoplay.halt(readAloudOwner().nowPlaying !== null ? readAloudOwner().nowPlaying.id : readAloudOwner().pendingRead),
+  clearView: () => voiceTranscript().onClear(),
+  // `guardQuietly`, not `guard`: erasing a stored record must never be able to hang up a live call.
+  forgetConversations: () => guardQuietly(voiceTranscript().forgetConversations)(),
+  toggleSpeaker: () => voiceCall().setSpeakerOff(!voiceCall().session.speakerOff),
+  retryStart: () => voiceCall().retryStart(),
+});
 // `#43 typed-input`, rehoused by `#59 text-entry-button` and then by `#241 voice-composer`: the
 // composer, in three listeners and no logic. Everything they call is a named function above, which
 // is exactly why moving the control from the dock to the bar and from the bar to the transcript did
@@ -31035,7 +31042,6 @@ el("post-confirm-more").addEventListener("click", () => {
 });
 el("open-settings").addEventListener("click", () => showScreen("settings"));
 el("dismiss-error").addEventListener("click", clearError);
-el("retry-start").addEventListener("click", voiceCall().retryStart);
 el("read-on-device").addEventListener("click", readAloudOwner().readOnDevice);
 el("audio-source").addEventListener("click", () =>
   readAloudOwner().setReadAudioSource(readAloudOwner().readAudioSource === "device" ? (readAloudOwner().witReadAloud ? "wit" : "agent") : "device")

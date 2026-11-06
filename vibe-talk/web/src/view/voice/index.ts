@@ -10,3 +10,5 @@ export { AUTOPLAY_WORDS, createAutoplay } from "./autoplay.ts";
 export type { Autoplay, AutoplayDependencies } from "./autoplay.ts";
 export { mountReadControls } from "./readcontrols.ts";
 export type { ReadControls, ReadControlsDependencies } from "./readcontrols.ts";
+export { mountCallControls } from "./callcontrols.ts";
+export type { CallControls, CallControlsDependencies } from "./callcontrols.ts";

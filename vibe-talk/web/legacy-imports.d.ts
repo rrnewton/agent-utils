@@ -418,6 +418,7 @@ declare const createVoiceTranscript: LegacyImports["createVoiceTranscript"];
 declare const createReadAloud: LegacyImports["createReadAloud"];
 declare const createAutoplay: LegacyImports["createAutoplay"];
 declare const mountReadControls: LegacyImports["mountReadControls"];
+declare const mountCallControls: LegacyImports["mountCallControls"];
 declare const createReadingJump: LegacyImports["createReadingJump"];
 
 declare const HELP_TOPICS: LegacyImports["HELP_TOPICS"];
