@@ -14528,6 +14528,7 @@ pub(crate) mod tests {
                     on_run: Mutex::new(None),
                     ended: Mutex::new(Vec::new()),
                     fail_ready_once: AtomicBool::new(false),
+                    fail_start_once: AtomicBool::new(false),
                 },
                 root,
                 registry_name: "registry",
@@ -15024,6 +15025,8 @@ pub(crate) mod tests {
         pub(crate) ended: Mutex<Vec<u64>>,
         /// Fail the readiness of the next harness start, after the harness started in its pane.
         pub(crate) fail_ready_once: AtomicBool,
+        /// Fail the next native harness start before anything starts: it never comes up.
+        pub(crate) fail_start_once: AtomicBool,
     }
     /// How a read that [`Fake::hold_reads`] holds ends.
     #[derive(Clone)]
@@ -15948,6 +15951,11 @@ pub(crate) mod tests {
             arguments: &[String],
             _: Duration,
         ) -> AdapterResult<()> {
+            if self.fail_start_once.swap(false, Ordering::Relaxed) {
+                return Err(AdapterError::unavailable(
+                    "timed out waiting for agent startup",
+                ));
+            }
             self.launches
                 .lock()
                 .unwrap()

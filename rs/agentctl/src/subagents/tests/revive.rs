@@ -2375,3 +2375,62 @@ fn an_incomplete_revive_recovers_by_running_the_printed_command_as_printed() {
         assert_eq!(revived["previous_token"], old.token, "{harness}");
     }
 }
+
+#[test]
+fn a_failed_launch_whose_harness_never_came_up_in_its_own_pane_is_abandoned_and_relaunched() {
+    // #920: a Codex revive under load opened its candidate pane, but Codex never came up and the
+    // launch failed. The pane holds something agentctl cannot call an idle shell, so #899 alone
+    // would leave the candidate unproven and refuse; the pane is this revive's own, so the
+    // printed rerun closes it, keeps the attempt as evidence, and launches afresh.
+    let (fixture, old) = recoverable("codex", true);
+    fixture
+        .client
+        .fail_start_once
+        .store(true, Ordering::Relaxed);
+    let error = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("incomplete"), "{error}");
+    let (_, candidate, _) =
+        super::super::revive::read_record_at(&stage_path(&fixture, &old), "worker").unwrap();
+    assert_eq!(candidate.lifecycle, "launch_failed");
+    let pane = candidate
+        .pane_id
+        .clone()
+        .expect("the candidate's pane was opened");
+    assert_ne!(Some(&pane), old.pane_id.as_ref());
+    fixture
+        .client
+        .custom_at_idle_shell
+        .store(false, Ordering::Relaxed);
+    let plan = fixture
+        .manager()
+        .revive("worker", true, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(
+        plan["action"], "revive",
+        "the dry run says what the rerun does: {plan}"
+    );
+    let result = fixture
+        .manager()
+        .revive("worker", false, Some(&old.token), TIMEOUT)
+        .unwrap_or_else(|error| panic!("the printed rerun refused: {error}"));
+    assert_eq!(result["revived"], true, "{result}");
+    let evidence = result["abandoned_candidate"]["evidence"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(evidence.contains("never came up"), "{result}");
+    assert!(fixture.client.closed.lock().unwrap().contains(&pane));
+    let (_, kept) = abandoned_attempt(&fixture, &old);
+    assert_eq!(kept["explicit"], false);
+    let new = fixture.manager().load("worker").unwrap();
+    assert_eq!(new.lifecycle, "running");
+    assert_eq!(
+        new.native_session.as_ref().map(|native| &native.value),
+        old.native_session.as_ref().map(|native| &native.value),
+        "the relaunch resumed another conversation"
+    );
+    assert_ne!(new.pane_id.as_deref(), Some(pane.as_str()));
+}

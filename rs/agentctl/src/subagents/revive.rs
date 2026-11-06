@@ -2195,6 +2195,21 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                                 "the interrupted revive's candidate is not abandoned: {evidence}"
                             ),
                         ),
+                        (CandidateCheck::Unproven(evidence), false) => {
+                            match self.failed_candidate_pane(&journal)? {
+                                Some(pane) => self.revive_plan_document(
+                                    &old,
+                                    "revive",
+                                    &format!(
+                                        "the interrupted revive's candidate is abandoned \
+                                         ({evidence}; its launch failed in pane {pane}, which \
+                                         this revive opened and closes): the attempt is kept as \
+                                         evidence and the agent launches again"
+                                    ),
+                                ),
+                                None => self.pending_revive_plan(&journal, &old, &stopped),
+                            }
+                        }
                         _ => self.pending_revive_plan(&journal, &old, &stopped),
                     };
                     plan["transaction_phase"] = json!(journal.phase);
@@ -2269,6 +2284,16 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 }
                 Some(CandidateCheck::Unproven(evidence)) if abandon_candidate => {
                     Some(self.abandon_revive(&journal, &evidence, true)?)
+                }
+                Some(CandidateCheck::Unproven(evidence)) => {
+                    match self.close_failed_candidate_pane(&journal)? {
+                        Some(closed) => Some(self.abandon_revive(
+                            &journal,
+                            &format!("{evidence}; {closed}"),
+                            false,
+                        )?),
+                        None => None,
+                    }
                 }
                 Some(CandidateCheck::Live(evidence)) if abandon_candidate => {
                     return Err(fail(format!(
@@ -2634,6 +2659,42 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         Ok(CandidateCheck::Unproven(format!(
             "its pane {pane} runs a process agentctl cannot identify as a harness or an idle shell"
         )))
+    }
+
+    /// Close the pane of an unproven candidate whose launch failed, when this revive opened that
+    /// pane itself (#920 revive-repeat-incomplete): the launch reported that its harness never
+    /// came up, no pinned harness process is alive and Herdr sees no agent there, so whatever
+    /// still runs in the pane (a wrapper that never started the harness, say) is this attempt's
+    /// own. Closing the pane ends it, which makes the attempt as dead as #899's dead candidates.
+    /// A candidate relaunched in the old pane is never closed: that pane is the old
+    /// generation's. Returns the evidence when it closed the pane.
+    fn close_failed_candidate_pane(&self, journal: &Journal) -> Result<Option<String>> {
+        let Some(pane) = self.failed_candidate_pane(journal)? else {
+            return Ok(None);
+        };
+        self.client.close_pane(&pane)?;
+        Ok(Some(format!(
+            "its launch failed and its harness never came up in pane {pane}, which this revive \
+             opened, so that pane was closed"
+        )))
+    }
+
+    /// The pane [`Self::close_failed_candidate_pane`] would close, read-only.
+    fn failed_candidate_pane(&self, journal: &Journal) -> Result<Option<String>> {
+        let stage_path = operation_directory(&self.registry, journal).join("new");
+        let (_, candidate, _) = read_record_at(&stage_path, &journal.name)?;
+        let Some(pane) = candidate.pane_id.as_deref() else {
+            return Ok(None);
+        };
+        if candidate.lifecycle != "launch_failed" || pane == journal.proof.pane_id {
+            return Ok(None);
+        }
+        let opened_here = self.client.panes()?.iter().any(|row| {
+            row.pane_id == pane
+                && Some(&row.tab_id) == candidate.tab_id.as_ref()
+                && Some(&row.workspace_id) == candidate.workspace_id.as_ref()
+        });
+        Ok(opened_here.then(|| pane.to_owned()))
     }
 
     /// Mark `journal`'s attempt failed (#899): its journal and operation directory move, whole,
