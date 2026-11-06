@@ -1080,6 +1080,9 @@ struct Anchor {
     /// Native conversation id to record in the launch spec when Herdr reports none; a Claude agent anchoring itself can pass "$CLAUDE_CODE_SESSION_ID". Refused if it contradicts Herdr's report. Default: Herdr's report, then the conversation the harness command line selects
     #[arg(long = "session-id", value_name = "ID")]
     session_id: Option<String>,
+    /// Explicitly rebind the record to a NEW conversation in its live pane (requires --replace --session-id NEW): the foreground process must be the recorded harness in the recorded cwd running the recorded argv apart from its resume tail
+    #[arg(long)]
+    new_conversation: bool,
 }
 
 #[derive(Args)]
@@ -4141,11 +4144,25 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Commands::Promote(value) => {
             manager.promote(&value.name, value.expected_token.as_deref())?
         }
-        Commands::Anchor(value) => manager.anchor(
-            &value.agent.name,
-            value.replace,
-            value.session_id.as_deref(),
-        )?,
+        Commands::Anchor(value) => {
+            if value.new_conversation {
+                if !value.replace {
+                    return Err(Failure::Usage(
+                        "--new-conversation requires --replace".to_owned(),
+                    ));
+                }
+                let session = value.session_id.as_deref().ok_or_else(|| {
+                    Failure::Usage("--new-conversation requires --session-id NEW".to_owned())
+                })?;
+                manager.anchor_new_conversation(&value.agent.name, session)?
+            } else {
+                manager.anchor(
+                    &value.agent.name,
+                    value.replace,
+                    value.session_id.as_deref(),
+                )?
+            }
+        }
         Commands::Doctor(value) => {
             let report = manager.doctor(value.repair_labels)?;
             write_json(&report).map_err(Failure::Output)?;

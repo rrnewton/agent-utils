@@ -247,6 +247,16 @@ def resumed_session(harness: str, recorded: Sequence[str], actual: Sequence[str]
     return value
 
 
+def same_launch_rest(harness: str, recorded: Sequence[str], actual: Sequence[str]) -> bool:
+    """Whether two argument vectors are the same launch apart from any
+    conversation selectors they name.
+    """
+    try:
+        return _split(harness, recorded)[1] == _split(harness, actual)[1]
+    except Exception:
+        return False
+
+
 def replay_arguments(harness: str, argv: Sequence[str], conversation: str) -> tuple[str, ...]:
     """The recorded arguments with every selector replaced by one explicit resume."""
     if not _text(conversation):

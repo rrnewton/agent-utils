@@ -7770,6 +7770,175 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }))
     }
 
+    /// Explicitly rebind a record to a NEW conversation in its live pane
+    /// (#987, `anchor --replace --session-id NEW --new-conversation`). The
+    /// foreground process must be the recorded harness, in the recorded
+    /// cwd, running the recorded argv apart from its resume tail; the old
+    /// session is kept in the record's history and the queue is untouched.
+    pub fn anchor_new_conversation(&self, agent_name: &str, session: &str) -> Result<Value> {
+        if !valid_metadata_text(session) {
+            return Err(fail(
+                "native session id must be nonempty and contain no NUL",
+            ));
+        }
+        let _lock = self.lock(agent_name)?;
+        let _identity_lock = self.identity_lock()?;
+        let mut record = self.load(agent_name)?;
+        let migrated_from = record.migrate_nested_to_flat();
+        let refusal = |detail: &str| {
+            fail(format!(
+                "cannot rebind '{agent_name}' to a new conversation: {detail}"
+            ))
+        };
+        let Some(pane) = record.pane_id.clone() else {
+            return Err(refusal("the record has no pane"));
+        };
+        let _pane_lock = self.pane_lock(&pane)?;
+        let info = self.client.pane_info(&pane)?;
+        if !same_directory(&info.cwd, &record.cwd)
+            || record
+                .terminal_id
+                .as_deref()
+                .is_some_and(|terminal| Some(terminal) != info.terminal_id.as_deref())
+        {
+            return Err(refusal("the pane is not in the recorded cwd or terminal"));
+        }
+        let candidate = if record.adapter == "herdr-relay" {
+            self.client.relay_process(&pane)?
+        } else {
+            self.client.harness_identity(&pane, &record.harness)?
+        };
+        let Some(candidate) = candidate else {
+            return Err(refusal("no foreground harness process can be pinned"));
+        };
+        if self.client.process_liveness(&candidate) != ProcessLiveness::Alive {
+            return Err(refusal("the foreground process is not provably alive"));
+        }
+        let Some(argv) = self.client.process_command_line(&candidate) else {
+            return Err(refusal(
+                "the foreground process command line cannot be read",
+            ));
+        };
+        if argv.is_empty() || !launch_spec::program_matches(&record.harness, Some(&argv[0])) {
+            return Err(refusal(
+                "the foreground program is not the recorded harness",
+            ));
+        }
+        let recorded: Vec<String> = record
+            .launch_spec
+            .as_ref()
+            .and_then(|spec| spec["argv"].as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|values| !values.is_empty())
+            .unwrap_or_else(|| record.arguments.clone());
+        if recorded.is_empty()
+            || !launch_spec::same_launch_rest(&record.harness, &recorded, &argv[1..])
+        {
+            return Err(refusal(
+                "the foreground argv is not the recorded argv apart from its resume tail",
+            ));
+        }
+        // For Muse, the new session's runtime file must exist on disk.
+        #[cfg(not(test))]
+        if record.harness == "muse" {
+            let root = crate::harness::home()
+                .map(|home| home.join(".local/share/muse/sessions"))
+                .unwrap_or_default();
+            let mut found = false;
+            let mut stack = vec![root];
+            while let Some(dir) = stack.pop() {
+                if dir.file_name().and_then(|name| name.to_str()) == Some(session) {
+                    found = true;
+                    break;
+                }
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    stack.extend(entries.flatten().map(|entry| entry.path()));
+                }
+            }
+            if !found {
+                return Err(refusal("no Muse session runtime file names that session"));
+            }
+        }
+        let previous_session = record
+            .native_session
+            .as_ref()
+            .map(|native| native.value.clone())
+            .or_else(|| record.session_value.clone());
+        if let Some(previous) = previous_session.as_deref() {
+            if previous != session {
+                let history = record
+                    .extra
+                    .entry("former_sessions".to_owned())
+                    .or_insert_with(|| json!([]));
+                if let Some(list) = history.as_array_mut() {
+                    if !list.iter().any(|value| value.as_str() == Some(previous)) {
+                        list.push(json!(previous));
+                    }
+                }
+            }
+        }
+        let previous_pid = if record.anchors_with_harness_identity() {
+            record.harness_anchor().map(|identity| identity.pid)
+        } else {
+            record
+                .custom_process_identity
+                .as_ref()
+                .map(|identity| identity.pid)
+        };
+        if record.anchors_with_harness_identity() && record.custom_process_identity.is_none() {
+            record.harness_identity = Some(candidate.clone());
+            record.anchor_rule = Some(ANCHOR_RULE);
+        } else {
+            record.custom_process_identity = Some(candidate.clone());
+        }
+        record.terminal_id = info.terminal_id.clone();
+        record.native_session = Some(NativeSession::new(&record.harness, session, "asserted"));
+        record.session_agent = Some(record.harness.clone());
+        record.session_value = Some(session.to_owned());
+        if record.lifecycle == "launch_failed" {
+            record.lifecycle = "running".to_owned();
+            record.error = None;
+        }
+        let label = match record.workspace_id.as_deref() {
+            Some(workspace) => self.client.workspace_label(workspace).ok(),
+            None => None,
+        };
+        let names_session = launch_spec::resumed_session(&record.harness, &recorded, &argv[1..])
+            .is_ok_and(|named| named == session);
+        record.launch_spec = Some(launch_spec::build(launch_spec::SpecFields {
+            source: "anchor",
+            captured_at: unix_seconds(),
+            harness: &record.harness,
+            executable: Some(&argv[0]),
+            argv: &argv[1..],
+            cwd: &record.cwd,
+            profile: record.profile.as_deref(),
+            environment_names: &record.environment_names,
+            slot: record.slot.as_deref(),
+            slot_project: record.slot_project.as_deref(),
+            slot_isolation: record.slot_isolation.as_deref(),
+            workspace_label: label.as_deref(),
+            native_session: Some((session, if names_session { "argv" } else { "asserted" })),
+        })?);
+        self.save(&record)?;
+        Ok(json!({
+            "name": agent_name,
+            "pane_id": pane,
+            "terminal_id": record.terminal_id,
+            "harness_pid": candidate.pid,
+            "replaced": true,
+            "previous": {"harness_pid": previous_pid, "session": previous_session},
+            "session": session,
+            "migrated_from": migrated_from,
+            "launch_spec_source": "anchor",
+        }))
+    }
+
     /// Promote a relay launch whose harness, pinned when it started, runs behind the relay.
     ///
     /// Herdr cannot see through the relay, so the proof is agentctl's own: the pinned process is

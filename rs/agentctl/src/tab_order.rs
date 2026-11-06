@@ -244,7 +244,12 @@ mod tests {
             entry("t1", "coord", ROLE_FRONT),
             entry("t4", "worker-a", ROLE_LANE),
         ];
-        let want = vec!["t1".to_owned(), "t4".to_owned(), "t2".to_owned(), "t3".to_owned()];
+        let want = vec![
+            "t1".to_owned(),
+            "t4".to_owned(),
+            "t2".to_owned(),
+            "t3".to_owned(),
+        ];
         assert_eq!(canonical_tabs(&tabs), want);
         let ordered = canonical_tabs(&tabs)
             .into_iter()

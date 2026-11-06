@@ -176,6 +176,9 @@ def parser() -> argparse.ArgumentParser:
         help="native conversation id to record in the launch spec when Herdr reports none; a Claude agent "
         "anchoring itself can pass \"$CLAUDE_CODE_SESSION_ID\". Refused if it contradicts Herdr's report. "
         "Default: Herdr's report, then the conversation the harness command line selects")
+    anchor.add_argument("--new-conversation", action="store_true",
+        help="with --replace --session-id NEW, rebind the record to a fresh conversation running in its "
+        "live pane (#987); refused unless the pane's foreground resumes that new session")
     doctor = command("doctor", "Compare every registry record with live Herdr state and report each mismatch. "
         "Read-only unless --repair-labels. Exit 0 when clean, 1 with findings.",
         "agentctl doctor")
@@ -599,7 +602,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "promote":
             result = sessions.promote(name, expected_token=args.expected_token)
         elif args.command == "anchor":
-            result = sessions.anchor(name, replace=args.replace, session=args.session_id)
+            if args.new_conversation:
+                if not args.replace or not args.session_id:
+                    raise ValueError("--new-conversation requires --replace --session-id NEW")
+                result = sessions.anchor_new_conversation(name, args.session_id)
+            else:
+                result = sessions.anchor(name, replace=args.replace, session=args.session_id)
         elif args.command == "doctor":
             report = sessions.doctor(repair_labels=args.repair_labels)
             print(json.dumps(report, indent=2, sort_keys=True))

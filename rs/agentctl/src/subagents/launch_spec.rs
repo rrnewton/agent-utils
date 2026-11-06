@@ -270,6 +270,15 @@ pub(super) fn resumed_session(
     Ok(id)
 }
 
+/// Whether two argument vectors are the same launch apart from any
+/// conversation selectors they name.
+pub(super) fn same_launch_rest(harness: &str, recorded: &[String], actual: &[String]) -> bool {
+    match (split(harness, recorded), split(harness, actual)) {
+        (Ok((_, recorded_rest)), Ok((_, actual_rest))) => recorded_rest == actual_rest,
+        _ => false,
+    }
+}
+
 /// The recorded arguments with every selector replaced by one explicit resume.
 pub(super) fn replay_arguments(
     harness: &str,

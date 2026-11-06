@@ -449,6 +449,52 @@ fn anchor_replace_pins_a_hand_resumed_muse_and_refuses_unrelated_processes() {
 }
 
 #[test]
+fn anchor_new_conversation_rebinds_a_fresh_muse_session() {
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                harness: "muse".to_owned(),
+                harness_args: vec!["--model".to_owned(), "m".to_owned()],
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let record = fixture.manager().load("worker").unwrap();
+    let pane = record.pane_id.clone().unwrap();
+    fixture
+        .client
+        .custom_processes
+        .lock()
+        .unwrap()
+        .remove(&pane);
+    let mut fresh = vec!["/usr/local/bin/muse".to_owned()];
+    fresh.extend(record.arguments.iter().cloned());
+    fresh.extend(["resume".to_owned(), "sess-new".to_owned()]);
+    fixture
+        .client
+        .command_lines
+        .lock()
+        .unwrap()
+        .insert(300, fresh);
+    // The resumed-session pin refuses a different session; the explicit
+    // new-conversation rebind accepts it and keeps the old one in history.
+    assert!(fixture.manager().anchor("worker", true, None).is_err());
+    let result = fixture
+        .manager()
+        .anchor_new_conversation("worker", "sess-new")
+        .unwrap();
+    assert_eq!(result["session"], "sess-new");
+    let saved = fixture.manager().load("worker").unwrap();
+    assert_eq!(saved.native_session.unwrap().value, "sess-new");
+    assert_eq!(saved.session_value.as_deref(), Some("sess-new"));
+    assert!(saved.extra["former_sessions"].is_array());
+}
+
+#[test]
 fn anchor_replace_pins_a_hand_resumed_claude_behind_a_relay() {
     let (fixture, mut record) = relay_worker_of("claude");
     // Simulate the reboot: the launch pin names a dead generation.

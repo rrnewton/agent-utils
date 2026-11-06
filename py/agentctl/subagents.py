@@ -6142,6 +6142,103 @@ class ManagedAgents:
             "migrated_from": migrated_from, "launch_spec_source": "anchor",
         }
 
+    def anchor_new_conversation(self, name: str, session: str) -> dict[str, object]:
+        """Explicitly rebind a record to a NEW conversation in its live pane
+        (#987, `anchor --replace --session-id NEW --new-conversation`). The
+        foreground process must be the recorded harness, in the recorded
+        cwd, running the recorded argv apart from its resume tail; the old
+        session is kept in the record's history and the queue is untouched.
+        """
+        if not session or "\0" in session:
+            raise AgentDeliveryError("native session id must be nonempty and contain no NUL")
+        with self._lock(name), self._identity_transaction():
+            record = self._load(name)
+            migrated = None
+            if record._nested_storage is not None:
+                migrated = record._nested_storage.get("schema")
+                record._nested_storage = None
+                record._session_source = None
+
+            def refusal(detail: str) -> AgentDeliveryError:
+                return AgentDeliveryError(f"cannot rebind {name!r} to a new conversation: {detail}")
+
+            if record.pane_id is None:
+                raise refusal("the record has no pane")
+            with self._pane_lock(record.pane_id):
+                info = self.client.pane_info(record.pane_id)
+                if (os.path.realpath(info.cwd) != os.path.realpath(record.cwd)
+                        or (record.terminal_id is not None and info.terminal_id != record.terminal_id)):
+                    raise refusal("the pane is not in the recorded cwd or terminal")
+                candidate = (self.client.relay_process(record.pane_id) if record.adapter == "herdr-relay"
+                             else self.client.harness_identity(record.pane_id, record.harness))
+                if candidate is None or self.client.process_liveness(candidate) != "alive":
+                    raise refusal("the foreground process is not provably alive")
+                argv = self.client.process_command_line(candidate)
+                if not argv or not launch_spec.program_matches(record.harness, argv[0]):
+                    raise refusal("the foreground program is not the recorded harness")
+                recorded: list[str] = []
+                if record.launch_spec is not None:
+                    spec_argv = record.launch_spec.get("argv")
+                    if isinstance(spec_argv, list):
+                        recorded = [value for value in spec_argv if isinstance(value, str)]
+                if not recorded:
+                    recorded = list(record.arguments)
+                try:
+                    same = launch_spec.same_launch_rest(record.harness, recorded, list(argv[1:]))
+                except Exception:
+                    same = False
+                if not recorded or not same:
+                    raise refusal("the foreground argv is not the recorded argv apart from its resume tail")
+                previous_session = (
+                    (None if record.native_session is None else record.native_session["value"])
+                    or record.session_value
+                )
+                if previous_session is not None and previous_session != session:
+                    history = record._unknown.setdefault("former_sessions", [])
+                    if isinstance(history, list) and previous_session not in history:
+                        history.append(previous_session)
+                previous_pid = (record.harness_identity if record.custom_process_identity is None
+                                else record.custom_process_identity)
+                if record.adapter in ("herdr-pane", "herdr-relay"):
+                    record.custom_process_identity = candidate
+                else:
+                    record.harness_identity = candidate
+                    record.anchor_rule = 2
+                record.terminal_id = info.terminal_id
+                record.native_session = _native_session(record.harness, session, "asserted")
+                record.session_agent = record.harness
+                record.session_value = session
+                if record.lifecycle == "launch_failed":
+                    record.lifecycle, record.error = "running", None
+                label: str | None = None
+                if record.workspace_id is not None:
+                    try:
+                        label = self.client.workspace_label(record.workspace_id)
+                    except HerdrRunError:
+                        label = None
+                try:
+                    named = launch_spec.resumed_session(record.harness, recorded, list(argv[1:]))
+                    source = "argv" if named == session else "asserted"
+                except Exception:
+                    source = "asserted"
+                record.set_launch_spec(launch_spec.build(
+                    source="anchor", captured_at=time.time(), harness=record.harness,
+                    executable=argv[0], argv=argv[1:], cwd=record.cwd, profile=record.profile,
+                    environment_names=record.environment_names, slot=record.slot,
+                    slot_project=record.slot_project, slot_isolation=record.slot_isolation,
+                    workspace_label=label, native_session=(session, source),
+                ))
+                self._save(record)
+                return {
+                    "name": name, "pane_id": record.pane_id,
+                    "terminal_id": record.terminal_id, "harness_pid": candidate.pid,
+                    "replaced": True,
+                    "previous": {"harness_pid": None if previous_pid is None else previous_pid.pid,
+                                 "session": previous_session},
+                    "session": session, "migrated_from": migrated,
+                    "launch_spec_source": "anchor",
+                }
+
     def rename(self, old: str, new: str) -> dict[str, object]:
         """Rename a live agent: registry entry, Herdr agent name and tab label together."""
         _name(old)
