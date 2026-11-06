@@ -89,6 +89,9 @@ pub struct RunOptions {
     /// heartbeat's window): what the run built, not the plan, which still names changes the
     /// run skips.
     pub window: Option<Arc<Mutex<Vec<Vec<i64>>>>>,
+    /// Shared `stopping: ...` line the serve heartbeat shows while the run is
+    /// parked after a stop decision (see [`Runner::log_stopped`]).
+    pub stopping: Option<Arc<Mutex<String>>>,
     /// How often a run with a batch in flight looks for requests recorded while it holds the
     /// queue ([`INTAKE_POLL`] when unset).
     pub intake_poll: Option<Duration>,
@@ -955,6 +958,11 @@ pub struct Runner<'a> {
     donors: Option<Donors>,
     /// The writer lock the caller holds, when the run may apply recorded requests itself.
     writer: Option<&'a Lock>,
+    /// Whether the `stopped` event has been logged for this run (at the stop
+    /// decision, not at the run's end).
+    stopped_logged: Mutex<bool>,
+    /// Set at a stop decision: no donor job is re-leased after it.
+    stopping: AtomicBool,
 }
 
 impl<'a> Runner<'a> {
@@ -1105,6 +1113,8 @@ impl<'a> Runner<'a> {
             donors,
             options,
             writer: None,
+            stopped_logged: Mutex::new(false),
+            stopping: AtomicBool::new(false),
         })
     }
 
@@ -1141,6 +1151,29 @@ impl<'a> Runner<'a> {
         }
         if !self.options.quiet {
             eprintln!("merge-queue: {kind}: {detail}");
+        }
+    }
+
+    /// Log the run's stop at the decision, at once: the `stopped` event is
+    /// written before any in-flight work is waited on, the serve heartbeat's
+    /// shared stopping line is set, and no donor job is re-leased after it.
+    /// Logged once per run; the run's end does not repeat it.
+    fn log_stopped(&self, reason: &str, waiting: &[Vec<i64>]) {
+        self.stopping.store(true, Ordering::Relaxed);
+        let detail = if waiting.is_empty() {
+            reason.to_owned()
+        } else {
+            let flights: Vec<String> = waiting.iter().map(|prs| list(prs)).collect();
+            format!("{reason}; waiting for {} to return", flights.join(", "))
+        };
+        if let Some(shared) = &self.options.stopping {
+            *lock(shared) = format!("stopping: {detail}");
+        }
+        let mut logged = lock(&self.stopped_logged);
+        if !*logged {
+            *logged = true;
+            drop(logged);
+            self.event("stopped", &detail);
         }
     }
 
@@ -3678,6 +3711,13 @@ impl<'a> Runner<'a> {
                     .cancel(&published, "the candidate was discarded");
                 return Ok(stopped(true, None));
             }
+            // After a stop decision a refused job is never re-leased: cancel
+            // it here instead of waiting for another donor attempt. Rooted
+            // jobs are detached, not cancelled (their green may be kept).
+            if self.stopping.load(Ordering::Relaxed) && !job.rooted {
+                let _ = donors.store.cancel(&published, "the run is stopping");
+                return Ok(stopped(true, None));
+            }
             let record = donors.store.get(&published)?;
             for entry in record.could_not_run.iter().skip(could_not_run) {
                 // No verdict: the job is queued again; the operator should look at that donor.
@@ -4101,7 +4141,7 @@ impl<'a> Runner<'a> {
             }
         }
         if !stop.is_empty() {
-            self.event("stopped", &stop);
+            self.log_stopped(&stop, &[]);
         }
         if self.options.widen && stop.is_empty() {
             if self.simulating() {
@@ -5793,7 +5833,14 @@ impl<'a> Runner<'a> {
                                 pending.push_front(prs);
                             }
                             BatchOutcome::Stop(reason, prs) => {
-                                discard(&mut flights, &rx, pending);
+                                // Log the stop at once, before waiting on
+                                // anything, then cancel/detach the rest.
+                                let waiting: Vec<Vec<i64>> = flights
+                                    .iter()
+                                    .map(|flight| flight.candidate.prs.clone())
+                                    .collect();
+                                self.log_stopped(&reason, &waiting);
+                                discard_detached(&mut flights, pending);
                                 if !prs.is_empty() {
                                     pending.push_front(prs);
                                 }
@@ -5834,8 +5881,9 @@ impl<'a> Runner<'a> {
                     }
                 }
             })();
-            if result.is_err() {
-                discard(&mut flights, &rx, pending);
+            if let Err(error) = &result {
+                self.log_stopped(error, &[]);
+                discard_detached(&mut flights, pending);
             }
             result
         })
@@ -7147,15 +7195,56 @@ fn stack_top(flights: &VecDeque<Flight>) -> Option<&Flight> {
     flights.iter().rev().find(|flight| flight.stacked)
 }
 
-/// Whether a push failure is a transient remote-side rejection worth retrying:
-/// a remote fault or a dropped connection, never a non-fast-forward (the base
-/// moved; the batch rebuilds instead) and never a plain local refusal.
-fn transient_push_error(error: &str) -> bool {
+/// How a landing-push failure should be treated: one classifier for every
+/// push failure, so the transient retry and the permanent rule-violation
+/// handling can never disagree about the same message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PushFailure {
+    /// A remote fault, dropped connection or SSH/proxy transport error:
+    /// retry with `push_retries` and backoff; the change is not at fault.
+    Transient,
+    /// A repository rule forbids this candidate on this branch: never
+    /// retried, for this candidate or in a later run.
+    Permanent,
+    /// Neither: no retry; the run stops and a human looks.
+    Unknown,
+}
+
+/// SSH/proxy transport markers in a push failure: the push never reached a
+/// remote that could judge the change.
+const SSH_TRANSPORT_MARKERS: [&str; 6] = [
+    "kex_exchange_identification",
+    "banner exchange",
+    "connection to unknown port",
+    "ssh: connect to host",
+    "connection closed by remote host",
+    "connection reset by peer",
+];
+
+/// Classify a landing-push failure (see [`PushFailure`]). Permanent is
+/// checked first, so a rule violation wrapped in transport noise is still
+/// permanent; a non-fast-forward is `Unknown` here (the landing path checks
+/// the moved base before it classifies).
+pub fn classify_push(error: &str) -> PushFailure {
     let lower = error.to_lowercase();
-    if lower.contains("non-fast-forward") || lower.contains("non fast forward") {
-        return false;
+    if lower.contains("gh013")
+        || lower.contains("repository rule violations")
+        || lower.contains("push declined due to repository rule violations")
+    {
+        return PushFailure::Permanent;
     }
-    [
+    if lower.contains("non-fast-forward") || lower.contains("non fast forward") {
+        return PushFailure::Unknown;
+    }
+    let transport = SSH_TRANSPORT_MARKERS
+        .iter()
+        .any(|needle| lower.contains(needle));
+    // `Could not read from remote repository` is a transport failure only
+    // when an SSH/proxy error precedes it; alone it can be a plain refusal.
+    if transport && lower.contains("could not read from remote repository") {
+        return PushFailure::Transient;
+    }
+    if [
         "fatal error in commit_refs",
         "remote rejected",
         "connection reset",
@@ -7173,6 +7262,50 @@ fn transient_push_error(error: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+        || transport
+    {
+        return PushFailure::Transient;
+    }
+    PushFailure::Unknown
+}
+
+/// The repository-rule line a permanent push failure quotes, for an ejection
+/// or hold reason: the specific violated rule when the output names one,
+/// else the GH013 / rule-violations header.
+pub fn push_rule_line(error: &str) -> Option<String> {
+    let clean = |line: &str| {
+        line.trim_start_matches("remote:")
+            .trim()
+            .trim_start_matches("error:")
+            .trim()
+            .trim_start_matches("- ")
+            .trim()
+            .to_owned()
+    };
+    for needle in ["must not contain merge commits", "required_linear_history"] {
+        if let Some(line) = error
+            .lines()
+            .map(str::trim)
+            .find(|line| line.to_lowercase().contains(needle))
+        {
+            return Some(clean(line));
+        }
+    }
+    error
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("repository rule violations") || lower.contains("gh013")
+        })
+        .map(clean)
+}
+
+/// Whether a push failure is a transient remote-side rejection worth retrying:
+/// a remote fault or a dropped connection, never a non-fast-forward (the base
+/// moved; the batch rebuilds instead) and never a plain local refusal.
+fn transient_push_error(error: &str) -> bool {
+    classify_push(error) == PushFailure::Transient
 }
 
 /// Whether a rooted batch may be decided now: every batch it jumped over (in
@@ -7258,6 +7391,31 @@ fn cut_after(
         pending.push_front(flight.candidate.prs);
     }
     flights.extend(roots);
+}
+
+/// Detached form of [`discard`] for a stop decision: cancel the dropped
+/// batches and return at once instead of waiting for the slowest one to
+/// report. Their validation records are already in the report (written by
+/// `validate_one`), so a green that finishes later is still kept; the
+/// pipeline's thread scope joins the threads, whose runners answer their
+/// cancel flags promptly. Rooted flights are kept as in [`discard`].
+fn discard_detached(flights: &mut VecDeque<Flight>, pending: &mut VecDeque<Vec<i64>>) {
+    let mut kept: VecDeque<Flight> = VecDeque::new();
+    let mut dropped: Vec<Flight> = Vec::new();
+    while let Some(flight) = flights.pop_front() {
+        if flight.rooted {
+            kept.push_back(flight);
+        } else {
+            dropped.push(flight);
+        }
+    }
+    for flight in &dropped {
+        flight.cancel.store(true, Ordering::Relaxed);
+    }
+    for flight in dropped.into_iter().rev() {
+        pending.push_front(flight.candidate.prs);
+    }
+    flights.append(&mut kept);
 }
 
 fn discard(
@@ -7843,6 +8001,47 @@ mod unit {
             "! [remote rejected] main -> main (non-fast-forward)"
         ));
         assert!(!transient_push_error("permission denied"));
+    }
+
+    #[test]
+    fn push_classifier_names_each_message_family() {
+        // Transient: remote faults and SSH/proxy transport errors.
+        for error in [
+            "remote: fatal error in commit_refs while verifying commit graph",
+            "error: RPC failed; HTTP 503",
+            "kex_exchange_identification: banner line contains invalid characters",
+            "banner exchange: Connection to UNKNOWN port 65535: invalid format",
+            "ssh: connect to host github.com port 22: Connection timed out",
+            "Connection closed by remote host",
+            "kex_exchange_identification: banner exchange: fatal: Could not read from remote repository.",
+        ] {
+            assert_eq!(classify_push(error), PushFailure::Transient, "{error}");
+            assert!(transient_push_error(error), "{error}");
+        }
+        // Permanent: repository rule violations, even with transport noise.
+        for error in [
+            "remote: error: GH013: Repository rule violations found for refs/heads/main",
+            "! [remote rejected] main (push declined due to repository rule violations)",
+            "GH013 banner exchange: Repository rule violations",
+        ] {
+            assert_eq!(classify_push(error), PushFailure::Permanent, "{error}");
+            assert!(!transient_push_error(error), "{error}");
+        }
+        assert_eq!(
+            push_rule_line(
+                "remote: error: GH013: Repository rule violations found\nremote: - This branch must not contain merge commits. Found 1 violation"
+            )
+            .as_deref(),
+            Some("This branch must not contain merge commits. Found 1 violation")
+        );
+        // Unknown: no retry, no blame.
+        for error in [
+            "! [remote rejected] main -> main (non-fast-forward)",
+            "permission denied",
+            "fatal: Could not read from remote repository.",
+        ] {
+            assert_eq!(classify_push(error), PushFailure::Unknown, "{error}");
+        }
     }
 
     #[test]

@@ -162,6 +162,92 @@ fn a_persistent_transient_rejection_keeps_the_greens_for_the_next_run() {
 }
 
 #[test]
+fn an_ssh_banner_push_failure_is_transient_and_lands_on_the_retry() {
+    let (fx, validated, pushes) = setup("push-retry-ssh");
+    set_wrapper(
+        &fx,
+        format!(
+            r#"for a in "$@"; do if [ "$a" = push ]; then echo push >> '{p}'; n=$(wc -l < '{p}'); if [ $n -le 1 ]; then echo 'kex_exchange_identification: banner line contains invalid characters' >&2; echo 'banner exchange: Connection to UNKNOWN port 65535: invalid format' >&2; echo 'fatal: Could not read from remote repository.' >&2; exit 128; fi; fi; done; exec "$@""#,
+            p = pushes.display()
+        ),
+    );
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let out = fx.mq(&["run"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(status(&fx, 1), "landed");
+    assert_eq!(
+        count(&validated),
+        1,
+        "validated once, landed on the push retry"
+    );
+    assert_eq!(count(&pushes), 2, "one SSH banner failure, one retry");
+    let events = latest_events(&fx);
+    assert!(
+        events.lines().any(|line| {
+            let event: Value = serde_json::from_str(line).unwrap();
+            event["kind"] == "push-retry"
+        }),
+        "{events}"
+    );
+}
+
+#[test]
+fn a_head_stop_logs_at_once_and_detaches_the_in_flight_validation() {
+    // Head validates fast and its push is refused for good (unknown, not
+    // transient); the second batch validates slowly beside it. The run must
+    // log `stopped` at the decision and end without waiting out the slow
+    // validation.
+    let fx = Fixture::new("push-stop-detach");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    let validated = fx.root.join("validated");
+    let validator = format!(
+        "echo run >> '{}'; if [ -f tests/slow ]; then sleep 30; fi; exit 0",
+        validated.display()
+    );
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        &validator,
+        "--max-batch",
+        "1",
+        "--depth",
+        "2",
+    ]);
+    set_wrapper(
+        &fx,
+        r#"for a in "$@"; do if [ "$a" = push ]; then echo 'permission denied' >&2; exit 1; fi; done; exec "$@""#.to_owned(),
+    );
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/slow", "slow\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    let started = std::time::Instant::now();
+    let out = fx.mq(&["run"]);
+    let elapsed = started.elapsed();
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(25),
+        "run parked behind the slow validation for {elapsed:?}"
+    );
+    let events = latest_events(&fx);
+    let stopped_at = events
+        .lines()
+        .position(|line| serde_json::from_str::<Value>(line).is_ok_and(|e| e["kind"] == "stopped"))
+        .expect("a stopped event at the stop decision");
+    assert!(stopped_at < events.lines().count(), "{events}");
+    assert_eq!(status(&fx, 1), "queued");
+    assert_eq!(status(&fx, 2), "queued");
+    let _ = count(&validated);
+}
+
+#[test]
 fn a_non_fast_forward_push_still_rebuilds_on_the_moved_base() {
     let (fx, validated, pushes) = setup("push-retry-non-ff");
     set_wrapper(

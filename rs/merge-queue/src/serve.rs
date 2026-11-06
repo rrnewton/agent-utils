@@ -177,6 +177,10 @@ pub struct Heartbeat {
     /// remedy, and the heartbeat is kept fresh while they run.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub applying_intakes: usize,
+    /// `stopping: <reason>; waiting for ...` while a run is parked after a
+    /// stop decision; empty otherwise. `status` shows it verbatim.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stopping: String,
 }
 
 impl Heartbeat {
@@ -210,6 +214,7 @@ impl Heartbeat {
             sync_error: String::new(),
             sync_started_at: String::new(),
             applying_intakes: 0,
+            stopping: String::new(),
         }
     }
 
@@ -865,6 +870,7 @@ fn refresh_heartbeat(
     shared: &Mutex<Heartbeat>,
     done: &AtomicBool,
     window: &Mutex<Vec<Vec<i64>>>,
+    stopping: &Mutex<String>,
 ) {
     let mut last = Instant::now();
     while !done.load(Ordering::SeqCst) {
@@ -876,10 +882,15 @@ fn refresh_heartbeat(
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
+            let stopping = stopping
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
             let mut heartbeat = lock_heartbeat(shared);
             heartbeat.slots_total = total;
             heartbeat.slots_in_use = in_use;
             heartbeat.active_batches = batches;
+            heartbeat.stopping = stopping;
             heartbeat.touch();
             let _ = write_heartbeat(state, &heartbeat);
         }
@@ -893,6 +904,7 @@ fn run_cycle(
     options: &ServeOptions,
     shared: &Mutex<Heartbeat>,
     window: &Arc<Mutex<Vec<Vec<i64>>>>,
+    stopping: &Arc<Mutex<String>>,
     writer: &crate::state::Lock,
 ) -> bool {
     // The heartbeat's window is what the run publishes as it builds and decides batches (see
@@ -905,6 +917,7 @@ fn run_cycle(
         offload: options.offload.clone(),
         drain_pid: Some(std::process::id()),
         window: Some(Arc::clone(window)),
+        stopping: Some(Arc::clone(stopping)),
         // A run in progress looks for recorded requests as often as the daemon polls.
         intake_poll: Some(options.poll),
         ..RunOptions::default()
@@ -1054,16 +1067,18 @@ fn work_cycle(
     let shared = Mutex::new(heartbeat.clone());
     let done = AtomicBool::new(false);
     let window = Arc::new(Mutex::new(Vec::new()));
+    let stopping = Arc::new(Mutex::new(String::new()));
     let clean = std::thread::scope(|scope| {
-        scope.spawn(|| refresh_heartbeat(state, &shared, &done, &window));
+        scope.spawn(|| refresh_heartbeat(state, &shared, &done, &window, &stopping));
         let _stop = SetOnDrop(&done);
-        run_cycle(state, options, &shared, &window, writer)
+        run_cycle(state, options, &shared, &window, &stopping, writer)
     });
     *heartbeat = shared.into_inner().unwrap_or_else(PoisonError::into_inner);
     heartbeat.state = "idle".to_owned();
     heartbeat.working_since.clear();
     heartbeat.working_since_unix = 0;
     heartbeat.active_batches.clear();
+    heartbeat.stopping.clear();
     clean
 }
 
@@ -1100,8 +1115,9 @@ fn apply_intake_fresh(
     let shared = Mutex::new(heartbeat.clone());
     let done = AtomicBool::new(false);
     let window = Arc::new(Mutex::new(Vec::new()));
+    let stopping = Arc::new(Mutex::new(String::new()));
     std::thread::scope(|scope| {
-        scope.spawn(|| refresh_heartbeat(state, &shared, &done, &window));
+        scope.spawn(|| refresh_heartbeat(state, &shared, &done, &window, &stopping));
         let _stop = SetOnDrop(&done);
         apply_intake(state, config, lock);
     });
@@ -1886,6 +1902,9 @@ pub fn render_status(report: &StatusReport) -> String {
                 } else {
                     "  mode: live\n"
                 });
+                if !h.stopping.is_empty() {
+                    out.push_str(&format!("  {}\n", h.stopping));
+                }
                 if let Some(request) = &report.drain {
                     out.push_str(&if Some(request.pid) == report.pid {
                         format!(

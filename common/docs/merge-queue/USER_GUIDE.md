@@ -1559,9 +1559,12 @@ for its own changes only.
 
 - **`push`.** The remote base is fast-forwarded to the exact validated candidate with a plain
   (non-force) push. A non-fast-forward rejection means the base moved: the batch is rebuilt on
-  the new base and validated again. A transient remote-side rejection instead (a remote fault
-  such as a `commit_refs` failure, a 5xx, or a dropped connection: anything that is not a
-  non-fast-forward) is retried with bounded backoff (`land.push_max_retries` extra attempts,
+  the new base and validated again. Push failures are classified once, as transient, permanent
+  or unknown. A transient remote-side rejection (a remote fault such as a `commit_refs`
+  failure, a 5xx, a dropped connection, or an SSH/proxy transport error —
+  `kex_exchange_identification`, `banner exchange`, `Connection to UNKNOWN port`,
+  `ssh: connect to host`, or `Could not read from remote repository` after one of those) is
+  retried with bounded backoff (`land.push_max_retries` extra attempts,
   `land.push_retry_backoff_secs` doubled per retry; with the defaults, three tries span about
   two minutes), and the base is checked after every attempt. After the push, the queue fetches
   the base and requires it to equal the candidate. For a local repository (`--remote ''`) the
@@ -1573,6 +1576,12 @@ for its own changes only.
   has not moved under it: every change is still queued at the validated head, the candidate
   rebuilt on the current base has exactly the validated tree, and the selection is the
   validated one. A kept batch that no longer matches is dropped and validated as usual.
+
+  A stop decision is recorded at once: the run writes its `stopped` event before it waits on
+  anything, cancels or detaches the validations still in flight (a green that finishes later
+  is still kept, above), and never re-leases a donor job that was refused after the decision.
+  While it is parked that way, `status` and the serve heartbeat show
+  `stopping: <reason>; waiting for <batches> to return`.
 - **`command`.** The template runs once per change, in order, in the repository directory, with:
 
   | Variable | Value |

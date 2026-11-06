@@ -2599,6 +2599,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     drain_pid: None,
                     // A one-shot run reports its own progress; no heartbeat shows a window.
                     window: None,
+                    stopping: None,
                     intake_poll: None,
                     // Its process ends with it: it waits for the work it left beside it.
                     wait_for_background: true,
