@@ -4011,6 +4011,12 @@ fn lock_target_with(
 /// file while a sender waits on it. A sender that then took the lock would hold a file no
 /// other process can open, while the next sender locked a fresh file at the same path; the
 /// check after locking sends it back to contend on the file that is there.
+/// How often taking a target lock refreshes the file's modification time: the
+/// `/tmp` cleaner works in days, so an hourly refresh protects exactly as well
+/// as one per acquisition did, without a timestamp write (and its filesystem
+/// journal) on every delivery attempt of a busy watcher (#932).
+const TARGET_LOCK_MTIME_REFRESH: Duration = Duration::from_secs(60 * 60);
+
 fn lock_current_file(
     path: &Path,
     purpose: &str,
@@ -4024,8 +4030,16 @@ fn lock_current_file(
             .map_err(|error| io_error(&format!("inspect {purpose}"), path, error))?;
         match fs::symlink_metadata(path) {
             Ok(current) if current.dev() == held.dev() && current.ino() == held.ino() => {
-                file.set_modified(SystemTime::now())
-                    .map_err(|error| io_error(&format!("mark {purpose} used"), path, error))?;
+                let fresh = held
+                    .modified()
+                    .ok()
+                    .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                    .is_some_and(|age| age < TARGET_LOCK_MTIME_REFRESH);
+                if !fresh {
+                    file.set_modified(SystemTime::now()).map_err(|error| {
+                        io_error(&format!("mark {purpose} used"), path, error)
+                    })?;
+                }
                 return Ok(file);
             }
             Ok(_) => {}
@@ -7103,6 +7117,55 @@ mod tests {
         assert_eq!(
             (current.dev(), current.ino()),
             (metadata.dev(), metadata.ino())
+        );
+    }
+
+    #[test]
+    fn a_target_lock_refresh_only_touches_a_stale_mtime() {
+        // #932: setting the time on every acquisition made each delivery attempt
+        // a timestamp write; the cleaner works in days, so an hourly cadence
+        // protects identically.
+        let directory = TestDirectory::new("throttled-target-lock");
+        let path = directory.path().join("fresh.lock");
+        let age = |when: SystemTime| {
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(0)
+                .open(&path)
+                .and_then(|file| file.set_modified(when))
+                .expect("set lock file time");
+        };
+        age(SystemTime::now() - TARGET_LOCK_MTIME_REFRESH * 2);
+        let held = lock_current_file(&path, "test target lock", &mut |file, path| {
+            FileExt::lock_exclusive(file).map_err(|error| io_error("lock", path, error))
+        })
+        .expect("lock a stale file");
+        let after_stale = fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .expect("mtime");
+        assert!(
+            SystemTime::now().duration_since(after_stale).expect("age") < Duration::from_secs(60),
+            "a stale lock file was not refreshed on acquisition"
+        );
+        drop(held);
+        let half_hour_ago = SystemTime::now() - Duration::from_secs(30 * 60);
+        age(half_hour_ago);
+        let _held = lock_current_file(&path, "test target lock", &mut |file, path| {
+            FileExt::lock_exclusive(file).map_err(|error| io_error("lock", path, error))
+        })
+        .expect("lock a fresh file");
+        let after_fresh = fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .expect("mtime");
+        let drift = after_fresh
+            .duration_since(half_hour_ago)
+            .unwrap_or(Duration::ZERO);
+        assert!(
+            drift < Duration::from_secs(60),
+            "a recently refreshed lock file was touched again: drift {drift:?}"
         );
     }
 

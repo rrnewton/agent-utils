@@ -33,6 +33,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -4350,6 +4351,25 @@ fn load_state(path: &Path) -> WatchState {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
+/// What this watch thread has spent publishing JSON files, for the watch
+/// report's `write_churn` counters (#932): device writes are dominated by
+/// rewrites of files whose content mostly did not change, so identical
+/// rewrites are now skipped and counted here beside the ones that did happen.
+/// Thread-local: one watcher runs per process, and unit tests get their own.
+thread_local! {
+    pub(crate) static WRITE_BYTES: AtomicU64 = const { AtomicU64::new(0) };
+    pub(crate) static FILES_REWRITTEN: AtomicU64 = const { AtomicU64::new(0) };
+    pub(crate) static FILES_SKIPPED: AtomicU64 = const { AtomicU64::new(0) };
+}
+
+pub(crate) fn write_counts() -> (u64, u64, u64) {
+    (
+        WRITE_BYTES.with(|value| value.load(Ordering::Relaxed)),
+        FILES_REWRITTEN.with(|value| value.load(Ordering::Relaxed)),
+        FILES_SKIPPED.with(|value| value.load(Ordering::Relaxed)),
+    )
+}
+
 fn write_json_file(path: &Path, value: &Value) -> Result<()> {
     let directory = path
         .parent()
@@ -4359,6 +4379,14 @@ fn write_json_file(path: &Path, value: &Value) -> Result<()> {
         .mode(0o700)
         .create(directory)
         .map_err(|error| fail(format!("cannot create {}: {error}", directory.display())))?;
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| fail(error.to_string()))?;
+    bytes.push(b'\n');
+    // Skip the whole tempfile + rename + fsync publication when nothing changed:
+    // on this host each such rewrite costs far more device write than its bytes.
+    if fs::read(path).is_ok_and(|existing| existing == bytes) {
+        FILES_SKIPPED.with(|value| value.fetch_add(1, Ordering::Relaxed));
+        return Ok(());
+    }
     let temporary = directory.join(format!(
         ".{}.{}.tmp",
         path.file_name()
@@ -4366,8 +4394,6 @@ fn write_json_file(path: &Path, value: &Value) -> Result<()> {
             .unwrap_or("agent-watch"),
         std::process::id()
     ));
-    let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| fail(error.to_string()))?;
-    bytes.push(b'\n');
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -4379,6 +4405,8 @@ fn write_json_file(path: &Path, value: &Value) -> Result<()> {
         .map_err(|error| fail(format!("cannot write {}: {error}", temporary.display())))?;
     fs::rename(&temporary, path)
         .map_err(|error| fail(format!("cannot publish {}: {error}", path.display())))?;
+    WRITE_BYTES.with(|value| value.fetch_add(bytes.len() as u64, Ordering::Relaxed));
+    FILES_REWRITTEN.with(|value| value.fetch_add(1, Ordering::Relaxed));
     crate::agent::sync_directory(directory)
 }
 
@@ -4423,6 +4451,9 @@ pub fn watch_agents(
         .as_ref()
         .map(|(state_path, _)| load_state(state_path))
         .unwrap_or_default();
+    // Episode rows already written to the log, as (agent, kind, detail, owed)
+    // signatures, so an unchanged episode is logged once, not on every pass (#932).
+    let mut logged_episodes: BTreeMap<(String, String, String, bool), ()> = BTreeMap::new();
     loop {
         let now = clock.now();
         let mut session_follows = Vec::new();
@@ -4439,6 +4470,16 @@ pub fn watch_agents(
         }
         let mut report = watch_agents_once(probe, notifier, &mut state, now, options);
         report["session_follow"] = json!(session_follows);
+        // Write churn of this watch process (#932): a spike in device writes
+        // should be visible here rather than only in the unit's IO totals.
+        {
+            let (bytes, rewritten, skipped) = write_counts();
+            report["write_churn"] = json!({
+                "bytes_written": bytes,
+                "files_rewritten": rewritten,
+                "files_skipped_unchanged": skipped,
+            });
+        }
         if !options.check_only {
             report["recovery"] = recover_due(&report, notifier, now, options)?;
         }
@@ -4466,6 +4507,18 @@ pub fn watch_agents(
             } else {
                 continue;
             };
+            // Log each unchanged episode once: the same child-done or stalled
+            // line re-logged on every ~62 s pass was steady log churn (#932).
+            // A change in kind, detail or owed state logs again.
+            let signature = (
+                row["agent"].as_str().unwrap_or("?").to_string(),
+                row["kind"].as_str().unwrap_or("?").to_string(),
+                row["detail"].as_str().unwrap_or("").to_string(),
+                row["owed"] == true,
+            );
+            if logged_episodes.insert(signature, ()).is_some() {
+                continue;
+            }
             log(format_args!(
                 "{} {}: {}{state}",
                 row["agent"].as_str().unwrap_or("?"),
@@ -5808,6 +5861,43 @@ mod tests {
             notice_fallback: Vec::new(),
             standing: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_unchanged_json_write_is_skipped_and_counted() {
+        // #932: republishing identical bytes must not touch the file at all —
+        // each temp+rename+fsync costs far more device write than the bytes.
+        let directory = std::env::temp_dir().join(format!(
+            "agent-watch-json-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("temp dir");
+        let path = directory.join("state.json");
+        let value = json!({"agents": {"one": {"reported": true}}});
+        let (bytes0, rewritten0, skipped0) = write_counts();
+        write_json_file(&path, &value).expect("first write");
+        assert!(path.is_file());
+        let mtime = fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .expect("mtime");
+        write_json_file(&path, &value).expect("identical write");
+        let (bytes1, rewritten1, skipped1) = write_counts();
+        let mtime_after = fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .expect("mtime after");
+        assert_eq!(mtime, mtime_after, "identical rewrite touched the file");
+        assert_eq!(skipped1, skipped0 + 1);
+        assert_eq!(rewritten1, rewritten0 + 1);
+        assert!(bytes1 > bytes0, "the changed write is counted in bytes");
+        write_json_file(&path, &json!({"agents": {}})).expect("changed write");
+        let (_, rewritten2, skipped2) = write_counts();
+        assert_eq!(rewritten2, rewritten1 + 1, "a real change rewrites exactly once");
+        assert_eq!(skipped2, skipped1, "a real change is not a skip");
+        fs::remove_dir_all(&directory).expect("cleanup");
     }
 
     fn observation(name: &str, status: &str, screen: Option<&str>) -> Observation {
