@@ -751,6 +751,19 @@ fn stopped_artifact(registry: &Path, journal: &Journal) -> Result<(AgentRecord, 
     Ok((record, bytes))
 }
 
+/// Whether a directory read now is the directory a revive journal pinned.
+///
+/// Only the inode is compared: `st_dev` is not stable for the same filesystem
+/// across a reboot or remount (btrfs assigns anonymous device numbers per
+/// mount), so a journal written before a reboot otherwise never matches the
+/// directory it pinned and every revive in the registry is refused. The
+/// journal comparisons that use this helper also pin the generation token
+/// and the SHA-256 of the record bytes, so an inode collision on a different
+/// filesystem cannot stand in for the pinned generation.
+fn same_journal_directory(inode: u64, journal_inode: u64) -> bool {
+    inode == journal_inode
+}
+
 /// Pending generations reserve their old and staged anchors even after a failed launch.
 pub(super) fn pending_claim_records(registry: &Path) -> Result<Vec<AgentRecord>> {
     let mut result = Vec::new();
@@ -773,8 +786,7 @@ pub(super) fn pending_claim_records(registry: &Path) -> Result<Vec<AgentRecord>>
         let (old_directory, old, old_bytes) = read_record_at(&old_path, &journal.name)?;
         let old_digest = digest(&old_bytes);
         if old.token != journal.old_token
-            || (old_directory.device, old_directory.inode)
-                != (journal.old_directory_device, journal.old_directory_inode)
+            || !same_journal_directory(old_directory.inode, journal.old_directory_inode)
             || ![
                 journal.old_record_sha256.as_str(),
                 journal.stopped_record_sha256.as_str(),
@@ -797,8 +809,7 @@ pub(super) fn pending_claim_records(registry: &Path) -> Result<Vec<AgentRecord>>
             Ok(_) => candidate,
         };
         let (pinned, record, bytes) = read_record_at(&candidate, &journal.name)?;
-        if (pinned.device, pinned.inode)
-            != (journal.new_directory_device, journal.new_directory_inode)
+        if !same_journal_directory(pinned.inode, journal.new_directory_inode)
             || record.token != journal.new_token
             || journal
                 .ready_record_sha256
@@ -1754,8 +1765,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 .as_ref()
                 .filter(|(_, record, _)| record.token == journal.old_token)
             {
-                if (pinned.device, pinned.inode)
-                    != (journal.old_directory_device, journal.old_directory_inode)
+                if !same_journal_directory(pinned.inode, journal.old_directory_inode)
                     || ![
                         journal.old_record_sha256.as_str(),
                         journal.stopped_record_sha256.as_str(),
@@ -1788,8 +1798,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 let (pinned, archived, bytes) = read_record_at(&archive_path, &journal.name)?;
                 if archived.token != journal.old_token
                     || bytes != stopped
-                    || (pinned.device, pinned.inode)
-                        != (journal.old_directory_device, journal.old_directory_inode)
+                    || !same_journal_directory(pinned.inode, journal.old_directory_inode)
                 {
                     return Err(fail(
                         "revive archive does not contain the exact old generation",
@@ -1806,8 +1815,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 })?
             };
             if candidate.token != journal.new_token
-                || (candidate_directory.device, candidate_directory.inode)
-                    != (journal.new_directory_device, journal.new_directory_inode)
+                || !same_journal_directory(candidate_directory.inode, journal.new_directory_inode)
             {
                 return Err(fail("retained revive candidate generation changed"));
             }
@@ -2699,8 +2707,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         if !already_published {
             let (staged, mut candidate, mut staged_bytes) =
                 read_record_at(&stage_path, &journal.name)?;
-            if (staged.device, staged.inode)
-                != (journal.new_directory_device, journal.new_directory_inode)
+            if !same_journal_directory(staged.inode, journal.new_directory_inode)
                 || candidate.token != journal.new_token
             {
                 return Err(fail("staged revive generation changed"));
@@ -2736,8 +2743,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             }
             if let Some((pinned, record, bytes)) = active {
                 if record.token != journal.old_token
-                    || (pinned.device, pinned.inode)
-                        != (journal.old_directory_device, journal.old_directory_inode)
+                    || !same_journal_directory(pinned.inode, journal.old_directory_inode)
                 {
                     return Err(fail(
                         "active agent generation changed before revive publication",
@@ -2797,8 +2803,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 let (archived, record, bytes) = read_record_at(&archive_path, &journal.name)?;
                 if record.token != journal.old_token
                     || bytes != stopped
-                    || (archived.device, archived.inode)
-                        != (journal.old_directory_device, journal.old_directory_inode)
+                    || !same_journal_directory(archived.inode, journal.old_directory_inode)
                 {
                     return Err(fail(
                         "revive archive does not contain the proved old generation",
@@ -2815,8 +2820,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         }
         let (active, mut candidate, bytes) = read_record_at(&active_path, &journal.name)?;
         if candidate.token != journal.new_token
-            || (active.device, active.inode)
-                != (journal.new_directory_device, journal.new_directory_inode)
+            || !same_journal_directory(active.inode, journal.new_directory_inode)
             || journal.ready_record_sha256.as_deref() != Some(&digest(&bytes))
         {
             return Err(fail("published revive generation changed"));
@@ -2825,8 +2829,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             read_record_at(&archive_path, &journal.name)?;
         if archived_record.token != journal.old_token
             || archive_bytes != stopped
-            || (archived.device, archived.inode)
-                != (journal.old_directory_device, journal.old_directory_inode)
+            || !same_journal_directory(archived.inode, journal.old_directory_inode)
         {
             return Err(fail("published revive has no exact stopped archive"));
         }
@@ -3162,7 +3165,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         if candidate.exists() {
             let (pin, candidate, _) = read_record_at(&candidate, &record.name)?;
             if candidate.token != journal.new_token
-                || pin.device != journal.new_directory_device
+                || !same_journal_directory(pin.inode, journal.new_directory_inode)
                 || pin.inode != journal.new_directory_inode
             {
                 return Err(fail("revive candidate generation or directory changed"));
