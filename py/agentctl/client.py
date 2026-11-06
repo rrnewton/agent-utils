@@ -23,6 +23,7 @@ from typing import Literal, Protocol
 
 from agentctl.errors import HerdrUnavailable, InputExpectationFailed
 from agentctl.jsonx import as_mapping, as_sequence, get_int, get_str, opt_str
+from agentctl.pidns import PidNamespaceView, Translation, TranslationRefused, translate
 from agentctl.procstat import ProcessStat, parse_process_stat
 from agentctl.submission import (
     SCREEN_LINES as SUBMISSION_SCREEN_LINES,
@@ -782,8 +783,12 @@ class HerdrClient:
         run: Runner | None = None,
         environ: Mapping[str, str] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        pid_namespace: PidNamespaceView | None = None,
     ) -> None:
         self._bin = herdr_bin
+        # Herdr reports process IDs in the server's PID namespace. ``None`` probes the
+        # real server once, on first use; injected protocol fakes are local by default.
+        self._pid_namespace = pid_namespace
         # Injected runners are protocol fakes and intentionally receive the literal configured
         # command.  Production calls pin the executable to one canonical absolute path before
         # invoking the public control interface.
@@ -2276,8 +2281,71 @@ class HerdrClient:
             return False
         return True
 
+    def pid_namespace(self) -> PidNamespaceView:
+        """Where the server's process IDs live, probed once per client.
+
+        A server outside this PID namespace (for example, on the host while this
+        manager runs in a container) reports numbers that name unrelated local
+        processes; ``process_info`` then translates or refuses.
+        """
+        if self._pid_namespace is None:
+            if not self._production_runner:
+                self._pid_namespace = PidNamespaceView(foreign=False)
+            else:
+                try:
+                    path = self.event_socket()
+                except HerdrUnavailable:
+                    return PidNamespaceView(foreign=False)
+                self._pid_namespace = PidNamespaceView.probe(path)
+        return self._pid_namespace
+
+    def _translate(
+        self, pane_id: str, raw: AgentPaneInfo,
+        argvs: tuple[tuple[str, ...], ...] | None = None,
+    ) -> Translation:
+        """Map a foreign-namespace pane onto local processes, or raise ``TranslationRefused``."""
+        view = self.pid_namespace()
+        if argvs is None:
+            argvs = self._reported_process_info(pane_id)[1]
+        return translate(
+            reported_foreground=argvs, session_agent=raw.session_agent,
+            session_value=raw.session_value, container_id=view.container_id,
+            table=view.table,
+        )
+
     def pane_info(self, pane_id: str) -> AgentPaneInfo:
-        """Return validated identity/readiness data for an interactive pane."""
+        """Return validated identity/readiness data for an interactive pane.
+
+        For a pane translated out of a foreign PID namespace, ``cwd`` is the local
+        foreground leader's working directory, and an undetected agent is reported as
+        the native session's harness when that harness is the local foreground.
+        """
+        raw = self._raw_pane_info(pane_id)
+        if not self.pid_namespace().foreign:
+            return raw
+        try:
+            translation = self._translate(pane_id, raw)
+        except TranslationRefused:
+            return raw
+        agent_kind = raw.agent
+        harness_name = os.path.basename(
+            (translation.harness_executable or "").removesuffix(" (deleted)")
+        )
+        if (agent_kind is None and raw.session_agent is not None
+                and harness_name == raw.session_agent
+                and any(entry[0] == translation.harness_pid
+                        for entry in translation.foreground)):
+            agent_kind = raw.session_agent
+        return AgentPaneInfo(
+            pane_id=raw.pane_id, workspace_id=raw.workspace_id,
+            cwd=raw.cwd if translation.cwd is None else translation.cwd,
+            agent=agent_kind, status=raw.status, session_agent=raw.session_agent,
+            session_value=raw.session_value, terminal_id=raw.terminal_id,
+            tab_id=raw.tab_id,
+        )
+
+    def _raw_pane_info(self, pane_id: str) -> AgentPaneInfo:
+        """``pane get`` exactly as the server reported it."""
         result = self._call(["pane", "get", pane_id], f"pane get {pane_id}")
         try:
             pane = as_mapping(result.get("pane"), "pane get")
@@ -2361,13 +2429,40 @@ class HerdrClient:
             raise HerdrUnavailable(f"invalid Herdr server status: {exc}") from exc
 
     def process_info(self, pane_id: str) -> ProcessInfo:
-        """The pane's live shell pid and foreground process group — the readiness signal."""
+        """The pane's live shell pid and foreground process group — the readiness signal.
+
+        Process IDs are always local. When the server is in another PID namespace the
+        pane is translated (see ``agentctl.pidns``); a pane that cannot be translated
+        raises ``HerdrUnavailable`` instead of returning numbers that name unrelated
+        local processes.
+        """
+        reported, argvs = self._reported_process_info(pane_id)
+        if not self.pid_namespace().foreign:
+            return reported
+        try:
+            translation = self._translate(pane_id, self._raw_pane_info(pane_id), argvs)
+        except TranslationRefused as exc:
+            raise HerdrUnavailable(
+                f"pane {pane_id} runs outside this PID namespace and cannot be mapped "
+                f"onto local processes: {exc}"
+            ) from exc
+        return ProcessInfo(
+            pane_id=pane_id, shell_pid=translation.shell_pid,
+            foreground_pgid=translation.foreground_pgid,
+            foreground=translation.foreground,
+        )
+
+    def _reported_process_info(
+        self, pane_id: str,
+    ) -> tuple[ProcessInfo, tuple[tuple[str, ...], ...]]:
+        """``pane process-info`` in the server's namespace, with each foreground argv."""
         result = self._call(
             ["pane", "process-info", "--pane", pane_id], f"pane process-info {pane_id}"
         )
         try:
             info = as_mapping(result.get("process_info"), "pane process-info")
             foreground: list[tuple[int, str, str, str, str | None]] = []
+            argvs: list[tuple[str, ...]] = []
             for entry in as_sequence(
                 info.get("foreground_processes"), "foreground_processes"
             ):
@@ -2379,6 +2474,7 @@ class HerdrClient:
                     or not argv[0] or "\0" in str(argv[0])
                 ):
                     raise TypeError("foreground process argv must have string entries and a nonempty NUL-free argv[0]")
+                argvs.append(tuple(str(argument) for argument in argv))
                 foreground.append(
                     (
                         _get_process_id(process, "pid", "foreground process"),
@@ -2400,7 +2496,7 @@ class HerdrClient:
                 raise HerdrUnavailable(
                     f"pane process-info: returned pane {parsed.pane_id!r}, expected {pane_id!r}"
                 )
-            return parsed
+            return parsed, tuple(argvs)
         except TypeError as exc:
             raise HerdrUnavailable(
                 f"pane process-info: invalid Herdr response: {exc}"

@@ -1999,6 +1999,49 @@ earlier prompt is still in the last three rows, the new one is taken for it
 and submitted with Enter instead of being pasted. A TUI whose screen never
 stands still (a clock with letters, an animation) never counts as ready.
 
+### Adopt an agent running in a container under a host Herdr server
+
+When this manager runs inside a container and the Herdr server runs on the host,
+Herdr reports process IDs from the host's PID namespace. The same numbers name
+unrelated processes in the container, so the Python distribution detects this
+case (the kernel reports the server's peer PID as 0 through `SO_PEERCRED`) and
+never uses those numbers directly. Every process proof for such a pane either
+uses a translated, local identity or refuses with `runs outside this PID
+namespace`.
+
+A pane is translated only when all of the following hold:
+
+- Herdr reports exactly one foreground process, a `podman exec` or `docker exec`
+  whose container argument is this container's full ID or an ID prefix of at
+  least 12 characters (the ID is read from the bind mount on `/etc/hostname`);
+- Herdr reports a native session for the pane, and exactly one local process
+  whose executable or name is that harness holds a file named
+  `SESSION.jsonl` or `*-SESSION.jsonl` open (Codex keeps its rollout open);
+- that process descends from an exec root (an ancestor whose parent is outside
+  the container, never the container's init), and every member of the root
+  terminal's foreground group descends from the same root.
+
+The pane's shell is then the exec root, its foreground group and processes are
+the local ones, its working directory is the local foreground leader's, and a
+pane Herdr shows without a detected agent is reported as the session's harness
+while that harness is the local foreground. Adoption, anchoring, readiness,
+delivery and stop then pin local kernel identities exactly as for a local pane.
+A pane whose session file is not held open (Claude Code, for example), a
+`podman run` pane, and host-native panes are refused rather than approximated.
+
+If the harness never reported its session (an exec session that inherited
+another pane's `HERDR_PANE_ID` reports to the wrong pane), report it for the
+right pane before adopting:
+
+```sh
+herdr pane report-agent-session PANE --source herdr:codex --agent codex \
+  --agent-session-id SESSION_ID
+agentctl adopt NAME --pane PANE --workspace LABEL --cwd /work/project --harness codex
+```
+
+Use a Herdr client whose protocol matches the server (`herdr status server`
+shows `compatible: yes`) and pass it with `--herdr-bin` on every command.
+
 ### Retire a dead adopted record after a restart
 
 After a Herdr restart, an adopted record can refer to a shell generation that
