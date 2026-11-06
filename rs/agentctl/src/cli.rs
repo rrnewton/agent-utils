@@ -1043,6 +1043,9 @@ struct Restart {
     /// Wait until the agent finishes its turn and is idle with nothing queued, instead of refusing
     #[arg(long)]
     when_idle: bool,
+    /// Accept Claude's exit-dialog stop-tasks choice (only when the agent confirms the listed tasks are stale)
+    #[arg(long)]
+    stop_background_tasks: bool,
     /// How long --when-idle may wait in seconds, greater than 0 and at most 3600 (default: 3600)
     #[arg(long, default_value = "3600", value_name = "SECONDS")]
     wait_idle: f64,
@@ -4331,11 +4334,12 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 )?
             } else {
                 let name = value.name.as_deref().expect("clap requires NAME or --team");
-                let result = manager.restart(
+                let result = manager.restart_stopping(
                     name,
                     value.when_idle,
                     Duration::from_secs_f64(value.wait_idle),
                     Duration::from_secs_f64(value.startup_timeout),
+                    value.stop_background_tasks,
                 )?;
                 manager.bring_coordinator_tab_forward(name, tab_socket);
                 result

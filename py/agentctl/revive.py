@@ -1024,7 +1024,8 @@ def revive(manager: ManagedAgents, name: str, *, dry_run: bool = False, expected
 
 
 def restart(manager: ManagedAgents, name: str, *, when_idle: bool = False,
-            wait_timeout: float = 3600.0, startup_timeout: float = 30.0) -> dict[str, object]:
+            wait_timeout: float = 3600.0, startup_timeout: float = 30.0,
+            stop_background_tasks: bool = False) -> dict[str, object]:
     """Restart one live agent in its own pane (R1 restart-when-idle): wait
     for an idle turn with nothing queued, exit the harness gracefully, then
     revive in the same pane with the recorded session. Refuses with no
@@ -1090,13 +1091,17 @@ def restart(manager: ManagedAgents, name: str, *, when_idle: bool = False,
         time.sleep(0.5)
         screen = manager.client.read(record.pane_id, source="visible", lines=200)
         if "Exit and stop tasks" in screen:
-            try:
-                manager.client.send_keys(record.pane_id, "Escape")
-            except Exception:
-                pass
-            raise AgentDeliveryError(
-                f"{name!r} has background tasks (its exit dialog appeared); finish or stop "
-                "them, note what to re-arm, then restart")
+            if stop_background_tasks:
+                manager.client.send_keys(record.pane_id, "Enter")
+            else:
+                try:
+                    manager.client.send_keys(record.pane_id, "Escape")
+                except Exception:
+                    pass
+                raise AgentDeliveryError(
+                    f"{name!r} has background tasks (its exit dialog appeared); finish or stop "
+                    "them, note what to re-arm, then restart (or pass --stop-background-tasks "
+                    "when the agent confirms they are stale)")
         shelled = False
         for attempt in range(2):
             shell_deadline = time.monotonic() + (15 if attempt == 0 else 60)

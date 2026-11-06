@@ -235,6 +235,8 @@ def parser() -> argparse.ArgumentParser:
     restart.add_argument("name", nargs="?", metavar="NAME", help="registered session name; required unless --team is used")
     restart.add_argument("--team", action="store_true",
         help="restart every agent managed by the caller (AGENTCTL_AGENT, else the designated coordinator), workers first, never the caller")
+    restart.add_argument("--stop-background-tasks", action="store_true",
+        help="accept Claude's exit-dialog stop-tasks choice (only when the agent confirms the listed tasks are stale)")
     restart.add_argument("--when-idle", action="store_true",
         help="wait until the agent finishes its turn and is idle with nothing queued, instead of refusing")
     restart.add_argument("--wait-idle", type=_ascii_float, default=3600.0, metavar="SECONDS",
@@ -592,7 +594,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                                                startup_timeout=args.startup_timeout)
             else:
                 result = sessions.restart(name, when_idle=args.when_idle, wait_timeout=args.wait_idle,
-                                          startup_timeout=args.startup_timeout)
+                                          startup_timeout=args.startup_timeout,
+                                          stop_background_tasks=args.stop_background_tasks)
         elif args.command == "promote":
             result = sessions.promote(name, expected_token=args.expected_token)
         elif args.command == "anchor":

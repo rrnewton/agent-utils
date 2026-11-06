@@ -57,10 +57,15 @@ item 5 restore-in-place. Based on the harness repo's `bin/restart-inplace`
     use the canonical spelling and handle refusal. A re-arm note typed
     into a just-restarted lane can strand unsubmitted, so the post-restart
     notice must go through agentctl's drain with submission evidence.
-18. (Ours) A restart kills session-only crons and background validation
+18. Claude's exit dialog can list STALE background tasks (the footer's
+    agent count stays after workers finish), so a careful restart aborts
+    on every retry. R1 gets the background-task truth from the agent (or
+    Claude's own task list) rather than the dialog alone, and offers
+    --stop-background-tasks for the confirmed-stale case.
+19. (Ours) A restart kills session-only crons and background validation
     gates: the RESTART-READY note must list every background job, monitor,
     and cron to re-arm, and the restarted lane re-arms before new work.
-19. (Ours) Manual recovery kept colliding on registry identity: Herdr
+20. (Ours) Manual recovery kept colliding on registry identity: Herdr
     name, pane census, and foreground argv disagreed after reboot; the
     argv-derived session (#947) and pane_id+terminal_id lookup are the
     tie-breakers, with any reported session staying authoritative.

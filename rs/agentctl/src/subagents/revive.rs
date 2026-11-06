@@ -2267,6 +2267,17 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         when_idle: bool,
         wait_timeout: Duration,
     ) -> Result<()> {
+        self.exit_to_shell_stopping(agent_name, pane, when_idle, wait_timeout, false)
+    }
+
+    fn exit_to_shell_stopping(
+        &self,
+        agent_name: &str,
+        pane: &str,
+        when_idle: bool,
+        wait_timeout: Duration,
+        stop_background_tasks: bool,
+    ) -> Result<()> {
         let deadline = std::time::Instant::now() + wait_timeout;
         let idle = |this: &Self| -> bool {
             this.pending_prompts(agent_name)
@@ -2303,10 +2314,16 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .read(&pane, "visible", Some(200))
             .unwrap_or_default();
         if screen.contains("Exit and stop tasks") {
-            let _ = self.client.send_keys(&pane, "Escape");
-            return Err(fail(format!(
-                "'{agent_name}' has background tasks (its exit dialog appeared); finish or stop them, note what to re-arm, then restart"
-            )));
+            if stop_background_tasks {
+                // The operator confirmed the listed tasks are stale:
+                // accept the dialog's stop-tasks choice and continue.
+                let _ = self.client.send_keys(&pane, "Enter");
+            } else {
+                let _ = self.client.send_keys(&pane, "Escape");
+                return Err(fail(format!(
+                    "'{agent_name}' has background tasks (its exit dialog appeared); finish or stop them, note what to re-arm, then restart (or pass --stop-background-tasks when the agent confirms they are stale)"
+                )));
+            }
         }
         let shell_deadline = std::time::Instant::now() + Duration::from_secs(15);
         let mut shelled = false;
@@ -2361,6 +2378,19 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         wait_timeout: Duration,
         startup_timeout: Duration,
     ) -> Result<Value> {
+        self.restart_stopping(agent_name, when_idle, wait_timeout, startup_timeout, false)
+    }
+
+    /// [`Self::restart`], optionally accepting Claude's exit-dialog
+    /// stop-tasks choice for operator-confirmed stale tasks (lesson 18).
+    pub fn restart_stopping(
+        &self,
+        agent_name: &str,
+        when_idle: bool,
+        wait_timeout: Duration,
+        startup_timeout: Duration,
+        stop_background_tasks: bool,
+    ) -> Result<Value> {
         let record = self.load(agent_name)?;
         if record.agentcloud.is_some() {
             return self.restart_cloud(agent_name);
@@ -2414,7 +2444,13 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 .pane_info(&pane)
                 .is_ok_and(|info| info.agent.as_deref() == Some(&record.harness));
         if alive {
-            self.exit_to_shell(agent_name, &pane, when_idle, wait_timeout)?;
+            self.exit_to_shell_stopping(
+                agent_name,
+                &pane,
+                when_idle,
+                wait_timeout,
+                stop_background_tasks,
+            )?;
         }
         let old_pid = identity.as_ref().map(|id| id.pid);
         let result = self.revive(agent_name, false, Some(&record.token), startup_timeout)?;

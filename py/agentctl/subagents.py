@@ -3051,11 +3051,13 @@ class ManagedAgents:
     def restart(
         self, name: str, *, when_idle: bool = False,
         wait_timeout: float = 3600.0, startup_timeout: float = 30.0,
+        stop_background_tasks: bool = False,
     ) -> dict[str, object]:
         """Restart one live agent in its own pane with its recorded session."""
         from agentctl.revive import restart
         return restart(self, name, when_idle=when_idle, wait_timeout=wait_timeout,
-                       startup_timeout=startup_timeout)
+                       startup_timeout=startup_timeout,
+                       stop_background_tasks=stop_background_tasks)
 
     def restart_team(
         self, caller: str, *, when_idle: bool = False,
