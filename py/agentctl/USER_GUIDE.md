@@ -1321,6 +1321,18 @@ the pass that first sees it; a larger value waits for the screen to hold still
 that long, which debounces a harness whose status says idle while it still
 streams.
 
+A standing agent rests idle between requests by design, such as a standing
+reviewer, so it is never reported `idle-no-verdict` (#901
+watch-standing-agents). Mark one with `agentctl set NAME --standing`, which
+keeps the setting in its record through rename, restore and revive, and undo it
+with `agentctl set NAME --no-standing`. `watch-agents --standing NAME`
+(repeatable) does the same for one watcher only. Every other condition still
+applies to it: an approval or permission prompt, a guardrail refusal, a dead
+harness, a stall while working, input queued behind a turn, a finish with a
+verdict, and owner requests left undelivered. `list` and `status` show
+`standing: true` for it, and each pass's report lists standing agents under
+`standing`, so the exemption stays visible.
+
 An agent that was never sent work, or that still has prompts queued, is never
 reported idle or finished. Idle is timed from the last screen change, since herdr can
 report a Claude Code agent idle while its output still streams. Nor is an

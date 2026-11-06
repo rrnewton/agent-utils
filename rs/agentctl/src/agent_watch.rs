@@ -162,6 +162,9 @@ pub struct WatchAgentsOptions {
     /// must never wait in (#844 watch-notice-route): another coordinator or a liaison agent.
     /// With none reachable, the watcher logs the notice and raises one owner alarm.
     pub notice_fallback: Vec<String>,
+    /// Agents treated as standing for this watcher only (`--standing NAME`), besides those whose
+    /// record says so (#901 watch-standing-agents).
+    pub standing: Vec<String>,
 }
 
 /// The auto-interrupt policy (#574 harness-adapters): the watcher interrupts an agent's turn
@@ -413,6 +416,9 @@ pub struct Observation {
     /// For a headless agent (`#589 headless-watch`), what its event log shows; it has no
     /// screen, so this replaces `screen` in every judgement.
     pub headless: Option<crate::headless::watch::View>,
+    /// A standing agent (`agentctl set NAME --standing`, or `watch-agents --standing NAME`)
+    /// rests idle between requests by design: it gets no idle-without-verdict episode (#901).
+    pub standing: bool,
 }
 
 use crate::harness::transcript::Activity;
@@ -1567,6 +1573,11 @@ fn blocked_work(
 /// The condition one observation shows, with the line or error that proves it. `memory` is
 /// already updated with this pass's screen, work counters and progress metric.
 /// Screen changes are handled by the caller: a changed screen ends a stall episode.
+/// Whether `observation`'s agent is standing: its record says so, or `--standing` names it.
+fn is_standing(observation: &Observation, options: &WatchAgentsOptions) -> bool {
+    observation.standing || options.standing.contains(&observation.name)
+}
+
 fn classify(
     observation: &Observation,
     options: &WatchAgentsOptions,
@@ -2362,7 +2373,11 @@ fn update_episode(
     }
     let work_moved = remember_work(&mut memory, observation, now);
     remember_motion(&mut memory, observation, now, work_moved);
+    // A standing agent rests idle by design: only its idle-without-verdict finding is dropped.
     let found = classify(observation, options, &memory, now)
+        .filter(|finding| {
+            !(finding.kind == EpisodeKind::IdleNoVerdict && is_standing(observation, options))
+        })
         .map(|finding| (finding.kind, finding.detail, finding.since, finding.window));
     // A view scrolled up hides whatever would show progress or a verdict, so neither a stall
     // nor idleness nor a finish can be judged from it, however long it holds still. No clock
@@ -3339,6 +3354,11 @@ fn watch_agents_once(
         "probe_error": probe_error,
         "agents": seen.len(),
         "episodes": episodes,
+        "standing": observations
+            .iter()
+            .filter(|row| is_standing(row, options))
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
         "scrolled": scrolled,
         "unchecked": unchecked,
         "notice": notice,
@@ -4956,6 +4976,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
             harness,
             transcript,
             headless,
+            standing: row["standing"] == true,
             name,
         }
     }
@@ -5498,6 +5519,7 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
                 harness: None,
                 transcript: None,
                 headless: None,
+                standing: false,
             });
         }
         Ok(observations)
@@ -5784,6 +5806,7 @@ mod tests {
             step_history: crate::work_state::StepHistory::default(),
             queue_stale: Duration::from_secs(600),
             notice_fallback: Vec::new(),
+            standing: Vec::new(),
         }
     }
 
@@ -5802,6 +5825,7 @@ mod tests {
             harness: None,
             transcript: None,
             headless: None,
+            standing: false,
         }
     }
 
@@ -7866,6 +7890,77 @@ mod tests {
             pass(&mut probe, &mut notifier, &mut state, at, &options);
         }
         assert_eq!(notifier.sent.len(), 1, "{:?}", notifier.sent);
+    }
+
+    #[test]
+    fn a_standing_agent_rests_idle_without_notice_but_keeps_every_other_one() {
+        // #901 watch-standing-agents.
+        let standing = |status: &str, screen: Option<&str>| {
+            let mut row = observation("reviewer", status, screen);
+            row.standing = true;
+            row
+        };
+        let run = |rows: Vec<Observation>, at: &[f64], options: &WatchAgentsOptions| {
+            let mut probe = ScriptedProbe(at.iter().map(|_| rows.clone()).collect());
+            let mut notifier = RecordingNotifier::default();
+            let mut state = WatchState::default();
+            let mut report = Value::Null;
+            for now in at {
+                report = pass(&mut probe, &mut notifier, &mut state, *now, options);
+            }
+            (report, notifier.sent.len())
+        };
+        let options = options();
+        // Idle past the idle threshold with no verdict: no episode and no notice, and the pass
+        // lists it as standing.
+        let (idle, sent) = run(
+            vec![standing("idle", Some(IDLE_SCREEN))],
+            &[0.0, 7200.0],
+            &options,
+        );
+        assert_eq!(idle["episodes"], json!([]), "{idle}");
+        assert_eq!(idle["standing"], json!(["reviewer"]), "{idle}");
+        assert_eq!(sent, 0);
+        // The same agent at an approval prompt, dead, or stalled while working is reported.
+        let (prompt, sent) = run(
+            vec![standing("idle", Some(PROMPT_SCREEN))],
+            &[0.0, 900.0],
+            &options,
+        );
+        assert_eq!(prompt["episodes"][0]["kind"], "approval-prompt", "{prompt}");
+        assert_eq!(sent, 1);
+        let mut gone = standing("gone", None);
+        gone.detail = "pane is gone".to_owned();
+        let (dead, sent) = run(vec![gone], &[0.0, 300.0], &options);
+        assert_eq!(dead["episodes"][0]["kind"], "dead", "{dead}");
+        assert_eq!(sent, 1);
+        let (stalled, sent) = run(
+            vec![standing("working", Some("◆ two\n"))],
+            &[0.0, 1800.0],
+            &options,
+        );
+        assert_eq!(stalled["episodes"][0]["kind"], "stalled", "{stalled}");
+        assert_eq!(sent, 1);
+        // Not standing (`--no-standing`): the idle notice is back. `--standing NAME` exempts an
+        // agent for this watcher alone.
+        let (idle, sent) = run(
+            vec![observation("reviewer", "idle", Some(IDLE_SCREEN))],
+            &[0.0, 7200.0],
+            &options,
+        );
+        assert_eq!(idle["episodes"][0]["kind"], "idle-no-verdict", "{idle}");
+        assert_eq!(idle["standing"], json!([]), "{idle}");
+        assert_eq!(sent, 1);
+        let mut named = options.clone();
+        named.standing = vec!["reviewer".to_owned()];
+        let (idle, sent) = run(
+            vec![observation("reviewer", "idle", Some(IDLE_SCREEN))],
+            &[0.0, 7200.0],
+            &named,
+        );
+        assert_eq!(idle["episodes"], json!([]), "{idle}");
+        assert_eq!(idle["standing"], json!(["reviewer"]), "{idle}");
+        assert_eq!(sent, 0);
     }
 
     #[test]

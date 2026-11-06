@@ -117,6 +117,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl manage worker-1\n  agentctl manage worker-1 --by lieutenant\n  agentctl manage worker-1 --clear\n\nmanaged_by decides who controls an agent: whom watch-agents tells about it, and where it sits in\n`agentctl tree`. start records the calling agent as both created_by (provenance, never changed) and\nmanaged_by; adopt records the adopting agent as managed_by. With neither --by nor --clear, the\ncalling agent takes over: it must be a registered agent of this registry whose pinned harness is an\nancestor of this process. A manager that would make a cycle is refused. An agent with no manager\nanswers to the designated coordinator."
     )]
     Manage(Manage),
+    /// Change a registered agent's durable settings: whether it is a standing agent
+    #[command(
+        after_help = "Examples:\n  agentctl set reviewer-1 --standing\n  agentctl set reviewer-1 --no-standing\n\nA standing agent rests idle between requests by design, such as a standing reviewer. watch-agents\nsends no idle-without-verdict notice about it; it still reports an approval or permission prompt, a\nguardrail refusal, a dead harness, a stall while working, input queued behind a turn, and owner\nrequests left undelivered. The setting is kept in the agent's record, so it follows the agent through\nrename, restore and revive; list and status show `standing: true`, and a watch-agents pass lists\nstanding agents under \"standing\". Prints the agent, the new setting and the previous one as JSON."
+    )]
+    Set(SetArgs),
     /// Print the control tree: the designated coordinator at the root and every agent under the agent that manages it, at any depth
     #[command(
         after_help = "Examples:\n  agentctl tree\n  agentctl tree --json\n\nAn agent hangs under the registered agent its managed_by names; one with no manager, a stopped\nmanager, or a manager in another registry hangs under the designated coordinator. created_by is shown\nwhere it differs from managed_by. --json adds tokens, edges and each agent's pinned harness process."
@@ -405,6 +410,19 @@ struct Manage {
     /// Remove the explicit pinned flag; the derived classification applies again
     #[arg(long)]
     unpin: bool,
+}
+
+#[derive(Args)]
+#[command(group(clap::ArgGroup::new("setting").required(true).args(["standing", "no_standing"])))]
+struct SetArgs {
+    #[command(flatten)]
+    agent: Named,
+    /// Mark the agent standing: watch-agents sends no idle-without-verdict notice about it
+    #[arg(long)]
+    standing: bool,
+    /// Mark the agent not standing, restoring the idle-without-verdict notice (the default for every agent)
+    #[arg(long)]
+    no_standing: bool,
 }
 
 #[derive(Args)]
@@ -885,6 +903,9 @@ struct WatchAgents {
     /// Agent told about the coordinator's own queue or composer, which a notice never waits in; repeatable, tried in order, skipping any agent whose own queue is stuck (default: none). Such a notice (owner requests stuck in the coordinator's queue, a delivery jam, a held queue, a draft in its editor) otherwise goes to no agent: it is logged and one owner alarm is raised (--owner-alarm-bridge)
     #[arg(long = "notice-fallback", value_name = "NAME")]
     notice_fallback: Vec<String>,
+    /// Treat this agent as standing for this watcher, as `agentctl set NAME --standing` does for every watcher: no idle-without-verdict notice, every other notice as before; repeatable (default: only agents whose record says standing)
+    #[arg(long = "standing", value_name = "NAME")]
+    standing: Vec<String>,
     /// Chat bridge state directory whose outbound helper posts the watcher's owner alarm, one per episode, to the bridge's first channel when no agent can be told (default: none; the alarm is then only logged)
     #[arg(long, value_name = "DIR")]
     owner_alarm_bridge: Option<PathBuf>,
@@ -3087,6 +3108,7 @@ fn writes_registry(command: &Commands) -> bool {
         | Commands::Adopt(_)
         | Commands::AttachSelf(_)
         | Commands::Manage(_)
+        | Commands::Set(_)
         | Commands::Move(_)
         | Commands::Rename(_)
         | Commands::Anchor(_)
@@ -3425,6 +3447,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 step_history: crate::work_state::StepHistory::load(&value.step_history),
                 queue_stale: Duration::from_secs(u64::from(value.queue_stale_minutes) * 60),
                 notice_fallback: value.notice_fallback,
+                standing: value.standing,
             };
             let mut probe = crate::agent_watch::ManagedProbe::new(
                 &observer,
@@ -4045,6 +4068,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             }
             CoordinatorCommand::Clear => manager.coordinator_clear()?,
         },
+        Commands::Set(value) => {
+            manager.set_standing(&value.agent.name, value.standing && !value.no_standing)?
+        }
         Commands::Manage(value) => manager.manage(
             &value.agent.name,
             match (value.by, value.clear, value.pin, value.unpin) {

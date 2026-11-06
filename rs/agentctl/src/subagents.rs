@@ -10168,6 +10168,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 result[key] = json!(edge);
             }
         }
+        if record.standing() {
+            result[control::STANDING] = json!(true);
+        }
         result["queue"] = json!(self.queue(agent_name)?);
         result["output"] = json!(self.directory(agent_name)?.join("output.json"));
         result["goal_source"] = if record.goal.is_some() {

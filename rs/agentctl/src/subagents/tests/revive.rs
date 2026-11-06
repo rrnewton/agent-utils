@@ -122,6 +122,33 @@ fn revive_resumes_without_reports_using_independent_process_and_terminal_anchors
 }
 
 #[test]
+fn a_standing_agent_stays_standing_through_revive_until_set_otherwise() {
+    // #901 watch-standing-agents: the flag is in the record, so the revived generation keeps
+    // it; list and status show it, and `--no-standing` removes it.
+    let (fixture, old) = recoverable("claude", false);
+    let set = fixture.manager().set_standing("worker", true).unwrap();
+    assert_eq!(
+        set,
+        json!({"name": "worker", "standing": true, "previous": false})
+    );
+    fixture
+        .manager()
+        .revive("worker", false, Some(&old.token), TIMEOUT)
+        .unwrap();
+    let new = fixture.manager().load("worker").unwrap();
+    assert_ne!(new.token, old.token);
+    assert!(new.standing());
+    assert_eq!(
+        fixture.manager().status("worker").unwrap()["standing"],
+        true
+    );
+    let cleared = fixture.manager().set_standing("worker", false).unwrap();
+    assert_eq!(cleared["previous"], true);
+    assert!(!fixture.manager().load("worker").unwrap().standing());
+    assert!(fixture.manager().status("worker").unwrap()["standing"].is_null());
+}
+
+#[test]
 fn revive_keeps_the_control_edges_and_answers_to_its_former_token() {
     let (fixture, old) = recoverable("claude", false);
     let path = fixture.root.join("registry/agents/worker/agent.json");

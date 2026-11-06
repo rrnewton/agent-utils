@@ -269,6 +269,8 @@ def parser() -> argparse.ArgumentParser:
          "edition refuses).", "agentctl coordinator show"),
         ("manage", "Change which agent controls a registered agent (Rust edition only; this edition refuses).",
          "agentctl manage worker-1 --by lieutenant"),
+        ("set", "Change a registered agent's durable settings, such as whether it is a standing agent (Rust "
+         "edition only; this edition refuses).", "agentctl set reviewer-1 --standing"),
         ("tree", "Print the control tree of coordinator, managers, and workers (Rust edition only; this "
          "edition refuses).", "agentctl tree"),
         ("progress", "Declare what counts as progress for an agent, for watch-agents to judge (Rust edition only; "
@@ -358,8 +360,8 @@ def _goal_command(args: argparse.Namespace) -> list[str] | None:
 
 
 #: Commands only the Rust edition implements; this edition refuses them with exit status 2.
-_RUST_ONLY = ("restore", "install-units", "watch", "watch-agents", "hold", "coordinator", "manage", "tree",
-              "progress", "services")
+_RUST_ONLY = ("restore", "install-units", "watch", "watch-agents", "hold", "coordinator", "manage", "set",
+              "tree", "progress", "services")
 
 
 #: Commands that change agents' state, so idle layout-1 agents move to layout 2 first (not before a

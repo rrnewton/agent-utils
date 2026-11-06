@@ -25,6 +25,9 @@ pub(crate) const MANAGED_BY: &str = "managed_by";
 /// Record key for the explicit pinned (persistent lane) flag (#917 chat-bang-commands).
 pub(crate) const PINNED: &str = "pinned";
 const FORMER_TOKENS: &str = "former_tokens";
+/// A standing agent rests idle between requests by design, so `watch-agents` reports no
+/// idle-without-verdict episode for it (#901 watch-standing-agents).
+pub(crate) const STANDING: &str = "standing";
 /// Earlier tokens a record keeps; older generations' edges are treated as stale.
 const FORMER_TOKENS_MAX: usize = 32;
 /// The edge was found by walking the caller's process ancestry to a pinned harness.
@@ -667,6 +670,35 @@ impl AgentRecord {
         }
     }
 
+    /// Whether this agent is standing ([`STANDING`]).
+    pub(super) fn standing(&self) -> bool {
+        let value = match &self.nested {
+            Some(nested) => nested.extensions().get(STANDING),
+            None => self.extra.get(STANDING),
+        };
+        value == Some(&Value::Bool(true))
+    }
+
+    /// Mark this agent standing, or not; a record that is not standing carries no field.
+    pub(super) fn set_standing(&mut self, standing: bool) {
+        match (&mut self.nested, standing) {
+            (Some(nested), true) => {
+                nested
+                    .extensions_mut()
+                    .insert(STANDING.to_owned(), Value::Bool(true));
+            }
+            (Some(nested), false) => {
+                nested.extensions_mut().remove(STANDING);
+            }
+            (None, true) => {
+                self.extra.insert(STANDING.to_owned(), Value::Bool(true));
+            }
+            (None, false) => {
+                self.extra.remove(STANDING);
+            }
+        }
+    }
+
     /// The pinned process ID to report as this agent's, only when it belongs to the current
     /// boot: after a restart the recorded PID may be an unrelated process.
     fn current_harness_pid(&self, boot_id: Option<&str>) -> Option<u64> {
@@ -709,6 +741,9 @@ impl AgentRecord {
                         .insert(key.to_owned(), serde_json::to_value(edge).expect("edge"));
                 }
             }
+        }
+        if previous.standing() {
+            self.set_standing(true);
         }
     }
 
@@ -1543,6 +1578,24 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "name": record.name,
             "token": record.token,
             "managed_by": edge,
+            "previous": previous,
+        }))
+    }
+
+    /// Mark `agent_name` standing or not (#901 watch-standing-agents): `watch-agents` then
+    /// reports no idle-without-verdict episode for it, and every other notice stays. The flag is
+    /// part of the record, so it follows the agent through rename, restore and revive.
+    pub fn set_standing(&self, agent_name: &str, standing: bool) -> Result<Value> {
+        let _lock = self.lock(agent_name)?;
+        let mut record = self.load(agent_name)?;
+        let previous = record.standing();
+        record.set_standing(standing);
+        if previous != standing {
+            self.save(&record)?;
+        }
+        Ok(json!({
+            "name": record.name,
+            "standing": standing,
             "previous": previous,
         }))
     }
