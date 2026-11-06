@@ -1737,6 +1737,16 @@ as the culprit it is, since the base it ran on was green. Below an 80% recent pa
 stacks and every batch is one change wide; at or above it, batches widen to `max_batch` and
 build on the stack top as usual. Every field absent is today's behaviour exactly.
 
+One exception below the gate: a candidate that was green on the immediately previous base and
+went stale only because unrelated changes landed — its files share no path with what landed
+since its green, and merging its green candidate onto the current stack head is clean — is
+stacked on that head anyway, so it lands in the same round instead of rebuilding as another
+disjoint root on the new base. The run records a `stale-green-stacked` event (the candidate,
+the previous green base, and the landed changes it was checked against). Fresh candidates
+still wait for the gate, a candidate whose paths overlap what landed or whose merge conflicts
+rebuilds as today, and a stacked validation that comes back red is handled as an ordinary
+red, with no strike beyond the normal one.
+
 ## The precheck
 
 A change that fails a cheap, deterministic check (a formatter check, a documentation build)

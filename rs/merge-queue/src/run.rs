@@ -966,6 +966,21 @@ pub struct Runner<'a> {
     stopped_logged: Mutex<bool>,
     /// Set at a stop decision: no donor job is re-leased after it.
     stopping: AtomicBool,
+    /// Candidates that were green on a previous base in this run and went
+    /// stale only because other changes landed (see `stale-green-stacked`).
+    stale_greens: Mutex<BTreeMap<i64, StaleGreen>>,
+}
+
+/// A green that went stale in this run: where it was green, and what had
+/// already landed when that was recorded.
+#[derive(Clone, Debug)]
+struct StaleGreen {
+    /// Base the green candidate was built on.
+    green_base: String,
+    /// The green candidate itself.
+    green_tip: String,
+    /// Changes landed when the stale green was recorded.
+    landed_before: BTreeSet<i64>,
 }
 
 impl<'a> Runner<'a> {
@@ -1118,6 +1133,7 @@ impl<'a> Runner<'a> {
             writer: None,
             stopped_logged: Mutex::new(false),
             stopping: AtomicBool::new(false),
+            stale_greens: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -1177,6 +1193,85 @@ impl<'a> Runner<'a> {
             *logged = true;
             drop(logged);
             self.event("stopped", &detail);
+        }
+    }
+
+    /// Record `candidate` as green on its parent base, for a later
+    /// stale-green stacking decision in this run.
+    fn record_stale_green(&self, candidate: &Candidate) {
+        let landed_before: BTreeSet<i64> = lock(&self.report)
+            .landed
+            .iter()
+            .flat_map(|landed| landed.prs.iter().copied())
+            .collect();
+        let mut greens = lock(&self.stale_greens);
+        for pr in &candidate.prs {
+            greens.insert(
+                *pr,
+                StaleGreen {
+                    green_base: candidate.parent.clone(),
+                    green_tip: candidate.tip.clone(),
+                    landed_before: landed_before.clone(),
+                },
+            );
+        }
+    }
+
+    /// Whether `prs` may stack on `stack_tip` despite the stack gate: every
+    /// change was green on the immediately previous base in this run, its
+    /// files share no path with what landed since, and merging its green
+    /// candidate onto the stack head is clean. Returns the previous green
+    /// base and the landed changes it was checked against.
+    fn stale_green_stack(&self, prs: &[i64], stack_tip: &str) -> Option<(String, Vec<i64>)> {
+        let greens = lock(&self.stale_greens).clone();
+        let first = greens.get(prs.first()?)?;
+        if prs.iter().any(|pr| {
+            greens
+                .get(pr)
+                .is_none_or(|g| g.green_base != first.green_base || g.green_tip != first.green_tip)
+        }) {
+            return None;
+        }
+        let current_base = lock(&self.base).clone();
+        if first.green_base == current_base {
+            return None;
+        }
+        let landed_now: BTreeSet<i64> = lock(&self.report)
+            .landed
+            .iter()
+            .flat_map(|landed| landed.prs.iter().copied())
+            .collect();
+        let landed_since: Vec<i64> = landed_now
+            .difference(&first.landed_before)
+            .copied()
+            .collect();
+        let candidate_files = self
+            .git
+            .changed_files(&first.green_base, &first.green_tip)
+            .ok()?;
+        let landed_files = self
+            .git
+            .changed_files(&first.green_base, &current_base)
+            .ok()?;
+        if !candidate_files.is_disjoint(&landed_files) {
+            return None;
+        }
+        if !self
+            .git
+            .merge_conflicts(stack_tip, &first.green_tip)
+            .is_ok_and(|paths| paths.is_empty())
+        {
+            return None;
+        }
+        Some((first.green_base.clone(), landed_since))
+    }
+
+    /// Forget stale-green records for `prs` (their candidate is being built,
+    /// stacked or not, so the previous green is spent).
+    fn clear_stale_greens(&self, prs: &[i64]) {
+        let mut greens = lock(&self.stale_greens);
+        for pr in prs {
+            greens.remove(pr);
         }
     }
 
@@ -3924,6 +4019,17 @@ impl<'a> Runner<'a> {
                 Err(_) => break,
             }
         }
+        // A rooted green cancelled as stale is still a green on its base:
+        // remember it for a stale-green stacking decision on its rebuild.
+        for flight in &cancelled {
+            if flight
+                .result
+                .as_ref()
+                .is_some_and(|result| result.as_ref().is_ok_and(|(_, ran)| ran.green()))
+            {
+                self.record_stale_green(&flight.candidate);
+            }
+        }
         let prs: Vec<i64> = cancelled
             .iter()
             .flat_map(|flight| flight.candidate.prs.iter().copied())
@@ -5235,10 +5341,36 @@ impl<'a> Runner<'a> {
                         && !self.draining()
                     {
                         crate::interrupt::check("building the next batch")?;
+                        // A stale green (green on the previous base,
+                        // disjoint from what landed since) stacks even
+                        // below the gate: it does not wait for a root slot.
+                        // Its stack head is the stack top, or a rooted
+                        // flight on the current base that will land first.
+                        let stale_tip = |flights: &VecDeque<Flight>| -> Option<String> {
+                            stack_top(flights)
+                                .map(|top| top.candidate.tip.clone())
+                                .or_else(|| {
+                                    let base = lock(&self.base).clone();
+                                    flights
+                                        .iter()
+                                        .rev()
+                                        .find(|flight| {
+                                            flight.rooted && flight.candidate.parent == base
+                                        })
+                                        .map(|flight| flight.candidate.tip.clone())
+                                })
+                        };
+                        let front_stale = !stack_allowed
+                            && stale_tip(&flights).is_some_and(|tip| {
+                                pending
+                                    .front()
+                                    .is_some_and(|prs| self.stale_green_stack(prs, &tip).is_some())
+                            });
                         // Below the stack pass-rate gate, with every root
                         // slot taken, a new batch waits for a flight to
                         // finish instead of building on the stack top.
                         if !stack_allowed
+                            && !front_stale
                             && !flights.is_empty()
                             && flights
                                 .iter()
@@ -5278,6 +5410,28 @@ impl<'a> Runner<'a> {
                             && front_disjoint
                             && (max_roots > 1 || (window >= 3 && occupied(&flights) + 1 >= window));
                         let mut prs = pending.pop_front().unwrap_or_default();
+                        // A stale green stacks on the stack head even
+                        // below the gate (its previous green, disjointness
+                        // and a clean merge were just checked); a fresh
+                        // candidate still waits for the gate.
+                        let stale_tip = stack_top(&flights)
+                            .map(|top| top.candidate.tip.clone())
+                            .or_else(|| {
+                                let base = lock(&self.base).clone();
+                                flights
+                                    .iter()
+                                    .rev()
+                                    .find(|flight| flight.rooted && flight.candidate.parent == base)
+                                    .map(|flight| flight.candidate.tip.clone())
+                            });
+                        let stale_stack = if !stack_allowed {
+                            stale_tip
+                                .as_ref()
+                                .and_then(|tip| self.stale_green_stack(&prs, tip))
+                        } else {
+                            None
+                        };
+                        let rooted = stale_stack.is_none() && rooted;
                         // Below the batch pass-rate gate, batches are one
                         // change wide whatever the plan made of them: the
                         // rest go back to the front as singles, in order.
@@ -5287,7 +5441,9 @@ impl<'a> Runner<'a> {
                                 pending.push_front(vec![pr]);
                             }
                         }
-                        let parent = if rooted {
+                        let parent = if stale_stack.is_some() {
+                            stale_tip.clone().unwrap_or_default()
+                        } else if rooted {
                             let base = self.current_base()?;
                             *lock(&self.base) = base.clone();
                             base
@@ -5305,6 +5461,19 @@ impl<'a> Runner<'a> {
                         let candidate = self.build_and_eject(&parent, &prs, pending, "")?;
                         if candidate.prs.is_empty() {
                             continue;
+                        }
+                        self.clear_stale_greens(&candidate.prs);
+                        if let Some((green_base, landed_since)) = &stale_stack {
+                            self.event(
+                                "stale-green-stacked",
+                                &format!(
+                                    "{} was green at {}; stacked on {} after checking against landed {}",
+                                    list(&candidate.prs),
+                                    short(green_base),
+                                    short(&parent),
+                                    list(landed_since)
+                                ),
+                            );
                         }
                         let chosen = self.select_peripheral(
                             &candidate.tip,
@@ -5553,6 +5722,7 @@ impl<'a> Runner<'a> {
                                             short(&base)
                                         ),
                                     );
+                                    self.record_stale_green(&stale.candidate);
                                     pending.push_front(stale.candidate.prs.clone());
                                     continue;
                                 }
