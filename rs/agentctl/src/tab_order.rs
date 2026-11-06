@@ -128,7 +128,7 @@ fn request(socket: &Path, method: &str, params: Value) -> Result<Value, String> 
     }
 }
 
-/// Tab roles in canonical order (agent-utils-979 canonical-tab-order):
+/// Tab roles in canonical order:
 /// liaison/coordinators first, then managed lanes, then unmanaged tabs.
 pub const ROLE_FRONT: u8 = 0;
 /// A managed lane's tab.

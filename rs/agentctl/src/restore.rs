@@ -175,7 +175,7 @@ pub struct RestoreConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scheduled: Vec<ScheduledUnit>,
     /// Seconds an unclaimed bare shell may idle before the watch closes it
-    /// (agent-utils-976 workspace-hygiene; default 600).
+    /// (workspace hygiene; default 600).
     #[serde(default = "default_bare_shell_grace")]
     pub bare_shell_grace_seconds: u64,
     /// Whether the watch closes idle bare shells at all (default true;
@@ -2697,7 +2697,7 @@ pub fn watch<A: ManagedApi + ?Sized>(
         };
         pass += 1;
         let mut findings = watch_once(client, registry, host, config, &pass_options);
-        // Workspace hygiene + canonical tab order (agent-utils-976/979):
+        // Workspace hygiene and canonical tab order:
         // close unclaimed bare shells idle past the grace period, and keep
         // managed workspaces' tabs in canonical order. Best-effort; a
         // failure is a finding, never a watch failure.

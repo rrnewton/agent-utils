@@ -1107,9 +1107,9 @@ def restart(manager: ManagedAgents, name: str, *, when_idle: bool = False,
                 time.sleep(0.25)
             if shelled:
                 break
-            manager.client.send_keys(record.pane_id, "C-c")
+            manager.client.send_keys(record.pane_id, "ctrl+c")
             time.sleep(1)
-            manager.client.send_keys(record.pane_id, "C-c")
+            manager.client.send_keys(record.pane_id, "ctrl+c")
         if not shelled:
             raise AgentDeliveryError(f"{name!r} did not exit to a bare shell; it was not restarted")
     old_pid = None if identity is None else identity.pid

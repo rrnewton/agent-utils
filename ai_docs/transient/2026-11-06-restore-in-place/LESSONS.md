@@ -49,10 +49,18 @@ item 5 restore-in-place. Based on the harness repo's `bin/restart-inplace`
 15. Model API outages kill turns mid-way; a lane that crashed out of its
     turn never says RESTART-READY itself. R2 treats a lane that is idle
     after a failed turn (no background work) as restartable, with a nudge.
-16. (Ours) A restart kills session-only crons and background validation
+16. Muse asks "Local work is still active, exit anyway?" on Ctrl-C when
+    the session has scheduled tasks or a paused goal; the restart must
+    detect that, choose Stay, and require the re-arm list (cron lines,
+    goal text) first, then restore those after resume.
+17. Herdr builds differ in key names (one rejects "C-c"; "ctrl+c" works);
+    use the canonical spelling and handle refusal. A re-arm note typed
+    into a just-restarted lane can strand unsubmitted, so the post-restart
+    notice must go through agentctl's drain with submission evidence.
+18. (Ours) A restart kills session-only crons and background validation
     gates: the RESTART-READY note must list every background job, monitor,
     and cron to re-arm, and the restarted lane re-arms before new work.
-17. (Ours) Manual recovery kept colliding on registry identity: Herdr
+19. (Ours) Manual recovery kept colliding on registry identity: Herdr
     name, pane census, and foreground argv disagreed after reboot; the
     argv-derived session (#947) and pane_id+terminal_id lookup are the
     tie-breakers, with any reported session staying authoritative.

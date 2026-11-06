@@ -2318,9 +2318,19 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             std::thread::sleep(Duration::from_millis(250));
         }
         if !shelled {
-            let _ = self.client.send_keys(&pane, "C-c");
+            let _ = self.client.send_keys(&pane, "ctrl+c");
             std::thread::sleep(Duration::from_secs(1));
-            let _ = self.client.send_keys(&pane, "C-c");
+            let screen = self
+                .client
+                .read(&pane, "visible", Some(200))
+                .unwrap_or_default();
+            if screen.contains("Local work is still active") {
+                let _ = self.client.send_keys(&pane, "Escape");
+                return Err(fail(format!(
+                    "'{agent_name}' has scheduled tasks or a paused goal (its exit dialog appeared); record the cron lines and goal text to restore after resume, then restart"
+                )));
+            }
+            let _ = self.client.send_keys(&pane, "ctrl+c");
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
             while std::time::Instant::now() < deadline {
                 if self.client.pane_is_idle_shell(&pane)? {
