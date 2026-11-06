@@ -99,6 +99,7 @@ pub mod recent_view;
 pub mod relist;
 pub mod render;
 pub mod replay;
+pub mod reply_pointers;
 pub mod reply_read;
 pub mod retrieval;
 pub mod search_query;

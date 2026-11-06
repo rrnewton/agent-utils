@@ -28,7 +28,7 @@ import { PAGE_CODE, brokenModule, BASE_CSS, BIG, BIG_ROOT, CHANNEL, CHARS_PER_LI
   sourceConstant, sseMessage, sseUpdate, stackPlaces, startTalking, statusText, tagOf, tallChannel,
   test, threadBadge, threadButton, threadData, threadOptions, threadPage, threadedService,
   timelineAnswer, twoColumnServer, twoColumns, unpackData, unpackPage, unpackRows, unpackedRow,
-  putReplyDown, untilDeepLink, upstreamReadButton, viewOf, wideCard } from "./fixture.mjs";
+  putReplyDown, untilDeepLink, upstreamReadButton, viewOf, wideCard, replyArrowOf, REPLY_DOUBLE_TAP_MS } from "./fixture.mjs";
 
 // --- `#489 card-root-lines`: a card showing its first message keeps its lines ----------------------
 
@@ -3816,4 +3816,38 @@ test("`#407 unpack-row-parity`: Enter and o fold the selected unpacked row, e ma
   await pressHere(page, "r");
   assert.ok(replyInStream(page), "r did not reply to the selected unpacked row");
   assert.match(page.el("reply-target-meta").textContent, /id 707$/, "r answered another message");
+});
+
+test("`#934 voice-page-reply-parent-arrow`: a reply and a quote-reply inside a thread draw the arrow to what they answer, in the thread and in All, and the arrow jumps there", async () => {
+  // The owner: "When I reply or quote reply especially inside a thread. I'm not getting a little blue arrows to
+  // blink it back to the parent." The server now says what a reply it posted answers wherever its provider keeps no
+  // pointer of its own (src/reply_pointers.rs); the page draws the arrow from that pointer in every list but Main's
+  // and Pinned, a thread's included.
+  const data = threadData();
+  const second = data.messages.find((m) => m.id === "204").thread;
+  data.messages.push(
+    message({ id: "205", content: "> second thread answer\nagreed", thread: second, reply_to: "204" }),
+    message({ id: "206", content: "and to the root", thread: second, reply_to: "203" }));
+  const page = newPage();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  for (const view of ["flat", "thread:spaces/A/threads/another"]) {
+    await pickThread(page, view);
+    for (const [id, parent] of [["205", "204"], ["206", "203"]]) {
+      const row = rowWithId(page, id);
+      assert.ok(row, `${view}: the reply ${id} is not drawn`);
+      assert.ok(replyArrowOf(row), `${view}: the reply ${id} draws no arrow to ${parent}`);
+      assert.equal(row.getAttribute("data-reply-to"), parent);
+    }
+    assert.equal(replyArrowOf(rowWithId(page, "204")), undefined, `${view}: a message that answers nothing drew an arrow`);
+  }
+  // In the thread, the quote-reply's arrow jumps to the answer it quotes.
+  const arrow = replyArrowOf(rowWithId(page, "205"));
+  await arrow.dispatch("click", { target: arrow, stopPropagation() {} });
+  await page.settle();
+  page.expireTimers(REPLY_DOUBLE_TAP_MS);
+  await page.settle();
+  assert.equal(rowWithId(page, "204").getAttribute("data-landed"), "true", "the arrow did not jump to what the reply answers");
 });

@@ -349,6 +349,9 @@ pub async fn clear_channel_alias(
 ///
 /// Everything downstream PRINTS these fields and must never compute them.
 pub(crate) fn stamp(state: &AppState, messages: &mut [Message]) {
+    // `#934 voice-page-reply-parent-arrow`. A reply this server posted, drawn as one wherever the
+    // provider keeps no pointer of its own.
+    state.reply_pointers.fill(messages);
     let now_ms = jiff::Timestamp::now().as_millisecond();
     for message in messages {
         message.spoken_time = crate::clock::spoken(&message.timestamp, &state.config.timezone);
@@ -425,6 +428,8 @@ pub(crate) async fn prepare_arrival(
 ) {
     message.content_html = String::new();
     message.heading = None;
+    // `#934 voice-page-reply-parent-arrow`. A reply this server posted, arriving as one.
+    state.reply_pointers.fill(std::slice::from_mut(message));
     message.spoken_time = crate::clock::spoken(&message.timestamp, &state.config.timezone);
     message.spoken_content = prepared_body(
         state,
@@ -5559,6 +5564,28 @@ fn remembered_answer(
     }
 }
 
+/// File in the store that `message`, just posted in `channel`, answers `parent`. A failure is logged,
+/// never the post's: it landed, and only a restart loses the arrow. `#934
+/// voice-page-reply-parent-arrow`.
+async fn file_reply_pointer(
+    state: &AppState,
+    channel: &ChannelId,
+    message: &MessageId,
+    parent: &MessageId,
+) {
+    match state
+        .store
+        .keep_reply_pointer(channel, message, parent, crate::store::now_ms())
+        .await
+    {
+        // No store configured: the pointers are in memory only.
+        Ok(()) | Err(crate::store::StoreError::Unavailable(_)) => {}
+        Err(error) => {
+            tracing::warn!(%error, "a reply pointer was not filed in the store; a restart forgets it");
+        }
+    }
+}
+
 /// File `kept` in the store. A failure is logged, never the post's: it landed, and only a repeat
 /// after a restart loses the answer. `#471 replication-c5-post-keys`.
 async fn keep_post_key(state: &AppState, kept: &crate::post_keys::Kept) {
@@ -5885,6 +5912,16 @@ async fn post_each(
         };
         match sent {
             Ok(mut one) => {
+                // `#934 voice-page-reply-parent-arrow`. The first part answers `parent`: said on it
+                // where the provider's answer did not say so (Slack keeps no pointer; our metadata
+                // names it only where the transport passes it back), and remembered whatever the
+                // answer said, so every later read of it, in the channel or its thread, is drawn as
+                // a reply too, metadata or none. Noted in memory at once; filed in the store below,
+                // once the post is noted as this server's own, which nothing may observe it before.
+                let pointed = parent.inspect(|parent| {
+                    one.reply_to.get_or_insert_with(|| (*parent).clone());
+                    state.reply_pointers.note(&one.id, parent);
+                });
                 stamp(state, std::slice::from_mut(&mut one));
                 // Its version: the provider took it after this part was asked for. `#473
                 // replication-c7-server-versions`.
@@ -5912,6 +5949,9 @@ async fn post_each(
                 }
                 if let Some((fill, into)) = fill {
                     fill.offer_posted(&one, into.as_deref());
+                }
+                if let Some(parent) = pointed {
+                    file_reply_pointer(state, &info.id, &one.id, parent).await;
                 }
                 posted.push(one);
                 if let Some(progress) = progress {
@@ -8050,6 +8090,92 @@ mod tests {
         assert_eq!(recorded.len(), 1, "{recorded:?}");
         assert_eq!(recorded[0].channel.as_str(), WRITE_CHANNEL);
         assert_eq!(recorded[0].content, "shipped it");
+    }
+
+    /// `#934 voice-page-reply-parent-arrow`. A provider that keeps no reply pointer (Slack) is given
+    /// this server's own: the posted reply says what it answers, every read of it does, an arrival on
+    /// the live path does, and a restart keeps it. A provider's own pointer is never overwritten.
+    #[tokio::test]
+    async fn a_reply_to_a_provider_without_reply_pointers_keeps_its_parent_through_reads_and_a_restart(
+    ) {
+        let (state, fake, store) = testing::state_with_store();
+        fake.keep_no_reply_pointers();
+        let channel = crate::model::ChannelId(WRITE_CHANNEL.to_owned());
+        let parent = fake.seed(&channel, "ada", "the question");
+        let (_info, posted, _parts) =
+            reply(&state, WRITE_CHANNEL, "the answer", Some(parent.as_str()))
+                .await
+                .expect("the reply posts");
+        assert_eq!(
+            posted.reply_to.as_ref(),
+            Some(&parent),
+            "the posted reply does not say what it answers"
+        );
+        assert_eq!(
+            fake.posted()[0].reply_to.as_ref(),
+            Some(&parent),
+            "fixture: the reply was not posted as one"
+        );
+        // Every later read: the provider hands it back as a loose message.
+        let window = messages(&state, Scope::Read, WRITE_CHANNEL, None)
+            .await
+            .expect("the channel reads");
+        let read = window
+            .messages
+            .iter()
+            .find(|message| message.id == posted.id)
+            .expect("the reply is read back");
+        assert_eq!(
+            read.reply_to.as_ref(),
+            Some(&parent),
+            "a read of the reply lost what it answers"
+        );
+        let loose = window
+            .messages
+            .iter()
+            .find(|message| message.id == parent)
+            .expect("the question is read back");
+        assert_eq!(
+            loose.reply_to, None,
+            "a message that answers nothing was given a parent"
+        );
+        // The live path: the same message arriving with no pointer.
+        let mut arrived = read.clone();
+        arrived.reply_to = None;
+        prepare_arrival(&state, Scope::Read, &channel, &mut arrived).await;
+        assert_eq!(
+            arrived.reply_to.as_ref(),
+            Some(&parent),
+            "an arrival of the reply lost what it answers"
+        );
+        // A provider's own pointer stands.
+        let mut native = read.clone();
+        native.reply_to = Some(crate::model::MessageId("777".to_owned()));
+        stamp(&state, std::slice::from_mut(&mut native));
+        assert_eq!(
+            native
+                .reply_to
+                .as_ref()
+                .map(crate::model::MessageId::as_str),
+            Some("777")
+        );
+        // A restart: a new server on the same store.
+        let (restarted, _fake) = testing::state_with(store);
+        assert_eq!(
+            restarted
+                .restore_reply_pointers()
+                .await
+                .expect("the store reads"),
+            1
+        );
+        let mut again = read.clone();
+        again.reply_to = None;
+        stamp(&restarted, std::slice::from_mut(&mut again));
+        assert_eq!(
+            again.reply_to.as_ref(),
+            Some(&parent),
+            "a restart forgot what the reply answers"
+        );
     }
 
     #[tokio::test]

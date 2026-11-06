@@ -61,6 +61,8 @@ struct State {
     read_epochs: BTreeMap<String, i64>,
     /// Key to `(record, at_ms)`. `#471 replication-c5-post-keys`.
     post_keys: BTreeMap<String, (String, i64)>,
+    /// Message to `(channel, parent, at_ms)`. `#934 voice-page-reply-parent-arrow`.
+    reply_pointers: BTreeMap<String, (String, String, i64)>,
     summaries: BTreeMap<(String, String, String, String), FakeSummary>,
     /// `(channel, message)` to `(snowflake, when it was dismissed)`. The same shape the real
     /// table has, so the count bound and the ordering can be reproduced rather than assumed.
@@ -617,6 +619,50 @@ impl StateStore for FakeStore {
             .collect();
         kept.sort_by_key(|(_, at)| *at);
         Ok(kept)
+    }
+
+    async fn keep_reply_pointer(
+        &self,
+        channel: &ChannelId,
+        message: &MessageId,
+        parent: &MessageId,
+        at_ms: i64,
+    ) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        state.reply_pointers.insert(
+            message.0.clone(),
+            (channel.as_str().to_owned(), parent.0.clone(), at_ms),
+        );
+        while state.reply_pointers.len() > super::MAX_REPLY_POINTERS {
+            let oldest = state
+                .reply_pointers
+                .iter()
+                .min_by_key(|(_, (_, _, at))| *at)
+                .map(|(message, _)| message.clone());
+            match oldest {
+                Some(message) => drop(state.reply_pointers.remove(&message)),
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    async fn reply_pointers(&self) -> Result<Vec<(MessageId, MessageId)>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let mut kept: Vec<(i64, MessageId, MessageId)> = state
+            .reply_pointers
+            .iter()
+            .map(|(message, (_, parent, at))| {
+                (*at, MessageId(message.clone()), MessageId(parent.clone()))
+            })
+            .collect();
+        kept.sort_by_key(|(at, _, _)| *at);
+        Ok(kept
+            .into_iter()
+            .map(|(_, message, parent)| (message, parent))
+            .collect())
     }
 
     async fn read_mark_epochs(&self) -> Result<Vec<(ChannelId, i64)>, StoreError> {
@@ -1665,6 +1711,7 @@ impl StateStore for FakeStore {
         state.marks.clear();
         state.read_epochs.clear();
         state.post_keys.clear();
+        state.reply_pointers.clear();
         state.summaries.clear();
         state.dismissals.clear();
         state.own_marks.clear();
@@ -1719,6 +1766,7 @@ mod tests {
         super::super::lattice_checks::evicted_hues_come_back(&store).await;
         super::super::lattice_checks::a_stale_mark_cannot_undo_a_forget(&store).await;
         super::super::lattice_checks::post_keys_are_kept_and_bounded(&FakeStore::new()).await;
+        super::super::lattice_checks::reply_pointers_are_kept_in_order(&FakeStore::new()).await;
     }
 
     fn id(text: &str) -> ConversationId {

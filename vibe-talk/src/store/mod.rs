@@ -1692,6 +1692,10 @@ pub const POST_KEY_KEEP_MS: i64 = 24 * 60 * 60 * 1000;
 /// [`crate::post_keys::MAX_KEPT`].
 pub const MAX_POST_KEYS: usize = crate::post_keys::MAX_KEPT;
 
+/// The most reply pointers the store keeps: [`crate::reply_pointers::MAX_KEPT`]. `#934
+/// voice-page-reply-parent-arrow`.
+pub const MAX_REPLY_POINTERS: usize = crate::reply_pointers::MAX_KEPT;
+
 /// Keep from `rows` (one channel's hues, any order) only the newest
 /// [`MAX_THREAD_HUES_PER_CHANNEL`] by assignment order, returning the survivors in assignment
 /// order. Shared by every backend so the bound means the same thing in each.
@@ -2029,6 +2033,32 @@ pub trait StateStore: Send + Sync {
     /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on
     /// failure.
     async fn kept_post_keys(&self, since_ms: i64) -> Result<Vec<(String, i64)>, StoreError>;
+
+    /// File that `message`, which this server posted in `channel`, answers `parent`, replacing what
+    /// it filed for `message` before. `#934 voice-page-reply-parent-arrow`; see
+    /// [`crate::reply_pointers`]. In the same write, the oldest past [`MAX_REPLY_POINTERS`] are
+    /// forgotten. Ids only, no words.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn keep_reply_pointer(
+        &self,
+        channel: &ChannelId,
+        message: &MessageId,
+        parent: &MessageId,
+        at_ms: i64,
+    ) -> Result<(), StoreError>;
+
+    /// Every reply pointer filed, as `(message, parent)`, oldest first. `#934
+    /// voice-page-reply-parent-arrow`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on
+    /// failure.
+    async fn reply_pointers(&self) -> Result<Vec<(MessageId, MessageId)>, StoreError>;
 
     /// Every channel alias the operator has set, in channel order. `#39 channel-alias`.
     ///
@@ -3525,6 +3555,35 @@ pub(crate) mod lattice_checks {
         );
         store.purge_everything().await.expect("purge");
         assert!(store.kept_post_keys(0).await.expect("read").is_empty());
+    }
+
+    /// Reply pointers are filed by message, replaced by a later filing of the message, read back
+    /// oldest first, and taken by the purge. `#934 voice-page-reply-parent-arrow`.
+    pub(crate) async fn reply_pointers_are_kept_in_order(store: &dyn StateStore) {
+        let channel = ChannelId("chan".to_owned());
+        let mid = |id: &str| MessageId(id.to_owned());
+        store
+            .keep_reply_pointer(&channel, &mid("r2"), &mid("p2"), 20)
+            .await
+            .expect("file r2");
+        store
+            .keep_reply_pointer(&channel, &mid("r1"), &mid("p1"), 10)
+            .await
+            .expect("file r1");
+        store
+            .keep_reply_pointer(&channel, &mid("r1"), &mid("p9"), 30)
+            .await
+            .expect("file r1 again");
+        assert_eq!(
+            store.reply_pointers().await.expect("read"),
+            [(mid("r2"), mid("p2")), (mid("r1"), mid("p9"))],
+            "a later filing does not replace the message's parent, or the order is not oldest first"
+        );
+        store.purge_everything().await.expect("purge");
+        assert!(
+            store.reply_pointers().await.expect("read").is_empty(),
+            "the purge kept a reply pointer"
+        );
     }
 
     /// A forget moves the channel to a later epoch; a mark naming the old epoch is not applied,

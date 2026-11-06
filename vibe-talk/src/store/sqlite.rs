@@ -490,6 +490,19 @@ pub const MIGRATIONS: &[&str] = &[
         updated_ms INTEGER NOT NULL
     ) STRICT;
     ",
+    // v24 — which message each reply this server posted answers. `#934
+    // voice-page-reply-parent-arrow`; see `crate::reply_pointers`. One row per reply, ids only, no
+    // words, bounded by count (`super::MAX_REPLY_POINTERS`) in the write that files a row.
+    "
+    CREATE TABLE reply_pointers (
+        message_id TEXT    PRIMARY KEY NOT NULL,
+        channel_id TEXT    NOT NULL,
+        reply_to   TEXT    NOT NULL,
+        at_ms      INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE INDEX reply_pointers_by_age ON reply_pointers (at_ms);
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -1677,6 +1690,58 @@ impl StateStore for SqliteStore {
             let rows = statement
                 .query_map([since_ms], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(backend)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+        })
+        .await
+    }
+
+    async fn keep_reply_pointer(
+        &self,
+        channel: &ChannelId,
+        message: &MessageId,
+        parent: &MessageId,
+        at_ms: i64,
+    ) -> Result<(), StoreError> {
+        let channel = channel.as_str().to_owned();
+        let message = message.0.clone();
+        let parent = parent.0.clone();
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            transaction
+                .execute(
+                    "INSERT INTO reply_pointers (message_id, channel_id, reply_to, at_ms)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(message_id) DO UPDATE SET channel_id = excluded.channel_id,
+                        reply_to = excluded.reply_to, at_ms = excluded.at_ms",
+                    rusqlite::params![message, channel, parent, at_ms],
+                )
+                .map_err(backend)?;
+            transaction
+                .execute(
+                    "DELETE FROM reply_pointers WHERE message_id IN (
+                         SELECT message_id FROM reply_pointers ORDER BY at_ms DESC
+                         LIMIT -1 OFFSET ?1)",
+                    [i64::try_from(super::MAX_REPLY_POINTERS).unwrap_or(i64::MAX)],
+                )
+                .map_err(backend)?;
+            transaction.commit().map_err(backend)
+        })
+        .await
+    }
+
+    async fn reply_pointers(&self) -> Result<Vec<(MessageId, MessageId)>, StoreError> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare("SELECT message_id, reply_to FROM reply_pointers ORDER BY at_ms ASC")
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        MessageId(row.get::<_, String>(0)?),
+                        MessageId(row.get::<_, String>(1)?),
+                    ))
                 })
                 .map_err(backend)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(backend)
@@ -3179,6 +3244,10 @@ impl StateStore for SqliteStore {
             // `#471 replication-c5-post-keys`.
             transaction
                 .execute("DELETE FROM post_keys", [])
+                .map_err(backend)?;
+            // `#934 voice-page-reply-parent-arrow`: and which message each reply answered.
+            transaction
+                .execute("DELETE FROM reply_pointers", [])
                 .map_err(backend)?;
             transaction
                 .execute("DELETE FROM summaries", [])
@@ -7425,7 +7494,7 @@ mod tests {
         // there are add tables, dropped here as their notes say.
         connection
             .execute_batch(
-                "DROP TABLE IF EXISTS history_modes;
+                "DROP TABLE IF EXISTS reply_pointers; DROP TABLE IF EXISTS history_modes;
                  DROP TABLE IF EXISTS own_decided; ALTER TABLE dismissals DROP COLUMN own;
                  DROP TABLE IF EXISTS post_keys; DROP TABLE IF EXISTS thread_hue_tombstones;
                  DROP TABLE IF EXISTS read_mark_epochs; DROP TABLE IF EXISTS client_settings;
@@ -7637,6 +7706,7 @@ mod tests {
         super::super::lattice_checks::evicted_hues_come_back(&store).await;
         super::super::lattice_checks::a_stale_mark_cannot_undo_a_forget(&store).await;
         super::super::lattice_checks::post_keys_are_kept_and_bounded(&store).await;
+        super::super::lattice_checks::reply_pointers_are_kept_in_order(&store).await;
         // Both survive a restart: they are rows, not memory.
         let channel = ChannelId("1111111111".to_owned());
         store

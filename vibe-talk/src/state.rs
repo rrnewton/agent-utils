@@ -139,6 +139,10 @@ pub struct AppState {
     /// [`crate::post_keys`]. A repeat of a post that landed, or that is landing now, is answered
     /// with that post's answer and posts nothing. In memory.
     pub post_keys: Arc<crate::post_keys::PostKeys>,
+    /// Which message each reply this server posted answers, for a provider that keeps no pointer of
+    /// its own. `#934 voice-page-reply-parent-arrow`; see [`crate::reply_pointers`]. In memory, and
+    /// filed in the store.
+    pub reply_pointers: Arc<crate::reply_pointers::ReplyPointers>,
     /// What the user said lately, as the voice page heard it, and which of their asks to send were
     /// spent. `#511 voice-explicit-send-only`; see [`crate::send_intent`]. In memory.
     pub send_intent: Arc<crate::send_intent::SendIntent>,
@@ -253,6 +257,20 @@ impl AppState {
             );
         }
         self.post_keys.restore(kept, now);
+        Ok(count)
+    }
+
+    /// Read every reply pointer the store filed back into [`AppState::reply_pointers`]. `#934
+    /// voice-page-reply-parent-arrow`. Read once at startup.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::store::StoreError`] when the store cannot be read; the replies posted before this
+    /// start are then drawn without their parent, as they were before the store kept them.
+    pub async fn restore_reply_pointers(&self) -> Result<usize, crate::store::StoreError> {
+        let pointers = self.store.reply_pointers().await?;
+        let count = pointers.len();
+        self.reply_pointers.restore(pointers);
         Ok(count)
     }
 

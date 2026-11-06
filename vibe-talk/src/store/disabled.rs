@@ -109,6 +109,20 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn keep_reply_pointer(
+        &self,
+        _: &ChannelId,
+        _: &MessageId,
+        _: &MessageId,
+        _: i64,
+    ) -> Result<(), StoreError> {
+        refuse()
+    }
+
+    async fn reply_pointers(&self) -> Result<Vec<(MessageId, MessageId)>, StoreError> {
+        refuse()
+    }
+
     async fn channel_aliases(&self) -> Result<Vec<ChannelAlias>, StoreError> {
         refuse()
     }

@@ -17977,9 +17977,11 @@ function ungatherButton() {
 // away. One in a thread that does name this message is a reply by pointer like any other.
 //
 // SLACK HAS NO POINTER. Its only reply is a thread reply, and its Reply posts into the message's
-// thread, which the thread chips count. So there Reply stays "Reply": none of its messages names
-// another, and a send of the owner's is not counted either (below). The thread's count is not put on
-// the button as well, for the reason just given.
+// thread, which the thread chips count. Since `#934 voice-page-reply-parent-arrow` the server names
+// what a reply it posted answers there too (its own record, and our metadata in Slack), so the reply
+// draws its arrow; but a reply naming the ROOT of the thread it is in is that thread's reply, which the
+// thread chips already count, and is not counted again as Reply (N), on any provider. One naming
+// another message of its thread is a reply by pointer like any other.
 //
 // THE OWNER'S OWN SEND COUNTS AT ONCE, from the outbox, the moment Send is pressed — where the
 // channel's replies are known to carry the pointer: a provider without threads, whose only reply is
@@ -18067,19 +18069,30 @@ function heldReplies(rows) {
   // ...and what each says, so that a send the stream has already brought back, ahead of the
   // server's answer to it, is not counted a second time from the outbox.
   const said = new Set();
+  // `#934 voice-page-reply-parent-arrow`. A reply naming the root of the thread it is in: the thread's chips count it.
+  const answersOwnRoot = (message) => Boolean(message && message.reply_to && message.thread &&
+    message.thread.is_root !== true && String(message.thread.root_message_id || "") === String(message.reply_to));
   for (const [id, message] of held) {
-    if (!message.reply_to) continue;
+    if (!message.reply_to || answersOwnRoot(message)) continue;
     add(String(message.reply_to), id, timeOf(message, "timestamp"));
     said.add(`${message.reply_to}\n${String(message.content || "").trim()}`);
   }
   const pointers = !providerFacts.threading() || replies.size > 0;
+  // Counted before the server answers only where the send stays a reply by pointer: with threads, a reply
+  // to a message in no thread, or to a thread's root, may become that thread's reply (Slack's Reply does),
+  // which is not counted; it is counted, where it is one, once the server's answer says so.
+  const staysPointer = (id) => {
+    if (!providerFacts.threading()) return true;
+    const target = held.get(String(id));
+    return Boolean(target && target.thread && target.thread.is_root !== true);
+  };
   for (const entry of outbox.values()) {
     if (entry.channel !== viewing || !entry.replyTo) continue;
     const first = entry.parts[0];
     if (first) {
-      if (first.reply_to) add(String(first.reply_to), String(first.id), timeOf(first, "timestamp"));
+      if (first.reply_to && !answersOwnRoot(first)) add(String(first.reply_to), String(first.id), timeOf(first, "timestamp"));
     } else if ((entry.state === "sending" || outgoingRetries.has(entry.id)) && entry.postedCount === 0 &&
-        pointers && !said.has(`${entry.replyTo}\n${String(entry.text).trim()}`)) {
+        pointers && staysPointer(entry.replyTo) && !said.has(`${entry.replyTo}\n${String(entry.text).trim()}`)) {
       add(String(entry.replyTo), `outgoing:${entry.id}`, entry.createdAt);
     }
   }

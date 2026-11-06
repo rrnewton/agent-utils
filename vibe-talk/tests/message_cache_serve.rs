@@ -3361,3 +3361,137 @@ async fn a_thread_listed_whole_since_its_count_is_complete_whatever_the_count_sa
         "a listing since proves it whole: {body}"
     );
 }
+
+/// `#934 voice-page-reply-parent-arrow`: a reply and a quote-reply posted in the channel and inside
+/// a thread still say what they answer when the cache serves them (`[message_cache] serve = true`),
+/// with Slack refusing every read, and still do after a restart reads this server's pointers back.
+/// Slack keeps no pointer of its own; with our metadata dropped on the way the cache has only the
+/// server's record to go by.
+#[tokio::test]
+async fn replies_served_from_the_cache_keep_their_parents_and_do_after_a_restart() {
+    for drops_metadata in [false, true] {
+        served_replies_keep_their_parents(drops_metadata).await;
+    }
+}
+
+async fn served_replies_keep_their_parents(drops_metadata: bool) {
+    let transport = if drops_metadata {
+        "metadata dropped"
+    } else {
+        "Slack"
+    };
+    let tag = if drops_metadata {
+        "served-replies-bare"
+    } else {
+        "served-replies"
+    };
+    let (state, fake, clock, _dir) = slack_threads_deployment(tag, true).await;
+    fake.with(|fixture| fixture.drops_metadata = drops_metadata);
+    let id = |at: i64| {
+        vibe_talk::slack::message_id_from_ts(&slack_fake::ts(at, 0))
+            .expect("an id")
+            .0
+    };
+    let main = ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    let in_thread = main["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["id"] == serde_json::json!(id(60)))
+        .and_then(|m| m["thread"]["id"].as_str())
+        .expect("message 1 heads its thread")
+        .to_owned();
+    // (what, text, the parent, posted inside the thread)
+    let cases = [
+        ("a reply in the channel", "yes", id(0), false),
+        (
+            "a quote-reply in the channel",
+            "> message 2\nagreed",
+            id(120),
+            false,
+        ),
+        ("a reply inside a thread", "suits me", id(70), true),
+        (
+            "a quote-reply inside a thread",
+            "> second reply\nfine by me",
+            id(80),
+            true,
+        ),
+    ];
+    let mut posted = Vec::new();
+    for (n, (what, text, parent, inside)) in cases.iter().enumerate() {
+        let mut body = serde_json::json!({
+            "text": text, "reply_to": parent, "idempotency_key": format!("k-934-{n}"),
+        });
+        if *inside {
+            body["thread_id"] = serde_json::json!(in_thread);
+        }
+        let (status, answered) = post(&state, &path(SLACK_CH, "/reply"), &body).await;
+        assert_eq!(status, StatusCode::OK, "{what}: {answered}");
+        let thread = answered["posted"]["thread"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{what} was posted in a thread: {answered}"))
+            .to_owned();
+        posted.push((
+            *what,
+            thread,
+            answered["posted"]["id"].clone(),
+            parent.clone(),
+        ));
+    }
+    let thread_page = |thread: &str| {
+        path(
+            SLACK_CH,
+            &format!(
+                "/timeline?view=thread&thread_id={}&limit=50",
+                url_encode(thread)
+            ),
+        )
+    };
+    // The cache holds each thread as Slack answers it, and then serves it.
+    clock.advance(SECOND);
+    for (_, thread, _, _) in &posted {
+        ok(&state, &thread_page(thread), WRITE_TOKEN).await;
+    }
+    settled(&state).await;
+    state.message_cache.set_serve(true);
+    rate_limit(&fake, "conversations.history");
+    rate_limit(&fake, "conversations.replies");
+    let mut restarted = state.clone();
+    restarted.reply_pointers = Arc::new(vibe_talk::reply_pointers::ReplyPointers::new());
+    assert_eq!(
+        restarted.restore_reply_pointers().await.expect("restored"),
+        cases.len()
+    );
+    for (server, when) in [(&state, "served"), (&restarted, "served after a restart")] {
+        for (what, thread, reply_id, parent) in &posted {
+            let began = std::time::Instant::now();
+            // A page entering the thread, as it does when the reader opens it.
+            let entering = format!("{}&reason=enter", thread_page(thread));
+            let page = ok(server, &entering, WRITE_TOKEN).await;
+            assert!(
+                began.elapsed() < AT_ONCE,
+                "{what}: the thread was not served from the cache: {:?}",
+                began.elapsed()
+            );
+            let found = page["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .find(|m| m["id"] == *reply_id)
+                .unwrap_or_else(|| {
+                    panic!("{transport}: {when}, the thread does not hold {what}: {page}")
+                });
+            assert_eq!(
+                found["reply_to"],
+                serde_json::json!(parent),
+                "{transport}: {when}, {what} lost what it answers"
+            );
+        }
+    }
+}

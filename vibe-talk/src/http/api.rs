@@ -4269,6 +4269,8 @@ pub const PURGED: &[&str] = &[
     "voice_post_prefix",
     "client_settings",
     "post_keys",
+    // `#934 voice-page-reply-parent-arrow`.
+    "reply_pointers",
     "message_cache",
 ];
 
@@ -4330,6 +4332,9 @@ pub async fn purge_storage(
     // The send log's memory first, so a post settling during the purge is not filed after it.
     // `#471 replication-c5-post-keys`.
     state.post_keys.forget_settled();
+    // `#934 voice-page-reply-parent-arrow`: and which message each reply answered, in memory as in
+    // the store.
+    state.reply_pointers.forget();
     state.store.purge_everything().await?;
     let forgotten = clearing.forget_all();
     drop(changing);

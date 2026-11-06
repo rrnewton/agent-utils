@@ -412,6 +412,7 @@ fn state_pieces_with(
         )),
         post_lanes: Arc::new(crate::post_lanes::PostLanes::new()),
         post_keys: Arc::new(crate::post_keys::PostKeys::new()),
+        reply_pointers: Arc::new(crate::reply_pointers::ReplyPointers::new()),
         send_intent: Arc::new(crate::send_intent::SendIntent::new()),
         reply_reads: Arc::new(crate::reply_read::ReplyReads::new()),
         spoken_names: Arc::new(crate::speakable::SharedNames::new()),

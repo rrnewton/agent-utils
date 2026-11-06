@@ -812,6 +812,7 @@ async fn main() -> anyhow::Result<()> {
         post_gate: Arc::new(vibe_talk::post_gate::PostGate::new()),
         post_lanes: Arc::new(vibe_talk::post_lanes::PostLanes::new()),
         post_keys: Arc::new(vibe_talk::post_keys::PostKeys::new()),
+        reply_pointers: Arc::new(vibe_talk::reply_pointers::ReplyPointers::new()),
         send_intent: Arc::new(vibe_talk::send_intent::SendIntent::new()),
         reply_reads: Arc::new(vibe_talk::reply_read::ReplyReads::new()),
         live: Arc::clone(&live),
@@ -881,6 +882,17 @@ async fn main() -> anyhow::Result<()> {
         // No store is a deployment that never set `storage.path`: nothing to restore.
         Err(vibe_talk::store::StoreError::Unavailable(_)) => {}
         Err(error) => tracing::warn!(%error, "could not restore the send log's settled posts"),
+    }
+    // `#934 voice-page-reply-parent-arrow`. Which message each reply posted before this restart
+    // answers, so it is drawn with its arrow still.
+    match state.restore_reply_pointers().await {
+        Ok(restored) => {
+            if restored > 0 {
+                tracing::info!(replies = restored, "restored the reply pointers");
+            }
+        }
+        Err(vibe_talk::store::StoreError::Unavailable(_)) => {}
+        Err(error) => tracing::warn!(%error, "could not restore the reply pointers"),
     }
     state.refresh_routes();
     // `#628 documents-index-server`. Rebuild the fold from the cache when it

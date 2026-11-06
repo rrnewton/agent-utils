@@ -4056,6 +4056,17 @@ taking the file back too. **Take a copy of `storage.path` before an upgrade.** R
 is the simplest way back to an older build. The other way is to undo the newest steps by hand, with
 the server stopped, newest first; each step's note below says how.
 
+**Step 24 (`#934 voice-page-reply-parent-arrow`)** only adds the `reply_pointers` table, which
+message each reply this server posted answers, so with the server stopped it can be undone in place;
+replies read from a provider that keeps no pointer of its own (Slack) then lose their arrows to
+their parents, unless the provider returns the message metadata that names them:
+
+```sh
+sqlite3 /path/to/vibe-talk.sqlite3 'DROP TABLE reply_pointers; PRAGMA user_version = 23;'
+```
+
+Run that only on a file at version 24, and only when the build being returned to predates the step.
+
 **Step 23 (`#602 history-settings-and-limits`)** only adds the `history_modes` table, each
 channel's own history mode chosen in Settings › Channels, so with the server stopped it can be
 undone in place, every channel then following `[message_cache] backfill` again:

@@ -1404,8 +1404,15 @@ impl HttpSlackClient {
                     (None, Some(id)) => Some(self.reply_thread(conversation, id).await?),
                     (None, None) => None,
                 };
-                self.post_raw(channel, conversation, content, thread.as_deref(), key)
-                    .await
+                self.post_raw(
+                    channel,
+                    conversation,
+                    content,
+                    thread.as_deref(),
+                    reply_to,
+                    key,
+                )
+                .await
             })
             .await
     }
@@ -1442,6 +1449,7 @@ impl HttpSlackClient {
         conversation: &str,
         content: &str,
         thread: Option<&str>,
+        reply_to: Option<&MessageId>,
         key: Option<&str>,
     ) -> Result<Message, ChatError> {
         if content.trim().is_empty() {
@@ -1462,8 +1470,11 @@ impl HttpSlackClient {
         }
         // The operation key, where the caller gave one, as message metadata: invisible in every
         // Slack client, and returned to reads that ask for it. `#465 replication-c6-op-key-marker`.
-        if let Some(key) = key {
-            params.push(("metadata", super::client::op_key_metadata(key)));
+        // With it, for a reply, the message it answers, which Slack has no pointer for: kept in
+        // Slack itself, so a read anywhere that returns metadata draws it as a reply. `#934
+        // voice-page-reply-parent-arrow`.
+        if let Some(metadata) = super::client::post_metadata(key, reply_to) {
+            params.push(("metadata", metadata));
         }
         let value = self.call("chat.postMessage", &params).await?;
         // What the thread list scanned of the conversation no longer holds this post.
@@ -1492,7 +1503,8 @@ impl HttpSlackClient {
 
     /// [`crate::chat::ChatClient::post_in_thread`], without the provider label.
     ///
-    /// The destination is the thread; `reply_to` adds nothing Slack can carry and is ignored.
+    /// The destination is the thread; `reply_to` names the message it answers in our metadata
+    /// (`#934 voice-page-reply-parent-arrow`), as Slack has no pointer of its own.
     ///
     /// A post, with the read that proves its thread, goes ahead of every other request (`#699
     /// vt-send-priority`, [`super::budget`]).
@@ -1501,7 +1513,7 @@ impl HttpSlackClient {
         channel: &ChannelId,
         thread_id: &str,
         content: &str,
-        _reply_to: Option<&MessageId>,
+        reply_to: Option<&MessageId>,
         key: Option<&str>,
     ) -> Result<Message, ChatError> {
         let _in_flight = self.write_in_flight();
@@ -1520,8 +1532,15 @@ impl HttpSlackClient {
                 if !self.root_known(&target.conversation, &thread) {
                     self.thread_root(&target.conversation, &thread).await?;
                 }
-                self.post_raw(channel, &target.conversation, content, Some(&thread), key)
-                    .await
+                self.post_raw(
+                    channel,
+                    &target.conversation,
+                    content,
+                    Some(&thread),
+                    reply_to,
+                    key,
+                )
+                .await
             })
             .await
     }

@@ -103,6 +103,185 @@ fn reply() -> String {
     format!("/api/v1/channels/{TEAM}/reply")
 }
 
+async fn get(state: &AppState, uri: &str) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+        .body(Body::empty())
+        .expect("request");
+    let response = vibe_talk::http::router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// `#934 voice-page-reply-parent-arrow`. The owner: "When I reply or quote reply especially inside
+/// a thread. I'm not getting a little blue arrows to blink it back to the parent." Slack keeps no
+/// reply pointer, so this server keeps its own: a reply and a quote-reply in the channel (which
+/// Slack posts in their parents' threads) and a reply and a quote-reply inside a thread each come
+/// back from every read saying what they answer, and still do after a restart: by our metadata in
+/// Slack itself, where the transport passes it both ways, and by this server's own record where it
+/// does not.
+#[tokio::test]
+async fn slack_replies_and_quote_replies_keep_their_parents_on_every_read_and_after_a_restart() {
+    for drops_metadata in [false, true] {
+        replies_keep_their_parents(drops_metadata).await;
+    }
+}
+
+async fn replies_keep_their_parents(drops_metadata: bool) {
+    let transport = if drops_metadata {
+        "a transport dropping metadata"
+    } else {
+        "Slack"
+    };
+    let mut fixture = FakeState {
+        drops_metadata,
+        ..fixture(vec![])
+    };
+    let mut root = profiled(&ts(20, 0), "UADA00001", "Ada", "shall we ship?");
+    let answer = ts(21, 0);
+    slack_fake::thread(
+        &mut fixture,
+        TEAM,
+        &mut root,
+        &[(answer.clone(), "after lunch".to_owned())],
+    );
+    let history = fixture.history.get_mut(TEAM).expect("the channel");
+    history.push(profiled(&ts(15, 0), "UADA00001", "Ada", "deploy tonight?"));
+    history.push(root);
+    let fake = Fake::start(fixture, 50).await;
+    let state = slack(&fake).await;
+    let id = |ts: &str| vibe_talk::slack::message_id_from_ts(ts).expect("an id").0;
+    let (status, main) = get(
+        &state,
+        &format!("/api/v1/channels/{TEAM}/timeline?view=main"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{main}");
+    let in_thread = main["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["id"] == json!(id(&ts(20, 0))))
+        .and_then(|m| m["thread"]["id"].as_str())
+        .expect("the root heads its thread")
+        .to_owned();
+    // (what, text, the parent, posted inside the thread)
+    let cases = [
+        (
+            "a reply in the channel",
+            "yes, it is green",
+            id(&ts(10, 0)),
+            false,
+        ),
+        (
+            "a quote-reply in the channel",
+            "> deploy tonight?\nno, tomorrow",
+            id(&ts(15, 0)),
+            false,
+        ),
+        ("a reply inside a thread", "suits me", id(&answer), true),
+        (
+            "a quote-reply inside a thread",
+            "> after lunch\nfine by me",
+            id(&answer),
+            true,
+        ),
+    ];
+    let mut posted = Vec::new();
+    for (n, (what, text, parent, inside)) in cases.iter().enumerate() {
+        let mut body =
+            json!({ "text": text, "reply_to": parent, "idempotency_key": format!("k-934-{n}") });
+        if *inside {
+            body["thread_id"] = json!(in_thread);
+        }
+        let (status, answered) = call(&state, &reply(), body).await;
+        assert_eq!(status, StatusCode::OK, "{what}: {answered}");
+        assert_eq!(
+            answered["posted"]["reply_to"],
+            json!(parent),
+            "{what}: the posted reply does not say what it answers"
+        );
+        let thread = answered["posted"]["thread"]["id"]
+            .as_str()
+            .expect("posted in a thread")
+            .to_owned();
+        posted.push((
+            *what,
+            thread,
+            answered["posted"]["id"].clone(),
+            parent.clone(),
+        ));
+    }
+    assert_eq!(fake.calls("chat.postMessage"), cases.len());
+    // Each post names its parent in our metadata, for every reader of Slack that returns it.
+    let filed: Vec<Value> = fake
+        .requests("chat.postMessage")
+        .iter()
+        .map(|params| serde_json::from_str(&params["metadata"]).expect("metadata as JSON"))
+        .collect();
+    for ((what, _, _, parent), filed) in posted.iter().zip(&filed) {
+        // Exactly `event_type` (text) and `event_payload` (an object), within 8 KB: a bridge in
+        // front of Slack refuses any other shape, and the post with it.
+        let fields = filed.as_object().expect("metadata is an object");
+        assert_eq!(fields.len(), 2, "{what}: {filed}");
+        assert!(
+            fields["event_type"].is_string() && fields["event_payload"].is_object(),
+            "{what}: {filed}"
+        );
+        assert!(filed.to_string().len() < 8 * 1024, "{what}: {filed}");
+        assert_eq!(
+            filed["event_payload"]["reply_to"],
+            json!(parent),
+            "{transport}: {what}: {filed}"
+        );
+    }
+    // Every read of each thread, and after a restart: the same store, the pointers read back.
+    let mut restarted = state.clone();
+    restarted.reply_pointers = Arc::new(vibe_talk::reply_pointers::ReplyPointers::new());
+    assert_eq!(
+        restarted.restore_reply_pointers().await.expect("restored"),
+        cases.len()
+    );
+    for (server, when) in [(&state, "a read"), (&restarted, "a read after a restart")] {
+        for (what, thread, reply_id, parent) in &posted {
+            let encoded = thread.replace(':', "%3A");
+            let (status, page) = get(
+                server,
+                &format!("/api/v1/channels/{TEAM}/timeline?view=thread&thread_id={encoded}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            let found = page["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .find(|m| m["id"] == *reply_id)
+                .unwrap_or_else(|| {
+                    panic!("{transport}: {when} of the thread does not hold {what}: {page}")
+                });
+            assert_eq!(
+                found["reply_to"],
+                json!(parent),
+                "{transport}: {when} lost what {what} answers"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_slack_post_whose_answer_was_lost_is_found_by_its_key_and_answered_as_posted() {
     let fake = Fake::start(fixture(vec![1]), 50).await;

@@ -1233,8 +1233,11 @@ impl Raw {
             spoken_time: String::new(),
             // Slack's `edited.ts`, on an edited message only. `#320 slack-edited-mark`.
             edited_timestamp: self.edited_micros().map(rfc3339),
-            // Slack has no reply pointer; a reply is thread membership, carried in `thread`.
-            reply_to: None,
+            // Slack has no reply pointer; a reply is thread membership, carried in `thread`. A reply
+            // vibe-talk posted names its parent in our metadata, where the read returns it (`#934
+            // voice-page-reply-parent-arrow`, `reply_to_of`); the server's own record fills the rest
+            // (`crate::reply_pointers`).
+            reply_to: reply_to_of(&self.value),
             // The words, then a line for each file the message shares: a post that is only a file
             // has no words at all (`#313 slack-file-posts`, `super::files`).
             content: super::files::body(
@@ -1867,14 +1870,43 @@ impl ChatClient for HttpSlackClient {
 /// under another type is never read as a key.
 pub const OP_KEY_EVENT_TYPE: &str = "vibe_talk_op_key";
 
-/// The `metadata` parameter of a `chat.postMessage` carrying `key`: Slack's documented shape,
-/// `{event_type, event_payload}`.
-pub(super) fn op_key_metadata(key: &str) -> String {
-    serde_json::json!({
-        "event_type": OP_KEY_EVENT_TYPE,
-        "event_payload": { "op_key": key },
-    })
-    .to_string()
+/// The `metadata` parameter of a `chat.postMessage` carrying `key` and, for a reply, the message it
+/// answers (`#934 voice-page-reply-parent-arrow`): Slack's documented shape, `{event_type,
+/// event_payload}`. None where there is neither.
+pub(super) fn post_metadata(key: Option<&str>, reply_to: Option<&MessageId>) -> Option<String> {
+    let mut payload = serde_json::Map::new();
+    if let Some(key) = key {
+        payload.insert("op_key".to_owned(), Value::String(key.to_owned()));
+    }
+    if let Some(parent) = reply_to {
+        payload.insert("reply_to".to_owned(), Value::String(parent.0.clone()));
+    }
+    if payload.is_empty() {
+        return None;
+    }
+    Some(
+        serde_json::json!({
+            "event_type": OP_KEY_EVENT_TYPE,
+            "event_payload": payload,
+        })
+        .to_string(),
+    )
+}
+
+/// The message a reply vibe-talk posted answers, as its metadata names it, if any. `#934
+/// voice-page-reply-parent-arrow`. Metadata another app filed under another `event_type` is not
+/// ours and is ignored.
+pub(super) fn reply_to_of(value: &Value) -> Option<MessageId> {
+    let metadata = value.get("metadata")?;
+    if metadata.get("event_type").and_then(Value::as_str) != Some(OP_KEY_EVENT_TYPE) {
+        return None;
+    }
+    metadata
+        .get("event_payload")
+        .and_then(|payload| payload.get("reply_to"))
+        .and_then(Value::as_str)
+        .filter(|parent| !parent.is_empty())
+        .map(|parent| MessageId(parent.to_owned()))
 }
 
 /// The operation key a message object carries in vibe-talk's metadata, if any. Metadata another
@@ -2000,6 +2032,69 @@ mod tests {
             op_key_of(
                 &serde_json::json!({"metadata": {"event_type": "vibe_talk_post",
             "event_payload": {"op_key": "theirs"}}})
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_names_its_parent_in_our_metadata_and_a_read_draws_it_as_a_reply() {
+        // `#934 voice-page-reply-parent-arrow`. Slack has no reply pointer: a reply vibe-talk posts
+        // names its parent in our metadata, beside its operation key, and a read that returns the
+        // metadata gives it back as `reply_to`.
+        let parent = MessageId("1700000000000100".to_owned());
+        let filed: Value = serde_json::from_str(
+            &post_metadata(Some("k.1"), Some(&parent)).expect("metadata for a keyed reply"),
+        )
+        .expect("JSON");
+        assert_eq!(filed["event_type"], OP_KEY_EVENT_TYPE);
+        assert_eq!(filed["event_payload"]["op_key"], "k.1");
+        assert_eq!(filed["event_payload"]["reply_to"], parent.0.as_str());
+        let unkeyed: Value = serde_json::from_str(
+            &post_metadata(None, Some(&parent)).expect("metadata for a reply"),
+        )
+        .expect("JSON");
+        assert!(unkeyed["event_payload"].get("op_key").is_none());
+        // A bridge in front of Slack refuses the post outright unless its metadata is an object
+        // of exactly `event_type` (text) and `event_payload` (an object), within 8 KB.
+        for metadata in [&filed, &unkeyed] {
+            let fields = metadata.as_object().expect("an object");
+            assert_eq!(fields.len(), 2, "{metadata}");
+            assert!(fields["event_type"].is_string(), "{metadata}");
+            assert!(fields["event_payload"].is_object(), "{metadata}");
+            assert!(metadata.to_string().len() < 8 * 1024, "{metadata}");
+        }
+        assert_eq!(
+            post_metadata(None, None),
+            None,
+            "a plain unkeyed post carried metadata"
+        );
+        let read = Raw::parse(serde_json::json!({
+            "ts": "1700000001.000200", "thread_ts": "1700000000.000100", "user": "U0ADA",
+            "text": "on it", "user_profile": {"display_name": "Ada"}, "metadata": filed,
+        }))
+        .expect("raw");
+        let channel = ChannelId("C0123ABCDE".to_owned());
+        let messages = client()
+            .messages(&channel, std::slice::from_ref(&read))
+            .await;
+        assert_eq!(
+            messages[0].reply_to.as_ref(),
+            Some(&parent),
+            "the read lost what the reply answers"
+        );
+        // Another app's metadata, or ours without a parent, names none.
+        assert_eq!(
+            reply_to_of(
+                &serde_json::json!({"metadata": {"event_type": "vibe_talk_post",
+                "event_payload": {"reply_to": "1"}}})
+            ),
+            None
+        );
+        assert_eq!(
+            reply_to_of(
+                &serde_json::json!({"metadata": {"event_type": OP_KEY_EVENT_TYPE,
+                "event_payload": {"op_key": "k.2"}}})
             ),
             None
         );

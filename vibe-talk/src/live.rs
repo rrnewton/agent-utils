@@ -2079,6 +2079,11 @@ fn judge(
 ) {
     if live.kind != LiveKind::Delete {
         noise.mark(std::slice::from_mut(&mut live.message));
+        // `#934 voice-page-reply-parent-arrow`. A reply this server posted, sent to every reader as
+        // one, whichever way it arrived — the poller's read, a pushed record, the replay — as
+        // `ops::stamp` gives it on a read.
+        app.reply_pointers
+            .fill(std::slice::from_mut(&mut live.message));
         let message = &mut live.message;
         if let Some(tag) = crate::heading::paren_candidate(&message.content, message.author_is_bot)
         {
@@ -3128,6 +3133,39 @@ mod tests {
 
     fn hub_for(_channel: &ChannelId) -> LiveHub {
         LiveHub::new()
+    }
+
+    /// `#934 voice-page-reply-parent-arrow`. Every event a reader is sent says what a reply this
+    /// server posted answers, whichever way it arrived, as a read does.
+    #[test]
+    fn a_live_event_carries_the_reply_pointer_this_server_kept() {
+        let (state, _fake) = crate::testing::state();
+        let channel = ChannelId(crate::testing::WRITE_CHANNEL.to_owned());
+        let parent = crate::model::MessageId("100".to_owned());
+        let mut message = crate::cache::fixtures::message("101", "vibe-talk", "the answer", 1);
+        state.reply_pointers.note(&message.id, &parent);
+        message.reply_to = None;
+        let mut live = LiveMessage {
+            event_id: "e1".to_owned(),
+            kind: LiveKind::Create,
+            historical: false,
+            message,
+            self_posted: true,
+            client_key: None,
+        };
+        let noise = crate::noise::NoiseFilter::nothing();
+        judge(
+            &noise,
+            &state,
+            &channel,
+            crate::render::Markup::default(),
+            &mut live,
+        );
+        assert_eq!(
+            live.message.reply_to,
+            Some(parent),
+            "a live event of the reply lost what it answers"
+        );
     }
 
     fn fake_with(channel: &ChannelId) -> Arc<FakeDiscord> {

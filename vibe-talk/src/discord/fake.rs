@@ -78,6 +78,8 @@ enum PostFailure {
 
 #[derive(Debug, Default)]
 struct State {
+    /// Keep no reply pointer on a post, as Slack keeps none. `#934 voice-page-reply-parent-arrow`.
+    pointerless: bool,
     known: BTreeSet<ChannelId>,
     fetches: usize,
     messages: Vec<Message>,
@@ -250,6 +252,12 @@ impl FakeDiscord {
     #[must_use]
     pub fn directory_forgotten(&self) -> usize {
         self.lock().directory_forgotten
+    }
+
+    /// Keep no reply pointer on what is posted from now on, as Slack keeps none: a reply comes back,
+    /// and reads back, as a loose message. `#934 voice-page-reply-parent-arrow`.
+    pub fn keep_no_reply_pointers(&self) {
+        self.lock().pointerless = true;
     }
 
     /// Delay each managed registration response, allowing concurrency tests to force overlap.
@@ -990,7 +998,8 @@ impl ChatClient for FakeDiscord {
                 // this, posting a reply here produced a loose message and the parent never showed
                 // as answered — which is exactly the behaviour the inbox view is built on, so the
                 // fake would have been unable to exercise the one loop that matters.
-                let id = match reply_to {
+                let pointerless = self.lock().pointerless;
+                let id = match reply_to.filter(|_| !pointerless) {
                     Some(parent) => self.seed_reply(channel, "vibe-talk", content, parent),
                     None => self.seed(channel, "vibe-talk", content),
                 };
