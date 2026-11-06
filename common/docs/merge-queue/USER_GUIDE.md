@@ -1183,6 +1183,17 @@ and the `refusal-deferred` notification. `serve` also prints it as an `ALARM:` l
 in the heartbeat's `last_error` until a clean cycle. A runner that reports failed tests and then
 exits `127` is still red: its own results are evidence.
 
+**An unparseable results row is could-not-run too.** If any row of a `command` validator's
+results file cannot be parsed (bad JSON, an unknown outcome, or an invalid test id), that
+validation is could-not-run with host scope, exactly like a refusal above: it is not an error
+that stops the run, and no row of the file — parsed or not — is a verdict for or against the
+change. The detail names the file, the line number and the parse error (cut to about 300
+bytes), for example `could not run: bad line in .../results.jsonl line 2: ...`; the rows that
+did parse stay in the validation record for diagnosis. The usual refusal retries, backoff and
+deferral bound apply, so an adapter that deterministically writes a bad row parks its change
+after the bound with a notification instead of re-validating the same batch forever. A donor
+receipt carries it as a host-scope could-not-run (`MQ_COULD_NOT_RUN_SCOPE: host ...`).
+
 **Bounded retry.** Validation that did not run is retried, but never forever. Each deferral of
 a change counts, whatever caused it: an admission refusal, a validator that cannot execute, a
 culprit-search probe that could not run on an unattributed red, or donors that could not run.

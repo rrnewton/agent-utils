@@ -181,6 +181,18 @@ pub fn is_empty_red(
                 .all(|outcome| matches!(outcome, Outcome::Error | Outcome::Missing)))
 }
 
+/// Cut a could-not-run detail to about 300 bytes, on a char boundary.
+fn truncate_detail(detail: &str) -> String {
+    if detail.len() <= 300 {
+        return detail.to_owned();
+    }
+    let mut end = 300;
+    while end > 0 && !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &detail[..end])
+}
+
 /// A red run whose results name no failed test has lost its attribution, since a results file
 /// can drop a failure. When the runner also prints dagrun-style verdict lines, a step they show
 /// failed is recorded failed, unless the results reported it passed. A red run that names no
@@ -986,19 +998,50 @@ impl Validator for CommandValidator {
         )?;
         let mut results = TestResults::default();
         let mut suspect: BTreeSet<TestId> = BTreeSet::new();
+        // A row the queue cannot parse is not an error that stops the run:
+        // it makes this validation could-not-run (host scope), with the rows
+        // that did parse kept for diagnosis and no verdict from any of them.
+        let mut bad_row: Option<String> = None;
         if let Ok(text) = std::fs::read_to_string(&results_path) {
-            for line in text.lines().filter(|line| !line.trim().is_empty()) {
-                let parsed: ResultLine = serde_json::from_str(line).map_err(|error| {
-                    format!("bad line in {}: {error}: {line}", results_path.display())
-                })?;
-                let outcome = Outcome::parse(&parsed.outcome).ok_or_else(|| {
-                    format!(
-                        "unknown outcome {:?} in {}",
-                        parsed.outcome,
-                        results_path.display()
-                    )
-                })?;
-                let id = TestId::parse(&parsed.id)?;
+            for (index, line) in text.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let line_no = index + 1;
+                let parsed: ResultLine = match serde_json::from_str(line) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        bad_row.get_or_insert_with(|| {
+                            truncate_detail(&format!(
+                                "bad line in {} line {line_no}: {error}: {line}",
+                                results_path.display()
+                            ))
+                        });
+                        continue;
+                    }
+                };
+                let Some(outcome) = Outcome::parse(&parsed.outcome) else {
+                    bad_row.get_or_insert_with(|| {
+                        truncate_detail(&format!(
+                            "unknown outcome {:?} in {} line {line_no}",
+                            parsed.outcome,
+                            results_path.display()
+                        ))
+                    });
+                    continue;
+                };
+                let id = match TestId::parse(&parsed.id) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        bad_row.get_or_insert_with(|| {
+                            truncate_detail(&format!(
+                                "bad line in {} line {line_no}: {error}",
+                                results_path.display()
+                            ))
+                        });
+                        continue;
+                    }
+                };
                 if outcome == Outcome::Fail
                     && parsed
                         .shape
@@ -1015,7 +1058,7 @@ impl Validator for CommandValidator {
                 });
             }
         }
-        if results.results.is_empty() {
+        if results.results.is_empty() && bad_row.is_none() {
             // No results file: a runner that prints dagrun-style verdict lines still attributes.
             results = parse_step_lines(&std::fs::read_to_string(&log).unwrap_or_default());
         }
@@ -1075,7 +1118,7 @@ impl Validator for CommandValidator {
         }
         results.require(selection);
         let log_text = std::fs::read_to_string(&log).unwrap_or_default();
-        let cannot_execute =
+        let mut cannot_execute =
             cannot_execute(&self.0, &argv, &finished, &log_text, reported_failures);
         let mut refused = cannot_execute.is_some()
             || (!cancelled && is_refusal(exit, &log_text, reported_failures));
@@ -1090,13 +1133,38 @@ impl Validator for CommandValidator {
             refused = true;
             empty_refused = true;
         }
-        if refused {
+        // An unparseable results row is could-not-run with host scope: the
+        // adapter produced output the queue cannot judge, so no parsed row
+        // is a verdict. Parsed rows stay in `results` for diagnosis; the
+        // scope line in the log carries the host scope to donor receipts.
+        let bad_refused = bad_row.is_some() && !cancelled;
+        if bad_refused {
+            refused = true;
+            if cannot_execute.is_none() {
+                if let Some(detail) = &bad_row {
+                    cannot_execute = Some(format!("could not run: {detail}"));
+                }
+            }
+            if let Some(detail) = &bad_row {
+                if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&log) {
+                    use std::io::Write as _;
+                    let _ = writeln!(file, "{COULD_NOT_RUN_SCOPE_MARKER}: host {detail}");
+                }
+            }
+        }
+        if refused && !bad_refused {
             // Validation did not run: keep no test verdict from this attempt. An
             // empty-red refusal keeps the unattributed flag so its reason can be
-            // named (see `refusal_detail` in `run`).
+            // named (see `refusal_detail` in `run`). A bad-row refusal keeps
+            // its parsed rows above, for diagnosis.
             results = TestResults::default();
             results.unattributed = empty_refused;
-        } else if !cancelled && !reported_failures && !results.unattributed && red_exit(exit) {
+        } else if !refused
+            && !cancelled
+            && !reported_failures
+            && !results.unattributed
+            && red_exit(exit)
+        {
             name_the_failures_of_a_red_run(&mut results, &log_text);
         }
         Ok(Ran {
@@ -1641,6 +1709,61 @@ mod unit {
         assert!(!ran.refused() && !ran.is_empty_red());
         assert_eq!(ran.failed(), [TestId::step("a")].into());
         assert_eq!(ran.probe_observation(), ProbeObservation::Fail);
+    }
+
+    #[test]
+    fn an_unparseable_result_row_is_could_not_run_not_an_error() {
+        let tmp = TempDir::new("validate-bad-row");
+        // Bad JSON, unknown outcome, invalid id, and a good row beside a bad
+        // one: every case is a refusal, never Err, never red or green, with
+        // the parsed rows kept for diagnosis.
+        for (tag, script) in [
+            (
+                "overflow",
+                r#"echo '{"id":"x","outcome":"fail","duration_ms":-1}' >> "$MQ_RESULTS"; exit 1"#,
+            ),
+            (
+                "outcome",
+                r#"echo '{"id":"x","outcome":"bogus"}' >> "$MQ_RESULTS"; exit 1"#,
+            ),
+            (
+                "badid",
+                r#"echo '{"id":"::x","outcome":"fail"}' >> "$MQ_RESULTS"; exit 1"#,
+            ),
+            (
+                "mixed",
+                r#"echo '{"id":"t0","outcome":"fail"}' >> "$MQ_RESULTS"; echo 'not json' >> "$MQ_RESULTS"; exit 1"#,
+            ),
+        ] {
+            let ran = from_config(&config(script))
+                .unwrap()
+                .run(
+                    &tmp.0,
+                    &Selection::All,
+                    &tmp.0.join(tag),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            assert!(ran.refused() && !ran.green(), "{tag}: {ran:?}");
+            assert!(ran.failed().is_empty(), "{tag}");
+            let why = ran.cannot_execute.as_deref().unwrap_or_default();
+            assert!(why.contains("could not run"), "{tag}: {why}");
+            assert!(
+                why.contains("line 1") || why.contains("line 2"),
+                "{tag}: {why}"
+            );
+            assert!(why.len() <= 340, "{tag}: {why}");
+            let log = std::fs::read_to_string(tmp.0.join(tag).join("run.log")).unwrap();
+            assert!(log.contains("MQ_COULD_NOT_RUN_SCOPE: host"), "{tag}: {log}");
+            if tag == "mixed" {
+                // The good fail row is kept for diagnosis but is no verdict.
+                assert_eq!(
+                    ran.results.results.get(&TestId::step("t0")),
+                    Some(&Outcome::Fail),
+                    "{ran:?}"
+                );
+            }
+        }
     }
 
     #[test]
