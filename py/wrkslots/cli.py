@@ -40252,6 +40252,106 @@ def _begin_or_resume_path_fence(
     return journal, fenced
 
 
+def _archive_fenced_slot_residue(
+    config: Config,
+    record: ActiveRecord,
+    fenced_slot: Path,
+    entries: Sequence[str],
+) -> Path:
+    """Move a journaled-removed checkout's leftover entries to salvage.
+
+    ``git worktree remove`` can delete a checkout's registration while
+    leaving its ignored or untracked residue in the fenced slot; the
+    journal then says the checkout is removed, Git agrees, and the
+    fenced tree is all that blocks finishing.  Moving (not copying, and
+    never deleting unseen) each leftover entry under the local salvage
+    archive, with a receipt naming them, preserves exactly what removal
+    had not judged while letting the removal finish.  The caller has
+    already proven the slot unused and that Git registers no checkout
+    there.
+    """
+
+    root = _default_salvage_archive_root(config)
+    destination = (
+        root
+        / _LOCAL_SALVAGE_DIRECTORY
+        / record.machine
+        / record.slot
+        / str(record.generation)
+        / "fenced-residue"
+        / fenced_slot.name
+    )
+    _prepare_local_salvage_directory(root, destination)
+    archived: list[str] = []
+    receipt_path = destination / "receipt.json"
+    if receipt_path.is_file():
+        previous = _strict_json_object(
+            receipt_path.read_bytes(), "fenced slot residue receipt"
+        )
+        archived.extend(
+            _as_str(item, "fenced slot residue receipt entry")
+            for item in _as_list(previous.get("entries", []), "residue entries")
+        )
+    for name in entries:
+        source = fenced_slot / name
+        target = destination / name
+        if target.exists() or target.is_symlink():
+            raise Refusal(
+                f"fenced slot residue already archived at {target}; "
+                "preserve both and inspect before recovery"
+            )
+        _rename_noreplace(source, target, f"archive fenced slot residue {name}")
+        archived.append(name)
+    # List Git-ignored build output inside the residue so a later salvage
+    # clean can drop exactly that with evidence, without judging the rest.
+    ignored_build_output: list[str] = []
+    for name in archived:
+        root = destination / name
+        if root.is_symlink() or not root.is_dir():
+            continue
+        if name in {"target", ".dagrun", ".mypy_cache", ".pytest_cache", "__pycache__"}:
+            ignored_build_output.append(name)
+            continue
+        for dirpath, dirnames, _filenames in os.walk(root):
+            kept: list[str] = []
+            for dirname in dirnames:
+                relative = (Path(dirpath) / dirname).relative_to(destination).as_posix()
+                if (
+                    dirname
+                    in {"target", ".dagrun", ".mypy_cache", ".pytest_cache", "__pycache__"}
+                    or any(
+                        _cache_glob_contains_path(pattern, relative)
+                        for pattern in config.cache_globs
+                    )
+                ):
+                    ignored_build_output.append(relative)
+                else:
+                    kept.append(dirname)
+            dirnames[:] = kept
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "kind": "fenced-slot-residue",
+                "machine": record.machine,
+                "slot": record.slot,
+                "generation": record.generation,
+                "fenced_slot": fenced_slot.name,
+                "recorded_at": _utc_now(),
+                "entries": sorted(archived),
+                "ignored_build_output": sorted(ignored_build_output),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _fsync_directory(destination)
+    _fsync_directory(fenced_slot)
+    return destination
+
+
 def _finish_remove_paths(
     config: Config,
     record: ActiveRecord,
@@ -40670,9 +40770,44 @@ def _finish_remove_paths(
             allowed |= slotimage.REPRESENTATION_RESIDUE
         unexpected = sorted(remaining_entries - allowed)
         if unexpected:
-            raise Refusal(
-                f"finished fenced slot contains unexpected entry: {unexpected[0]}"
-            )
+            # A checkout the journal already records as removed, whose
+            # registration Git no longer holds, can leave only its residue
+            # here (see ``_archive_fenced_slot_residue``).  Archive that
+            # residue and finish; anything else is still unexpected.
+            journaled_removed = bool(all_names) and removed >= all_names
+            residue_destination: Path | None = None
+            if journaled_removed and not any(
+                _git_registers_checkout(
+                    config,
+                    checkout,
+                    _checkout_at_slot(config, record, checkout, fenced_slot)[1],
+                    vcs,
+                )
+                for checkout in record.checkouts
+            ):
+                if private_fence_identity is None:
+                    _assert_slot_unused(
+                        fenced_slot,
+                        use_check_record,
+                        use_lsof=use_check_record is not None,
+                        ignore_invoking_ancestry=(
+                            finish.allow_live_validate_owner
+                            and record.slot_type == "validate"
+                        ),
+                        live_use_recheck=finish.live_use_recheck,
+                        **_agent_batch_use_check(
+                            finish.agent_batch,
+                            _slot_directory(config, record.slot, record.slot_type),
+                            after_fence=True,
+                        ),
+                    )
+                residue_destination = _archive_fenced_slot_residue(
+                    config, record, fenced_slot, unexpected
+                )
+            if residue_destination is None:
+                raise Refusal(
+                    f"finished fenced slot contains unexpected entry: {unexpected[0]}"
+                )
         if private_fence_identity is None:
             # The branch above checks the fenced slot for use before deleting
             # it; a slot with no checkout left is checked here, so a removal

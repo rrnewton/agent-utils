@@ -13993,6 +13993,70 @@ def test_interrupted_finish_recovers_archive_and_removal(tmp_path: Path) -> None
     assert len(archive["records"]) == 1
 
 
+def test_recover_archives_residue_of_a_journaled_removed_checkout(
+    tmp_path: Path,
+) -> None:
+    """Git removed the checkout's registration but left ignored residue.
+
+    The journal says the checkout is removed and Git agrees, so recovery
+    archives the leftover entries under local salvage (preserved, not
+    deleted unseen) and finishes the removal instead of refusing on the
+    first unexpected entry forever.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    interrupted = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-remove-worktree"},
+    )
+    assert interrupted.returncode == 86
+    fenced = fenced_historical_slot(project, "slot01")
+    assert fenced is not None
+    (fenced / ".dagrun" / "profiles").mkdir(parents=True)
+    (fenced / ".dagrun" / "profiles" / "step.csv").write_text(
+        "profile\n", encoding="utf-8"
+    )
+    (fenced / "residue.txt").write_text("ignored leftover\n", encoding="utf-8")
+
+    recovered = command(
+        project, "recover", "--coordinator-pid", str(os.getpid())
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert active_slots(project) == []
+    assert not fenced.exists()
+    config = wrkslots._load_config(str(project), "testhost")
+    residue = (
+        wrkslots._default_salvage_archive_root(config)
+        / wrkslots._LOCAL_SALVAGE_DIRECTORY
+        / "testhost"
+        / "slot01"
+        / "1"
+        / "fenced-residue"
+        / fenced.name
+    )
+    assert (residue / ".dagrun" / "profiles" / "step.csv").is_file()
+    assert (residue / "residue.txt").read_text(encoding="utf-8") == (
+        "ignored leftover\n"
+    )
+    receipt = json.loads((residue / "receipt.json").read_text(encoding="utf-8"))
+    assert receipt["entries"] == [".dagrun", "residue.txt"]
+    assert receipt["ignored_build_output"] == [".dagrun"]
+
+
 def test_interrupted_multicheckout_remove_rechecks_only_remaining_handoffs(
     tmp_path: Path,
 ) -> None:

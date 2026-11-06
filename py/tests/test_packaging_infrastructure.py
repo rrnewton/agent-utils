@@ -878,6 +878,7 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_create_binds_owner_running_beside_its_assigned_coordinator",
         "test_current_frozen_result_without_removal_proof_blocks_entry",
         "test_current_incomplete_frozen_accepts_later_service_result_schemas",
+        "test_validate_remove_accepts_schema_8_proof",
         "test_current_incomplete_frozen_binds_checkout_and_gitlink_identity",
         "test_current_incomplete_frozen_binds_initial_facts_to_recursive_snapshot",
         "test_current_incomplete_frozen_rechecks_after_fresh_census",
