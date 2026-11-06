@@ -640,6 +640,12 @@ struct ShownBefore {
     labels: Vec<(String, usize)>,
     /// The text above the composer before the paste, without its blanks.
     before_paste: String,
+    /// Copies of the whole prompt above the composer before the paste (the
+    /// fixed baseline [`queued_evidence`] compares against; [`Self::prompt_copies`]
+    /// moves as later reads note the prompt wherever it lands).
+    prompt_before: usize,
+    /// The exact `+k` counts this prompt's paste placeholder can carry.
+    line_counts: Vec<usize>,
     /// The most Codex pending-message previews that start the prompt any read showed: see
     /// [`codex_pending_copies`].
     pending_copies: usize,
@@ -649,6 +655,7 @@ impl ShownBefore {
     fn new(text: &str) -> Self {
         Self {
             prompt: compact(text),
+            line_counts: expected_line_counts(text),
             ..Self::default()
         }
     }
@@ -657,6 +664,7 @@ impl ShownBefore {
     fn note_before_paste(&mut self, view: &ComposerView) {
         self.before_paste = compact(&view.transcript);
         self.prompt_copies = self.before_paste.matches(self.prompt.as_str()).count();
+        self.prompt_before = self.prompt_copies;
         self.pending_copies = codex_pending_copies(&view.transcript, &self.prompt);
     }
 
@@ -998,6 +1006,9 @@ fn printed(after: &ComposerView, after_screen: &str, shown: &ShownBefore) -> Opt
     if codex_pending_copies(&after.transcript, &shown.prompt) > shown.pending_copies {
         return Some("Codex lists the prompt among the messages it holds for its turn".to_owned());
     }
+    if let Some(evidence) = queued_evidence(after, after_screen, shown) {
+        return Some(evidence);
+    }
     if !shown.queue_marker {
         if let Some(marker) = queue_marker(after_screen) {
             return Some(format!("agent queue marker appeared ({marker:?})"));
@@ -1005,6 +1016,45 @@ fn printed(after: &ComposerView, after_screen: &str, shown: &ShownBefore) -> Opt
     }
     if !shown.running_turn && running_turn(after_screen) == Some(true) {
         return Some("agent started reporting an active turn".to_owned());
+    }
+    None
+}
+
+/// Whether the agent's queued-message area holds this prompt, as a busy
+/// Claude Code pane draws it (captured on a real pane, #884 follow-up
+/// busy-evidence): the prompt in full above the composer's top rule with a
+/// `ctrl+enter to send now` row, or collapsed there to its numbered paste
+/// placeholder, while the empty composer holds the faint
+/// `Press up to edit queued messages` hint and the footer shows the paste
+/// hint instead of `esc to interrupt`. The prompt (or a placeholder of its
+/// exact size) must be new above the composer since before the paste, so an
+/// older queued prompt never vouches for this one.
+fn queued_evidence(
+    after: &ComposerView,
+    after_screen: &str,
+    shown: &ShownBefore,
+) -> Option<String> {
+    let queued_area = after.composer.contains("Press up to edit queued messages")
+        || after_screen.contains("ctrl+enter to send now")
+        || queue_marker(after_screen).is_some();
+    if !queued_area {
+        return None;
+    }
+    let transcript = compact(&after.transcript);
+    if transcript.matches(shown.prompt.as_str()).count() > shown.prompt_before {
+        return Some("prompt appeared in the queued messages (queue marker visible)".to_owned());
+    }
+    for label in placeholder_labels(&after.transcript) {
+        if shown.before_paste.contains(label.as_str()) {
+            continue;
+        }
+        if crate::stale_draft::pasted_line_count_pub(&label)
+            .is_some_and(|count| shown.line_counts.contains(&count))
+        {
+            return Some(
+                "pasted prompt appeared in the queued messages (queue marker visible)".to_owned(),
+            );
+        }
     }
     None
 }
@@ -1345,6 +1395,34 @@ pub fn submit_verified(
     // A prompt an earlier pass typed but never saw drawn (#884): never typed again while its
     // paste may still show; reported lost once the whole late-paste window has passed.
     if runtime.stranded_retry() && composer_draft(&before).is_none() {
+        // Before counting the paste lost, look where a busy agent puts a
+        // prompt it took: its queued messages above the composer, or the
+        // transcript as a user turn. Either is delivery, never a loss
+        // (#884 follow-up busy-evidence (a)).
+        let queued_area = before.composer.contains("Press up to edit queued messages")
+            || screen.contains("ctrl+enter to send now")
+            || queue_marker(&screen).is_some();
+        let in_transcript = transcript_count(&before, text) > 0
+            || placeholder_labels(&before.transcript).iter().any(|label| {
+                crate::stale_draft::pasted_line_count_pub(label)
+                    .is_some_and(|count| expected_line_counts(text).contains(&count))
+            });
+        if in_transcript {
+            return Ok(Submission::Verified(SubmissionReceipt {
+                key: "Enter",
+                key_presses: 0,
+                elapsed: Duration::ZERO,
+                evidence: if queued_area {
+                    "stranded prompt is in the agent's queued messages (queue marker visible)"
+                        .to_owned()
+                } else {
+                    "stranded prompt appeared above the composer".to_owned()
+                },
+                printed: true,
+                settled: true,
+                queued: queued_area,
+            }));
+        }
         let waited = runtime
             .stranded_since()
             .map(|since| (unix_seconds() - since).max(0.0));
@@ -1450,6 +1528,21 @@ pub fn submit_verified(
                 }
                 break view.clone();
             }
+            // A busy agent can take the paste straight into its queued
+            // messages without ever staging it in the composer: that is
+            // delivery, and no submission key is sent on the empty composer
+            // (#884 follow-up busy-evidence (a)).
+            if let Some(evidence) = queued_evidence(view, &screen, &shown) {
+                return Ok(Submission::Verified(SubmissionReceipt {
+                    key: "Enter",
+                    key_presses: 0,
+                    elapsed: runtime.monotonic().saturating_sub(started),
+                    evidence,
+                    printed: true,
+                    settled: true,
+                    queued: true,
+                }));
+            }
             // Fallback for every harness: bottom tail unchanged across
             // polls and fuzzy-matching our paste means it is sitting there.
             let tail = bottom_region(&screen);
@@ -1525,6 +1618,9 @@ pub fn submit_verified(
                 && transcript_count(&current, text) > transcript_count(&before, text)
             {
                 // Consumed before our Enter (echoed above): no key needed.
+                // In the queued-message area it counts as queued (#884
+                // follow-up busy-evidence (a)).
+                let queued = queued_evidence(&current, &screen, &shown).is_some();
                 return Ok(Submission::Verified(SubmissionReceipt {
                     key: "Enter",
                     key_presses: 0,
@@ -1532,7 +1628,7 @@ pub fn submit_verified(
                     evidence: "prompt text appeared above the composer".to_owned(),
                     printed: true,
                     settled: true,
-                    queued: false,
+                    queued,
                 }));
             }
         }
@@ -3572,6 +3668,133 @@ mod tests {
             )]
         );
         assert_eq!(*replay.keys.lock().unwrap(), ["Enter"]);
+    }
+
+    #[test]
+    #[test]
+    fn a_paste_taken_straight_into_the_queued_messages_is_delivered_without_a_key() {
+        // #884 follow-up busy-evidence (a), from a real busy Claude Code
+        // pane: the paste never stages in the composer; the prompt appears
+        // in full in the queued messages above the composer, the composer
+        // holds the faint queued-messages hint, and the footer shows the
+        // paste hint. No submission key is sent; the receipt is queued.
+        let replay = Replay::new(
+            claude_busy::before(),
+            claude_busy::queued(),
+            claude_busy::queued(),
+        );
+        let clock = Clock::default();
+        let outcome = submit_verified(
+            &replay,
+            "w1:p1",
+            "claude",
+            claude_busy::PROMPT,
+            in_lock_timeouts(),
+            &clock,
+        );
+        let receipt = receipt(outcome);
+        assert!(receipt.queued, "{receipt:?}");
+        assert!(receipt.printed, "{receipt:?}");
+        assert_eq!(receipt.key_presses, 0, "{receipt:?}");
+        assert!(replay.keys.lock().unwrap().is_empty());
+        assert_eq!(replay.pastes.lock().unwrap().len(), 1, "typed once");
+    }
+
+    #[test]
+    fn a_prompt_entered_into_the_queued_messages_as_a_chip_is_delivered_queued() {
+        // #884 follow-up busy-evidence (a): after Enter, the queued area
+        // holds only our collapsed placeholder, not the full prompt.
+        let replay = Replay::new(
+            claude_screen(&["• earlier"], "", BUSY_STATUS),
+            claude_screen(&["• earlier"], "[Pasted text #924 +10 lines]", PASTE_STATUS),
+            claude_screen(
+                &["• earlier", "❯ [Pasted text #924 +10 lines]"],
+                QUEUED_PLACEHOLDER,
+                PASTE_STATUS,
+            ),
+        );
+        let clock = Clock::default();
+        let outcome = submit_verified(
+            &replay,
+            "w1:p1",
+            "claude",
+            claude_busy::PROMPT,
+            SubmitTimeouts::default(),
+            &clock,
+        );
+        let receipt = receipt(outcome);
+        assert!(receipt.queued, "{receipt:?}");
+        assert!(receipt.printed, "{receipt:?}");
+        assert_eq!(replay.keys.lock().unwrap().as_slice(), ["Enter"]);
+        assert_eq!(replay.pastes.lock().unwrap().len(), 1, "typed once");
+    }
+
+    #[test]
+    fn a_stranded_prompt_found_in_the_queued_messages_is_delivered_never_lost() {
+        // #884 follow-up busy-evidence (a): an earlier pass typed the prompt
+        // and never saw it in the composer, because Claude Code had taken
+        // it into its queued messages. The stranded pass finds it there and
+        // records it delivered (queued), not late_paste_lost, and never
+        // types it again.
+        let replay = Replay::new(
+            claude_busy::queued(),
+            claude_busy::queued(),
+            claude_busy::queued(),
+        );
+        let clock = Clock {
+            stranded_since: Some(unix_seconds()),
+            ..Clock::default()
+        };
+        let outcome = submit_verified(
+            &replay,
+            "w1:p1",
+            "claude",
+            claude_busy::PROMPT,
+            in_lock_timeouts(),
+            &clock,
+        );
+        let receipt = receipt(outcome);
+        assert!(receipt.queued, "{receipt:?}");
+        assert!(receipt.printed, "{receipt:?}");
+        assert!(replay.pastes.lock().unwrap().is_empty(), "never retyped");
+        assert!(replay.keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stranded_prompt_found_as_a_user_turn_is_delivered() {
+        // #884 follow-up busy-evidence (a): the stranded prompt later
+        // appears in the transcript as a user turn (its queued turn came
+        // up). That is delivery, not a lost paste.
+        let mut rows: Vec<String> = vec!["• earlier".to_owned()];
+        for (index, line) in claude_busy::PROMPT.lines().enumerate() {
+            rows.push(if index == 0 {
+                format!("❯ {line}")
+            } else {
+                format!("  {line}")
+            });
+        }
+        let screen = claude_screen(
+            &rows.iter().map(String::as_str).collect::<Vec<_>>(),
+            "",
+            BUSY_STATUS,
+        );
+        let replay = Replay::new(screen.clone(), screen.clone(), screen);
+        let clock = Clock {
+            stranded_since: Some(unix_seconds()),
+            ..Clock::default()
+        };
+        let outcome = submit_verified(
+            &replay,
+            "w1:p1",
+            "claude",
+            claude_busy::PROMPT,
+            in_lock_timeouts(),
+            &clock,
+        );
+        let receipt = receipt(outcome);
+        assert!(!receipt.queued, "{receipt:?}");
+        assert!(receipt.printed, "{receipt:?}");
+        assert!(replay.pastes.lock().unwrap().is_empty(), "never retyped");
     }
 
     #[test]
