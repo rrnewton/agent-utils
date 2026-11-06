@@ -156,3 +156,59 @@ test("`#624 voice-page-modularity`: Save marks itself, puts itself back after a 
   run();
   assert.deepStrictEqual([reverted, button.textContent, button.className, button.disabled], [1, "Save token", "", false]);
 });
+
+test("`#624 voice-page-modularity`: the screen's sliders, steps, reload and grip mount in the page's order, the build said between them, reach what each names, and come down again", () => {
+  const { mountScreenControls } = VIEW_SETTINGS;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, value: `${id} value`, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type, event = {}) => nodes[id].listeners.filter((one) => one.type === type).forEach((one) => one.listener(event));
+  const said = (name) => (...args) => log.push(`${name} ${args.map((one) => (one && one.n) || one).join(" ")}`.trim());
+  const controls = mountScreenControls({
+    lookup: (id) => target(id),
+    readingWidthChanged: said("width"),
+    textSizeChanged: said("size"),
+    stepTextSize: said("size step"),
+    collapsedLinesChanged: said("lines"),
+    stepCollapsedLines: said("lines step"),
+    cardMaxLinesChanged: said("card"),
+    stepCardMaxLines: said("card step"),
+    reloadPage: said("reload"),
+    showPageBuild: said("show build"),
+    quoteReadPercentChanged: said("quote"),
+    stepQuoteReadPercent: said("quote step"),
+    gripDown: said("grip down"),
+    gripMove: said("grip move"),
+    gripUp: said("grip up"),
+    gripKey: said("grip key"),
+  });
+  assert.deepStrictEqual(log, ["listen reading-width input", "listen msg-scale input", "listen msg-scale-smaller click",
+    "listen msg-scale-larger click", "listen collapsed-lines input", "listen collapsed-lines-smaller click", "listen collapsed-lines-larger click",
+    "listen card-max-lines input", "listen page-update click", "show build", "listen card-max-lines-smaller click",
+    "listen card-max-lines-larger click", "listen quote-read-percent input", "listen quote-read-percent-smaller click",
+    "listen quote-read-percent-larger click", "listen width-grip pointerdown", "listen width-grip pointermove", "listen width-grip pointerup",
+    "listen width-grip pointercancel", "listen width-grip keydown"], "a listener was added out of the page's order, or the build said elsewhere");
+  log.length = 0;
+  // A slider says its value as it is when it moves, not as it was at the mount.
+  const moved = { "reading-width": "72", "msg-scale": "110", "collapsed-lines": "5", "card-max-lines": "4", "quote-read-percent": "60" };
+  for (const [id, now] of Object.entries(moved)) {
+    nodes[id].value = now;
+    fire(id, "input");
+  }
+  for (const id of ["msg-scale", "collapsed-lines", "card-max-lines", "quote-read-percent"]) {
+    fire(`${id}-smaller`, "click");
+    fire(`${id}-larger`, "click");
+  }
+  fire("page-update", "click", { n: "press" });
+  fire("width-grip", "pointerdown", { n: "down" });
+  fire("width-grip", "pointermove", { n: "move" });
+  fire("width-grip", "pointerup", { n: "up" });
+  fire("width-grip", "pointercancel", { n: "cancel" });
+  fire("width-grip", "keydown", { n: "ArrowLeft" });
+  assert.deepStrictEqual(log, ["width 72", "size 110", "lines 5", "card 4", "quote 60", "size step -1", "size step 1", "lines step -1", "lines step 1", "card step -1", "card step 1",
+    "quote step -1", "quote step 1", "reload", "grip down down", "grip move move", "grip up", "grip up", "grip key ArrowLeft"]);
+  controls.unmount();
+  assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+});

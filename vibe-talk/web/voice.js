@@ -30680,27 +30680,27 @@ if (typeof window.ResizeObserver === "function") {
   });
   for (const id of COMPOSER_GROW_BOXES) growing.observe(leftEl(id));
 }
-el("reading-width").addEventListener("input", () => readingWidthControl.changed(el("reading-width").value));
-el("msg-scale").addEventListener("input", () => textSize.changed(el("msg-scale").value));
-el("msg-scale-smaller").addEventListener("click", () => textSize.step(-1));
-el("msg-scale-larger").addEventListener("click", () => textSize.step(1));
-el("collapsed-lines").addEventListener("input", () => collapsedLinesChanged(el("collapsed-lines").value));
-el("collapsed-lines-smaller").addEventListener("click", () => stepCollapsedLines(-1));
-el("collapsed-lines-larger").addEventListener("click", () => stepCollapsedLines(1));
-el("card-max-lines").addEventListener("input", () => cardMaxLinesChanged(el("card-max-lines").value));
-// `#529 page-build-stale-notice`. Only on the reader's press.
-el("page-update").addEventListener("click", () => window.location.reload());
-settingsReadouts.pageBuild();
-el("card-max-lines-smaller").addEventListener("click", () => stepCardMaxLines(-1));
-el("card-max-lines-larger").addEventListener("click", () => stepCardMaxLines(1));
-el("quote-read-percent").addEventListener("input", () => quoteReadPercentChanged(el("quote-read-percent").value));
-el("quote-read-percent-smaller").addEventListener("click", () => stepQuoteReadPercent(-1));
-el("quote-read-percent-larger").addEventListener("click", () => stepQuoteReadPercent(1));
-el("width-grip").addEventListener("pointerdown", (event) => readingWidthControl.gripDown(event));
-el("width-grip").addEventListener("pointermove", (event) => readingWidthControl.gripMove(event));
-el("width-grip").addEventListener("pointerup", () => readingWidthControl.gripUp());
-el("width-grip").addEventListener("pointercancel", () => readingWidthControl.gripUp());
-el("width-grip").addEventListener("keydown", (event) => readingWidthControl.gripKey(event));
+// The screen's sliders and their steps, the page-build notice's reload (`#529 page-build-stale-notice`: only on the
+// reader's press), and the reading column's grip. One owner in web/src/view/settings/screencontrols.ts (`#624
+// voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's teardown.
+mountScreenControls({
+  lookup: (id) => el(id),
+  readingWidthChanged: (value) => readingWidthControl.changed(value),
+  textSizeChanged: (value) => textSize.changed(value),
+  stepTextSize: (direction) => textSize.step(direction),
+  collapsedLinesChanged: (value) => collapsedLinesChanged(value),
+  stepCollapsedLines: (direction) => stepCollapsedLines(direction),
+  cardMaxLinesChanged: (value) => cardMaxLinesChanged(value),
+  stepCardMaxLines: (direction) => stepCardMaxLines(direction),
+  reloadPage: () => window.location.reload(),
+  showPageBuild: () => settingsReadouts.pageBuild(),
+  quoteReadPercentChanged: (value) => quoteReadPercentChanged(value),
+  stepQuoteReadPercent: (direction) => stepQuoteReadPercent(direction),
+  gripDown: (event) => readingWidthControl.gripDown(event),
+  gripMove: (event) => readingWidthControl.gripMove(event),
+  gripUp: () => readingWidthControl.gripUp(),
+  gripKey: (event) => readingWidthControl.gripKey(event),
+});
 
 // `#54 resume-recovery`. The one signal a browser gives for "this page went away": it is what
 // distinguishes a socket that died because the reader switched apps from one that died because

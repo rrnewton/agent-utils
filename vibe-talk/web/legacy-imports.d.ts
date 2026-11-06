@@ -435,6 +435,7 @@ declare const mountIdentityList: LegacyImports["mountIdentityList"];
 declare const mountPairing: LegacyImports["mountPairing"];
 declare const mountSaveTokenButton: LegacyImports["mountSaveTokenButton"];
 declare const mountReadingWidth: LegacyImports["mountReadingWidth"];
+declare const mountScreenControls: LegacyImports["mountScreenControls"];
 declare const mountTextSize: LegacyImports["mountTextSize"];
 declare const mountBarPlacement: LegacyImports["mountBarPlacement"];
 declare const mountChannelSettings: LegacyImports["mountChannelSettings"];
