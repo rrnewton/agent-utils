@@ -61,47 +61,20 @@ def test_reanchor_generation_mismatch_is_none(
     assert wrkslots_cli._reanchor_liveness(record) is None  # type: ignore[arg-type]
 
 
-def test_real_agentctl_writer_records_reanchor() -> None:
-    """The real #744 writer appends the agreed entry on anchor --replace.
-
-    Runs agentctl's own Rust test, which drives ManagedAgents::anchor with
-    --replace against its fake Herdr client and asserts the agent.json
-    `reanchors` entry (reason restart-same-pane, current pid, null
-    slot_generation) that the reader above consumes.
-    """
-    import subprocess
-
-    repo = Path(__file__).resolve().parents[3]
-    # Bound the in-test Cargo build (#883): with default job parallelism
-    # its test-binary link peaked at 3.7 GiB inside a shard whose cap is
-    # about 1.9 GiB, OOM-killing whichever shard this test lands in.
-    # Two jobs and line-tables-only debug info keep the writer's real
-    # test while shrinking that build's peak.
-    env = dict(os.environ)
-    env["CARGO_BUILD_JOBS"] = "2"
-    env.update(
-        {
-            "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
-            "CARGO_PROFILE_TEST_DEBUG": "line-tables-only",
-            "CARGO_INCREMENTAL": "0",
-        }
-    )
-    result = subprocess.run(
-        [
-            "cargo", "test", "--quiet", "--locked",
-            "--manifest-path", str(repo / "rs" / "Cargo.toml"),
-            "-p", "agentctl", "--lib",
-            "anchor_refuses_a_changed_harness_without_replace",
-        ],
-        cwd=repo, capture_output=True, text=True, check=False, timeout=900, env=env,
-    )
-    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
-
-
 def test_writer_shaped_entry_is_alive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The exact entry record_reanchor emits (null generation) reads alive."""
+    """The exact entry record_reanchor emits (null generation) reads alive.
+
+    The writer side of this agreement is agentctl's own Rust test
+    `anchor_refuses_a_changed_harness_without_replace`, which drives
+    ManagedAgents::anchor with --replace and asserts this entry; it runs
+    in the agentctl Rust lane (validation/rust.dag.yaml, a 3 GiB
+    baseline sized for compiling that crate). It used to also run here
+    through a `cargo test` subprocess, whose single rustc process
+    peaked at 2.7 GiB and OOM-killed whichever wrkslots shard hosted
+    this file (#883), so the duplicate build stays in the Rust lane.
+    """
     record = _record(tmp_path, monkeypatch, generation=None)
     document = json.loads(
         (tmp_path / "agents" / "agent-a" / "agent.json").read_text()
