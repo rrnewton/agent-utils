@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-audit-wrong-row-unknown: audit stamps unchanged rows UNKNOWN when host churn discards its census'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-flakes
 created_at: 2026-11-06T22:15:00.000000000+00:00
-updated_at: 2026-11-06T22:15:00.000000000+00:00
+updated_at: 2026-11-06T23:20:00.000000000+00:00
+closed_at: 2026-11-06T23:20:00.000000000+00:00
 ---
 
 # Description
@@ -35,3 +36,13 @@ still refuses; evidence-changed still discards the attempt) is unchanged.
 - A census that still cannot close inside the window stays fail-closed
   with the same error and UNKNOWN stamps.
 - Deterministic regression test injecting one discarded census.
+
+## Resolution
+
+_cmd_audit retries the census with fresh snapshots inside a 120 s window
+(_AUDIT_CENSUS_WINDOW_SECONDS); the fail-closed error path is unchanged.
+Deterministic test: test_audit_retries_a_census_discarded_by_host_churn
+injects one discarded census and requires the retry (fails pre-fix).
+Parallel-load probe after the fix: 48/48 passes of the own-record audit
+test (was ~10% failures). A mount-census test records that a vanished
+representative is skipped while live unreadable evidence still refuses.

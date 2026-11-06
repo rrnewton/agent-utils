@@ -135,6 +135,31 @@ def test_audit_unrelated_creation_retains_unchanged_rows(
     assert "slot-b" in cast(list[object], payload["unknown_slots"])
 
 
+def test_audit_retries_a_census_discarded_by_host_churn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _fixture(tmp_path / "case")
+    _add_slot_b(root)
+    original = wrkslots_cli._capture_process_path_census
+    calls = 0
+
+    def census(paths: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise wrkslots_cli.Refusal(
+                "relevant process evidence changed during three liveness attempts"
+            )
+        return original(paths)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wrkslots_cli, "_capture_process_path_census", census)
+    payload = _python(root, tmp_path)
+    rows = _rows(payload)
+    assert calls == 2
+    assert rows["slot-a"]["verdict"] != "UNKNOWN"
+    assert rows["slot-b"]["verdict"] != "UNKNOWN"
+
+
 def test_audit_own_record_change_marks_only_that_row_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

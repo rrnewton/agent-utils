@@ -49922,6 +49922,35 @@ def test_mountinfo_census_refuses_genuinely_unreadable_live_process(
             os.waitpid(pid, 0)
 
 
+def test_mountinfo_census_skips_a_process_that_vanished_during_the_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = Path("/absent/validate/gone")
+    process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]")
+
+    def mountinfo(
+        _pid: int,
+        _budget: wrkslots._ReadOnlyCommandBudget,
+        _cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
+    ) -> tuple[tuple[Path, str], ...]:
+        try:
+            raise OSError(errno.EINVAL, "mountinfo of a vanished process")
+        except OSError as cause:
+            raise wrkslots.Refusal("cannot read mountinfo") from cause
+
+    monkeypatch.setattr(wrkslots, "_mountinfo_path_references", mountinfo)
+    monkeypatch.setattr(
+        wrkslots, "_process_observation_is_active", lambda _process: False
+    )
+    # The vanished representative is skipped (its generation can hold no
+    # mount reference) and the census closes; it must not discard the
+    # whole attempt as changed evidence.
+    assert (
+        wrkslots._absent_validate_mount_matches((process,), {target: "gone"})
+        == ()
+    )
+
+
 @pytest.mark.parametrize("persistent", (False, True))
 def test_mountinfo_census_retries_only_transient_stable_einval(
     monkeypatch: pytest.MonkeyPatch,

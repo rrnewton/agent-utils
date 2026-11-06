@@ -791,6 +791,10 @@ _AT_SYMLINK_FOLLOW = 0x400
 # distinct-content bound.
 _MOUNTINFO_CENSUS_BYTES_LIMIT = 256 * 1024 * 1024
 _ABSENT_PROCESS_CENSUS_SECONDS = 60.0
+# Total wall window for one audit's process census: fresh census attempts
+# are retried inside it while host churn keeps discarding attempt sets;
+# a census that still cannot close when it ends stays fail-closed.
+_AUDIT_CENSUS_WINDOW_SECONDS = 120.0
 # Per-process stderr allowance for the all-process census: privileged
 # helpers run per observed process and each may note a line (for example a
 # PID-namespace teardown), so a fixed 64 KiB budget overflows on busy
@@ -37035,12 +37039,25 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     process_census: _ProcessPathCensus | None = None
     process_census_error: str | None = None
     if records:
-        try:
-            process_census = _capture_process_path_census(
-                [_slot_directory(config, record.slot, record.slot_type) for record in records]
-            )
-        except Refusal as exc:
-            process_census_error = f"process/path census failed: {exc}"
+        # One census attempt set can be discarded by host process churn
+        # (a generation changed or vanished while it was read) even though
+        # no slot's evidence is in doubt: the census fail-closes as
+        # indeterminate and every otherwise-clean row would be stamped
+        # UNKNOWN for an unrelated host's motion.  Retry with a fresh
+        # snapshot while the audit's census window lasts; a census that
+        # still cannot close keeps the fail-closed error, unchanged.
+        census_deadline = time.monotonic() + _AUDIT_CENSUS_WINDOW_SECONDS
+        while True:
+            try:
+                process_census = _capture_process_path_census(
+                    [_slot_directory(config, record.slot, record.slot_type) for record in records]
+                )
+                process_census_error = None
+                break
+            except Refusal as exc:
+                process_census_error = f"process/path census failed: {exc}"
+                if time.monotonic() >= census_deadline:
+                    break
     metrics.finish(
         "process-census",
         census_started,
