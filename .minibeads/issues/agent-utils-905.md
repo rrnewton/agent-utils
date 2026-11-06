@@ -64,7 +64,7 @@ handlers 92-96 ms against the 21 ms budget.
 Scroll-stability: measured under the same scope. Its judgements are
 positions within a pixel, not times, and since #866 they already gate on
 observed stability with forgiving wall deadlines (`settled()`), so the same
-treatment there is: no change. It passed 4/4 runs under the contended scope
-on unchanged code while the fold fix above was being verified beside it;
-the remaining consecutive runs for the acceptance count follow in the gate
-record.
+treatment there is: no change. It passed 10/10 consecutive runs under the
+contended scope on unchanged code (four batches: 1 + 3 + 3 + 3), and the
+fold check passed 10/10 consecutive runs under the same scope after its
+fix, with idle runs unchanged (handlers 11-26 ms at load x1.0, as before).
