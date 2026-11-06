@@ -66,6 +66,19 @@ Filed 2026-11-06 9:30 AM ET at the lead coordinator's request, from one host's g
 - The slot is a loop-mounted ext4 image with `discard`, so the host got the space back: the image's allocation went down to 23.9 GiB.
 - A dry run over 27 GiB takes under a second.
 
+**Host allocation and trim (follow-up).** Freed blocks reach the host only once the slot image's online discard (or a trim) returns them, so the size of the target dirs alone can overstate the gain.
+- The prune now also reports the host's allocation to the slot image before and after.
+  - It finds the image through `/sys/dev/block/MAJ:MIN/loop/backing_file`, matched by size across mount namespaces.
+  - The ledger gets `host_bytes_before`, `host_bytes_after` and `trim_exit`.
+- After freeing anything, it syncs and reads once a second until the allocation stops falling (at most 15 s).
+- `GATE_TRIM_COMMAND`, when set, runs once a prune removed something, for example `wrkslots image trim agent SLOT`. It is off by default. Its output and exit status go into the report, and it never fails the gate.
+- Measured on this lane's slot (ext4 on loop, `discard`), with a 4 GiB file written, fsynced and deleted:
+  - nothing came back for 5 s;
+  - all 4 GiB came back by 10 s, which is the journal commit;
+  - a sync right after the delete returned about half at 0.3 s.
+- So a reading taken seconds after a cleanup can show no gain even though online discard does return everything, which matches a 626 -> 642 GiB jump seen only after a trim.
+- End to end, `gate.py prune --apply` removing a 4 GiB stale incremental cache reported host allocation 27.94 -> 23.93 GiB.
+
 **Second identical build.** `py/tests/test_gate_admission.py` covers it with real cargo:
 - `dep` is built with and without a feature by `cargo build` and `cargo test`, and a version bump supersedes the first build.
 - After the prune, the superseded units and their incremental cache are gone. Both variants and a dependency built "three days ago" remain.

@@ -21,8 +21,11 @@ so a killed lane never holds a slot forever.
 
 When a run finishes and has released its slot, it prunes this checkout's cargo
 target dirs of builds nothing can reuse, under cargo's own locks, and reports
-the bytes before and after (#940; `scripts/gate.py prune --help`). --no-prune or
-GATE_PRUNE_TARGETS=off skips that.
+the bytes before and after, both under the target dirs and allocated on the
+host to the slot image behind them (#940; `scripts/gate.py prune --help`).
+--no-prune or GATE_PRUNE_TARGETS=off skips that; GATE_TRIM_COMMAND, when set,
+runs after a prune that freed anything, for images mounted without online
+discard (for example `wrkslots image trim agent SLOT`).
 
 An admitted run's children see $GATE_ADMISSION_RUN_ID. A gate invoked from
 inside an admitted run (validate.py's gate-exclusive phase) releases the
@@ -59,7 +62,9 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -502,7 +507,7 @@ def _record_ledger(
     passed_steps: set[str],
     failed_steps: set[str],
     verdict_word: str | None,
-    pruned: dict[str, int] | None = None,
+    pruned: dict[str, int | None] | None = None,
 ) -> None:
     """Append one durable ledger line for the finished run (#827). Best effort:
     a ledger failure must never change the gate's own result."""
@@ -532,6 +537,9 @@ def _record_ledger(
             "log_path": None,
             "target_bytes_before": (pruned or {}).get("target_bytes_before"),
             "target_bytes_after": (pruned or {}).get("target_bytes_after"),
+            "host_bytes_before": (pruned or {}).get("host_bytes_before"),
+            "host_bytes_after": (pruned or {}).get("host_bytes_after"),
+            "trim_exit": (pruned or {}).get("trim_exit"),
         }
         path = ledger_path(getattr(args, "ledger", None))
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -887,45 +895,141 @@ def default_prune_dirs() -> list[Path]:
     return [repo / "rs" / "target", repo / "vibe-talk" / "target"]
 
 
+def host_allocation(path: Path) -> tuple[Path, int] | None:
+    """The host file backing *path*'s file system and the bytes the host has
+    allocated to it, when that file system is a loop-mounted image (a slot);
+    else None. Bytes freed inside an image reach the host only once they are
+    discarded or trimmed, so the target dir's own size can fall while the host
+    gains nothing.
+
+    The kernel names the backing file by the path it was attached with, which
+    can differ from this process's view of the same file (another mount
+    namespace); a path ending in the same components below one of *path*'s
+    ancestors, of exactly the device's size, is taken as that file."""
+
+    try:
+        device = os.stat(path).st_dev
+        sysfs = Path("/sys/dev/block") / f"{os.major(device)}:{os.minor(device)}"
+        backing = Path((sysfs / "loop" / "backing_file").read_text().strip())
+        size = int((sysfs / "size").read_text().strip()) * 512
+    except (OSError, ValueError):
+        return None
+    tail = backing.parts[1:]
+    candidates = [backing] + [ancestor.joinpath(*tail[k:])
+                              for ancestor in path.resolve().parents for k in range(1, len(tail))]
+    for candidate in candidates:
+        try:
+            st = candidate.stat()
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode) and st.st_size == size:
+            return candidate, st.st_blocks * 512
+    return None
+
+
 def _gib(n: int) -> str:
     return f"{n / 2**30:.2f} GiB"
 
 
-def prune_targets(tops: list[Path], *, keep_hours: float = PRUNE_KEEP_HOURS, dry_run: bool = False,
-                  prefix: str = "gate") -> tuple[int, int]:
-    """Prune every target dir under *tops*, print one line per top, and return
-    the bytes under them before and after."""
+def _host_allocations(tops: list[Path]) -> dict[Path, int]:
+    found: dict[Path, int] = {}
+    for top in tops:
+        allocation = host_allocation(top) if top.is_dir() else None
+        if allocation is not None:
+            found[allocation[0]] = allocation[1]
+    return found
 
-    before_total = after_total = 0
+
+def _settled_host_allocations(tops: list[Path], *, limit_s: float = 15.0) -> dict[Path, int]:
+    """Host allocations once they stop falling. An image's online discards
+    complete a few seconds after the journal commits the frees (on one slot, 4
+    GiB came back within 10 s, and about half of it 0.3 s after a sync), so
+    read once a second until two readings agree, for at most *limit_s*."""
+
+    deadline = time.monotonic() + limit_s
+    current = _host_allocations(tops)
+    while time.monotonic() < deadline:
+        time.sleep(1.0)
+        latest = _host_allocations(tops)
+        if latest == current:
+            break
+        current = latest
+    return current
+
+
+def _trim(prefix: str) -> int | None:
+    """Run $GATE_TRIM_COMMAND, if set, to hand freed blocks back to the host
+    (an image mounted without online discard keeps them until trimmed), and
+    return its exit status. Its output is reported; it never fails a gate."""
+
+    command = os.environ.get("GATE_TRIM_COMMAND", "").strip()
+    if not command:
+        return None
+    try:
+        done = subprocess.run(shlex.split(command), capture_output=True, text=True, timeout=600)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(f"{prefix}: trim command failed: {exc}", flush=True)
+        return -1
+    for line in (done.stdout + done.stderr).splitlines():
+        print(f"{prefix}: trim: {line}", flush=True)
+    print(f"{prefix}: trim command exited {done.returncode}", flush=True)
+    return done.returncode
+
+
+def prune_targets(tops: list[Path], *, keep_hours: float = PRUNE_KEEP_HOURS, dry_run: bool = False,
+                  prefix: str = "gate") -> dict[str, int | None]:
+    """Prune every target dir under *tops*, print one line per top and one per
+    host image behind them, and return the bytes before and after: under the
+    target dirs, and allocated on the host to their images (None when they are
+    not on a loop-mounted image)."""
+
+    hosts_before = _host_allocations(tops)
+    before_total = after_total = removed = 0
     for top in tops:
         if not top.is_dir():
             continue
         before = _tree_bytes(top)
         results = [prune_target_root(root, profiles, keep_hours=keep_hours, dry_run=dry_run)
                    for root, profiles in target_dirs(top).items()]
-        after = before - sum(r.freed for r in results) if dry_run else _tree_bytes(top)
+        freed = sum(r.freed for r in results)
+        after = before - freed if dry_run else _tree_bytes(top)
         before_total += before
         after_total += after
+        removed += sum(r.units + r.incremental for r in results)
         verb = "would prune" if dry_run else "pruned"
         line = (f"{prefix}: cargo target {top}: {_gib(before)} -> {_gib(after)} ({verb} "
                 f"{sum(r.units for r in results)} stale unit(s) and "
-                f"{sum(r.incremental for r in results)} incremental cache(s), {_gib(sum(r.freed for r in results))})")
+                f"{sum(r.incremental for r in results)} incremental cache(s), {_gib(freed)})")
         skipped = [f"{r.root.relative_to(top) if r.root != top else '.'}: {r.skipped}" for r in results if r.skipped]
         if skipped:
             line += "; skipped " + "; ".join(skipped)
         print(line, flush=True)
-    return before_total, after_total
+    hosts_after = hosts_before
+    trim_exit = None
+    if not dry_run and removed:
+        os.sync()  # online discard happens as the journal commits the frees
+        trim_exit = _trim(prefix)
+        hosts_after = _settled_host_allocations(tops) if hosts_before else {}
+    for image, allocated in hosts_before.items():
+        print(f"{prefix}: host allocation of {image}: {_gib(allocated)} -> "
+              f"{_gib(hosts_after.get(image, allocated))}", flush=True)
+    return {
+        "target_bytes_before": before_total,
+        "target_bytes_after": after_total,
+        "host_bytes_before": sum(hosts_before.values()) if hosts_before else None,
+        "host_bytes_after": sum(hosts_after.values()) if hosts_after else None,
+        "trim_exit": trim_exit,
+    }
 
 
-def _prune_after_gate() -> dict[str, int] | None:
+def _prune_after_gate() -> dict[str, int | None] | None:
     """Best effort: a prune failure must never change the gate's own result."""
 
     try:
         tops = default_prune_dirs()
         if not tops:
             return None
-        before, after = prune_targets(tops)
-        return {"target_bytes_before": before, "target_bytes_after": after}
+        return prune_targets(tops)
     except Exception as exc:
         print(f"gate: cargo target prune failed: {exc}", flush=True)
         return None
@@ -938,7 +1042,9 @@ def run_prune(argv: list[str]) -> int:
             "Prune cargo build artifacts no current build can reuse: older builds of a target, "
             "and everything only they used, plus idle incremental caches. A gate prunes its own "
             "checkout's target dirs when it finishes; this command reports, and with --apply "
-            "removes, by hand. Target dirs cargo is using are skipped."
+            "removes, by hand. Target dirs cargo is using are skipped. For target dirs on a "
+            "loop-mounted image it also reports the host's allocation to that image before and "
+            "after; with --apply, $GATE_TRIM_COMMAND (if set) runs once anything was freed."
         ),
         epilog=(
             "Examples:\n"

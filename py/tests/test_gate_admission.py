@@ -368,20 +368,32 @@ def test_a_finished_gate_prunes_its_own_targets_and_records_the_bytes(tmp_path: 
         _write(top / "debug/deps/libgone-0123456789abcdef.rlib", "x" * 9000)
         os.utime(unit, (old, old))
         stale.append(unit)
-    env = {**_env(tmp_path)}
+    env = {**_env(tmp_path), "GATE_TRIM_COMMAND": f"{PY} -c \"print('blocks returned')\""}
     env.pop("GATE_PRUNE_TARGETS")
     # A run ID leaked from an outer gate (this test runs inside one) is not a nested gate.
     env["GATE_ADMISSION_RUN_ID"] = "1-leaked-from-an-outer-gate"
+    failing = {**env, "GATE_TRIM_COMMAND": f"{PY} -c \"raise SystemExit(5)\""}
     result = subprocess.run([PY, str(checkout / "scripts/gate.py"), "--", PY, "-c", "print('validate: OK')"],
                             env=env, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout
     assert f"cargo target {checkout / 'rs/target'}:" in result.stdout, result.stdout
     assert "pruned 1 stale unit(s)" in result.stdout
+    assert "gate: trim: blocks returned" in result.stdout, "a prune that freed space runs the trim"
     assert result.stdout.splitlines()[-1] == "validate: OK"
     assert not stale[0].exists() and not (checkout / "rs/target/debug/deps/libgone-0123456789abcdef.rlib").exists()
     assert stale[1].is_dir(), "another checkout's target dir is never pruned by a gate"
     row = json.loads((tmp_path / "ledger.jsonl").read_text().splitlines()[-1])
     assert row["target_bytes_before"] > row["target_bytes_after"]
+    assert row["host_bytes_before"] is None  # a temp dir is not on a slot image
+    assert row["trim_exit"] == 0
+
+    unit = checkout / "rs/target/debug/.fingerprint/gone-0123456789abcdee"
+    unit.mkdir(parents=True)
+    os.utime(unit, (old, old))
+    failed_trim = subprocess.run([PY, str(checkout / "scripts/gate.py"), "--", PY, "-c", "print('validate: OK')"],
+                                 env=failing, capture_output=True, text=True, timeout=60)
+    assert failed_trim.returncode == 0, "a failing trim never fails the gate"
+    assert "gate: trim command exited 5" in failed_trim.stdout, failed_trim.stdout
 
     report = subprocess.run([PY, str(checkout / "scripts/gate.py"), "prune", str(tmp_path / "other/rs/target")],
                             capture_output=True, text=True, timeout=60)
