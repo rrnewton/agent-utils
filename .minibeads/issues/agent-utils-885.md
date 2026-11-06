@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-orphaned-create-journal: an orphaned create can be aborted and never blocks unrelated creates'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-salvage
 created_at: 2026-11-05T11:42:03.624088077+00:00
-updated_at: 2026-11-05T11:42:03.624088077+00:00
+updated_at: 2026-11-06T01:29:57.934729113+00:00
+closed_at: 2026-11-06T01:29:57.934728973+00:00
 ---
 
 # Description
