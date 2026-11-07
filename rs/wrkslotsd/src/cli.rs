@@ -21,9 +21,26 @@ pub(crate) struct Cli {
     command: Command,
 }
 
+// Split into flattened groups (#1003): as one 57-variant enum, clap's
+// derived `augment_subcommands` allocated a single ~2.9 MiB stack frame
+// in the debug profile and overflowed the default 2 MiB test-thread
+// stack. Each group's builder is its own smaller function; the
+// flattened surface (names, order, arguments) is unchanged.
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Command {
+    #[command(flatten)]
+    CommandWriters(CommandWriters),
+    #[command(flatten)]
+    CommandReaders(CommandReaders),
+    #[command(flatten)]
+    CommandRecovery(CommandRecovery),
+    #[command(flatten)]
+    CommandLifecycle(CommandLifecycle),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CommandWriters {
     /// Remove and archive one slot (writer; fixture registries only until cutover)
     Remove {
         /// Active slot to remove
@@ -179,6 +196,10 @@ pub(crate) enum Command {
         #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
         format: String,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CommandReaders {
     /// Print the Python `doctor` command's envelope (JSON) or human form
     DoctorText {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
@@ -436,6 +457,10 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CommandRecovery {
     /// Record one coordinator read of a slot's handoff (writer; fixture registries only until cutover)
     ReadHandoff {
         /// Active agent slot name
@@ -843,6 +868,10 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CommandLifecycle {
     /// Classify retained validation checkouts without removing them, printing the Python output (writer; fixture registries only until cutover)
     ClassifyOwnerlessValidateBatchText {
         /// Project-relative private ownerless validation checkout (repeatable)
@@ -1209,32 +1238,99 @@ fn after_separator() -> Vec<String> {
 pub fn run() -> u8 {
     let command = Cli::parse().command;
     let result: Result<serde_json::Value, crate::ObserverError> = match command {
-        Command::Rebuild {
-            events_dir,
-            index,
-            config,
-            evidence,
-        } => match (config, evidence) {
-            (Some(config), Some(evidence)) => {
-                rebuild_policy_index(&events_dir, &index, &config, &evidence)
+        Command::CommandWriters(inner) => match inner {
+            CommandWriters::Rebuild {
+                events_dir,
+                index,
+                config,
+                evidence,
+            } => match (config, evidence) {
+                (Some(config), Some(evidence)) => {
+                    rebuild_policy_index(&events_dir, &index, &config, &evidence)
+                }
+                (None, None) => rebuild_index(&events_dir, &index),
+                _ => unreachable!("clap enforces paired policy inputs"),
             }
-            (None, None) => rebuild_index(&events_dir, &index),
-            _ => unreachable!("clap enforces paired policy inputs"),
-        }
-        .and_then(|summary| encode_value(&CliSummary::from(&summary))),
-        Command::Status { index } => {
-            read_index(&index).and_then(|summary| encode_value(&CliSummary::from(&summary)))
-        }
-        Command::Explain { index, slot } => {
-            read_decision(&index, &slot).and_then(|decision| encode_value(&decision))
-        }
-        Command::Plan {
-            index,
-            target_bytes,
-            limit,
-        } => read_pressure_plan(&index, target_bytes, limit).and_then(|plan| encode_value(&plan)),
-        Command::ValidateConfig { root, machine } => {
-            match crate::config_validate::load_config(root.as_deref(), machine.as_deref()) {
+            .and_then(|summary| encode_value(&CliSummary::from(&summary))),
+            CommandWriters::Status { index } => {
+                read_index(&index).and_then(|summary| encode_value(&CliSummary::from(&summary)))
+            }
+            CommandWriters::Explain { index, slot } => {
+                read_decision(&index, &slot).and_then(|decision| encode_value(&decision))
+            }
+            CommandWriters::ValidateConfig { root, machine } => {
+                match crate::config_validate::load_config(root.as_deref(), machine.as_deref()) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandWriters::ParseState { root, machine } => {
+                match crate::active_state::parse_state(root.as_deref(), machine.as_deref()) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandWriters::ParseArchive { root, machine } => {
+                match crate::archive_state::parse_archive(root.as_deref(), machine.as_deref()) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandWriters::ParseHandoff {
+                root,
+                machine,
+                slot,
+            } => {
+                match crate::handoff_state::parse_handoff(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &slot,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandWriters::ParseHold {
+                root,
+                machine,
+                slot,
+            } => match crate::hold_state::parse_hold(root.as_deref(), machine.as_deref(), &slot) {
                 Ok(value) => {
                     println!(
                         "{}",
@@ -1246,283 +1342,172 @@ pub fn run() -> u8 {
                     eprintln!("wrkslotsd: {error}");
                     return 1;
                 }
-            }
-        }
-        Command::ParseState { root, machine } => {
-            match crate::active_state::parse_state(root.as_deref(), machine.as_deref()) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::ParseArchive { root, machine } => {
-            match crate::archive_state::parse_archive(root.as_deref(), machine.as_deref()) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::ParseHandoff {
-            root,
-            machine,
-            slot,
-        } => {
-            match crate::handoff_state::parse_handoff(root.as_deref(), machine.as_deref(), &slot) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::ParseHold {
-            root,
-            machine,
-            slot,
-        } => match crate::hold_state::parse_hold(root.as_deref(), machine.as_deref(), &slot) {
-            Ok(value) => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&value).unwrap_or_default()
-                );
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::ParseJournal {
-            root,
-            machine,
-            name,
-        } => {
-            match crate::journal_state::parse_journal(root.as_deref(), machine.as_deref(), &name) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::ParseStates { root, machine } => {
-            match crate::pair_state::parse_states(root.as_deref(), machine.as_deref()) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::ParseGlobal { root } => match crate::global_state::parse_global(root.as_deref()) {
-            Ok(value) => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&value).unwrap_or_default()
-                );
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::ParseHolds { root } => match crate::record_holds::parse_holds(root.as_deref()) {
-            Ok(value) => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&value).unwrap_or_default()
-                );
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::ParseJournals { root } => {
-            match crate::journals_state::parse_journals(root.as_deref()) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::StatusText {
-            root,
-            machine,
-            all_machines,
-            slot,
-            format,
-        } => match crate::status_state::status_cli(
-            root.as_deref(),
-            machine.as_deref(),
-            all_machines,
-            slot.as_deref(),
-            format == "human",
-        ) {
-            Ok(text) => {
-                print!("{text}");
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::DoctorText {
-            root,
-            machine,
-            all_machines,
-            format,
-        } => match crate::doctor_state::doctor_cli(
-            root.as_deref(),
-            machine.as_deref(),
-            all_machines,
-            format == "human",
-        ) {
-            Ok(text) => {
-                print!("{text}");
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::AuditText {
-            root,
-            machine,
-            cache_census_state,
-            cache_work_limit,
-            cache_wall_seconds,
-            cache_plan_total_seconds,
-            gate,
-            all_machines,
-            format,
-        } => match crate::audit_state::audit_cli(
-            root.as_deref(),
-            machine.as_deref(),
-            crate::audit_state::CensusRequest {
-                state: cache_census_state,
-                work_limit: cache_work_limit,
-                wall_seconds: cache_wall_seconds,
-                plan_total_seconds: cache_plan_total_seconds,
             },
-            gate,
-            format == "human",
-            all_machines,
-        ) {
-            Ok((text, code)) => {
-                print!("{text}");
-                return u8::try_from(code).unwrap_or(1);
+            CommandWriters::ParseJournal {
+                root,
+                machine,
+                name,
+            } => {
+                match crate::journal_state::parse_journal(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &name,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
             }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
+            CommandWriters::ParseStates { root, machine } => {
+                match crate::pair_state::parse_states(root.as_deref(), machine.as_deref()) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandWriters::ParseGlobal { root } => {
+                match crate::global_state::parse_global(root.as_deref()) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandWriters::ParseHolds { root } => {
+                match crate::record_holds::parse_holds(root.as_deref()) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandWriters::ParseJournals { root } => {
+                match crate::journals_state::parse_journals(root.as_deref()) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandWriters::StatusText {
+                root,
+                machine,
+                all_machines,
+                slot,
+                format,
+            } => match crate::status_state::status_cli(
+                root.as_deref(),
+                machine.as_deref(),
+                all_machines,
+                slot.as_deref(),
+                format == "human",
+            ) {
+                Ok(text) => {
+                    print!("{text}");
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            CommandWriters::Remove {
+                slot,
+                coordinator_pid,
+                expected_generation,
+                root,
+                machine,
+            } => {
+                match crate::remove_write::remove_slot(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &slot,
+                    coordinator_pid,
+                    expected_generation,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
             }
         },
-        Command::ShellCommand {
-            slot,
-            slot_type,
-            box_mode,
-            name,
-            writable,
-            cwd,
-            isolation,
-            shell,
-            format,
-            root,
-            machine,
-            command,
-        } => match crate::shell_command_state::shell_command_cli(
-            root.as_deref(),
-            machine.as_deref(),
-            slot.as_deref(),
-            &slot_type,
-            box_mode,
-            &name,
-            writable.as_deref(),
-            cwd.as_deref(),
-            isolation.as_deref(),
-            shell.as_deref(),
-            format == "json",
-            &command,
-            &after_separator(),
-        ) {
-            Ok(text) => {
-                print!("{text}");
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::ParseStatus { root } => match crate::status_state::parse_status(root.as_deref()) {
-            Ok(value) => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&value).unwrap_or_default()
-                );
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::ParseAudit {
-            root,
-            machine,
-            cache_census_state,
-            cache_work_limit,
-            cache_wall_seconds,
-            cache_plan_total_seconds,
-            all_machines,
-        } => {
-            match crate::audit_state::parse_audit(
+        Command::CommandReaders(inner) => match inner {
+            CommandReaders::DoctorText {
+                root,
+                machine,
+                all_machines,
+                format,
+            } => match crate::doctor_state::doctor_cli(
+                root.as_deref(),
+                machine.as_deref(),
+                all_machines,
+                format == "human",
+            ) {
+                Ok(text) => {
+                    print!("{text}");
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            CommandReaders::AuditText {
+                root,
+                machine,
+                cache_census_state,
+                cache_work_limit,
+                cache_wall_seconds,
+                cache_plan_total_seconds,
+                gate,
+                all_machines,
+                format,
+            } => match crate::audit_state::audit_cli(
                 root.as_deref(),
                 machine.as_deref(),
                 crate::audit_state::CensusRequest {
@@ -1531,6 +1516,152 @@ pub fn run() -> u8 {
                     wall_seconds: cache_wall_seconds,
                     plan_total_seconds: cache_plan_total_seconds,
                 },
+                gate,
+                format == "human",
+                all_machines,
+            ) {
+                Ok((text, code)) => {
+                    print!("{text}");
+                    return u8::try_from(code).unwrap_or(1);
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            CommandReaders::ShellCommand {
+                slot,
+                slot_type,
+                box_mode,
+                name,
+                writable,
+                cwd,
+                isolation,
+                shell,
+                format,
+                root,
+                machine,
+                command,
+            } => match crate::shell_command_state::shell_command_cli(
+                root.as_deref(),
+                machine.as_deref(),
+                slot.as_deref(),
+                &slot_type,
+                box_mode,
+                &name,
+                writable.as_deref(),
+                cwd.as_deref(),
+                isolation.as_deref(),
+                shell.as_deref(),
+                format == "json",
+                &command,
+                &after_separator(),
+            ) {
+                Ok(text) => {
+                    print!("{text}");
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            CommandReaders::ParseStatus { root } => {
+                match crate::status_state::parse_status(root.as_deref()) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandReaders::ParseAudit {
+                root,
+                machine,
+                cache_census_state,
+                cache_work_limit,
+                cache_wall_seconds,
+                cache_plan_total_seconds,
+                all_machines,
+            } => {
+                match crate::audit_state::parse_audit(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    crate::audit_state::CensusRequest {
+                        state: cache_census_state,
+                        work_limit: cache_work_limit,
+                        wall_seconds: cache_wall_seconds,
+                        plan_total_seconds: cache_plan_total_seconds,
+                    },
+                    all_machines,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandReaders::Unpushed {
+                root,
+                machine,
+                slot,
+            } => match crate::unpushed_state::unpushed(
+                root.as_deref(),
+                machine.as_deref(),
+                slot.as_deref(),
+            ) {
+                Ok(value) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            CommandReaders::UnpushedText {
+                root,
+                machine,
+                slot,
+                format,
+            } => match crate::unpushed_state::unpushed_text(
+                root.as_deref(),
+                machine.as_deref(),
+                slot.as_deref(),
+                format == "json",
+            ) {
+                Ok(text) => {
+                    print!("{text}");
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            CommandReaders::ParseDoctor {
+                root,
+                machine,
+                all_machines,
+            } => match crate::doctor_state::parse_doctor(
+                root.as_deref(),
+                machine.as_deref(),
                 all_machines,
             ) {
                 Ok(value) => {
@@ -1544,72 +1675,67 @@ pub fn run() -> u8 {
                     eprintln!("wrkslotsd: {error}");
                     return 1;
                 }
+            },
+            CommandReaders::ParseStorage { root } => {
+                match crate::storage_state::parse_storage(root.as_deref()) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
             }
-        }
-        Command::Unpushed {
-            root,
-            machine,
-            slot,
-        } => match crate::unpushed_state::unpushed(
-            root.as_deref(),
-            machine.as_deref(),
-            slot.as_deref(),
-        ) {
-            Ok(value) => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&value).unwrap_or_default()
-                );
-                return 0;
+            CommandReaders::ParseStorageGit { root } => {
+                match crate::git_storage_state::parse_storage_git(root.as_deref()) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
             }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
+            CommandReaders::Hold {
+                slot,
+                reason,
+                root,
+                machine,
+            } => {
+                match crate::hold_write::hold_slot(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &slot,
+                    &reason,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
             }
-        },
-        Command::UnpushedText {
-            root,
-            machine,
-            slot,
-            format,
-        } => match crate::unpushed_state::unpushed_text(
-            root.as_deref(),
-            machine.as_deref(),
-            slot.as_deref(),
-            format == "json",
-        ) {
-            Ok(text) => {
-                print!("{text}");
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::ParseDoctor {
-            root,
-            machine,
-            all_machines,
-        } => match crate::doctor_state::parse_doctor(
-            root.as_deref(),
-            machine.as_deref(),
-            all_machines,
-        ) {
-            Ok(value) => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&value).unwrap_or_default()
-                );
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::ParseStorage { root } => {
-            match crate::storage_state::parse_storage(root.as_deref()) {
+            CommandReaders::Unhold {
+                slot,
+                root,
+                machine,
+            } => match crate::hold_write::unhold_slot(root.as_deref(), machine.as_deref(), &slot) {
                 Ok(value) => {
                     println!(
                         "{}",
@@ -1621,430 +1747,321 @@ pub fn run() -> u8 {
                     eprintln!("wrkslotsd: {error}");
                     return 1;
                 }
-            }
-        }
-        Command::ParseStorageGit { root } => {
-            match crate::git_storage_state::parse_storage_git(root.as_deref()) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::Hold {
-            slot,
-            reason,
-            root,
-            machine,
-        } => {
-            match crate::hold_write::hold_slot(root.as_deref(), machine.as_deref(), &slot, &reason)
-            {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::Unhold {
-            slot,
-            root,
-            machine,
-        } => match crate::hold_write::unhold_slot(root.as_deref(), machine.as_deref(), &slot) {
-            Ok(value) => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&value).unwrap_or_default()
-                );
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::Heartbeat {
-            slot,
-            agent,
-            owner_pid,
-            expected_generation,
-            root,
-            machine,
-        } => {
-            match crate::heartbeat_write::heartbeat(
-                root.as_deref(),
-                machine.as_deref(),
-                &slot,
-                &agent,
+            },
+            CommandReaders::Heartbeat {
+                slot,
+                agent,
                 owner_pid,
                 expected_generation,
-            ) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
+                root,
+                machine,
+            } => {
+                match crate::heartbeat_write::heartbeat(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &slot,
+                    &agent,
+                    owner_pid,
+                    expected_generation,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
                 }
             }
-        }
-        Command::WriteHandoff {
-            slot,
-            agent,
-            owner_pid,
-            expected_generation,
-            from_file,
-            root,
-            machine,
-        } => {
-            match crate::handoff_write::write_handoff(
-                root.as_deref(),
-                machine.as_deref(),
-                &slot,
-                &agent,
+            CommandReaders::WriteHandoff {
+                slot,
+                agent,
                 owner_pid,
                 expected_generation,
-                &from_file,
-            ) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::Remove {
-            slot,
-            coordinator_pid,
-            expected_generation,
-            root,
-            machine,
-        } => {
-            match crate::remove_write::remove_slot(
-                root.as_deref(),
-                machine.as_deref(),
-                &slot,
-                coordinator_pid,
-                expected_generation,
-            ) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
+                from_file,
+                root,
+                machine,
+            } => {
+                match crate::handoff_write::write_handoff(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &slot,
+                    &agent,
+                    owner_pid,
+                    expected_generation,
+                    &from_file,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
                 }
             }
-        }
-        Command::Release {
-            slot,
-            agent,
-            owner_pid,
-            expected_generation,
-            root,
-            machine,
-        } => {
-            match crate::release_write::release_slot(
-                root.as_deref(),
-                machine.as_deref(),
-                &slot,
-                &agent,
+            CommandReaders::Release {
+                slot,
+                agent,
                 owner_pid,
                 expected_generation,
-            ) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
+                root,
+                machine,
+            } => {
+                match crate::release_write::release_slot(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &slot,
+                    &agent,
+                    owner_pid,
+                    expected_generation,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
                 }
             }
-        }
-        Command::ReadHandoff {
-            slot,
-            coordinator_pid,
-            coordinator_authorized,
-            adopt_legacy_change,
-            expected_generation,
-            root,
-            machine,
-        } => {
-            match crate::read_handoff_write::read_handoff(
-                root.as_deref(),
-                machine.as_deref(),
-                &slot,
+        },
+        Command::CommandRecovery(inner) => match inner {
+            CommandRecovery::ReadHandoff {
+                slot,
                 coordinator_pid,
                 coordinator_authorized,
                 adopt_legacy_change,
                 expected_generation,
-            ) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
+                root,
+                machine,
+            } => {
+                match crate::read_handoff_write::read_handoff(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &slot,
+                    coordinator_pid,
+                    coordinator_authorized,
+                    adopt_legacy_change,
+                    expected_generation,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
                 }
             }
-        }
-        Command::Adopt {
-            slot,
-            agent,
-            owner_pid,
-            expected_generation,
-            task_scope_unit,
-            task_scope_invocation_id,
-            root,
-            machine,
-        } => {
-            match crate::adopt_write::adopt_slot(
-                root.as_deref(),
-                machine.as_deref(),
-                &slot,
-                &agent,
+            CommandRecovery::Adopt {
+                slot,
+                agent,
                 owner_pid,
                 expected_generation,
-                task_scope_unit.as_deref(),
-                task_scope_invocation_id.as_deref(),
-            ) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
+                task_scope_unit,
+                task_scope_invocation_id,
+                root,
+                machine,
+            } => {
+                match crate::adopt_write::adopt_slot(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &slot,
+                    &agent,
+                    owner_pid,
+                    expected_generation,
+                    task_scope_unit.as_deref(),
+                    task_scope_invocation_id.as_deref(),
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
                 }
             }
-        }
-        Command::TransferOwner {
-            slot,
-            agent,
-            owner_pid,
-            expected_generation,
-            reopen,
-            coordinator_pid,
-            coordinator_authorized,
-            reason,
-            root,
-            machine,
-        } => {
-            match crate::transfer_write::transfer_owner(
-                root.as_deref(),
-                machine.as_deref(),
-                &slot,
-                &agent,
+            CommandRecovery::TransferOwner {
+                slot,
+                agent,
                 owner_pid,
                 expected_generation,
                 reopen,
                 coordinator_pid,
                 coordinator_authorized,
-                reason.as_deref(),
-            ) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::RecoverUnboundOwner {
-            slot,
-            coordinator_pid,
-            expected_generation,
-            recovery_note,
-            validation,
-            limitation,
-            root,
-            machine,
-        } => {
-            match crate::recover_unbound_write::recover_unbound_owner(
-                root.as_deref(),
-                machine.as_deref(),
-                &slot,
-                coordinator_pid,
-                expected_generation,
-                &recovery_note,
-                &validation,
-                &limitation,
-            ) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::RecoverAbsentAgentRow {
-            slot,
-            expected_generation,
-            record_sha256,
-            apply_mode,
-            coordinator_authorized,
-            coordinator_pid,
-            root,
-            machine,
-        } => {
-            match crate::recover_absent_write::recover_absent_agent_row(
-                root.as_deref(),
-                machine.as_deref(),
-                &slot,
-                expected_generation,
-                &record_sha256,
-                apply_mode,
-                coordinator_authorized,
-                coordinator_pid,
-            ) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::RecoverAbsentAgentRows {
-            row,
-            input,
-            apply_mode,
-            coordinator_authorized,
-            coordinator_pid,
-            root,
-            machine,
-        } => {
-            match crate::recover_absent_write::recover_absent_agent_rows(
-                root.as_deref(),
-                machine.as_deref(),
-                &row,
-                input.as_deref(),
-                apply_mode,
-                coordinator_authorized,
-                coordinator_pid,
-            ) {
-                Ok(value) => {
-                    let refused = value
-                        .get("counts")
-                        .and_then(|counts| counts.get("refused"))
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return if refused > 0 { 1 } else { 0 };
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::RecoverAbsentValidateRows {
-            input,
-            apply_mode,
-            coordinator_authorized,
-            coordinator_pid,
-            format,
-            root,
-            machine,
-        } => {
-            let (refusal, result) =
-                crate::recover_validate_write::recover_absent_validate_rows_wrapped(
+                reason,
+                root,
+                machine,
+            } => {
+                match crate::transfer_write::transfer_owner(
                     root.as_deref(),
                     machine.as_deref(),
-                    &input,
-                    apply_mode,
-                    coordinator_authorized,
+                    &slot,
+                    &agent,
+                    owner_pid,
+                    expected_generation,
+                    reopen,
                     coordinator_pid,
-                );
-            match result {
-                Ok(value) => {
-                    if format == "json" {
+                    coordinator_authorized,
+                    reason.as_deref(),
+                ) {
+                    Ok(value) => {
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&value).unwrap_or_default()
                         );
-                    } else if let Some(rows) = value.get("rows").and_then(|rows| rows.as_array()) {
-                        for row in rows {
-                            println!(
-                                "ROW machine={} slot={} generation={} outcome={} detail={}",
-                                row.get("machine")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default(),
-                                row.get("slot").and_then(|v| v.as_str()).unwrap_or_default(),
-                                row.get("generation")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or_default(),
-                                row.get("outcome")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default(),
-                                serde_json::to_string(
-                                    &row.get("detail").cloned().unwrap_or_default()
-                                )
-                                .unwrap_or_default(),
-                            );
-                        }
+                        return 0;
                     }
-                    return 0;
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
                 }
-                Err(error) => {
-                    if let Some(value) = refusal {
+            }
+            CommandRecovery::RecoverUnboundOwner {
+                slot,
+                coordinator_pid,
+                expected_generation,
+                recovery_note,
+                validation,
+                limitation,
+                root,
+                machine,
+            } => {
+                match crate::recover_unbound_write::recover_unbound_owner(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &slot,
+                    coordinator_pid,
+                    expected_generation,
+                    &recovery_note,
+                    &validation,
+                    &limitation,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandRecovery::RecoverAbsentAgentRow {
+                slot,
+                expected_generation,
+                record_sha256,
+                apply_mode,
+                coordinator_authorized,
+                coordinator_pid,
+                root,
+                machine,
+            } => {
+                match crate::recover_absent_write::recover_absent_agent_row(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &slot,
+                    expected_generation,
+                    &record_sha256,
+                    apply_mode,
+                    coordinator_authorized,
+                    coordinator_pid,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandRecovery::RecoverAbsentAgentRows {
+                row,
+                input,
+                apply_mode,
+                coordinator_authorized,
+                coordinator_pid,
+                root,
+                machine,
+            } => {
+                match crate::recover_absent_write::recover_absent_agent_rows(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &row,
+                    input.as_deref(),
+                    apply_mode,
+                    coordinator_authorized,
+                    coordinator_pid,
+                ) {
+                    Ok(value) => {
+                        let refused = value
+                            .get("counts")
+                            .and_then(|counts| counts.get("refused"))
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return if refused > 0 { 1 } else { 0 };
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandRecovery::RecoverAbsentValidateRows {
+                input,
+                apply_mode,
+                coordinator_authorized,
+                coordinator_pid,
+                format,
+                root,
+                machine,
+            } => {
+                let (refusal, result) =
+                    crate::recover_validate_write::recover_absent_validate_rows_wrapped(
+                        root.as_deref(),
+                        machine.as_deref(),
+                        &input,
+                        apply_mode,
+                        coordinator_authorized,
+                        coordinator_pid,
+                    );
+                match result {
+                    Ok(value) => {
                         if format == "json" {
                             println!(
                                 "{}",
@@ -2073,460 +2090,316 @@ pub fn run() -> u8 {
                                 );
                             }
                         }
+                        return 0;
                     }
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
+                    Err(error) => {
+                        if let Some(value) = refusal {
+                            if format == "json" {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&value).unwrap_or_default()
+                                );
+                            } else if let Some(rows) =
+                                value.get("rows").and_then(|rows| rows.as_array())
+                            {
+                                for row in rows {
+                                    println!(
+                                        "ROW machine={} slot={} generation={} outcome={} detail={}",
+                                        row.get("machine")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or_default(),
+                                        row.get("slot")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or_default(),
+                                        row.get("generation")
+                                            .and_then(|v| v.as_i64())
+                                            .unwrap_or_default(),
+                                        row.get("outcome")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or_default(),
+                                        serde_json::to_string(
+                                            &row.get("detail").cloned().unwrap_or_default()
+                                        )
+                                        .unwrap_or_default(),
+                                    );
+                                }
+                            }
+                        }
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
                 }
             }
-        }
-        Command::RecoverOwnerlessAgentWorktree {
-            path,
-            repository,
-            head,
-            branch,
-            detached,
-            remote,
-            remote_url_sha256,
-            handoff_sha256,
-            apply_mode,
-            coordinator_authorized,
-            coordinator_pid,
-            root,
-            machine,
-        } => {
-            match crate::recover_ownerless_write::recover_ownerless_agent_worktree(
-                root.as_deref(),
-                machine.as_deref(),
-                &path,
-                &repository,
-                &head,
-                branch.as_deref(),
+            CommandRecovery::RecoverOwnerlessAgentWorktree {
+                path,
+                repository,
+                head,
+                branch,
                 detached,
-                &remote,
-                &remote_url_sha256,
-                handoff_sha256.as_deref(),
+                remote,
+                remote_url_sha256,
+                handoff_sha256,
                 apply_mode,
                 coordinator_authorized,
                 coordinator_pid,
-            ) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
+                root,
+                machine,
+            } => {
+                match crate::recover_ownerless_write::recover_ownerless_agent_worktree(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &path,
+                    &repository,
+                    &head,
+                    branch.as_deref(),
+                    detached,
+                    &remote,
+                    &remote_url_sha256,
+                    handoff_sha256.as_deref(),
+                    apply_mode,
+                    coordinator_authorized,
+                    coordinator_pid,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
                 }
             }
-        }
-        Command::RecoverOwnerlessAgentClone {
-            path,
-            remote_urls,
-            handoff_sha256s,
-            discard_ignored,
-            apply_mode,
-            coordinator_authorized,
-            coordinator_pid,
-            root,
-            machine,
-        } => {
-            let parsed_urls: Vec<(String, String)> = remote_urls
-                .iter()
-                .map(|raw| {
-                    let (key, url) = raw.split_once('=').unwrap_or((raw.as_str(), ""));
-                    (key.to_string(), url.to_string())
-                })
-                .collect();
-            match crate::recover_clone_write::recover_ownerless_agent_clone(
-                root.as_deref(),
-                machine.as_deref(),
-                &path,
-                &parsed_urls,
-                &handoff_sha256s,
+            CommandRecovery::RecoverOwnerlessAgentClone {
+                path,
+                remote_urls,
+                handoff_sha256s,
                 discard_ignored,
                 apply_mode,
                 coordinator_authorized,
                 coordinator_pid,
-            ) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
+                root,
+                machine,
+            } => {
+                let parsed_urls: Vec<(String, String)> = remote_urls
+                    .iter()
+                    .map(|raw| {
+                        let (key, url) = raw.split_once('=').unwrap_or((raw.as_str(), ""));
+                        (key.to_string(), url.to_string())
+                    })
+                    .collect();
+                match crate::recover_clone_write::recover_ownerless_agent_clone(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &path,
+                    &parsed_urls,
+                    &handoff_sha256s,
+                    discard_ignored,
+                    apply_mode,
+                    coordinator_authorized,
+                    coordinator_pid,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
                 }
             }
-        }
-        Command::RecoverOwnerlessAgentCache {
-            apply_mode,
-            coordinator_authorized,
-            coordinator_pid,
-            root,
-            machine,
-        } => {
-            match crate::recover_cache_write::recover_ownerless_agent_cache(
+            CommandRecovery::RecoverOwnerlessAgentCache {
+                apply_mode,
+                coordinator_authorized,
+                coordinator_pid,
+                root,
+                machine,
+            } => {
+                match crate::recover_cache_write::recover_ownerless_agent_cache(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    apply_mode,
+                    coordinator_authorized,
+                    coordinator_pid,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandRecovery::RecoverOwnerlessValidateBatch {
+                checkouts,
+                frozen_validate_checkouts,
+                completed_records,
+                repositories,
+                validation_proof_manifests,
+                coordinator_authorized,
+                coordinator_pid,
+                root,
+                machine,
+            } => {
+                match crate::recover_cache_write::recover_ownerless_validate_batch(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &checkouts,
+                    &frozen_validate_checkouts,
+                    &completed_records,
+                    &repositories,
+                    &validation_proof_manifests,
+                    coordinator_authorized,
+                    coordinator_pid,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandRecovery::ClassifyOwnerlessValidateBatch {
+                checkouts,
+                frozen_validate_checkouts,
+                completed_records,
+                repositories,
+                validation_proof_manifests,
+                root,
+                machine,
+            } => {
+                match crate::recover_cache_write::classify_ownerless_validate_batch(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &checkouts,
+                    &frozen_validate_checkouts,
+                    &completed_records,
+                    &repositories,
+                    &validation_proof_manifests,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandRecovery::RecoverAbsentAgentRowsText {
+                row,
+                input,
+                apply_mode,
+                coordinator_authorized,
+                coordinator_pid,
+                format,
+                root,
+                machine,
+            } => match crate::recover_absent_write::recover_absent_agent_rows(
                 root.as_deref(),
                 machine.as_deref(),
+                &row,
+                input.as_deref(),
                 apply_mode,
                 coordinator_authorized,
                 coordinator_pid,
             ) {
                 Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
+                    let (text, refused) = crate::batch_text::agent_rows(&value, format == "json");
+                    print!("{text}");
+                    return if refused { 1 } else { 0 };
                 }
                 Err(error) => {
                     eprintln!("wrkslotsd: {error}");
                     return 1;
                 }
-            }
-        }
-        Command::RecoverOwnerlessValidateBatch {
-            checkouts,
-            frozen_validate_checkouts,
-            completed_records,
-            repositories,
-            validation_proof_manifests,
-            coordinator_authorized,
-            coordinator_pid,
-            root,
-            machine,
-        } => {
-            match crate::recover_cache_write::recover_ownerless_validate_batch(
-                root.as_deref(),
-                machine.as_deref(),
-                &checkouts,
-                &frozen_validate_checkouts,
-                &completed_records,
-                &repositories,
-                &validation_proof_manifests,
+            },
+            CommandRecovery::RecoverAbsentValidateRowsText {
+                input,
+                apply_mode,
                 coordinator_authorized,
                 coordinator_pid,
-            ) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                format,
+                root,
+                machine,
+            } => {
+                let (refusal, result) =
+                    crate::recover_validate_write::recover_absent_validate_rows_wrapped(
+                        root.as_deref(),
+                        machine.as_deref(),
+                        &input,
+                        apply_mode,
+                        coordinator_authorized,
+                        coordinator_pid,
                     );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::ClassifyOwnerlessValidateBatch {
-            checkouts,
-            frozen_validate_checkouts,
-            completed_records,
-            repositories,
-            validation_proof_manifests,
-            root,
-            machine,
-        } => {
-            match crate::recover_cache_write::classify_ownerless_validate_batch(
-                root.as_deref(),
-                machine.as_deref(),
-                &checkouts,
-                &frozen_validate_checkouts,
-                &completed_records,
-                &repositories,
-                &validation_proof_manifests,
-            ) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::RecoverAbsentAgentRowsText {
-            row,
-            input,
-            apply_mode,
-            coordinator_authorized,
-            coordinator_pid,
-            format,
-            root,
-            machine,
-        } => match crate::recover_absent_write::recover_absent_agent_rows(
-            root.as_deref(),
-            machine.as_deref(),
-            &row,
-            input.as_deref(),
-            apply_mode,
-            coordinator_authorized,
-            coordinator_pid,
-        ) {
-            Ok(value) => {
-                let (text, refused) = crate::batch_text::agent_rows(&value, format == "json");
-                print!("{text}");
-                return if refused { 1 } else { 0 };
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::RecoverAbsentValidateRowsText {
-            input,
-            apply_mode,
-            coordinator_authorized,
-            coordinator_pid,
-            format,
-            root,
-            machine,
-        } => {
-            let (refusal, result) =
-                crate::recover_validate_write::recover_absent_validate_rows_wrapped(
-                    root.as_deref(),
-                    machine.as_deref(),
-                    &input,
-                    apply_mode,
-                    coordinator_authorized,
-                    coordinator_pid,
-                );
-            match result {
-                Ok(value) => {
-                    print!(
-                        "{}",
-                        crate::batch_text::validate_rows(&value, format == "json")
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    if let Some(value) = refusal {
+                match result {
+                    Ok(value) => {
                         print!(
                             "{}",
                             crate::batch_text::validate_rows(&value, format == "json")
                         );
+                        return 0;
                     }
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
+                    Err(error) => {
+                        if let Some(value) = refusal {
+                            print!(
+                                "{}",
+                                crate::batch_text::validate_rows(&value, format == "json")
+                            );
+                        }
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
                 }
             }
-        }
-        Command::RecoverOwnerlessValidateBatchText {
-            checkouts,
-            frozen_validate_checkouts,
-            completed_records,
-            repositories,
-            validation_proof_manifests,
-            coordinator_authorized,
-            coordinator_pid,
-            format,
-            root,
-            machine,
-        } => match crate::recover_cache_write::recover_ownerless_validate_batch(
-            root.as_deref(),
-            machine.as_deref(),
-            &checkouts,
-            &frozen_validate_checkouts,
-            &completed_records,
-            &repositories,
-            &validation_proof_manifests,
-            coordinator_authorized,
-            coordinator_pid,
-        ) {
-            Ok(value) => {
-                print!(
-                    "{}",
-                    crate::batch_text::ownerless_recover(&value, format == "json")
-                );
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::ClassifyOwnerlessValidateBatchText {
-            checkouts,
-            frozen_validate_checkouts,
-            completed_records,
-            repositories,
-            validation_proof_manifests,
-            format,
-            root,
-            machine,
-        } => match crate::recover_cache_write::classify_ownerless_validate_batch(
-            root.as_deref(),
-            machine.as_deref(),
-            &checkouts,
-            &frozen_validate_checkouts,
-            &completed_records,
-            &repositories,
-            &validation_proof_manifests,
-        ) {
-            Ok(value) => {
-                print!(
-                    "{}",
-                    crate::batch_text::ownerless_classify(&value, format == "json")
-                );
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::Freeze {
-            action,
-            reason,
-            root,
-            machine,
-        } => match crate::freeze::freeze_command(
-            root.as_deref(),
-            machine.as_deref(),
-            &action,
-            &reason,
-        ) {
-            Ok(text) => {
-                print!("{text}");
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::ClassifyCreateJournals {
-            slot,
-            agent,
-            slot_type,
-            format,
-            all_machines,
-            root,
-            machine,
-        } => match crate::classify_journals::classify_create_journals(
-            root.as_deref(),
-            machine.as_deref(),
-            &slot,
-            &slot_type,
-            &agent,
-            format == "json",
-            all_machines,
-        ) {
-            Ok(text) => {
-                print!("{text}");
-                return 0;
-            }
-            Err(crate::classify_journals::ClassifyError::Busy { kind, pid, journal }) => {
-                // Retryable busy (#992): exit 75 (TEMPFAIL), not a refusal.
-                if format == "json" {
-                    println!(
-                        "{{\"blocking\":true,\"busy\":{{\"journal\":{},\"kind\":{},\"pid\":{pid}}},\"status\":\"busy\"}}",
-                        serde_json::to_string(&journal).unwrap_or_default(),
-                        serde_json::to_string(&kind).unwrap_or_default(),
-                    );
-                }
-                eprintln!("BUSY: busy: live '{kind}' mutation {journal} by pid {pid}; retry");
-                return 75;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::ReapStrayWorktrees {
-            repository,
-            apply_mode,
-            format,
-            root,
-            machine,
-        } => match crate::reap_strays::reap_stray_worktrees(
-            root.as_deref(),
-            machine.as_deref(),
-            &repository,
-            apply_mode,
-            format == "json",
-        ) {
-            Ok((text, retained_any)) => {
-                print!("{text}");
-                return if apply_mode && retained_any { 1 } else { 0 };
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::ReclaimOrphanState {
-            apply_mode,
-            format,
-            root,
-            machine,
-        } => match crate::reclaim_state::reclaim_orphan_state(
-            root.as_deref(),
-            machine.as_deref(),
-            apply_mode,
-            format == "json",
-        ) {
-            Ok(text) => {
-                print!("{text}");
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::Recover {
-            coordinator_pid,
-            slot,
-            coordinator_authorized,
-            discard_partial,
-            discard_stale_image_copy,
-            abort_import,
-            legacy_validate_checkout,
-            ownerless_validate_checkout,
-            ownerless_validate_cargo_home,
-            frozen_validate_checkout,
-            completed_record,
-            repository,
-            recovery_note,
-            validation_proof_manifest,
-            root,
-            machine,
-        } => {
-            match crate::recover_main_write::recover_main(
+            CommandRecovery::RecoverOwnerlessValidateBatchText {
+                checkouts,
+                frozen_validate_checkouts,
+                completed_records,
+                repositories,
+                validation_proof_manifests,
+                coordinator_authorized,
+                coordinator_pid,
+                format,
+                root,
+                machine,
+            } => match crate::recover_cache_write::recover_ownerless_validate_batch(
                 root.as_deref(),
                 machine.as_deref(),
-                coordinator_pid,
-                slot.as_deref(),
+                &checkouts,
+                &frozen_validate_checkouts,
+                &completed_records,
+                &repositories,
+                &validation_proof_manifests,
                 coordinator_authorized,
-                discard_partial,
-                discard_stale_image_copy,
-                abort_import,
-                legacy_validate_checkout.as_deref(),
-                ownerless_validate_checkout.as_deref(),
-                ownerless_validate_cargo_home.as_deref(),
-                frozen_validate_checkout.as_deref(),
-                completed_record.as_deref(),
-                repository.as_deref(),
-                recovery_note.as_deref(),
-                validation_proof_manifest.as_deref(),
+                coordinator_pid,
             ) {
                 Ok(value) => {
-                    println!(
+                    print!(
                         "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                        crate::batch_text::ownerless_recover(&value, format == "json")
                     );
                     return 0;
                 }
@@ -2534,30 +2407,272 @@ pub fn run() -> u8 {
                     eprintln!("wrkslotsd: {error}");
                     return 1;
                 }
+            },
+        },
+        Command::CommandLifecycle(inner) => match inner {
+            CommandLifecycle::Plan {
+                index,
+                target_bytes,
+                limit,
+            } => {
+                read_pressure_plan(&index, target_bytes, limit).and_then(|plan| encode_value(&plan))
             }
-        }
-        Command::Create {
-            slot,
-            slot_type,
-            coordinator_authorized,
-            agent,
-            task,
-            purpose,
-            owner_pid,
-            coordinator_pid,
-            repo,
-            remote,
-            remote_url,
-            branch,
-            start,
-            override_disk_floor,
-            task_scope_unit,
-            task_scope_invocation_id,
-            representation,
-            root,
-            machine,
-        } => {
-            match crate::create_write::create_slot(
+            CommandLifecycle::ClassifyOwnerlessValidateBatchText {
+                checkouts,
+                frozen_validate_checkouts,
+                completed_records,
+                repositories,
+                validation_proof_manifests,
+                format,
+                root,
+                machine,
+            } => match crate::recover_cache_write::classify_ownerless_validate_batch(
+                root.as_deref(),
+                machine.as_deref(),
+                &checkouts,
+                &frozen_validate_checkouts,
+                &completed_records,
+                &repositories,
+                &validation_proof_manifests,
+            ) {
+                Ok(value) => {
+                    print!(
+                        "{}",
+                        crate::batch_text::ownerless_classify(&value, format == "json")
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            CommandLifecycle::Freeze {
+                action,
+                reason,
+                root,
+                machine,
+            } => match crate::freeze::freeze_command(
+                root.as_deref(),
+                machine.as_deref(),
+                &action,
+                &reason,
+            ) {
+                Ok(text) => {
+                    print!("{text}");
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            CommandLifecycle::ClassifyCreateJournals {
+                slot,
+                agent,
+                slot_type,
+                format,
+                all_machines,
+                root,
+                machine,
+            } => match crate::classify_journals::classify_create_journals(
+                root.as_deref(),
+                machine.as_deref(),
+                &slot,
+                &slot_type,
+                &agent,
+                format == "json",
+                all_machines,
+            ) {
+                Ok(text) => {
+                    print!("{text}");
+                    return 0;
+                }
+                Err(crate::classify_journals::ClassifyError::Busy { kind, pid, journal }) => {
+                    // Retryable busy (#992): exit 75 (TEMPFAIL), not a refusal.
+                    if format == "json" {
+                        println!(
+                            "{{\"blocking\":true,\"busy\":{{\"journal\":{},\"kind\":{},\"pid\":{pid}}},\"status\":\"busy\"}}",
+                            serde_json::to_string(&journal).unwrap_or_default(),
+                            serde_json::to_string(&kind).unwrap_or_default(),
+                        );
+                    }
+                    eprintln!("BUSY: busy: live '{kind}' mutation {journal} by pid {pid}; retry");
+                    return 75;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            CommandLifecycle::ReapStrayWorktrees {
+                repository,
+                apply_mode,
+                format,
+                root,
+                machine,
+            } => match crate::reap_strays::reap_stray_worktrees(
+                root.as_deref(),
+                machine.as_deref(),
+                &repository,
+                apply_mode,
+                format == "json",
+            ) {
+                Ok((text, retained_any)) => {
+                    print!("{text}");
+                    return if apply_mode && retained_any { 1 } else { 0 };
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            CommandLifecycle::ReclaimOrphanState {
+                apply_mode,
+                format,
+                root,
+                machine,
+            } => match crate::reclaim_state::reclaim_orphan_state(
+                root.as_deref(),
+                machine.as_deref(),
+                apply_mode,
+                format == "json",
+            ) {
+                Ok(text) => {
+                    print!("{text}");
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            CommandLifecycle::Recover {
+                coordinator_pid,
+                slot,
+                coordinator_authorized,
+                discard_partial,
+                discard_stale_image_copy,
+                abort_import,
+                legacy_validate_checkout,
+                ownerless_validate_checkout,
+                ownerless_validate_cargo_home,
+                frozen_validate_checkout,
+                completed_record,
+                repository,
+                recovery_note,
+                validation_proof_manifest,
+                root,
+                machine,
+            } => {
+                match crate::recover_main_write::recover_main(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    coordinator_pid,
+                    slot.as_deref(),
+                    coordinator_authorized,
+                    discard_partial,
+                    discard_stale_image_copy,
+                    abort_import,
+                    legacy_validate_checkout.as_deref(),
+                    ownerless_validate_checkout.as_deref(),
+                    ownerless_validate_cargo_home.as_deref(),
+                    frozen_validate_checkout.as_deref(),
+                    completed_record.as_deref(),
+                    repository.as_deref(),
+                    recovery_note.as_deref(),
+                    validation_proof_manifest.as_deref(),
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandLifecycle::Create {
+                slot,
+                slot_type,
+                coordinator_authorized,
+                agent,
+                task,
+                purpose,
+                owner_pid,
+                coordinator_pid,
+                repo,
+                remote,
+                remote_url,
+                branch,
+                start,
+                override_disk_floor,
+                task_scope_unit,
+                task_scope_invocation_id,
+                representation,
+                root,
+                machine,
+            } => {
+                match crate::create_write::create_slot(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &slot,
+                    &slot_type,
+                    coordinator_authorized,
+                    &agent,
+                    &task,
+                    &purpose,
+                    owner_pid,
+                    coordinator_pid,
+                    &repo,
+                    &remote,
+                    &remote_url,
+                    &branch,
+                    &start,
+                    override_disk_floor,
+                    &representation,
+                    task_scope_unit.as_deref(),
+                    task_scope_invocation_id.as_deref(),
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            CommandLifecycle::CreateText {
+                slot,
+                slot_type,
+                coordinator_authorized,
+                agent,
+                task,
+                purpose,
+                owner_pid,
+                coordinator_pid,
+                repo,
+                remote,
+                remote_url,
+                branch,
+                start,
+                override_disk_floor,
+                task_scope_unit,
+                task_scope_invocation_id,
+                representation,
+                format,
+                root,
+                machine,
+            } => match crate::create_text::create_text(
                 root.as_deref(),
                 machine.as_deref(),
                 &slot,
@@ -2577,149 +2692,95 @@ pub fn run() -> u8 {
                 &representation,
                 task_scope_unit.as_deref(),
                 task_scope_invocation_id.as_deref(),
+                format == "json",
             ) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
+                Ok(text) => {
+                    print!("{text}");
                     return 0;
                 }
                 Err(error) => {
                     eprintln!("wrkslotsd: {error}");
                     return 1;
                 }
-            }
-        }
-        Command::CreateText {
-            slot,
-            slot_type,
-            coordinator_authorized,
-            agent,
-            task,
-            purpose,
-            owner_pid,
-            coordinator_pid,
-            repo,
-            remote,
-            remote_url,
-            branch,
-            start,
-            override_disk_floor,
-            task_scope_unit,
-            task_scope_invocation_id,
-            representation,
-            format,
-            root,
-            machine,
-        } => match crate::create_text::create_text(
-            root.as_deref(),
-            machine.as_deref(),
-            &slot,
-            &slot_type,
-            coordinator_authorized,
-            &agent,
-            &task,
-            &purpose,
-            owner_pid,
-            coordinator_pid,
-            &repo,
-            &remote,
-            &remote_url,
-            &branch,
-            &start,
-            override_disk_floor,
-            &representation,
-            task_scope_unit.as_deref(),
-            task_scope_invocation_id.as_deref(),
-            format == "json",
-        ) {
-            Ok(text) => {
-                print!("{text}");
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("wrkslotsd: {error}");
-                return 1;
-            }
-        },
-        Command::Finish {
-            slot,
-            agent,
-            owner_pid,
-            expected_generation,
-            validation,
-            limitation,
-            root,
-            machine,
-        } => {
-            match crate::finish_write::finish_slot(
-                root.as_deref(),
-                machine.as_deref(),
-                &slot,
-                &agent,
+            },
+            CommandLifecycle::Finish {
+                slot,
+                agent,
                 owner_pid,
                 expected_generation,
-                &validation,
-                &limitation,
-            ) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
-                }
-            }
-        }
-        Command::EnsureStates { root, machine } => {
-            match crate::ensure_states::ensure_states(root.as_deref(), machine.as_deref()) {
-                Ok(value) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
+                validation,
+                limitation,
+                root,
+                machine,
+            } => {
+                match crate::finish_write::finish_slot(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &slot,
+                    &agent,
+                    owner_pid,
+                    expected_generation,
+                    &validation,
+                    &limitation,
+                ) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
                 }
             }
-        }
-        Command::ParseConfig { config } => {
-            let parsed = std::fs::read_to_string(&config)
-                .map_err(|error| {
-                    crate::ObserverError::invalid(format!(
-                        "cannot read config {}: {error}",
-                        config.display()
-                    ))
-                })
-                .and_then(|text| {
-                    crate::yamlconfig::load_document(&text)
-                        .map_err(|error| crate::ObserverError::invalid(error.to_string()))
-                });
-            match parsed {
-                Ok((value, format)) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(
-                            &serde_json::json!({"format": format, "value": value})
-                        )
-                        .unwrap_or_default()
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("wrkslotsd: {error}");
-                    return 1;
+            CommandLifecycle::EnsureStates { root, machine } => {
+                match crate::ensure_states::ensure_states(root.as_deref(), machine.as_deref()) {
+                    Ok(value) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
                 }
             }
-        }
+            CommandLifecycle::ParseConfig { config } => {
+                let parsed = std::fs::read_to_string(&config)
+                    .map_err(|error| {
+                        crate::ObserverError::invalid(format!(
+                            "cannot read config {}: {error}",
+                            config.display()
+                        ))
+                    })
+                    .and_then(|text| {
+                        crate::yamlconfig::load_document(&text)
+                            .map_err(|error| crate::ObserverError::invalid(error.to_string()))
+                    });
+                match parsed {
+                    Ok((value, format)) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &serde_json::json!({"format": format, "value": value})
+                            )
+                            .unwrap_or_default()
+                        );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+        },
     };
     match result {
         Ok(value) => {
