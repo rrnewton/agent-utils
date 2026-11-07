@@ -52,7 +52,8 @@ function shownRowFor<T extends Element>(row: T | null | undefined): T | null | u
   // A run's rows are the same kind of element as the row asked about.
   const rows: Element[] = [...row.parentNode.children];
   for (let at = rows.indexOf(row); at >= 0; at -= 1) {
-    if (rows[at].getAttribute("data-read-run") === "head") return rows[at] as T;
+    const sibling = rows[at];
+    if (sibling && sibling.getAttribute("data-read-run") === "head") return sibling as T;
   }
   return row;
 }
