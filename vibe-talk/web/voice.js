@@ -30751,48 +30751,39 @@ function closeSpeedPopover() {
   scheduleBackSync();
 }
 
-el("read-speed").addEventListener("click", () => {
-  const open = el("speed-popover").hidden;
-  el("speed-popover").hidden = !open;
-  el("read-speed").setAttribute("aria-expanded", open ? "true" : "false");
-  // `#304 back-gesture-in-app`. An open popover is a level, with an entry of its own.
-  scheduleBackSync();
+// The reading preferences' switches: the read-aloud pace's popover, Your own messages, and the switches that shape
+// how messages are drawn and sent. One owner in web/src/view/settings/preferenceswitches.ts (`#624
+// voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's teardown.
+mountPreferenceSwitches({
+  lookup: (id) => el(id),
+  toggleSpeedPopover: () => {
+    const open = el("speed-popover").hidden;
+    el("speed-popover").hidden = !open;
+    el("read-speed").setAttribute("aria-expanded", open ? "true" : "false");
+    // `#304 back-gesture-in-app`. An open popover is a level, with an entry of its own.
+    scheduleBackSync();
+  },
+  applyOwnRead: guardQuietly(ownReadApply.apply),
+  undoOwnRead: guardQuietly(ownReadApply.undo),
+  markOwnReadChanged: messagePreferences.markOwnRead.changed,
+  hideEmptyChanged: messagePreferences.hideEmpty.changed,
+  combineChanged: messagePreferences.combine.changed,
+  richHeadersChanged: messagePreferences.richHeaders.changed,
+  inAppLinksChanged: messagePreferences.inAppLinks.changed,
+  openInViewChanged: messagePreferences.openInView.changed,
+  summariesChanged: messagePreferences.summaries.changed,
+  enterSendsChanged: (on) => enterSends.apply(on),
 });
 
-el("own-read-apply").addEventListener("click", guardQuietly(ownReadApply.apply));
-el("own-read-undo").addEventListener("click", guardQuietly(ownReadApply.undo));
-
-el("mark-own-read").addEventListener("change", messagePreferences.markOwnRead.changed);
-
-// `#386 hide-empty-messages`. Each column drawn again from what it holds, as for Your own messages: an
-// empty message comes back, or goes, with no read. The page without threads holds no store to draw
-// from: turned on, its rows are regrouped, which leaves the empty ones out; turned off, its newest page
-// is read again in place, and an empty message further back comes back when that history is re-read.
-el("hide-empty-messages").addEventListener("change", messagePreferences.hideEmpty.changed);
-
-el("combine-messages").addEventListener("change", messagePreferences.combine.changed);
-
-// `#242 rich-headers`. Nothing to redraw: the root's attribute moves every heading between the header
-// and the words it came from at once, in both columns.
-el("rich-headers").addEventListener("change", messagePreferences.richHeaders.changed);
-
-// `#543 in-app-message-links`. Each column drawn again from what it holds, its links decided anew.
-el("in-app-links").addEventListener("change", messagePreferences.inAppLinks.changed);
-
-// `#580 open-in-chat-jump`.
-el("open-in-view").addEventListener("change", messagePreferences.openInView.changed);
-
-// `#564 message-summary-toggle`. The chip over the list follows it (`setSummaryMode`).
-el("summarize-collapsed").addEventListener("change", messagePreferences.summaries.changed);
-
-// `#225 enter-to-send`. Nothing to redraw and nothing to say on the status line: the hint under the
-// switch changes in place, and the next Enter in any box follows it.
-el("enter-sends").addEventListener("change", () => enterSends.apply(el("enter-sends").checked));
-
-// `#240 reading-bookmark`. The chip is the left column's, as b is.
-el("jump-bookmark").addEventListener("click", () => guardQuietly(jumpToBookmark)());
-leftEl("jump-reading").addEventListener("click", () => readingJump.jump());
-el("back-to-reply").addEventListener("click", backToReply);
+// `#240 reading-bookmark`. The ways back: to the bookmark, to where the reader was reading (the left column's chip, as
+// b is), and back to a reply (web/src/view/channel/readingjumps.ts).
+mountReadingJumps({
+  lookup: (id) => el(id),
+  leftLookup: (id) => leftEl(id),
+  jumpToBookmark: () => guardQuietly(jumpToBookmark)(),
+  jumpToReading: () => readingJump.jump(),
+  backToReply: () => backToReply(),
+});
 
 // The read-aloud controls (`#567 pace-stepper`, `#376 read-aloud-blocks`, `#442 read-strip-order`, `#434
 // read-aloud-pause`, `#451 read-strip-followups`, `#627 scrubber-thumb-arrows`, `#886 voice-page-autoplay`): the pace's

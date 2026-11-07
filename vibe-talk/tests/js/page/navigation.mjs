@@ -3691,7 +3691,7 @@ test("`#304 back-gesture-in-app`: THE READING-PACE POPOVER is an entry, with clo
   // entry under the next gesture.
   for (const closeWatcher of [false, true]) {
     const silent = await paceWalk(closeWatcher, brokenScript(
-      "  // `#304 back-gesture-in-app`. An open popover is a level, with an entry of its own.\n  scheduleBackSync();\n", ""));
+      "    // `#304 back-gesture-in-app`. An open popover is a level, with an entry of its own.\n    scheduleBackSync();\n", ""));
     assert.equal(silent.gesture.left, true, "the control whose pace button pushes nothing did not leave the app");
     assert.equal(silent.gesture.open, true);
   }

@@ -21,6 +21,8 @@ export { mountPairing } from "./pairing.ts";
 export type { Pairing, PairingDependencies } from "./pairing.ts";
 export { mountSignInControls } from "./signincontrols.ts";
 export type { SignInControls, SignInControlsDependencies } from "./signincontrols.ts";
+export { mountPreferenceSwitches } from "./preferenceswitches.ts";
+export type { PreferenceSwitches, PreferenceSwitchesDependencies } from "./preferenceswitches.ts";
 export { mountReadingWidth, mountTextSize } from "./screen.ts";
 export type { ReadingWidth, ScreenSettingDependencies, TextSize } from "./screen.ts";
 export { mountScreenControls } from "./screencontrols.ts";

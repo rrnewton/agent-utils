@@ -1486,3 +1486,22 @@ test("`#624 voice-page-modularity`: the right column list's controls reach what 
   controls.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
+
+test("`#624 voice-page-modularity`: the ways back reach the bookmark, the reading place (the left column's chip) and the reply, in the page's order, and come down again", () => {
+  const { mountReadingJumps } = CHANNEL_VIEW;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id) => nodes[id].listeners.map((one) => one.listener({ type: "click" }));
+  const act = (name) => (...args) => { log.push(`${name} ${args.length}`); return name; };
+  const jumps = mountReadingJumps({ lookup: (id) => target(id), leftLookup: (id) => target(`left:${id}`),
+    jumpToBookmark: act("bookmark"), jumpToReading: act("reading"), backToReply: act("reply") });
+  assert.deepStrictEqual(log, ["listen jump-bookmark click", "listen left:jump-reading click", "listen back-to-reply click"]);
+  log.length = 0;
+  assert.deepStrictEqual([...fire("jump-bookmark"), ...fire("left:jump-reading"), ...fire("back-to-reply")], ["bookmark", "reading", "reply"]);
+  assert.deepStrictEqual(log, ["bookmark 0", "reading 0", "reply 0"]);
+  jumps.unmount();
+  assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+});
