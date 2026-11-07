@@ -170,3 +170,57 @@ test("`#624 voice-page-modularity`: the counts read is not begun for another cha
   await view.readAllForCounts("other-channel");
   await view.readAllForCounts("");
 });
+
+test("`#624 voice-page-modularity`: the older walks mount and dispose without a page, from the module alone", () => {
+  const { mountOlderWalks } = READCORE;
+  const column = { searchWalk: null, searchNote: null, searched: null };
+  const walks = mountOlderWalks({
+    ...fakeDeps().deps,
+    leftEl: (id) => ({ id, children: [], replaceChildren: () => {}, textContent: "", hidden: false, disabled: false }),
+    searchField: { open: () => true, query: () => "needle", links: () => false },
+    readModes: { hiding: () => false, mode: () => "show" },
+    searchIdentity: (q) => q,
+    searchTyped: () => true,
+    filterKey: () => "filter",
+    linkKindsHidden: () => [],
+    authorChoosing: () => "everyone",
+    pinsOnly: () => false,
+    screensView: () => "discord",
+    screensScreen: () => "main",
+    rowDay: () => 0,
+    threadPresenceAny: () => false,
+    endFilterWalk: () => {},
+    readerActed: () => {},
+    pullFingerDown: () => false,
+    sideCardsShown: () => false,
+    layoutColumnsShown: () => false,
+    lastPaneCurrent: () => null,
+    sidePaneValue: null,
+    serverSearchOwner: { state: () => ({ key: "", ticket: 0, loading: false, failed: "", hits: [], scopes: [], examined: 0, resume: null }), allChannels: () => false, schedule: () => {}, chooseAllChannels: () => {}, run: async () => {}, more: async () => {}, forget: () => {} },
+    serverFactsTokenScope: () => "write",
+    searchFurtherRunning: () => false,
+    serverCopyOpen: () => true,
+    gathering: { stop: () => {}, start: async () => {}, state: () => ({ channel: "", failed: "", state: null }) },
+    repliesWalks: { current: () => null, search: () => {}, end: () => {}, holds: () => false, noteFor: () => "" },
+    historyReadToStart: () => false,
+    api: async () => ({}),
+    channelName: () => "chan",
+    channelDirectoryChannels: () => [],
+    jumpToMessageLink: () => {},
+    messageBody: () => ({}),
+    markSearchHits: () => {},
+    searchParsed: () => ({ terms: [] }),
+    heldMessagesById: () => new Map(),
+    keepingCardPlace: (change) => change(),
+    columnWork: { active: () => column, side: () => false },
+    columns: { main: column, side: { ...column, mode: "list" } },
+    stillToDo: () => true,
+    viewKey: (view = "main", thread = null) => (view === "thread" ? `thread:${thread}` : view),
+    walkCursorOwed: () => false,
+    loadOlder: async () => {},
+  });
+  assert.equal(typeof walks.searchKey(), "string");
+  assert.equal(walks.searchOffered(), false);
+  walks.dispose();
+  walks.dispose();
+});

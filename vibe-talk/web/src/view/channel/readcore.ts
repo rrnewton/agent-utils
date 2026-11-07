@@ -34,13 +34,20 @@ export interface TimelineReaderLike {
   readTimeline(path: string, options?: { signal?: CancelSignal }): Promise<TimelineResponse>;
   timelinePath(before?: string | null, after?: string | null, reason?: string | null): string;
   readReasonOf(options: { readAs?: string; reason?: string | readonly (string | undefined)[] } | null | undefined): string | null;
+  withReadReason(path: string, options: { readAs?: string; reason?: string | readonly (string | undefined)[] } | null | undefined): string;
   olderReadReason(): string;
   forwardCursor(reason: string | readonly (string | undefined)[] | undefined): string | null;
   joinedDeltas(pages: readonly TimelineResponse[]): TimelineResponse;
   landedAnswer(pages: readonly TimelineResponse[]): { messages: Message[]; threads: ThreadSummary[]; delta: { complete: boolean } | null } | null;
   staleAsOf(payload: TimelineResponse): number | null;
 }
-import { allNoticeWords } from "../../present/rows/index.ts";
+import { READ_MODE_LABELS, READ_MODE_TITLES, READ_MODE_VERBS, allNoticeWords, nextReadMode } from "../../present/rows/index.ts";
+import { createOlderPager } from "../../core/channels/index.ts";
+import { isMessageRow, rowShown, shownRowFor } from "./rows.ts";
+import { cardRunIds, threadCardId } from "./cards.ts";
+import { childByClass } from "../dom/index.ts";
+import { neighbourStayed, rowNeighbours } from "./cardplace.ts";
+import { isNoise, joinsGroup, readRunText } from "../../present/rows/index.ts";
 import type { CancelSignal, ClockPort } from "../../ports/index.ts";
 
 /** The view on screen in the column being worked on (`selection()`). */
@@ -61,6 +68,8 @@ export interface TimelineOlderPages {
   cursor: string | null;
   moreAbove: boolean | undefined;
   inFlight: boolean;
+  step: Promise<void> | null;
+  deferred: boolean;
 }
 
 /** The column being worked on's read state (`loadState()`), as far as this view touches it. */
@@ -126,7 +135,7 @@ export interface TimelineViewDependencies {
   timelineRows(): TimelineRows;
   olderPages(): TimelineOlderPages;
   loadState(): TimelineLoadState;
-  listState(): { newestId: string | null; backlog: number };
+  listState(): { newestId: string | null; backlog: number; runRows: number };
   entryState(): TimelineEntryState;
   doneState(): { archived: Set<string> };
   selectedChannelId(): string;
@@ -148,7 +157,7 @@ export interface TimelineViewDependencies {
   abandonedReads: {
     held(key: string, options?: TimelineReadOptions | null): boolean;
     holdKey(): string;
-    abandon<T>(answer: Promise<T>, read: TimelineAbandonedRead, land: (payload: T) => void, settled?: ((landed: boolean, unused: T | null) => void) | null): void;
+    abandon<T>(answer: Promise<T>, read: { key: string; channel: string; sentAt: number; live: number; news: number; canon: unknown; generation?: number; number?: number }, land: (payload: T) => void, settled?: ((landed: boolean, unused: T | null) => void) | null): void;
   };
   channelReads: {
     claim(context: string | null): boolean;
@@ -158,16 +167,14 @@ export interface TimelineViewDependencies {
     payCursor(): void;
   };
   queueDiscordLoad(options?: TimelineReadOptions): void;
-  loadDiscord(options?: TimelineReadOptions): Promise<void>;
   finishDiscordLoad(column?: TimelineColumn): Promise<void>;
   replayLedger: { start(): unknown; mutationAwaits(): boolean };
   columnReadsSent: Map<TimelineColumn, { context: string; read: unknown; full: boolean }>;
-  landedReadPosition(area: HTMLElement, keepPosition: boolean, sentAtNewest: boolean): { wasAtNewest: boolean; keepPosition: boolean; [key: string]: unknown };
   landAbandonedTimelineRead(payload: TimelineResponse, read: TimelineFoldRead): void;
   queuePlaceUnplaced(): void;
   setStatus(text: string): void;
   prepareSpeech(): void;
-  guardQuietly(fn: () => void): () => void;
+  guardQuietly(fn: (...args: never[]) => unknown): (...args: never[]) => unknown;
   settleReplays(read: unknown, answer: { messages: Message[]; threads: ThreadSummary[]; delta: { complete: boolean } | null } | null): void;
   liveSeen(channel: string): number;
   liveNews(channel: string): number;
@@ -205,11 +212,9 @@ export interface TimelineViewDependencies {
   clearChannelScreen(): void;
   holdingReplyArrows(draw: () => void): void;
   holdingScrollTools<T>(draw: () => T): T;
-  channelReadPosition(area: HTMLElement): { wasAtNewest: boolean; anchorId: string | null; anchorTop: number; around: unknown };
   renderChannelFreshness(): void;
   preservingScroll(mutate: () => void): void;
-  columnWork: { active(): TimelineColumn };
-  settleAfterRead(messages: readonly { id: unknown }[], how: unknown): void;
+  columnWork: { active(): TimelineColumn; side(): boolean };
   catchUpHeldView(words?: boolean): boolean;
   catchUpFromAll(): void;
   syncUnreadReplies(): void;
@@ -221,7 +226,6 @@ export interface TimelineViewDependencies {
   requestVisibleSummaries(): void;
   seamsAfterMidnight(): void;
   applySearch(): void;
-  readRunsSuspended(): boolean;
   columnSteps(): TimelineColumnSteps;
   inColumn<T>(column: TimelineColumn, fn: () => T): T;
   inOtherColumn(fn: () => void): void;
@@ -241,12 +245,58 @@ export interface TimelineViewDependencies {
   threadPresenceNote(hasThreads: boolean | undefined, inThread: boolean): void;
   syncCanonDismissed(): void;
   olderTriggerPx: number;
+  inThisColumn(fn: (...args: never[]) => unknown): (...args: never[]) => unknown;
+  pinsView(): { only: boolean };
+  searchOffered(): boolean;
+  pullToRefresh: { fingerDown(): boolean };
+  heldFilterRow(): Element | null;
+  scrollAnchor(area: HTMLElement): Element | null;
+  followsNewest(area: HTMLElement): boolean;
+  visibleList(): HTMLElement;
+  noiseSettings: { renderCount(): void };
+  combineOn(): boolean;
+  columns: { main: TimelineColumn; side: TimelineColumn & { mode: string } };
+  sideShowing(): boolean;
+  openThreadRootId(): string | null;
+  isOpenThreadRoot(row: Element, rootId: string | null): boolean;
+  readRunWords(row: Element): string;
+  placeInReadRun(row: Element, role: string, count: number): void;
+  runDaysOf(row: Element): string;
+  renderReplyLinks(): void;
+  leftEl(id: string): HTMLElement;
+  cardRunKey(): string;
+  cardRunRows(head: Element): Element[];
+  screensScreen(): string;
+  cardsDrawnForget(): void;
+  renderSideColumn(): void;
+  keepSelection(): void;
+  searchField: { open(): boolean; links(): boolean; query(): string };
+  authorChosen(): string;
+  searchTyped(query: string): boolean;
+  stillToDo(message: Message, done?: ReadonlySet<string>): boolean;
+  screenBelongsToToken(): boolean;
+  readModes: { hiding(): boolean; mode(): string };
+  readLedger: { epoch(): number; noteSent(payload: unknown, sent: number): void };
+  api(path: string, options?: { signal?: CancelSignal }): Promise<TimelineResponse>;
+  currentDiscordLoad(generation: number, channel: string, readingTodo: boolean): boolean;
+  noChannelWords: string;
+  notePinsRevision(revision: unknown): void;
+  noteBookmark(payload: unknown): void;
+  plainReach: { noteNewest(saved: boolean, kept: number, before: number, messages: number, at: string | undefined): void; gapFrom(): number | null; restore(gap: number | null): void };
+  todoView: { note(payload: unknown): void; state(): { left: number; window: number; complete: boolean; channelId: string }; arrived(): void };
+  noiseRenderCount(): void;
+  foldedOneIds(key: string): Set<string>;
+  foldedOnes: Map<string, Set<string>>;
+  readRuns: { plan(rows: unknown, key: string, joins: unknown, idsFor?: unknown, forcedIds?: Set<string>): Map<Element, { role: string; count: number }>; open(key: string, ids: string[]): void };
+  setReadMode(mode: string): void;
+  setJumpNewest(wanted: boolean, view?: string, arrived?: number | null): void;
+  scrollToNewest(): void;
+  keepFilterHold(): boolean;
   unplacedNext(): number;
   threadPresence: { note(hasThreads: boolean | undefined, inThread: boolean): void };
   openThreadName(): string;
   captureScroll(): { pinned: boolean; anchor: Element | null; top: number };
   restoreScroll(mark: { pinned: boolean; anchor: Element | null; top: number }): void;
-  heldRowAfter(position: { anchorId?: string | null; anchorTop?: number; around?: unknown }): { row: Element; top: number } | null;
   screensView(): string;
   renderJumpNewest(): void;
 }
@@ -280,6 +330,26 @@ export interface TimelineView {
   foldLateTimelinePage(payload: TimelineResponse, read: TimelineFoldRead): void;
   loadOlderTimeline(signal?: CancelSignal): Promise<void>;
   foldLiveMessage(message: Message, live?: boolean, replayed?: boolean, read?: unknown): Message;
+  loadDiscord(options?: TimelineReadOptions): Promise<void>;
+  loadTodo(options?: TimelineReadOptions): Promise<void>;
+  loadOlder(signal?: CancelSignal): Promise<void> | null;
+  maybeLoadOlder(): void;
+  takeDeferredOlder(): void;
+  appendChannelRow(arriving: Message, live?: boolean, folded?: boolean): void;
+  appendToColumns(arriving: Message, live?: boolean, replayed?: boolean): Message;
+  applyReadRuns(): void;
+  readRunPlan(rows: unknown, key: string, joins: unknown, idsFor?: unknown, forcedIds?: Set<string>): Map<Element, { role: string; count: number }>;
+  readRunRows(row: Element): Element[];
+  openReadRun(row: Element): void;
+  renderReadModeControl(): void;
+  readRunsSuspended(): boolean;
+  applyNewestPage(payload: TimelineResponse, saved?: boolean): number;
+  channelReadPosition(area: HTMLElement): { wasAtNewest: boolean; previousTop: number; anchorId: string | null; anchorTop: number; around: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null };
+  settleAfterRead(messages: readonly Message[], how: { area: HTMLElement; keepPosition: boolean; ownAct?: boolean; wasAtNewest: boolean; previousTop: number; anchorId?: string | null; anchorTop?: number; around?: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null; heldPlaceAt?: number }): void;
+  landedReadPosition(area: HTMLElement, keepPosition: boolean, sentAtNewest: boolean): { wasAtNewest: boolean; keepPosition: boolean; previousTop: number; anchorId: string | null; anchorTop: number; around: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null };
+  todoSummary(): string;
+  rowIsRead(row: Element): boolean;
+  cycleReadMode(): void;
   inView(message: Message, view: string, thread: string | null, scope?: string | null): boolean;
   foldTimelinePage(payload: TimelineResponse, older: boolean, view?: string, thread?: string | null, held?: Map<string, Message> | null): void;
   foldTimelineDelta(payload: TimelineResponse, sent: string | null, view?: string, thread?: string | null): boolean;
@@ -318,7 +388,6 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   const abandonedReads = deps.abandonedReads;
   const channelReads = deps.channelReads;
   const queueDiscordLoad = deps.queueDiscordLoad;
-  const loadDiscord = deps.loadDiscord;
   const finishDiscordLoad = deps.finishDiscordLoad;
   const sentNumberOf = deps.sentNumberOf;
   const refreshFailed = deps.refreshFailed;
@@ -332,13 +401,41 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   const liveEvents = { seen: (channel: string) => deps.liveSeen(channel), news: (channel: string) => deps.liveNews(channel) };
   const replayLedger = deps.replayLedger;
   const columnReadsSent = deps.columnReadsSent;
-  const landedReadPosition = deps.landedReadPosition;
   const landAbandonedTimelineRead = deps.landAbandonedTimelineRead;
   const queuePlaceUnplaced = deps.queuePlaceUnplaced;
   const setStatus = deps.setStatus;
   const guardQuietly = deps.guardQuietly;
   const readAloudOwner = () => ({ prepareSpeech: deps.prepareSpeech });
   const renderChannelFreshness = deps.renderChannelFreshness;
+  const searchField = deps.searchField;
+  const authorFilters = { chosen: () => deps.authorChosen() };
+  const searchTyped = deps.searchTyped;
+  const cardsDrawn = { forget: () => deps.cardsDrawnForget() };
+  const renderSideColumn = deps.renderSideColumn;
+  const keepSelection = deps.keepSelection;
+  const stillToDo = deps.stillToDo;
+  const inThisColumn = deps.inThisColumn;
+  const pinsView = deps.pinsView;
+  const searchOffered = deps.searchOffered;
+  const pullToRefresh = deps.pullToRefresh;
+  const heldFilterRow = deps.heldFilterRow;
+  const scrollAnchor = deps.scrollAnchor;
+  const followsNewest = deps.followsNewest;
+  const visibleList = deps.visibleList;
+  const noiseSettings = deps.noiseSettings;
+  const combineSwitch = { on: () => deps.combineOn() };
+  const columns = deps.columns;
+  const sideShowing = deps.sideShowing;
+  const openThreadRootId = deps.openThreadRootId;
+  const isOpenThreadRoot = deps.isOpenThreadRoot;
+  const readRunWords = deps.readRunWords;
+  const placeInReadRun = deps.placeInReadRun;
+  const runDaysOf = deps.runDaysOf;
+  const renderReplyLinks = deps.renderReplyLinks;
+  const leftEl = deps.leftEl;
+  const cardRunKey = deps.cardRunKey;
+  const cardRunRows = deps.cardRunRows;
+  const OLDER_TRIGGER_PX = deps.olderTriggerPx;
   const preservingScroll = deps.preservingScroll;
   const columnWork = deps.columnWork;
   const settleReplays = deps.settleReplays;
@@ -354,7 +451,6 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   const noteReplyGaps = deps.noteReplyGaps;
   const captureScroll = deps.captureScroll;
   const restoreScroll = deps.restoreScroll;
-  const heldRowAfter = deps.heldRowAfter;
   const renderJumpNewest = deps.renderJumpNewest;
   const threadPresence = deps.threadPresence;
   const openThreadName = deps.openThreadName;
@@ -386,8 +482,6 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   const clearChannelScreen = deps.clearChannelScreen;
   const holdingReplyArrows = deps.holdingReplyArrows;
   const holdingScrollTools = deps.holdingScrollTools;
-  const channelReadPosition = deps.channelReadPosition;
-  const settleAfterRead = deps.settleAfterRead;
   const catchUpHeldView = deps.catchUpHeldView;
   const catchUpFromAll = deps.catchUpFromAll;
   const syncUnreadReplies = deps.syncUnreadReplies;
@@ -399,7 +493,6 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   const requestVisibleSummaries = deps.requestVisibleSummaries;
   const seamsAfterMidnight = deps.seamsAfterMidnight;
   const applySearch = deps.applySearch;
-  const readRunsSuspended = deps.readRunsSuspended;
   const columnSteps = deps.columnSteps;
   const inColumn = deps.inColumn;
   const inOtherColumn = deps.inOtherColumn;
@@ -410,7 +503,23 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   const restoreSavedBookmark = deps.restoreSavedBookmark;
   const knownChannel = deps.knownChannel;
   const screens = { view: () => deps.screensView() };
-  const olderPager = { loadedIsWhole: (moreAbove: boolean | undefined) => (moreAbove === undefined ? undefined : !moreAbove) };
+  const olderPager = createOlderPager();
+  const screenBelongsToToken = deps.screenBelongsToToken;
+  const readModes = deps.readModes;
+  const readLedger = deps.readLedger;
+  const api = deps.api;
+  const currentDiscordLoad = deps.currentDiscordLoad;
+  const notePinsRevision = deps.notePinsRevision;
+  const noteBookmark = deps.noteBookmark;
+  const plainReach = deps.plainReach;
+  const todoView = deps.todoView;
+  const foldedOneIds = deps.foldedOneIds;
+  const foldedOnes = deps.foldedOnes;
+  const readRuns = deps.readRuns;
+  const setReadMode = deps.setReadMode;
+  const setJumpNewest = deps.setJumpNewest;
+  const scrollToNewest = deps.scrollToNewest;
+  const keepFilterHold = deps.keepFilterHold;
   let disposed = false;
   const countsAllReadAt = new Map<string, number>();
   const countsAllReadFor = new Map<string, Map<string, number>>();
@@ -1415,11 +1524,1026 @@ async function loadOlderTimeline(signal?: CancelSignal): Promise<void> {
 
 /** Save before clearing an editor; storage refusal never prevents an intentional send (`outbox`). */
 
+function applyNewestPage(payload: TimelineResponse, saved = false): number {
+  const list = el("discord-log");
+  const messages = payload.messages || [];
+  if (!saved) observeOutgoingMessages(messages);
+  const oldest = messages.length ? (messages[0] as Message).id : null;
+  // Compared on the row's NEWEST constituent, so a combined row is kept only when the whole of it
+  // is older than this page — otherwise a message would be on screen twice, once in each row.
+  const newestOf = (li: Element) => {
+    const ids = idsOf(li);
+    return ids.length > 0 ? ids[ids.length - 1] : li.getAttribute("data-id");
+  };
+  const before = [...list.children].filter(isMessageRow);
+  const kept =
+    payload.has_more === true && oldest
+      ? [...list.children].filter((li) => olderPager.snowflakeOlder(newestOf(li), oldest))
+      : [];
+  // `#578 search-status-clarity`. Every message row kept is older than the whole page: none of it
+  // reaches down into what was loaded, so messages may lie between that no read brought, and the rows
+  // kept are scattered below the page (`historyReach`). Once a gap, always one, until a fresh list.
+  const keptRows = kept.filter(isMessageRow);
+  plainReach.noteNewest(saved, keptRows.length, before.length, messages.length,
+    messages.length > 0 ? (messages[0] as Message).timestamp : undefined);
+  list.replaceChildren(...kept, ...glom(messages).map(discordNode));
+  // The archive BEFORE the derivation that reads it. `kept` rows were already on screen and their
+  // ids are still in the set from the read that brought them, so a reset here would un-grey them.
+  noteArchived(payload, kept.length === 0);
+  // AFTER the rows exist: every row's replied state and speaker are facts about the list as it now
+  // stands rather than about the page that just arrived.
+  renderChannelRows();
+  // Only when nothing was kept. If older rows survived, the cursor that belongs to them is the one
+  // the older walk left behind, and overwriting it with this page's would rewind the walk.
+  if (kept.length === 0) {
+    olderPages().moreAbove = olderPager.normaliseHasMore(payload.has_more);
+    olderPages().cursor = payload.next_before || null;
+  }
+  renderOlderControl();
+  return list.children.length;
+}
+
+/**
+ * The step back under way, or null: a column's `olderPages().step`.
+ *
+ * `#204 reply-arrow`. A second caller while a step is in flight is handed THAT step rather than
+ * turned away. The automatic trigger and the button never notice the difference — they asked for
+ * a step, and one is coming — but the walk a reply's arrow makes counts the pages it reads, and
+ * one turned away would have counted a page it never saw and looked for its message too early.
+ */
+
+/**
+ * One step further back.
+ *
+ * Guarded against re-entry rather than debounced: the automatic trigger fires on every scroll
+ * event, and a phone produces a lot of those.
+ *
+ * `signal`, `#262 search-load-older`: the walk for the search stops its read on the wire with it. A
+ * step aborted that way ends quietly, as no failure. A scroll that asks while it is under way is handed
+ * the same step, and goes with it.
+ *
+ * @param {AbortSignal} [signal]
+ */
+
+function loadOlder(signal?: CancelSignal): Promise<void> | null {
+  // A click's event is not a signal.
+  const abort = signal && typeof signal === "object" && "aborted" in signal ? signal : undefined;
+  if (olderPages().step === null) {
+    // The step is this column's, and so is forgetting it, in the task it ends in. `#229`.
+    olderPages().step = (providerFacts.threading() ? loadOlderTimeline(abort) : loadOlderPage(abort)).finally(inThisColumn(() => {
+      olderPages().step = null;
+    }));
+  }
+  return olderPages().step;
+}
+
+/**
+ * `loadOlder` for a provider without threads: one step of the plain channel page.
+ *
+ * @param {AbortSignal} [signal]
+ */
+
+async function loadOlderPage(signal?: CancelSignal): Promise<void> {
+  if (olderPages().moreAbove !== true || !olderPages().cursor || olderPages().inFlight) {
+    return;
+  }
+  const channel = selectedChannelId();
+  const generation = loadState().generation;
+  if (!channel) {
+    return;
+  }
+  olderPages().inFlight = true;
+  renderOlderControl();
+  try {
+    let payload;
+    try {
+      payload = await api(
+        `/api/v1/channels/${encodeURIComponent(channel)}/page` +
+          `?limit=${DISCORD_PAGE_LIMIT}&before=${encodeURIComponent(olderPages().cursor as string)}&render=html` +
+          `&reason=${timelineReader.olderReadReason()}`,
+        signal ? { signal } : undefined
+      );
+    } catch (error) {
+      // Stopped by the walk that asked for it: no failure, and nothing to draw. `#262`.
+      if (signal && signal.aborted) return;
+      throw error;
+    }
+    if (generation !== loadState().generation || channel !== selectedChannelId()) return;
+    // `#427 server-thread-hues`: the step back's colours, before its rows are built.
+    noteServerThreadHuesIn(payload.messages || [], [], String(channel));
+    observeOutgoingMessages(payload.messages || []);
+    const list = el("discord-log");
+    const arriving = glom(payload.messages || []).map(discordNode);
+    // The step is OVER before the anchored mutation, so that every consequence of it — the rows,
+    // the summary and the control's final state — is one change of height rather than three. The
+    // block below is synchronous, so there is no window in which a second step could start.
+    olderPages().moreAbove = olderPager.normaliseHasMore(payload.has_more);
+    olderPages().cursor = payload.next_before || null;
+    olderPages().inFlight = false;
+    // Prepending is a mutation ABOVE the viewport, which is the one case browser scroll anchoring
+    // does not handle. Same helper as the fold control, deliberately.
+    // Additive: this step PREPENDS, so the rows already on screen keep the archive they arrived
+    // with and these older ones bring their own.
+    noteArchived(payload, false);
+    preservingScroll(() => {
+      list.replaceChildren(...arriving, ...list.children);
+      // Inside the anchored mutation with everything else that changes height. A step back can
+      // reveal the QUESTION a loaded answer belongs to, so this is not merely bookkeeping for the
+      // new rows — older rows already on screen can become "replied" because of them.
+      renderChannelRows();
+      // Re-stated inside the SAME anchored mutation. It sits above everything that just arrived,
+      // so rewriting it afterwards would be a second change of height above the viewport and the
+      // reader would move by whatever the difference happened to be.
+      renderChannelSeam(
+        channelSummary(list.children.length, olderPager.loadedIsWhole(olderPages().moreAbove), channelName(payload.channel))
+      );
+      // `#262 search-load-older`. And the search's pass over them, where a filter chooses rows, as in
+      // `loadOlderTimeline`: rows drawn and only then hidden would move a reader not at the head.
+      if (readRunsSuspended()) applySearch();
+      // ...and so is this, for exactly the same reason and one nobody photographs: the LAST step
+      // of the walk HIDES #load-older, which is a sibling above the log inside the scrolling
+      // element. Taking its height away outside the anchor jerks the reader by the height of a
+      // button on the one step where they have finally arrived at the beginning.
+      renderOlderControl();
+    });
+    saveChannelScope();
+    renderScrollTools();
+    // The rows that just arrived above the viewport are candidates too, and the reader is right
+    // at the top of them. `#49 cached-summaries`.
+    requestVisibleSummaries();
+  } finally {
+    // The success path has already done both, and doing them again is a no-op. This is here for
+    // the FAILURE path, where the step must stop reporting itself in flight.
+    olderPages().inFlight = false;
+    renderOlderControl();
+  }
+}
+
+/** The reader has arrived at the top of what is loaded. Take the next step for them. */
+
+function maybeLoadOlder() {
+  // Not at the head of the Pinned list, which is every pin already: older history adds none to it, and
+  // a step taken behind it reads for a list that is not on screen. A pin older than what is loaded is
+  // walked back to when the filter goes (`walkToFilterAnchor`, `#243 filter-keeps-selection`).
+  if (screens.view() !== "discord" || pinsView().only || olderPages().moreAbove !== true || olderPages().inFlight) {
+    return;
+  }
+  // `#262 search-load-older`. Nor while a filter chooses rows, where the step back offers a bounded walk
+  // instead (`searchOffered`). Measured in Chromium: once a search emptied the list, each step's page,
+  // drawn and then hidden by the search, moved the scroll position at the head enough to fire the next
+  // step, and the page read the channel's whole history back that nobody asked for.
+  if (searchOffered()) return;
+  if (el("scroll-area").scrollTop > OLDER_TRIGGER_PX) {
+    return;
+  }
+  // `#68 pull-to-refresh`. A FINGER ON THE GLASS SUSPENDS THIS STEP — not just a finger that has
+  // already been recognised as a pull. Two reasons, and the second is the one that makes both
+  // features reachable at once:
+  //
+  //   * prepending history under a finger that is mid-drag moves the ground the reader is
+  //     steering by, which is the fight this design exists to avoid; and
+  //   * the pull can only begin where the list has run out, so a step back that fires the instant
+  //     the top comes into range — `preservingScroll` then putting the reader back at a positive
+  //     offset — is a step that makes the top UNREACHABLE while any history remains. That is
+  //     every channel this issue is about.
+  //
+  // Suspended, never dropped: the step is remembered and taken the moment the finger lifts, which
+  // is what keeps `#65 scrollback-paging` automatic rather than turning it into a button.
+  if (pullToRefresh.fingerDown()) {
+    olderPages().deferred = true;
+    return;
+  }
+  guardQuietly(loadOlder)();
+}
+
+/** The finger has left the glass. Take the step that was refused while it was down. */
+
+function takeDeferredOlder() {
+  if (!olderPages().deferred) {
+    return;
+  }
+  olderPages().deferred = false;
+  maybeLoadOlder();
+}
+
+// --- pulling the channel down to refresh it -----------------------------------------------------
+//
+// `#68 pull-to-refresh`. The owner found the channel hours out of date and reached for the gesture
+// his thumb already makes: "especially when I swipe up on this view and it shows me something very
+// stale." `4e3d850` fixed the staleness itself — the view re-reads on entry and polls while it is
+// up — and that covers being stale AND WAITING. It gives no way to say "refresh, NOW".
+//
+// THE TWO GESTURES AT THIS END OF THE LIST ARE TOLD APART BY WHERE THE LIST RAN OUT, and the rule
+// is two sentences long because it has to leave BOTH of them reachable on a channel that still has
+// history above the reader — which is every channel this issue is about:
+//
+//   1. A FINGER ON THE GLASS SUSPENDS THE AUTOMATIC STEP BACK (`maybeLoadOlder` above). Deferred,
+//      not dropped: it is taken the moment the finger lifts.
+//   2. THE PULL'S TRAVEL IS MEASURED FROM WHERE THE LIST RAN OUT, never from where the finger
+//      landed. An overscroll begins at the edge, so the pixels the finger spent getting to the top
+//      are scrolling and only the pixels after it are a pull.
+//
+// Together those give the reader one continuous motion for each meaning, and neither is a mode:
+//
+//   * drag up through the history — the list scrolls; if the finger lifts within OLDER_TRIGGER_PX
+//     of the top the deferred step fires and the walk back continues, `#65 scrollback-paging`;
+//   * drag DOWN until the list runs out and keep going — the extra PULL_ARM_PX past the edge is
+//     the overscroll, and that is the pull. `overscroll-behavior: contain` on #scroll-area is what
+//     leaves that overscroll to this page rather than letting the browser's own pull-to-refresh
+//     reload the whole application.
+//
+// The earlier reading of this — "judged by the scroll position at touchstart" — is what rule 2
+// replaces, and it was wrong in a way no test then reached: arriving at the top of a paged channel
+// fires the step back, `preservingScroll` restores the reader to a positive offset, and so
+// `scrollTop === 0` at touchstart was a state a reader on a channel with history could never be
+// in. The gesture existed only once the whole channel had been walked back.
+//
+// Rule 2 keeps what that reading got right, and for the reason it was chosen: a flick started a
+// little below the top runs the list out within a single frame, so the first touchmove the page
+// sees already reports zero. Anchoring at the edge means that flick has travelled nothing yet —
+// judging it from where the finger IS would turn ordinary scrolling into a refresh.
+//
+// `keepPosition: false`, unlike Refresh and unlike the poll. This is a gesture made AT THE TOP of
+// the history asking for what is new, and "keep my place" there means "stay at the oldest thing
+// you have loaded", which is the opposite of the request. The button keeps its place because it
+// is pressed from wherever the reader happens to be reading.
+//
+// ...AND PULLING UP PAST THE NEWEST MESSAGE. `#188 pull-refresh-bottom`. The same gesture at the
+// other end of the list, which is the end the owner actually reads at: "I want pull UP to trigger
+// refresh even IF messages were loaded in the past." The pull above answers only a reader at the
+// TOP. Before anything has loaded, that is everyone — an empty list is at its top — which is why
+// it seemed to work then; once a channel has loaded, the reader is parked at the newest line, a
+// whole history away from it. Bouncing against the bottom did nothing, and showed nothing.
+//
+// ONE GESTURE, TWO EDGES, and the edge is whichever end of the list ran out under the finger. A
+// list too short to scroll is at both ends at once, and there the direction decides: down is the
+// top's pull, up is the bottom's. The axis test, the second-finger refusal, the threshold and the
+// refusal during a step back are shared, because a second gesture beside this one would be a
+// second set of rules about what counts as a pull, and the two would drift. What differs, and why:
+//
+//   * A PULL UP MUST BEGIN WITH THE READER PARKED AT THE NEWEST LINE — `atBottom` at touchstart,
+//     the same test that decides whether a re-read follows them. The top cannot ask this (rule 1:
+//     the step back makes "already at the top" unreachable on a paged channel), but nothing pages
+//     in at the bottom, so the bottom can. It is what keeps a fling from refreshing: a drag that
+//     starts in the history and runs the list out is a scroll however far the finger goes after
+//     it. Only a reader who stopped at the bottom and pulled again is asking.
+//   * ITS TRAVEL IS STILL MEASURED FROM WHERE THE LIST REALLY RAN OUT, which is rule 2 — to within
+//     PULL_EDGE_SLACK_PX, not `atBottom`'s thumb-sized slack. The pixels inside that slack still
+//     scroll, and pixels that scroll are not a pull.
+//   * `keepPosition: true`, like the poll. The reader is AT the newest line, which is the one place
+//     "keep my place" and "show me the newest" are the same instruction — and keeping it means a
+//     refresh does not throw away the history they walked back through to get here.
+//   * A READ ALREADY IN FLIGHT IS THE REFRESH. A poll, the stream's catch-up or the cold start's
+//     re-read is reading what the reader asked for, so the release waits for it and reports it
+//     rather than putting a second read on the wire behind it — whether it was already on the wire
+//     when the finger landed or began while the finger was down. The top's pull is NOT offered
+//     over a read in flight, as before: its release asks `loadDiscord` directly, which can only
+//     queue behind that read and return at once, and it would report a refresh that had not
+//     happened. The foot has to be offered there all the same. On a weak signal a channel read can
+//     hang for as long as the connection stalls, which is just when the owner bounces against the
+//     bottom, and a pull that showed nothing then would be "I don't get a refresh that shows in
+//     the UI" all over again.
+//   * WHAT IT REPORTS IS ABOUT THE VIEW IT WAS ASKED OVER, AND FROM THE RELEASE ON. A reader on a
+//     slow read taps another tab, another thread or another channel; the read they pulled for is
+//     then folded away for later, and the freshness the page restores belongs to the view they
+//     went to. Said at the foot, that would be "Updated" at a time the reader never refreshed,
+//     with "new messages" for rows that arrived with a different view. So the result is dropped
+//     once the view is not the one pulled, and "Updated" needs a read that landed since the
+//     release.
+//   * IT SAYS WHAT IT FOUND, ITSELF. At the top the affordance gives way to the freshness pill,
+//     which then says "Updated 07:15" or "Refresh failed" in the same place. From the bottom that
+//     pill is a screen away, so the affordance says it, for PULL_RESULT_MS, and goes.
+//
+// Chrome's OWN pull-to-refresh is not a concern at either end, and must not become one: it
+// reloads the whole application — the live stream, a call, the reader's place — to re-read a list
+// this page can re-read by itself. `overscroll-behavior: none` on the document and `contain` on
+// #scroll-area already keep every overscroll on this list: `contain` rather than `none`, so the
+// platform's own stretch at the edge still shows, which is the bounce the owner described and a
+// fair cue that the list has run out.
+//
+// The gesture itself — the touch it follows, its thresholds (PULL_ARM_PX, PULL_EDGE_SLACK_PX,
+// PULL_RISE_PX, PULL_RESULT_MS, PULL_WAIT_MS) and the affordance's words (PULL_LABELS) — is
+// web/src/view/channel's (`createPullToRefresh`, `#624 voice-page-modularity`); what a refresh reads is
+// here.
+
+function settleAfterRead(messages: readonly Message[], how: { area: HTMLElement; keepPosition: boolean; ownAct?: boolean; wasAtNewest: boolean; previousTop: number; anchorId?: string | null; anchorTop?: number; around?: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null; heldPlaceAt?: number }): void {
+  const previous = listState().newestId;
+  const newest = messages.length ? String((messages[messages.length - 1] as Message).id) : null;
+  const moved = newest !== null && listState().newestId !== null && newest !== listState().newestId;
+  const arrived = moved && how.ownAct !== true;
+  listState().newestId = newest;
+  // `#243 filter-keeps-selection`. A message a filter change holds in place stays where that change
+  // put it, whatever this read measured when it was sent — before the change, perhaps — and whether or
+  // not the reader was on the newest line then.
+  if (how.keepPosition && keepFilterHold()) {
+    if (arrived) {
+      const at = messages.findIndex((message) => String(message.id) === previous);
+      setJumpNewest(true, "discord", at >= 0 ? messages.length - 1 - at : null);
+    } else {
+      renderJumpNewest();
+    }
+    return;
+  }
+  if (how.keepPosition && !how.wasAtNewest) {
+    // A pixel offset is not a place in a conversation: an edit or deletion above it changes which
+    // message occupies that pixel. Prefer the same rendered message at the same viewport offset.
+    // A deleted anchor has no semantic destination, so only that case falls back to the old offset.
+    // ...or the line of the collapsed run it has joined since. `#221 read-modes`.
+    // `#612 view-stability`: in the Threads list, not after a card a reply moved to the foot (`heldRowAfter`).
+    const held = heldRowAfter(how);
+    if (held && Number.isFinite(how.anchorTop)) {
+      how.area.scrollTop = how.previousTop;
+      how.area.scrollTop += held.row.getBoundingClientRect().top - held.top;
+    } else if (how.heldPlaceAt !== undefined) {
+      // As near as the read reaches: the top, when everything it brought is newer than the reader's
+      // message — the walk back goes on from there — and otherwise the newest line.
+      if (!(messages.length > 0 && timeOf(messages[0], "timestamp") > how.heldPlaceAt)) {
+        scrollToNewest();
+        setJumpNewest(false, "discord");
+        return;
+      }
+      how.area.scrollTop = 0;
+    } else {
+      how.area.scrollTop = how.previousTop;
+    }
+    if (arrived) {
+      // How many, counted from the message that was newest before. When it is not in the list any
+      // more — more arrived than one read holds, or it was deleted — only that something did.
+      // `#207 scrollback-jump`.
+      const at = messages.findIndex((message) => String(message.id) === previous);
+      setJumpNewest(true, "discord", at >= 0 ? messages.length - 1 - at : null);
+    }
+  } else {
+    scrollToNewest();
+    setJumpNewest(false, "discord");
+  }
+}
+
+/**
+ * Where the reader is as a read LANDS, for `settleAfterRead`: measured then, never when the read was
+ * sent. `#280 scroll-stability`. The owner, 2026-10-13: "I swear I just saw an instance where it jumped
+ * me to the bottom of the screen in the main message view (two column mode)... I don't think I touched
+ * anything. I think it was something updating underneath." A read is on the wire for as long as the
+ * server takes — seconds, behind a bridge — and every read took the reader's place as it went out:
+ * one sent while the reader was on the newest line, who then scrolled up to read, threw them back to
+ * the bottom when it landed, and one sent while they were further up put them back where they had been
+ * before they scrolled. Measured in Chromium (tests/scroll_stability_browser.py). What was true at the
+ * send is kept for one question only: `sentAtNewest`, whether the reader was then on the newest line.
+ *
+ * A read that would take the reader to the newest message — entering the channel over rows already up,
+ * saved on this device or drawn by an earlier read — finds them where they are when it lands too: a
+ * reader who was on the newest line when it went out and has scrolled away since is reading, and is
+ * left there, with the jump to the newest offered for what arrived. One who was not on the newest line
+ * when it went out — a pull at the head of the list, a walk back whose snapshot expired — is taken to
+ * the newest as asked, as before.
+ *
+ * Asked once the in-flow loading line over the rows has gone (`renderChannelLoading(false)`): the rows
+ * as they stand without it, which is where a browser's own scroll anchoring has held them as it came
+ * and went, and where the reader was before it came.
+ *
+ * @param {HTMLElement} area
+ * @param {boolean} keepPosition
+ * @param {boolean} sentAtNewest
+ */
+
+function landedReadPosition(area: HTMLElement, keepPosition: boolean, sentAtNewest: boolean): { wasAtNewest: boolean; keepPosition: boolean; previousTop: number; anchorId: string | null; anchorTop: number; around: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null } {
+  const at = channelReadPosition(area);
+  return { ...at, keepPosition: keepPosition || (sentAtNewest && !at.wasAtNewest) };
+}
+
+/**
+ * Capture the channel row the reader is looking at before an authoritative replacement.
+ *
+ * `#612 view-stability`: in the Threads list, whose cards re-sort as replies come, `around` too — the cards on
+ * screen, fully shown first, and each card's neighbours — for when the card held is the one that moved
+ * (`heldRowAfter`). The lists of messages are in the order sent, and hold their reader by the row alone.
+ */
+
+function channelReadPosition(area: HTMLElement): { wasAtNewest: boolean; previousTop: number; anchorId: string | null; anchorTop: number; around: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null } {
+  // A message a filter change holds in place is the one kept, and the newest line is not followed.
+  // `#243 filter-keeps-selection`.
+  const anchor = screens.view() === "discord" ? heldFilterRow() || scrollAnchor(area) : null;
+  const anchorIds = anchor ? idsOf(anchor) : [];
+  return {
+    wasAtNewest: screens.view() === "discord" && followsNewest(area),
+    previousTop: area.scrollTop,
+    anchorId: anchor ? anchor.getAttribute("data-context-id") || anchorIds[0] || null : null,
+    anchorTop: anchor ? anchor.getBoundingClientRect().top : 0,
+    around: anchor && visibleList() === el("thread-list") ? threadListAround(area) : null,
+  };
+}
+
+/**
+ * The Threads list's cards on screen in `area`, fully shown first, with where each stands, and every card's
+ * neighbours (`rowNeighbours`). `#612 view-stability`.
+ *
+ * @param {HTMLElement} area
+ * @returns {ListAround}
+ */
+
+function threadListAround(area: HTMLElement): { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } {
+  const top = area.getBoundingClientRect().top;
+  const foot = top + (area.clientHeight || 0);
+  const cards = /** @type {HTMLElement[]} */ ([...el("thread-list").children]).filter((row) => row.hasAttribute("data-context-id"));
+  const shown = cards.filter((row) => rowShown(row)).map((row) => ({ row, box: row.getBoundingClientRect() }))
+    .filter(({ box }: { box: DOMRect }) => box.bottom > top && box.top < foot);
+  const whole = ({ box }: { box: DOMRect }) => box.top >= top - 1 && box.bottom <= foot + 1;
+  const marks = [...shown.filter(whole), ...shown.filter((one) => !whole(one))]
+    .map(({ row, box }) => ({ id: threadCardId(row), top: box.top }));
+  return { marks, near: rowNeighbours(cards, threadCardId) };
+}
+
+/**
+ * The cards of the Threads list on screen as a place was read: each card's id and the top of its box, fully
+ * shown first, and every card's neighbours. `#612 view-stability`.
+ *
+ * @typedef {{marks: {id: string, top: number}[], near: Map<string, {prev: string | null, next: string | null}>}} ListAround
+ */
+
+/**
+ * The row a list holds its reader by once it is drawn again, as `channelReadPosition` read the place, and the
+ * top it stood at then: the same message, found by id, or the line of the collapsed run it has joined since
+ * (`#221 read-modes`). Null when it is not drawn.
+ *
+ * `#612 view-stability`. In the Threads list, not a card that has moved, re-sorted to the foot by a reply: the first
+ * card on screen then that still stands beside a card it stood beside, and where it stood. The owner: "Whatever
+ * I'm looking at should not jump away."
+ *
+ * @param {{anchorId?: string | null, anchorTop?: number, around?: ListAround | null}} position
+ * @returns {{row: Element, top: number} | null}
+ */
+
+function heldRowAfter(position: { anchorId?: string | null; anchorTop?: number; around?: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null }): { row: Element; top: number } | null {
+  if (!position.anchorId) return null;
+  const rows = [...visibleList().children];
+  const around = position.around;
+  if (around && visibleList() === el("thread-list")) {
+    const now = rowNeighbours(rows.filter((row) => row.hasAttribute("data-context-id")), threadCardId);
+    if (!neighbourStayed(position.anchorId, now, around.near)) {
+      for (const mark of around.marks) {
+        const row = rows.find((one) => one.getAttribute("data-context-id") === mark.id);
+        if (row && rowShown(row) && neighbourStayed(mark.id, now, around.near)) return { row, top: mark.top };
+      }
+    }
+  }
+  const row = shownRowFor(rows.find((candidate) =>
+    candidate.getAttribute("data-context-id") === position.anchorId || idsOf(candidate).includes(position.anchorId as string)));
+  return row ? { row, top: Number(position.anchorTop) } : null;
+}
+
+/**
+ * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[], readAs?: string}} [options]
+ *   `keepPosition` marks a RE-read of a channel already on screen — the background poll, or the
+ *   Refresh button. It must not drag the reader to the bottom while they are reading older
+ *   messages; it follows the newest line only if that is where they already were. The FIRST load
+ *   of a channel is the other case and does not pass it: arriving at the top of a long history
+ *   means scrolling past everything already read. `reason` says what asked for the read — one of
+ *   `DELTA_REASONS`, or `enter`, `reset`, `expired` — which decides whether a timeline read may ask
+ *   only for what changed; absent reads in full. A queued read carries the reasons of every
+ *   trigger it stands for (`queueDiscordLoad`). `#203 incremental-refresh`. `quiet` and `ownAct`
+ *   are a read behind rows a view switch has already drawn (`readBehindSwitch`, `#220
+ *   view-switch-instant`): it shows no loading line over them, and what it adds is not counted as
+ *   arrived. `readAs` is only the word the read sends the server (`readReasonOf`), and decides nothing.
+ */
+
+async function loadDiscord(options?: TimelineReadOptions): Promise<void> {
+  screenBelongsToToken();
+  if (providerFacts.threading()) return loadTimeline(options);
+  // `#50 todo-view`. Every path that re-reads the channel comes through here — the background
+  // poll, Refresh, entering the view, changing channel — so the mode is honoured HERE rather than
+  // at four call sites, one of which would eventually be forgotten and overwrite the filtered
+  // list with the unfiltered one.
+  if (readModes.hiding()) {
+    return loadTodo(options);
+  }
+  // `remote-ops-audit` W7. As for a timeline read (`loadTimeline`).
+  const holdKey = abandonedReads.holdKey();
+  if (abandonedReads.held(holdKey, options)) return;
+  const generation = ++loadState().generation;
+  const keepPosition = Boolean(options && options.keepPosition);
+  const channel = selectedChannelId();
+  if (!channel) {
+    setStatus(deps.noChannelWords);
+    return;
+  }
+  // Not a timeline read: no view's read is out (`channelReads.readContext`).
+  if (!channelReads.claim(null)) {
+    queueDiscordLoad(options);
+    return;
+  }
+  const area = el("scroll-area");
+  const position = channelReadPosition(area);
+  renderChannelLoading(true);
+  try {
+    if (!keepPosition) {
+      setStatus("fetching the channel…");
+    }
+    // `render=html`: this route is also the voice agent's `read_page`, so its bodies are rendered
+    // only when asked. `#217 markdown-blocks`.
+    const path = timelineReader.withReadReason(
+      `/api/v1/channels/${encodeURIComponent(channel)}/page?limit=${DISCORD_PAGE_LIMIT}&render=html`, options);
+    const sent = readLedger.epoch();
+    // `remote-ops-audit` W7. Given up on, the read is kept, and its view held (`abandonRead`).
+    const abandoned = { key: holdKey, channel: String(channel), sentAt: Date.now(),
+      live: liveEvents.seen(String(channel)), news: liveEvents.news(String(channel)), canon: null,
+      generation };
+    const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => api(path, { signal }),
+      (answer) => abandonedReads.abandon(answer, abandoned, (late) => {
+        if (late && typeof late === "object") readLedger.noteSent(late, sent);
+        drawChannelPage(late, area, landedReadPosition(area, true, false));
+      }));
+    // When it was sent, for `noteBookmark`: a bookmark write settled since speaks over it.
+    if (payload && typeof payload === "object") readLedger.noteSent(payload, sent);
+    if (!currentDiscordLoad(generation, channel, false)) {
+      return;
+    }
+    renderChannelLoading(false);
+    // Where the reader is now, not where they were when the read went out. `#280 scroll-stability`.
+    drawChannelPage(payload, area, landedReadPosition(area, keepPosition, position.wasAtNewest));
+  } catch (error) {
+    if (currentDiscordLoad(generation, channel, false)) noteChannelReadFailure(error);
+    throw error;
+  } finally {
+    await finishDiscordLoad();
+  }
+}
+
+/**
+ * Draw the newest page of a channel without threads that `loadDiscord` read, the reader placed by `at`
+ * (`landedReadPosition`). Also the late answer of such a read given up on (`abandonRead`).
+ *
+ * @param {any} payload
+ * @param {HTMLElement} area
+ * @param {ReturnType<typeof landedReadPosition>} at
+ */
+
+function drawChannelPage(payload: TimelineResponse, area: HTMLElement, at: ReturnType<typeof landedReadPosition>): void {
+  // `#427 server-thread-hues`: this walk's messages carry their threads' colours too.
+  noteServerThreadHuesIn(payload.messages || [], []);
+  const loaded = applyNewestPage(payload);
+  // Inline, at the head of the list, rather than on the transient strip. `#63
+  // status-line-placement`: this is a standing fact about what you are looking at, and the strip
+  // takes itself away after a few seconds.
+  renderChannelSeam(channelSummary(loaded, olderPager.loadedIsWhole(olderPages().moreAbove), channelName(payload.channel)));
+  // What is drawn: an empty message the reader hides is not news at the foot (`#386 hide-empty-messages`).
+  const messages = (payload.messages || []).filter((message) => !hiddenEmpty(message));
+  settleAfterRead(messages, { area, ...at });
+  loadState().freshAt = Date.now();
+  setChannelFreshness("fresh");
+  notePinsRevision(payload.pins_revision);
+  noteBookmark(payload);
+  saveChannelScope();
+  renderScrollTools();
+  // Every row here is new — `applyNewestPage` replaced the list — so the ones on screen have to
+  // be asked about again. The summaries owner's `summariesAsked` is what stops that being a second
+  // request for a message already answered, which matters most here: this runs every DISCORD_POLL_MS.
+  requestVisibleSummaries();
+}
+
+// --- the to-do view: what you have not dealt with yet ---------------------------------------------
+//
+// `#50 todo-view`. A long backlog of assistant messages is a to-do list in practice, and until now
+// nothing on this page could tell the ones that still want attention from the ones already handled.
+//
+// A SUB-TOGGLE of the channel view rather than a third tab, because it is the same list filtered.
+// Turning it on reads a DIFFERENT route — `/todo`, which is the recent window minus what has been
+// dealt with — rather than filtering the rows already on screen. That is deliberate: the walk-back
+// cursor belongs to the unfiltered channel, and a filtered list paged by an unfiltered cursor would
+// step over messages without saying so. So `#load-older` is absent in this mode, and the view is
+// honestly the recent window.
+//
+// THE ONE THING THIS MODE HAS TO SAY OUT LOUD, from `#61 unread-status`: this read state is OURS.
+// Discord shares none with a bot, so nothing here is read from the Discord app and nothing here is
+// written back to it. `#inbox-note` carries the server's own sentence, quoted rather than rewritten
+// here, so the page and the server cannot come to describe the posture differently.
+//
+// WHAT IS NOT HERE, and why. The issue asks for a SWIPE to dismiss and a PRESS-AND-HOLD to declare
+// bankruptcy. Those are a gesture layer — horizontal intent disambiguated from vertical, on the one
+// list this page scrolls — and they are a change of their own; this lands the acts themselves, each
+// reachable by a control a keyboard can also get to, so the gestures become a second way in rather
+// than the only way. It also asks for a message to leave the list when it is REPLIED to; that is
+// derived state and needs a reply reference on the server's Message, which is a wire-format change.
+// Both are follow-ups, and until the second one lands "dealt with" here is always DECLARED — which
+// is why nothing in this file has to decide what happens when derived and declared disagree.
+
+// Is the reader looking at the to-do list rather than the whole channel? Kept across a reload with
+// the rest of what was on screen, in `UI_STATE_KEY`. `#189 restore-ui-state`. Since `#221 read-modes`
+// this is Hide read, the third of the read modes: the mode being "hide", set only with it. It keeps a
+// question of its own (`readModes.hiding()`) because every read path already asks it the one question
+// it answers, which is whether read messages are left out of the list.
+//
+// The mode itself, its names (READ_MODES, READ_MODE_LABELS, READ_MODE_VERBS, READ_MODE_SAID,
+// READ_MODE_TITLES), its kept copy (READ_MODE_KEY), what an old record means (`savedReadMode`) and the
+// cycle (`nextReadMode`) are web/src/present/rows' (`createReadMode`, `#624 voice-page-modularity`):
+// `readModes.mode()` is the mode, and `readModes.hiding()` this question.
+
+async function loadTodo(options?: TimelineReadOptions): Promise<void> {
+  if (providerFacts.threading()) return loadTimeline(options);
+  const generation = ++loadState().generation;
+  const keepPosition = Boolean(options && options.keepPosition);
+  const channel = selectedChannelId();
+  if (!channel) {
+    setStatus(deps.noChannelWords);
+    return;
+  }
+  // Not a timeline read: no view's read is out (`channelReads.readContext`).
+  if (!channelReads.claim(null)) {
+    queueDiscordLoad(options);
+    return;
+  }
+  const area = el("scroll-area");
+  const position = channelReadPosition(area);
+  renderChannelLoading(true);
+  try {
+    // The SAME window the unfiltered read uses, and it is sent rather than left to the server's
+    // default because the bulk clear has to send it back: `{through}` is resolved against a window
+    // on the server, and a boundary resolved against a WIDER window than the one this page
+    // displayed would clear messages the reader never saw. See `clearBacklog`.
+    const sent = readLedger.epoch();
+    const payload = await api(
+      timelineReader.withReadReason(`/api/v1/channels/${encodeURIComponent(channel)}/todo?limit=${DISCORD_PAGE_LIMIT}`, options)
+    );
+    // When it was sent, for `noteBookmark`: a bookmark write settled since speaks over it.
+    if (payload && typeof payload === "object") readLedger.noteSent(payload, sent);
+    if (!currentDiscordLoad(generation, channel, true)) {
+      return;
+    }
+    renderChannelLoading(false);
+    // Where the reader is now, not where they were when the read went out. `#280 scroll-stability`.
+    const at = landedReadPosition(area, keepPosition, position.wasAtNewest);
+    // THE QUEUE, as the server keeps it: the reader's own words in it only where their read state
+    // says so, like anyone's (`#549 own-read-stored`).
+    const served = payload.messages || [];
+    // And the window's messages the list leaves out as Done, the reader's own just sent among them:
+    // the provider has them, so a sent receipt waiting to see one may go (`#549 own-read-stored`).
+    const done = (Array.isArray((payload as unknown as { done?: unknown }).done) ? (payload as unknown as { done: unknown[] }).done : [])
+      .map((id) => ({ id: String(id), channel_id: String(channel) }));
+    observeOutgoingMessages([...served, ...done] as Message[]);
+    // Minus empty messages, while the reader hides those (`#386 hide-empty-messages`). Filtered
+    // BEFORE the count, because a backlog number that includes rows nobody can see is the kind of
+    // number a reader stops believing.
+    const messages = served.filter((m) => !hiddenEmpty(m));
+    const list = el("discord-log");
+    list.replaceChildren(...glom(messages).map(discordNode));
+    renderChannelRows();
+    // The walk back belongs to the UNFILTERED channel. Leaving a cursor armed here would let a
+    // scroll to the top prepend unfiltered rows into a filtered list.
+    olderPages().moreAbove = false;
+    olderPages().cursor = null;
+    channelReads.payCursor();
+    renderOlderControl();
+    listState().backlog = messages.length;
+    // Quoted, never rewritten: `#61 unread-status` is one posture and it is stated on the server.
+    el("inbox-note").textContent = (payload as { read_state_notice?: string }).read_state_notice || "";
+    noteTodoRead(payload);
+    notePinsRevision(payload.pins_revision);
+    noteBookmark(payload);
+    renderChannelSeam(todoSummary());
+    renderTodoControls();
+    settleAfterRead(messages, {
+      area,
+      ...at,
+      ownAct: Boolean(options && options.ownAct),
+    });
+    renderScrollTools();
+    requestVisibleSummaries();
+  } finally {
+    await finishDiscordLoad();
+  }
+}
+
+/**
+ * What the last `/todo` read said, held so that anything which changes the list can RESTATE it.
+ *
+ * Kept rather than recomputed from the payload at the call site, because the payload is not the
+ * only thing that changes the list: a message arriving on the live stream adds a row without any
+ * read at all, and the head of the list, the backlog count and the bulk control all have to move
+ * with it or the view contradicts itself. One owner in web/src/core/channels (`createTodoView`, `#624
+ * voice-page-modularity`).
+ */
+
+function noteTodoRead(payload: unknown): void {
+  todoView.note(payload);
+  noiseSettings.renderCount();
+}
+
+/**
+ * What the head of the to-do list says about itself.
+ *
+ * "9 of 30" rather than "9 messages": the second reads as the size of the channel, and the whole
+ * point of this view is that it is a SUBSET. `complete` is `#62 message-count-accuracy` again —
+ * the window is the channel's own only when the server says the set is whole.
+ */
+
+function todoSummary(): string {
+  const { left, window, complete, channelId } = todoView.state();
+  const label = channelName(knownChannel(channelId));
+  if (left === 0) {
+    return `nothing left to deal with in ${label}`;
+  }
+  const of = complete ? `of ${window}` : `of the ${window} most recent`;
+  return `${left} ${of} in ${label} still want attention`;
+}
+
+/**
+ * Put one row at the end of the channel list, and keep everything that DESCRIBES the list in step.
+ *
+ * TWO paths add a row without a read: a message arriving on the live stream, and a reply this page
+ * has just posted. Both are the same fact — the list on screen is now longer than the last `/todo`
+ * answer said — and both are wrong in the same way if only the row moves. In to-do mode a message
+ * that has just arrived has by definition not been dealt with, so it is one more thing to do, and
+ * the head of the list, the backlog count and the bulk control have to say so in the same moment
+ * the row appears. Otherwise the view contradicts itself: "nothing left to deal with" written
+ * directly above a message, a bulk control hidden while there is something to clear, or a count
+ * that says two over a list of three — which `clearBacklog` would then clear all three of.
+ *
+ * Outside the mode this is an ordinary append, because nothing on screen is claiming a count.
+ *
+ * `live` says which of the two it is: only the stream's copy can leave a message's thread unknown.
+ */
+
+function appendChannelRow(arriving: Message, live = false, folded = false): void {
+  // The store's copy, which may keep a thread record this one arrived without. `folded`: the caller
+  // folded it already, for every column at once (`appendToColumns`).
+  const message = providerFacts.threading() && !folded ? foldLiveMessage(arriving, live) : arriving;
+  // Saved once, from the left column: the store is the channel's, not a column's. `#229`.
+  const save = () => {
+    if (!columnWork.side()) saveChannelScope();
+  };
+  if ([...el("discord-log").children].some((row) => idsOf(row).includes(String(message.id)))) {
+    if (providerFacts.threading()) save();
+    return;
+  }
+  if (providerFacts.threading()) {
+    const id = threadOf(message);
+    if (selection().view === "threads" ||
+        (selection().view === "thread" && id !== selection().threadId) ||
+        (selection().view === "main" && !inView(message, "main", null))) {
+      // Not this view's row, but the store has it, and so will the next start. On Main a reply is
+      // one more to count on its root's chip, and may bring the root back under Hide read.
+      syncUnreadReplies();
+      save();
+      return;
+    }
+    if (!timelineRows().messages.some((held) => String(held.id) === String(message.id))) timelineRows().messages.push(message);
+  }
+  // `#196 auto-read-noise`. A placeholder arriving while Hide read is on is already read: it is
+  // held with the rest of the channel, and the list — and its count — are not told about it.
+  if (hidingRead() && isNoise(message)) {
+    save();
+    noiseSettings.renderCount();
+    return;
+  }
+  // `#386 hide-empty-messages`. An empty message is held with the rest and drawn nowhere.
+  if (hiddenEmpty(message)) {
+    save();
+    return;
+  }
+  const list = el("discord-log");
+  const append = () => {
+    // A LIVE ARRIVAL CAN JOIN THE ROW ABOVE IT, and it has to be given the chance: the second half
+    // of a split post usually arrives over the stream a fraction of a second after the first, so
+    // appending it unconditionally would leave exactly the pair this feature exists for as two rows
+    // until the next poll happened to redraw them together.
+    const rows = [...list.children];
+    const last = rows[rows.length - 1];
+    const held = rowMessages(last);
+    if (held.length > 0 && joinsGroup(held[held.length - 1], message, combineSwitch.on())) {
+      // The row is REBUILT rather than edited: one constructor for a row, wherever it came from.
+      list.replaceChildren(...rows.slice(0, -1), discordNode([...held, message]));
+    } else {
+      list.append(discordNode([message]));
+    }
+    // `#84 reply-aware-dismissal`. Re-derive the row states with the new row in place. It is here, in the one
+    // appender, rather than at each of its callers: an arriving message can be the ANSWER to
+    // something already on screen, so the row that changes is not necessarily the one just added.
+    renderChannelRows();
+  };
+  // `#215 reply-coalesce`. With replies gathered, a new reply to the parent joins the stack, which
+  // is ABOVE the foot of the list: the reader below it is held where they are reading.
+  if (gatheredParent() !== null) preservingScroll(append);
+  else append();
+  // A live arrival and an acknowledged send are both what a reload should show next.
+  save();
+  if (!readModes.hiding()) {
+    return;
+  }
+  // The channel gained a message too, so the SUBSET and the window it is a subset of both grow.
+  todoView.arrived();
+  listState().backlog += 1;
+  renderChannelSeam(todoSummary());
+  renderTodoControls();
+}
+
+/**
+ * A message that arrived, or was sent from here: into the store once, and onto each column showing
+ * messages it belongs in. `#229 desktop-two-column`. Answers the copy the store kept. `replayed`, a
+ * copy the stream replayed (`foldLiveMessage`).
+ */
+
+function appendToColumns(arriving: Message, live = false, replayed = false): Message {
+  const message = providerFacts.threading() ? foldLiveMessage(arriving, live, replayed) : arriving;
+  inColumn(columns.main, () => appendChannelRow(message, live, true));
+  if (sideShowing()) inColumn(columns.side, () => appendChannelRow(message, live, true));
+  return message;
+}
+
+/**
+ * Archive or unarchive ONE row, whichever it is asking for.
+ *
+ * Both the swipe and the row's button come through here, so the two cannot drift into two notions
+ * of what the gesture means.
+ */
+
+function readRunPlan(rows: unknown, key: string, joins: unknown, idsFor: unknown = idsOf, forcedIds: Set<string> = new Set<string>()): Map<Element, { role: string; count: number }> {
+  return readRuns.plan(rows, key, joins, idsFor, forcedIds);
+}
+
+/**
+ * The messages the reader folded away one by one (Shift+O, `#480 fold-one-message-key`), per view
+ * as `readRuns` keeps opened runs: ids, so a redraw draws them folded again, in any read mode — a
+ * thread being worked through keeps the parts closed up until their line is opened, which takes
+ * them out of this set (`openReadRun`). In memory only, as an opened run is: a reload lays the
+ * thread out afresh.
+ */
+
+function readRunRows(row: Element): Element[] {
+  const rows = [...(row.parentNode || el("discord-log")).children];
+  let head = rows.indexOf(row as never);
+  while (head > 0 && (rows[head] as Element).getAttribute("data-read-run") === "member") head -= 1;
+  const run = [rows[head] as Element];
+  for (let at = head + 1; at < rows.length && (rows[at] as Element).getAttribute("data-read-run") === "member"; at += 1) {
+    run.push(rows[at] as Element);
+  }
+  return run;
+}
+
+function applyReadRuns(): void {
+  const key = viewKey();
+  const forced = foldedOneIds(key);
+  // `#480 fold-one-message-key`: messages folded away one by one collapse in any read mode.
+  const collapsing = (readModes.mode() === "fold" || forced.size > 0) && !readRunsSuspended();
+  if (!collapsing && listState().runRows === 0) return;
+  const list = el("discord-log");
+  const rows = [...list.children];
+  const rootId = collapsing ? openThreadRootId() : null;
+  // Nor a row of replies the reader gathered under their message (`#215 reply-coalesce`): they were
+  // gathered to be read together, and a line in the stack would break the bridge. Nor a root on Main
+  // whose thread holds an unread reply (`#222 unread-replies`): Hide read keeps it, so Fold read
+  // does, by the attribute the pass has just set from the same rule.
+  const placed = collapsing ? readRunPlan(rows, key, (row: Element) => !isOpenThreadRoot(row, rootId) &&
+    !row.hasAttribute("data-coalesce") && !row.hasAttribute("data-unread-replies") &&
+    ((readModes.mode() === "fold" && rowIsRead(row)) || idsOf(row).some((id) => forced.has(id))),
+    idsOf, forced) : new Map();
+  listState().runRows = placed.size;
+  const want = (row: Element) => placed.get(row) || { role: null, count: 0 };
+  const changed = rows.some((row: Element) => {
+    const { role, count } = want(row);
+    return (row.getAttribute("data-read-run") || null) !== role ||
+      (role === "head" && readRunWords(row) !== readRunText(count, runDaysOf(row)));
+  });
+  if (!changed) return;
+  const apply = () => {
+    for (const row of rows) {
+      const { role, count } = want(row);
+      placeInReadRun(row, role, count);
+    }
+  };
+  // Only where the list is the one on screen: anywhere else there is no reader in it to hold.
+  if (deps.screensScreen() === "main" && screens.view() === "discord") preservingScroll(apply);
+  else apply();
+  // Which row is directly above a reply has changed with what is drawn, and its arrow with it.
+  renderReplyLinks();
+}
+
+/**
+ * The rows of the collapsed run `row` belongs to, its line's row first: in its own list, the channel's
+ * or the cards' with threads unpacked under them, where a card ends a block's run (`#407
+ * unpack-row-parity`).
+ */
+
+function openReadRun(row: Element): void {
+  if (!row || !row.hasAttribute("data-read-run")) return;
+  const thread = row.getAttribute("data-unpack-thread");
+  // `#432 read-mode-unify`. A run of read threads (and Main's read messages) over the cards: kept open by
+  // what its cards and rows stand for, and the cards drawn again.
+  if (thread === null && row.parentNode === leftEl("side-cards")) {
+    readRuns.open(cardRunKey(), cardRunRows(row).flatMap(cardRunIds));
+    cardsDrawn.forget();
+    renderSideColumn();
+    keepSelection();
+    return;
+  }
+  const key = thread === null ? viewKey() : viewKey("thread", thread);
+  const ids = readRunRows(row).flatMap(idsOf);
+  readRuns.open(key, ids);
+  // Opening a run is also un-folding what was folded into it one by one (`#480 fold-one-message-key`).
+  const folded = foldedOnes.get(key);
+  if (folded) for (const id of ids) folded.delete(id);
+  if (folded && folded.size === 0) foldedOnes.delete(key);
+  if (thread !== null) {
+    cardsDrawn.forget();
+    renderSideColumn();
+    // The block is new rows: the selection, its Tab stop and its focus go to the run's first row's.
+    keepSelection();
+    return;
+  }
+  applyReadRuns();
+  renderScrollTools();
+  requestVisibleSummaries();
+}
+
+/**
+ * The row now standing in the cards for `row`, a card or a Main row a redraw of the cards took away (an
+ * opened run of read threads, `#432 read-mode-unify`): the new one of the same kind and id, or null.
+ *
+ * @param {Element} row
+ * @returns {HTMLElement | null}
+ */
+
+function renderReadModeControl() {
+  const button = el("todo-filter");
+  const label = READ_MODE_LABELS[readModes.mode()];
+  // Two words in two spans, so a desk can stack them; made here when the markup's are absent.
+  const words = el("todo-filter-label");
+  let verb = childByClass(words, "read-mode-verb");
+  if (!verb) {
+    verb = document.createElement("span");
+    verb.className = "read-mode-verb";
+    const noun = document.createElement("span");
+    noun.className = "read-mode-noun";
+    noun.textContent = " read";
+    words.replaceChildren(verb, noun);
+  }
+  if (verb.textContent !== READ_MODE_VERBS[readModes.mode()]) verb.textContent = READ_MODE_VERBS[readModes.mode()] as string;
+  // The mode's own icon, and only it, by `hidden`: an icon is something a test of the dock can ask
+  // for by that attribute, as it asks of every other control's.
+  for (const icon of [...button.children]) {
+    if (!String(icon.getAttribute("class") || "").split(/\s+/).includes("read-mode-icon")) continue;
+    const mine = icon.getAttribute("data-mode") === readModes.mode();
+    if (icon.hasAttribute("hidden") === mine) icon.toggleAttribute("hidden", !mine);
+  }
+  // Written only when they change: this runs with every redraw of the controls.
+  const said = {
+    "data-read-mode": readModes.mode(),
+    "aria-pressed": readModes.mode() === "hide" ? "true" : readModes.mode() === "fold" ? "mixed" : "false",
+    "aria-label": `${label}. Tap for ${READ_MODE_LABELS[nextReadMode(readModes.mode())]}`,
+    title: READ_MODE_TITLES[readModes.mode()],
+  };
+  for (const [name, value] of Object.entries(said)) {
+    if (button.getAttribute(name) !== value) button.setAttribute(name, value as string);
+  }
+}
+
+/** Is `row` read, by the one rule both read modes share? Every message it stands for has to be. */
+
+function cycleReadMode() {
+  setReadMode(nextReadMode(readModes.mode()));
+}
+
+/**
+ * Which LOADED messages the reader has archived, as the server reported them.
+ *
+ * Held here rather than read off the rows because it is the server's answer, not a fact about the
+ * DOM: a row is greyed BECAUSE it is in this set, and the set survives the list being rebuilt by a
+ * poll. The ordinary channel view dims these; the To do filter never shows them at all, so in that
+ * mode this stays empty and nothing consults it.
+ *
+ * Only ever the ids in the window on screen — see `ops::dismissed_within`. The store holds every
+ * dismissal the channel ever had, and sending the lot would grow without bound.
+ *
+ * A column's own record (`#624 voice-page-modularity`, plan step 15, as `freshOlderPages`): `archived`,
+ * the set just described, a fresh empty one for each column.
+ *
+ * @returns {{archived: Set<string>}}
+ */
+
+function rowIsRead(row: Element): boolean {
+  const held = rowMessages(row);
+  return held.length > 0 && held.every((message) => !stillToDo(message));
+}
+
+/** Is `row` the root of the thread on screen? By identity, never by position: older replies may not be loaded. */
+
+function readRunsSuspended() {
+  return searchField.open() && (searchField.links() || authorFilters.chosen() !== "everyone" || searchTyped(searchField.query()));
+}
+
+/**
+ * Whether Hide read is leaving read messages out of the list now. `#262 search-load-older`: not while a
+ * filter chooses rows on a provider with threads, where Hide read steps aside as Fold read does
+ * (`readRunsSuspended`) — an old match is read by definition, and a search that walks back under Hide
+ * read would draw almost nothing of what it read and say it had searched it. The read mode the reader
+ * chose is untouched, and closing the search brings it back. Without threads Hide read is a read of
+ * its own (`loadTodo`), and stays in force.
+ */
+
   return {
     loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows,
     queueReadAllForCounts, readAllForCounts, rowsAsDrawn, applyTimelinePage,
     renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage,
     loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta,
+    loadDiscord, loadTodo, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition, todoSummary,
     dispose() { disposed = true; },
   };
 }

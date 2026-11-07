@@ -145,3 +145,5 @@ export { COLLAPSE_OVER_CHARS, FOLD_LESS, FOLD_LISTS, FOLD_MORE, SCROLLBACK_PX, S
 export type { FoldEntry, FoldPane, Folding, FoldingDependencies, ScrollPlace, ScrollToolsPass } from "./folding.ts";
 export { DISMISS_BATCH, createChannelRows } from "./channelrows.ts";
 export type { ChannelRows, ChannelRowsDependencies } from "./channelrows.ts";
+export { SEARCH_OLDER_HITS, SEARCH_OLDER_MS, SEARCH_OLDER_PAGES, SEARCH_OLDER_TAP_MS, mountOlderWalks } from "./olderwalks.ts";
+export type { OlderWalkColumn, OlderWalks, OlderWalksDependencies, SearchWalk } from "./olderwalks.ts";

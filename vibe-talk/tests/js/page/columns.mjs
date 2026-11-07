@@ -1528,8 +1528,7 @@ test("`#612 view-stability`: in the Threads list in one column, a reply moving t
   for (const [what, moved] of await run(SCRIPT)) {
     assert.deepStrictEqual(moved, [], `${what}, and the cards on screen moved by (id, px): ${JSON.stringify(moved)}`);
   }
-  const loose = await run(brokenScript("    if (!neighbourStayed(position.anchorId, now, around.near)) {",
-    "    if (false) {"));
+  const loose = await run(await brokenModule([{ file: "src/view/channel/readcore.ts", find: "    if (!neighbourStayed(position.anchorId, now, around.near)) {", replace: "    if (false) {" }]));
   assert.ok(loose[0][1].length > 0, "the negative control left the cards where they were, so the check above proves nothing");
 });
 

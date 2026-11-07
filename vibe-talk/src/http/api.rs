@@ -3545,7 +3545,12 @@ mod tests {
     fn channel_name_source() -> String {
         // Only the owners moved out of voice.js join its existing label rule. Presentation
         // metadata (for example a call seam's label) is a different domain.
-        page_source::page_source(&["src/view/voice", "src/view/settings"])
+        page_source::page_source(&[
+            "src/view/voice",
+            "src/view/settings",
+            "src/view/channel/readcore.ts",
+            "src/view/channel/olderwalks.ts",
+        ])
     }
 
     #[test]

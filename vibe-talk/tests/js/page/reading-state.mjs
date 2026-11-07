@@ -4923,9 +4923,8 @@ test("`#243 filter-keeps-selection`: and nothing else moves it afterwards — no
   await reReadChannel(page);
   assert.ok(atBottomOf(area), "a reader on the newest line was not followed once they had scrolled");
   // THE CONTROL: with the hold taken out, the read follows the newest line and the message moves.
-  const followed = await run(SCRIPT
-    .replace("  return atBottom(area) && heldFilterRow() === null;", "  return atBottom(area);")
-    .replace("  if (how.keepPosition && keepFilterHold()) {", "  if (false) {"));
+  const followed = await run(await brokenModule([{ file: "src/view/channel/readcore.ts", find: "  if (how.keepPosition && keepFilterHold()) {", replace: "  if (false) {" }],
+    SCRIPT.replace("  return atBottom(area) && heldFilterRow() === null;", "  return atBottom(area);")));
   const before = yOf(followed, "40");
   followed.messages = [...followed.messages, message({ id: "41", content: longMessage("arrived") })];
   await reReadChannel(followed);
