@@ -229,11 +229,13 @@ def parser() -> argparse.ArgumentParser:
     revive.add_argument("--startup-timeout", type=_ascii_float, default=30.0, metavar="SECONDS",
         help="replacement harness startup deadline, greater than 0 and at most 300 seconds (default: 30)")
 
-    restart = command("restart", "Restart a live agent in its own pane with its recorded session: exit the harness "
-        "gracefully at an idle turn boundary, relaunch in the same pane/tab resuming its session, re-pin it, restore "
+    restart = command("restart", "Restart a live agent with its recorded session: exit the harness "
+        "gracefully at an idle turn boundary, relaunch resuming its session, re-pin it, restore "
         "its Herdr name, transfer its slot ownership, and queue a re-arm notice (background shells, monitors and "
         "session crons do not survive). Refuses with nothing changed when the session is unknown or contradicts "
-        "the running argv, when input is queued, or on a background-task exit dialog.",
+        "the running argv, when input is queued, or on a background-task exit dialog. "
+        "Edition note: same-pane reuse is implemented only by the Rust edition; this edition relaunches "
+        "in a fresh tab and closes the old pane (see agent-utils-986).",
         "agentctl restart reviewer --when-idle", named=False)
     restart.add_argument("name", nargs="?", metavar="NAME", help="registered session name; required unless --team is used")
     restart.add_argument("--team", action="store_true",

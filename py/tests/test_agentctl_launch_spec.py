@@ -351,6 +351,15 @@ def test_rust_only_restore_commands_are_refused_by_this_edition(
     assert f"{command} is implemented only by the Rust edition" in capsys.readouterr().err
 
 
+def test_revive_fresh_is_a_rust_only_flag_in_this_edition() -> None:
+    # agent-utils-986 parity note: same-pane reuse and revive --fresh are
+    # Rust-edition behaviour; this edition refuses the flag by name.
+    from agentctl import cli
+    with pytest.raises(SystemExit) as refused:
+        cli.main(["--registry", "/nonexistent/.agentctl", "revive", "worker", "--fresh"])
+    assert refused.value.code == 2
+
+
 def relay_worker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str = "codex",
 ) -> tuple[Sessions, FakeManagedClient, CustomProcessIdentity]:
