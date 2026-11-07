@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-live-journal-busy: create-journal classification refuses a live non-create mutation as interrupted instead of busy'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-wrkslots
 created_at: 2026-11-07T01:40:00.000000000+00:00
-updated_at: 2026-11-07T01:40:00.000000000+00:00
+updated_at: 2026-11-07T11:50:00.000000000+00:00
+closed_at: 2026-11-07T11:50:00.000000000+00:00
 ---
 
 # Description
@@ -31,3 +32,12 @@ Seen 2026-11-06 on one host. A merge-queue donor probed slots while a `finish` m
 # Notes
 
 Reported 2026-11-06 by the lead coordinator from another harness's tracker. Related: #982 (owner transfer after restart), #954 (remove item budget).
+
+## Resolution
+
+Landed as 5ba9c3ec (with its two parent commits) by mu-wrkslots (watermelon), on 2026-11-07.
+
+- A non-create journal whose recorded owner is live now yields a retryable busy result: exit 75, JSON status busy naming the kind, PID and journal, and a BUSY line the merge-queue donor treats as could_not_run_busy and requeues. A dead or indeterminate owner keeps the hard "interrupted ... cannot coexist" refusal. Both editions.
+- Liveness uses the full owner identity: the first parseable owner in owner order, and, when a task scope is recorded, a scope-owner match plus systemd invocation verification. A live PID whose task scope ended counts as dead, so it is refused, not busy (test_live_pid_with_ended_task_scope_refuses_not_busy; the existing abort-import test keeps exit 3).
+- Validation: full selected gate (61 steps) on the final head; the one failure, rust.merge-queue.test CPU timeout under load, passed solo. An earlier version passed only a hand-picked subset and was caught by the full selection (the ended-scope regression), which is why the scope check exists.
+- Not done: the performance note about re-reading a 69k-event journal chain (about 16.4 s median) remains a follow-up.
