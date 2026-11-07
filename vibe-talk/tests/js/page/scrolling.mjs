@@ -303,6 +303,9 @@ test("SWITCHING VIEWS AND COMING BACK KEEPS YOUR PLACE", async () => {
   const area = await walkedBackChannel(page);
   const parked = parkMidway(page);
 
+  // `documents-view-client`: the rotation runs Channel -> Documents -> Voice -> Channel.
+  await page.el("view-switch").click();
+  await page.settle();
   await page.el("view-switch").click();
   await page.settle();
   await page.el("view-switch").click();
@@ -456,6 +459,8 @@ test("SWITCHING VIEWS AND COMING BACK KEEPS YOUR PLACE IN THE TRANSCRIPT TOO", a
   assert.equal(page.tab(), "discord", "the switch did not reach the channel");
   await page.el("view-switch").click();
   await page.settle();
+  await page.el("view-switch").click();
+  await page.settle();
   assert.equal(page.tab(), "voice");
 
   assert.equal(area.scrollTop, parked, "coming back to the transcript lost the reader's place");
@@ -478,7 +483,9 @@ test("...but a reader who left ON THE NEWEST TURN comes back to the NEWEST TURN"
     assistantSays(page, longMessage(`while you were away ${n}`));
   }
 
-  await page.el("view-switch").click(); // and back
+  await page.el("view-switch").click(); // and back, through Documents
+  await page.settle();
+  await page.el("view-switch").click();
   await page.settle();
   assert.equal(page.tab(), "voice");
 
@@ -521,6 +528,8 @@ test("A TURN ARRIVING WHILE YOU READ THE CHANNEL SAYS SO WHEN YOU COME BACK", as
 
   assert.equal(area.scrollTop, inTheChannel, "a voice turn moved the channel the reader was on");
 
+  await page.el("view-switch").click();
+  await page.settle();
   await page.el("view-switch").click();
   await page.settle();
 
@@ -2158,6 +2167,8 @@ test("a VOICE turn does not raise a chip over the channel list", async () => {
   // ...and the offer is waiting for them when they go back to the list it was about.
   await page.el("view-switch").click();
   await page.settle();
+  await page.el("view-switch").click();
+  await page.settle();
   assert.equal(page.tab(), "voice");
 });
 
@@ -2353,11 +2364,15 @@ test("a restore that lands up the history shows the jump at once; one that lands
   await page.settle();
   await page.el("view-switch").click();
   await page.settle();
+  await page.el("view-switch").click();
+  await page.settle();
   assert.equal(jumpShown(page), false, "coming back to the newest message offered a jump to it");
 
   // Away and back from halfway up: back halfway up, and the jump is there on arrival.
   await scrollToGap(page, halfway(page));
   const parked = area.scrollTop;
+  await page.el("view-switch").click();
+  await page.settle();
   await page.el("view-switch").click();
   await page.settle();
   await page.el("view-switch").click();
@@ -2556,7 +2571,9 @@ test("each list has its own jump: scrolled back in the channel, the transcript s
   await scrollToGap(page, halfway(page));
   assert.equal(jumpWords(page), "Newest / Jump to the newest message", "the premise: up the channel");
 
-  await page.el("view-switch").click(); // to the transcript, left on its newest turn
+  await page.el("view-switch").click(); // to the transcript, through Documents
+  await page.settle();
+  await page.el("view-switch").click();
   await page.settle();
   assert.equal(page.tab(), "voice");
   assert.equal(jumpShown(page), false, "the channel's scrollback was shown over the transcript's newest turn");
@@ -2571,6 +2588,8 @@ test("each list has its own jump: scrolled back in the channel, the transcript s
   assert.equal(jumpWords(page), "Newest / Jump to the newest message", "the transcript's arrival followed the reader to the channel");
   assert.equal(jumpShown(page), true);
   await page.el("view-switch").click(); // and back: the transcript's arrival is still waiting there
+  await page.settle();
+  await page.el("view-switch").click();
   await page.settle();
   assert.equal(jumpWords(page), "1 new / Jump to the newest message, 1 new");
 });

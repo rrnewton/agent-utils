@@ -467,6 +467,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
             page.wait_for_function("() => !document.getElementById('pane-discord').hidden", timeout=5_000)
             on_screen(page, f"{label}, the channel during a typed conversation", "view-switch", "hang-up")
             page.click("#view-switch")
+            page.click("#view-switch")
             page.wait_for_function("() => !document.getElementById('pane-voice').hidden", timeout=5_000)
             check(page.inner_text("#hangup-label") == "End chat", f"{label}: the typed conversation did not survive the switch")
             page.click("#hang-up")

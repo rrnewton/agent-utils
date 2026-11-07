@@ -332,6 +332,7 @@ test("A BOX THE READER IS TYPING IN keeps the focus through a sign-in, and throu
   // The search field, which stays on screen through a view switch.
   await press(page, page.el("scroll-area"), "/");
   await page.el("view-switch").click();
+  await page.el("view-switch").click();
   assert.equal(page.tab(), "voice");
   assert.equal(focused(page), page.el("search-field"), `a view switch took the focus from the search to ${focusName(page)}`);
 });
@@ -888,7 +889,8 @@ test("NO KEY FIRES while an input method composes, from a phone's keyboard, or w
     ["/", { ctrlKey: true, isComposing: true }], ["/", { metaKey: true, keyCode: 229 }],
     ["/", { ctrlKey: true, altKey: true }],
     // `#281 view-keys`. Ctrl+1 to Ctrl+4 choose the views now; a chord past them is still the browser's.
-    ["e", { altKey: true }], ["5", { ctrlKey: true }], ["1", { ctrlKey: true, isComposing: true }],
+    // (`documents-view-client`: Ctrl+5 chooses Documents, asserted below, so it leaves this list.)
+    ["e", { altKey: true }], ["6", { ctrlKey: true }], ["1", { ctrlKey: true, isComposing: true }],
     ["PageDown", { isComposing: true }],
   ]) {
     const event = await press(page, area, key, fields);
@@ -897,6 +899,10 @@ test("NO KEY FIRES while an input method composes, from a phone's keyboard, or w
     assert.equal(page.screen(), "main", `${what} left the list`);
     assert.equal(page.el("search-field").hidden, true, `${what} opened the search`);
   }
+  // `documents-view-client`: Ctrl+5 IS the page's — it opens Documents.
+  const docsEvent = await press(page, area, "5", { ctrlKey: true });
+  assert.equal(docsEvent.defaulted, false, "Ctrl+5 was left to the browser");
+  assert.equal(page.tab(), "docs", "Ctrl+5 did not open Documents");
   // An Escape while composing is the input method's: the search stays open.
   await press(page, area, "/");
   await press(page, page.el("search-field"), "Escape", { isComposing: true });
@@ -2610,6 +2616,7 @@ test("`#301 semicolon-expand-cycle`: THE FIRST PRESS in a list goes to the first
   assert.equal(statusSaid(short), "No long messages here to expand or collapse.");
   // On the call's view the keys are not the page's, as before.
   await short.el("view-switch").click();
+  await short.el("view-switch").click();
   assert.equal(short.tab(), "voice");
   assert.equal((await press(short, short.el("scroll-area"), ";")).defaulted, true, "; acted on the call's view");
 });
@@ -3093,6 +3100,7 @@ test("`#301 semicolon-expand-cycle`: THE CHORD WORKS WITH THE SINGLE KEYS OFF an
   event = await press(page, page.el("channel-compose-text"), ":", { metaKey: true, shiftKey: true });
   assert.deepStrictEqual(foldState(page), steps.collapse, "Cmd+: did not step the list back with the single keys off");
   // The call's view: none of the channel's lists is on screen, and the chord is left to the browser.
+  await page.el("view-switch").click();
   await page.el("view-switch").click();
   assert.equal(page.tab(), "voice");
   event = await press(page, page.el("compose-text"), ";", { ctrlKey: true });
@@ -4708,6 +4716,8 @@ test("`#240 reading-bookmark`: a screen cleared under a bookmark write still on 
   };
   await reReadChannel(page);
   assert.deepStrictEqual(shownIds(page), [], "the fixture's refused read left the rows standing");
+  // `documents-view-client`: leaving and coming back is the full rotation now.
+  await page.el("view-switch").click();
   await page.el("view-switch").click();
   await page.el("view-switch").click();
   await page.settle();

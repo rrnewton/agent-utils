@@ -39,7 +39,9 @@ test("returning to the channel RE-READS it, instead of showing what was true the
   await page.settle();
   assert.equal(page.reads, 1);
 
-  await page.el("view-switch").click(); // back to voice
+  await page.el("view-switch").click(); // back toward voice, through Documents
+  await page.settle();
+  await page.el("view-switch").click();
   await page.settle();
 
   page.messages = [message({ id: "1", content: "old" }), message({ id: "2", content: "posted while you were away" })];
@@ -3049,6 +3051,9 @@ test("`remote-ops-audit` W7: coming back to the channel view inside the wait rea
     await page.el("view-switch").click();
     await page.settle();
     assert.notEqual(page.tab(), "discord", "fixture: the switch did not leave the channel view");
+    // `documents-view-client`: coming back is the rest of the rotation (Voice, then Channel).
+    await page.el("view-switch").click();
+    await page.settle();
     await page.el("view-switch").click();
     await page.settle();
     await page.settle();
@@ -6889,7 +6894,8 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: A READER WHO SEES O
     };
     const toView = async (view) => {
       if (view === "call") {
-        if (!onCall()) await page.el("view-switch").click();
+        // `documents-view-client`: the rotation may pass Documents; press until the call is up.
+        for (let n = 0; n < 3 && !onCall(); n += 1) await page.el("view-switch").click();
       } else {
         if (onCall()) await page.el("view-switch").click();
         if (picker.value !== (view === "1" ? "main" : "flat")) await press(page, focused(page) || main, view, { metaKey: true });
@@ -7316,7 +7322,8 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: BACK FROM SETTINGS,
       }
     }
     // The call's view: the card is the transcript's next message, and its reader at the foot is at it again.
-    await page.el("view-switch").click();
+    // `documents-view-client`: rotate through Documents to reach it.
+    for (let k = 0; k < 3 && page.tab() !== "voice"; k += 1) await page.el("view-switch").click();
     fillTranscript(page, 4);
     await settled();
     for (const [route, how] of Object.entries(routes)) {
@@ -7468,7 +7475,8 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: BACK FROM HELP OPEN
       await page.settle();
     };
     const toView = async (view) => {
-      if ((view === "Call") !== onCall()) await page.el("view-switch").click();
+      // `documents-view-client`: rotate until the wanted side of the switch is up.
+      for (let k = 0; k < 3 && (view === "Call") !== onCall(); k += 1) await page.el("view-switch").click();
       await settled();
       if (view !== "Call" && picker.value !== (view === "Main" ? "main" : "flat")) {
         await press(page, focused(page) || main, view === "Main" ? "1" : "2", { metaKey: true });

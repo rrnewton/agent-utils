@@ -2419,7 +2419,11 @@ def card_alone_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: 
         serial = 180
         for view, how, up, back in cases:
             on_call = view == "the call's view"
-            if page.evaluate("() => document.getElementById('pane-discord').hidden") != on_call:
+            # `documents-view-client`: rotate until the wanted pane is up (Documents sits between).
+            for _ in range(3):
+                want = "pane-voice" if on_call else "pane-discord"
+                if not page.evaluate(f"() => document.getElementById('{want}').hidden"):
+                    break
                 page.click("#view-switch")
                 page.wait_for_timeout(400)
             if not on_call:
@@ -2527,7 +2531,11 @@ def settings_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
         page.wait_for_timeout(300)
         for view, up, there, back in trips:
             on_call = view == "the call's view"
-            if page.evaluate("() => document.getElementById('pane-discord').hidden") != on_call:
+            # `documents-view-client`: rotate until the wanted pane is up (Documents sits between).
+            for _ in range(3):
+                want = "pane-voice" if on_call else "pane-discord"
+                if not page.evaluate(f"() => document.getElementById('{want}').hidden"):
+                    break
                 page.click("#view-switch")
                 page.wait_for_timeout(400)
             if not on_call:
@@ -2635,7 +2643,11 @@ def help_key_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
         serial = 220
         for view, up, key, change, back in trips:
             on_call = view == "the call's view"
-            if page.evaluate("() => document.getElementById('pane-discord').hidden") != on_call:
+            # `documents-view-client`: rotate until the wanted pane is up (Documents sits between).
+            for _ in range(3):
+                want = "pane-voice" if on_call else "pane-discord"
+                if not page.evaluate(f"() => document.getElementById('{want}').hidden"):
+                    break
                 page.click("#view-switch")
                 page.wait_for_timeout(400)
             if not on_call:
@@ -2841,7 +2853,11 @@ def jump_after_settings_case(page: Page, url: str, voice: FakeVoice, api: FakeAp
         page.wait_for_timeout(300)
         for view, up, back in trips:
             on_call = view == "the call's view"
-            if page.evaluate("() => document.getElementById('pane-discord').hidden") != on_call:
+            # `documents-view-client`: rotate until the wanted pane is up (Documents sits between).
+            for _ in range(3):
+                want = "pane-voice" if on_call else "pane-discord"
+                if not page.evaluate(f"() => document.getElementById('{want}').hidden"):
+                    break
                 page.click("#view-switch")
                 page.wait_for_timeout(400)
             if not on_call:

@@ -2075,6 +2075,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     },
     /** Which tab is showing on the main screen. */
     tab() {
+      // `documents-view-client`: a third pane; Documents showing means neither of the two older answers.
+      if (!page.el("pane-docs").hidden) return "docs";
       return page.el("pane-discord").hidden ? "voice" : "discord";
     },
     /**
@@ -5145,6 +5147,13 @@ const TUNING_BANDS = {
     "limit of 50 is refused outright"],
   CHANNEL_LABEL_MAX: [60, 60,
     "a browsed channel's label must fit the same 60 characters the Add form's field allows"],
+  FETCH_RECENT_LIMIT: [1, 20,
+    "how many recent unfetched documents one Fetch-recent press fetches (documents-view-client): " +
+    "0 would fetch nothing, and the server's fetch-recent refuses more than 20"],
+  MAX_INLINE_DEPTH: [1, 32,
+    "how deep a document's inline formatting may nest before the rest is plain text " +
+    "(documents-view-client): 0 would render no emphasis at all, and no cap would let a crafted " +
+    "document nest the renderer until it overflows"],
   BROWSER_SPEECH_CHUNK_CHARS: [60, 300,
     "device voices need short utterances to avoid mobile synthesis stalls without pausing every word"],
   BROWSER_SPEECH_SENTENCE_MIN_CHARS: [8, 60,

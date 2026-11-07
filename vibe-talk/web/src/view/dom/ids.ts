@@ -122,7 +122,16 @@ export interface ElementById {
   "dismissed-send-restore": HTMLButtonElement;
   "dismissed-sends": HTMLOListElement;
   "dismissed-sends-state": HTMLParagraphElement;
+  "doc-back": HTMLButtonElement;
+  "doc-body": HTMLDivElement;
+  "doc-outline": HTMLUListElement;
+  "doc-read": HTMLButtonElement;
+  "doc-title": HTMLHeadingElement;
   "dock": HTMLElement;
+  "docs-fetch-recent": HTMLButtonElement;
+  "docs-list-view": HTMLDivElement;
+  "docs-reader": HTMLDivElement;
+  "documents-list": HTMLDivElement;
   "draft-chip": HTMLButtonElement;
   "draft-chip-label": HTMLSpanElement;
   "empty-line": HTMLParagraphElement;
@@ -349,6 +358,7 @@ export interface ElementById {
   "pair-submit": HTMLButtonElement;
   "pair-transfer": HTMLInputElement;
   "pane-discord": HTMLDivElement;
+  "pane-docs": HTMLDivElement;
   "pane-voice": HTMLDivElement;
   "pinned-filter": HTMLButtonElement;
   "pinned-log": HTMLOListElement;
@@ -599,6 +609,7 @@ export interface ElementById {
   "upstream-clear-threads-provider": HTMLSpanElement;
   "upstream-clear-warning": HTMLParagraphElement;
   "upstream-clear-warning-provider": HTMLSpanElement;
+  "view-cards": HTMLDivElement;
   "view-switch": HTMLButtonElement;
   "view-switch-label": HTMLSpanElement;
   "voice-ask-before-send": HTMLInputElement;

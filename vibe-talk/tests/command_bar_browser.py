@@ -224,7 +224,12 @@ def large_font_after_call(browser: Browser, url: str, width: int, height: int, n
     """The widest the pane gets — after a call, its note under Talk — in a 24px default font: past the
     bar's floor the pane wraps its own buttons, as a last resort, and nothing is drawn over anything."""
     page = open_page(browser, url, width, height)
-    page.click("#view-switch")
+    # `documents-view-client`: the switch rotates Channel -> Documents -> Voice; press until the call is up.
+    for _ in range(3):
+        if page.get_attribute("#view-switch", "aria-pressed") != "false":
+            break
+        page.click("#view-switch")
+        page.wait_for_timeout(300)
     page.wait_for_function("() => document.getElementById('view-switch').getAttribute('aria-pressed') !== 'false'",
                            timeout=10_000)
     page.evaluate("() => { document.documentElement.style.fontSize = '24px'; }")
@@ -397,9 +402,13 @@ def action_menu(browser: Browser, url: str, width: int, height: int, touch: bool
     now = menu_state(page)
     check(now["open"] is False and now["focus"] == "action-menu-open", f"{where}: Escape left {now}")
     hide_reader(page, where, touch, shots, width, height)
-    # The view button: a press, then Enter and Space from the keys.
-    press(page, "#view-switch", touch)
-    page.wait_for_timeout(300)
+    # The view button: presses rotate Channel -> Documents -> Voice (`documents-view-client`),
+    # then Enter and Space from the keys.
+    for _ in range(3):
+        if page.get_attribute("#view-switch", "aria-pressed") != "false":
+            break
+        press(page, "#view-switch", touch)
+        page.wait_for_timeout(300)
     now = menu_state(page)
     check(now["pressed"] == "true" and now["word"] == "Voice", f"{where}: a press on the view button left {now}")
     page.focus("#view-switch")
@@ -408,6 +417,10 @@ def action_menu(browser: Browser, url: str, width: int, height: int, touch: bool
     now = menu_state(page)
     check(now["pressed"] == "false" and now["word"] == "Channel", f"{where}: Enter on the view button left {now}")
     # Coming to the channel puts the keys in its list, as it always has: back on the button for Space.
+    # Space rotates Channel -> Documents -> Voice, so it takes two presses now.
+    page.focus("#view-switch")
+    page.keyboard.press(" ")
+    page.wait_for_timeout(300)
     page.focus("#view-switch")
     page.keyboard.press(" ")
     page.wait_for_timeout(300)

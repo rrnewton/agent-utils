@@ -555,6 +555,8 @@ test("switching views does not disturb a live call", async () => {
   await page.el("view-switch").click();
   await page.settle();
   assert.equal(page.tab(), "discord");
+  // `documents-view-client`: back to the call takes two more presses, through Documents.
+  await page.el("view-switch").click();
   await page.el("view-switch").click();
   assert.equal(page.tab(), "voice");
 
@@ -1421,7 +1423,11 @@ test("the page has ONE html sink, and only a message's content_html ever reaches
   // Static: one assignment to innerHTML in the whole script, inside `insertSanitizedHtml`, and that
   // function is called from one place, with what `renderedHtmlOf` read off a message. None of the
   // other ways to turn a string into markup appears at all.
-  assert.equal((PAGE_CODE.match(/innerHTML/g) || []).length, 1, "a second innerHTML sink appeared");
+  // `documents-view-client`: the Documents reader is the one other sink, fed solely by its
+  // sanitizer (`renderDocumentMarkdown` in view/documents), never by raw document text.
+  assert.equal((PAGE_CODE.match(/innerHTML/g) || []).length, 2, "a third innerHTML sink appeared");
+  assert.match(PAGE_CODE, /body\.innerHTML = renderDocumentMarkdown\(markdown\);/,
+    "the documents sink no longer passes the sanitizer's output");
   const sink = /function insertSanitizedHtml\(parent, contentHtml\) \{([\s\S]*?)\n\}/.exec(SCRIPT_CODE);
   assert.ok(sink && /template\.innerHTML = contentHtml;/.test(sink[1]), "innerHTML moved out of insertSanitizedHtml");
   const calls = [...SCRIPT_CODE.matchAll(/insertSanitizedHtml\(([^)]*)\)/g)].map((m) => m[1]);
@@ -1752,7 +1758,9 @@ test("EVERY visit to the channel view opens on the newest message, not just the 
   await signIn(page);
   await showDiscord(page, tallChannel());
 
-  await page.el("view-switch").click(); // back to the voice transcript
+  await page.el("view-switch").click(); // back toward the voice transcript, through Documents
+  await page.settle();
+  await page.el("view-switch").click();
   await page.settle();
   assert.equal(page.tab(), "voice");
 
@@ -2964,6 +2972,8 @@ test("the summary control is offered only where a summary can exist", async () =
   await turnSummariesOn(page);
   assert.equal(page.el("summarise").getAttribute("aria-pressed"), "true", "the toggle does not say it is on");
 
+  await page.el("view-switch").click();
+  await page.settle();
   await page.el("view-switch").click();
   await page.settle();
   assert.equal(page.tab(), "voice");

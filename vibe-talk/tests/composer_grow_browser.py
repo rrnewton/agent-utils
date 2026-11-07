@@ -522,6 +522,7 @@ def space_from_up_the_list(desk: Desk) -> None:
 def call_tick_after_paste(desk: Desk) -> None:
     """`tick_after_paste` in the call's box, on the call's view."""
     desk.page.click("#view-switch")
+    desk.page.click("#view-switch")
     desk.page.wait_for_selector(f"#{VOICE_PARTS[1]}", state="visible", timeout=10_000)
     tick_after_paste(desk, VOICE_PARTS, TEN)
     desk.page.click("#view-switch")
@@ -555,6 +556,7 @@ def call_box_with_recap(desk: Desk) -> None:
     """The call's box with its recap line shown above it: the line across the composer, Grow left of Send on its row."""
     page = desk.page
     where = f"{desk.label}, the call's box under its recap line"
+    page.click("#view-switch")
     page.click("#view-switch")
     page.wait_for_selector(f"#{VOICE_PARTS[1]}", state="visible", timeout=10_000)
     # What `renderCallRecap` draws once the voice service has taken a recap; no call is needed to lay it out.

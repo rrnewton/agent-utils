@@ -236,6 +236,10 @@ test("the Pinned filter sits right beside the glass, only while the bar is open,
   await page.settle();
   assert.equal(filter.getAttribute("aria-pressed"), "true", "the filter does not say it is on");
   // The call's transcript has no pins; the filter is not offered over it, and comes back with the channel.
+  // `documents-view-client`: the rotation passes Documents, which offers no filter either.
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(filter.hidden, true, "the filter is offered over the Documents view");
   await page.el("view-switch").click();
   await page.settle();
   assert.equal(filter.hidden, true, "the filter is offered over the call view");

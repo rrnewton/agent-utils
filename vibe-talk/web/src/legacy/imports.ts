@@ -147,3 +147,6 @@ export { DISCORD_PAGE_LIMIT, OLDER_TRIGGER_PX, createOlderPager } from "../core/
 export { isThreadRoot, readLook, unpackHeldMessages, unpackMessages, unpackReadSignature } from "../core/channels/index.ts";
 export { allNoticeWords, staleWords } from "../present/rows/index.ts";
 export { MESSAGE_CACHE_ROWS, createMessageCache, tokenFingerprint } from "../core/channels/index.ts";
+
+// view/documents (documents-view-client)
+export { createDocumentsView, createViewSelector } from "../view/documents/index.ts";

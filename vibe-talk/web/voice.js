@@ -2041,6 +2041,96 @@ function putBackOnSpot(spot) {
 // screen shows: one owner in web/src/view/shell/screens.ts (`#624 voice-page-modularity`).
 const screens = createScreens();
 
+// --- documents (`documents-view-client`) -------------------------------------------------------
+//
+// The third major view: the documents linked in chat, listed and read in
+// web/src/view/documents. The page's whole share is this mount, the `docs`
+// branch of `showView`, `pressViewSwitch` delegating to the selector, Ctrl+5,
+// and the `?v=docs` deep link in `reopenSavedView`. No document state lives
+// here; the view owns its list, its reader and its speaking.
+
+/** Speak `text` with the device voice, for the reader's Read. */
+function speakDocumentText(text) {
+  const speech = window.speechSynthesis;
+  if (!speech) {
+    setStatus("This device has no voice to read with.");
+    return;
+  }
+  speech.speak(new SpeechSynthesisUtterance(text));
+}
+
+/** The mounted Documents view. */
+const documentsView = createDocumentsView({
+  api: (path, options) => api(path, options),
+  byId: (id) => el(id),
+  speak: (text) => speakDocumentText(text),
+  stopSpeaking: () => {
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+  },
+  onStatus: (text) => setStatus(text),
+});
+
+/** The three-way selector over `#view-switch`; its press is `pressViewSwitch`. */
+const documentsSelector = createViewSelector({
+  byId: (id) => el(id),
+  current: () => /** @type {"voice"|"discord"|"docs"} */ (screens.view()),
+  choose: (view) => chooseMajorView(view),
+});
+
+/** The selector cards' auto-hide timer; a new press restarts it. */
+let viewCardsTimer = 0;
+
+/** Show major view `view` (voice/discord/docs), with each view's entry work. */
+function chooseMajorView(view) {
+  uiState.settle();
+  showView(view);
+  // The cards name what a press would reach; once seen they go, so they never cover the bar.
+  clearTimeout(viewCardsTimer);
+  viewCardsTimer = setTimeout(() => documentsSelector.hideCards(), 2500);
+  if (view === "discord") {
+    readEnteredChannel(viewScroll.restored());
+    return;
+  }
+  stopDiscordPolling();
+  if (view === "docs") void documentsView.show(documentsDeepLinkKey());
+}
+
+/** One `?name=value` of the address, decoded; null when absent. */
+function documentsQueryValue(name) {
+  for (const part of (window.location.search || "").replace(/^\?/, "").split("&")) {
+    const eq = part.indexOf("=");
+    if (eq === -1 || part.slice(0, eq) !== name) continue;
+    try {
+      return decodeURIComponent(part.slice(eq + 1).replace(/\+/g, " "));
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/** The document key `?v=docs&d=KEY` names, or undefined for the list. */
+function documentsDeepLinkKey() {
+  if (documentsQueryValue("v") !== "docs") return undefined;
+  return documentsQueryValue("d") || undefined;
+}
+
+// Ctrl+5 (Cmd+5 on a Mac) for Documents, beside Ctrl+0 for the call's view.
+document.addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key === "5") {
+    event.preventDefault();
+    chooseMajorView("docs");
+  }
+});
+
+// A tap anywhere but the switch or its cards puts the cards away at once.
+document.addEventListener("pointerdown", (event) => {
+  const target = /** @type {{closest?: (selector: string) => unknown} | null} */ (event.target || null);
+  if (target && typeof target.closest === "function" && (target.closest("#view-cards") || target.closest("#view-switch"))) return;
+  clearTimeout(viewCardsTimer);
+  documentsSelector.hideCards();
+}, true);
+
 /** What the header calls each screen that is a DESTINATION rather than the app itself. */
 const SCREEN_TITLES = { settings: "Settings", help: "Help" };
 
@@ -2473,14 +2563,20 @@ function showView(name) {
   screens.setView(name);
   el("pane-voice").hidden = name !== "voice";
   el("pane-discord").hidden = name !== "discord";
+  el("pane-docs").hidden = name !== "docs";
   // `#269 approval-card-inline`. A waiting draft is the next message of the list now on screen, put
   // there BEFORE the place in that list is restored, which counts it.
   voiceTranscript().placePostCard();
   const discord = name === "discord";
   // `#845 voice-toggle-colours`. Pressed, lit in the accent, is the call's view; the channel's is the darker one.
-  el("view-switch").setAttribute("aria-pressed", discord ? "false" : "true");
-  el("view-switch-label").textContent = discord ? "Channel" : "Voice";
-  el("view-switch").title = discord ? "Showing the channel. Press to show the call." : "Showing the call. Press to show the channel.";
+  el("view-switch").setAttribute("aria-pressed", name === "voice" ? "true" : "false");
+  el("view-switch-label").textContent = discord ? "Channel" : name === "docs" ? "Documents" : "Voice";
+  el("view-switch").title = discord
+    ? "Showing the channel. Press to show the documents."
+    : name === "docs"
+      ? "Showing the documents. Press to show the call."
+      : "Showing the call. Press to show the channel.";
+  documentsSelector.sync();
   // Both panes share ONE scroll container, so a switch swaps the content out from under a
   // scrollTop that belonged to the other pane. On a FIRST entry, landing on the newest message is
   // right and landing at the top is badly wrong: arriving at the top of a long channel means
@@ -6845,7 +6941,9 @@ const viewKeys = createViewKeys({
   mainColumn: () => columns.main,
   inColumn: (column, act) => inColumn(column, act),
   closeSettings: () => closeSettings(),
-  pressViewSwitch: () => pressViewSwitch(),
+  // The keys' switch keeps its two-way meaning (the call's view or the channel's, never
+  // Documents between them); the button's press is the three-way `pressViewSwitch`.
+  pressViewSwitch: () => chooseMajorView(screens.view() === "voice" ? "discord" : "voice"),
   selectedChannelId: () => selectedChannelId(),
   channelOnScreen: () => channelOnScreen(),
   chooseView: (which) => chooseView(which),
@@ -9454,6 +9552,13 @@ function returnToSavedPlace() {
 function reopenSavedView() {
   if (uiState.settled()) return;
   uiState.settle();
+  // `?v=docs` (with `&d=KEY` for one document) opens Documents (`documents-view-client`).
+  if (documentsQueryValue("v") === "docs") {
+    showView("docs");
+    void documentsView.show(documentsDeepLinkKey());
+    saveUiState();
+    return;
+  }
   const saved = uiState.saved();
   if (saved && saved.view === "discord" && selectedChannelId() && screens.view() !== "discord") {
     showView("discord");
@@ -30699,23 +30804,12 @@ mountReplyBox({
   pressViewSwitch: () => pressViewSwitch(),
 });
 
-/** The view switch, pressed: the call's view or the channel's, whichever is not up. */
+/** The view switch, pressed: rotate Voice -> Channel -> Documents -> Voice (`documents-view-client`). */
 function pressViewSwitch() {
-  const next = screens.view() === "voice" ? "discord" : "voice";
-  // The reader's own move, so the record follows it from here on. `#189 restore-ui-state`.
-  uiState.settle();
-  showView(next);
-  if (next !== "discord") {
-    stopDiscordPolling();
-    return;
-  }
-  // Deliberately NOT guarded on the log being empty. That guard is what made the view stale:
-  // after the first load it never fetched again, so switching back showed you the channel as it
-  // had been, with nothing on screen admitting it.
-  // KEEP THE POSITION when this entry was a return. `loadDiscord` with no options settles to the
-  // newest message, which would undo the restore `showView` just performed — the two halves have
-  // to agree or the fix is invisible.
-  readEnteredChannel(viewScroll.restored());
+  // The selector owns the rotation and, through `chooseMajorView`, each view's
+  // entry work: entering the channel re-reads it (keeping the position on a
+  // return, as the two-way switch did), and any other view stops its polling.
+  documentsSelector.cycle();
 }
 
 /** Read the channel just entered, and keep reading it while it stays on screen. */

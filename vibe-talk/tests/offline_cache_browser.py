@@ -3529,6 +3529,8 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 page.mouse.click(pace_x, pace_y)
                 until("() => document.getElementById('speed-popover').hidden", "Pace did not close its popover")
                 # The same spot again is the switch again: back to the call, and back to the channel.
+                # `documents-view-client`: Channel -> Documents -> Voice, so one extra flick first.
+                flick("false", "the flick through Documents left the channel's pressed state")
                 flick("true", "a second click in the same spot did not switch back to the call")
                 until("() => !document.getElementById('talk').hidden", "the call view's Talk did not come back")
                 flick("false", "a third click in the same spot did not open the channel again")
@@ -4222,6 +4224,8 @@ def links_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                   "folding the bar left the Links view up")
 
             # Over the call view there are no pins: Links stands beside the glass on its own.
+            # `documents-view-client`: Channel -> Documents -> Voice takes two presses.
+            page.click("#view-switch")
             page.click("#view-switch")
             page.wait_for_selector("#pane-voice", state="visible", timeout=5_000)
             tap("#search-toggle")
@@ -4508,6 +4512,7 @@ def kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                   "folding the bar left the kinds up")
 
             # Over the call view Links stands beside the glass: right-aligned under the bar's end.
+            page.click("#view-switch")
             page.click("#view-switch")
             page.wait_for_selector("#pane-voice", state="visible", timeout=5_000)
             links_on()

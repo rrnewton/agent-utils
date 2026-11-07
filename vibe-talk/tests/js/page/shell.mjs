@@ -440,6 +440,13 @@ test("the view control is ONE button carrying the word for the view you are in, 
   assert.equal(label.textContent, "Channel", "the word did not follow the switch");
   assert.equal(page.el("view-switch").getAttribute("aria-pressed"), "false", "the channel's view is the darker, unpressed one");
 
+  // `documents-view-client`: the switch is three-way now — the next press shows Documents.
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.tab(), "docs");
+  assert.equal(label.textContent, "Documents", "the word did not follow the switch to Documents");
+  assert.equal(page.el("view-switch").getAttribute("aria-pressed"), "false", "only the call's view is the pressed, lit one");
+
   await page.el("view-switch").click();
   assert.equal(page.tab(), "voice");
   assert.equal(label.textContent, "Voice");
@@ -1141,6 +1148,11 @@ test("the picker is offered where there is a channel to pick, and nowhere else",
   // `#241 voice-composer`. A draft in the call's message box changes nothing about the bar: the
   // box is in the call's transcript, so it goes when its view goes, and the picker comes back with
   // the channel exactly as it would have without one.
+  // `documents-view-client`: the switch rotates through Documents, so reaching the call's
+  // view from the channel's takes two presses (Documents between them).
+  await page.el("view-switch").click();
+  assert.equal(page.tab(), "docs");
+  assert.equal(page.el("discord-channel").hidden, true, "a channel picker over the Documents view");
   await page.el("view-switch").click();
   assert.equal(page.tab(), "voice");
   await compose(page, "half a thought");
@@ -1153,6 +1165,8 @@ test("the picker is offered where there is a channel to pick, and nowhere else",
   await page.el("view-switch").click();
   assert.equal(page.el("compose-text").value, "half a thought", "switching views lost the draft");
   await page.el("view-switch").click();
+  await page.el("view-switch").click();
+  assert.equal(page.tab(), "discord");
   assert.equal(page.el("discord-channel").hidden, false);
 
   // ...and so does the screen rule.
@@ -1161,6 +1175,7 @@ test("the picker is offered where there is a channel to pick, and nowhere else",
   await page.el("close-settings").click();
   assert.equal(page.el("discord-channel").hidden, false, "coming back lost the picker");
 
+  await page.el("view-switch").click();
   await page.el("view-switch").click();
   assert.equal(page.tab(), "voice");
   assert.equal(page.el("discord-channel").hidden, true, "the picker stayed after leaving its view");

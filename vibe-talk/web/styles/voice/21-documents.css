@@ -1,0 +1,100 @@
+/* ------------------------------------------------------- the Documents view --------- */
+/*
+ * `documents-view-client`: the third view's list and reader, and the view selector's
+ * cards. The cards stack directly above the switch so the switch reads as a triple
+ * button: the two views that are not showing, in the order rotating reaches them.
+ */
+
+/* The two not-current views, stacked above the switch. */
+#control-bar {
+  position: relative;
+}
+.view-cards {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  z-index: 5;
+}
+.view-cards[hidden] {
+  display: none;
+}
+.view-card {
+  padding: 6px 12px;
+  border: 1px solid;
+  border-radius: 8px;
+  background: var(--bg, Canvas);
+  white-space: nowrap;
+  text-align: center;
+  cursor: pointer;
+}
+.view-card:focus-visible {
+  outline: 2px solid var(--accent, Highlight);
+  outline-offset: 2px;
+}
+
+/* One card per document, newest last as the server sends them. */
+.doc-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  padding: 10px 12px;
+  margin: 0 0 8px;
+  text-align: left;
+  cursor: pointer;
+}
+.doc-unfetched {
+  opacity: 0.55;
+}
+.doc-title {
+  font-weight: 600;
+}
+.doc-subtitle {
+  font-size: 0.85em;
+  opacity: 0.8;
+}
+.doc-empty {
+  padding: 12px;
+}
+.docs-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+}
+.docs-toolbar h2 {
+  flex: 1;
+  margin: 0;
+  font-size: 1.05em;
+}
+
+/* The reader: rendered document body in the reading width, tables scroll in their box. */
+#doc-body {
+  padding: 0 4px 24px;
+  overflow-wrap: break-word;
+}
+#doc-body table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+#doc-body th,
+#doc-body td {
+  border: 1px solid;
+  padding: 4px 8px;
+  text-align: left;
+}
+#doc-body pre {
+  overflow-x: auto;
+}
+#doc-outline {
+  list-style: none;
+  padding: 0;
+}
+#doc-outline button {
+  cursor: pointer;
+}

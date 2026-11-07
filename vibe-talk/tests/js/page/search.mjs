@@ -150,6 +150,8 @@ test("ONE QUERY FILTERS BOTH LISTS, BECAUSE A READER SWITCHES VIEWS WITHOUT SWIT
 
   await page.el("view-switch").click();
   await page.settle();
+  await page.el("view-switch").click();
+  await page.settle();
   assert.equal(page.el("search-count").textContent, "3 of 4 loaded", "the count stayed behind");
 });
 
@@ -621,8 +623,9 @@ test("`#249 search-highlight`: markup in a message stays text, and a mark is bui
   assert.equal(rows[0].text().includes("<b>engine</b> & <script>engine()</script>"), true, "the text is not what was written");
   for (const tag of ["b", "script"]) assert.ok(!page.createdTags.includes(tag), `the text became a <${tag}>`);
   assert.equal(page.templatesParsed, templates, "marking parsed something as HTML");
-  // The page has one HTML sink, and marking added none.
-  assert.equal((PAGE_CODE.match(/\.innerHTML\s*=/g) || []).length, 1, "a second place parses HTML");
+  // The page has two HTML sinks (a message's content_html, and the Documents reader's
+  // sanitizer output), and marking added none.
+  assert.equal((PAGE_CODE.match(/\.innerHTML\s*=/g) || []).length, 2, "a third place parses HTML");
 });
 
 test("`#249 search-highlight`: a combined row is marked in each of its messages, and a turn of the call is marked too", async () => {

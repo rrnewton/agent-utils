@@ -482,3 +482,7 @@ declare const staleWords: LegacyImports["staleWords"];
 declare const createMessageCache: LegacyImports["createMessageCache"];
 declare const MESSAGE_CACHE_ROWS: LegacyImports["MESSAGE_CACHE_ROWS"];
 declare const tokenFingerprint: LegacyImports["tokenFingerprint"];
+
+// view/documents (documents-view-client)
+declare const createDocumentsView: LegacyImports["createDocumentsView"];
+declare const createViewSelector: LegacyImports["createViewSelector"];

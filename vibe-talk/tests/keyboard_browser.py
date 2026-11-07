@@ -681,6 +681,8 @@ def held_send_key(walk: Walk, api: FakeApi) -> None:
 def call_view_write_keys(walk: Walk) -> None:
     """`#248 composer-key` with `#241 voice-composer`: on the call's view Ctrl+S goes to the agent's box."""
     first_row = '#discord-log > li[data-id]'
+    # `documents-view-client`: Channel -> Documents -> Voice takes two presses.
+    walk.page.click("#view-switch")
     walk.page.click("#view-switch")
     walk.page.wait_for_function("() => document.getElementById('view-switch').getAttribute('aria-pressed') === 'true'")
     walk.page.focus("#scroll-area")
@@ -1637,6 +1639,7 @@ def main() -> int:
 
             # A click on the view switch and back: the switch must not keep the focus, or Space
             # presses it again.
+            page.click("#view-switch")
             page.click("#view-switch")
             page.wait_for_function("() => document.getElementById('view-switch').getAttribute('aria-pressed') === 'true'")
             with page.expect_response(lambda response: "/timeline" in response.url) as read:

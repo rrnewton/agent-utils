@@ -707,6 +707,27 @@
                 </div>
               </div>
             </div>
+            <!-- Documents (`documents-view-client`): the third view, beside the call's and the
+                 channel's panes in the one scroller. The list (`#docs-list-view`) and the reader
+                 (`#docs-reader`) trade places inside it; every id here, as the page suite builds
+                 its DOM from this file. -->
+            <div id="pane-docs" hidden>
+              <div id="docs-list-view">
+                <div class="row docs-toolbar">
+                  <button id="docs-fetch-recent" type="button">Fetch recent</button>
+                </div>
+                <div id="documents-list"></div>
+              </div>
+              <div id="docs-reader" hidden>
+                <div class="row docs-toolbar">
+                  <button id="doc-back" type="button">Back</button>
+                  <h2 id="doc-title"></h2>
+                  <button id="doc-read" type="button">Read</button>
+                </div>
+                <ul id="doc-outline"></ul>
+                <div id="doc-body"></div>
+              </div>
+            </div>
           </div>
 
           <!--
@@ -4107,6 +4128,10 @@
           >
             <span id="view-switch-label" class="switch-word">Voice</span>
           </button>
+          <!-- The selector's two cards (`documents-view-client`): drawn stacked directly above
+               the switch (the stylesheet lifts them there), naming the two views that are not
+               showing, in the order rotating reaches them; the selector fills and wires them. -->
+          <div id="view-cards" class="view-cards" hidden></div>
         </div>
       </div>
 

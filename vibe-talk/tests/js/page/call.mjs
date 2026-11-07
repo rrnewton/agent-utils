@@ -3285,6 +3285,7 @@ test("THE BOX IS IN THE CALL'S TRANSCRIPT IN EVERY STATE, AND THE SWITCH NEVER L
   assert.equal(idle.tab(), "discord");
   assert.equal(idle.el("hang-up").hidden, false, "switching to the channel lost the typed conversation's end control");
   await idle.el("view-switch").click();
+  await idle.el("view-switch").click();
   check(idle, "a typed conversation, back from the channel");
 
   // A voice call.
