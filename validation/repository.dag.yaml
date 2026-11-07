@@ -238,6 +238,34 @@ steps:
       rss_baseline_bytes: 536870912
 
   - group: hygiene
+    job: issue-parse-self-test
+    desc: prove the pinned-mb issue-parse guard can fail
+    cmd: python3 scripts/check_issue_parse.py --self-test
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 960
+    cpu_timeout: 600
+    hint:
+      resources: {cargo-target: 1}
+      est_duration_s: 60
+      classification: cpu-bound
+      rss_baseline_bytes: 536870912
+
+  - group: hygiene
+    job: issue-parse
+    desc: refuse an issue file the pinned mb reader cannot parse
+    cmd: python3 scripts/check_issue_parse.py
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 960
+    cpu_timeout: 600
+    hint:
+      resources: {cargo-target: 1}
+      est_duration_s: 30
+      classification: cpu-bound
+      rss_baseline_bytes: 536870912
+
+  - group: hygiene
     job: documented-defaults-self-test
     desc: prove the documented-default guard can fail
     cmd: python3 scripts/check_documented_defaults.py --self-test

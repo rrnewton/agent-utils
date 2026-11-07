@@ -258,6 +258,7 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("scripts/check_client_names.py", frozenset()),
     ("scripts/check_documented_defaults.py", frozenset()),
     ("scripts/check_issue_numbers.py", frozenset()),
+    ("scripts/check_issue_parse.py", frozenset()),
     ("scripts/check_site.py", frozenset()),
     # The public website is static HTML and CSS that nothing builds or embeds. Its checker runs in
     # the always-on hygiene group because the site links into the whole tree: a renamed document
@@ -1622,6 +1623,12 @@ def self_test() -> int:
         ["scripts/check_issue_numbers.py"],
         {PYTHON},
         "an issue-number guard change also runs its owned infrastructure tests",
+        {"repository-infrastructure"},
+    )
+    expect(
+        ["scripts/check_issue_parse.py"],
+        {PYTHON},
+        "an issue-parse guard change also runs its owned infrastructure tests",
         {"repository-infrastructure"},
     )
     expect(

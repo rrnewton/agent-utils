@@ -1,7 +1,7 @@
 # `make` just runs ./setup (both python and rust), per repo convention.
 .PHONY: all both py rs check check-workspace check-deps check-test-suite-selector \
 	check-validation-components check-pytest-sharder check-validate-selector check-client-names \
-	check-documented-defaults check-issue-numbers check-site mypy test cross check-packages check-python-packages \
+	check-documented-defaults check-issue-numbers check-issue-parse check-site mypy test cross check-packages check-python-packages \
 	check-rust-packages validate validate-all soak-agent-teams fmt clean
 
 all: both
@@ -26,7 +26,7 @@ mypy:
 # hygiene group once, then execute only the code-facing half here. `make check` remains the complete
 # standalone target for callers that did not already run those guards.
 check: check-workspace check-validate-selector check-validation-components check-pytest-sharder \
-	check-client-names check-documented-defaults check-issue-numbers check-site
+	check-client-names check-documented-defaults check-issue-numbers check-issue-parse check-site
 
 check-workspace: check-deps mypy check-test-suite-selector
 	@host_target="$$(rustc -vV | sed -n 's/^host: //p')"; \
@@ -89,6 +89,10 @@ check-documented-defaults:
 check-issue-numbers:
 	python3 scripts/check_issue_numbers.py --self-test
 	python3 scripts/check_issue_numbers.py
+
+check-issue-parse:
+	python3 scripts/check_issue_parse.py --self-test
+	python3 scripts/check_issue_parse.py
 
 # The public website under site/: pages parse, every link resolves (including #fragments into the
 # repository's Markdown), and nothing is loaded from another origin.

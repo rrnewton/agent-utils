@@ -312,6 +312,7 @@
         "scripts/check_documented_defaults.py",
         "scripts/check_editions.py",
         "scripts/check_issue_numbers.py",
+        "scripts/check_issue_parse.py",
         "scripts/check_no_any.py",
         "scripts/check_python_packages.py",
         "scripts/check_rust_only.py",
