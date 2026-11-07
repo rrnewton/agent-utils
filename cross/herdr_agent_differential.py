@@ -229,6 +229,18 @@ def save():
 def envelope(result):
     print(json.dumps({"result": result}, sort_keys=True))
 
+def stand_in(executable):
+    # A real process stands in for a harness so its kernel identity can be pinned. It lives
+    # exactly as long as this case's directory: the case retires it (pane close, or the
+    # differential's cleanup), and it ends by itself once the directory is removed. It never
+    # ends on a timer, which a loaded host outran mid-case: the pinned process exited before the
+    # case's last command, and agentctl rightly reported its generation changed (#1002).
+    loop = f"import os, time\nwhile os.path.isdir({root!r}):\n    time.sleep(1)\n"
+    return subprocess.Popen(
+        [executable, "-c", loop], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+
 def outside_case(program):
     # A bare name would be looked up on PATH; a path must stay inside this case directory both
     # with links followed before `..` (the kernel) and with `..` removed first.
@@ -571,12 +583,7 @@ elif args[:2] == ["agent", "start"]:
         if selector in state["launch_arguments"]:
             state["session_value"] = state["launch_arguments"][state["launch_arguments"].index(selector) + 1]
             break
-    # A real process stands in for the harness so its kernel identity can be pinned.
-    harness = subprocess.Popen(
-        ["/bin/sleep", "60"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL, start_new_session=True,
-    )
-    state["harness_pid"] = harness.pid
+    state["harness_pid"] = stand_in(sys.executable).pid
     if state.get("startup_timeout"):
         error = state.get("startup_error", {
             "id":"cli:agent:start", "error": {
@@ -609,13 +616,10 @@ elif args[:2] == ["pane", "run"]:
               f"{parsed[0]!r}, which is not inside the case directory", file=sys.stderr)
         save()
         raise SystemExit(127)
-    child_command = (["/bin/sleep", "60"] if state.get("wrong_custom_process_identity")
-                     else [parsed[0], "-c", "import time; time.sleep(60)"])
-    child = subprocess.Popen(
-        child_command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL, start_new_session=True,
-    )
-    state["custom_pid"] = child.pid
+    # The wrong identity is another program's: the fixture's own interpreter, not the runtime.
+    state["custom_pid"] = stand_in(
+        sys.executable if state.get("wrong_custom_process_identity") else parsed[0]
+    ).pid
 elif args[:2] == ["pane", "report-agent"]:
     state["harness"] = args[args.index("--agent") + 1]
     state["status"] = args[args.index("--state") + 1]

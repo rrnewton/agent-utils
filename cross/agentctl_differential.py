@@ -148,6 +148,18 @@ def _fixture_calls(root: Path) -> list[list[str]]:
     return cast(list[list[str]], values)
 
 
+def _fixture_process_alive(process_id: object) -> bool:
+    """Whether a fixture's stand-in process `process_id` still runs (a zombie does not)."""
+    if not isinstance(process_id, int):
+        return False
+    try:
+        process_stat = Path(f"/proc/{process_id}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    close = process_stat.rfind(")")
+    return close >= 0 and process_stat[close + 2:].split(maxsplit=1)[0] != "Z"
+
+
 def _retire_fixture_processes(case: PairCase) -> None:
     """Stop only custom children created by this differential's private Herdr fixtures."""
     process_ids: list[int] = []
@@ -1799,6 +1811,16 @@ def _muse14_status(harness: Harness, report: Report) -> None:
         len(list((root / "registry/agents/foreign/queue/inbox").glob("*.json"))) == 1
         for root in (case.python_root, case.rust_root)), "a staged Muse editor took input")
     _change(case, {"status": "idle", "screen": ""})
+    # The drain's recipient is the stand-in Muse this case launched. One that is gone is a
+    # fixture failure, not a difference between the editions, and says so (#1002).
+    gone = [edition for edition, root in (("Python", case.python_root), ("Rust", case.rust_root))
+            if not _fixture_process_alive(_state(root).get("custom_pid"))]
+    report.require("primary/muse14/fixture-alive-before-drain", not gone,
+                   f"fixture error in primary/muse14: the stand-in Muse of the {' and '.join(gone)} "
+                   "edition exited before the drain, so the drain compared nothing")
+    if gone:
+        _retire_fixture_processes(case)
+        return
     _pair(harness, report, case, "primary/muse14/resumed-drain", ("drain", "foreign", *_COMMON))
     report.require("primary/muse14/delivered-once-in-order", all(
         _submitted(root) == ["held while staged"]
