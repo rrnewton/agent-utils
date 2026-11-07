@@ -3289,6 +3289,14 @@ impl Worker<'_> {
     }
 }
 
+/// Whether an `--until-idle` donor may exit this pass: only when a claim
+/// was attempted and the queue genuinely held no job (`queue_empty`), no
+/// job is running, and the donor is not draining (cap 0). A failed claim
+/// is not emptiness: the donor stays and retries on its poll.
+fn until_idle_exits(until_idle: bool, queue_empty: bool, active: usize, cap: usize) -> bool {
+    until_idle && queue_empty && active == 0 && cap > 0
+}
+
 /// Run a donor: claim jobs from the queue through its route, validate them here, report
 /// receipts. Returns the exit status.
 pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
@@ -3557,6 +3565,12 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
             }
             let cap_text = cap.to_string();
             let mut claimed = false;
+            // A claim that was attempted and told us the queue holds no job
+            // for us: the only evidence on which `--until-idle` may exit. A
+            // failed claim (route timeout, queue busy) says nothing about
+            // emptiness, so it must not end an `--until-idle` donor; the
+            // poll at the foot of the loop is its retry back-off.
+            let mut queue_empty = false;
             // Draining: lease nothing, but say so to the queue, so its `donor status` shows the
             // cap. A queue too old to know `--drain` refuses the claim, which leases nothing too.
             if cap == 0 && !host_paused {
@@ -3606,14 +3620,19 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
                             active.fetch_sub(1, Ordering::SeqCst);
                         });
                     }
-                    Ok(Claimed { job: None }) => {}
+                    Ok(Claimed { job: None }) => queue_empty = true,
                     Err(error) => {
                         eprintln!("merge-queue donor {}: claim failed: {error}", options.name)
                     }
                 }
             }
             // A draining donor (cap 0) stays: it is idle by choice, not for want of work.
-            if options.until_idle && !claimed && active.load(Ordering::SeqCst) == 0 && cap > 0 {
+            if until_idle_exits(
+                options.until_idle,
+                queue_empty,
+                active.load(Ordering::SeqCst),
+                cap,
+            ) {
                 break;
             }
             if claimed {
@@ -4758,6 +4777,20 @@ mod unit {
         store.write(&job).unwrap();
         std::fs::remove_file(old_path).unwrap();
         job
+    }
+
+    #[test]
+    fn until_idle_exits_only_on_a_genuinely_empty_queue() {
+        // Genuinely empty, nothing running, not draining: exit.
+        assert!(until_idle_exits(true, true, 0, 1));
+        // A failed claim (queue_empty stays false) is not emptiness: stay.
+        assert!(!until_idle_exits(true, false, 0, 1));
+        // Work still running: stay even when the queue is empty.
+        assert!(!until_idle_exits(true, true, 1, 1));
+        // Draining (cap 0): idle by choice, not for want of work: stay.
+        assert!(!until_idle_exits(true, true, 0, 0));
+        // Not an --until-idle donor at all: never exits on idleness.
+        assert!(!until_idle_exits(false, true, 0, 1));
     }
 
     #[test]

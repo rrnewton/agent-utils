@@ -186,47 +186,50 @@ fn a_queued_probe_does_not_block_intake_or_other_decisions() {
     wait_for("the first donor job", Duration::from_secs(60), || {
         !jobs(&fx).is_empty()
     });
-    std::thread::scope(|scope| {
-        let d1 = scope.spawn(|| donor(&fx, &clone1, "d1"));
-        let d2 = scope.spawn(|| donor(&fx, &clone2, "d2"));
-        // Both batch jobs are published; the green one is gated, the red
-        // one's verdict is in behind it.
-        wait_for("two donor jobs", Duration::from_secs(60), || {
-            jobs(&fx).len() >= 2
-        });
-        // Let the green batch finish: it lands, the red is decided, and its
-        // probe is published and leased (gated) by the surviving donor.
-        std::fs::write(gates.join("slow"), "").unwrap();
-        wait_for("the green batch to land", Duration::from_secs(60), || {
-            item_status(&fx, 1) == "landed"
-        });
-        wait_for("the probe to be leased", Duration::from_secs(60), || {
-            jobs(&fx).len() >= 3 && jobs(&fx).iter().any(|job| job["state"] == "leased")
-        });
-        assert_eq!(item_status(&fx, 2), "queued");
-        assert!(
-            jobs(&fx).iter().any(|job| job["state"] == "leased"),
-            "the probe is still out: {:?}",
-            jobs(&fx)
-        );
-        // A recorded submit is applied at a free slot and its batch starts
-        // (a donor job is published for it) while the probe is still out.
-        fx.branch("c", &[("tests/c", "ok\n")]);
-        assert!(fx
-            .mq_ok(&["submit", "3", "--head", "c"])
-            .contains("recorded"));
-        wait_for("the intake batch job", Duration::from_secs(60), || {
-            jobs(&fx).len() >= 4
-        });
-        let d3 = scope.spawn(|| donor(&fx, &clone3, "d3"));
-        // Release the probe: the red rerun fails again, so #2 is ejected,
-        // and the intake batch lands after it.
-        std::fs::write(gates.join("probe"), "").unwrap();
-        let _ = d1.join();
-        let _ = d2.join();
-        let _ = d3.join();
+    // Persistent donors, killed below (see two_reds_probe_side_by_side:
+    // an `--until-idle` donor can exit before later jobs are published).
+    let mut d1 = spawn_donor(&fx, &clone1, "d1");
+    let mut d2 = spawn_donor(&fx, &clone2, "d2");
+    // Both batch jobs are published; the green one is gated, the red
+    // one's verdict is in behind it.
+    wait_for("two donor jobs", Duration::from_secs(60), || {
+        jobs(&fx).len() >= 2
     });
+    // Let the green batch finish: it lands, the red is decided, and its
+    // probe is published and leased (gated) by the surviving donor.
+    std::fs::write(gates.join("slow"), "").unwrap();
+    wait_for("the green batch to land", Duration::from_secs(60), || {
+        item_status(&fx, 1) == "landed"
+    });
+    wait_for("the probe to be leased", Duration::from_secs(60), || {
+        jobs(&fx).len() >= 3 && jobs(&fx).iter().any(|job| job["state"] == "leased")
+    });
+    assert_eq!(item_status(&fx, 2), "queued");
+    assert!(
+        jobs(&fx).iter().any(|job| job["state"] == "leased"),
+        "the probe is still out: {:?}",
+        jobs(&fx)
+    );
+    // A recorded submit is applied at a free slot and its batch starts
+    // (a donor job is published for it) while the probe is still out.
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    assert!(fx
+        .mq_ok(&["submit", "3", "--head", "c"])
+        .contains("recorded"));
+    wait_for("the intake batch job", Duration::from_secs(60), || {
+        jobs(&fx).len() >= 4
+    });
+    let mut d3 = spawn_donor(&fx, &clone3, "d3");
+    // Release the probe: the red rerun fails again, so #2 is ejected,
+    // and the intake batch lands after it.
+    std::fs::write(gates.join("probe"), "").unwrap();
     let (code, report, stderr) = finish(run);
+    d1.kill().unwrap();
+    let _ = d1.wait();
+    d2.kill().unwrap();
+    let _ = d2.wait();
+    d3.kill().unwrap();
+    let _ = d3.wait();
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(item_status(&fx, 1), "landed");
     assert_eq!(item_status(&fx, 2), "ejected");
@@ -295,26 +298,30 @@ fn two_reds_probe_side_by_side() {
     wait_for("the first donor job", Duration::from_secs(60), || {
         !jobs(&fx).is_empty()
     });
-    std::thread::scope(|scope| {
-        let d1 = scope.spawn(|| donor(&fx, &clone1, "d1"));
-        let d2 = scope.spawn(|| donor(&fx, &clone2, "d2"));
-        // Two batch jobs and both probe jobs exist, both probes leased,
-        // before either verdict is in.
-        wait_for("four donor jobs", Duration::from_secs(240), || {
-            jobs(&fx).len() >= 4
-        });
-        wait_for("both probes leased", Duration::from_secs(240), || {
-            jobs(&fx)
-                .iter()
-                .filter(|job| job["state"] == "leased")
-                .count()
-                >= 2
-        });
-        std::fs::write(gates.join("probe"), "").unwrap();
-        let _ = d1.join();
-        let _ = d2.join();
+    // Persistent donors, killed below: an `--until-idle` donor exits on
+    // its first empty claim, which can precede the second batch's
+    // publication, leaving one donor to serialise behind a gated probe
+    // while the other batch starves past its claim timeout.
+    let mut d1 = spawn_donor(&fx, &clone1, "d1");
+    let mut d2 = spawn_donor(&fx, &clone2, "d2");
+    // Two batch jobs and both probe jobs exist, both probes leased,
+    // before either verdict is in.
+    wait_for("four donor jobs", Duration::from_secs(240), || {
+        jobs(&fx).len() >= 4
     });
+    wait_for("both probes leased", Duration::from_secs(240), || {
+        jobs(&fx)
+            .iter()
+            .filter(|job| job["state"] == "leased")
+            .count()
+            >= 2
+    });
+    std::fs::write(gates.join("probe"), "").unwrap();
     let (code, report, stderr) = finish(run);
+    d1.kill().unwrap();
+    let _ = d1.wait();
+    d2.kill().unwrap();
+    let _ = d2.wait();
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(item_status(&fx, 1), "ejected", "{report}");
     assert_eq!(item_status(&fx, 2), "ejected", "{report}");
