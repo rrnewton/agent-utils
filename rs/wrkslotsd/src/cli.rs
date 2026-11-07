@@ -1431,7 +1431,7 @@ pub fn run() -> u8 {
             read_decision(&index, &slot).and_then(|decision| encode_value(&decision))
         }
         Command::Quickstart => {
-            print!("{QUICKSTART}\n");
+            println!("{QUICKSTART}");
             return 0;
         }
         Command::RetirementQueue {
