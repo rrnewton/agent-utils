@@ -1802,8 +1802,21 @@ pub fn restore<A: ManagedApi + ?Sized>(
                 if label.starts_with("parked:") {
                     continue;
                 }
+                // Parked labelling is only for lanes that did not come
+                // back (excluded/skipped); a duplicate of a lane that DID
+                // resume in place must be closed below, not labelled.
+                let disposition_of = |name: &str| {
+                    report["agents"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|row| row["name"].as_str() == Some(name))
+                        .and_then(|row| row["disposition"].as_str().map(str::to_owned))
+                };
                 let parked_lane = names.iter().find(|name| {
-                    label == **name && cwd_of(name).as_deref() == Some(info.cwd.as_str())
+                    label == **name
+                        && cwd_of(name).as_deref() == Some(info.cwd.as_str())
+                        && disposition_of(name).as_deref() == Some("parked")
                 });
                 if let (Some(name), Some(tab)) = (parked_lane, info.tab_id.as_deref()) {
                     if client.rename_tab(tab, &format!("parked: {name}")).is_ok() {
@@ -1815,7 +1828,12 @@ pub fn restore<A: ManagedApi + ?Sized>(
                     continue;
                 }
                 let duplicate = names.iter().find(|name| {
-                    label == **name && pane_of(name).is_some_and(|pane| claimed.contains(&pane))
+                    label == **name
+                        && pane_of(name).is_some_and(|pane| claimed.contains(&pane))
+                        && matches!(
+                            disposition_of(name).as_deref(),
+                            Some("resumed-in-place" | "resumed-fresh")
+                        )
                 });
                 if duplicate.is_some() && client.close_pane(&pane.pane_id).is_ok() {
                     tidy.push(json!({

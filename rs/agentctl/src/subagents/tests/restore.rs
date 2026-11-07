@@ -1662,6 +1662,91 @@ fn restore_resumes_a_claude_agent_whose_transcript_exists_or_cannot_be_checked()
     }
 }
 
+/// An auto-restored orphan shell whose tab names `lane`, in the lane's cwd.
+fn orphan_lane_pane(fixture: &Fixture) {
+    fixture.client.panes.lock().unwrap().push(Pane {
+        pane_id: "orphan".to_owned(),
+        tab_id: "orphan-tab".to_owned(),
+        workspace_id: "workspace".to_owned(),
+    });
+    fixture
+        .client
+        .labels
+        .lock()
+        .unwrap()
+        .insert("orphan-tab".to_owned(), "lane".to_owned());
+}
+
+#[test]
+fn restore_closes_an_orphan_duplicate_of_a_revived_lane() {
+    let fixture = Fixture::new();
+    dead_agent(&fixture);
+    orphan_lane_pane(&fixture);
+    let host = ScriptedHost::new();
+    let config = config(&fixture, None);
+    let registry = fixture.root.join("registry");
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(
+        report["agents"][0]["disposition"], "resumed-in-place",
+        "{report}"
+    );
+    assert_eq!(
+        report["tidy"],
+        json!([{
+            "pane_id": "orphan", "tab_id": "orphan-tab",
+            "cwd": fixture.root.display().to_string(),
+            "action": "closed-duplicate", "lane": "lane",
+        }]),
+        "{report}"
+    );
+    assert!(fixture
+        .client
+        .closed
+        .lock()
+        .unwrap()
+        .contains(&"orphan".to_owned()));
+}
+
+#[test]
+fn restore_labels_an_orphan_of_a_parked_lane_instead_of_closing_it() {
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture
+        .manager()
+        .start(
+            "lane",
+            &fixture.root,
+            StartOptions {
+                harness: "codex".to_owned(),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    orphan_lane_pane(&fixture);
+    let host = ScriptedHost::new();
+    let config = config(&fixture, None);
+    let registry = fixture.root.join("registry");
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(report["agents"][0]["disposition"], "parked", "{report}");
+    assert_eq!(
+        report["tidy"],
+        json!([{
+            "pane_id": "orphan", "tab_id": "orphan-tab",
+            "cwd": fixture.root.display().to_string(),
+            "action": "labelled-parked", "lane": "lane",
+        }]),
+        "{report}"
+    );
+    assert!(fixture.client.closed.lock().unwrap().is_empty());
+    assert_eq!(
+        fixture.client.labels.lock().unwrap()["orphan-tab"],
+        "parked: lane"
+    );
+}
+
 #[test]
 fn a_claude_transcript_verdict_needs_a_real_configuration_directory() {
     let root = std::env::temp_dir().join(format!("agentctl-verdict-{}", std::process::id()));
