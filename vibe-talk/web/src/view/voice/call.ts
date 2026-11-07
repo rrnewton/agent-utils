@@ -1948,7 +1948,7 @@ async function openConversation(options: {chat?: boolean} | undefined) {
  *
  * @param {WebSocket} socket the call's socket, already `session.socket`
  * @param {string} socketUrl the address it was opened on, for the reason a start failed
- * @param {any} resume what `fetchResume` answered for this call, null for nothing
+ * @param {Resume | null} resume what `fetchResume` answered for this call, null for nothing
  * @param {boolean} chat whether the conversation is typed
  * @param {ReconnectAttempt | null} [reconnect] `#352 voice-reconnect-on-bridge-error`: the reconnect
  *   this socket carries the call on. It opens nothing the call already has, and until its session
@@ -2571,7 +2571,7 @@ function drawSpoken(entry: LiveTurn) {
     const onFold = keepTurnFold(entry.li, li);
     entry.li.replaceWith(li);
     // Without moving the list: a reader scrolled up the call is not taken back to the row each frame.
-    if (onFold) /** @type {any} */ (li).foldEntry!.fold.focus({ preventScroll: true });
+    if (onFold) li.foldEntry!.fold.focus({ preventScroll: true });
     entry.li = li;
     deps.applySearch();
     deps.followIfPinned(pinned);
@@ -3214,7 +3214,7 @@ const AFTER_HANG_UP_MARK = "(text arrived after you hung up)";
  *
  * @param {WebSocket} socket
  * @param {string | null} conversationId
- * @param {Map<number, {li?: any, entry?: any}>} rows each turn's row on screen: a note's, or a live turn's entry
+ * @param {Map<number, {li?: VoiceRow, entry?: LiveTurn}>} rows each turn's row on screen: a note's, or a live turn's entry
  */
 function listenForTextAfterHangUp(socket: WebSocket, conversationId: string | null, rows: Map<number, {li?: VoiceRow; entry?: LiveTurn}>) {
   /** @type {Map<number | null, string>} */
@@ -3315,7 +3315,7 @@ function fileTurnIn(conversationId: string | null, speaker: string, text: string
  * @property {"relay" | "typed" | "none" | "unsent"} resend what goes to the new session again
  * @property {{text: string, kind: "notice", relays: {channel: string}[]} | null} notice the page's
  *   word on a send card the lost session never answered
- * @property {{resume: any, why: string | null} | null} recap what the new session is to be handed
+ * @property {{resume: Resume | null, why: string | null} | null} recap what the new session is to be handed
  * @property {Element | null} seam the transcript's line for it, once drawn
  */
 
@@ -3545,7 +3545,7 @@ async function continueReconnect(attempt: ReconnectAttempt) {
  * Never throws. Unlike a new call's (`fetchResume`), it says nothing to Settings: how the call
  * started is unchanged.
  *
- * @returns {Promise<{resume: any, why: string | null}>}
+ * @returns {Promise<{resume: Resume | null, why: string | null}>}
  */
 async function fetchCallRecap() {
   if (!deps.resumeAllowed || !deps.resumeWanted()) return { resume: null, why: "off" };
@@ -4511,7 +4511,7 @@ function endCall(endedBy: "hang_up" | "error_frame" | "reconnect_limit" | "recon
   const textOwed = endedBy === "hang_up" && session.protocol === "vibe-talk-v1" && !session.chat &&
     (session.replyArriving || session.noTextRows.size > 0);
   if (textOwed) {
-    /** @type {Map<number, {li?: any, entry?: any}>} */
+    /** @type {Map<number, {li?: VoiceRow, entry?: LiveTurn}>} */
     const rows: Map<number, { li?: VoiceRow; entry?: LiveTurn; }> = new Map();
     for (const [turn, li] of session.noTextRows) rows.set(turn, { li });
     for (const entry of session.liveTurns.values()) {
