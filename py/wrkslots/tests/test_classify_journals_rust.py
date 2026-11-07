@@ -265,6 +265,120 @@ def test_dead_non_create_journal_still_refuses_in_both_editions(
     assert "interrupted" in result.stderr
 
 
+def _write_seal(
+    root: Path,
+    actor: dict[str, object],
+    *,
+    kind: str = "validate-batch-seal",
+    with_target: bool = True,
+) -> Path:
+    control = root / "worktrees"
+    targets: list[dict[str, object]] = []
+    if with_target:
+        slot_dir = control / "validate" / "target"
+        slot_dir.mkdir(parents=True, exist_ok=True)
+        info = slot_dir.stat()
+        targets = [
+            {
+                "slot": "target",
+                "generation": 1,
+                "path": "worktrees/validate/target",
+                "original_mode": 0o755,
+                "identity": [info.st_dev, info.st_ino, 0o40755],
+            }
+        ]
+    seal = control / "VALIDATE-BATCH-SEAL.node-a.journal"
+    seal.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "kind": kind,
+                "machine": "node-a",
+                "created_at": "2026-11-07T00:00:00+00:00",
+                "actor": actor,
+                "targets": targets,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return seal
+
+
+def _python_main_classify(root: Path) -> tuple[int, str, str]:
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = wrkslots_cli.main(
+            [
+                "--project-root", str(root), "--machine", "node-a",
+                "classify-create-journals", "slot-c", "--agent", "agent-other",
+                "--slot-type", "agent", "--format", "json",
+            ]
+        )
+    return rc, out.getvalue(), err.getvalue()
+
+
+def test_classify_live_seal_structured_blocking_reason_matches_python(
+    tmp_path: Path,
+) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    _write_seal(rust_root, _live_identity(os.getpid()))
+    _write_seal(oracle_root, _live_identity(os.getpid()))
+    rc, out, err = _python_main_classify(oracle_root)
+    assert rc == 3, err
+    assert "interrupted validation-batch seal recorded" in err
+    result = _rust_classify(rust_root, fmt="json")
+    assert result.returncode == 3, result.stderr
+    assert "interrupted validation-batch seal recorded" in result.stderr
+    assert _norm(result.stdout, rust_root) == _norm(out, oracle_root)
+    reasons = json.loads(result.stdout)["blocking_reasons"]
+    assert reasons[0]["kind"] == "validate-batch-seal"
+    assert reasons[0]["operation"] == "remove-validate-batch"
+    assert reasons[0]["actor_state"] == "live"
+    assert reasons[0]["targets"] == ["target"]
+
+
+def test_classify_dead_seal_is_not_blocking_in_both_editions(
+    tmp_path: Path,
+) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    _write_seal(rust_root, _dead_identity())
+    _write_seal(oracle_root, _dead_identity())
+    rc, out, err = _python_main_classify(oracle_root)
+    assert rc == 0, err
+    result = _rust_classify(rust_root, fmt="json")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["blocking"] is False
+    assert "blocking_reasons" not in json.loads(result.stdout)
+    assert json.loads(out)["blocking"] is False
+
+
+def test_classify_unknown_and_other_kind_seals_match_python(
+    tmp_path: Path,
+) -> None:
+    for label, actor, kind, want_kind, want_state in [
+        ("unknown", {**_live_identity(os.getpid()), "host_id": "0" * 32},
+         "validate-batch-seal", "validate-batch-seal", "unknown"),
+        ("other", _live_identity(os.getpid()), "some-other-seal", "other", "unknown"),
+    ]:
+        rust_root = _fixture(tmp_path / f"rust-{label}")
+        oracle_root = _fixture(tmp_path / f"oracle-{label}")
+        _write_seal(rust_root, actor, kind=kind)
+        _write_seal(oracle_root, actor, kind=kind)
+        rc, out, err = _python_main_classify(oracle_root)
+        assert rc == 3, (label, err)
+        result = _rust_classify(rust_root, fmt="json")
+        assert result.returncode == 3, (label, result.stderr)
+        assert _norm(result.stdout, rust_root) == _norm(out, oracle_root)
+        reason = json.loads(result.stdout)["blocking_reasons"][0]
+        assert reason["kind"] == want_kind, label
+        assert reason["actor_state"] == want_state, label
+
+
 def test_classify_journals_empty_matches_python(tmp_path: Path) -> None:
     rust_root = _fixture(tmp_path / "rust")
     oracle_root = _fixture(tmp_path / "oracle")

@@ -443,7 +443,20 @@ pub(crate) enum ClassifyError {
         pid: i64,
         journal: String,
     },
+    /// A non-orphaned validation-batch seal blocks classification
+    /// (c4c4c64a): `payload` is the structured JSON for stdout in
+    /// JSON mode, `first` names the first blocking seal path.
+    Blocked {
+        first: String,
+        payload: Option<String>,
+    },
     Other(String),
+}
+
+impl From<String> for ClassifyError {
+    fn from(message: String) -> Self {
+        ClassifyError::Other(message)
+    }
 }
 
 impl std::fmt::Display for ClassifyError {
@@ -455,9 +468,100 @@ impl std::fmt::Display for ClassifyError {
                     "busy: live '{kind}' mutation {journal} by pid {pid}; retry"
                 )
             }
+            ClassifyError::Blocked { first, .. } => {
+                write!(
+                    formatter,
+                    "interrupted validation-batch seal recorded in {first}; run 'wrkslots recover' first"
+                )
+            }
             ClassifyError::Other(message) => write!(formatter, "{message}"),
         }
     }
+}
+
+/// Whether the seal at `path` was left by a process proven dead,
+/// mirroring `_validate_batch_seal_orphaned`: valid seal, actor on
+/// this host and boot, process dead, and no finish journal paired
+/// with it. Any doubt keeps the seal binding.
+fn seal_orphaned(cfg: &Cfg, path: &Path) -> bool {
+    let Ok(value) = crate::audit_state::read_seal_json(path) else {
+        return false;
+    };
+    let Ok((_machine, _targets)) = crate::audit_state::seal_journal(cfg, path, &value) else {
+        return false;
+    };
+    let Some(actor) = value.get("actor") else {
+        return false;
+    };
+    let Some(identity) = crate::status_state::identity_from_value(actor) else {
+        return false;
+    };
+    if crate::status_state::process_state(Some(&identity)).0 != "dead" {
+        return false;
+    }
+    // A paired finish keeps the seal binding; any outstanding finish
+    // journal is treated as potentially paired (conservative).
+    let machines = BTreeSet::from([cfg.machine.clone()]);
+    if let Ok(paths) = outstanding(&cfg.control, Some(&machines)) {
+        for other in &paths {
+            if let Ok((bytes, _id)) = read_identity(other) {
+                if let Ok(raw) = strict_obj(&bytes) {
+                    if raw.get("kind").and_then(Value::as_str) == Some("finish") {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Structured reasons each non-orphaned seal blocks classification,
+/// mirroring `_classify_blocking_seal_reasons` (c4c4c64a).
+fn seal_blocking_reasons(cfg: &Cfg) -> Vec<Value> {
+    let mut reasons: Vec<Value> = Vec::new();
+    for path in crate::heartbeat_write::seal_paths(cfg) {
+        if seal_orphaned(cfg, &path) {
+            continue;
+        }
+        let mut kind = "other".to_string();
+        let mut operation = "unknown".to_string();
+        let mut actor_state = "unknown".to_string();
+        let mut targets: Vec<String> = Vec::new();
+        let parsed_seal = crate::audit_state::read_seal_json(&path).and_then(|value| {
+            crate::audit_state::seal_journal(cfg, &path, &value).map(|parsed| (value, parsed))
+        });
+        match parsed_seal {
+            Ok((value, parsed)) => {
+                kind = "validate-batch-seal".to_string();
+                operation = "remove-validate-batch".to_string();
+                targets = parsed.1.iter().map(|(slot, _g, _p)| slot.clone()).collect();
+                if let Some(actor) = value.get("actor") {
+                    if let Some(identity) = crate::status_state::identity_from_value(actor) {
+                        let state = crate::status_state::process_state(Some(&identity)).0;
+                        if state == "live" || state == "dead" {
+                            actor_state = state;
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                if let Ok(value) = crate::audit_state::read_seal_json(&path) {
+                    if value.get("kind").and_then(Value::as_str) == Some("validate-batch-seal") {
+                        kind = "validate-batch-seal".to_string();
+                    }
+                }
+            }
+        }
+        reasons.push(json!({
+            "actor_state": actor_state,
+            "kind": kind,
+            "operation": operation,
+            "path": path.to_string_lossy(),
+            "targets": targets,
+        }));
+    }
+    reasons
 }
 
 fn classify_one(
@@ -920,7 +1024,6 @@ pub(crate) fn classify_create_journals(
         format_json,
         all_machines,
     )
-    .map_err(ClassifyError::Other)
 }
 
 fn classify_create_journals_inner(
@@ -931,15 +1034,42 @@ fn classify_create_journals_inner(
     agent: &str,
     format_json: bool,
     all_machines: bool,
-) -> Result<String> {
+) -> std::result::Result<String, ClassifyError> {
     let (cfg, _selected) = load_cfg(root, machine_override)?;
     let config = load_config(root, machine_override)?;
     if !matches!(slot_type, "agent" | "validate") {
-        return Err("slot type must be one of agent, validate".to_string());
+        return Err(ClassifyError::Other(
+            "slot type must be one of agent, validate".to_string(),
+        ));
     }
     let slot = validate_name(slot, "slot")?.to_string();
     let agent = validate_name(agent, "agent")?.to_string();
     refuse_partial_state_allow_seals(&cfg.control)?;
+    // Seal gate (c4c4c64a): a non-orphaned seal refuses, with the
+    // structured reasons on stdout in JSON mode.
+    let reasons = seal_blocking_reasons(&cfg);
+    if !reasons.is_empty() {
+        let first = reasons[0]
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let payload = if format_json {
+            let body = json!({
+                "blocking": true,
+                "blocking_reasons": reasons,
+                "journals": [],
+                "schema": 2,
+            });
+            Some(format!(
+                "{}\n",
+                crate::batch_text::py_compact_pub(&sort_keys(&body))
+            ))
+        } else {
+            None
+        };
+        return Err(ClassifyError::Blocked { first, payload });
+    }
     crate::hold_write::validate_global(root, &cfg)?;
     // Load every machine's ACTIVE/ARCHIVED documents.
     let mut states: Vec<(String, Vec<Value>)> = Vec::new();
@@ -997,38 +1127,38 @@ fn classify_create_journals_inner(
         let mut seen_agents: BTreeSet<String> = BTreeSet::new();
         for row in &rows {
             if !seen_slots.insert((row.machine.clone(), row.slot.clone())) {
-                return Err(format!(
+                return Err(ClassifyError::Other(format!(
                     "multiple interrupted creates claim {}/{}",
                     row.machine, row.slot
-                ));
+                )));
             }
             if row.slot_type == "agent" && !seen_agents.insert(row.agent.clone()) {
-                return Err(format!(
+                return Err(ClassifyError::Other(format!(
                     "multiple interrupted creates claim agent {:?}",
                     row.agent
-                ));
+                )));
             }
         }
     }
     let target = slot_directory(&cfg, &slot, slot_type)?;
     for row in &rows {
         if row.slot == slot {
-            return Err(format!(
+            return Err(ClassifyError::Other(format!(
                 "interrupted create already targets slot {slot:?}; recover that exact slot"
-            ));
+            )));
         }
         if slot_type == "agent" && row.slot_type == "agent" && row.agent == agent {
-            return Err(format!(
+            return Err(ClassifyError::Other(format!(
                 "interrupted create already belongs to agent {agent:?}; recover it first"
-            ));
+            )));
         }
         if within(&target, &row.slot_path) || within(&row.slot_path, &target) {
-            return Err(format!(
+            return Err(ClassifyError::Other(format!(
                 "requested slot path {} overlaps interrupted create {}/{}",
                 target.display(),
                 row.machine,
                 row.slot
-            ));
+            )));
         }
     }
     let journals: Vec<Value> = rows

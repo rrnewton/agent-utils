@@ -5758,7 +5758,7 @@ fn cleanup_target(cfg: &Cfg, value: &Value, label: &str) -> Result<(String, i64,
 }
 
 /// One seal journal, validated like `_validate_batch_seal_journal`.
-fn seal_journal(cfg: &Cfg, path: &Path, value: &Value) -> Result<(String, SealTargets)> {
+pub(crate) fn seal_journal(cfg: &Cfg, path: &Path, value: &Value) -> Result<(String, SealTargets)> {
     let label = "validation-batch seal journal";
     let raw = as_mapping(value, label)?;
     exact_keys(
@@ -5819,7 +5819,7 @@ fn seal_journal(cfg: &Cfg, path: &Path, value: &Value) -> Result<(String, SealTa
     Ok((machine, targets))
 }
 
-fn read_seal_json(path: &Path) -> Result<Value> {
+pub(crate) fn read_seal_json(path: &Path) -> Result<Value> {
     refuse_symlink(path, "validation-batch seal journal")?;
     let text = std::fs::read_to_string(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
