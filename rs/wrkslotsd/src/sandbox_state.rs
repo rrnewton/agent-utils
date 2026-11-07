@@ -329,6 +329,386 @@ pub(crate) fn all_slots_properties(limits: &SandboxLimits) -> Vec<String> {
     properties
 }
 
+pub(crate) const SETTING_KEYS: [&str; 14] = [
+    "isolation",
+    "home",
+    "home_shared",
+    "home_private",
+    "home_private_files",
+    "home_hidden",
+    "home_expose",
+    "outputs",
+    "read_write",
+    "env",
+    "tmp_size",
+    "protect_system",
+    "coordinator_writable",
+    "limits",
+];
+
+const RENAMED_KEYS: [(&str, &str); 9] = [
+    ("home_writable", "home_private"),
+    ("home_paths", "home_expose (with home: hidden)"),
+    ("memory_max", "limits.memory_max"),
+    ("memory_high", "limits.memory_high"),
+    ("cpu_quota", "limits.cpu_quota"),
+    ("tasks_max", "limits.tasks_max"),
+    ("io_weight", "limits.io_weight"),
+    ("all_slots_memory_max", "limits.all_slots_memory_max"),
+    ("all_slots_cpu_quota", "limits.all_slots_cpu_quota"),
+];
+
+/// The full `configuration.sandbox` section, mirroring Python
+/// `SandboxSettings` with its defaults.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SandboxSettings {
+    pub(crate) isolation: String,
+    pub(crate) home: String,
+    pub(crate) home_shared: Vec<String>,
+    pub(crate) home_private: Vec<String>,
+    pub(crate) home_private_files: Vec<String>,
+    pub(crate) home_hidden: Vec<String>,
+    pub(crate) home_expose: Vec<String>,
+    pub(crate) outputs: Vec<String>,
+    pub(crate) read_write: Vec<String>,
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) tmp_size: String,
+    pub(crate) protect_system: bool,
+    pub(crate) coordinator_writable: String,
+    pub(crate) limits: SandboxLimits,
+}
+
+impl Default for SandboxSettings {
+    fn default() -> Self {
+        let strings = |items: &[&str]| items.iter().map(|item| item.to_string()).collect();
+        Self {
+            isolation: "userns".to_string(),
+            home: "ro".to_string(),
+            home_shared: strings(&[
+                ".claude",
+                ".codex",
+                ".muse",
+                ".config/muse",
+                ".config/opencode",
+                ".local/share/opencode",
+                ".local/state/herdr",
+                ".local/share/muse",
+                ".cargo/registry",
+                ".cargo/git",
+            ]),
+            home_private: strings(&[".cache", ".buck"]),
+            home_private_files: strings(&[".claude.json"]),
+            home_hidden: strings(&[
+                ".ssh",
+                ".gnupg",
+                ".aws",
+                ".azure",
+                ".kube",
+                ".docker/config.json",
+                ".netrc",
+                ".git-credentials",
+                ".pgpass",
+                ".arcrc",
+                ".config/gh/hosts.yml",
+                ".config/gcloud",
+            ]),
+            home_expose: strings(&["bin", ".local/bin"]),
+            outputs: strings(&["ai_docs", "experiments"]),
+            read_write: Vec::new(),
+            env: Vec::new(),
+            tmp_size: "16G".to_string(),
+            protect_system: true,
+            coordinator_writable: "worktrees".to_string(),
+            limits: SandboxLimits::default(),
+        }
+    }
+}
+
+fn str_tuple(value: Option<&Value>, label: &str) -> Result<Vec<String>, String> {
+    match value {
+        None => Ok(Vec::new()),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::new();
+            for item in items {
+                let Some(text) = item.as_str() else {
+                    return Err(format!("{label} must be a list of strings"));
+                };
+                out.push(text.to_string());
+            }
+            Ok(out)
+        }
+        _ => Err(format!("{label} must be a list of strings")),
+    }
+}
+
+fn relative_ok(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && value != "."
+        && !value.split('/').any(|part| part == "..")
+}
+
+fn relative_list(
+    map: &serde_json::Map<String, Value>,
+    key: &str,
+    default: &[String],
+) -> Result<Vec<String>, String> {
+    let label = format!("configuration.sandbox.{key}");
+    let values = match map.get(key) {
+        None => default.to_vec(),
+        other => str_tuple(other, &label)?,
+    };
+    let mut out: Vec<String> = Vec::new();
+    for value in values {
+        if !relative_ok(&value) {
+            return Err(format!(
+                "{label} entries must be relative paths without '..': '{value}'"
+            ));
+        }
+        if !out.contains(&value) {
+            out.push(value);
+        }
+    }
+    Ok(out)
+}
+
+fn tmp_size_ok(value: &str) -> bool {
+    // Python `_TMP_SIZE_RE`: ^(\d+[KMGT]?|\d+%)$
+    let number = value
+        .strip_suffix('%')
+        .unwrap_or_else(|| value.strip_suffix(['K', 'M', 'G', 'T']).unwrap_or(value));
+    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Validate a `configuration.sandbox` mapping, mirroring Python
+/// `settings_from_obj` with its error strings.
+pub(crate) fn settings_from_obj(raw: &Value) -> Result<SandboxSettings, String> {
+    let Some(map) = raw.as_object() else {
+        return Err("configuration.sandbox must be an object".to_string());
+    };
+    let mut unknown: Vec<&String> = map
+        .keys()
+        .filter(|key| !SETTING_KEYS.contains(&key.as_str()))
+        .collect();
+    unknown.sort();
+    if !unknown.is_empty() {
+        let hints: Vec<String> = unknown
+            .iter()
+            .map(
+                |key| match RENAMED_KEYS.iter().find(|(old, _)| *old == key.as_str()) {
+                    Some((_, new)) => format!("{key} (now {new})"),
+                    None => key.to_string(),
+                },
+            )
+            .collect();
+        return Err(format!(
+            "configuration.sandbox has unknown keys: {}",
+            hints.join(", ")
+        ));
+    }
+    let defaults = SandboxSettings::default();
+    let isolation = map
+        .get("isolation")
+        .and_then(Value::as_str)
+        .unwrap_or(&defaults.isolation);
+    if !ISOLATIONS.contains(&isolation) {
+        let hint = if isolation == "namespace" {
+            " (namespace was renamed userns)"
+        } else {
+            ""
+        };
+        return Err(format!(
+            "configuration.sandbox.isolation must be one of {}{hint}",
+            ISOLATIONS.join(", ")
+        ));
+    }
+    let home = map
+        .get("home")
+        .and_then(Value::as_str)
+        .unwrap_or(&defaults.home);
+    if !HOME_MODES.contains(&home) {
+        let hint = if matches!(home, "select" | "none") {
+            " (use hidden with home_expose)"
+        } else {
+            ""
+        };
+        return Err(format!(
+            "configuration.sandbox.home must be one of {}{hint}",
+            HOME_MODES.join(", ")
+        ));
+    }
+    let protect = match map.get("protect_system") {
+        None => defaults.protect_system,
+        Some(Value::Bool(flag)) => *flag,
+        _ => return Err("configuration.sandbox.protect_system must be true or false".to_string()),
+    };
+    let tmp_size = map
+        .get("tmp_size")
+        .and_then(Value::as_str)
+        .unwrap_or(&defaults.tmp_size);
+    if !tmp_size_ok(tmp_size) {
+        return Err(format!(
+            "configuration.sandbox.tmp_size must look like 16G or 50%, not '{tmp_size}'"
+        ));
+    }
+    let scope = map
+        .get("coordinator_writable")
+        .and_then(Value::as_str)
+        .unwrap_or(&defaults.coordinator_writable);
+    if !COORDINATOR_SCOPES.contains(&scope) {
+        return Err(format!(
+            "configuration.sandbox.coordinator_writable must be one of {}",
+            COORDINATOR_SCOPES.join(", ")
+        ));
+    }
+    let mut env = defaults.env.clone();
+    if let Some(raw_env) = map.get("env") {
+        let Some(env_map) = raw_env.as_object() else {
+            return Err(
+                "configuration.sandbox.env must be an object of NAME: value strings".to_string(),
+            );
+        };
+        env = Vec::new();
+        for (key, item) in env_map {
+            let valid_name = !key.is_empty()
+                && key.bytes().enumerate().all(|(index, byte)| {
+                    byte.is_ascii_alphabetic()
+                        || byte == b'_'
+                        || (index > 0 && byte.is_ascii_digit())
+                });
+            if !valid_name {
+                return Err(format!(
+                    "configuration.sandbox.env has an invalid variable name: '{key}'"
+                ));
+            }
+            let Some(text) = item.as_str() else {
+                return Err(format!(
+                    "configuration.sandbox.env.{key} must be a one-line string"
+                ));
+            };
+            if text.contains('\n') || text.contains('\0') {
+                return Err(format!(
+                    "configuration.sandbox.env.{key} must be a one-line string"
+                ));
+            }
+            env.push((key.clone(), text.to_string()));
+        }
+    }
+    let limits = match map.get("limits") {
+        None => defaults.limits.clone(),
+        Some(raw_limits) => limits_from_obj(raw_limits)?,
+    };
+    let read_write_label = "configuration.sandbox.read_write";
+    let mut read_write: Vec<String> = Vec::new();
+    for item in str_tuple(map.get("read_write"), read_write_label)? {
+        if !(item.starts_with('/') || item == "~" || item.starts_with("~/")) {
+            return Err(format!(
+                "{read_write_label} entries must be absolute or ~/-relative paths: '{item}'"
+            ));
+        }
+        if !read_write.contains(&item) {
+            read_write.push(item);
+        }
+    }
+    Ok(SandboxSettings {
+        isolation: isolation.to_string(),
+        home: home.to_string(),
+        home_shared: relative_list(map, "home_shared", &defaults.home_shared)?,
+        home_private: relative_list(map, "home_private", &defaults.home_private)?,
+        home_private_files: {
+            let values = relative_list(map, "home_private_files", &defaults.home_private_files)?;
+            for value in &values {
+                if value.contains('/') {
+                    return Err(format!(
+                        "configuration.sandbox.home_private_files entries must be top-level $HOME names: '{value}'"
+                    ));
+                }
+            }
+            values
+        },
+        home_hidden: relative_list(map, "home_hidden", &defaults.home_hidden)?,
+        home_expose: relative_list(map, "home_expose", &defaults.home_expose)?,
+        outputs: relative_list(map, "outputs", &defaults.outputs)?,
+        read_write,
+        env,
+        tmp_size: tmp_size.to_string(),
+        protect_system: protect,
+        coordinator_writable: scope.to_string(),
+        limits,
+    })
+}
+
+/// The full JSON form of the settings, mirroring Python
+/// `settings_to_obj` (every key spelled out).
+pub(crate) fn settings_to_obj(settings: &SandboxSettings) -> Value {
+    json!({
+        "isolation": settings.isolation,
+        "home": settings.home,
+        "home_shared": settings.home_shared,
+        "home_private": settings.home_private,
+        "home_private_files": settings.home_private_files,
+        "home_hidden": settings.home_hidden,
+        "home_expose": settings.home_expose,
+        "outputs": settings.outputs,
+        "read_write": settings.read_write,
+        "env": settings
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), json!(value)))
+            .collect::<serde_json::Map<String, Value>>(),
+        "tmp_size": settings.tmp_size,
+        "protect_system": settings.protect_system,
+        "coordinator_writable": settings.coordinator_writable,
+        "limits": limits_to_obj(&settings.limits),
+    })
+}
+
+/// The `sandbox` section for a new project, mirroring Python
+/// `default_config_obj`.
+pub(crate) fn default_config_obj() -> Value {
+    settings_to_obj(&SandboxSettings::default())
+}
+
+/// Add every missing default key, mirroring Python `merge_defaults`:
+/// present keys are never changed, a present `limits` object gets
+/// only its missing limit keys. Returns the merged section and the
+/// dotted names added.
+pub(crate) fn merge_defaults(existing: &Value) -> Result<(Value, Vec<String>), String> {
+    let Some(map) = existing.as_object() else {
+        return Err("configuration.sandbox must be an object".to_string());
+    };
+    let mut merged = map.clone();
+    let mut added = Vec::new();
+    let defaults = default_config_obj();
+    let default_map = defaults.as_object().expect("default object");
+    for (key, value) in default_map {
+        match merged.get(key) {
+            None => {
+                merged.insert(key.clone(), value.clone());
+                added.push(key.clone());
+            }
+            Some(current) if key == "limits" => {
+                if let (Some(current_map), Some(default_limits)) =
+                    (current.as_object(), value.as_object())
+                {
+                    let mut limits = current_map.clone();
+                    for (limit_key, limit_value) in default_limits {
+                        if !limits.contains_key(limit_key) {
+                            limits.insert(limit_key.clone(), limit_value.clone());
+                            added.push(format!("limits.{limit_key}"));
+                        }
+                    }
+                    merged.insert(key.clone(), Value::Object(limits));
+                }
+            }
+            _ => {}
+        }
+    }
+    // The oracle validates the merged section before returning it.
+    settings_from_obj(&Value::Object(merged.clone()))?;
+    Ok((Value::Object(merged), added))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +771,25 @@ mod tests {
         );
         assert!(limits_from_obj(&json!({"bogus": 1})).is_err());
         assert!(limits_from_obj(&json!({"memory_max": "lots"})).is_err());
+    }
+
+    #[test]
+    fn settings_round_trip_and_merge() {
+        let settings = settings_from_obj(&json!({})).expect("defaults");
+        assert_eq!(settings.isolation, "userns");
+        assert_eq!(settings.home, "ro");
+        assert_eq!(settings.tmp_size, "16G");
+        let obj = settings_to_obj(&settings);
+        assert_eq!(obj["limits"]["tasks_max"], 8192);
+        assert_eq!(obj["coordinator_writable"], "worktrees");
+        let parsed = settings_from_obj(&obj).expect("round trip");
+        assert_eq!(parsed, settings);
+
+        let (merged, added) = merge_defaults(&json!({"isolation": "root"})).expect("merge");
+        assert_eq!(merged["isolation"], "root");
+        assert!(added.contains(&"limits".to_string()), "{added:?}");
+        assert!(settings_from_obj(&json!({"isolation": "namespace"})).is_err());
+        let renamed = settings_from_obj(&json!({"memory_max": "32G"})).expect_err("renamed");
+        assert!(renamed.contains("limits.memory_max"), "{renamed}");
     }
 }
