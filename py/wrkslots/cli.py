@@ -294,6 +294,7 @@ _FINISH_JOURNAL_OPTIONAL = frozenset(
         "validation_removal_proof",
         "nested_git_evidence",
         "archive_nested_cache_repositories",
+        "removing",
     }
 )
 _LEGACY_VALIDATE_JOURNAL_REQUIRED = frozenset(
@@ -25943,6 +25944,66 @@ def _remove_preconditions(
     return slot_path, final_checkouts
 
 
+def _checkout_registration_gone(vcs: _GitVcs, repository: Path, path: Path) -> bool:
+    """Whether `path`'s Git admin registration is gone while its files remain.
+
+    A linked worktree whose `.git` file names an admin directory that no
+    longer exists, and that its repository no longer lists, has no Git
+    registration left to judge: `git worktree remove` deleted the
+    registration as part of removing the checkout, so an actor that died
+    between that deletion and the file deletion leaves exactly this.
+    """
+
+    git_file = path / ".git"
+    try:
+        if not git_file.is_file() or git_file.is_symlink():
+            return False
+        text = git_file.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return False
+    if not text.startswith("gitdir:"):
+        return False
+    admin = Path(text[len("gitdir:"):].strip())
+    if not admin.is_absolute():
+        admin = path / admin
+    if admin.exists():
+        return False
+    try:
+        listed = vcs.listed_worktrees(repository)
+    except Refusal:
+        return False
+    return path.absolute() not in listed
+
+
+def _prepared_finish_journal(config: Config, record: ActiveRecord) -> bool:
+    """Whether a digest-matching prepared finish journal proves this removal.
+
+    The journal is written before the path fence and before any checkout
+    is removed, so its presence with this exact record proves reclaim
+    already judged the slot and the destructive sequence began; a
+    checkout whose registration is gone is at that sequence's midpoint,
+    not in an unjudged state.
+    """
+
+    for candidate in (
+        _finish_journal_path(config, record.slot),
+        _journal_path(config),
+    ):
+        try:
+            raw = _read_json(candidate, "finish journal")
+        except (OSError, Refusal, StateError):
+            continue
+        if not isinstance(raw, dict) or raw.get("kind") != "finish":
+            continue
+        try:
+            journal_record = _record_from_obj(raw["record"], "finish journal.record")
+        except (KeyError, Refusal, StateError):
+            continue
+        if _record_sha256(journal_record) == _record_sha256(record):
+            return True
+    return False
+
+
 def _reclaim_preconditions(
     config: Config,
     record: ActiveRecord,
@@ -25961,7 +26022,29 @@ def _reclaim_preconditions(
 
     _assert_record_paths(config, record)
     slot_path = _assert_slot_contents(config, record)
-    _assert_no_uncommitted_handoffs(config, record, slot_path, vcs)
+    # A validate checkout whose Git registration is already gone is at the
+    # midpoint of a removal a prepared finish journal proves began (see
+    # _prepared_finish_journal): it has no Git left to judge, and its files
+    # are residue for the fence to archive.  Agent checkouts keep refusing:
+    # authored work cannot be proven absent without Git.  #995.
+    abandoned: set[str] = set()
+    if record.slot_type == "validate" and _prepared_finish_journal(config, record):
+        for checkout in record.checkouts:
+            checkout_path = _stored_path(config, checkout.path, "checkout path")
+            _rel, checkout_repository = _stored_repository_path(
+                config, checkout.repository
+            )
+            if _checkout_registration_gone(vcs, checkout_repository, checkout_path):
+                abandoned.add(checkout.name)
+    _assert_no_uncommitted_handoffs(
+        config,
+        record,
+        slot_path,
+        vcs,
+        checkouts=tuple(
+            item for item in record.checkouts if item.name not in abandoned
+        ),
+    )
     _assert_handoff_read(config, record, slot_path)
     use_check_record = _record_for_slot_use_check(
         record,
@@ -25996,6 +26079,9 @@ def _reclaim_preconditions(
     for checkout in record.checkouts:
         path = _stored_path(config, checkout.path, "checkout path")
         _relative, repository = _stored_repository_path(config, checkout.repository)
+        if checkout.name in abandoned:
+            final.append(dataclasses.replace(checkout, head=checkout.head))
+            continue
         head = vcs.verify_existing_worktree(repository, path)
         # A drifted checkout was archived locally under its found branch and
         # remote (_CheckoutDrift); it must still differ exactly that way.
@@ -38482,6 +38568,7 @@ def _finish_journal_payload(
         "fenced": fenced.relative_to(config.root).as_posix(),
         "original_mode": original_mode,
         "removed": list(removed),
+        "removing": [],
         "salvage": [dict(item) for item in finish.salvage],
         "validate_complete": finish.validate_complete,
         "record": _record_to_obj(record),
@@ -40281,6 +40368,12 @@ def _begin_or_resume_path_fence(
             continue
         if _git_removal_finished_at_bind_root(config, record.slot, checkout, path, vcs):
             continue
+        if record.slot_type == "validate" and _checkout_registration_gone(
+            vcs, _stored_repository_path(config, checkout.repository)[1], path
+        ):
+            # #995: no registration left to repair; the residue is archived
+            # and the checkout judged removed in _finish_remove_paths.
+            continue
         if path.exists() or path.is_symlink():
             _repair_registration_at_slot(config, record, checkout, fenced, vcs)
     # A resumed fence (the deferred deletion of #894, or recovery) has
@@ -40292,6 +40385,40 @@ def _begin_or_resume_path_fence(
     if newly_fenced:
         _interrupt_for_test("after-path-fence")
     return journal, fenced
+
+
+def _archive_residue_entry(source: Path, destination: Path, label: str) -> None:
+    """Move one residue entry into the salvage archive, across filesystems.
+
+    The no-replace rename is atomic on one filesystem; a fenced slot on an
+    image mount and the control-side archive are different filesystems, so
+    there the entry is copied (links preserved, never followed) and only
+    then removed from the fence.  The destination must not exist either
+    way: an existing destination preserves both, as the rename does.
+    """
+
+    if destination.exists() or destination.is_symlink():
+        raise Refusal(
+            f"cannot {label}: destination already exists; preserved both paths: "
+            f"{source} and {destination}"
+        )
+    try:
+        _rename_noreplace(source, destination, label)
+        return
+    except Refusal:
+        if source.stat(follow_symlinks=False).st_dev == destination.parent.stat(
+            follow_symlinks=False
+        ).st_dev:
+            raise
+    if source.is_symlink():
+        os.symlink(os.readlink(source), destination)
+        source.unlink()
+    elif source.is_dir():
+        shutil.copytree(source, destination, symlinks=True)
+        shutil.rmtree(source)
+    else:
+        shutil.copy2(source, destination, follow_symlinks=False)
+        source.unlink()
 
 
 def _archive_fenced_slot_residue(
@@ -40342,7 +40469,7 @@ def _archive_fenced_slot_residue(
                 f"fenced slot residue already archived at {target}; "
                 "preserve both and inspect before recovery"
             )
-        _rename_noreplace(source, target, f"archive fenced slot residue {name}")
+        _archive_residue_entry(source, target, f"archive fenced slot residue {name}")
         archived.append(name)
     # List Git-ignored build output inside the residue so a later salvage
     # clean can drop exactly that with evidence, without judging the rest.
@@ -40410,6 +40537,10 @@ def _finish_remove_paths(
         raise StateError("validation removal proof requires a private cleanup fence")
     removed_values = _as_list(journal["removed"], "journal.removed")
     removed = {_as_str(item, "journal.removed item") for item in removed_values}
+    removing_values = _as_list(journal.get("removing", []), "journal.removing")
+    removing = {_as_str(item, "journal.removing item") for item in removing_values}
+    if not removing <= {item.name for item in record.checkouts}:
+        raise StateError("finish journal names an unknown removing checkout")
     all_names = {item.name for item in record.checkouts}
     if not removed <= all_names:
         raise StateError("finish journal names a checkout that is not in the active record")
@@ -40469,12 +40600,35 @@ def _finish_remove_paths(
         finish.private_cleanup.census_budget.remaining_seconds()
     present: list[Checkout] = []
     missing_after_remove: list[Checkout] = []
+    abandoned_after_remove: list[Checkout] = []
     for checkout in record.checkouts:
         if checkout.name in removed:
             continue
         _moved, path = _checkout_at_slot(config, record, checkout, fenced_slot)
         if path.is_symlink():
             raise Refusal(f"interrupted fenced checkout became a symlink: {path}")
+        if record.slot_type == "validate":
+            _rel, checkout_repository = _stored_repository_path(
+                config, checkout.repository
+            )
+            if _checkout_registration_gone(vcs, checkout_repository, path):
+                # Registration deleted by the interrupted removal, files
+                # left as residue: archive the residue (never delete it
+                # unseen) and judge the checkout removed.  The journal's
+                # removing intent or prepared record proved this removal
+                # began; _reclaim_preconditions already classified it.
+                if path.is_dir():
+                    entries = (
+                        [entry.name for entry in path.iterdir()]
+                        if path.absolute() == fenced_slot.absolute()
+                        else [path.name]
+                    )
+                    if entries:
+                        _archive_fenced_slot_residue(
+                            config, record, fenced_slot, entries
+                        )
+                abandoned_after_remove.append(checkout)
+                continue
         if (
             path.exists()
             and not _git_removal_finished_at_image_root(
@@ -40501,6 +40655,15 @@ def _finish_remove_paths(
                 vcs.delete_branch_at(repository, checkout.branch, checkout.head)
         removed.update(item.name for item in missing_after_remove)
         journal["removed"] = sorted(removed)
+        _write_journal(config, journal, journal_path=journal_path)
+    if abandoned_after_remove:
+        for checkout in abandoned_after_remove:
+            _relative, repository = _stored_repository_path(config, checkout.repository)
+            vcs.delete_branch_at(repository, checkout.branch, checkout.head)
+        removed.update(item.name for item in abandoned_after_remove)
+        removing.difference_update(item.name for item in abandoned_after_remove)
+        journal["removed"] = sorted(removed)
+        journal["removing"] = sorted(removing)
         _write_journal(config, journal, journal_path=journal_path)
     remaining = tuple(present)
     if remaining:
@@ -40539,6 +40702,18 @@ def _finish_remove_paths(
                 moved, moved_path = _checkout_at_slot(
                     config, record, checkout, fenced_slot
                 )
+                if record.slot_type == "validate" and _checkout_registration_gone(
+                    vcs,
+                    _stored_repository_path(config, checkout.repository)[1],
+                    moved_path,
+                ):
+                    # #995: registration already deleted by the interrupted
+                    # removal; the residue is archived below and the branch
+                    # deleted with the other removed checkouts.  There is no
+                    # Git registration left to repair or verify here.
+                    moved_checkouts.append(moved)
+                    moved_paths[checkout.name] = moved_path
+                    continue
                 if record.slot_type == "validate" or salvage:
                     _repair_registration_at_slot(
                         config, record, checkout, fenced_slot, vcs
@@ -40907,6 +41082,13 @@ def _finish_remove_paths(
             )
         _relative, repository = _stored_repository_path(config, checkout.repository)
         _moved, path = _checkout_at_slot(config, record, checkout, fenced_slot)
+        # Record the intent before the git call: `git worktree remove`
+        # deletes the registration as part of removing the checkout, so an
+        # actor that dies inside it leaves a journal that already names
+        # this checkout as removing, not an unjudged one.  #995.
+        removing.add(checkout.name)
+        journal["removing"] = sorted(removing)
+        _write_journal(config, journal, journal_path=journal_path)
         vcs.remove_worktree(
             repository,
             path,
@@ -40916,7 +41098,9 @@ def _finish_remove_paths(
         if record.slot_type == "validate":
             vcs.delete_branch_at(repository, checkout.branch, checkout.head)
         removed.add(checkout.name)
+        removing.discard(checkout.name)
         journal["removed"] = sorted(removed)
+        journal["removing"] = sorted(removing)
         _write_journal(config, journal, journal_path=journal_path)
         _interrupt_for_test("after-remove-worktree")
     if _record_layout(config, record) == "nested" and record.slot_type == "agent":
@@ -46597,6 +46781,16 @@ def _recover_finish(
         raise StateError("finish journal contains duplicate removed checkout names")
     if not set(removed_names) <= {checkout.name for checkout in record.checkouts}:
         raise StateError("finish journal names an unknown removed checkout")
+    removing_names = [
+        _as_str(value, f"finish journal.removing[{index}]")
+        for index, value in enumerate(
+            _as_list(raw.get("removing", []), "finish journal.removing")
+        )
+    ]
+    if len(removing_names) != len(set(removing_names)):
+        raise StateError("finish journal contains duplicate removing checkout names")
+    if not set(removing_names) <= {checkout.name for checkout in record.checkouts}:
+        raise StateError("finish journal names an unknown removing checkout")
     salvage = tuple(
         _as_mapping(item, f"finish journal.salvage[{index}]")
         for index, item in enumerate(

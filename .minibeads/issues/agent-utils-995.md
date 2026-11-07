@@ -1,10 +1,12 @@
 ---
 title: 'wrkslots-recover-pruned-admin: recover cannot finish a finish target whose Git worktree admin dir is gone'
-status: open
+status: closed
+assignee: mu-flakes
 priority: 1
 issue_type: bug
 created_at: 2026-11-07T01:55:00.000000000+00:00
-updated_at: 2026-11-07T01:55:00.000000000+00:00
+updated_at: 2026-11-07T03:10:00.000000000+00:00
+closed_at: 2026-11-07T03:10:00.000000000+00:00
 ---
 
 # Description
@@ -45,3 +47,21 @@ skips the unused/cleanliness proofs.
 
 Filed from a live consumer harness blockage (every wrkslots create
 refused). Investigation was read-only; the harness state is untouched.
+
+## Resolution
+
+Both editions classify the midpoint instead of refusing it. The finish
+journal records intent ("removing") before the git call and clears it
+into "removed"; reclaim accepts a validate checkout whose registration
+is gone at its recorded head when a digest-matching prepared finish
+journal proves the removal began and the unused census passed (agent
+checkouts keep refusing); at the fence, repair/verify is skipped for
+such checkouts, leftover files are archived to the local salvage
+archive as fenced residue (cross-filesystem copy fallback included),
+and branches are deleted with the other removed checkouts.
+
+Regression tests: recovery finishes a hand-pruned admin (and still
+refuses without the journal), a kill between registration delete and
+journal write recovers, and the legacy finish-recovery tests stay
+green. The consumer harness's saved journals/salvage (read-only)
+show the same recovered outcome the manual override reached.

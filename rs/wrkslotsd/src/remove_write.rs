@@ -916,6 +916,35 @@ fn salvage_gate(cfg: &Cfg, config: &Value, checkout: &Value, repository: &Path) 
     }))
 }
 
+fn checkout_registration_gone(repository: &Path, path: &Path) -> bool {
+    // A linked worktree whose .git file names an admin directory that no
+    // longer exists, and that its repository no longer lists, has no Git
+    // registration left to judge (#995, mirroring the Python edition).
+    let git_file = path.join(".git");
+    let Ok(raw) = std::fs::read_to_string(&git_file) else {
+        return false;
+    };
+    let Some(named) = raw.trim_end_matches('\n').strip_prefix("gitdir: ") else {
+        return false;
+    };
+    let named_path = PathBuf::from(named);
+    let admin = if named_path.is_absolute() {
+        named_path
+    } else {
+        path.join(&named_path)
+    };
+    if admin.exists() {
+        return false;
+    }
+    let Ok(listing) = git(repository, &["worktree", "list", "--porcelain"]) else {
+        return false;
+    };
+    !listing
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .any(|listed| Path::new(listed) == path)
+}
+
 fn reclaim_checkout(cfg: &Cfg, checkout: &Value, repository: &Path) -> Result<Value> {
     // The reclaim refresh: worktree identity, branch, unfinished
     // operations, ordinary history and index, and the recorded remote
@@ -1728,7 +1757,23 @@ pub(crate) fn remove_slot(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let (_stored, repository) = stored_repository_path(&cfg, repository_raw)?;
-        final_checkouts.push(reclaim_checkout(&cfg, &checkout, &repository)?);
+        // #995: a validate checkout whose registration an interrupted
+        // removal already deleted is accepted at its recorded evidence;
+        // this writer always journals the finish before fencing, which
+        // is the proof the removal began. Agent checkouts keep refusing.
+        let checkout_path = cfg.root.join(
+            checkout
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        if current.get("slot_type").and_then(Value::as_str) == Some("validate")
+            && checkout_registration_gone(&repository, &checkout_path)
+        {
+            final_checkouts.push(checkout);
+        } else {
+            final_checkouts.push(reclaim_checkout(&cfg, &checkout, &repository)?);
+        }
     }
     // Salvage evidence must still match after the refresh.
     for item in &salvage {
@@ -1845,6 +1890,7 @@ pub(crate) fn remove_slot(
         "fenced": fenced_relative,
         "original_mode": mode,
         "removed": [],
+        "removing": [],
         "salvage": salvage,
         "validate_complete": false,
         "record": current,
@@ -1954,20 +2000,47 @@ pub(crate) fn remove_slot(
                 moved_path.display()
             ));
         }
-        repair_registration(&repository, &moved_path)?;
-        git(
-            &repository,
-            &[
-                "worktree",
-                "remove",
-                "--force",
-                "--",
-                &moved_path.to_string_lossy(),
-            ],
-        )?;
-        removed.push(name);
+        // #995: record intent before the git call, and skip both the
+        // repair and the git call when an interrupted removal already
+        // deleted the registration (files are deleted with the fence).
+        let registration_gone = current.get("slot_type").and_then(Value::as_str)
+            == Some("validate")
+            && checkout_registration_gone(&repository, &moved_path);
+        let mut removing: Vec<String> = journal
+            .get("removing")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !removing.contains(&name) {
+            removing.push(name.clone());
+        }
+        if let Some(object) = journal.as_object_mut() {
+            object.insert("removing".to_string(), json!(removing));
+        }
+        write_journal(&cfg, &selected, &journal)?;
+        if !registration_gone {
+            repair_registration(&repository, &moved_path)?;
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    "--",
+                    &moved_path.to_string_lossy(),
+                ],
+            )?;
+        }
+        removed.push(name.clone());
+        removing.retain(|item| item != &name);
         if let Some(object) = journal.as_object_mut() {
             object.insert("removed".to_string(), json!(removed));
+            object.insert("removing".to_string(), json!(removing));
         }
         write_journal(&cfg, &selected, &journal)?;
     }

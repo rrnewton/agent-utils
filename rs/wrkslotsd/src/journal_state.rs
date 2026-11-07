@@ -445,6 +445,7 @@ fn finish_shape(
             "validation_removal_proof",
             "nested_git_evidence",
             "archive_nested_cache_repositories",
+            "removing",
         ],
         "finish journal",
     )?;
@@ -485,6 +486,14 @@ fn finish_shape(
         .enumerate()
     {
         as_str(item, &format!("finish journal.removed[{index}]"))?;
+    }
+    if let Some(removing) = raw.get("removing") {
+        for (index, item) in as_list(removing, "finish journal.removing")?
+            .iter()
+            .enumerate()
+        {
+            as_str(item, &format!("finish journal.removing[{index}]"))?;
+        }
     }
     if let Some(salvage) = raw.get("salvage") {
         for (index, item) in as_list(salvage, "finish journal.salvage")?

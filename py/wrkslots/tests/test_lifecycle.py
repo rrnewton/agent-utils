@@ -20283,6 +20283,127 @@ def test_finish_recovery_upgrades_legacy_mount_namespace_identity(
     assert not seal_path.exists()
 
 
+def _prune_checkout_admin(config: wrkslots.Config, slot_path: Path) -> Path:
+    """Delete one checkout's Git admin registration, leaving its files."""
+
+    record = wrkslots._load_active(config).slots[0]
+    checkout = wrkslots._stored_path(config, record.checkouts[0].path, "checkout path")
+    gitdir = (checkout / ".git").read_text(encoding="utf-8").removeprefix("gitdir:").strip()
+    admin = Path(gitdir)
+    if not admin.is_absolute():
+        admin = checkout / admin
+    shutil.rmtree(admin)
+    return checkout
+
+
+def _recover(project: Path) -> int:
+    return wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--slot",
+            "slot01",
+            "--coordinator-pid",
+            str(os.getpid()),
+        ]
+    )
+
+
+def test_finish_recovery_finishes_a_pruned_admin_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #995: the batch actor died after `git worktree remove` deleted the
+    # checkout's registration and before it deleted the files; the prepared
+    # finish journal proves the removal began, so recovery archives the
+    # residue and finishes instead of refusing on Git provenance.
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    stub_validate_batch_censuses(monkeypatch)
+    interrupt_validate_batch(project, monkeypatch, "after-finish-journal", ("slot01",))
+    config = wrkslots._load_config(str(project), "testhost")
+    finish_path = wrkslots._journal_path(config)
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    _prune_checkout_admin(config, slot_path)
+
+    assert _recover(project) == 0
+    assert not slot_path.exists()
+    assert not finish_path.exists()
+    assert not seal_path.exists()
+
+
+def test_finish_recovery_without_a_journal_still_refuses_a_pruned_admin_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The classification is anchored in the prepared finish journal: with
+    # no journal proving the removal began, a pruned registration still
+    # refuses and the slot is retained.
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    stub_validate_batch_censuses(monkeypatch)
+    interrupt_validate_batch(project, monkeypatch, "after-finish-journal", ("slot01",))
+    config = wrkslots._load_config(str(project), "testhost")
+    finish_path = wrkslots._journal_path(config)
+    _prune_checkout_admin(config, slot_path)
+    finish_path.unlink()
+
+    assert _recover(project) != 0
+    assert slot_path.exists()
+
+
+def test_finish_killed_between_registration_delete_and_journal_write_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Kill the removal inside `git worktree remove`'s midpoint: the
+    # registration is deleted, the files remain, and the journal already
+    # records the intent (removing), so recovery finishes the removal.
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    stub_validate_batch_censuses(monkeypatch)
+    config = wrkslots._load_config(str(project), "testhost")
+    finish_path = wrkslots._journal_path(config)
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+
+    class ActorDied(RuntimeError):
+        pass
+
+    original_remove = wrkslots._GitVcs.remove_worktree
+
+    def remove_then_die(
+        self: wrkslots._GitVcs, repository: Path, checkout: Path, *, force: bool = False
+    ) -> None:
+        gitdir = (checkout / ".git").read_text(encoding="utf-8").removeprefix("gitdir:").strip()
+        admin = Path(gitdir)
+        if not admin.is_absolute():
+            admin = checkout / admin
+        shutil.rmtree(admin)
+        raise ActorDied
+
+    monkeypatch.setattr(wrkslots._GitVcs, "remove_worktree", remove_then_die)
+    with pytest.raises(ActorDied):
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove-validate-batch",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--slot",
+                "slot01=1",
+            ]
+        )
+    journal = json.loads(finish_path.read_text(encoding="utf-8"))
+    record = wrkslots._load_active(config).slots[0]
+    assert journal["removing"] == [record.checkouts[0].name]
+    assert journal["removed"] == []
+
+    monkeypatch.setattr(wrkslots._GitVcs, "remove_worktree", original_remove)
+    assert _recover(project) == 0
+    assert not slot_path.exists()
+    assert not finish_path.exists()
+    assert not seal_path.exists()
+
+
 def test_destructive_legacy_identity_upgrade_refuses_dirty_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
