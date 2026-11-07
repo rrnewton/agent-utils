@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-withdrawn-batches: a batch holding a withdrawn change is retried, blocks disjoint roots, and stops the run'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-07T12:00:00.000000000+00:00
-updated_at: 2026-11-07T12:00:00.000000000+00:00
+updated_at: 2026-11-07T12:10:00.000000000+00:00
 ---
 
 # Description
@@ -71,3 +71,16 @@ Filed from GitHub issues 306 (merge-queue-withdrawn-refusal-retry) and
 307 (merge-queue-withdrawn-root-release), reported 2026-11-07 by the
 operator lane of a consuming project's merge queue. The two are landed
 together because they share the withdrawn-flight handling above.
+
+## Resolution
+
+Landed in the merge-queue withdrawn-batches change: `refused_again`
+never retries a flight holding a withdrawn change; a per-pass sweep
+(`drop_withdrawn_flights`) cancels withdrawn batches and their
+culprit-search probes out of the window so disjoint roots that jumped
+over them become decidable; a withdrawn batch that reaches a decision
+is decided with the new non-stopping `BatchOutcome::Withdrawn` instead
+of `Stop`. Covered by `rs/merge-queue/tests/cli_withdrawn_batches.rs`
+(a refused batch validated exactly once, a root landing without waiting
+for the withdrawn batch, a withdrawn green not ending the run, and a
+withdrawn red cancelling its probes).

@@ -547,6 +547,10 @@ enum BatchOutcome {
     /// The candidate's changes were ejected at landing (a permanent push
     /// rule violation): nothing landed, the run goes on without them.
     Ejected(Vec<i64>),
+    /// A change in the batch was withdrawn while it validated: nothing
+    /// landed, the withdrawn changes leave the window (their recorded
+    /// withdrawal is applied when the run ends), and the run goes on.
+    Withdrawn(String),
 }
 
 /// Worktree slots for concurrent validations, reused between candidates.
@@ -2077,6 +2081,10 @@ impl<'a> Runner<'a> {
                 BatchOutcome::Ejected(_) => {
                     self.state.save_kept_validations(&kept)?;
                 }
+                BatchOutcome::Withdrawn(reason) => {
+                    self.event("kept-validations", &reason);
+                    self.state.save_kept_validations(&kept)?;
+                }
                 BatchOutcome::Stop(reason, _)
                 | BatchOutcome::Deferred(reason, _)
                 | BatchOutcome::RefusedDeferred(reason) => {
@@ -2279,6 +2287,9 @@ impl<'a> Runner<'a> {
                         "push rule violation at landing",
                     );
                 }
+                BatchOutcome::Withdrawn(reason) => {
+                    self.log_ruling(ACCEPT_FLAKY, &accepted, "withdrawn", &reason);
+                }
                 BatchOutcome::Stop(reason, _)
                 | BatchOutcome::Deferred(reason, _)
                 | BatchOutcome::RefusedDeferred(reason) => {
@@ -2435,6 +2446,12 @@ impl<'a> Runner<'a> {
         if !ran.refused() {
             return None;
         }
+        // A batch holding a change withdrawn while it validated is never
+        // retried: its result could never land (see `drop_withdrawn_flights`,
+        // which decides it as withdrawn).
+        if self.withdrawn_pr(&flight.candidate.prs).is_some() {
+            return None;
+        }
         if at_head && !flight.head_round {
             flight.head_round = true;
             flight.retries = 0;
@@ -2466,6 +2483,92 @@ impl<'a> Runner<'a> {
             ),
             delay,
         ))
+    }
+
+    /// The first of `prs` a recorded request withdraws, if any. A run holds
+    /// the writer lock, so a withdrawal that arrives mid-run is only
+    /// recorded; this is how the run notices it before the run ends.
+    fn withdrawn_pr(&self, prs: &[i64]) -> Option<i64> {
+        let withdrawn = crate::intake::pending_withdrawals(self.state);
+        prs.iter().copied().find(|pr| withdrawn.contains(pr))
+    }
+
+    /// Drop every in-flight batch holding a change withdrawn while it
+    /// validated: cancel its validation (which cancels its donor job),
+    /// cancel any culprit-search probes that follow it, and take it out of
+    /// the window at once, so a disjoint root that jumped over it becomes
+    /// decidable as with a held item. The withdrawn changes are not
+    /// requeued (their recorded withdrawal is applied when the run ends);
+    /// changes built on the withdrawn batch's tree go back to the front of
+    /// `pending` to be rebuilt, and changes that depend on a withdrawn
+    /// change are set aside for the rest of the run. Nothing here waits
+    /// for a dropped validation to report: a root it releases must not
+    /// wait for the withdrawn batch's validator to return. Later results
+    /// for dropped flights are logged as lost by the run loop.
+    fn drop_withdrawn_flights(
+        &self,
+        flights: &mut VecDeque<Flight>,
+        pending: &mut VecDeque<Vec<i64>>,
+    ) {
+        let withdrawn = crate::intake::pending_withdrawals(self.state);
+        if withdrawn.is_empty() {
+            return;
+        }
+        let mut kept: VecDeque<Flight> = VecDeque::new();
+        let mut dropped: Vec<Flight> = Vec::new();
+        // A stacked batch built on a dropped batch's tree cannot land as
+        // built either: it follows the drop, to be rebuilt.
+        let mut tree_broken = false;
+        while let Some(flight) = flights.pop_front() {
+            let holds_withdrawn = flight.candidate.prs.iter().any(|pr| withdrawn.contains(pr));
+            if flight.probe_for.is_some() {
+                // A probe is never a batch: it follows its red batch (see
+                // `follow_dropped_reds` below).
+                kept.push_back(flight);
+            } else if holds_withdrawn || (tree_broken && !flight.rooted) {
+                if !flight.rooted {
+                    tree_broken = true;
+                }
+                dropped.push(flight);
+            } else {
+                kept.push_back(flight);
+            }
+        }
+        if dropped.is_empty() {
+            *flights = kept;
+            return;
+        }
+        let kept = follow_dropped_reds(kept, &mut dropped);
+        for flight in &dropped {
+            flight.cancel.store(true, Ordering::Relaxed);
+        }
+        let mut withdrawn_prs: Vec<i64> = Vec::new();
+        for flight in dropped.into_iter().rev() {
+            if flight.probe_for.is_some() {
+                continue;
+            }
+            let (gone, rest): (Vec<i64>, Vec<i64>) = flight
+                .candidate
+                .prs
+                .into_iter()
+                .partition(|pr| withdrawn.contains(pr));
+            withdrawn_prs.extend(gone);
+            if !rest.is_empty() {
+                pending.push_front(rest);
+            }
+        }
+        *flights = kept;
+        for pr in &withdrawn_prs {
+            self.drop_dependents_because(*pr, pending, &format!("depend on withdrawn #{pr}"));
+        }
+        self.event(
+            "withdrawn",
+            &format!(
+                "{} withdrawn while validating; its batch leaves the window \
+                 (the withdrawal is applied when this run ends)",
+                list(&withdrawn_prs)
+            ),
+        );
     }
 
     /// Start `job`, `flight`'s validation again, on a thread of `scope` once `delay` has passed,
@@ -5626,6 +5729,10 @@ impl<'a> Runner<'a> {
                     // rooted batch's parent: cancel it now, before the window
                     // is filled, so its slot and changes are reused at once.
                     self.cancel_stale_rooted(&mut flights, &rx, pending);
+                    // A batch whose change was withdrawn while it validated
+                    // leaves the window at once: the roots that jumped over
+                    // it are decidable from here, as with a held item.
+                    self.drop_withdrawn_flights(&mut flights, pending);
                     // A root left decidable by the last decisions, with
                     // nothing it jumped over landed, heads the stack from
                     // here: intake plans and refills build on its tip.
@@ -6310,6 +6417,10 @@ impl<'a> Runner<'a> {
                     // and it is cancelled instead (see `cancel_stale_rooted`
                     // at the top of the loop and after each landing below).
                     self.cancel_stale_rooted(&mut flights, &rx, pending);
+                    // A withdrawal recorded while these validations ran
+                    // drops its batches before anything is decided, so a
+                    // root they held up is promoted in this same pass.
+                    self.drop_withdrawn_flights(&mut flights, pending);
                     if let Some(index) = flights.iter().position(|flight| {
                         flight.rooted
                             && flight.result.is_some()
@@ -6465,6 +6576,47 @@ impl<'a> Runner<'a> {
                             self.start_again(scope, &tx, &head, job, delay);
                             flights.push_front(head);
                             break;
+                        }
+                        // A batch holding a change withdrawn while it
+                        // validated is decided as withdrawn, whatever its
+                        // result: never landed, never deferred as refused,
+                        // and the run goes on.
+                        if let Some(pr) = self.withdrawn_pr(&head.candidate.prs) {
+                            if head.stacked {
+                                discard(&mut flights, &rx, pending);
+                            }
+                            let withdrawn_now = crate::intake::pending_withdrawals(self.state);
+                            let rest: Vec<i64> = head
+                                .candidate
+                                .prs
+                                .iter()
+                                .copied()
+                                .filter(|p| !withdrawn_now.contains(p))
+                                .collect();
+                            self.event(
+                                "withdrawn",
+                                &format!(
+                                    "#{pr} was withdrawn while {} validated; not landing \
+                                     it (the withdrawal is applied when this run ends)",
+                                    list(&head.candidate.prs)
+                                ),
+                            );
+                            if !rest.is_empty() {
+                                pending.push_front(rest);
+                            }
+                            for gone in head
+                                .candidate
+                                .prs
+                                .iter()
+                                .filter(|p| withdrawn_now.contains(p))
+                            {
+                                self.drop_dependents_because(
+                                    *gone,
+                                    pending,
+                                    &format!("depend on withdrawn #{gone}"),
+                                );
+                            }
+                            continue;
                         }
                         // The batch being decided stays in the window until it is decided.
                         self.publish_window(
@@ -6840,6 +6992,17 @@ impl<'a> Runner<'a> {
                                 // window as the loop goes on.
                                 refused_stop = reason;
                             }
+                            BatchOutcome::Withdrawn(reason) => {
+                                // Withdrawn while it validated: not landed,
+                                // not requeued (the recorded withdrawal is
+                                // applied when this run ends), and the run
+                                // goes on. Batches built on its tree are
+                                // rebuilt on the base.
+                                self.event("withdrawn", &reason);
+                                if head.stacked {
+                                    discard(&mut flights, &rx, pending);
+                                }
+                            }
                         }
                         // A landing by the batch just decided moves the base
                         // off a rooted batch's parent: cancel the root at
@@ -7168,14 +7331,11 @@ impl<'a> Runner<'a> {
         // writer lock) is not landed; the withdrawal is applied when the run ends.
         let withdrawn = crate::intake::pending_withdrawals(self.state);
         if let Some(pr) = candidate.prs.iter().find(|pr| withdrawn.contains(pr)) {
-            return Ok(BatchOutcome::Stop(
-                format!(
-                    "#{pr} was withdrawn while {} validated; not landing it (the withdrawal is \
-                     applied when this run ends)",
-                    list(&candidate.prs)
-                ),
-                candidate.prs.clone(),
-            ));
+            return Ok(BatchOutcome::Withdrawn(format!(
+                "#{pr} was withdrawn while {} validated; not landing it (the withdrawal is \
+                 applied when this run ends)",
+                list(&candidate.prs)
+            )));
         }
         if self.config.exact_sha
             && ruling.is_none()
