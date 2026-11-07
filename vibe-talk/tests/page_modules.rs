@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 const SUITES: &[&str] = &[
+    "tests/js/app/application.test.mjs",
+    "tests/js/app/keyboard.test.mjs",
     "tests/js/core/annotations.test.mjs",
     "tests/js/core/api.test.mjs",
     "tests/js/core/call.test.mjs",
@@ -36,6 +38,7 @@ const SUITES: &[&str] = &[
     "tests/js/view/documents.test.mjs",
     "tests/js/view/dom.test.mjs",
     "tests/js/view/settings.test.mjs",
+    "tests/js/view/shell-navigation.test.mjs",
     "tests/js/view/settings-editors.test.mjs",
     "tests/js/view/voice.test.mjs",
 ];
