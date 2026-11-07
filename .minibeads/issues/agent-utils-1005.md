@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-donor-restamp-race: a remote donor whose tools are newer than a job''s stamp declines it, and the local donor takes the re-stamped job first'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-07T04:46:35.000000000+00:00
-updated_at: 2026-11-07T04:50:00.000000000+00:00
+updated_at: 2026-11-07T06:45:00.000000000+00:00
 ---
 
 # Description
