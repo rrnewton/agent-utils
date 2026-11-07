@@ -135,54 +135,82 @@ The long tail is recovery apply paths and the image/sandbox surface.
   only the success `{blocking:false}` and the #992 busy form.
   **Gap — port step P2.**
 
-## Ordered port plan (size estimates)
+## Ordered port plan (revised 2026-11-07, coordb direction)
 
+Rust becomes primary EARLY, per command, not in one final flip.
 Each step: Rust implementation, differential test against Python,
-soak mapping extended, router default flipped for that command only
-once parity is proven. Python stays until the last step.
-Estimates are agent-days including differential tests and review.
+soak mapping extended, router default flipped for that command once
+parity is proven. Python becomes the opt-out
+(`WRKSLOTS_ENGINE=python`) and stays only until P12. New behaviour
+lands in BOTH editions while both exist. P1, P3/P4, and the P5
+families run CONCURRENTLY across internal subagents (one per
+command group); integration and landing stay with mu-rswrk.
 
-- P1. recover roll-forward (#1007) + journal resume dispatch. M (2–3 d).
-- P2. classify-create-journals blocking_reasons (c4c4c64a). S (0.5–1 d).
-- P3. Small NONE commands: quickstart, retirement-queue, register,
-  supersede-handoff, config convert. S each; bundle (2 d).
-- P4. import-existing, relocate-repository, init command shell. M (3 d).
-- P5. Recovery apply paths: recover-create/finish resume,
-  absent-row census/salvage, ownerless apply (worktree/clone/cache),
-  validate-batch census/recovery. L (8–12 d, split per family).
+- P2 (next). classify-create-journals blocking_reasons (c4c4c64a).
+  S (0.5–1 d). Proves the port loop.
+- P10 + early P11 (immediately after P2). CLI compatibility shell:
+  wrkslotsd accepts the exact Python CLI (names, flags, global
+  options) so `WRKSLOTS_ENGINE=rust` is drop-in; soak translation
+  retired. Then flip Rust-default for the commands already FULL:
+  status, doctor, audit, unpushed, shell-command, config read,
+  hold/unhold, heartbeat, write/read-handoff, release, adopt,
+  transfer-owner, recover-unbound-owner, freeze,
+  reap-stray-worktrees, reclaim-orphan-state. Staged guard lift:
+  readers first, then writers (`WRKSLOTSD_FIXTURE_WRITER` lifted in
+  stages), each soaked on the harness with Python as opt-out.
+  M (3–4 d). **Target: those commands Rust-default by 2026-11-14.**
+- P1 (parallel). recover roll-forward (#1007) + journal resume
+  dispatch. M (2–3 d).
+- P3/P4 (parallel). Small NONE commands (quickstart,
+  retirement-queue, register, supersede-handoff, config convert),
+  then import-existing, relocate-repository, init shell. M (4 d).
+- P5 (parallel, per family). Recovery apply paths:
+  recover-create/finish resume, absent-row census/salvage,
+  ownerless apply (worktree/clone/cache), validate-batch
+  census/recovery. Each family flips Rust-default as it lands.
+  L (8–12 d, split per family).
 - P6. retire-pending, remove-validate-batch, remove-agent-batch,
   clean-caches. M–L (5–7 d).
-- P7. create/finish/remove completion: image representation,
-  slot-image records, host-context and salvage corners. L (5–8 d).
-- P8. Image surface: image, worktrees-image, migrate. L (6–10 d).
-- P9. Sandbox surface: run, box, sandbox, limits, shell-command
-  already done (the printed line must name the Rust entry). L (6–10 d).
-- P10. CLI compatibility shell: wrkslotsd accepts the exact Python
-  CLI (names, flags, global options) so `WRKSLOTS_ENGINE=rust` is
-  drop-in; soak translation retired. M (3–4 d).
-- P11. Lift the fixture-writer guard for live registries in stages
-  (readers, then writers), soak on the harness, then flip
-  `validation/editions.json` primary to rust command by command. M (3 d).
-- P12. Archive Python per #238: move `py/wrkslots` to archived with a
-  deprecation notice once every command is Rust-default with
-  differential coverage. S (1 d) after P11 soaks clean.
+- P7 (mu-rswrk side). create/finish/remove completion: image
+  representation hooks, host-context and salvage corners.
+  (Slot-image record diagnosis already landed in slice 45.) L (4–6 d).
+- P8/P9 (mu-rsimg lane, parallel). Image surface (image,
+  worktrees-image, migrate) and sandbox surface (run, box, sandbox,
+  limits). Self-contained modules; see boundary below. L (8–12 d).
+- Flip completion. Every remaining command flips Rust-default as
+  soon as its port lands; full Rust-default by 2026-12-10.
+- P12. Archive Python per #238: move `py/wrkslots` to archived with
+  a deprecation notice once every command is Rust-default with
+  differential coverage. S (1 d). **Target: 2026-12-15.**
 
-Total remaining: roughly 40–60 agent-days. The FAT lane splits P5,
-P7, P8, P9 across internal subagents (one per command group);
-integration and landing stay with mu-rswrk.
+Total remaining: roughly 40–60 agent-days across both lanes.
 
-## Landing sequence (clock ETAs, America/New_York)
+## Boundary with mu-rsimg (P8/P9 lane)
 
-- M1 inventory (this doc): 2026-11-07 12:00 ET.
-- P2 (small, proves the loop): 2026-11-08 17:00 ET.
-- P1 (recover roll-forward): 2026-11-10 17:00 ET.
-- P3 bundle: 2026-11-12 17:00 ET.
-- P4: 2026-11-16 17:00 ET.
-- P5 per-family landings: 2026-11-20 → 2026-12-01 17:00 ET.
-- P6: 2026-12-04 17:00 ET. P7: 2026-12-09 17:00 ET.
-- P8: 2026-12-15 17:00 ET. P9: 2026-12-21 17:00 ET.
-- P10: 2026-12-24 17:00 ET. P11 staged flip: 2027-01-05 17:00 ET.
-- P12 archive: 2027-01-08 17:00 ET.
+- mu-rswrk owns wrkslotsd's shared core: `rs/wrkslotsd/src/cli.rs`,
+  the format modules, `ensure_states`, the router
+  (`common/bin/engine-resolver`, `common/bin/wrkslots-soak`), and
+  `validation/editions.json`.
+- mu-rsimg owns the new Rust modules for the image and sandbox
+  surface (counterparts of `py/wrkslots/slotimage.py`,
+  `imagecmd.py`, `worktreesimage.py`, `sandbox.py`,
+  `imagehelper.py`) and their differentials.
+- mu-rsimg asks mu-rswrk before touching any shared file above;
+  mu-rswrk integrates shared-file changes. Until direct agentctl
+  sends are set up, both lanes coordinate through coordb.
+- Each lane lands from its own slot; neither edits the other's
+  slot checkout.
+
+## Landing sequence (revised clock ETAs, America/New_York)
+
+- M1 inventory (this doc): 2026-11-07.
+- P2: 2026-11-08 17:00 ET.
+- P10 + early flip (FULL commands Rust-default): 2026-11-14 17:00 ET.
+- P1 (parallel): 2026-11-15 17:00 ET. P3/P4 (parallel): 2026-11-18.
+- P5 families: 2026-11-25 17:00 ET. P6: 2026-11-28 17:00 ET.
+- P7: 2026-12-02 17:00 ET. P8/P9 (mu-rsimg): 2026-12-06 17:00 ET.
+- Full Rust-default: 2026-12-10 17:00 ET.
+- P12 archive: 2026-12-15 17:00 ET.
 
 Gate per landing: `python3 scripts/validate.py --all --keep-going`
 on the exact push tree, bare `scripts/check_client_names.py`, and
