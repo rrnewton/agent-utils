@@ -18,6 +18,7 @@ static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 
 /// `serve`'s pre-flight, then serve until killed.
 pub fn serve(archive: &Path, port: u16, open_browser: bool) -> u8 {
+    crate::cli::validation_checkpoint();
     let root = crate::json::resolve_path(archive);
     if !root.is_dir() {
         eprintln!(

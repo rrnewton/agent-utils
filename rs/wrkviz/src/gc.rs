@@ -1136,6 +1136,7 @@ fn remove_tree(path: &Path) -> i64 {
 
 /// Report, and -- only when asked -- sweep or empty the trash.
 pub fn collect(root: &Path, delete: bool, empty_trash: bool) -> Result<GcReport, String> {
+    crate::cli::validation_checkpoint();
     if delete && empty_trash {
         return Err(
             "--delete and --empty-trash are separate passes on purpose: the first is reversible and the second is not, so no single invocation does both".into(),

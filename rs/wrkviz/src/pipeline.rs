@@ -155,6 +155,7 @@ pub struct WriterLock {
 
 /// Take the archive writer lock.
 pub fn archive_writer_lock(archive: &Path) -> Result<WriterLock, String> {
+    crate::cli::validation_checkpoint();
     use std::os::unix::fs::OpenOptionsExt as _;
     if archive.exists() && !archive.is_dir() {
         return Err(format!(

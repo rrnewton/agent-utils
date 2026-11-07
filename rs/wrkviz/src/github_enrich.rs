@@ -137,6 +137,7 @@ pub fn enrich_pull_request_metadata(
     timeout_seconds: f64,
     fetched_at: &str,
 ) -> Result<PullMetadataReport, String> {
+    crate::cli::validation_checkpoint();
     enrich_with_transport(
         archive,
         team_slug,

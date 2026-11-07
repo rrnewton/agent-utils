@@ -6,6 +6,7 @@
 //! by name rather than falling back.
 
 use crate::inspect::inspect;
+use std::cell::Cell;
 use std::path::PathBuf;
 
 /// The Python edition's top-level help, verbatim.
@@ -166,18 +167,61 @@ fn explicit_argument_error(flag: TopFlag, value: &str) -> u8 {
     )
 }
 
+thread_local! {
+    static VALIDATING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Payload panicked at an execution boundary while validating
+/// subcommand arguments for `--userguide`.
+#[derive(Debug)]
+pub(crate) struct Validated;
+
+/// Stop before executing when only validating arguments: the
+/// `--userguide` parse runs the real subcommand parser, and a
+/// well-formed command must print the guide instead of running.
+/// Execution entry points call this after parsing succeeds.
+pub(crate) fn validation_checkpoint() {
+    if VALIDATING.with(|flag| flag.get()) {
+        std::panic::panic_any(Validated);
+    }
+}
+
+/// Parse (never run) a subcommand after `--userguide`, the way
+/// the oracle's single `parse_args` does: its help and its parse
+/// errors surface, a well-formed command prints the guide.
+fn validate_then_guide(name: &str, args: &[String]) -> u8 {
+    let mut full: Vec<String> = vec![name.to_string()];
+    full.extend(args.iter().cloned());
+    VALIDATING.with(|flag| flag.set(true));
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&full)));
+    let _taken = std::panic::take_hook();
+    std::panic::set_hook(previous_hook);
+    VALIDATING.with(|flag| flag.set(false));
+    match result {
+        Ok(code) => code,
+        Err(payload) => {
+            if payload.downcast_ref::<Validated>().is_some() {
+                print!("{USER_GUIDE}");
+                0
+            } else {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+}
+
 /// Print the embedded guide. The parser actions and errors that
 /// can still fire after `--userguide` are honoured: `-h`/`--help`
 /// and `--version` act as soon as they appear, unknown options
 /// are collected and reported at the end, and a subcommand that
 /// follows is only parsed, never run, so a well-formed one
-/// changes nothing. (A subcommand whose own arguments are
-/// invalid reports its error in the oracle; here it is not
-/// parsed, and the guide is printed.)
+/// changes nothing while an invalid one reports its own error.
 fn run_userguide(rest: &[String]) -> u8 {
     let mut unrecognized: Vec<&str> = Vec::new();
     let mut after_separator = false;
-    for token in rest {
+    for (index, token) in rest.iter().enumerate() {
         if !after_separator {
             if token == "--" {
                 after_separator = true;
@@ -213,8 +257,7 @@ fn run_userguide(rest: &[String]) -> u8 {
             );
         }
         if SUBCOMMANDS.contains(&token.as_str()) {
-            print!("{USER_GUIDE}");
-            return 0;
+            return validate_then_guide(token, &rest[index + 1..]);
         }
         return argparse_error(
             TOP_USAGE,
@@ -245,6 +288,8 @@ options:
   -h, --help       show this help message and exit
   --output OUTPUT
 "#;
+
+const INSPECT_USAGE: &str = "usage: wrkviz inspect [-h] --output OUTPUT";
 
 /// The Python edition's query help, verbatim.
 pub const QUERY_HELP: &str = r#"usage: wrkviz query [-h] --output OUTPUT [--format {json,jsonl,markdown,text}]
@@ -477,36 +522,6 @@ fn cli_path(raw: &str) -> PathBuf {
     out
 }
 
-/// Resolve an `--output`-style argument: `--name value`,
-/// `--name=value`, or an unambiguous prefix of `--name`.
-fn option_value(args: &[String], name: &str) -> Result<Option<String>, String> {
-    let long = format!("--{name}");
-    let mut found: Option<String> = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == &long {
-            index += 1;
-            match args.get(index) {
-                Some(value) => found = Some(value.clone()),
-                None => return Err(format!("argument --{name}: expected one argument")),
-            }
-        } else if let Some(value) = arg.strip_prefix(&format!("{long}=")) {
-            found = Some(value.to_string());
-        } else if arg.starts_with("--") && arg.len() > 2 && long.starts_with(arg.as_str()) {
-            index += 1;
-            match args.get(index) {
-                Some(value) => found = Some(value.clone()),
-                None => return Err(format!("argument --{name}: expected one argument")),
-            }
-        } else {
-            return Err(format!("unrecognized argument: {arg}"));
-        }
-        index += 1;
-    }
-    Ok(found)
-}
-
 /// Run the CLI and return the process exit code.
 pub fn run(args: &[String]) -> u8 {
     let Some(first) = args.first() else {
@@ -605,6 +620,7 @@ fn run_quickstart(args: &[String]) -> u8 {
         );
         return 2;
     }
+    validation_checkpoint();
     print!(
         "wrkviz v0.1.0\n\nBuild a version-controllable, multi-resolution website from an agent team's append-only logs.\n\n1. Ingest, summarize only cache misses, and build the site:\n\n   wrkviz refresh \\\n     --root-session SESSION_UUID --team example-team \\\n     --output ./timelines/example-team \\\n     --timezone America/New_York\n\n   Summaries come from the zero-rated headless muse CLI by default; --backend codex or\n   --backend claude (with --model) uses those CLIs instead.\n\n2. Open it locally:\n\n   cd ./timelines/example-team\n   make serve\n   # http://127.0.0.1:8765/\n\n3. Rerun the same refresh later. New log records are normalized; content-addressed summaries are\n   reused; only changed time windows and calendar rollups spend model tokens.\n\n4. See what a summarize run would spend before it spends anything, and cap it:\n\n   wrkviz summarize --team example-team --output ./timelines/example-team      --price input=2,output=10 --plan\n   wrkviz summarize --team example-team --output ./timelines/example-team      --price input=2,output=10 --budget-usd 20\n\n   A run estimated over the budget refuses to start; one that reaches it anyway stops, marks\n   summary_data/summarize_state.json partial, and the next run resumes from the cache.\n\nThe stages are separate on purpose: `ingest`, `summarize`, and `build`. The `build` command never\ncalls a model, so formatting and UI changes can be regenerated for free.\n"
     );
@@ -3610,15 +3626,12 @@ fn run_query(args: &[String]) -> u8 {
                     print!("{QUERY_HELP}");
                     return 0;
                 }
-                Some("list") => {
-                    print!("{QUERY_LIST_HELP}");
-                    return 0;
-                }
                 Some("show") => {
                     print!("{QUERY_SHOW_HELP}");
                     return 0;
                 }
-                Some("stats") | Some("prompts") | Some("messages") | Some("search") => {
+                Some("list") | Some("stats") | Some("prompts") | Some("messages")
+                | Some("search") => {
                     // These parsers validate their options in
                     // order; a `--help` after an invalid choice
                     // must not win over that error.
@@ -3682,22 +3695,12 @@ fn run_query(args: &[String]) -> u8 {
         }
         index += 1;
     }
-    // A `show` flag carrying an explicit `=value` is refused
-    // during parsing, before argparse checks the query
-    // parser's required arguments; let the show parser say so
-    // even when --output is missing.
+    // The show parser runs before the query parser's
+    // required-argument check: its own errors (a missing
+    // reference, a refused explicit flag value) outrank a
+    // missing --output, so always delegate.
     if action.as_deref() == Some("show") && output.is_none() {
-        let explicit = rest.iter().any(|arg| {
-            let Some((name, _)) = arg.split_once('=') else {
-                return false;
-            };
-            name.len() > 2
-                && name.starts_with("--")
-                && ("--help".starts_with(name) || "--transcript".starts_with(name))
-        });
-        if explicit {
-            return run_query_show("", &format, &rest);
-        }
+        return run_query_show("", &format, &rest, true);
     }
     if action.as_deref() == Some("stats") && output.is_none() {
         // The stats parser runs before the query parser's
@@ -3718,6 +3721,9 @@ fn run_query(args: &[String]) -> u8 {
         if early {
             return run_query_stats("", &format, &rest, true);
         }
+    }
+    if action.as_deref() == Some("list") && output.is_none() {
+        return run_query_list("", &format, &rest, true);
     }
     if action.as_deref() == Some("search") && output.is_none() {
         return run_query_search("", &format, &rest, true);
@@ -3748,8 +3754,8 @@ fn run_query(args: &[String]) -> u8 {
     }
     let output = output.unwrap_or_default();
     match action.as_deref() {
-        Some("list") => run_query_list(&output, &format, &rest),
-        Some("show") => run_query_show(&output, &format, &rest),
+        Some("list") => run_query_list(&output, &format, &rest, false),
+        Some("show") => run_query_show(&output, &format, &rest, false),
         Some("stats") => run_query_stats(&output, &format, &rest, false),
         Some(action @ ("prompts" | "messages")) => {
             run_query_transcript(action, &output, &format, &rest, false)
@@ -3765,7 +3771,7 @@ fn run_query(args: &[String]) -> u8 {
     }
 }
 
-fn run_query_show(output: &str, format: &str, args: &[String]) -> u8 {
+fn run_query_show(output: &str, format: &str, args: &[String], output_missing: bool) -> u8 {
     let mut reference: Option<String> = None;
     let mut transcript = false;
     let mut extras: Vec<String> = Vec::new();
@@ -3832,6 +3838,13 @@ fn run_query_show(output: &str, format: &str, args: &[String]) -> u8 {
             "the following arguments are required: reference",
         );
     };
+    if output_missing {
+        return argparse_error(
+            QUERY_USAGE,
+            "wrkviz query",
+            "the following arguments are required: --output",
+        );
+    }
     if !extras.is_empty() {
         // Once a subcommand parser is chosen, unknown
         // arguments are reported by the root parser with
@@ -4415,19 +4428,19 @@ fn run_query_search(output: &str, format: &str, args: &[String], output_missing:
             "the following arguments are required: text",
         );
     };
-    if extras.iter().any(|arg| arg != "--") {
-        eprintln!(
-            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
-            extras.join(" ")
-        );
-        return 2;
-    }
     if output_missing {
         return argparse_error(
             QUERY_USAGE,
             "wrkviz query",
             "the following arguments are required: --output",
         );
+    }
+    if extras.iter().any(|arg| arg != "--") {
+        eprintln!(
+            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
+            extras.join(" ")
+        );
+        return 2;
     }
     let timeline = match crate::query::Timeline::open(&cli_path(output)) {
         Ok(timeline) => timeline,
@@ -4649,11 +4662,7 @@ fn run_query_stats(output: &str, format: &str, args: &[String], output_missing: 
     }
 }
 
-fn run_query_list(output: &str, format: &str, args: &[String]) -> u8 {
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        print!("{QUERY_LIST_HELP}");
-        return 0;
-    }
+fn run_query_list(output: &str, format: &str, args: &[String], output_missing: bool) -> u8 {
     let mut resource: Option<String> = None;
     let mut filters = crate::query::Filters {
         teams: Vec::new(),
@@ -4662,9 +4671,56 @@ fn run_query_list(output: &str, format: &str, args: &[String]) -> u8 {
         kinds: Vec::new(),
         agent: None,
     };
+    let mut extras: Vec<String> = Vec::new();
+    let mut after_separator = false;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
+        if after_separator {
+            if resource.is_none() {
+                if !["teams", "agents", "phases", "rollups"].contains(&arg.as_str()) {
+                    return argparse_error(
+                        QUERY_LIST_USAGE,
+                        "wrkviz query list",
+                        &format!(
+                            "argument resource: invalid choice: '{arg}' (choose from teams, agents, phases, rollups)"
+                        ),
+                    );
+                }
+                resource = Some(arg.clone());
+            } else {
+                extras.push(arg.clone());
+            }
+            index += 1;
+            continue;
+        }
+        if arg == "--" {
+            after_separator = true;
+            index += 1;
+            continue;
+        }
+        {
+            let (head, explicit) = match arg.split_once('=') {
+                Some((head, value)) => (head, Some(value)),
+                None => (arg.as_str(), None),
+            };
+            let long_help = head.len() > 1 && head.starts_with("--") && "--help".starts_with(head);
+            let short_help = !head.starts_with("--")
+                && head.len() > 1
+                && head.starts_with('-')
+                && head[1..].starts_with('h');
+            if long_help || short_help {
+                if let Some(value) = explicit {
+                    return argparse_error(
+                        QUERY_LIST_USAGE,
+                        "wrkviz query list",
+                        &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                    );
+                }
+                print!("{QUERY_LIST_HELP}");
+                return 0;
+            }
+        }
         let mut handled = true;
         for (name, target) in [
             ("--team", 0),
@@ -4711,21 +4767,10 @@ fn run_query_list(output: &str, format: &str, args: &[String]) -> u8 {
             handled = false;
         }
         if !handled {
-            if arg.starts_with("--") {
-                return argparse_error(
-                    QUERY_LIST_USAGE,
-                    "wrkviz query list",
-                    &format!("unrecognized arguments: {arg}"),
-                );
-            }
-            if resource.is_some() {
-                return argparse_error(
-                    QUERY_LIST_USAGE,
-                    "wrkviz query list",
-                    &format!("unrecognized arguments: {arg}"),
-                );
-            }
-            if !["teams", "agents", "phases", "rollups"].contains(&arg.as_str()) {
+            let positional = !arg.starts_with('-') || arg == "-" || looks_like_negative_number(arg);
+            if !positional || resource.is_some() {
+                extras.push(arg.clone());
+            } else if !["teams", "agents", "phases", "rollups"].contains(&arg.as_str()) {
                 return argparse_error(
                     QUERY_LIST_USAGE,
                     "wrkviz query list",
@@ -4733,8 +4778,9 @@ fn run_query_list(output: &str, format: &str, args: &[String]) -> u8 {
                         "argument resource: invalid choice: '{arg}' (choose from teams, agents, phases, rollups)"
                     ),
                 );
+            } else {
+                resource = Some(arg.clone());
             }
-            resource = Some(arg.clone());
         }
         index += 1;
     }
@@ -4745,6 +4791,20 @@ fn run_query_list(output: &str, format: &str, args: &[String]) -> u8 {
             "the following arguments are required: resource",
         );
     };
+    if output_missing {
+        return argparse_error(
+            QUERY_USAGE,
+            "wrkviz query",
+            "the following arguments are required: --output",
+        );
+    }
+    if !extras.is_empty() {
+        eprintln!(
+            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
+            extras.join(" ")
+        );
+        return 2;
+    }
     let timeline = match crate::query::Timeline::open(&cli_path(output)) {
         Ok(timeline) => timeline,
         Err(error) => {
@@ -4773,21 +4833,70 @@ fn run_query_list(output: &str, format: &str, args: &[String]) -> u8 {
 }
 
 fn run_inspect(args: &[String]) -> u8 {
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        print!("{INSPECT_HELP}");
-        return 0;
-    }
-    let output = match option_value(args, "output") {
-        Ok(value) => value,
-        Err(error) => {
-            eprintln!("wrkviz: {error}");
-            return 2;
+    let mut output: Option<String> = None;
+    let mut extras: Vec<String> = Vec::new();
+    let mut after_separator = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if after_separator {
+            extras.push(arg.clone());
+            index += 1;
+            continue;
         }
-    };
+        if arg == "--" {
+            after_separator = true;
+            extras.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        {
+            let (head, explicit) = match arg.split_once('=') {
+                Some((head, value)) => (head, Some(value)),
+                None => (arg.as_str(), None),
+            };
+            let long_help = head.len() > 1 && head.starts_with("--") && "--help".starts_with(head);
+            let short_help = !head.starts_with("--")
+                && head.len() > 1
+                && head.starts_with('-')
+                && head[1..].starts_with('h');
+            if long_help || short_help {
+                if let Some(value) = explicit {
+                    return argparse_error(
+                        INSPECT_USAGE,
+                        "wrkviz inspect",
+                        &format!("argument -h/--help: ignored explicit argument '{value}'"),
+                    );
+                }
+                print!("{INSPECT_HELP}");
+                return 0;
+            }
+        }
+        match named_value(args, &mut index, "--output") {
+            Ok(Some(value)) => output = Some(value),
+            Ok(None) => {
+                if !is_option_token(arg, &["--output"]) {
+                    extras.push(arg.clone());
+                }
+            }
+            Err((_, message)) => return argparse_error(INSPECT_USAGE, "wrkviz inspect", &message),
+        }
+        index += 1;
+    }
     let Some(output) = output else {
-        eprintln!("wrkviz: the following arguments are required: --output");
-        return 2;
+        return argparse_error(
+            INSPECT_USAGE,
+            "wrkviz inspect",
+            "the following arguments are required: --output",
+        );
     };
+    if !extras.is_empty() {
+        eprintln!(
+            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
+            extras.join(" ")
+        );
+        return 2;
+    }
     match inspect(&cli_path(&output)) {
         Ok(text) => {
             println!("{text}");
@@ -7354,6 +7463,7 @@ fn run_gc(args: &[String]) -> u8 {
     let mut values: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     let mut flags: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut extras: Vec<String> = Vec::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -7408,11 +7518,9 @@ fn run_gc(args: &[String]) -> u8 {
             );
         }
         let Some(name) = value_candidates.first() else {
-            return argparse_error(
-                GC_USAGE,
-                "wrkviz gc",
-                &format!("unrecognized arguments: {arg}"),
-            );
+            extras.push(arg.clone());
+            index += 1;
+            continue;
         };
         let name = name.clone();
         let value = match explicit {
@@ -7452,6 +7560,13 @@ fn run_gc(args: &[String]) -> u8 {
                 crate::json::py_repr_str(&format)
             ),
         );
+    }
+    if !extras.is_empty() {
+        eprintln!(
+            "usage: wrkviz [-h] [--version] [--userguide]\n              {{quickstart,ingest-project,ingest,ingest-claude,ingest-claude-history,ingest-muse,ingest-orc,summarize,build,extract-transcripts,export,refresh,github-metadata,refresh-claude,refresh-orc,serve,inspect,gc,migrate-build-state,migrate-snapshots,audit-glossary,audit-losslessness,query,responsiveness,discover-agents}}\n              ...\nwrkviz: error: unrecognized arguments: {}",
+            extras.join(" ")
+        );
+        return 2;
     }
     let root = cli_path(&get("--output").unwrap());
     match crate::gc::collect(

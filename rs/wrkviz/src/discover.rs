@@ -1297,6 +1297,7 @@ pub fn discover(
     cwd_prefixes: &[String],
     since: Option<f64>,
 ) -> Result<Discovery, String> {
+    crate::cli::validation_checkpoint();
     let mut sessions: Vec<Session> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     fn add(sessions: &mut Vec<Session>, index: &mut HashMap<String, usize>, session: Session) {

@@ -1625,6 +1625,7 @@ pub fn audit_archive_losslessness(
     archive: &Path,
     team_slugs: &[String],
 ) -> Result<ArchiveLosslessnessReport, String> {
+    crate::cli::validation_checkpoint();
     let selected: Vec<String> = if team_slugs.is_empty() {
         crate::build_store::ingested_team_slugs(archive)?
     } else {

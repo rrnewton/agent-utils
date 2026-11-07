@@ -440,9 +440,13 @@ fn same_agent_identifier(team: &str, left: &str, right: &str) -> bool {
     local_identifier(team, left) == local_identifier(team, right)
 }
 
+/// An assembled schema-2 timeline plus its bootstrap.
+type SchemaTwoTimeline = (Map<String, Value>, Map<String, Value>);
+
 enum Generation {
     Three(SchemaThree),
     One(Map<String, Value>),
+    Two(Map<String, Value>, Map<String, Value>),
 }
 
 /// An opened timeline: teams plus a generation to read
@@ -456,6 +460,7 @@ pub struct Timeline {
     spine_groups: RefCell<BTreeMap<(String, String), RecordList>>,
     stream_records: RefCell<BTreeMap<String, RecordList>>,
     ref_tables: RefCell<BTreeMap<(String, String), RefTable>>,
+    search_bootstrap_cache: RefCell<Option<Map<String, Value>>>,
 }
 
 fn record_array(source: &Map<String, Value>, key: &str) -> Result<Vec<Map<String, Value>>, String> {
@@ -470,48 +475,180 @@ fn record_array(source: &Map<String, Value>, key: &str) -> Result<Vec<Map<String
     Ok(out)
 }
 
+/// `TimelineQuery._schema_2_range`: a validated half-open range.
+fn schema2_range(record: &Map<String, Value>, where_: &str) -> Result<(Value, i64, i64), String> {
+    let raw = record.get("range").unwrap_or(&Value::Null);
+    let time_range = as_object(raw, &format!("{where_}.range"))?;
+    let start_ms = as_int(
+        time_range.get("start_ms").unwrap_or(&Value::Null),
+        &format!("{where_}.range.start_ms"),
+    )?;
+    let end_ms = as_int(
+        time_range.get("end_ms").unwrap_or(&Value::Null),
+        &format!("{where_}.range.end_ms"),
+    )?;
+    if end_ms <= start_ms {
+        return Err(format!("{where_}.range: end must be after start"));
+    }
+    Ok((raw.clone(), start_ms, end_ms))
+}
+
+/// `TimelineQuery._schema_2_teams`: validated team stubs and slugs.
+fn schema2_teams(
+    record: &Map<String, Value>,
+    where_: &str,
+) -> Result<(Vec<Value>, std::collections::BTreeSet<String>), String> {
+    let raw_teams = as_array(
+        record.get("teams").unwrap_or(&Value::Null),
+        &format!("{where_}.teams"),
+    )?;
+    if raw_teams.is_empty() {
+        return Err(format!("{where_}.teams: must contain at least one team"));
+    }
+    let mut slugs = std::collections::BTreeSet::new();
+    for (index, raw_team) in raw_teams.iter().enumerate() {
+        let team = as_object(raw_team, &format!("{where_}.teams[{index}]"))?;
+        let slug = as_string(
+            team.get("slug").unwrap_or(&Value::Null),
+            &format!("{where_}.teams[{index}].slug"),
+        )?;
+        if slug.is_empty() {
+            return Err(format!("{where_}.teams[{index}].slug: must not be empty"));
+        }
+        if !slugs.insert(slug.to_string()) {
+            return Err(format!(
+                "{where_}.teams: duplicate team slug {}",
+                py_repr(&Value::String(slug.to_string()))
+            ));
+        }
+    }
+    Ok((raw_teams.clone(), slugs))
+}
+
+/// `_stamp_sole_team` over already-cloned records.
+fn stamp_sole_team(records: &mut [Map<String, Value>], sole: Option<&str>) {
+    let Some(slug) = sole else {
+        return;
+    };
+    for record in records.iter_mut() {
+        if record.get("team").is_none_or(Value::is_null) {
+            record.insert("team".to_string(), Value::String(slug.to_string()));
+        }
+    }
+}
+
+/// `TimelineQuery._safe_file` against an explicit archive root.
+fn safe_file_at(root: &Path, relative: &str) -> Result<(PathBuf, Vec<String>), String> {
+    let escaped = || {
+        format!(
+            "archive path escapes root: {}",
+            py_repr(&Value::String(relative.to_string()))
+        )
+    };
+    if relative.starts_with('/') || relative.is_empty() {
+        return Err(escaped());
+    }
+    let parts: Vec<String> = relative
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(str::to_string)
+        .collect();
+    if parts.is_empty() || parts.iter().any(|part| part == "..") {
+        return Err(escaped());
+    }
+    let mut joined = root.to_path_buf();
+    for part in &parts {
+        joined.push(part);
+    }
+    let path = resolve_path(&joined);
+    if !path.starts_with(root) {
+        return Err(escaped());
+    }
+    if path.is_file() {
+        return Ok((path, parts));
+    }
+    let mut stored_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    stored_name.push_str(".gz");
+    let stored = path.with_file_name(stored_name);
+    if stored.is_file() {
+        return Ok((stored, parts));
+    }
+    Err(format!("archive file is missing: {relative}"))
+}
+
+/// `TimelineQuery._content_addressed_object`: verify and read one object.
+fn content_addressed_object(
+    root: &Path,
+    raw_reference: &Value,
+    where_: &str,
+) -> Result<(Map<String, Value>, String), String> {
+    let reference = as_object(raw_reference, where_)?;
+    let digest = as_string(
+        reference.get("sha256").unwrap_or(&Value::Null),
+        &format!("{where_}.sha256"),
+    )?;
+    let digest_ok = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !digest_ok {
+        return Err(format!(
+            "{where_}.sha256: expected a lowercase SHA-256 digest"
+        ));
+    }
+    let relative = as_string(
+        reference.get("url").unwrap_or(&Value::Null),
+        &format!("{where_}.url"),
+    )?;
+    let expected_relative = format!("data/timeline-v2/objects/{digest}.json");
+    if relative != expected_relative {
+        return Err(format!(
+            "{where_}.url: expected content-addressed path {}",
+            py_repr(&Value::String(expected_relative.clone()))
+        ));
+    }
+    let (path, _parts) = safe_file_at(root, &expected_relative)?;
+    let encoded = std::fs::read(&path).map_err(|error| crate::json::os_error(&error, &path))?;
+    if hex_digest(&encoded) != digest {
+        return Err(format!(
+            "{where_}: object digest mismatch for {expected_relative}"
+        ));
+    }
+    if let Some(raw_bytes) = reference.get("bytes") {
+        if !raw_bytes.is_null()
+            && as_int(raw_bytes, &format!("{where_}.bytes"))? != encoded.len() as i64
+        {
+            return Err(format!(
+                "{where_}: object byte count mismatch for {expected_relative}"
+            ));
+        }
+    }
+    let decoded = String::from_utf8(encoded)
+        .ok()
+        .and_then(|text| parse_json_lenient(&text).ok());
+    let Some(decoded) = decoded else {
+        return Err(format!("{where_}: invalid JSON object {expected_relative}"));
+    };
+    let object = as_object(&decoded, &expected_relative)?.clone();
+    Ok((object, expected_relative))
+}
+
 impl Timeline {
     /// Open one archive: a complete schema-3 generation when
-    /// present, otherwise the schema-1 monolith.
+    /// present, otherwise schema 2, otherwise the schema-1 monolith
+    /// (`TimelineQuery.__init__`).
     pub fn open(root: &Path) -> Result<Timeline, String> {
+        crate::cli::validation_checkpoint();
         let root = resolve_path(root);
         let (generation, source) = match open_schema_3(&root) {
             Ok(three) => {
                 let source = three.bootstrap.clone();
                 (Generation::Three(three), source)
             }
-            Err(_) => {
-                let v2 = root.join("data/timeline-v2.json");
-                if let Ok(meta) = std::fs::symlink_metadata(&v2) {
-                    if !meta.is_file() {
-                        return Err(format!(
-                            "timeline schema-2 bootstrap is not a regular file: {}",
-                            v2.display()
-                        ));
-                    }
-                    return Err(
-                        "the Rust edition has not ported the schema-2 timeline generation yet; \
-                         the Python edition remains the oracle for it"
-                            .to_string(),
-                    );
-                }
-                let path = root.join("data/timeline.json");
-                if !path.is_file() {
-                    return Err(format!("no built timeline at {}", path.display()));
-                }
-                let value = crate::json::read_json(&path)?;
-                let source = as_object(&value, &path.display().to_string())?.clone();
-                let version = as_int(
-                    source.get("schema_version").unwrap_or(&Value::Null),
-                    "timeline.schema_version",
-                )?;
-                if version != 1 {
-                    return Err(format!(
-                        "unsupported timeline schema version {version}; expected 1"
-                    ));
-                }
-                (Generation::One(source.clone()), source)
-            }
+            Err(_) => Self::open_older(&root)?,
         };
         let teams = record_array(&source, "teams")?;
         let sole_team = if teams.len() == 1 {
@@ -534,7 +671,474 @@ impl Timeline {
             spine_groups: RefCell::new(BTreeMap::new()),
             stream_records: RefCell::new(BTreeMap::new()),
             ref_tables: RefCell::new(BTreeMap::new()),
+            search_bootstrap_cache: RefCell::new(None),
         })
+    }
+
+    /// `TimelineQuery._load_older_generation`.
+    fn open_older(root: &Path) -> Result<(Generation, Map<String, Value>), String> {
+        let bootstrap_path = root.join("data/timeline-v2.json");
+        if bootstrap_path.is_file() {
+            let value = crate::json::read_json(&bootstrap_path)?;
+            let bootstrap = as_object(&value, &bootstrap_path.display().to_string())?.clone();
+            let schema = as_int(
+                bootstrap.get("schema_version").unwrap_or(&Value::Null),
+                "timeline-v2.schema_version",
+            )?;
+            let predates = schema == 2
+                && bootstrap.get("kind").and_then(Value::as_str) == Some("timeline-bootstrap")
+                && !bootstrap.contains_key("phase_index");
+            if predates {
+                let source = Self::load_schema_1(root)?;
+                return Ok((Generation::One(source.clone()), source));
+            }
+            let (timeline, bootstrap) = Self::load_schema_2(root, &bootstrap_path, bootstrap)?;
+            return Ok((Generation::Two(timeline.clone(), bootstrap), timeline));
+        }
+        if bootstrap_path.exists() {
+            return Err(format!(
+                "timeline schema-2 bootstrap is not a regular file: {}",
+                bootstrap_path.display()
+            ));
+        }
+        let source = Self::load_schema_1(root)?;
+        Ok((Generation::One(source.clone()), source))
+    }
+
+    /// `TimelineQuery._load_schema_1_timeline` plus the version check.
+    fn load_schema_1(root: &Path) -> Result<Map<String, Value>, String> {
+        let path = root.join("data/timeline.json");
+        if !path.is_file() {
+            return Err(format!("no built timeline at {}", path.display()));
+        }
+        let value = crate::json::read_json(&path)?;
+        let source = as_object(&value, &path.display().to_string())?.clone();
+        let version = as_int(
+            source.get("schema_version").unwrap_or(&Value::Null),
+            "timeline.schema_version",
+        )?;
+        if version != 1 {
+            return Err(format!(
+                "unsupported timeline schema version {version}; expected 1"
+            ));
+        }
+        Ok(source)
+    }
+
+    /// `TimelineQuery._load_schema_2_timeline`: assemble the
+    /// schema-1-shaped timeline from the global and phase-index objects.
+    fn load_schema_2(
+        root: &Path,
+        bootstrap_path: &Path,
+        mut bootstrap: Map<String, Value>,
+    ) -> Result<SchemaTwoTimeline, String> {
+        if as_int(
+            bootstrap.get("schema_version").unwrap_or(&Value::Null),
+            "timeline-v2.schema_version",
+        )? != 2
+            || bootstrap.get("kind").and_then(Value::as_str) != Some("timeline-bootstrap")
+        {
+            return Err(format!(
+                "unsupported timeline schema-2 bootstrap at {}",
+                bootstrap_path.display()
+            ));
+        }
+        let source_digest = as_string(
+            bootstrap.get("source_digest").unwrap_or(&Value::Null),
+            "timeline-v2.source_digest",
+        )?
+        .to_string();
+        if source_digest.is_empty() {
+            return Err("timeline-v2.source_digest: must not be empty".to_string());
+        }
+        let (teams, team_slugs) = schema2_teams(&bootstrap, "timeline-v2")?;
+        let (time_range, timeline_start_ms, timeline_end_ms) =
+            schema2_range(&bootstrap, "timeline-v2")?;
+
+        let (mut global_record, global_relative) = content_addressed_object(
+            root,
+            bootstrap.get("global").unwrap_or(&Value::Null),
+            "timeline-v2.global",
+        )?;
+        if as_int(
+            global_record.get("schema_version").unwrap_or(&Value::Null),
+            &format!("{global_relative}.schema_version"),
+        )? != 2
+            || global_record.get("kind").and_then(Value::as_str) != Some("timeline-global")
+        {
+            return Err(format!(
+                "unsupported timeline global object: {global_relative}"
+            ));
+        }
+        if let Some(global_digest) = global_record.get("source_digest") {
+            if !global_digest.is_null()
+                && as_string(global_digest, &format!("{global_relative}.source_digest"))?
+                    != source_digest
+            {
+                return Err(
+                    "timeline global object belongs to a different source generation".to_string(),
+                );
+            }
+        }
+        if global_record.contains_key("range") {
+            let (global_range, _start, _end) = schema2_range(&global_record, &global_relative)?;
+            if global_range != time_range {
+                return Err("timeline global range does not match bootstrap".to_string());
+            }
+        }
+        if global_record.contains_key("teams") {
+            let (_teams, global_team_slugs) = schema2_teams(&global_record, &global_relative)?;
+            if global_team_slugs != team_slugs {
+                return Err("timeline global team set does not match bootstrap".to_string());
+            }
+        }
+
+        let sole: Option<String> = if team_slugs.len() == 1 {
+            team_slugs.iter().next().cloned()
+        } else {
+            None
+        };
+        // Agents: stamp, then validate in the oracle's order.
+        let mut agents: Vec<Map<String, Value>> = Vec::new();
+        {
+            let raw_agents = as_array(
+                global_record.get("agents").unwrap_or(&Value::Null),
+                &format!("{global_relative}.agents"),
+            )?
+            .clone();
+            for (index, raw) in raw_agents.iter().enumerate() {
+                let agent = as_object(raw, &format!("{global_relative}.agents[{index}]"))?;
+                agents.push(agent.clone());
+            }
+        }
+        stamp_sole_team(&mut agents, sole.as_deref());
+        let mut agent_teams: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for (index, agent) in agents.iter().enumerate() {
+            let where_ = format!("{global_relative}.agents[{index}]");
+            let identifier = as_string(
+                agent.get("id").unwrap_or(&Value::Null),
+                &format!("{where_}.id"),
+            )?
+            .to_string();
+            let team = team_of(agent, &where_)?.to_string();
+            if !team_slugs.contains(&team) {
+                return Err(format!(
+                    "{where_}.team: unknown team {}",
+                    py_repr(&Value::String(team.clone()))
+                ));
+            }
+            let (start_ms, end_ms) = interval(agent, &where_)?;
+            if end_ms <= start_ms || start_ms < timeline_start_ms || end_ms > timeline_end_ms {
+                return Err(format!(
+                    "{where_}: agent interval is outside timeline range"
+                ));
+            }
+            if agent_teams.contains_key(&identifier) {
+                return Err(format!(
+                    "{global_relative}.agents: duplicate exact agent id {}",
+                    py_repr(&Value::String(identifier.clone()))
+                ));
+            }
+            agent_teams.insert(identifier, team);
+        }
+        // Write the stamped agents back into the global record.
+        global_record.insert(
+            "agents".to_string(),
+            Value::Array(agents.into_iter().map(Value::Object).collect()),
+        );
+        for key in ["rollups", "project_overviews"] {
+            let Some(raw_values) = global_record.get(key) else {
+                continue;
+            };
+            if raw_values.is_null() {
+                continue;
+            }
+            let mut records: Vec<Map<String, Value>> = Vec::new();
+            {
+                let raw_list = as_array(raw_values, &format!("{global_relative}.{key}"))?.clone();
+                for (index, raw) in raw_list.iter().enumerate() {
+                    let record = as_object(raw, &format!("{global_relative}.{key}[{index}]"))?;
+                    records.push(record.clone());
+                }
+            }
+            stamp_sole_team(&mut records, sole.as_deref());
+            for (index, record) in records.iter().enumerate() {
+                let team = team_of(record, &format!("{global_relative}.{key}[{index}]"))?;
+                if !team_slugs.contains(&team) {
+                    return Err(format!(
+                        "{global_relative}.{key}[{index}].team: unknown team {}",
+                        py_repr(&Value::String(team.to_string()))
+                    ));
+                }
+            }
+            global_record.insert(
+                key.to_string(),
+                Value::Array(records.into_iter().map(Value::Object).collect()),
+            );
+        }
+
+        let (phase_index, phase_relative) = content_addressed_object(
+            root,
+            bootstrap.get("phase_index").unwrap_or(&Value::Null),
+            "timeline-v2.phase_index",
+        )?;
+        if as_int(
+            phase_index.get("schema_version").unwrap_or(&Value::Null),
+            &format!("{phase_relative}.schema_version"),
+        )? != 2
+            || phase_index.get("kind").and_then(Value::as_str) != Some("timeline-phase-index")
+        {
+            return Err(format!(
+                "unsupported timeline phase index: {phase_relative}"
+            ));
+        }
+        if let Some(phase_digest) = phase_index.get("source_digest") {
+            if !phase_digest.is_null()
+                && as_string(phase_digest, &format!("{phase_relative}.source_digest"))?
+                    != source_digest
+            {
+                return Err(
+                    "timeline phase index belongs to a different source generation".to_string(),
+                );
+            }
+        }
+        let mut phases: Vec<Map<String, Value>> = Vec::new();
+        let mut seen_phase_ids = std::collections::BTreeSet::new();
+        {
+            let raw_phases = as_array(
+                phase_index.get("phases").unwrap_or(&Value::Null),
+                &format!("{phase_relative}.phases"),
+            )?
+            .clone();
+            for (index, raw_phase) in raw_phases.iter().enumerate() {
+                let where_ = format!("{phase_relative}.phases[{index}]");
+                let mut phase = as_object(raw_phase, &where_)?.clone();
+                let phase_id = as_string(
+                    phase.get("id").unwrap_or(&Value::Null),
+                    &format!("{where_}.id"),
+                )?
+                .to_string();
+                if !seen_phase_ids.insert(phase_id.clone()) {
+                    return Err(format!(
+                        "{phase_relative}.phases: duplicate id {}",
+                        py_repr(&Value::String(phase_id.clone()))
+                    ));
+                }
+                let agent_id = as_string(
+                    phase.get("agent_id").unwrap_or(&Value::Null),
+                    &format!("{where_}.agent_id"),
+                )?
+                .to_string();
+                let (start_ms, end_ms) = interval(&phase, &where_)?;
+                if end_ms <= start_ms || start_ms < timeline_start_ms || end_ms > timeline_end_ms {
+                    return Err(format!(
+                        "{where_}: phase interval is outside timeline range"
+                    ));
+                }
+                let Some(phase_team) = agent_teams.get(&agent_id) else {
+                    return Err(format!(
+                        "{where_}.agent_id: no exact global agent match for {}",
+                        py_repr(&Value::String(agent_id.clone()))
+                    ));
+                };
+                let phase_team = phase_team.clone();
+                if let Some(existing) = phase.get("team") {
+                    if !existing.is_null()
+                        && as_string(existing, &format!("{where_}.team"))? != phase_team
+                    {
+                        return Err(format!("{where_}.team: does not match phase agent"));
+                    }
+                }
+                phase.insert("team".to_string(), Value::String(phase_team));
+                phases.push(phase);
+            }
+        }
+
+        // Activity bins: stamp and validate team membership.
+        {
+            let raw_bins = as_array(
+                bootstrap.get("activity_bins").unwrap_or(&Value::Null),
+                "timeline-v2.activity_bins",
+            )?
+            .clone();
+            let mut bins: Vec<Map<String, Value>> = Vec::new();
+            for (index, raw_bin) in raw_bins.iter().enumerate() {
+                let bin = as_object(raw_bin, &format!("timeline-v2.activity_bins[{index}]"))?;
+                bins.push(bin.clone());
+            }
+            stamp_sole_team(&mut bins, sole.as_deref());
+            for (index, bin) in bins.iter().enumerate() {
+                let team = team_of(bin, &format!("timeline-v2.activity_bins[{index}]"))?;
+                if !team_slugs.contains(&team) {
+                    return Err(format!(
+                        "timeline-v2.activity_bins[{index}].team: unknown team {}",
+                        py_repr(&Value::String(team.to_string()))
+                    ));
+                }
+            }
+            bootstrap.insert(
+                "activity_bins".to_string(),
+                Value::Array(bins.into_iter().map(Value::Object).collect()),
+            );
+        }
+
+        let mut timeline = Map::new();
+        for (key, value) in global_record {
+            if ["schema_version", "kind", "source_digest", "range", "teams"].contains(&key.as_str())
+            {
+                continue;
+            }
+            timeline.insert(key, value);
+        }
+        timeline.insert("schema_version".to_string(), Value::from(1));
+        timeline.insert(
+            "generated_at".to_string(),
+            Value::String(
+                as_string(
+                    bootstrap.get("generated_at").unwrap_or(&Value::Null),
+                    "timeline-v2.generated_at",
+                )?
+                .to_string(),
+            ),
+        );
+        timeline.insert("source_digest".to_string(), Value::String(source_digest));
+        timeline.insert(
+            "display_timezone".to_string(),
+            Value::String(
+                as_string(
+                    bootstrap.get("display_timezone").unwrap_or(&Value::Null),
+                    "timeline-v2.display_timezone",
+                )?
+                .to_string(),
+            ),
+        );
+        let display_source = match bootstrap.get("display_timezone_source") {
+            None => "legacy_team_data",
+            Some(value) => as_string(value, "timeline-v2.display_timezone_source")?,
+        };
+        timeline.insert(
+            "display_timezone_source".to_string(),
+            Value::String(display_source.to_string()),
+        );
+        timeline.insert("range".to_string(), time_range);
+        timeline.insert("teams".to_string(), Value::Array(teams));
+        timeline.insert(
+            "activity_bins".to_string(),
+            bootstrap
+                .get("activity_bins")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        timeline.insert(
+            "phases".to_string(),
+            Value::Array(phases.into_iter().map(Value::Object).collect()),
+        );
+        timeline.insert("events".to_string(), Value::Array(Vec::new()));
+        Ok((timeline, bootstrap))
+    }
+
+    /// The `source_digest` the open generation declares, if any.
+    fn source_digest(&self) -> Option<Value> {
+        let raw = match &self.generation {
+            Generation::Three(three) => three.bootstrap.get("source_digest"),
+            Generation::One(source) => source.get("source_digest"),
+            Generation::Two(timeline, _) => timeline.get("source_digest"),
+        };
+        match raw {
+            Some(value) if !value.is_null() => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    /// `TimelineQuery._search_bootstrap`.
+    fn search_bootstrap(&self) -> Result<Map<String, Value>, String> {
+        if let Generation::Two(_, bootstrap) = &self.generation {
+            if bootstrap.get("search").is_none_or(Value::is_null) {
+                return Err(
+                    "this archive has no transcript search corpus; rebuild the website".to_string(),
+                );
+            }
+            return Ok(bootstrap.clone());
+        }
+        if let Some(cached) = self.search_bootstrap_cache.borrow().clone() {
+            if cached.get("search").is_none_or(Value::is_null) {
+                return Err(
+                    "this archive has no transcript search corpus; rebuild the website".to_string(),
+                );
+            }
+            return Ok(cached);
+        }
+        let path = self.root.join("data/timeline-v2.json");
+        if !path.is_file() {
+            return Err(
+                "this archive has no transcript search corpus; rebuild the website".to_string(),
+            );
+        }
+        let value = crate::json::read_json(&path)?;
+        let bootstrap = as_object(&value, &path.display().to_string())?.clone();
+        if as_int(
+            bootstrap.get("schema_version").unwrap_or(&Value::Null),
+            "timeline-v2.schema_version",
+        )? != 2
+            || bootstrap.get("kind").and_then(Value::as_str) != Some("timeline-bootstrap")
+        {
+            return Err(format!(
+                "unsupported timeline schema-2 bootstrap at {}",
+                path.display()
+            ));
+        }
+        let ours = self.source_digest();
+        let theirs = match bootstrap.get("source_digest") {
+            Some(value) if !value.is_null() => Some(value.clone()),
+            _ => None,
+        };
+        if let (Some(ours), Some(theirs)) = (&ours, &theirs) {
+            if ours != theirs {
+                return Err(format!(
+                    "the transcript search corpus belongs to a different source generation ({}) than the timeline being read ({}); rebuild the website",
+                    py_repr(theirs),
+                    py_repr(ours)
+                ));
+            }
+        }
+        self.search_bootstrap_cache
+            .borrow_mut()
+            .replace(bootstrap.clone());
+        if bootstrap.get("search").is_none_or(Value::is_null) {
+            return Err(
+                "this archive has no transcript search corpus; rebuild the website".to_string(),
+            );
+        }
+        Ok(bootstrap)
+    }
+
+    /// Counts of the six inspect collections in the assembled
+    /// timeline, for an archive with no monolith (`inspect` fallback).
+    pub fn legacy_counts(&self) -> Result<Map<String, Value>, String> {
+        let source = match &self.generation {
+            Generation::One(source) => Some(source.clone()),
+            Generation::Two(timeline, _) => Some(timeline.clone()),
+            Generation::Three(_) => None,
+        };
+        let mut counts = Map::new();
+        if let Some(source) = source {
+            for name in [
+                "agents",
+                "phases",
+                "edges",
+                "events",
+                "rollups",
+                "summary_files",
+            ] {
+                let items = as_array(
+                    source.get(name).unwrap_or(&Value::Null),
+                    &format!("timeline.{name}"),
+                )?;
+                counts.insert(name.to_string(), Value::from(items.len() as i64));
+            }
+        }
+        Ok(counts)
     }
 
     /// One team's line range of one spine kind, unwrapped and
@@ -677,6 +1281,17 @@ impl Timeline {
                 }
                 records
             }
+            Generation::Two(timeline, _) => {
+                let mut records = record_array(timeline, name)?;
+                if let Some(sole) = &self.sole_team {
+                    for record in &mut records {
+                        if record.get("team").is_none_or(Value::is_null) {
+                            record.insert("team".to_string(), Value::String(sole.clone()));
+                        }
+                    }
+                }
+                records
+            }
         };
         if pushdown.is_some() {
             // A pushed-down read is already scoped; do not let
@@ -709,7 +1324,7 @@ impl Timeline {
                 };
                 self.spine_group(three, kind, team)
             }
-            Generation::One(_) => {
+            Generation::One(_) | Generation::Two(..) => {
                 let singular = match name {
                     "agents" => "agent",
                     "phases" => "phase",
@@ -731,6 +1346,41 @@ impl Timeline {
     fn project_overviews(&self, wanted: &[String]) -> Result<Vec<Map<String, Value>>, String> {
         match &self.generation {
             Generation::Three(three) => self.spine(three, "project_overview", wanted),
+            Generation::Two(timeline, _) => {
+                let source = timeline;
+                if let Some(plural) = source.get("project_overviews") {
+                    if !plural.is_null() {
+                        let raw = as_array(plural, "timeline.project_overviews")?;
+                        let mut out = Vec::new();
+                        for (index, value) in raw.iter().enumerate() {
+                            out.push(
+                                as_object(value, &format!("timeline.project_overviews[{index}]"))?
+                                    .clone(),
+                            );
+                        }
+                        return Ok(out);
+                    }
+                }
+                let Some(singular) = source.get("project_overview") else {
+                    return Ok(Vec::new());
+                };
+                if singular.is_null() {
+                    return Ok(Vec::new());
+                }
+                if self.teams.len() != 1 {
+                    return Err(
+                        "timeline.project_overview requires exactly one timeline team".to_string(),
+                    );
+                }
+                let mut result = as_object(singular, "timeline.project_overview")?.clone();
+                let slug = as_string(
+                    self.teams[0].get("slug").unwrap_or(&Value::Null),
+                    "timeline.teams[0].slug",
+                )?
+                .to_string();
+                result.insert("team".to_string(), Value::String(slug));
+                Ok(vec![result])
+            }
             Generation::One(source) => {
                 if let Some(plural) = source.get("project_overviews") {
                     if !plural.is_null() {
@@ -1299,17 +1949,413 @@ impl Timeline {
                 }
                 Ok(out)
             }
-            _ => {
-                let bootstrap = self.root.join("data").join("timeline-v2.json");
-                if !bootstrap.is_file() {
-                    return Err(
-                        "this archive has no transcript search corpus; rebuild the website"
-                            .to_string(),
-                    );
+            _ => self.iter_search_records_v2(filters, bloom_terms),
+        }
+    }
+
+    /// `TimelineQuery._iter_search_records_v2`: schema-2 day shards.
+    fn iter_search_records_v2(
+        &self,
+        filters: Option<&Filters>,
+        bloom_terms: &[String],
+    ) -> Result<Vec<Map<String, Value>>, String> {
+        let bootstrap = self.search_bootstrap()?;
+        let mut timeline_teams: Vec<String> = Vec::new();
+        for (index, team) in self.teams.iter().enumerate() {
+            let _ = index;
+            timeline_teams.push(
+                as_string(
+                    team.get("slug").unwrap_or(&Value::Null),
+                    "timeline team.slug",
+                )?
+                .to_string(),
+            );
+        }
+        timeline_teams.sort();
+        let raw_search = bootstrap.get("search").unwrap_or(&Value::Null);
+        if raw_search.is_null() {
+            return Err(
+                "this archive has no transcript search corpus; rebuild the website".to_string(),
+            );
+        }
+        let search = as_object(raw_search, "timeline-v2.search")?;
+        if search.get("strategy").and_then(Value::as_str) != Some("transcript-message-shards") {
+            return Err("this archive predates transcript search; rebuild the website".to_string());
+        }
+        if as_int(
+            search.get("schema_version").unwrap_or(&Value::Null),
+            "timeline-v2.search.schema_version",
+        )? != 1
+        {
+            return Err("unsupported transcript search schema".to_string());
+        }
+        let source_digest = as_string(
+            bootstrap.get("source_digest").unwrap_or(&Value::Null),
+            "timeline-v2.source_digest",
+        )?
+        .to_string();
+        let window = match filters {
+            None => None,
+            Some(filters) => parse_window(filters)?,
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        let shards = as_array(
+            search.get("shards").unwrap_or(&Value::Null),
+            "timeline-v2.search.shards",
+        )?
+        .clone();
+        for (shard_index, raw_shard) in shards.iter().enumerate() {
+            let where_ = format!("timeline-v2.search.shards[{shard_index}]");
+            let shard = as_object(raw_shard, &where_)?;
+            let shard_team = as_string(
+                shard.get("team").unwrap_or(&Value::Null),
+                &format!("{where_}.team"),
+            )?
+            .to_string();
+            let shard_start = as_int(
+                shard.get("start_ms").unwrap_or(&Value::Null),
+                &format!("{where_}.start_ms"),
+            )?;
+            let shard_end = as_int(
+                shard.get("end_ms").unwrap_or(&Value::Null),
+                &format!("{where_}.end_ms"),
+            )?;
+            if !timeline_teams.contains(&shard_team) || shard_end <= shard_start {
+                return Err(format!("invalid transcript search shard scope at {where_}"));
+            }
+            if let Some(filters) = filters {
+                if !filters.teams.is_empty()
+                    && !filters.teams.iter().any(|team| team == &shard_team)
+                {
+                    continue;
                 }
-                Err("schema 2 transcript search is not yet ported in the Rust edition".to_string())
+            }
+            if let Some(window) = &window {
+                if !window.overlaps(shard_start, shard_end) {
+                    continue;
+                }
+            }
+            if !bloom_terms.is_empty() {
+                let raw_bloom = shard.get("trigram_bloom");
+                if !bloom_might_match(raw_bloom, bloom_terms, &format!("{where_}.trigram_bloom"))? {
+                    continue;
+                }
+            }
+            let (root_obj, relative) = content_addressed_object(&self.root, raw_shard, &where_)?;
+            if !crate::json::json_eq_one(root_obj.get("schema_version"))
+                || root_obj.get("kind").and_then(Value::as_str) != Some("timeline-search-day")
+            {
+                return Err(format!("unsupported transcript search shard: {relative}"));
+            }
+            if let Some(shard_digest) = root_obj.get("source_digest") {
+                if !shard_digest.is_null()
+                    && as_string(shard_digest, &format!("{relative}.source_digest"))?
+                        != source_digest
+                {
+                    return Err(format!(
+                        "transcript search shard belongs to a different source generation: {relative}"
+                    ));
+                }
+            }
+            if as_string(
+                root_obj.get("team").unwrap_or(&Value::Null),
+                &format!("{relative}.team"),
+            )? != shard_team
+            {
+                return Err(format!("transcript search shard team mismatch: {relative}"));
+            }
+            let root_range = as_object(
+                root_obj.get("range").unwrap_or(&Value::Null),
+                &format!("{relative}.range"),
+            )?;
+            let mut expected_range = Map::new();
+            expected_range.insert("start_ms".to_string(), Value::from(shard_start));
+            expected_range.insert("end_ms".to_string(), Value::from(shard_end));
+            if *root_range != expected_range {
+                return Err(format!(
+                    "transcript search shard range mismatch: {relative}"
+                ));
+            }
+            let raw_records = as_array(
+                root_obj.get("records").unwrap_or(&Value::Null),
+                &format!("{relative}.records"),
+            )?
+            .clone();
+            let catalog_counts = as_object(
+                shard.get("counts").unwrap_or(&Value::Null),
+                &format!("{where_}.counts"),
+            )?;
+            if as_int(
+                catalog_counts.get("records").unwrap_or(&Value::Null),
+                &format!("{where_}.counts.records"),
+            )? != raw_records.len() as i64
+            {
+                return Err(format!(
+                    "transcript search shard count mismatch: {relative}"
+                ));
+            }
+            for (record_index, raw_record) in raw_records.iter().enumerate() {
+                let record = as_object(raw_record, &format!("{relative}.records[{record_index}]"))?;
+                out.push(self.validated_search_record(
+                    record,
+                    &format!("{relative}.records[{record_index}]"),
+                    &shard_team,
+                    shard_start,
+                    shard_end,
+                    &mut seen,
+                )?);
             }
         }
+        Ok(out)
+    }
+
+    /// `TimelineQuery._search_link_context_from_sidecars`.
+    #[allow(clippy::too_many_arguments)]
+    fn search_link_context_sidecars(
+        &self,
+        shards: &[Value],
+        filters: &Filters,
+        selected_agent: Option<&str>,
+        candidate_prompt_refs: &std::collections::BTreeSet<String>,
+        needed_prompt_refs: &std::collections::BTreeSet<String>,
+    ) -> Result<SearchLinkContext, String> {
+        let bootstrap = self.search_bootstrap()?;
+        let source_digest = as_string(
+            bootstrap.get("source_digest").unwrap_or(&Value::Null),
+            "timeline-v2.source_digest",
+        )?
+        .to_string();
+        let mut timeline_teams = std::collections::BTreeSet::new();
+        for team in &self.teams {
+            timeline_teams.insert(
+                as_string(
+                    team.get("slug").unwrap_or(&Value::Null),
+                    "timeline team.slug",
+                )?
+                .to_string(),
+            );
+        }
+        let window = parse_window(filters)?;
+        let mut prompt_excerpts: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let mut response_counts: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+        let mut seen_prompts = std::collections::BTreeSet::new();
+        let mut seen_responses = std::collections::BTreeSet::new();
+        for (shard_index, raw_shard) in shards.iter().enumerate() {
+            let where_ = format!("timeline-v2.search.shards[{shard_index}]");
+            let shard = as_object(raw_shard, &where_)?;
+            let shard_team = as_string(
+                shard.get("team").unwrap_or(&Value::Null),
+                &format!("{where_}.team"),
+            )?
+            .to_string();
+            let shard_start = as_int(
+                shard.get("start_ms").unwrap_or(&Value::Null),
+                &format!("{where_}.start_ms"),
+            )?;
+            let shard_end = as_int(
+                shard.get("end_ms").unwrap_or(&Value::Null),
+                &format!("{where_}.end_ms"),
+            )?;
+            if !timeline_teams.contains(&shard_team) || shard_end <= shard_start {
+                return Err(format!("invalid transcript search shard scope at {where_}"));
+            }
+            if !filters.teams.is_empty() && !filters.teams.iter().any(|team| team == &shard_team) {
+                continue;
+            }
+            let raw_linkage = shard.get("linkage").unwrap_or(&Value::Null);
+            let linkage_reference = as_object(raw_linkage, &format!("{where_}.linkage"))?.clone();
+            let (linkage, relative) =
+                content_addressed_object(&self.root, raw_linkage, &format!("{where_}.linkage"))?;
+            if as_int(
+                linkage.get("schema_version").unwrap_or(&Value::Null),
+                &format!("{relative}.schema_version"),
+            )? != 1
+                || linkage.get("kind").and_then(Value::as_str) != Some("timeline-search-links-day")
+            {
+                return Err(format!(
+                    "unsupported transcript search linkage shard: {relative}"
+                ));
+            }
+            if as_string(
+                linkage.get("source_digest").unwrap_or(&Value::Null),
+                &format!("{relative}.source_digest"),
+            )? != source_digest
+            {
+                return Err(format!(
+                    "transcript search linkage shard belongs to a different source generation: {relative}"
+                ));
+            }
+            if as_string(
+                linkage.get("team").unwrap_or(&Value::Null),
+                &format!("{relative}.team"),
+            )? != shard_team
+            {
+                return Err(format!(
+                    "transcript search linkage shard team mismatch: {relative}"
+                ));
+            }
+            let linkage_range = as_object(
+                linkage.get("range").unwrap_or(&Value::Null),
+                &format!("{relative}.range"),
+            )?;
+            let mut expected_range = Map::new();
+            expected_range.insert("start_ms".to_string(), Value::from(shard_start));
+            expected_range.insert("end_ms".to_string(), Value::from(shard_end));
+            if *linkage_range != expected_range {
+                return Err(format!(
+                    "transcript search linkage shard range mismatch: {relative}"
+                ));
+            }
+            let raw_prompts = as_array(
+                linkage.get("prompts").unwrap_or(&Value::Null),
+                &format!("{relative}.prompts"),
+            )?
+            .clone();
+            let raw_responses = as_array(
+                linkage.get("responses").unwrap_or(&Value::Null),
+                &format!("{relative}.responses"),
+            )?
+            .clone();
+            let catalog_counts = as_object(
+                linkage_reference.get("counts").unwrap_or(&Value::Null),
+                &format!("{where_}.linkage.counts"),
+            )?;
+            if as_int(
+                catalog_counts.get("prompts").unwrap_or(&Value::Null),
+                &format!("{where_}.linkage.counts.prompts"),
+            )? != raw_prompts.len() as i64
+            {
+                return Err(format!(
+                    "transcript search linkage prompt count mismatch: {relative}"
+                ));
+            }
+            if as_int(
+                catalog_counts.get("responses").unwrap_or(&Value::Null),
+                &format!("{where_}.linkage.counts.responses"),
+            )? != raw_responses.len() as i64
+            {
+                return Err(format!(
+                    "transcript search linkage response count mismatch: {relative}"
+                ));
+            }
+            let message_prefix = format!("message:{shard_team}::");
+            let agent_prefix = format!("agent:{shard_team}::");
+            for (prompt_index, raw_prompt) in raw_prompts.iter().enumerate() {
+                let prompt = as_object(raw_prompt, &format!("{relative}.prompts[{prompt_index}]"))?;
+                let reference = as_string(
+                    prompt.get("ref").unwrap_or(&Value::Null),
+                    &format!("{relative}.prompts[{prompt_index}].ref"),
+                )?
+                .to_string();
+                if !reference.starts_with(&message_prefix) {
+                    return Err(format!(
+                        "transcript search linkage prompt belongs to another team: {reference}"
+                    ));
+                }
+                let excerpt = as_string(
+                    prompt.get("excerpt").unwrap_or(&Value::Null),
+                    &format!("{relative}.prompts[{prompt_index}].excerpt"),
+                )?
+                .to_string();
+                if !needed_prompt_refs.contains(&reference) {
+                    continue;
+                }
+                if !seen_prompts.insert(reference.clone()) {
+                    return Err(format!(
+                        "duplicate transcript search linkage prompt {}",
+                        py_repr(&Value::String(reference.clone()))
+                    ));
+                }
+                prompt_excerpts.insert(reference, excerpt);
+            }
+            for (response_index, raw_response) in raw_responses.iter().enumerate() {
+                let spot = format!("{relative}.responses[{response_index}]");
+                let response = as_object(raw_response, &spot)?;
+                let reference = as_string(
+                    response.get("ref").unwrap_or(&Value::Null),
+                    &format!("{spot}.ref"),
+                )?
+                .to_string();
+                if !reference.starts_with(&message_prefix) {
+                    return Err(format!(
+                        "transcript search linkage response belongs to another team: {reference}"
+                    ));
+                }
+                let prompt_reference = as_string(
+                    response.get("prompt_ref").unwrap_or(&Value::Null),
+                    &format!("{spot}.prompt_ref"),
+                )?
+                .to_string();
+                if !prompt_reference.starts_with(&message_prefix) {
+                    return Err(format!(
+                        "transcript search linkage prompt belongs to another team: {reference}"
+                    ));
+                }
+                let at_ms = as_int(
+                    response.get("at_ms").unwrap_or(&Value::Null),
+                    &format!("{spot}.at_ms"),
+                )?;
+                if !(shard_start <= at_ms && at_ms < shard_end) {
+                    return Err(format!(
+                        "transcript search linkage response escapes shard: {reference}"
+                    ));
+                }
+                let agent_reference = as_string(
+                    response.get("agent_ref").unwrap_or(&Value::Null),
+                    &format!("{spot}.agent_ref"),
+                )?
+                .to_string();
+                if !agent_reference.starts_with(&agent_prefix) {
+                    return Err(format!(
+                        "transcript search linkage agent belongs to another team: {reference}"
+                    ));
+                }
+                let Some((agent_kind, agent_record)) = self.lookup_entry(&agent_reference)? else {
+                    return Err(format!(
+                        "transcript search linkage response has unknown agent {}",
+                        py_repr(&Value::String(agent_reference.clone()))
+                    ));
+                };
+                if agent_kind != "agent" {
+                    return Err(format!(
+                        "transcript search linkage response has unknown agent {}",
+                        py_repr(&Value::String(agent_reference.clone()))
+                    ));
+                }
+                if team_of(&agent_record, "search linkage response agent")? != shard_team {
+                    return Err(format!(
+                        "transcript search linkage agent belongs to another team: {reference}"
+                    ));
+                }
+                if !candidate_prompt_refs.contains(&prompt_reference) {
+                    continue;
+                }
+                if let Some(window) = &window {
+                    if !window.contains_dec(&at_ms.to_string()) {
+                        continue;
+                    }
+                }
+                if let Some(selected) = selected_agent {
+                    if agent_reference != selected {
+                        continue;
+                    }
+                }
+                if !seen_responses.insert(reference.clone()) {
+                    return Err(format!(
+                        "duplicate transcript search linkage response {}",
+                        py_repr(&Value::String(reference.clone()))
+                    ));
+                }
+                *response_counts.entry(prompt_reference).or_insert(0) += 1;
+            }
+        }
+        Ok(SearchLinkContext {
+            prompt_excerpts,
+            response_counts,
+        })
     }
 
     fn search_link_context(
@@ -1328,73 +2374,111 @@ impl Timeline {
                 response_counts,
             });
         }
-        let Generation::Three(three) = &self.generation else {
-            // Without a schema-3 corpus the context comes from
-            // the same records the search walked.
-            let team_filters = Filters {
-                teams: filters.teams.clone(),
-                start_time: None,
-                end_time: None,
-                kinds: Vec::new(),
-                agent: None,
-            };
-            for record in self.iter_search_records(Some(&team_filters), &[])? {
-                let reference = as_string(
-                    record.get("ref").unwrap_or(&Value::Null),
-                    "search record.ref",
-                )?
-                .to_string();
-                let record_type = as_string(
-                    record.get("record_type").unwrap_or(&Value::Null),
-                    "search record.record_type",
-                )?;
-                if needed_prompt_refs.contains(&reference)
-                    && ["prompt", "inter_agent_prompt"].contains(&record_type)
-                {
-                    let text = as_string(
-                        record.get("text").unwrap_or(&Value::Null),
-                        "search record.text",
-                    )?;
-                    let compact: String = compact_text(text).chars().take(320).collect();
-                    prompt_excerpts.insert(reference.clone(), compact);
+        let has_v3_corpus = match &self.generation {
+            Generation::Three(three) => Self::has_search_corpus(three),
+            _ => false,
+        };
+        if !has_v3_corpus {
+            // Schema-2 linkage sidecars when every shard carries one,
+            // otherwise the same records the search walked.
+            let bootstrap = self.search_bootstrap()?;
+            let search = as_object(
+                bootstrap.get("search").unwrap_or(&Value::Null),
+                "timeline-v2.search",
+            )?;
+            let shards = as_array(
+                search.get("shards").unwrap_or(&Value::Null),
+                "timeline-v2.search.shards",
+            )?
+            .clone();
+            let mut all_linkage = !shards.is_empty();
+            for (index, raw) in shards.iter().enumerate() {
+                let shard_obj = as_object(raw, &format!("timeline-v2.search.shards[{index}]"))?;
+                if !shard_obj.contains_key("linkage") {
+                    all_linkage = false;
+                    break;
                 }
-                if !["response", "inter_agent_response"].contains(&record_type) {
-                    continue;
-                }
-                let prompt_reference = optional_string(&record, "prompt_ref");
-                let Some(prompt_reference) = prompt_reference else {
-                    continue;
-                };
-                if !candidate_prompt_refs.contains(prompt_reference) {
-                    continue;
-                }
-                let at_ms = as_int(
-                    record.get("at_ms").unwrap_or(&Value::Null),
-                    "search record.at_ms",
-                )?;
-                let window = parse_window(filters)?;
-                if let Some(window) = &window {
-                    if !window.contains_dec(&at_ms.to_string()) {
-                        continue;
-                    }
-                }
-                let agent_reference = as_string(
-                    record.get("agent_ref").unwrap_or(&Value::Null),
-                    "search record.agent_ref",
-                )?;
-                if let Some(selected) = selected_agent {
-                    if agent_reference != selected {
-                        continue;
-                    }
-                }
-                *response_counts
-                    .entry(prompt_reference.to_string())
-                    .or_insert(0) += 1;
             }
-            return Ok(SearchLinkContext {
-                prompt_excerpts,
-                response_counts,
-            });
+            if all_linkage {
+                return self.search_link_context_sidecars(
+                    &shards,
+                    filters,
+                    selected_agent,
+                    candidate_prompt_refs,
+                    needed_prompt_refs,
+                );
+            }
+        }
+        let three = match &self.generation {
+            Generation::Three(three) if has_v3_corpus => three,
+            _ => {
+                // Without a schema-3 corpus the context comes from
+                // the same records the search walked.
+                let team_filters = Filters {
+                    teams: filters.teams.clone(),
+                    start_time: None,
+                    end_time: None,
+                    kinds: Vec::new(),
+                    agent: None,
+                };
+                for record in self.iter_search_records(Some(&team_filters), &[])? {
+                    let reference = as_string(
+                        record.get("ref").unwrap_or(&Value::Null),
+                        "search record.ref",
+                    )?
+                    .to_string();
+                    let record_type = as_string(
+                        record.get("record_type").unwrap_or(&Value::Null),
+                        "search record.record_type",
+                    )?;
+                    if needed_prompt_refs.contains(&reference)
+                        && ["prompt", "inter_agent_prompt"].contains(&record_type)
+                    {
+                        let text = as_string(
+                            record.get("text").unwrap_or(&Value::Null),
+                            "search record.text",
+                        )?;
+                        let compact: String = compact_text(text).chars().take(320).collect();
+                        prompt_excerpts.insert(reference.clone(), compact);
+                    }
+                    if !["response", "inter_agent_response"].contains(&record_type) {
+                        continue;
+                    }
+                    let prompt_reference = optional_string(&record, "prompt_ref");
+                    let Some(prompt_reference) = prompt_reference else {
+                        continue;
+                    };
+                    if !candidate_prompt_refs.contains(prompt_reference) {
+                        continue;
+                    }
+                    let at_ms = as_int(
+                        record.get("at_ms").unwrap_or(&Value::Null),
+                        "search record.at_ms",
+                    )?;
+                    let window = parse_window(filters)?;
+                    if let Some(window) = &window {
+                        if !window.contains_dec(&at_ms.to_string()) {
+                            continue;
+                        }
+                    }
+                    let agent_reference = as_string(
+                        record.get("agent_ref").unwrap_or(&Value::Null),
+                        "search record.agent_ref",
+                    )?;
+                    if let Some(selected) = selected_agent {
+                        if agent_reference != selected {
+                            continue;
+                        }
+                    }
+                    *response_counts
+                        .entry(prompt_reference.to_string())
+                        .or_insert(0) += 1;
+                }
+                return Ok(SearchLinkContext {
+                    prompt_excerpts,
+                    response_counts,
+                });
+            }
         };
         // Schema-3 linkage sidecars.
         let mut days_by_team: std::collections::BTreeMap<String, std::collections::BTreeSet<i64>> =
@@ -2487,7 +3571,7 @@ impl Timeline {
                 self.ref_tables.borrow_mut().insert(table_key, table);
                 Ok(entry)
             }
-            Generation::One(_) => {
+            Generation::One(_) | Generation::Two(..) => {
                 let mut entries: Vec<(String, String, Map<String, Value>)> = Vec::new();
                 for (name, reference_of) in [
                     ("agents", agent_ref as ReferenceOf),
@@ -3311,6 +4395,7 @@ impl TranscriptQuery {
     /// Open the manifest and check every declared projection
     /// the way `TranscriptQuery.__init__` does.
     pub fn open(root: &Path) -> Result<TranscriptQuery, String> {
+        crate::cli::validation_checkpoint();
         let root = resolve_path(root);
         let transcript_root = root.join("extracted").join("transcripts");
         let manifest_path = transcript_root.join("manifest.json");

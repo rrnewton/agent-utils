@@ -2412,6 +2412,7 @@ pub fn run(
     output_format: &str,
     episodes_file: Option<&Path>,
 ) -> Result<String, String> {
+    crate::cli::validation_checkpoint();
     if output_format != "json" && output_format != "markdown" {
         return Err(format!(
             "unsupported format {}",

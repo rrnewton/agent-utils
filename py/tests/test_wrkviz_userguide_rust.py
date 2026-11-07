@@ -8,11 +8,9 @@ with the flag's argparse neighbourhood: abbreviations, explicit
 arguments, the help and version actions that still fire after
 it, unrecognized options, and invalid subcommand choices.
 
-Known divergence, unpinned: after `--userguide`, a subcommand
-with invalid arguments makes the oracle report the subcommand's
-own parse error; the Rust edition prints the guide. A subcommand
-with well-formed arguments is only parsed, never run, by either
-edition, and both print the guide.
+After `--userguide`, a subcommand is only parsed, never run, by
+either edition: a well-formed one prints the guide, an invalid
+one reports the subcommand's own parse error.
 """
 
 from __future__ import annotations
@@ -96,3 +94,34 @@ def test_userguide_following_tokens_match(rust_wrkviz: Path) -> None:
         ["--userguide", "frobnicate"],
     ):
         _both(rust_wrkviz, args)
+
+
+def test_userguide_invalid_subcommand_args_match(rust_wrkviz: Path) -> None:
+    for args in (
+        ["--userguide", "query", "list", "bogus"],
+        ["--userguide", "query", "--output", "/tmp/x", "list", "bogus"],
+        ["--userguide", "query", "list", "--kind", "bogus", "teams"],
+        ["--userguide", "inspect"],
+        ["--userguide", "inspect", "--output", "/tmp/x", "extra"],
+        ["--userguide", "query", "show"],
+        ["--userguide", "query", "search", "the", "extra"],
+        ["--userguide", "gc", "--bogus"],
+        ["--userguide", "serve", "--output", "/tmp/x", "--port", "abc"],
+        ["--userguide", "query", "stats", "--kind", "bogus"],
+    ):
+        _both(rust_wrkviz, args)
+
+
+def test_userguide_wellformed_subcommand_prints_guide(
+    rust_wrkviz: Path,
+) -> None:
+    # Parsed, never run: the archive need not exist, and both
+    # editions still print the guide itself.
+    for args in (
+        ["--userguide", "query", "--output", "/tmp/x", "list", "teams"],
+        ["--userguide", "query", "--output", "/tmp/x", "show", "team:a"],
+        ["--userguide", "inspect", "--output", "/tmp/x"],
+    ):
+        oracle, _ = _both(rust_wrkviz, args)
+        assert oracle.stdout == GUIDE.read_text(encoding="utf-8")
+        assert oracle.returncode == 0

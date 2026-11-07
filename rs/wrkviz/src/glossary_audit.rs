@@ -547,6 +547,7 @@ pub fn audit_legacy_glossaries(
     archive: &Path,
     team_slugs: &[String],
 ) -> Result<LegacyGlossaryAuditReport, String> {
+    crate::cli::validation_checkpoint();
     let selected = selected_teams(archive, team_slugs)?;
     let resolved = crate::json::resolve_path(archive);
     let mut teams = Vec::new();

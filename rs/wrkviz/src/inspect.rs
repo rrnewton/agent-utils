@@ -548,6 +548,16 @@ fn inspect_counts(archive: &Path) -> Result<Map<String, Value>, String> {
     }
     let timeline_path = archive.join("data").join("timeline.json");
     if !timeline_path.is_file() {
+        // Schema-2 fallback: count the assembled timeline the
+        // query reader opens when no monolith was published.
+        if archive.join("data/timeline-v2.json").is_file() {
+            if let Ok(timeline) = crate::query::Timeline::open(archive) {
+                let counts = timeline.legacy_counts()?;
+                if !counts.is_empty() {
+                    return Ok(counts);
+                }
+            }
+        }
         let (_complete, declined) = schema_3_completeness(archive);
         return Err(format!(
             "no built timeline in {}: {declined}, and no {}",
@@ -578,6 +588,7 @@ fn inspect_counts(archive: &Path) -> Result<Map<String, Value>, String> {
 /// `wrkviz inspect --output <archive>`: counts as JSON. The
 /// manifest is read first, as the Python `_inspect` reads it.
 pub fn inspect(archive: &Path) -> Result<String, String> {
+    crate::cli::validation_checkpoint();
     let manifest_path = archive.join("manifest.json");
     let manifest: Value = if manifest_path.is_file() {
         let value = read_json(&manifest_path)?;
