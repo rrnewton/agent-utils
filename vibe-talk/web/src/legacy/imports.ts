@@ -116,6 +116,7 @@ export {
   focusAtEnd,
   isComposer,
   mountComposerGrowListeners,
+  mountMessageBox,
   mountQuickReplyListeners,
   watchBoxInsertions as watchInsertions,
   wireNewlineKey,

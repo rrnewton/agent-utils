@@ -30952,12 +30952,14 @@ autoplay.render();
 // a state the opener has to be ASSERTING for a screen reader to hear it — an `aria-expanded` that
 // only appears after somebody has already opened the tray is no use to the reader who needs it.
 setPromptsOpen(false);
-// `#225 enter-to-send`. One rule for every message box; see `onComposerKey`. A textarea since
-// `#241 voice-composer`, as the channel's box is, so with Enter to send off an Enter is a new line.
-el("compose-text").addEventListener("keydown", (event) =>
-  onComposerKey(event, guardQuietly(voiceCall().sendTyped), el("compose-text")));
-// `paste-never-sends`. Every message box: a paste only ever puts text in.
-watchBoxInsertions(el("compose-text"));
+// The call's box (web/src/view/composer/boxlisteners.ts, `#624 voice-page-modularity`). `#225 enter-to-send`: one
+// rule for every message box; see `onComposerKey`. A textarea since `#241 voice-composer`, as the channel's box is, so
+// with Enter to send off an Enter is a new line. `paste-never-sends`: every message box, a paste only ever puts text in.
+mountMessageBox({
+  box: el("compose-text"),
+  onKey: (event) => onComposerKey(event, guardQuietly(voiceCall().sendTyped), el("compose-text")),
+  watchBoxInsertions: (box) => watchBoxInsertions(box),
+});
 el("dismiss-banner").addEventListener("click", dismissBanner);
 el("dismiss-status").addEventListener("click", dismissStatus);
 el("post-confirm-send").addEventListener("click", voiceTranscript().sendPostProposal);
@@ -31039,13 +31041,16 @@ for (const type of ["focus", "pointerdown"]) {
     guardQuietly(refreshThreadDirectory)();
   });
 }
-el("channel-compose-text").addEventListener("input", rememberChannelDraft);
-el("channel-send").addEventListener("click", guardQuietly(sendChannelMessage));
-// The channel's box, and a thread's, which is the same box posting somewhere else.
-el("channel-compose-text").addEventListener("keydown", (event) =>
-  onComposerKey(event, guardQuietly(sendChannelMessage), el("channel-compose-text"))
-);
-watchBoxInsertions(el("channel-compose-text"));
+// The channel's box, and a thread's, which is the same box posting somewhere else: what is written kept as it is
+// written, Send, its keys, and what is pasted (web/src/view/composer/boxlisteners.ts).
+mountMessageBox({
+  box: el("channel-compose-text"),
+  remember: () => rememberChannelDraft(),
+  sendButton: el("channel-send"),
+  send: guardQuietly(sendChannelMessage),
+  onKey: (event) => onComposerKey(event, guardQuietly(sendChannelMessage), el("channel-compose-text")),
+  watchBoxInsertions: (box) => watchBoxInsertions(box),
+});
 // The thread's back gesture and the right column's controls (`#304 back-gesture-in-app`, `#229 desktop-two-column`,
 // `#388 thread-header-collapse`, `#281 view-keys`, `#262 search-load-older`, `#404`, `#419`, `#426`): a swipe right out
 // of a thread, the layout button, the X, the card at the top of a thread, the card's flight ending, and the Threads
@@ -31076,12 +31081,16 @@ renderUnpackToggle();
 renderMainToggle();
 renderOrderToggle();
 inColumn(columns.side, () => {
-  el("channel-compose-text").addEventListener("input", inThisColumn(rememberChannelDraft));
-  el("channel-send").addEventListener("click", inThisColumn(guardQuietly(sendChannelMessage)));
+  // The right column's twin of the channel's box, each of its acts done in that column.
   const sideBox = el("channel-compose-text");
-  sideBox.addEventListener("keydown", inThisColumn((event) =>
-    onComposerKey(event, guardQuietly(sendChannelMessage), sideBox)));
-  watchBoxInsertions(sideBox);
+  mountMessageBox({
+    box: sideBox,
+    remember: inThisColumn(rememberChannelDraft),
+    sendButton: el("channel-send"),
+    send: inThisColumn(guardQuietly(sendChannelMessage)),
+    onKey: inThisColumn((event) => onComposerKey(event, guardQuietly(sendChannelMessage), sideBox)),
+    watchBoxInsertions: (box) => watchBoxInsertions(box),
+  });
   el("load-older").addEventListener("click", inThisColumn(guardQuietly(olderControlPressed)));
   el("clear-backlog").addEventListener("click", inThisColumn(guardQuietly(clearBacklog)));
   // `#338 column-overscroll`. The reader's own way to the newest line lands on the foot, as End does.

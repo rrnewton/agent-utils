@@ -392,3 +392,38 @@ test("`#624 voice-page-modularity`: with no ResizeObserver the grow switches and
   assert.equal(heard.length, 7);
   mounted.unmount();
 });
+
+test("`#624 voice-page-modularity`: a message box keeps what is written, sends from its button, hears its keys and watches what is pasted, in the page's order, and comes down again", () => {
+  const { mountMessageBox } = VIEW_COMPOSER;
+  const log = [];
+  const node = (id) => ({ id, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (on, type, event = {}) => on.listeners.filter((one) => one.type === type).map((one) => one.listener(event));
+  const box = node("channel-compose-text");
+  const button = node("channel-send");
+  const mounted = mountMessageBox({
+    box,
+    sendButton: button,
+    remember: (...args) => log.push(`remember ${args.length}`),
+    send: (...args) => { log.push(`send ${args.length}`); return "sending"; },
+    onKey: (event) => { log.push(`key ${event.key}`); return "composer"; },
+    watchBoxInsertions: (watched) => log.push(`watch ${watched.id}`),
+  });
+  assert.deepStrictEqual(log, ["listen channel-compose-text input", "listen channel-send click", "listen channel-compose-text keydown",
+    "watch channel-compose-text"], "the box's listeners were not added in the page's order");
+  log.length = 0;
+  fire(box, "input", { n: 1 });
+  // What Send and the keys answer reaches whoever dispatched them (a send is awaited).
+  assert.deepStrictEqual(fire(button, "click", { n: 2 }), ["sending"]);
+  assert.deepStrictEqual(fire(box, "keydown", { key: "Enter" }), ["composer"]);
+  assert.deepStrictEqual(log, ["remember 0", "send 0", "key Enter"], "an act was handed the event, or a key not passed on");
+  mounted.unmount();
+  assert.deepStrictEqual([box.listeners.length, button.listeners.length], [0, 0], "a listener outlived unmount");
+
+  // The call's box: keys and pastes only, its Send and its draft heard elsewhere.
+  log.length = 0;
+  const call = node("compose-text");
+  mountMessageBox({ box: call, onKey: (event) => log.push(`key ${event.key}`), watchBoxInsertions: (watched) => log.push(`watch ${watched.id}`) });
+  assert.deepStrictEqual(log, ["listen compose-text keydown", "watch compose-text"]);
+});

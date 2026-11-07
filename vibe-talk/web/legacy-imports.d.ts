@@ -70,6 +70,7 @@ declare const NEWLINE_KEYS: LegacyImports["NEWLINE_KEYS"];
 declare const createComposerKeys: LegacyImports["createComposerKeys"];
 declare const createOnScreenKeyboard: LegacyImports["createOnScreenKeyboard"];
 declare const createDictation: LegacyImports["createDictation"];
+declare const mountMessageBox: LegacyImports["mountMessageBox"];
 declare const mountComposerGrowListeners: LegacyImports["mountComposerGrowListeners"];
 declare const mountQuickReplyListeners: LegacyImports["mountQuickReplyListeners"];
 declare const watchInsertions: LegacyImports["watchInsertions"];
