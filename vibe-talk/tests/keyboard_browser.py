@@ -81,6 +81,7 @@ import mimetypes
 import os
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -812,9 +813,20 @@ def ring(walk: Walk) -> dict[str, object]:
     return value
 
 
-def ringed(walk: Walk, chord: str, why: str) -> dict[str, object]:
-    """Press `chord`, and the row it selected: ringed, a Tab stop, and shown whole."""
+def ringed(walk: Walk, chord: str, why: str, leaving: str | None = None) -> dict[str, object]:
+    """Press `chord`, and the row it selected: ringed, a Tab stop, and shown whole.
+
+    With `leaving`, the key moves the ring only once a scroll it starts has happened (PgDn), which a
+    loaded host can begin later than settled()'s quiet window, so a list that has not moved yet would
+    read as at rest (#998): first wait, with a forgiving deadline, for the ring to leave that row."""
     press(walk.cdp, chord)
+    if leaving is not None:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:  # judged below, where the message names the row it stayed on
+            held = walk.page.evaluate(RING_JS)
+            if isinstance(held, dict) and held.get("id") != leaving:
+                break
+            walk.page.wait_for_timeout(40)
     row = ring(walk)
     check(row["visible"] is True and row["outline"] != "none" and number(row, "width") >= 1,
           f"{why}: the selected message {row['id']} has no visible focus ring: {row}")
@@ -860,7 +872,7 @@ def keymap_keys(walk: Walk, api: FakeApi) -> None:
     walk.shot("keymap-done")
 
     # PgDn from the selected message: the browser pages the list, and the ring comes to the screen.
-    paged = ringed(walk, "PageDown", "PgDn")
+    paged = ringed(walk, "PageDown", "PgDn", leaving=str(after["id"]))
     check(paged["id"] != after["id"] and number(paged, "top") >= -1,
           f"after PgDn the ring stayed on {after['id']} rather than following the page: {paged}")
 

@@ -105,6 +105,10 @@ LONG_TEXTS = [str(text) for text in _TEXTS] if isinstance(_TEXTS, list) else []
 # `#379 read-aloud-sentences`. Each block's audio is as long as what it says at this rate, the rate
 # the page assumes until it has measured the voice, so the sentence it lights can be checked.
 SECONDS_PER_CHAR = 0.068
+# But no block's audio is shorter than this (#998): the walk waits to see each position the strip shows,
+# and a loaded host has stalled this process past a 1.6 s block, so it saw the read already on the next.
+# Block 1, the one with sentences to light, is longer anyway; the others say one sentence each.
+BLOCK_AT_LEAST_S = 2.5
 FIRST_SENTENCES = ["Where the overnight run got to.", "Three things finished.", "One is still going."]
 SHORT_SECONDS = 1.2
 
@@ -118,10 +122,12 @@ SPEAKING_PACE = 1.0
 AHEAD_PACE = 2.0
 # Slack on every measured boundary, for scheduling and a loaded machine.
 SLACK_MS = 60
-# A pause between two pieces of one block, as the voice sent them, long enough to say the host held the
-# voice up: four pieces' worth. An underrun inside a block needs its piece half a second late (the
-# page's cushion), so a host that caused one shows a pause like this on the voice's side.
-STALL_S = 0.2
+# The underrun control's stall (#998): halfway through one block the voice holds its audio back until the
+# page has played everything it was given and run dry for CONTROL_DRY_S, however much it had in hand (a
+# loaded host can leave it seconds ahead), so it runs out with nothing to play and is not blamed. The
+# voice gives up holding after CONTROL_HOLD_LIMIT_S, and the control then fails for seeing no underrun.
+CONTROL_DRY_S = 0.2
+CONTROL_HOLD_LIMIT_S = 30.0
 # At speaking pace a block cannot be generated before its turn, so a boundary is the next block's own
 # first-audio wait (`voice_wait_ms`) and no longer: the page spends none of its cushion on it, and adds
 # nothing.
@@ -133,18 +139,64 @@ CONTROL_GAP_AT_LEAST_MS = round(CONTROL_FIRST_AUDIO_SECONDS * 1000) - 300
 # Records every Web Audio source the page starts: when it was due, how long it lasts, the audio clock
 # when it was started (when its piece had arrived and been decoded), and its sample rate, which says
 # which block it is from (`rate_of`).
+# Each source as scheduled: when it is due and runs until on the audio clock, when it was scheduled, and
+# when its buffer was made (the page makes one as each piece's bytes arrive), so an underrun can tell a
+# page that had the next piece and scheduled it late from one whose piece had not come yet (#998).
 SOURCE_PROBE = """(() => {
   const proto = window.AudioBufferSourceNode && AudioBufferSourceNode.prototype;
   if (!proto) return;
   const sources = [];
-  window.readAloudProbe = { sources };
+  const made = new WeakMap();
+  window.readAloudProbe = { sources, context: null };
+  const context = window.BaseAudioContext && BaseAudioContext.prototype;
+  if (context) {
+    const create = context.createBuffer;
+    context.createBuffer = function (...args) {
+      const buffer = create.apply(this, args);
+      made.set(buffer, this.currentTime);
+      return buffer;
+    };
+  }
   const start = proto.start;
   proto.start = function (when = 0, ...rest) {
+    const madeAt = this.buffer && made.has(this.buffer) ? made.get(this.buffer) : null;
     sources.push({ due: when, until: when + (this.buffer ? this.buffer.duration : 0), stopped: false,
-                   at: this.context.currentTime, rate: this.buffer ? this.buffer.sampleRate : 0 });
+                   at: this.context.currentTime, made: madeAt, rate: this.buffer ? this.buffer.sampleRate : 0 });
     const probe = sources[sources.length - 1];
+    window.readAloudProbe.context = this.context;
     const stop = this.stop;
     this.stop = function (...args) { probe.stopped = true; return stop.apply(this, args); };
+    return start.call(this, when, ...rest);
+  };
+})();"""
+
+# The late-page control (#998), installed after SOURCE_PROBE: a page that, with block 2's fourth piece
+# and those after it in hand, schedules none of them for LATE_PAGE_MS and then all of them back to back
+# from that moment. `%d` is block 2's sample rate.
+LATE_PAGE_MS = 700
+LATE_PAGE_SHIM = """(() => {
+  const proto = window.AudioBufferSourceNode && AudioBufferSourceNode.prototype;
+  if (!proto) return;
+  const start = proto.start;
+  let seen = 0, held = null, released = false;
+  const release = () => {
+    released = true;
+    let at = 0;
+    for (const [node, rest] of held) {
+      at = Math.max(at, node.context.currentTime);
+      start.call(node, at, ...rest);
+      at += node.buffer.duration;
+    }
+  };
+  proto.start = function (when = 0, ...rest) {
+    if (!released && this.buffer && this.buffer.sampleRate === %d) {
+      seen += 1;
+      if (seen >= 4) {
+        if (held === null) { held = []; setTimeout(release, """ + str(LATE_PAGE_MS) + """); }
+        held.push([this, rest]);
+        return;
+      }
+    }
     return start.call(this, when, ...rest);
   };
 })();"""
@@ -276,14 +328,25 @@ class BarLayout(TypedDict):
 # whether it is a block boundary (the two are from different blocks, by their sample rates), the block
 # the later one is from, and, inside a block, whether it is an underrun -- the piece after it was
 # scheduled only once the audio before it had run out (`#472 gate-flake-hardening`).
+# Whether the page has played all of one block's audio it scheduled (`rate` names the block) and been
+# silent for `dry` seconds since: the underrun control's voice holds its audio back until then.
+RAN_DRY = """([rate, dry]) => {
+  const probe = window.readAloudProbe;
+  const ends = probe.sources.filter((s) => !s.stopped && s.rate === rate).map((s) => s.until);
+  return probe.context !== null && ends.length > 0 && probe.context.currentTime > Math.max(...ends) + dry;
+}"""
+
+
 GAPS = """() => {
   const sources = window.readAloudProbe.sources.filter((s) => !s.stopped).sort((a, b) => a.due - b.due);
   const gaps = [];
   for (let at = 1; at < sources.length; at += 1) {
     const before = sources[at - 1], next = sources[at];
     const boundary = before.rate !== next.rate;
-    gaps.push({ ms: Math.round((next.due - before.until) * 1000), boundary, rate: next.rate,
-                underrun: !boundary && next.at >= before.until - 0.006 });
+    const underrun = !boundary && next.at >= before.until - 0.006;
+    gaps.push({ ms: Math.round((next.due - before.until) * 1000), boundary, rate: next.rate, underrun,
+                had: underrun && next.made !== null && next.made < before.until - 0.006,
+                madeLateMs: underrun && next.made !== null ? Math.round((next.made - before.until) * 1000) : null });
   }
   return gaps;
 }"""
@@ -297,6 +360,10 @@ class Gap:
     boundary: bool
     rate: int
     underrun: bool
+    # For an underrun: whether the page had already made the next piece's buffer before the audio ran out,
+    # and when it made it relative to that moment, in ms (negative: before).
+    had: bool = False
+    made_late_ms: int | None = None
 
     @property
     def block(self) -> int:
@@ -346,11 +413,9 @@ class Read:
     opened: float
     closed: float | None = None
     finished: bool = False
-    # When its first and its latest piece of audio were sent, and how often the host held it up between
-    # two pieces (`STALL_S`).
+    # When its first and its latest piece of audio were sent.
     first_sent: float | None = None
     last_sent: float | None = None
-    stalls: int = 0
 
 
 def voice_wait_ms(before: Read, after: Read) -> int:
@@ -378,6 +443,11 @@ class FakeApi:
     # other selection is cut off, queued or speaking, as the real session cuts it off.
     queue: list[Read] = field(default_factory=list)
     speaking: str | None = None
+    # The underrun control: the block whose audio the voice holds up once, halfway through; it says it is
+    # holding with `stall_held` and goes on when the check sets `stall_release`.
+    stall_block: int | None = None
+    stall_held: threading.Event = field(default_factory=threading.Event)
+    stall_release: threading.Event = field(default_factory=threading.Event)
 
     def client_config(self) -> Json:
         return {
@@ -495,7 +565,7 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
             if message_id == LONG and (block is None or not 0 <= block < len(LONG_BLOCKS)):
                 self.json(404, {"error": "unknown_speech_block", "detail": "no such block"})
                 return
-            seconds = (max(0.6, len(LONG_TEXTS[block or 0]) * SECONDS_PER_CHAR) if message_id == LONG
+            seconds = (max(BLOCK_AT_LEAST_S, len(LONG_TEXTS[block or 0]) * SECONDS_PER_CHAR) if message_id == LONG
                        else SHORT_SECONDS)
             read = Read(message_id, selection, block, time.monotonic())
             with api.lock:
@@ -528,12 +598,16 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                     count = min(per, total - sent)
                     chunk(tone(sent, count, pitch, rate))
                     now = time.monotonic()
-                    if read.last_sent is not None and now - read.last_sent > STALL_S:
-                        read.stalls += 1
                     read.last_sent = now
                     if read.first_sent is None:
                         read.first_sent = now
                     sent += count
+                    if api.stall_block is not None and block == api.stall_block and sent >= total // 2:
+                        api.stall_block = None  # once: the underrun control's held-up voice
+                        held = time.monotonic()
+                        api.stall_held.set()
+                        api.stall_release.wait(CONTROL_HOLD_LIMIT_S)
+                        began += time.monotonic() - held
                     delay = began + sent / rate / api.pace - time.monotonic()
                     if delay > 0:
                         time.sleep(delay)
@@ -623,7 +697,8 @@ def gaps_of(page: Page) -> list[Gap]:
     found: object = page.evaluate(GAPS)
     if not isinstance(found, list) or not all(isinstance(gap, dict) for gap in found):
         raise AssertionError(f"the page returned no gaps: {found!r}")
-    return [Gap(int(gap["ms"]), bool(gap["boundary"]), int(gap["rate"]), bool(gap["underrun"])) for gap in found]
+    return [Gap(int(gap["ms"]), bool(gap["boundary"]), int(gap["rate"]), bool(gap["underrun"]), bool(gap["had"]),
+                None if gap["madeLateMs"] is None else int(gap["madeLateMs"])) for gap in found]
 
 
 def boundaries(gaps: list[Gap]) -> list[int]:
@@ -631,20 +706,22 @@ def boundaries(gaps: list[Gap]) -> list[int]:
     return [gap.ms for gap in gaps if gap.boundary]
 
 
-def check_within_blocks(gaps: list[Gap], reads: list[Read], where: str) -> int:
-    """Inside a block the audio is continuous, but for an underrun the host caused: the page scheduled a
-    piece only after the audio before it had run out, AND the voice was held up sending that block at
-    least as often (`Read.stalls`). A page that holds pieces back, or schedules them late, with the voice
-    on time, still fails. Says how many there were."""
+def check_within_blocks(gaps: list[Gap], where: str) -> int:
+    """Inside a block the audio is continuous, but for an underrun the page could not help: it scheduled a
+    piece only after the audio before it had run out, AND that piece's buffer was made only then, because
+    its bytes had not come yet (the voice, the server or the host held them up). A page that holds pieces
+    back, or schedules one late with its buffer already made, still fails. Says how many there were.
+
+    Blind spot (#998): a page that delays reading its stream makes each buffer late too, and is excused
+    here; the boundary-gap budget against the voice's own wait and the slow-voice negative control still
+    catch a page that is slow to take its audio."""
     late = [gap for gap in gaps if not gap.boundary and gap.ms > SLACK_MS]
     check(all(gap.underrun for gap in late),
           f"{where}: a block's audio was given a gap though its next piece was there in time: {late}")
-    for block in sorted({gap.block for gap in late}):
-        stalls = max((r.stalls for r in reads if r.message_id == LONG and r.block == block), default=0)
-        underruns = sum(1 for gap in late if gap.block == block)
-        check(underruns <= stalls,
-              f"{where}: block {block + 1} ran out {underruns} time(s) inside it, but the voice was held up"
-              f" sending it only {stalls} time(s), so the page was late with audio it had: {late}")
+    held = [gap for gap in late if gap.had]
+    check(not held, f"{where}: block {held[0].block + 1 if held else 0} ran out with its next piece's buffer made"
+                    f" {-(held[0].made_late_ms or 0) if held else 0} ms before, so the page was late with audio it had:"
+                    f" {held}")
     return len(late)
 
 
@@ -680,7 +757,7 @@ def main() -> int:
         with sync_playwright() as playwright:
 
             def open_page(profile: str, width: int, height: int, mobile: bool,
-                          scheme: str = "light") -> tuple[BrowserContext, Page]:
+                          scheme: str = "light", shim: str | None = None) -> tuple[BrowserContext, Page]:
                 context = playwright.chromium.launch_persistent_context(
                     profile,
                     args=CHROMIUM_AUDIO_ARGS,
@@ -693,6 +770,8 @@ def main() -> int:
                 )
                 context.add_init_script("localStorage.setItem('vibe-talk.voice.read-audio-source', 'agent');")
                 context.add_init_script(SOURCE_PROBE)
+                if shim is not None:
+                    context.add_init_script(shim)  # after the probe, so the probe sees what the shim does
                 context.add_init_script(MEDIA_PROBE)
                 page = context.pages[0]
                 page.goto(url, wait_until="load")
@@ -814,7 +893,47 @@ def main() -> int:
                   f"with first audio {CONTROL_FIRST_AUDIO_SECONDS} s the worst boundary was {control_worst} ms"
                   f" ({control_gaps}), so this harness cannot see a gap and proves nothing")
 
+            # THE UNDERRUN CONTROLS (#998). A voice held up inside block 2 until the page has run dry leaves
+            # an underrun the page could not help: its next piece's buffer is made only after the audio ran
+            # out, and it is not blamed. A page that has block 2's next piece in hand and schedules it late
+            # is blamed.
             api.first_audio = FIRST_AUDIO_SECONDS
+            api.stall_held.clear()
+            api.stall_release.clear()
+            api.stall_block = 1
+            with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
+                context, page = open_page(profile, 412, 915, True)
+                press(page, f"{row} .body", True)
+                check(api.stall_held.wait(CONTROL_HOLD_LIMIT_S), "the voice never reached the middle of block 2")
+                held_since = time.monotonic()
+                deadline = held_since + CONTROL_HOLD_LIMIT_S
+                while time.monotonic() < deadline and not page.evaluate(RAN_DRY, [rate_of(1), CONTROL_DRY_S]):
+                    page.wait_for_timeout(20)
+                held_s = time.monotonic() - held_since
+                api.stall_release.set()
+                wait_position(page, "3 of 7", 15)
+                stalled_gaps = gaps_of(page)
+                context.close()
+            api.stall_block = None
+            stalled = [gap for gap in stalled_gaps if gap.underrun and gap.block == 1]
+            check(bool(stalled), f"a voice held up inside block 2 until the page ran dry ({held_s:.1f} s) left no"
+                                 f" underrun there ({stalled_gaps}), so this harness cannot see one and proves nothing")
+            check_within_blocks(stalled_gaps, "with the voice held up inside block 2")
+            with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
+                context, page = open_page(profile, 412, 915, True, shim=LATE_PAGE_SHIM % rate_of(1))
+                press(page, f"{row} .body", True)
+                wait_position(page, "3 of 7", 15)
+                late_gaps = gaps_of(page)
+                context.close()
+            try:
+                check_within_blocks(late_gaps, "a page holding its audio back")
+                blamed = ""
+            except AssertionError as error:
+                blamed = str(error)
+            check("late with audio it had" in blamed or "its next piece was there in time" in blamed,
+                  f"a page that held block 2's pieces back {LATE_PAGE_MS} ms with them in hand was not blamed:"
+                  f" {late_gaps}")
+
             with api.lock:
                 api.reads.clear()
                 api.dismissed.clear()
@@ -873,7 +992,7 @@ def main() -> int:
                     check(gap <= wait + SLACK_MS,
                           f"a block boundary ran {gap} ms with nothing to play, more than the voice's own"
                           f" {wait} ms first-audio wait there: {natural_gaps}")
-                underruns = check_within_blocks(natural_gaps, api.reads_of(LONG), "at speaking pace")
+                underruns = check_within_blocks(natural_gaps, "at speaking pace")
                 pace_boundaries = sorted(gap for gap in boundaries(natural_gaps) if gap > 0)
                 check(len({r.selection for r in boundary_reads}) == 1,
                       "the blocks of one read were asked for under different selections, so each cut off the last")
@@ -975,7 +1094,6 @@ def main() -> int:
             # 8. On a desk, with a voice that generates faster than it speaks: the strip is there,
             # the boundaries have no gap at all, and Next moves the read.
             api.pace = AHEAD_PACE
-            ahead_from = len(api.reads_of(LONG))
             with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
                 context, page = open_page(profile, 1280, 800, False)
                 press(page, f"{row} .body", False)
@@ -990,7 +1108,7 @@ def main() -> int:
                 check(len(boundaries(ahead_gaps)) >= 3, f"not three block boundaries were scheduled: {ahead_gaps}")
                 check(ahead_worst <= GAP_AHEAD_MOST_MS,
                       f"with the voice running ahead a block boundary still ran {ahead_worst} ms: {ahead_gaps}")
-                underruns += check_within_blocks(ahead_gaps, api.reads_of(LONG)[ahead_from:], "running ahead")
+                underruns += check_within_blocks(ahead_gaps, "running ahead")
                 press(page, "#read-next", False)
                 wait_position(page, "5 of 7")
                 check_strip_order(page, "a desk", desk=True)
@@ -1224,7 +1342,10 @@ def main() -> int:
               f" first audio {round(FIRST_AUDIO_SECONDS * 1000)} ms: at speaking pace {pace_boundaries} ms"
               f" (worst {worst}, the voice's waits {waits} ms); generating {AHEAD_PACE:g}x faster than it speaks, worst {ahead_worst} ms;"
               f" control with first audio {round(CONTROL_FIRST_AUDIO_SECONDS * 1000)} ms, worst {control_worst} ms;"
-              f" {underruns} underrun(s) inside a block, the host late with the audio."
+              f" {underruns} underrun(s) inside a block, the host late with the audio;"
+              f" a voice held up inside block 2 until the page ran dry ({held_s:.1f} s) left {len(stalled)} underrun(s)"
+              f" there, not blamed;"
+              f" a page holding block 2 back {LATE_PAGE_MS} ms with it in hand blamed ({'its buffer made before the underrun' if 'audio it had' in blamed else 'a gap with no underrun'})."
               f" On a phone the strip stands full width on the bottom row, playing, held and stopped at 393x852 and"
               f" 412x915 in both schemes ({'; '.join(grown)}); on a desk it stands on the chips row, {gap_desk:.1f}px"
               " off it. Strip order fat Previous and Next section, k of n, thin Previous and Next block (44px targets, at the"

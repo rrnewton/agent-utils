@@ -134,6 +134,14 @@ HEAD_JS = """() => {
     selection.removeAllRanges();
     selection.addRange(range);
     const copied = selection.toString();
+    // Why a copy came out wrong, said with it (#998).
+    const copyState = copied === location.host ? null : {
+        ranges: selection.rangeCount, type: selection.type, innerText: host.innerText,
+        rects: host.getClientRects().length, height: host.offsetHeight,
+        visible: host.checkVisibility({visibilityProperty: true, opacityProperty: true, contentVisibilityAuto: true}),
+        focused: document.hasFocus(), active: document.activeElement ? document.activeElement.id : null,
+        animations: document.getAnimations().length, userSelect: getComputedStyle(host).userSelect,
+    };
     selection.removeAllRanges();
     const order = ['settings-server-host', 'fold-settings-all', 'open-help', 'settings-panes']
         .map((id) => document.getElementById(id));
@@ -148,7 +156,7 @@ HEAD_JS = """() => {
         cut: name.scrollWidth > name.clientWidth + 1,
         port: port.textContent, portWhole: port.scrollWidth <= port.clientWidth + 1
             && port.getBoundingClientRect().right <= host.getBoundingClientRect().right + 1,
-        text: host.textContent, title: host.title, location: location.host, copied,
+        text: host.textContent, title: host.title, location: location.host, copied, copyState,
         inOrder: order.every((node, i) => i === 0
             || Boolean(order[i - 1].compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING)),
         overflow: settings.scrollWidth - settings.clientWidth,
@@ -342,7 +350,7 @@ def settings_walk(desk: Desk) -> None:
         desk.check(bool(head["cut"]), "on a phone the long host was expected not to fit its line")
     desk.check(head["port"] == ":" + head["location"].rsplit(":", 1)[1] and bool(head["portWhole"]),
                f"the port is not shown whole after the name: {head['port']!r}")
-    desk.check(head["copied"] == head["location"], f"the host selected whole copies {head['copied']!r}")
+    desk.check(head["copied"] == head["location"], f"the host selected whole copies {head['copied']!r} ({head['copyState']})")
     desk.check(host["right"] <= desk.width and host["left"] >= 0, f"the host runs off the screen: {host}")
 
     # The buttons: one row, at its end, beside the host on a desk and under it on a phone.

@@ -4962,29 +4962,40 @@ async function shiftOPage(script = SCRIPT) {
   return page;
 }
 
-/** Per-press budget in this fixture, which lays nothing out: a press that draws more than its own rows misses it. */
+/**
+ * Per-press budget in this fixture, which lays nothing out: a press that draws more than its own rows misses it.
+ * It is the main thread's CPU time for the press (`process.threadCpuUsage`), not the wall clock, so a shared
+ * host that deschedules this process, or the collector's helper threads it waits on, mid-press does not count
+ * (#998: one Shift+O read 56 ms of wall in a loaded gate against ~10 ms solo). Measured solo 2026-11-07: Shift+O
+ * 8-13 ms, e 20-26 ms.
+ */
 const SHIFT_O_BUDGET_MS = 50;
 
 /**
- * Press `key` `times` times on whatever holds the focus, each press timed and the elements it built
- * counted, and the Threads view's rows of every other thread compared before and after.
+ * Press `key` `times` times on whatever holds the focus, each press timed (`took` in main-thread CPU ms,
+ * `wall` in wall ms) and the elements it built counted, and the Threads view's rows of every other thread
+ * compared before and after.
  */
 async function pressesInPlace(page, key, fields, times, own) {
   const others = () => page.el("side-cards").children.filter((li) => li.getAttribute("data-unpack-thread") !== own &&
     !(li.hasAttribute("data-card") && li.getAttribute("data-id") === own));
   const before = others();
   const took = [];
+  const wall = [];
   let built = 0;
   for (let at = 0; at < times; at += 1) {
     const made = page.createdTags.length;
     const start = performance.now();
+    const cpuStart = process.threadCpuUsage();
     await pressHere(page, key, fields);
-    took.push(performance.now() - start);
+    const cpu = process.threadCpuUsage(cpuStart);
+    wall.push(performance.now() - start);
+    took.push((cpu.user + cpu.system) / 1000);
     built += builtSince(page, made, "li");
   }
   const after = others();
   const kept = after.length === before.length && after.every((li, at) => li === before[at]);
-  return { took, built, kept };
+  return { took, wall, built, kept };
 }
 
 test("`#532 shift-o-latency`: four Shift+O and four e in an unpacked Threads view each draw in place, within budget, and the folds, Dones and Undo are right", async () => {
@@ -5006,7 +5017,8 @@ test("`#532 shift-o-latency`: four Shift+O and four e in an unpacked Threads vie
     [["9532115"], ["9532114"], ["9532113"], ["9532112"]], "each fold did not mark its message read");
   for (const li of rows().slice(1)) assert.equal(li.getAttribute("data-archived"), "true", "a folded row is not drawn read");
   assert.ok(folds.took.every((ms) => ms < SHIFT_O_BUDGET_MS),
-    `a Shift+O took over ${SHIFT_O_BUDGET_MS} ms: ${folds.took.map((ms) => ms.toFixed(1)).join(", ")}`);
+    `a Shift+O took over ${SHIFT_O_BUDGET_MS} ms of CPU: ${folds.took.map((ms) => ms.toFixed(1)).join(", ")}` +
+    ` (wall ${folds.wall.map((ms) => ms.toFixed(1)).join(", ")})`);
 
   // e down another thread: each Done drawn on its row, the card's unread counted again in place.
   const other = "spaces/A/threads/s10";
@@ -5024,7 +5036,8 @@ test("`#532 shift-o-latency`: four Shift+O and four e in an unpacked Threads vie
   const counted = () => card.children.find((node) => node.className === "side-card-open").getAttribute("aria-label");
   assert.match(counted(), /· 1 unread$/, `the card did not count the Dones: ${counted()}`);
   assert.ok(dones.took.every((ms) => ms < SHIFT_O_BUDGET_MS),
-    `an e took over ${SHIFT_O_BUDGET_MS} ms: ${dones.took.map((ms) => ms.toFixed(1)).join(", ")}`);
+    `an e took over ${SHIFT_O_BUDGET_MS} ms of CPU: ${dones.took.map((ms) => ms.toFixed(1)).join(", ")}` +
+    ` (wall ${dones.wall.map((ms) => ms.toFixed(1)).join(", ")})`);
   // z puts back the last, on the row drawn, and the card counts it.
   await pressHere(page, "z");
   assert.deepStrictEqual(page.restoreCalls.at(-1), { messages: ["9532104"] }, "z did not undo the last e");

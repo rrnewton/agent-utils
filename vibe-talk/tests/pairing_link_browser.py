@@ -44,6 +44,11 @@ QUESTION = {"id": "1110000000000000300", "channel_id": CHANNEL["id"], "author": 
             "timestamp": "2026-01-05T09:00:00Z", "spoken_time": "", "reply_to": None,
             "content": "Is the release branch green?"}
 TOKEN_KEY = "vibe-talk.token"
+# How long to wait for the page to show a state it is expected to reach (#998). Every wait below is for
+# an observed state, so a pass takes only as long as the page does and the deadline only bounds a
+# failure. The old 10 s deadlines ran out twice in loaded shared gates on 2026-11-06 and passed solo; a
+# page that never gets there still fails, after this.
+SHOWN_MS = 60_000
 Json = dict[str, object]
 
 
@@ -234,7 +239,7 @@ def main() -> int:
                             check(len(api.redemptions) == 2, "invalid input reached redemption")
                         page.fill("#pair-input", link)
                         page.tap("#pair-submit")
-                        page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+                        page.wait_for_selector("#view-switch", state="visible", timeout=SHOWN_MS)
                         check(page.evaluate(f"() => localStorage.getItem({json.dumps(TOKEN_KEY)})") == TOKEN,
                               "pasting a pairing link did not sign the installed app's storage in")
                         check(page.input_value("#pair-input") == "", "the pasted credential was retained")
@@ -244,7 +249,7 @@ def main() -> int:
                     page.goto(link, wait_until="load")
                     # Opening the link alone spends nothing: a link scanner that runs the page
                     # must not be able to use it up. The person taps.
-                    page.wait_for_selector("#pair-confirm", state="visible", timeout=10_000)
+                    page.wait_for_selector("#pair-confirm", state="visible", timeout=SHOWN_MS)
                     page.wait_for_timeout(300)
                     check(len(api.redemptions) == (0 if attempt == "first" else 1),
                           f"the {attempt} browser redeemed the code before anyone tapped: {api.redemptions}")
@@ -255,24 +260,24 @@ def main() -> int:
                           "Safari did not offer the unspent pairing link for transfer")
                     page.tap("#pair-confirm")
                     if attempt == "first":
-                        page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+                        page.wait_for_selector("#view-switch", state="visible", timeout=SHOWN_MS)
                         stored = page.evaluate(f"() => localStorage.getItem({json.dumps(TOKEN_KEY)})")
                         check(stored == TOKEN, f"the redeemed token was not stored under {TOKEN_KEY}: {stored!r}")
                         # A second link opened in the same tab: a fragment navigation, which runs no
                         # script afresh. It is offered all the same, and its code leaves the address.
                         page.goto(f"{base}#pair={SECOND_CODE}")
-                        page.wait_for_selector("#pair-confirm", state="visible", timeout=10_000)
+                        page.wait_for_selector("#pair-confirm", state="visible", timeout=SHOWN_MS)
                         address = page.evaluate("() => location.href")
                         check(SECOND_CODE not in address,
                               f"a link opened in a tab already showing the app kept its code: {address!r}")
                         if args.shots:
                             page.screenshot(path=str(args.shots / "first-second-link.png"))
                         page.tap("#pair-dismiss")
-                        page.wait_for_selector("#pair-confirm", state="hidden", timeout=5_000)
+                        page.wait_for_selector("#pair-confirm", state="hidden", timeout=SHOWN_MS)
                     else:
                         page.wait_for_function(
                             "() => /expired or was already used/.test(document.getElementById('error').textContent)",
-                            timeout=10_000,
+                            timeout=SHOWN_MS,
                         )
                         check(page.locator("#screen-signin").is_visible(),
                               "a used link did not leave the browser on the sign-in screen")

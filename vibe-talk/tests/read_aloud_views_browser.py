@@ -74,6 +74,10 @@ CHUNK_MS = 50
 BLOCK_SECONDS = 1.0
 BLOCK_STAY_AT_LEAST_S = 0.7
 DEVICE_MS_PER_CHAR = 12
+# The most a walk waits for a state it expects the page to reach (#998). Each such wait polls for the
+# state, so a pass takes as long as the page does and the deadline only bounds a failure; the old 8 s
+# and 300 ms windows ran out under shared-gate load and passed solo.
+STATE_S = 30.0
 
 # Messages of three paragraphs, read in three blocks: in Main, a reply in the runner's thread, the
 # runner's root (its card summarised, so the root is the first row under it), and the replica's root
@@ -312,7 +316,7 @@ class Walk:
         assert box is not None
         self.page.mouse.click(box["x"] + 12, box["y"] + min(10, box["height"] / 2))
 
-    def wait_for(self, why: str, condition: str, seconds: float = 8) -> None:
+    def wait_for(self, why: str, condition: str, seconds: float = STATE_S) -> None:
         self.desk.wait_for(condition, f"{self.voice}: {why}", seconds)
 
     def read(self, label: str, selector: str, message_id: str, mark: str, card: str | None = None,
@@ -323,17 +327,23 @@ class Walk:
         tickets_before = len(self.api.tickets(message_id))
         self.click(selector)
         if self.voice == "agent":
-            deadline = time.monotonic() + 8
+            deadline = time.monotonic() + STATE_S
             while time.monotonic() < deadline and len(self.api.tickets(message_id)) <= tickets_before:
                 self.page.wait_for_timeout(25)
             self.desk.check(len(self.api.tickets(message_id)) > tickets_before,
                             f"{label}: the agent's voice was never asked for {message_id}")
             self.wait_for(f"{label}: no audio started", f"() => window.audioProbe.sources.length > {audio_before}"
                           " && window.audioProbe.sources.slice(-1)[0].state === 'running'")
+            # The clock must run: 0.15 s of audio played. A loaded host can starve the audio thread for
+            # a few hundred milliseconds (#998), so this waits for the clock to move, not a fixed 300 ms.
             clock = self.page.evaluate("() => window.audioProbe.contexts.slice(-1)[0].currentTime")
-            self.page.wait_for_timeout(300)
-            moved = self.page.evaluate("() => window.audioProbe.contexts.slice(-1)[0].currentTime") - clock
-            self.desk.check(moved > 0.15, f"{label}: the audio clock stood still ({moved:.3f}s in 300ms)")
+            started = time.monotonic()
+            moved = 0.0
+            while moved <= 0.15 and time.monotonic() - started < STATE_S:
+                self.page.wait_for_timeout(50)
+                moved = self.page.evaluate("() => window.audioProbe.contexts.slice(-1)[0].currentTime") - clock
+            self.desk.check(moved > 0.15, f"{label}: the audio clock stood still "
+                                          f"({moved:.3f}s in {time.monotonic() - started:.1f}s)")
         else:
             # The message's first sentence, or more (`#554 read-pause-reply-resume`: one sentence an utterance).
             words = json.dumps(self.message_words(message_id))
@@ -399,9 +409,16 @@ def walk(walk_: Walk) -> None:
     # The thread list: each card, its first message read.
     walk_.view("threads", "() => document.getElementById('screen-main').getAttribute('data-columns') === 'list'"
                " && document.querySelectorAll('#side-cards > li[data-card]').length === 3", "the thread list did not open")
-    kinds = page.evaluate("() => Object.fromEntries([...document.querySelectorAll('#side-cards > li[data-card]')].map((card) =>"
-                          " [card.getAttribute('data-id'), card.hasAttribute('data-summarised-card') ? 'summary'"
-                          " : card.hasAttribute('data-split-card') ? 'split' : 'other']))")
+    # A card is marked summarised or split once its summary or its layout has come in, which a loaded
+    # host can finish after the three cards are drawn (#998): wait for the marks, then judge them.
+    kinds_js = ("() => Object.fromEntries([...document.querySelectorAll('#side-cards > li[data-card]')].map((card) =>"
+                " [card.getAttribute('data-id'), card.hasAttribute('data-summarised-card') ? 'summary'"
+                " : card.hasAttribute('data-split-card') ? 'split' : 'other']))")
+    deadline = time.monotonic() + STATE_S
+    kinds = page.evaluate(kinds_js)
+    while time.monotonic() < deadline and not (kinds.get(RUNNER) == "summary" and kinds.get(REPLICA) == "split"):
+        page.wait_for_timeout(50)
+        kinds = page.evaluate(kinds_js)
     desk.check(kinds.get(RUNNER) == "summary" and kinds.get(REPLICA) == "split",
                f"the runner's card is not summarised or the replica's not split: {kinds}")
     # (Not the summarised card first: its root, 202, is being read, and a press on what is being read stops it.)
