@@ -8730,7 +8730,7 @@ fn receipt_ran(receipt: &crate::donor::Receipt, dir: &std::path::Path) -> Result
         effective_selection: receipt.effective_selection.clone(),
         cpu: receipt.cpu_ms.map(Duration::from_millis),
         donor: Some(format!("{}@{}", receipt.donor.name, receipt.donor.host)),
-        early_red: false,
+        early_red: receipt.early_red,
     })
 }
 

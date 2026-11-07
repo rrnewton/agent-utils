@@ -86,6 +86,27 @@ pub fn could_not_run_busy(log_text: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
+/// The line of a refusal's log that names why it refused: the first line
+/// holding `REFUSED`, else the last non-empty line. A wrapper's cleanup
+/// lines (`validate-lock RELEASED`, `box FREE`) otherwise bury the reason
+/// as the log's last line.
+pub fn refusal_line(log_text: &str) -> Option<&str> {
+    let lines: Vec<&str> = log_text.lines().map(str::trim).collect();
+    lines
+        .iter()
+        .copied()
+        .find(|line| line.contains("REFUSED"))
+        .or_else(|| lines.iter().rev().copied().find(|line| !line.is_empty()))
+}
+
+/// A log line cut to at most 200 chars, for a reason quoted in a receipt
+/// or a job record.
+pub fn cut_line(line: &str) -> &str {
+    line.char_indices()
+        .nth(200)
+        .map_or(line, |(end, _)| &line[..end])
+}
+
 /// Environment variable set to `1` when a donor probes its validator after a host-scope
 /// refusal: admission checks only, exit 0 means ready to validate again.
 pub const PROBE_ENV: &str = "MQ_PROBE";
@@ -774,16 +795,8 @@ fn cannot_execute(
         std::env::var("PATH").unwrap_or_default()
     );
     if finished.spawn_error.is_none() {
-        if let Some(last) = log_text
-            .lines()
-            .map(str::trim)
-            .rfind(|line| !line.is_empty())
-        {
-            let cut = last
-                .char_indices()
-                .nth(200)
-                .map_or(last, |(end, _)| &last[..end]);
-            detail.push_str(&format!("; last output: {cut}"));
+        if let Some(line) = refusal_line(log_text) {
+            detail.push_str(&format!("; last output: {}", cut_line(line)));
         }
     }
     Some(detail)
@@ -1684,6 +1697,19 @@ mod unit {
             .unwrap();
         assert!(ran.refused() && ran.failed().is_empty());
         assert!(ran.cannot_execute.unwrap().contains("/nonexistent/dagrun"));
+    }
+
+    #[test]
+    fn refusal_line_reports_the_first_refused_line_else_the_last_line() {
+        let log = "starting\nREFUSED: pinned image not present\nvalidate-lock RELEASED\nbox FREE\n";
+        assert_eq!(refusal_line(log), Some("REFUSED: pinned image not present"));
+        assert_eq!(
+            refusal_line("one\n\nlast line\n"),
+            Some("last line"),
+            "no REFUSED line falls back to the last non-empty line"
+        );
+        assert_eq!(refusal_line(""), None);
+        assert_eq!(refusal_line("  \n\n"), None);
     }
 
     #[test]

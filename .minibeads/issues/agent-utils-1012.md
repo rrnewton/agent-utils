@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-receipt-reasons: refusal receipts name the log tail instead of the refusal, and donor receipts drop the early-red flag'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-11-07T12:55:00.000000000+00:00
-updated_at: 2026-11-07T12:55:00.000000000+00:00
+updated_at: 2026-11-07T13:05:00.000000000+00:00
 ---
 
 # Description
@@ -53,3 +53,13 @@ Two receipt defects hide why a validation did not run or stopped early:
 Reported from a consuming project's merge-queue operation on
 2026-11-07 (consumer trackers dh-dv6ja and dh-4pn71). Consumers are
 named generically here, as everywhere in this tree.
+
+## Resolution
+
+Landed with `validate::refusal_line` (first `REFUSED` line, falling
+back to the last non-empty line) and `cut_line` used by both labelling
+sites, and with `early_red` carried on the donor `Receipt` from the
+donor's run into queue-side `receipt_ran`. The guide contradiction is
+fixed. Covered by unit tests for the line choice and the receipt
+round-trip, and by `cli_donor_early_verdict.rs` (a donor early verdict
+recorded as an early red).

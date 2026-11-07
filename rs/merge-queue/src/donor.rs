@@ -381,6 +381,11 @@ pub struct Receipt {
     /// Admission refused to run at all (neither green nor red).
     #[serde(default)]
     pub refused: bool,
+    /// The validation stopped at an early red (a streamed deterministic
+    /// failure, or the runner's own early verdict). Receipts written
+    /// before this field existed parse with it off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub early_red: bool,
     /// Per-test results.
     pub results: TestResults,
     /// Wall time of the validation.
@@ -1560,11 +1565,8 @@ impl Store {
         if receipt.refused || receipt.exit == Some(crate::validate::REFUSAL_EXIT) {
             // Validation never ran: no verdict in either mode, so the job goes back to the
             // queue. A donor that keeps answering this way is left out of it.
-            let last = receipt
-                .log_tail
-                .lines()
-                .map(str::trim)
-                .rfind(|line| !line.is_empty())
+            let last = crate::validate::refusal_line(&receipt.log_tail)
+                .map(crate::validate::cut_line)
                 .unwrap_or("");
             let detail = format!(
                 "exit {}{}",
@@ -3179,6 +3181,7 @@ impl Worker<'_> {
                 effective_selection: ran.effective_selection.clone(),
                 exit: ran.exit,
                 refused: ran.refused,
+                early_red: ran.early_red,
                 results: ran.results.clone(),
                 elapsed_ms: ran.elapsed.as_millis() as u64,
                 cpu_ms: ran.cpu.map(|cpu| cpu.as_millis() as u64),
@@ -3810,6 +3813,55 @@ mod unit {
         assert!(error.contains("remote-real-error"), "{error}");
         assert!(error.contains("local-stderr"), "{error}");
         assert!(!error.contains("--ws-url"), "{error}");
+    }
+
+    #[test]
+    fn a_receipt_without_early_red_still_parses_and_a_flagged_one_round_trips() {
+        let store = Store::new(&temp("receipt-early-red"));
+        let job = publish(&store, "c1");
+        let plain = receipt(&job, "d1");
+        assert!(!plain.early_red);
+        let text = serde_json::to_string(&plain).unwrap();
+        assert!(!text.contains("early_red"), "{text}");
+        let back: Receipt = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, plain);
+        // A receipt written before the field existed parses with it off.
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value.as_object_mut().unwrap().remove("early_red");
+        let old: Receipt = serde_json::from_value(value).unwrap();
+        assert!(!old.early_red);
+        let mut flagged = plain.clone();
+        flagged.early_red = true;
+        let text = serde_json::to_string(&flagged).unwrap();
+        let back: Receipt = serde_json::from_str(&text).unwrap();
+        assert!(back.early_red);
+    }
+
+    #[test]
+    fn a_refused_receipt_names_the_refused_line_not_the_log_tail() {
+        let mut store = Store::new(&temp("refused-line"));
+        store.could_not_run_limit = 99;
+        publish(&store, "c1");
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        let error = store
+            .report(
+                &claimed.id,
+                &token,
+                refused_receipt(
+                    &claimed,
+                    "d1",
+                    "REFUSED: pinned image not present\nvalidate-lock RELEASED\nbox FREE",
+                ),
+            )
+            .unwrap_err();
+        assert!(error.contains("pinned image not present"), "{error}");
+        assert!(!error.contains("box FREE"), "{error}");
+        let after = store.read(&claimed.id).unwrap();
+        assert!(
+            after.could_not_run[0].contains("pinned image not present"),
+            "{after:?}"
+        );
     }
 
     fn refused_receipt(job: &Job, donor: &str, log_tail: &str) -> Receipt {

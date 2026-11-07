@@ -1345,8 +1345,8 @@ turns the watch off. The adapter contract is:
   work still happen after the verdict, off the slot.
 - The watch composes with fail-fast: with both on, `$MQ_FAIL_FAST=1` asks the runner to stop
   inside its own step while the watch stops the whole run; whichever acts first reports red.
-- With `validator.offload: decide`, receipts arrive whole, so there is no early red from donors;
-  the watch applies to validations this host runs.
+- With `validator.offload: decide`, a donor runs the same watch and its receipt carries the
+  early-red flag, so an early red from a donor is recorded as one too.
 
 
 **Early red (streamed verdicts).** By default the queue watches a running validation and stops
@@ -1375,8 +1375,8 @@ turns the watch off. The adapter contract is:
   work still happen after the verdict, off the slot.
 - The watch composes with fail-fast: with both on, `$MQ_FAIL_FAST=1` asks the runner to stop
   inside its own step while the watch stops the whole run; whichever acts first reports red.
-- With `validator.offload: decide`, receipts arrive whole, so there is no early red from donors;
-  the watch applies to validations this host runs.
+- With `validator.offload: decide`, a donor runs the same watch and its receipt carries the
+  early-red flag, so an early red from a donor is recorded as one too.
 
 **Early verdict (declared by the runner).** A runner that streams no verdicts during the run
 can still say that a red is final. With `validator.early_verdict: true` the queue sets
@@ -1393,7 +1393,8 @@ can still say that a red is final. With `validator.early_verdict: true` the queu
   `early_red: true`, decided on the verdicts seen so far plus `<test>` as failed. The verdict is
   final but not by itself deterministic, so with `confirm_reruns` on the red is still confirmed.
 - The option is independent of `disable_early_red`. A donor runs the same watch, so a donor's
-  receipt arrives as soon as its run stops, with the test recorded as failed.
+  receipt arrives as soon as its run stops, with the test recorded as failed and the receipt
+  carrying the early-red flag.
 
 **Held for a ruling.** Two marker lines let a runner say that its run is neither a plain pass nor
 a product failure; each names the tests it concerns:
