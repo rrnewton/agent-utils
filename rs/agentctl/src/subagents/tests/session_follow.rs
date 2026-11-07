@@ -190,3 +190,37 @@ fn a_discovered_conversation_is_bound_only_into_a_free_record_that_names_none() 
     assert!(fixture.client.runs.lock().unwrap().is_empty());
     assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
 }
+
+/// A lock dropped while a copy of its descriptor lives on, as in a child that another thread
+/// forked and that has not reached exec yet, is free at once: the guards unlock rather than
+/// only close. Before they did, the bind right after a dropped lock found it "lifecycle busy"
+/// whenever a test beside it was spawning a process.
+#[test]
+fn a_dropped_lock_is_free_while_a_forked_copy_of_its_descriptor_lives() {
+    let fixture = Fixture::new();
+    fixture.adopt();
+    let manager = fixture.manager();
+    let lock = manager.lock("foreign").unwrap();
+    let forked: Vec<File> = lock
+        ._files
+        .0
+        .iter()
+        .map(|file| file.try_clone().unwrap())
+        .collect();
+    drop(lock);
+    let locks = manager
+        .try_record_locks("foreign", "session bind")
+        .expect("the lifecycle lock is free once its guard is dropped");
+    let forked_too: Vec<File> = locks
+        .0
+        .iter()
+        .map(|file| file.try_clone().unwrap())
+        .collect();
+    drop(locks);
+    drop(
+        manager
+            .try_record_locks("foreign", "session bind")
+            .expect("the record locks are free once their guard is dropped"),
+    );
+    drop((forked, forked_too));
+}

@@ -138,7 +138,33 @@ fn rename_directory_noreplace_at(
 #[must_use]
 #[derive(Debug)]
 pub(crate) struct LifecycleLock {
-    _files: Vec<File>,
+    _files: HeldLocks,
+}
+
+/// Lock files whose flock locks this process holds, released explicitly when dropped.
+///
+/// A flock lock belongs to the open file description, not the descriptor, and a child that any
+/// thread forks shares every descriptor until its exec closes them. Closing our descriptor
+/// alone therefore leaves the lock held for as long as such a child sits between fork and exec,
+/// and an observer that tries the lock right after it was dropped finds it busy (under load, in
+/// about 5% of attempts beside a thread spawning processes). Unlocking releases it for every
+/// copy at once.
+#[must_use]
+#[derive(Debug, Default)]
+pub(crate) struct HeldLocks(Vec<File>);
+
+impl HeldLocks {
+    pub(crate) fn push(&mut self, file: File) {
+        self.0.push(file);
+    }
+}
+
+impl Drop for HeldLocks {
+    fn drop(&mut self) {
+        for file in self.0.iter().rev() {
+            let _ = FileExt::unlock(file);
+        }
+    }
 }
 
 /// Move an agent directory between registry layouts with one no-replace rename; see
@@ -6187,7 +6213,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 first_path,
             )? {
                 return Ok(LifecycleLock {
-                    _files: files.into_iter().map(|(file, _)| file).collect(),
+                    _files: HeldLocks(files.into_iter().map(|(file, _)| file).collect()),
                 });
             }
         }
