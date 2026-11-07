@@ -30,17 +30,17 @@ pub(crate) struct Cli {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Command {
     #[command(flatten)]
-    CommandWriters(CommandWriters),
+    Writers(Writers),
     #[command(flatten)]
-    CommandReaders(CommandReaders),
+    Readers(Readers),
     #[command(flatten)]
-    CommandRecovery(CommandRecovery),
+    Recovery(Recovery),
     #[command(flatten)]
-    CommandLifecycle(CommandLifecycle),
+    Lifecycle(Lifecycle),
 }
 
 #[derive(Subcommand)]
-pub(crate) enum CommandWriters {
+pub(crate) enum Writers {
     /// Remove and archive one slot (writer; fixture registries only until cutover)
     Remove {
         /// Active slot to remove
@@ -199,7 +199,7 @@ pub(crate) enum CommandWriters {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum CommandReaders {
+pub(crate) enum Readers {
     /// Print the Python `doctor` command's envelope (JSON) or human form
     DoctorText {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
@@ -460,7 +460,7 @@ pub(crate) enum CommandReaders {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum CommandRecovery {
+pub(crate) enum Recovery {
     /// Record one coordinator read of a slot's handoff (writer; fixture registries only until cutover)
     ReadHandoff {
         /// Active agent slot name
@@ -871,7 +871,7 @@ pub(crate) enum CommandRecovery {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum CommandLifecycle {
+pub(crate) enum Lifecycle {
     /// Classify retained validation checkouts without removing them, printing the Python output (writer; fixture registries only until cutover)
     ClassifyOwnerlessValidateBatchText {
         /// Project-relative private ownerless validation checkout (repeatable)
@@ -1238,8 +1238,8 @@ fn after_separator() -> Vec<String> {
 pub fn run() -> u8 {
     let command = Cli::parse().command;
     let result: Result<serde_json::Value, crate::ObserverError> = match command {
-        Command::CommandWriters(inner) => match inner {
-            CommandWriters::Rebuild {
+        Command::Writers(inner) => match inner {
+            Writers::Rebuild {
                 events_dir,
                 index,
                 config,
@@ -1252,13 +1252,13 @@ pub fn run() -> u8 {
                 _ => unreachable!("clap enforces paired policy inputs"),
             }
             .and_then(|summary| encode_value(&CliSummary::from(&summary))),
-            CommandWriters::Status { index } => {
+            Writers::Status { index } => {
                 read_index(&index).and_then(|summary| encode_value(&CliSummary::from(&summary)))
             }
-            CommandWriters::Explain { index, slot } => {
+            Writers::Explain { index, slot } => {
                 read_decision(&index, &slot).and_then(|decision| encode_value(&decision))
             }
-            CommandWriters::ValidateConfig { root, machine } => {
+            Writers::ValidateConfig { root, machine } => {
                 match crate::config_validate::load_config(root.as_deref(), machine.as_deref()) {
                     Ok(value) => {
                         println!(
@@ -1273,7 +1273,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandWriters::ParseState { root, machine } => {
+            Writers::ParseState { root, machine } => {
                 match crate::active_state::parse_state(root.as_deref(), machine.as_deref()) {
                     Ok(value) => {
                         println!(
@@ -1288,7 +1288,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandWriters::ParseArchive { root, machine } => {
+            Writers::ParseArchive { root, machine } => {
                 match crate::archive_state::parse_archive(root.as_deref(), machine.as_deref()) {
                     Ok(value) => {
                         println!(
@@ -1303,7 +1303,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandWriters::ParseHandoff {
+            Writers::ParseHandoff {
                 root,
                 machine,
                 slot,
@@ -1326,7 +1326,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandWriters::ParseHold {
+            Writers::ParseHold {
                 root,
                 machine,
                 slot,
@@ -1343,7 +1343,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandWriters::ParseJournal {
+            Writers::ParseJournal {
                 root,
                 machine,
                 name,
@@ -1366,7 +1366,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandWriters::ParseStates { root, machine } => {
+            Writers::ParseStates { root, machine } => {
                 match crate::pair_state::parse_states(root.as_deref(), machine.as_deref()) {
                     Ok(value) => {
                         println!(
@@ -1381,7 +1381,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandWriters::ParseGlobal { root } => {
+            Writers::ParseGlobal { root } => {
                 match crate::global_state::parse_global(root.as_deref()) {
                     Ok(value) => {
                         println!(
@@ -1396,7 +1396,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandWriters::ParseHolds { root } => {
+            Writers::ParseHolds { root } => {
                 match crate::record_holds::parse_holds(root.as_deref()) {
                     Ok(value) => {
                         println!(
@@ -1411,7 +1411,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandWriters::ParseJournals { root } => {
+            Writers::ParseJournals { root } => {
                 match crate::journals_state::parse_journals(root.as_deref()) {
                     Ok(value) => {
                         println!(
@@ -1426,7 +1426,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandWriters::StatusText {
+            Writers::StatusText {
                 root,
                 machine,
                 all_machines,
@@ -1448,7 +1448,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandWriters::Remove {
+            Writers::Remove {
                 slot,
                 coordinator_pid,
                 expected_generation,
@@ -1476,8 +1476,8 @@ pub fn run() -> u8 {
                 }
             }
         },
-        Command::CommandReaders(inner) => match inner {
-            CommandReaders::DoctorText {
+        Command::Readers(inner) => match inner {
+            Readers::DoctorText {
                 root,
                 machine,
                 all_machines,
@@ -1497,7 +1497,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandReaders::AuditText {
+            Readers::AuditText {
                 root,
                 machine,
                 cache_census_state,
@@ -1529,7 +1529,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandReaders::ShellCommand {
+            Readers::ShellCommand {
                 slot,
                 slot_type,
                 box_mode,
@@ -1566,7 +1566,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandReaders::ParseStatus { root } => {
+            Readers::ParseStatus { root } => {
                 match crate::status_state::parse_status(root.as_deref()) {
                     Ok(value) => {
                         println!(
@@ -1581,7 +1581,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandReaders::ParseAudit {
+            Readers::ParseAudit {
                 root,
                 machine,
                 cache_census_state,
@@ -1614,7 +1614,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandReaders::Unpushed {
+            Readers::Unpushed {
                 root,
                 machine,
                 slot,
@@ -1635,7 +1635,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandReaders::UnpushedText {
+            Readers::UnpushedText {
                 root,
                 machine,
                 slot,
@@ -1655,7 +1655,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandReaders::ParseDoctor {
+            Readers::ParseDoctor {
                 root,
                 machine,
                 all_machines,
@@ -1676,7 +1676,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandReaders::ParseStorage { root } => {
+            Readers::ParseStorage { root } => {
                 match crate::storage_state::parse_storage(root.as_deref()) {
                     Ok(value) => {
                         println!(
@@ -1691,7 +1691,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandReaders::ParseStorageGit { root } => {
+            Readers::ParseStorageGit { root } => {
                 match crate::git_storage_state::parse_storage_git(root.as_deref()) {
                     Ok(value) => {
                         println!(
@@ -1706,7 +1706,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandReaders::Hold {
+            Readers::Hold {
                 slot,
                 reason,
                 root,
@@ -1731,7 +1731,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandReaders::Unhold {
+            Readers::Unhold {
                 slot,
                 root,
                 machine,
@@ -1748,7 +1748,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandReaders::Heartbeat {
+            Readers::Heartbeat {
                 slot,
                 agent,
                 owner_pid,
@@ -1777,7 +1777,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandReaders::WriteHandoff {
+            Readers::WriteHandoff {
                 slot,
                 agent,
                 owner_pid,
@@ -1808,7 +1808,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandReaders::Release {
+            Readers::Release {
                 slot,
                 agent,
                 owner_pid,
@@ -1838,8 +1838,8 @@ pub fn run() -> u8 {
                 }
             }
         },
-        Command::CommandRecovery(inner) => match inner {
-            CommandRecovery::ReadHandoff {
+        Command::Recovery(inner) => match inner {
+            Recovery::ReadHandoff {
                 slot,
                 coordinator_pid,
                 coordinator_authorized,
@@ -1870,7 +1870,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandRecovery::Adopt {
+            Recovery::Adopt {
                 slot,
                 agent,
                 owner_pid,
@@ -1903,7 +1903,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandRecovery::TransferOwner {
+            Recovery::TransferOwner {
                 slot,
                 agent,
                 owner_pid,
@@ -1940,7 +1940,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandRecovery::RecoverUnboundOwner {
+            Recovery::RecoverUnboundOwner {
                 slot,
                 coordinator_pid,
                 expected_generation,
@@ -1973,7 +1973,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandRecovery::RecoverAbsentAgentRow {
+            Recovery::RecoverAbsentAgentRow {
                 slot,
                 expected_generation,
                 record_sha256,
@@ -2006,7 +2006,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandRecovery::RecoverAbsentAgentRows {
+            Recovery::RecoverAbsentAgentRows {
                 row,
                 input,
                 apply_mode,
@@ -2042,7 +2042,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandRecovery::RecoverAbsentValidateRows {
+            Recovery::RecoverAbsentValidateRows {
                 input,
                 apply_mode,
                 coordinator_authorized,
@@ -2130,7 +2130,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandRecovery::RecoverOwnerlessAgentWorktree {
+            Recovery::RecoverOwnerlessAgentWorktree {
                 path,
                 repository,
                 head,
@@ -2173,7 +2173,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandRecovery::RecoverOwnerlessAgentClone {
+            Recovery::RecoverOwnerlessAgentClone {
                 path,
                 remote_urls,
                 handoff_sha256s,
@@ -2215,7 +2215,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandRecovery::RecoverOwnerlessAgentCache {
+            Recovery::RecoverOwnerlessAgentCache {
                 apply_mode,
                 coordinator_authorized,
                 coordinator_pid,
@@ -2242,7 +2242,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandRecovery::RecoverOwnerlessValidateBatch {
+            Recovery::RecoverOwnerlessValidateBatch {
                 checkouts,
                 frozen_validate_checkouts,
                 completed_records,
@@ -2277,7 +2277,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandRecovery::ClassifyOwnerlessValidateBatch {
+            Recovery::ClassifyOwnerlessValidateBatch {
                 checkouts,
                 frozen_validate_checkouts,
                 completed_records,
@@ -2308,7 +2308,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandRecovery::RecoverAbsentAgentRowsText {
+            Recovery::RecoverAbsentAgentRowsText {
                 row,
                 input,
                 apply_mode,
@@ -2336,7 +2336,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandRecovery::RecoverAbsentValidateRowsText {
+            Recovery::RecoverAbsentValidateRowsText {
                 input,
                 apply_mode,
                 coordinator_authorized,
@@ -2374,7 +2374,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandRecovery::RecoverOwnerlessValidateBatchText {
+            Recovery::RecoverOwnerlessValidateBatchText {
                 checkouts,
                 frozen_validate_checkouts,
                 completed_records,
@@ -2409,15 +2409,15 @@ pub fn run() -> u8 {
                 }
             },
         },
-        Command::CommandLifecycle(inner) => match inner {
-            CommandLifecycle::Plan {
+        Command::Lifecycle(inner) => match inner {
+            Lifecycle::Plan {
                 index,
                 target_bytes,
                 limit,
             } => {
                 read_pressure_plan(&index, target_bytes, limit).and_then(|plan| encode_value(&plan))
             }
-            CommandLifecycle::ClassifyOwnerlessValidateBatchText {
+            Lifecycle::ClassifyOwnerlessValidateBatchText {
                 checkouts,
                 frozen_validate_checkouts,
                 completed_records,
@@ -2447,7 +2447,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandLifecycle::Freeze {
+            Lifecycle::Freeze {
                 action,
                 reason,
                 root,
@@ -2467,7 +2467,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandLifecycle::ClassifyCreateJournals {
+            Lifecycle::ClassifyCreateJournals {
                 slot,
                 agent,
                 slot_type,
@@ -2505,7 +2505,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandLifecycle::ReapStrayWorktrees {
+            Lifecycle::ReapStrayWorktrees {
                 repository,
                 apply_mode,
                 format,
@@ -2527,7 +2527,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandLifecycle::ReclaimOrphanState {
+            Lifecycle::ReclaimOrphanState {
                 apply_mode,
                 format,
                 root,
@@ -2547,7 +2547,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandLifecycle::Recover {
+            Lifecycle::Recover {
                 coordinator_pid,
                 slot,
                 coordinator_authorized,
@@ -2596,7 +2596,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandLifecycle::Create {
+            Lifecycle::Create {
                 slot,
                 slot_type,
                 coordinator_authorized,
@@ -2651,7 +2651,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandLifecycle::CreateText {
+            Lifecycle::CreateText {
                 slot,
                 slot_type,
                 coordinator_authorized,
@@ -2703,7 +2703,7 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
-            CommandLifecycle::Finish {
+            Lifecycle::Finish {
                 slot,
                 agent,
                 owner_pid,
@@ -2736,7 +2736,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandLifecycle::EnsureStates { root, machine } => {
+            Lifecycle::EnsureStates { root, machine } => {
                 match crate::ensure_states::ensure_states(root.as_deref(), machine.as_deref()) {
                     Ok(value) => {
                         println!(
@@ -2751,7 +2751,7 @@ pub fn run() -> u8 {
                     }
                 }
             }
-            CommandLifecycle::ParseConfig { config } => {
+            Lifecycle::ParseConfig { config } => {
                 let parsed = std::fs::read_to_string(&config)
                     .map_err(|error| {
                         crate::ObserverError::invalid(format!(

@@ -403,6 +403,25 @@ steps:
       rss_baseline_bytes: 134217728
 
   - group: check
+    job: wrkslots-debug-test
+    desc: wrkslots daemon Rust lib tests in the debug profile (catches stack frames that only overflow unoptimised, #1003)
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=4 python3 scripts/case_timings.py run-cargo -- cargo test --no-fail-fast --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p wrkslotsd --lib ${DAGRUN_EXTRA_ARGS}
+    deps: [build.rust-launchers]
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust, component-wrkslots]
+    timeout: 9600
+    cpu_timeout: 1200
+    hint:
+      resources: {cargo-target: 1}
+      est_duration_s: 180
+      classification: cpu-bound
+      preferred_inner_jobs: 8
+      rss_baseline_bytes: 4294967296
+
+  - group: check
     job: rust-clippy
     desc: clippy every workspace target with warnings denied
     cmd: >-
