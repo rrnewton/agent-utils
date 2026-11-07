@@ -512,7 +512,7 @@ test("`#207 scrollback-jump` x `#280 scroll-stability`: BACK FROM SETTINGS the j
   assert.deepStrictEqual(real, { up0back: true, up0esc: true, up40back: true, up40esc: true, up150back: true, up150esc: true });
   // THE CONTROL: the jump decided as the screen is shown, under the header still up. The reader 40px up is
   // offered it, and only they are.
-  const early = await run(brokenScript("  if (!main) renderJumpNewest();\n", "  renderJumpNewest();\n"));
+  const early = await run(await brokenModule([{ file: "src/view/shell/screenshowing.ts", find: "    if (!main) deps.renderJumpNewest();\n", replace: "    deps.renderJumpNewest();\n" }]));
   assert.deepStrictEqual(early, { ...real, up40back: false, up40esc: false });
 });
 

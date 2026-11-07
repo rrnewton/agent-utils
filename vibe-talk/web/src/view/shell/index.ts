@@ -8,6 +8,8 @@ export type { ChipsOverComposer, ChipsOverComposerDependencies } from "./chips.t
 export { createUndoOffer, createUndoStamps } from "./undo.ts";
 export type { UndoOffer, UndoStamps } from "./undo.ts";
 export { SCREENS, createScreens } from "./screens.ts";
+export { SCREEN_TITLES, createScreenShowing } from "./screenshowing.ts";
+export type { ScreenShowing, ScreenShowingDependencies } from "./screenshowing.ts";
 export type { Screens } from "./screens.ts";
 export { ACTION_MENU_ITEMS, createActionMenu } from "./actionmenu.ts";
 export { createRowShortcuts } from "./rowshortcuts.ts";
@@ -62,6 +64,8 @@ export type { DocumentListeners, DocumentListenersDependencies } from "./documen
 export { mountPageListeners } from "./pagelisteners.ts";
 export type { PageListeners, PageListenersDependencies } from "./pagelisteners.ts";
 export { mountMenuOpeners } from "./menuopeners.ts";
+export { createPageNavigation } from "./navigation.ts";
+export type { NavChannelPlace, NavDeepLinkWanted, NavHistoryPort, NavLinkJump, NavLinkSpot, NavMessage, PageNavigation, PageNavigationDependencies } from "./navigation.ts";
 export type { MenuOpeners, MenuOpenersDependencies } from "./menuopeners.ts";
 export { READER_WORDS, createReaderRow } from "./readerrow.ts";
 export type { ReaderRow, ReaderRowDependencies } from "./readerrow.ts";

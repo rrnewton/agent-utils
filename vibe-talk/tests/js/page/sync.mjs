@@ -831,8 +831,8 @@ test("with a token saved, a reload never shows the sign-in form while the token 
 
   // THE CONTROL: with the startup's no-token branch showing the form whatever is saved, this sees it.
   const control = [];
-  const flashing = newPage(first.storage, brokenScript('} else if (token()) {\n  if (hydrateFromCache()) {',
-    '} else if (token()) {\n  showScreen("signin");\n  if (hydrateFromCache()) {'), (p) => {
+  const flashing = newPage(first.storage, brokenScript('      } else if (token()) {\n        if (hydrateFromCache()) {',
+    '      } else if (token()) {\n        showScreen("signin");\n        if (hydrateFromCache()) {'), (p) => {
     noteSigninShown(control)(p);
     p.clientConfig = () => new Promise(() => {});
   });
@@ -7353,7 +7353,7 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: BACK FROM SETTINGS,
   assert.deepStrictEqual(await run(SCRIPT, false), every(() => true));
   // The card put back only once the main screen is shown: every reader is moved, at the foot and seeing
   // only the card alike, on every way back.
-  const late = await run(brokenScript('  if (name === "main" && previous !== "main") voiceTranscript().postCardBackToMain();\n', ""));
+  const late = await run(await brokenModule([{ file: "src/view/shell/screenshowing.ts", find: '    if (name === "main" && previous !== "main") deps.postCardBackToMain();\n', replace: "" }]));
   assert.deepStrictEqual(late, every(() => false));
 });
 
@@ -7551,9 +7551,8 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: BACK FROM HELP OPEN
   // as before this: every trip to Help moves its reader, whatever went from under Help and whichever way back.
   // A trip by the gear and Settings' Back is kept even so, since Settings lets go of the focus before anything
   // is shown and nothing lays the list out before the pane is back: the model clamps where Chromium lays out.
-  const first = await run(brokenScript(
-    "    if (screen !== name) el(`screen-${screen}`).hidden = true;\n",
-    "    el(`screen-${screen}`).hidden = screen !== name;\n"));
+  const first = await run(await brokenModule([{ file: "src/view/shell/screenshowing.ts", find: "      if (screen !== name) el(`screen-${screen}`).hidden = true;\n",
+    replace: "      el(`screen-${screen}`).hidden = screen !== name;\n" }]));
   assert.deepStrictEqual(first, every((key) => key === "gear"));
 });
 
