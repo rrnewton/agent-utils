@@ -17,6 +17,8 @@ pub(crate) const SCHEMA: &str = "wrkslots-slot-image/v1";
 pub(crate) const IMAGES_DIRECTORY: &str = "slot-images";
 pub(crate) const RECORD_NAME: &str = "IMAGE.json";
 pub(crate) const IMAGE_FILE_NAME: &str = "slot.img";
+pub(crate) const STATE_IMAGE_NAME: &str = "state.img";
+pub(crate) const STATE_MOUNT_NAME: &str = "state";
 pub(crate) const DISCARD_PHASE: &str = "discarding-stale-copy";
 
 /// One validated `IMAGE.json`, mirroring Python `slotimage.SlotImage`'s
@@ -41,6 +43,16 @@ impl ImageRecord {
 
     pub(crate) fn image_file(&self) -> PathBuf {
         self.directory.join(IMAGE_FILE_NAME)
+    }
+
+    /// The sparse state image, mirroring `SlotImage.state_image`.
+    pub(crate) fn state_image(&self) -> PathBuf {
+        self.directory.join(STATE_IMAGE_NAME)
+    }
+
+    /// Where the state image mounts, mirroring `SlotImage.state_mount`.
+    pub(crate) fn state_mount(&self) -> PathBuf {
+        self.directory.join(STATE_MOUNT_NAME)
     }
 
     /// The `IMAGE.json` document, mirroring `slotimage._record_to_obj`.
