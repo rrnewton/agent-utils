@@ -66,6 +66,10 @@ mod handoff_write;
 mod heartbeat_write;
 mod hold_state;
 mod hold_write;
+#[allow(dead_code)] // wired into create/finish/remove by the shared core (P7 hooks, mu-rsimg)
+mod image_mounts;
+#[allow(dead_code)] // wired into create/finish/remove by the shared core (P7 hooks, mu-rsimg)
+mod image_record;
 mod index;
 mod journal_state;
 mod journals_state;
