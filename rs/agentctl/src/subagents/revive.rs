@@ -572,7 +572,10 @@ pub(super) fn valid_digest(value: &str) -> bool {
 }
 
 pub(super) fn artifact_name_allowed(pinned: &PinnedAgentDirectory, file_name: &str) -> bool {
-    if pinned.path.file_name().and_then(|value| value.to_str()) == Some(".revives") {
+    if matches!(
+        pinned.path.file_name().and_then(|value| value.to_str()),
+        Some(".revives" | ".restarts")
+    ) {
         return file_name.strip_suffix(".json").is_some_and(token);
     }
     file_name == "stopped.json"
@@ -2431,6 +2434,20 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 )));
             }
         };
+        // Preflight BEFORE exit (R1 gap 1): every refusal revive could
+        // raise must surface while the harness is still running, so a
+        // refused restart changes nothing. The launch plan checks
+        // lifecycle/mode/backend/adapter/harness, the recorded cwd, and
+        // profile/policy drift; a pending revive journal also refuses.
+        if journals(&self.registry)?
+            .iter()
+            .any(|journal| journal.name == agent_name)
+        {
+            return Err(fail(format!(
+                "agent '{agent_name}' has an interrupted revive; run `agentctl revive {agent_name}` to finish it before restarting"
+            )));
+        }
+        self.revive_launch_plan(&record, startup_timeout, Some(pane.clone()))?;
         let identity = if record.anchors_with_harness_identity() {
             record.harness_anchor().cloned()
         } else {
@@ -2443,7 +2460,44 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 .client
                 .pane_info(&pane)
                 .is_ok_and(|info| info.agent.as_deref() == Some(&record.harness));
-        if alive {
+        // Restart journal (R1 gap 2): planned -> exited -> removed on
+        // success, so an interrupted restart is visible and resumable.
+        // A journal already at "exited" means the harness is out; the
+        // rerun skips the exit and goes straight to revive.
+        let journal_path = self
+            .registry
+            .join(".restarts")
+            .join(format!("{}.json", record.token));
+        let resumed_exited = fs::read(&journal_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|doc| doc["phase"] == "exited" && doc["name"] == agent_name);
+        let write_journal = |phase: &str| -> Result<()> {
+            agent::create_private_directory(
+                &self.registry.join(".restarts"),
+                "restart journal directory",
+                false,
+                false,
+            )?;
+            let root = pin_directory(&self.registry.join(".restarts"), agent_name)?;
+            let doc = json!({
+                "schema": "agentctl-restart/v1",
+                "name": agent_name,
+                "old_token": record.token,
+                "session": session,
+                "phase": phase,
+                "started_at": SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or_default(),
+            });
+            let content = document_bytes(&doc)?;
+            atomic_replace_bytes(&root, &format!("{}.json", record.token), &content)
+                .map_err(|error| *error.error)?;
+            Ok(())
+        };
+        if alive && !resumed_exited {
+            write_journal("planned")?;
             self.exit_to_shell_stopping(
                 agent_name,
                 &pane,
@@ -2451,9 +2505,77 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 wait_timeout,
                 stop_background_tasks,
             )?;
+            write_journal("exited")?;
         }
         let old_pid = identity.as_ref().map(|id| id.pid);
         let result = self.revive(agent_name, false, Some(&record.token), startup_timeout)?;
+        // Drain, never archive (R1 gap 3): prompts that reached the old
+        // generation during the restart window were archived by revive;
+        // re-enqueue their text into the restarted session under fresh
+        // ids, then drain the new inbox. Delivered ids are the
+        // submission evidence; the report maps old id -> new id.
+        let mut replayed = Vec::new();
+        if let (Some(archive), Some(rows)) = (
+            result["archive"].as_str(),
+            result["archived_prompts"].as_array(),
+        ) {
+            use agent_queue::queue::QueueDirectories;
+            let old_queue = QueueDirectories::new(&Path::new(archive).join("queue"));
+            for row in rows {
+                let (Some(id), Some(lane)) = (row["id"].as_str(), row["lane"].as_str()) else {
+                    continue;
+                };
+                if !matches!(lane, "inbox" | "inbox.v2" | "inflight") {
+                    continue;
+                }
+                let directory = match lane {
+                    "inbox" => &old_queue.inbox,
+                    "inbox.v2" => &old_queue.inbox_v2,
+                    _ => &old_queue.inflight,
+                };
+                let Ok(document) =
+                    agent_queue::queue::load_message(&directory.join(format!("{id}.json")))
+                else {
+                    continue;
+                };
+                let Some(text) = document.get("text").and_then(Value::as_str) else {
+                    continue;
+                };
+                let new_id = format!("restart-{id}");
+                if self
+                    .queue_identified(agent_name, text, None, Some(&new_id))
+                    .is_ok()
+                {
+                    replayed.push(json!({"old_id": id, "new_id": new_id, "lane": lane}));
+                }
+            }
+        }
+        let drained = self.drain(
+            agent_name,
+            DrainOptions {
+                ready_timeout: Duration::from_secs(60),
+                deliver_while_working: true,
+                ..DrainOptions::default()
+            },
+        );
+        let drain_report = match &drained {
+            Ok(queue) => json!({
+                "delivered": queue.delivered,
+                "pending": queue.pending,
+                "outcome": format!("{:?}", queue.outcome),
+            }),
+            Err(error) => json!({"error": error.to_string()}),
+        };
+        // The restart completed: the journal's work is done. A journal
+        // left at "exited" by an interrupted run is consumed above.
+        let _ = fs::remove_file(&journal_path);
+        let restart_journal = if resumed_exited {
+            "resumed-after-exit"
+        } else if alive {
+            "planned-exited-completed"
+        } else {
+            "not-needed-harness-already-out"
+        };
         let new_record = self.load(agent_name)?;
         let new_pane = new_record.pane_id.clone().unwrap_or_default();
         let renamed = self
@@ -2534,6 +2656,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "renamed": renamed,
             "slot_owner": slot,
             "notified": notified,
+            "restart_journal": restart_journal,
+            "replayed_prompts": replayed,
+            "drain": drain_report,
             "peers": peers,
         }))
     }

@@ -39,6 +39,118 @@ fn recoverable(harness: &str, reports_session: bool) -> (Fixture, AgentRecord) {
     (fixture, record)
 }
 
+#[test]
+fn restart_refuses_before_exit_when_the_recorded_cwd_is_gone() {
+    let (fixture, mut old) = recoverable("muse", false);
+    old.session_agent = Some("muse".to_owned());
+    old.session_value = Some("sess-1".to_owned());
+    old.cwd = "/nonexistent-restart-cwd".to_owned();
+    fixture.manager().save(&old).unwrap();
+    let pane = old.pane_id.clone().unwrap();
+    fixture.client.dead_panes.lock().unwrap().remove(&pane);
+    fixture.client.started.store(true, Ordering::Relaxed);
+    fixture.client.custom_alive.store(true, Ordering::Relaxed);
+    fixture.client.exit_to_shell.store(true, Ordering::Relaxed);
+    let error = fixture
+        .manager()
+        .restart("worker", false, Duration::from_secs(30), TIMEOUT)
+        .unwrap_err();
+    assert!(error.to_string().contains("starting directory"), "{error}");
+    // Nothing was exited: no /exit was typed into the pane.
+    assert!(
+        !fixture
+            .client
+            .runs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|run| run.contains("/exit")),
+        "a refused restart must not touch the harness"
+    );
+}
+
+#[test]
+fn restart_resumes_from_an_exited_journal_without_exiting_again() {
+    let (fixture, mut old) = recoverable("muse", false);
+    old.session_agent = Some("muse".to_owned());
+    old.session_value = Some("sess-1".to_owned());
+    fixture.manager().save(&old).unwrap();
+    // A previous restart wrote its journal and exited the harness, then
+    // was interrupted: the rerun must skip the exit and revive.
+    let journal = fixture
+        .root
+        .join("registry/.restarts")
+        .join(format!("{}.json", old.token));
+    fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    fs::write(
+        &journal,
+        json!({
+            "schema": "agentctl-restart/v1", "name": "worker",
+            "old_token": old.token, "session": "sess-1",
+            "phase": "exited", "started_at": 0.0,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let result = fixture
+        .manager()
+        .restart("worker", false, Duration::from_secs(30), TIMEOUT)
+        .unwrap();
+    assert_eq!(result["action"], "restarted", "{result}");
+    assert_eq!(result["restart_journal"], "resumed-after-exit");
+    assert!(
+        !journal.exists(),
+        "a completed restart consumes its journal"
+    );
+}
+
+#[test]
+fn restart_drains_prompts_queued_during_the_restart_window() {
+    let (fixture, mut old) = recoverable("muse", false);
+    old.session_agent = Some("muse".to_owned());
+    old.session_value = Some("sess-1".to_owned());
+    fixture.manager().save(&old).unwrap();
+    // A prompt that reached the old generation while it was down: revive
+    // archives it, and restart must replay it into the new session.
+    // The restarted Muse sits at an idle composer, ready to be drained into.
+    *fixture.client.muse_editor.lock().unwrap() = Some(
+        super::herdr_compatibility::MuseEditor::new("Launch overrides", false, None),
+    );
+    let queue = fixture.root.join("registry/agents/worker/queue/inbox");
+    agent::create_private_directory(&queue, "test queue lane", true, false).unwrap();
+    agent::atomic_json(
+        &queue.join("m-1.json"),
+        &json!({"id": "m-1", "text": "[from lane-a via agentctl · reply: agentctl send lane-a]\nplease run the gate"}),
+    )
+    .unwrap();
+    let result = fixture
+        .manager()
+        .restart("worker", false, Duration::from_secs(30), TIMEOUT)
+        .unwrap();
+    assert_eq!(result["action"], "restarted", "{result}");
+    assert_eq!(
+        result["replayed_prompts"],
+        json!([{"old_id": "m-1", "new_id": "restart-m-1", "lane": "inbox"}]),
+        "{result}"
+    );
+    assert!(
+        result["drain"]["delivered"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id == "restart-m-1")),
+        "{result}"
+    );
+    assert!(
+        fixture
+            .client
+            .literal_pastes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, text)| text.contains("please run the gate")),
+        "the replayed prompt was typed into the restarted session"
+    );
+}
+
 fn journal_path(fixture: &Fixture, record: &AgentRecord) -> PathBuf {
     fixture
         .root
