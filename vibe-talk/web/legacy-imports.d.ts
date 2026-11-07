@@ -43,6 +43,7 @@ declare const createKeySelection: LegacyImports["createKeySelection"];
 declare const createKeymap: LegacyImports["createKeymap"];
 declare const createReadCollapse: LegacyImports["createReadCollapse"];
 declare const mountKeyListeners: LegacyImports["mountKeyListeners"];
+declare const mountMenuOpeners: LegacyImports["mountMenuOpeners"];
 declare const mountPageListeners: LegacyImports["mountPageListeners"];
 declare const createKeyTiming: LegacyImports["createKeyTiming"];
 declare const keyTimingLine: LegacyImports["keyTimingLine"];
@@ -421,6 +422,7 @@ declare const createReadAloud: LegacyImports["createReadAloud"];
 declare const createAutoplay: LegacyImports["createAutoplay"];
 declare const mountReadControls: LegacyImports["mountReadControls"];
 declare const mountCallControls: LegacyImports["mountCallControls"];
+declare const mountPageButtons: LegacyImports["mountPageButtons"];
 declare const createReadingJump: LegacyImports["createReadingJump"];
 
 declare const HELP_TOPICS: LegacyImports["HELP_TOPICS"];

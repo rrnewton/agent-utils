@@ -105,7 +105,7 @@ export {
   shownNode,
   tagNameOf,
 } from "../view/dom/index.ts";
-export { KEYS_MESSAGE, KEYS_MOVING, KEYS_PAGE, KEYS_VIEW, KEYS_WRITING, SCREENS, createActionMenu, createChannelKeys, createChipsOverComposer, createDoneKeys, createFoldKeys, createHighlightCopy, createKeyDispatch, createKeyHints, createKeySelection, createKeyTiming, createKeymap, createPointerSelection, createPromptsTray, createReadCollapse, createReaderRow, createReplySight, createRowKeys, createRowShortcuts, createScreenKeys, createScreens, createScrollKeys, createSelectionKeys, createShellNotices, createUndoOffer, createUndoStamps, createViewKeys, createWriteKeys, keyTimingLine, modHeld, mountKeyListeners, mountPageListeners, pageStep, swallow } from "../view/shell/index.ts";
+export { KEYS_MESSAGE, KEYS_MOVING, KEYS_PAGE, KEYS_VIEW, KEYS_WRITING, SCREENS, createActionMenu, createChannelKeys, createChipsOverComposer, createDoneKeys, createFoldKeys, createHighlightCopy, createKeyDispatch, createKeyHints, createKeySelection, createKeyTiming, createKeymap, createPointerSelection, createPromptsTray, createReadCollapse, createReaderRow, createReplySight, createRowKeys, createRowShortcuts, createScreenKeys, createScreens, createScrollKeys, createSelectionKeys, createShellNotices, createUndoOffer, createUndoStamps, createViewKeys, createWriteKeys, keyTimingLine, modHeld, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow } from "../view/shell/index.ts";
 export {
   COMPOSER_FIELDS,
   NEWLINE_KEYS,
@@ -138,7 +138,7 @@ import { decode, decodeTagged, is, roots } from "../contract/index.ts";
  */
 export const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged });
 
-export { createAutoplay, createReadAloud, createReadingJump, createVoiceCall, createVoiceTranscript, mountCallControls, mountReadControls } from "../view/voice/index.ts";
+export { createAutoplay, createReadAloud, createReadingJump, createVoiceCall, createVoiceTranscript, mountCallControls, mountPageButtons, mountReadControls } from "../view/voice/index.ts";
 
 export { HELP_TOPICS } from "../present/settings/index.ts";
 export { CANNED_PROMPTS, mountAgentPrefix, mountAgentSettings, mountAudioDevices, mountBarPlacement, mountCannedPrompts, mountChannelDirectory, mountChannelHistory, mountChannelSettings, mountConnectionReadouts, mountDismissedSends, mountHelpFolds, mountIdentityList, mountMessagePreferences, mountMicrophoneSettings, mountNoiseRules, mountOwnReadApply, mountPairing, mountReadingWidth, mountResumePreference, mountSaveTokenButton, mountScreenControls, mountServerCache, mountSettingsFolds, mountSettingsReadouts, mountSettingsSwitches, mountSettingsSyncView, mountTextSize, mountUpstreamClear, restoreStoredSettings } from "../view/settings/index.ts";

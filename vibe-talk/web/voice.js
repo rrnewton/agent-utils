@@ -30937,21 +30937,19 @@ for (const entry of CANNED_PROMPTS) {
     }
   });
 }
-// The opener. A plain toggle: the button that shows the tray is the button that hides it again,
-// which is the only interaction model that needs no second control and no tap-outside handler to
-// escape from.
-el("prompts-open").addEventListener("click", () => setPromptsOpen(!promptsTray.open()));
-// `#820 voice-page-action-menu`. The action menu's opener, a toggle as the tray's is.
-el("action-menu-open").addEventListener("click", () => setActionMenuOpen(!actionMenu.open()));
-setActionMenuOpen(false);
-// `#880 voice-page-menu-placement`. The reader's row as this device keeps it, before the first frame.
-readerRow.render();
-// `#886 voice-page-autoplay`. Autoplay as this device keeps it, on the strip's toggle and the menu's item.
-autoplay.render();
-// ...and stated once at load, rather than left to the first tap. The markup ships shut, but shut is
-// a state the opener has to be ASSERTING for a screen reader to hear it — an `aria-expanded` that
-// only appears after somebody has already opened the tray is no use to the reader who needs it.
-setPromptsOpen(false);
+// The prompts tray's and the action menu's openers, each a plain toggle, and what they show stated once at load
+// (`#820 voice-page-action-menu`, `#880 voice-page-menu-placement`, `#886 voice-page-autoplay`). One owner in
+// web/src/view/shell/menuopeners.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its `unmount`
+// waits for the ordered boot's teardown.
+mountMenuOpeners({
+  lookup: (id) => el(id),
+  togglePrompts: () => setPromptsOpen(!promptsTray.open()),
+  toggleActionMenu: () => setActionMenuOpen(!actionMenu.open()),
+  shutActionMenu: () => setActionMenuOpen(false),
+  renderReaderRow: () => readerRow.render(),
+  renderAutoplay: () => autoplay.render(),
+  shutPrompts: () => setPromptsOpen(false),
+});
 // The call's box (web/src/view/composer/boxlisteners.ts, `#624 voice-page-modularity`). `#225 enter-to-send`: one
 // rule for every message box; see `onComposerKey`. A textarea since `#241 voice-composer`, as the channel's box is, so
 // with Enter to send off an Enter is a new line. `paste-never-sends`: every message box, a paste only ever puts text in.
@@ -30960,34 +30958,36 @@ mountMessageBox({
   onKey: (event) => onComposerKey(event, guardQuietly(voiceCall().sendTyped), el("compose-text")),
   watchBoxInsertions: (box) => watchBoxInsertions(box),
 });
-el("dismiss-banner").addEventListener("click", dismissBanner);
-el("dismiss-status").addEventListener("click", dismissStatus);
-el("post-confirm-send").addEventListener("click", voiceTranscript().sendPostProposal);
-el("post-confirm-cancel").addEventListener("click", voiceTranscript().cancelPostProposal);
-// `#269 approval-card-inline`. More opens a long draft in place, and Less folds it again. Measured
-// before, so a reader at the newest line still sees the buttons after the card grows upward. Docked
-// under the thread list (`#281 view-keys`), the same for the left column's list behind the cards, and
-// `showPostProposal` keeps a reader at the foot of the cards on it.
-el("post-confirm-more").addEventListener("click", () => {
-  if (!voiceTranscript().postWatch.shown) return;
-  const pinned = atBottom(leftEl("scroll-area"));
-  voiceTranscript().postWatch.unfolded = !voiceTranscript().postWatch.unfolded;
-  voiceTranscript().showPostProposal(voiceTranscript().postWatch.shown);
-  if (screens.screen() === "main") followIfPinned(pinned, 0, screens.view());
+// The page's own buttons beside the call: the banner's, the status line's and the error's dismissals, the post card's
+// Send, Cancel and More, Settings opened and closed, reading on the device, and the read-aloud source and voice. One
+// owner in web/src/view/voice/pagebuttons.ts (`#624 voice-page-modularity`), mounted here, in the page's order; the
+// acts its owners take the press for are handed as they were taken here, at load.
+mountPageButtons({
+  lookup: (id) => el(id),
+  dismissBanner,
+  dismissStatus,
+  sendPostProposal: voiceTranscript().sendPostProposal,
+  cancelPostProposal: voiceTranscript().cancelPostProposal,
+  // `#269 approval-card-inline`. More opens a long draft in place, and Less folds it again. Measured
+  // before, so a reader at the newest line still sees the buttons after the card grows upward. Docked
+  // under the thread list (`#281 view-keys`), the same for the left column's list behind the cards, and
+  // `showPostProposal` keeps a reader at the foot of the cards on it.
+  togglePostDraft: () => {
+    if (!voiceTranscript().postWatch.shown) return;
+    const pinned = atBottom(leftEl("scroll-area"));
+    voiceTranscript().postWatch.unfolded = !voiceTranscript().postWatch.unfolded;
+    voiceTranscript().showPostProposal(voiceTranscript().postWatch.shown);
+    if (screens.screen() === "main") followIfPinned(pinned, 0, screens.view());
+  },
+  openSettings: () => showScreen("settings"),
+  clearError,
+  readOnDevice: readAloudOwner().readOnDevice,
+  toggleAudioSource: () =>
+    readAloudOwner().setReadAudioSource(readAloudOwner().readAudioSource === "device" ? (readAloudOwner().witReadAloud ? "wit" : "agent") : "device"),
+  setWitVoice: (voice) => readAloudOwner().setWitVoice(voice),
+  setReadAudioSource: (source) => readAloudOwner().setReadAudioSource(source),
+  closeSettings,
 });
-el("open-settings").addEventListener("click", () => showScreen("settings"));
-el("dismiss-error").addEventListener("click", clearError);
-el("read-on-device").addEventListener("click", readAloudOwner().readOnDevice);
-el("audio-source").addEventListener("click", () =>
-  readAloudOwner().setReadAudioSource(readAloudOwner().readAudioSource === "device" ? (readAloudOwner().witReadAloud ? "wit" : "agent") : "device")
-);
-el("settings-wit-voice").addEventListener("change", () =>
-  readAloudOwner().setWitVoice(el("settings-wit-voice").value)
-);
-el("settings-audio-source").addEventListener("change", () =>
-  readAloudOwner().setReadAudioSource(el("settings-audio-source").value)
-);
-el("close-settings").addEventListener("click", closeSettings);
 
 // `#85 voice-desktop-review`. The paragraphs that used to stand between the reader and every switch
 // now live on their own screen, and each `?` on the settings screen opens the matching entry.

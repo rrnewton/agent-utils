@@ -2231,6 +2231,28 @@ test("`#624 voice-page-modularity`: the page's listeners word a time, say its da
   }
 });
 
+test("`#624 voice-page-modularity`: the tray's and the menu's openers toggle each, then state at load what they show, in the page's order, and come down again", () => {
+  const { mountMenuOpeners } = VIEW_SHELL;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const said = (name) => (...args) => log.push(`${name}${args.length ? ` ${args.length}` : ""}`);
+  const openers = mountMenuOpeners({
+    lookup: (id) => target(id),
+    togglePrompts: said("toggle prompts"), toggleActionMenu: said("toggle menu"), shutActionMenu: said("shut menu"),
+    renderReaderRow: said("draw reader row"), renderAutoplay: said("draw autoplay"), shutPrompts: said("shut prompts"),
+  });
+  assert.deepStrictEqual(log, ["listen prompts-open click", "listen action-menu-open click", "shut menu", "draw reader row", "draw autoplay", "shut prompts"],
+    "the openers were not mounted before what they show was stated, in the page's order");
+  log.length = 0;
+  for (const id of ["prompts-open", "action-menu-open"]) nodes[id].listeners.forEach((one) => one.listener({ id }));
+  assert.deepStrictEqual(log, ["toggle prompts", "toggle menu"], "an opener was handed the press, or reached the wrong toggle");
+  openers.unmount();
+  assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+});
+
 test("`#624 voice-page-modularity`: a mount's listening adds each listener with its options and takes every one down once", () => {
   const { createListening } = VIEW_DOM;
   const calls = [];

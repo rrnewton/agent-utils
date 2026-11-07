@@ -244,3 +244,37 @@ test("`#624 voice-page-modularity`: the call's controls reach the act each names
   controls.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
+
+test("`#624 voice-page-modularity`: the page's buttons beside the call reach the act each names in the page's order, the press handed to the acts that take it, and come down again", () => {
+  const { mountPageButtons } = VIEW_VOICE;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, value: "", listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type, event = { id }) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener(event));
+  const act = (name) => (...args) => { log.push(`${name}${args.map((one) => ` ${one && one.id ? `event:${one.id}` : one}`).join("")}`); return name; };
+  const buttons = mountPageButtons({
+    lookup: (id) => target(id),
+    dismissBanner: act("dismiss banner"), dismissStatus: act("dismiss status"), sendPostProposal: act("send post"),
+    cancelPostProposal: act("cancel post"), togglePostDraft: act("more"), openSettings: act("open settings"), clearError: act("clear error"),
+    readOnDevice: act("read on device"), toggleAudioSource: act("toggle source"), setWitVoice: act("voice"), setReadAudioSource: act("source"),
+    closeSettings: act("close settings"),
+  });
+  assert.deepStrictEqual(log, ["listen dismiss-banner click", "listen dismiss-status click", "listen post-confirm-send click",
+    "listen post-confirm-cancel click", "listen post-confirm-more click", "listen open-settings click", "listen dismiss-error click",
+    "listen read-on-device click", "listen audio-source click", "listen settings-wit-voice change", "listen settings-audio-source change",
+    "listen close-settings click"], "a button was heard out of the page's order");
+  log.length = 0;
+  for (const id of ["dismiss-banner", "dismiss-status", "post-confirm-send", "post-confirm-cancel", "post-confirm-more", "open-settings",
+    "dismiss-error", "read-on-device", "audio-source", "close-settings"]) fire(id, "click");
+  nodes["settings-wit-voice"].value = "aria";
+  fire("settings-wit-voice", "change");
+  nodes["settings-audio-source"].value = "device";
+  assert.deepStrictEqual(fire("settings-audio-source", "change"), ["source"], "what an act answers did not reach the dispatcher");
+  assert.deepStrictEqual(log, ["dismiss banner event:dismiss-banner", "dismiss status event:dismiss-status", "send post event:post-confirm-send",
+    "cancel post event:post-confirm-cancel", "more", "open settings", "clear error event:dismiss-error", "read on device event:read-on-device",
+    "toggle source", "close settings event:close-settings", "voice aria", "source device"]);
+  buttons.unmount();
+  assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+});

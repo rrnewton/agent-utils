@@ -12,3 +12,5 @@ export { mountReadControls } from "./readcontrols.ts";
 export type { ReadControls, ReadControlsDependencies } from "./readcontrols.ts";
 export { mountCallControls } from "./callcontrols.ts";
 export type { CallControls, CallControlsDependencies } from "./callcontrols.ts";
+export { mountPageButtons } from "./pagebuttons.ts";
+export type { PageButtons, PageButtonsDependencies } from "./pagebuttons.ts";

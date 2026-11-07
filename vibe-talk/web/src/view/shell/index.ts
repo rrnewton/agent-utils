@@ -59,5 +59,7 @@ export { mountKeyListeners } from "./keylisteners.ts";
 export type { KeyListeners, KeyListenersDependencies, ListenedPane } from "./keylisteners.ts";
 export { mountPageListeners } from "./pagelisteners.ts";
 export type { PageListeners, PageListenersDependencies } from "./pagelisteners.ts";
+export { mountMenuOpeners } from "./menuopeners.ts";
+export type { MenuOpeners, MenuOpenersDependencies } from "./menuopeners.ts";
 export { READER_WORDS, createReaderRow } from "./readerrow.ts";
 export type { ReaderRow, ReaderRowDependencies } from "./readerrow.ts";
