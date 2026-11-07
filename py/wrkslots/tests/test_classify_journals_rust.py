@@ -164,6 +164,91 @@ def test_live_non_create_journal_is_busy_in_both_editions(tmp_path: Path) -> Non
     assert payload["busy"]["pid"] == os.getpid()
 
 
+def _write_scoped_import_journal(root: Path) -> Path:
+    active = root / "worktrees" / "ACTIVE.node-a.json"
+    document = json.loads(active.read_text(encoding="utf-8"))
+    record = document["slots"][0]
+    owner = _live_identity(os.getpid())
+    scope_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/wrkslots-recovery.scope"
+    owner["cgroup_path"] = scope_cgroup
+    record["owner"] = owner
+    record["task_scope"] = {
+        "unit": "wrkslots-recovery.scope",
+        "invocation_id": "a" * 32,
+        "cgroup_path": scope_cgroup,
+        "boot_id": owner["boot_id"],
+        "leader_pid": owner["pid"],
+        "leader_start_ticks": owner["start_ticks"],
+        "verification": "systemd-runtime-invocation-symlink-v1",
+    }
+    journal = root / "worktrees" / "ACTIVE.node-a.journal"
+    journal.write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "kind": "import-existing",
+                "machine": "node-a",
+                "slot": "slot-a",
+                "record": record,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return journal
+
+
+def test_live_pid_with_ended_task_scope_refuses_not_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Unit proof: with the process generation itself live, only the
+    # ended task scope stands between busy and the hard refusal.
+    owner = _live_identity(os.getpid())
+    scope_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/wrkslots-recovery.scope"
+    owner["cgroup_path"] = scope_cgroup
+    raw: dict[str, object] = {
+        "kind": "import-existing",
+        "owner": owner,
+        "task_scope": {
+            "unit": "wrkslots-recovery.scope",
+            "invocation_id": "a" * 32,
+            "cgroup_path": scope_cgroup,
+            "boot_id": owner["boot_id"],
+            "leader_pid": owner["pid"],
+            "leader_start_ticks": owner["start_ticks"],
+            "verification": "systemd-runtime-invocation-symlink-v1",
+        },
+    }
+    monkeypatch.setattr(
+        wrkslots_cli, "_process_state", lambda identity: ("live", "live")
+    )
+    monkeypatch.setattr(
+        wrkslots_cli,
+        "_verify_task_scope_invocation",
+        lambda scope: (_ for _ in ()).throw(
+            wrkslots_cli.Refusal("task scope invocation does not match")
+        ),
+    )
+    assert wrkslots_cli._live_journal_owner(raw) is None
+    monkeypatch.setattr(
+        wrkslots_cli, "_verify_task_scope_invocation", lambda scope: None
+    )
+    live = wrkslots_cli._live_journal_owner(raw)
+    assert live is not None and live.pid == os.getpid()
+    monkeypatch.undo()
+
+    rust_root = _transfer_fixture(tmp_path / "rust", None)
+    oracle_root = _transfer_fixture(tmp_path / "oracle", None)
+    _write_scoped_import_journal(rust_root)
+    _write_scoped_import_journal(oracle_root)
+    with pytest.raises(wrkslots_cli.Refusal) as caught:
+        _python_classify(oracle_root, fmt="json")
+    assert not isinstance(caught.value, wrkslots_cli._JournalBusy)
+    assert "interrupted" in str(caught.value)
+    result = _rust_classify(rust_root, fmt="json")
+    assert result.returncode == 1, result.stderr
+    assert "interrupted" in result.stderr
+
+
 def test_dead_non_create_journal_still_refuses_in_both_editions(
     tmp_path: Path,
 ) -> None:

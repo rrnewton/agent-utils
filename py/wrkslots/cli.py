@@ -10521,36 +10521,50 @@ def _create_journal_owner_state(
 
 
 def _live_journal_owner(raw: Mapping[str, object]) -> ProcessIdentity | None:
-    """The first live process identity a non-create journal records, if any.
+    """The live owner a non-create journal records, if it is still live.
 
-    Journals record their acting process under different keys by kind:
-    a top-level ``owner``/``coordinator_lease``/``coordinator``, an
-    identity ``actor``, or the owner of the embedded ``record``. A
-    malformed candidate proves nothing, so it is skipped and the
-    journal keeps its hard refusal.
+    The first parseable identity in owner order -- a top-level ``owner``,
+    the embedded ``record``'s owner, an identity ``actor``, then a
+    coordinator lease -- is the journal's owner; a later live identity
+    does not resurrect a dead owner. When the journal (or its record)
+    carries a task scope, the owner counts as live only while that
+    scope's systemd invocation still verifies, the same proof the
+    create branch requires: a pid whose scope ended is dead or
+    indeterminate here, never busy. A malformed candidate proves
+    nothing, so it is skipped and the journal keeps its hard refusal.
     """
 
+    record = raw.get("record")
+    record_map = record if isinstance(record, Mapping) else {}
     candidates: list[object] = [
         raw.get("owner"),
-        raw.get("coordinator_lease"),
-        raw.get("coordinator"),
+        record_map.get("owner"),
         raw.get("actor"),
+        raw.get("coordinator_lease"),
+        record_map.get("coordinator_lease"),
+        raw.get("coordinator"),
     ]
-    record = raw.get("record")
-    if isinstance(record, Mapping):
-        candidates.extend(
-            [record.get("owner"), record.get("coordinator_lease")]
-        )
+    owner: ProcessIdentity | None = None
     for candidate in candidates:
         if not isinstance(candidate, Mapping):
             continue
         try:
-            identity = _identity_from_obj(candidate, "journal owner")
+            owner = _identity_from_obj(candidate, "journal owner")
         except (Refusal, StateError, KeyError, TypeError, ValueError):
             continue
-        if identity is not None and _process_state(identity)[0] == "live":
-            return identity
-    return None
+        if owner is not None:
+            break
+    if owner is None:
+        return None
+    scope_raw = raw.get("task_scope", record_map.get("task_scope"))
+    if scope_raw is not None:
+        try:
+            scope = _task_scope_from_obj(scope_raw, "journal task_scope")
+            _assert_task_scope_matches_owner(scope, owner, "journal task_scope")
+            _verify_task_scope_invocation(scope)
+        except (Refusal, StateError, KeyError, TypeError, ValueError):
+            return None
+    return owner if _process_state(owner)[0] == "live" else None
 
 
 def _classify_create_journal(

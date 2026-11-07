@@ -379,30 +379,60 @@ fn ownerless_cargo_home_journal_is_unrelated(
         .any(|candidate| within(candidate, &requested) || within(&requested, candidate))
 }
 
-/// The first live process identity a non-create journal records, if any
-/// (mirrors the Python `_live_journal_owner` candidate keys).
+/// The live owner a non-create journal records, if it is still live
+/// (mirrors the Python `_live_journal_owner`): the first parseable
+/// identity in owner order decides, and a carried task scope must
+/// still verify, so a pid whose scope ended is never busy.
 fn live_journal_owner(raw: &Map<String, Value>) -> Option<crate::status_state::Identity> {
-    let mut candidates: Vec<&Value> = vec![
+    let record = raw.get("record").and_then(Value::as_object);
+    let candidates: Vec<&Value> = vec![
         raw.get("owner").unwrap_or(&Value::Null),
-        raw.get("coordinator_lease").unwrap_or(&Value::Null),
-        raw.get("coordinator").unwrap_or(&Value::Null),
+        record.and_then(|r| r.get("owner")).unwrap_or(&Value::Null),
         raw.get("actor").unwrap_or(&Value::Null),
+        raw.get("coordinator_lease").unwrap_or(&Value::Null),
+        record
+            .and_then(|r| r.get("coordinator_lease"))
+            .unwrap_or(&Value::Null),
+        raw.get("coordinator").unwrap_or(&Value::Null),
     ];
-    if let Some(record) = raw.get("record").and_then(Value::as_object) {
-        candidates.push(record.get("owner").unwrap_or(&Value::Null));
-        candidates.push(record.get("coordinator_lease").unwrap_or(&Value::Null));
-    }
+    let mut owner: Option<crate::status_state::Identity> = None;
     for candidate in candidates {
         if !candidate.is_object() {
             continue;
         }
         if let Some(identity) = crate::status_state::identity_from_value(candidate) {
-            if process_state(Some(&identity)).0 == "live" {
-                return Some(identity);
-            }
+            owner = Some(identity);
+            break;
         }
     }
-    None
+    let owner = owner?;
+    let scope_raw = raw
+        .get("task_scope")
+        .or_else(|| record.and_then(|r| r.get("task_scope")));
+    if let Some(scope_value) = scope_raw {
+        let scope = crate::active_state::scope_from_obj(scope_value, "journal task_scope").ok()?;
+        if scope.leader_pid != owner.pid
+            || scope.leader_start_ticks != owner.start_ticks
+            || scope.boot_id != owner.boot_id
+            || scope.cgroup_path != owner.cgroup_path
+        {
+            return None;
+        }
+        let unit = scope_value
+            .get("unit")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let invocation = scope_value
+            .get("invocation_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        crate::adopt_write::verify_task_scope(&owner, unit, invocation).ok()?;
+    }
+    if process_state(Some(&owner)).0 == "live" {
+        Some(owner)
+    } else {
+        None
+    }
 }
 
 /// A retryable busy result (#992), distinct from a hard refusal.
