@@ -14,6 +14,9 @@ thread_local! {
     /// The files a test pretends an agent's processes hold open.
     pub(super) static HELD_FILES: std::cell::RefCell<Option<Vec<PathBuf>>> =
         const { std::cell::RefCell::new(None) };
+    /// The Muse data root a test pretends the runtime writes under (#948).
+    pub(super) static MUSE_STORE_ROOT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Where a record says why its native conversation is unknown (#916 muse-native-session-id).
@@ -65,6 +68,105 @@ fn held_files(record: &AgentRecord) -> Vec<PathBuf> {
     }
 }
 
+/// The Muse data root (`<data>/muse`): tests pretend one, production uses
+/// `$XDG_DATA_HOME/muse` or `~/.local/share/muse`.
+fn muse_store_root() -> Option<PathBuf> {
+    #[cfg(test)]
+    return MUSE_STORE_ROOT.with(|root| root.borrow().clone());
+    #[cfg(not(test))]
+    {
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| crate::harness::home().map(|home| home.join(".local/share")))?;
+        Some(data.join("muse"))
+    }
+}
+
+/// The pids that may be the record's runtime: the pinned process and, outside
+/// tests, its descendants. A Muse runtime need not sit under the pinned
+/// process in the fd walk, so capture also asks the store about these pids.
+fn record_runtime_pids(record: &AgentRecord) -> Vec<u64> {
+    let Some(identity) = record
+        .harness_anchor()
+        .or(record.custom_process_identity.as_ref())
+    else {
+        return Vec::new();
+    };
+    #[cfg(test)]
+    return vec![identity.pid];
+    #[cfg(not(test))]
+    {
+        let processes = crate::work_state::ProcView::processes(&crate::work_state::LinuxProc);
+        let mut pids = vec![identity.pid];
+        let mut index = 0;
+        while index < pids.len() {
+            let parent = pids[index];
+            pids.extend(
+                processes
+                    .iter()
+                    .filter(|row| u64::from(row.ppid) == parent && u64::from(row.pid) != parent)
+                    .map(|row| u64::from(row.pid)),
+            );
+            index += 1;
+        }
+        pids
+    }
+}
+
+/// Sessions the Muse runtime at `pid` names for itself under `root` (#948): the
+/// runtime session json whose `process_generation_hint` is this pid, and any
+/// dated `.session.lock` whose content names this pid. Neither needs the fd
+/// walk that misses a runtime outside the pinned process's descendants.
+fn muse_sessions_for_pid(root: &Path, pid: u64) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let hint = format!("pid={pid}");
+    if let Ok(entries) = fs::read_dir(root.join("runtime/muse/sessions")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let Ok(value) = fs::read_to_string(&path)
+                .map_err(|_| ())
+                .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|_| ()))
+            else {
+                continue;
+            };
+            if value["process_generation_hint"].as_str() == Some(hint.as_str()) {
+                if let Some(id) = value["session_id"].as_str() {
+                    if !ids.iter().any(|seen| seen == id) {
+                        ids.push(id.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    let sessions = root.join("sessions");
+    if let Ok(years) = fs::read_dir(&sessions) {
+        for year in years.flatten() {
+            for month in fs::read_dir(year.path()).into_iter().flatten().flatten() {
+                for day in fs::read_dir(month.path()).into_iter().flatten().flatten() {
+                    for session in fs::read_dir(day.path()).into_iter().flatten().flatten() {
+                        let lock = session.path().join(".session.lock");
+                        let Ok(text) = fs::read_to_string(&lock) else {
+                            continue;
+                        };
+                        let names_pid = text.lines().any(|line| line.trim() == hint);
+                        if names_pid {
+                            if let Some(id) = session.file_name().to_str() {
+                                if !ids.iter().any(|seen| seen == id) {
+                                    ids.push(id.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ids
+}
+
 /// Record the native conversation a just-started or just-adopted agent holds open, when the
 /// record names none (#916 muse-native-session-id). Muse and Codex name their conversation by
 /// the session files their runtime holds (Claude Code's is assigned at launch). One held
@@ -84,6 +186,19 @@ pub(super) fn capture_held_session(record: &mut AgentRecord) -> Option<String> {
             std::thread::sleep(Duration::from_millis(500));
         }
         ids = adapter.held_sessions(&held_files(record));
+        // A Muse runtime outside the pinned process's descendants holds no
+        // lock the fd walk can see; the store names its session by pid (#948).
+        if record.harness == "muse" {
+            if let Some(root) = muse_store_root() {
+                for pid in record_runtime_pids(record) {
+                    for id in muse_sessions_for_pid(&root, pid) {
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
         ids.retain(|id| valid_metadata_text(id));
         if !ids.is_empty() {
             break;
@@ -252,6 +367,63 @@ pub(super) fn discover_codex_session(record: &AgentRecord) -> Option<NativeSessi
             .map(PathBuf::from)
             .or_else(|| crate::harness::home().map(|h| h.join(".codex")))?;
         discover_codex_in(&home.join("sessions"), record)
+    }
+}
+
+/// What the Muse session store says about a record that names no session (#948).
+pub(super) enum MuseDiscovery {
+    /// No session journal under the store names the record's cwd.
+    None,
+    /// Exactly one does; revive may record and resume it.
+    One(NativeSession),
+    /// Several do; revive must not guess, and the caller names them.
+    Many(Vec<String>),
+}
+
+/// Discover a Muse session for `record` from the session store: dated session
+/// journals whose head mentions the record's cwd, exactly as the Claude and
+/// Codex discoveries confirm theirs. Unlike them this reports several matches,
+/// because a shared cwd is exactly how a wrong session gets bound.
+pub(super) fn discover_muse_session(record: &AgentRecord) -> MuseDiscovery {
+    if record.harness != "muse" {
+        return MuseDiscovery::None;
+    }
+    let Some(root) = muse_store_root() else {
+        return MuseDiscovery::None;
+    };
+    discover_muse_in(&root.join("sessions"), record)
+}
+
+fn discover_muse_in(sessions: &Path, record: &AgentRecord) -> MuseDiscovery {
+    let mut ids: Vec<String> = Vec::new();
+    if let Ok(years) = fs::read_dir(sessions) {
+        for year in years.flatten() {
+            for month in fs::read_dir(year.path()).into_iter().flatten().flatten() {
+                for day in fs::read_dir(month.path()).into_iter().flatten().flatten() {
+                    for session in fs::read_dir(day.path()).into_iter().flatten().flatten() {
+                        let journal = session.path().join("session.jsonl");
+                        let Ok(bytes) = fs::read(&journal) else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(65536)]);
+                        if !head.contains(&record.cwd) {
+                            continue;
+                        }
+                        if let Some(id) = session.file_name().to_str() {
+                            if valid_metadata_text(id) && !ids.iter().any(|seen| seen == id) {
+                                ids.push(id.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ids.sort();
+    match ids.as_slice() {
+        [] => MuseDiscovery::None,
+        [id] => MuseDiscovery::One(NativeSession::new("muse", id, "observed")),
+        _ => MuseDiscovery::Many(ids),
     }
 }
 
@@ -911,6 +1083,7 @@ fn conversation(record: &AgentRecord) -> Result<NativeSession> {
             "recorded native conversation provider is incomplete or conflicts with the harness",
         ));
     }
+    let mut muse_many: Vec<String> = Vec::new();
     let native = record
         .native_session
         .clone()
@@ -932,7 +1105,23 @@ fn conversation(record: &AgentRecord) -> Result<NativeSession> {
         .or_else(|| discover_claude_session(&claude_config_roots(), record))
         .or_else(|| discover_muse_session(record))
         .or_else(|| discover_codex_session(record))
+        .or_else(|| match discover_muse_session(record) {
+            MuseDiscovery::One(native) => Some(native),
+            MuseDiscovery::Many(candidates) => {
+                muse_many = candidates;
+                None
+            }
+            MuseDiscovery::None => None,
+        })
         .ok_or_else(|| {
+            if !muse_many.is_empty() {
+                return fail(format!(
+                    "record has no native conversation ID: {} muse sessions in the session store name its cwd ({}), and agentctl does not guess which one is its own; name it with `agentctl bind-session {} <id>`",
+                    muse_many.len(),
+                    muse_many.join(", "),
+                    record.name
+                ));
+            }
             match record
                 .extra
                 .get(NATIVE_SESSION_UNKNOWN)
@@ -4212,6 +4401,125 @@ mod discovery_tests {
         assert!(newest_archive(&root, "missing").is_none());
         let _ = fs::remove_dir_all(&root);
     }
+    fn muse_store(root: &Path, runtime: &[(&str, u64)], locks: &[(&str, u64, &str)]) {
+        let runtime_dir = root.join("runtime/muse/sessions");
+        fs::create_dir_all(&runtime_dir).unwrap();
+        for (id, pid) in runtime {
+            fs::write(
+                runtime_dir.join(format!("{id}.json")),
+                json!({"session_id": id, "process_generation_hint": format!("pid={pid}")})
+                    .to_string(),
+            )
+            .unwrap();
+        }
+        for (id, pid, cwd) in locks {
+            let dir = root.join("sessions/2026/11/06").join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(".session.lock"), format!("pid={pid}\nhost=localhost\n")).unwrap();
+            fs::write(dir.join("session.jsonl"), format!("{{\"cwd\":\"{cwd}\"}}\n")).unwrap();
+        }
+    }
+
+    #[test]
+    fn pid_keyed_store_names_only_the_runtime_sessions() {
+        let root = std::env::temp_dir().join(format!("muse-pid-{}", std::process::id()));
+        muse_store(
+            &root,
+            &[
+                ("11111111-1111-1111-1111-111111111111", 4242),
+                ("22222222-2222-2222-2222-222222222222", 777),
+            ],
+            &[("33333333-3333-3333-3333-333333333333", 4242, "/tmp/proj")],
+        );
+        let mut ids = muse_sessions_for_pid(&root, 4242);
+        ids.sort();
+        assert_eq!(
+            ids,
+            [
+                "11111111-1111-1111-1111-111111111111",
+                "33333333-3333-3333-3333-333333333333"
+            ]
+        );
+        assert!(muse_sessions_for_pid(&root, 999).is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn capture_records_the_session_the_store_names_by_pid_when_no_lock_is_held() {
+        // #948: the fd walk sees no held lock (the runtime is not a
+        // descendant of the pinned process), but the store names the
+        // session by the pinned pid, so capture still records it.
+        let root = std::env::temp_dir().join(format!("muse-cap-{}", std::process::id()));
+        muse_store(
+            &root,
+            &[("11111111-1111-1111-1111-111111111111", 4242)],
+            &[],
+        );
+        MUSE_STORE_ROOT.with(|cell| *cell.borrow_mut() = Some(root.clone()));
+        HELD_FILES.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
+        let mut record = rec("/tmp/proj");
+        record.harness = "muse".into();
+        record.custom_process_identity = Some(CustomProcessIdentity {
+            version: 1,
+            boot_id: "boot".into(),
+            pid: 4242,
+            starttime_ticks: 1,
+            executable_device: 5,
+            executable_inode: 6,
+        });
+        let warning = capture_held_session(&mut record);
+        assert!(warning.is_none(), "{warning:?}");
+        let native = record.native_session.expect("captured by pid");
+        assert_eq!(native.value, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(native.source, "observed");
+        HELD_FILES.with(|cell| *cell.borrow_mut() = None);
+        MUSE_STORE_ROOT.with(|cell| *cell.borrow_mut() = None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn muse_store_discovery_is_one_many_or_none_by_cwd() {
+        let root = std::env::temp_dir().join(format!("muse-disc-{}", std::process::id()));
+        muse_store(
+            &root,
+            &[],
+            &[
+                ("11111111-1111-1111-1111-111111111111", 4242, "/tmp/proj"),
+                ("22222222-2222-2222-2222-222222222222", 777, "/other"),
+            ],
+        );
+        let mut record = rec("/tmp/proj");
+        record.harness = "muse".into();
+        match discover_muse_in(&root.join("sessions"), &record) {
+            MuseDiscovery::One(native) => {
+                assert_eq!(native.value, "11111111-1111-1111-1111-111111111111")
+            }
+            _ => panic!("expected exactly one match"),
+        }
+        muse_store(
+            &root,
+            &[],
+            &[("33333333-3333-3333-3333-333333333333", 888, "/tmp/proj")],
+        );
+        match discover_muse_in(&root.join("sessions"), &record) {
+            MuseDiscovery::Many(ids) => assert_eq!(
+                ids,
+                [
+                    "11111111-1111-1111-1111-111111111111",
+                    "33333333-3333-3333-3333-333333333333"
+                ]
+            ),
+            _ => panic!("expected several matches to refuse, not guess"),
+        }
+        let mut other = rec("/nowhere");
+        other.harness = "muse".into();
+        assert!(matches!(
+            discover_muse_in(&root.join("sessions"), &other),
+            MuseDiscovery::None
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn refuses_without_content_confirmation() {
         let root = std::env::temp_dir().join(format!("disc2-{}", std::process::id()));

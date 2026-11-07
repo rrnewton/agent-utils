@@ -8767,6 +8767,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if !session_matches(record, &info) {
             findings.push("session-mismatch");
         }
+        // A live lane whose conversation was never captured cannot be
+        // revived after a reboot; say so while it can still be bound (#948).
+        if matches!(record.harness.as_str(), "muse" | "codex")
+            && record.native_session.is_none()
+        {
+            findings.push("native-session-missing");
+        }
         match info.agent.as_deref() {
             None => findings.push("harness-exited"),
             Some(agent) if agent != record.harness => findings.push("harness-kind-mismatch"),
@@ -10364,7 +10371,17 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     /// Report live state or an explicit probe error without reaping durable records.
     pub fn status(&self, agent_name: &str) -> Result<Value> {
-        self.status_record(&self.load(agent_name)?)
+        let record = self.load(agent_name)?;
+        let mut result = self.status_record(&record)?;
+        // A live lane whose conversation was never captured cannot be
+        // revived after a reboot; flag it while it can still be bound (#948).
+        if record.lifecycle == "running"
+            && matches!(record.harness.as_str(), "muse" | "codex")
+            && record.native_session.is_none()
+        {
+            result["native_session_missing"] = json!(true);
+        }
+        Ok(result)
     }
 
     fn status_record_listed(

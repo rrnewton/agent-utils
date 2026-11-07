@@ -2240,6 +2240,34 @@ fn pretend_held(files: Vec<PathBuf>) -> PretendHeld {
     PretendHeld
 }
 
+/// Pretend the Muse data root lives at `root` until the guard drops (#948).
+struct PretendMuseStore;
+
+impl Drop for PretendMuseStore {
+    fn drop(&mut self) {
+        crate::subagents::revive::MUSE_STORE_ROOT.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+#[must_use]
+fn pretend_muse_store(fixture: &Fixture) -> (PathBuf, PretendMuseStore) {
+    let root = fixture.root.join("data/muse");
+    crate::subagents::revive::MUSE_STORE_ROOT
+        .with(|cell| *cell.borrow_mut() = Some(root.clone()));
+    (root, PretendMuseStore)
+}
+
+/// A session journal under the store naming `cwd`, as a Muse runtime writes it.
+fn fake_muse_journal(root: &Path, id: &str, cwd: &Path) {
+    let dir = root.join("sessions/2026/11/06").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("session.jsonl"),
+        format!("{{\"cwd\":\"{}\"}}\n", cwd.display()),
+    )
+    .unwrap();
+}
+
 /// What a fake Muse writes when it starts: `<data>/muse/sessions/2026/11/06/<id>/` with the
 /// `.session.lock` its runtime holds (`pid=`, `host=`). Returns the lock.
 fn fake_muse_session(fixture: &Fixture, id: &str) -> PathBuf {
@@ -2387,6 +2415,80 @@ fn a_muse_lane_holding_two_sessions_is_recorded_as_unknown_and_says_so() {
     let refused = stop_and_revive_archived(&fixture).unwrap_err().to_string();
     assert!(refused.contains("no native conversation ID"), "{refused}");
     assert!(refused.contains("does not guess"), "{refused}");
+}
+
+#[test]
+fn a_muse_lane_with_no_native_id_is_flagged_live_and_revives_through_the_single_store_match() {
+    // #948: capture missed this lane entirely, so the record names no
+    // session. Status flags it while it lives, and after archival the one
+    // store journal naming its cwd is recorded and resumed; none holds.
+    let fixture = unreported();
+    let (store, _store_guard) = pretend_muse_store(&fixture);
+    let id = "44444444-4444-4444-4444-444444444444";
+    fake_muse_journal(&store, id, &fixture.root);
+    let _held = pretend_held(Vec::new());
+    let status = start_worker(&fixture, "muse");
+    assert_eq!(status["native_session_missing"], json!(true), "{status}");
+    let record = fixture.manager().load("worker").unwrap();
+    assert!(record.native_session.is_none(), "capture still missed");
+
+    let revived = stop_and_revive_archived(&fixture).unwrap();
+    assert_eq!(revived["revived"], true, "{revived}");
+    let new = fixture.manager().load("worker").unwrap();
+    assert_eq!(new.arguments, ["resume", id]);
+    assert_eq!(
+        new.native_session.as_ref().map(|native| native.value.as_str()),
+        Some(id),
+        "the store match was recorded"
+    );
+}
+
+#[test]
+fn revive_refuses_zero_and_several_store_matches_with_candidates_listed() {
+    // #948: a shared cwd is how a wrong session gets bound, so several
+    // store journals naming the record's cwd refuse and name them all.
+    let fixture = unreported();
+    let (store, _store_guard) = pretend_muse_store(&fixture);
+    fake_muse_journal(
+        &store,
+        "55555555-5555-5555-5555-555555555555",
+        &fixture.root,
+    );
+    fake_muse_journal(
+        &store,
+        "66666666-6666-6666-6666-666666666666",
+        &fixture.root,
+    );
+    let _held = pretend_held(Vec::new());
+    start_worker(&fixture, "muse");
+    let refused = stop_and_revive_archived(&fixture).unwrap_err().to_string();
+    assert!(refused.contains("no native conversation ID"), "{refused}");
+    assert!(
+        refused.contains("55555555-5555-5555-5555-555555555555"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("66666666-6666-6666-6666-666666666666"),
+        "{refused}"
+    );
+    assert!(refused.contains("does not guess"), "{refused}");
+
+    // Zero matches keep the plain refusal.
+    let fixture = unreported();
+    let (store, _store_guard) = pretend_muse_store(&fixture);
+    fake_muse_journal(
+        &store,
+        "77777777-7777-7777-7777-777777777777",
+        Path::new("/somewhere/else"),
+    );
+    let _held = pretend_held(Vec::new());
+    start_worker(&fixture, "muse");
+    let refused = stop_and_revive_archived(&fixture).unwrap_err().to_string();
+    assert!(refused.contains("no native conversation ID"), "{refused}");
+    assert!(
+        !refused.contains("77777777-7777-7777-7777-777777777777"),
+        "{refused}"
+    );
 }
 
 #[test]
