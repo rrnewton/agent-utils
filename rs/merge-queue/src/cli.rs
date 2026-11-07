@@ -2104,6 +2104,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     },
                     fail_fast,
                     disable_early_red: false,
+                    early_verdict: false,
                     confirm_reruns,
                     split_red_batches,
                     suspect_flake_reruns,

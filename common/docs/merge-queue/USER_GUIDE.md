@@ -1020,6 +1020,9 @@ An **item record** (`items/<pr>.json`) has these fields:
 - `disable_early_red`: `true` turns off the early-red watch (see "Early red (streamed
   verdicts)"); absent (the default) means the watch is on. A binary older than this field
   refuses a config that has it.
+- `early_verdict`: `true` lets a `command` runner end a candidate validation at its own early
+  verdict (see "Early verdict (declared by the runner)"); absent (the default) means off. A
+  binary older than this field refuses a config that has it.
 - `confirm_reruns`: `true` turns same-commit confirmation on: red batches are searched and a
   blamed failure must be seen twice (see "Keeping the base green"). Absent (the default) means
   off: the first red is the verdict. A binary older than this field refuses a config that has it.
@@ -1374,6 +1377,23 @@ turns the watch off. The adapter contract is:
   inside its own step while the watch stops the whole run; whichever acts first reports red.
 - With `validator.offload: decide`, receipts arrive whole, so there is no early red from donors;
   the watch applies to validations this host runs.
+
+**Early verdict (declared by the runner).** A runner that streams no verdicts during the run
+can still say that a red is final. With `validator.early_verdict: true` the queue sets
+`$MQ_EARLY_VERDICT` for a `command` runner to the path of `early-verdict` in its run directory
+(removed before the run starts); it is never set otherwise. The contract:
+
+- The runner creates the file holding one line, `FAILED <test>` and a newline, at a red that
+  nothing it does later can change: not a failure its own retry may still pass, and not one it
+  would classify as a refusal or hold for a ruling (`INFRA-BLOCKED:`). Only the runner can know
+  that, so the queue never infers it from output lines. Create the file whole (write a temporary
+  file, then rename or link it); a partial line, or any other text, is ignored.
+- The queue reads the file on the same poll as the streamed verdicts. A whole `FAILED <test>`
+  line stops the runner's process group as an early red does: the run is red with
+  `early_red: true`, decided on the verdicts seen so far plus `<test>` as failed. The verdict is
+  final but not by itself deterministic, so with `confirm_reruns` on the red is still confirmed.
+- The option is independent of `disable_early_red`. A donor runs the same watch, so a donor's
+  receipt arrives as soon as its run stops, with the test recorded as failed.
 
 **Held for a ruling.** Two marker lines let a runner say that its run is neither a plain pass nor
 a product failure; each names the tests it concerns:

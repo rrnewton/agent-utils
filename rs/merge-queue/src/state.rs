@@ -142,6 +142,14 @@ pub struct ValidatorConfig {
     /// its dependents at once. A runner that streams nothing keeps the post-run behaviour.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub disable_early_red: bool,
+    /// Stop a candidate validation at the runner's own early verdict: a `command` runner gets
+    /// `$MQ_EARLY_VERDICT`, a file in its run directory, and one that creates it holding
+    /// `FAILED <test>` is stopped at once, with that test recorded as failed beside the
+    /// verdicts streamed so far (an early red, not by itself a deterministic one). The runner
+    /// must write the file only for a red that nothing it does later can change: not a failure
+    /// its own retry may still pass, and not one it would classify as a refusal. Off by default.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub early_verdict: bool,
     /// Confirm a red by validating the same commit again before blaming a change (the
     /// same-commit rerun, which gets `$MQ_RERUN_FROM`), and search a red batch for its culprit
     /// with probes of its prefixes. Off by default: retries belong in the validator, so the

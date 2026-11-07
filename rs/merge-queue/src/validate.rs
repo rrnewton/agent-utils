@@ -134,6 +134,15 @@ pub const PERIPHERAL_ENV: &str = "MQ_PERIPHERAL";
 /// with a `RERUN-EXEMPT:` line. A runner that does neither keeps the post-run behaviour.
 pub const EARLY_RED_ENV: &str = "MQ_EARLY_RED";
 
+/// Environment variable naming the early-verdict file of a `command` validation when
+/// `validator.early_verdict` is on: the runner creates it holding `FAILED <test>` at a red that
+/// nothing it does later can change, and the queue stops the run there (see
+/// [`Ran::early_red`]). Never set otherwise.
+pub const EARLY_VERDICT_ENV: &str = "MQ_EARLY_VERDICT";
+
+/// The early-verdict file's name in a `command` validation's output directory.
+const EARLY_VERDICT_FILE: &str = "early-verdict";
+
 /// The attributed failures of `results` that belong to a step named in `exempt`: the
 /// failures a rerun of the same commit cannot change.
 pub fn deterministic_failures(results: &TestResults, exempt: &[TestId]) -> BTreeSet<TestId> {
@@ -329,8 +338,9 @@ pub struct Ran {
     /// The donor that ran it (`NAME@HOST`); `None` for a validation run here.
     pub donor: Option<String>,
     /// The queue stopped this run early at its first deterministic failure, streamed by the
-    /// runner before it exited (see [`EARLY_RED_ENV`]). Its results are the verdicts seen
-    /// so far; unreported tests carry no outcome. Never also `cancelled`.
+    /// runner before it exited (see [`EARLY_RED_ENV`]), or at the runner's early verdict (see
+    /// [`EARLY_VERDICT_ENV`]). Its results are the verdicts seen so far; unreported tests carry
+    /// no outcome. Never also `cancelled`.
     pub early_red: bool,
 }
 
@@ -611,7 +621,8 @@ fn shared_select_peripheral(
 }
 
 /// Files a running validation streams its verdicts into, watched for an early deterministic
-/// failure. A runner that never writes them until it exits is never stopped early.
+/// failure, and the runner's early-verdict file. A runner that writes none of them until it
+/// exits is never stopped early.
 struct EarlyRedFiles {
     /// `$MQ_RESULTS` of a `command` runner, when it has one.
     results: Option<PathBuf>,
@@ -619,12 +630,29 @@ struct EarlyRedFiles {
     journal: Option<PathBuf>,
     /// Combined runner output (verdict lines and the `RERUN-EXEMPT:` declaration).
     log: PathBuf,
+    /// Watch the streamed verdicts for a deterministic failure (the early-red watch is on).
+    streamed: bool,
+    /// The runner's early-verdict file (`$MQ_EARLY_VERDICT`), when `validator.early_verdict` is on.
+    verdict: Option<PathBuf>,
 }
 
 impl EarlyRedFiles {
+    /// The test the runner's early verdict names, once the file holds a whole `FAILED <test>`
+    /// line; `None` before that, and for a file that says anything else.
+    fn early_verdict(&self) -> Option<TestId> {
+        let text = std::fs::read_to_string(self.verdict.as_ref()?).ok()?;
+        if !text.ends_with('\n') {
+            return None;
+        }
+        TestId::parse(text.lines().next()?.strip_prefix("FAILED ")?.trim()).ok()
+    }
+
     /// The deterministic failures streamed so far, if any: a reported failure in a step the
     /// runner has already declared `RERUN-EXEMPT:`.
     fn streamed_failures(&self) -> BTreeSet<TestId> {
+        if !self.streamed {
+            return BTreeSet::new();
+        }
         let log_text = std::fs::read_to_string(&self.log).unwrap_or_default();
         let exempt = marker_ids(&log_text, RERUN_EXEMPT_MARKER);
         if exempt.is_empty() {
@@ -671,8 +699,11 @@ struct Finished {
     elapsed: Duration,
     /// The queue cancelled it, or it was interrupted.
     cancelled: bool,
-    /// The queue stopped it early at a streamed deterministic failure.
+    /// The queue stopped it early at a streamed deterministic failure or the runner's early
+    /// verdict.
     early_red: bool,
+    /// The test the runner's early verdict named, when that is what stopped it.
+    early_verdict: Option<TestId>,
     /// Set when a stop request or an outside kill signal ended it (see [`Ran::interrupted`]).
     interrupted: Option<String>,
     /// The runner could not be started at all (no such file, not executable).
@@ -830,6 +861,7 @@ fn run_logged(
                 elapsed: started.elapsed(),
                 cancelled: false,
                 early_red: false,
+                early_verdict: None,
                 interrupted: None,
                 spawn_error: Some(error),
                 cpu: None,
@@ -852,6 +884,7 @@ fn run_logged(
                 elapsed: started.elapsed(),
                 cancelled: interrupted.is_some(),
                 early_red: false,
+                early_verdict: None,
                 interrupted,
                 spawn_error: None,
                 cpu,
@@ -878,6 +911,24 @@ fn run_logged(
                         elapsed: started.elapsed(),
                         cancelled: false,
                         early_red: true,
+                        early_verdict: None,
+                        interrupted: None,
+                        spawn_error: None,
+                        cpu: None,
+                    });
+                }
+                if let Some(test) = files.early_verdict() {
+                    stop_group(
+                        &mut child,
+                        log,
+                        &format!("stopped early: the runner's early verdict names {test}"),
+                    );
+                    return Ok(Finished {
+                        exit: None,
+                        elapsed: started.elapsed(),
+                        cancelled: false,
+                        early_red: true,
+                        early_verdict: Some(test),
                         interrupted: None,
                         spawn_error: None,
                         cpu: None,
@@ -899,6 +950,7 @@ fn run_logged(
                 elapsed: started.elapsed(),
                 cancelled,
                 early_red: false,
+                early_verdict: None,
                 interrupted: stopping
                     .then(|| crate::interrupt::check("this validation finished").unwrap_err()),
                 spawn_error: None,
@@ -1002,13 +1054,21 @@ impl Validator for CommandValidator {
         if self.0.early_red_enabled() {
             env.push((EARLY_RED_ENV, "1".to_owned()));
         }
+        let verdict_path = out.join(EARLY_VERDICT_FILE);
+        let _ = std::fs::remove_file(&verdict_path);
+        if self.0.early_verdict {
+            env.push((EARLY_VERDICT_ENV, verdict_path.display().to_string()));
+        }
         let log = out.join("run.log");
         let argv = vec!["sh".to_owned(), "-c".to_owned(), self.0.run.clone()];
-        let early_files = self.0.early_red_enabled().then(|| EarlyRedFiles {
-            results: Some(results_path.clone()),
-            journal: None,
-            log: log.clone(),
-        });
+        let early_files =
+            (self.0.early_red_enabled() || self.0.early_verdict).then(|| EarlyRedFiles {
+                results: Some(results_path.clone()),
+                journal: None,
+                log: log.clone(),
+                streamed: self.0.early_red_enabled(),
+                verdict: self.0.early_verdict.then(|| verdict_path.clone()),
+            });
         let finished = run_logged(
             &self.0,
             &argv,
@@ -1095,8 +1155,19 @@ impl Validator for CommandValidator {
         let early_red = finished.early_red;
         let interrupted = finished.interrupted.clone();
         if early_red {
-            // Stopped at the first streamed deterministic failure: the verdicts seen so far
-            // are the result; unreported tests carry no outcome and are not required.
+            // Stopped at the first streamed deterministic failure or at the runner's early
+            // verdict: the verdicts seen so far are the result, with the verdict's test failed;
+            // unreported tests carry no outcome and are not required.
+            if let Some(test) = finished.early_verdict.clone() {
+                if !results.attributed_failures().contains(&test) {
+                    results.record(TestResult {
+                        id: test,
+                        outcome: Outcome::Fail,
+                        duration_ms: None,
+                        log: None,
+                    });
+                }
+            }
             let log_text = std::fs::read_to_string(&log).unwrap_or_default();
             return Ok(Ran {
                 results,
@@ -1446,6 +1517,8 @@ impl Validator for DagrunValidator {
             results: None,
             journal: Some(journal_dir.join("journal.jsonl")),
             log: log.clone(),
+            streamed: true,
+            verdict: None,
         });
         let finished = run_logged(
             &self.0,
@@ -1893,6 +1966,114 @@ mod unit {
             ran.failed().contains(&TestId::parse("flaky::a").unwrap()),
             "{ran:?}"
         );
+    }
+
+    fn early_verdict_config(run: &str) -> ValidatorConfig {
+        ValidatorConfig {
+            early_verdict: true,
+            ..config(run)
+        }
+    }
+
+    #[test]
+    fn an_early_verdict_stops_the_run_and_fails_the_step_it_names() {
+        let tmp = TempDir::new("validate-early-verdict");
+        let v = from_config(&early_verdict_config(
+            r#"echo '{"id":"check.unit","outcome":"pass"}' >> "$MQ_RESULTS"; printf 'FAILED test.slow\n' > "$MQ_EARLY_VERDICT"; sleep 30"#,
+        ))
+        .unwrap();
+        let ran = v
+            .run(
+                &tmp.0,
+                &Selection::of([TestId::step("check.unit"), TestId::step("test.slow")]),
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(ran.early_red, "{ran:?}");
+        assert!(!ran.cancelled && !ran.green() && !ran.refused(), "{ran:?}");
+        // The verdict says the red is final, not that a rerun could not change it.
+        assert!(!ran.deterministic_red(), "{ran:?}");
+        assert_eq!(ran.failed(), [TestId::step("test.slow")].into());
+        assert_eq!(
+            ran.results.results.get(&TestId::step("check.unit")),
+            Some(&Outcome::Pass),
+            "{ran:?}"
+        );
+        assert!(ran.elapsed < Duration::from_secs(10), "{ran:?}");
+        let log = std::fs::read_to_string(&ran.log).unwrap();
+        assert!(
+            log.contains("the runner's early verdict names test.slow"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn an_early_verdict_stops_the_run_with_the_early_red_watch_off() {
+        let tmp = TempDir::new("validate-early-verdict-no-watch");
+        let mut cfg = early_verdict_config(
+            r#"echo 'RERUN-EXEMPT: check.unit'; echo '{"id":"check.unit::a","outcome":"fail"}' >> "$MQ_RESULTS"; sleep 1; printf 'FAILED test.slow\n' > "$MQ_EARLY_VERDICT"; sleep 30"#,
+        );
+        cfg.disable_early_red = true;
+        let ran = from_config(&cfg)
+            .unwrap()
+            .run(
+                &tmp.0,
+                &Selection::of([TestId::step("check.unit"), TestId::step("test.slow")]),
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        // The streamed deterministic failure does not stop it (that watch is off); the verdict does.
+        assert!(ran.early_red, "{ran:?}");
+        assert!(ran.elapsed >= Duration::from_secs(1), "{ran:?}");
+        assert!(ran.elapsed < Duration::from_secs(10), "{ran:?}");
+        assert!(ran.failed().contains(&TestId::step("test.slow")), "{ran:?}");
+    }
+
+    #[test]
+    fn without_early_verdict_the_runner_gets_no_verdict_file_and_one_is_ignored() {
+        let tmp = TempDir::new("validate-no-early-verdict");
+        let v = from_config(&config(
+            r#"echo "v=${MQ_EARLY_VERDICT-unset}" > seen.txt; printf 'FAILED a\n' > o/early-verdict; sleep 2; echo '{"id":"a","outcome":"pass"}' >> "$MQ_RESULTS""#,
+        ))
+        .unwrap();
+        let ran = v
+            .run(
+                &tmp.0,
+                &Selection::of([TestId::step("a")]),
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(!ran.early_red && ran.green(), "{ran:?}");
+        let seen = std::fs::read_to_string(tmp.0.join("seen.txt")).unwrap();
+        assert_eq!(seen.trim(), "v=unset", "{seen}");
+    }
+
+    #[test]
+    fn an_early_verdict_file_without_a_whole_failed_line_never_stops_the_run() {
+        for written in [
+            r"printf 'FAILED a'",
+            r"printf 'PASSED a\n'",
+            r"printf 'FAILED \n'",
+        ] {
+            let tmp = TempDir::new("validate-early-verdict-partial");
+            let run = format!(
+                r#"{written} > "$MQ_EARLY_VERDICT"; sleep 2; echo '{{"id":"a","outcome":"pass"}}' >> "$MQ_RESULTS""#
+            );
+            let ran = from_config(&early_verdict_config(&run))
+                .unwrap()
+                .run(
+                    &tmp.0,
+                    &Selection::of([TestId::step("a")]),
+                    &tmp.0.join("o"),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            assert!(!ran.early_red && ran.green(), "{written}: {ran:?}");
+            assert!(ran.elapsed >= Duration::from_secs(2), "{written}: {ran:?}");
+        }
     }
 
     #[test]

@@ -3656,10 +3656,12 @@ impl<'a> Runner<'a> {
                 } else {
                     format!(", failed: {}", ids(&record.failed()))
                 },
-                if record.early_red {
+                if !record.early_red {
+                    ""
+                } else if ran.deterministic_red() {
                     " (early red: stopped at the first deterministic failure)"
                 } else {
-                    ""
+                    " (early red: stopped at the runner's early verdict)"
                 }
             ),
         );
