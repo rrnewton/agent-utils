@@ -164,6 +164,13 @@ fn a_passing_pre_claim_check_claims_and_lands_with_the_job_env() {
     let (code, report, stderr) = finish(run);
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(item_status(&fx, 1), "landed", "{report}");
+    // The donor reported admission before it executed the job (the
+    // same Worker path a queue-host-local donor takes).
+    let done = jobs(&fx)[0].clone();
+    assert!(
+        done["history"].to_string().contains("admitted by d1"),
+        "{done}"
+    );
     let env = std::fs::read_to_string(&env_file).unwrap();
     let parts: Vec<&str> = env.split('|').collect();
     assert_eq!(parts.len(), 3, "{env}");

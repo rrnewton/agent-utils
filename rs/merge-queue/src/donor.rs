@@ -165,6 +165,12 @@ pub struct Lease {
     pub claimed_unix: u64,
     /// Unix seconds after which the lease is gone unless renewed.
     pub expires_unix: u64,
+    /// The donor declared at claim time that it reports admission
+    /// (`Job::admitted`) before execution. Leases recorded before this
+    /// field existed, and donors that do not declare it, keep the old
+    /// rule that a lease itself counts as started.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reports_admission: bool,
 }
 
 /// A validation published for donors.
@@ -196,6 +202,12 @@ pub struct Job {
     /// The live lease, while leased.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<Lease>,
+    /// The current lease's donor has admitted the job: its pre-run checks
+    /// passed and validation is about to execute. A lease alone is not
+    /// admission; tool or admission waits can hold a leased job for
+    /// minutes. Absent in job files written before admission was reported.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub admitted: bool,
     /// The accepted receipt, once done.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt: Option<Receipt>,
@@ -252,6 +264,26 @@ impl Job {
     /// than the queue host).
     pub fn compared_after_landing(&self) -> bool {
         self.comparison.is_some() && self.candidate_gone.is_some()
+    }
+
+    /// Whether the current (or a past) donor has admitted this job:
+    /// a receipt proves a past admission, and `admitted` proves the
+    /// live lease's. A lease with neither has not started in any way
+    /// that should protect it from stale cancellation.
+    pub fn was_admitted(&self) -> bool {
+        self.admitted || self.receipt.is_some()
+    }
+
+    /// Whether stale sweeps must keep this job's lease: it was admitted,
+    /// or its lease comes from a donor that never declared admission
+    /// reporting (including every lease recorded before the declaration
+    /// existed), for which a lease alone has always counted as started.
+    pub fn stale_protected(&self) -> bool {
+        self.was_admitted()
+            || self
+                .lease
+                .as_ref()
+                .is_some_and(|lease| !lease.reports_admission)
     }
 
     /// Whether any donor has ever started this job: it was claimed at
@@ -1168,6 +1200,7 @@ impl Store {
             created_at: now(),
             state: JobState::Queued,
             lease: None,
+            admitted: false,
             receipt: None,
             attempts: 0,
             history: Vec::new(),
@@ -1241,7 +1274,21 @@ impl Store {
     /// The returned job carries the lease token; nothing else ever returns it. With
     /// [`Store::current_tools`] set, queued jobs are re-stamped first
     /// ([`Store::restamp_queued`]).
+    /// Lease a job to a donor that does not declare admission reporting:
+    /// its lease keeps the old started rule (see `Job::stale_protected`).
     pub fn claim(&self, donor: &str, host: &str, max_jobs: usize) -> Result<Option<Job>, String> {
+        self.claim_reporting(donor, host, max_jobs, false)
+    }
+
+    /// [`Self::claim`], declaring whether this donor reports admission
+    /// before execution (`--reports-admission` on the claim verb).
+    pub fn claim_reporting(
+        &self,
+        donor: &str,
+        host: &str,
+        max_jobs: usize,
+        reports_admission: bool,
+    ) -> Result<Option<Job>, String> {
         if donor.trim().is_empty() {
             return Err("a donor needs a name".to_owned());
         }
@@ -1297,12 +1344,14 @@ impl Store {
         };
         job.state = JobState::Leased;
         job.attempts += 1;
+        job.admitted = false;
         job.lease = Some(Lease {
             donor: donor.to_owned(),
             host: host.to_owned(),
             token: token()?,
             claimed_unix: at,
             expires_unix: at + self.lease_secs,
+            reports_admission,
         });
         job.history
             .push(format!("{}: leased to {donor} on {host}", now()));
@@ -1384,6 +1433,26 @@ impl Store {
             }
             Err(reason) => Ok(Renewal::Stop { reason }),
         }
+    }
+
+    /// Record that the lease's donor has admitted the job: its pre-run
+    /// checks passed and validation is about to execute. Until this is
+    /// recorded, a leased rooted job counts as unstarted for the stale
+    /// sweeps.
+    pub fn admit(&self, id: &str, token: &str) -> Result<Job, String> {
+        let _lock = self.lock()?;
+        let mut job = self.leased(id, token, unix_now())?;
+        if !job.admitted {
+            job.admitted = true;
+            let donor = job
+                .lease
+                .as_ref()
+                .map(|lease| lease.donor.clone())
+                .unwrap_or_default();
+            job.history.push(format!("{}: admitted by {donor}", now()));
+            self.write(&job)?;
+        }
+        Ok(job)
     }
 
     /// The job for a bundle request, if `token` is its live lease's.
@@ -1532,6 +1601,7 @@ impl Store {
             token: String::new(),
             claimed_unix: 0,
             expires_unix: 0,
+            reports_admission: false,
         });
         let (tool_refusal, tool_notes) = self.tool_check(&job, &receipt);
         let refusal = if receipt.schema != RECEIPT_SCHEMA {
@@ -1790,7 +1860,12 @@ impl Store {
             .jobs()?
             .into_iter()
             .filter(|job| matches!(job.state, JobState::Queued | JobState::Leased))
-            .filter(|job| !(keep_stale_roots && job.rooted && job.state == JobState::Leased))
+            .filter(|job| {
+                !(keep_stale_roots
+                    && job.rooted
+                    && job.state == JobState::Leased
+                    && job.stale_protected())
+            })
             .filter(|job| !contains(&job.commit))
             .map(|job| job.id)
             .collect();
@@ -3207,6 +3282,25 @@ impl Worker<'_> {
                 .map_err(|error| Unreported::Declined(error.to_string()))?;
             let validator =
                 crate::validate::from_config(&job.validator).map_err(Unreported::Declined)?;
+            // Admission is reported only now, when the validator is
+            // about to start: every wait before this point (tool
+            // materialization, identity refresh, fetch, checkout, and
+            // the validator's own admission wrapper inside the run) is
+            // still ahead of or at execution, so a lease that never
+            // reaches here counts as unstarted for the stale sweeps.
+            // A lease admitted here and then held in the validator's
+            // materialization/admission wait is protected. An old queue
+            // host without the verb refuses the call; that donor binary
+            // and its queue must upgrade together, as with the digest.
+            self.route
+                .call(
+                    &["donor", "admit", "--job", &job.id],
+                    token.as_bytes(),
+                    ROUTE_TIMEOUT,
+                )
+                .map_err(|error| {
+                    Unreported::Released(format!("cannot report admission: {error}"))
+                })?;
             let started_at = now();
             let env: Vec<(String, String)> = if job.extra.is_empty() {
                 Vec::new()
@@ -3693,6 +3787,7 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
                     "--jobs",
                     &cap_text,
                 ];
+                args.push("--reports-admission");
                 if probe_passed {
                     args.push("--probe-passed");
                 }
@@ -4457,6 +4552,58 @@ mod unit {
     }
 
     #[test]
+    fn a_rooted_job_leased_but_not_admitted_is_swept_and_an_admitted_one_is_kept() {
+        let store = Store::new(&temp("stale-sweep-admission"));
+        let unadmitted = publish_rooted(&store, "c1", true);
+        let claimed = store
+            .claim_reporting("d1", "h1", 1, true)
+            .unwrap()
+            .expect("a rooted job");
+        assert_eq!(claimed.id, unadmitted.id);
+        assert!(!store.read(&unadmitted.id).unwrap().was_admitted());
+        let cancelled = store
+            .sweep_stale("base99", &|commit| commit == "fresh", true)
+            .unwrap();
+        assert_eq!(cancelled, vec![unadmitted.id.clone()]);
+        let job = store.read(&unadmitted.id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert!(job.could_not_run.is_empty(), "stale is not a donor failure");
+
+        let admitted = publish_rooted(&store, "c2", true);
+        let claimed = store
+            .claim_reporting("d1", "h1", 1, true)
+            .unwrap()
+            .expect("a rooted job");
+        assert_eq!(claimed.id, admitted.id);
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        store.admit(&claimed.id, &token).unwrap();
+        assert!(store.read(&admitted.id).unwrap().was_admitted());
+        assert!(store
+            .sweep_stale("base99", &|commit| commit == "fresh", true)
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.read(&admitted.id).unwrap().state, JobState::Leased);
+        let _ = token;
+    }
+
+    #[test]
+    fn an_old_style_claims_leased_rooted_job_is_kept_as_today() {
+        // A donor that never declares admission reporting (including
+        // every lease recorded before the declaration existed) keeps
+        // the old rule: its lease alone protects a rooted job.
+        let store = Store::new(&temp("stale-sweep-legacy-claim"));
+        let legacy = publish_rooted(&store, "c1", true);
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a rooted job");
+        assert_eq!(claimed.id, legacy.id);
+        assert!(store.read(&legacy.id).unwrap().stale_protected());
+        assert!(store
+            .sweep_stale("base99", &|commit| commit == "fresh", true)
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.read(&legacy.id).unwrap().state, JobState::Leased);
+    }
+
+    #[test]
     fn the_sweep_keeps_only_leased_rooted_jobs_under_keep_stale_roots() {
         // #915 merge-queue-keep-running-roots-only. A rooted job a donor holds
         // survives while the flag is on: its validation is paid for and its
@@ -4470,6 +4617,8 @@ mod unit {
         let plain = publish(&store, "c3");
         let claimed = store.claim("d1", "h1", 1).unwrap().expect("oldest job");
         assert_eq!(claimed.id, leased_root.id);
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        store.admit(&claimed.id, &token).unwrap();
         let cancelled = store
             .sweep_stale("base99", &|commit| commit == "fresh", true)
             .unwrap();

@@ -422,6 +422,11 @@ enum DonorCommand {
         /// lease nothing.
         #[arg(long)]
         drain: bool,
+        /// This donor reports admission (`donor admit`) before it executes
+        /// a leased job, so a lease alone does not count as started for
+        /// the stale sweeps. Donors that do not send it keep the old rule.
+        #[arg(long)]
+        reports_admission: bool,
     },
     /// Queue host: clear a donor's host fault without leasing anything. With
     /// --probe-passed the donor's probe (MQ_PROBE=1) just passed: an ordinary
@@ -457,6 +462,14 @@ enum DonorCommand {
     },
     /// Queue host: extend a lease (token on stdin); prints continue or stop.
     Renew {
+        /// Job id.
+        #[arg(long)]
+        job: String,
+    },
+    /// Queue host: record that the lease's donor has admitted the job
+    /// (token on stdin); its pre-run checks passed and validation is
+    /// about to execute.
+    Admit {
         /// Job id.
         #[arg(long)]
         job: String,
@@ -588,6 +601,7 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             jobs,
             probe_passed,
             drain,
+            reports_admission,
         } => {
             if probe_passed {
                 store.note_probe_pass(&donor);
@@ -664,7 +678,7 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
                     }
                 }
             }
-            let job = store.claim(&donor, &host, jobs)?;
+            let job = store.claim_reporting(&donor, &host, jobs, reports_admission)?;
             print_json_reply(
                 &serde_json::to_value(&crate::donor::Claimed { job })
                     .map_err(|error| error.to_string())?,
@@ -707,6 +721,11 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
         DonorCommand::Renew { job } => {
             let renewal = store.renew(&job, &read_token()?)?;
             print_json_reply(&serde_json::to_value(&renewal).map_err(|error| error.to_string())?)?;
+            Ok(0)
+        }
+        DonorCommand::Admit { job } => {
+            let admitted = store.admit(&job, &read_token()?)?;
+            print_json_reply(&serde_json::json!({"admitted": admitted.id}))?;
             Ok(0)
         }
         DonorCommand::Bundle { job } => {

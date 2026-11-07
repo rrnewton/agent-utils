@@ -4135,7 +4135,7 @@ impl<'a> Runner<'a> {
             // run has ended it is superseded like anything else.
             if stale && !ended && self.config.keep_stale_roots {
                 if let Ok(record) = donors.store.get(id) {
-                    if record.rooted {
+                    if record.rooted && record.stale_protected() {
                         return true;
                     }
                 }
@@ -4645,10 +4645,11 @@ impl<'a> Runner<'a> {
         )
     }
 
-    /// Whether no donor has started validating rooted `flight`: its donor job is still
-    /// queued, or not yet published. Validated on this host, or by donors that only
-    /// compare, a flight started when it was dispatched (#915
-    /// merge-queue-keep-running-roots-only).
+    /// Whether no donor has admitted validating rooted `flight`: its donor
+    /// job is still queued or leased-but-unadmitted, or not yet published.
+    /// A lease alone does not start it; admission does. Validated on this
+    /// host, or by donors that only compare, a flight started when it was
+    /// dispatched (#915 merge-queue-keep-running-roots-only).
     fn root_unstarted(&self, flight: &Flight) -> bool {
         if flight.result.is_some() {
             return false;
@@ -4660,15 +4661,16 @@ impl<'a> Runner<'a> {
         else {
             return false;
         };
-        // Every deciding job published for its candidate, settled or not: one a donor
-        // has leased, or has finished, has started; none published yet has not.
+        // Every deciding job published for its candidate, settled or not:
+        // only one protected from stale cancellation (admitted, or leased
+        // by a donor that never declared admission reporting) has started.
         let Ok(jobs) = donors.store.jobs() else {
             return false;
         };
         jobs.iter()
             .filter(|job| job.commit == flight.candidate.tip && !job.compare_only)
             .filter(|job| job.state != crate::donor::JobState::Cancelled)
-            .all(|job| job.state == crate::donor::JobState::Queued)
+            .all(|job| !job.stale_protected())
     }
 
     /// Promote a rooted flight that has become decidable (every batch it

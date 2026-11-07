@@ -1902,9 +1902,19 @@ fn kept_stale_roots_keep_their_donor_jobs_and_decide_after_a_landing() {
         .min_by_key(|job| job["id"].as_str().unwrap().to_owned())
         .expect("a job for change 3");
     if first_c["state"] == "cancelled" {
-        assert_eq!(
-            first_c["attempts"], 0,
-            "a stale root no donor had started was claimed: {first_c}"
+        // Under #1026 a job can be claimed (attempts 1, leased) yet
+        // still unstarted for stale purposes: its donor never admitted
+        // it before the base moved. That cancellation is the new
+        // intended branch, distinct from an admitted job's.
+        assert!(
+            first_c["attempts"] == 0 || first_c.get("admitted") != Some(&Value::Bool(true)),
+            "a stale root a donor had admitted was cancelled: {first_c}"
+        );
+        assert!(
+            first_c["could_not_run"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "{first_c}"
         );
     } else {
         assert!(third["history"].to_string().contains("green at"), "{third}");
@@ -2067,9 +2077,12 @@ fn kept_stale_roots_keep_only_running_roots_and_rebuild_unstarted_ones_on_the_ne
     let after = jobs(&fx);
     let record = |id: &str| after.iter().find(|job| job["id"] == id).unwrap().clone();
     // The unstarted root: cancelled, never claimed by a donor, no strike against anything.
+    // This is the deterministic leased-but-unadmitted case (#1026): the
+    // fake lease holds the job out of every real donor's admission.
     let c = record(&job_c);
     assert_eq!(c["state"], "cancelled", "{c}");
     assert_eq!(c["attempts"], 0, "a donor claimed the stale candidate: {c}");
+    assert_ne!(c.get("admitted"), Some(&Value::Bool(true)), "{c}");
     assert!(
         c["could_not_run"]
             .as_array()
@@ -2086,7 +2099,16 @@ fn kept_stale_roots_keep_only_running_roots_and_rebuild_unstarted_ones_on_the_ne
         "change 3 was not validated again on the new base: {after:?}"
     );
     // The running root: kept through the move, its job done, green at B0 and requeued.
+    // This is the deterministic admitted case (#1026): its donor reached
+    // validator start (the 8 s sleep is inside the validator), so the
+    // job was admitted before the base moved and stayed protected.
     assert_eq!(record(&job_b)["state"], "done", "{}", record(&job_b));
+    assert_eq!(
+        record(&job_b)["admitted"],
+        Value::Bool(true),
+        "{}",
+        record(&job_b)
+    );
     let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
     let second = items
         .as_array()
