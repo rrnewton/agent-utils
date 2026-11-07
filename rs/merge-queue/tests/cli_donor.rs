@@ -482,10 +482,11 @@ fn an_older_donor_refreshes_its_tools_and_takes_the_job() {
 }
 
 #[test]
-fn a_donor_still_different_after_refreshing_its_tools_declines() {
+fn a_donor_still_different_after_refreshing_its_tools_gives_the_job_back() {
     // After the refresh the donor has the newest tooling, and the job still names another:
-    // the donor is newer than the job (or unrelated to it), so it declines; a claim after the
-    // queue host's tooling moves re-stamps the job and offers it again.
+    // the donor is newer than the job (or unrelated to it). It gives the job back rather
+    // than decline it (#1005): no `declined_by`, so once the queue re-stamps the job the
+    // donor is offered it again, and another donor may take it meanwhile.
     let fx = Fixture::new("donor-refresh-newer");
     fx.mq_ok(&[
         "init",
@@ -511,18 +512,108 @@ fn a_donor_still_different_after_refreshing_its_tools_declines() {
     wait_for("a published job", Duration::from_secs(30), || {
         !jobs(&fx).is_empty()
     });
+    // Keep the queue host from refreshing its own stale stamp at claim time, so the
+    // donor still meets the mismatch this test is about.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        state_dir(&fx).join("donor").join("tool-refresh-at"),
+        now.to_string(),
+    )
+    .unwrap();
     let out = donor(&fx, &clone, "d1", &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("DECLINED"), "{stderr}");
+    assert!(stderr.contains("gave back"), "{stderr}");
+    assert!(!stderr.contains("DECLINED"), "{stderr}");
     assert!(
         stderr.contains("still differ from the job's after refreshing them")
             && stderr.contains("newer than the job or unrelated to it"),
         "{stderr}"
     );
+    let job = &jobs(&fx)[0];
+    assert!(job.get("declined_by").is_none(), "{job}");
+    assert!(
+        job["history"].to_string().contains("released by d1"),
+        "{job}"
+    );
+    // The queue host's tools move to the donor's: the next claim re-stamps the job and
+    // the same donor takes it.
+    std::fs::write(fx.queue().join(".tool-version"), "1.91\n").unwrap();
+    let out = donor(&fx, &clone, "d1", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
     let (code, report, _) = finish(run);
-    assert_eq!(code, Some(3));
-    assert!(report["ejected"].as_array().unwrap().is_empty(), "{report}");
-    assert_eq!(jobs(&fx)[0]["declined_by"], serde_json::json!(["d1"]));
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        report["landed"][0]["prs"],
+        serde_json::json!([1, 2]),
+        "{report}"
+    );
+    let job = &jobs(&fx)[0];
+    assert_eq!(job["state"], "done", "{job}");
+    assert!(job.get("declined_by").is_none(), "{job}");
+}
+
+#[test]
+fn the_queue_host_refreshes_a_stale_stamp_before_claim() {
+    // The job was stamped with the queue host's stale tools. At claim time the queue
+    // host runs `tool_refresh` itself (bounded, rate-limited), so the claim re-stamps
+    // the job with the fresh answer and the donor whose tools already moved takes it.
+    // Without the queue-side refresh the donor still differs after its own refresh
+    // and gives the job back (#1005).
+    let fx = Fixture::new("queue-refresh-stale");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "decide",
+        "--tool-identity",
+        "toolchain=cat .tool-version",
+        "--tool-refresh",
+        "toolchain=echo 1.91 > .tool-version",
+    ]);
+    std::fs::write(fx.queue().join(".tool-version"), "1.90\n").unwrap();
+    two_changes(&fx);
+    let clone = donor_clone(&fx, "donor-host");
+    std::fs::write(clone.join(".tool-version"), "1.91\n").unwrap();
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    assert_eq!(
+        jobs(&fx)[0]["tool"]["tools"]["toolchain"],
+        "1.90",
+        "the job starts with the stale stamp"
+    );
+    let out = donor(&fx, &clone, "d1", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(fx.queue().join(".tool-version"))
+            .unwrap()
+            .trim(),
+        "1.91",
+        "the queue host refreshed its own tools at claim time"
+    );
+    let (code, report, _) = finish(run);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        report["landed"][0]["prs"],
+        serde_json::json!([1, 2]),
+        "{report}"
+    );
+    let job = &jobs(&fx)[0];
+    assert_eq!(job["state"], "done", "{job}");
+    assert_eq!(
+        job["receipt"]["tool"]["tools"]["toolchain"], "1.91",
+        "{job}"
+    );
+    assert!(job.get("declined_by").is_none(), "{job}");
 }
 
 #[test]

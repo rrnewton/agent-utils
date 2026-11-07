@@ -205,8 +205,9 @@ pub struct Job {
     /// What happened to the job, oldest first. Never holds a lease token.
     #[serde(default)]
     pub history: Vec<String>,
-    /// Donors that declined the job (tools still different after a refresh, no base, bundle
-    /// too big); a claim never hands it to them again unless the job is re-stamped.
+    /// Donors that declined the job (no base, bundle too big); a claim never hands it to
+    /// them again unless the job is re-stamped. A tools mismatch is not a decline: the
+    /// donor gives the job back and may claim it again (see `Worker::validate`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declined_by: Vec<String>,
     /// The queue's own verdict for the same commit (offload `compare`).
@@ -629,6 +630,14 @@ pub fn mismatched_tools(
 /// How long one `validator.tool_refresh` command may run on a donor.
 const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How long one `validator.tool_refresh` command may run on the queue host at claim
+/// time: long enough for a fetch, short enough that a claim is not held up by it.
+pub const QUEUE_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Least time between queue-host claim-time refreshes: concurrent claims share one
+/// refresh instead of fetching in a storm.
+pub const QUEUE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Bring the tools `names` up to date on this host: run each one's `validator.tool_refresh`
 /// command in `cwd`, bounded by [`REFRESH_TIMEOUT`]. Fails on a tool with no such command, or a
 /// command that fails or runs out of time.
@@ -636,6 +645,16 @@ pub fn refresh_tools(
     validator: &ValidatorConfig,
     cwd: &Path,
     names: &[String],
+) -> Result<(), String> {
+    refresh_tools_with_timeout(validator, cwd, names, REFRESH_TIMEOUT)
+}
+
+/// Like [`refresh_tools`], with a caller-chosen bound on each command.
+pub fn refresh_tools_with_timeout(
+    validator: &ValidatorConfig,
+    cwd: &Path,
+    names: &[String],
+    timeout: std::time::Duration,
 ) -> Result<(), String> {
     for name in names {
         let command = validator
@@ -667,12 +686,12 @@ pub fn refresh_tools(
             {
                 break status;
             }
-            if started.elapsed() > REFRESH_TIMEOUT {
+            if started.elapsed() > timeout {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(format!(
                     "the refresh of {name:?} ran out of time ({}s)",
-                    REFRESH_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 ));
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -762,6 +781,32 @@ impl Store {
         file.lock_exclusive()
             .map_err(|error| format!("cannot lock {}: {error}", path.display()))?;
         Ok(StoreLock(file))
+    }
+
+    /// When the queue host last attempted a claim-time tool refresh (unix seconds),
+    /// or 0 when it never has. The attempt time is recorded whether the refresh
+    /// succeeded or not, so a failing refresh is retried at most once per interval.
+    pub fn queue_refresh_attempted_at(&self) -> u64 {
+        std::fs::read_to_string(self.dir.join("tool-refresh-at"))
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Record a queue-host claim-time tool-refresh attempt now.
+    pub fn note_queue_refresh_attempt(&self) {
+        let _ = std::fs::create_dir_all(&self.dir);
+        let _ = write_private(
+            &self.dir.join("tool-refresh-at"),
+            unix_now().to_string().as_bytes(),
+        );
+    }
+
+    /// Whether a queue-host claim-time tool refresh is due: at least
+    /// [`QUEUE_REFRESH_INTERVAL`] since the last attempt.
+    pub fn queue_refresh_due(&self) -> bool {
+        unix_now().saturating_sub(self.queue_refresh_attempted_at())
+            >= QUEUE_REFRESH_INTERVAL.as_secs()
     }
 
     fn read(&self, id: &str) -> Result<Job, String> {
@@ -2660,8 +2705,8 @@ impl Worker<'_> {
         let differing = mismatched_tools(&job.tool.tools, &have);
         if !differing.is_empty() {
             let before = tool_mismatch(&job.tool.tools, &have).unwrap_or_default();
-            // An older donor catches up and runs the job; only one that still differs after
-            // that (newer than the job, or unrelated) declines it.
+            // An older donor catches up and runs the job; one that still differs after
+            // that (newer than the job, or unrelated) gives it back, below.
             if let Err(why) = refresh_tools(&job.validator, &self.options.clone, &differing) {
                 self.back_off(backoff);
                 return Err(Unreported::Released(format!(
@@ -2672,8 +2717,14 @@ impl Worker<'_> {
             have =
                 tool_answers(&job.validator, &self.options.clone).map_err(Unreported::Declined)?;
             if let Some(after) = tool_mismatch(&job.tool.tools, &have) {
+                // Still different after a refresh: this donor is newer than the job, or
+                // unrelated to it. Give the job back (with the back-off above) rather than
+                // decline it: a decline would bar this donor until the queue re-stamps the
+                // job, and the re-stamped job may never return here. As a release it is
+                // offered again once the queue re-stamps it, and other donors may take it
+                // meanwhile (#1005 merge-queue-donor-restamp-race).
                 self.back_off(backoff);
-                return Err(Unreported::Declined(format!(
+                return Err(Unreported::Released(format!(
                     "this donor's tools still differ from the job's after refreshing them \
                      ({after}), so this donor is newer than the job or unrelated to it"
                 )));
@@ -4047,6 +4098,15 @@ mod unit {
         assert!(store.claim("d2", "h2", 1).unwrap().is_none());
         let job = store.read(&first.id).unwrap();
         assert_eq!(job.tool.tools, moved, "a leased job is not re-stamped");
+    }
+
+    #[test]
+    fn a_queue_refresh_attempt_is_rate_limited() {
+        let store = Store::new(&temp("queue-refresh-rate"));
+        assert!(store.queue_refresh_due(), "never attempted: due");
+        store.note_queue_refresh_attempt();
+        assert!(!store.queue_refresh_due(), "just attempted: not due");
+        assert!(store.queue_refresh_attempted_at() > 0);
     }
 
     #[test]

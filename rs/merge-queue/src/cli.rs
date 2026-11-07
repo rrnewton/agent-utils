@@ -610,6 +610,25 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
                 )?;
                 return Ok(0);
             }
+            // Refresh this host's tools first (bounded and rate-limited, #1005): only
+            // donors fetched, so a busy local donor left every stamp stale. A failed or
+            // timed-out refresh falls back to the current answer and is logged; the
+            // attempt is recorded either way, so concurrent claims share one refresh.
+            if !config.validator.tool_refresh.is_empty() && store.queue_refresh_due() {
+                let names: Vec<String> = config.validator.tool_refresh.keys().cloned().collect();
+                if let Err(error) = crate::donor::refresh_tools_with_timeout(
+                    &config.validator,
+                    &config.repo,
+                    &names,
+                    crate::donor::QUEUE_REFRESH_TIMEOUT,
+                ) {
+                    eprintln!(
+                        "merge-queue donor claim: queue-host tool refresh failed ({error}); \
+                         jobs keep their published tool stamps"
+                    );
+                }
+                store.note_queue_refresh_attempt();
+            }
             // Answer the tool identity now, so a job published before a tool moved is offered
             // under the tools this host would validate with (see `Store::current_tools`).
             let mut store = store;
@@ -1142,11 +1161,12 @@ enum Command {
         /// second line of --version) is always compared.
         #[arg(long, value_name = "NAME=COMMAND")]
         tool_identity: Vec<String>,
-        /// How a donor brings the tool NAME (one of --tool-identity) up to date, as
+        /// How the tool NAME (one of --tool-identity) is brought up to date, as
         /// NAME=COMMAND (repeatable), for example a fetch of the tool repository. A donor whose
         /// answer differs from the job's runs it once and asks again: an older donor then takes
-        /// the job; one that still differs declines it. Without one, a donor whose answer
-        /// differs gives the job back instead of declining it.
+        /// the job; one that still differs gives the job back (and is offered it again after a
+        /// re-stamp). The queue host runs it too, bounded and rate-limited, at claim time.
+        /// Without one, a donor whose answer differs gives the job back.
         #[arg(long, value_name = "NAME=COMMAND")]
         tool_refresh: Vec<String>,
         /// Delete ignored files (build caches) from reused checkouts before each validation.
