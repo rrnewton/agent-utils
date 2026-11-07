@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 
 import { ALICE, CHANNEL, CODER, CSS, FakeElement, HOLD_MS, HTML, HTML_CODE, LINK_ATTRS, PAGE_CODE,
-  RECORD_EPOCH, SCRIPT_CODE, UNPACK_STORAGE, allLeavingOut, assertMarkupContains, assistantSays,
+  RECORD_EPOCH, UNPACK_STORAGE, allLeavingOut, assertMarkupContains, assistantSays,
   authorChannel, authorState, backlog, beforeOf, boxesOf, builtSince, cardRow, channelSummaryText,
   chooseAuthor, chooseReadMode, collapsedRows, cssBlock, cssRules, deliver, excerptOf, foldButton,
   gate, headOf, hitsIn, inTwoColumns, json, lineText, longMessage, marksPending, message,
@@ -360,8 +360,8 @@ test("every list of messages is a list the filter reaches", () => {
   // declared in the markup and the filter's set of them is declared in the script, so a fifth one
   // added to the page is unsearchable until somebody remembers this file. A reader who searches
   // and sees a list unchanged concludes the feature is broken, which — for that list — it is.
-  const declared = /const SEARCH_LISTS = \[([^\]]*)\]/.exec(SCRIPT_CODE);
-  assert.ok(declared, "web/voice.js no longer declares SEARCH_LISTS");
+  const declared = /const SEARCH_LISTS = \[([^\]]*)\]/.exec(PAGE_CODE);
+  assert.ok(declared, "the page's code no longer declares SEARCH_LISTS");
   const filtered = [...declared[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
   // `#channel-summary` is built in the same idiom and holds no messages: it is the one-row seam
   // naming the channel, which `#63 status-line-placement` moved to the head of its own list so it
@@ -374,8 +374,8 @@ test("every list of messages is a list the filter reaches", () => {
   // `#229 desktop-two-column`. The right column's lists stand in for the channel pane's, by
   // `COLUMN_IDS`, and the filter reaches them the way everything else does: it runs once in each
   // column, and `el()` gives it that column's list for each id. So each counts as its counterpart.
-  const table = /const COLUMN_IDS = \{([\s\S]*?)\n\};/.exec(SCRIPT_CODE);
-  assert.ok(table, "web/voice.js no longer declares COLUMN_IDS");
+  const table = /const COLUMN_IDS = \{([\s\S]*?)\n\};/.exec(PAGE_CODE);
+  assert.ok(table, "the page's code no longer declares COLUMN_IDS");
   const standsFor = new Map([...table[1].matchAll(/"([^"]+)": "([^"]+)"/g)].map((m) => [m[2], m[1]]));
   const inMarkup = [...new Set([...HTML.matchAll(/<ol id="([^"]+)" class="messages"/g)]
     .map((m) => standsFor.get(m[1]) || m[1]))]

@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 
 import { BOTTOM_SLACK_PX, CHANNEL, CHARS_PER_LINE, CSS_CODE, CSS_UNCONDITIONAL, DESKTOP_QUERY,
   DISCORD_POLL_MS, HTML_CODE, LINE_PX, PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS, PULL_ARM_PX,
-  PULL_WAIT_MS, RELAY_FENCE_OPEN, SCRIPT, SCRIPT_CODE, SCROLLBACK_PX, SCROLL_VIEWPORT_PX,
+  PULL_WAIT_MS, RELAY_FENCE_OPEN, SCRIPT, SCROLLBACK_PX, SCROLL_VIEWPORT_PX,
   SHORT_MESSAGE, assertMarkupContains, assistantSays, atBottomOf, brokenModule, brokenScript, brokenScriptEach,
   channelSummaryText, countingChannel, cssBlock, cssBlockIn, cssBlockOutside, cssRules, deliver,
   errorResponse, fillTranscript, focused, foldButton, gate, helpEntry, holdChannelReads,
@@ -218,7 +218,7 @@ test("ONE COLLAPSING IDIOM: the transcript and the channel fold a long message i
   // And it is literally one function — not implementations that agree today — called once by each
   // row builder: a turn, a channel message, and (`#270 voice-transcript-markers`) a frozen send card,
   // which is a row of the transcript like any turn.
-  assert.match(SCRIPT_CODE, /function foldable\(/, "the folding idiom is not a shared function");
+  assert.match(PAGE_CODE, /function foldable\(/, "the folding idiom is not a shared function");
   const calls = sourceCalls("foldable");
   assert.equal(calls, 3, `foldable() is called from ${calls} places; each row builder needs it once`);
 });
