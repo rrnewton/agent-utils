@@ -139,3 +139,5 @@ export { mountSideControls } from "./sidecontrols.ts";
 export type { GestureStart, SideControls, SideControlsDependencies } from "./sidecontrols.ts";
 export { LINKED_MARK_WORDS, createLinkedMark } from "./linkedmark.ts";
 export type { LinkedMark, LinkedMarkDependencies, LinkedMessage } from "./linkedmark.ts";
+export { createTimelineView } from "./readcore.ts";
+export type { TimelineAbandonedRead, TimelineColumn, TimelineColumnSteps, TimelineEntryState, TimelineFoldRead, TimelineLoadState, TimelineOlderPages, TimelineReadOptions, TimelineReaderLike, TimelineRows, TimelineSelection, TimelineView, TimelineViewDependencies } from "./readcore.ts";

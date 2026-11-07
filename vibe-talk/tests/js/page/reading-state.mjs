@@ -622,7 +622,7 @@ test("...and the read behind held rows keeps the landing when the row above it g
   assert.equal(await run(SCRIPT), 0, "the read behind the held rows moved the landed message");
   // Negative control: without putting the landing back, the read keeps the reader by the row at the
   // top of the screen, which now starts a message earlier, and the answer goes down by that message.
-  assert.notEqual(await run(brokenScript("      if (landing) keepEntryLanding(landing);\n", "")), 0,
+  assert.notEqual(await run(await brokenModule([{ file: "src/view/channel/readcore.ts", find: "      if (landing) keepEntryLanding(landing);\n", replace: "" }])), 0,
     "the read left the landing where it was without being told to; the control proves nothing");
 });
 
@@ -816,8 +816,7 @@ test("...and keeps it when another read overtakes the read behind the held rows:
       `${name} during the read behind the held rows moved or folded the landed message`);
   }
   // Negative control: the overtaken read folded into the store without keeping the landing.
-  const control = await run(brokenScript("    if (landing) keepEntryLanding(landing);\n    payThreadEntry();\n  } else if",
-    "    payThreadEntry();\n  } else if"), interruptions["a live message"]);
+  const control = await run(await brokenModule([{ file: "src/view/channel/readcore.ts", find: "    if (landing) keepEntryLanding(landing);\n    payThreadEntry();\n  } else if", replace: "    payThreadEntry();\n  } else if" }]), interruptions["a live message"]);
   assert.notEqual(control.moved, 0, "the overtaken read kept the landing without being told to; the control proves nothing");
 });
 
@@ -904,11 +903,10 @@ test("...and a landing left to the read behind held rows is paid by that read wh
   assert.deepStrictEqual(await run(SCRIPT), { open: "false", atTheHead: true },
     "the read behind the held rows, overtaken by the way out and back, did not land on the answer");
   // Negative control: the overtaken read pays nothing, and the landing is left to the next poll.
-  assert.deepStrictEqual(await run(brokenScript("    if (landing) keepEntryLanding(landing);\n    payThreadEntry();\n  } else if",
-    "    if (landing) keepEntryLanding(landing);\n  } else if")), { open: "true", atTheHead: false },
+  assert.deepStrictEqual(await run(await brokenModule([{ file: "src/view/channel/readcore.ts", find: "    if (landing) keepEntryLanding(landing);\n    payThreadEntry();\n  } else if", replace: "    if (landing) keepEntryLanding(landing);\n  } else if" }])), { open: "true", atTheHead: false },
   "the overtaken read landed without paying the landing; the control proves nothing");
   // ...nor on the page's read messages drawn unread: the landing goes to the oldest of them instead.
-  assert.deepStrictEqual(await run(brokenScript("    noteArchived(payload, false);\n    // Words and all", "    // Words and all")),
+  assert.deepStrictEqual(await run(await brokenModule([{ file: "src/view/channel/readcore.ts", find: "    noteArchived(payload, false);\n    // Words and all", replace: "    // Words and all" }])),
     { open: "true", atTheHead: false }, "the overtaken read found the answer without what it says is read; the control proves nothing");
 });
 
@@ -982,7 +980,7 @@ test("...and held rows with nothing unread whose read fails leave the reader on 
   assert.deepStrictEqual(await run(SCRIPT), { atBottom: true, open: "true" },
     "the poll after the failed read paid the landing the read owed");
   // Negative control: the deferral kept through the failure, as before.
-  assert.deepStrictEqual(await run(brokenScript("      if (entryState().threadAwaitsRead) entryState().threadOwed = null;\n", "")),
+  assert.deepStrictEqual(await run(await brokenModule([{ file: "src/view/channel/readcore.ts", find: "      if (entryState().threadAwaitsRead) entryState().threadOwed = null;\n", replace: "" }])),
     { atBottom: false, open: "false" }, "the poll moved nobody without the failure ending the wait; the control proves nothing");
 });
 

@@ -3315,6 +3315,7 @@ function brokenAlso(script, [find, replace]) {
 }
 /** A negative control: a read of All for Main's counts speaking for every message held when it lands. */
 const COUNTS_SPEAK_FOR_ALL = ["    held: heldNow(channelStore.current()) };", "    held: null };"];
+const COUNTS_HELD_MODULE = { file: "src/view/channel/readcore.ts", find: COUNTS_SPEAK_FOR_ALL[0], replace: COUNTS_SPEAK_FOR_ALL[1] };
 /** A negative control: a read bringing back a message removed upstream after it was sent (`#316 late-counts-resurrect`). */
 const REMOVALS_FORGOTTEN = { file: "src/core/channels/fold.ts",
   find: "  return at !== undefined && at >= number;\n", replace: "  return false;\n" };
@@ -3914,7 +3915,7 @@ for (const mode of ["newest", "delta"]) {
 
     // THE CONTROLS. The read for the counts speaking for every message held when it lands takes the
     // reply out of the store, as round 3 did; the placing read still puts it back in its thread.
-    const speaking = await run(brokenScript(...COUNTS_SPEAK_FOR_ALL));
+    const speaking = await run(await brokenModule([COUNTS_HELD_MODULE]));
     assert.equal(speaking.afterCounts, null, "the read for the counts kept the reply anyway, so this test cannot see it");
     assert.ok(await placed(speaking.page, speaking.first), "the placing read did not put the reply back in its thread");
     // And with that, as round 2 did: the newest page taken as the newer because it LANDED after the
@@ -3923,9 +3924,9 @@ for (const mode of ["newest", "delta"]) {
     const control = await run(mode === "newest"
       // `readOrder` is the legacy script's, found in the page's global scope at run time.
       ? await brokenModule([{ file: "src/core/channels/fold.ts", find: "      cover.fullSent = deps.numberOf();\n",
-        replace: "      cover.fullSent = readOrder.asked() + 1;\n" }], brokenScriptEach(COUNTS_SPEAK_FOR_ALL))
+        replace: "      cover.fullSent = readOrder.asked() + 1;\n" } , COUNTS_HELD_MODULE])
       : await brokenModule([{ file: "src/core/channels/placement.ts", find: "  const back = newerPage(canon, \"flat\", number) ? []",
-        replace: "  const back = true ? []" }], brokenScriptEach(COUNTS_SPEAK_FOR_ALL)));
+        replace: "  const back = true ? []" } , COUNTS_HELD_MODULE]));
     assert.equal(savedMessage(control.page, "300"), null, "the reply was held anyway, so this test cannot see it");
     assert.ok(!(await threadFromStore(control.page, control.first.id)).includes("300"),
       "the reply reached its thread anyway, so this test cannot see it");
@@ -4049,8 +4050,7 @@ test("`#308 live-reply-in-main`: a read of All for Main's counts sent after a pl
 
   // THE CONTROL, as round 2 did: the placing page taken as the newer because it LANDED after the read
   // for the counts was sent.
-  const control = await run(brokenScript("    if (!newerPage(channelStore.current(), \"flat\", number)) {",
-    "    if (!(channelStore.current().views.get(viewKey(\"flat\")) && channelStore.current().views.get(viewKey(\"flat\")).fullAt > now)) {"));
+  const control = await run(await brokenModule([{ file: "src/view/channel/readcore.ts", find: "    if (!newerPage(channelStore.current(), \"flat\", number)) {", replace: "    if (!(channelStore.current().views.get(viewKey(\"flat\")) && channelStore.current().views.get(viewKey(\"flat\")).fullAt > now)) {" }]));
   assert.notEqual(savedMessage(control.page, "202").content, edited, "the read for the counts was folded anyway, so this test cannot see it");
 });
 
@@ -4309,7 +4309,7 @@ test("`#308 live-reply-in-main`: a read of All for Main's counts sent between tw
 
   // THE CONTROL, as round 3 did: the read for the counts speaking for every message held when it lands
   // takes the second reply out as deleted.
-  const control = await run(brokenScript(...COUNTS_SPEAK_FOR_ALL));
+  const control = await run(await brokenModule([COUNTS_HELD_MODULE]));
   assert.equal(savedMessage(control.page, "301"), null, "the read for the counts kept the second reply anyway, so this test cannot see it");
   assert.ok(!(await threadFromStore(control.page, control.first.id)).includes("301"),
     "the second reply reached its thread anyway, so this test cannot see it");
@@ -4806,7 +4806,7 @@ for (const via of ["stream", "poll"]) {
 
     // THE CONTROL, as #308 left it: folded whatever the store has lost since it was sent, and whatever was
     // removed after, the read for the counts puts the message back, and the poll leaves it there.
-    const control = await run(await brokenModule([REMOVALS_FORGOTTEN], brokenScriptEach(COUNTS_SPEAK_FOR_ALL)));
+    const control = await run(await brokenModule([REMOVALS_FORGOTTEN, COUNTS_HELD_MODULE]));
     assert.deepStrictEqual(control.landed.shown, ["200", "201", "203"],
       "the read for the counts left the message out anyway, so this test cannot see it");
     assert.deepStrictEqual(shownIds(control.page), ["200", "201", "203"]);
@@ -4879,7 +4879,7 @@ test("`#316 late-counts-resurrect`: a read of All for Main's counts sent before 
 
   // THE CONTROL, as #308 left it: folded whatever the store has replaced since it was sent, the read for
   // the counts undoes the edit, and the polls after bring nothing to correct it.
-  const control = await run(brokenScript(...COUNTS_SPEAK_FOR_ALL));
+  const control = await run(await brokenModule([COUNTS_HELD_MODULE]));
   assert.equal(control.landed.saved, "main channel announcement", "the edit survived anyway, so this test cannot see it");
   assert.equal(savedMessage(control.page, "200").content, "main channel announcement");
 });
@@ -5301,7 +5301,7 @@ for (const view of ["flat", "main"]) {
 
     // THE CONTROL, as before: the column's own newest page folded whatever the store gained since it was
     // sent takes the second message away until its own read lands.
-    const control = await run(brokenScript("      const held = heldNow(canon);\n", "      const held = null;\n"));
+    const control = await run(await brokenModule([{ file: "src/view/channel/readcore.ts", find: "      const held = heldNow(canon);\n", replace: "      const held = null;\n" }]));
     assert.ok(!control.landed.ids.includes("301"), "the late read left the second message drawn anyway, so this test cannot see it");
     assert.ok(shownIds(control.page).includes("301"), "the control's second read did not put the message back");
   });
@@ -5606,7 +5606,7 @@ test("`#310 stale-live-read-flicker`: All's newest page brings a bridge's finish
 
   // THE CONTROL: the thread record the stream put on stamped as new as the moment it went in, All's page,
   // sent before then, refuses its copy, and the polls after never bring the finished text.
-  const control = await run(brokenScript("    buildCopyOn(placed, held);\n", "    orderCopy(placed, orderNow());\n"));
+  const control = await run(brokenScript("    buildCopyOn(placed, held);\n", "    orderCopy(placed, readOrder.now());\n"));
   assert.equal(control.landed.saved, "the bridge's answer, in the first discussion",
     "All's page brought the finished answer anyway, so this test cannot see it");
   assert.deepStrictEqual(control.polls, Array(3).fill("the bridge's answer, in the first discussion"));
@@ -8003,8 +8003,7 @@ test("`#650 cache-first-older-reads`: a counts read the server answered from its
   assert.equal(counted.length, 2, "a counts read the page trusts did not end the asking");
 
   // THE CONTROL, the page as it was: one counts read, then nothing for five minutes.
-  const control = await countsFromCopy(brokenScript(
-    "    else if (!soon) setTimeout(() => void readAllForCounts(channel, true).catch(() => {}), COUNTS_SOON_MS);\n", ""),
+  const control = await countsFromCopy(await brokenModule([{ file: "src/view/channel/readcore.ts", find: "    else if (!soon) clock.setTimeout(() => void readAllForCounts(channel, true).catch(() => {}), COUNTS_SOON_MS);\n", replace: "" }]),
   () => true);
   control.page.expireTimers(COUNTS_SOON_MS);
   for (let i = 0; i < 3; i += 1) await control.page.settle();

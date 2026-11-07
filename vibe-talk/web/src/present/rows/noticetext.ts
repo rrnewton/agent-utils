@@ -47,7 +47,7 @@ export interface AllNoticeFacts {
   readonly threading: boolean;
   readonly view: string;
   readonly messages: readonly Message[];
-  readonly tally: ReplyTally;
+  readonly tally: () => ReplyTally;
 }
 
 /**
@@ -61,7 +61,7 @@ export interface AllNoticeFacts {
 export function allNoticeWords(notice: string, facts: AllNoticeFacts): string {
   // Only the notice that All left replies out: a forum's own words on All, say, are another matter.
   if (!notice || !facts.threading || facts.view !== "flat" || !BOUNDED_ALL_NOTICE.test(notice)) return notice;
-  const tally = facts.tally;
+  const tally = facts.tally();
   let lacking = 0;
   let unknown = false;
   for (const message of facts.messages) {

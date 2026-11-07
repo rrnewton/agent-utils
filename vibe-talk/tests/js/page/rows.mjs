@@ -5327,7 +5327,7 @@ test("`#250 date-separators`: past midnight a channel nobody writes in says Yest
   assert.equal(written, 0, "a quiet refresh on the same day drew the lines again");
   // The control: without the turn of the day noticed there, the quiet refresh leaves Today standing,
   // so the refresh above really was the one that draws nothing.
-  const control = await quietMidnight(brokenScript("      seamsAfterMidnight();\n", ""));
+  const control = await quietMidnight(await brokenModule([{ file: "src/view/channel/readcore.ts", find: "      seamsAfterMidnight();\n", replace: "" }]));
   assert.deepStrictEqual(words(control.after), ["Yesterday, Oct 11, Sun", "Today, Oct 12, Mon"],
     "the control relabelled the days anyway, so the quiet refresh was not the one under test");
 });

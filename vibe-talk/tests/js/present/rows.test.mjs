@@ -403,6 +403,6 @@ test("`#624 voice-page-modularity`: how fresh the rows are said to be, and All's
   assert.equal(staleWords("fresh", Date.UTC(2026, 0, 1), false, "messages", () => "Slack"), "");
   assert.match(staleWords("slow", Date.UTC(2026, 0, 1), false, "messages", () => "Slack"), /is slow to answer/);
   const notice = "Some threads' replies are not in All";
-  assert.equal(allNoticeWords(notice, { threading: false, view: "flat", messages: [], tally: { threads: new Map() } }), notice);
-  assert.equal(allNoticeWords("other words", { threading: true, view: "flat", messages: [], tally: { threads: new Map() } }), "other words");
+  assert.equal(allNoticeWords(notice, { threading: false, view: "flat", messages: [], tally: () => ({ threads: new Map() }) }), notice);
+  assert.equal(allNoticeWords("other words", { threading: true, view: "flat", messages: [], tally: () => ({ threads: new Map() }) }), "other words");
 });

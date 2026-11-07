@@ -23,7 +23,7 @@ export {
 export { speechHoldFrom } from "../core/speech/index.ts";
 export { createApi, createServerFacts, isSlowFailure, readableFailure } from "../core/api/index.ts";
 
-export { allReachesThread, answerUnplaced, answeredThread, coverViewOf, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createPlainReach, createProviderFacts, createRemovals, createSummaries, createThreadPresence, createTodoView, createUnpackReads, emptyTally, exactReplyCount, foldDeltaIn, foldLiveIn, foldPageIn, heldAsSent, heldNow, inTimeOrder, inViewOf, markDoneIn, namedRecord, newerPage, newerPageSpeaksFor, noteReplyGapsIn, pageFoldIn, placeFromPageIn, projectionOf, refreshFailed, replyTallyOf, restoreCanon, savedTimelineOf, settleDoneIn, summaryKey, tallyRecord, threadOf, timeOf, unplacedToAsk, unseenRepliesIn, upsertThreadSummary } from "../core/channels/index.ts";
+export { allReachesThread, answerUnplaced, answeredThread, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createPlainReach, createProviderFacts, createRemovals, createSummaries, createThreadPresence, createTodoView, createUnpackReads, emptyTally, exactReplyCount, heldAsSent, heldNow, inTimeOrder, markDoneIn, namedRecord, newerPage, noteReplyGapsIn, placeFromPageIn, refreshFailed, replyTallyOf, savedTimelineOf, settleDoneIn, summaryKey, tallyRecord, threadOf, timeOf, unplacedToAsk, unseenRepliesIn, upsertThreadSummary } from "../core/channels/index.ts";
 export { anchorOfMessage, createBookmarkUndo, createBookmarkWrites, createBookmarks, createLegacyMarker, createPins, createReadLedger, isBookmarkState, sameAnchor } from "../core/annotations/index.ts";
 export { REOPENED_VIEWS, UI_STATE_CHARS, UI_STATE_KEY, UI_STATE_VERSION, createBackStack, createDeepLinks, createLayoutChoice, createLinkJumps, createNavigation, createUiState, createViewPlaces, createVisits, deepLinkQuery, visitKey } from "../core/navigation/index.ts";
 export {
@@ -145,8 +145,8 @@ export { blankResumeLast, createAudioRoute, createCallResume, createVoiceProvide
 export { createAbandonedReads, createTimelineReader } from "../core/sync/index.ts";
 export { DISCORD_PAGE_LIMIT, OLDER_TRIGGER_PX, createOlderPager } from "../core/channels/index.ts";
 export { isThreadRoot, readLook, unpackHeldMessages, unpackMessages, unpackReadSignature } from "../core/channels/index.ts";
-export { allNoticeWords, staleWords } from "../present/rows/index.ts";
+export { staleWords } from "../present/rows/index.ts";
 export { MESSAGE_CACHE_ROWS, createMessageCache, tokenFingerprint } from "../core/channels/index.ts";
-
 // view/documents (documents-view-client)
 export { createDocumentsView, createViewSelector } from "../view/documents/index.ts";
+export { createTimelineView } from "../view/channel/index.ts";
