@@ -1,14 +1,13 @@
 // Tests for the keyboard composition (web/src/app/keyboard.ts) on its own: the composition
 // built as the page build builds it and held directly, with fake page acts and no page
 // around it (`#624 voice-page-modularity`, step 17 move 2). Lands as
-// vibe-talk/tests/js/app-keyboard.test.mjs (a new suite; it may instead be appended to
-// tests/js/app.test.mjs, which already loads src/app/index.ts the same way).
-// Run with the other module suites: node --test tests/js/app-keyboard.test.mjs
+// vibe-talk/tests/js/app/keyboard.test.mjs. Run with the other module suites under
+// cargo test (tests/page_modules.rs).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { moduleForTests } from "../../web/build.mjs";
+import { moduleForTests } from "../../../web/build.mjs";
 
 /** The composition root (web/src/app). */
 const APP = await moduleForTests("src/app/index.ts");

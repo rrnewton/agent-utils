@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { moduleForTests } from "../../web/build.mjs";
+import { moduleForTests } from "../../../web/build.mjs";
 
 /** The ordered boot (web/src/app). */
 const APP = await moduleForTests("src/app/index.ts");
