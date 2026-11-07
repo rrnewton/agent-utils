@@ -50,9 +50,9 @@ const rowShown = (row: Element): boolean => !(row as HTMLElement).hidden && !Str
 function shownRowFor<T extends Element>(row: T | null | undefined): T | null | undefined {
   if (!row || row.getAttribute("data-read-run") !== "member" || !row.parentNode) return row;
   // A run's rows are the same kind of element as the row asked about.
-  const rows = [...row.parentNode.children] as unknown as T[];
+  const rows: Element[] = [...row.parentNode.children];
   for (let at = rows.indexOf(row); at >= 0; at -= 1) {
-    if ((rows[at] as T).getAttribute("data-read-run") === "head") return rows[at];
+    if (rows[at].getAttribute("data-read-run") === "head") return rows[at] as T;
   }
   return row;
 }

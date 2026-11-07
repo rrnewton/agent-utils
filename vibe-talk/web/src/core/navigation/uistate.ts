@@ -110,7 +110,10 @@ function fromUiStateV1(saved: Loose, viewKey: (view: string, thread: string | nu
   const place = saved.place as Loose | null;
   return {
     v: UI_STATE_VERSION, identity: saved.identity, view: saved.view as string, todo: saved.todo, channel: saved.channel,
-    place: place === null ? null : ({ ...place, view } as unknown as SavedPlace),
+    place: place === null ? null : {
+      view, atNewest: place.atNewest as boolean, anchor: place.anchor as string | null,
+      offset: place.offset as number,
+    },
     channels: saved.chosen ? [{ channel: saved.channel, channelView: saved.channelView as string, thread }] : [],
   };
 }
