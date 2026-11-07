@@ -26419,6 +26419,58 @@ def _validate_batch_seal_orphaned(config: Config, path: Path) -> tuple[bool, str
     return True, f"its actor PID {identity.pid} is dead: {reason}"
 
 
+def _classify_blocking_seal_reasons(config: Config) -> list[dict[str, object]]:
+    """Structured reasons each non-orphaned seal blocks classification.
+
+    Reuses ``_validate_batch_seal_orphaned``/``_process_state`` for liveness;
+    no new pid checks. Proven-dead seals are filtered exactly as
+    ``_refuse_partial_state(allow_orphaned_validate_batch_seals=True)`` does.
+    A seal that cannot be parsed is ``kind=other``/``actor_state=unknown``.
+    """
+
+    reasons: list[dict[str, object]] = []
+    for path in _validate_batch_seal_journals(config):
+        if _validate_batch_seal_orphaned(config, path)[0]:
+            continue
+        kind: str = "other"
+        operation = "unknown"
+        actor_state = "unknown"
+        targets: list[str] = []
+        try:
+            raw, parsed_targets = _validate_batch_seal_journal(
+                config, path, _read_json(path, "validation-batch seal journal")
+            )
+        except (Refusal, StateError):
+            raw = {}
+            parsed_targets = ()
+            try:
+                value = _read_json(path, "validation-batch seal journal")
+            except (Refusal, StateError):
+                value = {}
+            if isinstance(value, Mapping) and value.get("kind") == "validate-batch-seal":
+                kind = "validate-batch-seal"
+        else:
+            kind = "validate-batch-seal"
+            operation = "remove-validate-batch"
+            targets = [slot for slot, _gen, _t in parsed_targets]
+            identity = _identity_from_obj(
+                raw.get("actor"), "validation-batch seal journal.actor"
+            )
+            if identity is not None:
+                state, _reason = _process_state(identity)
+                actor_state = state if state in {"live", "dead"} else "unknown"
+        reasons.append(
+            {
+                "actor_state": actor_state,
+                "kind": kind,
+                "operation": operation,
+                "path": str(path),
+                "targets": targets,
+            }
+        )
+    return reasons
+
+
 def _recover_orphaned_validate_batch_seal(config: Config) -> None:
     """Retire this machine's seal journal when its actor is proven dead.
 
@@ -28259,7 +28311,26 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
     slot_type = _require_slot_type(args, "create-journal classification")
     slot = _validate_name(args.slot, "slot")
     agent = _validate_name(args.agent, "agent")
-    _refuse_partial_state(config, allow_orphaned_validate_batch_seals=True)
+    try:
+        _refuse_partial_state(config, allow_orphaned_validate_batch_seals=True)
+    except Refusal:
+        # Keep rc/stderr identical (main prints REFUSED); JSON consumers get
+        # each blocking seal structured on stdout.
+        if getattr(args, "format", None) == "json":
+            reasons = _classify_blocking_seal_reasons(config)
+            if reasons:
+                print(
+                    json.dumps(
+                        {
+                            "blocking": True,
+                            "blocking_reasons": reasons,
+                            "journals": [],
+                            "schema": 2,
+                        },
+                        sort_keys=True,
+                    )
+                )
+        raise
     before_states, before_archives, absent_paths, absent_slots = (
         _validate_global_state_beside_absent_batch(config)
     )

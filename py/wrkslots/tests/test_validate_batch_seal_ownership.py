@@ -585,6 +585,92 @@ def test_a_seal_whose_actor_is_not_proven_dead_here_still_binds(
     assert target.stat().st_mode & 0o777 == mode
 
 
+def test_classify_reports_live_validate_batch_seal_as_structured_blocking_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _target, seal, _original = _crashed_seal(tmp_path, monkeypatch)
+    _rewrite_actor(
+        seal, **dataclasses.asdict(wrkslots._read_process_identity(os.getpid()))
+    )
+
+    classified = _classify(project, "next")
+
+    assert classified.returncode == 3, classified.stderr
+    assert "interrupted validation-batch seal recorded" in classified.stderr
+    payload = json.loads(classified.stdout)
+    assert payload["blocking"] is True
+    assert payload["schema"] == 2
+    reasons = payload["blocking_reasons"]
+    assert len(reasons) == 1
+    assert reasons[0]["kind"] == "validate-batch-seal"
+    assert reasons[0]["operation"] == "remove-validate-batch"
+    assert reasons[0]["actor_state"] == "live"
+    assert reasons[0]["targets"] == ["target"]
+    assert reasons[0]["path"] == str(seal)
+
+
+def test_classify_dead_validate_batch_seal_is_not_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _target, seal, _original = _crashed_seal(tmp_path, monkeypatch)
+    _rewrite_actor(seal, pid=2_147_483_647)
+
+    classified = _classify(project, "next")
+
+    assert classified.returncode == 0, classified.stderr
+    payload = json.loads(classified.stdout)
+    assert payload["blocking"] is False
+    assert "blocking_reasons" not in payload
+
+
+def test_classify_unknown_actor_seal_reports_unknown_blocking_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _target, seal, _original = _crashed_seal(tmp_path, monkeypatch)
+    _rewrite_actor(seal, host_id="0" * 32)
+
+    classified = _classify(project, "next")
+
+    assert classified.returncode == 3, classified.stderr
+    assert "interrupted validation-batch seal recorded" in classified.stderr
+    payload = json.loads(classified.stdout)
+    reasons = payload["blocking_reasons"]
+    assert len(reasons) == 1
+    assert reasons[0]["actor_state"] == "unknown"
+    assert reasons[0]["targets"] == ["target"]
+
+
+def test_classify_other_kind_seal_reports_other_blocking_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _target, seal, _original = _crashed_seal(tmp_path, monkeypatch)
+    raw = json.loads(seal.read_text())
+    raw["kind"] = "some-other-seal"
+    seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+
+    classified = _classify(project, "next")
+
+    assert classified.returncode == 3, classified.stderr
+    assert "interrupted validation-batch seal recorded" in classified.stderr
+    payload = json.loads(classified.stdout)
+    reasons = payload["blocking_reasons"]
+    assert len(reasons) == 1
+    assert reasons[0]["kind"] == "other"
+    assert reasons[0]["actor_state"] == "unknown"
+
+
+def test_classify_clean_state_success_json_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    del monkeypatch
+    classified = _classify(project, "next")
+    assert classified.returncode == 0, classified.stderr
+    payload = json.loads(classified.stdout)
+    assert payload["blocking"] is False
+    assert set(payload) == {"blocking", "foreign_shards", "journals", "requested", "schema"}
+
+
 def test_only_wrkslots_processes_of_this_project_can_hold_a_seal_open(tmp_path: Path) -> None:
     project = tmp_path / "project"
     other = tmp_path / "other"
