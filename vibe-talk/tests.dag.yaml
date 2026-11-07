@@ -1847,12 +1847,12 @@ steps:
       est_duration_s: 30
 
   # `#532 shift-o-latency` in the browser engine: twenty threads of long replies unpacked in the Threads view;
-  # four Shift+O and four e, each drawn in the frame after its key, each handler held to a 50 ms budget at the
-  # median, and hiding one row restyling a few elements rather than the page (a #429 rule on a touch screen
+  # four Shift+O and four e, each drawn in the frame after its key, each handler held to 28 ms of main-thread
+  # work at the median (its CPU time, corrected by a layout reference, #998), and hiding one row restyling a few elements rather than the page (a #429 rule on a touch screen
   # restyled about 5,000). Measured on 2026-10-26: about 20s wall.
   - group: check
     job: fold-latency-browser
-    desc: Shift+O and e in an unpacked Threads view each draw in the frame after the key within a 50 ms handler budget, and hiding a row restyles only what it touches (#532), in current Chromium at 393x852 and 1280x800
+    desc: Shift+O and e in an unpacked Threads view each draw in the frame after the key within a 28 ms main-thread work budget, and hiding a row restyles only what it touches (#532), in current Chromium at 393x852 and 1280x800
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/fold_latency_browser.py
     jobs_flag: ""
@@ -1861,7 +1861,7 @@ steps:
     cpu_timeout: 120
     hint:
       # A latency budget measures the page, so it owns every browser slot,
-      # like timeline.browser.benchmark. Keep the 50 ms budget unchanged.
+      # like timeline.browser.benchmark.
       resources: {browser: 4}
       est_duration_s: 25
 

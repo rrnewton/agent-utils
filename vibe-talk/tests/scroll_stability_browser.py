@@ -121,6 +121,8 @@ THREAD_PAGE = 8
 FLAT_PAGE = 60
 # How far a row may move and still be said to have stood still: sub-pixel layout, never a jump.
 STILL_PX = 1.0
+# The most the fake server holds a thread's older page for the check (#998); it bounds only a failure.
+HOLD_LIMIT_S = 30.0
 # How long a step that could start the page's glide between the columns (`#261 two-column-connectors`,
 # COLUMN_GLIDE_MS = 1500 in web/src/view/channel/columnlinks.ts) is held before it is judged: longer than that wait, with room.
 GLIDE_HOLD_MS = 2500
@@ -135,6 +137,13 @@ FIRST_ROW_JS = """(list) => {
         if (box.bottom > top) return {id: row.getAttribute('data-id'), offset: box.top - top};
     }
     return null;
+}"""
+
+# Where one row of a list is, by its id: its offset from the top of its scroller, or null when it is not drawn.
+ROW_JS = """([list, id]) => {
+    const area = document.getElementById(list === 'discord-log' ? 'scroll-area' : 'side-scroll');
+    const row = [...document.getElementById(list).children].find((one) => one.getAttribute('data-id') === id);
+    return row && row.getClientRects().length ? row.getBoundingClientRect().top - area.getBoundingClientRect().top : null;
 }"""
 
 # How far the list runs below what its scroller shows: 0 at its foot.
@@ -260,6 +269,11 @@ class StabilityApi(FakeApi):
         self.frames: queue.Queue[bytes] = queue.Queue()
         self.summary_delay = 0.3
         self.summaries_asked = 0
+        # A thread's older page is held until the check lets it go (`older_release`), so the reader's row is
+        # measured before it comes in, whatever the host's load (#998); `older_held` says one is waiting.
+        self.hold_older = False
+        self.older_held = threading.Event()
+        self.older_release = threading.Event()
         self.messages = []
         self.threads = []
         self.dismissed: set[str] = set()
@@ -326,6 +340,10 @@ class StabilityApi(FakeApi):
         view = query.get("view", ["main"])[0]
         thread_id = query.get("thread_id", [None])[0]
         before = query.get("before", [None])[0]
+        if view == "thread" and before and self.hold_older:
+            self.hold_older = False
+            self.older_held.set()
+            self.older_release.wait(HOLD_LIMIT_S)
         with self.lock:
             rows = [m for m in self.messages if view == "flat"
                     or (view == "thread" and thread_of(m).get("id") == thread_id)
@@ -549,10 +567,16 @@ class Reader:
         self.check(False, f"the first row of #{list_id} never settled within {seconds:.0f}s")
 
     def still(self, before: tuple[str, float], why: str, list_id: str = "discord-log") -> None:
-        """The row the reader was on is still the first on screen, within a pixel of where it was."""
-        after = self.first(list_id)
-        self.check(after[0] == before[0] and abs(after[1] - before[1]) <= STILL_PX,
-                   f"{why} moved the reader: row {before[0]} at {before[1]:.1f}px became row {after[0]} at {after[1]:.1f}px")
+        """The row the reader was on (the first on screen when `before` was taken) is within a pixel of where
+        it was. It is found by its id, not as the first row on screen: at the head of a list, rows read in
+        above it fill the room there and the first on screen is one of them, though the reader's row has
+        not moved (#998: a loaded host measured that order; a fast one had the rows in before `before`)."""
+        offset = self.page.evaluate(ROW_JS, [list_id, before[0]])
+        first = self.first(list_id)
+        self.check(isinstance(offset, (int, float)) and abs(float(offset) - before[1]) <= STILL_PX,
+                   f"{why} moved the reader: row {before[0]} at {before[1]:.1f}px is "
+                   f"{'not drawn' if not isinstance(offset, (int, float)) else f'at {float(offset):.1f}px'}"
+                   f" (the first row on screen is {first[0]} at {first[1]:.1f}px)")
 
     def watch(self, list_id: str = "discord-log") -> None:
         """Start sampling the first row on screen of `list_id` (Main's by default) and its offset at every frame."""
@@ -1003,9 +1027,17 @@ def thread_walk(reader: Reader) -> None:
     reader.shot("4-thread-newest")
 
     # At its head, the step back reads the page before, and the row the reader is on stays where it was.
+    # The older page is held until the row is measured: a fast host could otherwise land it first and the
+    # check would judge a reader already moved, a loaded one not (#998).
+    api = reader.api
+    api.older_held.clear()
+    api.older_release.clear()
+    api.hold_older = True
     page.evaluate(f"() => {{ document.getElementById('{scroller}').scrollTop = 0; }}")
+    reader.check(api.older_held.wait(HOLD_LIMIT_S), "scrolled to the head of the long thread, no older page was asked for")
     reader.frames(2)
     before = reader.first(list_id)
+    api.older_release.set()
     reader.wait_for(f"() => document.querySelectorAll('#{list_id} > li[data-id]').length > {rows}",
                     "scrolled to the head of the long thread, no older page came")
     reader.settled(list_id)

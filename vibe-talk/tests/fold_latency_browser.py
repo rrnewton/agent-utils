@@ -10,15 +10,18 @@ Against a fake API of twenty threads, one with twelve long replies and the rest 
 unpacked in the Threads view (Unpack all):
 
 * Shift+O: four presses 60 ms apart on the last reply fold the four last replies, each folded in the frame
-  after its key; each press's handler (the keydown task on the main thread, from the window's capture
-  to the end of its dispatch) under `--cpu-ms` at the median and twice that for the second largest
-  press (one press may be descheduled mid-handler on a loaded host; sustained work lifts them all,
-  #905), and from the key
-  to the next frame drawn under the wall budget at the median. The budgets follow the owner's rule
-  (#866): the main-thread (CPU) budget bites at ~1.5x the measured solo median, and the wall budget
-  is forgiving at 8x the CPU budget, derived unless `--frame-ms` overrides it. Handler time is the
-  page's own work; frame time also carries queueing and rendering, so contention is absorbed by
-  the wall budget, never by loosening the CPU one.
+  after its key; each press's handler work under `--cpu-ms` at the median and twice that for the second
+  largest press (#905), and from the key to the next frame drawn under the wall budget at the median.
+  The budgets follow the owner's rule (#866): the work budget bites at ~1.5x the measured solo median,
+  and the wall budget is forgiving at 8x it, derived unless `--frame-ms` overrides it.
+
+  Handler work is what a shared host cannot inflate (#998). It is the main thread's own CPU time for
+  the key's dispatch, from the browser's trace (`EventDispatch` thread time), so time the renderer spent
+  descheduled or throttled by its cgroup is not counted. It is divided by how much slower this browser
+  lays out a fixed, page-independent document at that moment, measured just before each press, so a
+  host whose memory and caches are contended (the gate's usual load, which a CPU-bound calibration loop
+  does not see) does not count either. Sustained main-thread work, the regression this exists to catch,
+  is CPU time the reference does not share, so it still fails.
 * e: the same on another thread's replies, each marked Done in the frame after its key, held to the same.
 * style: hiding one row restyles a few elements, not the page: under `--restyle-max` elements in the
   browser's own trace (on a touch screen a rule of #429 keyboard-hides-bar restyled every element of the
@@ -160,17 +163,19 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--screenshots", type=Path, help="directory to write one PNG per size into (default: none)")
     parser.add_argument("--size", choices=[size[0] for size in SIZES], action="append",
                         help="walk only at these sizes, repeatable (default: all of them)")
-    parser.add_argument("--cpu-ms", type=float, default=21.0,
-                        help="most a press's handler may take on the main thread at the median, in ms; "
-                             "twice it at most (default: 21, ~1.5x the measured solo median)")
+    parser.add_argument("--cpu-ms", type=float, default=28.0,
+                        help="most work a press's handler may take at the median, in ms of main-thread CPU time "
+                             "corrected by the reference workload; twice it for the second largest press "
+                             "(default: 28, ~1.5x the 19 ms solo median measured at 1280x800 on 2026-11-06)")
     parser.add_argument("--frame-ms", type=float, default=0.0,
                         help="most from a key to the next frame drawn at the median, in ms "
-                             "(default: 0 = derived, 8x the CPU budget)")
+                             "(default: 0 = derived, 8x the work budget)")
     parser.add_argument("--budget-ms", type=float, default=None,
                         help="deprecated alias for --cpu-ms")
-    parser.add_argument("--calib-idle-ms", type=float, default=88.0,
-                        help="idle time of the in-page calibration workload in ms, measured solo on this "
-                             "host class; handler times are divided by the measured slowdown (default: 88)")
+    parser.add_argument("--ref-idle-ms", type=float, default=4.4,
+                        help="time of the reference layout workload in an uncontended browser of this host class, "
+                             "in ms; each press's work is divided by how much slower it ran just before that "
+                             "press (default: 4.4, measured 2026-11-06)")
     parser.add_argument("--restyle-max", type=int, default=500,
                         help="most elements hiding one row may restyle (default: 500)")
     parser.add_argument("--report-only", action="store_true",
@@ -217,67 +222,155 @@ def select(desk: Desk, row_id: str) -> None:
     desk.settled()
 
 
-def presses(desk: Desk, key: str, ids: list[str]) -> tuple[list[float], list[float], dict[str, float]]:
-    """Four presses of `key` 60 ms apart, watching `ids` for the frame each is drawn folded or Done."""
+# A fixed document, the same whatever the page holds: sixty reply-shaped rows in a hidden iframe of the
+# same renderer. Toggling a style that moves every row and reading their boxes is a few milliseconds of
+# the style, layout and DOM work a fold does; how much longer it takes than --ref-idle-ms says how much
+# slower this browser is running that kind of work right now (#998).
+REF_SETUP_JS = """async () => {
+  if (window.__refDoc) return;
+  const frame = document.createElement('iframe');
+  frame.setAttribute('aria-hidden', 'true');
+  frame.style.cssText = 'position:fixed;left:-5000px;top:0;width:1200px;height:800px;border:0';
+  const para = 'The nightly run finished; the integration shard was retried twice and passed. '.repeat(4);
+  const rows = Array.from({length: 60}, (_, i) =>
+    `<li class="row"><b>Reply ${i}</b><p>${para}</p><pre><code>cargo test\\nok ${i}</code></pre><p>${para}</p></li>`).join('');
+  frame.srcdoc = `<!doctype html><style>.row{margin:4px;padding:6px;border:1px solid #444}
+    body.alt .row{padding:7px;font-size:15px} p{line-height:1.4}</style><ul>${rows}</ul>`;
+  await new Promise((resolve) => { frame.onload = resolve; document.body.appendChild(frame); });
+  window.__refDoc = frame.contentDocument;
+}"""
+
+# Run in a timer task so the trace holds its main-thread CPU time (TimerFire thread time, matched by the
+# timer's id): like the handlers, the reference must not count time the renderer was descheduled or
+# throttled, or a throttled host would excuse a real regression (#998).
+REF_JS = """() => new Promise((resolve) => { const id = setTimeout(() => {
+  const doc = window.__refDoc; const t0 = performance.now();
+  doc.body.classList.toggle('alt'); void doc.body.offsetHeight;
+  for (const li of doc.querySelectorAll('li.row')) { if (li.getBoundingClientRect().height < 0) console.log(li); }
+  resolve({id, ms: performance.now() - t0}); }, 0); })"""
+
+
+class Presses:
+    """One key's four presses: wall handler and key-to-frame times, when each watched row was drawn, the
+    main thread's CPU time for each key's dispatch (None when the trace did not hold four), and the
+    reference workload's CPU time just before each press (its wall time, said so, when the trace did not
+    hold it)."""
+
+    def __init__(self, handler: list[float], frame: list[float], seen: dict[str, float],
+                 cpu: list[float] | None, ref: list[float]) -> None:
+        self.handler, self.frame, self.seen, self.cpu, self.ref = handler, frame, seen, cpu, ref
+        self.ref_source = "CPU"
+
+
+def timer_cpu_ms(events: list[Json], ids: list[int]) -> list[float] | None:
+    """Thread CPU time of the timer tasks `ids`, in that order, from the trace's TimerFire events; None
+    unless the trace holds each one."""
+    cpu: dict[int, float] = {}
+    for event in events:
+        args = event.get("args")
+        data = args.get("data") if isinstance(args, dict) else None
+        tdur = event.get("tdur")
+        if event.get("name") == "TimerFire" and isinstance(data, dict) and isinstance(tdur, (int, float)):
+            timer = data.get("timerId")
+            if isinstance(timer, int):
+                cpu[timer] = float(tdur) / 1000.0
+    return [cpu[id] for id in ids] if all(id in cpu for id in ids) else None
+
+
+def key_cpu_ms(events: list[Json]) -> list[float] | None:
+    """Thread CPU time of the four keys' dispatches, in order, from the trace's keydown EventDispatch
+    events. A Shift+O press also dispatches a keydown for Shift, which does next to nothing, so the four
+    largest are the measured keys'."""
+    dispatches = []
+    for event in events:
+        args = event.get("args")
+        data = args.get("data") if isinstance(args, dict) else None
+        cpu = event.get("tdur")
+        if (event.get("name") == "EventDispatch" and isinstance(data, dict) and data.get("type") == "keydown"
+                and isinstance(cpu, (int, float))):
+            dispatches.append((float(str(event.get("ts") or 0)), float(cpu) / 1000.0))
+    if len(dispatches) < 4:
+        return None
+    largest = sorted(sorted(dispatches, key=lambda one: one[1])[-4:])
+    return [cpu for _ts, cpu in largest]
+
+
+def presses(desk: Desk, key: str, ids: list[str]) -> Presses:
+    """Four presses of `key` 60 ms apart, watching `ids` for the frame each is drawn folded or Done, with
+    the reference workload timed just before each press and the browser's trace holding each dispatch's
+    CPU time."""
     page = desk.page
+    page.evaluate(REF_SETUP_JS)
+    for _ in range(3):
+        page.evaluate(REF_JS)  # warm: a new document's first layouts are not its steady cost
     page.evaluate(WATCH_JS, ids)
+    cdp = page.context.new_cdp_session(page)
+    events: list[Json] = []
+    finished: list[bool] = []
+    cdp.on("Tracing.dataCollected", lambda event: events.extend(event["value"]))
+    cdp.on("Tracing.tracingComplete", lambda _event: finished.append(True))
+    cdp.send("Tracing.start", {"transferMode": "ReportEvents",
+                               "traceConfig": {"includedCategories": ["devtools.timeline"]}})
+    ref_wall: list[float] = []
+    ref_ids: list[int] = []
     for _ in range(4):
+        sample = page.evaluate(REF_JS)
+        assert isinstance(sample, dict)
+        ref_wall.append(float(str(sample["ms"])))
+        ref_ids.append(int(str(sample["id"])))
+        page.wait_for_timeout(30)
         page.keyboard.press(key)
         page.wait_for_timeout(60)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and not page.evaluate(
             "() => window.__keys.length === 4 && window.__keys.every((press) => press.frame !== null)"):
         page.wait_for_timeout(50)
+    cdp.send("Tracing.end")
+    deadline = time.monotonic() + 10
+    while not finished and time.monotonic() < deadline:
+        page.wait_for_timeout(50)
     keys = page.evaluate("() => window.__keys")
     seen = page.evaluate("() => window.__seen")
     assert isinstance(keys, list) and isinstance(seen, dict)
     first = float(keys[0]["start"]) if keys else 0.0
-    return ([float(press["handler"] or 0) for press in keys], [float(press["frame"] or 0) for press in keys],
-            {str(id): float(at) - first for id, at in seen.items()})
+    ref_cpu = timer_cpu_ms(events, ref_ids)
+    pressed = Presses([float(press["handler"] or 0) for press in keys], [float(press["frame"] or 0) for press in keys],
+                      {str(id): float(at) - first for id, at in seen.items()}, key_cpu_ms(events),
+                      ref_cpu if ref_cpu is not None else ref_wall)
+    if ref_cpu is None:
+        pressed.ref_source = "wall (no trace)"
+    return pressed
 
 
-# A fixed CPU-bound workload run in the page itself. Its solo time on this host class is
-# --calib-idle-ms; the ratio of the median of five runs to that is how much slower this
-# browser currently executes the same work, so handler task times divided by it are
-# work-equivalent (CPU) milliseconds rather than contention-stretched wall ones (#866).
-CALIB_JS = """() => { const samples = []; for (let s = 0; s < 5; s++) { const t0 = performance.now();
-  let x = 0; for (let i = 0; i < 3000000; i++) { x += Math.sin(x + i) * Math.cos(i); }
-  samples.push(performance.now() - t0); if (x === 12345) console.log(x); } return samples; }"""
-
-
-def load_factor(page: Page, args: argparse.Namespace) -> float:
-    """How much slower than idle this browser currently runs fixed work (>= 1)."""
-    raw = page.evaluate(CALIB_JS)
-    assert isinstance(raw, list) and raw
-    samples = [float(one) for one in raw]
-    return max(1.0, statistics.median(samples) / float(args.calib_idle_ms))
-
-
-def judge(desk: Desk, args: argparse.Namespace, what: str, handler: list[float], frame: list[float],
-          seen: dict[str, float], ids: list[str]) -> str:
+def judge(desk: Desk, args: argparse.Namespace, what: str, pressed: Presses, ids: list[str]) -> str:
     cpu_ms = args.cpu_ms
     frame_ms = args.frame_ms if args.frame_ms > 0 else 8 * cpu_ms
-    factor = load_factor(desk.page, args)
-    work = [ms / factor for ms in handler]
-    # The per-press ceiling is the second largest of the four, not the largest
-    # (#905): one press can be descheduled by the OS mid-handler on a loaded
-    # host — measured 170 ms of wall for the same ~14 ms of work its sibling
-    # presses did — and no calibration factor can divide that stall away,
-    # because the calibration workload is descheduled the same way only on
-    # average. Sustained main-thread work, the regression this budget exists
-    # to catch, lifts every press: the median still bites at the budget and
-    # the second largest at twice it.
+    handler, frame, seen = pressed.handler, pressed.frame, pressed.seen
+    factors = [max(1.0, ms / args.ref_idle_ms) for ms in pressed.ref]
+    # The main thread's CPU time when the trace held every key; else the wall handler times, which a
+    # loaded host stretches, and the report says so.
+    if pressed.cpu is not None and len(pressed.cpu) == len(handler):
+        measured, source = pressed.cpu, "CPU"
+    else:
+        measured, source = handler, "wall (no trace)"
+    work = [ms / factor for ms, factor in zip(measured, factors)]
+    # The per-press ceiling is the second largest of the four, not the largest (#905): one press can
+    # still meet a stall the reference just before it missed, while sustained main-thread work, the
+    # regression this budget exists to catch, lifts every press.
     trimmed_max = sorted(work)[-2] if len(work) >= 2 else (work[0] if work else 0.0)
     longtasks = desk.page.evaluate("() => window.__longtasks || 0")
-    said = (f"{what}: handlers {', '.join(f'{ms:.0f}' for ms in handler)} ms "
-            f"({', '.join(f'{ms:.0f}' for ms in work)} work-equivalent at load x{factor:.1f}), key to frame "
-            f"{', '.join(f'{ms:.0f}' for ms in frame)} ms, rows drawn at {', '.join(f'{seen.get(id, -1):.0f}' for id in ids)} ms"
-            f" (main-thread budget {cpu_ms:.0f} ms, wall budget {frame_ms:.0f} ms, {longtasks} long tasks)")
+    said = (f"{what}: handlers {', '.join(f'{ms:.0f}' for ms in handler)} ms wall, "
+            f"{', '.join(f'{ms:.0f}' for ms in measured)} ms {source}, "
+            f"{', '.join(f'{ms:.0f}' for ms in work)} ms work at load {', '.join(f'x{f:.2f}' for f in factors)}"
+            f" ({pressed.ref_source} reference), "
+            f"key to frame {', '.join(f'{ms:.0f}' for ms in frame)} ms, "
+            f"rows drawn at {', '.join(f'{seen.get(id, -1):.0f}' for id in ids)} ms"
+            f" (work budget {cpu_ms:.0f} ms, wall budget {frame_ms:.0f} ms, {longtasks} long tasks)")
     if not args.report_only:
         desk.check(len(handler) == 4, f"{what}: not four presses heard: {said}")
         desk.check(all(id in seen for id in ids), f"{what}: not every press drew its row: {said}")
         desk.check(statistics.median(work) <= cpu_ms and trimmed_max <= 2 * cpu_ms,
-                   f"{what}: over the {cpu_ms:.0f} ms main-thread budget: {said}")
+                   f"{what}: over the {cpu_ms:.0f} ms work budget: {said}")
         desk.check(statistics.median(frame) <= frame_ms, f"{what}: the frames came late: {said}")
     return said
 
@@ -349,8 +442,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             assert isinstance(target, list)
             select(desk, str(target[-1]))
             folded = [str(one) for one in target[-4:]][::-1]
-            handler, frame, seen = presses(desk, "Shift+O", folded)
-            notes.append(judge(desk, args, "Shift+O", handler, frame, seen, folded))
+            notes.append(judge(desk, args, "Shift+O", presses(desk, "Shift+O", folded), folded))
             desk.check(page.evaluate("(id) => document.querySelector(`#side-cards > li[data-unpack-thread][data-id='${id}']`)"
                                      ".getAttribute('data-read-run')", folded[-1]) == "head",
                        "the four folds are not one line")
@@ -360,8 +452,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             assert isinstance(other, list)
             select(desk, str(other[0]))
             marked = [str(one) for one in other[:4]]
-            handler, frame, seen = presses(desk, "e", marked)
-            notes.append(judge(desk, args, "e", handler, frame, seen, marked))
+            notes.append(judge(desk, args, "e", presses(desk, "e", marked), marked))
             desk.shot("2-done")
 
             count = restyled(page)
