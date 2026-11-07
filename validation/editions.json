@@ -69,7 +69,7 @@
       "parity_check": null,
       "rust_entrypoint": null,
       "python_entrypoint": "py/bin/herdr-chat",
-      "note": "Standalone chat-bridge entrypoint (agentctl.chat). The Rust agentctl chat subcommand covers run/status/reply/close but not launch/history/context; see the agentctl subcommands."
+      "note": "Standalone chat-bridge entrypoint (agentctl.chat). The Rust agentctl chat subcommand covers the full chat surface including launch, history and context (#545); this standalone entrypoint remains Python-primary only for the retired Google Chat polling transport, which is being retired (no byte-parity port; Slack is the live instance) in favour of the Rust agentctl chat commands."
     },
     {
       "name": "herdr-run",
