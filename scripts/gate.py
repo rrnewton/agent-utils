@@ -31,6 +31,13 @@ host to the slot image behind them (#940; `scripts/gate.py prune --help`).
 runs after a prune that freed anything, for images mounted without online
 discard (for example `wrkslots image trim agent SLOT`).
 
+An admitted run's command runs in its own process group. SIGTERM, SIGINT or
+SIGHUP to gate.py forwards SIGTERM to that whole group, waits a grace period
+($GATE_ABORT_GRACE_S, default 10 s; twice that for a top-level gate, so a
+nested gate can stop its own group first), then SIGKILLs whatever is left,
+releases the slot and records the run as `aborted` in the ledger, so a
+stopped gate never leaves dagrun and its steps running outside admission.
+
 An admitted run's children see $GATE_ADMISSION_RUN_ID. A gate invoked from
 inside an admitted run (validate.py's gate-exclusive phase) releases the
 parent's slot before queueing: the parent is blocked on that call, so holding
@@ -87,6 +94,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -616,7 +624,13 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     failed_steps: set[str] = set()
     verdict_word: str | None = None
     last_line = ""
+    aborted: str | None = None
+    previous = {sig: signal.getsignal(sig) for sig in _ABORT_SIGNALS}
+    proc: subprocess.Popen[str] | None = None
     try:
+        for sig in _ABORT_SIGNALS:
+            signal.signal(sig, _raise_aborted)
+        group = {"process_group": 0} if sys.version_info >= (3, 11) else {"preexec_fn": os.setpgrp}
         proc = subprocess.Popen(
             command,
             env={**os.environ, "GATE_ADMISSION_RUN_ID": run_id},
@@ -625,6 +639,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             text=True,
             errors="replace",
             bufsize=1,
+            **group,  # type: ignore[arg-type]
         )
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -641,7 +656,15 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             if match:
                 verdict_word = match.group(1)
         rc = proc.wait()
+    except _Aborted as exc:
+        name = signal.Signals(exc.signum).name
+        how = _stop_group(proc, _abort_grace(nested)) if proc is not None else "not started"
+        aborted = f"{name}; run's process group {how}"
+        rc = 128 + exc.signum
+        print(f"gate: aborted by {aborted}", flush=True)
     finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
         finished = time.time()
         adm.finish(run_id)
         adm.record({"id": run_id, "class": args.cls, "command": command,
@@ -657,8 +680,64 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             sys.stdout.flush()
         _record_ledger(args, command, started, finished, rc,
                        passed_steps, failed_steps, verdict_word, pruned, queued_at,
-                       preflight=preflight)
+                       preflight=preflight, aborted=aborted)
     return rc
+
+
+class _Aborted(Exception):
+    """gate.py was told to stop while its command ran."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+_ABORT_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+def _raise_aborted(signum: int, _frame: object) -> None:
+    raise _Aborted(signum)
+
+
+def _abort_grace(nested: bool) -> float:
+    try:
+        grace = float(os.environ.get("GATE_ABORT_GRACE_S", "10"))
+    except ValueError:
+        grace = 10.0
+    return max(grace, 0.0) * (1 if nested else 2)
+
+
+def _group_alive(proc: subprocess.Popen[str]) -> bool:
+    proc.poll()
+    try:
+        os.killpg(proc.pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _stop_group(proc: subprocess.Popen[str], grace: float) -> str:
+    """SIGTERM the command's process group, then SIGKILL what outlives `grace`."""
+
+    for sig in _ABORT_SIGNALS:
+        signal.signal(sig, signal.SIG_IGN)
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "already gone"
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        if not _group_alive(proc):
+            return "stopped by SIGTERM"
+        time.sleep(0.1)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return "stopped by SIGTERM"
+    proc.wait()
+    return f"SIGKILLed after {grace:.0f}s"
 
 
 def _record_ledger(
@@ -675,6 +754,7 @@ def _record_ledger(
     *,
     kind: str | None = None,
     preflight: str | None = None,
+    aborted: str | None = None,
 ) -> None:
     """Append one durable ledger line for the finished run (#827). Best effort:
     a ledger failure must never change the gate's own result. `queued_utc` and
@@ -687,7 +767,7 @@ def _record_ledger(
         base: str | None = None
         if "--base" in command:
             base = command[command.index("--base") + 1]
-        verdict = {"OK": "pass", "PARTIAL": "partial", "FAILED": "fail"}.get(
+        verdict = "aborted" if aborted else {"OK": "pass", "PARTIAL": "partial", "FAILED": "fail"}.get(
             verdict_word or "", "pass" if rc == 0 else "fail"
         )
         if kind is None:
@@ -709,6 +789,7 @@ def _record_ledger(
             "exit_code": rc,
             "blackout_ignored": bool(getattr(args, "ignore_blackout", False)),
             "preflight": preflight,
+            "aborted": aborted,
             "log_path": None,
             "target_bytes_before": (pruned or {}).get("target_bytes_before"),
             "target_bytes_after": (pruned or {}).get("target_bytes_after"),
@@ -776,7 +857,8 @@ def show_stats(args: argparse.Namespace) -> int:
             str(row.get("finished_utc", "1970-01-01T00:00:00Z")).replace("Z", "+00:00")
         ).timestamp() >= since
     ]
-    gates = [row for row in rows if row.get("kind") == "gate"]
+    aborted = [row for row in rows if row.get("verdict") == "aborted"]
+    gates = [row for row in rows if row.get("kind") == "gate" and row.get("verdict") != "aborted"]
     reruns = [row for row in rows if row.get("kind") == "exclusive-rerun"]
     passed = sum(1 for row in gates if row.get("verdict") == "pass")
     partial = sum(1 for row in gates if row.get("verdict") == "partial")
@@ -791,6 +873,8 @@ def show_stats(args: argparse.Namespace) -> int:
           f"({args.since or 'all time'}, ledger {path})")
     print(f"gate stats: {sum(1 for r in reruns if r.get('rerun_passed'))}/{len(reruns)} "
           "exclusive rerun(s) passed")
+    if aborted:
+        print(f"gate stats: {len(aborted)} run(s) aborted by a signal (not counted as first runs)")
     refused = sum(1 for row in rows if row.get("kind") == "preflight-refused")
     skipped = sum(1 for row in rows if row.get("preflight") == "skipped: --skip-preflight")
     if refused or skipped:

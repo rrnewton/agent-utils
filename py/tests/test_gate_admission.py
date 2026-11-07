@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -603,3 +604,71 @@ def test_a_finished_gate_prunes_its_own_targets_and_records_the_bytes(tmp_path: 
                              str(tmp_path / "other/rs/target")], capture_output=True, text=True, timeout=60)
     assert report.returncode == 0 and "would prune 1 stale unit(s)" in report.stdout, report.stdout
     assert stale[1].is_dir(), "a report removes nothing"
+
+
+_CHILD_TREE = """
+import os, signal, subprocess, sys, time
+if sys.argv[2] == "ignore":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+grandchild = subprocess.Popen([sys.executable, "-c",
+    "import signal, sys, time\\n"
+    "if sys.argv[1] == 'ignore': signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"
+    "time.sleep(300)", sys.argv[2]])
+with open(sys.argv[1], "w") as fh:
+    fh.write(f"{os.getpid()} {grandchild.pid}")
+time.sleep(300)
+"""
+
+
+def _alive_pid(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    # A zombie still answers kill(0); it no longer runs.
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().split(") ")[1][0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def _start_tree(tmp_path: Path, mode: str) -> tuple[subprocess.Popen[str], list[int]]:
+    pids = tmp_path / "pids"
+    script = tmp_path / "tree.py"
+    script.write_text(_CHILD_TREE)
+    env = {**_env(tmp_path), "GATE_ABORT_GRACE_S": "1"}
+    gate = subprocess.Popen([PY, str(GATE), "--", PY, str(script), str(pids), mode], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    deadline = time.time() + 15
+    while time.time() < deadline and not (pids.exists() and pids.read_text().strip()):
+        time.sleep(0.05)
+    assert pids.exists(), "the gated command did not start"
+    return gate, [int(p) for p in pids.read_text().split()]
+
+
+@pytest.mark.parametrize("mode", ["obey", "ignore"])
+def test_a_stopped_gate_stops_its_whole_command_tree_and_records_the_abort(
+        tmp_path: Path, mode: str) -> None:
+    """SIGTERM to gate.py reaches the command's grandchildren too (they used to
+    be orphaned and keep running outside admission); a tree that ignores
+    SIGTERM is SIGKILLed after the grace period. The slot is released and the
+    ledger says aborted."""
+    gate, pids = _start_tree(tmp_path, mode)
+    assert all(_alive_pid(pid) for pid in pids)
+    gate.send_signal(signal.SIGTERM)
+    out, _ = gate.communicate(timeout=30)
+    assert gate.returncode == 128 + signal.SIGTERM, out
+    deadline = time.time() + 5
+    while time.time() < deadline and any(_alive_pid(pid) for pid in pids):
+        time.sleep(0.05)
+    assert not any(_alive_pid(pid) for pid in pids), (mode, out)
+    expected = "stopped by SIGTERM" if mode == "obey" else "SIGKILLed after 2s"
+    assert f"gate: aborted by SIGTERM; run's process group {expected}" in out
+    assert not list((tmp_path / "admission" / "runs").glob("*.json"))
+    row = json.loads((tmp_path / "ledger.jsonl").read_text().splitlines()[-1])
+    assert row["verdict"] == "aborted"
+    assert row["aborted"].startswith("SIGTERM")
+    stats = subprocess.run([PY, str(GATE), "stats"], env=_env(tmp_path),
+                           capture_output=True, text=True, timeout=30)
+    assert "1 run(s) aborted by a signal" in stats.stdout
+    assert "0 first-run gate(s)" in stats.stdout
