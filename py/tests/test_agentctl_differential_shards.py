@@ -13,7 +13,7 @@ def test_three_shards_cover_every_group_exactly_once() -> None:
     full = [name for name, _ in shard_groups(0, 1)]
     sharded = [name for shard in range(3) for name, _ in shard_groups(shard, 3)]
     assert sorted(sharded) == sorted(full)
-    assert len(sharded) == len(full) == 27
+    assert len(sharded) == len(full) == 30
 
 
 def test_an_out_of_range_shard_is_refused() -> None:

@@ -23,10 +23,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from herdr_agent_differential import (
-    FIXTURE_HERDR, Harness, Outcome, PairCase, Report, _option_values, _queue_snapshot, _revive_interop, _state, _submitted,
+    FIXTURE_HERDR, REPO_ROOT, Harness, Outcome, PairCase, Report, _normalize as _normalize_outcome,
+    _option_values, _queue_snapshot, _revive_interop, _state, _submitted,
     SENDER_HEADER,
     _stop_recovery_arguments,
-    init_case_repository,
+    guarded_path, init_case_repository, with_case_git, without_ambient_executables,
 )
 
 _COMMON = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
@@ -3239,6 +3240,490 @@ def _registry_layout_migration(harness: Harness, report: Report) -> None:
     )
 
 
+_RUST_ONLY_REFUSAL = "is implemented only by the Rust edition of agentctl"
+_BOOT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _rust_only(harness: Harness, report: Report, case: PairCase, label: str,
+               arguments: Sequence[str]) -> Outcome:
+    """Invoke a Rust-only command: the Python edition must refuse it by name with exit
+    status 2 and create nothing, and the Rust outcome is returned for frozen checks.
+
+    ``watch``, ``watch-agents`` and ``restore`` have no Python implementation to agree
+    with (py/agentctl/cli.py ``_RUST_ONLY``), so this group pins the Rust behaviour
+    against frozen expectations instead of forcing parity the contract does not have.
+    """
+    python, rust = harness.invoke(case, arguments)
+    report.require(
+        f"{label}/python-refusal",
+        python.returncode == 2 and not python.stdout
+        and _RUST_ONLY_REFUSAL in python.stderr
+        and "traceback" not in python.stderr.lower(),
+        f"the Python edition did not refuse a Rust-only command by name: {python!r}",
+    )
+    return rust
+
+
+def _seed_restore_config(case: PairCase, document: Mapping[str, object]) -> dict[Path, bytes]:
+    """Write the same restore.json into both registries (paths stay per-root)."""
+    written: dict[Path, bytes] = {}
+    for root in (case.python_root, case.rust_root):
+        registry = root / "registry"
+        registry.mkdir(mode=0o700, parents=True, exist_ok=True)
+        registry.chmod(0o700)
+        seeded = {
+            key: (value.replace("<ROOT>", str(root)) if isinstance(value, str) else value)
+            for key, value in document.items()
+        }
+        payload = json.dumps(seeded, indent=2, sort_keys=True).encode()
+        (registry / "restore.json").write_bytes(payload)
+        written[root] = payload
+    return written
+
+
+def _watch_services(harness: Harness, report: Report) -> None:
+    """`watch` and `watch-agents` are Rust-only: the Python edition refuses them, and
+    the Rust edition is pinned against frozen health reports on fixture registries.
+
+    Every pass is `--once --check-only` against the case's fake Herdr with an explicit
+    fixture `--state-dir`, so no unit is started, no alert is sent, and no live agent
+    or host unit is touched. Configurations name no units or timers for the same
+    reason: a configured unit would be judged by the host's real service manager.
+    """
+    case = harness.case("watch-services")
+    for command in ("watch", "watch-agents"):
+        python, rust = harness.invoke(case, (command, "--help"))
+        report.require(
+            f"watch/help/{command}",
+            python.returncode == rust.returncode == 0
+            and "Rust edition only" in python.stdout
+            and "--once" in rust.stdout and "--check-only" in rust.stdout,
+            f"help for a Rust-only command diverged: python={python!r} rust={rust!r}",
+        )
+    rust = _rust_only(harness, report, case, "watch/once",
+                      ("watch", "--once", "--check-only", "--state-dir", "<ROOT>/watch-state", *_COMMON))
+    health = _json(rust)
+    report.require(
+        "watch/once/report",
+        rust.returncode == 0 and not rust.stderr and isinstance(health, dict)
+        and health.get("schema") == "agentctl-watch-health/v1" and health.get("ok") is True
+        and health.get("findings") == [{
+            "check": "herdr", "subject": "server", "ok": True,
+            "detail": "answers", "repair": None,
+        }]
+        and health.get("notice") == {"sent": False, "reason": "check only"}
+        and health.get("warnings") == []
+        and isinstance(health.get("boot_id"), str)
+        and _BOOT_ID.fullmatch(str(health["boot_id"])) is not None
+        and isinstance(health.get("checked_at"), (int, float))
+        and not isinstance(health.get("checked_at"), bool),
+        f"the Rust watch pass on an empty registry diverged: {rust!r}",
+    )
+    written = case.rust_root / "watch-state" / "health.json"
+    try:
+        persisted = json.loads(written.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        persisted = None
+    health_findings = health.get("findings") if isinstance(health, dict) else None
+    report.require(
+        "watch/once/health-file",
+        isinstance(persisted, dict) and persisted.get("schema") == "agentctl-watch-health/v1"
+        and persisted.get("ok") is True and persisted.get("findings") == health_findings
+        and not (case.python_root / "watch-state").exists()
+        and not (case.python_root / "registry").exists(),
+        "watch --once did not persist its health report, or the refusal wrote state",
+    )
+    rust = _rust_only(harness, report, case, "watch/agents-once",
+                      ("watch-agents", "--once", "--check-only", "--coordinator", "coord",
+                       "--state-dir", "<ROOT>/agent-watch-state", *_COMMON))
+    watched = _json(rust)
+    report.require(
+        "watch/agents-once/report",
+        rust.returncode == 0 and isinstance(watched, dict)
+        and watched.get("schema") == "agentctl-agent-watch/v1" and watched.get("ok") is True
+        and watched.get("agents") == 0 and watched.get("coordinator") == "coord"
+        and watched.get("episodes") == [] and watched.get("probe_error") is None
+        and watched.get("notice") == {"sent": False, "reason": "check only", "waiting": 0},
+        f"the Rust watch-agents pass on an empty registry diverged: {rust!r}",
+    )
+    report.require(
+        "watch/agents-once/state-file",
+        (case.rust_root / "agent-watch-state" / "agent-watch.json").is_file()
+        and not (case.python_root / "agent-watch-state").exists(),
+        "watch-agents --once did not persist its report, or the refusal wrote state",
+    )
+    configured = harness.case("watch-configured")
+    _seed_restore_config(configured, {
+        "schema": "agentctl-restore/v1", "coordinator": "coordinator",
+        "report_dir": "<ROOT>/restore-reports",
+    })
+    rust = _rust_only(harness, report, configured, "watch/configured",
+                      ("watch", "--once", "--check-only", "--state-dir", "<ROOT>/watch-state", *_COMMON))
+    health = _json(rust)
+    findings = health.get("findings") if isinstance(health, dict) else None
+    report.require(
+        "watch/configured/report",
+        rust.returncode == 1 and isinstance(findings, list) and len(findings) == 3
+        and findings[0] == {
+            "check": "herdr", "subject": "server", "ok": True,
+            "detail": "answers", "repair": None,
+        }
+        and isinstance(findings[1], dict)
+        and findings[1].get("check") == "restore" and findings[1].get("ok") is False
+        and findings[1].get("detail") == "no completed restore report for this boot"
+        and isinstance(findings[1].get("subject"), str)
+        and _BOOT_ID.fullmatch(str(findings[1]["subject"])) is not None
+        and isinstance(findings[2], dict)
+        and findings[2].get("check") == "coordinator" and findings[2].get("ok") is False
+        and findings[2].get("subject") == "coordinator"
+        and isinstance(health, dict) and health.get("ok") is False
+        and "no completed restore report for this boot" in rust.stderr
+        and not (configured.python_root / "restore-reports").exists(),
+        f"the Rust watch pass on a configured registry diverged: {rust!r}",
+    )
+    rust = _rust_only(harness, report, case, "watch/invalid-interval",
+                      ("watch", "--once", "--interval", "5", *_COMMON))
+    report.require(
+        "watch/invalid-interval/rust",
+        rust.returncode == 2 and "invalid value" in rust.stderr
+        and "traceback" not in rust.stderr.lower() and "panicked" not in rust.stderr.lower(),
+        f"an out-of-range watch interval was not a clean Rust usage error: {rust!r}",
+    )
+
+
+def _restore_team(harness: Harness, report: Report) -> None:
+    """`restore` is Rust-only: the Python edition refuses it, and the Rust edition is
+    pinned against frozen restore reports on fixture registries.
+
+    Dry runs and a report-dir-only real run keep every effect inside the case: no
+    coordinator is registered, no unit is started (dry runs only name the units a
+    real run would start), and slot images name no wrkslots binary.
+    """
+    case = harness.case("restore-team")
+    python, rust = harness.invoke(case, ("restore", "--help"))
+    report.require(
+        "restore/help",
+        python.returncode == rust.returncode == 0
+        and "Rust edition only" in python.stdout
+        and "--dry-run" in rust.stdout and "--write-agents" in rust.stdout,
+        f"restore help diverged: python={python!r} rust={rust!r}",
+    )
+    rust = _rust_only(harness, report, case, "restore/dry-run-empty",
+                      ("restore", "--dry-run", *_COMMON))
+    value = _json(rust)
+    report.require(
+        "restore/dry-run-empty/report",
+        rust.returncode == 0 and isinstance(value, dict)
+        and value.get("schema") == "agentctl-restore-report/v1"
+        and value.get("dry_run") is True and value.get("complete") is False
+        and value.get("would_complete") is True and value.get("refused") == 0
+        and value.get("agents") == [] and value.get("units") == []
+        and value.get("herdr") == {"ready": True, "waited_seconds": 0.0}
+        and value.get("slot_images") == {"action": "skipped", "reason": "dry run"}
+        and value.get("certificate") == {"present": None, "detail": "not configured"}
+        and value.get("trigger") == "manual"
+        and isinstance(value.get("boot_id"), str)
+        and _BOOT_ID.fullmatch(str(value["boot_id"])) is not None
+        and str(value.get("report", "")).endswith(f"/{value['boot_id']}.json")
+        and (case.rust_root / "registry" / ".restore.lock").is_file()
+        and not (case.python_root / "registry").exists(),
+        f"the Rust restore dry run on an empty registry diverged: {rust!r}",
+    )
+    configured = harness.case("restore-configured")
+    written = _seed_restore_config(configured, {
+        "schema": "agentctl-restore/v1", "coordinator": "coordinator",
+        "units": ["example.service"], "report_dir": "<ROOT>/restore-reports",
+    })
+    rust = _rust_only(harness, report, configured, "restore/dry-run-configured",
+                      ("restore", "--dry-run", *_COMMON))
+    value = _json(rust)
+    report.require(
+        "restore/dry-run-configured/report",
+        rust.returncode == 0 and isinstance(value, dict)
+        and value.get("coordinator") == {
+            "name": "coordinator", "action": "refused",
+            "reason": "the coordinator is not registered",
+        }
+        and value.get("units") == [{"unit": "example.service", "action": "start", "dry_run": True}]
+        and value.get("would_complete") is False and value.get("complete") is False
+        and value.get("report") == f"<ROOT>/restore-reports/{value.get('boot_id')}.json"
+        and not (configured.rust_root / "restore-reports").exists()
+        and all((root / "registry" / "restore.json").read_bytes() == payload
+                for root, payload in written.items()),
+        f"the Rust restore dry run on a configured registry diverged: {rust!r}",
+    )
+    rust = _rust_only(harness, report, configured, "restore/write-agents",
+                      ("restore", "--write-agents", *_COMMON))
+    value = _json(rust)
+    report.require(
+        "restore/write-agents/preview",
+        rust.returncode == 0 and value == {
+            "action": "preview", "coordinator": "coordinator", "before": [], "after": [],
+            "added": [], "removed": [], "mismatches": [],
+        }
+        and all((root / "registry" / "restore.json").read_bytes() == payload
+                for root, payload in written.items()),
+        f"restore --write-agents preview diverged or wrote: {rust!r}",
+    )
+    real = harness.case("restore-real")
+    _seed_restore_config(real, {
+        "schema": "agentctl-restore/v1", "report_dir": "<ROOT>/restore-reports",
+    })
+    rust = _rust_only(harness, report, real, "restore/real", ("restore", *_COMMON))
+    value = _json(rust)
+    report_path = real.rust_root / "restore-reports" / f"{value.get('boot_id')}.json" \
+        if isinstance(value, dict) else Path()
+    try:
+        persisted = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        persisted = None
+    report.require(
+        "restore/real/report",
+        rust.returncode == 0 and isinstance(value, dict)
+        and value.get("complete") is True and value.get("dry_run") is False
+        and value.get("refused") == 0
+        and value.get("slot_images") == {
+            "action": "skipped", "reason": "no wrkslots configured or on PATH",
+        }
+        and isinstance(persisted, dict) and persisted.get("complete") is True
+        and persisted.get("schema") == "agentctl-restore-report/v1"
+        and not (real.python_root / "restore-reports").exists()
+        and not (real.python_root / "registry" / ".restore.lock").exists(),
+        f"the Rust restore on an empty registry diverged: {rust!r}",
+    )
+    rust = _rust_only(harness, report, real, "restore/already-restored", ("restore", *_COMMON))
+    value = _json(rust)
+    report.require(
+        "restore/already-restored/report",
+        rust.returncode == 0 and isinstance(value, dict)
+        and value.get("action") == "already-restored"
+        and value.get("schema") == "agentctl-restore-report/v1"
+        and value.get("report") == f"<ROOT>/restore-reports/{value.get('boot_id')}.json",
+        f"a second restore for the same boot diverged: {rust!r}",
+    )
+    invalid = harness.case("restore-invalid-config")
+    _seed_restore_config(invalid, {"schema": "nope/v9"})
+    rust = _rust_only(harness, report, invalid, "restore/invalid-config",
+                      ("restore", "--dry-run", *_COMMON))
+    report.require(
+        "restore/invalid-config/rust",
+        rust.returncode == 75 and not rust.stdout
+        and "schema must be agentctl-restore/v1" in rust.stderr,
+        f"an invalid restore.json was not refused by the Rust edition: {rust!r}",
+    )
+    rust = _rust_only(harness, report, invalid, "watch/invalid-config",
+                      ("watch", "--once", "--check-only", "--state-dir", "<ROOT>/watch-state", *_COMMON))
+    report.require(
+        "watch/invalid-config/rust",
+        rust.returncode == 75 and not rust.stdout
+        and "schema must be agentctl-restore/v1" in rust.stderr,
+        f"watch accepted an invalid restore.json: {rust!r}",
+    )
+
+
+def _mcp_invoke(harness: Harness, case: PairCase, payload: str) -> tuple[Outcome, Outcome]:
+    """Run both `agentctl mcp` servers on the same stdio payload, in the harness's
+    guarded environment (the paired `Harness.invoke` gives editions an empty stdin,
+    which an MCP server can only answer with silence)."""
+    outcomes: list[Outcome] = []
+    for command, root in ((harness.python, case.python_root), (harness.rust, case.rust_root)):
+        argv = ["--registry", str(root / "registry"), "--herdr-bin", str(root / "fake-herdr"), "mcp"]
+        refusal = harness.refuse_host_cli(root, argv)
+        if refusal is not None:
+            outcomes.append(_normalize_outcome(Outcome(
+                127, "", f"cross harness host CLI guard: refused to run the editions: {refusal}\n",
+            ), root))
+            continue
+        environment = with_case_git(without_ambient_executables(dict(os.environ)), root)
+        existing = environment.get("PYTHONPATH", "")
+        local = str(REPO_ROOT / "py")
+        environment["PYTHONPATH"] = local if not existing else local + os.pathsep + existing
+        environment.update({
+            "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "NO_COLOR": "1", "HERDR_WORKSPACE_ID": "w1",
+        })
+        for harness_name in ("CODEX", "CLAUDE"):
+            environment[f"AGENTCTL_{harness_name}_SKILLS_DIR"] = str(
+                root / "skill-homes" / harness_name.lower()
+            )
+        environment["PATH"] = guarded_path(
+            root, str(root / "hostile-bin") if _state(root).get("hostile_path")
+            else environment.get("PATH"),
+        )
+        environment["AGENTCTL_MUSE_BIN"] = str(root / "fake-muse-runtime")
+        environment["XDG_CONFIG_HOME"] = str(root / "xdg-config")
+        try:
+            completed = subprocess.run(
+                [*command, *argv], input=payload, timeout=30, cwd=root, env=environment,
+                capture_output=True, encoding="utf-8", errors="replace",
+            )
+            outcome = Outcome(completed.returncode, completed.stdout, completed.stderr)
+        except subprocess.TimeoutExpired as error:
+            outcome = Outcome(124, _decode_timeout(error.stdout),
+                              _decode_timeout(error.stderr) + "\nTIMEOUT\n")
+        outcomes.append(_normalize_outcome(outcome, root))
+    return outcomes[0], outcomes[1]
+
+
+def _decode_timeout(value: bytes | str | None) -> str:
+    if value is None:
+        return ""
+    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+
+
+def _mcp_replies(outcome: Outcome) -> list[object] | None:
+    replies: list[object] = []
+    for line in outcome.stdout.splitlines():
+        try:
+            replies.append(json.loads(line))
+        except ValueError:
+            return None
+    return replies
+
+
+def _mcp_stdio(harness: Harness, report: Report) -> None:
+    """Both editions serve the same MCP stdio protocol (`agentctl mcp`).
+
+    The corpus compares parsed JSON-RPC replies exactly, except the three replies
+    whose message wording is each implementation's own (its JSON parser's error, its
+    argument-shape sentence, and the operating system's error text): those compare
+    the error code, the id, and the shared refusal prefix only.
+    """
+    case = harness.case("mcp-stdio")
+    eof = harness.invoke(case, ("mcp", *_COMMON))
+    report.require(
+        "mcp/eof",
+        all(outcome.returncode == 0 and not outcome.stdout and not outcome.stderr
+            for outcome in eof),
+        f"an MCP server at end of input was not silent: {eof!r}",
+    )
+    requests: list[tuple[str, object, str]] = [
+        ("initialize", {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": "2024-11-05"}}, "exact"),
+        ("notification", {"jsonrpc": "2.0", "method": "notifications/initialized"}, "none"),
+        ("ping", {"jsonrpc": "2.0", "id": "p1", "method": "ping"}, "exact"),
+        ("tools-list", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, "exact"),
+        ("list-empty", {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                        "params": {"name": "agent_list", "arguments": {}}}, "exact"),
+        ("missing-required", {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                              "params": {"name": "agent_status", "arguments": {}}}, "exact"),
+        ("unknown-field", {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                           "params": {"name": "agent_status",
+                                      "arguments": {"name": "worker", "bogus": 1}}}, "exact"),
+        ("bool-name", {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                       "params": {"name": "agent_status", "arguments": {"name": True}}}, "exact"),
+        ("unknown-tool", {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                          "params": {"name": "agent_nope", "arguments": {}}}, "exact"),
+        ("unsupported-method", {"jsonrpc": "2.0", "id": 8, "method": "bogus/method"}, "exact"),
+        ("wrong-version", {"jsonrpc": "1.0", "id": 9, "method": "ping"}, "exact"),
+        ("status-absent", {"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                           "params": {"name": "agent_status",
+                                      "arguments": {"name": "worker"}}}, "error-text"),
+        ("arguments-not-object", {"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                                  "params": {"name": "agent_status",
+                                             "arguments": "nope"}}, "code"),
+        ("missing-tool-name", {"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                               "params": {"arguments": {}}}, "exact"),
+        ("request-not-object", [1, 2], "code"),
+        ("invalid-json", "not json", "code"),
+    ]
+    payload = "".join(
+        (request if isinstance(request, str) else json.dumps(request)) + "\n"
+        for _label, request, _mode in requests
+    )
+    python, rust = _mcp_invoke(harness, case, payload)
+    python_replies, rust_replies = _mcp_replies(python), _mcp_replies(rust)
+    expected = [(label, mode) for label, _request, mode in requests if mode != "none"]
+    report.require(
+        "mcp/stdio/framing",
+        python.returncode == rust.returncode == 0 and not python.stderr and not rust.stderr
+        and python_replies is not None and rust_replies is not None
+        and len(python_replies) == len(rust_replies) == len(expected),
+        f"MCP replies were not one JSON document per request: python={python!r} rust={rust!r}",
+    )
+    if python_replies is None or rust_replies is None \
+            or len(python_replies) != len(expected) or len(rust_replies) != len(expected):
+        return
+    for (label, mode), python_reply, rust_reply in zip(expected, python_replies, rust_replies, strict=True):
+        if mode == "exact":
+            report.require(
+                f"mcp/stdio/{label}",
+                _normalize(python_reply) == _normalize(rust_reply),
+                f"MCP {label} replies diverged: python={python_reply!r} rust={rust_reply!r}",
+            )
+        elif mode == "error-text":
+            texts: list[object] = []
+            for reply in (python_reply, rust_reply):
+                result = reply.get("result") if isinstance(reply, dict) else None
+                content = result.get("content") if isinstance(result, dict) else None
+                texts.append(content[0].get("text") if isinstance(content, list) and content
+                             and isinstance(content[0], dict) else None)
+            report.require(
+                f"mcp/stdio/{label}",
+                all(isinstance(reply, dict) and isinstance(reply.get("result"), dict)
+                    and reply["result"].get("isError") is True for reply in (python_reply, rust_reply))
+                and all(isinstance(text, str)
+                        and text.startswith("agentctl: cannot inspect agent registry <ROOT>/registry:")
+                        for text in texts),
+                f"MCP {label} refusals diverged: python={python_reply!r} rust={rust_reply!r}",
+            )
+        else:
+            report.require(
+                f"mcp/stdio/{label}",
+                all(isinstance(reply, dict) and isinstance(reply.get("error"), dict)
+                    and reply["error"].get("code") == -32602
+                    and isinstance(reply["error"].get("message"), str)
+                    and reply["error"]["message"] != ""
+                    for reply in (python_reply, rust_reply))
+                and isinstance(python_reply, dict) and isinstance(rust_reply, dict)
+                and python_reply.get("id") == rust_reply.get("id"),
+                f"MCP {label} error replies diverged: python={python_reply!r} rust={rust_reply!r}",
+            )
+    live = harness.case("mcp-live")
+    if not _start(harness, report, live, "mcp/live/start", "--harness", "codex"):
+        return
+    payload = "".join(json.dumps(request) + "\n" for request in (
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+         "params": {"name": "agent_list", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": "agent_status", "arguments": {"name": "worker"}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+         "params": {"name": "agent_send",
+                    "arguments": {"name": "worker", "text": "mcp followup",
+                                  "message_id": "mcp-1"}}},
+    ))
+    python, rust = _mcp_invoke(harness, live, payload)
+    python_replies, rust_replies = _mcp_replies(python), _mcp_replies(rust)
+    contents: list[list[object]] = []
+    for replies in (python_replies, rust_replies):
+        live_texts: list[object] = []
+        for reply in replies or []:
+            result = reply.get("result") if isinstance(reply, dict) else None
+            content = result.get("content") if isinstance(result, dict) else None
+            text = content[0].get("text") if isinstance(content, list) and content \
+                and isinstance(content[0], dict) else None
+            try:
+                live_texts.append(_normalize(json.loads(text)) if isinstance(text, str) else text)
+            except ValueError:
+                live_texts.append(text)
+        contents.append(live_texts)
+    report.require(
+        "mcp/live/tools",
+        python.returncode == rust.returncode == 0
+        and python_replies is not None and rust_replies is not None
+        and len(python_replies) == len(rust_replies) == 3
+        and all(isinstance(reply, dict) and isinstance(reply.get("result"), dict)
+                and reply["result"].get("isError") is False
+                for reply in (*python_replies, *rust_replies))
+        and contents[0] == contents[1]
+        and isinstance(contents[0][0], list) and len(contents[0][0]) == 1
+        and isinstance(contents[0][1], dict) and contents[0][1].get("name") == "worker"
+        and all(_submission_count(root, "mcp followup") == 1
+                for root in (live.python_root, live.rust_root)),
+        f"MCP tools against a live registry diverged: python={python!r} rust={rust!r}",
+    )
+    _pair(harness, report, live, "mcp/live/stop", ("stop", "worker", *_COMMON))
+
+
 def _groups() -> list[tuple[str, object]]:
     # Imported here: the group's module imports this one's helpers.
     from agentctl_nested_records import nested_records
@@ -3260,7 +3745,8 @@ def _groups() -> list[tuple[str, object]]:
         ("stop-recovery", _stop_recovery_quoted_globals),
         ("revive", _revive_interop), ("adoption", _adoption),
         ("identity", _identity_and_rename), ("nested-records", nested_records),
-        ("invalid-cli", _invalid_cli),
+        ("invalid-cli", _invalid_cli), ("watch", _watch_services),
+        ("restore", _restore_team), ("mcp", _mcp_stdio),
     ]
 
 
