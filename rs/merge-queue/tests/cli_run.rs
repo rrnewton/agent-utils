@@ -648,14 +648,36 @@ fn green_batches_land_in_order_with_speculation() {
     let r = report(&fx.mq_ok(&["run", "--json"]));
     assert_eq!(landed_prs(&r), vec![vec![1], vec![2], vec![3]]);
     assert!(r["ejected"].as_array().unwrap().is_empty());
-    // Batches 1 and 2 validated concurrently: their intervals overlap.
-    let span = |v: &Value| {
-        let start = v["start_ms"].as_u64().unwrap();
-        (start, start + v["elapsed_ms"].as_u64().unwrap())
+    // Speculation is a launch-order fact, not a wall-clock overlap (#1019):
+    // batch 2 was launched (its `validate` event) before batch 1 landed,
+    // sitting at speculation depth 2 on top of batch 1, so its validation
+    // was pipelined ahead of the landing it depends on. Two timed
+    // validation intervals need not overlap when a contended host
+    // serialises their execution, and the launch itself may follow
+    // batch 1's verdict when planning lags a fast verdict.
+    assert_eq!(r["validations"][1]["speculation"]["depth"], 2, "{r}");
+    let run_dir = std::path::Path::new(r["validations"][0]["dir"].as_str().unwrap())
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let events = std::fs::read_to_string(run_dir.join("events.jsonl")).unwrap();
+    let position = |kind: &str, tag: &str| {
+        events.lines().position(|line| {
+            let event: Value = serde_json::from_str(line).unwrap();
+            event["kind"] == kind
+                && event["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.starts_with(tag))
+        })
     };
-    let (s1, e1) = span(&r["validations"][0]);
-    let (s2, e2) = span(&r["validations"][1]);
-    assert!(s1 < e2 && s2 < e1, "no overlap: {s1}-{e1} vs {s2}-{e2}");
+    let launched2 = position("validate", "v2 ").expect("a v2 launch event");
+    let landed1 = position("landed", "#1 ").expect("a #1 landed event");
+    assert!(
+        launched2 < landed1,
+        "v2 launched only after #1 landed: not speculation\n{events}"
+    );
     let files = remote_files(&fx);
     assert!(files.contains("tests/a") && files.contains("tests/b") && files.contains("tests/c"));
     assert_eq!(status(&fx, 2), "landed");
