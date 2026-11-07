@@ -137,7 +137,8 @@ HEAD_JS = """() => {
     // Why a copy came out wrong, said with it (#998).
     const copyState = copied === location.host ? null : {
         ranges: selection.rangeCount, type: selection.type, innerText: host.innerText,
-        rects: host.getClientRects().length, height: host.offsetHeight,
+        rects: host.getClientRects().length, height: host.offsetHeight, width: host.getBoundingClientRect().width,
+        nameWidth: name.getBoundingClientRect().width, portWidth: port.getBoundingClientRect().width,
         visible: host.checkVisibility({visibilityProperty: true, opacityProperty: true, contentVisibilityAuto: true}),
         focused: document.hasFocus(), active: document.activeElement ? document.activeElement.id : null,
         animations: document.getAnimations().length, userSelect: getComputedStyle(host).userSelect,
