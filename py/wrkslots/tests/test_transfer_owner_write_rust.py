@@ -384,7 +384,9 @@ def test_rust_transfer_warns_and_proceeds_with_unregistered_nested_worktrees(
     assert "nested-a" in result.stderr
     outcome = json.loads(result.stdout)
     assert "nested-a" in str(outcome["unregistered_nested_worktrees"])
-    assert _active(rust_root)["slots"][0]["owner"]["pid"] == os.getpid()
+    slots = cast(list[dict[str, object]], _active(rust_root)["slots"])
+    owner = cast(dict[str, object], slots[0]["owner"])
+    assert owner["pid"] == os.getpid()
 
 
 def test_rust_released_generation_rebinds_only_with_coordinator_authorization(
@@ -410,15 +412,17 @@ def test_rust_released_generation_rebinds_only_with_coordinator_authorization(
     assert reopened.returncode == 0, reopened.stderr
     outcome = json.loads(reopened.stdout)
     assert outcome["reopened"] is True and outcome["generation"] == 2
-    record = _active(rust_root)["slots"][0]
-    assert record["generation"] == 2 and record["owner"]["pid"] == os.getpid()
+    record = cast(list[dict[str, object]], _active(rust_root)["slots"])[0]
+    record_owner = cast(dict[str, object], record["owner"])
+    assert record["generation"] == 2 and record_owner["pid"] == os.getpid()
     reopened_events = [
         event for event in _events(rust_root)
         if event["kind"] == "active-state-recorded"
-        and event["payload"].get("action") == "owner-reopened"
+        and cast(dict[str, object], event["payload"]).get("action") == "owner-reopened"
     ]
     assert reopened_events
-    evidence = reopened_events[-1]["payload"]["evidence"]
+    payload = cast(dict[str, object], reopened_events[-1]["payload"])
+    evidence = cast(dict[str, object], payload["evidence"])
     assert evidence["coordinator_authorized"] is True
     assert evidence["reason"] == "lane resumed after restart"
     assert evidence["previous_generation"] == 1
