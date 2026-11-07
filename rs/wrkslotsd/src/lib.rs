@@ -50,6 +50,8 @@ mod canonical;
 mod classify_journals;
 pub mod cli;
 mod config;
+mod config_convert;
+mod config_docs;
 mod config_validate;
 mod create_text;
 mod create_write;
@@ -91,15 +93,18 @@ mod recover_main_write;
 mod recover_ownerless_write;
 mod recover_unbound_write;
 mod recover_validate_write;
+mod register_write;
 mod release_write;
 mod remove_write;
 mod replay;
+mod retirement_queue;
 #[allow(dead_code)] // wired into cli.rs dispatch by the shared core (P9, mu-rsimg)
 mod sandbox_state;
 mod schema;
 mod shell_command_state;
 mod status_state;
 mod storage_state;
+mod supersede_write;
 mod transfer_write;
 mod unpushed_state;
 #[allow(dead_code)] // wired into cli.rs dispatch by the shared core (P8, mu-rsimg)

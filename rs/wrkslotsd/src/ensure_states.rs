@@ -144,7 +144,7 @@ pub(crate) fn atomic_write_json(path: &Path, payload: &Value) -> Result<()> {
     atomic_write_bytes(path, text.as_bytes())
 }
 
-fn atomic_write_bytes(path: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write_bytes(path: &Path, contents: &[u8]) -> Result<()> {
     refuse_symlink(path, "state file")?;
     let parent = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent).map_err(|error| {

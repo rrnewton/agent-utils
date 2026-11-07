@@ -5086,7 +5086,12 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "unpushed-text",
             "status",
             "status-text",
-            "validate-config"
+            "validate-config",
+            "quickstart",
+            "retirement-queue",
+            "register",
+            "supersede-handoff",
+            "config"
         ])
     );
     for subcommand in command.get_subcommands() {
