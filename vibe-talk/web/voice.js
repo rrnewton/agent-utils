@@ -4542,430 +4542,108 @@ function focusLost() {
 /** @typedef {import("./src/view/shell/index.ts").KeyPane} KeyPane */
 
 /**
- * The channel's messages, in the one scrolling area both views share. Its rows are the channel's own
- * list or the Pinned filter's, never the call's transcript (the proposal's question 9) and never the
- * list of threads, whose rows are threads.
+ * The keyboard composition: every list the keys move through and every owner the keys dispatch
+ * through, built in order (web/src/app/keyboard.ts, `#624 voice-page-modularity`, step 17 move 2).
+ * The page destructures what it still calls under the old names; what each key does on a row, a
+ * channel or the screen is handed in as it was taken here, every one of them read as it is called,
+ * so a key pressed after start-up finds them as they then stand. Owners whose acts call later
+ * owners keep their thunk shape inside the composition exactly as they had it here.
  *
- * @type {KeyPane}
+ * @type {import("./src/app/index.ts").KeyboardComposition}
  */
-const channelPane = {
-  name: "channel",
-  // The left column's, whichever column the code is working on when it asks. `#229 desktop-two-column`.
-  scroller: () => leftEl("scroll-area"),
-  // None while the thread list is up on its own: the left column is behind it. `#281 view-keys`.
-  list: () => inColumn(columns.main, () =>
-    (screens.screen() === "main" && screens.view() === "discord" && !layoutShown.threadList() &&
-      (pinsView().only || selection().view !== "threads") ? shownChannelList() : null)),
-  head: () => floatingClearance(leftEl("scroll-area")),
-  // The chips float over the foot of the list, the read-aloud strip stands on them while a read
-  // plays (`#433 read-strip-low`), and the status line floats over both: a row under any is under
-  // something.
-  foot: () => {
-    const area = leftEl("scroll-area");
-    const over = ["scroll-tools", "read-steer", "status-line"].reduce((room, id) =>
-      room + (leftEl(id).hidden ? 0 : leftEl(id).getBoundingClientRect().height), 0);
-    return area.getBoundingClientRect().top + (area.clientHeight || 0) - over;
-  },
-  context: () => inColumn(columns.main, () => JSON.stringify([channelContextKey(), pinsView().only])),
-  // Session-only and one short entry per list visited, for the reason `expandedIds` gives.
-  marks: new Map(),
-  row: null,
-  lit: null,
-  follow: null,
-};
-
-/**
- * `#229 desktop-two-column`. The right column's list in two columns: the thread's messages, or with
- * none selected its cards, which the arrows, j and k, Home and End move through as through messages,
- * Enter highlights and → enters (`#277 thread-card-focus`). Nothing floats over its head (its heading
- * is above the scroller), and its jump floats over its foot. `#281 view-keys`: and the same cards in
- * the thread list, the column on its own.
- *
- * @type {KeyPane}
- */
-const sidePane = {
-  name: "side",
-  scroller: () => leftEl("side-scroll"),
-  list: () => (screens.screen() === "main" && screens.view() === "discord" && sideColumnUp()
-    ? leftEl(columns.side.mode === "thread" ? "side-log" : "side-cards") : null),
-  head: () => leftEl("side-scroll").getBoundingClientRect().top,
-  foot: () => {
-    const area = leftEl("side-scroll");
-    const jump = leftEl("side-jump-newest");
-    const over = jump.hidden ? 0 : leftEl("side-tools").getBoundingClientRect().height;
-    return area.getBoundingClientRect().top + (area.clientHeight || 0) - over;
-  },
-  context: () => inColumn(columns.side, () => JSON.stringify([channelContextKey(), columns.side.mode])),
-  marks: new Map(),
-  row: null,
-  lit: null,
-  follow: null,
-};
-
-/** Every list the keys can move through: the channel's, and in two columns the right column's. */
-const KEY_PANES = [channelPane, sidePane];
-
-/** The column a pane's list is in, which a key acting on one of its rows works on. `#229`. */
-const paneColumn = (pane) => (pane === sidePane ? columns.side : columns.main);
-
-/**
- * The pane the keys moved last, which keys from outside every pane go to while it takes them (web/src/view/
- * channel `createLastPane`).
- *
- * @type {import("./src/view/channel/index.ts").LastPane<typeof channelPane>}
- */
-const lastPane = createLastPane(channelPane);
-
-/**
- * The selection the keys move: which list a key is for (`paneFor`, `visibleScroller`), the rows it moves
- * through, the selection kept per list by message id, drawing it as the one lit row of the page, selecting
- * a row and bringing it into view, and putting the selection back after a redraw (`keepSelection`). One
- * owner in web/src/view/shell/keyselection.ts (`#624 voice-page-modularity`); the page destructures what
- * it still calls under the old names.
- *
- * @type {import("./src/view/shell/index.ts").KeySelectionModel<KeyPane>}
- */
-const keySelection = createKeySelection({
-  keyPanes: () => KEY_PANES,
-  channelPane: () => channelPane,
-  sidePane: () => sidePane,
-  lastPane: () => lastPane.current(),
-  takeLastPane: (pane) => lastPane.take(pane),
-  threadListOnScreen: () => threadListOnScreen(),
+const keyboard = createKeyboardComposition({
+  screens,
+  el: (id) => el(id),
+  leftEl: (id) => leftEl(id),
+  documentRoot: () => document.documentElement,
+  mainColumn: () => columns.main,
+  sideColumn: () => columns.side,
+  inColumn: (column, act) => inColumn(column, act),
+  inSide: () => columnWork.side(),
+  activeColumn: () => columnWork.active(),
+  shownChannelList: () => shownChannelList(),
+  floatingClearance: (area) => floatingClearance(area),
+  channelContextKey: () => channelContextKey(),
+  selectionView: () => selection().view,
+  pinsOnly: () => pinsView().only,
+  threadListShown: () => layoutShown.threadList(),
   sideColumnUp: () => sideColumnUp(),
-  replyDocked: () => Boolean(replyState.docked),
-  replyPane: () => replyPane(),
-  screen: () => screens.screen(),
-  byId: (id) => el(id),
-  leftById: (id) => leftEl(id),
+  threadListOnScreen: () => threadListOnScreen(),
   rowShown: (row) => rowShown(row),
   idsOf: (row) => idsOf(row),
   shownRowFor: (row) => shownRowFor(row),
   rowTimeTabStop: (row, on) => rowTimeTabStop(row, on),
-  readerActedIn: (pane) => inColumn(paneColumn(pane), readerActed),
+  readerActed: () => readerActed(),
   putOutLanding: (row) => putOutLanding(row),
   noteLinkedSelection: () => noteLinkedSelection(),
   focusLost: () => focusLost(),
-  landingGap: () => REPLY_LANDING_GAP_PX,
-});
-const {
-  paneFor, visibleScroller, paneRows, rowOf, paneRowFor, markOf, markedRow, markNames, releaseRow, activePane,
-  drawSelection, takeRow, noteRow, currentRow, drawnRow, nearRow, rowInView, firstRowInView, selectRow, bringIntoView,
-  keepSelection,
-} = keySelection;
-
-// --- the mouse and the keys move one selection (`#239 single-selection`)
-
-/**
- * What the reader used last — keys, mouse, or a finger or a pen — said on the root element for
- * web/voice.css, and where the mouse last moved, telling a mouse really moving from a list scrolled under
- * a still pointer: web/src/view/channel's (`createInputKinds`, `#624 voice-page-modularity`).
- */
-const inputKinds = createInputKinds({ root: () => document.documentElement });
-
-/**
- * The mouse and the keys move one selection: what the reader used last, a real mouse move or a click taking
- * the selection (`pointRow`, `focusFollowsSelection`), the focus arriving in a list, a jump landing, the ring
- * following a page of scrolling, and handing the keys to the list on screen. One owner in
- * web/src/view/shell/pointerselection.ts (`#624 voice-page-modularity`); the page destructures what it still
- * calls under the old names.
- *
- * @type {import("./src/view/shell/index.ts").PointerSelection<KeyPane>}
- */
-const pointerSelection = createPointerSelection({
-  inputKinds,
-  screen: () => screens.screen(),
-  view: () => screens.view(),
-  focusLost: () => focusLost(),
-  keyPanes: () => KEY_PANES,
-  paneFor: (node) => paneFor(node),
-  channelPane: () => channelPane,
-  sidePane: () => sidePane,
-  lastPane: () => lastPane.current(),
-  takeLastPane: (pane) => lastPane.take(pane),
+  replyLandingGapPx: () => REPLY_LANDING_GAP_PX,
+  replyDocked: () => Boolean(replyState.docked),
+  replyPane: () => replyPane(),
   rowMenuOpen: () => Boolean(rowMenus.open()),
-  takeRow: (pane, row, focus) => takeRow(pane, row, focus),
-  noteRow: (pane, row) => noteRow(pane, row),
-  drawSelection: () => drawSelection(),
-  rowOf: (pane, node) => rowOf(pane, node),
-  rowShown: (row) => rowShown(row),
-  markOf: (pane) => markOf(pane),
-  markNames: (mark, row) => markNames(mark, row),
+  openRowMenu: () => rowMenus.open(),
   dwellColumnGlide: (pane, row) => dwellColumnGlide(pane, row),
   driftFromColumnGlide: () => driftFromColumnGlide(),
-  byId: (id) => el(id),
-  leftById: (id) => leftEl(id),
-  inSide: () => columnWork.side(),
-  mainColumn: () => columns.main,
-  paneColumn: (pane) => paneColumn(pane),
-  inColumn: (column, act) => inColumn(column, act),
-  readerActed: () => readerActed(),
-  rowInView: (pane, row) => rowInView(pane, row),
-  firstRowInView: (pane) => firstRowInView(pane),
-  selectRow: (pane, row, bring) => selectRow(pane, row, bring),
-  drawnRow: (pane) => drawnRow(pane),
-  releaseRow: (pane, row) => releaseRow(pane, row),
-  rowTimeTabStop: (row, on) => rowTimeTabStop(row, on),
-  visibleScroller: () => visibleScroller(),
-  threadListOnScreen: () => threadListOnScreen(),
-  sideColumnUp: () => sideColumnUp(),
-});
-const {
-  drawnBy, keysInUse, onPointerMove, onPointerDown, noteClickedRow, onPaneFocus, selectLanded, followPageScroll,
-  focusList, settleFocus, behindThreadList, inColumnGone,
-} = pointerSelection;
-
-// Giving a control the focus scrolling only as far as shows it (`focusMinimally`, `#280
-// scroll-stability`) is web/src/view/dom's.
-
-// --- scrolling
-
-/**
- * The scroll keys: a page key, Home, End, Space or an arrow no binding took, sent to the list on screen
- * (`routeScrollKey`), the Newest chip and End (`jumpToNewest`), and Home, End, Ctrl+Home and Ctrl+End
- * (`listEdge`, `jumpList`). One owner in web/src/view/shell/scrollkeys.ts (`#624 voice-page-modularity`).
- *
- * @type {import("./src/view/shell/index.ts").ScrollKeys}
- */
-const scrollKeys = createScrollKeys({
-  scrollArea: () => el("scroll-area"),
-  sideScroll: () => leftEl("side-scroll"),
   toFoot: (area) => toFoot(area),
   endFilterWalk: () => endFilterWalk(),
   closeOverscroll: () => closeOverscroll(),
   openOverscroll: (area) => openOverscroll(area),
   scrollToNewest: () => scrollToNewest(),
-  visibleScroller: (node) => visibleScroller(node),
   isTextField: (node) => isTextField(node),
   scrollsItself: (node) => scrollsItself(node),
   keepsOwnKeys: (node) => keepsOwnKeys(node),
   pressedBySpace: (node) => pressedBySpace(node),
-  onMain: () => screens.screen() === "main",
-  paneFor: (node) => paneFor(node),
-  paneRows: (pane) => paneRows(pane),
-  selectRow: (pane, row, bring) => selectRow(pane, row, bring),
-  followPageScroll: (pane, row, up) => followPageScroll(pane, row, up),
-});
-
-// --- moving the selection
-
-/**
- * Moving the selection: ↓ and ↑, j and k through the messages and an open ⋯ menu, and the row every key about
- * one message acts on (`keyContext`, `rowForAct`). One owner in web/src/view/shell/selectionkeys.ts (`#624
- * voice-page-modularity`); the page destructures what it still calls under the old names.
- *
- * @type {import("./src/view/shell/index.ts").SelectionKeys<KeyPane>}
- */
-const selectionKeys = createSelectionKeys({
-  paneFor: (node) => paneFor(node),
-  paneRows: (pane) => paneRows(pane),
-  currentRow: (pane, node) => currentRow(pane, node),
-  rowInView: (pane, row) => rowInView(pane, row),
-  firstRowInView: (pane) => firstRowInView(pane),
-  landingHolds: () => entryLandingHolds(),
-  landingFirst: () => entryState().landing.first,
-  selectRow: (...args) => selectRow(...args),
-  takeRow: (pane, row, focus) => takeRow(pane, row, focus),
-  landingGap: () => REPLY_LANDING_GAP_PX,
-  openOverscroll: (area) => openOverscroll(area),
-  openRowMenu: () => rowMenus.open(),
+  entryLandingHolds: () => entryLandingHolds(),
+  entryLandingFirst: () => entryState().landing.first,
   setStatus: (text) => setStatus(text),
-});
-const { menuItems, stepFromKeyboard, keyContext, rowForAct } = selectionKeys;
-
-/**
- * The Done and next-unread keys: n to the next unread message, and e and Ctrl+E (Cmd+E) Done or not and on.
- * One owner in web/src/view/shell/donekeys.ts (`#624 voice-page-modularity`); the page destructures its keys
- * under their old names.
- *
- * @type {import("./src/view/shell/index.ts").DoneKeys}
- */
-const doneKeys = createDoneKeys({
-  keyContext: (target) => keyContext(target),
-  rowForAct: (target, runLine, stay) => rowForAct(target, runLine, stay),
-  paneRows: (pane) => paneRows(pane),
-  rowInView: (pane, row) => rowInView(pane, row),
   rowIsRead: (row) => rowIsRead(row),
-  selectRow: (pane, row) => selectRow(pane, row),
-  setStatus: (text) => setStatus(text),
-  paneRowFor: (pane, id, card) => paneRowFor(pane, id, card),
-  nearRow: (pane, at) => nearRow(pane, at),
-  takeRow: (pane, row, focus) => takeRow(pane, row, focus),
-  bringIntoView: (pane, row) => bringIntoView(pane, row),
-  idsOf: (row) => idsOf(row),
   isDone: (id) => doneState().archived.has(id),
-  toggleDone: (ids, row) => guardQuietly(() => toggleArchived(ids, row))(),
-});
-const { nextUnreadFromKeyboard, doneFromKeyboard } = doneKeys;
-
-/**
- * Shift+E, read and collapse (`#295 shift-e-read-collapse`): the selected message marked read — Done, and in
- * the chat service too where it can be (`#300 reply-marks-read`) — and folded, the reader's place kept. One
- * owner in web/src/view/shell/readcollapse.ts (`#624 voice-page-modularity`); marking Done, the service's
- * marker and the fold are the page's, handed in. The page destructures the key under its old name.
- *
- * @type {import("./src/view/shell/index.ts").ReadCollapse<KeyPane>}
- */
-const readCollapse = createReadCollapse({
-  rowForAct: (target) => rowForAct(target),
-  idsOf: (row) => idsOf(row),
-  runQuietly: (act) => guardQuietly(act)(),
-  channelId: () => selectedChannelId(),
-  foldForRead: (pane, row) => foldForRead(pane, row),
-  isDone: (id) => doneState().archived.has(id),
+  toggleArchived: (ids, row) => toggleArchived(ids, row),
+  guardQuietly: (run) => guardQuietly(run),
+  selectedChannelId: () => selectedChannelId(),
   markRowDone: (ids, row) => markRowDone(ids, row),
   doneSaved: (ids) => doneSaved(ids),
   markReadInService: (channel, id) => markReadInService(channel, id),
   doneReadWords: (mark, also) => doneReadWords(mark, also),
   serviceReadWords: (mark, also) => serviceReadWords(mark, also),
   localReadWords: (wasDone, also) => localReadWords(wasDone, also),
-  setStatus: (text) => setStatus(text),
   statusSays: (text) => statusSays(text),
   dismissStatus: () => dismissStatus(),
-});
-const { readCollapseFromKeyboard } = readCollapse;
-
-/**
- * Folding a message from the keyboard: Shift+O folds the selected message away into a line of read messages
- * and steps above it, and Shift+E's fold (`foldForRead`, which `readAndCollapse` calls) keeps what the reader is
- * looking at where it was.
- * One owner in web/src/view/shell/foldkeys.ts (`#624 voice-page-modularity`); the page destructures its two
- * under their old names.
- *
- * @type {import("./src/view/shell/index.ts").FoldKeys<KeyPane>}
- */
-const foldKeys = createFoldKeys({
   showingLinks: (row) => showingLinks(row),
   isFolded: (entry) => isFolded(entry),
   setFolded: (entry, folded) => setFolded(entry, folded),
   atBottom: (area) => atBottom(area),
   preservingScroll: (act) => preservingScroll(act),
   renderScrollTools: () => renderScrollTools(),
-  rowForAct: (target) => rowForAct(target),
-  paneRows: (pane) => paneRows(pane),
-  shownRowFor: (row) => shownRowFor(row),
   rowMessages: (row) => rowMessages(row),
-  isThreadRoot: (message) => Boolean(message.thread && message.thread.is_root),
   isOpenThreadRoot: (row) => isOpenThreadRoot(row, openThreadRootId()),
-  setStatus: (text) => setStatus(text),
-  idsOf: (row) => idsOf(row),
-  threadViewKey: (id) => viewKey("thread", id),
-  columnViewKey: (column) => inColumn(column, () => viewKey()),
-  paneColumn: (pane) => paneColumn(pane),
-  inColumn: (column, act) => inColumn(column, act),
+  viewKey: (kind, id) => viewKey(kind, id),
   foldedOnes: () => foldedOnes,
   closeReadRun: (key, ids) => readRuns.close(key, ids),
-  isDone: (id) => doneState().archived.has(id),
-  markDone: (ids, row) => guardQuietly(() => markRowDone(ids, row))(),
   renderSideColumn: () => renderSideColumn(),
   applyReadRuns: () => applyReadRuns(),
-  paneRowFor: (pane, id, card) => paneRowFor(pane, id, card),
-  selectRow: (pane, row) => selectRow(pane, row),
-});
-const { foldForRead, foldOneFromKeyboard } = foldKeys;
-
-/**
- * The keys that act on the selected row: Enter and o, → and ←, [ and ], r, ".", s, i and l, and pressing one
- * of the row's own buttons. One owner in web/src/view/shell/rowkeys.ts (`#624 voice-page-modularity`); the
- * page destructures its keys under their old names.
- *
- * @type {import("./src/view/shell/index.ts").RowKeys}
- */
-const rowKeys = createRowKeys({
-  rowForAct: (target, runLine) => rowForAct(target, runLine),
-  keyContext: (target) => keyContext(target),
   openReadRun: (row) => openReadRun(row),
   liveUnpackedRow: (row) => liveUnpackedRow(row),
   liveCardRow: (row) => liveCardRow(row),
-  selectRow: (...args) => selectRow(...args),
-  channelPane: () => channelPane,
-  sidePane: () => sidePane,
-  focusList: (pane) => focusList(pane),
-  settleFocus: () => settleFocus(),
   actOnRow: (row, fold) => actOnRow(row, fold),
   cardForArrow: (target) => cardForArrow(target),
   columnsShown: () => layoutShown.columns(),
   isComposer: (node) => isComposer(node),
-  closeThread: () => guardQuietly(closeThread)(),
-  inSide: () => columnWork.side(),
-  screen: () => screens.screen(),
-  view: () => screens.view(),
-  sideMode: () => columns.side.mode,
-  sideFromCards: () => columns.side.fromCards,
+  closeThread: () => closeThread(),
   sideThreadId: () => inColumn(columns.side, () => String(selection().threadId)),
   cardRowOnRight: (id) => cardRowOnRight(id),
   closeSideThread: () => closeSideThread(),
-  rowShown: (row) => rowShown(row),
-  threadListOnScreen: () => threadListOnScreen(),
-  selectionView: () => selection().view,
-  channelOnScreen: () => channelOnScreen(),
-  replyOnScreen: () => replyOnScreen(),
-  byId: (id) => el(id),
-  menuItems: () => menuItems(),
-  readCardAloud: (card) => readAloudOwner().readCardAloud(card),
-  readRowAloud: (row) => guardQuietly(() => readAloudOwner().readAloud(idsOf(row)))(),
-  toggleDetails: (row) => toggleMessageDetails(row, rowMessages(row)),
-  firstMessage: (row) => rowMessages(row)[0],
+  toggleMessageDetails: (row, messages) => toggleMessageDetails(row, messages),
   upstreamUrlOf: (message) => upstreamUrlOf(message),
-  openRowMenu: () => rowMenus.open(),
-  copyUpstreamLink: (url, message) => guardQuietly(() => copyUpstreamLink(url, upstreamServiceName(message)))(),
-  copyDeepLink: (message) => guardQuietly(() => copyDeepLink(message))(),
-});
-const {
-  openFromKeyboard, pressRowButton, threadFromKeyboard, leaveThread, threadOutFromKeyboard, columnFromKeyboard,
-  replyFromKeyboard, menuFromKeyboard, readFromKeyboard, detailsFromKeyboard, copyLinkFromKeyboard, deepLinkFromKeyboard,
-} = rowKeys;
-
-/** The text the reader has selected on the page, or "". */
-function selectedText() {
-  return typeof getSelection === "function" ? String(getSelection() || "") : "";
-}
-
-// --- copying the highlighted message (`#296 copy-highlighted-message`)
-
-/** What the status pill says when no way of copying worked: never a silent no-op the reader mistakes for a copy. */
-const COPY_REFUSED = "This browser would not copy to the clipboard.";
-
-/**
- * Copying the highlighted message: Ctrl+C (Cmd+C) with nothing selected, through the browser's own `copy`
- * event, and c or y. One owner in web/src/view/shell/highlightcopy.ts (`#624 voice-page-modularity`), with
- * the design.
- *
- * @type {import("./src/view/shell/index.ts").HighlightCopy}
- */
-const highlightCopy = createHighlightCopy({
-  isTextField: (node) => isTextField(/** @type {any} */ (node)),
-  selectedText: () => selectedText(),
-  activePane: () => activePane(),
-  rowShown: (row) => rowShown(row),
-  rowMessages: (row) => rowMessages(row),
+  upstreamServiceName: (message) => upstreamServiceName(message),
+  copyUpstreamLink: (url, service) => copyUpstreamLink(url, service),
+  copyDeepLink: (message) => copyDeepLink(message),
+  readCardAloud: (card) => readAloudOwner().readCardAloud(card),
+  readRowAloud: (row) => readAloudOwner().readAloud(idsOf(row)),
   combinedContent: (messages) => combinedContent(messages),
   renderedHtmlOf: (message) => renderedHtmlOf(message),
   rawTextOf: (message) => rawTextOf(message),
-  setStatus: (text) => setStatus(text),
-  copyRefused: COPY_REFUSED,
   writeClipboardText: (text) => writeClipboardText(text),
-  guardQuietly: (run) => guardQuietly(run),
-  setTimeout: (run, ms) => setTimeout(run, ms),
-});
-
-// --- views, filters and channels
-
-/** Whether the list of the channel is the one on screen: where the keys about messages and views apply. */
-const channelOnScreen = () => screens.screen() === "main" && screens.view() === "discord";
-
-/**
- * The keys for the views (Ctrl+0 to Ctrl+4), the read mode (h), the filters (Shift+P, Shift+L, the author
- * filter's) and Undo (z). One owner in web/src/view/shell/viewkeys.ts (`#624 voice-page-modularity`); the
- * page destructures its keys under their old names.
- *
- * @type {import("./src/view/shell/index.ts").ViewKeys}
- */
-const viewKeys = createViewKeys({
-  screens,
-  inSide: () => columnWork.side(),
-  mainColumn: () => columns.main,
-  inColumn: (column, act) => inColumn(column, act),
   closeSettings: () => closeSettings(),
   // The keys' switch keeps its two-way meaning (the call's view or the channel's, never
   // Documents between them); the button's press is the three-way `pressViewSwitch`.
@@ -4973,290 +4651,76 @@ const viewKeys = createViewKeys({
   selectedChannelId: () => selectedChannelId(),
   channelOnScreen: () => channelOnScreen(),
   chooseView: (which) => chooseView(which),
-  settleFocus: () => settleFocus(),
-  readModeHidden: () => el("todo-filter").hidden,
   cycleReadMode: () => cycleReadMode(),
   readModeSaid: () => READ_MODE_SAID[readModes.mode()],
-  setStatus: (text) => setStatus(text),
-  threadListOnScreen: () => threadListOnScreen(),
   searchOpen: () => searchField.open(),
   setSearchOpen: (open) => setSearchOpen(open),
-  pinnedOnly: () => pinsView().only,
   setPinnedOnly: (on) => setPinnedOnly(on),
   linksOnly: () => searchField.links(),
   setLinksOnly: (on) => setLinksOnly(on),
   cycleAuthorFilter: () => cycleAuthorFilter(),
-  focusChannelList: () => focusList(channelPane),
   doneOffer: () => lastDismissal.current(),
-  undoDone: () => guardQuietly(undoDismissal)(),
+  undoDismissal: () => undoDismissal(),
   sendOffer: () => sendUndo.current(),
   sendHeld: (id) => Boolean(dismissedSends.find(id)),
-  putBackSend: (id) => putBackDismissedSend(id),
+  putBackDismissedSend: (id) => putBackDismissedSend(id),
   bookmarkOffer: () => bookmarkUndos.current(),
   currentChannelId: () => currentChannelId(),
   undoBookmarkRemoval: () => undoBookmarkRemoval(),
-});
-const { voiceFromKeyboard, viewFromKeyboard, readModeFromKeyboard, filterFromKeyboard, undoFromKeyboard } = viewKeys;
-
-/**
- * The keys to the message box: m and Ctrl+S (Cmd+S) take the reader to the box to write in, and ↑ in the
- * channel's empty box selects the newest message. One owner in web/src/view/shell/writekeys.ts (`#624
- * voice-page-modularity`); the page destructures its keys under their old names.
- *
- * @type {import("./src/view/shell/index.ts").WriteKeys}
- */
-const writeKeys = createWriteKeys({
-  byId: (id) => el(id),
-  leftById: (id) => leftEl(id),
-  screen: () => screens.screen(),
-  view: () => screens.view(),
-  closeSettings: () => closeSettings(),
-  replyOnScreen: () => replyOnScreen(),
-  channelOnScreen: () => channelOnScreen(),
-  threadListOnScreen: () => threadListOnScreen(),
   threadListBack: () => threadListBack(),
   mainRowsOnScreen: () => mainRowsOnScreen(),
-  behindThreadList: (node) => behindThreadList(node),
-  inColumnGone: (node) => inColumnGone(node),
-  isComposer: (node) => isComposer(node),
-  inSide: () => columnWork.side(),
-  activeColumn: () => columnWork.active(),
-  mainColumn: () => columns.main,
-  inColumn: (column, act) => inColumn(column, act),
-  channelPane: () => channelPane,
-  sidePane: () => sidePane,
-  paneFor: (node) => paneFor(node),
-  paneColumn: (pane) => paneColumn(pane),
-  paneRows: (pane) => paneRows(pane),
-  selectRow: (pane, row) => selectRow(pane, row),
-});
-const { composeFromKeyboard, writeFromKeyboard, newestFromComposer } = writeKeys;
-
-/**
- * The channel keys: Alt+↓ and Alt+↑ through the channels, Ctrl+K (Cmd+K) for the picker, and the keys back
- * to the list once a channel is chosen from the picker Ctrl+K opened. One owner in
- * web/src/view/shell/channelkeys.ts (`#624 voice-page-modularity`); the page destructures its keys under
- * their old names.
- *
- * @type {import("./src/view/shell/index.ts").ChannelKeys}
- */
-const channelKeys = createChannelKeys({
-  channelOnScreen: () => channelOnScreen(),
-  picker: () => el("discord-channel"),
   channelsInPickerOrder: () => channelsInPickerOrder(),
-  selectedChannelId: () => selectedChannelId(),
   chooseChannel: (id) => chooseChannel(id),
-  changeChannel: () => guardQuietly(changeSelectedChannel)(),
-  settleFocus: () => settleFocus(),
-});
-const { stepChannel, pickChannel, channelPicked } = channelKeys;
-
-// --- search, Settings, help and Escape
-
-/**
- * The keys for the search ("/", Ctrl+/), Settings (","), Help ("?") and Escape, and where Back goes from
- * the screen that is up. One owner in web/src/view/shell/screenkeys.ts (`#624 voice-page-modularity`); the
- * page destructures its keys under their old names.
- *
- * @type {import("./src/view/shell/index.ts").ScreenKeys}
- */
-const screenKeys = createScreenKeys({
-  screens,
+  changeSelectedChannel: () => changeSelectedChannel(),
   showScreen: (name) => showScreen(name),
-  closeSettings: () => closeSettings(),
   showHelp: (entry) => showHelp(entry),
-  byId: (id) => el(id),
-  searchOpen: () => searchField.open(),
-  setSearchOpen: (open) => setSearchOpen(open),
   openMenus: () => openMenus(),
   closeOpenMenu: (name) => closeOpenMenu(name),
   closeRowMenuOnEscape: (event) => closeRowMenuOnEscape(event),
-  replyDocked: () => replyState.docked,
   replyKeysHere: () => replyKeysHere(),
   closeReply: () => closeReply(),
-  threadListOnScreen: () => threadListOnScreen(),
-  threadListBack: () => threadListBack(),
-  channelOnScreen: () => channelOnScreen(),
-  selectionView: () => selection().view,
-  sideShowsCards: () => columnWork.side() && columns.side.mode === "list",
-  leaveThread: () => leaveThread(),
-  keyContext: (target) => keyContext(target),
-  selectRow: (pane, row, bring) => selectRow(pane, row, bring),
-  settleFocus: () => settleFocus(),
-  isComposer: (node) => isComposer(node),
-  focusList: (pane) => focusList(pane),
-  paneFor: (node) => paneFor(node),
-  forgetChannelPick: () => channelKeys.forgetPick(),
   putOutLitCard: () => putOutLitCard(),
   clearAllThreadFocus: () => clearAllThreadFocus(),
   clearLinkedMark: () => linkedMark.clearOnEscape(),
-});
-const { searchFromKeyboard, searchFromAnywhere, settingsFromKeyboard, closeHelp, keysFromKeyboard, replyOnScreen, onEscape } = screenKeys;
-
-// --- the keymap
-
-/**
- * Every key the page answers, in the order the list of keys shows them, with what each does in the words of that
- * list: the table the keyboard dispatch walks and the key hints read. One owner in web/src/view/shell/keymap.ts
- * (`#624 voice-page-modularity`); what each key does is the page's, handed in as its acts.
- *
- * @type {import("./src/view/shell/index.ts").KeymapBinding<HTMLElement>[]}
- */
-const KEYMAP = createKeymap({
   modKeyName: () => modKeyName(),
   manyChatServices: () => channelDirectory.providers().size > 1,
   chatServiceName: () => chatServiceName(),
   threadOrderWords: () => THREAD_ORDER_NAMES.map((name) => THREAD_ORDERS[name].name).join(", "),
   minCollapsedLines: () => MIN_COLLAPSED_LINES,
   maxCollapsedLines: () => MAX_COLLAPSED_LINES,
-  keyContext: (target) => keyContext(target),
-  pressRowButton: (target, className) => pressRowButton(target, className),
-  onEscape: (event, target) => onEscape(event, target),
   placeFromKeyboard: (step) => placeFromKeyboard(step),
-  listEdge: (target, end) => scrollKeys.listEdge(target, end),
-  jumpList: (target, end) => scrollKeys.jumpList(target, end),
-  searchFromAnywhere: () => searchFromAnywhere(),
-  searchFromKeyboard: () => searchFromKeyboard(),
-  settingsFromKeyboard: () => settingsFromKeyboard(),
-  keysFromKeyboard: () => keysFromKeyboard(),
-  stepFromKeyboard: (...args) => stepFromKeyboard(...args),
-  stepChannel: (event) => stepChannel(event),
-  pickChannel: () => pickChannel(),
-  openFromKeyboard: (event, target) => openFromKeyboard(event, target),
-  threadFromKeyboard: (target) => threadFromKeyboard(target),
-  threadOutFromKeyboard: () => threadOutFromKeyboard(),
   threadStripFromKeyboard: (target) => threadStripFromKeyboard(target),
-  columnFromKeyboard: (right) => columnFromKeyboard(right),
-  replyFromKeyboard: (target) => replyFromKeyboard(target),
-  menuFromKeyboard: (target) => menuFromKeyboard(target),
-  readFromKeyboard: (target) => readFromKeyboard(target),
-  detailsFromKeyboard: (target) => detailsFromKeyboard(target),
-  copyLinkFromKeyboard: (target) => copyLinkFromKeyboard(target),
-  deepLinkFromKeyboard: (target) => deepLinkFromKeyboard(target),
-  // `#889 voice-page-copy-link-key`. The installed app, where Ctrl+L (Cmd+L) has no address bar to go to: as the
-  // stylesheet says it (`--app-standalone`, styles/voice/00-frame.css), which decides the display mode, not this script.
-  standalone: () => typeof window.getComputedStyle === "function" &&
-    window.getComputedStyle(document.documentElement).getPropertyValue("--app-standalone").trim() === "1",
-  copyChordFromKeyboard: () => highlightCopy.copyChordFromKeyboard(),
-  copyFromKeyboard: () => highlightCopy.copyFromKeyboard(),
-  nextUnreadFromKeyboard: (target) => nextUnreadFromKeyboard(target),
-  doneFromKeyboard: (target) => doneFromKeyboard(target),
-  readCollapseFromKeyboard: (target) => readCollapseFromKeyboard(target),
-  foldOneFromKeyboard: (target) => foldOneFromKeyboard(target),
   foldStepFromKeyboard: (step, event, target) => foldStepFromKeyboard(step, event, target),
   collapsedLinesFromKeyboard: (step, target) => collapsedLinesFromKeyboard(step, target),
   packFromKeyboard: (target) => packFromKeyboard(target),
   unpackFromKeyboard: () => unpackFromKeyboard(),
   bookmarkFromKeyboard: (target) => bookmarkFromKeyboard(target),
   bookmarkJumpFromKeyboard: () => bookmarkJumpFromKeyboard(),
-  viewFromKeyboard: (...args) => viewFromKeyboard(...args),
-  voiceFromKeyboard: (...args) => voiceFromKeyboard(...args),
-  readModeFromKeyboard: () => readModeFromKeyboard(),
-  filterFromKeyboard: (name) => filterFromKeyboard(name),
-  undoFromKeyboard: () => undoFromKeyboard(),
   orderFromKeyboard: () => orderFromKeyboard(),
   mainRowsFromKeyboard: () => mainRowsFromKeyboard(),
   columnsFromKeyboard: () => columnsFromKeyboard(),
-  composeFromKeyboard: () => composeFromKeyboard(),
-  writeFromKeyboard: () => writeFromKeyboard(),
-  newestFromComposer: (target) => newestFromComposer(target),
-});
-
-/**
- * Whether the single-key shortcuts are on: ON unless the reader turned them off, kept on the device. One
- * owner in web/src/core/settings/keychoices.ts (`#624 voice-page-modularity`), with what was stored, its
- * restoring at load and turning them on or off, which keeps the choice and says the keys as they now are
- * (`keyHints.render`).
- *
- * @type {import("./src/core/settings/index.ts").SingleKeys}
- */
-const singleKeys = createSingleKeys({
-  deviceSettings: () => deviceSettings(),
-  render: () => keyHints.render(),
-});
-
-/**
- * The page's keyboard dispatch: the keydown listeners `onPageKey`, at the document, and `onEverywhereKey`, at
- * the window in the capture phase, which walk `KEYMAP`; `chordAllowed`, the rules at the top of this
- * section; and `macFieldEditKey`, the Ctrl keys a text field keeps on a Mac. One owner in
- * web/src/view/shell/keydispatch.ts (`#624 voice-page-modularity`).
- *
- * @type {import("./src/view/shell/index.ts").KeyDispatch<HTMLElement>}
- */
-const keyDispatch = createKeyDispatch({
-  keymap: () => KEYMAP,
-  singleKeysOn: () => singleKeys.current(),
-  isTextField: (target) => isTextField(target),
-  keepsOwnKeys: (target) => keepsOwnKeys(target),
-  keysInUse: () => keysInUse(),
-  modKeyName: () => modKeyName(),
-  activeElement: () => /** @type {HTMLElement} */ (document.activeElement),
-  onMain: () => screens.screen() === "main",
-  paneFor: (target) => paneFor(target),
-  paneColumn: (pane) => paneColumn(pane),
-  mainColumn: () => columns.main,
-  inColumn: (column, act) => inColumn(column, act),
-  listGroups: [KEYS_MOVING, KEYS_MESSAGE],
-  readerActed: () => readerActed(),
-  routeScrollKey: (event, target) => scrollKeys.routeScrollKey(event, target),
-});
-
-/** Whether the address the page was opened at asks for key timing: the page writes its own place over it later. */
-const keyTimingInAddress = /[?&]key-timing(=|&|$)/.test(window.location.search || "");
-
-/**
- * How long each key takes to show (`#892 voice-page-optimistic-done`): the page's own work on it, and the
- * frame painted after it, said on the console and marked on the browser's performance timeline. Off unless
- * asked for, by `?key-timing` in the address or by the device setting (`DEVICE_SETTINGS.keyTiming`, set from
- * the console). One owner in web/src/view/shell/keytiming.ts.
- *
- * @type {import("./src/view/shell/index.ts").KeyTiming}
- */
-const keyTiming = createKeyTiming({
-  enabled: () => keyTimingInAddress || deviceSettings().get(DEVICE_SETTINGS.keyTiming),
-  now: () => performance.now(),
-  afterPaint: (act) => requestAnimationFrame(() => setTimeout(act, 0)),
-  report: (entry, start) => {
-    console.info(`[key-timing] ${keyTimingLine(entry)}`);
-    try {
-      performance.measure(`key ${entry.chord}`, { start, duration: entry.paint || 0 });
-    } catch (_error) {
-      // A browser without user timing still has the console line.
-    }
-  },
-});
-
-// --- saying the keys
-
-/**
- * The `aria-keyshortcuts` of each row button as the key hints last said them, by class, for the rows drawn
- * after it (web/src/view/shell `createRowShortcuts`).
- */
-const rowShortcuts = createRowShortcuts();
-
-/** Give a row button its `aria-keyshortcuts`, or take them away when its key is turned off. */
-function sayRowShortcut(button, className) {
-  rowShortcuts.say(button, className);
-}
-
-/**
- * Saying the keys where a reader looks for them, from `KEYMAP` and in the words on their own keyboard: the
- * list of every key on the Help screen, the single-key switch's line, every `aria-keyshortcuts` and the
- * tooltips of the glass, the gear and the Back buttons. One owner in web/src/view/shell/keyhints.ts (`#624
- * voice-page-modularity`).
- *
- * @type {import("./src/view/shell/index.ts").KeyHints}
- */
-const keyHints = createKeyHints({
-  keymap: () => KEYMAP,
-  singleKeysOn: () => singleKeys.current(),
-  modKeyName: () => modKeyName(),
-  byId: (id) => el(id),
-  rowShortcuts,
   childByClass: (row, className) => childByClass(row, className),
-  groups: [KEYS_PAGE, KEYS_MOVING, KEYS_MESSAGE, KEYS_VIEW, KEYS_WRITING],
-  viewGroup: KEYS_VIEW,
+  deviceSettings: () => deviceSettings(),
+  keyTimingSetting: () => deviceSettings().get(DEVICE_SETTINGS.keyTiming),
+  locationSearch: () => window.location.search || "",
 });
+const {
+  channelPane, sidePane, KEY_PANES, paneColumn, lastPane, keySelection,
+  paneFor, visibleScroller, paneRows, rowOf, paneRowFor, markOf, markedRow, markNames, releaseRow, activePane,
+  drawSelection, takeRow, noteRow, currentRow, drawnRow, nearRow, rowInView, firstRowInView, selectRow, bringIntoView,
+  keepSelection, inputKinds, pointerSelection,
+  drawnBy, keysInUse, onPointerMove, onPointerDown, noteClickedRow, onPaneFocus, selectLanded, followPageScroll,
+  focusList, settleFocus, behindThreadList, inColumnGone, scrollKeys, selectionKeys,
+  menuItems, stepFromKeyboard, keyContext, rowForAct, doneKeys, nextUnreadFromKeyboard, doneFromKeyboard,
+  readCollapse, readCollapseFromKeyboard, foldKeys, foldForRead, foldOneFromKeyboard, rowKeys,
+  openFromKeyboard, pressRowButton, threadFromKeyboard, leaveThread, threadOutFromKeyboard, columnFromKeyboard,
+  replyFromKeyboard, menuFromKeyboard, readFromKeyboard, detailsFromKeyboard, copyLinkFromKeyboard, deepLinkFromKeyboard,
+  highlightCopy, COPY_REFUSED, selectedText, channelOnScreen, viewKeys,
+  voiceFromKeyboard, viewFromKeyboard, readModeFromKeyboard, filterFromKeyboard, undoFromKeyboard,
+  writeKeys, composeFromKeyboard, writeFromKeyboard, newestFromComposer, channelKeys, stepChannel, pickChannel, channelPicked,
+  screenKeys, searchFromKeyboard, searchFromAnywhere, settingsFromKeyboard, closeHelp, keysFromKeyboard, replyOnScreen, onEscape,
+  KEYMAP, singleKeys, keyDispatch, keyTimingInAddress, keyTiming, rowShortcuts, sayRowShortcut, keyHints,
+} = keyboard;
 
 // --- the canned prompts -------------------------------------------------------------------------
 //

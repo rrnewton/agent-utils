@@ -1076,10 +1076,14 @@ const DONE_UNLESS_DONE = "    const marking = wasDone ? null : deps.markRowDone(
 /** ...and the line that waits for that Done's write, a failure taking back what the status line said at once. */
 const AWAITS_DONE = "    if (marking) await marking.catch(unsaying);\n";
 
-/** Shift+E's act as it was before `#295`: Done through here, every message above marked too. */
-const OLD_SHIFT_E = ["  readCollapseFromKeyboard: (target) => readCollapseFromKeyboard(target),\n",
-  "  readCollapseFromKeyboard: (target) => { const { pane, row, took } = rowForAct(target); const ids = row ? idsOf(row) : []; " +
-  "if (!pane || !row || ids.length === 0) return took; guardQuietly(() => markReadThroughHere(row, ids[ids.length - 1]))(); return true; },\n"];
+/** Shift+E's act as it was before `#295`: Done through here, every message above marked too, as a
+ * brokenModule overlay on the keyboard composition (src/app/keyboard.ts), in its own scope. */
+const OLD_SHIFT_E = [{ file: "src/app/keyboard.ts",
+  find: "    readCollapseFromKeyboard: (target) => readCollapseFromKeyboard(target),\n",
+  replace: "    readCollapseFromKeyboard: (target) => { const { pane, row, took } = rowForAct(target); if (!pane || !row) return took; " +
+    "const rows = paneRows(pane); const at = rows.indexOf(row); const covered = (at < 0 ? [row] : rows.slice(0, at + 1))" +
+    ".flatMap((one) => deps.idsOf(one)).filter((id) => !deps.isDone(id)); if (covered.length === 0) return took; " +
+    "deps.guardQuietly(() => deps.markRowDone(covered, row))(); return true; },\n" }];
 
 /**
  * A channel of thirty long messages at its top, message 3 selected and opened with Enter, then Shift+E.
@@ -1145,13 +1149,14 @@ test("Shift+E's negative controls: a key that does not fold, one that toggles, a
     "the negative control folded the message anyway, so the check above proves nothing");
   // As a toggle, the e key's act: a second press puts the message back.
   const toggled = await readCollapseOnThree(await brokenModule([{ file: "src/view/shell/readcollapse.ts", find: DONE_UNLESS_DONE,
-    replace: "    const marking = deps.markRowDone(ids, row);\n" }], brokenScript("  markRowDone: (ids, row) => markRowDone(ids, row),\n",
-    "  markRowDone: (ids, row) => toggleArchived(ids, row),\n")));
+    replace: "    const marking = deps.markRowDone(ids, row);\n" },
+    { file: "src/app/keyboard.ts", find: "    markRowDone: (ids, row) => deps.markRowDone(ids, row),\n",
+      replace: "    markRowDone: (ids, row) => deps.toggleArchived(ids, row),\n" }]));
   await pressHere(toggled.page, "E", { shiftKey: true });
   assert.notDeepStrictEqual(toggled.page.restoreCalls, [],
     "the negative control's toggle put nothing back, so the check above proves nothing");
   // The old act: every message above is marked too.
-  const through = await readCollapseOnThree(brokenScript(...OLD_SHIFT_E));
+  const through = await readCollapseOnThree(await brokenModule(OLD_SHIFT_E));
   assert.notDeepStrictEqual(othersOf(rowStates(through.page), "3"), othersOf(through.before.states, "3"),
     "the negative control's Done through here changed no other message, so the check above proves nothing");
 });
@@ -1628,7 +1633,7 @@ test("NO KEY MARKS EVERY MESSAGE ABOVE ONE READ ANY MORE: not Shift+E, nor any k
   };
   assert.deepStrictEqual(await sweep(SCRIPT), [], "a key marked more than the message it was pressed on");
   // The control: Shift+E as it was. The sweep has to see it.
-  const old = brokenScript(...OLD_SHIFT_E);
+  const old = await brokenModule(OLD_SHIFT_E);
   const caught = await sweep(old, (c) => c.key === "e");
   assert.ok(caught.some(({ chord }) => chord.shiftKey), "the sweep did not catch the old Shift+E, so it proves nothing");
 });

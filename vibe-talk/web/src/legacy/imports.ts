@@ -1,4 +1,4 @@
-export { createApplication } from "../app/index.ts";
+export { createApplication, createKeyboardComposition } from "../app/index.ts";
 // What the legacy page script (web/voice.js) takes from the modules, and nothing else.
 //
 // `#624 voice-page-modularity`. The page's code moves out of web/voice.js into these modules a
@@ -81,7 +81,7 @@ export {
   unsentText,
   waitingItsTurn as outboxWaitingItsTurn,
 } from "../core/outbox/index.ts";
-export { DEFAULT_CARD_MAX_LINES, DEFAULT_COLLAPSED_LINES, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, createCardMaxLines, createCollapsedLines, createCredentials, createDeviceSettings, createEnterSends, createInAppLinks, createKeptSwitch, createQuoteReadPercent, createSettingsSync, createSingleKeys } from "../core/settings/index.ts";
+export { DEFAULT_CARD_MAX_LINES, DEFAULT_COLLAPSED_LINES, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, createCardMaxLines, createCollapsedLines, createCredentials, createDeviceSettings, createEnterSends, createInAppLinks, createKeptSwitch, createQuoteReadPercent, createSettingsSync } from "../core/settings/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
 export {
   childByClass,
@@ -102,7 +102,7 @@ export {
   shownNode,
   tagNameOf,
 } from "../view/dom/index.ts";
-export { KEYS_MESSAGE, KEYS_MOVING, KEYS_PAGE, KEYS_VIEW, KEYS_WRITING, SCREEN_TITLES, createActionMenu, createChannelKeys, createChipsOverComposer, createDoneKeys, createFoldKeys, createHighlightCopy, createKeyDispatch, createKeyHints, createKeySelection, createKeyTiming, createKeymap, createPointerSelection, createPromptsTray, createReadCollapse, createPageNavigation, createReaderRow, createReplySight, createRowKeys, createRowShortcuts, createScreenKeys, createScreens, createScreenShowing, createScrollKeys, createSelectionKeys, createShellNotices, createUndoOffer, createUndoStamps, createViewKeys, createWriteKeys, keyTimingLine, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow } from "../view/shell/index.ts";
+export { SCREEN_TITLES, createActionMenu, createChipsOverComposer, createPromptsTray, createPageNavigation, createReaderRow, createReplySight, createScreens, createScreenShowing, createShellNotices, createUndoOffer, createUndoStamps, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow } from "../view/shell/index.ts";
 export {
   COMPOSER_FIELDS,
   NEWLINE_KEYS,
@@ -125,7 +125,8 @@ export { briefAge, dayClock, dayKeyOf, fullLocalAt, fullLocalTime, messageTimeLa
 
 export { doneReadWords, failureWords, fmtDuration, localReadWords, messagesWords, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, repliesWalkWords, searchMomentWords, serviceReadWords } from "../present/notices/index.ts";
 export { AUTHOR_FILTERS, CARD_STATES, LINK_KINDS, LINK_KINDS_KEY, READ_MODES, READ_MODE_KEY, READ_MODE_SAID, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, UNPACK_MODE_NAMES, UNPACK_MODE_SAID, authorEmptyWords, bookmarkSpot, cardGapWords, cardProxyLines, cardRunText, collapsedLinesWords, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, createReadRuns, createThreadOrder, editedDrawn, firstLineOf, foldedCardText, forgetElisionCounts, gapWords, hiddenKindWords, inThreadOrder, isNoise, linkKindCountText, mainRunsAmong, messageLook, nextAuthorFilter, proxyLinesOf, quoteBlock, quoteMarksRead, quoteShare, rawTextOf, reactionsDrawn, readRunText, renderedHtmlOf, replyMarkerName, rowEdited, savedReadMode, seamPlan, threadChoice, threadFacts, threadOrderAfter, undoLabel, undoName, upstreamUrlOf } from "../present/rows/index.ts";
-export { DAY_TITLED, PULL_WAIT_MS, QUOTE_REPLY_TITLE, RESTATED_CLASS, anchorOfRow, anchorsAmong, authorLabel, authorPasses, cardGapGroups, cardGapTally, cardMarkTarget, cardRunIds, cardStubText, cardUnits, createArming, createAuthorFilter, createBookmarkLines, createCardFlight, createCardPlaces, createCardsDrawn, createColumnLinks, createColumnWork, createFilterChanges, createFootRooms, createInputKinds, createLastPane, createLayoutShown, createLinkedMark, createPackSlides, createPinSync, createPullToRefresh, createQuoting, createReplyState, createRowDrawing, createRowGestures, createScrollKeeping, createSeamLines, createSummaryWatch, createThreadHues, createUnderLists, createUnpackWatch, doneButtonOf, fillCardText, findableParts, foldedTextLine, freshenDayTitle, fromGatheredThread, gutterPiece, idsOf, isMessageRow, keepCardUnits, markCardLayout, messageTop, mountChannelViewControls, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, pointerOn, quoteLabelFits, renderedText, rowIn, rowMessages, rowNewestMs, rowSentMs, rowShown, rowTime, rowTimeTabStop, sameCardPlace, setArrowReach, setMarkerLift, shownRowFor, stackUnder, standingRow, textHits, textRunsOf } from "../view/channel/index.ts";
+export { AUTHOR_FILTERS, CARD_STATES, LINK_KINDS, LINK_KINDS_KEY, READ_MODES, READ_MODE_KEY, READ_MODE_LABELS, READ_MODE_SAID, READ_MODE_TITLES, READ_MODE_VERBS, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, UNPACK_MODE_NAMES, UNPACK_MODE_SAID, authorEmptyWords, bookmarkSpot, cardGapWords, cardProxyLines, cardRunText, collapsedLinesWords, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, createReadRuns, createThreadOrder, editedDrawn, firstLineOf, foldedCardText, forgetElisionCounts, gapWords, hiddenKindWords, inThreadOrder, isNoise, joinsGroup, linkKindCountText, mainRunsAmong, messageLook, nextAuthorFilter, nextReadMode, proxyLinesOf, quoteBlock, quoteMarksRead, quoteShare, rawTextOf, reactionsDrawn, readRunText, renderedHtmlOf, replyMarkerName, rowEdited, savedReadMode, seamPlan, threadChoice, threadFacts, threadOrderAfter, undoLabel, undoName, upstreamUrlOf } from "../present/rows/index.ts";
+>>>>>>> 0f471ea5 (vibe-talk: the keyboard graph composes from app)
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
 
