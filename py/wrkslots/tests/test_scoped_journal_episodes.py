@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import subprocess
@@ -17,6 +18,7 @@ from wrkslots.tests.test_lifecycle import (
     create,
     make_project,
     mark_owner_dead,
+    raw_command,
     raw_command_with_census_authority_stub,
     remove_completed_validation,
     set_liveness,
@@ -248,6 +250,269 @@ def test_create_retried_after_abort_recovers_its_interruption(
         "slot01"
     ]
     assert not journal.exists()
+
+
+def _advanced_journal(journal: Mapping[str, object], seconds: int) -> dict[str, object]:
+    """The next create progress: the same journal one heartbeat later."""
+
+    heartbeat = dt.datetime.fromisoformat(str(journal["heartbeat_at"]))
+    return {
+        **journal,
+        "heartbeat_at": (heartbeat + dt.timedelta(seconds=seconds)).isoformat(
+            timespec="seconds"
+        ),
+    }
+
+
+def _lagging_validate_create(
+    tmp_path: Path,
+) -> tuple[Path, wrkslots.Config, Path, dict[str, object], dict[str, object]]:
+    """An interrupted validate create whose next progress exists only as an event.
+
+    Returns the project, config, journal path, the on-disk (stale) journal and
+    the latest progress journal the event log already carries.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    interrupted = create(
+        project,
+        slot="target",
+        slot_type="validate",
+        branch=None,
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    path = wrkslots._create_journal_path(config, "target")
+    stale = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(stale, dict)
+    return project, config, path, stale, _advanced_journal(stale, 1)
+
+
+def _progress_payload(
+    path: Path, journal: Mapping[str, object]
+) -> dict[str, object]:
+    return {
+        "slot": "target",
+        "operation": "create",
+        "journal_path": path.name,
+        "journal": dict(journal),
+    }
+
+
+def _append_progress_durable(
+    config: wrkslots.Config, path: Path, journal: Mapping[str, object]
+) -> None:
+    wrkslots._write_event_file(
+        config,
+        "testhost",
+        "operation-progress-recorded",
+        _progress_payload(path, journal),
+    )
+
+
+def _append_progress_temp(
+    config: wrkslots.Config, path: Path, journal: Mapping[str, object]
+) -> Path:
+    """Write the next progress event as a complete temp file, never renamed."""
+
+    events = wrkslots._load_events(config, "testhost")
+    sequence = len(events) + 1
+    previous = "0" * 64 if not events else str(events[-1]["sha256"])
+    core: dict[str, object] = {
+        "schema": wrkslots.EVENT_SCHEMA,
+        "machine": "testhost",
+        "sequence": sequence,
+        "previous_sha256": previous,
+        "recorded_at": wrkslots._utc_now(),
+        "kind": "operation-progress-recorded",
+        "payload": _progress_payload(path, journal),
+    }
+    event = {**core, "sha256": wrkslots._event_digest(core)}
+    temp = wrkslots._event_directory(config, "testhost") / (
+        f"{sequence:020d}.json.tmp.4242.cafef00d"
+    )
+    temp.write_text(
+        json.dumps(event, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return temp
+
+
+def _refuse_ownerless_cleanup(
+    project: Path, config: wrkslots.Config, *, discard_partial: bool
+) -> subprocess.CompletedProcess[str]:
+    """Plain recover that must refuse the ownerless cleanup it was also asked for."""
+
+    target = wrkslots._slot_directory(config, "target", "validate")
+    flags = ["--discard-partial"] if discard_partial else []
+    return raw_command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        *flags,
+        "--ownerless-validate-checkout",
+        str(target),
+    )
+
+
+def _abort_then_recreate(project: Path) -> None:
+    aborted = _abort_create(project)
+    assert aborted.returncode == 0, aborted.stderr
+    assert active_slots(project) == []
+    made = create(project, slot="target", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    assert [row["slot"] for row in active_slots(project) if isinstance(row, dict)] == [
+        "target"
+    ]
+
+
+def test_recover_rolls_forward_a_create_journal_behind_a_promoted_event(
+    tmp_path: Path,
+) -> None:
+    """Exact crash sequence: event temp written, rename and journal rewrite lost."""
+
+    project, config, path, _stale, latest = _lagging_validate_create(tmp_path)
+    temp = _append_progress_temp(config, path, latest)
+
+    recovered = _refuse_ownerless_cleanup(project, config, discard_partial=True)
+
+    assert recovered.returncode == 3, recovered.stdout + recovered.stderr
+    assert "recovered append-only event" in recovered.stdout
+    assert "rolled forward scoped create journal" in recovered.stdout
+    assert "ownerless validation cleanup is coordinator-owned" in recovered.stderr
+    assert not temp.exists()
+    assert json.loads(path.read_text(encoding="utf-8")) == latest
+    _abort_then_recreate(project)
+
+
+def test_plain_recover_rolls_forward_a_lagging_journal_before_refusing(
+    tmp_path: Path,
+) -> None:
+    """Already-promoted lag, no temp file: plain recover repairs, then refuses."""
+
+    project, config, path, _stale, latest = _lagging_validate_create(tmp_path)
+    _append_progress_durable(config, path, latest)
+
+    blocked = create(project, slot="other", slot_type="validate", branch=None)
+    assert blocked.returncode == 3, blocked.stdout + blocked.stderr
+    assert "differs from append-only progress evidence" in blocked.stderr
+
+    recovered = _refuse_ownerless_cleanup(project, config, discard_partial=False)
+
+    assert recovered.returncode == 3, recovered.stdout + recovered.stderr
+    assert "rolled forward scoped create journal" in recovered.stdout
+    assert "ownerless validation cleanup is coordinator-owned" in recovered.stderr
+    assert json.loads(path.read_text(encoding="utf-8")) == latest
+    _abort_then_recreate(project)
+
+
+def test_recover_refuses_a_journal_two_steps_behind(tmp_path: Path) -> None:
+    project, config, path, stale, latest = _lagging_validate_create(tmp_path)
+    _append_progress_durable(config, path, latest)
+    _append_progress_durable(config, path, _advanced_journal(latest, 1))
+    before = path.read_bytes()
+
+    recovered = raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "target",
+    )
+
+    assert recovered.returncode == 3, recovered.stdout + recovered.stderr
+    assert "differs from append-only progress evidence" in recovered.stderr
+    assert "rolled forward" not in recovered.stdout
+    assert path.read_bytes() == before
+    assert json.loads(path.read_text(encoding="utf-8")) == stale
+
+
+def test_recover_refuses_a_lagging_journal_with_the_wrong_identity(
+    tmp_path: Path,
+) -> None:
+    project, config, path, stale, latest = _lagging_validate_create(tmp_path)
+    _append_progress_durable(config, path, latest)
+    forged = {**stale, "operation_id": "0" * 32}
+    path.write_text(json.dumps(forged, indent=2, sort_keys=True) + "\n", "utf-8")
+    before = path.read_bytes()
+
+    recovered = raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "target",
+    )
+
+    assert recovered.returncode == 3, recovered.stdout + recovered.stderr
+    assert "differs from append-only progress evidence" in recovered.stderr
+    assert "rolled forward" not in recovered.stdout
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("operation", ("create", "finish"))
+def test_roll_forward_target_accepts_exactly_one_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """Create and finish share the window: one step rolls, two do not."""
+
+    _project, _repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(_project), "testhost")
+    path = (
+        wrkslots._create_journal_path(config, "target")
+        if operation == "create"
+        else wrkslots._finish_journal_path(config, "target")
+    )
+
+    def journal(step: int) -> dict[str, object]:
+        base: dict[str, object] = {
+            "kind": operation,
+            "slot": "target",
+            "machine": "testhost",
+        }
+        if operation == "create":
+            base.update({"created": [], "hook_progress": step, "operation_id": "a" * 32})
+        else:
+            base.update({"phase": "prepared" if step == 0 else "fenced", "fenced": "b" * 32})
+        return base
+
+    def event(step: int) -> dict[str, object]:
+        return {
+            "kind": "operation-progress-recorded",
+            "payload": {
+                "slot": "target",
+                "operation": operation,
+                "journal_path": path.name,
+                "journal": journal(step),
+            },
+        }
+
+    monkeypatch.setattr(
+        wrkslots, "_load_events", lambda *_a, **_k: [event(0), event(1)]
+    )
+    assert wrkslots._scoped_journal_roll_forward_target(
+        config, path, journal(0), operation
+    ) == journal(1)
+    assert (
+        wrkslots._scoped_journal_roll_forward_target(
+            config, path, journal(1), operation
+        )
+        is None
+    )
+    monkeypatch.setattr(
+        wrkslots, "_load_events", lambda *_a, **_k: [event(0), event(1), event(2)]
+    )
+    assert (
+        wrkslots._scoped_journal_roll_forward_target(
+            config, path, journal(0), operation
+        )
+        is None
+    )
 
 
 def _abort_create(project: Path) -> subprocess.CompletedProcess[str]:

@@ -9998,6 +9998,143 @@ def _scoped_operation_journal_completed(
     return completed
 
 
+def _scoped_journal_roll_forward_target(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    operation: str,
+) -> Mapping[str, object] | None:
+    """Latest progress for a journal exactly one step behind, else ``None``.
+
+    Mirrors the episode walk in :func:`_scoped_operation_journal_completed`,
+    including its refusals for broken event history, but instead of requiring
+    the journal bytes to equal the latest progress it reports the one repair
+    ``recover`` may make: the on-disk journal equals the progress immediately
+    before the latest progress in the same, still-open episode (same
+    operation identity, exactly one step behind).  Anything else — current,
+    completed, two or more steps behind, or from another episode — returns
+    ``None`` and the strict check refuses as before.
+    """
+
+    label = f"scoped {operation} journal"
+    machine = _as_str(raw["machine"], f"{operation} journal.machine")
+    recorded: Mapping[str, object] | None = None
+    completed = False
+    current: str | None = None
+    retired: set[str] = set()
+    episode: list[Mapping[str, object]] = []
+    for event in _load_events(config, machine):
+        event_kind = _as_str(event["kind"], "append-only event.kind")
+        if event_kind not in {"operation-progress-recorded", "operation-completed"}:
+            continue
+        payload = _as_mapping(event["payload"], "append-only event.payload")
+        journal = (
+            _as_mapping(payload.get("journal"), "append-only operation journal")
+            if event_kind == "operation-progress-recorded"
+            else None
+        )
+        event_path = _operation_event_journal_path(
+            config, machine, payload, journal=journal
+        )
+        if event_path != path:
+            continue
+        if event_kind == "operation-progress-recorded":
+            assert journal is not None
+            identity = _scoped_operation_identity(journal, operation)
+            if completed and (
+                not _scoped_operation_journal_opens(journal, operation)
+                or identity is None
+            ):
+                raise StateError(
+                    f"{label} path was reused after completion without a new "
+                    "operation"
+                )
+            if identity in retired:
+                raise StateError(
+                    f"{label} path was reopened with the identity of a completed "
+                    "operation"
+                )
+            if recorded is None or completed:
+                current = identity
+                episode = [journal]
+            elif identity != current:
+                raise StateError(
+                    f"{label} progress changed its operation identity"
+                )
+            else:
+                episode.append(journal)
+            recorded = journal
+            completed = False
+            continue
+        if recorded is None:
+            raise StateError(f"scoped {operation} completion has no preceding progress evidence")
+        if current is not None:
+            retired.add(current)
+        completed = True
+        episode = []
+    if recorded is None:
+        raise StateError(f"{label} has no matching append-only progress evidence")
+    if completed or _json_equal(raw, recorded):
+        return None
+    if len(episode) >= 2 and _json_equal(raw, episode[-2]):
+        return recorded
+    return None
+
+
+def _roll_forward_lagging_scoped_journals(config: Config) -> None:
+    """Repair scoped journals one step behind their event log (#1007).
+
+    ``recover`` only, under its mutation lock, before any other refusal: the
+    append-only events are authoritative, so a journal that equals the
+    previous progress in its episode is atomically rewritten from the latest
+    progress and the repair is persisted even when the rest of the run then
+    refuses.  Journals that do not qualify exactly are left untouched for the
+    strict provenance check to refuse.
+    """
+
+    paths = sorted(config.control.glob("CREATE.*.journal"))
+    paths += sorted(config.control.glob("FINISH.*.journal"))
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            continue
+        if sorted(path.parent.glob(f"{path.name}.tmp.*")):
+            continue
+        try:
+            contents, _identity = _read_regular_file_identity(
+                path, "recovery journal", 1024 * 1024
+            )
+            raw = _strict_json_object(contents, "recovery journal")
+        except (Refusal, StateError):
+            continue
+        operation = raw.get("kind")
+        if operation not in {"create", "finish"}:
+            continue
+        machine = raw.get("machine")
+        slot = raw.get("slot")
+        if not isinstance(machine, str) or not isinstance(slot, str):
+            continue
+        try:
+            expected = (
+                _create_journal_path(config, slot, machine)
+                if operation == "create"
+                else _finish_journal_path(config, slot, machine)
+            )
+        except (Refusal, StateError):
+            continue
+        if path != expected:
+            continue
+        target = _scoped_journal_roll_forward_target(
+            config, path, raw, str(operation)
+        )
+        if target is None:
+            continue
+        _atomic_write_json(path, dict(target))
+        print(
+            f"rolled forward scoped {operation} journal {path.name} "
+            "to latest append-only progress evidence"
+        )
+
+
 def _scoped_create_journal_completed(
     config: Config,
     path: Path,
@@ -45248,6 +45385,10 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
                 require_filename=False,
             )
             _forget_event_chain(_event_directory(config, machine), machine)
+            # Promotion is kept even under --discard-partial: the temp passed
+            # full digest/chain/sequence validation, so discarding it would
+            # lose a completed step.  _cmd_recover rolls any journal this
+            # promotion leaves behind forward in the same run (#1007).
             os.replace(leftover, target)
             _fsync_directory(target.parent)
             _load_events(config, machine)
@@ -64459,6 +64600,12 @@ def _cmd_recover(
     with _mutation_locks(config, args.wait_lock):
         _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
         recovered_partial = _recover_partial_updates(config, args.discard_partial)
+        # #1007 create-journal-rollforward: the promotion above (or an
+        # earlier crash after the event rename) can leave a scoped journal
+        # one progress step behind its authoritative event log.  Roll it
+        # forward now, before any other refusal in this run, and persist the
+        # repair even when the rest of the run then refuses.
+        _roll_forward_lagging_scoped_journals(config)
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         if (
             recovered_partial
