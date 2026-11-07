@@ -201,7 +201,14 @@ class Sessions(ManagedAgents):
 
     def status(self, name: str) -> dict[str, object]:
         """Distinguish saved lifecycle, runtime liveness, and supported operations."""
-        return self._status_record(self._load(name))
+        record = self._load(name)
+        result = self._status_record(record)
+        # As in the base status: flag a live lane with no native session (#948).
+        if (record.lifecycle == "running"
+                and record.harness in ("muse", "codex")
+                and result.get("native_session") is None):
+            result["native_session_missing"] = True
+        return result
 
     def _status_record(self, record: AgentRecord) -> dict[str, object]:
         if record.adapter in ("herdr", "herdr-pane", "herdr-foreign", "herdr-relay"):

@@ -211,6 +211,121 @@ fn restore_remounts_first_revives_then_starts_units_and_is_idempotent() {
 }
 
 #[test]
+fn restore_refuses_an_ambiguous_muse_lane_per_lane_and_carries_on() {
+    // #948 conditions 1, 2 and 4: one dead Muse lane has no recorded
+    // session and the store holds two for its cwd, so its row refuses
+    // naming every candidate and the remedies; the other lane revives;
+    // the summary names the refused lane. A dry run lists the same
+    // refusal first and changes nothing.
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture
+        .client
+        .report_session
+        .store(false, Ordering::Relaxed);
+    let store = fixture.root.join("data/muse");
+    crate::subagents::revive::MUSE_STORE_ROOT.with(|cell| *cell.borrow_mut() = Some(store.clone()));
+    for id in [
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "cccccccc-cccc-cccc-cccc-cccccccccccc",
+    ] {
+        let dir = store.join("sessions/2026/11/06").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("session.jsonl"),
+            format!(
+                "{{\"cwd\":\"{}\",\"text\":\"fix the flaky shard\"}}\n",
+                fixture.root.display()
+            ),
+        )
+        .unwrap();
+    }
+    let dead = |fixture: &Fixture, name: &str, harness: &str| {
+        fixture
+            .manager()
+            .start(
+                name,
+                &fixture.root,
+                StartOptions {
+                    harness: harness.to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let record = fixture.manager().load(name).unwrap();
+        fixture
+            .client
+            .dead_panes
+            .lock()
+            .unwrap()
+            .insert(record.pane_id.clone().unwrap());
+        fixture.client.started.store(false, Ordering::Relaxed);
+    };
+    dead(&fixture, "lane", "muse");
+    // The lane that carries on is a Codex lane whose session Herdr
+    // reported at start, the shape restore already revives.
+    fixture.client.report_session.store(true, Ordering::Relaxed);
+    dead(&fixture, "other", "codex");
+    fixture
+        .client
+        .report_session
+        .store(false, Ordering::Relaxed);
+    let host = ScriptedHost::new();
+    let config = config(&fixture, None);
+    let registry = fixture.root.join("registry");
+
+    let dry = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config,
+        &RestoreOptions {
+            dry_run: true,
+            ..options(None)
+        },
+    )
+    .unwrap();
+    let dry_row = dry["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "lane")
+        .unwrap_or_else(|| panic!("no dry-run row for lane: {dry}"));
+    assert_eq!(dry_row["action"], "refused", "{dry}");
+    assert!(
+        dry_row["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        "{dry_row}"
+    );
+
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    crate::subagents::revive::MUSE_STORE_ROOT.with(|cell| *cell.borrow_mut() = None);
+    let rows = report["agents"].as_array().unwrap();
+    let lane = rows.iter().find(|row| row["name"] == "lane").unwrap();
+    assert_eq!(lane["action"], "refused", "{report}");
+    let reason = lane["reason"].as_str().unwrap_or_default();
+    for needle in [
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "cccccccc-cccc-cccc-cccc-cccccccccccc",
+        "last activity",
+        "fix the flaky shard",
+        "bind-session lane",
+        "anchor lane --replace --session-id",
+    ] {
+        assert!(reason.contains(needle), "{needle} missing from: {reason}");
+    }
+    let other = rows.iter().find(|row| row["name"] == "other").unwrap();
+    assert_eq!(other["action"], "revived", "{report}");
+    assert_eq!(report["refused"], 1, "{report}");
+    assert_eq!(report["refused_lanes"], json!(["lane"]), "{report}");
+}
+
+#[test]
 fn restore_queues_a_catch_up_for_each_revived_agent_without_blocking() {
     let fixture = Fixture::new();
     dead_agent(&fixture);

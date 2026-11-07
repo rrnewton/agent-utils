@@ -325,6 +325,41 @@ fn restart_exits_and_revives_in_the_same_pane() {
 }
 
 #[test]
+fn restart_resumes_the_launch_spec_session_when_the_top_level_field_is_empty() {
+    // #948 on the real restart path (#986): a lane whose session lives
+    // only in its launch spec (anchored before the top-level write)
+    // restarts into that session, not into a refusal.
+    let (fixture, mut old) = recoverable("muse", false);
+    let mut spec = old.launch_spec.clone().expect("start recorded a spec");
+    spec["native_session"] = json!({
+        "agent": "muse", "value": "sess-9", "source": "caller"
+    });
+    old.launch_spec = Some(spec);
+    old.native_session = None;
+    old.session_value = None;
+    old.resume = None;
+    fixture.manager().save(&old).unwrap();
+    let pane = old.pane_id.clone().unwrap();
+    fixture.client.dead_panes.lock().unwrap().remove(&pane);
+    fixture.client.started.store(true, Ordering::Relaxed);
+    fixture.client.custom_alive.store(true, Ordering::Relaxed);
+    fixture.client.exit_to_shell.store(true, Ordering::Relaxed);
+    let result = fixture
+        .manager()
+        .restart("worker", false, Duration::from_secs(30), TIMEOUT)
+        .unwrap();
+    assert_eq!(result["action"], "restarted", "{result}");
+    let new = fixture.manager().load("worker").unwrap();
+    assert!(
+        new.arguments
+            .windows(2)
+            .any(|pair| pair == ["resume", "sess-9"]),
+        "{:?}",
+        new.arguments
+    );
+}
+
+#[test]
 fn restart_refuses_an_unknown_session_without_touching_the_pane() {
     let (fixture, mut old) = recoverable("muse", false);
     old.native_session = None;
@@ -2252,8 +2287,7 @@ impl Drop for PretendMuseStore {
 #[must_use]
 fn pretend_muse_store(fixture: &Fixture) -> (PathBuf, PretendMuseStore) {
     let root = fixture.root.join("data/muse");
-    crate::subagents::revive::MUSE_STORE_ROOT
-        .with(|cell| *cell.borrow_mut() = Some(root.clone()));
+    crate::subagents::revive::MUSE_STORE_ROOT.with(|cell| *cell.borrow_mut() = Some(root.clone()));
     (root, PretendMuseStore)
 }
 
@@ -2418,6 +2452,69 @@ fn a_muse_lane_holding_two_sessions_is_recorded_as_unknown_and_says_so() {
 }
 
 #[test]
+fn a_muse_lane_records_the_session_the_store_names_by_pid_at_start() {
+    // #948 condition 3: the fd walk holds nothing (the runtime is not a
+    // descendant the walk can see), but the store names the session by
+    // the pinned pid, so start records it and restore never discovers.
+    let fixture = unreported();
+    let (store, _store_guard) = pretend_muse_store(&fixture);
+    let id = "88888888-8888-8888-8888-888888888888";
+    let runtime = store.join("runtime/muse/sessions");
+    fs::create_dir_all(&runtime).unwrap();
+    fs::write(
+        runtime.join(format!("{id}.json")),
+        json!({"session_id": id, "process_generation_hint": "pid=4242"}).to_string(),
+    )
+    .unwrap();
+    let _held = pretend_held(Vec::new());
+    let status = start_worker(&fixture, "muse");
+    assert!(status.get("native_session_missing").is_none(), "{status}");
+    let record = fixture.manager().load("worker").unwrap();
+    let native = record.native_session.clone().expect("captured at start");
+    assert_eq!(native.value, id);
+    assert_eq!(native.source, "observed");
+}
+
+#[test]
+fn doctor_names_a_live_muse_lane_whose_store_match_is_ambiguous() {
+    // #948 condition 4: the pre-reboot check. Several store sessions name
+    // the lane's cwd, so revive would refuse; doctor says so while the
+    // lane can still be bound by hand.
+    let fixture = unreported();
+    let (store, _store_guard) = pretend_muse_store(&fixture);
+    fake_muse_journal(
+        &store,
+        "99999999-9999-9999-9999-999999999999",
+        &fixture.root,
+    );
+    fake_muse_journal(
+        &store,
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        &fixture.root,
+    );
+    let _held = pretend_held(Vec::new());
+    start_worker(&fixture, "muse");
+    let report = fixture.manager().doctor(false).unwrap();
+    let row = report["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "worker")
+        .unwrap_or_else(|| panic!("no doctor row: {report}"));
+    let findings: Vec<&str> = row["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding.as_str().unwrap())
+        .collect();
+    assert!(findings.contains(&"native-session-missing"), "{findings:?}");
+    assert!(
+        findings.contains(&"native-session-ambiguous"),
+        "{findings:?}"
+    );
+}
+
+#[test]
 fn a_muse_lane_with_no_native_id_is_flagged_live_and_revives_through_the_single_store_match() {
     // #948: capture missed this lane entirely, so the record names no
     // session. Status flags it while it lives, and after archival the one
@@ -2437,7 +2534,9 @@ fn a_muse_lane_with_no_native_id_is_flagged_live_and_revives_through_the_single_
     let new = fixture.manager().load("worker").unwrap();
     assert_eq!(new.arguments, ["resume", id]);
     assert_eq!(
-        new.native_session.as_ref().map(|native| native.value.as_str()),
+        new.native_session
+            .as_ref()
+            .map(|native| native.value.as_str()),
         Some(id),
         "the store match was recorded"
     );

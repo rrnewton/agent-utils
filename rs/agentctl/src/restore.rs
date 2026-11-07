@@ -1860,10 +1860,20 @@ pub fn restore<A: ManagedApi + ?Sized>(
         }));
     }
     report["units"] = json!(units);
-    let refused = report["agents"].as_array().map_or(0, |rows| {
-        rows.iter().filter(|row| row["action"] == "refused").count()
-    });
+    let refused_lanes: Vec<Value> = report["agents"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| row["action"] == "refused")
+                .filter_map(|row| row["name"].as_str().map(|name| json!(name)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let refused = refused_lanes.len();
     report["refused"] = json!(refused);
+    // The summary names every refused lane, so a boot log shows at a
+    // glance which lanes still need a hand-bound session (#948).
+    report["refused_lanes"] = json!(refused_lanes);
     // Loud: every agent that lost its conversation, the coordinator included.
     let fresh_starts: Vec<Value> = std::iter::once(&report["coordinator"])
         .chain(report["agents"].as_array().into_iter().flatten())

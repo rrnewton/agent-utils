@@ -141,7 +141,7 @@ enum Commands {
     Promote(Promote),
     /// Bring the coordinator team back after the host restarts: remount slot images, wait for Herdr, revive the coordinator and then every dead agent from its launch spec, managers before the agents they manage, register the coordinator's new pane in other registries, start the configured units, and queue one recovery notice. Idempotent; writes a JSON report for the boot
     #[command(
-        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl restore --dry-run\n  agentctl --registry ~/project/.agentctl restore --boot\n\nConfiguration is REGISTRY/restore.json (schema agentctl-restore/v1): coordinator (default: the\nregistry's designated coordinator; when both are set and disagree, restore.json wins and the report\nsays so under designation_problem), also_registered\n([{registry, name}]), units, exclude (names to leave alone), startup_delay_seconds (default 20), herdr_wait_seconds (default 300),\nreport_dir (default $XDG_STATE_HOME/agentctl/restore), herdr_unit, timers (used by watch), and scheduled ([{name, on_calendar, command}], rendered as persistent timer units by install-units --scheduled).\nThe slot manager is AGENTCTL_WRKSLOTS_BIN, then profiles.json \"wrkslots\", then PATH; restore runs\n`wrkslots image status` once, before any agent starts, so image-backed slots are mounted.\nA completed restore for this boot makes a rerun exit 0 at once unless --force. Exit 0 when the\nrestore completed with no refusal, 75 otherwise; every step and refusal is in the report."
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl restore --dry-run\n  agentctl --registry ~/project/.agentctl restore --boot\n\nConfiguration is REGISTRY/restore.json (schema agentctl-restore/v1): coordinator (default: the\nregistry's designated coordinator; when both are set and disagree, restore.json wins and the report\nsays so under designation_problem), also_registered\n([{registry, name}]), units, exclude (names to leave alone), startup_delay_seconds (default 20), herdr_wait_seconds (default 300),\nreport_dir (default $XDG_STATE_HOME/agentctl/restore), herdr_unit, timers (used by watch), and scheduled ([{name, on_calendar, command}], rendered as persistent timer units by install-units --scheduled).\nThe slot manager is AGENTCTL_WRKSLOTS_BIN, then profiles.json \"wrkslots\", then PATH; restore runs\n`wrkslots image status` once, before any agent starts, so image-backed slots are mounted.\nA completed restore for this boot makes a rerun exit 0 at once unless --force. Exit 0 when the\nrestore completed with no refusal; 74 when it completed except for refused lanes (named in the\nreport's refused_lanes; not a failure a boot unit should retry); 75 otherwise. Every step and\nrefusal is in the report."
     )]
     Restore(Restore),
     /// Write the user units that restore the team at boot: a persistent herdr-server.service, the agent-restore.service boot hook, agent-watch.service, and a drop-in that orders the chat bridge after Herdr and restarts it on failure (start limits stay with the bridge's own policy). With --bridge NAME, write only that bridge's persistent unit (agentctl-bridge-NAME.service) instead of a transient. With --scheduled, write only the persistent timer/service pairs the team spec names. Never enables, starts, or reloads anything
@@ -3391,7 +3391,17 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             }
             let done = report["action"] == "already-restored"
                 || (report["complete"] == true && report["refused"] == 0);
-            return Ok(if done || value.dry_run { 0 } else { 75 });
+            // Some lanes refused (74): everything else completed, so a
+            // boot unit must not retry this as a failure; the refused
+            // lanes are named in the report's refused_lanes (#948).
+            let some_refused = report["complete"] == true && report["refused"] != 0;
+            return Ok(if done || value.dry_run {
+                0
+            } else if some_refused {
+                74
+            } else {
+                75
+            });
         }
         Commands::Watch(value) => {
             let client = HerdrClient::with_executable("direct", &args.herdr_bin)

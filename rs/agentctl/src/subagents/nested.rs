@@ -654,6 +654,19 @@ impl AgentRecord {
             .filter(|_| !self.session_asserted())
     }
 
+    /// The record's native session, or the one its launch spec recorded when
+    /// the top-level field is empty (#948): anchor wrote only the spec, so a
+    /// reader that stops at the top-level field calls a recorded session none.
+    pub(super) fn effective_native_session(&self) -> Option<NativeSession> {
+        if let Some(native) = &self.native_session {
+            return Some(native.clone());
+        }
+        let native = &self.launch_spec.as_ref()?["native_session"];
+        let value = native["value"].as_str()?;
+        let source = native["source"].as_str().unwrap_or("asserted");
+        Some(NativeSession::new(&self.harness, value, source))
+    }
+
     /// The `(session_agent, session_value)` pair a delivery target pins.
     pub(super) fn routing_session(&self) -> (Option<String>, Option<String>) {
         if self.session_asserted() {

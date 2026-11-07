@@ -295,61 +295,6 @@ pub(super) fn discover_claude_session(
         .map(|transcript| NativeSession::new("claude", &transcript.session, "observed"))
 }
 
-/// Discover a Muse session for `record`: newest `session.jsonl` under
-/// `~/.local/share/muse/sessions/` whose head mentions the record's cwd;
-/// the session id is its directory name. The session-index.db SQLite
-/// database is the index of the same facts; the files are read directly.
-pub(super) fn discover_muse_session(record: &AgentRecord) -> Option<NativeSession> {
-    if record.harness != "muse" {
-        return None;
-    }
-    #[cfg(test)]
-    {
-        None
-    }
-    #[cfg(not(test))]
-    {
-        let root = crate::harness::home()?.join(".local/share/muse/sessions");
-        let mut best: Option<(std::time::SystemTime, String)> = None;
-        let mut stack = vec![root];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if path.file_name().and_then(|name| name.to_str()) != Some("session.jsonl") {
-                    continue;
-                }
-                let Ok(bytes) = fs::read(&path) else { continue };
-                let head = String::from_utf8_lossy(&bytes[..bytes.len().min(65536)]);
-                if !head.contains(&record.cwd) {
-                    continue;
-                }
-                let Some(id) = path
-                    .parent()
-                    .and_then(|dir| dir.file_name())
-                    .and_then(|name| name.to_str())
-                    .filter(|id| valid_metadata_text(id))
-                else {
-                    continue;
-                };
-                let Ok(mtime) = entry.metadata().and_then(|meta| meta.modified()) else {
-                    continue;
-                };
-                if best.as_ref().is_none_or(|(when, _)| mtime > *when) {
-                    best = Some((mtime, id.to_owned()));
-                }
-            }
-        }
-        best.map(|(_, id)| NativeSession::new("muse", &id, "observed"))
-    }
-}
-
 /// Discover a Codex session for `record` (#741): newest `rollout-*-<thread>.jsonl` under
 /// `$CODEX_HOME/sessions` (default `~/.codex/sessions`) whose head mentions the record's cwd.
 pub(super) fn discover_codex_session(record: &AgentRecord) -> Option<NativeSession> {
@@ -370,6 +315,34 @@ pub(super) fn discover_codex_session(record: &AgentRecord) -> Option<NativeSessi
     }
 }
 
+/// One store session that names a record's cwd, with the evidence an
+/// operator needs to tell it apart from the others (#948).
+pub(super) struct MuseCandidate {
+    id: String,
+    cwd: String,
+    last_activity: std::time::SystemTime,
+    first_prompt: Option<String>,
+}
+
+impl MuseCandidate {
+    fn describe(&self) -> String {
+        let activity = self
+            .last_activity
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let prompt = self
+            .first_prompt
+            .as_deref()
+            .map(|text| format!(", first prompt {text:?}"))
+            .unwrap_or_default();
+        format!(
+            "{} (cwd {}, last activity {activity} unix seconds{prompt})",
+            self.id, self.cwd
+        )
+    }
+}
+
 /// What the Muse session store says about a record that names no session (#948).
 pub(super) enum MuseDiscovery {
     /// No session journal under the store names the record's cwd.
@@ -377,7 +350,48 @@ pub(super) enum MuseDiscovery {
     /// Exactly one does; revive may record and resume it.
     One(NativeSession),
     /// Several do; revive must not guess, and the caller names them.
-    Many(Vec<String>),
+    Many(Vec<MuseCandidate>),
+}
+
+/// The first prompt-like text in a session journal's head, if cheap to find:
+/// the first nonempty `text` or `prompt` string in its JSON records (nested
+/// `record_json` frames included), flattened and truncated.
+fn first_prompt_line(head: &str) -> Option<String> {
+    fn search(value: &Value) -> Option<String> {
+        match value {
+            Value::Object(map) => {
+                for (key, item) in map {
+                    if matches!(key.as_str(), "text" | "prompt") {
+                        if let Some(text) = item.as_str() {
+                            let flat: String =
+                                text.split_whitespace().collect::<Vec<_>>().join(" ");
+                            if !flat.is_empty() {
+                                return Some(flat.chars().take(120).collect());
+                            }
+                        }
+                    }
+                    if key == "record_json" {
+                        if let Some(text) = item.as_str() {
+                            if let Ok(inner) = serde_json::from_str::<Value>(text) {
+                                if let Some(found) = search(&inner) {
+                                    return Some(found);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(found) = search(item) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            Value::Array(items) => items.iter().find_map(search),
+            _ => None,
+        }
+    }
+    head.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|value| search(&value))
 }
 
 /// Discover a Muse session for `record` from the session store: dated session
@@ -395,7 +409,7 @@ pub(super) fn discover_muse_session(record: &AgentRecord) -> MuseDiscovery {
 }
 
 fn discover_muse_in(sessions: &Path, record: &AgentRecord) -> MuseDiscovery {
-    let mut ids: Vec<String> = Vec::new();
+    let mut candidates: Vec<MuseCandidate> = Vec::new();
     if let Ok(years) = fs::read_dir(sessions) {
         for year in years.flatten() {
             for month in fs::read_dir(year.path()).into_iter().flatten().flatten() {
@@ -410,8 +424,17 @@ fn discover_muse_in(sessions: &Path, record: &AgentRecord) -> MuseDiscovery {
                             continue;
                         }
                         if let Some(id) = session.file_name().to_str() {
-                            if valid_metadata_text(id) && !ids.iter().any(|seen| seen == id) {
-                                ids.push(id.to_owned());
+                            if valid_metadata_text(id)
+                                && !candidates.iter().any(|seen| seen.id == id)
+                            {
+                                candidates.push(MuseCandidate {
+                                    id: id.to_owned(),
+                                    cwd: record.cwd.clone(),
+                                    last_activity: fs::metadata(&journal)
+                                        .and_then(|meta| meta.modified())
+                                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                                    first_prompt: first_prompt_line(&head),
+                                });
                             }
                         }
                     }
@@ -419,11 +442,11 @@ fn discover_muse_in(sessions: &Path, record: &AgentRecord) -> MuseDiscovery {
             }
         }
     }
-    ids.sort();
-    match ids.as_slice() {
+    candidates.sort_by(|a, b| a.id.cmp(&b.id));
+    match candidates.as_slice() {
         [] => MuseDiscovery::None,
-        [id] => MuseDiscovery::One(NativeSession::new("muse", id, "observed")),
-        _ => MuseDiscovery::Many(ids),
+        [only] => MuseDiscovery::One(NativeSession::new("muse", &only.id, "observed")),
+        _ => MuseDiscovery::Many(candidates),
     }
 }
 
@@ -1083,7 +1106,7 @@ fn conversation(record: &AgentRecord) -> Result<NativeSession> {
             "recorded native conversation provider is incomplete or conflicts with the harness",
         ));
     }
-    let mut muse_many: Vec<String> = Vec::new();
+    let mut muse_many: Vec<MuseCandidate> = Vec::new();
     let native = record
         .native_session
         .clone()
@@ -1102,8 +1125,8 @@ fn conversation(record: &AgentRecord) -> Result<NativeSession> {
                 )
             })
         })
+        .or_else(|| record.effective_native_session())
         .or_else(|| discover_claude_session(&claude_config_roots(), record))
-        .or_else(|| discover_muse_session(record))
         .or_else(|| discover_codex_session(record))
         .or_else(|| match discover_muse_session(record) {
             MuseDiscovery::One(native) => Some(native),
@@ -1115,10 +1138,15 @@ fn conversation(record: &AgentRecord) -> Result<NativeSession> {
         })
         .ok_or_else(|| {
             if !muse_many.is_empty() {
+                let described = muse_many
+                    .iter()
+                    .map(MuseCandidate::describe)
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 return fail(format!(
-                    "record has no native conversation ID: {} muse sessions in the session store name its cwd ({}), and agentctl does not guess which one is its own; name it with `agentctl bind-session {} <id>`",
+                    "record has no native conversation ID: {} muse sessions in the session store name its cwd, and agentctl does not guess which one is its own: {described}; name yours with `agentctl bind-session {} <id>` or `agentctl anchor {} --replace --session-id <id>`",
                     muse_many.len(),
-                    muse_many.join(", "),
+                    record.name,
                     record.name
                 ));
             }
@@ -2599,9 +2627,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             )));
         }
         let recorded = record
-            .native_session
-            .as_ref()
-            .map(|native| native.value.clone())
+            .effective_native_session()
+            .map(|native| native.value)
             .or_else(|| record.session_value.clone())
             .or_else(|| record.resume.clone());
         let derived = self
@@ -2877,9 +2904,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 continue;
             }
             let session = record
-                .native_session
-                .as_ref()
-                .map(|native| native.value.clone())
+                .effective_native_session()
+                .map(|native| native.value)
                 .or_else(|| record.session_value.clone())
                 .or_else(|| record.resume.clone());
             let Some(pane) = record.pane_id.clone() else {
@@ -2936,6 +2962,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         Ok(json!({
             "caller": caller,
             "restarted": rows.iter().filter(|row| row["action"] == "restarted").count(),
+            // Every lane restart refused, by name, beside the count (#948).
+            "refused_lanes": rows
+                .iter()
+                .filter(|row| row["action"] == "failed")
+                .filter_map(|row| row["name"].as_str().map(|name| json!(name)))
+                .collect::<Vec<_>>(),
             "agents": rows,
         }))
     }
@@ -4415,8 +4447,16 @@ mod discovery_tests {
         for (id, pid, cwd) in locks {
             let dir = root.join("sessions/2026/11/06").join(id);
             fs::create_dir_all(&dir).unwrap();
-            fs::write(dir.join(".session.lock"), format!("pid={pid}\nhost=localhost\n")).unwrap();
-            fs::write(dir.join("session.jsonl"), format!("{{\"cwd\":\"{cwd}\"}}\n")).unwrap();
+            fs::write(
+                dir.join(".session.lock"),
+                format!("pid={pid}\nhost=localhost\n"),
+            )
+            .unwrap();
+            fs::write(
+                dir.join("session.jsonl"),
+                format!("{{\"cwd\":\"{cwd}\"}}\n"),
+            )
+            .unwrap();
         }
     }
 
@@ -4502,13 +4542,21 @@ mod discovery_tests {
             &[("33333333-3333-3333-3333-333333333333", 888, "/tmp/proj")],
         );
         match discover_muse_in(&root.join("sessions"), &record) {
-            MuseDiscovery::Many(ids) => assert_eq!(
-                ids,
-                [
-                    "11111111-1111-1111-1111-111111111111",
-                    "33333333-3333-3333-3333-333333333333"
-                ]
-            ),
+            MuseDiscovery::Many(candidates) => {
+                let ids: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
+                assert_eq!(
+                    ids,
+                    [
+                        "11111111-1111-1111-1111-111111111111",
+                        "33333333-3333-3333-3333-333333333333"
+                    ]
+                );
+                assert!(
+                    candidates[0].describe().contains("/tmp/proj"),
+                    "{}",
+                    candidates[0].describe()
+                );
+            }
             _ => panic!("expected several matches to refuse, not guess"),
         }
         let mut other = rec("/nowhere");

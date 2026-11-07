@@ -16,11 +16,14 @@ A Muse lane started on a harness checkout that already contains #916 muse-native
 - Find why #916's capture missed this start, for example a timing window or a start path that skips the capture, and fix the capture.
 - Revive fallback: when the record has no native id, look in Muse's session store for sessions whose working directory is the record's cwd or slot. Use the match only if exactly one is found, record it, and say so in the revive result. With zero or several matches, refuse and list the candidates.
 - Make this case visible before a reboot needs it: status/doctor flags a live Muse record that has no native id.
+- One session, every reader (scope added 2026-11-06): after `anchor NAME --replace --session-id ID`, the record's launch_spec.native_session was set (source caller) but the top-level native_session stayed null, including for Claude lanes. anchor --session-id and bind-session must also set the record's top-level native_session (keeping the source), and restart, restore and revive must fall back to launch_spec.native_session when the top-level field is empty, through one effective-session reader. `restart --when-idle` is not on main yet; the fallback belongs in the shared session resolution it will call (restart_with_resume), not in the new command alone.
 
 # Acceptance Criteria
 
 - A test reproduces the missed capture and shows it fixed.
 - A test revives a record with no native id through the single-match fallback; zero and several matches are refused with candidates listed.
+- A test anchors with --session-id and shows the top-level native_session set with its source kept, in status.
+- A test restarts (or revives) a record whose native session lives only in launch_spec and shows it resumes that session.
 
 # Notes
 

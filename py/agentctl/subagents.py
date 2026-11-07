@@ -3784,7 +3784,15 @@ class ManagedAgents:
 
     def status(self, name: str) -> dict[str, object]:
         """Report live state or a visible probe error, preserving every durable record."""
-        return self._status_record(self._load(name))
+        record = self._load(name)
+        result = self._status_record(record)
+        # A live lane whose conversation was never captured cannot be
+        # revived after a reboot; flag it while it can still be bound (#948).
+        if (record.lifecycle == "running"
+                and record.harness in ("muse", "codex")
+                and result.get("native_session") is None):
+            result["native_session_missing"] = True
+        return result
 
     def move_to_project_workspace(self, name: str) -> dict[str, object]:
         """Move one owned interactive pane to the configured project workspace.
@@ -4045,7 +4053,11 @@ class ManagedAgents:
         rows: list[dict[str, object]] = []
         for other_name in self._registered_names():
             try:
-                rows.append(self.status(other_name))
+                row = self.status(other_name)
+                # The missing-session flag belongs to a single status,
+                # not to fleet rows (the Rust list omits it too) (#948).
+                row.pop("native_session_missing", None)
+                rows.append(row)
             except HerdrRunError as exc:
                 rows.append({
                     "name": other_name,

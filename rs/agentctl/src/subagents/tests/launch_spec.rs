@@ -122,9 +122,16 @@ fn anchor_records_a_caller_conversation_and_refuses_a_contradiction() {
     assert_eq!(anchored["launch_spec_source"], "anchor");
     let record = fixture.manager().load("foreign").unwrap();
     assert_eq!(
-        record.launch_spec.unwrap()["native_session"],
+        record.launch_spec.as_ref().unwrap()["native_session"],
         json!({"agent": "codex", "value": "after-clear", "source": "caller"})
     );
+    // The caller-named session is also the record's top-level one, so
+    // status shows it without reading the spec (#948).
+    let native = record.native_session.as_ref().expect("top-level native");
+    assert_eq!(native.value, "after-clear");
+    assert_eq!(native.source, "asserted");
+    let status = fixture.manager().status("foreign").unwrap();
+    assert_eq!(status["native_session"]["value"], "after-clear", "{status}");
 
     let (reported, result) = adopted(Some(&[CODEX, "resume", "x"]), true);
     let session = result["session_value"].as_str().unwrap().to_owned();

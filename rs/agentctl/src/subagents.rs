@@ -6333,9 +6333,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             return false;
         }
         let recorded = record
-            .native_session
-            .as_ref()
-            .map(|native| native.value.clone())
+            .effective_native_session()
+            .map(|native| native.value)
             .or_else(|| record.session_value.clone())
             .or_else(|| record.resume.clone());
         let Some(recorded) = recorded else {
@@ -7595,6 +7594,29 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 record.harness
             )));
         }
+        // The caller-named session is the record's own, not only its spec's:
+        // status, restart and revive read the top-level field (#948).
+        if let Some(session) = session {
+            match &record.native_session {
+                Some(native) if native.value != session => {
+                    return Err(fail(format!(
+                        "session {session:?} contradicts the recorded native session of {:?}",
+                        record.name
+                    )));
+                }
+                _ => {
+                    // The spec keeps the "caller" source; the record's own
+                    // native vocabulary is observed/asserted, and a caller
+                    // naming the session asserts it. Align resume, which
+                    // validation requires to agree with the native session.
+                    record.native_session =
+                        Some(NativeSession::new(&record.harness, session, "asserted"));
+                    if record.resume.is_some() {
+                        record.resume = Some(session.to_owned());
+                    }
+                }
+            }
+        }
         self.save(&record)?;
         Ok(json!({
             "name": agent_name,
@@ -7663,6 +7685,28 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         };
         record.launch_spec = Some(spec);
+        // As in anchor: a caller-named session is the record's own (#948).
+        if let Some(session) = session {
+            match &record.native_session {
+                Some(native) if native.value != session => {
+                    return Err(fail(format!(
+                        "session {session:?} contradicts the recorded native session of {:?}",
+                        record.name
+                    )));
+                }
+                _ => {
+                    // The spec keeps the "caller" source; the record's own
+                    // native vocabulary is observed/asserted, and a caller
+                    // naming the session asserts it. Align resume, which
+                    // validation requires to agree with the native session.
+                    record.native_session =
+                        Some(NativeSession::new(&record.harness, session, "asserted"));
+                    if record.resume.is_some() {
+                        record.resume = Some(session.to_owned());
+                    }
+                }
+            }
+        }
         self.save(&record)?;
         Ok(json!({
             "name": record.name,
@@ -8769,10 +8813,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         // A live lane whose conversation was never captured cannot be
         // revived after a reboot; say so while it can still be bound (#948).
-        if matches!(record.harness.as_str(), "muse" | "codex")
-            && record.native_session.is_none()
-        {
+        // For Muse, name the worse case too: the store holds several
+        // sessions for its cwd, so revive would refuse, not discover.
+        if matches!(record.harness.as_str(), "muse" | "codex") && record.native_session.is_none() {
             findings.push("native-session-missing");
+            if record.harness == "muse"
+                && matches!(
+                    revive::discover_muse_session(record),
+                    revive::MuseDiscovery::Many(_)
+                )
+            {
+                findings.push("native-session-ambiguous");
+            }
         }
         match info.agent.as_deref() {
             None => findings.push("harness-exited"),
@@ -9291,6 +9343,24 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         });
         // Keep this generation's lifecycle lock through startup delivery and returned status.
         // Sending by name after releasing it can redirect the old brief into a replacement.
+        // Without a brief nothing else re-runs capture after launch, so a
+        // session the launch could not yet see would stay unrecorded (#948).
+        if options.brief.is_none()
+            && record.native_session.is_none()
+            && !record.extra.contains_key(revive::NATIVE_SESSION_UNKNOWN)
+        {
+            if let Some(warning) = revive::capture_held_session(&mut record) {
+                eprintln!("agentctl: warning: {warning}");
+            }
+            if let Some(warning) = self.guard_duplicate_capture(&mut record) {
+                eprintln!("agentctl: warning: {warning}");
+            }
+            if record.native_session.is_some()
+                || record.extra.contains_key(revive::NATIVE_SESSION_UNKNOWN)
+            {
+                self.save(&record)?;
+            }
+        }
         if let Some(brief) = options.brief {
             // A just-started harness may take longer than READBACK to print its first prompt;
             // it gets as long as it has to start working.
@@ -11546,7 +11616,10 @@ its drain would also type, so it was not queued",
             .session_value
             .clone()
             .or_else(|| record.resume.clone())
-            .or_else(|| record.observed_session_value().map(str::to_owned));
+            .or_else(|| record.observed_session_value().map(str::to_owned))
+            // A session anchor recorded only in the launch spec (or the
+            // top-level field bind-session wrote) still resumes (#948).
+            .or_else(|| record.effective_native_session().map(|native| native.value));
         // The whole tree, runtime first: a TERM to a wrapper alone (Muse's) orphans the
         // runtime, which then keeps the session while the relaunch resumes it (#920).
         if !self.client.end_harness(identity, Duration::from_secs(15))? {
