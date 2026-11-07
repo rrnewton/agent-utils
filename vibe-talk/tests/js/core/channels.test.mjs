@@ -803,3 +803,40 @@ test("thread presence: what the last page said, yes while a thread is open, noth
   presence.forget();
   assert.equal(presence.any(), false);
 });
+
+test("`#624 voice-page-modularity`: a step back's pure questions and the unpacked held rows, from the module alone", () => {
+  const { createOlderPager, emptyCanon, unpackHeldMessages, unpackMessages, unpackReadSignature } = CHANNELS;
+  const pager = createOlderPager();
+  assert.equal(pager.normaliseHasMore(true), true);
+  assert.equal(pager.normaliseHasMore(1), undefined);
+  assert.equal(pager.loadedIsWhole(undefined), undefined);
+  assert.equal(pager.loadedIsWhole(false), true);
+  assert.equal(pager.snowflakeOlder("9", "10"), true);
+  assert.equal(pager.snowflakeOlder("10", "9"), false);
+  const canon = emptyCanon("c");
+  const root = { id: "1", timestamp: "2026-01-01T00:00:00Z", thread: { id: "t", is_root: true } };
+  const reply = { id: "2", timestamp: "2026-01-01T00:01:00Z", thread: { id: "t", is_root: false } };
+  canon.messages = [root, reply];
+  const choice = { id: "t", root };
+  assert.deepStrictEqual(unpackHeldMessages(canon, choice, false), []);
+  assert.deepStrictEqual(unpackHeldMessages(canon, choice, true).map((m) => m.id), ["1", "2"]);
+  const filter = { empty: () => false, hiding: () => false, keeps: () => () => true, toDo: () => true };
+  assert.deepStrictEqual(unpackMessages(choice, [root, reply], false, filter).map((m) => m.id), ["2"]);
+  assert.equal(unpackReadSignature([root], new Set(), filter), "-1");
+});
+
+test("`#624 voice-page-modularity`: the saved rows' envelope is scoped to its token and trimmed, from the module alone", () => {
+  const { createMessageCache, MESSAGE_CACHE_KEY } = CHANNELS;
+  const store = new Map();
+  const storage = { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, v), removeItem: (k) => store.delete(k) };
+  const cache = createMessageCache({ storage, token: () => "tok-a", channels: () => [], stillToDo: () => true });
+  assert.equal(cache.readMessageCache().identity.length > 0, true);
+  const envelope = cache.readMessageCache();
+  cache.writeMessageCache(envelope, "c");
+  const stored = JSON.parse(store.get(MESSAGE_CACHE_KEY));
+  assert.equal(stored.identity, envelope.identity, "the envelope was not stored under its token's fingerprint");
+  const other = createMessageCache({ storage, token: () => "tok-b", channels: () => [], stillToDo: () => true });
+  assert.notEqual(other.readMessageCache().identity, envelope.identity, "another token kept this token's identity");
+  cache.dropMessageCache();
+  assert.equal(store.has(MESSAGE_CACHE_KEY), false, "dropping the cache left the envelope on the device");
+});

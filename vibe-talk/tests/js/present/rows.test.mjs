@@ -396,3 +396,13 @@ test("`#624 voice-page-modularity`: a message's upstream addresses are read only
   assert.equal(upstreamAppUrlOf({ upstream_app_url: "slack://channel?team=T1&id=C2&evil=1" }), null);
   assert.equal(upstreamAppUrlOf({ upstream_app_url: "https://example.com" }), null);
 });
+
+test("`#624 voice-page-modularity`: how fresh the rows are said to be, and All's bounded notice, from the module alone", () => {
+  const { staleWords, allNoticeWords } = ROWS;
+  assert.match(staleWords("saved", Date.UTC(2026, 0, 1), false, "messages", () => "Slack"), /^Showing messages saved /);
+  assert.equal(staleWords("fresh", Date.UTC(2026, 0, 1), false, "messages", () => "Slack"), "");
+  assert.match(staleWords("slow", Date.UTC(2026, 0, 1), false, "messages", () => "Slack"), /is slow to answer/);
+  const notice = "Some threads' replies are not in All";
+  assert.equal(allNoticeWords(notice, { threading: false, view: "flat", messages: [], tally: { threads: new Map() } }), notice);
+  assert.equal(allNoticeWords("other words", { threading: true, view: "flat", messages: [], tally: { threads: new Map() } }), "other words");
+});

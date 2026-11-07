@@ -3970,7 +3970,7 @@ test("a queued read standing for triggers that read differently is a delta only 
   // waiting reads a delta; neither outranks the other, so the read standing for both is full.
   const probe = `${SCRIPT}\n;el("scroll-area").queueProbe = {\n` +
     "  queue: queueDiscordLoad,\n" +
-    "  cursor: () => { const held = channelReads.pending(columns.main); return forwardCursor(held && held.reason); },\n" +
+    "  cursor: () => { const held = channelReads.pending(columns.main); return timelineReader.forwardCursor(held && held.reason); },\n" +
     "  clear: () => { channelReads.drop(columns.main); channelReads.drop(columns.side); },\n};\n";
   const { page, server } = await forwardPage({ complete: false }, null, probe);
   const arriving = server.post(message({ id: "385", content: "learns what the deltas carry" }));

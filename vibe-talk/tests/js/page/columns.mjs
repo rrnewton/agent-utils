@@ -1107,7 +1107,7 @@ test("`#231 two-column-polish`: on a channel whose changes carry additions alone
   assert.ok(ids.includes("205"), "the live reply left the thread on the right");
   // The control: any read of the thread since counts, a read of what changed too. The edit's read is
   // then collapsed into one that could not carry it, and the edit is never shown.
-  const control = await edited(brokenScript("    (sent.full || forwardCursor(reason) !== null);", "    true;"));
+  const control = await edited(brokenScript("    (sent.full || timelineReader.forwardCursor(reason) !== null);", "    true;"));
   assert.deepStrictEqual(control.reads, ["main", "thread delta"],
     "the negative control still read the thread in full, so the check above proves nothing");
   assert.doesNotMatch(control.text, /corrected/);

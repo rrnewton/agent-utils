@@ -503,7 +503,7 @@ function voiceCall() {
     set heardTyped(value) { voiceTranscript().heardTyped = value; },
     get el() { return el; },
     get reportAnswerOutcome() { return voiceTranscript().reportAnswerOutcome; },
-    get storedExactly() { return storedExactly; },
+    get storedExactly() { return messageCache.storedExactly; },
     get deviceStorage() { return deviceStorage; },
     get fitGrowingBox() { return fitGrowingBox; },
     get leftEl() { return leftEl; },
@@ -671,7 +671,7 @@ function voiceTranscript() {
     get jumpToSentMessage() { return jumpToSentMessage; },
     get keepTurnFold() { return voiceCall().keepTurnFold; },
     get liveFollowers() { return liveFollowers; },
-    get normaliseHasMore() { return normaliseHasMore; },
+    get normaliseHasMore() { return olderPager.normaliseHasMore; },
     get noteTypedTurn() { return voiceCall().noteTypedTurn; },
     get placeChipsOverComposer() { return placeChipsOverComposer; },
     get preservingScroll() { return preservingScroll; },
@@ -2304,7 +2304,7 @@ const channelContexts = new Map();
  *
  * @type {import("./src/core/outbox/index.ts").ChannelDrafts}
  */
-const channelDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeRoom: () => dropMessageCache() });
+const channelDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeRoom: () => messageCache.dropMessageCache() });
 
 /**
  * `#819 voice-page-quoted-reply-and-draft-chip`. What was written in quick replies and not sent, by channel,
@@ -2312,7 +2312,7 @@ const channelDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeR
  *
  * @type {import("./src/core/outbox/index.ts").ChannelDrafts}
  */
-const quickDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeRoom: () => dropMessageCache(), key: QUICK_DRAFTS_KEY });
+const quickDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeRoom: () => messageCache.dropMessageCache(), key: QUICK_DRAFTS_KEY });
 
 /**
  * `#819 voice-page-quoted-reply-and-draft-chip`. Every draft by where it is written, its channel and when it
@@ -2321,7 +2321,7 @@ const quickDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeRoo
  *
  * @type {import("./src/core/outbox/index.ts").DraftLedger}
  */
-const draftLedger = createDraftLedger({ storage: deviceStorageOnUse(), makeRoom: () => dropMessageCache(), now: () => Date.now() });
+const draftLedger = createDraftLedger({ storage: deviceStorageOnUse(), makeRoom: () => messageCache.dropMessageCache(), now: () => Date.now() });
 
 /**
  * A column's own record of its message box (`#624 voice-page-modularity`, plan step 15, as
@@ -2363,7 +2363,7 @@ const OUTGOING_PROGRESS_MS = 2000;
  */
 const outbox = createOutboxStore({
   storage: deviceStorageOnUse(),
-  makeRoom: () => dropMessageCache(),
+  makeRoom: () => messageCache.dropMessageCache(),
   keepsOwnPosts: (channel) => storeKeepsOwnPosts(channel),
 });
 const outgoingObservations = new Map();
@@ -2418,7 +2418,7 @@ const CHANNEL_DRAFT_REFUSED = "This browser could not save the draft. Keep this 
 const dismissedSends = createDismissedSends({
   storage: deviceStorageOnUse(),
   now: () => Date.now(),
-  makeRoom: () => dropMessageCache(),
+  makeRoom: () => messageCache.dropMessageCache(),
   decode: (saved) => outgoingFromSaved(saved),
 });
 /**
@@ -7300,7 +7300,7 @@ function theServer() {
       token,
       // A token the server no longer accepts, or a read it refuses, ends this device's copy of
       // what that token read.
-      readRefused: dropMessageCache,
+      readRefused: () => messageCache.dropMessageCache(),
       // `remote-ops-audit` W7. Every timeline read the page sends passes here, and is counted as it
       // is sent, so a read given up on can tell whether any was sent after it (`abandonedReadStands`).
       asking: (type) => {
@@ -8433,14 +8433,17 @@ voiceCall().initializePageInstance();
 // refusal — deletes the whole envelope rather than filtering it. Messages that credential can no
 // longer read must not stay on the device.
 
-const MESSAGE_CACHE_KEY = "vibe-talk.voice.message-cache";
-const MESSAGE_CACHE_VERSION = 1;
-/** Rows kept per channel, newest first: its messages, and separately its thread cards. */
-const MESSAGE_CACHE_ROWS = 120;
-/** Channels kept at once; the least recently opened goes first. */
-const MESSAGE_CACHE_SCOPES = 12;
-/** The whole envelope, in UTF-16 code units — about 1.2 MB, leaving the quota to the outbox. */
-const MESSAGE_CACHE_CHARS = 600000;
+/**
+ * The device's saved copy of the channels' rows (web/src/core/channels `createMessageCache`,
+ * `#624 voice-page-modularity`), over the device's storage looked up on use, scoped to the token
+ * saved as it stands on each use. Here where the envelope it keeps stood.
+ */
+const messageCache = createMessageCache({
+  storage: deviceStorageOnUse(),
+  token,
+  channels: () => channelDirectory.channels(),
+  stillToDo: (message, done) => stillToDo(message, /** @type {any} */ (done)),
+});
 
 /**
  * A column's own record of its reads' state (`#624 voice-page-modularity`, plan step 15, as
@@ -8474,261 +8477,9 @@ function loadState() {
 // Kept per column: `loadState().refreshing` (`freshLoadState`, `#624 voice-page-modularity`).
 // Whether `/client-config` has answered in this page, as opposed to the saved shell standing in, is the server
 // facts' (`ServerFacts.configApplied`).
+
 /** The fingerprint of the token the channel rows on screen were read or drawn for (web/src/core/sync `createScreenIdentity`). */
 const screenIdentity = createScreenIdentity(tokenFingerprint(token()));
-
-/** A stable 64-bit label for a token. Not a secret and not a check: only "is it the same one". */
-function tokenFingerprint(value) {
-  if (!value) return "";
-  let a = 0x811c9dc5;
-  let b = 0x9747b28c;
-  for (let i = 0; i < value.length; i += 1) {
-    const c = value.charCodeAt(i);
-    a = Math.imul(a ^ c, 0x01000193);
-    b = Math.imul(b ^ c, 0x5bd1e995);
-    b ^= b >>> 13;
-  }
-  const hex = (n) => (n >>> 0).toString(16).padStart(8, "0");
-  return hex(a) + hex(b);
-}
-
-/** Write and read back: private browsing and a full quota both refuse silently or by throwing. */
-function storedExactly(key, encoded) {
-  try {
-    deviceStorage().setItem(key, encoded);
-    return deviceStorage().getItem(key) === encoded;
-  } catch (_error) {
-    return false;
-  }
-}
-
-function dropMessageCache() {
-  try {
-    deviceStorage().removeItem(MESSAGE_CACHE_KEY);
-  } catch (_error) {
-    // Nothing was readable either, so nothing is left to disclose.
-  }
-}
-
-const cachedRowsValid = (rows) => Array.isArray(rows) && rows.every((row) =>
-  row !== null && typeof row === "object" && (typeof row.id === "string" || typeof row.id === "number"));
-
-/**
- * Saved messages and thread cards are server rows held across a reload, and storage is a boundary
- * like the network: another version of this page, an interrupted write, or anything else with
- * access to the origin may have left them. Each row must still match the wire contract, or its
- * entry is dropped exactly as a damaged one always was — the channel then reads fresh.
- *
- * @param {unknown} rows
- * @param {"Message" | "ThreadSummary"} type
- */
-const cachedWireRowsValid = (rows, type) =>
-  Array.isArray(rows) && rows.every((row) => VibeTalkContract.is(type, row));
-
-const coverageValid = (views) => views !== null && typeof views === "object" && !Array.isArray(views) &&
-  Object.values(views).every((cover) => cover !== null && typeof cover === "object" &&
-    (cover.floor === null || Number.isFinite(cover.floor)) && typeof cover.more === "boolean" &&
-    Number.isFinite(cover.at) && typeof cover.notice === "string" &&
-    // Absent from a cover saved before `#578 search-status-clarity`, whose next read then joins nothing.
-    [cover.top, cover.dense].every((at) => at === undefined || at === null || Number.isFinite(at)));
-
-function validCacheEntry(entry) {
-  if (entry === null || typeof entry !== "object" || !Number.isFinite(entry.usedAt) ||
-      !cachedWireRowsValid(entry.messages, "Message") ||
-      !cachedWireRowsValid(entry.threads, "ThreadSummary") ||
-      !Array.isArray(entry.dismissed)) return false;
-  if (entry.mode === "timeline") {
-    return coverageValid(entry.views) && typeof entry.hasThreads === "boolean" &&
-      (entry.scope === undefined || entry.scope === null || typeof entry.scope === "string") &&
-      // Absent from an entry saved before `#185 reply-new-thread`, which then has nothing unplaced.
-      (entry.unplaced === undefined ||
-        (Array.isArray(entry.unplaced) && entry.unplaced.every((id) => typeof id === "string"))) &&
-      // Absent from an entry saved before `#315 removed-reply-target`, which then holds nothing removed.
-      (entry.removed === undefined ||
-        (Array.isArray(entry.removed) && entry.removed.every((id) => typeof id === "string"))) &&
-      // Absent from an entry saved before `#222 unread-replies`, which then knows no gap yet.
-      (entry.replyGaps === undefined || (entry.replyGaps !== null && typeof entry.replyGaps === "object" &&
-        !Array.isArray(entry.replyGaps) &&
-        Object.values(entry.replyGaps).every((gap) => Number.isInteger(gap) && gap >= 0))) &&
-      // Absent from an entry saved before All's page passing over a thread was kept.
-      (entry.passedOver === undefined ||
-        (Array.isArray(entry.passedOver) && entry.passedOver.every((id) => typeof id === "string"))) &&
-      // Absent from an entry saved before what Done settled was kept (`loadCanon` then drops its gaps).
-      (entry.settledByDone === undefined || (entry.settledByDone !== null &&
-        typeof entry.settledByDone === "object" && !Array.isArray(entry.settledByDone) &&
-        Object.values(entry.settledByDone).every((gap) => Number.isInteger(gap) && gap >= 0)));
-  }
-  return entry.mode === "page" && Number.isFinite(entry.savedAt) && typeof entry.more === "boolean";
-}
-
-function validCacheShell(shell) {
-  return shell !== null && typeof shell === "object" && cachedRowsValid(shell.channels);
-}
-
-/**
- * The envelope for the token saved right now, or null when there is no token to scope it to.
- *
- * Anything unreadable — an interrupted write, another version, another identity — is removed and
- * replaced by an empty envelope. A damaged entry is dropped on its own; the rest survive it.
- */
-function readMessageCache() {
-  const identity = tokenFingerprint(token());
-  let raw = null;
-  try {
-    raw = deviceStorage().getItem(MESSAGE_CACHE_KEY);
-  } catch (_error) {
-    return null;
-  }
-  const empty = identity ? { v: MESSAGE_CACHE_VERSION, identity, shell: null, scopes: {} } : null;
-  if (raw === null) return empty;
-  let cache = null;
-  try {
-    cache = JSON.parse(raw);
-  } catch (_error) {
-    cache = null;
-  }
-  if (!identity || cache === null || typeof cache !== "object" || cache.v !== MESSAGE_CACHE_VERSION ||
-      cache.identity !== identity || cache.scopes === null || typeof cache.scopes !== "object" ||
-      Array.isArray(cache.scopes)) {
-    dropMessageCache();
-    return empty;
-  }
-  for (const [key, entry] of Object.entries(cache.scopes)) {
-    if (!validCacheEntry(entry)) delete cache.scopes[key];
-  }
-  if (!validCacheShell(cache.shell)) cache.shell = null;
-  return cache;
-}
-
-/** Cut a timeline entry's `field` to its newest `limit` and say which views lost rows by it. */
-function trimCanonField(entry, field, limit) {
-  if (entry[field].length <= limit) return;
-  const timeField = field === "threads" ? "updated_at" : "timestamp";
-  const removed = entry[field].slice(0, entry[field].length - limit);
-  entry[field] = entry[field].slice(-limit);
-  const cut = timeOf(entry[field][0], timeField);
-  // `#222 unread-replies`. A read reply cut is one more of its thread's the store lacks for being
-  // old, so the shortfall against the thread's count is not read as replies posted since. AN UNREAD
-  // ONE IS NOT: counted as old it would vanish from its root's count, and the root from Hide read,
-  // after a reload. Left out of the gap, it counts as new ("1 new") until a read of the thread or
-  // of All brings it back. What Done settled moves with the gap, so putting the root back still
-  // finds it (`unsettleReplies`).
-  if (field === "messages" && entry.replyGaps) {
-    const done = new Set(entry.dismissed.map(String));
-    for (const message of removed) {
-      const id = threadOf(message);
-      if (!id || message.thread.is_root === true || !Number.isInteger(entry.replyGaps[id]) ||
-          stillToDo(message, done)) continue;
-      entry.replyGaps[id] += 1;
-      if (entry.settledByDone && Number.isInteger(entry.settledByDone[id])) entry.settledByDone[id] += 1;
-    }
-  }
-  for (const [key, cover] of Object.entries(entry.views)) {
-    const { view, thread } = viewOfKey(key);
-    if ((field === "threads") !== (view === "threads")) continue;
-    if (field === "messages" && !removed.some((message) => inView(message, view, thread, entry.scope || null))) continue;
-    cover.more = true;
-    if (Number.isFinite(cut)) cover.floor = cover.floor === null ? cut : Math.max(cover.floor, cut);
-  }
-}
-
-/**
- * Keep the newest `limit` rows of an entry. A timeline entry is one channel's store, so cutting it
- * raises the floor of every view that lost a row — the view then says older history exists rather
- * than showing a gap. A timeline cursor is never kept: it is opaque and it expires. A legacy page
- * cursor is just the oldest id, so it is kept.
- */
-function trimCacheEntry(entry, limit) {
-  if (entry.mode === "timeline") {
-    trimCanonField(entry, "messages", limit);
-    trimCanonField(entry, "threads", limit);
-  } else if (entry.messages.length > limit) {
-    entry.messages = entry.messages.slice(-limit);
-    entry.more = true;
-  }
-  const kept = new Set(entry.messages.map((message) => String(message.id)));
-  entry.dismissed = entry.dismissed.map(String).filter((id) => kept.has(id));
-  if (entry.unplaced) entry.unplaced = entry.unplaced.filter((id) => kept.has(id));
-  if (entry.removed) entry.removed = entry.removed.filter((id) => kept.has(id));
-  if (entry.mode === "page") {
-    entry.cursor = entry.more && entry.messages.length > 0 ? String(entry.messages[0].id) : null;
-  }
-}
-
-/**
- * Store the envelope inside its bounds, giving up space in a fixed order: other channels, least
- * recently opened first; then half of `keep` at a time; then the whole cache. It is a convenience,
- * so it never holds on to space the token, the drafts or an unsent message could need.
- */
-function writeMessageCache(cache, keep = null) {
-  const leastRecent = () => Object.keys(cache.scopes)
-    .filter((key) => key !== keep)
-    .sort((a, b) => cache.scopes[a].usedAt - cache.scopes[b].usedAt);
-  while (Object.keys(cache.scopes).length > MESSAGE_CACHE_SCOPES) {
-    delete cache.scopes[leastRecent()[0]];
-  }
-  for (;;) {
-    const encoded = JSON.stringify(cache);
-    if (encoded.length <= MESSAGE_CACHE_CHARS && storedExactly(MESSAGE_CACHE_KEY, encoded)) return true;
-    const oldest = leastRecent()[0];
-    const held = keep === null ? null : cache.scopes[keep];
-    const size = held ? Math.max(held.messages.length, held.threads.length) : 0;
-    if (oldest !== undefined) {
-      delete cache.scopes[oldest];
-    } else if (size > 1) {
-      trimCacheEntry(held, Math.floor(size / 2));
-    } else {
-      dropMessageCache();
-      return false;
-    }
-  }
-}
-
-/** Forget the saved rows of every channel `gone` answers true for. */
-function forgetChannelScopes(gone) {
-  const cache = readMessageCache();
-  if (!cache) return;
-  for (const key of Object.keys(cache.scopes)) {
-    if (gone(key)) delete cache.scopes[key];
-  }
-  writeMessageCache(cache);
-}
-
-/**
- * Keep what the page needs to draw the channel before `/client-config` answers: the channels, the
- * read mode, and who "me" is, so a saved row is coloured as it was. Channels the server no longer
- * lists go at the same moment — the credential can no longer read them.
- */
-function saveCacheShell(config) {
-  const cache = readMessageCache();
-  if (!cache) return;
-  const channels = Array.isArray(config.channels) ? config.channels : [];
-  cache.shell = {
-    channels,
-    threading_supported: config.threading_supported === true,
-    self_author_id: config.self_author_id || null,
-    owner_author_id: config.owner_author_id || null,
-    coding_agent_ids: Array.isArray(config.coding_agent_ids) ? config.coding_agent_ids : [],
-    coding_agents_named_only: config.coding_agents_named_only === true,
-    providers: Array.isArray(config.providers) ? config.providers : [],
-  };
-  const listed = new Set(channels.map((channel) => String(channel.id)));
-  for (const key of Object.keys(cache.scopes)) {
-    if (!listed.has(key)) delete cache.scopes[key];
-  }
-  writeMessageCache(cache);
-}
-
-/**
- * Carry an add, rename or removal made here into the saved channel list, so the next cold start
- * draws the picker as it now is, not as `/client-config` last described it.
- */
-function saveCacheChannels() {
-  const cache = readMessageCache();
-  if (!cache || !cache.shell) return;
-  cache.shell.channels = channelDirectory.channels();
-  writeMessageCache(cache);
-}
 
 // --- one store per channel, and the views projected from it ---
 //
@@ -8823,7 +8574,7 @@ function foldTimelinePage(payload, older, view = selection().view, thread = sele
     scopeChanged: () => {
       Promise.resolve().then(renderColumns);
     },
-    staleAsOf: () => staleAsOf(payload),
+    staleAsOf: () => timelineReader.staleAsOf(payload),
     foldReadState: () => {
       foldReadState(payload, view);
     },
@@ -8853,16 +8604,6 @@ function pageFold(canon, payload, held) {
 }
 
 /**
- * When the server says it could not bring this page up to date: the instant it is complete up to,
- * as a time, if that is old enough to say so — or null, which means now. `#203 incremental-refresh`.
- * A bridge serving a snapshot it failed to refresh sends `as_of`; a page that took it for a fresh
- * read would claim to be current when it is not.
- */
-function staleAsOf(payload) {
-  return syncStaleAsOf(payload, refreshFailed(payload), () => Date.now());
-}
-
-/**
  * Fold a DELTA — what changed in a view since its forward cursor — into the store (web/src/core/channels
  * `foldDeltaIn`, `#203 incremental-refresh`, which says why each rule is what it is): false, and nothing
  * touched, when the cover no longer holds the cursor the read was sent with. What it does to the page
@@ -8884,7 +8625,7 @@ function foldTimelineDelta(payload, sent, view = selection().view, thread = sele
     foldReadState: () => foldReadState(payload, view),
     noteReplyGaps: (before) => noteReplyGaps(payload, view, false, true, before),
     markUnchanged: () => unchangedDeltas.add(payload),
-    staleAsOf: () => staleAsOf(payload),
+    staleAsOf: () => timelineReader.staleAsOf(payload),
   });
 }
 
@@ -8934,7 +8675,7 @@ function syncCanonDismissed() {
 /** Load a channel's store from the device, or start it empty. Marks it recently used. */
 function loadCanon(channel) {
   channelStore.open(channel);
-  const cache = readMessageCache();
+  const cache = messageCache.readMessageCache();
   const entry = cache ? cache.scopes[String(channel)] : undefined;
   if (!entry || entry.mode !== "timeline") return;
   // What the device kept of it (web/src/core/channels `restoreCanon`).
@@ -8944,7 +8685,7 @@ function loadCanon(channel) {
   // so a reload draws the server's colours before any read lands — not this browser's fallback.
   noteServerThreadHuesIn(channelStore.current().messages, channelStore.current().threads, String(channel), true);
   entry.usedAt = Date.now();
-  writeMessageCache(cache, String(channel));
+  messageCache.writeMessageCache(cache, String(channel));
 }
 
 /**
@@ -8975,7 +8716,7 @@ function drawProjection() {
   } catch (_error) {
     // A saved row this version cannot draw is a damaged entry, not a reason to break the page.
     clearChannelScreen();
-    forgetChannelScopes((id) => id === String(channel));
+    messageCache.forgetChannelScopes((id) => id === String(channel));
     return false;
   }
   listState().newestId = timelineRows().messages.length > 0 ? String(timelineRows().messages[timelineRows().messages.length - 1].id) : null;
@@ -9085,10 +8826,11 @@ function drawHeldRows(rows, freshAt, freshness) {
  */
 function saveChannelScope() {
   if (!selectedChannelId() || (readModes.hiding() && !providerFacts.threading()) || !screenBelongsToToken()) return;
-  const cache = readMessageCache();
+  const cache = messageCache.readMessageCache();
   if (!cache) return;
   const key = String(selectedChannelId());
   const now = Date.now();
+  /** @type {import("./src/core/channels/index.ts").CacheEntry | null} */
   let entry = null;
   if (providerFacts.threading()) {
     if (channelStore.current().channel !== key) return;
@@ -9114,9 +8856,9 @@ function saveChannelScope() {
       bookmark: bookmarkToSave(key),
     };
   }
-  trimCacheEntry(entry, MESSAGE_CACHE_ROWS);
+  messageCache.trimCacheEntry(entry, MESSAGE_CACHE_ROWS);
   cache.scopes[key] = entry;
-  writeMessageCache(cache, key);
+  messageCache.writeMessageCache(cache, key);
 }
 
 /**
@@ -9132,12 +8874,12 @@ function hydrateChannelScope() {
     inheritAllCover(selection().view, selection().threadId, selection().thread);
     return drawProjection();
   }
-  const cache = readMessageCache();
+  const cache = messageCache.readMessageCache();
   const key = String(channel);
   const entry = cache ? cache.scopes[key] : undefined;
   if (!entry || entry.mode !== "page") return false;
   entry.usedAt = Date.now();
-  writeMessageCache(cache, key);
+  messageCache.writeMessageCache(cache, key);
   restoreSavedBookmark(key, entry.bookmark);
   const payload = {
     channel: knownChannel(channel),
@@ -9150,10 +8892,10 @@ function hydrateChannelScope() {
     el("discord-log").replaceChildren();
     const loaded = applyNewestPage(payload, true);
     plainReach.restore(entry.gapFrom);
-    renderChannelSeam(channelSummary(loaded, loadedIsWhole(), channelName(payload.channel)));
+    renderChannelSeam(channelSummary(loaded, olderPager.loadedIsWhole(olderPages().moreAbove), channelName(payload.channel)));
   } catch (_error) {
     clearChannelScreen();
-    forgetChannelScopes((id) => id === key);
+    messageCache.forgetChannelScopes((id) => id === key);
     return false;
   }
   const rows = entry.messages;
@@ -9169,7 +8911,7 @@ function hydrateChannelScope() {
  * a reload opens on the application rather than on the sign-in form and an empty channel.
  */
 function hydrateFromCache() {
-  const cache = readMessageCache();
+  const cache = messageCache.readMessageCache();
   if (!cache || !cache.shell) return false;
   const shell = cache.shell;
   providerFacts.setThreading(shell.threading_supported === true);
@@ -9242,7 +8984,7 @@ function screenBelongsToToken() {
   clearChannelScreen();
   forgetBookmarks();
   // Reading the envelope deletes it when it, too, belongs to the previous token.
-  readMessageCache();
+  messageCache.readMessageCache();
   return false;
 }
 
@@ -9252,7 +8994,7 @@ function forgetMessages() {
   // `#277 reply-in-column`. A reply open in a column answers a message that is going; its words are
   // kept as a draft, as every reply put down is.
   putDockedReplyAway();
-  dropMessageCache();
+  messageCache.dropMessageCache();
   clearChannelScreen();
   forgetBookmarks();
   // `#892 voice-page-optimistic-done`. Nor the Done writes it kept to send again.
@@ -9275,7 +9017,7 @@ function noteChannelReadFailure(error) {
   }
   if (error && error.status === 404 && error.code === "unknown_channel") {
     const channel = String(selectedChannelId());
-    forgetChannelScopes((id) => id === channel);
+    messageCache.forgetChannelScopes((id) => id === channel);
     clearChannelScreen();
     return;
   }
@@ -9316,7 +9058,7 @@ function renderChannelFreshness() {
     ? `${liveFollow.attached() && providerFacts.liveDelivery() !== "off" ? "Live · updated" : "Updated"} ${at}` +
       (refreshing ? " · refreshing…" : "")
     : "";
-  const text = staleWords(loadState().freshness, loadState().freshAt, refreshing) || current;
+  const text = staleWords(loadState().freshness, loadState().freshAt, refreshing, "messages", () => chatServiceOf(selectedChannelId())) || current;
   pill.textContent = text;
   pill.setAttribute("data-state", loadState().freshness);
   // It gives way to a pull at the TOP, which draws in the same place (a pull up at the foot leaves
@@ -9328,31 +9070,6 @@ function renderChannelFreshness() {
   reserveFreshnessRoom(text !== "");
 }
 
-/**
- * What a freshness pill says of rows that are not a read that just succeeded, in `state` — saved on
- * this device, kept after a refresh that failed, from a service slow to answer — and last current at
- * `atMs`; "" for rows that are current, which each pill says in its own way. `noun` is what the rows
- * are. The left column's pill and, since `#231 two-column-polish`, the right column's line, in one
- * set of words.
- *
- * @param {string} state
- * @param {number} atMs
- * @param {boolean} refreshing
- * @param {string} [noun]
- */
-function staleWords(state, atMs, refreshing, noun = "messages") {
-  const at = stamp(atMs);
-  if (state === "saved") return refreshing ? `Saved ${at} · refreshing…` : `Showing ${noun} saved ${at}`;
-  if (state === "offline") return `Offline · showing ${noun} saved ${at}`;
-  // `#617 cold-load-first-paint`: not while a read that may bring them up to date is out.
-  if (state === "failed") {
-    return refreshing ? `Showing ${noun} from ${at} · refreshing…` : `Refresh failed · showing ${noun} from ${at}`;
-  }
-  if (state === "slow") {
-    return `${sentenceStart(chatServiceOf(selectedChannelId()))} is slow to answer · showing ${noun} from ${at}`;
-  }
-  return "";
-}
 
 /**
  * The right column's line saying how old its rows are: drawn only when it changed, and only when
@@ -9367,13 +9084,13 @@ function renderSideFreshness() {
   let text = "";
   if (layoutShown.columns() && columns.side.mode === "thread") {
     [state, text] = inColumn(columns.side, () =>
-      [loadState().freshness, staleWords(loadState().freshness, loadState().freshAt, loadState().refreshing)]);
+      [loadState().freshness, staleWords(loadState().freshness, loadState().freshAt, loadState().refreshing, "messages", () => chatServiceOf(selectedChannelId()))]);
   } else if (sideColumnUp()) {
     const channel = String(selectedChannelId());
     state = threadListFailures.get(channel) || "fresh";
     const at = threadListLandedAt.get(channel) || inColumn(columns.main, () => loadState().freshAt);
     // With no time to give, the state alone, rather than a time nothing was read at.
-    text = state === "fresh" ? "" : at ? staleWords(state, at, false, "threads")
+    text = state === "fresh" ? "" : at ? staleWords(state, at, false, "threads", () => chatServiceOf(selectedChannelId()))
       : state === "offline" ? "Offline" : "Refresh failed";
   }
   setTextIfChanged(line, text);
@@ -9708,7 +9425,7 @@ function saveUiState() {
   }
   uiState.setChosen(record.channels);
   // The device's, for the next brand-new window; and this window's, for a reload of it. `#265`.
-  storedExactly(UI_STATE_KEY, encoded);
+  messageCache.storedExactly(UI_STATE_KEY, encoded);
   keepWindowItem(UI_STATE_KEY, encoded);
 }
 
@@ -11805,6 +11522,19 @@ function readFilterKeeps(thread = selection().view === "thread" ? openThreadChoi
  * Called by every pass over the rows, which follows every redraw, so the counts follow arrivals, reads
  * and Done wherever they happen. Written only when they change: this runs with every pass.
  */
+
+/**
+ * The read-state facts unpacking filters by (web/src/core/channels `UnpackFilter`,
+ * `#624 voice-page-modularity`), for `unpackMessages`/`unpackReadSignature`/`readLook`.
+ *
+ * @type {import("./src/core/channels/index.ts").UnpackFilter}
+ */
+const unpackFilter = {
+  empty: (message) => hiddenEmpty(message),
+  hiding: () => hidingRead(),
+  keeps: (choice) => readFilterKeeps(/** @type {any} */ (choice)),
+  toDo: (message, done) => stillToDo(message, /** @type {any} */ (done)),
+};
 function drawThreadChips(row, tally, inMain, inAll = false) {
   const message = rowMessages(row)[0];
   if (!message) return;
@@ -12225,7 +11955,7 @@ async function readAllForCounts(channel, soon = false) {
     held: heldNow(channelStore.current()) };
   const seen = unplacedArrivals.count();
   try {
-    const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(
+    const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => timelineReader.readTimeline(
       `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}&reason=counts`,
       { signal }));
     // `#614 timeline-read-failures`: the server's own copy, the chat service having failed or kept
@@ -12322,23 +12052,30 @@ function copyOlderThan(copy, id, number, held, says = false) {
 }
 
 /**
- * Read one timeline page, remembering when it was sent (`readSpeaksFor`), and in what order
- * (`sentNumberOf`).
+ * Sending the timeline's reads, the paths and reason words they carry, and joining what
+ * landed (web/src/core/sync `createTimelineReader`, `#624 voice-page-modularity`).
  *
- * @param {string} path
- * @param {{signal?: AbortSignal}} [options]
- * @returns {Promise<VibeTalk.TimelineResponse>}
+ * @type {import("./src/core/sync/index.ts").TimelineReader}
  */
-async function readTimeline(path, options) {
-  const sent = readLedger.epoch();
-  // Counted as it is sent, before the answer is awaited (`apiDecoded`).
-  const asked = apiDecoded("TimelineResponse", path, options);
-  const number = readOrder.asked();
-  const payload = await asked;
-  readLedger.noteSent(payload, sent);
-  readOrder.noteSent(payload, number);
-  return payload;
-}
+const timelineReader = createTimelineReader({
+  decoded: (path, options) => apiDecoded("TimelineResponse", path, /** @type {{signal?: AbortSignal}} */ (options)),
+  ledger: readLedger,
+  order: readOrder,
+  // Read as it is used: the constant itself is declared with the read it sizes, below.
+  get pageLimit() { return DISCORD_PAGE_LIMIT; },
+  channelId: () => selectedChannelId(),
+  view: () => selection().view,
+  threadId: () => selection().threadId,
+  withThreadQuery,
+  searchWalkActive: () => Boolean(columnWork.active().searchWalk),
+  storeChannel: () => channelStore.current().channel,
+  selectedChannel: () => String(selectedChannelId()),
+  cover: () => channelStore.current().views.get(viewKey()),
+  complete: () => channelStore.current().complete,
+  mutationAwaits: mutationAwaitsRead,
+  refreshFailed,
+  now: () => Date.now(),
+});
 
 /**
  * What a Done or a put back changed in the store (web/src/core/channels `HeldDoneMark`).
@@ -12438,56 +12175,6 @@ async function writeInBatches(route, ids, landed) {
   return stored;
 }
 
-/**
- * The path of a read of the view on screen. `reason` is the word it sends as `reason=`
- * (`readReasonOf`).
- *
- * @param {string | null} [before]
- * @param {string | null} [after]
- * @param {string | null} [reason]
- */
-function timelinePath(before = null, after = null, reason = null) {
-  let path = `/api/v1/channels/${encodeURIComponent(selectedChannelId())}/timeline` +
-    `?view=${selection().view}&limit=${DISCORD_PAGE_LIMIT}`;
-  path = withThreadQuery(path, selection().threadId);
-  if (before) path += `&before=${encodeURIComponent(before)}`;
-  if (after) path += `&after=${encodeURIComponent(after)}`;
-  if (reason) path += `&reason=${encodeURIComponent(reason)}`;
-  return path;
-}
-
-/**
- * The word a read of the channel sends the server as `reason=`: why it was made. `remote-ops-audit`,
- * read reason tags. The server writes it in the request's access line and counts the provider reads
- * the request makes under it, so a figure like "forty timeline reads a minute" can be taken apart by
- * cause. ATTRIBUTION ONLY: nothing on the server, and nothing here, decides anything by the word.
- *
- * `readAs` names it where the refresh's `reason` would say the wrong thing or nothing: the right
- * column's read beside Main is `side` whatever refresh asked for it, and a pull up, a step back the
- * walk to a cursor takes, or a re-read after the reader's own change says so, where its `reason`
- * (which decides what the read asks for) is left as it was. Otherwise the refresh's own `reason`, the
- * first of several merged into one queued read (`queueDiscordLoad`). Null when neither names one.
- *
- * @param {{readAs?: string, reason?: string | (string | undefined)[]} | undefined} options
- * @returns {string | null}
- */
-function readReasonOf(options) {
-  if (options && typeof options.readAs === "string") return options.readAs;
-  const reason = options && options.reason;
-  const first = Array.isArray(reason) ? reason.find((one) => typeof one === "string") : reason;
-  return typeof first === "string" ? first : null;
-}
-
-/** `path` with the `reason=` of `options` (`readReasonOf`), when it names one. */
-function withReadReason(path, options) {
-  const reason = readReasonOf(options);
-  return reason ? `${path}${path.includes("?") ? "&" : "?"}reason=${encodeURIComponent(reason)}` : path;
-}
-
-/** The word a step back sends: `search` while the column's walk for the search is under way. */
-function olderReadReason() {
-  return columnWork.active().searchWalk ? "search" : "older";
-}
 
 /**
  * Whether the list on screen is exactly what drawing delta `pages` would draw: the store's projection
@@ -12584,7 +12271,10 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
   holdingReplyArrows(renderChannelRows);
   renderChannelNavigation();
   renderOlderControl();
-  const notice = allNoticeWords(payload.notice || "");
+  const notice = allNoticeWords(payload.notice || "", {
+    threading: providerFacts.threading(), view: selection().view,
+    messages: timelineRows().messages, tally: replyTally(),
+  });
   el("timeline-notice").textContent = notice;
   el("timeline-notice").hidden = !notice;
   el("inbox-note").textContent = payload.read_state_notice || "";
@@ -12593,49 +12283,12 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
   el("clear-backlog").hidden = true;
   const label = selection().view === "threads"
     ? `${timelineRows().threads.length} recent thread${timelineRows().threads.length === 1 ? "" : "s"}`
-    : channelSummary(shown.length, loadedIsWhole(), selection().view === "thread"
+    : channelSummary(shown.length, olderPager.loadedIsWhole(olderPages().moreAbove), selection().view === "thread"
       ? openThreadName() : channelName(payload.channel));
   renderChannelSeam(label);
   return selection().view === "threads" ? timelineRows().threads : shown;
 }
 
-/** The words a server's notice that All left some threads' replies out begins with, then and now. */
-// The apostrophe is escaped: a bare one in a regular expression reads as an open quote to the page
-// suite's scan of this file's code outside its strings.
-const BOUNDED_ALL_NOTICE = /^(Some threads\x27 replies are not in All|Flat view includes replies)/;
-
-/**
- * What the notice under the step back says over All of a page the server says it bounded: in threads,
- * not pages (`#578 search-status-clarity`). The owner: "PAGES are not a concept in vibe talk. THREADS
- * are." So it counts the threads on screen whose replies All has not all brought, by their exact counts
- * (`exactReplyCount`), and says nothing once the reader has every one — opened, say. The server's own
- * words where a count is not known; and the notice as it came everywhere else.
- *
- * @param {string} notice
- */
-function allNoticeWords(notice) {
-  // Only the notice that All left replies out: a forum's own words on All, say, are another matter.
-  if (!notice || !providerFacts.threading() || selection().view !== "flat" || !BOUNDED_ALL_NOTICE.test(notice)) return notice;
-  const tally = replyTally();
-  let lacking = 0;
-  let unknown = false;
-  for (const message of timelineRows().messages) {
-    const id = threadOf(message);
-    if (!id || message.thread.is_root !== true) continue;
-    const count = exactReplyCount(id, message, tally);
-    if (count === null) {
-      unknown = true;
-      continue;
-    }
-    const entry = tally.threads.get(id);
-    if (count > (entry ? entry.held : 0)) lacking += 1;
-  }
-  if (lacking > 0) {
-    return `${lacking} thread${lacking === 1 ? " here has replies" : "s here have replies"} All has not loaded; ` +
-      "open a thread to read all of it.";
-  }
-  return unknown ? notice : "";
-}
 
 /**
  * `preservingScroll` for a redraw that REBUILDS the rows, which takes its anchor with it: the reader
@@ -12670,7 +12323,7 @@ function renderCachedTimeline() {
     renderTodoControls();
     renderChannelSeam(channelSummary(
       shown.length,
-      loadedIsWhole(),
+      olderPager.loadedIsWhole(olderPages().moreAbove),
       selection().view === "thread"
         ? openThreadName()
         : channelName(knownChannel(selectedChannelId()))
@@ -12710,25 +12363,6 @@ function mutationAwaitsRead() {
 }
 
 
-/**
- * The forward cursor this refresh may read from, or null for a full read. Only a view this page
- * has read live, recently enough, and only where the reason can be served by what this channel's
- * deltas carry: an edit or deletion needs a complete one. A queued read standing for several
- * triggers carries all their reasons, and is a delta only if every one of them could be.
- *
- * @param {string | (string | undefined)[] | undefined} reason
- * @returns {string | null}
- */
-function forwardCursor(reason) {
-  return deltaCursor(reason, {
-    storeChannel: () => channelStore.current().channel,
-    selectedChannel: () => String(selectedChannelId()),
-    cover: () => channelStore.current().views.get(viewKey()),
-    complete: () => channelStore.current().complete,
-    mutationAwaits: mutationAwaitsRead,
-    now: () => Date.now(),
-  });
-}
 
 // Whether the server can no longer continue from a cursor (`isCursorRefusal`) is web/src/core/sync's.
 
@@ -12750,56 +12384,30 @@ const standInRetries = createStandInRetries();
  * at the copy's time). Either way the next read comes soon (`STAND_IN_RETRY_MS`).
  */
 function noteFreshRead(payload) {
-  const asOf = staleAsOf(payload);
-  loadState().freshAt = asOf === null ? Date.now() : asOf;
-  const failed = refreshFailed(payload);
-  const retryWanted = standInRetries.noteRead(failed);
+  const decision = timelineReader.freshDecision(payload);
+  loadState().freshAt = decision.freshAt;
+  const retryWanted = standInRetries.noteRead(decision.failed);
   // A poll already armed comes forward; one armed after this read takes it up as it is armed.
-  if (failed && retryWanted && channelPoll.armed()) {
+  if (decision.failed && retryWanted && channelPoll.armed()) {
     scheduleDiscordPoll(Math.max(0, channelPoll.dueAt() - Date.now()));
   }
-  const old = Date.now() - loadState().freshAt > STALE_AS_OF_MS;
-  setChannelFreshness(failed ? (old ? "failed" : "fresh") : asOf === null ? "fresh" : "slow");
+  setChannelFreshness(decision.freshness);
   // `#206 pin-message`. Every landed read, delta included, says what revision the pins are at.
   notePinsRevision(payload.pins_revision);
   // `#240 reading-bookmark`. ...and where the bookmark is, which another device may have moved.
   noteBookmark(payload);
 }
 
-/** Several delta pages of one refresh, as the one page that draws them. */
-function joinedDeltas(pages) {
-  const last = pages[pages.length - 1];
-  const joined = {
-    ...last,
-    messages: pages.flatMap((page) => page.messages || []),
-    threads: pages.flatMap((page) => page.threads || []),
-    dismissed: pages.flatMap((page) => page.dismissed || []),
-  };
-  // As old as its oldest page, for `readSpeaksFor`. `#222 unread-replies`.
-  readLedger.noteSent(joined, Math.min(...pages.map(sentEpochOf)));
-  return joined;
-}
-
-/** What one refresh's landed pages answer for, for `settleReplays`; null when none landed. */
-function landedAnswer(pages) {
-  if (!pages.length) return null;
-  const full = pages.some((page) => !page.delta);
-  return {
-    messages: pages.flatMap((page) => page.messages || []),
-    threads: pages.flatMap((page) => page.threads || []),
-    delta: full ? null : { complete: pages.every((page) => page.delta && page.delta.complete === true) },
-  };
-}
 
 async function loadTimeline(options) {
   // `remote-ops-audit` W7. No poll while a read of this view the page gave up on may still be running at
   // the server. Every other read goes.
-  if (readHeld(readHoldKey(), options)) return;
+  if (abandonedReads.held(abandonedReads.holdKey(), options)) return;
   const generation = ++loadState().generation;
   // `#229 desktop-two-column`. The column this read is for: its work after every wait is done there.
   const steps = columnSteps();
   const context = channelContextKey();
-  const holdKey = readHoldKey();
+  const holdKey = abandonedReads.holdKey();
   const channel = String(selectedChannelId());
   const [view, thread, canon] = [selection().view, selection().threadId, channelStore.current()];
   if (!channel) return;
@@ -12823,7 +12431,7 @@ async function loadTimeline(options) {
   const landed = [];
   /** @type {VibeTalk.TimelineResponse[]} the delta pages among them, still to be drawn */
   const deltas = [];
-  let sent = forwardCursor(options && options.reason);
+  let sent = timelineReader.forwardCursor(options && options.reason);
   // What a refresh asking for this view again soon after may count as read already. `#231`.
   const record = { context, read, full: sent === null };
   columnReadsSent.set(steps.column, record);
@@ -12857,7 +12465,7 @@ async function loadTimeline(options) {
     const at = landedReadPosition(area, keepPosition, position.wasAtNewest);
     // One pass over the scroll tools, at the end, however often settling asks. `#226`.
     holdingScrollTools(() => {
-      const messages = applyTimelinePage(joinedDeltas(deltas), false, false, true);
+      const messages = applyTimelinePage(timelineReader.joinedDeltas(deltas), false, false, true);
       settleAfterRead(messages, { area, ...at, ownAct });
       noteFreshRead(deltas[deltas.length - 1]);
       saveChannelScope();
@@ -12871,7 +12479,7 @@ async function loadTimeline(options) {
   };
   try {
     for (;;) {
-      const path = timelinePath(null, sent, readReasonOf(options));
+      const path = timelineReader.timelinePath(null, sent, timelineReader.readReasonOf(options));
       // What the stream had left unplaced when this went out, which a newest page of All answers for.
       const seenArrivals = unplacedArrivals.count();
       // `#310 stale-live-read-flicker`. And the store's copies as it went out: a newest page is folded
@@ -12886,9 +12494,9 @@ async function loadTimeline(options) {
         // `remote-ops-audit` W7. Given up on, the read is kept, and its view held (`abandonRead`).
         const abandoned = { key: holdKey, context, channel, view, thread, canon, column: steps.column, sent, held,
           sentAt: Date.now(), live: liveEvents.seen(channel), news: liveEvents.news(channel), number: 0 };
-        const asked = within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }),
+        const asked = within(CHANNEL_READ_TIMEOUT_MS, (signal) => timelineReader.readTimeline(path, { signal }),
           // Once it settles, the placing read that waited for it goes (`placeUnplacedWaits`). `#308`.
-          (answer) => abandonRead(answer, abandoned, (late) => landAbandonedTimelineRead(late, abandoned),
+          (answer) => abandonedReads.abandon(answer, abandoned, (late) => landAbandonedTimelineRead(late, abandoned),
             queuePlaceUnplaced));
         abandoned.number = readOrder.asked();
         payload = await asked;
@@ -13034,7 +12642,7 @@ async function loadTimeline(options) {
       throw error;
     }
   } finally {
-    settleReplays(read, landedAnswer(landed));
+    settleReplays(read, timelineReader.landedAnswer(landed));
     // A read that brought nothing back answers for nothing.
     if (!landed.length && columnReadsSent.get(steps.column) === record) columnReadsSent.delete(steps.column);
     steps.pause();
@@ -13104,10 +12712,10 @@ async function pagesBackTo(payload, placeAt, current) {
   try {
     while (pages.length < REPLY_JUMP_PAGES && last.has_more === true && last.next_before &&
         !(timeOf((last.messages || [])[0], "timestamp") <= placeAt)) {
-      const path = timelinePath(last.next_before, null, "older");
+      const path = timelineReader.timelinePath(last.next_before, null, "older");
       try {
         steps.pause();
-        last = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }));
+        last = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => timelineReader.readTimeline(path, { signal }));
         steps.resume();
       } catch (_error) {
         steps.resume();
@@ -13133,7 +12741,7 @@ async function readWalkCursor() {
   renderOlderControl();
   try {
     steps.pause();
-    await loadDiscord({ keepPosition: true, quiet: true, reason: "enter", readAs: olderReadReason() });
+    await loadDiscord({ keepPosition: true, quiet: true, reason: "enter", readAs: timelineReader.olderReadReason() });
     steps.resume();
   } catch (error) {
     steps.resume();
@@ -13159,11 +12767,11 @@ async function loadOlderTimeline(signal) {
   olderPages().inFlight = true;
   renderOlderControl();
   try {
-    const path = timelinePath(olderPages().cursor, null, olderReadReason());
+    const path = timelineReader.timelinePath(olderPages().cursor, null, timelineReader.olderReadReason());
     steps.pause();
     let payload;
     try {
-      payload = await readTimeline(path, signal ? { signal } : undefined);
+      payload = await timelineReader.readTimeline(path, signal ? { signal } : undefined);
     } finally {
       steps.resume();
     }
@@ -13880,7 +13488,7 @@ async function placeReplyTarget(entry) {
   refuseRemoved();
   const held = current() ? heldMessage(id) : null;
   if (held && !channelStore.current().unplaced.has(id)) return answeredThread(held);
-  const payload = await readTimeline(
+  const payload = await timelineReader.readTimeline(
     `/api/v1/channels/${encodeURIComponent(entry.channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}` +
       "&reason=reply-place"
   );
@@ -14026,7 +13634,7 @@ function queuePlaceUnplaced() {
 }
 
 /**
- * @typedef {AbandonedRead & {sent: string | null, seen: number, number: number, held: Map<string, any>,
+ * @typedef {import("./src/core/sync/index.ts").AbandonedRead & {canon: any, sent: string | null, seen: number, number: number, held: Map<string, any>,
  *   removals: number}} PlacingRead A placing read: the position in All it continues, or null for All's
  *   newest page, `unplacedArrivals` and `readOrder` when it was sent, the store's copies of
  *   the messages it held then (`heldAsSent`), and `liveEvents.removals` for its channel then. Its `key` is
@@ -14054,7 +13662,7 @@ async function placeUnplaced() {
   let sent = all && all.live && all.newest && Date.now() - (all.fullAt || 0) < TIMELINE_RECONCILE_MS
     ? all.newest : null;
   const base = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}`;
-  const key = inColumn(columns.main, readHoldKey);
+  const key = inColumn(columns.main, abandonedReads.holdKey);
   let again = false;
   try {
     for (;;) {
@@ -14068,8 +13676,8 @@ async function placeUnplaced() {
       try {
         // A late answer that lands asks again for what it could not answer; a failure does not. One
         // that something newer has replaced still places what it carries (`placeFromAnswer`).
-        const asked = within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }),
-          (answer) => abandonRead(answer, read, (late) => landPlacingRead(late, read), (landed, unused) => {
+        const asked = within(CHANNEL_READ_TIMEOUT_MS, (signal) => timelineReader.readTimeline(path, { signal }),
+          (answer) => abandonedReads.abandon(answer, read, (late) => landPlacingRead(late, read), (landed, unused) => {
             if (unused) placeFromAnswer(unused, read);
             if (landed) queuePlaceUnplaced();
           }));
@@ -17639,10 +17247,10 @@ function arrangeChannelRows() {
   const thread = gatheredThread();
   const own = rows.filter((row) => !fromGatheredThread(row)).flatMap(rowMessages);
   const ids = new Set(own.map((message) => String(message.id)));
-  const brought = thread === null ? [] : unpackMessages(thread, unpackHeldMessages(thread), false)
+  const brought = thread === null ? [] : unpackMessages(thread, unpackHeldMessages(channelStore.current(), thread, channelStore.current().channel === String(selectedChannelId())), false, unpackFilter)
     .filter((message) => !ids.has(String(message.id)));
   const extra = new Set(brought.map((message) => String(message.id)));
-  if (thread !== null && unpackNeedsRead(thread, unpackHeldMessages(thread))) queueUnpackRead(thread.id);
+  if (thread !== null && unpackNeedsRead(thread, unpackHeldMessages(channelStore.current(), thread, channelStore.current().channel === String(selectedChannelId())))) queueUnpackRead(thread.id);
   const messages = inTimeOrder([...own, ...brought], "timestamp");
   let groups = parent === null ? null : gatheredRows(messages, parent);
   // The parent has left the list — Hide read hides it, or a read no longer holds it — and the
@@ -19472,14 +19080,6 @@ function channelSummary(count, complete, label) {
 // it goes through `preservingScroll`, the mechanism `#47 scrollback-stability` already built, and
 // not a second one beside it.
 
-// What one step asks for. The server clamps it by its own `discord.max_fetch_limit`, so this is a
-// ceiling on what the page WANTS rather than a promise about what it gets — which is why the walk
-// is driven by the cursor the server hands back and never by arithmetic on this number.
-const DISCORD_PAGE_LIMIT = 50;
-
-// How close to the top counts as "the reader is looking for something older".
-const OLDER_TRIGGER_PX = 80;
-
 /*
  * Is anything older than the OLDEST ROW ON SCREEN still out there? A column's `olderPages().moreAbove`.
  *
@@ -19512,29 +19112,14 @@ function olderPages() {
 // first step back owes the view a read of its own newest page first (`readWalkCursor`), is the channel
 // reads' (`channelReads.cursorOwed`, web/src/core/sync, `#624 voice-page-modularity`).
 
-/** `has_more` absent means a server too old to say — which is UNKNOWN, and never "no". */
-const normaliseHasMore = (hasMore) => (typeof hasMore === "boolean" ? hasMore : undefined);
-
 /**
- * Is what is loaded the WHOLE channel? Read from the page's own state rather than from a payload,
- * so that a re-read of the newest page cannot contradict a walk that is still holding older rows.
- */
-const loadedIsWhole = () => (olderPages().moreAbove === undefined ? undefined : !olderPages().moreAbove);
-
-/**
- * Is snowflake `a` older than snowflake `b`?
+ * What a step back asks and what a page said about what is above (web/src/core/channels
+ * `createOlderPager`, `#624 voice-page-modularity`). The column's own record stays above
+ * (`freshOlderPages`/`olderPages`); this owns only the pure questions over it.
  *
- * Discord ids are timestamps, so ORDER is comparison — but they are decimal strings of differing
- * length, and `"9" < "10"` is false lexicographically. Length first, then the string.
+ * @type {import("./src/core/channels/index.ts").OlderPager}
  */
-function snowflakeOlder(a, b) {
-  const x = String(a === null || a === undefined ? "" : a);
-  const y = String(b === null || b === undefined ? "" : b);
-  if (!x || !y) {
-    return false;
-  }
-  return x.length === y.length ? x < y : x.length < y.length;
-}
+const olderPager = createOlderPager();
 
 // `#63 status-line-placement`. The channel's own summary — how much is loaded, and whether that is
 // the whole channel — used to be a line on the status strip, and the strip is transient now: a
@@ -20580,7 +20165,7 @@ const repliesWalks = createRepliesWalk({
   holds: (walk) => repliesKey() === walk.key && channelStore.current() === walk.canon &&
     sideColumnUp() && columns.side.mode === "list",
   heldNow: () => heldNow(channelStore.current()),
-  read: (channel, before, signal) => readTimeline(
+  read: (channel, before, signal) => timelineReader.readTimeline(
     `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}` +
     `${before === null ? "" : `&before=${encodeURIComponent(before)}`}&reason=search`,
     // The signal of the `AbortController` made by `controller` above.
@@ -20633,7 +20218,7 @@ function applyNewestPage(payload, saved = false) {
   const before = [...list.children].filter(isMessageRow);
   const kept =
     payload.has_more === true && oldest
-      ? [...list.children].filter((li) => snowflakeOlder(newestOf(li), oldest))
+      ? [...list.children].filter((li) => olderPager.snowflakeOlder(newestOf(li), oldest))
       : [];
   // `#578 search-status-clarity`. Every message row kept is older than the whole page: none of it
   // reaches down into what was loaded, so messages may lie between that no read brought, and the rows
@@ -20651,7 +20236,7 @@ function applyNewestPage(payload, saved = false) {
   // Only when nothing was kept. If older rows survived, the cursor that belongs to them is the one
   // the older walk left behind, and overwriting it with this page's would rewind the walk.
   if (kept.length === 0) {
-    olderPages().moreAbove = normaliseHasMore(payload.has_more);
+    olderPages().moreAbove = olderPager.normaliseHasMore(payload.has_more);
     olderPages().cursor = payload.next_before || null;
   }
   renderOlderControl();
@@ -20713,7 +20298,7 @@ async function loadOlderPage(signal) {
       payload = await api(
         `/api/v1/channels/${encodeURIComponent(channel)}/page` +
           `?limit=${DISCORD_PAGE_LIMIT}&before=${encodeURIComponent(olderPages().cursor)}&render=html` +
-          `&reason=${olderReadReason()}`,
+          `&reason=${timelineReader.olderReadReason()}`,
         signal ? { signal } : undefined
       );
     } catch (error) {
@@ -20730,7 +20315,7 @@ async function loadOlderPage(signal) {
     // The step is OVER before the anchored mutation, so that every consequence of it — the rows,
     // the summary and the control's final state — is one change of height rather than three. The
     // block below is synchronous, so there is no window in which a second step could start.
-    olderPages().moreAbove = normaliseHasMore(payload.has_more);
+    olderPages().moreAbove = olderPager.normaliseHasMore(payload.has_more);
     olderPages().cursor = payload.next_before || null;
     olderPages().inFlight = false;
     // Prepending is a mutation ABOVE the viewport, which is the one case browser scroll anchoring
@@ -20748,7 +20333,7 @@ async function loadOlderPage(signal) {
       // so rewriting it afterwards would be a second change of height above the viewport and the
       // reader would move by whatever the difference happened to be.
       renderChannelSeam(
-        channelSummary(list.children.length, loadedIsWhole(), channelName(payload.channel))
+        channelSummary(list.children.length, olderPager.loadedIsWhole(olderPages().moreAbove), channelName(payload.channel))
       );
       // `#262 search-load-older`. And the search's pass over them, where a filter chooses rows, as in
       // `loadOlderTimeline`: rows drawn and only then hidden would move a reader not at the head.
@@ -21154,8 +20739,8 @@ async function loadDiscord(options) {
     return loadTodo(options);
   }
   // `remote-ops-audit` W7. As for a timeline read (`loadTimeline`).
-  const holdKey = readHoldKey();
-  if (readHeld(holdKey, options)) return;
+  const holdKey = abandonedReads.holdKey();
+  if (abandonedReads.held(holdKey, options)) return;
   const generation = ++loadState().generation;
   const keepPosition = Boolean(options && options.keepPosition);
   const channel = selectedChannelId();
@@ -21177,7 +20762,7 @@ async function loadDiscord(options) {
     }
     // `render=html`: this route is also the voice agent's `read_page`, so its bodies are rendered
     // only when asked. `#217 markdown-blocks`.
-    const path = withReadReason(
+    const path = timelineReader.withReadReason(
       `/api/v1/channels/${encodeURIComponent(channel)}/page?limit=${DISCORD_PAGE_LIMIT}&render=html`, options);
     const sent = readLedger.epoch();
     // `remote-ops-audit` W7. Given up on, the read is kept, and its view held (`abandonRead`).
@@ -21185,7 +20770,7 @@ async function loadDiscord(options) {
       live: liveEvents.seen(String(channel)), news: liveEvents.news(String(channel)), canon: null,
       generation };
     const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => api(path, { signal }),
-      (answer) => abandonRead(answer, abandoned, (late) => {
+      (answer) => abandonedReads.abandon(answer, abandoned, (late) => {
         if (late && typeof late === "object") readLedger.noteSent(late, sent);
         drawChannelPage(late, area, landedReadPosition(area, true, false));
       }));
@@ -21220,7 +20805,7 @@ function drawChannelPage(payload, area, at) {
   // Inline, at the head of the list, rather than on the transient strip. `#63
   // status-line-placement`: this is a standing fact about what you are looking at, and the strip
   // takes itself away after a few seconds.
-  renderChannelSeam(channelSummary(loaded, loadedIsWhole(), channelName(payload.channel)));
+  renderChannelSeam(channelSummary(loaded, olderPager.loadedIsWhole(olderPages().moreAbove), channelName(payload.channel)));
   // What is drawn: an empty message the reader hides is not news at the foot (`#386 hide-empty-messages`).
   const messages = (payload.messages || []).filter((message) => !hiddenEmpty(message));
   settleAfterRead(messages, { area, ...at });
@@ -21820,7 +21405,7 @@ async function loadTodo(options) {
     // displayed would clear messages the reader never saw. See `clearBacklog`.
     const sent = readLedger.epoch();
     const payload = await api(
-      withReadReason(`/api/v1/channels/${encodeURIComponent(channel)}/todo?limit=${DISCORD_PAGE_LIMIT}`, options)
+      timelineReader.withReadReason(`/api/v1/channels/${encodeURIComponent(channel)}/todo?limit=${DISCORD_PAGE_LIMIT}`, options)
     );
     // When it was sent, for `noteBookmark`: a bookmark write settled since speaks over it.
     if (payload && typeof payload === "object") readLedger.noteSent(payload, sent);
@@ -22337,7 +21922,7 @@ function queueInboxWrite(task) {
 const inboxLedger = createInboxWriteLedger({
   storage: deviceStorageOnUse(),
   now: () => Date.now(),
-  makeRoom: () => dropMessageCache(),
+  makeRoom: () => messageCache.dropMessageCache(),
   // This page load's own name, as the back stack's (`BACK_SESSION`): another page open on the device keeps
   // its own writes.
   page: BACK_SESSION,
@@ -23445,7 +23030,7 @@ const serverCacheBox = mountServerCache({
 // bound for a new thread, are web/src/core/outbox's (`createReplyDrafts`, `#624 voice-page-modularity`).
 
 /** The reply drafts, by message id. */
-const replyDrafts = createReplyDrafts({ storage: deviceStorageOnUse(), makeRoom: () => dropMessageCache() });
+const replyDrafts = createReplyDrafts({ storage: deviceStorageOnUse(), makeRoom: () => messageCache.dropMessageCache() });
 
 /**
  * The reply open in the stream and what it was opened with — its message, channel and route, its column and
@@ -26047,8 +25632,8 @@ function sideCardParts({ choice, view, text, summarized, root, age, replies, unr
     view.cut ? [view.cut.head, view.cut.whole] : null, choice.root ? renderedHtmlOf(choice.root) || rawTextOf(choice.root) : ""]),
     counts: JSON.stringify([age, replies, unread, read, size.messages, size.exact]), block: "", read: "", fold: "" };
   if (state !== "unpacked") return parts;
-  const held = unpackHeldMessages(choice);
-  return { ...parts, block: unpackSignature(choice, held), read: unpackReadSignature(held),
+  const held = unpackHeldMessages(channelStore.current(), choice, channelStore.current().channel === String(selectedChannelId()));
+  return { ...parts, block: unpackSignature(choice, held), read: unpackReadSignature(held, channelStore.current().dismissed, unpackFilter),
     fold: [...foldedOneIds(viewKey("thread", choice.id))].sort().join(",") };
 }
 
@@ -26137,7 +25722,7 @@ function renderSideCards() {
   const whole = JSON.stringify([order, readModes.mode(), readRunsSuspended(), cardPacking.mode(),
     main.length ? [readModes.mode(), combineSwitch.on(), readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.id : "", readAloudOwner().pendingRead] : ""]);
   const parts = cards.map(sideCardParts);
-  const signature = JSON.stringify([whole, parts, main.map((message) => [messageLook(message), readLook(message)])]);
+  const signature = JSON.stringify([whole, parts, main.map((message) => [messageLook(message), readLook(message, channelStore.current().dismissed, unpackFilter)])]);
   const more = olderThreadsToRead();
   if (cardsDrawn.changed(signature)) {
     // Kept only from a pass under the same whole, and never where the cards were asked to be drawn anew
@@ -26163,7 +25748,7 @@ function renderSideCards() {
       // store's for every message drawn, as each thread's own would be: a key acting on a row asks it.
       const blocks = unpacked ? inColumn(columns.side, () => {
         const shown = cards.filter((card) => card.state === "unpacked")
-          .flatMap((card) => unpackHeldMessages(card.choice).map((message) => String(message.id)));
+          .flatMap((card) => unpackHeldMessages(channelStore.current(), card.choice, channelStore.current().channel === String(selectedChannelId())).map((message) => String(message.id)));
         doneState().archived = caughtUpDone(doneState().archived, shown);
         return cards.map((card, at) => {
           const was = kept[at];
@@ -26176,7 +25761,7 @@ function renderSideCards() {
             redrawUnpackBlock(card.choice, was.rows, tally);
             // Placing the runs can remember a run opened as it grew (`readRunPlan`), which the block's
             // signature says: read again, so the next pass finds it the same.
-            now.block = unpackSignature(card.choice, unpackHeldMessages(card.choice));
+            now.block = unpackSignature(card.choice, unpackHeldMessages(channelStore.current(), card.choice, channelStore.current().channel === String(selectedChannelId())));
           }
           return was.rows;
         });
@@ -26807,7 +26392,7 @@ const unpackReadQueue = createUnpackReads({
     const held = heldNow(channelStore.current());
     const path = withThreadQuery(
       `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=thread&limit=${DISCORD_PAGE_LIMIT}&reason=threads`, id);
-    return { channel, held, payload: await readTimeline(path, undefined) };
+    return { channel, held, payload: await timelineReader.readTimeline(path, undefined) };
   },
   land: (id, fetched) => {
     const { channel, held, payload } = /** @type {{channel: string, held: Map<string, any>, payload: any}} */ (fetched);
@@ -26979,23 +26564,7 @@ function packButton(id) {
   return button;
 }
 
-/** The store's messages of thread `choice.id`, oldest first, its root among them where it is held. */
-function unpackHeldMessages(choice) {
-  if (channelStore.current().channel !== String(selectedChannelId())) return [];
-  const held = channelStore.current().messages.filter((message) => threadOf(message) === choice.id);
-  const root = choice.root;
-  if (root && !channelStore.current().removed.has(String(root.id)) &&
-      !held.some((message) => String(message.id) === String(root.id))) {
-    return inTimeOrder([root, ...held], "timestamp");
-  }
-  return held;
-}
 
-/** Is `message` the root of thread `id`, by its record or by being the summary's root? */
-function isThreadRoot(message, choice) {
-  if (message.thread && message.thread.is_root === true) return true;
-  return Boolean(choice.root) && String(message.id) === String(choice.root.id);
-}
 
 /** Whether thread `choice` still owes unpacking a read: held replies short of its count, uncovered. */
 function unpackNeedsRead(choice, held) {
@@ -27051,35 +26620,14 @@ function unpackSignature(choice, held) {
   const view = cardView(choice);
   return JSON.stringify([choice.id, readModes.mode(), readRunsSuspended(), hideEmptySwitch.on(), combineSwitch.on(),
     view.mode, view.cut ? view.cut.head : 0, view.cut && choice.root ? renderedHtmlOf(choice.root) || rawTextOf(choice.root) : "",
-    held.map(messageLook), hidingRead() ? unpackReadSignature(held) : "",
+    held.map(messageLook), hidingRead() ? unpackReadSignature(held, channelStore.current().dismissed, unpackFilter) : "",
     opened ? [...opened].sort() : [], unpackReadQueue.state(choice.id) || "", readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.id : "", readAloudOwner().pendingRead,
     // `#532 shift-o-latency`: what decides its loading or end line (`unpackNeedsRead`, the cover), which
     // a block kept from the last pass would otherwise never ask again.
     typeof choice.count === "number" ? choice.count : null, cover ? cover.more !== false : null]);
 }
 
-/**
- * Which of a block's messages `held` are still to do, as a signature. Apart from the block's own
- * (`unpackSignature`), but under Hide read, which takes a read message out of the block: elsewhere a
- * Done or a put back changes only how its row is dressed and where the runs fall, which a block already
- * drawn takes in place (`redrawUnpackBlock`, `#532 shift-o-latency`).
- *
- * @param {any[]} held
- */
-function unpackReadSignature(held) {
-  return held.map(readLook).join("");
-}
 
-/**
- * How a message's row draws its read state, as a signature: Done or not in the store, and still to do
- * or not — two answers, since a message read by a rule (noise, or the reader's own under Mark own read)
- * is not to do whether it is Done or not, and its row says which. `#532 shift-o-latency`.
- *
- * @param {any} message
- */
-function readLook(message) {
-  return `${channelStore.current().dismissed.has(String(message.id)) ? "d" : "-"}${stillToDo(message, channelStore.current().dismissed) ? "1" : "0"}`;
-}
 
 /**
  * Thread `choice`'s unpacked block: its message rows under its card, bridged. They are the rows a
@@ -27097,13 +26645,13 @@ function readLook(message) {
  * @returns {HTMLElement[]}
  */
 function unpackBlock(choice, tally) {
-  const held = unpackHeldMessages(choice);
+  const held = unpackHeldMessages(channelStore.current(), choice, channelStore.current().channel === String(selectedChannelId()));
   // `#528 thread-card-markdown-and-cap`: and under a card waiting for its summary, or one clamped.
   const summarized = rootInward(choice);
   // `#522 thread-card-max-lines`. Under a split card the root's continuation is the first child: the
   // root's own row, alone in it, never joined to a reply by the same author.
   const split = summarized ? null : cardSplit(choice);
-  const messages = unpackMessages(choice, held, summarized || split !== null);
+  const messages = unpackMessages(choice, held, summarized || split !== null, unpackFilter);
   const root = split ? messages.find((message) => isThreadRoot(message, choice)) || null : null;
   const groups = root
     ? [[continuationOf(root, split)], ...glom(messages.filter((message) => message !== root))]
@@ -27161,22 +26709,6 @@ function unpackBlock(choice, tally) {
   return rows;
 }
 
-/**
- * The messages thread `choice` draws unpacked, oldest first, from `held` (`unpackHeldMessages`): what a
- * thread draws of them — no empty message where those are hidden, and under Hide read what a thread
- * keeps (`readFilterKeeps`) — with its root only where `withRoot`. Shared by the cards' blocks and by
- * a Main root's replies gathered under it for Reply (`#410 inline-reply-editor`, `arrangeChannelRows`).
- *
- * @param {ReturnType<typeof threadChoice>} choice
- * @param {Array<any>} held
- * @param {boolean} withRoot
- */
-function unpackMessages(choice, held, withRoot) {
-  let messages = held.filter((message) => !hiddenEmpty(message));
-  if (!withRoot) messages = messages.filter((message) => !isThreadRoot(message, choice));
-  if (hidingRead()) messages = messages.filter(readFilterKeeps(choice));
-  return messages;
-}
 
 /** Read thread `id` for its block as `row` nears the screen; at once where nothing can watch. */
 function watchUnpackBlock(row, id) {
@@ -28295,7 +27827,7 @@ const columnReadsSent = new Map();
 function answeredSince(since, reason) {
   const sent = columnReadsSent.get(columnWork.active());
   return Boolean(sent) && sent.read > since && sent.context === channelContextKey() &&
-    (sent.full || forwardCursor(reason) !== null);
+    (sent.full || timelineReader.forwardCursor(reason) !== null);
 }
 
 /** Whether a message belongs to the thread the right column is showing. */
@@ -28434,118 +27966,25 @@ const readHolds = createReadHolds({ now: () => Date.now() });
  */
 const liveEvents = createLiveEvents();
 
-/** The view a read of the column being worked on is for: its context, and the to-do list apart. */
-function readHoldKey() {
-  return !providerFacts.threading() && readModes.hiding() ? `${channelContextKey()} todo` : channelContextKey();
-}
-
 /**
- * A read of the view `key` names, in `channel`, sent at `sentAt`, was given up on: hold the view to the
- * server's bound. The hold set, for the read to take away when it answers (`abandonRead`).
+ * Reads the page gave up on: their views' holds, what a live event does to them, and whether
+ * a late answer may still be used (web/src/core/sync `createAbandonedReads`, `#624
+ * voice-page-modularity`). Landing one (`landAbandonedTimelineRead`) stays below.
  *
- * @param {string} key
- * @param {string} channel
- * @param {number} sentAt
+ * @type {import("./src/core/sync/index.ts").AbandonedReads}
  */
-function holdView(key, channel, sentAt) {
-  return readHolds.hold(key, channel, sentAt);
-}
+const abandonedReads = createAbandonedReads({
+  holds: readHolds,
+  live: liveEvents,
+  threading: () => providerFacts.threading(),
+  hiding: () => readModes.hiding(),
+  contextKey: () => channelContextKey(),
+  selectedChannel: () => String(selectedChannelId()),
+  currentStore: () => channelStore.current(),
+  asked: () => readOrder.asked(),
+  generation: () => loadState().generation,
+});
 
-/**
- * Whether a read of the view `key` names, with `options`, must not be sent now: a read of it given up
- * on may still be running at the server, and no live event has said since that the service is
- * answering. Only a read whose every reason is in `HELD_REASONS`, so a queued read that also stands
- * for any other trigger goes.
- *
- * @param {string} key
- * @param {{reason?: string | (string | undefined)[]} | undefined} options
- */
-function readHeld(key, options) {
-  return readHolds.held(key, options && options.reason);
-}
-
-/**
- * A live event for `channel` arrived. One out of the stream's replay tail (`fromTail`) is old news; any
- * other says the service is answering, and ends the holds on the channel's views. Either may be newer
- * than the answer of a read given up on.
- *
- * @param {unknown} channel
- * @param {boolean} fromTail
- */
-function noteLiveEvent(channel, fromTail) {
-  if (channel === undefined || channel === null) return;
-  const id = String(channel);
-  liveEvents.noteEvent(id);
-  if (fromTail) return;
-  liveEvents.noteNews(id);
-  readHolds.liftChannel(id);
-}
-
-/**
- * @typedef {object} AbandonedRead
- * @property {string} key the view it read (`readHoldKey`)
- * @property {string} channel
- * @property {number} sentAt when it was sent, by the clock
- * @property {number} live `liveEvents.seen` for its channel when it was sent
- * @property {number} news `liveEvents.news` for its channel when it was sent
- * @property {any} canon the store it was read for
- */
-
-/**
- * The read `read` describes was given up on with `answer` still on the wire: hold its view, and use
- * the answer if it lands and nothing newer has replaced it (`abandonedReadStands`), through `land`. A
- * failure later is nobody's to report: the wait for it was over, and was reported then.
- *
- * No hold when a live event that is news arrived for the channel after the read was sent: the service
- * is answering, and a read that event queued behind this one must go. And the hold goes when the
- * answer settles, landed or failed, used or not: the server is reading nothing for it then. What waited
- * for that is told through `settled`, after the answer is used, with whether it landed, and the answer
- * if it landed and was not used: the placing read (`placeUnplaced`, `#308 live-reply-in-main`) waits
- * while any read of its channel given up on may still be answered, and its own answer, replaced, still
- * says where what it carries is.
- *
- * @template T
- * @param {Promise<T>} answer
- * @param {AbandonedRead} read
- * @param {(payload: T) => void} land
- * @param {((landed: boolean, unused: T | null) => void) | null} [settled]
- */
-function abandonRead(answer, read, land, settled = null) {
-  const answering = liveEvents.news(read.channel) !== read.news;
-  const hold = answering ? null : holdView(read.key, read.channel, read.sentAt);
-  const release = () => {
-    readHolds.release(read.key, hold);
-  };
-  answer.then((payload) => {
-    release();
-    const stands = abandonedReadStands(read);
-    if (stands) land(payload);
-    if (settled) settled(true, stands ? null : payload);
-  }, () => {
-    release();
-    if (settled) settled(false, null);
-  });
-}
-
-/**
- * Whether the late answer of a read given up on may still be used: the same channel and store, no live
- * event for the channel since it was sent, and no read of the channel sent after it — the event is
- * newer than anything this answer can say, and so is any later read, landed or still on its way (one
- * on its way builds on what the store held when it was sent, which this answer must not move under
- * it). `number` is how many timeline reads had been sent with this one (`apiDecoded`); on a channel
- * without threads, `generation` answers for it instead.
- *
- * @param {AbandonedRead & {number?: number, generation?: number}} read
- */
-function abandonedReadStands(read) {
-  if (String(selectedChannelId()) !== read.channel) return false;
-  if (liveEvents.seen(read.channel) !== read.live) return false;
-  if (providerFacts.threading()) {
-    return read.canon === channelStore.current() && channelStore.current().channel === read.channel &&
-      read.number === readOrder.asked();
-  }
-  return read.generation === loadState().generation && !readModes.hiding();
-}
 
 /**
  * The late answer of a timeline read given up on, which nothing has replaced (`abandonRead`): into the
@@ -29169,7 +28608,7 @@ function onStreamFrame(frame) {
   if (payload && typeof payload === "object" &&
       ["message", "message_update", "message_delete"].includes(frame.event)) {
     const about = payload.message && typeof payload.message === "object" ? payload.message.channel_id : payload.channel_id;
-    noteLiveEvent(about, payload.from_tail === true);
+    abandonedReads.noteLiveEvent(about, payload.from_tail === true);
   }
   if (frame.event === "message_update" || frame.event === "message_delete") {
     // `#308 live-reply-in-main`. An edit is a copy too: one that names the thread of a message the
@@ -29778,8 +29217,8 @@ const channelSettings = mountChannelSettings({
   guard: (run) => guardQuietly(run),
   adoptChannelList: (payload) => adoptChannelList(payload),
   changeSelectedChannel: () => changeSelectedChannel(),
-  forgetChannelScopes: (matches) => forgetChannelScopes(matches),
-  saveCacheChannels: () => saveCacheChannels(),
+  forgetChannelScopes: (matches) => messageCache.forgetChannelScopes(matches),
+  saveCacheChannels: () => messageCache.saveCacheChannels(),
   fillReadingSelect: () => fillChannelSelect("discord-channel"),
   restateChannelSeam: () => restateChannelSeam(),
   setStatus: (text) => setStatus(text),
@@ -29925,7 +29364,7 @@ function fillChannelSelect(id) {
 function adoptChannelList(payload) {
   if (payload && Array.isArray(payload.channels)) channelDirectory.setChannels(payload.channels);
   if (payload && Array.isArray(payload.hidden_channels)) channelDirectory.setHidden(payload.hidden_channels);
-  saveCacheChannels();
+  messageCache.saveCacheChannels();
   channelSettings.fillServiceSelect();
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");
@@ -30003,7 +29442,7 @@ function restateChannelSeam() {
   renderChannelSeam(
     channelSummary(
       el("discord-log").children.length,
-      loadedIsWhole(),
+      olderPager.loadedIsWhole(olderPages().moreAbove),
       channelName(knownChannel(selectedChannelId()))
     )
   );
@@ -30194,7 +29633,7 @@ function applyClientConfig(config) {
   // only the visible view would mean the relay was off precisely while the reader was talking.
   startChannelStream(selectedChannelId());
   serverFacts.markConfigApplied();
-  saveCacheShell(config);
+  messageCache.saveCacheShell(config);
   // ...and the views chosen in channels it no longer lists, as their saved rows went: a thread's
   // summary is the credential's reading too. `#205 channel-view-memory`.
   const listed = new Set(channelDirectory.channels().map((channel) => String(channel.id)));

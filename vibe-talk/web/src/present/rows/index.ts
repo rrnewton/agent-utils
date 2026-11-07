@@ -96,3 +96,5 @@ export type { LinkKind, LinkKinds, LinkKindsDependencies } from "./linkkinds.ts"
 export { THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, cardTime, createThreadOrder, inThreadOrder, threadOrderAfter } from "./threadorder.ts";
 export type { OrderedCard, ThreadOrder, ThreadOrderChoice, ThreadOrderDependencies } from "./threadorder.ts";
 export { upstreamAppUrlOf, upstreamUrlOf } from "./upstream.ts";
+export { BOUNDED_ALL_NOTICE, allNoticeWords, staleWords } from "./noticetext.ts";
+export type { AllNoticeFacts } from "./noticetext.ts";

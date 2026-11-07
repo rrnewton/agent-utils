@@ -670,3 +670,98 @@ test("`#624 voice-page-modularity`: the stream of every channel attaches, resume
   bare.stop();
   assert.deepStrictEqual(plain, [null]);
 });
+
+test("`#624 voice-page-modularity`: a timeline read is counted as it is sent and joins its deltas oldest-first, from the module alone", async () => {
+  const { createTimelineReader } = SYNC;
+  const noted = [];
+  let epoch = 5;
+  const ledger = { epoch: () => epoch, noteSent: (p, s) => noted.push([p, s]), sentEpochOf: (p) => p.__epoch ?? 0 };
+  let askedCount = 0;
+  const order = { asked: () => ++askedCount, noteSent: (p, n) => { p.__number = n; } };
+  const reader = createTimelineReader({
+    decoded: async (path) => ({ path, messages: [], threads: [], dismissed: [] }),
+    ledger, order, pageLimit: 50,
+    channelId: () => "c/1", view: () => "flat", threadId: () => null,
+    withThreadQuery: (path) => path, searchWalkActive: () => false,
+    storeChannel: () => "c/1", selectedChannel: () => "c/1",
+    cover: () => undefined, complete: () => null, mutationAwaits: () => false,
+    refreshFailed: () => false, now: () => 100000,
+  });
+  const payload = await reader.readTimeline("/x");
+  assert.equal(payload.__number, 1, "the read was not counted as it was sent");
+  assert.deepStrictEqual(noted, [[payload, 5]]);
+  assert.equal(reader.timelinePath("9", null, "poll"), "/api/v1/channels/c%2F1/timeline?view=flat&limit=50&before=9&reason=poll");
+  assert.equal(reader.readReasonOf({ reason: ["poll", "live"] }), "poll");
+  assert.equal(reader.readReasonOf({ readAs: "side", reason: "poll" }), "side");
+  assert.equal(reader.readReasonOf({}), null);
+  assert.equal(reader.withReadReason("/a?x=1", { reason: "enter" }), "/a?x=1&reason=enter");
+  assert.equal(reader.olderReadReason(), "older");
+  const a = { messages: [{ id: "1" }], threads: [], dismissed: [], __epoch: 3 };
+  const b = { messages: [{ id: "2" }], threads: [{ id: "t" }], dismissed: ["9"], __epoch: 7 };
+  const joined = reader.joinedDeltas([a, b]);
+  assert.deepStrictEqual(joined.messages.map((m) => m.id), ["1", "2"]);
+  assert.deepStrictEqual(noted[noted.length - 1], [joined, 3], "joined deltas were not as old as their oldest page");
+  assert.equal(reader.landedAnswer([]), null);
+  assert.equal(reader.landedAnswer([a]).delta, null);
+});
+test("`#624 voice-page-modularity`: reads given up on hold their view and their late answers stand or not, from the module alone", async () => {
+  const { createAbandonedReads, createLiveEvents, createReadHolds } = SYNC;
+  let now = 1000;
+  const page = { threading: true, hiding: false, context: '["c","main",null]',
+    selected: "c", store: { channel: "c" }, asked: 7, generation: 3 };
+  const live = createLiveEvents();
+  const holds = createReadHolds({ now: () => now });
+  const reads = createAbandonedReads({ holds, live,
+    threading: () => page.threading, hiding: () => page.hiding,
+    contextKey: () => page.context, selectedChannel: () => page.selected,
+    currentStore: () => page.store, asked: () => page.asked, generation: () => page.generation });
+  const read = (over = {}) => ({ key: reads.holdKey(), channel: "c", sentAt: now,
+    live: live.seen("c"), news: live.news("c"), canon: page.store, number: page.asked,
+    generation: page.generation, ...over });
+  const deferred = () => { let resolve, reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject }; };
+
+  // holdKey: the to-do list is its own view only without threads, while read is hidden.
+  assert.equal(reads.holdKey(), page.context);
+  page.threading = false; page.hiding = true;
+  assert.equal(reads.holdKey(), `${page.context} todo`);
+  page.hiding = false;
+  assert.equal(reads.holdKey(), page.context);
+  page.threading = true;
+
+  // No news since it was sent: the view is held, the hold goes before the answer is used,
+  // and settled hears of it after, with nothing unused.
+  const a = deferred(); const landed = []; const settledA = [];
+  reads.abandon(a.promise, read(), (p) => {
+    assert.equal(reads.held(reads.holdKey(), { reason: "poll" }), false,
+      "the hold was still up while its answer was being landed");
+    landed.push(p);
+  }, (ok, unused) => settledA.push([ok, unused]));
+  assert.equal(reads.held(reads.holdKey(), { reason: "poll" }), true);
+  assert.equal(reads.held(reads.holdKey(), { reason: "reset" }), false, "a non-poll read waited");
+  assert.equal(reads.held(reads.holdKey()), false);
+  a.resolve("page");
+  await a.promise; await Promise.resolve();
+  assert.deepStrictEqual([landed, settledA], [["page"], [[true, null]]]);
+
+  // A failure releases the hold too, lands nothing, and settled says so.
+  const b = deferred(); const settledB = [];
+  reads.abandon(b.promise, read(), () => assert.fail("a failed read landed"),
+    (ok, unused) => settledB.push([ok, unused]));
+  assert.equal(reads.held(reads.holdKey(), { reason: "poll" }), true);
+  b.reject(new Error("slow"));
+  await b.promise.catch(() => {}); await Promise.resolve();
+  assert.deepStrictEqual(settledB, [[false, null]]);
+  assert.equal(reads.held(reads.holdKey(), { reason: "poll" }), false);
+
+  // News after it was sent: no hold at all, and the answer still lands while nothing
+  // newer has replaced it.
+  const c = read();
+  live.noteNews("c");
+  const landedC = [];
+  reads.abandon(Promise.resolve("late"), c, (p) => landedC.push(p));
+  assert.equal(reads.held(c.key, { reason: "poll" }), false, "news did not prevent the hold");
+  await Promise.resolve(); await Promise.resolve();
+  assert.deepStrictEqual(landedC, ["late"]);
+});

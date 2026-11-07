@@ -3631,7 +3631,7 @@ test("`#308 live-reply-in-main` x `remote-ops-audit` W7: a placing read given up
   // poll of Main goes beside it.
   const control = await run(brokenScript(" ||\n      placeUnplacedWaits(channel)) return;", ") return;"));
   assert.equal(control.placing(), 2, "the placing read waited anyway, so this test cannot see it");
-  const unheld = await run(brokenScript("  const key = inColumn(columns.main, readHoldKey);\n", "  const key = \"elsewhere\";\n"));
+  const unheld = await run(brokenScript("  const key = inColumn(columns.main, abandonedReads.holdKey);\n", "  const key = \"elsewhere\";\n"));
   assert.ok(unheld.polled > 0, "the poll of Main waited for a placing read held for no view, so this test cannot see it");
 });
 
@@ -3685,7 +3685,7 @@ test("`#308 live-reply-in-main` x `remote-ops-audit` W7: the late answer of a pl
   // places what it carries (`placeFromAnswer`, review round 3), and brings nothing else of All.
   const dropped = await run(brokenScript("(late) => landPlacingRead(late, read),", "() => {},"));
   assert.ok(shownIds(dropped.page).includes("300"), "the late answer placed the reply anyway, so this test cannot see it");
-  const unheld = await run(brokenScript("  const key = inColumn(columns.main, readHoldKey);\n", "  const key = \"elsewhere\";\n"));
+  const unheld = await run(brokenScript("  const key = inColumn(columns.main, abandonedReads.holdKey);\n", "  const key = \"elsewhere\";\n"));
   assert.ok(unheld.polled > 0 && !heldIds(unheld.page).includes("204"),
     "the poll of Main waited, or the late answer stood beside it, so this test cannot see it");
 });

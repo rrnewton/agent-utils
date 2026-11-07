@@ -23,12 +23,11 @@ export {
 export { speechHoldFrom } from "../core/speech/index.ts";
 export { createApi, createServerFacts, isSlowFailure, readableFailure } from "../core/api/index.ts";
 
-export { allReachesThread, answerUnplaced, answeredThread, coverViewOf, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createPlainReach, createProviderFacts, createRemovals, createSummaries, createThreadPresence, createTodoView, createUnpackReads, emptyTally, exactReplyCount, foldDeltaIn, foldLiveIn, foldPageIn, heldAsSent, heldNow, inTimeOrder, inViewOf, markDoneIn, namedRecord, newerPage, newerPageSpeaksFor, noteReplyGapsIn, pageFoldIn, placeFromPageIn, projectionOf, refreshFailed, replyTallyOf, restoreCanon, savedTimelineOf, settleDoneIn, summaryKey, tallyRecord, threadOf, timeOf, unplacedToAsk, unseenRepliesIn, upsertThreadSummary, viewOfKey } from "../core/channels/index.ts";
+export { allReachesThread, answerUnplaced, answeredThread, coverViewOf, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createPlainReach, createProviderFacts, createRemovals, createSummaries, createThreadPresence, createTodoView, createUnpackReads, emptyTally, exactReplyCount, foldDeltaIn, foldLiveIn, foldPageIn, heldAsSent, heldNow, inTimeOrder, inViewOf, markDoneIn, namedRecord, newerPage, newerPageSpeaksFor, noteReplyGapsIn, pageFoldIn, placeFromPageIn, projectionOf, refreshFailed, replyTallyOf, restoreCanon, savedTimelineOf, settleDoneIn, summaryKey, tallyRecord, threadOf, timeOf, unplacedToAsk, unseenRepliesIn, upsertThreadSummary } from "../core/channels/index.ts";
 export { anchorOfMessage, createBookmarkUndo, createBookmarkWrites, createBookmarks, createLegacyMarker, createPins, createReadLedger, isBookmarkState, sameAnchor } from "../core/annotations/index.ts";
 export { REOPENED_VIEWS, UI_STATE_CHARS, UI_STATE_KEY, UI_STATE_VERSION, createBackStack, createDeepLinks, createLayoutChoice, createLinkJumps, createNavigation, createUiState, createViewPlaces, createVisits, deepLinkQuery, visitKey } from "../core/navigation/index.ts";
 export {
   DISCORD_POLL_MS,
-  STALE_AS_OF_MS,
   TIMELINE_DELTA_PAGES,
   TIMELINE_RECONCILE_MS,
   VISIBLE_REFRESH_MS,
@@ -49,9 +48,7 @@ export {
   createStandInRetries,
   createStreamGeneration,
   createWatchAll,
-  deltaCursor,
   isCursorRefusal,
-  staleAsOf as syncStaleAsOf,
 } from "../core/sync/index.ts";
 export {
   DISMISSED_SENDS_DAYS,
@@ -143,3 +140,10 @@ export { createAutoplay, createReadAloud, createReadingJump, createVoiceCall, cr
 
 export { CANNED_PROMPTS, mountAgentPrefix, mountAgentSettings, mountAudioDevices, mountBarPlacement, mountCannedPrompts, mountChannelBoxListeners, mountChannelDirectory, mountChannelHistory, mountChannelSettings, mountConnectionReadouts, mountDismissedSends, mountHelpFolds, mountHelpLinks, mountIdentityList, mountMessagePreferences, mountMicrophoneSettings, mountNoiseRules, mountOwnReadApply, mountPairing, mountPreferenceSwitches, mountReadingWidth, mountResumePreference, mountSaveTokenButton, mountScreenControls, mountServerCache, mountSettingsFolds, mountSettingsReadouts, mountSettingsSwitches, mountSettingsSyncView, mountSignInControls, mountTextSize, mountUpstreamClear, restoreStoredSettings } from "../view/settings/index.ts";
 export { blankResumeLast, createAudioRoute, createCallResume, createVoiceProvider } from "../core/call/index.ts";
+
+// read core (#624 mu-readcore)
+export { createAbandonedReads, createTimelineReader } from "../core/sync/index.ts";
+export { DISCORD_PAGE_LIMIT, OLDER_TRIGGER_PX, createOlderPager } from "../core/channels/index.ts";
+export { isThreadRoot, readLook, unpackHeldMessages, unpackMessages, unpackReadSignature } from "../core/channels/index.ts";
+export { allNoticeWords, staleWords } from "../present/rows/index.ts";
+export { MESSAGE_CACHE_ROWS, createMessageCache, tokenFingerprint } from "../core/channels/index.ts";

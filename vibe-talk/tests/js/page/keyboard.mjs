@@ -5085,7 +5085,7 @@ test("`#532 shift-o-latency`: a kept block is drawn again for what its rows show
   assert.notEqual(look({ ...base, reactions: [{ emoji: "👍", count: 1, me: false }] }), look(base),
     "a reaction is not in a row's signature");
   const choice = (count) => ({ ...page.pure("threadChoices")().find((one) => one.id === "spaces/A/threads/s11"), count });
-  const held = page.pure("unpackHeldMessages")(choice(SHIFT_O_REPLIES));
+  const held = page.preludeBinding("unpackHeldMessages")(page.pure("channelStore.current()"), choice(SHIFT_O_REPLIES), page.pure("channelStore.current().channel === String(selectedChannelId())"));
   assert.notEqual(page.pure("unpackSignature")(choice(SHIFT_O_REPLIES + 1), held),
     page.pure("unpackSignature")(choice(SHIFT_O_REPLIES), held), "a thread grown by its count keeps its block, unread");
 });
