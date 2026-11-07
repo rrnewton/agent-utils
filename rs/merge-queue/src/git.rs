@@ -630,7 +630,9 @@ impl Git {
         for parent in parents {
             args.extend(["-p", parent]);
         }
-        args.extend(["-m", message]);
+        // The message travels on stdin, never as an argument: Linux limits
+        // one argv string to 131,072 bytes (MAX_ARG_STRLEN), so `-m` fails
+        // with E2BIG on large consumer messages that git itself accepts.
         let mut command = self.command(&args);
         if let Some((name, email, date)) = author {
             command
@@ -642,7 +644,28 @@ impl Git {
                 .env("GIT_AUTHOR_NAME", name)
                 .env("GIT_AUTHOR_EMAIL", email);
         }
-        let output = self.output(command, "git commit-tree", &[0])?;
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("could not run git commit-tree: {error}"))?;
+        let fed = child
+            .stdin
+            .take()
+            .map_or(Ok(()), |mut stdin| stdin.write_all(message.as_bytes()));
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("could not run git commit-tree: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git commit-tree failed ({}): {}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        fed.map_err(|error| format!("could not feed git commit-tree: {error}"))?;
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 
@@ -1266,6 +1289,61 @@ mod unit {
         };
         assert_ne!(tip, b);
         assert!(git.is_ancestor(&a, &tip).unwrap());
+    }
+
+    #[test]
+    fn replay_preserves_a_message_over_the_argv_limit() {
+        // Linux limits one argv string to 131,072 bytes (MAX_ARG_STRLEN), so a
+        // message passed with `-m` can never reach `commit-tree` at all; the
+        // message must travel on stdin. 140,000 bytes is over that limit.
+        let tmp = TempDir::new("git-big-message");
+        let mut git = init(&tmp.0);
+        git.identity = Some(("Test".to_owned(), "test@example.com".to_owned()));
+        let base = git.rev_parse("main").unwrap();
+        let message = format!("big subject\n\n{}", "x".repeat(140_000));
+        // Build the large-message commit with plumbing, feeding the message
+        // on stdin so the fixture itself does not hit the argv limit.
+        write(&tmp.0, "big.txt", "big\n");
+        testrepo::git(&tmp.0, &["add", "-A"]);
+        let tree = testrepo::git(&tmp.0, &["write-tree"]);
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&tmp.0)
+            .args(["commit-tree", &tree, "-p", &base])
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(message.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let big = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        testrepo::git(&tmp.0, &["reset", "-q", "--hard", "main"]);
+        // Land another change first so the big commit is replayed (not
+        // fast-forwarded) through `commit_tree`.
+        let a = branch(&tmp.0, "a", "main", &[("a.txt", "a\n")]);
+        let Combined::Clean(tip) = git
+            .combine(CombineMode::Rebase, &base, &a, &[], "")
+            .unwrap()
+        else {
+            panic!("a should apply");
+        };
+        let Combined::Clean(tip2) = git
+            .combine(CombineMode::Rebase, &tip, &big, &[], "")
+            .unwrap()
+        else {
+            panic!("the large-message commit should replay");
+        };
+        assert_eq!(git.message(&tip2).unwrap(), message.trim_end());
     }
 
     #[test]

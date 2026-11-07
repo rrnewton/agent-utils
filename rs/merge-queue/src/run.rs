@@ -3375,15 +3375,15 @@ impl<'a> Runner<'a> {
                 let mut add = vec!["add", "-A", "--"];
                 add.extend(changed.iter().map(String::as_str));
                 wt.run(&add)?;
+                // The message names every regenerated path, so it grows
+                // without bound; feed it on stdin (`-F -`), never as an
+                // argument, which Linux caps at 131,072 bytes per string.
                 let message = format!("merge-queue: regenerate {} after #{pr}", changed.join(", "));
                 let mut command = Command::new("git");
-                command.arg("-C").arg(&checkout).args([
-                    "commit",
-                    "-q",
-                    "--no-verify",
-                    "-m",
-                    &message,
-                ]);
+                command
+                    .arg("-C")
+                    .arg(&checkout)
+                    .args(["commit", "-q", "--no-verify", "-F", "-"]);
                 if let Some((name, email)) = &self.git.identity {
                     command
                         .env("GIT_AUTHOR_NAME", name)
@@ -3391,8 +3391,25 @@ impl<'a> Runner<'a> {
                         .env("GIT_COMMITTER_NAME", name)
                         .env("GIT_COMMITTER_EMAIL", email);
                 }
-                let committed = command
-                    .output()
+                command
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                let mut child = command
+                    .spawn()
+                    .map_err(|error| format!("cannot commit regenerated files: {error}"))?;
+                {
+                    use std::io::Write;
+                    let mut stdin = child
+                        .stdin
+                        .take()
+                        .ok_or_else(|| "cannot commit regenerated files: no stdin".to_owned())?;
+                    stdin
+                        .write_all(message.as_bytes())
+                        .map_err(|error| format!("cannot commit regenerated files: {error}"))?;
+                }
+                let committed = child
+                    .wait_with_output()
                     .map_err(|error| format!("cannot commit regenerated files: {error}"))?;
                 if !committed.status.success() {
                     return Err(format!(
