@@ -1,10 +1,11 @@
 ---
 title: 'merge-queue-commit-tree-stdin: commit-tree passes the message as argv and fails on large messages'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-07T12:18:00.000000000+00:00
-updated_at: 2026-11-07T12:18:00.000000000+00:00
+updated_at: 2026-11-07T14:18:27.000000000+00:00
+closed_at: 2026-11-07T14:18:27.000000000+00:00
 ---
 
 # Description
@@ -44,3 +45,8 @@ Filed from GitHub issue 308
 (https://github.com/rrnewton/agent-utils/issues/308), reported by a
 consuming project's merge queue. Consumers are referred to generically
 here, per repository convention.
+
+Landed as 98f4b65d by mu-argmax (watermelon-full-preview): `commit_tree`
+feeds the message on stdin and the regenerate commit uses `-F -`; a
+140,000-byte message replays cleanly (regression test
+`replay_preserves_a_message_over_the_argv_limit`).
