@@ -184,6 +184,22 @@ fn an_operator_draft_an_approval_form_or_a_slash_command_holds_the_prompt_untype
     no_input(&fixture);
     fs::remove_file(&error.undelivered().unwrap().artifact).unwrap();
 
+    // A peer-approval dialog also holds the prompt untyped (#974): whether a peer may
+    // talk to the session is a human decision, so send refuses and types nothing.
+    set(&|editor| {
+        editor.approval = false;
+        editor.peer_approval = true;
+    });
+    let error = manager
+        .send("worker", "at a peer dialog", held())
+        .unwrap_err();
+    assert!(matches!(error, AgentError::Pending(_)), "{error}");
+    assert!(error.to_string().contains("is blocked"), "{error}");
+    assert_eq!(manager.status("worker").unwrap()["agent_status"], "blocked");
+    no_input(&fixture);
+    fs::remove_file(&error.undelivered().unwrap().artifact).unwrap();
+    set(&|editor| editor.peer_approval = false);
+
     // Slash commands open Muse menus at once even mid-turn, so they wait for an idle editor.
     set(&|editor| editor.approval = false);
     let error = manager.send("worker", "/model", held()).unwrap_err();

@@ -5209,7 +5209,8 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 let reported = info.status.clone();
                 let status = muse_verified_pane_status(&info.status, &screen);
                 info.status = if status == "working"
-                    && crate::harness_tui::muse::MuseTui::approval_form(&screen)
+                    && (crate::harness_tui::muse::MuseTui::approval_form(&screen)
+                        || crate::harness_tui::muse::MuseTui::peer_approval_form(&screen))
                 {
                     "blocked"
                 } else {
@@ -5420,7 +5421,8 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 let reported = info.status.clone();
                 let status = muse_verified_pane_status(&info.status, &screen);
                 info.status = if status == "working"
-                    && crate::harness_tui::muse::MuseTui::approval_form(&screen)
+                    && (crate::harness_tui::muse::MuseTui::approval_form(&screen)
+                        || crate::harness_tui::muse::MuseTui::peer_approval_form(&screen))
                 {
                     "blocked"
                 } else {

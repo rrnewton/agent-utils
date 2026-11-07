@@ -41,6 +41,13 @@ impl MuseTui {
             .is_some_and(|rows| muse_editor_rows_empty(&rows))
     }
 
+    /// Whether Muse's peer-approval dialog stands where the editor would be (#974
+    /// muse-peer-approval-prompt), so the pane waits for a person. Detection only: whether
+    /// a peer may talk to this session is a human decision, and nothing here answers it.
+    pub(crate) fn peer_approval_form(screen: &str) -> bool {
+        crate::agent_watch::peer_approval_prompt_line(screen).is_some()
+    }
+
     /// Whether a command approval form stands where the editor would be, so the pane waits for
     /// a person: `agentctl status` reports it `blocked` rather than `working` (#678
     /// muse-bridge-latency).
@@ -86,6 +93,9 @@ impl HarnessTui for MuseTui {
         if FORM_MARKERS.iter().any(|marker| tail.contains(marker)) {
             return View::state(State::MenuOrPicker);
         }
+        if Self::peer_approval_form(screen) {
+            return View::state(State::MenuOrPicker);
+        }
         View::state(State::Unknown)
     }
     fn answer_plan(
@@ -119,6 +129,10 @@ mod tests {
     const MULTILINE: &str = include_str!("../../testdata/muse-busy/muse-steered-multiline.txt");
     const HELP: &str = include_str!("../../testdata/muse-busy/muse-help-panel.txt");
     const APPROVAL: &str = include_str!("../../testdata/muse-busy/muse-approval.txt");
+    // The peer-approval dialog before and after a Down key focuses its menu (#974).
+    const PEER_APPROVAL: &str = include_str!("../../testdata/muse-busy/muse-peer-approval.txt");
+    const PEER_APPROVAL_FOCUSED: &str =
+        include_str!("../../testdata/muse-busy/muse-peer-approval-focused.txt");
     const DOUBLE_CHECKING: &str =
         include_str!("../../testdata/muse-busy/muse-double-checking-queued.txt");
     const INTERRUPTING: &str = include_str!("../../testdata/muse-busy/muse-interrupting.txt");
@@ -329,6 +343,20 @@ mod tests {
         for screen in [IDLE, THINKING, COMMAND, STEER_FAILED] {
             assert!(!MuseTui::approval_form(screen));
         }
+    }
+
+    #[test]
+    fn a_peer_approval_dialog_blocks_focused_or_not_and_an_idle_editor_does_not() {
+        // #974: the dialog waits for a human whether or not its menu has focus yet, and
+        // detection never answers it.
+        for screen in [PEER_APPROVAL, PEER_APPROVAL_FOCUSED] {
+            assert_eq!(state(screen), State::MenuOrPicker);
+            assert!(MuseTui::peer_approval_form(screen));
+            assert!(!MuseTui::editor_empty(screen));
+        }
+        assert_eq!(state(IDLE), State::IdleComposer);
+        assert!(!MuseTui::peer_approval_form(IDLE));
+        assert!(!MuseTui::peer_approval_form(APPROVAL));
     }
 
     #[test]

@@ -31,6 +31,8 @@ pub(super) struct MuseEditor {
     pub(super) ignore_enter: bool,
     /// A command approval form takes the editor's place.
     pub(super) approval: bool,
+    /// Muse's peer-approval dialog takes the editor's place (#974).
+    pub(super) peer_approval: bool,
     /// A staged paste draws with its last character missing, so it never shows as the exact
     /// prompt, as a wrap the proof cannot read once did.
     pub(super) garble: bool,
@@ -66,6 +68,7 @@ impl Default for MuseEditor {
             busy: false,
             ignore_enter: false,
             approval: false,
+            peer_approval: false,
             garble: false,
             goal: None,
             question: None,
@@ -113,6 +116,8 @@ impl MuseEditor {
             }
             _ if self.approval => "Would you like to run the following command?\n  $ date\n\
                                    ⟩ 1. Allow this stage once (y)\n  2. Abort the entire command (esc)"
+                .to_owned(),
+            _ if self.peer_approval => "Message from coordinator\n\ncoordinator sent a message to this session and is asking for a reply:\n  1. Allow once\n  2. Reject once\n  3. Allow for this session\n  4. Block"
                 .to_owned(),
             (Some(text), _) => format!("❯ [Pasted Content {} chars]", length(text)),
             (None, Some(text)) if self.garble => {

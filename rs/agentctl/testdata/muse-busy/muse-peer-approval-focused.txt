@@ -1,0 +1,22 @@
+  Muse Code 1.4.14
+
+  Skills: 64 loaded · 3 details hidden (ctrl+o to expand)
+
+❯ Keep working on the current task and tell me when the gate finishes.
+
+◆ Worked for 2m 10s
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Message from coordinator
+
+coordinator sent a message to this session and is asking for a reply:
+
+  "The gate queue moved; may I re-run your shard on the new base?"
+
+⟩ 1. Allow once
+  2. Reject once
+  3. Allow for this session
+  4. Block
+
+↑/↓ to navigate · Enter to select
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  watermelon-full-preview · xhigh · ~/work/project · Launch overrides

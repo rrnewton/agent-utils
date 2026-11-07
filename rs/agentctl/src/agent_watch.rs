@@ -442,6 +442,9 @@ pub(crate) fn blocked_finding(screen: &str) -> Option<(EpisodeKind, String)> {
 
 /// The prompt line at the bottom of `screen`, trimmed and bounded, when one is showing.
 pub(crate) fn approval_prompt_line(screen: &str) -> Option<String> {
+    if let Some(peer) = peer_approval_prompt_line(screen) {
+        return Some(peer);
+    }
     let lines: Vec<&str> = screen.lines().collect();
     let start = lines.len().saturating_sub(PROMPT_WINDOW_LINES);
     lines[start..].iter().rev().find_map(|line| {
@@ -451,6 +454,53 @@ pub(crate) fn approval_prompt_line(screen: &str) -> Option<String> {
             .any(|pattern| lowered.contains(pattern))
             .then(|| line.trim().chars().take(QUOTED_LINE_CHARS).collect())
     })
+}
+
+/// Muse's peer-approval dialog choices, in the order the dialog draws them.
+const PEER_APPROVAL_CHOICES: [&str; 4] = [
+    "Allow once",
+    "Reject once",
+    "Allow for this session",
+    "Block",
+];
+
+/// The Muse peer-approval dialog at the bottom of `screen` (#974
+/// muse-peer-approval-prompt): a `Message from <peer>` heading with its choices
+/// (`Allow once / Reject once / Allow for this session / Block`). A peer asking
+/// is a human decision, so this only ever names the dialog; nothing answers it.
+/// Both the heading and at least two choices must show in the prompt window, so
+/// a screen merely quoting a peer message does not count. The returned line
+/// names the dialog and the choices it offers, focused or not (before a Down
+/// key focuses the menu the choices are drawn with no focus marker).
+pub(crate) fn peer_approval_prompt_line(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    // The dialog is taller than the generic prompt window: heading, message and four
+    // choices, plus a navigation hint once the menu has focus.
+    let window = &lines[lines.len().saturating_sub(24)..];
+    let lowered: Vec<String> = window
+        .iter()
+        .map(|line| line.to_ascii_lowercase())
+        .collect();
+    let heading = window
+        .iter()
+        .zip(&lowered)
+        .find(|(_, line)| line.contains("message from "))
+        .map(|(line, _)| {
+            line.trim()
+                .chars()
+                .take(QUOTED_LINE_CHARS)
+                .collect::<String>()
+        })?;
+    let offered: Vec<&str> = PEER_APPROVAL_CHOICES
+        .iter()
+        .filter(|choice| {
+            lowered
+                .iter()
+                .any(|line| line.contains(&choice.to_ascii_lowercase()))
+        })
+        .copied()
+        .collect();
+    (offered.len() >= 2).then(|| format!("{heading} (choices: {})", offered.join(" / ")))
 }
 
 /// Bullets a harness draws at column 0 to open an assistant block: Claude Code's `●` (`⏺`
@@ -9278,6 +9328,52 @@ mod tests {
             .clone();
         assert_eq!(row["since"], 60.0, "{row}");
         assert_eq!(row["reported"], true, "{row}");
+    }
+
+    #[test]
+    fn the_quick_check_reports_a_peer_approval_dialog_as_waiting_for_a_human() {
+        // #974 muse-peer-approval-prompt: the dialog is reported on the quick check, by
+        // name and with its choices, focused or not; it is never answered.
+        let peer = include_str!("../testdata/muse-busy/muse-peer-approval.txt");
+        let peer_focused = include_str!("../testdata/muse-busy/muse-peer-approval-focused.txt");
+        for screen in [peer, peer_focused] {
+            let (kind, detail) = blocked_finding(screen).expect("the dialog is blocked");
+            assert_eq!(kind, EpisodeKind::ApprovalPrompt);
+            assert!(detail.contains("Message from coordinator"), "{detail}");
+            assert!(detail.contains("Allow once"), "{detail}");
+            assert!(detail.contains("Block"), "{detail}");
+
+            let mut options = options();
+            options.approval = Duration::ZERO;
+            options.interval = Duration::from_secs(900);
+            options.blocked_check = Duration::from_secs(60);
+            options.min_notice_interval = Duration::from_secs(3600);
+            let worker = |screen: &str| Observation {
+                recipient: Some("lieutenant".to_owned()),
+                ..observation("worker", "working", Some(screen))
+            };
+            let mut probe = QuickProbe {
+                passes: vec![vec![worker("◆ building the thing\n")]],
+                visible: vec![vec![("worker".to_owned(), screen.to_owned())]],
+            };
+            let mut notifier = RecordingNotifier::default();
+            let mut state = WatchState::default();
+            watch_agents_once(&mut probe, &mut notifier, &mut state, 0.0, &options);
+            assert!(notifier.sent.is_empty());
+            let quick = check_blocked(&mut probe, &mut notifier, &mut state, 60.0, &options)
+                .expect("the dialog is found between passes");
+            assert_eq!(quick["found"][0]["kind"], "approval-prompt", "{quick}");
+            assert_eq!(notifier.sent.len(), 1, "{quick}");
+            assert!(
+                notifier.sent[0].1.contains("Message from coordinator"),
+                "{}",
+                notifier.sent[0].1
+            );
+        }
+        // Merely quoting the dialog far above the prompt window is not the dialog.
+        let quoted = format!("{peer}{}", "\n◆ later work on other things".repeat(15));
+        assert!(blocked_finding(&quoted).is_none());
+        assert!(blocked_finding(IDLE_SCREEN).is_none());
     }
 
     #[test]
