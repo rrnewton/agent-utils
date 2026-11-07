@@ -1514,8 +1514,8 @@ test("`#433 read-strip-low`: the strip hugs the chips' measured height and the p
   const own = cssRules(CSS_CODE, "#channel-composer").find((rule) => /margin-top:/.test(rule));
   assert.match(own, /margin-top:[^;]*--read-steer-clearance/,
     "the list's foot keeps no room for the strip, so its last message cannot scroll clear of it");
-  assert.match(SCRIPT_CODE, /"--scroll-tools-height"/, "nothing writes the chips' measured height");
-  assert.match(SCRIPT_CODE, /"--read-steer-clearance"[\s\S]*?\.observe\(el\("read-steer"\)\)/,
+  assert.match(PAGE_CODE, /"--scroll-tools-height"/, "nothing writes the chips' measured height");
+  assert.match(PAGE_CODE, /"--read-steer-clearance"[\s\S]*?\.observe\(el\("read-steer"\)\)/,
     "nothing measures the strip for the room kept over it");
 });
 
@@ -1763,7 +1763,7 @@ test("`scrubber-full-width`: on a phone the strip playing is a full-width row on
     "the list's foot keeps room for a strip it no longer runs under");
   assert.match(rule(":root[data-read-strip] #frame-body"), /--chips-foot:\s*max\(calc\(var\(--read-steer-height, 0px\) \+ 0\.5rem\)/,
     "the chips and the pill do not stand on the strip");
-  assert.match(SCRIPT_CODE, /"--read-steer-height"[\s\S]*?\.observe\(el\("read-steer"\)\)/, "nothing measures the strip's height");
+  assert.match(PAGE_CODE, /"--read-steer-height"[\s\S]*?\.observe\(el\("read-steer"\)\)/, "nothing measures the strip's height");
   // Playing: the second row (in the dock or the header) and the chips go. Held: the second row only.
   assert.match(rule(":root[data-read-strip] #control-bar"), /display:\s*none;/, "the second row stays up during playback");
   // (By the text: the rule parser splits a selector at the commas inside its `:has`.)
