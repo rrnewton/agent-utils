@@ -245,6 +245,78 @@ pub(crate) fn live_custom_process(pid: u64) -> Result<LiveCustomProcess> {
     agent_queue::identity::observe(pid).map_err(identity_error)
 }
 
+/// Read the argument vector of one pinned process generation, or `None`; see
+/// [`HerdrClient::process_command_line`].
+pub(crate) fn pinned_command_line(expected: &CustomProcessIdentity) -> Option<Vec<String>> {
+    const LIMIT: u64 = 256 << 10;
+    let same = || {
+        live_custom_process(expected.pid)
+            .ok()
+            .is_some_and(|observed| observed.identity == *expected)
+    };
+    if !same() {
+        return None;
+    }
+    let mut raw = Vec::new();
+    fs::File::open(format!("/proc/{}/cmdline", expected.pid))
+        .ok()?
+        .take(LIMIT + 1)
+        .read_to_end(&mut raw)
+        .ok()?;
+    if !same() || raw.is_empty() || raw.len() as u64 > LIMIT {
+        return None;
+    }
+    if raw.last() == Some(&0) {
+        raw.pop();
+    }
+    let argv = raw
+        .split(|byte| *byte == 0)
+        .map(|item| String::from_utf8(item.to_vec()).ok())
+        .collect::<Option<Vec<_>>>()?;
+    (!argv.is_empty() && argv.iter().all(|item| !item.is_empty())).then_some(argv)
+}
+
+/// A pinned command process that has re-executed itself since it was recorded (#933
+/// agentctl-agentcloud-viewer-identity): the same boot, PID and start time, so the same kernel
+/// process, now running another executable image, as a program that upgrades itself in place
+/// does. Its identity no longer matches the record, yet nothing else took the pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReexecutedCommand {
+    /// The live identity, carrying the new image's device and inode.
+    pub identity: CustomProcessIdentity,
+    /// The kernel-reported path of the image it runs now.
+    pub executable_path: PathBuf,
+    /// Its argument vector, read under the live identity.
+    pub argv: Vec<String>,
+}
+
+/// `recorded`'s process, leading foreground group `foreground_process_group_id`, when it has
+/// re-executed: everything but the executable image still matches the record.
+pub(crate) fn reexecuted_command(
+    recorded: &CustomProcessIdentity,
+    foreground_process_group_id: u64,
+) -> Option<ReexecutedCommand> {
+    if !recorded.valid() {
+        return None;
+    }
+    let observed = live_custom_process(recorded.pid).ok()?;
+    let live = &observed.identity;
+    if observed.process_group_id != foreground_process_group_id
+        || live.boot_id != recorded.boot_id
+        || live.starttime_ticks != recorded.starttime_ticks
+        || (live.executable_device, live.executable_inode)
+            == (recorded.executable_device, recorded.executable_inode)
+    {
+        return None;
+    }
+    let argv = pinned_command_line(live)?;
+    Some(ReexecutedCommand {
+        identity: live.clone(),
+        executable_path: observed.executable_path,
+        argv,
+    })
+}
+
 /// SIGTERM the pinned process `identity` and every process under it, deepest first, then wait
 /// up to `timeout` for all of them to exit; returns whether they did. A wrapper that only
 /// launches the real runtime (as Muse's does) would otherwise die alone and orphan it, so the
@@ -3121,32 +3193,26 @@ impl HerdrClient {
     /// environment. A vector that is not NUL-separated UTF-8 text, exceeds 256 KiB, or holds an
     /// empty argument is `None`.
     pub fn process_command_line(&self, expected: &CustomProcessIdentity) -> Option<Vec<String>> {
-        const LIMIT: u64 = 256 << 10;
-        let same = || {
-            live_custom_process(expected.pid)
-                .ok()
-                .is_some_and(|observed| observed.identity == *expected)
-        };
-        if !same() {
-            return None;
+        pinned_command_line(expected)
+    }
+
+    /// The pinned command process `identity`, still the pane's foreground process, when it has
+    /// re-executed itself since it was recorded (see [`ReexecutedCommand`]).
+    pub fn pane_command_reexecuted(
+        &self,
+        pane_id: &str,
+        identity: &CustomProcessIdentity,
+    ) -> Result<Option<ReexecutedCommand>> {
+        let (foreground_process_group_id, processes) =
+            self.foreground_processes(pane_id, &|| false)?;
+        let matches = processes
+            .iter()
+            .filter(|process| process.get("pid").and_then(Value::as_u64) == Some(identity.pid))
+            .count();
+        if matches != 1 {
+            return Ok(None);
         }
-        let mut raw = Vec::new();
-        fs::File::open(format!("/proc/{}/cmdline", expected.pid))
-            .ok()?
-            .take(LIMIT + 1)
-            .read_to_end(&mut raw)
-            .ok()?;
-        if !same() || raw.is_empty() || raw.len() as u64 > LIMIT {
-            return None;
-        }
-        if raw.last() == Some(&0) {
-            raw.pop();
-        }
-        let argv = raw
-            .split(|byte| *byte == 0)
-            .map(|item| String::from_utf8(item.to_vec()).ok())
-            .collect::<Option<Vec<_>>>()?;
-        (!argv.is_empty() && argv.iter().all(|item| !item.is_empty())).then_some(argv)
+        Ok(reexecuted_command(identity, foreground_process_group_id))
     }
 
     /// Is the same pinned process still the foreground group leader? Helpers are
@@ -3846,6 +3912,72 @@ mod tests {
     static EXECUTABLE_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[cfg(target_os = "linux")]
     static SIGNAL_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// #933 agentctl-agentcloud-viewer-identity: a viewer upgraded in place, its file replaced and
+    /// then re-executed by the running process, is the same kernel process on another image. It is
+    /// recognised, with the arguments it runs under now; a different generation is not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_viewer_reexecuted_after_its_executable_was_replaced_is_recognised() {
+        let fixture = FakeExecutable::new("{}");
+        let viewer = fixture.root.join("agentterm");
+        let upgrade = fixture.root.join("agentterm.new");
+        let go = fixture.root.join("go");
+        install_test_elf("/bin/sh", &viewer);
+        // Written and closed now, so no forked test child can hold it open when it is executed.
+        install_test_elf("/bin/sh", &upgrade);
+        let script = "while [ ! -e \"$1\" ]; do sleep 0.02; done; exec \"$0\" -c 'sleep 30; :' agentterm -s SESSION";
+        let mut started = None;
+        for _ in 0..100 {
+            let mut command = Command::new(&viewer);
+            command
+                .arg("-c")
+                .arg(script)
+                .arg(&viewer)
+                .arg(&go)
+                .process_group(0);
+            match command.spawn() {
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                result => {
+                    started = Some(ChildGuard(result.expect("start the viewer")));
+                    break;
+                }
+            }
+        }
+        let process = started.expect("the viewer's executable stayed busy for 2s");
+        let pid = u64::from(process.0.id());
+        let _group = ProcessGroupGuard(process.0.id() as libc::pid_t);
+        let recorded = live_custom_process(pid).unwrap().identity;
+        assert_eq!(
+            reexecuted_command(&recorded, pid),
+            None,
+            "nothing has changed yet"
+        );
+
+        fs::rename(&upgrade, &viewer).unwrap();
+        fs::write(&go, "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let change = loop {
+            if let Some(change) = reexecuted_command(&recorded, pid) {
+                break change;
+            }
+            assert!(Instant::now() < deadline, "the viewer never re-executed");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(change.identity.pid, pid);
+        assert_eq!(change.identity.starttime_ticks, recorded.starttime_ticks);
+        assert_ne!(change.identity.executable_inode, recorded.executable_inode);
+        assert_eq!(change.executable_path, viewer);
+        assert_eq!(&change.argv[change.argv.len() - 2..], ["-s", "SESSION"]);
+
+        // Not the foreground group, or another generation of that PID: not the recorded viewer.
+        assert_eq!(reexecuted_command(&recorded, pid + 1), None);
+        let mut other = recorded.clone();
+        other.starttime_ticks += 1;
+        assert_eq!(reexecuted_command(&other, pid), None);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

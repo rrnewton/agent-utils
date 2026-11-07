@@ -2467,7 +2467,12 @@ Starting one is two steps, and `agentctl` performs both:
    opens no tab.
 2. The agent's new Herdr tab runs `agentterm -s SESSION_ID`. `agentctl` pins the
    `agentterm` process as the tab's foreground process, so `status` can later
-   say whether the viewer is still attached. A project `workspace` setting
+   say whether the viewer is still attached. An agentterm that re-executes
+   itself after an upgrade is still that viewer when the kernel process (boot,
+   PID and start time), the tab's foreground and its `-s SESSION_ID` argument
+   are unchanged: `status` reports it attached with a `viewer_reexecuted` entry
+   naming both executables, and `stop` closes its tab. A process that exec'd
+   into anything else is refused as before. A project `workspace` setting
    places this tab exactly as it places a local worker's tab. The same policy
    then governs the agent: `send` and terminal reads (`read --output tail` or
    `all`) refuse while the tab is missing or in another workspace, before any
@@ -2742,8 +2747,11 @@ per record `workspace-missing`, `tab-missing` and `pane-missing` (Herdr has
 closed it; doctor reports it and goes on to the other records), `harness-exited`, `harness-kind-mismatch`,
 `harness-replaced`, `terminal-mismatch`, `tab-moved`, `label-mismatch`,
 `herdr-name-mismatch`, `workspace-mismatch`, `rename-incomplete`,
-`unanchored`, `duplicate-claim`; per workspace `label-collision` and the
-informational `unmanaged-tab`. It exits 0 when clean and 1 with findings, and
+`unanchored`, `duplicate-claim`, and the informational `viewer-reexecuted`
+(Rust distribution: an agentcloud tab's agentterm re-executed itself, as an
+in-place upgrade does, so it runs another executable than the one recorded; the
+row's `detail` names the recorded and current device and inode and the new
+path); per workspace `label-collision` and the informational `unmanaged-tab`. It exits 0 when clean and 1 with findings, and
 changes nothing unless `--repair-labels`, which restores the label and Herdr
 name of an owned agent only when every other check still passes. agentctl does
 not schedule doctor; run it by hand, from cron, or from a coordinator's health

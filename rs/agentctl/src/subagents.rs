@@ -28,7 +28,7 @@ use crate::client::{
     muse_verified_process_idle_composer, muse_verified_process_paste_in_composer,
     muse_verified_process_paste_is_exact_composer, muse_verified_process_prompt_queued_count,
     muse_verified_process_prompt_transcript_count, AgentIdentity, AgentPaneInfo,
-    CustomProcessIdentity, HerdrClient, Pane, PaneShellProof, ProcessLiveness,
+    CustomProcessIdentity, HerdrClient, Pane, PaneShellProof, ProcessLiveness, ReexecutedCommand,
 };
 use crate::error::{AdapterError, AdapterErrorKind};
 use crate::submission::{GuardedInput, GuardedPrompt, Submission};
@@ -1083,6 +1083,15 @@ pub trait ManagedApi: AgentApi {
             "pane command verification is unavailable",
         ))
     }
+    /// The pinned command process, still the pane's foreground process, when it has
+    /// re-executed itself since it was recorded (an in-place upgrade); `None` otherwise.
+    fn pane_command_reexecuted(
+        &self,
+        _pane: &str,
+        _identity: &CustomProcessIdentity,
+    ) -> crate::error::Result<Option<ReexecutedCommand>> {
+        Ok(None)
+    }
     /// Require the configured custom harness in one exact foreground pane.
     fn verify_custom_harness(
         &self,
@@ -1561,6 +1570,13 @@ impl ManagedApi for HerdrClient {
         identity: &CustomProcessIdentity,
     ) -> crate::error::Result<bool> {
         HerdrClient::pane_runs_command(self, pane, identity)
+    }
+    fn pane_command_reexecuted(
+        &self,
+        pane: &str,
+        identity: &CustomProcessIdentity,
+    ) -> crate::error::Result<Option<ReexecutedCommand>> {
+        HerdrClient::pane_command_reexecuted(self, pane, identity)
     }
     fn verify_custom_harness(
         &self,
@@ -8636,6 +8652,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "pane_id": record.pane_id,
                 "findings": findings,
             });
+            if findings.contains(&"viewer-reexecuted") {
+                row["detail"] = json!(self.cloud_viewer_detail(record));
+            }
             if repair_labels
                 && !findings.is_empty()
                 && findings
@@ -8673,7 +8692,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         let clean = registry_findings.is_empty()
             && rows.iter().all(|row| {
-                row["findings"].as_array().is_some_and(Vec::is_empty) || row["repaired"] == true
+                // A re-executed viewer is reported, not a fault: `stop` still closes its pane.
+                row["findings"].as_array().is_some_and(|findings| {
+                    findings
+                        .iter()
+                        .all(|finding| finding == "viewer-reexecuted")
+                }) || row["repaired"] == true
             })
             && workspace_findings
                 .iter()
@@ -8705,8 +8729,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             return Ok(vec!["pane-missing"]);
         };
         if record.is_cloud() {
-            // An agentcloud tab runs agentterm, not a Herdr-detected harness.
-            return Ok(Vec::new());
+            // An agentcloud tab runs agentterm, not a Herdr-detected harness. A viewer that
+            // re-executed itself (an upgrade) no longer matches its recorded image; say so
+            // (#933 agentctl-agentcloud-viewer-identity).
+            return Ok(if self.cloud_viewer_detail(record).is_some() {
+                vec!["viewer-reexecuted"]
+            } else {
+                Vec::new()
+            });
         }
         let mut findings = Vec::new();
         let info = self.client.pane_info(pane)?;

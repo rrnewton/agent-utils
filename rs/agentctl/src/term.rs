@@ -1486,6 +1486,21 @@ impl crate::subagents::ManagedApi for TmuxBackend {
         verify_foreground_identity(&pane_processes(self, pane)?, identity)
     }
 
+    fn pane_command_reexecuted(
+        &self,
+        pane: &str,
+        identity: &CustomProcessIdentity,
+    ) -> Result<Option<crate::client::ReexecutedCommand>> {
+        let state = pane_processes(self, pane)?;
+        if !state.foreground.contains(&identity.pid) {
+            return Ok(None);
+        }
+        Ok(crate::client::reexecuted_command(
+            identity,
+            state.foreground_pgid,
+        ))
+    }
+
     fn start_pane_command(
         &self,
         pane: &str,

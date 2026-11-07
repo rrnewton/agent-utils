@@ -677,6 +677,19 @@ fn parse_session_id(stdout: &str) -> Option<String> {
     (lines.next().is_none() && valid_session_id(first)).then(|| first.to_owned())
 }
 
+/// The recorded and current image of a re-executed viewer, for `status`'s terminal facts.
+fn viewer_change_json(recorded: &CustomProcessIdentity, change: &ReexecutedCommand) -> Value {
+    json!({
+        "pid": recorded.pid,
+        "recorded": {"device": recorded.executable_device, "inode": recorded.executable_inode},
+        "current": {
+            "device": change.identity.executable_device,
+            "inode": change.identity.executable_inode,
+            "executable": change.executable_path,
+        },
+    })
+}
+
 /// Bound diagnostic text to `MAX_NOTE_CHARS` characters in total, suffix included, and replace
 /// NUL so the value is always safe to store and print.
 fn excerpt(text: &str) -> String {
@@ -1516,11 +1529,64 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         });
         if let Some(identity) = identity {
             match self.client.pane_runs_command(pane_id, identity) {
-                Ok(attached) => terminal["agentterm_attached"] = json!(attached),
+                Ok(true) => terminal["agentterm_attached"] = json!(true),
+                Ok(false) => match self.cloud_viewer_reexecuted(record, pane_id) {
+                    Ok(Some(change)) => {
+                        terminal["agentterm_attached"] = json!(true);
+                        terminal["viewer_reexecuted"] = viewer_change_json(identity, &change);
+                    }
+                    Ok(None) => terminal["agentterm_attached"] = json!(false),
+                    Err(error) => terminal["probe_error"] = json!(error.to_string()),
+                },
                 Err(error) => terminal["probe_error"] = json!(error.to_string()),
             }
         }
         terminal
+    }
+
+    /// The recorded viewer after it re-executed itself, as an upgrading agentterm does (#933
+    /// agentctl-agentcloud-viewer-identity): the same kernel process (boot, PID and start time)
+    /// in the pane's foreground, still showing this record's session (`-s SESSION` in its
+    /// arguments), with another executable image than the one recorded. Anything else,
+    /// including a different program the process exec'd into, is `None`.
+    pub(super) fn cloud_viewer_reexecuted(
+        &self,
+        record: &AgentRecord,
+        pane_id: &str,
+    ) -> Result<Option<ReexecutedCommand>> {
+        let identity = record
+            .agentcloud
+            .as_ref()
+            .and_then(|cloud| cloud.terminal_identity.as_ref());
+        let (Some(identity), Some(session)) = (identity, record.session_value.as_deref()) else {
+            return Ok(None);
+        };
+        Ok(self
+            .client
+            .pane_command_reexecuted(pane_id, identity)?
+            .filter(|change| {
+                change
+                    .argv
+                    .windows(2)
+                    .any(|pair| pair[0] == "-s" && pair[1] == session)
+            }))
+    }
+
+    /// One line naming the recorded and current identity of a re-executed viewer, for doctor.
+    pub(super) fn cloud_viewer_detail(&self, record: &AgentRecord) -> Option<String> {
+        let identity = record.agentcloud.as_ref()?.terminal_identity.as_ref()?;
+        let change = self
+            .cloud_viewer_reexecuted(record, record.pane_id.as_deref()?)
+            .ok()??;
+        Some(format!(
+            "the agentterm viewer (pid {}) re-executed itself: recorded executable device {} inode {}, now device {} inode {} ({}); `stop` still closes its pane",
+            identity.pid,
+            identity.executable_device,
+            identity.executable_inode,
+            change.identity.executable_device,
+            change.identity.executable_inode,
+            change.executable_path.display()
+        ))
     }
 
     /// Status without attaching to the session: the fleet listing never wakes a dormant session.
@@ -2275,7 +2341,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .as_ref()
             .and_then(|cloud| cloud.terminal_identity.as_ref());
         let viewer = match identity {
-            Some(identity) => self.client.pane_runs_command(&saved.pane_id, identity)?,
+            Some(identity) => {
+                self.client.pane_runs_command(&saved.pane_id, identity)?
+                    || self
+                        .cloud_viewer_reexecuted(record, &saved.pane_id)?
+                        .is_some()
+            }
             None => false,
         };
         if !viewer && !self.client.pane_is_idle_shell(&saved.pane_id)? {
@@ -2537,6 +2608,8 @@ mod tests {
         move_on_read: AtomicBool,
         /// The pane runs some foreground process other than the recorded viewer or a shell.
         busy_foreign: AtomicBool,
+        /// The recorded viewer process re-executed itself into this image and argument vector.
+        reexecuted: Mutex<Option<Vec<String>>>,
     }
 
     fn identity() -> CustomProcessIdentity {
@@ -2674,6 +2747,30 @@ mod tests {
         }
         fn pane_is_idle_shell(&self, _: &str) -> AdapterResult<bool> {
             Ok(!self.busy_foreign.load(Ordering::Relaxed))
+        }
+        fn agent_names(&self) -> AdapterResult<BTreeMap<String, String>> {
+            Ok(BTreeMap::new())
+        }
+        fn tab_labels(&self, _: &str) -> AdapterResult<BTreeMap<String, String>> {
+            Ok(BTreeMap::from([(
+                "cloud-tab".to_owned(),
+                "sub-worker".to_owned(),
+            )]))
+        }
+        fn pane_command_reexecuted(
+            &self,
+            _: &str,
+            recorded: &CustomProcessIdentity,
+        ) -> AdapterResult<Option<ReexecutedCommand>> {
+            Ok(self.reexecuted.lock().unwrap().clone().map(|argv| {
+                let mut identity = recorded.clone();
+                identity.executable_inode += 1;
+                ReexecutedCommand {
+                    identity,
+                    executable_path: PathBuf::from("/opt/agentterm/bin/agentterm"),
+                    argv,
+                }
+            }))
         }
         fn agent_pane(&self, _: &str) -> AdapterResult<String> {
             unused()
@@ -3864,6 +3961,72 @@ exit 0
         assert_eq!(
             record["agentcloud"]["halted"], true,
             "the halt is recorded for the retry"
+        );
+    }
+
+    /// #933 agentctl-agentcloud-viewer-identity: the viewer re-executed itself after an upgrade, so
+    /// its image no longer matches the record, but it is the same process showing this session.
+    #[test]
+    fn stop_closes_the_pane_of_a_viewer_that_reexecuted_and_doctor_reports_it() {
+        let fixture = Fixture::new();
+        fixture.list_row(false);
+        fixture.start(None).unwrap();
+        fixture.herdr.detached.store(true, Ordering::Relaxed);
+        fixture.herdr.busy_foreign.store(true, Ordering::Relaxed);
+        *fixture.herdr.reexecuted.lock().unwrap() = Some(strings(&["agentterm", "-s", SESSION]));
+
+        let status = fixture.manager().status("sub-worker").unwrap();
+        assert_eq!(status["terminal"]["agentterm_attached"], true);
+        assert_eq!(
+            status["terminal"]["viewer_reexecuted"]["recorded"]["inode"],
+            9
+        );
+        assert_eq!(
+            status["terminal"]["viewer_reexecuted"]["current"]["inode"],
+            10
+        );
+        let doctor = fixture.manager().doctor(false).unwrap();
+        let row = &doctor["records"][0];
+        assert_eq!(row["findings"], json!(["viewer-reexecuted"]), "{doctor}");
+        assert_eq!(
+            doctor["clean"], true,
+            "informational: stop still closes the pane"
+        );
+        let detail = row["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("inode 9")
+                && detail.contains("inode 10")
+                && detail.contains("/opt/agentterm/bin/agentterm"),
+            "{detail}"
+        );
+
+        let stopped = fixture.manager().stop("sub-worker").unwrap();
+        assert_eq!(stopped["pane_closed"], true);
+        assert_eq!(*fixture.herdr.closed.lock().unwrap(), ["cloud-pane"]);
+    }
+
+    /// The recorded process exec'd into something that does not show this session: not the viewer.
+    #[test]
+    fn stop_refuses_a_recorded_process_that_reexecuted_into_another_program() {
+        let fixture = Fixture::new();
+        fixture.list_row(false);
+        fixture.start(None).unwrap();
+        fixture.herdr.detached.store(true, Ordering::Relaxed);
+        fixture.herdr.busy_foreign.store(true, Ordering::Relaxed);
+        *fixture.herdr.reexecuted.lock().unwrap() = Some(strings(&["vim", "notes.txt"]));
+        let message = fixture
+            .manager()
+            .stop("sub-worker")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("other than the recorded agentterm viewer"),
+            "{message}"
+        );
+        assert!(fixture.herdr.closed.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture.manager().doctor(false).unwrap()["records"][0]["findings"],
+            json!([])
         );
     }
 
