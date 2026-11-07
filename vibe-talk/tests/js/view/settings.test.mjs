@@ -282,3 +282,13 @@ test("`#624 voice-page-modularity`: Settings' switches mount where the browser h
   });
   assert.ok(!heard.includes("devicechange"), "a device change was listened for with no media devices");
 });
+
+test("`#624 voice-page-modularity`: every setting is restored as kept, once, in the page's order", () => {
+  const { restoreStoredSettings } = VIEW_SETTINGS;
+  const order = ["readingWidth", "textSize", "collapsedLines", "cardMaxLines", "quoteReadPercent", "readSpeed", "ownRead", "combine",
+    "hideEmpty", "richHeaders", "inAppLinks", "openInView", "summarizeCollapsed", "enterSends"];
+  const log = [];
+  const deps = Object.fromEntries([...order].reverse().map((name) => [name, (...args) => log.push(`${name}${args.length ? ` ${args.length}` : ""}`)]));
+  assert.equal(restoreStoredSettings(deps), undefined);
+  assert.deepStrictEqual(log, order, "a setting was restored out of the page's order, twice, or handed something");
+});

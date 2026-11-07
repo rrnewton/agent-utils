@@ -30613,47 +30613,37 @@ mountSettingsSwitches({
   },
 });
 
-// The column the reader last chose, restored before anything is drawn into it. Applied
-// unconditionally: on a phone the stylesheet never consults the value, so there is nothing to
-// branch on here and no second definition of "is this a desktop" to drift.
-readingWidthControl.apply(storedReadingWidth());
-textSize.apply(storedMsgScale());
-// `#425 collapsed-lines`. Before anything is drawn, for the same reason: a first list folded at
-// three and refolded at the reader's count a moment later is a jump nobody asked for.
-collapsedLines.apply(collapsedLines.stored());
-// Before the first card is drawn: nothing to draw again yet.
-cardMaxLines.apply(cardMaxLines.stored(), false);
-quoteReadPercent.apply(quoteReadPercent.stored());
-readAloudOwner().applyReadSpeed(readAloudOwner().storedReadSpeed());
-ownReadSwitch.apply(ownReadSwitch.stored());
-combineSwitch.apply(combineSwitch.stored());
-hideEmptySwitch.apply(hideEmptySwitch.stored());
-applyRichHeaders(storedRichHeaders());
-inAppLinks.apply(inAppLinks.stored());
-renderOpenInView();
-applySummarizeCollapsed(storedSummarizeCollapsed());
-enterSends.apply(enterSends.stored());
-// `#340 composer-grow-box`. Drawn as stored, and stored only once the reader ticks one: absent means off.
-renderComposerGrow(storedComposerGrow());
-for (const id of COMPOSER_GROW_IDS) {
-  // The checkbox the change came from, not the focus, which a click in Safari or Firefox on a Mac leaves on nothing.
-  leftEl(id).addEventListener("change", () => applyComposerGrow(/** @type {HTMLInputElement} */ (leftEl(id)).checked, leftEl(id)));
-}
-// The call's box is measured as it saves its draft (`rememberComposeDraft`); these three, as they are typed in.
-for (const id of ["channel-compose-text", "side-compose-text", "reply-text"]) {
-  leftEl(id).addEventListener("input", () => fitGrowingBox(leftEl(id)));
-}
-// Send kept in view as the box grows under the reader's typing. In the observer, not after it: a scroll
-// changes no size, so it cannot come round again as the loop a browser reports, and the list is where it
-// will be before the jump to the newest is decided again after the observer (`#207 scrollback-jump`). In
-// the right column a reader at the foot is kept there already (`#280 scroll-stability`), and this then
-// finds the composer in view and moves nothing.
-if (typeof window.ResizeObserver === "function") {
-  const growing = new window.ResizeObserver((entries) => {
-    for (const entry of entries) keepGrowingBoxInView(/** @type {HTMLElement} */ (entry.target));
-  });
-  for (const id of COMPOSER_GROW_BOXES) growing.observe(leftEl(id));
-}
+// Every setting restored as kept before anything is drawn: the column and the type, the line counts (`#425
+// collapsed-lines`), the read-aloud speed, the switches that shape the lists, and the message box's Enter. The order
+// is said once, in web/src/view/settings/restore.ts (`#624 voice-page-modularity`); each setting's owner applies it.
+restoreStoredSettings({
+  readingWidth: () => readingWidthControl.apply(storedReadingWidth()),
+  textSize: () => textSize.apply(storedMsgScale()),
+  collapsedLines: () => collapsedLines.apply(collapsedLines.stored()),
+  cardMaxLines: () => cardMaxLines.apply(cardMaxLines.stored(), false),
+  quoteReadPercent: () => quoteReadPercent.apply(quoteReadPercent.stored()),
+  readSpeed: () => readAloudOwner().applyReadSpeed(readAloudOwner().storedReadSpeed()),
+  ownRead: () => ownReadSwitch.apply(ownReadSwitch.stored()),
+  combine: () => combineSwitch.apply(combineSwitch.stored()),
+  hideEmpty: () => hideEmptySwitch.apply(hideEmptySwitch.stored()),
+  richHeaders: () => applyRichHeaders(storedRichHeaders()),
+  inAppLinks: () => inAppLinks.apply(inAppLinks.stored()),
+  openInView: () => renderOpenInView(),
+  summarizeCollapsed: () => applySummarizeCollapsed(storedSummarizeCollapsed()),
+  enterSends: () => enterSends.apply(enterSends.stored()),
+});
+// `#340 composer-grow-box`. The grow switches drawn as kept and heard, three boxes fitted as they are typed in, and
+// Send kept in view as a box grows. One owner in web/src/view/composer/growlisteners.ts (`#624
+// voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's teardown.
+mountComposerGrowListeners({
+  lookup: (id) => leftEl(id),
+  storedComposerGrow: () => storedComposerGrow(),
+  renderComposerGrow: (on) => renderComposerGrow(on),
+  applyComposerGrow: (on, grow) => applyComposerGrow(on, grow),
+  fitGrowingBox: (field) => fitGrowingBox(field),
+  keepGrowingBoxInView: (field) => keepGrowingBoxInView(field),
+  resizeObserver: () => window.ResizeObserver,
+});
 // The screen's sliders and their steps, the page-build notice's reload (`#529 page-build-stale-notice`: only on the
 // reader's press), and the reading column's grip. One owner in web/src/view/settings/screencontrols.ts (`#624
 // voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's teardown.

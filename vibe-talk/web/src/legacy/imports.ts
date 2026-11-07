@@ -108,8 +108,6 @@ export {
 export { KEYS_MESSAGE, KEYS_MOVING, KEYS_PAGE, KEYS_VIEW, KEYS_WRITING, SCREENS, createActionMenu, createChannelKeys, createChipsOverComposer, createDoneKeys, createFoldKeys, createHighlightCopy, createKeyDispatch, createKeyHints, createKeySelection, createKeyTiming, createKeymap, createPointerSelection, createPromptsTray, createReadCollapse, createReaderRow, createReplySight, createRowKeys, createRowShortcuts, createScreenKeys, createScreens, createScrollKeys, createSelectionKeys, createShellNotices, createUndoOffer, createUndoStamps, createViewKeys, createWriteKeys, keyTimingLine, modHeld, mountKeyListeners, mountPageListeners, pageStep, swallow } from "../view/shell/index.ts";
 export {
   COMPOSER_FIELDS,
-  COMPOSER_GROW_BOXES,
-  COMPOSER_GROW_IDS,
   NEWLINE_KEYS,
   createComposerGrow,
   createComposerKeys,
@@ -117,6 +115,7 @@ export {
   createOnScreenKeyboard,
   focusAtEnd,
   isComposer,
+  mountComposerGrowListeners,
   mountQuickReplyListeners,
   watchBoxInsertions as watchInsertions,
   wireNewlineKey,
@@ -141,5 +140,5 @@ export const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged 
 export { createAutoplay, createReadAloud, createReadingJump, createVoiceCall, createVoiceTranscript, mountCallControls, mountReadControls } from "../view/voice/index.ts";
 
 export { HELP_TOPICS } from "../present/settings/index.ts";
-export { CANNED_PROMPTS, mountAgentPrefix, mountAgentSettings, mountAudioDevices, mountBarPlacement, mountCannedPrompts, mountChannelDirectory, mountChannelHistory, mountChannelSettings, mountConnectionReadouts, mountDismissedSends, mountHelpFolds, mountIdentityList, mountMessagePreferences, mountMicrophoneSettings, mountNoiseRules, mountOwnReadApply, mountPairing, mountReadingWidth, mountResumePreference, mountSaveTokenButton, mountScreenControls, mountServerCache, mountSettingsFolds, mountSettingsReadouts, mountSettingsSwitches, mountSettingsSyncView, mountTextSize, mountUpstreamClear } from "../view/settings/index.ts";
+export { CANNED_PROMPTS, mountAgentPrefix, mountAgentSettings, mountAudioDevices, mountBarPlacement, mountCannedPrompts, mountChannelDirectory, mountChannelHistory, mountChannelSettings, mountConnectionReadouts, mountDismissedSends, mountHelpFolds, mountIdentityList, mountMessagePreferences, mountMicrophoneSettings, mountNoiseRules, mountOwnReadApply, mountPairing, mountReadingWidth, mountResumePreference, mountSaveTokenButton, mountScreenControls, mountServerCache, mountSettingsFolds, mountSettingsReadouts, mountSettingsSwitches, mountSettingsSyncView, mountTextSize, mountUpstreamClear, restoreStoredSettings } from "../view/settings/index.ts";
 export { blankResumeLast, createAudioRoute, createCallResume, createVoiceProvider } from "../core/call/index.ts";

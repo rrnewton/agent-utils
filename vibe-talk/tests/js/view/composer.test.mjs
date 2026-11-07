@@ -342,3 +342,53 @@ test("`#624 voice-page-modularity`: the quoted words' and the quick-reply box's 
     globalThis.document = was;
   }
 });
+
+test("`#624 voice-page-modularity`: the grow switches are drawn as kept, heard from the box that changed, three boxes fitted as typed in, and every box observed to keep Send in view, then all come down", () => {
+  const { mountComposerGrowListeners, COMPOSER_GROW_IDS, COMPOSER_GROW_BOXES } = VIEW_COMPOSER;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, checked: false, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type) => nodes[id].listeners.filter((one) => one.type === type).forEach((one) => one.listener({ type }));
+  const observers = [];
+  class Observer {
+    constructor(callback) { this.callback = callback; this.watched = []; observers.push(this); log.push("observer"); }
+    observe(node) { this.watched.push(node); log.push(`observe ${node.id}`); }
+    disconnect() { this.watched = []; log.push("disconnect"); }
+  }
+  const mounted = mountComposerGrowListeners({
+    lookup: (id) => target(id),
+    storedComposerGrow: () => { log.push("stored"); return true; },
+    renderComposerGrow: (on) => log.push(`draw ${on}`),
+    applyComposerGrow: (on, grow) => log.push(`apply ${on} ${grow.id}`),
+    fitGrowingBox: (field) => log.push(`fit ${field.id}`),
+    keepGrowingBoxInView: (field) => log.push(`keep ${field.id}`),
+    resizeObserver: () => Observer,
+  });
+  assert.deepStrictEqual(log, ["stored", "draw true", ...COMPOSER_GROW_IDS.map((id) => `listen ${id} change`),
+    "listen channel-compose-text input", "listen side-compose-text input", "listen reply-text input",
+    "observer", ...COMPOSER_GROW_BOXES.map((id) => `observe ${id}`)], "the switches were not drawn first, or a box was missed");
+  log.length = 0;
+  nodes["side-compose-grow"].checked = true;
+  fire("side-compose-grow", "change");
+  fire("reply-grow", "change");
+  fire("reply-text", "input");
+  observers[0].callback([{ target: nodes["compose-text"] }, { target: nodes["side-compose-text"] }]);
+  assert.deepStrictEqual(log, ["apply true side-compose-grow", "apply false reply-grow", "fit reply-text", "keep compose-text", "keep side-compose-text"]);
+  log.length = 0;
+  mounted.unmount();
+  assert.deepStrictEqual(log, ["disconnect"]);
+  assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+});
+
+test("`#624 voice-page-modularity`: with no ResizeObserver the grow switches and the typed boxes are still heard", () => {
+  const { mountComposerGrowListeners } = VIEW_COMPOSER;
+  const heard = [];
+  const node = (id) => ({ id, addEventListener: (type) => heard.push(`${id} ${type}`), removeEventListener() {} });
+  const nothing = () => undefined;
+  const mounted = mountComposerGrowListeners({ lookup: node, storedComposerGrow: () => false, renderComposerGrow: nothing,
+    applyComposerGrow: nothing, fitGrowingBox: nothing, keepGrowingBoxInView: nothing, resizeObserver: () => undefined });
+  assert.equal(heard.length, 7);
+  mounted.unmount();
+});

@@ -23,6 +23,8 @@ export { mountReadingWidth, mountTextSize } from "./screen.ts";
 export type { ReadingWidth, ScreenSettingDependencies, TextSize } from "./screen.ts";
 export { mountScreenControls } from "./screencontrols.ts";
 export type { ScreenControls, ScreenControlsDependencies } from "./screencontrols.ts";
+export { restoreStoredSettings } from "./restore.ts";
+export type { StoredSettingsDependencies } from "./restore.ts";
 export { mountBarPlacement } from "./placement.ts";
 export type { BarPlacement, BarPlacementDependencies } from "./placement.ts";
 export { mountChannelSettings } from "./channels.ts";
