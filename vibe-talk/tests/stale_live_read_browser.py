@@ -184,7 +184,7 @@ def main() -> int:
         # THE NEGATIVE CONTROL: the same walk against the page with the fix taken out.
         # Built from patched sources exactly as the page is (`#624 voice-page-modularity`); FIX must
         # occur once, or the control is refused rather than run unchanged.
-        fixture.WEB_ROOT = page_sources.variant(root, Path(copy), [("voice.js", FIX, UNFIXED)])
+        fixture.WEB_ROOT = page_sources.variant(root, Path(copy), [(page_sources.file_holding(root, FIX), FIX, UNFIXED)])
         control = walk(playwright.chromium, args, "control-1280")
         fixture.WEB_ROOT = root
         check(control.missing > 0,

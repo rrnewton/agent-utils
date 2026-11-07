@@ -2081,10 +2081,10 @@ DESK_CONTROL_PX = (32, 40)
 PHONE_DOCK_PX = 1 + 2.85 * 16 + 6.4 * 16
 PHONE_SPAN_PX = 5.2 * 16
 PHONE_NARROW_PX = 3.5 * 16
-# How far from the end of the list a reader may be and still be followed: web/voice.js's own number.
-_BOTTOM_SLACK = re.search(r"const BOTTOM_SLACK_PX = (\d+);", page_sources.source_text(WEB_ROOT, "voice.js"))
+# How far from the end of the list a reader may be and still be followed: the page's own number.
+_BOTTOM_SLACK = re.search(r"const BOTTOM_SLACK_PX = (\d+);", page_sources.page_code(WEB_ROOT))
 if _BOTTOM_SLACK is None:
-    raise SystemExit("web/voice.js no longer declares BOTTOM_SLACK_PX, which the dock walk follows from")
+    raise SystemExit("the page's code no longer declares BOTTOM_SLACK_PX, which the dock walk follows from")
 BOTTOM_SLACK_PX = int(_BOTTOM_SLACK[1])
 
 # Rows enough to make the call's transcript scroll, then the reader parked on its newest line. The

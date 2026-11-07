@@ -132,6 +132,43 @@ def source_text(root: Path, name: str) -> str:
     return _read_source(_built_from(root), name)
 
 
+def page_code(root: Path) -> str:
+    """The page's handwritten code: every `web/src` module, then `voice.js` (`#624 voice-page-modularity`).
+
+    Mirrors `PAGE_CODE` in `tests/js/page/fixture.mjs`: a walk that reads one of the page's own
+    numbers or statements reads it here, so the read survives the code moving out of `voice.js`.
+    """
+    sources = _built_from(root)
+    texts: list[str] = []
+    src = sources / "src"
+    if src.is_dir():
+        for path in sorted(src.rglob("*")):
+            if path.is_file() and path.suffix in (".ts", ".js", ".mjs"):
+                texts.append(path.read_text())
+    texts.append(_read_source(sources, "voice.js"))
+    return "\n".join(texts)
+
+
+def file_holding(root: Path, text: str) -> str:
+    """The page source file (relative to `web/`) holding `text` exactly once, modules first.
+
+    A negative control patches the file that holds its text today, wherever `#624
+    voice-page-modularity` has moved it; a text held zero or several times is refused here
+    rather than patched in the wrong place or not at all.
+    """
+    sources = _built_from(root)
+    candidates: list[Path] = []
+    src = sources / "src"
+    if src.is_dir():
+        candidates.extend(p for p in sorted(src.rglob("*")) if p.is_file() and p.suffix in (".ts", ".js", ".mjs"))
+    candidates.append(sources / "voice.js")
+    holders = [p for p in candidates if p.read_text().count(text) == 1]
+    total = sum(p.read_text().count(text) for p in candidates)
+    if total != 1 or len(holders) != 1:
+        raise SystemExit(f"the control patches {text!r}, which the page's code holds {total} times, not once")
+    return holders[0].relative_to(sources).as_posix()
+
+
 def variant(root: Path, into: Path, patches: Sequence[tuple[str, str, str]]) -> Path:
     """The page `root` serves with `patches` applied to its sources, built below `into`.
 
