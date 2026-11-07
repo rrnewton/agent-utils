@@ -695,6 +695,17 @@ struct Flight {
     retries: u32,
     /// Whether its retries were counted afresh when it became the head.
     head_round: bool,
+    /// The red batch this flight is a culprit-search probe for, by flight id: it validates
+    /// like any other flight, but it is never decided as a batch, never built on, and its
+    /// result resumes that batch's search instead of deciding anything itself.
+    probe_for: Option<u64>,
+    /// The culprit search this red batch is waiting on, while its probes are in flight:
+    /// the batch keeps its place in the window (cut out of the stack, as a red batch
+    /// behind the head is) and is decided when the last probe returns.
+    red_work: Option<RedWork>,
+    /// The outcome a finished culprit search decided for this batch, waiting for the
+    /// decision loop to apply it in order.
+    red_outcome: Option<BatchOutcome>,
 }
 
 /// Observations of one prefix during a culprit search.
@@ -808,6 +819,233 @@ enum Culprit {
         /// How the failure was confirmed ([`Obs::confirmation`]).
         confirmation: &'static str,
     },
+}
+
+/// A culprit search in progress: the observations so far, from which the next probes (or
+/// the verdict) are derived. Kept apart from the validations themselves, so a search can
+/// pause while its probes run as ordinary window flights and resume when they return,
+/// instead of joining them on the spot.
+struct CulpritSearch {
+    candidate: Candidate,
+    focus: Selection,
+    obs: BTreeMap<usize, Obs>,
+    /// Prefixes the probes in flight are measuring, aligned with their jobs.
+    probes: Vec<usize>,
+}
+
+impl CulpritSearch {
+    fn new(
+        candidate: &Candidate,
+        focus: &Selection,
+        first_failed: &BTreeSet<TestId>,
+        first_deterministic: bool,
+        trust_base: bool,
+        confirm_reruns: bool,
+    ) -> Self {
+        // Off, one sighting of any failure confirms it.
+        let unconfirmed = (!confirm_reruns).then_some(UNCONFIRMED_ONCE);
+        let mut obs: BTreeMap<usize, Obs> = BTreeMap::new();
+        obs.insert(
+            candidate.prs.len(),
+            Obs {
+                fails: 1,
+                passes: 0,
+                unknowns: 0,
+                failed: first_failed.clone(),
+                once: if first_deterministic {
+                    Some(DETERMINISTIC_ONCE)
+                } else {
+                    unconfirmed
+                },
+            },
+        );
+        if trust_base && !candidate.prs.is_empty() {
+            obs.insert(
+                0,
+                Obs {
+                    passes: 1,
+                    ..Obs::default()
+                },
+            );
+        }
+        Self {
+            candidate: candidate.clone(),
+            focus: focus.clone(),
+            obs,
+            probes: Vec::new(),
+        }
+    }
+
+    fn seen(&self, i: usize) -> Seen {
+        self.obs.get(&i).map_or(Seen::Unknown, Obs::seen)
+    }
+
+    fn confirmed(&self, i: usize) -> bool {
+        self.obs.get(&i).is_some_and(Obs::confirmed_fail)
+    }
+
+    /// The verdict the observations already decide, if any.
+    fn verdict(&self) -> Option<Culprit> {
+        let n = self.candidate.prs.len();
+        let flaky: BTreeSet<TestId> = self
+            .obs
+            .values()
+            .filter(|o| o.passes > 0 && o.fails > 0)
+            .flat_map(|o| o.failed.iter().cloned())
+            .collect();
+        if self.seen(n) == Seen::Pass {
+            return Some(Culprit::Flaky(flaky));
+        }
+        if self.confirmed(0) {
+            return Some(Culprit::BaseRed(
+                self.obs[&0].failed.clone(),
+                self.obs[&0].confirmation(),
+            ));
+        }
+        let hi = (0..=n).find(|i| self.seen(*i) == Seen::Fail).unwrap_or(n);
+        let lo = (0..hi).rev().find(|i| self.seen(*i) == Seen::Pass);
+        if hi > 0 && lo == Some(hi - 1) && self.confirmed(hi) {
+            return Some(Culprit::Found {
+                index: hi - 1,
+                failed: self.obs[&hi].failed.clone(),
+                flaky,
+                confirmation: self.obs[&hi].confirmation(),
+            });
+        }
+        None
+    }
+
+    /// The prefixes to probe next, when no verdict is decided yet.
+    fn probe_points(&self, width: usize) -> Vec<usize> {
+        let n = self.candidate.prs.len();
+        let hi = (0..=n).find(|i| self.seen(*i) == Seen::Fail).unwrap_or(n);
+        let lo = (0..hi).rev().find(|i| self.seen(*i) == Seen::Pass);
+        let mut probes: Vec<usize> = Vec::new();
+        if hi == 0 {
+            probes.push(0);
+        } else {
+            if lo.is_none() {
+                probes.push(0);
+            }
+            let start = lo.unwrap_or(0);
+            let room = width.saturating_sub(probes.len());
+            for k in 1..=room {
+                let point = start + (hi - start) * k / (room + 1);
+                if point > start && point < hi && !probes.contains(&point) {
+                    probes.push(point);
+                }
+            }
+            if probes.len() < width && !self.confirmed(hi) {
+                probes.push(hi);
+            }
+            if probes.is_empty() {
+                probes.push(hi);
+            }
+        }
+        probes
+    }
+
+    /// Record one round of probe results. `Some` verdict ends the search at once (a
+    /// refusal, a hold, an inconclusive probe); `None` means probe again or read the
+    /// verdict from the observations.
+    fn record(
+        &mut self,
+        probes: &[usize],
+        results: Vec<JobResult>,
+        confirm_reruns: bool,
+    ) -> Result<Option<Culprit>, String> {
+        let n = self.candidate.prs.len();
+        let unconfirmed = (!confirm_reruns).then_some(UNCONFIRMED_ONCE);
+        for (i, result) in probes.iter().zip(results) {
+            let (_, ran) = result?;
+            if ran.refused() {
+                return Ok(Some(Culprit::Refused(refusal_detail(&ran))));
+            }
+            // A rerun of the whole candidate the validator holds for a ruling: no verdict on
+            // the change either way. Only a validator that prints the markers gets here.
+            if *i == n && !ran.cancelled {
+                if !ran.infra_blocked.is_empty() {
+                    return Ok(Some(Culprit::Held(
+                        Hold::InfraBlocked,
+                        ran.infra_blocked.clone(),
+                    )));
+                }
+                if ran.green() && !ran.flaky_passes.is_empty() {
+                    return Ok(Some(Culprit::Held(
+                        Hold::GreenFlaky,
+                        ran.flaky_passes.clone(),
+                    )));
+                }
+            }
+            if !ran.infra_blocked.is_empty() {
+                return Ok(Some(Culprit::Inconclusive(format!(
+                    "probe at prefix {i} of {} was INFRA-BLOCKED ({}): the host refused to measure it",
+                    self.candidate.prs.len(),
+                    ids(&ran.infra_blocked.clone())
+                ))));
+            }
+            let entry = self.obs.entry(*i).or_default();
+            match ran.probe_observation() {
+                ProbeObservation::Fail => {
+                    entry.fails += 1;
+                    entry.failed.extend(ran.reproduced());
+                    if ran.deterministic_red() {
+                        entry.once = Some(DETERMINISTIC_ONCE);
+                    } else if entry.once.is_none() {
+                        entry.once = unconfirmed;
+                    }
+                }
+                ProbeObservation::Pass => entry.passes += 1,
+                ProbeObservation::Unknown => {
+                    entry.unknowns += 1;
+                    return Ok(Some(Culprit::Inconclusive(if ran.is_empty_red() {
+                        format!(
+                            "probe at prefix {i} of {} was a {} (exit {}): it can name no culprit",
+                            self.candidate.prs.len(),
+                            crate::validate::NO_RECORDED_RESULT,
+                            ran.exit.map_or("none".to_owned(), |code| code.to_string())
+                        )
+                    } else {
+                        format!(
+                            "probe at prefix {i} of {} observed only missing/skipped tests (no pass, no reproduced failure)",
+                            self.candidate.prs.len()
+                        )
+                    })));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// A red batch's culprit search and everything its decision needs, held on its flight
+/// while its probes are out (see [`Flight::red_work`]).
+struct RedWork {
+    chosen: Chosen,
+    seen_failed: BTreeSet<TestId>,
+    unproven: BTreeSet<TestId>,
+    validations: Vec<usize>,
+    flaky: BTreeSet<TestId>,
+    carried: bool,
+    attributed: bool,
+    deterministic: bool,
+    search: CulpritSearch,
+}
+
+/// What advancing a red batch's search does next.
+enum RedStep {
+    /// Probes to start as window flights: the batch waits on them.
+    Probing(Vec<Job>),
+    /// The batch is decided.
+    Decided(BatchOutcome),
+}
+
+/// What beginning a red batch's decision does next.
+enum RedStart {
+    /// The search work, to advance.
+    Work(Box<RedWork>),
+    /// Decided without a search.
+    Decided(BatchOutcome),
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -3279,7 +3517,7 @@ impl<'a> Runner<'a> {
     /// can depend on generated paths: `shared_select` in `validate.rs` runs the
     /// configured `validator.select` shell command inside a checkout of the
     /// prefix commit with `MQ_BASE`/`MQ_HEAD` set, so a select script may map
-    /// generated files to tests; `Runner::handle_red` uses exactly that to
+    /// generated files to tests; `Runner::finish_red` uses exactly that to
     /// compute the tests a culprit affected. Probe validation can depend on
     /// them too: `find_culprit` runs the validator in a prefix checkout, and a
     /// test may compare a generated file against its sources (the `gen` test in
@@ -4067,6 +4305,8 @@ impl<'a> Runner<'a> {
             *flights = kept;
             return;
         }
+        // Probes of a cancelled root follow it: their verdict decides nothing.
+        let mut kept = follow_dropped_reds(kept, &mut cancelled);
         for flight in &cancelled {
             flight.cancel.store(true, Ordering::Relaxed);
         }
@@ -4103,7 +4343,9 @@ impl<'a> Runner<'a> {
             .flat_map(|flight| flight.candidate.prs.iter().copied())
             .collect();
         for flight in cancelled.into_iter().rev() {
-            pending.push_front(flight.candidate.prs);
+            if flight.probe_for.is_none() {
+                pending.push_front(flight.candidate.prs);
+            }
         }
         *flights = kept;
         self.event(
@@ -5334,6 +5576,49 @@ impl<'a> Runner<'a> {
             let wide_allowed = self.config.batch_min_pass_percent == 0
                 || recent_pass_percent
                     .is_some_and(|pass| pass >= self.config.batch_min_pass_percent as f64);
+            // Start culprit-search probes as ordinary window flights for the
+            // red batch `red_id`: they validate (on donors, when offloaded)
+            // while the run loop goes on, and their results resume the batch.
+            let start_probes =
+                |flights: &mut VecDeque<Flight>, next_id: &mut u64, red_id: u64, jobs: Vec<Job>| {
+                    for job in jobs {
+                        let id = *next_id;
+                        *next_id += 1;
+                        let tx = tx.clone();
+                        let cancel = Arc::new(AtomicBool::new(false));
+                        let flag = Arc::clone(&cancel);
+                        let candidate = Candidate {
+                            prs: job.prs.clone(),
+                            parent: job.parent.clone(),
+                            tip: job.commit.clone(),
+                            prefixes: Vec::new(),
+                        };
+                        let chosen = Chosen {
+                            selection: job.selection.clone(),
+                            policy: job.policy.clone(),
+                            extra: job.extra.clone(),
+                        };
+                        scope.spawn(move || {
+                            let _ = tx.send((id, self.validate_one(job, &flag)));
+                        });
+                        flights.push_back(Flight {
+                            id,
+                            candidate,
+                            chosen,
+                            cancel,
+                            result: None,
+                            stacked: false,
+                            rooted: false,
+                            jumped_over: BTreeSet::new(),
+                            speculation: None,
+                            retries: 0,
+                            head_round: false,
+                            probe_for: Some(red_id),
+                            red_work: None,
+                            red_outcome: None,
+                        });
+                    }
+                };
             let result = (|| -> Result<String, String> {
                 loop {
                     // A landing since the last iteration (a head decided below,
@@ -5348,6 +5633,7 @@ impl<'a> Runner<'a> {
                     self.publish_window(
                         flights
                             .iter()
+                            .filter(|flight| flight.probe_for.is_none())
                             .map(|flight| flight.candidate.prs.clone())
                             .collect(),
                     );
@@ -5828,12 +6114,16 @@ impl<'a> Runner<'a> {
                             speculation,
                             retries: 0,
                             head_round: false,
+                            probe_for: None,
+                            red_work: None,
+                            red_outcome: None,
                         });
                         started += 1;
                         lock(&self.report).windows.push(window);
                         self.publish_window(
                             flights
                                 .iter()
+                                .filter(|flight| flight.probe_for.is_none())
                                 .map(|flight| flight.candidate.prs.clone())
                                 .collect(),
                         );
@@ -5898,8 +6188,10 @@ impl<'a> Runner<'a> {
                         // when it reaches the head (see `refused_again`).
                         if let Some(index) = flights.iter().position(|flight| flight.id == id) {
                             let flight = &mut flights[index];
-                            if let Some((job, delay)) = self.refused_again(flight, index == 0) {
-                                self.start_again(scope, &tx, flight, job, delay);
+                            if flight.probe_for.is_none() {
+                                if let Some((job, delay)) = self.refused_again(flight, index == 0) {
+                                    self.start_again(scope, &tx, flight, job, delay);
+                                }
                             }
                         }
                     }
@@ -5943,6 +6235,74 @@ impl<'a> Runner<'a> {
                             }
                         }
                     }
+                    // A red batch behind the head starts its culprit search
+                    // now, as window flights, instead of when it is decided:
+                    // with two reds in one run, the second one's probes are
+                    // out while the first one's verdict is still waited on.
+                    // The decision itself still happens in order, at the
+                    // front; batches the decision would not search (a split
+                    // batch, a precheck ejection, a suspect flake) are left
+                    // to the front, as are searches needing no probe.
+                    if let Some(id) = arrived_id {
+                        let park = flights
+                            .iter()
+                            .position(|flight| flight.id == id)
+                            .filter(|index| *index > 0)
+                            .and_then(|index| {
+                                let flight = &flights[index];
+                                // Only a root's search is valid before its
+                                // turn: its candidate sits on the base, while
+                                // a stacked batch's prefixes blame or clear
+                                // the batches beneath it, which the in-order
+                                // decision may still eject or land.
+                                if !flight.rooted
+                                    || flight.probe_for.is_some()
+                                    || flight.red_work.is_some()
+                                    || !plainly_red(flight.result.as_ref())
+                                {
+                                    return None;
+                                }
+                                let Some(Ok((vid, ran))) = &flight.result else {
+                                    return None;
+                                };
+                                if (!self.config.validator.confirm_reruns
+                                    || self.config.validator.split_red_batches)
+                                    && flight.candidate.prs.len() > 1
+                                {
+                                    return None;
+                                }
+                                if !self.precheck_culprits(&flight.candidate, ran).is_empty() {
+                                    return None;
+                                }
+                                if self.suspect_flake(&flight.candidate, ran).is_some() {
+                                    return None;
+                                }
+                                match self.start_red(&flight.candidate, &flight.chosen, ran, *vid) {
+                                    Ok(RedStart::Work(work)) if work.search.verdict().is_none() => {
+                                        Some((index, work))
+                                    }
+                                    _ => None,
+                                }
+                            });
+                        if let Some((index, mut work)) = park {
+                            let probes = work.search.probe_points(self.width);
+                            if let Ok(jobs) = self.search_jobs(&work.search, &probes) {
+                                work.search.probes = probes;
+                                let red_id = flights[index].id;
+                                flights[index].stacked = false;
+                                flights[index].red_work = Some(*work);
+                                self.event(
+                                    "confirm-probe",
+                                    &format!(
+                                        "{} is red behind the head; its culprit search runs as {} window flight(s) while the run goes on",
+                                        list(&flights[index].candidate.prs),
+                                        jobs.len()
+                                    ),
+                                );
+                                start_probes(&mut flights, &mut next_id, red_id, jobs);
+                            }
+                        }
+                    }
                     // A disjoint root is decided as soon as every batch it
                     // jumped over is decided, with no wait on the rest of
                     // pending or on batches started after it. If any batch it
@@ -5966,6 +6326,62 @@ impl<'a> Runner<'a> {
                         .front()
                         .is_some_and(|flight| flight.result.is_some())
                     {
+                        // A red head whose culprit-search probes are still out
+                        // keeps its place and waits: the run goes on around it.
+                        // When the last probe is back, the search resumes and
+                        // its verdict decides the batch in order.
+                        if flights
+                            .front()
+                            .is_some_and(|flight| flight.red_work.is_some())
+                        {
+                            let red_id = flights.front().map(|flight| flight.id).unwrap_or(0);
+                            let probes_out = flights.iter().any(|flight| {
+                                flight.probe_for == Some(red_id) && flight.result.is_none()
+                            });
+                            if probes_out {
+                                break;
+                            }
+                            let mut work = flights
+                                .front_mut()
+                                .and_then(|flight| flight.red_work.take())
+                                .expect("red work");
+                            let mut results: Vec<JobResult> = Vec::new();
+                            let mut kept: VecDeque<Flight> = VecDeque::new();
+                            while let Some(flight) = flights.pop_front() {
+                                if flight.probe_for == Some(red_id) {
+                                    results.push(
+                                        flight.result.unwrap_or_else(|| {
+                                            Err("missing probe result".to_owned())
+                                        }),
+                                    );
+                                } else {
+                                    kept.push_back(flight);
+                                }
+                            }
+                            flights = kept;
+                            match self.feed_red(&mut work, results, pending)? {
+                                RedStep::Decided(outcome) => {
+                                    if let Some(front) = flights.front_mut() {
+                                        front.red_outcome = Some(outcome);
+                                    }
+                                }
+                                RedStep::Probing(jobs) => {
+                                    self.event(
+                                        "confirm-probe",
+                                        &format!(
+                                            "{} awaits {} more culprit probe(s) as window flights",
+                                            list(&work.search.candidate.prs),
+                                            jobs.len()
+                                        ),
+                                    );
+                                    if let Some(front) = flights.front_mut() {
+                                        front.red_work = Some(work);
+                                    }
+                                    start_probes(&mut flights, &mut next_id, red_id, jobs);
+                                    break;
+                                }
+                            }
+                        }
                         if flights.front().is_some_and(|flight| {
                             flight.rooted && !rooted_decidable(flight, &flights)
                         }) {
@@ -6053,7 +6469,12 @@ impl<'a> Runner<'a> {
                         // The batch being decided stays in the window until it is decided.
                         self.publish_window(
                             std::iter::once(head.candidate.prs.clone())
-                                .chain(flights.iter().map(|flight| flight.candidate.prs.clone()))
+                                .chain(
+                                    flights
+                                        .iter()
+                                        .filter(|flight| flight.probe_for.is_none())
+                                        .map(|flight| flight.candidate.prs.clone()),
+                                )
                                 .collect(),
                         );
                         let (vid, ran) = head
@@ -6061,7 +6482,8 @@ impl<'a> Runner<'a> {
                             .unwrap_or_else(|| Err("missing result".to_owned()))?;
                         // A red batch verdict fires on_red once, before
                         // whatever the run decides to do about it.
-                        if !ran.green()
+                        if head.red_outcome.is_none()
+                            && !ran.green()
                             && !ran.refused()
                             && !ran.cancelled
                             && ran.infra_blocked.is_empty()
@@ -6082,7 +6504,11 @@ impl<'a> Runner<'a> {
                         }
                         // Admission refusal, its retries used up (see `refused_again`): defer.
                         // Never land, never search for a culprit, never eject.
-                        let outcome = if ran.refused() {
+                        let outcome = if let Some(outcome) = head.red_outcome.take() {
+                            // Decided by the culprit search that ran as
+                            // window flights: apply its verdict in order.
+                            outcome
+                        } else if ran.refused() {
                             let detail = refusal_detail(&ran);
                             discard(&mut flights, &rx, pending);
                             let (retry_after, _) =
@@ -6311,7 +6737,35 @@ impl<'a> Runner<'a> {
                             if ran.suspect_only().is_some() {
                                 window = (window / 2).max(1);
                             }
-                            self.handle_red(&head.candidate, &head.chosen, &ran, vid, pending)?
+                            // The culprit search runs as ordinary window
+                            // flights, not synchronously here: the batch
+                            // keeps its place, cut out of the stack, and the
+                            // loop goes on while its probes are out.
+                            match self.start_red(&head.candidate, &head.chosen, &ran, vid)? {
+                                RedStart::Decided(outcome) => outcome,
+                                RedStart::Work(mut work) => {
+                                    match self.advance_red(&mut work, pending)? {
+                                        RedStep::Decided(outcome) => outcome,
+                                        RedStep::Probing(jobs) => {
+                                            self.event(
+                                                "confirm-probe",
+                                                &format!(
+                                                    "{} is red; its culprit search runs as {} window flight(s) while the run goes on",
+                                                    list(&head.candidate.prs),
+                                                    jobs.len()
+                                                ),
+                                            );
+                                            let red_id = head.id;
+                                            head.stacked = false;
+                                            head.result = Some(Ok((vid, ran)));
+                                            head.red_work = Some(*work);
+                                            flights.push_front(head);
+                                            start_probes(&mut flights, &mut next_id, red_id, jobs);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                         };
                         match outcome {
                             BatchOutcome::Done => {}
@@ -7083,14 +7537,17 @@ impl<'a> Runner<'a> {
     }
 
     /// A red batch: find culprits with failed-test-only probes, eject them, and land the rest.
-    fn handle_red(
+    /// Begin deciding a red batch: the work its culprit search needs, or the
+    /// decision itself when no search can name a culprit (an unconverted empty
+    /// red). The search then advances with [`Runner::advance_red`] and
+    /// [`Runner::feed_red`], synchronously or as window flights.
+    fn start_red(
         &self,
         candidate: &Candidate,
         chosen: &Chosen,
         ran: &Ran,
         vid: usize,
-        pending: &mut VecDeque<Vec<i64>>,
-    ) -> Result<BatchOutcome, String> {
+    ) -> Result<RedStart, String> {
         // An unconverted empty red (a donor receipt) on the could-not-run path
         // defers here as in the batch decision: it can name no culprit.
         if self.config.validator.empty_red_could_not_run() && ran.is_empty_red() {
@@ -7101,64 +7558,140 @@ impl<'a> Runner<'a> {
                 None => crate::validate::NO_RECORDED_RESULT.to_owned(),
             };
             let (retry_after, _) = self.defer_refusal(&candidate.prs, &detail)?;
-            return Ok(BatchOutcome::Deferred(
+            return Ok(RedStart::Decided(BatchOutcome::Deferred(
                 format!(
                     "validation refused for {} ({detail}); stays queued, retry after {retry_after}",
                     list(&candidate.prs)
                 ),
                 candidate.prs.clone(),
-            ));
+            )));
         }
-        let mut seen_failed = ran.failed();
+        let seen_failed = ran.failed();
         // Without per-test attribution the only focus available is the batch's own selection.
-        let mut focus = if ran.results.unattributed {
+        let focus = if ran.results.unattributed {
             chosen.selection.clone()
         } else {
             Selection::of(seen_failed.iter().cloned())
         };
         // Tests the batch run did not see pass cannot be carried forward to a remainder.
-        let mut unproven: BTreeSet<TestId> = not_passed(ran);
-        let mut current = candidate.clone();
-        let mut validations = vec![vid];
-        let mut flaky = BTreeSet::new();
-        let mut carried = false;
+        let unproven: BTreeSet<TestId> = not_passed(ran);
         // The red run attributed its failures to named tests (not only an exit status).
-        let mut attributed = !ran.results.unattributed && !seen_failed.is_empty();
+        let attributed = !ran.results.unattributed && !seen_failed.is_empty();
         // Every failure of the red run is a deterministic check: seen once, it is confirmed.
-        let mut deterministic = ran.deterministic_red();
+        let deterministic = ran.deterministic_red();
+        let search = CulpritSearch::new(
+            candidate,
+            &focus,
+            &seen_failed,
+            deterministic,
+            self.config.trust_base,
+            self.config.validator.confirm_reruns,
+        );
+        Ok(RedStart::Work(Box::new(RedWork {
+            chosen: chosen.clone(),
+            seen_failed,
+            unproven,
+            validations: vec![vid],
+            flaky: BTreeSet::new(),
+            carried: false,
+            attributed,
+            deterministic,
+            search,
+        })))
+    }
+
+    /// Advance a red batch's search until it needs probes or is decided.
+    fn advance_red(
+        &self,
+        work: &mut RedWork,
+        pending: &mut VecDeque<Vec<i64>>,
+    ) -> Result<RedStep, String> {
         loop {
-            match self.find_culprit(&current, &focus, &seen_failed, deterministic)? {
+            if let Some(culprit) = work.search.verdict() {
+                if let Some(outcome) = self.finish_red(work, culprit, pending)? {
+                    return Ok(RedStep::Decided(outcome));
+                }
+                continue;
+            }
+            let probes = work.search.probe_points(self.width);
+            let jobs = self.search_jobs(&work.search, &probes)?;
+            work.search.probes = probes;
+            return Ok(RedStep::Probing(jobs));
+        }
+    }
+
+    /// Feed one round of probe results into a red batch's search and advance it.
+    fn feed_red(
+        &self,
+        work: &mut RedWork,
+        results: Vec<JobResult>,
+        pending: &mut VecDeque<Vec<i64>>,
+    ) -> Result<RedStep, String> {
+        let probes = std::mem::take(&mut work.search.probes);
+        if let Some(culprit) =
+            work.search
+                .record(&probes, results, self.config.validator.confirm_reruns)?
+        {
+            if let Some(outcome) = self.finish_red(work, culprit, pending)? {
+                return Ok(RedStep::Decided(outcome));
+            }
+        }
+        self.advance_red(work, pending)
+    }
+
+    /// Decide a red batch on its culprit search's verdict. `None` means the
+    /// search starts again on a remainder (a culprit was ejected and the rest
+    /// came back red), with `work` updated for it.
+    fn finish_red(
+        &self,
+        work: &mut RedWork,
+        culprit: Culprit,
+        pending: &mut VecDeque<Vec<i64>>,
+    ) -> Result<Option<BatchOutcome>, String> {
+        let chosen = &work.chosen;
+        let mut current = work.search.candidate.clone();
+        let mut seen_failed = std::mem::take(&mut work.seen_failed);
+        let mut unproven = std::mem::take(&mut work.unproven);
+        let mut validations = std::mem::take(&mut work.validations);
+        let mut flaky = std::mem::take(&mut work.flaky);
+        let mut carried = work.carried;
+        let mut attributed = work.attributed;
+        let mut focus = work.search.focus.clone();
+        {
+            match culprit {
                 Culprit::Refused(detail) if attributed => {
-                    return self.red_without_probe(&current, &seen_failed, &detail, pending);
+                    return self
+                        .red_without_probe(&current, &seen_failed, &detail, pending)
+                        .map(Some);
                 }
                 Culprit::Refused(detail) => {
                     let (retry_after, _) = self.defer_refusal(&current.prs, &detail)?;
-                    return Ok(BatchOutcome::Deferred(
+                    return Ok(Some(BatchOutcome::Deferred(
                         format!(
                             "validation refused for {} ({detail}); stays queued, retry after {retry_after}",
                             list(&current.prs)
                         ),
                         current.prs.clone(),
-                    ));
+                    )));
                 }
                 Culprit::Inconclusive(detail) => {
-                    return Ok(BatchOutcome::Stop(
+                    return Ok(Some(BatchOutcome::Stop(
                         format!(
                             "culprit search inconclusive for {}: {detail}; no culprit named, nothing ejected",
                             list(&current.prs)
                         ),
                         current.prs.clone(),
-                    ));
+                    )));
                 }
                 Culprit::BaseRed(tests, confirmation) => {
-                    return Ok(BatchOutcome::Stop(
+                    return Ok(Some(BatchOutcome::Stop(
                         format!(
                             "the base {} itself fails {} ({confirmation}); fix the base first",
                             short(&current.parent),
                             failed_label(&tests.into_iter().collect::<Vec<_>>())
                         ),
                         current.prs.clone(),
-                    ));
+                    )));
                 }
                 // A rerun of a red batch that passed only after retries of tests all on the
                 // known-flaky list is a plain flaky pass: the list is the standing ruling.
@@ -7186,13 +7719,13 @@ impl<'a> Runner<'a> {
                         claim.policy = format!("carried-forward+delta({})", chosen.policy);
                         claim.scope = Scope::Focused;
                     }
-                    return self.land(&current, claim, validations, flaky);
+                    return self.land(&current, claim, validations, flaky).map(Some);
                 }
                 // The hold of a red batch's rerun records no candidate: what was validated
                 // there is the rerun of its failed tests, not a green batch to land as is.
                 Culprit::Held(hold, tests) => {
                     let until = self.hold_for_ruling(&current, hold, &tests, None)?;
-                    return Ok(BatchOutcome::Deferred(
+                    return Ok(Some(BatchOutcome::Deferred(
                         format!(
                             "{} rerun of {} on the same tree ({}); held for a ruling until {until}, not landed",
                             hold.label(),
@@ -7200,7 +7733,7 @@ impl<'a> Runner<'a> {
                             ids(&tests)
                         ),
                         current.prs.clone(),
-                    ));
+                    )));
                 }
                 Culprit::Flaky(tests) => {
                     self.event(
@@ -7220,7 +7753,7 @@ impl<'a> Runner<'a> {
                         claim.policy = format!("carried-forward+delta({})", chosen.policy);
                         claim.scope = Scope::Focused;
                     }
-                    return self.land(&current, claim, validations, flaky);
+                    return self.land(&current, claim, validations, flaky).map(Some);
                 }
                 Culprit::Found {
                     index,
@@ -7279,7 +7812,7 @@ impl<'a> Runner<'a> {
                         &format!(" once #{culprit} is removed"),
                     )?;
                     if rebuilt.prs.is_empty() {
-                        return Ok(BatchOutcome::Done);
+                        return Ok(Some(BatchOutcome::Done));
                     }
                     // Delta revalidation: the failed tests, the tests not yet seen passing, and
                     // whatever the removed change touched, within what the batch selected. Under
@@ -7324,13 +7857,13 @@ impl<'a> Runner<'a> {
                     if rran.refused() {
                         let detail = refusal_detail(&rran);
                         let (retry_after, _) = self.defer_refusal(&rebuilt.prs, &detail)?;
-                        return Ok(BatchOutcome::Deferred(
+                        return Ok(Some(BatchOutcome::Deferred(
                             format!(
                                 "validation refused for {} ({detail}); stays queued, retry after {retry_after}",
                                 list(&rebuilt.prs)
                             ),
                             rebuilt.prs.clone(),
-                        ));
+                        )));
                     }
                     if rran.green() {
                         let claim = if exact {
@@ -7349,7 +7882,7 @@ impl<'a> Runner<'a> {
                                 commit: rebuilt.tip.clone(),
                             }
                         };
-                        return self.land(&rebuilt, claim, validations, flaky);
+                        return self.land(&rebuilt, claim, validations, flaky).map(Some);
                     }
                     let passed_now: BTreeSet<TestId> = rran
                         .results
@@ -7365,7 +7898,7 @@ impl<'a> Runner<'a> {
                         .collect();
                     seen_failed = rran.failed();
                     attributed = !rran.results.unattributed && !seen_failed.is_empty();
-                    deterministic = rran.deterministic_red();
+                    work.deterministic = rran.deterministic_red();
                     focus = if rran.results.unattributed {
                         delta
                     } else {
@@ -7376,6 +7909,22 @@ impl<'a> Runner<'a> {
                 }
             }
         }
+        // The remainder came back red: search it again, from its own red run.
+        work.seen_failed = seen_failed.clone();
+        work.unproven = unproven;
+        work.validations = validations;
+        work.flaky = flaky;
+        work.carried = carried;
+        work.attributed = attributed;
+        work.search = CulpritSearch::new(
+            &current,
+            &focus,
+            &seen_failed,
+            work.deterministic,
+            self.config.trust_base,
+            self.config.validator.confirm_reruns,
+        );
+        Ok(None)
     }
 
     /// A red validation that named failed tests, whose follow-up probe could not run. The red
@@ -7531,169 +8080,26 @@ impl<'a> Runner<'a> {
         Ok(())
     }
 
-    /// Search the candidate's prefixes for the first change that makes `focus` fail, running only
-    /// `focus`, with up to `width` probes at once. The bare parent is probed until known, so a
-    /// broken base never ejects an innocent change; spare probe slots re-run the suspected
-    /// failing prefix, and every blaming conclusion needs its failure seen twice, or once when
-    /// the run that saw it named it a deterministic check (`first_deterministic` for the red
-    /// run that started the search) or same-commit confirmation is off.
-    fn find_culprit(
-        &self,
-        candidate: &Candidate,
-        focus: &Selection,
-        first_failed: &BTreeSet<TestId>,
-        first_deterministic: bool,
-    ) -> Result<Culprit, String> {
-        let n = candidate.prs.len();
-        // Off, one sighting of any failure confirms it.
-        let unconfirmed = (!self.config.validator.confirm_reruns).then_some(UNCONFIRMED_ONCE);
-        let mut obs: BTreeMap<usize, Obs> = BTreeMap::new();
-        obs.insert(
-            n,
-            Obs {
-                fails: 1,
-                passes: 0,
-                unknowns: 0,
-                failed: first_failed.clone(),
-                once: if first_deterministic {
-                    Some(DETERMINISTIC_ONCE)
-                } else {
-                    unconfirmed
-                },
-            },
-        );
-        if self.config.trust_base && n > 0 {
-            obs.insert(
-                0,
-                Obs {
-                    passes: 1,
-                    ..Obs::default()
-                },
-            );
+    /// The probe jobs for one round of `search` at `probes`. Probe commits are regenerated
+    /// on demand: the validator runs in a checkout of the prefix and may read generated
+    /// files, so a stale prefix could blame the wrong change.
+    fn search_jobs(&self, search: &CulpritSearch, probes: &[usize]) -> Result<Vec<Job>, String> {
+        let mut jobs = Vec::with_capacity(probes.len());
+        for i in probes {
+            jobs.push(Job {
+                purpose: "probe",
+                prs: search.candidate.prs[..*i].to_vec(),
+                commit: self.regenerated_prefix(&search.candidate, *i)?,
+                parent: search.candidate.parent.clone(),
+                speculation: None,
+                selection: search.focus.clone(),
+                policy: "failed-tests".to_owned(),
+                extra: BTreeSet::new(),
+                peripheral: false,
+                rooted: false,
+            });
         }
-        let seen =
-            |obs: &BTreeMap<usize, Obs>, i: usize| obs.get(&i).map_or(Seen::Unknown, Obs::seen);
-        let confirmed =
-            |obs: &BTreeMap<usize, Obs>, i: usize| obs.get(&i).is_some_and(Obs::confirmed_fail);
-        loop {
-            let flaky: BTreeSet<TestId> = obs
-                .values()
-                .filter(|o| o.passes > 0 && o.fails > 0)
-                .flat_map(|o| o.failed.iter().cloned())
-                .collect();
-            if seen(&obs, n) == Seen::Pass {
-                return Ok(Culprit::Flaky(flaky));
-            }
-            if confirmed(&obs, 0) {
-                return Ok(Culprit::BaseRed(
-                    obs[&0].failed.clone(),
-                    obs[&0].confirmation(),
-                ));
-            }
-            let hi = (0..=n).find(|i| seen(&obs, *i) == Seen::Fail).unwrap_or(n);
-            let lo = (0..hi).rev().find(|i| seen(&obs, *i) == Seen::Pass);
-            if hi > 0 && lo == Some(hi - 1) && confirmed(&obs, hi) {
-                return Ok(Culprit::Found {
-                    index: hi - 1,
-                    failed: obs[&hi].failed.clone(),
-                    flaky,
-                    confirmation: obs[&hi].confirmation(),
-                });
-            }
-            let mut probes: Vec<usize> = Vec::new();
-            if hi == 0 {
-                probes.push(0);
-            } else {
-                if lo.is_none() {
-                    probes.push(0);
-                }
-                let start = lo.unwrap_or(0);
-                let room = self.width.saturating_sub(probes.len());
-                for k in 1..=room {
-                    let point = start + (hi - start) * k / (room + 1);
-                    if point > start && point < hi && !probes.contains(&point) {
-                        probes.push(point);
-                    }
-                }
-                if probes.len() < self.width && !confirmed(&obs, hi) {
-                    probes.push(hi);
-                }
-                if probes.is_empty() {
-                    probes.push(hi);
-                }
-            }
-            // Probe commits are regenerated on demand: the validator runs in a
-            // checkout of the prefix and may read generated files, so a stale
-            // prefix could blame the wrong change.
-            let mut jobs = Vec::with_capacity(probes.len());
-            for i in &probes {
-                jobs.push(Job {
-                    purpose: "probe",
-                    prs: candidate.prs[..*i].to_vec(),
-                    commit: self.regenerated_prefix(candidate, *i)?,
-                    parent: candidate.parent.clone(),
-                    speculation: None,
-                    selection: focus.clone(),
-                    policy: "failed-tests".to_owned(),
-                    extra: BTreeSet::new(),
-                    peripheral: false,
-                    rooted: false,
-                });
-            }
-            for (i, result) in probes.iter().zip(self.validate_all(jobs)) {
-                let (_, ran) = result?;
-                if ran.refused() {
-                    return Ok(Culprit::Refused(refusal_detail(&ran)));
-                }
-                // A rerun of the whole candidate the validator holds for a ruling: no verdict on
-                // the change either way. Only a validator that prints the markers gets here.
-                if *i == n && !ran.cancelled {
-                    if !ran.infra_blocked.is_empty() {
-                        return Ok(Culprit::Held(Hold::InfraBlocked, ran.infra_blocked.clone()));
-                    }
-                    if ran.green() && !ran.flaky_passes.is_empty() {
-                        return Ok(Culprit::Held(Hold::GreenFlaky, ran.flaky_passes.clone()));
-                    }
-                }
-                if !ran.infra_blocked.is_empty() {
-                    return Ok(Culprit::Inconclusive(format!(
-                        "probe at prefix {i} of {} was INFRA-BLOCKED ({}): the host refused to measure it",
-                        candidate.prs.len(),
-                        ids(&ran.infra_blocked.clone())
-                    )));
-                }
-                let entry = obs.entry(*i).or_default();
-                match ran.probe_observation() {
-                    ProbeObservation::Fail => {
-                        entry.fails += 1;
-                        entry.failed.extend(ran.reproduced());
-                        if ran.deterministic_red() {
-                            entry.once = Some(DETERMINISTIC_ONCE);
-                        } else if entry.once.is_none() {
-                            entry.once = unconfirmed;
-                        }
-                    }
-                    ProbeObservation::Pass => entry.passes += 1,
-                    ProbeObservation::Unknown => {
-                        entry.unknowns += 1;
-                        return Ok(Culprit::Inconclusive(if ran.is_empty_red() {
-                            format!(
-                                "probe at prefix {i} of {} was a {} (exit {}): it can name no culprit",
-                                candidate.prs.len(),
-                                crate::validate::NO_RECORDED_RESULT,
-                                ran.exit
-                                    .map_or("none".to_owned(), |code| code.to_string())
-                            )
-                        } else {
-                            format!(
-                                "probe at prefix {i} of {} observed only missing/skipped tests (no pass, no reproduced failure)",
-                                candidate.prs.len()
-                            )
-                        }));
-                    }
-                }
-            }
-        }
+        Ok(jobs)
     }
 
     /// Run the complete suite on the current base. A green run discharges every open obligation
@@ -7912,11 +8318,26 @@ fn rooted_decidable(flight: &Flight, flights: &VecDeque<Flight>) -> bool {
 
 /// Places taken in the window: every batch in flight but one cut out of the stack, which only
 /// waits for its turn to be decided. A disjoint root holds a place: it is validating.
+/// A culprit-search probe holds one too, and the red batch waiting on it keeps
+/// its place: refills neither build on its tree (it is cut out of the stack)
+/// nor jump its slot onto the base while its verdict is out.
 fn occupied(flights: &VecDeque<Flight>) -> usize {
     flights
         .iter()
-        .filter(|flight| flight.stacked || flight.rooted)
+        .filter(|flight| {
+            flight.stacked
+                || flight.rooted
+                || flight.probe_for.is_some()
+                || flight.red_work.is_some()
+        })
         .count()
+}
+
+/// Whether a flight survives a discard of the batches around it: disjoint
+/// roots (built on the base), culprit-search probes, and the red batches
+/// waiting on them (their searches resume when the probes return).
+fn kept_in_discard(flight: &Flight) -> bool {
+    flight.rooted || flight.probe_for.is_some() || flight.red_work.is_some()
 }
 
 /// Whether `result` is a red verdict: a validation that ran to its end and is not green, not
@@ -7936,6 +8357,28 @@ fn plainly_red(result: Option<&JobResult>) -> bool {
 /// Cancel the batches after `index`, all built on its tree, and wait for each to stop; their
 /// changes go back to the front of `pending`, in order. A result that arrives meanwhile for a
 /// batch kept is stored on it.
+/// Move probes whose red batch is being dropped out of `kept` into `dropped`:
+/// a probe outlives its batch only while the batch itself is kept.
+fn follow_dropped_reds(kept: VecDeque<Flight>, dropped: &mut Vec<Flight>) -> VecDeque<Flight> {
+    let reds: BTreeSet<u64> = dropped
+        .iter()
+        .filter(|flight| flight.red_work.is_some())
+        .map(|flight| flight.id)
+        .collect();
+    if reds.is_empty() {
+        return kept;
+    }
+    let mut still: VecDeque<Flight> = VecDeque::new();
+    for flight in kept {
+        if flight.probe_for.is_some_and(|red| reds.contains(&red)) {
+            dropped.push(flight);
+        } else {
+            still.push_back(flight);
+        }
+    }
+    still
+}
+
 fn cut_after(
     flights: &mut VecDeque<Flight>,
     index: usize,
@@ -7947,12 +8390,13 @@ fn cut_after(
     let mut cut: Vec<Flight> = Vec::new();
     let mut roots: Vec<Flight> = Vec::new();
     for flight in drained {
-        if flight.rooted {
+        if kept_in_discard(&flight) {
             roots.push(flight);
         } else {
             cut.push(flight);
         }
     }
+    let mut roots: VecDeque<Flight> = follow_dropped_reds(roots.into(), &mut cut);
     for flight in &cut {
         flight.cancel.store(true, Ordering::Relaxed);
     }
@@ -7978,7 +8422,9 @@ fn cut_after(
         }
     }
     for flight in cut.into_iter().rev() {
-        pending.push_front(flight.candidate.prs);
+        if flight.probe_for.is_none() {
+            pending.push_front(flight.candidate.prs);
+        }
     }
     flights.extend(roots);
 }
@@ -7993,17 +8439,25 @@ fn discard_detached(flights: &mut VecDeque<Flight>, pending: &mut VecDeque<Vec<i
     let mut kept: VecDeque<Flight> = VecDeque::new();
     let mut dropped: Vec<Flight> = Vec::new();
     while let Some(flight) = flights.pop_front() {
-        if flight.rooted {
+        if kept_in_discard(&flight) {
+            // Kept, but on a stop its probes are cancelled with the rest: the
+            // scope joins their threads before the run ends.
+            if flight.probe_for.is_some() {
+                flight.cancel.store(true, Ordering::Relaxed);
+            }
             kept.push_back(flight);
         } else {
             dropped.push(flight);
         }
     }
+    let mut kept = follow_dropped_reds(kept, &mut dropped);
     for flight in &dropped {
         flight.cancel.store(true, Ordering::Relaxed);
     }
     for flight in dropped.into_iter().rev() {
-        pending.push_front(flight.candidate.prs);
+        if flight.probe_for.is_none() {
+            pending.push_front(flight.candidate.prs);
+        }
     }
     flights.append(&mut kept);
 }
@@ -8018,12 +8472,13 @@ fn discard(
     let mut kept: VecDeque<Flight> = VecDeque::new();
     let mut dropped: Vec<Flight> = Vec::new();
     while let Some(flight) = flights.pop_front() {
-        if flight.rooted {
+        if kept_in_discard(&flight) {
             kept.push_back(flight);
         } else {
             dropped.push(flight);
         }
     }
+    let mut kept = follow_dropped_reds(kept, &mut dropped);
     for flight in &dropped {
         flight.cancel.store(true, Ordering::Relaxed);
     }
@@ -8045,7 +8500,9 @@ fn discard(
         }
     }
     for flight in dropped.into_iter().rev() {
-        pending.push_front(flight.candidate.prs);
+        if flight.probe_for.is_none() {
+            pending.push_front(flight.candidate.prs);
+        }
     }
     flights.append(&mut kept);
 }

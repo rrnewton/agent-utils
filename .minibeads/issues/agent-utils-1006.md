@@ -1,6 +1,6 @@
 ---
 title: 'merge-queue-confirm-probe-blocks-run: the same-commit confirm probe runs synchronously inside handle_red, so the whole run stops while the probe waits for a donor'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-07T05:15:00.000000000+00:00
@@ -74,3 +74,9 @@ Run the probe as an ordinary window batch, not synchronously inside
   confirmed red, flaky on a green rerun.
 - With two reds in one run, the second red's probe starts without waiting for
   the first one's verdict.
+
+# Notes
+
+## Resolution
+
+The culprit search is a resumable stepper (`CulpritSearch` in rs/merge-queue/src/run.rs). A red batch's probes run as ordinary window flights: the batch keeps its place for in-order decisions, cut out of the stack, while the run loop keeps taking intake and deciding other batches; a rooted red behind the head starts its search on its red result. The probe's verdict decides the red in order, with the same limits and receipts as the synchronous search. Covered by rs/merge-queue/tests/cli_confirm_async.rs (non-blocking intake and decisions, both verdicts, two reds side by side, cancelled and untaken probes, restart recovery).
