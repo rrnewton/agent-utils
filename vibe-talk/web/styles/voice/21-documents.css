@@ -24,8 +24,19 @@
 .view-cards[hidden] {
   display: none;
 }
+/* Shown cards take themselves away: a moment's signpost, never a cover over the
+   list (and no timer on the page's clock for it). */
+.view-cards:not([hidden]) {
+  animation: view-cards-away 0s linear 600ms forwards;
+}
+@keyframes view-cards-away {
+  to {
+    visibility: hidden;
+  }
+}
 .view-card {
-  padding: 6px 12px;
+  padding: 4px 10px;
+  font-size: 0.85em;
   border: 1px solid;
   border-radius: 8px;
   background: var(--bg, Canvas);
@@ -49,6 +60,13 @@
   margin: 0 0 8px;
   text-align: left;
   cursor: pointer;
+  /* A tap opens the document; it never starts a text selection. */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+.doc-busy {
+  opacity: 0.7;
 }
 .doc-unfetched {
   opacity: 0.55;

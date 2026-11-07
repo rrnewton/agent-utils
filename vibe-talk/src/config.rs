@@ -229,6 +229,10 @@ pub struct DocumentsConfig {
     pub github_token_file: Option<PathBuf>,
     /// Raw-content base for GitHub fetches (a fake in tests).
     pub github_raw_base: Option<String>,
+    /// HTTPS proxy for the documents fetcher only (e.g. `http://fwdproxy:8080` on a
+    /// host with no direct egress). Absent means direct, as before; no other traffic
+    /// of the server uses it.
+    pub https_proxy: Option<String>,
     /// URL prefixes under which a paste id names a document.
     pub paste_url_prefixes: Vec<String>,
     /// Argv template fetching a paste, `{}` for the id, `--` before it.
@@ -246,6 +250,7 @@ impl Default for DocumentsConfig {
         Self {
             github_token_file: None,
             github_raw_base: None,
+            https_proxy: None,
             paste_url_prefixes: Vec::new(),
             paste_command: Vec::new(),
             max_cached_documents: crate::documents::DEFAULT_MAX_CACHED,
@@ -1589,6 +1594,7 @@ struct FileConfig {
 struct FileDocuments {
     github_token_file: Option<String>,
     github_raw_base: Option<String>,
+    https_proxy: Option<String>,
     #[serde(default)]
     paste_url_prefixes: Vec<String>,
     #[serde(default)]
@@ -2353,6 +2359,22 @@ fn documents_config(file: FileDocuments) -> Result<DocumentsConfig, ConfigError>
             .github_raw_base
             .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty()),
+        https_proxy: match file.https_proxy {
+            None => None,
+            Some(v) => {
+                let v = v.trim().to_owned();
+                if v.is_empty() {
+                    None
+                } else if reqwest::Proxy::https(&v).is_err() {
+                    return Err(invalid(
+                        "https_proxy",
+                        format!("{v} is not a usable proxy address"),
+                    ));
+                } else {
+                    Some(v)
+                }
+            }
+        },
         paste_url_prefixes: file.paste_url_prefixes,
         paste_command: file.paste_command,
         max_cached_documents: ranged(

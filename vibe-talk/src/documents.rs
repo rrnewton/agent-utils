@@ -342,6 +342,14 @@ pub fn recognize(text: &str, paste_prefixes: &[String]) -> Vec<Recognized> {
         if bytes[i] == b'[' {
             if let Some(close) = text[i..].find("](") {
                 let label = &text[i + 1..i + close];
+                // A label is one bracketed span: it cannot itself hold brackets or a
+                // line break. Without this, a message that opens with a bracketed
+                // word (an author tag, a citation) lends the whole message prefix
+                // to the document it later links.
+                if label.contains(['[', ']', '\n', '\r']) {
+                    i += 1;
+                    continue;
+                }
                 let start = i + close + 2;
                 if let Some(end) = text[start..].find([')', ' ', '\n']) {
                     let url = &text[start..start + end];
@@ -818,10 +826,21 @@ pub struct GithubFetcher {
 
 impl GithubFetcher {
     /// A fetcher against `raw_base` (default `https://raw.githubusercontent.com`).
+    /// `https_proxy`, when set, applies to this client only.
     #[must_use]
-    pub fn new(token: Option<String>, raw_base: Option<String>) -> Self {
+    pub fn new(
+        token: Option<String>,
+        raw_base: Option<String>,
+        https_proxy: Option<String>,
+    ) -> Self {
+        let mut builder = reqwest::Client::builder();
+        if let Some(proxy) = https_proxy.as_deref().filter(|p| !p.trim().is_empty()) {
+            if let Ok(proxy) = reqwest::Proxy::https(proxy) {
+                builder = builder.proxy(proxy);
+            }
+        }
         Self {
-            client: reqwest::Client::new(),
+            client: builder.build().unwrap_or_else(|_| reqwest::Client::new()),
             token,
             raw_base: raw_base
                 .unwrap_or_else(|| "https://raw.githubusercontent.com".to_owned())
@@ -1079,6 +1098,7 @@ pub fn service_from_config(config: &crate::config::DocumentsConfig) -> Arc<Servi
     let mut fetchers: Vec<Arc<dyn Fetcher>> = vec![Arc::new(GithubFetcher::new(
         token,
         config.github_raw_base.clone(),
+        config.https_proxy.clone(),
     ))];
     if !config.paste_command.is_empty() {
         fetchers.push(Arc::new(PasteFetcher::new(config.paste_command.clone())));
@@ -1378,6 +1398,19 @@ mod tests {
         assert_eq!(rec[0].key, "github:octo/widgets@main:docs/report.md");
         assert_eq!(rec[0].label.as_deref(), Some("the report"));
         assert_eq!(rec[1].kind, DocKind::GithubFile);
+    }
+
+    #[test]
+    fn a_bracketed_prefix_is_not_the_link_label() {
+        // A cached message that opens with a bracketed author tag and links a
+        // document at its end: the document's label is the link's own, never
+        // the whole message prefix.
+        let rec = recognize(
+            "[agent] *Done.* Write-up: [RESULTS.md](https://github.com/octo/widgets/blob/main/docs/RESULTS.md)",
+            &prefixes(),
+        );
+        assert_eq!(rec.len(), 1);
+        assert_eq!(rec[0].label.as_deref(), Some("RESULTS.md"));
     }
 
     #[test]

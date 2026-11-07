@@ -501,6 +501,8 @@ enabled = true
 # absolute path. Fetched copies live in a bounded in-memory cache.
 # github_token_file = "/run/secrets/github-documents-token"
 # github_raw_base = "https://raw.githubusercontent.com"
+# HTTPS proxy for the documents fetcher only, on hosts with no direct egress.
+# https_proxy = "http://fwdproxy:8080"
 # paste_url_prefixes = ["https://paste.example/"]
 # paste_command = ["paste-cli", "show", "--", "{}"]
 # max_cached_documents = 100

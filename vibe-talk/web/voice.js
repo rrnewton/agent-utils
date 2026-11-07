@@ -2077,16 +2077,10 @@ const documentsSelector = createViewSelector({
   choose: (view) => chooseMajorView(view),
 });
 
-/** The selector cards' auto-hide timer; a new press restarts it. */
-let viewCardsTimer = 0;
-
 /** Show major view `view` (voice/discord/docs), with each view's entry work. */
 function chooseMajorView(view) {
   uiState.settle();
   showView(view);
-  // The cards name what a press would reach; once seen they go, so they never cover the bar.
-  clearTimeout(viewCardsTimer);
-  viewCardsTimer = setTimeout(() => documentsSelector.hideCards(), 700);
   if (view === "discord") {
     readEnteredChannel(viewScroll.restored());
     return;
@@ -2123,19 +2117,16 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
+// Keys are the reader at work (reading, stepping): put the cards away at once.
+document.addEventListener("keydown", () => documentsSelector.hideCards(), true);
+
 // A tap anywhere but the switch or its cards puts the cards away at once.
 document.addEventListener("pointerdown", (event) => {
   const target = /** @type {{closest?: (selector: string) => unknown} | null} */ (event.target || null);
   if (target && typeof target.closest === "function" && (target.closest("#view-cards") || target.closest("#view-switch"))) return;
-  clearTimeout(viewCardsTimer);
   documentsSelector.hideCards();
 }, true);
 
-// And so does scrolling a list: the cards are a moment's signpost, not a cover.
-document.addEventListener("scroll", () => {
-  clearTimeout(viewCardsTimer);
-  documentsSelector.hideCards();
-}, true);
 
 /** What the header calls each screen that is a DESTINATION rather than the app itself. */
 const SCREEN_TITLES = { settings: "Settings", help: "Help" };
@@ -2634,6 +2625,8 @@ function showView(name) {
   renderColumns();
   // `#245 done-feedback`. The chips stand on the channel's message box, which only the channel has.
   placeChipsOverComposer();
+  // The call's controls (Sound, Clear, Talk) are not the Documents view's.
+  if (screens.screen() === "main") el("control-pane").hidden = name === "docs";
   saveUiState();
   // `#224 keyboard-shortcuts`. The list on screen takes the focus, so that the scroll keys move it.
   // Above all off the view switch: left holding the focus from the click that pressed it, it took
@@ -9293,15 +9286,17 @@ function returnToSavedPlace() {
  * The view's one newest page is owed from here, and `payReopenRead` reads it.
  */
 function reopenSavedView() {
-  if (uiState.settled()) return;
-  uiState.settle();
   // `?v=docs` (with `&d=KEY` for one document) opens Documents (`documents-view-client`).
+  // Before the settled guard: an explicit address outranks a saved place.
   if (documentsQueryValue("v") === "docs") {
+    uiState.settle();
     showView("docs");
     void documentsView.show(documentsDeepLinkKey());
     saveUiState();
     return;
   }
+  if (uiState.settled()) return;
+  uiState.settle();
   const saved = uiState.saved();
   if (saved && saved.view === "discord" && selectedChannelId() && screens.view() !== "discord") {
     showView("discord");

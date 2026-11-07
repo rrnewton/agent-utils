@@ -193,8 +193,9 @@ test("documents list: refresh renders rows in order, unfetched dimmed; clicks fe
     `list exports no list factory (found: ${Object.keys(mod).join(", ") || "none"})`);
 
   const rows = [
-    { key: "doc-alpha", id: "doc-alpha", url: "https://example.com/alpha.md", title: "Alpha doc", fetched: true },
-    { key: "doc-beta", id: "doc-beta", url: "https://example.com/beta.md", title: "Beta doc", fetched: false },
+    { key: "doc-alpha", id: "doc-alpha", url: "https://example.com/alpha.md", title: "Alpha doc", file_name: "alpha.md", mention_count: 1, kind: "github_markdown", fetched: true },
+    // Unfetched: the server's title can carry the linking message's words; the card names the file.
+    { key: "doc-beta", id: "doc-beta", url: "https://example.com/beta.md", title: "a whole linking message, not the document", file_name: "beta.md", mention_count: 2, kind: "github_markdown", fetched: false },
   ];
   // One payload readable as a bare array or under documents/rows/items, whichever the module reads.
   const listPayload = () => { const out = [...rows]; out.documents = rows; out.rows = rows; out.items = rows; return out; };
@@ -263,7 +264,8 @@ test("documents list: refresh renders rows in order, unfetched dimmed; clicks fe
       .filter((kid) => kid && typeof kid === "object");
     assert.equal(cards.length, 2, `refresh rendered ${cards.length} cards, not two (container HTML: ${String(container.innerHTML).slice(0, 200)})`);
     assert.ok(cards[0].textContent.includes("Alpha doc"), "first card is not the first row in order");
-    assert.ok(cards[1].textContent.includes("Beta doc"), "second card is not the second row in order");
+    assert.ok(cards[1].textContent.includes("beta.md"), "second card does not name its file");
+    assert.ok(!cards[1].textContent.includes("a whole linking message"), "the unfetched card carries the linking message");
 
     const dimmed = (el) => /dim|unfetch|not-fetched|pending/i.test(`${el.className || ""}`);
     assert.equal(dimmed(cards[0]), false, "the fetched card carries the dimmed class");
@@ -283,11 +285,14 @@ test("documents list: refresh renders rows in order, unfetched dimmed; clicks fe
     assert.ok(JSON.stringify(opened[0]).includes("doc-beta") || JSON.stringify(opened[0]).includes("Beta doc"),
       "onOpen was not handed the unfetched row");
 
-    // Clicking the fetched card opens it without fetching.
+    // Clicking the fetched card opens it without fetching. (Re-query: fetching a
+    // row redraws the list, so the first render's cards are detached by now.)
     order.length = 0; fetchCalls.length = 0; opened.length = 0;
-    pending = dispatchClick(cards[0]);
+    const fresh = [...(container.children.length ? container.children : container.childNodes)]
+      .filter((kid) => kid && typeof kid === "object");
+    pending = dispatchClick(fresh[0]);
     if (pending.length === 0 && (container.listeners.click || []).length) {
-      pending = dispatchClick(container, { target: cards[0] });
+      pending = dispatchClick(container, { target: fresh[0] });
     }
     await flush(pending);
     assert.equal(fetchCalls.length, 0, "clicking the fetched card fetched anyway");

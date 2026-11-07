@@ -81,9 +81,24 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     if (wired) return;
     wired = true;
     listening.listen(deps.byId("docs-fetch-recent"), "click", () => {
-      void list.fetchRecent().catch((error: unknown) => {
-        deps.onStatus?.(error instanceof Error ? error.message : String(error));
-      });
+      const button = deps.byId("docs-fetch-recent") as HTMLButtonElement;
+      const label = button.textContent;
+      button.disabled = true;
+      button.textContent = "Fetching…";
+      void list
+        .fetchRecent()
+        .then((fetched) => {
+          deps.onStatus?.(
+            fetched > 0 ? `Fetched ${fetched} document${fetched === 1 ? "" : "s"}.` : "No new documents fetched.",
+          );
+        })
+        .catch((error: unknown) => {
+          deps.onStatus?.(error instanceof Error ? error.message : String(error));
+        })
+        .finally(() => {
+          button.disabled = false;
+          button.textContent = label;
+        });
     });
   }
 
