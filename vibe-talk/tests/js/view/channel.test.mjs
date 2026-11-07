@@ -1206,7 +1206,7 @@ test("`#624 voice-page-modularity`: the list's tools reach the act each names, i
   const log = [];
   const nodes = {};
   const target = (id) => (nodes[id] ||= { id, listeners: [], checked: false,
-    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    addEventListener(type, listener, options) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}${options && options.passive ? " passive" : ""}`); },
     removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); },
     focus(options) { log.push(`focus ${id} ${options && options.preventScroll}`); } });
   const press = (id, type = "click") => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener({}));
@@ -1280,7 +1280,7 @@ test("`#624 voice-page-modularity`: the thread's back gesture commits only a lon
   const log = [];
   const nodes = {};
   const target = (id) => (nodes[id] ||= { id, listeners: [],
-    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    addEventListener(type, listener, options) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}${options && options.passive ? " passive" : ""}`); },
     removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
   const fire = (id, type, event = {}) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener(event));
   let inThread = true;
@@ -1441,7 +1441,7 @@ test("`#624 voice-page-modularity`: the view chips, the thread's Back and the pi
   const log = [];
   const nodes = {};
   const target = (id) => (nodes[id] ||= { id, listeners: [],
-    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    addEventListener(type, listener, options) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}${options && options.passive ? " passive" : ""}`); },
     removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
   const fire = (id, type) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener({ type }));
   const controls = mountChannelViewControls({
@@ -1470,7 +1470,7 @@ test("`#624 voice-page-modularity`: the right column list's controls reach what 
   const log = [];
   const nodes = {};
   const target = (id) => (nodes[id] ||= { id, listeners: [],
-    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    addEventListener(type, listener, options) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}${options && options.passive ? " passive" : ""}`); },
     removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
   const fire = (id, type) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener({ type }));
   const act = (name) => (...args) => { log.push(`${name} ${args.length}`); return name; };
@@ -1492,7 +1492,7 @@ test("`#624 voice-page-modularity`: the ways back reach the bookmark, the readin
   const log = [];
   const nodes = {};
   const target = (id) => (nodes[id] ||= { id, listeners: [],
-    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    addEventListener(type, listener, options) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}${options && options.passive ? " passive" : ""}`); },
     removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
   const fire = (id) => nodes[id].listeners.map((one) => one.listener({ type: "click" }));
   const act = (name) => (...args) => { log.push(`${name} ${args.length}`); return name; };
@@ -1511,7 +1511,7 @@ test("`#624 voice-page-modularity`: what the page kept of its sends is read back
   const log = [];
   const nodes = {};
   const target = (id) => (nodes[id] ||= { id, listeners: [],
-    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    addEventListener(type, listener, options) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}${options && options.passive ? " passive" : ""}`); },
     removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
   const fire = (id, type) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener({ type }));
   const act = (name) => (...args) => { log.push(`${name} ${args.length}`); return name; };
@@ -1537,5 +1537,80 @@ test("`#624 voice-page-modularity`: what the page kept of its sends is read back
     assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
   } finally {
     globalThis.window = was;
+  }
+});
+
+test("`#624 voice-page-modularity`: the reply box's listeners are mounted in the page's order, each answering its own act, the size watcher fitted and stopped, then all come down", () => {
+  const { mountReplyBox } = CHANNEL_VIEW;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener, options) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}${options && options.passive ? " passive" : ""}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type, event = { type }) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener(event));
+  const act = (name) => (...args) => { log.push(`${name} ${args.length}`); return name; };
+  const watchers = [];
+  const was = globalThis.document;
+  globalThis.document = target("document");
+  try {
+    const box = mountReplyBox({
+      lookup: (id) => target(id),
+      leftLookup: (id) => target(`left:${id}`),
+      canWatchSizes: () => true,
+      sizeWatcher: (report) => { const watcher = { report, seen: [], disconnected: false,
+        observe(node) { this.seen.push(node.id); log.push(`observe ${node.id}`); },
+        disconnect() { this.disconnected = true; } };
+        watchers.push(watcher); return watcher; },
+      cancelReply: act("cancel"), answerReplyDiscard: act("discard"), draftChipAsk: act("chip"),
+      sendReply: act("send"), onBoxKey: act("key"), watchBoxInsertions: (node) => log.push(`watch ${node.id}`),
+      rememberDraft: act("remember"), renderReplyDestination: act("destination"),
+      noteFocusLeaving: act("focus leaving"), noteFocusIn: act("focus in"), fitInlineRoom: act("fit"), pressViewSwitch: act("view"),
+    });
+    assert.deepStrictEqual(log, ["listen reply-cancel click", "listen reply-discard-yes click", "listen reply-discard-no click",
+      "listen left:scroll-area scroll passive", "listen left:side-scroll scroll passive", "listen reply-send click", "listen reply-text keydown",
+      "watch reply-text", "listen reply-branch change", "listen reply-text input", "listen reply-compose focusout",
+      "listen document focusin", "observe left:column-reply", "observe left:side-reply", "listen view-switch click"], "mounted out of the page's order");
+    log.length = 0;
+    fire("reply-cancel", "click"); fire("reply-discard-yes", "click"); fire("reply-discard-no", "click");
+    fire("left:scroll-area", "scroll"); fire("left:side-scroll", "scroll"); fire("reply-send", "click");
+    assert.deepStrictEqual(fire("reply-text", "keydown", { key: "Enter" }), ["key"], "the box's keys answered what its act did not");
+    fire("reply-branch", "change"); fire("reply-text", "input"); fire("reply-compose", "focusout"); fire("document", "focusin"); fire("view-switch", "click");
+    watchers[0].report();
+    assert.deepStrictEqual(log, ["cancel 0", "discard 1", "discard 1", "chip 0", "chip 0", "send 0", "key 1", "remember 0",
+      "destination 0", "remember 0", "focus leaving 1", "focus in 0", "view 0", "fit 0"]);
+    box.unmount();
+    assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+    assert.ok(watchers[0].disconnected, "the size watcher outlived unmount");
+  } finally {
+    globalThis.document = was;
+  }
+});
+
+test("`#624 voice-page-modularity`: the reply box's discard answers carry their own values, and no size watcher is made where sizes cannot be watched", () => {
+  const { mountReplyBox } = CHANNEL_VIEW;
+  const seen = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id) => nodes[id].listeners.map((one) => one.listener({ type: "click" }));
+  const idle = () => {};
+  const was = globalThis.document;
+  globalThis.document = target("document");
+  try {
+    const box = mountReplyBox({
+      lookup: (id) => target(id), leftLookup: (id) => target(`left:${id}`),
+      canWatchSizes: () => false,
+      sizeWatcher: () => { throw new Error("a watcher was made where sizes cannot be watched"); },
+      cancelReply: idle, answerReplyDiscard: (discard) => seen.push(discard), draftChipAsk: idle,
+      sendReply: idle, onBoxKey: idle, watchBoxInsertions: idle, rememberDraft: idle,
+      renderReplyDestination: idle, noteFocusLeaving: idle, noteFocusIn: idle, fitInlineRoom: idle, pressViewSwitch: idle,
+    });
+    fire("reply-discard-yes"); fire("reply-discard-no");
+    assert.deepStrictEqual(seen, [true, false]);
+    box.unmount();
+    assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+  } finally {
+    globalThis.document = was;
   }
 });

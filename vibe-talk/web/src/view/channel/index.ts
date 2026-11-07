@@ -131,6 +131,8 @@ export { mountSideListControls } from "./sidelistcontrols.ts";
 export type { SideListControls, SideListControlsDependencies } from "./sidelistcontrols.ts";
 export { mountReadingJumps } from "./readingjumps.ts";
 export type { ReadingJumps, ReadingJumpsDependencies } from "./readingjumps.ts";
+export { mountReplyBox } from "./replybox.ts";
+export type { ReplyBox, ReplyBoxDependencies } from "./replybox.ts";
 export { mountKeptSends } from "./keptsends.ts";
 export type { KeptSends, KeptSendsDependencies } from "./keptsends.ts";
 export { mountSideControls } from "./sidecontrols.ts";

@@ -31233,9 +31233,6 @@ whoIsWho.load();
 identityList.render();
 renderChannelRows();
 for (const [key, box] of NEWLINE_KEYS) wireNewlineKey(leftEl(key), leftEl(box));
-el("reply-cancel").addEventListener("click", () => cancelReply());
-el("reply-discard-yes").addEventListener("click", () => answerReplyDiscard(true));
-el("reply-discard-no").addEventListener("click", () => answerReplyDiscard(false));
 // `#846 draft-chip-honest`. A reply open in the stream scrolls on and off screen with its list: the chip
 // follows, once a frame.
 // Redrawn only when the reply crosses its list's edge (`replySight`), not on every frame of a scroll.
@@ -31244,41 +31241,34 @@ const draftChipFrame = createOncePerFrame(() => {
   if (!replySight.crossed(now)) return;
   renderDraftChip();
 }, () => (typeof requestAnimationFrame === "function" ? requestAnimationFrame : null));
-for (const id of ["scroll-area", "side-scroll"]) {
-  leftEl(id).addEventListener("scroll", () => {
+// The reply box's listeners (`#410 inline-reply-editor`, `#846 draft-chip-honest`, `#225 enter-to-send`,
+// `#185 reply-new-thread`, `#314 reply-focus-flake`): Cancel and its discard question, the lists' scrolls,
+// Send and the box's keys, what is pasted in, the tick and the words kept as they are typed, the focus
+// leaving, and the box's height fitted again. One owner in web/src/view/channel/replybox.ts (`#624
+// voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's
+// teardown.
+mountReplyBox({
+  lookup: (id) => el(id),
+  leftLookup: (id) => leftEl(id),
+  canWatchSizes: () => typeof window.ResizeObserver === "function",
+  sizeWatcher: (report) => new window.ResizeObserver(() => report()),
+  cancelReply: () => cancelReply(),
+  answerReplyDiscard: (discard) => answerReplyDiscard(discard),
+  draftChipAsk: () => {
     if (replyState.docked) draftChipFrame.ask();
-  }, { passive: true });
-}
-el("reply-send").addEventListener("click", guardQuietly(sendReply));
-// `#225 enter-to-send`. The box that had no Enter handler at all, so the one the owner had to reach
-// for the mouse in.
-el("reply-text").addEventListener("keydown", (event) => onComposerKey(event, guardQuietly(sendReply), el("reply-text")));
-watchBoxInsertions(el("reply-text"));
-// The tick is the draft's as the words are, so it is kept as it is changed, not only when the words
-// next are; and the note under the box says where the reply now goes. `#185 reply-new-thread`.
-el("reply-branch").addEventListener("change", () => {
-  rememberDraft();
-  renderReplyDestination();
+  },
+  sendReply: guardQuietly(sendReply),
+  onBoxKey: (event) => onComposerKey(event, guardQuietly(sendReply), el("reply-text")),
+  watchBoxInsertions: (box) => watchBoxInsertions(box),
+  rememberDraft: () => rememberDraft(),
+  renderReplyDestination: () => renderReplyDestination(),
+  noteFocusLeaving: (event) => noteReplyFocusLeaving(event),
+  noteFocusIn: () => {
+    replyState.focusTaken = false;
+  },
+  fitInlineRoom: () => fitInlineRoom(),
+  pressViewSwitch: () => pressViewSwitch(),
 });
-// A draft survives leaving the screen without sending, so it is written as it is typed rather than
-// only on the way out — a way out that is not a control (the browser's own back, a reload) would
-// otherwise lose it.
-el("reply-text").addEventListener("input", rememberDraft);
-// `#314 reply-focus-flake`. The focus a narrowed window takes off a reply open in a column, for the hand-off;
-// forgotten once anything has the focus again, which is where the reader went.
-el("reply-compose").addEventListener("focusout", noteReplyFocusLeaving);
-document.addEventListener("focusin", () => {
-  replyState.focusTaken = false;
-});
-// `#410 inline-reply-editor`. A reply open in the stream changes height without the window changing —
-// the box growing with its words or dragged taller, a failed send's line, the new-thread choice — and the
-// room its row keeps under itself goes with it, in the same frame, so the rows below never show through
-// the box or a gap. Only rows are written to, never the box observed, so this cannot feed itself.
-if (typeof window.ResizeObserver === "function") {
-  const replyGeometry = new window.ResizeObserver(() => fitInlineRoom());
-  for (const id of ["column-reply", "side-reply"]) replyGeometry.observe(leftEl(id));
-}
-el("view-switch").addEventListener("click", pressViewSwitch);
 
 /** The view switch, pressed: the call's view or the channel's, whichever is not up. */
 function pressViewSwitch() {
