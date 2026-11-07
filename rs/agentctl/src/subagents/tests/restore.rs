@@ -280,6 +280,7 @@ fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
             state_dir: None,
             queue_stale: Duration::from_secs(600),
         },
+        &mut Default::default(),
     );
     let queue = findings.iter().find(|row| row["check"] == "queue").unwrap();
     assert_eq!(queue["subject"], "lane", "{findings:?}");
@@ -310,6 +311,7 @@ fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
             state_dir: None,
             queue_stale: Duration::ZERO,
         },
+        &mut Default::default(),
     );
     let queue = findings.iter().find(|row| row["check"] == "queue").unwrap();
     assert_eq!(queue["ok"], false, "{findings:?}");
@@ -515,6 +517,7 @@ fn watch_restarts_a_timer_that_never_fires_and_starts_its_service_when_needed() 
             state_dir: Some(fixture.root.join("watch")),
             queue_stale: Duration::from_secs(600),
         },
+        &mut Default::default(),
     );
     let timers = findings
         .iter()
@@ -534,6 +537,369 @@ fn watch_restarts_a_timer_that_never_fires_and_starts_its_service_when_needed() 
     assert!(findings
         .iter()
         .any(|row| row["check"] == "herdr" && row["ok"] == true));
+}
+
+/// One `watch_once` pass over `config` sharing a timer-repair cooldown map (#961).
+fn timer_pass(
+    fixture: &Fixture,
+    host: &ScriptedHost,
+    config: &RestoreConfig,
+    repaired: &mut std::collections::BTreeMap<String, f64>,
+) -> Vec<Value> {
+    watch_once(
+        &fixture.client,
+        &fixture.root.join("registry"),
+        host,
+        config,
+        &WatchOptions {
+            interval: Duration::from_secs(60),
+            once: true,
+            check_only: false,
+            wrkslots: None,
+            state_dir: None,
+            queue_stale: Duration::from_secs(600),
+        },
+        repaired,
+    )
+}
+
+fn timer_row(findings: &[Value]) -> &Value {
+    findings.iter().find(|row| row["check"] == "timer").unwrap()
+}
+
+#[test]
+fn watch_leaves_a_monotonic_timer_alone_when_its_service_ran_recently() {
+    // #961: LastTriggerUSec is ancient, but the service succeeded a minute ago, so the
+    // timer is keeping its schedule and must not be restarted or started.
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    host.answer(
+        "show observer.timer --timestamp=unix -p ActiveState",
+        0,
+        "ActiveState=active\nNextElapseUSecRealtime=\nNextElapseUSecMonotonic=1d 2h\nLastTriggerUSec=@1990000000\n",
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    host.answer(
+        "show observer.service",
+        0,
+        "ActiveState=inactive\nResult=success\nExecMainExitTimestamp=@1999999940\n",
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    host.answer(
+        "show observer.service",
+        0,
+        "ActiveState=inactive\nResult=success\nExecMainStatus=0\n",
+        "",
+    );
+    let findings = timer_pass(
+        &fixture,
+        &host,
+        &timer_config(&fixture, "observer.timer"),
+        &mut Default::default(),
+    );
+    let timer = timer_row(&findings);
+    assert_eq!(timer["ok"], true, "{findings:?}");
+    assert_eq!(timer["detail"], "keeps its schedule");
+    assert!(!changed_anything(&host), "{:?}", host.commands());
+}
+
+#[test]
+fn watch_starts_a_stale_monotonic_timers_service_once_then_holds_the_cooldown() {
+    // #961: the stale timer gets one service start, never a timer restart, and a second
+    // pass inside the window reports the cooldown instead of starting it again.
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    let stale_timer = "ActiveState=active\nNextElapseUSecRealtime=\nNextElapseUSecMonotonic=1d 2h\nLastTriggerUSec=@1990000000\n";
+    let stale_service = "ActiveState=inactive\nResult=success\nExecMainExitTimestamp=@1999994600\n";
+    host.answer(
+        "show observer.timer --timestamp=unix -p ActiveState",
+        0,
+        stale_timer,
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    host.answer("show observer.service", 0, stale_service, "");
+    host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    // The recheck after the start: the timer now reads fresh and its service is healthy.
+    host.answer(
+        "show observer.timer --timestamp=unix -p ActiveState",
+        0,
+        "ActiveState=active\nNextElapseUSecRealtime=\nNextElapseUSecMonotonic=1d 2h\nLastTriggerUSec=@1999999990\n",
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    host.answer(
+        "show observer.service",
+        0,
+        "ActiveState=inactive\nResult=success\nExecMainStatus=0\n",
+        "",
+    );
+    let config = timer_config(&fixture, "observer.timer");
+    let mut repaired = Default::default();
+    let findings = timer_pass(&fixture, &host, &config, &mut repaired);
+    let timer = timer_row(&findings);
+    assert_eq!(timer["ok"], true, "{findings:?}");
+    assert_eq!(
+        timer["repair"]["actions"],
+        json!(["systemctl --user start observer.service"])
+    );
+    assert!(
+        timer["detail"]
+            .as_str()
+            .unwrap()
+            .contains("last succeeded 5400 seconds ago"),
+        "{timer}"
+    );
+    assert!(
+        !host
+            .commands()
+            .iter()
+            .any(|command| command.contains("restart observer.timer")),
+        "{:?}",
+        host.commands()
+    );
+
+    // Second pass, still stale, inside the cooldown window: no second start.
+    host.answer(
+        "show observer.timer --timestamp=unix -p ActiveState",
+        0,
+        stale_timer,
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    host.answer("show observer.service", 0, stale_service, "");
+    let findings = timer_pass(&fixture, &host, &config, &mut repaired);
+    let timer = timer_row(&findings);
+    assert_eq!(timer["ok"], false, "{findings:?}");
+    assert_eq!(timer["cooldown"], true, "{timer}");
+    assert!(
+        timer["detail"]
+            .as_str()
+            .unwrap()
+            .contains("repair on cooldown"),
+        "{timer}"
+    );
+    assert_eq!(
+        host.commands()
+            .iter()
+            .filter(|command| command.contains("start observer.service"))
+            .count(),
+        1,
+        "{:?}",
+        host.commands()
+    );
+}
+
+#[test]
+fn watch_starts_a_never_run_timers_service_exactly_once() {
+    // #961 add (a): no successful run on record at all still earns one service start.
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    host.answer(
+        "show observer.timer --timestamp=unix -p ActiveState",
+        0,
+        "ActiveState=active\nNextElapseUSecRealtime=\nNextElapseUSecMonotonic=1d 2h\nLastTriggerUSec=\n",
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    host.answer(
+        "show observer.service",
+        0,
+        "ActiveState=inactive\nResult=\nExecMainExitTimestamp=\n",
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p ActiveState",
+        0,
+        "ActiveState=active\nNextElapseUSecRealtime=\nNextElapseUSecMonotonic=1d 2h\nLastTriggerUSec=@1999999990\n",
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    host.answer(
+        "show observer.service",
+        0,
+        "ActiveState=inactive\nResult=success\nExecMainStatus=0\n",
+        "",
+    );
+    let findings = timer_pass(
+        &fixture,
+        &host,
+        &timer_config(&fixture, "observer.timer"),
+        &mut Default::default(),
+    );
+    let timer = timer_row(&findings);
+    assert_eq!(timer["ok"], true, "{findings:?}");
+    assert_eq!(
+        timer["repair"]["actions"],
+        json!(["systemctl --user start observer.service"])
+    );
+    assert!(
+        timer["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no successful run on record"),
+        "{timer}"
+    );
+}
+
+#[test]
+fn watch_still_repairs_a_stale_calendar_timer() {
+    // A calendar timer stale by the service clock is repaired (with a service start),
+    // never silently ignored because freshness moved to the service.
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    host.answer(
+        "show observer.timer --timestamp=unix -p ActiveState",
+        0,
+        "ActiveState=active\nNextElapseUSecRealtime=@2000001000\nNextElapseUSecMonotonic=\nLastTriggerUSec=@1990000000\n",
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    host.answer(
+        "show observer.service",
+        0,
+        "ActiveState=inactive\nResult=success\nExecMainExitTimestamp=@1999994600\n",
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p ActiveState",
+        0,
+        "ActiveState=active\nNextElapseUSecRealtime=@2000001000\nNextElapseUSecMonotonic=\nLastTriggerUSec=@1999999990\n",
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    host.answer(
+        "show observer.service",
+        0,
+        "ActiveState=inactive\nResult=success\nExecMainStatus=0\n",
+        "",
+    );
+    let findings = timer_pass(
+        &fixture,
+        &host,
+        &timer_config(&fixture, "observer.timer"),
+        &mut Default::default(),
+    );
+    let timer = timer_row(&findings);
+    assert_eq!(timer["ok"], true, "{findings:?}");
+    assert_eq!(
+        timer["repair"]["actions"],
+        json!(["systemctl --user start observer.service"])
+    );
+}
+
+#[test]
+fn watch_reports_a_failed_service_without_repairing_a_stale_timer() {
+    // A stale trigger plus a failed service is a report, never a start or restart.
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    host.answer(
+        "show observer.timer --timestamp=unix -p ActiveState",
+        0,
+        "ActiveState=active\nNextElapseUSecRealtime=\nNextElapseUSecMonotonic=1d 2h\nLastTriggerUSec=@1990000000\n",
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    host.answer(
+        "show observer.service",
+        0,
+        "ActiveState=failed\nResult=exit-code\nExecMainExitTimestamp=@1999994600\n",
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    host.answer(
+        "show observer.service",
+        0,
+        "ActiveState=failed\nResult=exit-code\nExecMainStatus=1\n",
+        "",
+    );
+    let findings = timer_pass(
+        &fixture,
+        &host,
+        &timer_config(&fixture, "observer.timer"),
+        &mut Default::default(),
+    );
+    let timer = timer_row(&findings);
+    assert_eq!(timer["ok"], false, "{findings:?}");
+    assert_eq!(
+        timer["detail"],
+        "observer.service failed on its last run (Result=exit-code, exit status 1)"
+    );
+    assert!(!changed_anything(&host), "{:?}", host.commands());
 }
 
 #[test]
@@ -563,6 +929,7 @@ fn watch_reports_a_failed_unit_it_cannot_start() {
             state_dir: None,
             queue_stale: Duration::from_secs(600),
         },
+        &mut Default::default(),
     );
     let unit = findings.iter().find(|row| row["check"] == "unit").unwrap();
     assert_eq!(unit["ok"], false);
@@ -757,6 +1124,7 @@ fn watch_reports_a_timer_whose_service_fails_on_every_run_without_restarting_it(
             state_dir: None,
             queue_stale: Duration::from_secs(600),
         },
+        &mut Default::default(),
     );
     let timer = findings.iter().find(|row| row["check"] == "timer").unwrap();
     assert_eq!(timer["ok"], false);
@@ -1043,6 +1411,7 @@ fn slot_image_finding(fixture: &Fixture, host: &ScriptedHost) -> Value {
             state_dir: None,
             queue_stale: Duration::from_secs(600),
         },
+        &mut Default::default(),
     );
     findings
         .into_iter()
@@ -1183,6 +1552,7 @@ fn watch_pass(fixture: &Fixture, host: &ScriptedHost, config: &RestoreConfig) ->
             state_dir: None,
             queue_stale: Duration::from_secs(600),
         },
+        &mut Default::default(),
     )
 }
 

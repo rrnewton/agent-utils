@@ -2049,8 +2049,56 @@ fn active_state(host: &dyn Host, unit: &str) -> std::result::Result<String, Stri
 /// service manager confirmed, `Err(reason)` could not check.
 type Check = std::result::Result<Option<String>, String>;
 
+/// Whether a timer problem is its schedule itself or only its freshness clock.
+///
+/// A broken schedule (inactive, not loaded, no next elapse) is repaired by restarting the
+/// timer. A merely stale timer is repaired by starting its service once: restarting a timer
+/// whose trigger counts from its service's last run resets that trigger, so the timer never
+/// elapses on its own and the watch would restart it on every pass (#961).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimerProblemKind {
+    ScheduleBroken,
+    Stale,
+}
+
+/// A timer problem the service manager confirmed, with the repair it calls for.
+struct TimerProblem {
+    detail: String,
+    kind: TimerProblemKind,
+}
+
+/// A timer check that may not get an answer: `Ok(None)` healthy, `Ok(Some(problem))` a
+/// confirmed problem, `Err(reason)` could not check.
+type TimerCheck = std::result::Result<Option<TimerProblem>, String>;
+
+/// A `@<unix-seconds>` property from a `--timestamp=unix` answer.
+fn unix_timestamp(state: &BTreeMap<String, String>, key: &str) -> Option<f64> {
+    state
+        .get(key)
+        .and_then(|value| value.strip_prefix('@'))
+        .and_then(|value| value.parse::<f64>().ok())
+}
+
+/// The service a timer triggers, if it has one.
+fn triggered_service(
+    host: &dyn Host,
+    timer: &TimerWatch,
+) -> std::result::Result<Option<String>, String> {
+    let triggers = show(host, &timer.unit, &["Triggers"])?;
+    Ok(triggers
+        .get("Triggers")
+        .filter(|value| unit_name(value))
+        .cloned())
+}
+
 /// Why a timer is not keeping its schedule.
-fn timer_problem(host: &dyn Host, timer: &TimerWatch) -> Check {
+///
+/// Freshness is the triggered service's last successful run, not `LastTriggerUSec` alone:
+/// a monotonic-only timer's trigger never moves when the watch keeps restarting it, but
+/// its service's `ExecMainExitTimestamp` with `Result=success` says when the work last
+/// actually happened. The service is only consulted when the trigger clock already looks
+/// stale, so a healthy timer costs the same queries as before.
+fn timer_problem(host: &dyn Host, timer: &TimerWatch) -> TimerCheck {
     let state = show(
         host,
         &timer.unit,
@@ -2063,7 +2111,12 @@ fn timer_problem(host: &dyn Host, timer: &TimerWatch) -> Check {
     )?;
     let active = state["ActiveState"].as_str();
     if active != "active" {
-        return confirm_inactive_timer(host, timer, active);
+        return Ok(
+            confirm_inactive_timer(host, timer, active)?.map(|detail| TimerProblem {
+                detail,
+                kind: TimerProblemKind::ScheduleBroken,
+            }),
+        );
     }
     let scheduled = |key: &str| {
         state
@@ -2076,28 +2129,67 @@ fn timer_problem(host: &dyn Host, timer: &TimerWatch) -> Check {
         && !scheduled("NextElapseUSecMonotonic")
         && show(host, &timer.unit, &["SubState"])?["SubState"] != "running"
     {
-        return Ok(Some(
-            "timer is active but will never fire again (no next elapse)".to_owned(),
-        ));
+        return Ok(Some(TimerProblem {
+            detail: "timer is active but will never fire again (no next elapse)".to_owned(),
+            kind: TimerProblemKind::ScheduleBroken,
+        }));
     }
-    let last = state
-        .get("LastTriggerUSec")
-        .and_then(|value| value.strip_prefix('@'))
-        .and_then(|value| value.parse::<f64>().ok());
-    Ok(match last {
-        Some(last) if host.now() - last > timer.max_age_seconds as f64 => Some(format!(
-            "last fired {:.0} seconds ago, more than {}",
-            host.now() - last,
-            timer.max_age_seconds
-        )),
-        None if host
+    let now = host.now();
+    let max_age = timer.max_age_seconds as f64;
+    let last = unix_timestamp(&state, "LastTriggerUSec");
+    let trigger_stale = match last {
+        Some(last) => now - last > max_age,
+        None => host
             .boot_time()
-            .is_some_and(|boot| host.now() - boot as f64 > timer.max_age_seconds as f64) =>
-        {
-            Some("has not fired since boot".to_owned())
-        }
-        _ => None,
-    })
+            .is_some_and(|boot| now - boot as f64 > max_age),
+    };
+    if !trigger_stale {
+        return Ok(None);
+    }
+    let trigger_detail = match last {
+        Some(last) => format!(
+            "last fired {:.0} seconds ago, more than {}",
+            now - last,
+            timer.max_age_seconds
+        ),
+        None => "has not fired since boot".to_owned(),
+    };
+    let Some(service) = triggered_service(host, timer)? else {
+        return Ok(Some(TimerProblem {
+            detail: trigger_detail,
+            kind: TimerProblemKind::Stale,
+        }));
+    };
+    let service_state = show(
+        host,
+        &service,
+        &["ActiveState", "Result", "ExecMainExitTimestamp"],
+    )?;
+    // The work is happening now; a second start would claim a repair that is not needed.
+    if matches!(
+        service_state["ActiveState"].as_str(),
+        "active" | "activating"
+    ) {
+        return Ok(None);
+    }
+    let result = service_state["Result"].as_str();
+    // A failed service is reported by `service_failure`, never repaired and never a
+    // freshness witness.
+    if !matches!(result, "" | "success") {
+        return Ok(None);
+    }
+    Ok(Some(TimerProblem {
+        detail: match unix_timestamp(&service_state, "ExecMainExitTimestamp") {
+            Some(exit) if result == "success" && now - exit <= max_age => return Ok(None),
+            Some(exit) if result == "success" => format!(
+                "{service} last succeeded {:.0} seconds ago, more than {} (timer {trigger_detail})",
+                now - exit,
+                timer.max_age_seconds
+            ),
+            _ => format!("{service} has no successful run on record (timer {trigger_detail})"),
+        },
+        kind: TimerProblemKind::Stale,
+    }))
 }
 
 /// Look again, after a pause, before calling a timer inactive or unknown.
@@ -2158,11 +2250,10 @@ fn confirm_inactive_timer(host: &dyn Host, timer: &TimerWatch, first: &str) -> C
 /// cannot repair that, so this is reported, never repaired. `Result=` already honours the
 /// service's `SuccessExitStatus=`.
 fn service_failure(host: &dyn Host, timer: &TimerWatch) -> Check {
-    let triggers = show(host, &timer.unit, &["Triggers"])?;
-    let Some(service) = triggers.get("Triggers").filter(|value| unit_name(value)) else {
+    let Some(service) = triggered_service(host, timer)? else {
         return Ok(None);
     };
-    let state = show(host, service, &["ActiveState", "Result", "ExecMainStatus"])?;
+    let state = show(host, &service, &["ActiveState", "Result", "ExecMainStatus"])?;
     let result = state["Result"].as_str();
     let active = state["ActiveState"].as_str();
     Ok(
@@ -2190,6 +2281,7 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
     host: &dyn Host,
     config: &RestoreConfig,
     options: &WatchOptions,
+    timer_repaired_at: &mut BTreeMap<String, f64>,
 ) -> Vec<Value> {
     let mut findings = Vec::new();
     let herdr_up = client.panes().is_ok();
@@ -2307,13 +2399,58 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
             Ok(Some(problem)) => problem,
         };
         if options.check_only {
-            findings.push(finding("timer", &timer.unit, false, problem, Value::Null));
+            findings.push(finding(
+                "timer",
+                &timer.unit,
+                false,
+                problem.detail.clone(),
+                Value::Null,
+            ));
             continue;
         }
-        let _ = systemctl(host, "restart", &timer.unit);
-        let mut repair = vec![format!("systemctl --user restart {}", timer.unit)];
+        // One repair per timer per max_age window (#961): after a start, the service's
+        // success timestamp has a full window to move before the timer is kicked again, and
+        // a timer that has never run gets exactly one start, not one per pass.
+        if let Some(last_repair) = timer_repaired_at
+            .get(&timer.unit)
+            .filter(|last| host.now() - *last < timer.max_age_seconds as f64)
+        {
+            let mut row = finding(
+                "timer",
+                &timer.unit,
+                false,
+                format!(
+                    "{}; repair on cooldown (last repaired {:.0} seconds ago, one repair per {} second window)",
+                    problem.detail,
+                    host.now() - last_repair,
+                    timer.max_age_seconds
+                ),
+                Value::Null,
+            );
+            row["cooldown"] = json!(true);
+            findings.push(row);
+            continue;
+        }
+        timer_repaired_at.insert(timer.unit.clone(), host.now());
+        let mut repair: Vec<String> = Vec::new();
+        match problem.kind {
+            TimerProblemKind::ScheduleBroken => {
+                let _ = systemctl(host, "restart", &timer.unit);
+                repair.push(format!("systemctl --user restart {}", timer.unit));
+            }
+            TimerProblemKind::Stale => match triggered_service(host, timer) {
+                Ok(Some(service)) => {
+                    let _ = systemctl(host, "start", &service);
+                    repair.push(format!("systemctl --user start {service}"));
+                }
+                _ => {
+                    let _ = systemctl(host, "restart", &timer.unit);
+                    repair.push(format!("systemctl --user restart {}", timer.unit));
+                }
+            },
+        }
         let mut remaining = timer_problem(host, timer);
-        if matches!(remaining, Ok(Some(_))) {
+        if problem.kind == TimerProblemKind::ScheduleBroken && matches!(remaining, Ok(Some(_))) {
             // A timer whose only trigger counts from its service's last run has no base until
             // that service runs once in this service manager.
             if let Ok(triggers) = show(host, &timer.unit, &["Triggers"]) {
@@ -2325,7 +2462,12 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
             }
         }
         let remaining = match remaining {
-            Ok(None) => service_failure(host, timer),
+            Ok(None) => service_failure(host, timer).map(|failure| {
+                failure.map(|detail| TimerProblem {
+                    detail,
+                    kind: TimerProblemKind::Stale,
+                })
+            }),
             other => other,
         };
         findings.push(match remaining {
@@ -2333,21 +2475,22 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
                 "timer",
                 &timer.unit,
                 true,
-                format!("{problem}; repaired"),
+                format!("{}; repaired", problem.detail),
                 json!({"actions": repair}),
             ),
             Ok(Some(still)) => finding(
                 "timer",
                 &timer.unit,
                 false,
-                still,
+                still.detail,
                 json!({"actions": repair}),
             ),
             Err(reason) => unchecked(
                 "timer",
                 &timer.unit,
                 format!(
-                    "{problem}; repaired with {}, then {reason}",
+                    "{}; repaired with {}, then {reason}",
+                    problem.detail,
                     repair.join(" && ")
                 ),
                 json!({"actions": repair}),
@@ -2761,6 +2904,14 @@ pub fn watch<A: ManagedApi + ?Sized>(
         .and_then(read_report)
         .and_then(|previous| serde_json::from_value(previous["bare_shell_since"].clone()).ok())
         .unwrap_or_default();
+    let mut timer_repaired_at: BTreeMap<String, f64> = path
+        .as_deref()
+        .and_then(read_report)
+        .and_then(|previous| serde_json::from_value(previous["timer_repaired_at"].clone()).ok())
+        .unwrap_or_default();
+    // Units whose cooldown finding has already gone to stderr this episode (#961): a
+    // cooldown is logged once when it starts, not on every pass it spans.
+    let mut cooldown_noted: std::collections::BTreeSet<String> = Default::default();
     let mut closed_bare_shells: Vec<Value> = Vec::new();
     let mut pass: u64 = 0;
     loop {
@@ -2771,7 +2922,14 @@ pub fn watch<A: ManagedApi + ?Sized>(
             ..options.clone()
         };
         pass += 1;
-        let mut findings = watch_once(client, registry, host, config, &pass_options);
+        let mut findings = watch_once(
+            client,
+            registry,
+            host,
+            config,
+            &pass_options,
+            &mut timer_repaired_at,
+        );
         // Workspace hygiene and canonical tab order:
         // close unclaimed bare shells idle past the grace period, and keep
         // managed workspaces' tabs in canonical order. Best-effort; a
@@ -2799,7 +2957,18 @@ pub fn watch<A: ManagedApi + ?Sized>(
                 row["detail"].as_str().unwrap_or("")
             )
         };
+        for row in findings
+            .iter()
+            .filter(|row| row["check"] == "timer" && row["cooldown"] != true)
+        {
+            cooldown_noted.remove(row["subject"].as_str().unwrap_or(""));
+        }
         for row in findings.iter().filter(|row| row["ok"] == false) {
+            if row["cooldown"] == true
+                && !cooldown_noted.insert(row["subject"].as_str().unwrap_or("").to_owned())
+            {
+                continue;
+            }
             eprintln!("agentctl watch: {}", line(row));
         }
         // What the watch itself could not check: its own health, not the subject's.
@@ -2820,6 +2989,7 @@ pub fn watch<A: ManagedApi + ?Sized>(
             "findings": findings,
             "notice": notice,
             "alerted": alerted,
+            "timer_repaired_at": timer_repaired_at,
             "bare_shell_since": bare_since,
             "closed_bare_shells": closed_bare_shells,
         });
