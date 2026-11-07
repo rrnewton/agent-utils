@@ -334,9 +334,13 @@ def _write(path: Path, text: str) -> None:
 
 
 def _cargo(ws: Path, target: Path, *args: str) -> list[dict[str, object]]:
+    # Incremental caches are part of what the prune is tested on, so they are
+    # built whatever the caller's CARGO_INCREMENTAL says (a gate run with it
+    # at 0 left none to count).
     out = subprocess.run(
         ["cargo", *args, "--offline", "--message-format=json", "--manifest-path", str(ws / "Cargo.toml"),
          "--target-dir", str(target)],
+        env={**os.environ, "CARGO_INCREMENTAL": "1"},
         capture_output=True, text=True, timeout=300, check=True,
     ).stdout
     return [m for m in map(json.loads, out.splitlines()) if m.get("reason") == "compiler-artifact"]
