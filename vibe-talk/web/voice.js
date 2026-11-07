@@ -1133,9 +1133,6 @@ document.addEventListener("pointerdown", (event) => {
   documentsSelector.hideCards();
 }, true);
 
-
-/** What the header calls each screen that is a DESTINATION rather than the app itself. */
-const SCREEN_TITLES = { settings: "Settings", help: "Help" };
 /**
  * Showing a screen — everything that goes with the change, in order, the screen itself shown last:
  * one owner in web/src/view/shell/screenshowing.ts (`createScreenShowing`, `#624
@@ -4648,8 +4645,6 @@ const keyboard = createKeyboardComposition({
   // The keys' switch keeps its two-way meaning (the call's view or the channel's, never
   // Documents between them); the button's press is the three-way `pressViewSwitch`.
   pressViewSwitch: () => chooseMajorView(screens.view() === "voice" ? "discord" : "voice"),
-  selectedChannelId: () => selectedChannelId(),
-  channelOnScreen: () => channelOnScreen(),
   chooseView: (which) => chooseView(which),
   cycleReadMode: () => cycleReadMode(),
   readModeSaid: () => READ_MODE_SAID[readModes.mode()],
