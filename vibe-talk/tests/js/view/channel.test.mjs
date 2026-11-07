@@ -1505,3 +1505,37 @@ test("`#624 voice-page-modularity`: the ways back reach the bookmark, the readin
   jumps.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
+
+test("`#624 voice-page-modularity`: what the page kept of its sends is read back in the page's order, the Done writes sent and handed over with the connection and the page, and the Undo and Forget buttons heard, then all come down", () => {
+  const { mountKeptSends } = CHANNEL_VIEW;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener({ type }));
+  const act = (name) => (...args) => { log.push(`${name} ${args.length}`); return name; };
+  const was = globalThis.window;
+  globalThis.window = target("window");
+  try {
+    const kept = mountKeptSends({
+      lookup: (id) => target(id),
+      loadReplyDrafts: act("reply drafts"), loadOwnPosts: act("own posts"), loadOutgoingMessages: act("outbox"),
+      sendLeftOverInboxWrites: act("send done writes"), leaveInbox: act("hand over"), loadDismissedSends: act("dismissed"),
+      renderDismissedSends: act("draw dismissed"), undoSendDismiss: act("undo send"), undoBookmarkRemoval: act("undo bookmark"),
+      forgetDismissedSends: act("forget"),
+    });
+    assert.deepStrictEqual(log, ["reply drafts 0", "own posts 0", "outbox 0", "send done writes 0", "listen window online", "listen window pagehide",
+      "dismissed 0", "draw dismissed 0", "listen undo-send-dismiss click", "listen undo-bookmark click", "listen forget-dismissed-sends click"],
+      "read back or heard out of the page's order");
+    log.length = 0;
+    assert.deepStrictEqual([fire("window", "online"), fire("window", "pagehide"), fire("undo-send-dismiss", "click"),
+      fire("undo-bookmark", "click"), fire("forget-dismissed-sends", "click")].flat(),
+      ["send done writes", "hand over", undefined, "undo bookmark", "forget"], "a listener answered what its act did not");
+    assert.deepStrictEqual(log, ["send done writes 0", "hand over 0", "undo send 0", "undo bookmark 0", "forget 0"]);
+    kept.unmount();
+    assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+  } finally {
+    globalThis.window = was;
+  }
+});

@@ -5,6 +5,8 @@ export { mountSettingsFolds } from "./folds.ts";
 export type { SettingsFolds, SettingsFoldsDependencies } from "./folds.ts";
 export { mountHelpFolds } from "./help.ts";
 export type { HelpFolds, HelpFoldsDependencies } from "./help.ts";
+export { mountHelpLinks } from "./helplinks.ts";
+export type { HelpLinks, HelpLinksDependencies } from "./helplinks.ts";
 export { mountChannelHistory } from "./history.ts";
 export type { ChannelHistoryBox, ChannelHistoryDependencies } from "./history.ts";
 export { mountUpstreamClear } from "./upstream.ts";

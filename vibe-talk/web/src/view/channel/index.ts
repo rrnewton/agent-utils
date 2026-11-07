@@ -131,6 +131,8 @@ export { mountSideListControls } from "./sidelistcontrols.ts";
 export type { SideListControls, SideListControlsDependencies } from "./sidelistcontrols.ts";
 export { mountReadingJumps } from "./readingjumps.ts";
 export type { ReadingJumps, ReadingJumpsDependencies } from "./readingjumps.ts";
+export { mountKeptSends } from "./keptsends.ts";
+export type { KeptSends, KeptSendsDependencies } from "./keptsends.ts";
 export { mountSideControls } from "./sidecontrols.ts";
 export type { GestureStart, SideControls, SideControlsDependencies } from "./sidecontrols.ts";
 export { LINKED_MARK_WORDS, createLinkedMark } from "./linkedmark.ts";

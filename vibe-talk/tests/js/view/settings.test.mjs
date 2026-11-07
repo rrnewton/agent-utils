@@ -358,3 +358,21 @@ test("`#624 voice-page-modularity`: the reading preferences' switches reach what
   switches.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
+
+test("`#624 voice-page-modularity`: Help is closed, opened at its top, and opened at each topic's entry, in the page's order, and comes down again", () => {
+  const { mountHelpLinks } = VIEW_SETTINGS;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const links = mountHelpLinks({ lookup: (id) => target(id), closeHelp: (...args) => log.push(`close ${args.length}`), showHelp: (topic) => log.push(`show ${topic}`) });
+  const topics = log.filter((line) => line.startsWith("listen help-link-")).map((line) => line.slice("listen help-link-".length));
+  assert.ok(topics.length > 0, "no topic's ? was heard");
+  assert.deepStrictEqual(log, ["listen close-help", "listen open-help", ...topics.map((topic) => `listen help-link-${topic}`)]);
+  log.length = 0;
+  for (const id of ["close-help", "open-help", `help-link-${topics[0]}`]) nodes[id].listeners.forEach((one) => one.listener({ type: "click" }));
+  assert.deepStrictEqual(log, ["close 0", "show null", `show ${topics[0]}`]);
+  links.unmount();
+  assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+});

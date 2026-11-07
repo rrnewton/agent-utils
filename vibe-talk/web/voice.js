@@ -30980,32 +30980,33 @@ mountPageButtons({
 // `?` — and this page's suite refuses ids that are not declared in web/voice.html, so a new
 // settings group would mean inventing one there purely to hang a listener on. The attribute names
 // the entry, the entry's id is `help-<that>`, and adding a group is one button plus one article.
-el("close-help").addEventListener("click", closeHelp);
-el("open-help").addEventListener("click", () => showHelp(null));
-for (const topic of HELP_TOPICS) {
-  el(`help-link-${topic}`).addEventListener("click", () => showHelp(topic));
-}
-// `#51 reply-view`. Every way out of a reply goes through `closeReply`, so none can be the one that
-// forgets to put the reader back where they were reading.
-replyDrafts.load();
-// `#500 sent-receipts-pile-up`. Before the outbox, whose confirmed sends are no longer saved.
-loadOwnPosts();
-loadOutgoingMessages();
-// `#892 voice-page-optimistic-done`. The Done writes a page closed before the server had them: now, when the
-// connection comes back, and whenever a write of this page's is answered. A page going hands its own over.
-sendLeftOverInboxWrites();
-window.addEventListener("online", () => sendLeftOverInboxWrites());
-window.addEventListener("pagehide", () => inboxLedger.leave());
-// `#193 compose-draft-loss`. What was dismissed from the outbox in the last days, for Settings.
-loadDismissedSends();
-dismissedSendsView.render();
-el("undo-send-dismiss").addEventListener("click", () => {
-  const offer = sendUndo.current();
-  if (offer) putBackDismissedSend(offer.id);
+// Help's ways in and out (web/src/view/settings/helplinks.ts, `#624 voice-page-modularity`).
+mountHelpLinks({
+  lookup: (id) => el(id),
+  closeHelp: () => closeHelp(),
+  showHelp: (topic) => showHelp(topic),
 });
-// `#420 bookmark-clear`.
-el("undo-bookmark").addEventListener("click", undoBookmarkRemoval);
-el("forget-dismissed-sends").addEventListener("click", forgetDismissedSends);
+// What the page kept of its sends, read back, and the listeners over it: the replies' drafts (`#51 reply-view`), this
+// device's own posts before the outbox (`#500 sent-receipts-pile-up`), the Done writes a page closed before the server
+// had them, sent now, when the connection comes back, and whenever a write of this page's is answered (`#892
+// voice-page-optimistic-done`), and the sends dismissed in the last days (`#193 compose-draft-loss`) with their Undo
+// and Forget, and the bookmark's Undo (`#420 bookmark-clear`). One owner in web/src/view/channel/keptsends.ts.
+mountKeptSends({
+  lookup: (id) => el(id),
+  loadReplyDrafts: () => replyDrafts.load(),
+  loadOwnPosts: () => loadOwnPosts(),
+  loadOutgoingMessages: () => loadOutgoingMessages(),
+  sendLeftOverInboxWrites: () => sendLeftOverInboxWrites(),
+  leaveInbox: () => inboxLedger.leave(),
+  loadDismissedSends: () => loadDismissedSends(),
+  renderDismissedSends: () => dismissedSendsView.render(),
+  undoSendDismiss: () => {
+    const offer = sendUndo.current();
+    if (offer) putBackDismissedSend(offer.id);
+  },
+  undoBookmarkRemoval: () => undoBookmarkRemoval(),
+  forgetDismissedSends: () => forgetDismissedSends(),
+});
 channelDrafts.load();
 // `#819 voice-page-quoted-reply-and-draft-chip`. The quick replies' drafts, and where every draft is.
 quickDrafts.load();
