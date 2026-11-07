@@ -45,3 +45,10 @@ all: today only `agentctl watch` runs it, and a registry with only
 `watch-agents` never gets it. Say whether the pass should also run from
 `watch-agents` or from start/revive/restart/restore, or whether an
 `agentctl watch` unit should be added, and recommend one.
+
+# Edition parity note (Python)
+
+The liaison-first ranking is Rust-edition behaviour. The Python edition
+has no tab-order or hygiene logic: its `watch`, `restore` and
+`watch-agents` commands are refused as Rust-only, so there is no Python
+surface to rank tabs with and no differential covers one.

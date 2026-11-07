@@ -2562,9 +2562,44 @@ fn alert<A: ManagedApi + ?Sized>(
 /// Run the watch: one pass with `once`, otherwise one pass per interval until termination is
 /// requested (`Host::terminated`), when it answers the last pass's health. A pass in progress
 /// finishes, its waits cut short; no other starts (#909 watch-sigterm-stop).
+/// One claimed pane in a hygiene pass: agent name, tab, launch profile, and
+/// the record's `role` field.
+type ClaimedTab = (String, Option<String>, Option<String>, Option<String>);
+
+/// Each launch profile's `role` in `<registry>/profiles.json`, by profile
+/// name; empty when the file is absent or unreadable, so ranking falls back
+/// to profile names alone.
+fn profile_roles(registry: &Path) -> BTreeMap<String, String> {
+    let Ok(text) = fs::read_to_string(registry.join("profiles.json")) else {
+        return BTreeMap::new();
+    };
+    let Ok(document) = serde_json::from_str::<Value>(&text) else {
+        return BTreeMap::new();
+    };
+    document["profiles"]
+        .as_object()
+        .map(|profiles| {
+            profiles
+                .iter()
+                .filter_map(|(name, profile)| {
+                    Some((name.clone(), profile["role"].as_str()?.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// One hygiene pass: canonical tab order in managed workspaces, and
 /// closing unclaimed bare shells idle past the grace period. Returns
 /// findings; every close is logged with pane, tab, cwd, and why.
+///
+/// Canonical order (#1004 liaison-first-tab-order, see
+/// [`crate::tab_order::role_for`]): a chat bridge's target first, then an
+/// explicitly marked liaison, then the designated coordinator, then other
+/// coordinators, then lanes by name, then unmanaged tabs. Bridge targets
+/// come from the bridges registered for discovery
+/// ([`crate::chat_lookup::candidates`]); a registry with none and no
+/// liaison mark keeps the designated coordinator first.
 fn hygiene_pass<A: ManagedApi + ?Sized>(
     client: &A,
     registry: &Path,
@@ -2587,7 +2622,13 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
         }
     };
     let names = registered_names(registry).unwrap_or_default();
-    let mut claimed: BTreeMap<String, (String, Option<String>, Option<String>)> = BTreeMap::new();
+    let bridge_targets: std::collections::BTreeSet<String> =
+        crate::chat_lookup::candidates(registry)
+            .into_iter()
+            .map(|candidate| candidate.agent)
+            .collect();
+    let roles = profile_roles(registry);
+    let mut claimed: BTreeMap<String, ClaimedTab> = BTreeMap::new();
     for name in &names {
         if let Ok(status) = manager.status(name) {
             if let Some(pane) = status["pane_id"].as_str() {
@@ -2597,6 +2638,7 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
                         name.clone(),
                         status["tab_id"].as_str().map(str::to_owned),
                         status["profile"].as_str().map(str::to_owned),
+                        status["role"].as_str().map(str::to_owned),
                     ),
                 );
             }
@@ -2622,24 +2664,23 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
                 .map(|tab| {
                     let lane = claimed
                         .values()
-                        .find(|(_, lane_tab, _)| lane_tab.as_deref() == Some(tab.as_str()));
+                        .find(|(_, lane_tab, _, _)| lane_tab.as_deref() == Some(tab.as_str()));
                     match lane {
-                        Some((name, _, profile)) => {
-                            let front = Some(name.as_str()) == config.coordinator.as_deref()
-                                || crate::tab_order::is_coordinator_profile(profile.as_deref())
-                                || profile
+                        Some((name, _, profile, record_role)) => (
+                            tab.clone(),
+                            name.clone(),
+                            crate::tab_order::role_for(
+                                name,
+                                profile.as_deref(),
+                                profile
                                     .as_deref()
-                                    .is_some_and(|p| p == "liaison" || p.ends_with("-liaison"));
-                            (
-                                tab.clone(),
-                                name.clone(),
-                                if front {
-                                    crate::tab_order::ROLE_FRONT
-                                } else {
-                                    crate::tab_order::ROLE_LANE
-                                },
-                            )
-                        }
+                                    .and_then(|name| roles.get(name))
+                                    .map(String::as_str),
+                                record_role.as_deref(),
+                                &bridge_targets,
+                                config.coordinator.as_deref(),
+                            ),
+                        ),
                         None => (
                             tab.clone(),
                             labels.get(tab).cloned().unwrap_or_default(),
@@ -2804,6 +2845,25 @@ pub fn watch<A: ManagedApi + ?Sized>(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn profile_roles_reads_each_profiles_role_and_tolerates_absence() {
+        let directory = std::env::temp_dir().join(format!("restore-roles-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        assert!(profile_roles(&directory).is_empty());
+        fs::write(
+            directory.join("profiles.json"),
+            r#"{"schema": "agentctl-profiles/v1", "profiles": {"coordinator": {"harness": "claude", "mode": "interactive", "role": "liaison"}, "worker": {"harness": "claude", "mode": "interactive"}}}"#,
+        )
+        .unwrap();
+        let roles = profile_roles(&directory);
+        assert_eq!(
+            roles.get("coordinator").map(String::as_str),
+            Some("liaison")
+        );
+        assert!(!roles.contains_key("worker"));
+        fs::remove_dir_all(&directory).unwrap();
+    }
 
     struct BusyOnceHost {
         status_calls: RefCell<u32>,

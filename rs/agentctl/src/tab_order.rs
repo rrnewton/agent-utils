@@ -9,6 +9,11 @@
 //!
 //! An agent counts as a coordinator when it is the registry's designated coordinator, or when it
 //! was started with a launch profile named `coordinator` or ending in `-coordinator`.
+//!
+//! The canonical order the watch hygiene pass keeps (#979 canonical-tab-order, #1004
+//! liaison-first-tab-order) ranks the owner-facing liaison first: see [`role_for`] for the
+//! precedence. This ranking is implemented only by this edition; the other edition has no
+//! tab-order or hygiene logic.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
@@ -25,6 +30,12 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 #[must_use]
 pub fn is_coordinator_profile(profile: Option<&str>) -> bool {
     profile.is_some_and(|name| name == "coordinator" || name.ends_with("-coordinator"))
+}
+
+/// Whether a launch profile named `profile` is a liaison's.
+#[must_use]
+pub fn is_liaison_profile(profile: Option<&str>) -> bool {
+    profile.is_some_and(|name| name == "liaison" || name.ends_with("-liaison"))
 }
 
 /// The Herdr socket: `$HERDR_SOCKET_PATH`, else `~/.config/herdr/herdr.sock`.
@@ -128,13 +139,69 @@ fn request(socket: &Path, method: &str, params: Value) -> Result<Value, String> 
     }
 }
 
-/// Tab roles in canonical order:
-/// liaison/coordinators first, then managed lanes, then unmanaged tabs.
-pub const ROLE_FRONT: u8 = 0;
+/// Tab roles in canonical order (#1004 liaison-first-tab-order): the
+/// owner-facing liaison first, then the designated coordinator, then other
+/// coordinators, then lanes by name, then unmanaged tabs.
+pub const ROLE_LIAISON: u8 = 0;
+/// An explicitly marked liaison (record or profile role `liaison`, or a
+/// liaison profile) that no chat bridge targets.
+pub const ROLE_LIAISON_MARKED: u8 = 1;
+/// The registry's designated coordinator.
+pub const ROLE_DESIGNATED: u8 = 2;
+/// Another coordinator (a coordinator profile, or a profile role of
+/// `coordinator` or `coordinator-hands`).
+pub const ROLE_COORDINATOR: u8 = 3;
 /// A managed lane's tab.
-pub const ROLE_LANE: u8 = 1;
+pub const ROLE_LANE: u8 = 4;
 /// A tab no registered agent claims.
-pub const ROLE_UNMANAGED: u8 = 2;
+pub const ROLE_UNMANAGED: u8 = 5;
+
+/// The canonical rank of one registered agent's tab (#1004
+/// liaison-first-tab-order). Precedence, highest first:
+///
+/// 1. [`ROLE_LIAISON`]: `name` is a chat bridge's target (`bridge_targets`,
+///    the `agent_name` of each configured bridge). This wins over every
+///    other mark because it is what the owner actually talks to; the
+///    liaison commonly runs the `coordinator` profile, which is why the
+///    profile alone cannot put it first.
+/// 2. [`ROLE_LIAISON_MARKED`]: an explicit liaison mark — the record's
+///    `role` field, its launch profile's `role`, or a profile named
+///    `liaison` / `*-liaison`.
+/// 3. [`ROLE_DESIGNATED`]: the designated coordinator (`designated`).
+/// 4. [`ROLE_COORDINATOR`]: a coordinator profile, or a profile role of
+///    `coordinator` / `coordinator-hands`.
+/// 5. [`ROLE_LANE`]: any other registered agent.
+///
+/// With no bridge target and no liaison mark the designated coordinator
+/// still leads, as before #1004.
+#[must_use]
+pub fn role_for(
+    name: &str,
+    profile: Option<&str>,
+    profile_role: Option<&str>,
+    record_role: Option<&str>,
+    bridge_targets: &BTreeSet<String>,
+    designated: Option<&str>,
+) -> u8 {
+    if bridge_targets.contains(name) {
+        return ROLE_LIAISON;
+    }
+    if record_role == Some("liaison")
+        || profile_role == Some("liaison")
+        || is_liaison_profile(profile)
+    {
+        return ROLE_LIAISON_MARKED;
+    }
+    if designated == Some(name) {
+        return ROLE_DESIGNATED;
+    }
+    if is_coordinator_profile(profile)
+        || matches!(profile_role, Some("coordinator" | "coordinator-hands"))
+    {
+        return ROLE_COORDINATOR;
+    }
+    ROLE_LANE
+}
 
 /// The canonical order of `tabs` (`(tab_id, sort_name, role)`): by role,
 /// then by name, stable within equal keys. Idempotent by construction.
@@ -241,7 +308,7 @@ mod tests {
         let tabs = vec![
             entry("t3", "shell", ROLE_UNMANAGED),
             entry("t2", "worker-b", ROLE_LANE),
-            entry("t1", "coord", ROLE_FRONT),
+            entry("t1", "coord", ROLE_COORDINATOR),
             entry("t4", "worker-a", ROLE_LANE),
         ];
         let want = vec![
@@ -265,6 +332,317 @@ mod tests {
         assert!(!is_coordinator_profile(Some("worker")));
         assert!(!is_coordinator_profile(Some("coordinator-helper")));
         assert!(!is_coordinator_profile(None));
+        assert!(is_liaison_profile(Some("liaison")));
+        assert!(is_liaison_profile(Some("team-liaison")));
+        assert!(!is_liaison_profile(Some("coordinator")));
+        assert!(!is_liaison_profile(None));
+    }
+
+    fn role_of(
+        name: &str,
+        profile: Option<&str>,
+        profile_role: Option<&str>,
+        record_role: Option<&str>,
+        bridge: &[&str],
+        designated: Option<&str>,
+    ) -> u8 {
+        let bridge: BTreeSet<String> = bridge.iter().map(|name| (*name).to_owned()).collect();
+        role_for(
+            name,
+            profile,
+            profile_role,
+            record_role,
+            &bridge,
+            designated,
+        )
+    }
+
+    #[test]
+    fn a_bridge_target_liaison_on_a_coordinator_profile_comes_first() {
+        // #1004: the liaison runs the coordinator profile, so by name the
+        // designated coordinator would sort first; the bridge target wins.
+        let entry = |tab: &str, name: &str, role: u8| (tab.to_owned(), name.to_owned(), role);
+        let bridge = ["liaison"];
+        let shuffled = vec![
+            entry(
+                "t-lane-b",
+                "lane-b",
+                role_of(
+                    "lane-b",
+                    Some("muse-worker"),
+                    None,
+                    None,
+                    &bridge,
+                    Some("coordb"),
+                ),
+            ),
+            entry(
+                "t-coord",
+                "coordb",
+                role_of("coordb", None, None, None, &bridge, Some("coordb")),
+            ),
+            entry(
+                "t-lane-a",
+                "lane-a",
+                role_of(
+                    "lane-a",
+                    Some("muse-worker"),
+                    None,
+                    None,
+                    &bridge,
+                    Some("coordb"),
+                ),
+            ),
+            entry(
+                "t-liaison",
+                "liaison",
+                role_of(
+                    "liaison",
+                    Some("coordinator"),
+                    None,
+                    None,
+                    &bridge,
+                    Some("coordb"),
+                ),
+            ),
+            entry("t-shell", "shell", ROLE_UNMANAGED),
+        ];
+        let want = tabs(&["t-liaison", "t-coord", "t-lane-a", "t-lane-b", "t-shell"]);
+        assert_eq!(canonical_tabs(&shuffled), want);
+        let ordered = canonical_tabs(&shuffled)
+            .into_iter()
+            .map(|tab| {
+                shuffled
+                    .iter()
+                    .find(|entry| entry.0 == tab)
+                    .unwrap()
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            canonical_tabs(&ordered),
+            want,
+            "canonical order is idempotent"
+        );
+    }
+
+    #[test]
+    fn an_explicit_liaison_without_a_bridge_still_comes_first() {
+        let bridge: &[&str] = &[];
+        // Each explicit mark on its own outranks the designated coordinator.
+        for (profile, profile_role, record_role) in [
+            (Some("worker"), Some("liaison"), None),
+            (Some("worker"), None, Some("liaison")),
+            (Some("liaison"), None, None),
+            (Some("team-liaison"), None, None),
+        ] {
+            assert_eq!(
+                role_of(
+                    "liaison",
+                    profile,
+                    profile_role,
+                    record_role,
+                    bridge,
+                    Some("coordb")
+                ),
+                ROLE_LIAISON_MARKED,
+                "profile={profile:?} profile_role={profile_role:?} record_role={record_role:?}"
+            );
+        }
+        // A bridge target outranks an explicit mark on another agent.
+        assert_eq!(
+            role_of(
+                "other",
+                Some("worker"),
+                None,
+                None,
+                &["other"],
+                Some("coordb")
+            ),
+            ROLE_LIAISON
+        );
+        assert!(
+            role_of(
+                "liaison",
+                Some("liaison"),
+                None,
+                None,
+                &["other"],
+                Some("coordb")
+            ) > ROLE_LIAISON
+        );
+    }
+
+    #[test]
+    fn without_a_bridge_or_liaison_the_designated_coordinator_leads() {
+        let bridge: &[&str] = &[];
+        assert_eq!(
+            role_of("coordb", None, None, None, bridge, Some("coordb")),
+            ROLE_DESIGNATED
+        );
+        assert_eq!(
+            role_of(
+                "helper",
+                Some("muse-coordinator"),
+                None,
+                None,
+                bridge,
+                Some("coordb")
+            ),
+            ROLE_COORDINATOR
+        );
+        assert_eq!(
+            role_of(
+                "hands",
+                Some("worker"),
+                Some("coordinator-hands"),
+                None,
+                bridge,
+                Some("coordb")
+            ),
+            ROLE_COORDINATOR
+        );
+        assert_eq!(
+            role_of(
+                "lane-a",
+                Some("muse-worker"),
+                None,
+                None,
+                bridge,
+                Some("coordb")
+            ),
+            ROLE_LANE
+        );
+    }
+
+    type SharedTabs = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A stateful fake Herdr socket: `tab.list` answers the current order and
+    /// `tab.move` applies the move, recording each moved tab.
+    fn stateful_herdr(
+        path: &Path,
+        workspace: &str,
+        initial: &[&str],
+        connections: usize,
+    ) -> (SharedTabs, SharedTabs, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::{Arc, Mutex};
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        let order = Arc::new(Mutex::new(tabs(initial)));
+        let moves = Arc::new(Mutex::new(Vec::new()));
+        let (seen_order, seen_moves) = (Arc::clone(&order), Arc::clone(&moves));
+        let workspace = workspace.to_owned();
+        let server = std::thread::spawn(move || {
+            for _ in 0..connections {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let result = match request["method"].as_str() {
+                    Some("tab.list") => {
+                        let listed: Vec<Value> = seen_order
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|tab| json!({"tab_id": tab, "workspace_id": workspace}))
+                            .collect();
+                        json!({"tabs": listed})
+                    }
+                    Some("tab.move") => {
+                        let tab = request["params"]["tab_id"].as_str().unwrap().to_owned();
+                        let index = request["params"]["insert_index"].as_u64().unwrap() as usize;
+                        let mut order = seen_order.lock().unwrap();
+                        order.retain(|candidate| candidate != &tab);
+                        let at = index.min(order.len());
+                        order.insert(at, tab.clone());
+                        seen_moves.lock().unwrap().push(tab);
+                        json!({})
+                    }
+                    _ => json!({}),
+                };
+                let mut reply =
+                    serde_json::to_vec(&json!({"id": request["id"], "result": result})).unwrap();
+                reply.push(b'\n');
+                (&stream).write_all(&reply).unwrap();
+            }
+        });
+        (order, moves, server)
+    }
+
+    #[test]
+    fn a_fake_herdr_pass_puts_the_liaison_first_and_then_moves_nothing() {
+        // #1004: liaison (coordinator profile, bridge target) + designated
+        // coordinator + two lanes, shuffled; the hygiene move loop must reach
+        // liaison, coordinator, lanes by name, and a second pass must move
+        // nothing.
+        let directory =
+            std::env::temp_dir().join(format!("agentctl-liaison-herdr-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("herdr.sock");
+        let bridge: BTreeSet<String> = tabs(&["liaison"]).into_iter().collect();
+        let role = |name: &str, profile: Option<&str>| {
+            role_for(name, profile, None, None, &bridge, Some("coordb"))
+        };
+        let entries: Vec<(String, String, u8)> = vec![
+            (
+                "t-lane-b".to_owned(),
+                "lane-b".to_owned(),
+                role("lane-b", Some("muse-worker")),
+            ),
+            (
+                "t-coord".to_owned(),
+                "coordb".to_owned(),
+                role("coordb", None),
+            ),
+            (
+                "t-lane-a".to_owned(),
+                "lane-a".to_owned(),
+                role("lane-a", Some("muse-worker")),
+            ),
+            (
+                "t-liaison".to_owned(),
+                "liaison".to_owned(),
+                role("liaison", Some("coordinator")),
+            ),
+        ];
+        // Pass one: one list plus three moves. Pass two: one list, no moves.
+        let (order, moves, server) = stateful_herdr(
+            &socket,
+            "w1",
+            &["t-lane-b", "t-coord", "t-lane-a", "t-liaison"],
+            5,
+        );
+        for _ in 0..2 {
+            let current = list_tabs(&socket, "w1").unwrap();
+            let by_tab: std::collections::BTreeMap<String, (String, String, u8)> = entries
+                .iter()
+                .map(|entry| (entry.0.clone(), entry.clone()))
+                .collect();
+            let listed: Vec<(String, String, u8)> =
+                current.iter().map(|tab| by_tab[tab].clone()).collect();
+            let desired = canonical_tabs(&listed);
+            let mut applied = current.clone();
+            for (index, tab) in desired.iter().enumerate() {
+                if applied.get(index) != Some(tab) {
+                    move_tab(&socket, tab, index).unwrap();
+                    applied.retain(|candidate| candidate != tab);
+                    applied.insert(index, tab.clone());
+                }
+            }
+            assert_eq!(applied, desired);
+        }
+        server.join().unwrap();
+        assert_eq!(
+            *order.lock().unwrap(),
+            tabs(&["t-liaison", "t-coord", "t-lane-a", "t-lane-b"])
+        );
+        assert_eq!(
+            moves.lock().unwrap().len(),
+            3,
+            "the second pass moved nothing"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
