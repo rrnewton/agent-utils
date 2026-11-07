@@ -1,11 +1,12 @@
 ---
 title: 'watch-agents-write-churn: the agent watcher writes far more to disk than its state explains'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-validate
 created_at: 2026-11-06T12:30:00.000000000+00:00
-updated_at: 2026-11-06T12:30:00.000000000+00:00
+updated_at: 2026-11-06T19:29:20.000000000+00:00
+closed_at: 2026-11-06T19:29:20.000000000+00:00
 ---
 
 # Description
@@ -72,3 +73,7 @@ unit was measured read-only and never stopped; the fix must not change notice
 delivery semantics, only what is written when nothing changed. Rollout is a
 normal agentctl build; the running watcher picks the fix up on its next
 service refresh.
+
+# Resolution
+
+Landed on main as b6b181f9. The fixes: write_json_file in agentctl skips rewriting the watcher state (and report) when the new content is identical to what's on disk, avoiding the extra tempfile+rename+fsync pass; send target locks only refresh mtime hourly (protecting against the /tmp cleaner's day-scale expiry without inflating write volume), and the watcher logs each unchanged episode line once per state instead of every pass. The watch report now includes write_churn counters (bytes written, files rewritten, files skipped as unchanged) to size a recurrence. Full gate on the rebased SHA was green (validate OK). Closing this issue.
