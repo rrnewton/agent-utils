@@ -1,10 +1,11 @@
 ---
 title: 'mb-id-collision-guard: stop two lanes from filing different issues under the same number'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-11-06T18:34:21.000000000+00:00
-updated_at: 2026-11-06T18:34:21.000000000+00:00
+updated_at: 2026-11-07T03:24:19.000000000+00:00
+closed_at: 2026-11-07T03:24:19.000000000+00:00
 ---
 
 # Description
@@ -48,3 +49,13 @@ mb-create-atomic-allocation instead of being written here.
 One follow-up seen while wiring: two lanes pushing the same stale issue-edit
 (the same slug edited differently) still needs the normal content rebase; this
 guard covers the number/slug collision it was filed for.
+
+## Resolution
+
+Landed on main as 78056f94 (with the #932 close as b593bc79). The guard
+refused three of its own follow-up filings during development as main took
+the numbers first, which was its first live exercise. Atomic allocation for
+`mb create` is filed as #991 mb-create-atomic-allocation. A companion hygiene
+step parsing every issue file with the pinned `mb` reader follows separately,
+so a file mb refuses fails the gate instead of blocking `mb` repo-wide
+unnoticed.
