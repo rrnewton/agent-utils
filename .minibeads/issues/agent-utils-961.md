@@ -1,11 +1,12 @@
 ---
 title: 'agentctl-watch-timer-repair-loop: watch restarts a monotonic-only timer on every pass because LastTriggerUSec never moves'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-validate
 created_at: 2026-11-06T20:11:28.000000000+00:00
-updated_at: 2026-11-06T20:11:28.000000000+00:00
+updated_at: 2026-11-07T14:30:00.000000000+00:00
+closed_at: 2026-11-07T14:30:00.000000000+00:00
 ---
 
 # Description
@@ -33,3 +34,7 @@ Live case on a consumer host, 2026-11-06: an observer timer with `max_age_second
 # Notes
 
 Reported 2026-11-06 by the lead coordinator. P1 because it is burning real resources now. Assigned to mu-validate, which knows the watch code from #932 watch-agents-write-churn.
+
+## Resolution
+
+Landed as c8cce1d2 by mu-validate (watermelon) on 2026-11-07: restore judges a timer's freshness by its service's last successful run, not by timer bookkeeping. A recent success is left untouched. A stale monotonic timer gets one service start and then a cooldown (one repair per timer per max_age_seconds window, persisted in health.json and threaded through watch_once; the cooldown is reported once per episode). A timer that never ran gets one start. A stale calendar timer is repaired. A failed service is only reported. A unit restart is reserved for a broken schedule. Five new ScriptedHost tests cover these cases (42/42 restore tests). Full gate 41/41 + 6/6, validate OK.
