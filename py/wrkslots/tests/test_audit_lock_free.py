@@ -135,29 +135,60 @@ def test_audit_unrelated_creation_retains_unchanged_rows(
     assert "slot-b" in cast(list[object], payload["unknown_slots"])
 
 
-def test_audit_retries_a_census_discarded_by_host_churn(
+def test_audit_does_not_retry_a_discarded_census(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _fixture(tmp_path / "case")
     _add_slot_b(root)
-    original = wrkslots_cli._capture_process_path_census
     calls = 0
 
     def census(paths: object) -> object:
         nonlocal calls
         calls += 1
-        if calls == 1:
-            raise wrkslots_cli.Refusal(
-                "relevant process evidence changed during three liveness attempts"
-            )
-        return original(paths)  # type: ignore[arg-type]
+        raise wrkslots_cli.Refusal(
+            "relevant process evidence changed during three liveness attempts"
+        )
 
     monkeypatch.setattr(wrkslots_cli, "_capture_process_path_census", census)
     payload = _python(root, tmp_path)
     rows = _rows(payload)
-    assert calls == 2
-    assert rows["slot-a"]["verdict"] != "UNKNOWN"
-    assert rows["slot-b"]["verdict"] != "UNKNOWN"
+    # One capture attempt set per audit: the capture's own internal
+    # retries are unchanged, but the audit no longer multiplies its
+    # budget by retrying the whole capture until a wall window ends.
+    # The failure stays fail-closed for rows that needed the census.
+    assert calls == 1
+    assert rows["slot-a"]["verdict"] == "UNKNOWN"
+    assert rows["slot-b"]["verdict"] == "UNKNOWN"
+
+
+def test_audit_skips_census_when_no_row_can_use_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _fixture(tmp_path / "case")
+    document = _read_active(root)
+    # A fresh heartbeat means no row can reach the branch that consults
+    # the census, so a host-wide process scan cannot change a verdict.
+    cast(list[dict[str, object]], document["slots"])[0][
+        "heartbeat_at"
+    ] = wrkslots_cli._utc_now()
+    _write_active(root, document)
+
+    def census(paths: object) -> object:
+        raise AssertionError("census ran although no row can consult it")
+
+    monkeypatch.setattr(wrkslots_cli, "_capture_process_path_census", census)
+    payload = _python(root, tmp_path)
+    rows = _rows(payload)
+    assert rows["slot-a"]["verdict"] == "BLOCKED"
+    phases = {
+        str(phase["name"]): phase
+        for phase in cast(
+            list[dict[str, object]],
+            cast(dict[str, object], payload["metrics"])["phases"],
+        )
+    }
+    census_phase = phases["process-census"]
+    assert cast(dict[str, object], census_phase["work"])["census_attempted"] == 0
 
 
 def test_audit_own_record_change_marks_only_that_row_unknown(

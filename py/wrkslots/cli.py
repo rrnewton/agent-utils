@@ -792,10 +792,10 @@ _AT_SYMLINK_FOLLOW = 0x400
 # distinct-content bound.
 _MOUNTINFO_CENSUS_BYTES_LIMIT = 256 * 1024 * 1024
 _ABSENT_PROCESS_CENSUS_SECONDS = 60.0
-# Total wall window for one audit's process census: fresh census attempts
-# are retried inside it while host churn keeps discarding attempt sets;
-# a census that still cannot close when it ends stays fail-closed.
-_AUDIT_CENSUS_WINDOW_SECONDS = 120.0
+# One audit makes a single process-census attempt set. The capture itself
+# already retries snapshot attempts inside its shared budget; retrying the
+# whole capture until a wall window ends only multiplies that budget on a
+# busy host, where churn is likeliest, and still ends fail-closed.
 # Per-process stderr allowance for the all-process census: privileged
 # helpers run per observed process and each may note a line (for example a
 # PID-namespace teardown), so a fixed 64 KiB budget overflows on busy
@@ -37484,32 +37484,51 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     census_started = metrics.start()
     process_census: _ProcessPathCensus | None = None
     process_census_error: str | None = None
-    if records:
-        # One census attempt set can be discarded by host process churn
-        # (a generation changed or vanished while it was read) even though
-        # no slot's evidence is in doubt: the census fail-closes as
-        # indeterminate and every otherwise-clean row would be stamped
-        # UNKNOWN for an unrelated host's motion.  Retry with a fresh
-        # snapshot while the audit's census window lasts; a census that
-        # still cannot close keeps the fail-closed error, unchanged.
-        census_deadline = time.monotonic() + _AUDIT_CENSUS_WINDOW_SECONDS
-        while True:
-            try:
-                process_census = _capture_process_path_census(
-                    [_slot_directory(config, record.slot, record.slot_type) for record in records]
-                )
-                process_census_error = None
-                break
-            except Refusal as exc:
-                process_census_error = f"process/path census failed: {exc}"
-                if time.monotonic() >= census_deadline:
-                    break
+    # The census is consulted only for a row that can otherwise be
+    # published DELETABLE or RECOVERABLE, which additionally requires
+    # every other per-row check to pass.  Testing the entry condition
+    # here is therefore a superset of the rows that can consult it: when
+    # no row qualifies, a host-wide process scan (whose cost follows the
+    # host's process count, not the slot count) cannot change any
+    # verdict, so it is not run.  When a row does qualify, one capture
+    # attempt set runs; its own internal retries and shared budget are
+    # unchanged, and a failure keeps the fail-closed error, unchanged.
+    census_needed = False
+    for record in records:
+        _heartbeat_age, heartbeat_expired = _heartbeat_diagnosis(record)
+        liveness_state, _liveness_detail = registered_liveness[
+            (record.machine, record.slot, record.generation)
+        ]
+        owner_state, _owner_detail = _process_state(record.owner)
+        release, release_void = _owner_release_state(
+            config, record, event_logs[record.machine]
+        )
+        release_honoured = (
+            release is not None
+            and release_void is None
+            and owner_state in ("live", "dead")
+            and not _owner_record_is_absent(record)
+        )
+        if release_honoured or (
+            heartbeat_expired
+            and liveness_state == "dead"
+            and owner_state == "dead"
+        ):
+            census_needed = True
+            break
+    if census_needed:
+        try:
+            process_census = _capture_process_path_census(
+                [_slot_directory(config, record.slot, record.slot_type) for record in records]
+            )
+        except Refusal as exc:
+            process_census_error = f"process/path census failed: {exc}"
     metrics.finish(
         "process-census",
         census_started,
         {
-            "census_attempted": int(bool(records)),
-            "slot_paths": len(records),
+            "census_attempted": int(census_needed),
+            "slot_paths": len(records) if census_needed else 0,
         },
     )
     on_disk: set[tuple[str, str]] = set()
