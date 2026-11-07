@@ -1,10 +1,12 @@
 ---
 title: 'agentctl-rebind-queue-target: a #987 rebind leaves the queue bound to the old target, so every send is refused'
-status: open
+status: closed
 priority: 1
 issue_type: bug
+assignee: cl-sync
 created_at: 2026-11-07T17:40:00.000000000+00:00
-updated_at: 2026-11-07T17:40:00.000000000+00:00
+updated_at: 2026-11-07T21:29:21.000000000+00:00
+closed_at: 2026-11-07T21:29:21.000000000+00:00
 ---
 
 # Description
@@ -15,16 +17,34 @@ But the queue's `target.json` still says `{"kind": "pane", "pane_id": ...}`, whi
 
 # Design
 
-- A successful `anchor --replace --new-conversation` (and any other rebind that changes the target kind or value) re-binds the queue's target in the same locked step, keeping the queue's entries, and records the old target in the journal.
-- Pending entries queued before the rebind are reported, with their age, by the rebind command. The operator chooses `--deliver-pending` or `--cancel-pending`, so stale instructions are never typed silently into the new session.
-- `agentctl status` shows a mismatch between the record target and the queue binding as a named problem with the fix.
+Root cause: the #987 rebind wrote the operator-asserted session into the record's routing session, so the record's delivery target became `{kind: session, value: B}`. agentctl's own rule is that an asserted session never pins routing, and Herdr reports no session for a Muse pane, so a session-bound target could never resolve, even with the queue rebound to it.
+
+- `anchor --replace --session-id NEW --new-conversation` routes by the pane and its pinned process unless the pane itself reports the new session; only a reported session pins routing (then recorded `observed`, else `asserted`).
+- When the record's target changes all the same (old routing session to pane, or to a reported new session), the rebind rebinds the queue's `target.json` under the queue's delivery and binding locks, binding first and record second, as a session follow does. Repeating the rebind accepts either binding, which also repairs a record left by the earlier rebind (record routed by session B, queue bound to the pane). The previous binding is kept in the record under `queue_rebinds` (last 8) and returned as `queue_rebound_from`.
+- Prompts pending in the queue are listed with their age, and the rebind refuses before changing anything unless the operator passes `--deliver-pending` (keep them for the new conversation) or `--cancel-pending` (tombstone each one, untyped, into `cancelled/`; the Rust edition only, as only it has the cancel lane). The result lists each pending prompt and what was done with it.
+- `agentctl status` reports `queue_binding_mismatch` (the queue's binding, the record's, the problem and the fix command) whenever the two disagree.
 
 # Acceptance Criteria
 
-- A test: after `anchor --replace --session-id NEW --new-conversation`, `agentctl send` delivers to the live session, and the queue binding names it.
-- A test: pending entries from before the rebind are neither delivered nor dropped silently; the rebind lists them and acts only on an explicit flag.
-- `agentctl status` names a record/queue target mismatch.
+- A test: after `anchor --replace --session-id NEW --new-conversation`, the queue binding names the record's target (the pane, when the pane does not report the session; the reported session otherwise), and repeating the rebind changes nothing.
+- A test: a record left routed by the asserted session while its queue stays bound to the pane (the live case) is named by `agentctl status` and repaired by repeating the rebind.
+- A test: pending prompts from before the rebind are neither delivered nor dropped silently: the rebind refuses and lists them with their age, leaving record, binding and queue unchanged; `--deliver-pending` keeps them; `--cancel-pending` sets them aside untyped.
+- `agentctl status` names a record/queue target mismatch, with the fix.
 
 # Notes
 
 Found by the devbig030 coordinator right after deploying agentctl 888124cc, while rebinding a long-running Muse lane under #987 agentctl-muse-fresh-rebind. The lane's pending queue was left in place, not hand-edited.
+
+## Resolution
+
+[opus 5.5 cl-sync] Fixed in both editions as the Design above describes: the rebind routes by the
+pane and its pinned process unless the pane reports the new session, rebinds the queue in the same
+locked step when the target changes, holds pending prompts for `--deliver-pending` or
+`--cancel-pending`, and `agentctl status` names a record/queue mismatch with the fix command.
+Tests: four Rust tests in `rs/agentctl/src/subagents/tests/launch_spec.rs` (rebind and its repeat,
+the live shape, pending prompts, a pane that reports the session) and two Python tests in
+`py/tests/test_agentctl_launch_spec.py`.
+
+Unverified live: the stuck lane's record is untouched. Its repair, once this build is deployed, is
+`agentctl anchor NAME --replace --session-id <its native session> --new-conversation --cancel-pending`
+(its two queued prompts are stale), run by the coordinator.

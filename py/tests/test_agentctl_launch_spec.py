@@ -12,7 +12,7 @@ from agentctl import launch_spec, profiles
 from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient
 from agentctl.errors import AgentDeliveryError, HerdrUnavailable
 from agentctl.sessions import Sessions
-from agentctl.subagents import AgentRecord, wrkslots_executable
+from agentctl.subagents import AgentRecord, _native_session, wrkslots_executable
 from .test_herdr_subagents import FakeManagedClient, setup
 
 CODEX = "/usr/local/bin/codex_cli/codex"
@@ -445,6 +445,73 @@ def test_anchor_replace_pins_a_hand_resumed_claude_behind_a_relay(
     saved = sessions.get("worker")
     assert saved.custom_process_identity == identity
     assert saved.native_session is not None and saved.native_session["value"] == recorded_session
+
+
+def _resumed_elsewhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Sessions, FakeManagedClient, str]:
+    """A relay Claude whose record and queue route by session ``sess-old`` while its pinned
+    process now resumes ``sess-new`` (#1020 agentctl-rebind-queue-target)."""
+    from agentctl import agent
+    sessions, fake, identity = relay_worker(tmp_path, monkeypatch, harness="claude")
+    record = sessions.get("worker")
+    queue = sessions._queue("worker")
+    pane_bound = record.target()
+    record.session_agent, record.session_value = "claude", "sess-old"
+    record.native_session = _native_session("claude", "sess-old", "observed")
+    record.resume = None
+    sessions._save(record)
+    agent.rebind_queue(queue, pane_bound, record.target())
+    monkeypatch.setattr(fake, "relay_process", lambda pane: identity, raising=False)
+    fake.command_lines[identity.pid] = (
+        "/usr/local/bin/claude", *record.arguments, "--resume", "sess-new",
+    )
+    return sessions, fake, queue
+
+
+def test_a_new_conversation_rebind_moves_the_queue_and_holds_old_prompts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentctl import agent
+    sessions, _fake, queue = _resumed_elsewhere(tmp_path, monkeypatch)
+    agent.enqueue(queue, "an instruction for the old conversation", message_id="old-1")
+    before = sessions.get("worker").to_document()
+    with pytest.raises(AgentDeliveryError, match=r"1 prompt\(s\) .* old-1 \(queued .*--cancel-pending"):
+        sessions.anchor_new_conversation("worker", "sess-new")
+    with pytest.raises(AgentDeliveryError, match="cannot cancel queued prompts"):
+        sessions.anchor_new_conversation("worker", "sess-new", "cancel")
+    assert sessions.get("worker").to_document() == before
+    assert json.loads(Path(queue, "target.json").read_text())["kind"] == "session"
+
+    result = sessions.anchor_new_conversation("worker", "sess-new", "deliver")
+    assert result["routing"] == "pane"
+    rebound = result["queue_rebound_from"]
+    assert isinstance(rebound, dict) and rebound["value"] == "sess-old"
+    assert result["pending"] == [
+        {"message_id": "old-1", "queued_at_ms": agent.pending_prompts(queue)[0][1], "action": "kept"},
+    ]
+    saved = sessions.get("worker")
+    assert saved.session_value is None
+    binding = json.loads(Path(queue, "target.json").read_text())
+    assert binding["kind"] == "pane" and binding["pane_id"] == saved.pane_id
+    assert agent.queue_binding_mismatch(queue, saved.target()) is None
+    assert "queue_binding_mismatch" not in sessions.status("worker")
+
+
+def test_status_names_a_record_and_queue_target_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _fake, _queue = _resumed_elsewhere(tmp_path, monkeypatch)
+    record = sessions.get("worker")
+    record.session_value = "sess-new"
+    record.native_session = _native_session("claude", "sess-new", "asserted")
+    sessions._save(record)
+    problem = sessions.status("worker")["queue_binding_mismatch"]
+    assert isinstance(problem, dict)
+    queue_side, record_side = problem["queue"], problem["record"]
+    assert isinstance(queue_side, dict) and queue_side["value"] == "sess-old"
+    assert isinstance(record_side, dict) and record_side["value"] == "sess-new"
+    assert "--new-conversation" in str(problem["fix"])
 
 
 def test_promote_marks_a_failed_relay_launch_running_when_its_pinned_harness_runs(

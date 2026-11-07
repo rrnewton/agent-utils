@@ -3275,6 +3275,37 @@ pub fn cancel(root: &Path, message_id: &str, reason: &str) -> AgentResult<Cancel
     Ok(agent_queue::queue::cancel(root, message_id, reason)?)
 }
 
+/// [`cancel`] for a caller that holds the queue's delivery lock, so no drain can be typing: a
+/// prompt still waiting is set aside untyped at once rather than left for the next drain (#1020
+/// agentctl-rebind-queue-target). Any other phase is reported as [`cancel`] reports it.
+pub(crate) fn cancel_holding_delivery(
+    root: &Path,
+    message_id: &str,
+    reason: &str,
+) -> AgentResult<CancelOutcome> {
+    let outcome = cancel(root, message_id, reason)?;
+    if outcome != CancelOutcome::Pending {
+        return Ok(outcome);
+    }
+    let directories = agent_queue::queue::QueueDirectories::new(root);
+    for inbox in [&directories.inbox, &directories.inbox_v2] {
+        let item = inbox.join(format!("{message_id}.json"));
+        if fs::symlink_metadata(&item).is_ok() {
+            let document = agent_queue::queue::load_message(&item)?;
+            agent_queue::queue::set_aside(
+                root,
+                &directories,
+                &item,
+                document,
+                "cancelled",
+                reason,
+            )?;
+            return Ok(CancelOutcome::SetAside);
+        }
+    }
+    Ok(outcome)
+}
+
 pub use agent_queue::queue::now_millis;
 
 /// Read recent terminal output from a validated interactive-agent target.
@@ -3976,6 +4007,29 @@ where
     validate_target_authority(&replacement)?;
     atomic_json(&path, &binding(&replacement)?)?;
     Ok(result)
+}
+
+/// The queue's recorded target binding and the binding `target` would need, when the two
+/// disagree; `None` while they agree or the queue is not bound yet. `agentctl status` names such
+/// a mismatch, which refuses every send and drain (#1020 agentctl-rebind-queue-target).
+pub(crate) fn queue_binding_mismatch(
+    root: &Path,
+    target: &Target,
+) -> AgentResult<Option<(Value, Value)>> {
+    let binding_path = root.join("target.json");
+    let actual = match fs::symlink_metadata(&binding_path) {
+        Ok(_) => read_private_json(&binding_path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(io_error(
+                "inspect queue target binding",
+                &binding_path,
+                error,
+            ))
+        }
+    };
+    let expected = binding(target)?;
+    Ok((!binding_identity_matches(&actual, &expected, true)).then_some((actual, expected)))
 }
 
 fn validate_existing_binding(

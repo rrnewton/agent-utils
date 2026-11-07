@@ -492,13 +492,207 @@ fn anchor_new_conversation_rebinds_a_fresh_muse_session() {
     assert!(fixture.manager().anchor("worker", true, None).is_err());
     let result = fixture
         .manager()
-        .anchor_new_conversation("worker", "sess-new")
+        .anchor_new_conversation("worker", "sess-new", PendingChoice::Refuse)
         .unwrap();
     assert_eq!(result["session"], "sess-new");
     let saved = fixture.manager().load("worker").unwrap();
-    assert_eq!(saved.native_session.unwrap().value, "sess-new");
-    assert_eq!(saved.session_value.as_deref(), Some("sess-new"));
+    let native = saved.native_session.unwrap();
+    assert_eq!(native.value, "sess-new");
+    // The pane does not report the asserted session, so it never pins routing (#1020).
+    assert_eq!(native.source, "asserted");
+    assert_eq!(result["routing"], "pane");
+    assert_eq!(saved.session_value, None);
     assert!(saved.extra["former_sessions"].is_array());
+}
+
+// #1020 agentctl-rebind-queue-target: a new-conversation rebind keeps the record and its queue
+// bound to the same target, and never types or drops prompts queued for the old conversation
+// without the operator's word.
+
+/// A started Muse worker whose pane now runs `muse ... resume sess-new` under a process the
+/// record does not pin yet; its record and queue are bound to session `sess-old`.
+fn muse_worker_resumed_elsewhere() -> (Fixture, PathBuf) {
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                harness: "muse".to_owned(),
+                harness_args: vec!["--model".to_owned(), "m".to_owned()],
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let manager = fixture.manager();
+    let mut record = manager.load("worker").unwrap();
+    let queue = manager.queue("worker").unwrap();
+    let pane_bound = record.target().unwrap();
+    record.session_agent = Some("muse".to_owned());
+    record.session_value = Some("sess-old".to_owned());
+    record.native_session = Some(NativeSession::new("muse", "sess-old", "observed"));
+    manager.save(&record).unwrap();
+    agent::rebind_queue(&queue, &pane_bound, &record.target().unwrap()).unwrap();
+    let pane = record.pane_id.clone().unwrap();
+    fixture
+        .client
+        .custom_processes
+        .lock()
+        .unwrap()
+        .remove(&pane);
+    let mut fresh = vec!["/usr/local/bin/muse".to_owned()];
+    fresh.extend(record.arguments.iter().cloned());
+    fresh.extend(["resume".to_owned(), "sess-new".to_owned()]);
+    fixture
+        .client
+        .command_lines
+        .lock()
+        .unwrap()
+        .insert(300, fresh);
+    (fixture, queue)
+}
+
+fn queue_binding(queue: &Path) -> Value {
+    serde_json::from_slice(&fs::read(queue.join("target.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn a_new_conversation_rebind_moves_the_queue_to_the_record_target() {
+    let (fixture, queue) = muse_worker_resumed_elsewhere();
+    let manager = fixture.manager();
+    let mut record = manager.load("worker").unwrap();
+    record.resume = Some("sess-old".to_owned());
+    manager.save(&record).unwrap();
+    assert_eq!(queue_binding(&queue)["kind"], "session");
+    let result = manager
+        .anchor_new_conversation("worker", "sess-new", PendingChoice::Refuse)
+        .unwrap();
+    assert_eq!(result["routing"], "pane");
+    assert_eq!(result["queue_rebound_from"]["value"], "sess-old");
+    let saved = manager.load("worker").unwrap();
+    let binding = queue_binding(&queue);
+    assert_eq!(binding["kind"], "pane");
+    assert_eq!(binding["pane_id"], json!(saved.pane_id));
+    assert!(
+        agent::queue_binding_mismatch(&queue, &saved.target().unwrap())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        saved.extra["queue_rebinds"][0]["previous"]["value"],
+        "sess-old"
+    );
+    // A recorded resume follows the native session, as validation requires (#948).
+    assert_eq!(saved.resume.as_deref(), Some("sess-new"));
+    assert!(manager.status("worker").unwrap()["queue_binding_mismatch"].is_null());
+    // Repeating the rebind finds the queue already bound to the record and changes nothing.
+    let again = manager
+        .anchor_new_conversation("worker", "sess-new", PendingChoice::Refuse)
+        .unwrap();
+    assert!(again["queue_rebound_from"].is_null());
+    assert_eq!(queue_binding(&queue), binding);
+}
+
+#[test]
+fn a_rebind_that_wrote_the_asserted_session_into_routing_is_repaired_by_repeating_it() {
+    // The live case: an earlier rebind routed by the asserted session while the queue stayed
+    // bound to the pane, so every send and drain was refused.
+    let (fixture, queue) = muse_worker_resumed_elsewhere();
+    let manager = fixture.manager();
+    let mut record = manager.load("worker").unwrap();
+    let session_bound = record.target().unwrap();
+    record.session_value = None;
+    record.session_agent = None;
+    let pane_bound = record.target().unwrap();
+    agent::rebind_queue(&queue, &session_bound, &pane_bound).unwrap();
+    record.session_agent = Some("muse".to_owned());
+    record.session_value = Some("sess-new".to_owned());
+    record.native_session = Some(NativeSession::new("muse", "sess-new", "asserted"));
+    manager.save(&record).unwrap();
+    let status = manager.status("worker").unwrap();
+    let mismatch = &status["queue_binding_mismatch"];
+    assert_eq!(mismatch["queue"]["kind"], "pane", "{status}");
+    assert_eq!(mismatch["record"]["kind"], "session", "{status}");
+    assert!(mismatch["fix"]
+        .as_str()
+        .unwrap()
+        .contains("agentctl anchor worker --replace --session-id sess-new --new-conversation"));
+    manager
+        .anchor_new_conversation("worker", "sess-new", PendingChoice::Refuse)
+        .unwrap();
+    let saved = manager.load("worker").unwrap();
+    assert_eq!(saved.session_value, None);
+    assert_eq!(queue_binding(&queue)["kind"], "pane");
+    assert!(manager.status("worker").unwrap()["queue_binding_mismatch"].is_null());
+}
+
+#[test]
+fn prompts_queued_for_the_old_conversation_wait_for_the_operator_word() {
+    let (fixture, queue) = muse_worker_resumed_elsewhere();
+    let manager = fixture.manager();
+    agent::enqueue(
+        &queue,
+        "an instruction for the old conversation",
+        Some("old-1"),
+    )
+    .unwrap();
+    agent::enqueue(&queue, "another one", Some("old-2")).unwrap();
+    let before = manager.load("worker").unwrap();
+    let error = manager
+        .anchor_new_conversation("worker", "sess-new", PendingChoice::Refuse)
+        .unwrap_err()
+        .to_string();
+    for needle in [
+        "2 prompt(s)",
+        "old-1 (queued",
+        "old-2",
+        "--deliver-pending",
+        "--cancel-pending",
+    ] {
+        assert!(error.contains(needle), "{needle}: {error}");
+    }
+    // Refused before any change: record, binding and queue as they were.
+    assert_eq!(manager.load("worker").unwrap(), before);
+    assert_eq!(queue_binding(&queue)["kind"], "session");
+    assert_eq!(agent::queued_prompts(&queue).unwrap(), ["old-1", "old-2"]);
+
+    let kept = manager
+        .anchor_new_conversation("worker", "sess-new", PendingChoice::Deliver)
+        .unwrap();
+    assert_eq!(kept["pending"][0]["message_id"], "old-1");
+    assert_eq!(kept["pending"][0]["action"], "kept");
+    assert_eq!(agent::queued_prompts(&queue).unwrap(), ["old-1", "old-2"]);
+
+    let cancelled = manager
+        .anchor_new_conversation("worker", "sess-new", PendingChoice::Cancel)
+        .unwrap();
+    // Set aside under the rebind's own delivery lock: at once, never left for a later drain.
+    for (index, identifier) in ["old-1", "old-2"].iter().enumerate() {
+        assert_eq!(cancelled["pending"][index]["message_id"], *identifier);
+        assert_eq!(cancelled["pending"][index]["action"], "set_aside");
+        assert!(queue.join(format!("cancelled/{identifier}.json")).is_file());
+    }
+    assert!(agent::queued_prompts(&queue).unwrap().is_empty());
+    assert!(fixture.client.runs.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_new_session_the_pane_reports_pins_routing_and_the_queue_follows() {
+    let (fixture, queue) = muse_worker_resumed_elsewhere();
+    *fixture.client.session_override.lock().unwrap() =
+        Some((Some("muse".into()), Some("sess-new".into())));
+    let manager = fixture.manager();
+    let result = manager
+        .anchor_new_conversation("worker", "sess-new", PendingChoice::Refuse)
+        .unwrap();
+    assert_eq!(result["routing"], "session");
+    let saved = manager.load("worker").unwrap();
+    assert_eq!(saved.session_value.as_deref(), Some("sess-new"));
+    assert_eq!(saved.native_session.unwrap().source, "observed");
+    let binding = queue_binding(&queue);
+    assert_eq!(binding["kind"], "session");
+    assert_eq!(binding["value"], "sess-new");
 }
 
 #[test]

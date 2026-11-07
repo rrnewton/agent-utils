@@ -14,7 +14,8 @@ use crate::client::HerdrClient;
 use crate::sender_header;
 use crate::subagents::{
     environment_entries, stop_reason, AdoptOptions, CloudLaunch, CloudTools, ManageAction,
-    ManagedAgents, RecoveryAction, SlotLaunch, StartOptions, StopContext, StopFailure, StopOptions,
+    ManagedAgents, PendingChoice, RecoveryAction, SlotLaunch, StartOptions, StopContext,
+    StopFailure, StopOptions,
 };
 
 const MAX_CHAT_PUBLISH_BYTES: usize = 30_000;
@@ -1083,6 +1084,12 @@ struct Anchor {
     /// Explicitly rebind the record to a NEW conversation in its live pane (requires --replace --session-id NEW): the foreground process must be the recorded harness in the recorded cwd running the recorded argv apart from its resume tail
     #[arg(long)]
     new_conversation: bool,
+    /// With --new-conversation: keep the prompts queued for the old conversation and deliver them to the new one. Without this or --cancel-pending, the rebind refuses while any prompt waits and lists them with their age
+    #[arg(long, requires = "new_conversation", conflicts_with = "cancel_pending")]
+    deliver_pending: bool,
+    /// With --new-conversation: cancel the prompts queued for the old conversation, untyped (each lands in the queue's cancelled/)
+    #[arg(long, requires = "new_conversation")]
+    cancel_pending: bool,
 }
 
 #[derive(Args)]
@@ -4164,7 +4171,14 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 let session = value.session_id.as_deref().ok_or_else(|| {
                     Failure::Usage("--new-conversation requires --session-id NEW".to_owned())
                 })?;
-                manager.anchor_new_conversation(&value.agent.name, session)?
+                let pending = if value.deliver_pending {
+                    PendingChoice::Deliver
+                } else if value.cancel_pending {
+                    PendingChoice::Cancel
+                } else {
+                    PendingChoice::Refuse
+                };
+                manager.anchor_new_conversation(&value.agent.name, session, pending)?
             } else {
                 manager.anchor(
                     &value.agent.name,

@@ -119,6 +119,16 @@ def _session_matches(record: AgentRecord, info: AgentPaneInfo) -> bool:
             and info.session_agent == (record.session_agent or record.harness))
 
 
+def _format_age(seconds: float) -> str:
+    """An age for a one-line notice: ``2 h 5 m``, ``40 min``, ``45 s``."""
+    whole = int(max(seconds, 0.0))
+    if whole >= 3600:
+        return f"{whole // 3600} h {whole % 3600 // 60} m"
+    if whole >= 60:
+        return f"{whole // 60} min"
+    return f"{whole} s"
+
+
 def _native_session(agent_kind: str, value: str, source: str) -> dict[str, str]:
     """Recovery provenance, separate from the pane's observed routing anchor."""
     return {"schema": "agentctl-native-session/v1", "agent": agent_kind,
@@ -4043,7 +4053,28 @@ class ManagedAgents:
             result["probe_error"] = None
         except HerdrRunError as exc:
             result["agent_status"], result["probe_error"] = "unknown", str(exc)
+        problem = self._queue_binding_problem(record)
+        if problem is not None:
+            result["queue_binding_mismatch"] = problem
         return result
+
+    def _queue_binding_problem(self, record: AgentRecord) -> dict[str, object] | None:
+        """The record's target and its queue's binding when they disagree, which refuses every
+        send and drain, with the command that rebinds them (#1020); None while they agree."""
+        try:
+            mismatch = agent.queue_binding_mismatch(self._queue(record.name), self._target(record))
+        except HerdrRunError:
+            return None
+        if mismatch is None:
+            return None
+        session = "SESSION" if record.native_session is None else record.native_session["value"]
+        return {
+            "queue": mismatch[0], "record": mismatch[1],
+            "problem": ("the queue is bound to another target than the record's, so every send "
+                        "and drain is refused"),
+            "fix": (f"agentctl anchor {record.name} --replace --session-id {session} "
+                    "--new-conversation (add --deliver-pending or --cancel-pending if prompts wait)"),
+        }
 
     def list(self) -> list[dict[str, object]]:
         """List each row independently; one malformed row cannot hide the fleet."""
@@ -6154,17 +6185,29 @@ class ManagedAgents:
             "migrated_from": migrated_from, "launch_spec_source": "anchor",
         }
 
-    def anchor_new_conversation(self, name: str, session: str) -> dict[str, object]:
+    def anchor_new_conversation(
+        self, name: str, session: str, pending: str = "refuse",
+    ) -> dict[str, object]:
         """Explicitly rebind a record to a NEW conversation in its live pane
         (#987, `anchor --replace --session-id NEW --new-conversation`). The
         foreground process must be the recorded harness, in the recorded
         cwd, running the recorded argv apart from its resume tail; the old
-        session is kept in the record's history and the queue is untouched.
+        session is kept in the record's history.
+
+        Routing stays on the pane and its pinned process unless the pane
+        itself reports the new session. When the delivery target changes all
+        the same, the queue is rebound to it before the record is saved
+        (#1020 agentctl-rebind-queue-target). Prompts still queued for the old
+        conversation are listed, and the rebind refuses unless ``pending`` is
+        ``deliver``; this edition cannot cancel queued prompts.
         """
         if not session or "\0" in session:
             raise AgentDeliveryError("native session id must be nonempty and contain no NUL")
+        if pending not in ("refuse", "deliver", "cancel"):
+            raise AgentDeliveryError(f"unknown pending choice {pending!r}")
         with self._lock(name), self._identity_transaction():
             record = self._load(name)
+            old_target = record.target() if record.pane_id else None
             migrated = None
             if record._nested_storage is not None:
                 migrated = record._nested_storage.get("schema")
@@ -6201,6 +6244,25 @@ class ManagedAgents:
                     same = False
                 if not recorded or not same:
                     raise refusal("the foreground argv is not the recorded argv apart from its resume tail")
+                queue = self._queue(name)
+                waiting = agent.pending_prompts(queue)
+                if waiting and pending == "cancel":
+                    raise refusal(
+                        "this edition cannot cancel queued prompts; run the Rust edition "
+                        "with --cancel-pending, or pass --deliver-pending"
+                    )
+                if waiting and pending == "refuse":
+                    now = time.time() * 1000
+                    listed = ", ".join(
+                        identifier if queued_at is None
+                        else f"{identifier} (queued {_format_age((now - queued_at) / 1000)} ago)"
+                        for identifier, queued_at in waiting
+                    )
+                    raise refusal(
+                        f"{len(waiting)} prompt(s) queued for the old conversation still wait: "
+                        f"{listed}; pass --deliver-pending to deliver them to the new "
+                        "conversation, or --cancel-pending to cancel them"
+                    )
                 previous_session = (
                     (None if record.native_session is None else record.native_session["value"])
                     or record.session_value
@@ -6217,9 +6279,16 @@ class ManagedAgents:
                     record.harness_identity = candidate
                     record.anchor_rule = 2
                 record.terminal_id = info.terminal_id
-                record.native_session = _native_session(record.harness, session, "asserted")
-                record.session_agent = record.harness
-                record.session_value = session
+                # Only a session the pane reports may pin routing; an asserted one leaves the
+                # pane and its pinned process as the recipient.
+                reported = info.session_agent == record.harness and info.session_value == session
+                record.native_session = _native_session(
+                    record.harness, session, "observed" if reported else "asserted")
+                record.session_agent = record.harness if reported else None
+                record.session_value = session if reported else None
+                # Validation requires a recorded resume to agree with the native session (#948).
+                if record.resume is not None:
+                    record.resume = session
                 if record.lifecycle == "launch_failed":
                     record.lifecycle, record.error = "running", None
                 label: str | None = None
@@ -6240,6 +6309,22 @@ class ManagedAgents:
                     slot_project=record.slot_project, slot_isolation=record.slot_isolation,
                     workspace_label=label, native_session=(session, source),
                 ))
+                # Binding first, as a session follow does: an interruption leaves the record
+                # naming the old target, and repeating the rebind accepts either binding.
+                new_target = record.target()
+                mismatch = agent.queue_binding_mismatch(queue, new_target)
+                previous_binding = None if mismatch is None else mismatch[0]
+                assert old_target is not None
+                agent.rebind_queue_after(
+                    queue, old_target, lambda: (new_target, None),
+                    already_replacement=new_target, allow_legacy_workspace_binding=True,
+                )
+                if previous_binding is not None:
+                    rebinds = record._unknown.setdefault("queue_rebinds", [])
+                    if isinstance(rebinds, list):
+                        rebinds.append({"previous": previous_binding, "at": time.time(),
+                                        "reason": "new-conversation"})
+                        del rebinds[:-8]
                 self._save(record)
                 return {
                     "name": name, "pane_id": record.pane_id,
@@ -6247,7 +6332,12 @@ class ManagedAgents:
                     "replaced": True,
                     "previous": {"harness_pid": None if previous_pid is None else previous_pid.pid,
                                  "session": previous_session},
-                    "session": session, "migrated_from": migrated,
+                    "session": session,
+                    "routing": "session" if reported else "pane",
+                    "queue_rebound_from": previous_binding,
+                    "pending": [{"message_id": identifier, "queued_at_ms": queued_at,
+                                 "action": "kept"} for identifier, queued_at in waiting],
+                    "migrated_from": migrated,
                     "launch_spec_source": "anchor",
                 }
 

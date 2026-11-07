@@ -1713,6 +1713,41 @@ def rebind_queue_after(
         os.close(delivery_descriptor)
 
 
+def pending_prompts(root: str) -> list[tuple[str, int | None]]:
+    """The inbox's prompts with their enqueue time in Unix milliseconds when recorded, oldest first."""
+    inbox = os.path.join(root, "inbox")
+    if not os.path.lexists(inbox):
+        return []
+    _validate_private_directory(inbox, "queue state directory")
+    prompts: list[tuple[str, int | None]] = []
+    for name in sorted(name for name in os.listdir(inbox) if name.endswith(".json")):
+        queued_at: int | None = None
+        try:
+            document = _read_queue_json(os.path.join(inbox, name), "queued prompt", require_private=True)
+            value = document.get("queued_at") if isinstance(document, dict) else None
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                queued_at = int(value * 1000)
+        except (AgentDeliveryError, OSError):
+            queued_at = None
+        prompts.append((name[:-5], queued_at))
+    return prompts
+
+
+def queue_binding_mismatch(
+    root: str, target: Target,
+) -> tuple[dict[str, object], dict[str, object]] | None:
+    """The queue's binding and the one ``target`` needs when they disagree, else None (#1020)."""
+    binding_path = os.path.join(root, "target.json")
+    if not os.path.lexists(binding_path):
+        return None
+    actual = _read_queue_json(binding_path, "queue target binding", require_private=True)
+    expected = _binding(target)
+    if isinstance(actual, dict) and _binding_identity_matches(
+            actual, expected, allow_legacy_workspace_binding=True):
+        return None
+    return (actual if isinstance(actual, dict) else {"binding": actual}), expected
+
+
 def _validate_existing_binding(
     root: str, target: Target, *, allow_legacy_workspace_binding: bool = False,
 ) -> None:

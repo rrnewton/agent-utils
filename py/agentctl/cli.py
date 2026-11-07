@@ -179,6 +179,14 @@ def parser() -> argparse.ArgumentParser:
     anchor.add_argument("--new-conversation", action="store_true",
         help="with --replace --session-id NEW, rebind the record to a fresh conversation running in its "
         "live pane (#987); refused unless the pane's foreground resumes that new session")
+    pending_choice = anchor.add_mutually_exclusive_group()
+    pending_choice.add_argument("--deliver-pending", action="store_true",
+        help="with --new-conversation: keep the prompts queued for the old conversation and deliver them to "
+        "the new one. Without this or --cancel-pending, the rebind refuses while any prompt waits and lists "
+        "them with their age")
+    pending_choice.add_argument("--cancel-pending", action="store_true",
+        help="with --new-conversation: cancel the prompts queued for the old conversation, untyped (the "
+        "Rust edition only; this edition refuses it while prompts wait)")
     doctor = command("doctor", "Compare every registry record with live Herdr state and report each mismatch. "
         "Read-only unless --repair-labels. Exit 0 when clean, 1 with findings.",
         "agentctl doctor")
@@ -604,10 +612,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "promote":
             result = sessions.promote(name, expected_token=args.expected_token)
         elif args.command == "anchor":
+            if (args.deliver_pending or args.cancel_pending) and not args.new_conversation:
+                raise ValueError("--deliver-pending and --cancel-pending require --new-conversation")
             if args.new_conversation:
                 if not args.replace or not args.session_id:
                     raise ValueError("--new-conversation requires --replace --session-id NEW")
-                result = sessions.anchor_new_conversation(name, args.session_id)
+                pending = ("deliver" if args.deliver_pending
+                           else "cancel" if args.cancel_pending else "refuse")
+                result = sessions.anchor_new_conversation(name, args.session_id, pending)
             else:
                 result = sessions.anchor(name, replace=args.replace, session=args.session_id)
         elif args.command == "doctor":

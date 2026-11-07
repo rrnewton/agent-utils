@@ -791,6 +791,19 @@ fn new_journal_id() -> Result<String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// What `anchor --new-conversation` does with prompts still queued for the old conversation
+/// (#1020 agentctl-rebind-queue-target).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PendingChoice {
+    /// Refuse the rebind while any prompt waits, listing them.
+    #[default]
+    Refuse,
+    /// Keep them queued for the new conversation.
+    Deliver,
+    /// Cancel them, untyped.
+    Cancel,
+}
+
 /// A Claude conversation id is a hyphenated UUID4, assigned before launch.
 fn new_conversation_id() -> Result<String> {
     let hex = new_journal_id()?;
@@ -7922,8 +7935,21 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// (#987, `anchor --replace --session-id NEW --new-conversation`). The
     /// foreground process must be the recorded harness, in the recorded
     /// cwd, running the recorded argv apart from its resume tail; the old
-    /// session is kept in the record's history and the queue is untouched.
-    pub fn anchor_new_conversation(&self, agent_name: &str, session: &str) -> Result<Value> {
+    /// session is kept in the record's history.
+    ///
+    /// Routing stays on the pane and its pinned process unless the pane
+    /// itself reports the new session: an asserted session never pins
+    /// routing. When the delivery target changes all the same, the queue is
+    /// rebound to it before the record is saved (#1020
+    /// agentctl-rebind-queue-target). Prompts still queued for the old
+    /// conversation are listed, and the rebind refuses unless `pending`
+    /// says to deliver or cancel them.
+    pub fn anchor_new_conversation(
+        &self,
+        agent_name: &str,
+        session: &str,
+        pending: PendingChoice,
+    ) -> Result<Value> {
         if !valid_metadata_text(session) {
             return Err(fail(
                 "native session id must be nonempty and contain no NUL",
@@ -7932,6 +7958,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let _lock = self.lock(agent_name)?;
         let _identity_lock = self.identity_lock()?;
         let mut record = self.load(agent_name)?;
+        // The target the queue was bound to, before a nested row's migration can change it.
+        let old_target = record.target();
         let migrated_from = record.migrate_nested_to_flat();
         let refusal = |detail: &str| {
             fail(format!(
@@ -7941,6 +7969,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let Some(pane) = record.pane_id.clone() else {
             return Err(refusal("the record has no pane"));
         };
+        let old_target = old_target?;
         let _pane_lock = self.pane_lock(&pane)?;
         let info = self.client.pane_info(&pane)?;
         if !same_directory(&info.cwd, &record.cwd)
@@ -8012,6 +8041,30 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 return Err(refusal("no Muse session runtime file names that session"));
             }
         }
+        // Prompts queued for the old conversation are never typed into the new one, nor
+        // dropped, without the operator's word.
+        let queue = self.queue(agent_name)?;
+        let waiting = agent::pending_prompts(&queue)?;
+        if !waiting.is_empty() && pending == PendingChoice::Refuse {
+            let now = agent::now_millis();
+            let listed = waiting
+                .iter()
+                .map(|(identifier, queued_at)| match queued_at {
+                    Some(at) => format!(
+                        "{identifier} (queued {} ago)",
+                        crate::turn_state::format_age(now.saturating_sub(*at) as f64 / 1000.0)
+                    ),
+                    None => identifier.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(refusal(&format!(
+                "{} prompt(s) queued for the old conversation still wait: {listed}; pass \
+                 --deliver-pending to deliver them to the new conversation, or \
+                 --cancel-pending to cancel them",
+                waiting.len()
+            )));
+        }
         let previous_session = record
             .native_session
             .as_ref()
@@ -8045,9 +8098,26 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             record.custom_process_identity = Some(candidate.clone());
         }
         record.terminal_id = info.terminal_id.clone();
-        record.native_session = Some(NativeSession::new(&record.harness, session, "asserted"));
-        record.session_agent = Some(record.harness.clone());
-        record.session_value = Some(session.to_owned());
+        // Only a session the pane reports may pin routing; an asserted one leaves the pane and
+        // its pinned process as the recipient.
+        let reported = info.session_agent.as_deref() == Some(record.harness.as_str())
+            && info.session_value.as_deref() == Some(session);
+        record.native_session = Some(NativeSession::new(
+            &record.harness,
+            session,
+            if reported { "observed" } else { "asserted" },
+        ));
+        // Validation requires a recorded resume to agree with the native session (#948).
+        if record.resume.is_some() {
+            record.resume = Some(session.to_owned());
+        }
+        if reported {
+            record.session_agent = Some(record.harness.clone());
+            record.session_value = Some(session.to_owned());
+        } else {
+            record.session_agent = None;
+            record.session_value = None;
+        }
         if record.lifecycle == "launch_failed" {
             record.lifecycle = "running".to_owned();
             record.error = None;
@@ -8073,6 +8143,44 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             workspace_label: label.as_deref(),
             native_session: Some((session, if names_session { "argv" } else { "asserted" })),
         })?);
+        // Binding first, as a session follow does: an interruption leaves the record naming the
+        // old target, and repeating the rebind accepts either binding. Prompts to cancel are set
+        // aside under the same delivery lock, so no drain is typing one meanwhile.
+        let new_target = record.target()?;
+        let previous_binding =
+            agent::queue_binding_mismatch(&queue, &new_target)?.map(|(actual, _)| actual);
+        let pending_report =
+            agent::rebind_queue_after(&queue, &old_target, Some(&new_target), true, || {
+                let mut report = Vec::new();
+                for (identifier, queued_at) in &waiting {
+                    let action = if pending == PendingChoice::Cancel {
+                        json!(agent::cancel_holding_delivery(
+                            &queue,
+                            identifier,
+                            "rebound to a new conversation",
+                        )?)
+                    } else {
+                        json!("kept")
+                    };
+                    report.push(json!({
+                        "message_id": identifier,
+                        "queued_at_ms": queued_at,
+                        "action": action,
+                    }));
+                }
+                Ok((new_target.clone(), report))
+            })?;
+        if let Some(binding) = &previous_binding {
+            let list = record
+                .extra
+                .entry("queue_rebinds".to_owned())
+                .or_insert_with(|| json!([]));
+            if let Some(entries) = list.as_array_mut() {
+                entries.push(json!({"previous": binding, "at": unix_seconds(), "reason": "new-conversation"}));
+                let excess = entries.len().saturating_sub(8);
+                entries.drain(..excess);
+            }
+        }
         self.save(&record)?;
         Ok(json!({
             "name": agent_name,
@@ -8082,6 +8190,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             "replaced": true,
             "previous": {"harness_pid": previous_pid, "session": previous_session},
             "session": session,
+            "routing": if reported { "session" } else { "pane" },
+            "queue_rebound_from": previous_binding,
+            "pending": pending_report,
             "migrated_from": migrated_from,
             "launch_spec_source": "anchor",
         }))
@@ -10916,7 +11027,32 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 result["probe_error"] = json!(error.to_string());
             }
         }
+        if let Some(mismatch) = self.queue_binding_problem(record) {
+            result["queue_binding_mismatch"] = mismatch;
+        }
         Ok(result)
+    }
+
+    /// The record's delivery target and its queue's binding, when they disagree, which refuses
+    /// every send and drain, with the command that rebinds them (#1020
+    /// agentctl-rebind-queue-target). `None` while they agree or cannot be read.
+    fn queue_binding_problem(&self, record: &AgentRecord) -> Option<Value> {
+        let target = self.target(record).ok()?;
+        let (bound, needed) =
+            agent::queue_binding_mismatch(&self.queue(&record.name).ok()?, &target).ok()??;
+        let session = record
+            .native_session
+            .as_ref()
+            .map_or("SESSION", |native| native.value.as_str());
+        Some(json!({
+            "queue": bound,
+            "record": needed,
+            "problem": "the queue is bound to another target than the record's, so every send and drain is refused",
+            "fix": format!(
+                "agentctl anchor {} --replace --session-id {session} --new-conversation (add --deliver-pending or --cancel-pending if prompts wait)",
+                record.name
+            ),
+        }))
     }
 
     /// The running turn of an interactive agent whose verified pane is `pane_id`, as the `turn`
