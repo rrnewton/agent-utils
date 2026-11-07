@@ -258,8 +258,9 @@ machine's event log.
 
 A non-create journal (for example a live `finish`) whose recorded owner process is still alive
 is not an interrupted mutation: `classify-create-journals` reports it as retryable busy — exit
-75, with JSON `{"status": "busy", "busy": {"kind": ..., "pid": ..., "journal": ...}}` — so a
-caller such as the merge-queue donor waits and retries instead of losing its job. A dead or
+75, with a JSON payload whose `status` is `busy` and whose `busy` object names the journal
+`kind`, its owner's `pid`, and the `journal` file — so a caller such as the merge-queue donor
+waits and retries instead of losing its job. A dead or
 indeterminate owner keeps the hard `interrupted ... cannot coexist` refusal.
 
 A registered row whose slot directory is absent -- `lstat` reports that nothing exists at the path
