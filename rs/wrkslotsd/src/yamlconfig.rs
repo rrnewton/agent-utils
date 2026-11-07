@@ -827,6 +827,254 @@ pub(crate) fn load_document(text: &str) -> Result<(Value, &'static str)> {
     Ok((parser.parse_document()?, "yaml"))
 }
 
+// ------------------------------------------------------------------ writing
+
+const YAML11_WORDS: &[&str] = &[
+    "yes", "Yes", "YES", "no", "No", "NO", "on", "On", "ON", "off", "Off", "OFF", "y", "Y", "n",
+    "N",
+];
+
+fn wrap_comment(text: &str, prefix: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        let words: Vec<&str> = paragraph.split_whitespace().collect();
+        if words.is_empty() {
+            lines.push(prefix.trim_end().to_string());
+            continue;
+        }
+        let mut current = prefix.to_string();
+        for word in words {
+            if current != prefix && current.chars().count() + 1 + word.chars().count() > 96 {
+                lines.push(current);
+                current = prefix.to_string();
+            }
+            if current != prefix {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+        lines.push(current);
+    }
+    lines
+}
+
+fn comment_block(text: &str, indent: usize) -> Vec<String> {
+    wrap_comment(text, &format!("{}# ", " ".repeat(indent)))
+}
+
+fn is_scalar_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+    )
+}
+
+/// The canonical YAML text of one scalar (the Python `scalar_text`).
+pub(crate) fn scalar_text(value: &Value, flow: bool) -> std::result::Result<String, String> {
+    match value {
+        Value::Null => Ok("null".to_string()),
+        Value::Bool(true) => Ok("true".to_string()),
+        Value::Bool(false) => Ok("false".to_string()),
+        Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                return Ok(integer.to_string());
+            }
+            if let Some(unsigned) = number.as_u64() {
+                return Ok(unsigned.to_string());
+            }
+            let float = number.as_f64().unwrap_or(f64::NAN);
+            if float.is_nan() {
+                return Ok(".nan".to_string());
+            }
+            if float.is_infinite() {
+                return Ok(if float < 0.0 { "-.inf" } else { ".inf" }.to_string());
+            }
+            if float == float.trunc() && float.abs() < 1e16 {
+                return Ok(format!("{float:.1}"));
+            }
+            Ok(format!("{float}"))
+        }
+        Value::String(text) => {
+            let plain_ok = !text.is_empty()
+                && text.trim() == text.as_str()
+                && !YAML11_WORDS.contains(&text.as_str())
+                && !(flow
+                    && text
+                        .chars()
+                        .any(|ch| matches!(ch, ',' | '[' | ']' | '{' | '}')))
+                && !text
+                    .chars()
+                    .any(|ch| (ch as u32) < 32 || matches!(ch, '#' | '"' | '\''));
+            if plain_ok {
+                if let Ok(parsed) = plain_scalar(text, 0) {
+                    if parsed == Value::String(text.clone())
+                        && !PLAIN_FORBIDDEN_START.contains(&text.as_bytes()[0])
+                    {
+                        return Ok(text.clone());
+                    }
+                }
+            }
+            Ok(serde_json::to_string(text).unwrap_or_default())
+        }
+        _ => Err(format!(
+            "cannot write {} as a YAML scalar",
+            match value {
+                Value::Array(_) => "list",
+                Value::Object(_) => "dict",
+                _ => "value",
+            }
+        )),
+    }
+}
+
+fn key_text(key: &str) -> String {
+    let text = scalar_text(&Value::String(key.to_string()), false).unwrap_or_default();
+    if text == key && !key.contains(':') {
+        text
+    } else {
+        serde_json::to_string(key).unwrap_or_default()
+    }
+}
+
+/// Write `value` as literate YAML (the Python `yamlconfig.emit`).
+pub(crate) fn emit_document(
+    value: &Value,
+    header: &str,
+    footer: &str,
+    comments: &std::collections::HashMap<Vec<String>, String>,
+    order: &dyn Fn(&[String], &[String]) -> Vec<String>,
+) -> std::result::Result<String, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "cannot write a non-mapping document to YAML".to_string())?;
+    let mut out: Vec<String> = Vec::new();
+    if !header.is_empty() {
+        out.extend(comment_block(header, 0));
+        out.push(String::new());
+    }
+    emit_mapping(object, &[], 0, comments, order, &mut out)?;
+    if !footer.is_empty() {
+        out.push(String::new());
+        out.extend(comment_block(footer, 0));
+    }
+    Ok(out.join("\n") + "\n")
+}
+
+fn emit_mapping(
+    node: &Map<String, Value>,
+    path: &[String],
+    indent: usize,
+    comments: &std::collections::HashMap<Vec<String>, String>,
+    order: &dyn Fn(&[String], &[String]) -> Vec<String>,
+    out: &mut Vec<String>,
+) -> std::result::Result<(), String> {
+    let keys: Vec<String> = node.keys().cloned().collect();
+    let arranged = order(path, &keys);
+    for (position, key) in arranged.iter().enumerate() {
+        let Some(item) = node.get(key) else { continue };
+        let mut here: Vec<String> = path.to_vec();
+        here.push(key.clone());
+        if let Some(note) = comments.get(&here) {
+            if position > 0 && indent == 0 {
+                out.push(String::new());
+            }
+            out.extend(comment_block(note, indent));
+        }
+        let prefix = format!("{}{}:", " ".repeat(indent), key_text(key));
+        emit_entry(item, &here, indent, &prefix, comments, order, out)?;
+    }
+    Ok(())
+}
+
+fn emit_entry(
+    item: &Value,
+    here: &[String],
+    indent: usize,
+    prefix: &str,
+    comments: &std::collections::HashMap<Vec<String>, String>,
+    order: &dyn Fn(&[String], &[String]) -> Vec<String>,
+    out: &mut Vec<String>,
+) -> std::result::Result<(), String> {
+    if is_scalar_value(item) {
+        out.push(format!("{prefix} {}", scalar_text(item, false)?));
+    } else if let Some(map) = item.as_object() {
+        if map.is_empty() {
+            out.push(format!("{prefix} {{}}"));
+        } else {
+            out.push(prefix.to_string());
+            emit_mapping(map, here, indent + 2, comments, order, out)?;
+        }
+    } else if let Some(items) = item.as_array() {
+        if items.is_empty() {
+            out.push(format!("{prefix} []"));
+        } else {
+            out.push(prefix.to_string());
+            emit_sequence(items, here, indent + 2, comments, order, out)?;
+        }
+    } else {
+        return Err("cannot write value to YAML".to_string());
+    }
+    Ok(())
+}
+
+fn emit_sequence(
+    items: &[Value],
+    path: &[String],
+    indent: usize,
+    comments: &std::collections::HashMap<Vec<String>, String>,
+    order: &dyn Fn(&[String], &[String]) -> Vec<String>,
+    out: &mut Vec<String>,
+) -> std::result::Result<(), String> {
+    for item in items {
+        if is_scalar_value(item) {
+            out.push(format!(
+                "{}- {}",
+                " ".repeat(indent),
+                scalar_text(item, false)?
+            ));
+        } else if let Some(map) = item.as_object() {
+            if map.is_empty() {
+                out.push(format!("{}- {{}}", " ".repeat(indent)));
+            } else {
+                let keys: Vec<String> = map.keys().cloned().collect();
+                let inner = indent + 2;
+                let first = &keys[0];
+                let mut first_path: Vec<String> = path.to_vec();
+                first_path.push(first.clone());
+                let prefix = format!("{}- {}:", " ".repeat(indent), key_text(first));
+                emit_entry(
+                    &map[first],
+                    &first_path,
+                    inner,
+                    &prefix,
+                    comments,
+                    order,
+                    out,
+                )?;
+                for key in &keys[1..] {
+                    let mut key_path: Vec<String> = path.to_vec();
+                    key_path.push(key.clone());
+                    let prefix = format!("{}{}:", " ".repeat(inner), key_text(key));
+                    emit_entry(&map[key], &key_path, inner, &prefix, comments, order, out)?;
+                }
+            }
+        } else if let Some(inner_items) = item.as_array() {
+            if inner_items.is_empty() {
+                out.push(format!("{}- []", " ".repeat(indent)));
+            } else if inner_items.iter().all(is_scalar_value) {
+                let parts: std::result::Result<Vec<String>, String> = inner_items
+                    .iter()
+                    .map(|part| scalar_text(part, true))
+                    .collect();
+                out.push(format!("{}- [{}]", " ".repeat(indent), parts?.join(", ")));
+            } else {
+                return Err("nested non-scalar sequences cannot be written".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

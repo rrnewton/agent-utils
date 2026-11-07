@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::index::{read_decision, read_pressure_plan, rebuild_policy_index};
@@ -1153,6 +1153,104 @@ pub(crate) enum Command {
         #[arg(long, value_name = "FILE")]
         config: PathBuf,
     },
+    /// Print the normal end-to-end workflow (Python `quickstart`)
+    Quickstart,
+    /// Inspect handoff-read slots awaiting safe retirement (Python `retirement-queue`)
+    RetirementQueue {
+        /// Output format: human or json
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Register already-created live worktrees (writer; fixture registries only until cutover)
+    Register {
+        /// Existing managed slot name
+        slot: String,
+        /// Type recorded at registration: agent or validate
+        #[arg(long, value_name = "TYPE")]
+        slot_type: Option<String>,
+        /// Confirm that the coordinator authorized this registration
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Registered agent name
+        #[arg(long, value_name = "AGENT")]
+        agent: String,
+        /// Task or work-item identifier
+        #[arg(long, value_name = "TASK")]
+        task: String,
+        /// Short human-readable reason for the slot
+        #[arg(long, value_name = "TEXT")]
+        purpose: String,
+        /// Live owner PID to bind
+        #[arg(long, value_name = "PID")]
+        owner_pid: i64,
+        /// Live coordinator PID to bind
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: i64,
+        /// Confirm that the named worktrees are currently owned and in use
+        #[arg(long)]
+        verified_live: bool,
+        /// Source repository as NAME=PATH (repeat once per checkout)
+        #[arg(long, value_name = "NAME=PATH")]
+        repo: Vec<String>,
+        /// Configured Git remote as NAME=REMOTE
+        #[arg(long, value_name = "NAME=REMOTE")]
+        remote: Vec<String>,
+        /// Expected fetch URL as NAME=URL
+        #[arg(long, value_name = "NAME=URL")]
+        remote_url: Vec<String>,
+        /// Transient systemd scope containing --owner-pid (both scope options together)
+        #[arg(long, value_name = "UNIT.scope")]
+        task_scope_unit: Option<String>,
+        /// Lowercase 32-hex systemd InvocationID for --task-scope-unit
+        #[arg(long, value_name = "HEX32")]
+        task_scope_invocation_id: Option<String>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Void a handoff-read retirement entry and rebind the slot to its live agent (writer; fixture registries only until cutover)
+    SupersedeHandoff {
+        /// Active slot whose handoff-read entry is superseded
+        slot: String,
+        /// Live agent name to record on the slot
+        #[arg(long, value_name = "AGENT")]
+        agent: String,
+        /// Live new-owner PID to bind
+        #[arg(long, value_name = "PID")]
+        owner_pid: i64,
+        /// Current slot generation; refuses stale callers
+        #[arg(long, value_name = "N")]
+        expected_generation: i64,
+        /// Live coordinator PID recorded with the supersession
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: i64,
+        /// Record that the coordinator authorized this supersession (required)
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Why the lane supersedes the handoff; recorded in the event log
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Convert or regenerate .wrkslots.yml (writer; fixture registries only until cutover)
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigCommand>,
+    },
     /// Partition reconstructed decisions into a bounded, non-executing pressure report
     Plan {
         /// Existing disposable SQLite index
@@ -1164,6 +1262,22 @@ pub(crate) enum Command {
         /// Optional stricter future-candidate count; indexed configuration remains the ceiling
         #[arg(long)]
         limit: Option<usize>,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ConfigCommand {
+    /// Rewrite the configuration as literate YAML or as JSON
+    Convert {
+        /// Format to write: yaml or json
+        #[arg(long = "to", value_name = "FORMAT", value_parser = ["yaml", "json"])]
+        target: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
     },
 }
 
@@ -1193,6 +1307,94 @@ impl<'a> From<&'a ReplaySummary> for CliSummary<'a> {
         }
     }
 }
+
+const QUICKSTART: &str = r##"wrkslots manages durable agent and validation worktree slots.
+
+1. Initialize the project once. The running command is project-owned and is called with the agent
+   name. It must return 0 for dead, 1 for alive, or 2 when it cannot determine the answer. init
+   writes .wrkslots.yml as literate YAML with a comment above every key (older JSON projects
+   still load; `wrkslots config convert --to yaml` converts them).
+
+     wrkslots init . --worktrees-dir worktrees/slots --liveness-command tools/agent-liveness.py
+
+2. Create a new linked worktree and branch from an existing source repository. The repository's
+   configured origin is used by default; add --remote product=upstream to choose another remote,
+   and add --remote-url product=URL when the caller must verify its fetch URL.
+
+     wrkslots create slot01 \
+       --slot-type agent --coordinator-authorized \
+       --agent codex-1 --task task-123 --purpose "fix parser" \
+       --coordinator-pid "$COORDINATOR_PID" --owner-pid "$OWNER_PID" \
+       --repo product=product --branch product=codex/fix-parser
+
+3. The exact recorded owner refreshes its heartbeat while working.
+
+     wrkslots heartbeat slot01 \
+       --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1
+
+4. Before exiting, the owner may record a clean, published handoff. This retains the slot.
+
+     wrkslots write-handoff slot01 \
+       --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1 \
+       --from-file /path/to/HANDOFF.md
+
+     wrkslots finish slot01 \
+       --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1 \
+       --validation "make test: pass"
+
+   An owner that is done with the slot but keeps running gives it back after writing the
+   handoff. The release is bound to that owner process, the generation, the current heartbeat,
+   and the handoff digest. It stops this generation's heartbeat, and removal then no longer waits
+   for the owner to exit or for the time-to-live. Leave the slot first: removal still refuses
+   while any process, the owner included, uses it.
+
+     wrkslots release slot01 \
+       --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1
+
+5. Reading a handoff prints its exact contents and enqueues that generation without removing it.
+
+     wrkslots read-handoff slot01 \
+       --coordinator-pid "$CURRENT_COORDINATOR_PID"
+
+6. After the registered running command and exact process identity prove the owner dead, and the
+   recorded time-to-live expires without renewal, any later coordinator may remove the slot. A
+   slot its owner released needs only the handoff read from step 5.
+   Agent slots preserve dirty and unpushed work first; validate slots skip salvage. Salvage never
+   stages a HANDOFF* file, and it pushes only to remotes listed in salvage_push_remotes. Work on
+   any other remote is kept in a self-contained Git bundle under <control>/wrkslots-salvage/ (or
+   under --salvage-archive-root), and removal begins only after the bundle and receipt pass
+   readback checks. If a push to an allowed remote refuses and an operator explicitly approves
+   durable local custody, pass an existing absolute directory outside the project.
+
+     wrkslots remove slot01 \
+       --coordinator-pid "$CURRENT_COORDINATOR_PID" --expected-generation 1
+
+   Add `--salvage-archive-root "$HOME/temp/agent_checkouts"` to that remove command to enable
+   this fallback for a refused push.
+
+If a create or removal is interrupted, preserve all paths and run:
+
+     wrkslots recover --coordinator-pid "$CURRENT_COORDINATOR_PID"
+
+Box a command or agent to a slot (plain or image-backed alike): per-slot limits, a fresh /tmp,
+the real $HOME read-only under a per-slot private layer, and only the slot, its Git directories,
+the project's outputs (ai_docs, experiments), and shared harness state writable. `init` writes
+every default into the configuration's sandbox section; inspect it with `sandbox show-config`.
+
+     wrkslots run slot01 -- make test
+     wrkslots run slot01 --isolation root -- HARNESS ...   # setuid helpers work inside
+     wrkslots shell-command slot01 --format json            # for agent launchers
+     wrkslots sandbox write-defaults                        # older projects: add missing keys
+
+Box a (sub)coordinator that creates slots and launches subagents into them: the same view,
+but every slot, the registry, and the slots' Git directories writable (--writable project: the
+whole project root), with no slot. Image slots it creates are mounted on the host.
+
+     wrkslots box --isolation root --cwd worktrees -- HARNESS ...
+     wrkslots shell-command --box --cwd worktrees --format json   # for agent launchers
+
+Use `wrkslots COMMAND --help` for the exact effects and inputs of one command.
+"##;
 
 /// Words after the first literal `--` in the process arguments, for
 /// handlers that must know which side of `--` a word was on (the
@@ -1228,6 +1430,133 @@ pub fn run() -> u8 {
         Command::Explain { index, slot } => {
             read_decision(&index, &slot).and_then(|decision| encode_value(&decision))
         }
+        Command::Quickstart => {
+            print!("{QUICKSTART}\n");
+            return 0;
+        }
+        Command::RetirementQueue {
+            format,
+            root,
+            machine,
+        } => match crate::retirement_queue::retirement_queue(
+            root.as_deref(),
+            machine.as_deref(),
+            format == "json",
+        ) {
+            Ok(text) => {
+                print!("{text}");
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
+        Command::Register {
+            slot,
+            slot_type,
+            coordinator_authorized,
+            agent,
+            task,
+            purpose,
+            owner_pid,
+            coordinator_pid,
+            verified_live,
+            repo,
+            remote,
+            remote_url,
+            task_scope_unit,
+            task_scope_invocation_id,
+            root,
+            machine,
+        } => match crate::register_write::register_slot(
+            root.as_deref(),
+            machine.as_deref(),
+            &slot,
+            slot_type.as_deref(),
+            coordinator_authorized,
+            &agent,
+            &task,
+            &purpose,
+            owner_pid,
+            coordinator_pid,
+            verified_live,
+            &repo,
+            &remote,
+            &remote_url,
+            task_scope_unit.as_deref(),
+            task_scope_invocation_id.as_deref(),
+        ) {
+            Ok(text) => {
+                print!("{text}");
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
+        Command::SupersedeHandoff {
+            slot,
+            agent,
+            owner_pid,
+            expected_generation,
+            coordinator_pid,
+            coordinator_authorized,
+            reason,
+            root,
+            machine,
+        } => match crate::supersede_write::supersede_handoff(
+            root.as_deref(),
+            machine.as_deref(),
+            &slot,
+            &agent,
+            owner_pid,
+            expected_generation,
+            coordinator_pid,
+            coordinator_authorized,
+            &reason,
+        ) {
+            Ok(text) => {
+                print!("{text}");
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("wrkslotsd: {error}");
+                return 1;
+            }
+        },
+        Command::Config { action } => match action {
+            Some(ConfigCommand::Convert {
+                target,
+                root,
+                machine,
+            }) => match crate::config_convert::config_convert(
+                root.as_deref(),
+                machine.as_deref(),
+                &target,
+            ) {
+                Ok(text) => {
+                    print!("{text}");
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            None => {
+                let mut command = Cli::command();
+                if let Some(config) = command
+                    .get_subcommands_mut()
+                    .find(|sub| sub.get_name() == "config")
+                {
+                    let _ = config.write_long_help(&mut std::io::stdout());
+                    println!();
+                }
+                return 0;
+            }
+        },
         Command::Plan {
             index,
             target_bytes,
