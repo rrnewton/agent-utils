@@ -2713,7 +2713,12 @@ fn journal_legacy_path(cfg: &Cfg, machine: &str) -> PathBuf {
     cfg.control.join(format!("ACTIVE.{machine}.journal"))
 }
 
-fn journal_scoped_path(cfg: &Cfg, operation: &str, machine: &str, slot: &str) -> PathBuf {
+pub(crate) fn journal_scoped_path(
+    cfg: &Cfg,
+    operation: &str,
+    machine: &str,
+    slot: &str,
+) -> PathBuf {
     cfg.control.join(format!(
         "{operation}.{}.{}.{}.{}.journal",
         machine.chars().count(),
@@ -2723,7 +2728,7 @@ fn journal_scoped_path(cfg: &Cfg, operation: &str, machine: &str, slot: &str) ->
     ))
 }
 
-fn json_equal(left: &Value, right: &Value) -> bool {
+pub(crate) fn json_equal(left: &Value, right: &Value) -> bool {
     match (canonical_json(left), canonical_json(right)) {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
@@ -2732,7 +2737,7 @@ fn json_equal(left: &Value, right: &Value) -> bool {
 
 /// The path one append-only operation event claims for its
 /// journal, with the oracle's identity checks.
-fn operation_event_journal_path(
+pub(crate) fn operation_event_journal_path(
     cfg: &Cfg,
     machine: &str,
     payload: &Map<String, Value>,
@@ -2856,7 +2861,10 @@ fn pending_journal_for_path(
     Ok(matches.into_iter().next())
 }
 
-fn scoped_operation_identity(journal: &Map<String, Value>, operation: &str) -> Option<String> {
+pub(crate) fn scoped_operation_identity(
+    journal: &Map<String, Value>,
+    operation: &str,
+) -> Option<String> {
     let field = if operation == "finish" {
         "fenced"
     } else {
@@ -2868,7 +2876,7 @@ fn scoped_operation_identity(journal: &Map<String, Value>, operation: &str) -> O
         .map(str::to_owned)
 }
 
-fn scoped_operation_opens(journal: &Map<String, Value>, operation: &str) -> bool {
+pub(crate) fn scoped_operation_opens(journal: &Map<String, Value>, operation: &str) -> bool {
     if operation == "finish" {
         journal.get("phase").and_then(Value::as_str) == Some("prepared")
     } else {

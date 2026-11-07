@@ -15,6 +15,8 @@ live registry before the edition cutover.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import socket
@@ -176,6 +178,179 @@ def test_recover_wrong_machine_journal_refuses(tmp_path: Path) -> None:
     result = _run(rust_root, [])
     assert result.returncode == 1
     assert "journal belongs to machine other-machine" in result.stderr
+
+
+def _scoped_name(operation: str, slot: str) -> str:
+    return f"{operation.upper()}.{len(MACHINE)}.{MACHINE}.{len(slot)}.{slot}.journal"
+
+
+def _events(root: Path, payloads: list[dict[str, object]]) -> None:
+    events = root / "worktrees" / f"EVENTS.{MACHINE}"
+    events.mkdir(exist_ok=True)
+    previous = "0" * 64
+    for index, payload in enumerate(payloads, start=1):
+        core: dict[str, object] = {
+            "schema": 1,
+            "machine": MACHINE,
+            "sequence": index,
+            "previous_sha256": previous,
+            "recorded_at": "2026-10-26T03:00:00Z",
+            "kind": payload.pop("kind"),
+            "payload": payload,
+        }
+        event = {**core, "sha256": wrkslots_cli._event_digest(core)}
+        previous = str(event["sha256"])
+        (events / f"{index:020d}.json").write_text(json.dumps(event))
+
+
+def _journal(operation: str, step: int) -> dict[str, object]:
+    base: dict[str, object] = {
+        "schema": 2, "kind": operation, "machine": MACHINE, "slot": "s1",
+    }
+    if operation == "create":
+        base.update(
+            {"created": [], "hook_progress": step, "operation_id": "a" * 32}
+        )
+    else:
+        base.update(
+            {"phase": "prepared" if step == 0 else "fenced", "fenced": "b" * 32}
+        )
+    return base
+
+
+def _progress(operation: str, journal: dict[str, object]) -> dict[str, object]:
+    return {
+        "kind": "operation-progress-recorded",
+        "operation": operation,
+        "slot": "s1",
+        "journal_path": _scoped_name(operation, "s1"),
+        "journal": journal,
+    }
+
+
+def _seed_scoped(
+    root: Path, operation: str, steps: list[dict[str, object]], on_disk: int
+) -> Path:
+    name = _scoped_name(operation, "s1")
+    path = root / "worktrees" / name
+    path.write_text(json.dumps(steps[on_disk]))
+    _events(root, [_progress(operation, step) for step in steps])
+    return path
+
+
+def _python_roll_forward(root: Path) -> str:
+    config = wrkslots_cli._load_config(str(root), None)
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        wrkslots_cli._roll_forward_lagging_scoped_journals(config)
+    return captured.getvalue()
+
+
+@pytest.mark.parametrize("operation", ["create", "finish"])
+def test_recover_rolls_forward_journal_one_step_behind(
+    tmp_path: Path, operation: str
+) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    steps = [_journal(operation, 0), _journal(operation, 1)]
+    rust_path = _seed_scoped(rust_root, operation, steps, 0)
+    oracle_path = _seed_scoped(oracle_root, operation, steps, 0)
+    printed = _python_roll_forward(oracle_root)
+    assert "rolled forward" in printed
+    assert json.loads(oracle_path.read_text()) == steps[1]
+    result = _run(rust_root, [])
+    assert result.returncode == 1
+    assert "rolled forward scoped " + operation + " journal" in result.stdout
+    assert "stays with the Python edition" in result.stderr
+    assert json.loads(rust_path.read_text()) == json.loads(oracle_path.read_text())
+
+
+@pytest.mark.parametrize("operation", ["create", "finish"])
+def test_recover_does_not_roll_journal_two_steps_behind(
+    tmp_path: Path, operation: str
+) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    steps = [_journal(operation, step) for step in range(3)]
+    # A third distinct progress step so the disk journal is two behind.
+    if operation == "create":
+        steps[2] = {**steps[1], "hook_progress": 2}
+    else:
+        steps[2] = {**steps[1], "phase": "archived"}
+    rust_path = _seed_scoped(rust_root, operation, steps, 0)
+    oracle_path = _seed_scoped(oracle_root, operation, steps, 0)
+    before = rust_path.read_bytes()
+    assert _python_roll_forward(oracle_root) == ""
+    assert oracle_path.read_bytes() == before
+    result = _run(rust_root, [])
+    assert result.returncode == 1
+    assert "rolled forward" not in result.stdout
+    assert rust_path.read_bytes() == before
+
+
+def test_recover_does_not_roll_completed_journal(tmp_path: Path) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    steps = [_journal("create", 0), _journal("create", 1)]
+    completion = {
+        "kind": "operation-completed",
+        "operation": "create",
+        "slot": "s1",
+        "journal_path": _scoped_name("create", "s1"),
+    }
+    paths = []
+    for root in (rust_root, oracle_root):
+        path = _seed_scoped(root, "create", steps, 0)
+        _events_append(root, dict(completion))
+        paths.append(path)
+    rust_path, oracle_path = paths
+    before = rust_path.read_bytes()
+    assert _python_roll_forward(oracle_root) == ""
+    assert oracle_path.read_bytes() == before
+    result = _run(rust_root, [])
+    assert result.returncode == 1
+    assert "rolled forward" not in result.stdout
+    assert rust_path.read_bytes() == before
+
+
+def _events_append(root: Path, payload: dict[str, object]) -> None:
+    events = root / "worktrees" / f"EVENTS.{MACHINE}"
+    existing = sorted(events.glob("*.json"))
+    core_events = [json.loads(path.read_text()) for path in existing]
+    index = len(core_events) + 1
+    previous = str(core_events[-1]["sha256"]) if core_events else "0" * 64
+    core: dict[str, object] = {
+        "schema": 1,
+        "machine": MACHINE,
+        "sequence": index,
+        "previous_sha256": previous,
+        "recorded_at": "2026-10-26T03:00:00Z",
+        "kind": payload.pop("kind"),
+        "payload": payload,
+    }
+    event = {**core, "sha256": wrkslots_cli._event_digest(core)}
+    (events / f"{index:020d}.json").write_text(json.dumps(event))
+
+
+def test_recover_roll_forward_identity_change_refuses_like_python(
+    tmp_path: Path,
+) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    first = _journal("create", 0)
+    forged = {**_journal("create", 1), "operation_id": "c" * 32}
+    rust_path = _seed_scoped(rust_root, "create", [first, forged], 0)
+    oracle_path = _seed_scoped(oracle_root, "create", [first, forged], 0)
+    before = rust_path.read_bytes()
+    config = wrkslots_cli._load_config(str(oracle_root), None)
+    with pytest.raises(Exception) as caught:
+        wrkslots_cli._roll_forward_lagging_scoped_journals(config)
+    assert "progress changed its operation identity" in str(caught.value)
+    assert oracle_path.read_bytes() == before
+    result = _run(rust_root, [])
+    assert result.returncode == 1
+    assert "progress changed its operation identity" in result.stderr
+    assert rust_path.read_bytes() == before
 
 
 def test_recover_refuses_without_fixture_attestation(tmp_path: Path) -> None:
