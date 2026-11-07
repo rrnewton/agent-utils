@@ -1433,10 +1433,8 @@ impl Store {
                 "the receipt validated tree {}, not the job's tree {}",
                 receipt.tree, job.tree
             ))
-        } else if let Some(reason) = tool_refusal {
-            Some(reason)
         } else {
-            None
+            tool_refusal
         };
         if let Some(reason) = refusal {
             job.history
