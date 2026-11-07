@@ -1,6 +1,6 @@
 ---
 title: 'create-journal-rollforward: a scoped create journal one progress step behind its event log blocks every create until recover rolls it forward'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-07T06:20:00.000000000+00:00
@@ -81,3 +81,14 @@ lands in Python and the Rust divergence is documented rather than duplicated.
 - Refusals preserved: two steps behind and wrong identity still refuse with
   "differs from append-only progress evidence" and leave the journal
   untouched.
+
+# Resolution
+
+Landed as dd825eee49383c1776b5e6c5847550455ee9d7af. `recover` rolls a scoped
+create or finish journal forward when it is exactly one progress step behind
+its authoritative event log, before any other refusal in the run; the
+validated event-temp promotion is kept and repaired in the same run. Rust
+`wrkslotsd` shares the strict check but leaves partial-update recovery with
+the Python edition, so no Rust change was needed. `make validate-all` exit 0
+(every selected node passed; 7 delegated-live-scope cross checks skipped and
+UNVERIFIED).
