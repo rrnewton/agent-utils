@@ -14,3 +14,5 @@ export { mountCallControls } from "./callcontrols.ts";
 export type { CallControls, CallControlsDependencies } from "./callcontrols.ts";
 export { mountPageButtons } from "./pagebuttons.ts";
 export type { PageButtons, PageButtonsDependencies } from "./pagebuttons.ts";
+export { mountCallComposer } from "./callcomposer.ts";
+export type { CallComposer, CallComposerDependencies, CannedPromptEntry } from "./callcomposer.ts";

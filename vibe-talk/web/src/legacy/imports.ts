@@ -138,7 +138,7 @@ import { decode, decodeTagged, is, roots } from "../contract/index.ts";
  */
 export const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged });
 
-export { createAutoplay, createReadAloud, createReadingJump, createVoiceCall, createVoiceTranscript, mountCallControls, mountPageButtons, mountReadControls } from "../view/voice/index.ts";
+export { createAutoplay, createReadAloud, createReadingJump, createVoiceCall, createVoiceTranscript, mountCallComposer, mountCallControls, mountPageButtons, mountReadControls } from "../view/voice/index.ts";
 
 export { HELP_TOPICS } from "../present/settings/index.ts";
 export { CANNED_PROMPTS, mountAgentPrefix, mountAgentSettings, mountAudioDevices, mountBarPlacement, mountCannedPrompts, mountChannelDirectory, mountChannelHistory, mountChannelSettings, mountConnectionReadouts, mountDismissedSends, mountHelpFolds, mountIdentityList, mountMessagePreferences, mountMicrophoneSettings, mountNoiseRules, mountOwnReadApply, mountPairing, mountPreferenceSwitches, mountReadingWidth, mountResumePreference, mountSaveTokenButton, mountScreenControls, mountServerCache, mountSettingsFolds, mountSettingsReadouts, mountSettingsSwitches, mountSettingsSyncView, mountSignInControls, mountTextSize, mountUpstreamClear, restoreStoredSettings } from "../view/settings/index.ts";

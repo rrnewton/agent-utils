@@ -425,6 +425,7 @@ declare const createReadAloud: LegacyImports["createReadAloud"];
 declare const createAutoplay: LegacyImports["createAutoplay"];
 declare const mountReadControls: LegacyImports["mountReadControls"];
 declare const mountCallControls: LegacyImports["mountCallControls"];
+declare const mountCallComposer: LegacyImports["mountCallComposer"];
 declare const mountPageButtons: LegacyImports["mountPageButtons"];
 declare const createReadingJump: LegacyImports["createReadingJump"];
 

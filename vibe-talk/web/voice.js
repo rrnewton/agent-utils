@@ -30891,31 +30891,25 @@ mountCallControls({
 // `guardQuietly`, NOT `guard`. `guard()` calls `teardown()`, so a send that failed would hang up on
 // the owner — which is the one thing a failed message must never do. The conversation a first send
 // starts is guarded on its own, inside `sendTyped`, exactly as Talk's is.
-el("send-text").addEventListener("click", guardQuietly(voiceCall().sendTyped));
-el("compose-text").value = voiceCall().storedComposeDraft();
-// `#241 voice-composer`. A tap on the part of the box that shows takes the whole of it into view.
-el("compose-text").addEventListener("focus", () => {
-  if (voiceCall().writingToAgent()) voiceCall().keepComposerInView();
-});
-el("compose-text").addEventListener("input", () => {
-  voiceCall().rememberComposeDraft();
-  voiceCall().noteComposing();
-});
-// `#60 canned-prompt-buttons`. ONE loop over the list: the field is restored, the field is saved
-// when it changes, and the button sends whatever the field says. A third canned prompt is one more
-// entry in `CANNED_PROMPTS` and one more pair of elements in web/voice.html — there is deliberately
-// no third place to remember.
-//
-// The defaults are written into `.value` HERE rather than typed into web/voice.html, exactly as
-// `#api-token` is: text inside a <textarea> in the markup is its child text, and `.value` and the
-// markup would then be two different answers to "what does this button send".
-for (const entry of CANNED_PROMPTS) {
-  /** @type {HTMLTextAreaElement} */ (el(entry.field)).value = cannedPrompts.stored()[entry.key];
-  // `input` as well as `change`: `change` waits for the field to lose focus, and a phone that kills
-  // the app while the field still has it never gets one. `#193 compose-draft-loss`.
-  el(entry.field).addEventListener("input", cannedPrompts.changed);
-  el(entry.field).addEventListener("change", cannedPrompts.changed);
-  el(entry.button).addEventListener("click", () => {
+// Send, the box's draft restored and kept as it is written, a tap that takes the box into view (`#241
+// voice-composer`), and each canned prompt's field restored and kept and its button (`#60 canned-prompt-buttons`).
+// One owner in web/src/view/voice/callcomposer.ts (`#624 voice-page-modularity`), mounted here, in the page's order;
+// its `unmount` waits for the ordered boot's teardown.
+mountCallComposer({
+  lookup: (id) => el(id),
+  sendTyped: guardQuietly(voiceCall().sendTyped),
+  storedComposeDraft: () => voiceCall().storedComposeDraft(),
+  composerFocused: () => {
+    if (voiceCall().writingToAgent()) voiceCall().keepComposerInView();
+  },
+  composeInput: () => {
+    voiceCall().rememberComposeDraft();
+    voiceCall().noteComposing();
+  },
+  cannedPrompts: CANNED_PROMPTS,
+  storedCannedPrompts: () => cannedPrompts.stored(),
+  cannedPromptsChanged: () => cannedPrompts.changed(),
+  pressCannedPrompt: (entry) => {
     // Shut FIRST, and whether or not the send goes. Choosing from a menu closes it — and when the
     // send is refused the reason appears on the status line at the far end of the screen, which an
     // open tray would be standing in front of.
@@ -30925,8 +30919,8 @@ for (const entry of CANNED_PROMPTS) {
       // message. This says WHICH question was asked, because the button carries five letters.
       setStatus(entry.said);
     }
-  });
-}
+  },
+});
 // The prompts tray's and the action menu's openers, each a plain toggle, and what they show stated once at load
 // (`#820 voice-page-action-menu`, `#880 voice-page-menu-placement`, `#886 voice-page-autoplay`). One owner in
 // web/src/view/shell/menuopeners.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its `unmount`

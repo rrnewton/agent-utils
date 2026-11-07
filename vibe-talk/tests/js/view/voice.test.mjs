@@ -278,3 +278,40 @@ test("`#624 voice-page-modularity`: the page's buttons beside the call reach the
   buttons.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
+
+test("`#624 voice-page-modularity`: the call's box and the canned prompts are restored as kept and heard in the page's order, each prompt's button sending its own, and come down again", () => {
+  const { mountCallComposer } = VIEW_VOICE;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, value: "", listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener({ type }));
+  const entries = [{ field: "prompt-a", button: "send-a", key: "a" }, { field: "prompt-b", button: "send-b", key: "b" }];
+  const composer = mountCallComposer({
+    lookup: (id) => target(id),
+    sendTyped: (...args) => { log.push(`send ${args.length}`); return "sending"; },
+    storedComposeDraft: () => { log.push("stored draft"); return "half a thought"; },
+    composerFocused: () => log.push("focused"),
+    composeInput: () => log.push("input"),
+    cannedPrompts: entries,
+    storedCannedPrompts: () => { log.push("stored prompts"); return { a: "what's new?", b: "summarise" }; },
+    cannedPromptsChanged: (...args) => log.push(`prompts changed ${args.length}`),
+    pressCannedPrompt: (entry) => log.push(`press ${entry.key}`),
+  });
+  assert.deepStrictEqual(log, ["listen send-text click", "stored draft", "listen compose-text focus", "listen compose-text input",
+    "stored prompts", "listen prompt-a input", "listen prompt-a change", "listen send-a click",
+    "stored prompts", "listen prompt-b input", "listen prompt-b change", "listen send-b click"], "restored or heard out of the page's order");
+  assert.deepStrictEqual([nodes["compose-text"].value, nodes["prompt-a"].value, nodes["prompt-b"].value], ["half a thought", "what's new?", "summarise"]);
+  log.length = 0;
+  assert.deepStrictEqual(fire("send-text", "click"), ["sending"], "Send did not answer what the send answers");
+  fire("compose-text", "focus");
+  fire("compose-text", "input");
+  fire("prompt-b", "input");
+  fire("prompt-a", "change");
+  fire("send-b", "click");
+  fire("send-a", "click");
+  assert.deepStrictEqual(log, ["send 0", "focused", "input", "prompts changed 0", "prompts changed 0", "press b", "press a"]);
+  composer.unmount();
+  assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+});
