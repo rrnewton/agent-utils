@@ -31028,19 +31028,16 @@ quickDrafts.load();
 draftLedger.load();
 // What the ledger kept of drafts sent, emptied or overwritten elsewhere since is let go of.
 draftLedger.prune(draftHeld);
-for (const view of ["main", "threads", "flat"]) {
-  el(`channel-view-${view}`).addEventListener("click", guardQuietly(() => changeChannelView(view)));
-}
-el("thread-back").addEventListener("click", guardQuietly(closeThread));
-el("thread-select").addEventListener("change", guardQuietly(onThreadSelect));
-// Touching the picker is the cue that the reader wants the full list of threads. (`#231
-// two-column-polish` greyed it in two columns, and touching that one read nothing; since `#281
-// view-keys` it chooses there too.)
-for (const type of ["focus", "pointerdown"]) {
-  el("thread-select").addEventListener(type, () => {
-    guardQuietly(refreshThreadDirectory)();
-  });
-}
+// The channel's view chips, the thread's Back, a thread chosen, and the picker touched, the cue that the reader wants
+// the full list of threads. One owner in web/src/view/channel/viewcontrols.ts (`#624 voice-page-modularity`), mounted
+// here, in the page's order; its `unmount` waits for the ordered boot's teardown.
+mountChannelViewControls({
+  lookup: (id) => el(id),
+  changeView: (view) => guardQuietly(() => changeChannelView(view))(),
+  closeThread: () => guardQuietly(closeThread)(),
+  selectThread: () => guardQuietly(onThreadSelect)(),
+  refreshThreadDirectory: () => guardQuietly(refreshThreadDirectory)(),
+});
 // The channel's box, and a thread's, which is the same box posting somewhere else: what is written kept as it is
 // written, Send, its keys, and what is pasted (web/src/view/composer/boxlisteners.ts).
 mountMessageBox({
@@ -31091,28 +31088,32 @@ inColumn(columns.side, () => {
     onKey: inThisColumn((event) => onComposerKey(event, guardQuietly(sendChannelMessage), sideBox)),
     watchBoxInsertions: (box) => watchBoxInsertions(box),
   });
-  el("load-older").addEventListener("click", inThisColumn(guardQuietly(olderControlPressed)));
-  el("clear-backlog").addEventListener("click", inThisColumn(guardQuietly(clearBacklog)));
-  // `#338 column-overscroll`. The reader's own way to the newest line lands on the foot, as End does.
-  el("jump-newest").addEventListener("click", inThisColumn(() => {
-    closeOverscroll();
-    scrollToNewest();
-  }));
-  // What the left column's scroll listener does, for this list: the jump, the way back to a reply,
-  // the step back at the top, and the summaries of what has come into view.
-  el("scroll-area").addEventListener("scroll", inThisColumn(() => {
-    if (!sideShowing()) return;
-    renderJumpNewest();
-    if (replyArrows().back !== null) {
-      const reply = replyReturnRow();
-      if (reply === null || rowOnScreen(reply)) {
-        replyArrows().back = null;
-        renderScrollTools();
+  // This list's own controls (web/src/view/channel/sidelistcontrols.ts), each act done in this column.
+  mountSideListControls({
+    lookup: (id) => el(id),
+    loadOlder: inThisColumn(guardQuietly(olderControlPressed)),
+    clearBacklog: inThisColumn(guardQuietly(clearBacklog)),
+    // `#338 column-overscroll`. The reader's own way to the newest line lands on the foot, as End does.
+    jumpNewest: inThisColumn(() => {
+      closeOverscroll();
+      scrollToNewest();
+    }),
+    // What the left column's scroll listener does, for this list: the jump, the way back to a reply,
+    // the step back at the top, and the summaries of what has come into view.
+    listScrolled: inThisColumn(() => {
+      if (!sideShowing()) return;
+      renderJumpNewest();
+      if (replyArrows().back !== null) {
+        const reply = replyReturnRow();
+        if (reply === null || rowOnScreen(reply)) {
+          replyArrows().back = null;
+          renderScrollTools();
+        }
       }
-    }
-    maybeLoadOlder();
-    requestVisibleSummaries();
-  }));
+      maybeLoadOlder();
+      requestVisibleSummaries();
+    }),
+  });
 });
 // The window's width decides one column or two, through the stylesheet: asked again once per frame of
 // a resize, never per scroll (web/src/view/dom `createOncePerFrame`).

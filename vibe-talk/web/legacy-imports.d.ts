@@ -339,6 +339,8 @@ declare const mountListWatch: LegacyImports["mountListWatch"];
 declare const mountListKeepers: LegacyImports["mountListKeepers"];
 declare const mountListGestures: LegacyImports["mountListGestures"];
 declare const mountListControls: LegacyImports["mountListControls"];
+declare const mountChannelViewControls: LegacyImports["mountChannelViewControls"];
+declare const mountSideListControls: LegacyImports["mountSideListControls"];
 declare const mountSideControls: LegacyImports["mountSideControls"];
 declare const createLinkedMark: LegacyImports["createLinkedMark"];
 declare const createCardFlight: LegacyImports["createCardFlight"];

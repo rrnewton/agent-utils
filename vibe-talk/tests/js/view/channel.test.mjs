@@ -1435,3 +1435,54 @@ test("`#890 voice-page-linked-highlight`: the linked message is marked on every 
     globalThis.document = was;
   }
 });
+
+test("`#624 voice-page-modularity`: the view chips, the thread's Back and the picker reach what each names in the page's order, a touch on the picker answering nothing, and come down again", () => {
+  const { mountChannelViewControls } = CHANNEL_VIEW;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener({ type }));
+  const controls = mountChannelViewControls({
+    lookup: (id) => target(id),
+    changeView: (...args) => { log.push(`view ${args.join(" ")}`); return "changing"; },
+    closeThread: (...args) => { log.push(`back ${args.length}`); return "closing"; },
+    selectThread: (...args) => { log.push(`select ${args.length}`); return "selecting"; },
+    refreshThreadDirectory: (...args) => { log.push(`refresh ${args.length}`); return "refreshing"; },
+  });
+  assert.deepStrictEqual(log, ["listen channel-view-main click", "listen channel-view-threads click", "listen channel-view-flat click",
+    "listen thread-back click", "listen thread-select change", "listen thread-select focus", "listen thread-select pointerdown"],
+    "a control was heard out of the page's order");
+  log.length = 0;
+  assert.deepStrictEqual(["main", "threads", "flat"].flatMap((view) => fire(`channel-view-${view}`, "click")), ["changing", "changing", "changing"]);
+  assert.deepStrictEqual(fire("thread-back", "click"), ["closing"]);
+  assert.deepStrictEqual(fire("thread-select", "change"), ["selecting"]);
+  // The read goes on behind a touch: nothing waits on it.
+  assert.deepStrictEqual([...fire("thread-select", "focus"), ...fire("thread-select", "pointerdown")], [undefined, undefined]);
+  assert.deepStrictEqual(log, ["view main", "view threads", "view flat", "back 0", "select 0", "refresh 0", "refresh 0"]);
+  controls.unmount();
+  assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+});
+
+test("`#624 voice-page-modularity`: the right column list's controls reach what each names in the page's order, answering what each answers, and come down again", () => {
+  const { mountSideListControls } = CHANNEL_VIEW;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener({ type }));
+  const act = (name) => (...args) => { log.push(`${name} ${args.length}`); return name; };
+  const controls = mountSideListControls({
+    lookup: (id) => target(id),
+    loadOlder: act("older"), clearBacklog: act("clear"), jumpNewest: act("newest"), listScrolled: act("scrolled"),
+  });
+  assert.deepStrictEqual(log, ["listen load-older click", "listen clear-backlog click", "listen jump-newest click", "listen scroll-area scroll"]);
+  log.length = 0;
+  assert.deepStrictEqual([fire("load-older", "click"), fire("clear-backlog", "click"), fire("jump-newest", "click"), fire("scroll-area", "scroll")].flat(),
+    ["older", "clear", "newest", "scrolled"]);
+  assert.deepStrictEqual(log, ["older 0", "clear 0", "newest 0", "scrolled 0"], "an act was handed the event");
+  controls.unmount();
+  assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+});
