@@ -27,3 +27,24 @@ Two parts. Either alone helps.
 # Notes
 
 Requested 2026-11-06 by the lead coordinator after five collisions in one day.
+
+Status from mu-validate, 2026-11-06: the landing guard ships in this change
+as `scripts/check_issue_numbers.py` (wired into validation/repository.dag.yaml
+as repository.hygiene.issue-numbers plus its self-test, and `make
+check-issue-numbers`). It refuses a touched issue file whose number the target
+main already files under a different slug, naming both slugs, and lets edits
+under the existing slug through; a change filing one new number twice is
+refused the same way. Chosen base handling: the target main is `--base` or the
+first of github/main/origin/main that resolves, fail-closed when none does.
+
+Atomic allocation choice: reserve the number against the canonical remote with
+compare-and-swap (a pushed reservation object or lease-guarded ref update),
+NOT collision-proof suffixes — the readable `#N slug` convention (#86-era
+agents cite numbers in commits, PRs and chat, and renumbering breaks those
+quotes) is worth the guard. `mb` belongs to the external minibeads tool
+consumed via ext/minibeads + PATH, so the implementation is filed as #991
+mb-create-atomic-allocation instead of being written here.
+
+One follow-up seen while wiring: two lanes pushing the same stale issue-edit
+(the same slug edited differently) still needs the normal content rebase; this
+guard covers the number/slug collision it was filed for.

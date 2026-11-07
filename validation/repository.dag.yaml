@@ -212,6 +212,32 @@ steps:
       rss_baseline_bytes: 268435456
 
   - group: hygiene
+    job: issue-numbers-self-test
+    desc: prove the issue-number collision guard can fail
+    cmd: python3 scripts/check_issue_numbers.py --self-test
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 536870912
+
+  - group: hygiene
+    job: issue-numbers
+    desc: refuse an issue filed under a number the target main already owns under another slug
+    cmd: python3 scripts/check_issue_numbers.py
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      est_duration_s: 2
+      classification: light
+      rss_baseline_bytes: 536870912
+
+  - group: hygiene
     job: documented-defaults-self-test
     desc: prove the documented-default guard can fail
     cmd: python3 scripts/check_documented_defaults.py --self-test
