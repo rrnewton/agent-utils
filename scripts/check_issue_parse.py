@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import shutil
 import subprocess
 import sys
@@ -38,20 +39,69 @@ def _run(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
 
 
+def _local_minibeads(root: Path, commit: str) -> Path | None:
+    """A minibeads clone already on this host that holds the pinned commit.
+
+    Every linked worktree of this repository keeps its own submodule clone
+    under the common git directory, so a fresh worktree can check the
+    submodule out from a sibling's clone with no network.
+    """
+
+    done = _run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=root)
+    if done.returncode != 0:
+        return None
+    common = Path(done.stdout.strip())
+    candidates = [common / "modules" / PINNED]
+    candidates += sorted((common / "worktrees").glob(f"*/modules/{PINNED}"))
+    for candidate in candidates:
+        has = _run(["git", "--git-dir", str(candidate), "cat-file", "-e", f"{commit}^{{commit}}"], cwd=root)
+        if has.returncode == 0:
+            return candidate
+    return None
+
+
+def _checkout_pinned(root: Path, source: Path) -> None:
+    """Check out `ext/minibeads` without the network, or name the one fix."""
+
+    pinned = _run(["git", "rev-parse", f"HEAD:{PINNED}"], cwd=root)
+    commit = pinned.stdout.strip()
+    local = _local_minibeads(root, commit) if pinned.returncode == 0 else None
+    if local is not None:
+        # Clone from a sibling worktree's submodule: a gate never needs the network.
+        done = _run(
+            ["git", "-c", "protocol.file.allow=always",
+             "-c", f"submodule.{PINNED}.url={local}",
+             "submodule", "update", "--init", str(PINNED)],
+            cwd=root,
+        )
+        if done.returncode == 0 and (source / "Cargo.toml").is_file():
+            return
+        detail = done.stderr.strip()
+    else:
+        detail = f"no clone of minibeads on this host holds the pinned commit {commit or '?'}"
+    raise SystemExit(
+        f"check-issue-parse: cannot check out the pinned minibeads at {PINNED} "
+        f"without the network ({detail}).\n"
+        "  Initialize it once, outside the gate: "
+        f"herdr-run run --cwd {root} \"git submodule update --init {PINNED}\""
+    )
+
+
 def ensure_mb(root: Path) -> Path:
-    """The pinned `mb` binary, built from `ext/minibeads` (never PATH)."""
+    """The pinned `mb` binary, built from `ext/minibeads` (never PATH).
+
+    The check and its self-test run as two gate steps at once, so the checkout
+    and the build happen under one lock in the worktree's git directory.
+    """
 
     source = root / PINNED
-    if not (source / "Cargo.toml").is_file():
-        done = _run(
-            ["git", "submodule", "update", "--init", str(PINNED)], cwd=root
-        )
-        if done.returncode != 0 or not (source / "Cargo.toml").is_file():
-            raise SystemExit(
-                "check-issue-parse: cannot check out the pinned minibeads at "
-                f"{PINNED}:\n{done.stderr.strip()}"
-            )
-    done = _run(["cargo", "build", "--release", "--bin", "mb"], cwd=source)
+    git_dir = _run(["git", "rev-parse", "--path-format=absolute", "--git-dir"], cwd=root)
+    lock_path = Path(git_dir.stdout.strip() or root) / "check-issue-parse.lock"
+    with lock_path.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not (source / "Cargo.toml").is_file():
+            _checkout_pinned(root, source)
+        done = _run(["cargo", "build", "--release", "--bin", "mb"], cwd=source)
     binary = source / "target" / "release" / "mb"
     if done.returncode != 0 or not binary.is_file():
         raise SystemExit(
