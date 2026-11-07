@@ -20,7 +20,8 @@ PY = sys.executable
 
 def _env(tmp_path: Path) -> dict[str, str]:
     return {**os.environ, "GATE_ADMISSION_DIR": str(tmp_path / "admission"),
-            "GATE_LEDGER": str(tmp_path / "ledger.jsonl"), "GATE_PRUNE_TARGETS": "off"}
+            "GATE_LEDGER": str(tmp_path / "ledger.jsonl"), "GATE_PRUNE_TARGETS": "off",
+            "GATE_SLOTS_CONFIG": str(tmp_path / "gate-slots.toml")}
 
 
 def _start(tmp_path: Path, *args: str) -> subprocess.Popen[str]:
@@ -86,6 +87,44 @@ def test_shared_gates_run_up_to_the_cap_and_queue_the_rest(tmp_path: Path) -> No
     assert "admitted after" in out
     for proc in sleepers:
         proc.communicate(timeout=30)
+
+
+def test_the_host_slots_file_caps_every_waiter_and_is_reread_while_queued(tmp_path: Path) -> None:
+    """A host cap lowers a waiter's own --slots, and lifting it admits the
+    queued waiter at once, without re-queueing, while the first still runs."""
+    cap = tmp_path / "gate-slots.toml"
+    cap.write_text("slots = 1\n")
+    holder = _start(tmp_path, "--slots", "3", "--", PY, "-c", "import time; time.sleep(8)")
+    _wait_for_runs(tmp_path, 1)
+    second = _start(tmp_path, "--slots", "3", "--", PY, "-c", "pass")
+    _wait_for_queue(tmp_path, 1)
+    time.sleep(1.5)
+    assert second.poll() is None  # held by the cap, not by its own --slots 3
+    cap.unlink()
+    out, _ = second.communicate(timeout=30)
+    assert holder.poll() is None, "the second gate should start beside the first once the cap lifts"
+    assert "queued at position 1" in out
+    assert "admitted after" in out
+    holder.communicate(timeout=30)
+
+
+def test_a_malformed_host_slots_file_caps_at_one_and_says_why(tmp_path: Path) -> None:
+    cap = tmp_path / "gate-slots.toml"
+    for text in ("slots = 0\n", "slots = 'two'\n", "slots = 2\nextra = 1\n", "not toml = =\n"):
+        cap.write_text(text)
+        result = subprocess.run([PY, str(GATE), "status"], env={**_env(tmp_path), "GATE_SLOTS": "3"},
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout
+        assert "shared slots 1" in result.stdout, (text, result.stdout)
+        assert "capping at 1" in result.stdout, (text, result.stdout)
+    cap.write_text("slots = 2\n")
+    result = subprocess.run([PY, str(GATE), "status"], env=_env(tmp_path),
+                            capture_output=True, text=True, timeout=30)
+    assert f"shared slots 2 (host cap 2 from {cap})" in result.stdout
+    cap.unlink()
+    result = subprocess.run([PY, str(GATE), "status"], env=_env(tmp_path),
+                            capture_output=True, text=True, timeout=30)
+    assert "shared slots 2 (no host cap;" in result.stdout
 
 
 def _wait_for_queue(tmp_path: Path, count: int) -> None:

@@ -8,7 +8,11 @@ Drop-in replacement for the one-gate-at-a-time flock line:
 
 Shared gates run up to --slots (default 2) concurrently; each gate is already
 boxed by the validation scheduler's own resource caps, so concurrency here is
-admission, not scheduling. An --exclusive run waits until nothing else is
+admission, not scheduling. A per-host slots file (default
+~/.local/etc/agent-utils/gate-slots.toml, override with $GATE_SLOTS_CONFIG)
+holding `slots = N` caps every waiter at N, and is re-read on every poll, so
+an operator can lower the host's limit (for example while disk is short)
+without anyone re-queueing; with no file each waiter keeps its own --slots. An --exclusive run waits until nothing else is
 running and blocks new admissions until it finishes, so load-sensitive steps
 (timing-sensitive browser walks, solo shard reruns) never share the box.
 
@@ -108,6 +112,40 @@ BLACKOUT_EXIT = 78
 RERUN_MAX_STEPS = 4
 
 DEFAULT_BLACKOUT_CONFIG = Path("~/.local/etc/agent-utils/gate.toml")
+
+#: The host-wide slot cap lives in its own file, not in gate.toml: a checkout
+#: older than this key refuses every start when gate.toml holds anything but
+#: [[blackout]] tables, and every slot runs its own checkout's gate.py.
+DEFAULT_SLOTS_CONFIG = Path("~/.local/etc/agent-utils/gate-slots.toml")
+
+
+def slots_config_path() -> Path:
+    return Path(os.environ.get("GATE_SLOTS_CONFIG") or DEFAULT_SLOTS_CONFIG).expanduser()
+
+
+def host_slot_cap(path: Path | None = None) -> tuple[int | None, str | None]:
+    """The host's slot cap and, when the file is unusable, why.
+
+    No file means no cap. A file that cannot be read as `slots = N` with N a
+    positive integer caps at 1: the file exists because someone wanted fewer
+    concurrent gates, so a typo must not quietly restore the default.
+    """
+
+    path = slots_config_path() if path is None else path
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        return 1, f"gate slots config {path} is unreadable ({exc}); capping at 1"
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        return 1, f"gate slots config {path} is not TOML ({exc}); capping at 1"
+    value = raw.get("slots")
+    if set(raw) != {"slots"} or isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return 1, f"gate slots config {path} must hold only `slots = N` with N >= 1; capping at 1"
+    return value, None
 
 
 def blackout_config_path(explicit: str | None = None) -> Path:
@@ -264,6 +302,7 @@ class Admission:
     def __init__(self, root: Path, slots: int) -> None:
         self.root = root
         self.slots = slots
+        self._slots_problem: str | None = None
         (root / "queue").mkdir(parents=True, exist_ok=True)
         (root / "runs").mkdir(parents=True, exist_ok=True)
         self._lock = (root / "admission.lock").open("a+")
@@ -281,6 +320,14 @@ class Admission:
             return data if isinstance(data, dict) else None
         except Exception:
             return None
+
+    def effective_slots(self) -> int:
+        """This waiter's --slots, lowered to the host cap when one is set."""
+        cap, problem = host_slot_cap()
+        if problem and problem != self._slots_problem:
+            print(f"gate: {problem}", flush=True)
+        self._slots_problem = problem
+        return self.slots if cap is None else min(self.slots, cap)
 
     def _reap(self) -> None:
         for folder in ("queue", "runs"):
@@ -341,7 +388,7 @@ class Admission:
                     return False
                 if any(run.get("class") == "exclusive" for run in runs):
                     return False
-                if len(runs) >= self.slots:
+                if len(runs) >= self.effective_slots():
                     return False
             for path, data in tickets:
                 if str(data["id"]) == run_id:
@@ -604,6 +651,11 @@ def show_status(args: argparse.Namespace) -> int:
     recent = [r for r in rows if float(str(r.get("finished_at", 0))) >= cutoff]
     waits = sorted(float(str(r["wait_s"])) for r in recent if "wait_s" in r)
     print(f"gate status: {len(runs)} running {runs}, {len(queue)} queued {queue}")
+    cap, problem = host_slot_cap()
+    print(f"gate status: shared slots {adm.effective_slots()}"
+          + (f" (host cap {cap} from {slots_config_path()})" if cap is not None else
+             f" (no host cap; {slots_config_path()} absent)")
+          + (f"; {problem}" if problem else ""))
     print(f"gate status: {len(recent)} finished in 24h "
           f"({len(recent) / 24.0:.1f}/hour), "
           f"median wait {(waits[len(waits) // 2] if waits else 0):.0f}s, "
@@ -1144,7 +1196,9 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--slots", type=int, default=int(os.environ.get("GATE_SLOTS", "2")),
-                        help="concurrent shared gates (default 2, or $GATE_SLOTS)")
+                        help="concurrent shared gates (default 2, or $GATE_SLOTS); a host cap in "
+                             "~/.local/etc/agent-utils/gate-slots.toml (`slots = N`, or the file "
+                             "$GATE_SLOTS_CONFIG names) lowers it and is re-read on every poll")
     parser.add_argument("--exclusive", dest="cls", action="store_const", const="exclusive", default="shared",
                         help="run alone: wait for an empty box and block new admissions")
     parser.add_argument("--wait-timeout", type=float, default=0.0, help="give up queueing after N seconds (0 = wait forever)")
