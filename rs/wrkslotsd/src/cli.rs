@@ -2488,6 +2488,17 @@ pub fn run() -> u8 {
                     print!("{text}");
                     return 0;
                 }
+                Err(crate::classify_journals::ClassifyError::Blocked { first, payload }) => {
+                    // Seal refusal (c4c4c64a): structured reasons on stdout
+                    // in JSON mode; refusal exit 3 like the Python main.
+                    if let Some(payload) = payload {
+                        print!("{payload}");
+                    }
+                    eprintln!(
+                        "wrkslotsd: interrupted validation-batch seal recorded in {first}; run 'wrkslots recover' first"
+                    );
+                    return 3;
+                }
                 Err(crate::classify_journals::ClassifyError::Busy { kind, pid, journal }) => {
                     // Retryable busy (#992): exit 75 (TEMPFAIL), not a refusal.
                     if format == "json" {
