@@ -3020,7 +3020,7 @@ test("`#304 back-gesture-in-app`: a thread opened is one entry at the page's own
 
   // NEGATIVE CONTROLS. With no popstate listener the gesture lands on the page's base and leaves the
   // thread open; with no entry pushed at all, it leaves the app from inside the thread — the owner's report.
-  const deaf = await threadThenGesture(brokenScript('window.addEventListener("popstate", onBackPop);', ""));
+  const deaf = await threadThenGesture(await brokenModule([{ file: "src/view/shell/navigation.ts", find: 'window.addEventListener("popstate", onBackPop);', replace: "" }]));
   assert.equal(deaf.after.thread, true, "the control without a popstate listener closed the thread anyway");
   const flat = await threadThenGesture(await brokenModule([{ file: "src/core/navigation/backstack.ts", find: 'history.pushState(backEntry(at + 1, levels[at]), "");', replace: "" }]));
   assert.equal(flat.opened.grew, 0, "the control that pushes nothing pushed an entry");
@@ -3482,7 +3482,7 @@ test("`#304 back-gesture-in-app`: CTRL+1 TO CTRL+4 between Main, All and two col
   assert.equal(thread.left, false);
 
   // NEGATIVE CONTROL: a page that takes every view but Main for a thread pushes for All.
-  const pushy = await viewKeyWalk(brokenScript('} else if (selection().view === "thread") {', '} else if (selection().view !== "main") {'));
+  const pushy = await viewKeyWalk(await brokenModule([{ file: "src/view/shell/navigation.ts", find: '    } else if (deps.selection().view === "thread") {', replace: '    } else if (deps.selection().view !== "main") {' }]));
   assert.ok(pushy.seen.slice(0, 6).some((step) => step.pushed > 0), "the control that takes All for a screen pushed nothing");
 });
 
@@ -3639,8 +3639,8 @@ test("`#304 back-gesture-in-app`: A MENU IS AN ENTRY even where the browser has 
 
   // NEGATIVE CONTROL: the page as this change first made it, where a browser with close watchers gives
   // a menu no entry: a plain Back closes the thread under the menu, and the menu stays open.
-  const unlisted = await menuOverLevel(false, brokenScript("  levels.push(...openMenus());",
-    "  if (typeof window.CloseWatcher !== \"function\") levels.push(...openMenus());"));
+  const unlisted = await menuOverLevel(false, await brokenModule([{ file: "src/view/shell/navigation.ts", find: "    levels.push(...openMenus());",
+    replace: "    if (typeof window.CloseWatcher !== \"function\") levels.push(...openMenus());" }]));
   assert.deepStrictEqual(unlisted.opened.facts, { depth: 1, tag: "thread" }, "the control gave the menu an entry");
   assert.equal(unlisted.first.thread, false, "the control's Back did not close the thread under the menu");
   assert.equal(unlisted.first.menu, true, "the control's Back closed the menu");
@@ -3762,7 +3762,7 @@ test("`#304 back-gesture-in-app`: A REPLY OPEN AT THE FOOT OF THE RIGHT COLUMN i
   // NEGATIVE CONTROLS. A page that takes no reply open in a column for a level closes the thread under
   // it with the one gesture; one never told a reply opened gives it no entry; one never told it was put
   // down leaves its entry for the next gesture to spend.
-  const unlevelled = await dockedReplyWalk(brokenScript('  if (replyState.docked) levels.push("reply");\n', "\n"));
+  const unlevelled = await dockedReplyWalk(await brokenModule([{ file: "src/view/shell/navigation.ts", find: '    if (deps.replyDocked()) levels.push("reply");\n', replace: "\n" }]));
   assert.deepStrictEqual(unlevelled.docked.facts, { depth: 1, tag: "side" }, "the control with no reply level pushed an entry for it");
   assert.equal(unlevelled.gesture.cards, true, "the control with no reply level kept the right column's thread on the gesture");
   const untold = await dockedReplyWalk(brokenScript(
@@ -3811,7 +3811,7 @@ test("`#304 back-gesture-in-app`: an entry wanted before the reader has touched 
 
 test("`#304 back-gesture-in-app`: a Back that cannot close what is open never traps the reader: no entry is pushed for it again, and the next gesture leaves", async () => {
   // A page whose thread the gesture cannot close, made so on purpose: the safety net is what is tested.
-  const page = await backPage({ script: brokenScript('else if (tag === "thread") leaveThread();', "") });
+  const page = await backPage({ script: await brokenModule([{ file: "src/view/shell/navigation.ts", find: '    else if (tag === "thread") deps.leaveThread();', replace: "" }]) });
   await openFirstThread(page);
   assert.deepStrictEqual(backFacts(page), { depth: 1, tag: "thread" });
   await page.browserBack();

@@ -2,7 +2,7 @@
 // voice-page-modularity`, moved from the legacy script into view/shell): the screen shown (sign-in, the main
 // screen, Settings, Help), the screen Settings' way out goes back to, where Back on Help goes, and the view
 // the main screen shows (the call's or the channel's). Showing and hiding the screens and panes, and what goes
-// with each change, are the page's (`showScreen`, `showView`).
+// with each change, are view/shell's and the page's (`createScreenShowing`, `showView`).
 
 /** The screens: three sections stacked in one grid cell, and `hidden` picks. */
 const SCREENS: readonly string[] = Object.freeze(["signin", "main", "settings", "help"]);

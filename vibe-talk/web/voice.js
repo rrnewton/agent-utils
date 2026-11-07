@@ -768,561 +768,154 @@ function signedOutByRename() {
   return credentialStore().signedOutByRename();
 }
 
-// --- the phone's back gesture, and the browser's Back -----------------------------------------
+// --- navigation orchestration (`#304`, `#423`, `#462`, `#543`, `#580`) -------------------------
 //
-// `#304 back-gesture-in-app`. The owner, 2026-10-14: on the installed Android app the system back
-// gesture inside a thread left the app for the home screen; only the on-screen Back closed the
-// thread. The page had never made a history entry of its own, so the browser's Back — which is what
-// the gesture is — had nothing of the page's to go back through, and went back out of it.
-//
-// WHAT OPENS OVER THE CHANNEL, and how each closed before this:
-//
-//   * a thread in one column, from its Thread(N), a reply count or the picker: ← Back, a swipe
-//     right, Esc and ←; a thread opened from the thread list goes back to the list the same ways;
-//   * the thread list (the picker's "Thread list", Ctrl/Cmd+3): Esc, to the view it was chosen from,
-//     or the picker and the view keys;
-//   * the right column's thread, in two columns: its X, and Esc or ← in that column;
-//   * a reply open in the stream (`#410 inline-reply-editor`): Cancel, Esc in an empty box, and Send;
-//   * Settings and Help: their Back, Esc and ",";
-//   * the ⋯ menu of a message, the reading-pace popover and the prompts tray: Esc, a tap outside the
-//     ⋯ menu, and the buttons that open the other two.
-//
-// Not screens, and given no entry: the call's view and the channel's, one switch with two positions;
-// Main, All and two columns, which are views (`#281 view-keys`); the search, a filter over the list,
-// which Esc closes; a message's details sheet, part of its row; a highlighted card; the agent's
-// proposal to post, which a Back must never answer; and the sign-in screen, the app's own first
-// screen. There is no image viewer or preview overlay: a picture or a link opens in the browser.
-//
-// THE HISTORY MIRRORS WHAT IS OPEN. `backLevels` reads from the page's own state what a Back would
-// close, the first-opened first, and the page keeps one history entry above its own for each: at the
-// page's own URL, `/`, its query saying where the reader is (`#462 webapp-deep-links`, replaced
-// in step without touching any entry's state), so a reload and the browser's Back on a desk
-// are as they were; each tagged with what it stands for, how deep it is, and this page load's own
-// name (`BACK_SESSION`). `syncBackStack` puts the history in step after
-// anything opens or closes: an entry pushed for each thing opened, the top entry replaced where one
-// thing gives way to another at the same depth (another thread, the thread list over a thread), and
-// entries gone back through where things closed by other means. A view switch at the top pushes
-// nothing, the top has no entry of the page's above it, and Back there leaves the app as it always did.
-//
-// THE GESTURE CLOSES WHAT THE BUTTON CLOSES. A popstate — the gesture, the browser's Back, a mouse's
-// back button — closes from the top down to the depth of the entry it lands on, each thing through
-// `closeBackLevel`, which calls just what its own Back or Esc calls: `leaveThread`, `threadListBack`,
-// the X's `closeSideByX`, `closeReply`, `closeSettings`, `closeHelp`, a menu's Escape. So the focus
-// and the reader's place (`#280 scroll-stability`) come back exactly as they do there.
-//
-// ...AND THE BUTTON GOES BACK THROUGH THE HISTORY. The on-screen Back, the X, Esc and the rest close at
-// once, in the press's own task, as before — so the keys, the scroll rules and every check that presses
-// them see no gap — and the entry their screen pushed is then gone back through with `history.back()`,
-// leaving the gesture after them nothing stale to undo. The popstate that follows closes nothing more:
-// it closes only down to its entry's depth, the page is already there, and `backTraversal` tells it
-// from a reader's own Back. Where the entry is gone — never pushed, or the browser holds another — the
-// close stands alone and nothing is gone back through.
-//
-// A RELOAD STANDS ON THE EARLIER LOAD'S ENTRIES. A reload keeps the tab's history, and the browser
-// lands on the earlier load's entries as on any of the page's (measured in Chromium 149: a popstate,
-// not a load). So they are not left under the page as a stale stack. The entry the page opens on says
-// how deep it was, `d`; the `d` entries under it are that load's, one for each thing it had open, and
-// the page takes all of them as its own (`backAdopted`): the one it is on at depth `d`, and each of the
-// others, at the depth it says, when the browser lands on it. Whatever the page reopened as it loaded
-// (`#189 restore-ui-state`, from the channel the device saved) then stands on them, as if it had pushed
-// them: a thread opened from the thread list, reopened, is the two entries it was, and the first Back
-// closes the thread alone, before the reader has touched the page as after. Where less was reopened
-// than there are entries, the page goes back through the rest at once, as for anything closed, down to
-// the earlier load's own base where nothing was. That base is where this load's begins, so there is
-// never an entry left under it to spend a press on: in an installed app, whose window starts its
-// history at the app, the Back after the last thing closes is the system's. The page never asks to go
-// back further than the browser says there are entries of its own under it (`historyIndex`). Where more
-// was reopened than there are entries, the rest are pushed — at the reader's first touch, as Chromium's
-// back button skips an entry a page pushed before it was touched, against pages that trap the button
-// (`backDeferred`). So is what is reopened only once sign-in answers, where the device saved no channel
-// to open on: by then the page, finding nothing open as it loaded, has gone back through the entries. A
-// Back while something waits for its entry closes as many things as entries it goes back through, never
-// all that is over the entry it lands on. An entry the page cannot account for (someone else's, or out
-// of line with the earlier load's) is never taken for a depth: a Back onto it closes one thing, the top
-// one, and a Forward onto it is gone back through.
-//
-// A MENU IS AN ENTRY TOO. An open ⋯ menu, pace popover or prompts tray is one more level on top, its
-// entry pushed and gone back through as a screen's is. Not a `CloseWatcher`, though Chrome has them: a
-// close watcher hears Esc and the phone's back gesture, but the browser's own Back on a desk, a mouse's
-// back button and Alt+Left are plain traversals that pass it by, and one of those over a menu with no
-// entry would close the thing under the menu and leave the menu open. With an entry, every Back closes
-// the menu first, and a close watcher would have nothing left to do.
+// The phone's back gesture and the browser's Back, Back and Forward through the places visited,
+// deep links and in-app message links: the orchestration — reading where the reader stands,
+// deciding what a Back closes, showing a visited place, keeping the address in step, applying the
+// link the page opened by, and jumping to a message a link names — is one owner in
+// web/src/view/shell/navigation.ts (`createPageNavigation`, `#624 voice-page-modularity`), which
+// creates the `core/navigation` owners (`createBackStack`, `createVisits`, `createDeepLinks`,
+// `createLinkJumps`) from the prelude's factories. The long rationale for each rule stays in that
+// file's section heads and in the core owners' headers. Every dep below is a thunk: this wiring
+// runs where the legacy sections stood, long before `screens` (the screens section), the layout
+// choice and the channel store are created, and nothing may read them until a returned function
+// is called. The page destructures the orchestration under its old names, so callers do not change.
 
 /** This page load's own name for the entries it makes: an entry with another is from before a reload. */
 const BACK_SESSION = `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 10)}`;
 
-// The page's own history entries: what those above its base stand for, a going-back asked for and not yet
-// landed, an entry put off until the reader's first touch, the levels a Back could not close, how deep the
-// earlier load's entries reach, and the browser's place when last looked; pushing, replacing and going back
-// through them as levels open and close: one owner in web/src/core/navigation/backstack.ts (`#624
-// voice-page-modularity`). What is open (`backLevels`) and how each level closes (`closeBackLevel`) are here.
-const backStack = createBackStack({
+/** @type {import("./src/view/shell/index.ts").PageNavigation} */
+const shellNavigation = createPageNavigation({
+  createBackStack, createVisits, createDeepLinks, createLinkJumps, visitKey, deepLinkQuery,
   clock: clockOnUse(),
   session: BACK_SESSION,
-  history: () => backHistory(),
-  index: () => historyIndex(),
-  mayPush: () => mayPushHistory(),
-  levels: () => backLevels(),
-  close: (tag) => closeBackLevel(tag),
-  failed: (message) => showError(message),
-  notePlace: () => notePlace(),
-  syncAddress: () => syncDeepLinkAddress(),
-  applyLink: () => guardQuietly(applyDeepLink)(),
+  screens: () => screens,
+  el: (id) => el(id),
+  leftEl: (id) => leftEl(id),
+  inSide: () => columnWork.side(),
+  mainColumn: () => columns.main,
+  inColumn: (column, act) => inColumn(column, act),
+  sideColumn: () => columns.side,
+  sideMode: () => columns.side.mode,
+  sideThreadId: (channel) => { const held = sideThreads.get(channel); return held ? String(held.id) : null; },
+  selectedChannelId: () => selectedChannelId(),
+  selection: () => selection(),
+  layoutColumns: () => layoutShown.columns(),
+  layoutThreadList: () => layoutShown.threadList(),
+  layoutFit: () => layoutShown.fit(),
+  listBefore: () => layoutChoice.listBefore(),
+  sideThreadsHas: (channel) => sideThreads.has(channel),
+  replyDocked: () => replyState.docked,
+  rowMenuOpen: () => rowMenus.open(),
+  promptsOpen: () => promptsTray.open(),
+  actionMenuOpen: () => actionMenu.open(),
+  closeSpeedPopover: () => closeSpeedPopover(),
+  setPromptsOpen: (open) => setPromptsOpen(open),
+  setActionMenuOpen: (open) => setActionMenuOpen(open),
+  closeDismissedPopout: () => dismissedSendsView.close(),
+  focusList: (pane) => focusList(pane),
+  sidePane: () => sidePane,
+  focusLost: () => focusLost(),
+  closeSideThread: () => closeSideThread(),
+  closeHelp: () => closeHelp(),
+  closeSettings: () => closeSettings(),
+  closeReply: () => closeReply(),
+  threadListBack: () => threadListBack(),
+  leaveThread: () => leaveThread(),
+  showScreen: (name) => showScreen(name),
+  showHelp: (entry) => showHelp(entry),
+  showView: (name) => showView(name),
+  helpEntries: () => helpFolds.entries(),
+  threadListOffered: () => threadListOffered(),
+  threadStillKnown: (id) => threadStillKnown(id),
+  threading: () => providerFacts.threading(),
+  chooseView: (which) => chooseView(which),
+  selectSideThread: (id) => selectSideThread(id),
+  openThreadFromList: (id) => openThreadFromList(id),
+  chooseOneColumn: (choice) => chooseOneColumn(choice),
+  defaultChannelView: () => defaultChannelView(),
+  threadsOfChannel: () => channelStore.current().threads,
+  threadIdOf: (thread) => thread.id,
+  token: () => token(),
+  channels: () => channelDirectory.channels(),
+  chooseChannel: (id) => chooseChannel(id),
+  changeSelectedChannel: () => changeSelectedChannel(),
+  viewKey: () => viewKey(),
+  viewsHas: (key) => channelStore.current().views.has(key),
+  readsBusy: () => channelReads.busy(),
+  readsStarted: () => replayLedger.started(),
+  seekMessage: (target, land, elsewhere) => seekMessage(target, land, elsewhere),
+  rowHolding: (id) => rowHolding(id),
+  answeredElsewhere: (target) => answeredElsewhere(target),
+  providerNameOf: (channel) => { const held = providerOfChannel(channel); return held && typeof held.name === "string" && held.name.trim() ? held.name.trim() : ""; },
+  providerName: () => channelDirectory.providerName(),
+  threadOf: (message) => threadOf(message),
+  setStatus: (text) => setStatus(text),
+  showError: (message) => showError(message),
+  guardQuietly: (run) => guardQuietly(run),
+  settleFocus: () => settleFocus(),
+  replyOnScreen: () => replyOnScreen(),
+  setLinkedMark: (channel, id) => linkedMark.set(channel, id),
+  cardsCycle: () => cardsCycle(),
+  rowShown: (row) => rowShown(row),
+  visibleList: () => visibleList(),
+  rowOnScreen: (row) => rowOnScreen(row),
+  eachColumn: (act) => eachColumn(act),
+  openReadRun: (row) => openReadRun(row),
+  setSearchOpen: (open) => setSearchOpen(open),
+  finishPackSlide: () => finishPackSlide(),
+  headOfList: (area, row) => headOfList(area, row),
+  renderScrollTools: () => renderScrollTools(),
+  revealRow: (row, center) => revealRow(row, center),
+  idsOf: (row) => idsOf(row),
+  inAppLinksOn: () => inAppLinks.current(),
+  channelLabel: (channel) => channelLabel(channel),
+  renderedText: (node) => renderedText(node),
+  inThisColumn: (act) => inThisColumn(act),
+  captureScroll: () => captureScroll(),
+  listPlaceTop: (area) => listPlaceTop(area),
+  sideShowing: () => sideShowing(),
+  restoreScroll: (place) => restoreScroll(place),
+  scrollToNewest: () => scrollToNewest(),
+  bumpReplyJump: () => replyJumpTicket.bump(),
+  settleUiState: () => uiState.settle(),
+  readEnteredChannel: (restored) => readEnteredChannel(restored),
+  viewRestored: () => viewScroll.restored(),
+  stopDiscordPolling: () => stopDiscordPolling(),
+  storedOpenInView: () => storedOpenInView(),
+  writeClipboardText: (text) => writeClipboardText(text),
+  copiedRefusedText: () => COPY_REFUSED,
+  pullWaitMs: () => PULL_WAIT_MS,
+  delay: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  userActivation: () => (typeof navigator === "object" && navigator ? navigator.userActivation : null),
+  locationSearch: () => window.location.search || "",
+  locationOrigin: () => (typeof window === "object" && window.location && window.location.origin ? String(window.location.origin) : ""),
+  locationPathname: () => (typeof window === "object" && window.location && window.location.pathname) || "/",
+  navigationIndex: () => {
+    const navigation = typeof window === "object" && window ? window.navigation : null;
+    const entry = navigation ? navigation.currentEntry : null;
+    return entry && Number.isInteger(entry.index) && entry.index >= 0 ? entry.index : null;
+  },
+  historyPort: () => {
+    const history = typeof window === "object" && window ? window.history : null;
+    if (!history || typeof history.pushState !== "function" || typeof history.replaceState !== "function" ||
+        typeof history.back !== "function" || typeof history.go !== "function") return null;
+    return history;
+  },
+  layoutRestoring: () => layoutShown.restoring(),
 });
-
-/** The window's history, where it can be written; null in a host without one. */
-function backHistory() {
-  const history = typeof window === "object" && window ? window.history : null;
-  if (!history || typeof history.pushState !== "function" || typeof history.replaceState !== "function" ||
-      typeof history.back !== "function" || typeof history.go !== "function") return null;
-  return history;
-}
-
-/**
- * Where the browser is in the tab's history, by the Navigation API where it has one; null elsewhere.
- * Counted from the first of the run of this origin's entries the browser is in, so in an installed app,
- * whose window starts at the app, it is how many entries of the app's own there are under this one.
- */
-function historyIndex() {
-  const navigation = typeof window === "object" && window ? window.navigation : null;
-  const entry = navigation ? navigation.currentEntry : null;
-  return entry && Number.isInteger(entry.index) && entry.index >= 0 ? entry.index : null;
-}
-
-/** Whether the page may push an entry now: not before the reader has ever touched it, where the browser says. */
-function mayPushHistory() {
-  const activation = typeof navigator === "object" && navigator ? navigator.userActivation : null;
-  return !activation || activation.hasBeenActive !== false;
-}
-
-/** The menus open now, as levels, in the order Escape closes them. */
-function openMenus() {
-  const open = [];
-  if (rowMenus.open()) open.push("menu:row");
-  if (!el("speed-popover").hidden) open.push("menu:pace");
-  if (promptsTray.open()) open.push("menu:prompts");
-  if (actionMenu.open()) open.push("menu:actions");
-  // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed, on Settings.
-  if (!el("dismissed-send-popout").hidden) open.push("menu:dismissed");
-  return open;
-}
-
-/**
- * Close menu `name` as Escape closes it, and say whether it was open. The ⋯ menu gives the focus back
- * to the ⋯ that opened it when the focus was inside it — an item just hidden is a focus on nothing —
- * and the pace popover and the prompts tray give it to their buttons.
- */
-function closeOpenMenu(name) {
-  const rowMenu = rowMenus.open();
-  if (name === "menu:row" && rowMenu) {
-    const { root, close, button } = rowMenu;
-    const inside = nodeWithin(root, document.activeElement);
-    close();
-    if (inside && button && typeof button.focus === "function") button.focus({ preventScroll: true });
-    return true;
-  }
-  if (name === "menu:pace" && !el("speed-popover").hidden) {
-    closeSpeedPopover();
-    el("read-speed").focus();
-    return true;
-  }
-  if (name === "menu:prompts" && promptsTray.open()) {
-    setPromptsOpen(false);
-    el("prompts-open").focus();
-    return true;
-  }
-  if (name === "menu:actions" && actionMenu.open()) {
-    setActionMenuOpen(false);
-    el("action-menu-open").focus();
-    return true;
-  }
-  if (name === "menu:dismissed" && !el("dismissed-send-popout").hidden) return dismissedSendsView.close();
-  return false;
-}
-
-/**
- * What a Back would close now, the first-opened first: the levels the page keeps an entry for. Read
- * in the left column, the one worked on outside `inColumn`.
- *
- * @returns {string[]}
- */
-function backLevels() {
-  // `#543 in-app-message-links`. A jump by a link is a level over what was open when it was taken.
-  return withLinkJumps(screenLevelsNow());
-}
-
-/**
- * What is open now, as levels, the first-opened first, without the jumps taken by links. Read in the
- * left column, the one worked on outside `inColumn`.
- *
- * @returns {string[]}
- */
-function screenLevelsNow() {
-  if (columnWork.side()) return inColumn(columns.main, screenLevelsNow);
-  const levels = screenLevels(screens.screen());
-  // On top of everything, in every browser: see "A MENU IS AN ENTRY TOO".
-  levels.push(...openMenus());
-  return levels;
-}
-
-/**
- * The levels of screen `name`, with those of the screen it covers under it: Settings over the screen
- * it was opened from, Help over Settings or over where "?" was pressed (`helpReturn`). The sign-in
- * screen is the bottom of everything, with none.
- *
- * @returns {string[]}
- */
-function screenLevels(name, depth = 0) {
-  if (depth > 2) return [];
-  if (name === "main") return channelLevels();
-  if (name === "settings") return [...screenLevels(screens.beforeSettings(), depth + 1), "settings"];
-  if (name === "help") return [...screenLevels(screens.helpReturn(), depth + 1), "help"];
-  return [];
-}
-
-/**
- * What is open over the channel's own view: the right column's thread in two columns; the thread list,
- * over what Esc on it goes back to; a thread in one column, over the thread list it was opened from;
- * and a reply open in a list. Nothing on the call's view, which waits in front of them.
- *
- * @returns {string[]}
- */
-function channelLevels() {
-  if (screens.view() !== "discord") return [];
-  const levels = [];
-  if (layoutShown.columns()) {
-    if (columns.side.mode === "thread") levels.push("side");
-  } else if (layoutShown.threadList()) {
-    levels.push(...underThreadList(), "list");
-  } else if (selection().view === "thread") {
-    if (selection().origin === "list" && threadListOffered()) levels.push(...underThreadList(), "list");
-    levels.push("thread");
-  }
-  if (replyState.docked) levels.push("reply");
-  return levels;
-}
-
-/**
- * What Esc on the thread list goes back to, where that is itself something a Back closes: a thread in
- * one column, or two columns with a thread on the right (`threadListBack`). So the list chosen over a
- * thread is one entry more, and its Back finds the thread's entry still there.
- *
- * @returns {string[]}
- */
-function underThreadList() {
-  const channel = String(selectedChannelId() || "");
-  const listBefore = layoutChoice.listBefore();
-  if (listBefore.layout === "two") return layoutShown.fit() && sideThreads.has(channel) ? ["side"] : [];
-  const thread = listBefore.layout === "one" && listBefore.channel === channel && listBefore.view === "thread";
-  return thread && listBefore.thread ? ["thread"] : [];
-}
-
-/** The X of the right column: its thread goes and the cards come back, the keys going to them if they had none. */
-function closeSideByX() {
-  closeSideThread();
-  // The X has gone with the thread: the keys go to the cards.
-  if (document.activeElement === el("side-close") || focusLost()) focusList(sidePane);
-}
-
-/** Close level `tag` as its own Back, X or Escape closes it. */
-function closeBackLevel(tag) {
-  if (tag.startsWith("menu:")) closeOpenMenu(tag);
-  else if (tag === "help") closeHelp();
-  else if (tag === "settings") closeSettings();
-  else if (tag === "reply") closeReply();
-  else if (tag === "side") closeSideByX();
-  else if (tag === "list") threadListBack();
-  else if (tag === "thread") leaveThread();
-  else if (tag === "jump") returnFromLinkJump();
-}
-
-/** Put the history in step with what is open, at the end of the task that changed it (`BackStack.schedule`). */
-function scheduleBackSync() {
-  backStack.schedule();
-}
-
-/**
- * The browser went back (or forward) to another entry: close one thing for each entry it went back
- * through, as the Back of each thing closed would (`BackStack.pop`).
- *
- * @param {PopStateEvent} event
- */
-function onBackPop(event) {
-  backStack.pop(event ? event.state : null);
-}
-
-/**
- * Keep the history in step from here on. The page takes the entry it opened on for its own: at the
- * depth an earlier load gave it, standing on that load's entries under it (`backAdopted`), never more
- * than the browser says there are entries of the page's own under it; or, holding anything else, as
- * its base. The browser is told not to move the document on a Back, the lists keeping their own places
- * (`#280 scroll-stability`); and an entry put off until the reader's first touch is pushed then.
- */
-function startBackStack() {
-  if (backStack.start()) {
-    window.addEventListener("popstate", onBackPop);
-  }
-  const touched = () => {
-    if (backStack.deferred()) scheduleBackSync();
-  };
-  for (const type of ["pointerup", "keydown", "click"]) document.addEventListener(type, touched, true);
-  scheduleBackSync();
-}
-
-// --- Back and Forward through the places visited (#423 back-key-consistency) ---------------------
-//
-// The owner, 2026-10-22: "if I press `Cmd-[` on the thread list view it jumps back to the Main view but it
-// does NOT have kind of navigation (or back?) effect on other views." Cmd+[ on a Mac is the browser's own
-// Back, and the page bound nothing for it: the browser's Back closes what `#304` gives an entry (above),
-// which is the thread list, a thread, the right column's thread, a reply, Settings, Help and a menu, and
-// never a view switch, so in Main, All and two columns it had nothing of the page's to go back through.
-//
-// THE RULE. Ctrl/Cmd+[ goes Back and Ctrl/Cmd+] goes Forward, from anywhere, in every view and screen,
-// through the PLACES the reader has been on the channel since choosing it. A place is the screen (the
-// channel, Settings, Help) and, on the channel, the view (Main, All, the thread list, two columns) with
-// the thread open in it, across the window or on the right. Every move to a new place, by whatever
-// control (the view keys and picker, the layout button, a thread entered or left, Settings and Help and
-// their Back, the browser's Back), is noted after the place the reader is at, the places ahead of it
-// dropped, as a browser does (`notePlace`, heard where the history entries are kept in step,
-// `scheduleBackSync`); Back and Forward move along them and note none. Something open over a place that
-// closes onto it (Esc, the X, the browser's Back) is a step back, as Back would have been, with what
-// closed kept ahead for Forward. With nothing noted behind (a reload, another channel), Back closes what
-// is open over the view as Esc does. A place that cannot be shown any
-// more (a thread gone, two columns in a window too narrow, a channel that is one thread) is passed over.
-// An open menu is closed first, as Esc closes it, and by Back a reply open in a list too, its words kept
-// as a draft. At either end the key says so and does nothing more: it never leaves the app. Another
-// channel starts afresh. On the call's view, which is no place, the keys say so.
-//
-// THE SPECIAL CASES. `#304`'s closes are this rule where the place before is the one under what is open,
-// and Back goes there by the very close Esc uses: a thread entered from the thread list back to the list
-// (`leaveThread`), the list back to the view it was chosen from (`threadListBack`), the right column's
-// thread back to its cards (`closeSideByX`), Settings and Help back to where they were opened. So the
-// thread list's Back is no exception: Main, All and two columns simply gain theirs.
-//
-// WHAT STAYS. The browser's own Back (its button, Alt+Left, a mouse's) and the phone's back gesture keep
-// `#304`'s meaning, closing what is open and then leaving the app: a gesture that walked back through
-// every view switch would hold a phone reader in it. The page takes Ctrl/Cmd+[ and ] from the browser,
-// heard first at the window as Ctrl+S is (`keyDispatch.onEverywhereKey`); the bare [ and ] still move between two
-// columns (`#229`).
-
-// The places visited on this channel, which one the reader is at, and whether a Back or Forward is
-// arriving: one owner in web/src/core/navigation/visits.ts (`#624 voice-page-modularity`), which keeps at
-// most `PLACES_KEPT`.
-const visits = createVisits();
-
-/**
- * @typedef {import("./src/core/navigation/index.ts").ChannelPlace} ChannelPlace
- * @typedef {import("./src/core/navigation/index.ts").Place} Place
- */
-// What tells one place from another (visitKey) is in web/src/core/navigation/, and which close onto
-// another (placeIsOver) is the visits owner's (`#624 voice-page-modularity`).
-
-/** The place on the channel now, read in the left column, whose state is the page's; null on the call's view. */
-function channelPlace() {
-  if (columnWork.side()) return inColumn(columns.main, channelPlace);
-  if (screens.view() !== "discord") return null;
-  const channel = String(selectedChannelId() || "");
-  if (!channel) return null;
-  /** @type {ChannelPlace} */
-  const place = { screen: "main", channel, layout: "one", view: null, thread: null, origin: null, side: null };
-  if (layoutShown.columns()) {
-    place.layout = "two";
-    const side = columns.side.mode === "thread" ? sideThreads.get(channel) : null;
-    place.side = side ? String(side.id) : null;
-  } else if (layoutShown.threadList()) {
-    place.layout = "list";
-  } else {
-    place.view = selection().view;
-    if (selection().view === "thread") {
-      place.thread = selection().threadId ? String(selection().threadId) : null;
-      place.origin = selection().origin || null;
-    }
-  }
-  return place;
-}
-
-/** The place the reader is at now: the channel's, or Settings or Help over the screen they were opened from. */
-function currentPlace() {
-  if (screens.screen() === "main") return channelPlace();
-  if (screens.screen() !== "settings" && screens.screen() !== "help") return null;
-  const under = screens.beforeSettings() === "main" ? channelPlace() : null;
-  const open = screens.screen() === "help" ? helpFolds.entries().find((entry) => entry.open) : null;
-  return {
-    screen: screens.screen(), channel: String(selectedChannelId() || ""), under,
-    from: screens.screen() === "help" ? screens.helpReturn() : null, entry: open ? String(open.id).replace(/^help-/, "") : null,
-  };
-}
-
-/** Note the place the reader is at, as the one after the place they were at, unless it is that place. */
-function notePlace() {
-  visits.note(currentPlace());
-}
-
-/** Whether channel place `place` can be shown now. */
-function channelPlaceShowable(place) {
-  if (!place) return true;
-  if (place.channel !== String(selectedChannelId() || "")) return false;
-  if (place.layout === "two") return layoutShown.fit() && threadListOffered() && (!place.side || threadStillKnown(place.side));
-  if (place.layout === "list") return threadListOffered();
-  if (place.view === "thread") return Boolean(place.thread) && threadStillKnown(place.thread);
-  return place.view === "main" || providerFacts.threading();
-}
-
-/** Whether `place` can be shown now: its channel the one chosen, and what it shows still there. */
-function placeShowable(place) {
-  if (place.screen === "main") return channelPlaceShowable(place);
-  return place.channel === String(selectedChannelId() || "") && channelPlaceShowable(place.under);
-}
-
-/**
- * Put the channel on place `place`, by the close Esc uses where `place` is what is under what is open
- * (see THE SPECIAL CASES), and by the views' own choosing for whatever is left to change.
- *
- * @param {ChannelPlace} place
- */
-function showChannelPlace(place) {
-  if (columnWork.side()) return inColumn(columns.main, () => showChannelPlace(place));
-  // Arriving, not choosing: Back and Forward, and a link being applied. `#462 webapp-deep-links`.
-  return deepLinks.arrive(() => showChannelPlaceWithin(place));
-}
-
-/** `showChannelPlace`, with `#462 webapp-deep-links`'s arriving-not-choosing already noted. */
-function showChannelPlaceWithin(place) {
-  if (screens.screen() !== "main" || screens.view() !== "discord") return undefined;
-  const now = channelPlace();
-  if (now && now.layout === "one" && now.view === "thread" && now.origin === "list" && place.layout === "list") leaveThread();
-  else if (now && now.layout === "list" && place.layout !== "list") threadListBack();
-  else if (now && now.layout === "two" && now.side && place.layout === "two" && !place.side) closeSideByX();
-  if (visitKey(channelPlace()) === visitKey(place)) return undefined;
-  if (place.layout === "list") {
-    chooseView("threads");
-  } else if (place.layout === "two") {
-    if (!layoutShown.columns()) chooseView("columns");
-    const shown = columns.side.mode === "thread" ? sideThreads.get(place.channel) : null;
-    if (place.side && (!shown || String(shown.id) !== place.side)) selectSideThread(place.side);
-    else if (!place.side && columns.side.mode === "thread") closeSideByX();
-  } else if (place.view === "thread") {
-    const id = String(place.thread);
-    if (place.origin === "list" && threadListOffered()) openThreadFromList(id);
-    else {
-      const summary = channelStore.current().threads.find((held) => String(held.id) === id) || null;
-      chooseOneColumn({ view: "thread", thread: id, summary, origin: place.origin || defaultChannelView() });
-    }
-  } else {
-    chooseView(/** @type {"main" | "flat"} */ (place.view));
-  }
-  return undefined;
-}
-
-/** Go to place `place`: off the screens over the channel, the channel on the place under, and on to its screen. */
-function showPlace(place) {
-  if (screens.screen() === "help" && visitKey(place) !== visitKey(currentPlace())) closeHelp();
-  const under = place.screen === "main" ? place : place.under;
-  if (screens.screen() === "settings" && (place.screen === "main" || (place.screen === "help" && place.from !== "settings"))) {
-    closeSettings();
-  }
-  if (screens.screen() === "main" && under) showChannelPlace(under);
-  if (place.screen === "settings" && screens.screen() !== "settings") showScreen("settings");
-  if (place.screen === "help" && screens.screen() !== "help") {
-    if (place.from === "settings" && screens.screen() !== "settings") showScreen("settings");
-    screens.setHelpReturn(screens.screen());
-    showHelp(place.entry);
-  }
-}
-
-/**
- * Ctrl/Cmd+[ (`step` -1) and Ctrl/Cmd+] (+1): back to the place before, or forward to the place after. See
- * the rule above. Always takes the chord, so it is never the browser's Back or Forward.
- */
-function placeFromKeyboard(step) {
-  if (columnWork.side()) return inColumn(columns.main, () => placeFromKeyboard(step));
-  const menus = openMenus();
-  if (menus.length > 0) {
-    closeOpenMenu(menus[menus.length - 1]);
-    return true;
-  }
-  if (screens.screen() === "main" && screens.view() !== "discord") {
-    setStatus("Back and Forward go through the channel's views; the call has none.");
-    return true;
-  }
-  if (step < 0 && replyOnScreen()) {
-    closeReply();
-    settleFocus();
-    return true;
-  }
-  notePlace();
-  const here = visitKey(currentPlace());
-  // Passed over: what cannot be shown now, and the place the reader is at (`Visits.walk`).
-  if (visits.walk(step, here, placeShowable, (place) => {
-    showPlace(place);
-    notePlace();
-  })) {
-    if (screens.screen() === "main") settleFocus();
-    return true;
-  }
-  // Nothing noted behind, as after a reload or a change of channel that opened on something over a view
-  // (the thread list, a thread opened from it): Back closes it as Esc does, onto what is under it.
-  if (step < 0) {
-    const levels = backLevels().filter((tag) => tag !== "reply" && !tag.startsWith("menu:"));
-    if (levels.length > 0) {
-      closeBackLevel(levels[levels.length - 1]);
-      if (screens.screen() === "main") settleFocus();
-      return true;
-    }
-  }
-  setStatus(step < 0 ? "Nothing to go back to." : "Nothing to go forward to.");
-  return true;
-}
-
-// --- deep links: the address names the view, and can name a message (#462 webapp-deep-links) ----
-//
-// The owner: "shouldn't there be some argument to the single page that selects the view and
-// makes things linkable? … shouldn't we have a link that jumps to a specific message in
-// vibe-talk?" So the page's address carries where the reader is, as a QUERY on `/` (`/voice`
-// already forwards there keeping it, `#302 root-is-the-app`) — never the FRAGMENT, which holds
-// a pairing code and is stripped before any request (`#369`):
-//
-//   /?c=<channel>&v=<main|all|threads|thread|columns>&t=<thread>
-//   /?m=<provider>:<channel>:<message>[:<thread>]        (+ c/v/t for where it opens)
-//
-// Each `m` part is percent-encoded before joining, so a `:` inside an id is data, never a
-// separator. The parts are DURABLE identity: the service's name, then the upstream's own ids
-// as this server canonically derives them — Discord snowflakes verbatim, a Slack conversation
-// verbatim and its `ts` losslessly encoded (`slack/ids.rs`), a bridged service's resource
-// names. No server-local row id, store or session is named, so any server on the same upstream
-// resolves the same link and a reboot changes nothing. A link carries ids only, never text.
-//
-// THE ADDRESS FOLLOWS, IT NEVER LEADS NAVIGATION. Where the reader goes is still decided by the
-// places above (`#423`) and the Back entries (`#304`): the query is rewritten in step with them
-// (`syncDeepLinkAddress`, heard where the history is kept in step), by `replaceState` carrying
-// the entry's own state untouched, so no entry is added or taken and Back keeps its meaning.
-// The one time the address leads is the OPEN: a link read at load wins over the device's
-// restored state (`#189`) — its channel and view are shown, its message fetched around and
-// landed on by the reply arrow's own walk. `v=voice` is read and refused politely: a link
-// never starts a call. Unknown values are ignored one by one; a link cannot break the open.
-
-// DEEP_LINK_PART_MAX, the longest query value read from a link, is in web/src/foundation/ with the
-// link ref helpers deepLinkRefFrom, deepLinkRefText and messageLinkRef; the views a link may name
-// (DEEP_LINK_VIEWS), reading a query (deepLinkParams, deepLinkPart, read once by `createDeepLinks`) and
-// writing one (deepLinkQuery) are in web/src/core/navigation/ (`#624 voice-page-modularity`).
-/** How long opening from a link waits for sign-in and a first read, in `PULL_WAIT_MS` waits. */
-const DEEP_LINK_WAITS = 600;
-
-/**
- * @typedef {{provider: string, channel: string, message: string, thread: string | null}} DeepLinkRef
- * @typedef {{channel: string | null, view: string | null, thread: string | null,
- *   message: DeepLinkRef | null}} DeepLinkWanted
- */
-
-// The link the page opened by, the message it focused, the address last written, whether opening from it
-// was done or is under way, the reader's own choices since it was read, whether a place is being arrived
-// at rather than chosen, and signing out's epoch: one owner in web/src/core/navigation/deeplinks.ts
-// (`#624 voice-page-modularity`).
-const deepLinks = createDeepLinks({
-  search: () => window.location.search || "",
-  // A layout the page itself restores (`layoutShown.restoring()` — a turned or resized window) is no choice.
-  arriving: () => visits.arriving() || layoutShown.restoring(),
-});
+const {
+  backStack, visits, deepLinks, linkJumps, backHistory, historyIndex, mayPushHistory, openMenus,
+  closeOpenMenu, backLevels, screenLevelsNow, closeSideByX, closeBackLevel, scheduleBackSync,
+  onBackPop, startBackStack, channelPlace, currentPlace, notePlace, channelPlaceShowable,
+  placeShowable, showChannelPlace, showPlace, placeFromKeyboard, noteDeepLinkReaderMove,
+  deepLinkReaderMoved, deepLinkRefOf, deepLinkFromAddress, deepLinkFor, syncDeepLinkAddress,
+  linkedRowShown, landOnDeepLink, waitForDeepLink, applyDeepLink, copyDeepLink, keepsInApp,
+  messageLinkLabel, wireMessageLinks, onMessageLinkTap, linkJumpSpot, withLinkJumps,
+  arriveOnChannel, arriveAtPlace, jumpToMessageLink, jumpToSentMessage, returnFromLinkJump,
+  putBackOnSpot,
+} = shellNavigation;
 
 // `#890 voice-page-linked-highlight`. The message a link landed on, marked until the reader puts the mark out (Esc, its
 // ×, another link): one owner in web/src/view/channel/linkedmark.ts, drawn on every row and card as it is drawn
@@ -1350,295 +943,6 @@ const linkedMark = createLinkedMark({
     syncDeepLinkAddress();
   },
 });
-
-/**
- * Whether any of `row` shows in a list on screen: the cards where they cycle, else the list a column shows, between
- * what floats over its head and its foot. A mark scrolled out of sight is not what Esc is asked about.
- */
-function linkedRowShown(row) {
-  if (screens.screen() !== "main" || screens.view() !== "discord" || !rowShown(row)) return false;
-  if (row.parentNode === leftEl("side-cards")) {
-    if (!cardsCycle()) return false;
-    const box = row.getBoundingClientRect();
-    const area = leftEl("side-scroll").getBoundingClientRect();
-    return box.bottom > area.top && box.top < area.bottom;
-  }
-  let shown = false;
-  eachColumn(() => {
-    if (row.parentNode === visibleList() && rowOnScreen(row)) shown = true;
-  });
-  return shown;
-}
-
-/**
- * Note a choice of view or channel the reader made, for `applyDeepLink` to lose to. A layout
- * the page itself restores (`layoutShown.restoring()` — a turned or resized window) is no choice.
- */
-function noteDeepLinkReaderMove() {
-  deepLinks.noteReaderMove();
-}
-
-/** Whether the reader has chosen anywhere of their own since the link was first read. */
-function deepLinkReaderMoved() {
-  return deepLinks.readerMoved();
-}
-
-/** A message's durable identity as a link names it: its service, channel, id, and thread. */
-function deepLinkRefOf(message) {
-  const channel = String((message && message.channel_id) || selectedChannelId() || "");
-  const described = providerOfChannel(channel);
-  const name = described && typeof described.name === "string" && described.name.trim()
-    ? described.name.trim() : channelDirectory.providerName();
-  const thread = threadOf(message);
-  const record = message && message.thread;
-  const root = !record || record.is_root === true || String(record.root_message_id || "") === String(message.id);
-  return {
-    provider: String(name || "").toLowerCase(), channel, message: String(message.id),
-    thread: thread && !root ? thread : null,
-  };
-}
-
-/**
- * The link the page opened by, read from the query once; null for a plain open. A reload
- * standing on an address this tab wrote is read the same way: it names the place the reader
- * left, applying it lands back on a linked message, and where the reader already stands
- * there the apply shows nothing over them (`applyDeepLink`'s standing place).
- */
-function deepLinkFromAddress() {
-  return deepLinks.wanted();
-}
-
-/** A whole link to `ref`'s message, opening where it stands: its thread, or Main for a root. */
-function deepLinkFor(ref) {
-  /** @type {ChannelPlace} */
-  const place = {
-    screen: "main", channel: ref.channel, layout: "one",
-    view: ref.thread ? "thread" : "main", thread: ref.thread, origin: null, side: null,
-  };
-  const origin = typeof window === "object" && window.location && window.location.origin ? String(window.location.origin) : "";
-  return `${origin}/?${deepLinkQuery(place, ref)}`;
-}
-
-/**
- * Keep the address saying where the reader is: the channel place's query, replaced into the
- * current entry with its state untouched. Only a channel place is written — Settings, Help and
- * the call keep the channel's address under them, as a link copied there should still name it.
- */
-function syncDeepLinkAddress() {
-  const history = backHistory();
-  if (!history || typeof window !== "object" || !window.location) return;
-  const place = screens.screen() === "main" ? channelPlace() : null;
-  if (!place) return;
-  const focused = deepLinks.focus();
-  const focus = focused && focused.channel === place.channel &&
-    (!focused.thread || place.thread === focused.thread || place.side === focused.thread ||
-      place.view === "flat") ? focused : null;
-  const query = deepLinkQuery(place, focus);
-  const address = `${window.location.pathname || "/"}?${query}`;
-  const standing = `${window.location.pathname || "/"}${window.location.search || ""}`;
-  // Only the standing entry's own address is compared: what another entry (behind Back,
-  // ahead of Forward) was left saying is corrected when the reader stands on it again.
-  if (address === standing) return;
-  try {
-    history.replaceState(history.state, "", address);
-    deepLinks.noteWritten(address);
-  } catch (_error) {
-    // A host that refuses the address keeps the page; only its link is stale.
-  }
-}
-
-/**
- * Land on the linked message where a row holds it, as the reply arrow lands on its answer. Over the
- * Threads view's cards, a thread's first message is its card: a link to it lands on the card, at the
- * head of the list (`#522 thread-card-max-lines`), never on the hidden column under the cards nor on
- * the root's row unpacked beneath it — a summarised card's root child, or a split card's continuation.
- */
-function landOnDeepLink(id, center = false) {
-  const cardOf = () => (cardsCycle() ? /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
-    .find((one) => one.hasAttribute("data-card") && /** @type {any} */ (one).cardRoot &&
-      String(/** @type {any} */ (one).cardRoot.id) === String(id)) || null : null);
-  let card = cardOf();
-  if (card) {
-    if (String(card.className).split(/\s+/).includes("search-hidden")) setSearchOpen(false);
-    // A card folded into a run of read threads: the run opened, which draws the cards anew.
-    openReadRun(card);
-    card = cardOf() || card;
-    // `#890 voice-page-linked-highlight`. Marked before it is brought on screen, which the note's line moves.
-    linkedMark.set(String(selectedChannelId()), String(id));
-    if (!rowShown(card)) {
-      setStatus("Hide read is hiding that message.");
-      return true;
-    }
-    const area = leftEl("side-scroll");
-    finishPackSlide();
-    area.scrollTop = headOfList(area, card);
-    renderScrollTools();
-    setStatus("Here is the linked message's card.");
-    return true;
-  }
-  const row = rowHolding(id);
-  if (!row) return false;
-  if (String(row.className).split(/\s+/).includes("search-hidden")) setSearchOpen(false);
-  openReadRun(row);
-  linkedMark.set(String(selectedChannelId()), String(id));
-  revealRow(rowHolding(id) || row, center);
-  renderScrollTools();
-  setStatus("Here is the linked message.");
-  return true;
-}
-
-/** Wait `waits` short waits for `ready`, as the seek walk waits for a read in flight. */
-async function waitForDeepLink(ready) {
-  for (let waited = 0; waited < DEEP_LINK_WAITS && !ready(); waited += 1) {
-    await new Promise((resolve) => setTimeout(resolve, PULL_WAIT_MS));
-  }
-  return ready();
-}
-
-/**
- * Open where the link says, once: its channel over the restored one, its view over the
- * channel's chosen one, its message landed on by the reply arrow's walk. Best-effort in every
- * part, said in the status line where it cannot be done: an unreadable part never breaks the open.
- */
-async function applyDeepLink() {
-  const wanted = deepLinkFromAddress();
-  if (!wanted || deepLinks.applied() || deepLinks.applying()) return;
-  const epoch = deepLinks.epoch();
-  deepLinks.setApplying(true);
-  try {
-  // Until the channel itself is on screen: applied over sign-in or the call view, the page's
-  // own open would simply overwrite it. Giving up here is not final — the next place noted
-  // kicks this again (`scheduleBackSync`); applied is only ever set past this wait.
-  if (!await waitForDeepLink(() => Boolean(token()) && channelDirectory.channels().length > 0 &&
-      Boolean(selectedChannelId()) && screens.screen() === "main" && screens.view() === "discord")) return;
-  deepLinks.markApplied();
-  // A reader who chose a channel or a view while that wait ran is not moved at all — least
-  // of all half-moved, onto the link's channel in a view of their own choosing.
-  if (epoch !== deepLinks.epoch() || deepLinkReaderMoved()) return;
-  const wantedChannel = (wanted.message && wanted.message.channel) || wanted.channel;
-  if (wantedChannel) {
-    if (!channelDirectory.channels().some((channel) => String(channel.id) === wantedChannel)) {
-      setStatus("That link names a channel this server does not read.");
-      syncDeepLinkAddress();
-      return;
-    }
-    if (String(selectedChannelId()) !== wantedChannel) {
-      chooseChannel(wantedChannel);
-      // The link's own arrival on its channel is no choice of the reader's.
-      deepLinks.arrive(() => changeSelectedChannel());
-    }
-  }
-  if (screens.view() !== "discord") showView("discord");
-  const channel = String(selectedChannelId());
-  const startPlace = channelPlace();
-  const startVisit = visits.position();
-  // The channel's own first read decides its opening view as it lands; a place put on before
-  // it would be decided over. Wait for that read, then put the link's place on — unless the
-  // reader has navigated for themselves meanwhile: a link opened the page, it does not chase
-  // a reader who has already gone somewhere of their own choosing.
-  await waitForDeepLink(() => String(selectedChannelId()) !== channel ||
-    (replayLedger.started() > 0 && channelStore.current().views.has(viewKey())));
-  if (epoch !== deepLinks.epoch() || String(selectedChannelId()) !== channel) return;
-  const thread = wanted.thread || (wanted.message && wanted.message.thread) || null;
-  /** @type {ChannelPlace | null} */
-  let place = null;
-  if (wanted.view === "threads") {
-    place = { screen: "main", channel, layout: "list", view: null, thread: null, origin: null, side: null };
-  } else if (wanted.view === "columns") {
-    place = { screen: "main", channel, layout: "two", view: null, thread: null, origin: null, side: thread };
-  } else if (wanted.view === "thread" || (!wanted.view && thread)) {
-    if (thread) place = { screen: "main", channel, layout: "one", view: "thread", thread, origin: "main", side: null };
-  } else if (wanted.view === "all") {
-    place = { screen: "main", channel, layout: "one", view: "flat", thread: null, origin: null, side: null };
-  } else if (wanted.view === "main") {
-    place = { screen: "main", channel, layout: "one", view: "main", thread: null, origin: null, side: null };
-  }
-  // The reader moved while the read was coming: the link loses, quietly. Moved is read from
-  // the places history, not only the standing place — a reader who went elsewhere and came
-  // back has still chosen since the link opened.
-  const stood = channelPlace();
-  const moved = deepLinkReaderMoved() ||
-    visits.position().at !== startVisit.at || visits.position().length !== startVisit.length ||
-    (startPlace && stood && visitKey(stood) !== visitKey(startPlace));
-  if (moved && !(place && stood && visitKey(stood) === visitKey(place))) return;
-  // Already there — the opening decision (or the reader) put this place on: showing it again
-  // would only redraw and re-read under a settled reader.
-  const standing = Boolean(place && stood && visitKey(stood) === visitKey(place));
-  if (!standing && place && channelPlaceShowable(place)) {
-    showChannelPlace(place);
-  } else if (!standing && place && place.view === "thread" && place.thread) {
-    // Not yet known is not gone: a thread named before its channel was read opens by id, and
-    // the read that follows names it, as a reopened thread without its summary does.
-    chooseOneColumn({ view: "thread", thread: place.thread, summary: null, origin: "main" });
-  } else if (!standing && place) {
-    setStatus("That link's view cannot be shown here; showing the channel instead.");
-  }
-  syncDeepLinkAddress();
-  if (wanted.view === "voice") {
-    setStatus("Links never start a call.");
-  }
-  if (!wanted.message) return;
-  deepLinks.setFocus(wanted.message);
-  syncDeepLinkAddress();
-  const movesBeforeSeek = deepLinks.readerMoves();
-  // The first read of the view now open, waited for as a seek waits for All to land.
-  await waitForDeepLink(() => String(selectedChannelId()) !== channel ||
-    (channelStore.current().views.has(viewKey()) && !channelReads.busy()));
-  if (epoch !== deepLinks.epoch() || String(selectedChannelId()) !== channel) return;
-  // Chosen while the read landed: the seek would walk views the reader just left.
-  if (deepLinks.readerMoves() !== movesBeforeSeek) {
-    deepLinks.setFocus(null);
-    syncDeepLinkAddress();
-    return;
-  }
-  const target = wanted.message.message;
-  await seekMessage(target, () => landOnDeepLink(target),
-    () => providerFacts.threading() && selection().view !== "flat" && answeredElsewhere(target));
-  if (!rowHolding(target)) {
-    deepLinks.setFocus(null);
-    syncDeepLinkAddress();
-  }
-  } finally {
-    deepLinks.setApplying(false);
-  }
-}
-
-/** Copy this message's vibe-talk link, and say whether it went. The ⋯ menu's third copy. */
-async function copyDeepLink(message) {
-  const copied = await writeClipboardText(deepLinkFor(deepLinkRefOf(message)));
-  setStatus(copied ? "Copied the vibe-talk link." : COPY_REFUSED);
-  return copied;
-}
-
-// --- in-app message links (#543 in-app-message-links) -----------------------------------------
-//
-// The owner, 2026-10-26, of a thread whose messages cite earlier ones by their Slack permalinks:
-// "Threads like this are actually really horrible on mobile … It would be great if we could recognize
-// chat links and translate them into vibe talk links to jump there in the client directly. It would
-// also be great if our jump worked with the back gesture in Android so we could jump back after we look
-// at the message. I would prefer to keep these message links in vibe talk by default."
-//
-// THE SERVER RECOGNIZES, THE PAGE DECIDES. The server marks every link in a rendered body whose address
-// is a message's, a thread's or a conversation's in a service it reads (src/message_links.rs): its
-// `data-msg` says the channel, the message and the thread, in this server's own ids. The address is
-// untouched. As the body is drawn (`wireMessageLinks`), a marked link becomes this app's when the
-// switch is on (`inAppLinks`, Settings' Message links, ON by default and synced) and the channel is
-// one this server reads: a link whose text was its own address is shown as `#channel › message`, and a
-// tap jumps (`jumpToMessageLink`) instead of leaving. A modified click — a new tab, a new window — and
-// a link the page does not take still go where the address goes, and from the message itself the ⋯
-// menu still opens or copies the service's own link (`#408`, `#409`).
-//
-// THE JUMP walks the way a `#462` link's open does: the channel switched if it must be, a reply's
-// thread opened over the view it was read from, a root message's view kept where it can show it, and
-// the message fetched around and landed on by the reply arrow's own walk (`seekMessage`).
-//
-// BACK COMES BACK. Each jump is one level of `#304`'s Back stack (`jump`), so it is one history entry:
-// the gesture, the browser's Back and a mouse's back button return to where the reader was — the
-// channel, the view, the thread open, and the message their eye was on at the same height
-// (`linkJumpSpot`, `returnToLinkSpot`). A jump is a level over everything that was open when it was
-// taken, and what it opened itself is part of it rather than a level of its own, so ONE Back undoes
-// one jump, however much it changed; what the reader opens after landing is a level over the jump, as
-// anywhere. Several jumps stack, each Back undoing one. Nothing else is pushed: scrolling is no place.
 
 /**
  * Whether a link to a message opens it here: ON unless the reader has turned it off, kept on the device and
@@ -1729,305 +1033,6 @@ function chooseOpenInView(view) {
     // A browser that refuses storage keeps the shipped default.
   }
   renderOpenInView();
-}
-
-/**
- * @typedef {{service: string, channel: string, message: string | null, thread: string | null}} MessageLinkRef
- * @typedef {import("./src/core/navigation/index.ts").LinkSpot} LinkSpot
- * @typedef {import("./src/core/navigation/index.ts").LinkJump} LinkJump
- */
-
-/** Whether a link to `ref` is this app's now: the switch on, and its channel one this server reads. */
-function keepsInApp(ref) {
-  return inAppLinks.current() && Boolean(ref) && channelDirectory.channels().some((channel) => String(channel.id) === ref.channel);
-}
-
-/** The words for a link to `ref` whose text was only its address: where it goes, in this app's names. */
-function messageLinkLabel(ref) {
-  const what = ref.message ? (ref.thread ? "reply" : "message") : ref.thread ? "thread" : null;
-  const channel = `#${channelLabel(ref.channel)}`;
-  return what ? `${channel} › ${what}` : channel;
-}
-
-/**
- * Make the links to messages in a body just drawn this app's, where they are (see the head of this
- * section): each one marked by the server is given a tap that jumps, decided again when it is tapped,
- * and one this app takes is marked for the stylesheet and, if its text was its address, named.
- */
-function wireMessageLinks(box) {
-  const walk = (node) => {
-    for (const kid of node.children) {
-      if (String(kid.tagName).toLowerCase() !== "a") {
-        walk(kid);
-        continue;
-      }
-      const ref = messageLinkRef(kid.getAttribute("data-msg"));
-      if (!ref) continue;
-      kid.addEventListener("click", inThisColumn((event) => onMessageLinkTap(ref, event)));
-      if (!keepsInApp(ref)) continue;
-      const href = String(kid.getAttribute("href") || "");
-      kid.setAttribute("data-in-app", "");
-      if (renderedText(kid) === href) {
-        const label = messageLinkLabel(ref);
-        kid.replaceChildren(document.createTextNode(label));
-      }
-      kid.setAttribute("title", `Opens here — ${href}`);
-    }
-  };
-  walk(box);
-}
-
-/**
- * A tap on a link to a message: a jump, when the link is this app's and nothing asks for another tab.
- * Otherwise the browser follows the address, as for any link.
- *
- * @param {MessageLinkRef} ref
- * @param {any} event
- */
-function onMessageLinkTap(ref, event) {
-  if (!keepsInApp(ref)) return;
-  if (event && (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || (event.button || 0) > 0)) return;
-  if (event && typeof event.preventDefault === "function") event.preventDefault();
-  if (event && typeof event.stopPropagation === "function") event.stopPropagation();
-  void guardQuietly(jumpToMessageLink)(ref);
-}
-
-// The jumps taken by links, the tickets each jump and return takes, how many returns are putting a place
-// back, and the levels a Back would close with the jumps among them: one owner in
-// web/src/core/navigation/jumps.ts (`#624 voice-page-modularity`).
-const linkJumps = createLinkJumps();
-
-/**
- * Where the reader is, to come back to: the place, the column, and the message their eye is on.
- *
- * @returns {LinkSpot}
- */
-function linkJumpSpot() {
-  const column = columnWork.side() ? "side" : "main";
-  const place = channelPlace();
-  const mark = captureScroll();
-  const anchor = mark.anchor;
-  return {
-    place, column, pinned: mark.pinned,
-    anchor: anchor ? anchor.getAttribute("data-context-id") || idsOf(anchor)[0] || null : null,
-    offset: anchor ? mark.top - listPlaceTop(el("scroll-area")) : 0,
-    focus: deepLinks.focus(),
-    call: false,
-  };
-}
-
-/**
- * The levels a Back would close, with the jumps taken by links among them (`LinkJumps.levels`).
- *
- * @param {string[]} levels what is open, as `backLevels` reads it without the jumps
- */
-function withLinkJumps(levels) {
-  return linkJumps.levels(levels);
-}
-
-/** Wait for the channel on screen to have read the view it shows, or to be left; false when it was left. */
-async function linkJumpRead(channel, ticket) {
-  await waitForDeepLink(() => !linkJumps.current(ticket) || String(selectedChannelId()) !== channel ||
-    (replayLedger.started() > 0 && channelStore.current().views.has(viewKey()) && !channelReads.busy()));
-  return linkJumps.current(ticket) && String(selectedChannelId()) === channel;
-}
-
-/** Choose channel `channel` as a link's arrival, which is no choice of the reader's (`#462`). */
-function arriveOnChannel(channel) {
-  chooseChannel(channel);
-  deepLinks.arrive(() => changeSelectedChannel());
-}
-
-/** Put channel place `place` on as an arrival: by the views' own choosing, or a thread by its id. */
-function arriveAtPlace(place) {
-  if (visitKey(channelPlace()) === visitKey(place)) return;
-  if (channelPlaceShowable(place)) {
-    showChannelPlace(place);
-  } else if (place.view === "thread" && place.thread) {
-    // Not yet known is not gone: opened by id, as a link's thread is, and named by the read after.
-    deepLinks.arrive(() => chooseOneColumn({ view: "thread", thread: place.thread, summary: null, origin: place.origin || "main" }));
-  }
-}
-
-/**
- * Jump to what a link names: see THE JUMP above. The reader's spot is taken first, and the jump is a
- * level from the start, so its entry is pushed in the tap's own task and a Back at any point undoes it.
- *
- * @param {MessageLinkRef} ref
- */
-async function jumpToMessageLink(ref) {
-  if (screens.screen() !== "main" || screens.view() !== "discord") return undefined;
-  // Where the reader is, in the column the link was tapped in; the jump itself is the left column's.
-  const spot = linkJumpSpot();
-  return inColumn(columns.main, () => jumpFromSpot(ref, spot));
-}
-
-/**
- * Jump to the message a sent card names (`#580 open-in-chat-jump`), from the call's view or the
- * channel's: a link's jump (`jumpFromSpot`), landing in the view Settings names (All unless the
- * reader chose Main) with the message centred and lit. From the call's view the channel's view comes
- * up as part of the jump, and its Back is the call's view again.
- *
- * @param {MessageLinkRef} ref
- */
-async function jumpToSentMessage(ref) {
-  if (screens.screen() !== "main") return undefined;
-  const fromCall = screens.view() !== "discord";
-  /** @type {LinkSpot} */
-  const spot = fromCall
-    ? { place: null, column: "main", pinned: false, anchor: null, offset: 0, focus: deepLinks.focus(), call: true }
-    : linkJumpSpot();
-  const enter = fromCall ? async () => {
-    uiState.settle();
-    showView("discord");
-    // A channel the jump changes to is read as it is chosen; the one already chosen is read here.
-    if (String(selectedChannelId()) === ref.channel) await readEnteredChannel(viewScroll.restored());
-  } : null;
-  return inColumn(columns.main, () => jumpFromSpot(ref, spot, { view: storedOpenInView(), center: true, enter }));
-}
-
-/**
- * `jumpToMessageLink` from `spot`, in the left column.
- *
- * `options.view` (`#580 open-in-chat-jump`) is the view to land a message in, "flat" for All or
- * "main", where the channel's layout leaves the choice to the jump: never over two columns, which
- * keep their own. `options.center` centres the message rather than putting it under the top.
- * `options.enter` runs once the jump is a level, before anything else it does.
- *
- * @param {MessageLinkRef} ref
- * @param {LinkSpot} spot
- * @param {{view?: "flat" | "main", center?: boolean, enter?: (() => Promise<void>) | null}} [options]
- */
-async function jumpFromSpot(ref, spot, options = {}) {
-  const here = String(selectedChannelId() || "");
-  if (ref.channel === here && !ref.message && !ref.thread) {
-    setStatus("That link is to this channel.");
-    return;
-  }
-  const under = linkJumps.top();
-  // A jump still under way when another is taken: what it had opened by now is its own.
-  if (under && under.landed === null) under.landed = screenLevelsNow();
-  // From the call's view nothing is open under the jump: what the channel's view shows is the jump's.
-  /** @type {LinkJump} */
-  const jump = { spot, below: spot.call ? [] : backLevels(), landed: null };
-  const ticket = linkJumps.take(jump);
-  scheduleBackSync();
-  try {
-    if (options.enter) await options.enter();
-    if (!linkJumps.current(ticket)) return;
-    if (ref.channel !== here) {
-      arriveOnChannel(ref.channel);
-      if (!await linkJumpRead(ref.channel, ticket)) return;
-    }
-    const channel = ref.channel;
-    const now = channelPlace();
-    /** @type {ChannelPlace | null} */
-    let place = null;
-    const want = providerFacts.threading() && ref.message && !(now && now.layout === "two") ? options.view || null : null;
-    if (want === "flat") {
-      // All: every message in the order sent, a reply among them, so no thread is opened.
-      place = { screen: "main", channel, layout: "one", view: "flat", thread: null, origin: null, side: null };
-    } else if (ref.thread && providerFacts.threading()) {
-      const origin = want === "main" ? "main"
-        : now && now.layout === "one" && (now.view === "main" || now.view === "flat") ? now.view
-          : now && now.view === "thread" && (now.origin === "main" || now.origin === "flat") ? now.origin
-            : defaultChannelView();
-      place = { screen: "main", channel, layout: "one", view: "thread", thread: ref.thread, origin, side: null };
-    } else if (want === "main") {
-      place = { screen: "main", channel, layout: "one", view: "main", thread: null, origin: null, side: null };
-    } else if (ref.message && now && (now.layout === "list" || (now.layout === "one" && now.view === "thread"))) {
-      // A root message is on the channel's own timeline: the view a thread was opened from, or the
-      // channel's own, where the thread list or a thread cannot show it.
-      const view = now.layout === "one" && (now.origin === "main" || now.origin === "flat") ? now.origin : defaultChannelView();
-      place = { screen: "main", channel, layout: "one", view: view === "flat" ? "flat" : "main", thread: null, origin: null, side: null };
-    }
-    if (place) {
-      arriveAtPlace(place);
-      if (!await linkJumpRead(channel, ticket)) return;
-    }
-    if (!ref.message) {
-      setStatus(ref.thread ? "Here is the linked thread." : `Here is #${channelLabel(channel)}.`);
-      return;
-    }
-    const provider = providerOfChannel(channel);
-    const name = provider && typeof provider.name === "string" && provider.name.trim() ? provider.name.trim() : channelDirectory.providerName();
-    deepLinks.setFocus({ provider: String(name || ref.service).toLowerCase(), channel, message: ref.message, thread: ref.thread });
-    const target = ref.message;
-    // A Back while the walk looks further back ends it: nothing lands over the place put back.
-    await seekMessage(target, () => linkJumps.current(ticket) && landOnDeepLink(target, Boolean(options.center)),
-      () => linkJumps.current(ticket) && providerFacts.threading() && selection().view !== "flat" && answeredElsewhere(target));
-    if (linkJumps.current(ticket) && !rowHolding(target)) deepLinks.setFocus(null);
-  } finally {
-    // Landed, or given up: what is open now is the jump's, and what opens after is over it.
-    if (jump.landed === null && linkJumps.holds(jump)) {
-      jump.landed = screenLevelsNow();
-      scheduleBackSync();
-    }
-  }
-}
-
-/** Undo the last jump: its level goes at once, and the reader is put back where they were. */
-function returnFromLinkJump() {
-  const jump = linkJumps.undo();
-  if (!jump) return;
-  // A walk the jump's seek is still making is over: its next step finds another ticket.
-  replyJumpTicket.bump();
-  linkJumps.returnStarted();
-  void guardQuietly(returnToLinkSpot)(jump.spot).finally(() => {
-    linkJumps.returnEnded();
-    scheduleBackSync();
-  });
-}
-
-/**
- * Put the reader back on `spot`: its channel, its place, and the message their eye was on, at the same
- * height — walked back to if it is no longer in the list, as a link's message is.
- *
- * @param {LinkSpot} spot
- */
-async function returnToLinkSpot(spot) {
-  const ticket = linkJumps.nextTicket();
-  // `#580 open-in-chat-jump`. A jump from the call's view goes back to it, where the reader was.
-  if (spot.call) {
-    if (screens.screen() !== "main" || screens.view() === "voice") return;
-    uiState.settle();
-    showView("voice");
-    stopDiscordPolling();
-    setStatus("Back on the call's view.");
-    return;
-  }
-  const place = spot.place;
-  if (!place || screens.screen() !== "main" || screens.view() !== "discord") return;
-  if (!channelDirectory.channels().some((channel) => String(channel.id) === place.channel)) return;
-  if (String(selectedChannelId()) !== place.channel) {
-    arriveOnChannel(place.channel);
-    if (!await linkJumpRead(place.channel, ticket)) return;
-  }
-  arriveAtPlace(place);
-  if (!await linkJumpRead(place.channel, ticket)) return;
-  deepLinks.setFocus(spot.focus);
-  syncDeepLinkAddress();
-  const column = spot.column === "side" && sideShowing() ? columns.side : columns.main;
-  const put = () => inColumn(column, () => putBackOnSpot(spot));
-  if (spot.pinned || !spot.anchor) {
-    if (spot.pinned) inColumn(column, scrollToNewest);
-    setStatus("Back where you were.");
-    return;
-  }
-  if (put()) return;
-  const anchor = spot.anchor;
-  await inColumn(column, () => seekMessage(anchor, () => linkJumps.current(ticket) && putBackOnSpot(spot),
-    () => providerFacts.threading() && selection().view !== "flat" && answeredElsewhere(anchor)));
-}
-
-/** Put the row `spot` names at the height it was, in the column being worked on; false when it is not drawn. */
-function putBackOnSpot(spot) {
-  const row = [...visibleList().children].find((candidate) =>
-    candidate.getAttribute("data-context-id") === spot.anchor || idsOf(candidate).includes(String(spot.anchor)));
-  if (!row) return false;
-  restoreScroll({ pinned: false, anchor: row, top: listPlaceTop(el("scroll-area")) + spot.offset });
-  setStatus("Back where you were.");
-  return true;
 }
 
 // --- screens ----------------------------------------------------------------------------------
@@ -2131,114 +1136,46 @@ document.addEventListener("pointerdown", (event) => {
 
 /** What the header calls each screen that is a DESTINATION rather than the app itself. */
 const SCREEN_TITLES = { settings: "Settings", help: "Help" };
+/**
+ * Showing a screen — everything that goes with the change, in order, the screen itself shown last:
+ * one owner in web/src/view/shell/screenshowing.ts (`createScreenShowing`, `#624
+ * voice-page-modularity`). The page destructures its command under its old name; what each thing
+ * done there does is handed in as it was taken here, every one of them read as it is called, so a
+ * screen shown during start-up finds them as they then stand.
+ *
+ * @type {import("./src/view/shell/index.ts").ScreenShowing}
+ */
+const screenShowing = createScreenShowing({
+  screens,
+  el: (id) => el(id),
+  closeOverscroll: () => closeOverscroll(),
+  holdChannelPlace: () => holdChannelPlace(),
+  postCardBackToMain: () => voiceTranscript().postCardBackToMain(),
+  placePostCard: () => voiceTranscript().placePostCard(),
+  disarmClear: () => voiceTranscript().disarmClear(),
+  browserReading: () => readAloudOwner().readAloudPlayback === "browser" || (readAloudOwner().nowPlaying !== null && readAloudOwner().nowPlaying.playback === "browser"),
+  stopReading: () => readAloudOwner().stopReading(),
+  closeDismissedSends: () => dismissedSendsView.close(false),
+  renderDismissedSends: () => dismissedSendsView.render(),
+  renderJumpNewest: () => renderJumpNewest(),
+  placeChipsOverComposer: () => placeChipsOverComposer(),
+  renderControlBar: () => renderControlBar(),
+  renderColumns: () => renderColumns(),
+  pointSettingsAtReading: () => channelSettings.pointSettingsAtReading(),
+  refreshUpstreamClear: () => upstreamClearBox.refresh(),
+  refreshChannelHistory: () => channelHistoryBox.refresh(),
+  refreshAgentPrefix: () => agentPrefix.refresh(),
+  renderIdentities: () => identityList.render(),
+  focusLost: () => focusLost(),
+  settleFocus: () => settleFocus(),
+  scheduleBackSync: () => scheduleBackSync(),
+});
+const { showScreen } = screenShowing;
 
 // Where Back on Help goes — Settings, which is where Help is opened from, unless `?` opened it
 // (`keysFromKeyboard`) — and where Settings' way out goes are the screens' (`Screens.helpReturn`,
 // `Screens.beforeSettings`), put back as each screen is arrived at (`Screens.arrive`).
 
-function showScreen(name) {
-  const previous = screens.screen();
-  // `#338 column-overscroll`. The room past the right column's foot goes with the main screen: a reader who
-  // was in it comes back to the foot.
-  if (name !== "main") closeOverscroll();
-  // The channel list is about to be hidden, and a hidden list has nothing left to measure: the
-  // reader's message is noted now, for a reopen. `#189 restore-ui-state`.
-  if (screens.screen() === "main" && name !== "main") holdChannelPlace();
-  // `#269 approval-card-inline`. ...and the list about to be shown again is whole when it is first laid out:
-  // a draft docked under the screen being left is back at its foot BEFORE it is shown (`postCardBackToMain`).
-  if (name === "main" && previous !== "main") voiceTranscript().postCardBackToMain();
-  // `#280 scroll-stability`. Everything going goes FIRST, and the screen coming is shown LAST, once the frame
-  // around it is as it will be (below). A browser lays a list on a hidden screen out again the first time it
-  // lays the page out after the screen is shown, and clamps the reader's place to the list's window as it is
-  // then. Hiding a control that holds the focus is such a time: Chromium blurs it on the spot, and lays the
-  // page out to do so. Help's list holds the focus after "?" or Ctrl+?, and Help's Back button after a tap on
-  // it, and both were hidden after the main screen was shown and before the control pane was: the list was
-  // laid out in a window 66px taller than its own on a 393x852 phone. A reader whose long draft was settled
-  // while Help was up was left 58px above the foot, and 200px once the box took back its room, the jump
-  // offered. (Settings' ways out let go of the focus before they get here, `closeSettings`.)
-  for (const screen of SCREENS) {
-    if (screen !== name) el(`screen-${screen}`).hidden = true;
-  }
-  const main = name === "main";
-  // Settings and Reply are both destinations: the header becomes a title bar with a way back, and
-  // the controls that act on the screen you have left are absent.
-  const destination = Object.prototype.hasOwnProperty.call(SCREEN_TITLES, name);
-  // Two separate ways back, because they go to two different places — and because
-  // scripts/screenshots.py drives #close-settings by name.
-  el("close-settings").hidden = name !== "settings";
-  el("close-help").hidden = name !== "help";
-  el("topbar-title").hidden = !destination;
-  if (destination) {
-    el("topbar-title").textContent = SCREEN_TITLES[name];
-  }
-  // Which screen is up, where the stylesheet can see it.
-  el("frame-body").setAttribute("data-screen", name);
-  // The control pane is a grid ROW inside the dock. Hiding it collapses the row, so the body grows
-  // to fill the frame rather than leaving a band of empty pane under a sign-in form.
-  //
-  // The status line is not touched here any more. It used to be kept visible on every screen so a
-  // sign-in failure could say so — but a sign-in failure is shown by the `#error` panel, which is
-  // permanent and is on whichever screen is up, and the sign-in screen states what to paste in its
-  // own body. `#63 status-line-placement`.
-  el("control-pane").hidden = !main;
-  // ...and only now the screen itself (`#280 scroll-stability`, above).
-  el(`screen-${name}`).hidden = false;
-  if (!main) {
-    // And a device-voice read Read with device voice started under the cloud voice (`#548`).
-    if (readAloudOwner().readAloudPlayback === "browser" || (readAloudOwner().nowPlaying !== null && readAloudOwner().nowPlaying.playback === "browser")) readAloudOwner().stopReading();
-    voiceTranscript().disarmClear();
-  }
-  // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed is Settings', and goes with it.
-  if (name !== "settings") dismissedSendsView.close(false);
-  // Help is reached FROM settings and returns TO it, so it must not become the thing settings
-  // remembers to go back to — that would make the gear's way out lead into the document the
-  // reader just left. `#85 voice-desktop-review`.
-  // `#224 keyboard-shortcuts`. Help left by any way at all (its Back, Esc, or the search or Settings
-  // key, which leave it as Settings' Back does) forgets where `?` opened it from: the next Help, from
-  // a `?` in Settings, goes back to Settings. Here rather than in each way out, so that a way out
-  // added later cannot leave a stale answer behind (`Screens.arrive`).
-  screens.arrive(name, previous);
-  // The jump is about the list on the main screen, and is gone with it. `#207 scrollback-jump`. Back on
-  // the main screen it is decided at the end, on the list as it is then laid out (below).
-  if (!main) renderJumpNewest();
-  // ...and so is the channel's message box the chips stand on. `#245 done-feedback`.
-  placeChipsOverComposer();
-  // LAST, and after `currentScreen` is set: the bar decides what it shows from the screen that is
-  // now up, and it is also what collapses the header when nothing is left in it. `#58 control-bar`.
-  renderControlBar();
-  // `#224 keyboard-shortcuts`. A new screen is a new list for the scroll keys, so its scroller takes
-  // the focus, which the control that brought the reader here would otherwise keep (the gear) or
-  // drop (a Back button, which has just hidden itself), leaving PgDn and Space to the document. Only
-  // on a real change, or with the focus already lost: a sign-in that lands on the screen already up
-  // must not pull the reader out of the box they have started typing in.
-  // `#229 desktop-two-column`. Back on the main screen, two columns are decided again: the window may
-  // have been resized behind Settings.
-  if (main) renderColumns();
-  // `#269 approval-card-inline`. A waiting draft follows the owner to the screen now up.
-  voiceTranscript().placePostCard();
-  // `#207 scrollback-jump` x `#280 scroll-stability`. The jump over the list now shown, decided once the
-  // header has collapsed (`renderControlBar`) and the columns and the card are in place. Decided as the
-  // screen was un-hidden, it measured the list under the header the screen being left kept, 54px shorter
-  // at a desk and 8px on a phone: a reader 40px above the foot read as 94px up, past `SCROLLBACK_PX`, and
-  // was offered the jump, whose own room under the box then held it there.
-  if (main) renderJumpNewest();
-  // `#355 provider-grouped-channels`. Settings opens on the service of the channel being read; not on
-  // the way back from Help, which is the same visit, where the reader's choice stands.
-  if (name === "settings" && previous !== "settings" && previous !== "help") channelSettings.pointSettingsAtReading();
-  // `#232 upstream-mark-read`. The server may have pushed since the box was last drawn.
-  if (name === "settings" && previous !== "settings") upstreamClearBox.refresh();
-  // `#602 history-settings-and-limits`. The walk has gone on since the box was last drawn.
-  if (name === "settings" && previous !== "settings") channelHistoryBox.refresh();
-  // `#303 voice-post-prefix`. Another device may have saved or reset the tag since sign-in.
-  if (name === "settings" && previous !== "settings") agentPrefix.refresh();
-  // `#193 compose-draft-loss`. Its ages and channel names as they are now, and none past its days.
-  if (name === "settings" && previous !== "settings") dismissedSendsView.render();
-  // `#402 who-is-who-channel-box`. Who is who in the box's channel, as the census stands now.
-  if (name === "settings" && previous !== "settings") identityList.render();
-  if (name !== previous || focusLost()) settleFocus();
-  // `#304 back-gesture-in-app`. A screen opened has an entry to go back through, and one left has none.
-  scheduleBackSync();
-}
 
 /**
  * Leave Settings for the screen it was opened from: what its Back button does, and Escape.
@@ -26082,6 +25019,81 @@ function startSettingsSync() { settingsSyncView().start(); }
 
 // --- wiring ------------------------------------------------------------------------------------
 
+// The ordered boot (`#624 voice-page-modularity`, plan step 17): every mount below is tracked
+// with the application as it is mounted, in this order, and the final sequence runs as its start
+// acts, in theirs. `dispose()` takes the tracked mounts down in reverse order; production does
+// not call it yet — the owners above the wiring (the pairing offer, the settings owners) join it
+// as their bundles land. One boot in web/src/app/application.ts (`createApplication`).
+const application = createApplication({
+  mounts: [],
+  starts: [
+    // The LOAD-TIME sentence only, which is why this act uses `noTokenSentence()` and the causes
+    // below it do not: `forgetToken` and an empty Save are causes the owner just supplied
+    // themselves, and blaming the rename for either would be a wrong explanation of something
+    // they already know.
+    () => setTokenState(token() ? "token saved in this browser" : noTokenSentence()),
+    // With no token there is nothing to report YET, and firing a toast at page load to say so
+    // would put a message over a screen whose entire subject is the thing it is asking for. The
+    // sign-in screen says it in its own body; see `setTokenState`. `#63 status-line-placement`.
+    () => {
+      if (token() && devicePairing.code() === null) {
+        setStatus("Checking your token…");
+      }
+    },
+    // Before the first screen is shown, so the bar is in its home from the first frame rather
+    // than visibly jumping out of the header once script catches up. `#58 control-bar`.
+    () => barPlacement.set(barPlacement.stored()),
+    // The read mode as the reader left it, before the first row is drawn or read. `#189
+    // restore-ui-state`, and `#221 read-modes`: a record an older page kept says only Hide read
+    // or not.
+    () => {
+      if (uiState.saved()) {
+        readModes.set(savedReadMode(uiState.saved()));
+        // As in `setReadMode`: the record just read is the restore either way.
+        readModes.keep();
+      }
+    },
+    () => {
+      showView("voice");
+      renderEmptyState();
+      voiceCall().renderControls();
+    },
+    // No token means no interface to show yet: the sign-in screen is the whole page until there
+    // is one. With a token, prove it before showing the main screen — unless this device saved
+    // the channel for that same token, in which case the application is up in this task, with
+    // the saved rows in it, and the proof arrives behind it. A refusal still ends on the sign-in
+    // screen, with every saved row gone. `#18 offline-message-cache`.
+    //
+    // ...and up where the reader left it: on the channel, in their view, at their message. The
+    // view's one read waits for the proof, and for the live stream it starts (`payReopenRead`).
+    // `#189 restore-ui-state`.
+    () => {
+      if (devicePairing.code() !== null) {
+        // `#369 pairing-link`. The person decides, with one tap: sign in with the link, or not now.
+        devicePairing.offer();
+      } else if (token()) {
+        if (hydrateFromCache()) {
+          showScreen("main");
+          reopenSavedView();
+        }
+        // `#625 signin-flash`. ...and with no saved shell to show, NO screen until the proof
+        // arrives: the sign-in form is served hidden and stays so, and "Checking your token…"
+        // says what is happening. A form asking for a token the reader has already given, up for
+        // a round trip on every reload, read as being signed out. `signIn` shows the main
+        // screen, or this one after a refusal.
+        guardQuietly(signIn)();
+      } else {
+        showScreen("signin");
+      }
+    },
+    // `#304 back-gesture-in-app`. Last, with every part of the page defined: the history kept in
+    // step with what is open, from the screen the page opened on.
+    () => startBackStack(),
+    // `#462 webapp-deep-links`. Open where a link says, once sign-in gives it a channel to open.
+    () => guardQuietly(applyDeepLink)(),
+  ],
+});
+
 // `#616 composer-no-autofill`. The token field starts EMPTY, even with a token saved, and is emptied again
 // once a token has signed in. A password field holding the token, in one form with every message box, is
 // what made a phone's password manager take a send for a sign-in and offer to save it (see #signin-form
@@ -26089,7 +25101,7 @@ function startSettingsSync() { settingsSyncView().start(); }
 // again. The form is never submitted; should something submit it, nothing happens. Sign-in's and pairing's listeners,
 // a second pairing link opened in this tab included: one owner in web/src/view/settings/signincontrols.ts (`#624
 // voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's teardown.
-mountSignInControls({
+application.track(mountSignInControls({
   lookup: (id) => el(id),
   saveToken: guardQuietly(saveToken),
   forgetToken: () => forgetToken(),
@@ -26098,7 +25110,7 @@ mountSignInControls({
   declinePairing: () => devicePairing.decline(),
   takePairingCode: () => takePairingCode(),
   pairingOpened: (code) => devicePairing.opened(code),
-});
+}));
 
 // Settings' switches and choices, each restored as kept before it is heard, since the controls carry the live truth
 // `start()` and the rest read: the microphone's checkboxes, the audio devices (`#619 voice-bluetooth-output`), where
@@ -26106,7 +25118,7 @@ mountSignInControls({
 // select (`#44 live-push`, `#126 read-new-selector`), and resuming (`#46 conversation-replay`). One owner in
 // web/src/view/settings/switches.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its `unmount`
 // waits for the ordered boot's teardown.
-mountSettingsSwitches({
+application.track(mountSettingsSwitches({
   lookup: (id) => el(id),
   storedMicSettings: () => microphoneSettings.stored(),
   micSettingsChanged: () => microphoneSettings.changed(),
@@ -26144,7 +25156,7 @@ mountSettingsSwitches({
         : "The next call will start the agent from nothing."
     );
   },
-});
+}));
 
 // Every setting restored as kept before anything is drawn: the column and the type, the line counts (`#425
 // collapsed-lines`), the read-aloud speed, the switches that shape the lists, and the message box's Enter. The order
@@ -26168,7 +25180,7 @@ restoreStoredSettings({
 // `#340 composer-grow-box`. The grow switches drawn as kept and heard, three boxes fitted as they are typed in, and
 // Send kept in view as a box grows. One owner in web/src/view/composer/growlisteners.ts (`#624
 // voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's teardown.
-mountComposerGrowListeners({
+application.track(mountComposerGrowListeners({
   lookup: (id) => leftEl(id),
   storedComposerGrow: () => storedComposerGrow(),
   renderComposerGrow: (on) => renderComposerGrow(on),
@@ -26176,11 +25188,11 @@ mountComposerGrowListeners({
   fitGrowingBox: (field) => fitGrowingBox(field),
   keepGrowingBoxInView: (field) => keepGrowingBoxInView(field),
   resizeObserver: () => window.ResizeObserver,
-});
+}));
 // The screen's sliders and their steps, the page-build notice's reload (`#529 page-build-stale-notice`: only on the
 // reader's press), and the reading column's grip. One owner in web/src/view/settings/screencontrols.ts (`#624
 // voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's teardown.
-mountScreenControls({
+application.track(mountScreenControls({
   lookup: (id) => el(id),
   readingWidthChanged: (value) => readingWidthControl.changed(value),
   textSizeChanged: (value) => textSize.changed(value),
@@ -26197,25 +25209,25 @@ mountScreenControls({
   gripMove: (event) => readingWidthControl.gripMove(event),
   gripUp: () => readingWidthControl.gripUp(),
   gripKey: (event) => readingWidthControl.gripKey(event),
-});
+}));
 
 // The page's last document-level listeners (`#54 resume-recovery`, `#280 scroll-stability`): the page
 // going away or coming back, a pointer down outside a row's menu, and the mouse leaving the window.
 // One owner in web/src/view/shell/documentlisteners.ts (`#624 voice-page-modularity`), mounted here,
 // in the page's order; its `unmount` waits for the ordered boot's teardown.
-mountDocumentListeners({
+application.track(mountDocumentListeners({
   root: () => document.documentElement,
   onVisibility: () => onVisibility(),
   closeRowMenuOutside: (event) => closeRowMenuOutside(event),
   onPointerLeavePage: (event) => onPointerLeavePage(event),
-});
+}));
 // The keys' and the selection's listeners (`#224 keyboard-shortcuts`, `#344 search-shortcut`, `#296
 // copy-highlighted-message`, `#239 single-selection`): every key heard in one place, the chords that act whatever
 // holds the focus heard first, a copy with nothing selected, the single-key switch (restored first, so the keys are
 // said as they will act), and the clicks, the focus and the pointer that move the one selection. One owner in
 // web/src/view/shell/keylisteners.ts (`#624 voice-page-modularity`), mounted here, in the page's order; the page
 // never takes them down, and its `unmount` waits for the ordered boot to have a teardown.
-mountKeyListeners({
+application.track(mountKeyListeners({
   onPageKey: (event) => keyTiming.around(event, () => keyDispatch.onPageKey(event)),
   onEverywhereKey: (event) => keyDispatch.onEverywhereKey(event),
   onPageBeforeCopy: (event) => highlightCopy.onPageBeforeCopy(event),
@@ -26229,7 +25241,7 @@ mountKeyListeners({
   onPaneFocus: (pane, event) => onPaneFocus(pane, event),
   onPointerMove: (event) => onPointerMove(event),
   onPointerDown: (event) => onPointerDown(event),
-});
+}));
 // The quoted words' and the quick-reply box's listeners: words selected in one message make its Reply a Quote reply
 // (`#267 quote-reply`); the selection chip and its twin in the paused read's strip, pressed without taking the
 // selection or the focus from the words they quote (`#726 vt-selection-chip`, `#819
@@ -26239,7 +25251,7 @@ mountKeyListeners({
 // message: `putDownQuickReply`), and the lists and the window that move it. One owner in
 // web/src/view/composer/quickreply.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its
 // `unmount` waits for the ordered boot's teardown.
-mountQuickReplyListeners({
+application.track(mountQuickReplyListeners({
   byId: (id) => el(id),
   leftById: (id) => leftEl(id),
   noteQuoteSelection: () => noteQuoteSelection(),
@@ -26262,14 +25274,14 @@ mountQuickReplyListeners({
   placeQuickReply: () => placeQuickReply(),
   selectionHeld: () => Boolean(quoteOwner.held()),
   placeSelectionChip: () => placeSelectionChip(),
-});
+}));
 // The page's own listeners at the document and the window: a message's time worded as the pointer or the focus
 // reaches it (`#260 timestamp-hover`) and its day said on a tap or Enter, captured ahead of the row's own press
 // (`#479 message-time-full-date`); and the last moments a phone promises this page before it may reclaim it,
 // hidden or being unloaded, when the reader's place (`#189 restore-ui-state`) and then a turn still being said
 // (`#330 voice-long-turn-drop`) are written down. One owner in web/src/view/shell/pagelisteners.ts (`#624
 // voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's teardown.
-mountPageListeners({
+application.track(mountPageListeners({
   wordDayTitle: (event) => freshenDayTitle(event),
   onTimeTap: (event) => onTimeTap(event),
   onTimeKey: (event) => onTimeKey(event),
@@ -26279,7 +25291,7 @@ mountPageListeners({
     saveUiState();
   },
   saveUnsettledTurns: () => voiceCall().saveUnsettledTurns(),
-});
+}));
 
 /** Take the pace popover down. Safe to call when it is already down. */
 function closeSpeedPopover() {
@@ -26291,7 +25303,7 @@ function closeSpeedPopover() {
 // The reading preferences' switches: the read-aloud pace's popover, Your own messages, and the switches that shape
 // how messages are drawn and sent. One owner in web/src/view/settings/preferenceswitches.ts (`#624
 // voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's teardown.
-mountPreferenceSwitches({
+application.track(mountPreferenceSwitches({
   lookup: (id) => el(id),
   toggleSpeedPopover: () => {
     const open = el("speed-popover").hidden;
@@ -26310,17 +25322,17 @@ mountPreferenceSwitches({
   openInViewChanged: messagePreferences.openInView.changed,
   summariesChanged: messagePreferences.summaries.changed,
   enterSendsChanged: (on) => enterSends.apply(on),
-});
+}));
 
 // `#240 reading-bookmark`. The ways back: to the bookmark, to where the reader was reading (the left column's chip, as
 // b is), and back to a reply (web/src/view/channel/readingjumps.ts).
-mountReadingJumps({
+application.track(mountReadingJumps({
   lookup: (id) => el(id),
   leftLookup: (id) => leftEl(id),
   jumpToBookmark: () => guardQuietly(jumpToBookmark)(),
   jumpToReading: () => readingJump.jump(),
   backToReply: () => backToReply(),
-});
+}));
 
 // The read-aloud controls (`#567 pace-stepper`, `#376 read-aloud-blocks`, `#442 read-strip-order`, `#434
 // read-aloud-pause`, `#451 read-strip-followups`, `#627 scrubber-thumb-arrows`, `#886 voice-page-autoplay`): the pace's
@@ -26328,7 +25340,7 @@ mountReadingJumps({
 // One owner in web/src/view/voice/readcontrols.ts (`#624 voice-page-modularity`), mounted here, in the page's order;
 // its `unmount` waits for the ordered boot's teardown. Read and Stop leave reading mode by `setReadingMode` and
 // `leaveReadingMode`, below.
-mountReadControls({
+application.track(mountReadControls({
   byId: (id) => el(id),
   win: () => (typeof window.addEventListener === "function" ? window : null),
   stepReadSpeed: (direction) => readAloudOwner().stepReadSpeed(direction),
@@ -26350,7 +25362,7 @@ mountReadControls({
   readingMode: () => readAloudOwner().readingMode,
   setReadingMode: (on) => setReadingMode(on),
   leaveReadingMode: () => leaveReadingMode(),
-});
+}));
 
 /**
  * `#442 read-strip-order`. Stop: the read ends AND reading mode is left, in one tap, by the path
@@ -26407,7 +25419,7 @@ function setReadingMode(on) {
 // The call's controls: Talk, Hang up, the speaker, clearing the view, forgetting the stored conversations, and a
 // failed start tried again. One owner in web/src/view/voice/callcontrols.ts (`#624 voice-page-modularity`), mounted
 // here, in the page's order; its `unmount` waits for the ordered boot's teardown.
-mountCallControls({
+application.track(mountCallControls({
   byId: (id) => el(id),
   onTalk: () => voiceCall().onTalk(),
   hangUp: () => voiceCall().stop(),
@@ -26419,7 +25431,7 @@ mountCallControls({
   forgetConversations: () => guardQuietly(voiceTranscript().forgetConversations)(),
   toggleSpeaker: () => voiceCall().setSpeakerOff(!voiceCall().session.speakerOff),
   retryStart: () => voiceCall().retryStart(),
-});
+}));
 // `#43 typed-input`, rehoused by `#59 text-entry-button` and then by `#241 voice-composer`: the
 // composer, in three listeners and no logic. Everything they call is a named function above, which
 // is exactly why moving the control from the dock to the bar and from the bar to the transcript did
@@ -26432,7 +25444,7 @@ mountCallControls({
 // voice-composer`), and each canned prompt's field restored and kept and its button (`#60 canned-prompt-buttons`).
 // One owner in web/src/view/voice/callcomposer.ts (`#624 voice-page-modularity`), mounted here, in the page's order;
 // its `unmount` waits for the ordered boot's teardown.
-mountCallComposer({
+application.track(mountCallComposer({
   lookup: (id) => el(id),
   sendTyped: guardQuietly(voiceCall().sendTyped),
   storedComposeDraft: () => voiceCall().storedComposeDraft(),
@@ -26457,12 +25469,12 @@ mountCallComposer({
       setStatus(entry.said);
     }
   },
-});
+}));
 // The prompts tray's and the action menu's openers, each a plain toggle, and what they show stated once at load
 // (`#820 voice-page-action-menu`, `#880 voice-page-menu-placement`, `#886 voice-page-autoplay`). One owner in
 // web/src/view/shell/menuopeners.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its `unmount`
 // waits for the ordered boot's teardown.
-mountMenuOpeners({
+application.track(mountMenuOpeners({
   lookup: (id) => el(id),
   togglePrompts: () => setPromptsOpen(!promptsTray.open()),
   toggleActionMenu: () => setActionMenuOpen(!actionMenu.open()),
@@ -26470,20 +25482,20 @@ mountMenuOpeners({
   renderReaderRow: () => readerRow.render(),
   renderAutoplay: () => autoplay.render(),
   shutPrompts: () => setPromptsOpen(false),
-});
+}));
 // The call's box (web/src/view/composer/boxlisteners.ts, `#624 voice-page-modularity`). `#225 enter-to-send`: one
 // rule for every message box; see `onComposerKey`. A textarea since `#241 voice-composer`, as the channel's box is, so
 // with Enter to send off an Enter is a new line. `paste-never-sends`: every message box, a paste only ever puts text in.
-mountMessageBox({
+application.track(mountMessageBox({
   box: el("compose-text"),
   onKey: (event) => onComposerKey(event, guardQuietly(voiceCall().sendTyped), el("compose-text")),
   watchBoxInsertions: (box) => watchBoxInsertions(box),
-});
+}));
 // The page's own buttons beside the call: the banner's, the status line's and the error's dismissals, the post card's
 // Send, Cancel and More, Settings opened and closed, reading on the device, and the read-aloud source and voice. One
 // owner in web/src/view/voice/pagebuttons.ts (`#624 voice-page-modularity`), mounted here, in the page's order; the
 // acts its owners take the press for are handed as they were taken here, at load.
-mountPageButtons({
+application.track(mountPageButtons({
   lookup: (id) => el(id),
   dismissBanner,
   dismissStatus,
@@ -26508,7 +25520,7 @@ mountPageButtons({
   setWitVoice: (voice) => readAloudOwner().setWitVoice(voice),
   setReadAudioSource: (source) => readAloudOwner().setReadAudioSource(source),
   closeSettings,
-});
+}));
 
 // `#85 voice-desktop-review`. The paragraphs that used to stand between the reader and every switch
 // now live on their own screen, and each `?` on the settings screen opens the matching entry.
@@ -26518,17 +25530,17 @@ mountPageButtons({
 // settings group would mean inventing one there purely to hang a listener on. The attribute names
 // the entry, the entry's id is `help-<that>`, and adding a group is one button plus one article.
 // Help's ways in and out (web/src/view/settings/helplinks.ts, `#624 voice-page-modularity`).
-mountHelpLinks({
+application.track(mountHelpLinks({
   lookup: (id) => el(id),
   closeHelp: () => closeHelp(),
   showHelp: (topic) => showHelp(topic),
-});
+}));
 // What the page kept of its sends, read back, and the listeners over it: the replies' drafts (`#51 reply-view`), this
 // device's own posts before the outbox (`#500 sent-receipts-pile-up`), the Done writes a page closed before the server
 // had them, sent now, when the connection comes back, and whenever a write of this page's is answered (`#892
 // voice-page-optimistic-done`), and the sends dismissed in the last days (`#193 compose-draft-loss`) with their Undo
 // and Forget, and the bookmark's Undo (`#420 bookmark-clear`). One owner in web/src/view/channel/keptsends.ts.
-mountKeptSends({
+application.track(mountKeptSends({
   lookup: (id) => el(id),
   loadReplyDrafts: () => replyDrafts.load(),
   loadOwnPosts: () => loadOwnPosts(),
@@ -26543,7 +25555,7 @@ mountKeptSends({
   },
   undoBookmarkRemoval: () => undoBookmarkRemoval(),
   forgetDismissedSends: () => forgetDismissedSends(),
-});
+}));
 channelDrafts.load();
 // `#819 voice-page-quoted-reply-and-draft-chip`. The quick replies' drafts, and where every draft is.
 quickDrafts.load();
@@ -26553,29 +25565,29 @@ draftLedger.prune(draftHeld);
 // The channel's view chips, the thread's Back, a thread chosen, and the picker touched, the cue that the reader wants
 // the full list of threads. One owner in web/src/view/channel/viewcontrols.ts (`#624 voice-page-modularity`), mounted
 // here, in the page's order; its `unmount` waits for the ordered boot's teardown.
-mountChannelViewControls({
+application.track(mountChannelViewControls({
   lookup: (id) => el(id),
   changeView: (view) => guardQuietly(() => changeChannelView(view))(),
   closeThread: () => guardQuietly(closeThread)(),
   selectThread: () => guardQuietly(onThreadSelect)(),
   refreshThreadDirectory: () => guardQuietly(refreshThreadDirectory)(),
-});
+}));
 // The channel's box, and a thread's, which is the same box posting somewhere else: what is written kept as it is
 // written, Send, its keys, and what is pasted (web/src/view/composer/boxlisteners.ts).
-mountMessageBox({
+application.track(mountMessageBox({
   box: el("channel-compose-text"),
   remember: () => rememberChannelDraft(),
   sendButton: el("channel-send"),
   send: guardQuietly(sendChannelMessage),
   onKey: (event) => onComposerKey(event, guardQuietly(sendChannelMessage), el("channel-compose-text")),
   watchBoxInsertions: (box) => watchBoxInsertions(box),
-});
+}));
 // The thread's back gesture and the right column's controls (`#304 back-gesture-in-app`, `#229 desktop-two-column`,
 // `#388 thread-header-collapse`, `#281 view-keys`, `#262 search-load-older`, `#404`, `#419`, `#426`): a swipe right out
 // of a thread, the layout button, the X, the card at the top of a thread, the card's flight ending, and the Threads
 // view's chips. One owner in web/src/view/channel/sidecontrols.ts (`#624 voice-page-modularity`), mounted here, in the
 // page's order; its `unmount` waits for the ordered boot's teardown.
-mountSideControls({
+application.track(mountSideControls({
   byId: (id) => el(id),
   leftById: (id) => leftEl(id),
   inThread: () => selection().view === "thread",
@@ -26593,7 +25605,7 @@ mountSideControls({
   nextUnpack: () => setUnpackMode(cardPacking.nextMode()),
   toggleMainRows: () => setMainRowsShown(!mainRowsChoice.on()),
   nextOrder: () => setThreadOrder(nextThreadOrder()),
-});
+}));
 // `#388 thread-header-collapse`. The card at the top of a thread drawn as the device last chose before anything is shown.
 renderThreadCardFold();
 renderUnpackToggle();
@@ -26736,7 +25748,7 @@ function applyKeyboardDebug(on) {
 // first measure. One owner in web/src/view/composer/keyboardlisteners.ts (`#624
 // voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered
 // boot's teardown.
-mountKeyboardListeners({
+application.track(mountKeyboardListeners({
   lookup: (id) => el(id),
   leftLookup: (id) => leftEl(id),
   windowTarget: () => (typeof window.addEventListener === "function" ? window : null),
@@ -26750,7 +25762,7 @@ mountKeyboardListeners({
   keyboardDebugChecked: () => el("keyboard-debug").checked,
   showKeyboardDebug: () => showKeyboardDebug(storedKeyboardDebug()),
   afterThisTask: (act) => { setTimeout(act, 0); },
-});
+}));
 // Before the first channel read, so the very first list of rows is already filtered rather
 // than appearing unfiltered for a frame and then rearranging under the reader.
 whoIsWho.load();
@@ -26771,7 +25783,7 @@ const draftChipFrame = createOncePerFrame(() => {
 // leaving, and the box's height fitted again. One owner in web/src/view/channel/replybox.ts (`#624
 // voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's
 // teardown.
-mountReplyBox({
+application.track(mountReplyBox({
   lookup: (id) => el(id),
   leftLookup: (id) => leftEl(id),
   canWatchSizes: () => typeof window.ResizeObserver === "function",
@@ -26792,7 +25804,7 @@ mountReplyBox({
   },
   fitInlineRoom: () => fitInlineRoom(),
   pressViewSwitch: () => pressViewSwitch(),
-});
+}));
 
 /** The view switch, pressed: rotate Voice -> Channel -> Documents -> Voice (`documents-view-client`). */
 function pressViewSwitch() {
@@ -26907,7 +25919,7 @@ function changeSelectedChannel() {
 // web/src/view/settings/channelboxlisteners.ts (`#624 voice-page-modularity`), mounted here, in the
 // page's order; its `unmount` waits for the ordered boot's teardown. The guarded acts are evaluated
 // here, at mount, as they were.
-mountChannelBoxListeners({
+application.track(mountChannelBoxListeners({
   lookup: (id) => el(id),
   selectChannel: () => selectionOwner().selectChannel(el("discord-channel").value),
   changeSelectedChannel: guardQuietly(changeSelectedChannel),
@@ -26976,13 +25988,13 @@ mountChannelBoxListeners({
     if (event.key === "Enter") guardQuietly(noiseSettings.add)();
   },
   clearAlias: guardQuietly(channelSettings.clearChannelAlias),
-});
+}));
 // The list's tools (`#65`, `#262 search-load-older`, `#605`-`#608 server-side-search`, `#221 read-modes`, `#564
 // message-summary-toggle`, `#820 voice-page-action-menu`, `#880 voice-page-menu-placement`): the ways further back,
 // the search's ways wider, the action menu's items closing it after their own acts, and the chips over the list. One
 // owner in web/src/view/channel/listcontrols.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its
 // `unmount` waits for the ordered boot's teardown.
-mountListControls({
+application.track(mountListControls({
   byId: (id) => el(id),
   leftById: (id) => leftEl(id),
   loadOlder: () => guardQuietly(olderControlPressed)(),
@@ -27004,13 +26016,13 @@ mountListControls({
   focusInActionMenu: () => nodeWithin(el("action-menu"), document.activeElement),
   closeActionMenu: () => setActionMenuOpen(false),
   jumpToNewest: () => scrollKeys.jumpToNewest(),
-});
+}));
 // The search's and the filter chips' listeners (`#129 message-search`, `#206 pin-message`, `#211`/`#212
 // link-filter`, `#251 author-filter`, `#266 link-filter-kinds`, `#620 link-url-chip`): the glass and the filters
 // as toggles, each kind of link, and the search field's typing, Enter and Escape. One owner in
 // web/src/view/channel/filterchips.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its
 // `unmount` waits for the ordered boot's teardown.
-mountFilterChips({
+application.track(mountFilterChips({
   byId: (id) => el(id),
   searchOpen: () => searchField.open(),
   setSearchOpen: (open) => setSearchOpen(open),
@@ -27037,7 +26049,7 @@ mountFilterChips({
   searchOlderFromField: () => searchOlderFromField(),
   settleFocus: () => settleFocus(),
   swallow: (event) => swallow(event),
-});
+}));
 
 // Watching the lists move (`#207 scrollback-jump`, `#245 done-feedback`, `#204 reply-arrow`, `#49 cached-summaries`,
 // `#340 composer-grow-box`, `#261 two-column-connectors`, `#229 desktop-two-column`, `#338 column-overscroll`):
@@ -27054,7 +26066,7 @@ const sizeWatching = {
   canWatchSizes: () => typeof window.ResizeObserver === "function",
   sizeWatcher: (report) => new window.ResizeObserver(() => report()),
 };
-mountListWatch({
+application.track(mountListWatch({
   ...sizeWatching,
   byId: (id) => el(id),
   leftById: (id) => leftEl(id),
@@ -27074,7 +26086,7 @@ mountListWatch({
   fitOverscroll: (area) => fitOverscroll(area),
   sideShowing: () => sideShowing(),
   renderSideJumpNewest: () => inColumn(columns.side, renderJumpNewest),
-});
+}));
 /**
  * How much stands under the main screen's lists, for the dock-growth keepers below: the dock, and the
  * send card while it is docked under the thread list (`#269 approval-card-inline` x `#281 view-keys`).
@@ -27139,7 +26151,7 @@ function cardsPlacedUnderLists() {
 // newest line as what is in it changes size, and the reply arrows measured again as layout changes. One owner in
 // web/src/view/channel/listkeepers.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its
 // `unmount` waits for the ordered boot's teardown.
-mountListKeepers({
+application.track(mountListKeepers({
   ...sizeWatching,
   el: (id) => el(id),
   leftEl: (id) => leftEl(id),
@@ -27173,14 +26185,14 @@ mountListKeepers({
   channelContextKey: () => channelContextKey(),
   pinsView: () => pinsView(),
   measureReplyArrows: () => measureReplyArrows(),
-});
+}));
 // The lists' gestures and scrolls (`#68 pull-to-refresh`, `#188 pull-refresh-bottom`, `#261 two-column-connectors`,
 // `#338 column-overscroll`, `#460 pack-gap-slide`): the pull on Main's list, each column's scroll moving the links'
 // ends, the wheel at the right column's foot, the reader's own wheel or key ending a slide, and the room past the
 // foot following the scroll, every listener on a list passive. One owner in web/src/view/channel/listgestures.ts
 // (`#624 voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's
 // teardown.
-mountListGestures({
+application.track(mountListGestures({
   byId: (id) => el(id),
   leftById: (id) => leftEl(id),
   pullStart: (event) => pullStart(event),
@@ -27191,7 +26203,7 @@ mountListGestures({
   footWheel: (event) => footRooms.wheel(event),
   footScrolled: (timeStamp) => footRooms.scrolled(timeStamp),
   finishPackSlide: () => finishPackSlide(),
-});
+}));
 
 /**
  * Like `guard`, but for things that are not a call: it reports, and it does NOT tear down a live
@@ -27222,57 +26234,7 @@ function refreshQuietly(fn) {
     });
 }
 
-// The LOAD-TIME sentence only, which is why this site uses `noTokenSentence()` and the three
-// below it do not: `forgetToken` and an empty Save are causes the owner just supplied themselves,
-// and blaming the rename for either would be a wrong explanation of something they already know.
-setTokenState(token() ? "token saved in this browser" : noTokenSentence());
-// With no token there is nothing to report YET, and firing a toast at page load to say so would
-// put a message over a screen whose entire subject is the thing it is asking for. The sign-in
-// screen says it in its own body; see `setTokenState`. `#63 status-line-placement`.
-if (token() && devicePairing.code() === null) {
-  setStatus("Checking your token…");
-}
-// Before the first screen is shown, so the bar is in its home from the first frame rather than
-// visibly jumping out of the header once script catches up. `#58 control-bar`.
-barPlacement.set(barPlacement.stored());
-// The read mode as the reader left it, before the first row is drawn or read. `#189
-// restore-ui-state`, and `#221 read-modes`: a record an older page kept says only Hide read or not.
-if (uiState.saved()) {
-  readModes.set(savedReadMode(uiState.saved()));
-  // As in `setReadMode`: the record just read is the restore either way.
-  readModes.keep();
-}
-showView("voice");
-renderEmptyState();
-voiceCall().renderControls();
-// No token means no interface to show yet: the sign-in screen is the whole page until there is
-// one. With a token, prove it before showing the main screen — unless this device saved the
-// channel for that same token, in which case the application is up in this task, with the saved
-// rows in it, and the proof arrives behind it. A refusal still ends on the sign-in screen, with
-// every saved row gone. `#18 offline-message-cache`.
-//
-// ...and up where the reader left it: on the channel, in their view, at their message. The view's
-// one read waits for the proof, and for the live stream it starts (`payReopenRead`).
-// `#189 restore-ui-state`.
-if (devicePairing.code() !== null) {
-  // `#369 pairing-link`. The person decides, with one tap: sign in with the link, or not now.
-  devicePairing.offer();
-} else if (token()) {
-  if (hydrateFromCache()) {
-    showScreen("main");
-    reopenSavedView();
-  }
-  // `#625 signin-flash`. ...and with no saved shell to show, NO screen until the proof arrives: the
-  // sign-in form is served hidden and stays so, and "Checking your token…" says what is happening.
-  // A form asking for a token the reader has already given, up for a round trip on every reload, read
-  // as being signed out. `signIn` shows the main screen, or this one after a refusal.
-  guardQuietly(signIn)();
-} else {
-  showScreen("signin");
-}
-// `#304 back-gesture-in-app`. Last, with every part of the page defined: the history kept in step with
-// what is open, from the screen the page opened on.
-startBackStack();
-
-// `#462 webapp-deep-links`. Open where a link says, once sign-in gives it a channel to open.
-guardQuietly(applyDeepLink)();
+// The boot, mounted and started in the page's order (`createApplication`, above): the mounts
+// were tracked as the wiring mounted them, and the start acts are the first drawing and sign-in.
+application.mount();
+application.start();

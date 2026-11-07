@@ -159,7 +159,7 @@ test("`#543 in-app-message-links`: a tap jumps to a reply — its thread opens o
   assert.equal(page.left, true, "a Back at the top after a jump and its return did not leave the app");
 
   // NEGATIVE CONTROL: with no way back from a jump, Back lands and leaves the thread open.
-  const deaf = await linkedPage({ script: brokenScript('  else if (tag === "jump") returnFromLinkJump();\n', "\n") });
+  const deaf = await linkedPage({ script: await brokenModule([{ file: "src/view/shell/navigation.ts", find: '    else if (tag === "jump") returnFromLinkJump();\n', replace: "\n" }]) });
   await tapLink(deaf, linkIn(rowWithId(deaf, "300")));
   await untilDeepLink(deaf, () => rowWithId(deaf, "204")?.getAttribute("data-landed") === "true");
   await deaf.browserBack();

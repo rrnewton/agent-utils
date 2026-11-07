@@ -2343,3 +2343,59 @@ test("`#624 voice-page-modularity`: the page's last document listeners are mount
     globalThis.document = was;
   }
 });
+
+
+test("`#624 voice-page-modularity`: showing a screen hides the others first, shows it last, and does what goes with the change in order", () => {
+  const { createScreens, createScreenShowing, SCREEN_TITLES } = VIEW_SHELL;
+  assert.deepStrictEqual({ ...SCREEN_TITLES }, { settings: "Settings", help: "Help" });
+  const el = elements();
+  const screens = createScreens();
+  const log = [];
+  const showing = createScreenShowing({
+    screens, el,
+    closeOverscroll: () => log.push("closeOverscroll"),
+    holdChannelPlace: () => log.push("holdChannelPlace"),
+    postCardBackToMain: () => log.push("postCardBackToMain"),
+    placePostCard: () => log.push("placePostCard"),
+    disarmClear: () => log.push("disarmClear"),
+    browserReading: () => true,
+    stopReading: () => log.push("stopReading"),
+    closeDismissedSends: () => log.push("closeDismissedSends"),
+    renderDismissedSends: () => log.push("renderDismissedSends"),
+    renderJumpNewest: () => log.push("renderJumpNewest"),
+    placeChipsOverComposer: () => log.push("placeChipsOverComposer"),
+    renderControlBar: () => log.push("renderControlBar"),
+    renderColumns: () => log.push("renderColumns"),
+    pointSettingsAtReading: () => log.push("pointSettingsAtReading"),
+    refreshUpstreamClear: () => log.push("refreshUpstreamClear"),
+    refreshChannelHistory: () => log.push("refreshChannelHistory"),
+    refreshAgentPrefix: () => log.push("refreshAgentPrefix"),
+    renderIdentities: () => log.push("renderIdentities"),
+    focusLost: () => false,
+    settleFocus: () => log.push("settleFocus"),
+    scheduleBackSync: () => log.push("scheduleBackSync"),
+  });
+  showing.showScreen("settings");
+  assert.deepStrictEqual(log, ["closeOverscroll", "stopReading", "disarmClear",
+    "renderJumpNewest", "placeChipsOverComposer", "renderControlBar", "placePostCard", "pointSettingsAtReading",
+    "refreshUpstreamClear", "refreshChannelHistory", "refreshAgentPrefix", "renderDismissedSends",
+    "renderIdentities", "settleFocus", "scheduleBackSync"], "leaving sign-in for Settings, in order");
+  assert.deepStrictEqual([el("screen-signin").hidden, el("screen-settings").hidden, el("screen-main").hidden,
+    el("screen-help").hidden], [true, false, true, true]);
+  assert.deepStrictEqual([el("close-settings").hidden, el("close-help").hidden, el("topbar-title").hidden,
+    el("topbar-title").textContent, el("control-pane").hidden, screens.screen()],
+    [false, true, false, "Settings", true, "settings"]);
+  assert.equal(el("frame-body").getAttribute("data-screen"), "settings");
+  log.length = 0;
+  showing.showScreen("main");
+  assert.deepStrictEqual(log, ["postCardBackToMain", "closeDismissedSends",
+    "placeChipsOverComposer", "renderControlBar", "renderColumns", "placePostCard", "renderJumpNewest",
+    "settleFocus", "scheduleBackSync"], "back to the main screen: card back before it is shown, jump decided last");
+  assert.deepStrictEqual([el("screen-main").hidden, el("control-pane").hidden, el("topbar-title").hidden],
+    [false, false, true]);
+  log.length = 0;
+  showing.showScreen("main");
+  assert.deepStrictEqual(log, ["closeDismissedSends", "placeChipsOverComposer", "renderControlBar",
+    "renderColumns", "placePostCard", "renderJumpNewest", "scheduleBackSync"],
+    "the screen already up: no focus settled again, nothing noted or put back");
+});

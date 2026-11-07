@@ -138,7 +138,7 @@ test("`#624 voice-page-modularity`: page.pure reaches only what is still the leg
   const page = newPage();
   assert.equal(page.pure("selectedChannelId()"), "", "a binding of the legacy script's own was refused");
   assert.throws(() => page.pure("searchQueryTree"), /reaches searchQueryTree, which the page takes from web\/src/);
-  assert.throws(() => page.pure('JSON.stringify(messageLinkRef("slack:C1:2"))'), /reaches messageLinkRef/);
+  assert.throws(() => page.pure('JSON.stringify(messageLinkRef("slack:C1:2"))'), /messageLinkRef is not defined/, "a name the navigation owner took still reaches the page");
   assert.equal(typeof page.preludeBinding("searchQueryTree"), "function");
   assert.throws(() => page.preludeBinding("selectedChannelId"), /not a name the page takes from its modules/);
 });

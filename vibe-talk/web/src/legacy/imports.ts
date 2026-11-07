@@ -1,3 +1,4 @@
+export { createApplication } from "../app/index.ts";
 // What the legacy page script (web/voice.js) takes from the modules, and nothing else.
 //
 // `#624 voice-page-modularity`. The page's code moves out of web/voice.js into these modules a
@@ -101,7 +102,7 @@ export {
   shownNode,
   tagNameOf,
 } from "../view/dom/index.ts";
-export { KEYS_MESSAGE, KEYS_MOVING, KEYS_PAGE, KEYS_VIEW, KEYS_WRITING, SCREENS, createActionMenu, createChannelKeys, createChipsOverComposer, createDoneKeys, createFoldKeys, createHighlightCopy, createKeyDispatch, createKeyHints, createKeySelection, createKeyTiming, createKeymap, createPointerSelection, createPromptsTray, createReadCollapse, createReaderRow, createReplySight, createRowKeys, createRowShortcuts, createScreenKeys, createScreens, createScrollKeys, createSelectionKeys, createShellNotices, createUndoOffer, createUndoStamps, createViewKeys, createWriteKeys, keyTimingLine, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow } from "../view/shell/index.ts";
+export { KEYS_MESSAGE, KEYS_MOVING, KEYS_PAGE, KEYS_VIEW, KEYS_WRITING, SCREEN_TITLES, createActionMenu, createChannelKeys, createChipsOverComposer, createDoneKeys, createFoldKeys, createHighlightCopy, createKeyDispatch, createKeyHints, createKeySelection, createKeyTiming, createKeymap, createPointerSelection, createPromptsTray, createReadCollapse, createPageNavigation, createReaderRow, createReplySight, createRowKeys, createRowShortcuts, createScreenKeys, createScreens, createScreenShowing, createScrollKeys, createSelectionKeys, createShellNotices, createUndoOffer, createUndoStamps, createViewKeys, createWriteKeys, keyTimingLine, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow } from "../view/shell/index.ts";
 export {
   COMPOSER_FIELDS,
   NEWLINE_KEYS,
@@ -118,7 +119,7 @@ export {
   watchBoxInsertions as watchInsertions,
   wireNewlineKey,
 } from "../view/composer/index.ts";
-export { HTTP_ADDRESS, createSerialQueue, linkKind, linksIn, messageLinkRef, sentenceStart } from "../foundation/index.ts";
+export { HTTP_ADDRESS, createSerialQueue, linkKind, linksIn, sentenceStart } from "../foundation/index.ts";
 
 export { briefAge, dayClock, dayKeyOf, fullLocalAt, fullLocalTime, messageTimeLabel, stamp } from "../present/time/index.ts";
 
