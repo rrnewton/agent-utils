@@ -49922,6 +49922,54 @@ def test_mountinfo_census_refuses_genuinely_unreadable_live_process(
             os.waitpid(pid, 0)
 
 
+def test_bounded_scan_bounds_cpu_time_not_wall_time() -> None:
+    def sleeping(_cancel: threading.Event) -> str:
+        time.sleep(0.6)
+        return "done"
+
+    # Descheduled (sleeping) work burns no CPU budget: it may finish well
+    # past its CPU bound in wall time.
+    assert (
+        wrkslots._run_bounded_scan(
+            sleeping,
+            seconds=0.2,
+            on_timeout=lambda: wrkslots.Refusal("scan cpu bound"),
+        )
+        == "done"
+    )
+
+    def spinning(cancel: threading.Event) -> str:
+        end = time.monotonic() + 5
+        while time.monotonic() < end and not cancel.is_set():
+            pass
+        return "done"
+
+    # Work that burns CPU past the bound refuses promptly.
+    started = time.monotonic()
+    with pytest.raises(wrkslots.Refusal, match="scan cpu bound"):
+        wrkslots._run_bounded_scan(
+            spinning,
+            seconds=0.2,
+            on_timeout=lambda: wrkslots.Refusal("scan cpu bound"),
+        )
+    assert time.monotonic() - started < 4
+
+    def wedged(_cancel: threading.Event) -> str:
+        time.sleep(5)
+        return "done"
+
+    # Work that neither burns CPU nor finishes still refuses at the wall
+    # outer bound (8x the CPU budget by default).
+    started = time.monotonic()
+    with pytest.raises(wrkslots.Refusal, match="scan cpu bound"):
+        wrkslots._run_bounded_scan(
+            wedged,
+            seconds=0.2,
+            on_timeout=lambda: wrkslots.Refusal("scan cpu bound"),
+        )
+    assert time.monotonic() - started < 4
+
+
 def test_mountinfo_census_skips_a_process_that_vanished_during_the_scan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

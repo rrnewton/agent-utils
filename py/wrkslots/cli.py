@@ -44116,19 +44116,46 @@ def _agent_batch_fenced_use(
 _ScanResult = TypeVar("_ScanResult")
 
 
+def _scan_thread_cpu_seconds(thread: threading.Thread) -> float | None:
+    """CPU seconds (user + system) burned by one live thread, if readable."""
+
+    tid = thread.native_id
+    if tid is None:
+        return None
+    try:
+        text = Path(f"/proc/self/task/{tid}/stat").read_text(
+            encoding="utf-8", errors="surrogateescape"
+        )
+        fields = text.rsplit(")", 1)[1].split()
+        # fields[0] is field 3 (state); utime is field 14, stime field 15.
+        ticks = int(fields[11]) + int(fields[12])
+    except (OSError, ValueError, IndexError):
+        return None
+    return ticks / os.sysconf("SC_CLK_TCK")
+
+
 def _run_bounded_scan(
     work: Callable[[threading.Event], _ScanResult],
     *,
     seconds: float,
     on_timeout: Callable[[], Refusal],
+    wall_multiplier: float = 8.0,
 ) -> _ScanResult:
-    """Run ``work`` on a daemon thread and wait for it at most ``seconds``.
+    """Run ``work`` on a daemon thread bounded by its CPU time.
 
     The thread runs in a copy of the caller's context, so it sees the
     caller's remove-agent-batch item budget.  ``work`` receives an event that
     is set when the wait ends; a scan that checks it stops, and a scan
     blocked in a system call is abandoned and ends on its own.  Its exception
     is raised here.
+
+    ``seconds`` bounds the scan thread's CPU time (user + system), not the
+    wall clock: a scan descheduled by host load has spent no budget, so a
+    loaded host no longer trips the bound on a healthy scan, while a scan
+    that is genuinely burning CPU (or wedged past ``wall_multiplier`` times
+    the budget in wall time) still refuses.  Callers whose ``seconds`` is a
+    hard wall budget (the remaining item budget) pass ``wall_multiplier=1``
+    so the wall bound stays exactly that budget.
     """
 
     cancel = threading.Event()
@@ -44148,7 +44175,15 @@ def _run_bounded_scan(
         daemon=True,
     )
     thread.start()
-    thread.join(max(0.0, seconds))
+    wall_deadline = time.monotonic() + max(0.0, seconds) * wall_multiplier
+    while thread.is_alive():
+        remaining_wall = wall_deadline - time.monotonic()
+        if remaining_wall <= 0:
+            break
+        thread.join(min(0.05, remaining_wall))
+        cpu = _scan_thread_cpu_seconds(thread)
+        if cpu is not None and cpu > seconds:
+            break
     if thread.is_alive():
         cancel.set()
         raise on_timeout()
@@ -44185,7 +44220,15 @@ def _run_item_scan(
             f"{seconds:g}-second bound"
         )
 
-    return _run_bounded_scan(work, seconds=wait, on_timeout=timed_out)
+    return _run_bounded_scan(
+        work,
+        seconds=wait,
+        on_timeout=timed_out,
+        # The item budget bounds how long the registry lock may be held in
+        # wall time; when it is the limiter it stays a wall bound.  The
+        # scan's own bound is CPU time (see _run_bounded_scan).
+        wall_multiplier=1.0 if limited_by_item else 8.0,
+    )
 
 
 @dataclasses.dataclass

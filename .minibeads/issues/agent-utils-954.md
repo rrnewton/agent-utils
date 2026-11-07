@@ -5,7 +5,7 @@ priority: 2
 issue_type: bug
 assignee: mu-wrkslots
 created_at: 2026-11-06T19:14:11.000000000+00:00
-updated_at: 2026-11-06T19:14:11.000000000+00:00
+updated_at: 2026-11-06T23:40:00.000000000+00:00
 ---
 
 # Description
@@ -25,3 +25,18 @@ On a consumer host at load about 50, `remove-agent-batch` refused all 7 dead slo
 # Notes
 
 Reported 2026-11-06 by the lead coordinator from a consumer registry. Part 1 of 3 with #955 and #956. Queued for mu-wrkslots after #950.
+
+# Measurements appended by #943 gate-flake-wrkslots-proc-scan (mu-flakes)
+
+Independent confirmation from the differential remove tests
+(test_remove_matches_python and siblings, bounded contention):
+
+- 2-core scope (CPUQuota=200% + stress --cpu 6): unchanged code 0/1,
+  scan-CPU-bound code 1/2 — every failure the 60 s item budget.
+- 8-core dagrun box (same stress): 19/20; run 20 died on the item budget
+  at a trivial `git rev-parse --git-common-dir` after ~60 s of censuses
+  and git work, on a slot with no nested-submodule salvage at all.
+
+So the budget is also consumed by census/git pre-deletion work under
+load, not only by salvage; the phase named in the refusal (a git
+command) is where the clock ran out, not necessarily what spent it.

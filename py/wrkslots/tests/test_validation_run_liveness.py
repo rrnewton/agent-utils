@@ -2374,14 +2374,23 @@ def _refused_for_the_run(
     `#389 gate-flakes`.
     """
 
-    deadline = time.monotonic() + 60
+    # The deadline scales with measured progress: each attempt is a full
+    # remove (whole-host censuses included), so under gate load one attempt
+    # can take most of a fixed budget while still progressing.  Every
+    # transient refusal earns at least two more attempts' worth of time,
+    # bounded overall so a permanently indeterminate host still fails.
+    started = time.monotonic()
+    deadline = started + 60
     while True:
+        attempt_started = time.monotonic()
         returncode, text = attempt()
+        attempt_seconds = time.monotonic() - attempt_started
         assert returncode == expected_returncode, text
         if needle in text:
             return text
         assert "zap_pid_ns_processes" in text, text
-        assert time.monotonic() < deadline, text
+        deadline = max(deadline, time.monotonic() + 2 * attempt_seconds)
+        assert time.monotonic() < min(deadline, started + 600), text
         time.sleep(0.1)
 
 
