@@ -297,11 +297,13 @@ steps:
   # clearing, empty Cache Storage and no service worker. `#32 freshness-pill-overlap`: refreshing,
   # offline and failed, the pill clear of the view tabs and the list's header, #scroll-area unmoved,
   # and a scrolled reader held in place as the pill comes and goes.
+  # One step per device profile, so the phones and the desk walk side by side; together the
+  # three profiles are the whole check, exactly as one step walked them before.
   - group: check
-    job: offline-cache-browser
-    desc: saved-message snapshot and a read-scope sign-in in current Chromium at 412x915 and 360x800 Android viewports and a 1280x800 desk
+    job: offline-cache-phone-browser
+    desc: saved-message snapshot and a read-scope sign-in in current Chromium at a 412x915 Android viewport
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/offline_cache_browser.py
+    cmd: cd vibe-talk && python3 tests/offline_cache_browser.py --profile phone
     jobs_flag: ""
     deps: [setup.contract-tools]
     # The walk has grown with every page feature it checks (search bar, Pinned, Links and their kinds,
@@ -314,7 +316,37 @@ steps:
     cpu_timeout: 180
     hint:
       resources: {browser: 1}
-      est_duration_s: 155
+      est_duration_s: 70
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  - group: check
+    job: offline-cache-phone-360-browser
+    desc: saved-message snapshot and a read-scope sign-in in current Chromium at a 360x800 Android viewport
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/offline_cache_browser.py --profile phone-360
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 1440
+    cpu_timeout: 180
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 70
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  - group: check
+    job: offline-cache-desk-browser
+    desc: saved-message snapshot and a read-scope sign-in in current Chromium at a 1280x800 desk
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/offline_cache_browser.py --profile desktop
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 1440
+    cpu_timeout: 180
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 70
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
@@ -725,15 +757,15 @@ steps:
   #
   # `#474 browser-lane-critical-path`: the whole check ran about 690s wall on 2026-10-23 for about 85s of CPU,
   # waiting on the page's own holds and settles, and as one step it was the longest in the gate. Its runs fall
-  # into five independent parts (`PARTS` in the script), each in its own browser profiles against its own fake
-  # API and server, so they are five steps here that the browser cap lets run side by side. The graph contract
+  # into independent parts (`PARTS` in the script), each in its own browser profiles against its own fake
+  # API and server, so they are steps here that the browser cap lets run side by side. The graph contract
   # (py/tests/test_validation_graph_contract.py) holds these steps to exactly the script's parts, one each.
-  # Measured alone on a quiet host: the 393x852 walk's three stretches about 150s, 110s and 95s, the smaller
-  # phones and short screens about 170s, and the desk about 160s. Each wall limit is about three times that.
+  # Measured alone on a quiet host: the 393x852 walk's stretches about 150s, 110s and 95s, the smaller
+  # phones and short screens about 170s together, and the desk about 160s. Each wall limit is about three times that.
   # Each CPU limit is half the whole check's 200s, as a backstop: no part used a quarter of the whole's 85s.
   - group: check
     job: approval-card-phone-place-browser
-    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, at 393x852; docked under the thread list through the view keys, arriving there and back from it with the channel's reader where they were, a draft arriving while Settings or Help was up, the reader kept at the foot as the box takes back its room after Send, and a reader of a draft opened by More kept on it, at 393x852, in current Chromium
+    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, at 393x852, in current Chromium
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part phone-place
     jobs_flag: ""
@@ -743,6 +775,21 @@ steps:
     hint:
       resources: {browser: 1}
       est_duration_s: 150
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  - group: check
+    job: approval-card-phone-threads-browser
+    desc: docked under the thread list through the view keys, arriving there and back from it with the channel's reader where they were, a draft arriving while Settings or Help was up, the reader kept at the foot as the box takes back its room after Send, and a reader of a draft opened by More kept on it, at 393x852, in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part phone-threads
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 800
+    cpu_timeout: 100
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
@@ -777,17 +824,32 @@ steps:
       rss_baseline_bytes: 1073741824
 
   - group: check
-    job: approval-card-small-screens-browser
-    desc: the send card's place, reach, hold, docked layout, frozen card and recap line, the channel's list held still and a reader who saw only the card, at 360x780 and 375x667, the trips to Settings and Help at 375x667, and the docked card whole at 667x375 and 375x330, in current Chromium
+    job: approval-card-small-phones-browser
+    desc: the send card's place, reach, hold, docked layout, frozen card and recap line, the channel's list held still and a reader who saw only the card, at 360x780 and 375x667, and the trips to Settings and Help at 375x667, in current Chromium
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part small-screens
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part small-phones
     jobs_flag: ""
     deps: [setup.contract-tools]
     timeout: 800
     cpu_timeout: 100
     hint:
       resources: {browser: 1}
-      est_duration_s: 170
+      est_duration_s: 120
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  - group: check
+    job: approval-card-short-screens-browser
+    desc: the docked card whole at 667x375 and 375x330, screens too short to hold it as an upright phone does, in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part short-screens
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 800
+    cpu_timeout: 100
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
@@ -802,7 +864,22 @@ steps:
     cpu_timeout: 100
     hint:
       resources: {browser: 1}
-      est_duration_s: 160
+      est_duration_s: 100
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  - group: check
+    job: approval-card-desk-away-browser
+    desc: the reader kept at the foot after Send, a draft opened by More through two columns and back, the jump back from Settings and a draft arriving while Settings or Help was up, at 1280x800 with a mouse, in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part desk-away
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 800
+    cpu_timeout: 100
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 80
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
@@ -1491,17 +1568,32 @@ steps:
   # 2026-10-19 in the gate: 198s wall and about 20s CPU, eight Chromium launches, most of it the
   # frame-sampled holds; the budgets are about three and six times that.
   - group: check
-    job: column-overscroll-browser
-    desc: the right column scrolls past its foot into blank room at a desk until the last card's top is mid-column, by the wheel after a rest and by PgDn, Space and the down arrow, closes it going back up, by End and by a search, holds the reader in it as the last card changes size and as replies arrive, and stops a fling or a held key on the foot, in current Chromium at 1280x700 and 1920x1080, with six negative controls
+    job: column-overscroll-1280-browser
+    desc: the right column scrolls past its foot into blank room at a desk until the last card's top is mid-column, by the wheel after a rest and by PgDn, Space and the down arrow, closes it going back up, by End and by a search, holds the reader in it as the last card changes size and as replies arrive, and stops a fling or a held key on the foot, in current Chromium at 1280x700
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/column_overscroll_browser.py
+    cmd: cd vibe-talk && python3 tests/column_overscroll_browser.py --size desk-1280
     jobs_flag: ""
     deps: [setup.contract-tools]
     timeout: 960
     cpu_timeout: 120
     hint:
       resources: {browser: 1}
-      est_duration_s: 200
+      est_duration_s: 120
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  - group: check
+    job: column-overscroll-1920-browser
+    desc: the right column scrolls past its foot into blank room at a desk until the last card's top is mid-column, by the wheel after a rest and by PgDn, Space and the down arrow, closes it going back up, by End and by a search, holds the reader in it as the last card changes size and as replies arrive, and stops a fling or a held key on the foot, in current Chromium at 1920x1080, with six negative controls
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/column_overscroll_browser.py --size desk-1920
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 960
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 120
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
@@ -2352,10 +2444,10 @@ steps:
   # descendants are reaped with it whether or not the script's own trap fires -- which is the whole
   # reason this file exists, because for six days that trap did not.
   - group: shots
-    job: screenshots
-    desc: the screenshot harness — a real server and a real browser
+    job: screenshots-phones
+    desc: the screenshot harness on the phone profiles — a real server and a real browser
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && ./scripts/run.sh --screenshots --theme dark
+    cmd: cd vibe-talk && ./scripts/run.sh --screenshots --theme dark --profiles iphone15,iphone-se,android-412
     jobs_flag: ""
     deps: [build.release, setup.contract-tools]
     # Wall, not only CPU: a browser waiting on a page that never loads burns no CPU at all, so a
@@ -2363,54 +2455,56 @@ steps:
     timeout: 4800
     cpu_timeout: 600
     hint:
-      # Holds every browser slot in its gate (the fold-latency pattern):
-      # its per-scene expectation windows are timing budgets that sibling
-      # browser steps starve under multi-gate load.
-      resources: {browser: 4}
-      # MEASURED, not guessed. Everything in this block used to be an estimate for a step that had
-      # never once started -- the `cmd` above did not parse, so the job failed in milliseconds and
-      # no profile of it could exist. The first run that got through put the walk at 284s wall,
-      # 170s CPU and a 682MB peak, against guesses of 120s and 4GiB. Both were wrong by more than
-      # a factor of two, in opposite directions, which is the worst way for a scheduler estimate
-      # to be wrong: it under-books the time and over-books the memory at the same time.
-      #
-      # 300 rather than 284 because this is a whole-walk figure and the walk grows a state at a
-      # time; re-measure with `dagrun run --dag vibe-talk/tests.dag.yaml --selected
-      # shots.screenshots --ignore-selected-deps` and read `.dagrun/profiles/step_profiles_*.csv`.
-      # Unusually for this file, the number travels: at 0.60 effective cores this step is waiting,
-      # not computing, so a slower machine does not stretch it the way it stretches clippy.
-      #
-      # Re-measured on 2026-10-18 at 494s wall on a loaded host, after the owner's Settings batch
-      # (`#345 settings-multi-column` to `#349 channel-settings-all`) added scenes 63 to 71, most at
-      # three sizes, so the estimate is 500. The 900s timeout above still leaves room.
-      #
-      # Re-measured on 2026-10-24 (`test-time-vibe-talk`): 508s wall for 222 captures, 221s of it the
-      # walk waiting while each capture's PNG was decoded and judged, a second or so of pure Python
-      # apiece. With the decoder doing a row at a time and the judging done in two processes beside
-      # the walk, 311s wall and 235s of CPU (280s wall in a gate), so the estimate is 330.
-      est_duration_s: 330
-      # latency-bound, not cpu-bound: most of its wall time is waiting for a page to settle, and
-      # telling the scheduler otherwise makes it reserve cores it will not use. Confirmed by the
-      # same run -- 0.60 effective cores over 284 seconds.
+      # One browser slot per profile shard: the six device profiles walk in parallel steps
+      # instead of one step holding every browser slot for the whole walk. Together the
+      # three shards photograph every profile, exactly as the single step did.
+      resources: {browser: 1}
+      est_duration_s: 120
       classification: latency-bound
       preferred_inner_jobs: 4
-      # 1GiB against a 682MB observed peak.
-      #
-      # This is NOT what the planner reserves for this step, and a previous version of this
-      # comment said it was. `sizing.step_mem_cap_bytes` is "an explicit hard cap wins; otherwise
-      # factor x the RSS baseline" -- so while `hard_mem_max_bytes` below is set, the baseline is
-      # never consulted for the footprint sum. It is still worth being true: the visualiser reads
-      # it, and `--refine-memory` compares profile-derived peaks against it.
       rss_baseline_bytes: 1073741824
-      # THE CAP IS THE RESERVATION. That is the part worth knowing before making this number
-      # comfortable: because an explicit cap wins outright, whatever is written here is what
-      # `schedulable_peak_mem_bytes` adds up when it decides how many steps may run at once. A cap
-      # set high "just to be safe" is not free -- it is spent against the run's memory budget for
-      # the step's whole duration, which is the serialization #113 dagrun-memory-admission is
-      # about, and this step is held for 284 seconds at a time.
-      #
-      # So: a backstop sized from the measurement rather than from imagination. 3GiB is 4.4x the
-      # observed 682MB peak, which still catches a browser that genuinely runs away -- the thing
-      # this cap exists for -- while reserving half of what 6GiB did. Re-measure before lowering
-      # it further; `peak_bytes` in the profile CSV is the column.
+      hard_mem_max_bytes: 3221225472
+
+  - group: shots
+    job: screenshots-desks
+    desc: the screenshot harness on the desk profiles — a real server and a real browser
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && ./scripts/run.sh --screenshots --theme dark --profiles desktop,laptop-1280
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    # Wall, not only CPU: a browser waiting on a page that never loads burns no CPU at all, so a
+    # CPU budget alone would let it hang until the run timeout. This is the hang backstop.
+    timeout: 4800
+    cpu_timeout: 600
+    hint:
+      # One browser slot per profile shard: the six device profiles walk in parallel steps
+      # instead of one step holding every browser slot for the whole walk. Together the
+      # three shards photograph every profile, exactly as the single step did.
+      resources: {browser: 1}
+      est_duration_s: 150
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824
+      hard_mem_max_bytes: 3221225472
+
+  - group: shots
+    job: screenshots-wide
+    desc: the screenshot harness on the 1920-wide desk profile — a real server and a real browser
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && ./scripts/run.sh --screenshots --theme dark --profiles desk-1920
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    # Wall, not only CPU: a browser waiting on a page that never loads burns no CPU at all, so a
+    # CPU budget alone would let it hang until the run timeout. This is the hang backstop.
+    timeout: 4800
+    cpu_timeout: 600
+    hint:
+      # One browser slot per profile shard: the six device profiles walk in parallel steps
+      # instead of one step holding every browser slot for the whole walk. Together the
+      # three shards photograph every profile, exactly as the single step did.
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824
       hard_mem_max_bytes: 3221225472

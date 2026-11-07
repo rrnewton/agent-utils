@@ -796,7 +796,22 @@ def arguments() -> argparse.Namespace:
         type=Path,
         help="directory to write one PNG per step into (default: none are kept)",
     )
+    parser.add_argument(
+        "--profile",
+        action="append",
+        choices=("phone", "phone-360", "desktop"),
+        help="walk only this profile's sizes (repeatable); the gate runs one profile per step "
+             "so the phones and the desk walk side by side, and every walk still runs under "
+             "the profile it names (default: every profile)",
+    )
     return parser.parse_args()
+
+
+def profile_of(_label: str, width: int, mobile: bool) -> str:
+    """The gate profile a size belongs to: the desk, the 412px phone, or the 360px one."""
+    if not mobile:
+        return "desktop"
+    return "phone" if width >= 400 else "phone-360"
 
 
 def check(condition: bool, message: str) -> None:
@@ -2297,10 +2312,13 @@ def main() -> int:
         args.screenshots.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as playwright:
-        windows_walk(playwright.chromium, args)
-        print("desktop at 1280x800, two windows of one profile: each reloaded on its own channel, not the"
-              " one the other chose last, and a third window opened on the channel chosen last")
+        if not args.profile or "desktop" in args.profile:
+            windows_walk(playwright.chromium, args)
+            print("desktop at 1280x800, two windows of one profile: each reloaded on its own channel, not the"
+                  " one the other chose last, and a third window opened on the channel chosen last")
         for label, width, height, mobile in DOCK_SIZES:
+            if args.profile and profile_of(label, width, mobile) not in args.profile:
+                continue
             heights = dock_walk(playwright.chromium, args, label, width, height, mobile)
             if mobile:
                 print(f"{label} at {width}x{height}, dark: the dock the phone had — its bar and its tile of"
@@ -2316,6 +2334,8 @@ def main() -> int:
                       " there as the dock grows a row and one up the history left alone,"
                       f" and every Tab stop ringed and unclipped: {heights}")
         for label, width, height, mobile in PROFILES:
+            if args.profile and label not in args.profile:
+                continue
             pin_walk(playwright.chromium, args, label, width, height, mobile)
             print(f"{label} at {width}x{height}: a pin made elsewhere shown as a legible Pinned chip and an"
                   " edge, the ⋯ menus of a pinned and an unpinned row as Copy text, Pin and the captioned"
@@ -2371,11 +2391,15 @@ def main() -> int:
                   " reply and 150% type, its X a 44px target that put them back with the root unmoved; two"
                   f" {'taps' if mobile else 'clicks'} on an arrow gathered them with the reply kept in place")
         for label, width, height, root_percent in MENU_SCALES:
+            if args.profile and profile_of(label, width, True) not in args.profile:
+                continue
             menu_walk(playwright.chromium, args, label, width, height, root_percent)
             print(f"{label} at {width}x{height}, root font {root_percent}%: every row's ⋯ menu, the pinned"
                   " row's in the Pinned filter too, on the screen with full-size items a tap reaches, in"
                   " both provider shapes, and Unpin tapped for real")
         for label, width, height, root_percent in BAR_SCALES:
+            if args.profile and profile_of(label, width, True) not in args.profile:
+                continue
             text = links_bar_walk(playwright.chromium, args, label, width, height, root_percent)
             print(f"{label} at {width}x{height}, root font {root_percent}%: the open bar with Links on and its"
                   f" count up — the glass at least {GLASS_MIN_PX}px, Links and Pinned 44px targets beside it,"
@@ -2383,6 +2407,8 @@ def main() -> int:
                   " link on its own 44px line, clear of the bar, and the six kinds of link 44px targets"
                   " under Links, inside the screen")
         for label, width, height, mobile, root_percent in KINDS_SIZES:
+            if args.profile and profile_of(label, width, mobile) not in args.profile:
+                continue
             placed = kinds_walk(playwright.chromium, args, label, width, height, mobile, root_percent)
             print(f"{label} at {width}x{height}, root font {root_percent}%: PRs, Commits, Actions, Issues, Files"
                   f" and Other under Links, numbers adding up to every link, {placed} under it over the channel"
@@ -2391,11 +2417,15 @@ def main() -> int:
                   " on each took its links out of their rows, and a row with nothing left went, Other keeping the"
                   " documents; the choice outlived a reload, and the glass took the row away")
         for label, width, height, root_percent in CROWDED_KINDS_SIZES:
+            if args.profile and profile_of(label, width, True) not in args.profile:
+                continue
             span = crowded_kinds_walk(playwright.chromium, args, label, width, height, root_percent)
             print(f"{label} at {width}x{height}, root font {root_percent}%: the six kinds each reading 99+,"
                   f" {span:.0f}px of buttons scrolling inside the bar, under Links and inside the screen, each a"
                   " 44px target; a real swipe brought Other into view and a real tap turned it off")
         for label, width, height, root_percent, mode in EMPTY_SIZES:
+            if args.profile and profile_of(label, width, True) not in args.profile:
+                continue
             top = empty_walk(playwright.chromium, args, label, width, height, root_percent, mode)
             print(f"{label} at {width}x{height}, root font {root_percent}%: a list emptied ({mode}) from its"
                   " newest line says why wholly on the screen, below the bar and any kinds of link under it,"

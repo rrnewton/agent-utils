@@ -160,8 +160,8 @@ WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol (and
 hosted one). Pass --web-root DIR to
 run it against another copy of the page, and --screenshots DIR to keep a PNG of each placement.
 
-The runs fall into five independent parts, each in its own browser profiles against its own fake API
-(`PARTS`). The gate runs them as five steps side by side; --part NAME runs one of them, and with no
+The runs fall into independent parts, each in its own browser profiles against its own fake API
+(`PARTS`). The gate runs them as steps side by side; --part NAME runs one of them, and with no
 --part every part runs, one after another.
 """
 
@@ -221,17 +221,20 @@ THREAD_ID = "1110000000000000300"
 # A phone's walk in three stretches: the card's place, reach, hold, frozen card and recap and the channel
 # and thread list kept still (points 1 to 7, 9 to 13, 15, 16 and 23); a reader who saw only the card and
 # the trips to Settings (18, 19); and the trips to Help by its key, the chips' room and the jump (20 to 22).
-STRETCHES = ("place", "alone", "help")
+STRETCHES = ("place", "threads", "alone", "help")
 # The check's parts. Each runs in its own browser profiles against its own fake API and server, so the
 # gate runs each as a step of its own beside the others (tests.dag.yaml), and all of them together are
-# the whole check: the walk at 393x852 split at its stretches, the two smaller phones and the short
-# screens, and the desk. With no --part they run one after another, in this order.
+# the whole check: the walk at 393x852 split at its stretches, the two smaller phones, the short
+# screens, and the desk in two halves. With no --part they run one after another, in this order.
 PARTS = {
-    "phone-place": "393x852, the card's place, reach, hold, frozen card and recap, and the lists kept still",
+    "phone-place": "393x852, the card's place, reach, hold, frozen card and recap, and the channel kept still",
+    "phone-threads": "393x852, the thread list kept still as the card comes and goes, and a draft opened by More",
     "phone-alone": "393x852, a reader who saw only the card, and the trips to Settings",
     "phone-help": "393x852, the trips to Help by its key, the chips' room and the jump back from Settings",
-    "small-screens": "360x780 and 375x667 whole, and the docked card alone at 667x375 and 375x330",
+    "small-phones": "360x780 and 375x667 whole, as the 393x852 phone walks them",
+    "short-screens": "the docked card alone at 667x375 and 375x330, too short to hold it upright",
     "desk": "1280x800 with a mouse: two columns, the thread list and the reader kept across both",
+    "desk-away": "1280x800 with a mouse: the reader kept as the card goes, opened by More through two columns, and the jump back from Settings",
 }
 Json = dict[str, object]
 
@@ -1291,13 +1294,13 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
                 said.append(f"Send's centre at >= {lowest:.3f} of the screen in every run; on the channel the card"
                             " coming and going left a reader up the list on their row and one at the foot there;"
                             " the next call's line says '412-word recap sent'")
-                if size == PHONES[0]:
-                    said.append(thread_list_case(page, url, voice, api, size, True, args.screenshots))
-                    said.append(thread_list_place_case(page, url, voice, api, size, True))
-                    said.append(thread_list_arrival_case(page, url, voice, api, size, True))
-                    said.append(thread_list_away_case(page, url, voice, api, size, True))
-                    said.append(room_back_case(page, url, voice, api, size, True))
-                    said.append(opened_card_case(page, url, voice, api, size))
+            if "threads" in stretches and size == PHONES[0]:
+                said.append(thread_list_case(page, url, voice, api, size, True, args.screenshots))
+                said.append(thread_list_place_case(page, url, voice, api, size, True))
+                said.append(thread_list_arrival_case(page, url, voice, api, size, True))
+                said.append(thread_list_away_case(page, url, voice, api, size, True))
+                said.append(room_back_case(page, url, voice, api, size, True))
+                said.append(opened_card_case(page, url, voice, api, size))
             if "alone" in stretches:
                 said.append(card_alone_case(page, url, voice, api, size,
                                             CARD_ALONE_CASES if size == PHONES[0] else CARD_ALONE_FEW))
@@ -2880,8 +2883,13 @@ def jump_after_settings_case(page: Page, url: str, voice: FakeVoice, api: FakeAp
             f" and Esc, one {' and '.join(str(up) for up in far)}px up offered it still")
 
 
-def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi) -> str:
-    """Points 8, 11 to 15, 17 and 21 on a desk with a mouse, where two columns are offered."""
+def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi,
+              half: str = "columns") -> str:
+    """Points 8, 11 to 15, 17 and 21 on a desk with a mouse, where two columns are offered.
+
+    The gate runs the two halves as its own steps (`desk`, `desk-away`), each in its own
+    browser profile; with no --part both halves run, in this order.
+    """
     width, height = DESK
     voice = FakeVoice()
     with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-approval-card-") as directory:
@@ -2894,15 +2902,17 @@ def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: Fa
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
-            line = columns_case(page, url, voice, api, args.screenshots)
-            line += "; " + thread_list_case(page, url, voice, api, DESK, False, args.screenshots)
-            line += "; " + thread_list_place_case(page, url, voice, api, DESK, False)
-            line += "; " + thread_list_arrival_case(page, url, voice, api, DESK, False)
-            line += "; " + thread_list_away_case(page, url, voice, api, DESK, False)
-            line += "; " + thread_list_cards_case(page, url, voice, api, DESK)
-            line += "; " + room_back_case(page, url, voice, api, DESK, False)
-            line += "; " + two_columns_opened_case(page, url, voice, api, DESK)
-            line += "; " + jump_after_settings_case(page, url, voice, api, DESK, False, JUMP_TRIPS_DESK)
+            if half == "columns":
+                line = columns_case(page, url, voice, api, args.screenshots)
+                line += "; " + thread_list_case(page, url, voice, api, DESK, False, args.screenshots)
+                line += "; " + thread_list_place_case(page, url, voice, api, DESK, False)
+                line += "; " + thread_list_arrival_case(page, url, voice, api, DESK, False)
+            else:
+                line = thread_list_away_case(page, url, voice, api, DESK, False)
+                line += "; " + thread_list_cards_case(page, url, voice, api, DESK)
+                line += "; " + room_back_case(page, url, voice, api, DESK, False)
+                line += "; " + two_columns_opened_case(page, url, voice, api, DESK)
+                line += "; " + jump_after_settings_case(page, url, voice, api, DESK, False, JUMP_TRIPS_DESK)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
@@ -2934,15 +2944,20 @@ def main() -> int:
             for part in (part for part in PARTS if part in (args.part or PARTS)):
                 if part == "phone-place":
                     lines.append(walk(chromium, args, url, api, PHONES[0], ("place",)))
+                elif part == "phone-threads":
+                    lines.append(walk(chromium, args, url, api, PHONES[0], ("threads",)))
                 elif part == "phone-alone":
                     lines.append(walk(chromium, args, url, api, PHONES[0], ("alone",)))
                 elif part == "phone-help":
                     lines.append(walk(chromium, args, url, api, PHONES[0], ("help",)))
-                elif part == "small-screens":
+                elif part == "small-phones":
                     lines += [walk(chromium, args, url, api, size) for size in PHONES[1:]]
+                elif part == "short-screens":
                     lines += [walk_short(chromium, args, url, api, size) for size in SHORT_SCREENS]
                 elif part == "desk":
-                    lines.append(walk_desk(chromium, args, url, api))
+                    lines.append(walk_desk(chromium, args, url, api, "columns"))
+                elif part == "desk-away":
+                    lines.append(walk_desk(chromium, args, url, api, "away"))
                 else:
                     raise AssertionError(f"part {part!r} is named in PARTS but runs nothing")
         for line in lines:

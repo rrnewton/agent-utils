@@ -7101,6 +7101,7 @@ def run_captures(
     only: Iterable[str],
     themes: Iterable[Theme],
     mock_control: str = "",
+    profiles: Iterable[str] = (),
 ) -> list[tuple[str, Path, Verdict]]:
     try:
         from playwright.sync_api import sync_playwright
@@ -7109,6 +7110,14 @@ def run_captures(
             "The python3 'playwright' package is not installed.", INSTALL_HINT
         ) from error
 
+    wanted_profiles = set(profiles)
+    if wanted_profiles:
+        unknown = wanted_profiles - {profile.name for profile in PROFILES}
+        if unknown:
+            raise SystemExit(
+                f"unknown profile name(s): {', '.join(sorted(unknown))}\n"
+                f"known profiles: {', '.join(profile.name for profile in PROFILES)}"
+            )
     wanted = set(only)
     scenes = [scene for scene in SCENES if not wanted or scene.name in wanted]
     if wanted:
@@ -7165,6 +7174,8 @@ def run_captures(
             try:
                 for theme in themes:
                     for profile in PROFILES:
+                        if wanted_profiles and profile.name not in wanted_profiles:
+                            continue
                         context = browser.new_context(**profile.context_options(theme))
                         context.grant_permissions(["microphone"], origin=url)
                         # The vendor boundary, and the ONLY request that is faked. Everything else
@@ -8370,6 +8381,14 @@ def build_parser() -> argparse.ArgumentParser:
         "contrast that reads on white can vanish on black)",
     )
     parser.add_argument(
+        "--profile",
+        action="append",
+        default=[],
+        metavar="PROFILE",
+        help="capture only this device profile (repeatable); the gate runs the profiles as "
+             "parallel steps so no step holds every browser slot (default: all of them)",
+    )
+    parser.add_argument(
         "--mock-control",
         default="",
         metavar="URL",
@@ -8446,6 +8465,7 @@ def main(argv: list[str]) -> int:
             args.only,
             themes,
             args.mock_control or "",
+            args.profile,
         )
     except PlaywrightMissing as error:
         print(f"screenshots.py: {error}", file=sys.stderr)

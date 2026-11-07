@@ -27,7 +27,7 @@
 # Usage:
 #   scripts/run.sh [--shutdown] [--restart] [--logs] [--follow] [--status] [--tunnel-status]
 #                  [--smoke-agent [--nonce] [--replay-check]]
-#                  [--screenshots [--out DIR] [--theme THEME]]
+#                  [--screenshots [--out DIR] [--theme THEME] [--profiles LIST]]
 #                  [--config FILE] [--tunnel|--no-tunnel] [--tag TAG] [--port PORT]
 #                  [--restart-policy POLICY] [--build-network MODE] [--dry-run] [--help]
 #
@@ -144,6 +144,9 @@
 #                  automation default — so the whole set reviewed a page he never sees. Contrast
 #                  between the two speakers is exactly what does not survive the swap, so the
 #                  theme that counts is the one captured by default.
+#   --profiles LIST Only with --screenshots. Comma-separated device profiles to photograph
+#                  (default: all of them). The gate runs disjoint profile lists as parallel
+#                  steps so no step holds every browser slot.
 #   --config FILE  Use exactly this configuration file and no other. Missing file is an error.
 #   --tunnel       Force the cloudflared tunnel check ON for this run.
 #   --no-tunnel    Force the cloudflared tunnel check OFF for this run.
@@ -276,6 +279,7 @@ SMOKE_REPLAY=0
 SCREENSHOTS=0
 SHOTS_OUT=""
 SHOTS_THEME=""
+SHOTS_PROFILES=""
 TUNNEL_OVERRIDE=""
 TAG_OVERRIDE=""
 PORT_OVERRIDE=""
@@ -312,6 +316,7 @@ while [ $# -gt 0 ]; do
         --screenshots) SCREENSHOTS=1; shift ;;
         --out) SHOTS_OUT="${2:?--out needs a directory}"; shift 2 ;;
         --theme) SHOTS_THEME="${2:?--theme needs dark, light or both}"; shift 2 ;;
+        --profiles) SHOTS_PROFILES="${2:?--profiles needs a comma-separated profile list}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unrecognized argument: $1" >&2; echo "" >&2; usage >&2; exit 2 ;;
     esac
@@ -366,6 +371,13 @@ if [ -n "$SHOTS_THEME" ] && [ "$SCREENSHOTS" != 1 ]; then
     die "--theme only means something together with --screenshots.
 It picks the colour scheme the app is photographed in. On its own there is nothing to
 photograph, and accepting it silently would leave you believing you had chosen a theme for a run
+that never took a picture."
+fi
+
+if [ -n "$SHOTS_PROFILES" ] && [ "$SCREENSHOTS" != 1 ]; then
+    die "--profiles only means something together with --screenshots.
+It picks which device profiles are photographed. On its own there is nothing to
+photograph, and accepting it silently would leave you believing you had chosen profiles for a run
 that never took a picture."
 fi
 
@@ -701,12 +713,20 @@ Its output is above. Without it every summary state is unreachable."
     # Through the environment, never the command line, for the same reason as the smoke test: a
     # command line is readable by every process on this box.
     export VIBE_TALK_WRITE_TOKEN="$SHOTS_WRITE_TOKEN"
+    SHOTS_PROFILE_ARGS=()
+    if [ -n "$SHOTS_PROFILES" ]; then
+        IFS=',' read -ra SHOTS_PROFILE_LIST <<< "$SHOTS_PROFILES"
+        for shot_profile in "${SHOTS_PROFILE_LIST[@]}"; do
+            SHOTS_PROFILE_ARGS+=(--profile "$shot_profile")
+        done
+    fi
     rc=0
     "$SHOTS_SCRIPT" \
         --url "http://127.0.0.1:$SHOTS_PORT" \
         --channel "$SHOTS_CHANNEL" \
         --out "$SHOTS_OUT" \
         --theme "${SHOTS_THEME:-dark}" \
+        "${SHOTS_PROFILE_ARGS[@]}" \
         --mock-control "http://127.0.0.1:$SHOTS_MOCK_HTTP_PORT" || rc=$?
     if [ "$rc" -ne 0 ]; then
         echo "" >&2

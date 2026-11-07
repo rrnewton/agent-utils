@@ -271,6 +271,14 @@ def arguments() -> argparse.Namespace:
         action="store_true",
         help="walk the page at both sizes and skip the negative controls, for the edit-run loop (default: run them)",
     )
+    parser.add_argument(
+        "--size",
+        action="append",
+        choices=tuple(label for label, *_rest in SIZES),
+        help="walk only this size (repeatable); the gate runs one size per step so the two desks "
+             "walk side by side, and the negative controls walk with desk-1920, the size they "
+             "control (default: every size, then the controls)",
+    )
     return parser.parse_args()
 
 
@@ -330,8 +338,15 @@ def main() -> int:
     with sync_playwright() as playwright, tempfile.TemporaryDirectory(prefix="vibe-talk-overscroll-") as copies:
         fixture.WEB_ROOT = root
         for label, width, height, thread_room in SIZES:
+            if args.size and label not in args.size:
+                continue
             report.append(walk(playwright.chromium, args, label, width, height, thread_room, rest_ms))
-        for at, (name, file, patches, tags) in enumerate(() if args.no_controls else CONTROLS):
+        controls = () if args.no_controls else CONTROLS
+        if args.size and CONTROL_SIZE[0] not in args.size:
+            # The controls judge the walk at CONTROL_SIZE; a step walking another size
+            # does not run them, and the desk-1920 step runs them all.
+            controls = ()
+        for at, (name, file, patches, tags) in enumerate(controls):
             # Built from patched sources exactly as the page is (`#624 voice-page-modularity`): each
             # text must occur once, or the control is refused rather than run unchanged.
             fixture.WEB_ROOT = page_sources.variant(root, Path(copies) / f"control-{at}",

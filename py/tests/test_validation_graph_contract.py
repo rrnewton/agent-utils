@@ -172,8 +172,34 @@ def test_rust_and_cross_nodes_cover_their_registries_once() -> None:
 def test_timing_browser_steps_hold_every_browser_slot() -> None:
     config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
     by_tag = config.by_tag()
-    for tag in ("vibe-talk.shots.screenshots", "vibe-talk.check.read-aloud-blocks-browser"):
-        assert by_tag[tag].hint.resources.get("browser") == 4, tag
+    tag = "vibe-talk.check.read-aloud-blocks-browser"
+    assert by_tag[tag].hint.resources.get("browser") == 4, tag
+
+
+def test_screenshot_shards_cover_every_profile_once() -> None:
+    # The screenshot walk is sharded by device profile so no step holds every browser
+    # slot: together the shards' --profiles lists are the harness's whole profile set,
+    # each profile exactly once, and each shard holds one browser slot.
+    import re
+
+    text = (REPO_ROOT / "vibe-talk/scripts/screenshots.py").read_text(encoding="utf-8")
+    block = text.split("PROFILES: tuple[Profile, ...] = (", 1)[1].split("\n)\n", 1)[0]
+    profiles = set(re.findall(r'name="([a-z0-9-]+)"', block))
+    by_tag = dag_from_path(REPO_ROOT / "validation.dag.yaml").by_tag()
+    shards = {
+        tag: step
+        for tag, step in by_tag.items()
+        if tag.startswith("vibe-talk.shots.screenshots-")
+    }
+    assert shards, "no screenshot shard steps"
+    covered: list[str] = []
+    for tag, step in shards.items():
+        assert step.hint.resources.get("browser") == 1, tag
+        named = _flag_values(step.cmd, "--profiles")
+        assert len(named) == 1, f"{tag} passes --profiles {named}, not one list"
+        covered += named[0].split(",")
+    assert sorted(covered) == sorted(profiles), \
+        f"shards cover {sorted(covered)}, the harness has {sorted(profiles)}"
 
 
 def test_wrkslots_shards_cover_eight_way_partition() -> None:
