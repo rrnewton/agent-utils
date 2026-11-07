@@ -1,6 +1,6 @@
 ---
 title: 'merge-queue-stale-probe: a culprit-search probe cancelled as stale counts as an inconclusive search'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-07T15:30:00.000000000+00:00
@@ -50,3 +50,12 @@ prefix 0 of 1 observed only missing/skipped tests").
 Found 2026-11-07 by a consuming queue's operator after swapping to
 38908bd2; reproduced here at 38908bd2 (3 of 5 runs of the kept-roots
 test). Regression from #1013 merge-queue-stale-cancel-retry.
+
+## Resolution
+
+Landed: a stale-marked cancelled probe ends the culprit search with
+`Culprit::Stale`; the search is abandoned and the red batch is
+recomposed on the current base instead of the probe counting as an
+inconclusive observation. Covered by the new `cli_stale_cancel`
+probe test and by `kept_stale_roots_keep_their_donor_jobs` passing
+repeatedly.

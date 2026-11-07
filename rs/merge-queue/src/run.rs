@@ -814,6 +814,10 @@ enum Culprit {
     /// A probe observed nothing conclusive (`Missing`/`Skip`-only): no
     /// culprit can be named; the batch stops rather than guessing.
     Inconclusive(String),
+    /// A probe's donor job was cancelled as stale (the base moved under
+    /// the search): the search is abandoned and the batch recomposed on
+    /// the current base, like any stale batch.
+    Stale,
     /// The change at `index` makes the focus fail (seen twice, or once for a deterministic
     /// check) and the prefix before it passes.
     Found {
@@ -962,6 +966,18 @@ impl CulpritSearch {
         let unconfirmed = (!confirm_reruns).then_some(UNCONFIRMED_ONCE);
         for (i, result) in probes.iter().zip(results) {
             let (_, ran) = result?;
+            // A probe cancelled as stale observed nothing about the
+            // candidate: the base moved under the search, so the search
+            // is abandoned and the batch recomposed, never counted as
+            // an inconclusive observation.
+            if ran.cancelled
+                && ran
+                    .cannot_execute
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("stale:"))
+            {
+                return Ok(Some(Culprit::Stale));
+            }
             if ran.refused() {
                 return Ok(Some(Culprit::Refused(refusal_detail(&ran))));
             }
@@ -7924,6 +7940,19 @@ impl<'a> Runner<'a> {
                         ),
                         current.prs.clone(),
                     )));
+                }
+                Culprit::Stale => {
+                    self.event(
+                        "stale-probe",
+                        &format!(
+                            "a culprit-search probe for {} was cancelled as stale; \
+                             the search is abandoned and the batch is recomposed on \
+                             the current base",
+                            list(&current.prs)
+                        ),
+                    );
+                    pending.push_front(current.prs.clone());
+                    return Ok(Some(BatchOutcome::Done));
                 }
                 Culprit::BaseRed(tests, confirmation) => {
                     return Ok(Some(BatchOutcome::Stop(

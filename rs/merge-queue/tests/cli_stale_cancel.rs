@@ -329,6 +329,121 @@ fn a_stale_cancelled_root_is_recomposed_on_the_new_base_not_retried() {
     let _ = donor_run;
 }
 
+#[test]
+fn a_stale_cancelled_probe_abandons_the_search_and_the_batch_is_recomposed() {
+    // A red batch's culprit search runs its probe as a donor job. When
+    // that job is cancelled as stale (here written directly, standing in
+    // for the sweep), the probe has observed nothing: the search must be
+    // abandoned and the batch recomposed, never counted as an
+    // inconclusive search that stops the run.
+    let fx = Fixture::new("stale-probe");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    // The first probe run sleeps, so the test can cancel its job
+    // mid-flight; later probes answer at once.
+    let probes = fx.root.join("probe-runs");
+    let runner = format!(
+        r#"if [ "$MQ_SELECTION" = tests ]; then
+  n=$(cat '{probes}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{probes}'
+  if [ "$n" -lt 2 ]; then sleep 30; fi
+  set -- $MQ_TESTS
+else
+  set -- $(ls tests)
+fi
+rc=0
+for t in "$@"; do
+  if [ -f "tests/$t" ] && grep -q FAIL "tests/$t"; then o=fail; rc=1; else o=pass; fi
+  printf '{{"id":"%s","outcome":"%s"}}\n' "$t" "$o" >> "$MQ_RESULTS"
+done
+exit $rc"#,
+        probes = probes.display()
+    );
+    let script = fx.root.join("validator.sh");
+    std::fs::write(&script, runner).unwrap();
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        &format!("sh '{}'", script.display()),
+        "--offload",
+        "decide",
+        "--confirm-reruns",
+    ]);
+    fx.branch("a", &[("tests/a", "FAIL\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let clone = donor_clone(&fx, "donor-host");
+    let run = spawn_run(&fx, &[]);
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let (code, report, stderr) = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = donor_run(&fx, &clone, "d1", "1");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        // The batch job validates red, then its probe job is published.
+        wait_for("the probe job", Duration::from_secs(60), || {
+            jobs(&fx).len() >= 2
+        });
+        let probe = jobs(&fx)
+            .into_iter()
+            .max_by_key(|job| job["id"].as_str().unwrap().to_owned())
+            .unwrap();
+        cancel_job_as_stale(&fx, probe["id"].as_str().unwrap());
+        let outcome = finish(run);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        outcome
+    });
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("culprit search inconclusive"), "{stderr}");
+    assert!(
+        report["stopped"].is_null(),
+        "the stale probe stopped the run: {report}"
+    );
+    // The abandoned search does not decide the batch: the red batch is
+    // validated again as a recomposed batch, searched again, and only
+    // that second, complete search ejects it.
+    let batch_validations = report["validations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v["purpose"] == "batch" && v["prs"] == serde_json::json!([1]))
+        .count();
+    assert_eq!(
+        batch_validations, 2,
+        "the red batch was not recomposed and validated again: {report}"
+    );
+    let probe_validations = report["validations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v["purpose"] == "probe")
+        .count();
+    assert!(
+        probe_validations >= 2,
+        "the recomposed batch was not searched again: {report}"
+    );
+    assert_eq!(item_status(&fx, 1), "ejected", "{report}");
+    let runs = fx.queue().join(".git/merge-queue/runs");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(runs)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join("events.jsonl").is_file())
+        .collect();
+    dirs.sort();
+    let events = std::fs::read_to_string(dirs.pop().unwrap().join("events.jsonl")).unwrap();
+    assert!(events.contains("stale-probe"), "{events}");
+    assert!(
+        events.contains("recomposed on the current base"),
+        "{events}"
+    );
+}
+
 fn cancel_job_as_stale(fx: &Fixture, id: &str) {
     let path = job_path(fx, id);
     let mut job: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
