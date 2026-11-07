@@ -1,6 +1,6 @@
 ---
 title: 'donor-claim-plan-order: Store::claim leases the oldest queued job by id, ignoring plan order and prioritized changes'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-07T07:10:00.000000000+00:00

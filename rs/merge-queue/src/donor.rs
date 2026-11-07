@@ -235,6 +235,16 @@ pub struct Job {
     /// claim-time stale sweep and the run's own stale pruning leave it alone.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rooted: bool,
+    /// Any change in the batch was prioritized: claims lease it ahead of
+    /// unprioritized jobs (#1008 donor-claim-plan-order). Absent in job files
+    /// written before claim order was recorded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prioritized: bool,
+    /// The batch's index in the queue's plan: claims follow plan order, with
+    /// job age as the tiebreak. Absent in job files written before claim
+    /// order was recorded, and for jobs no planned batch matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_index: Option<usize>,
 }
 
 impl Job {
@@ -1129,6 +1139,8 @@ impl Store {
         validator: &ValidatorConfig,
         tool: &ToolIdentity,
         rooted: bool,
+        prioritized: bool,
+        plan_index: Option<usize>,
     ) -> Result<Job, String> {
         let _lock = self.lock()?;
         self.prune()?;
@@ -1161,6 +1173,8 @@ impl Store {
             could_not_run: Vec::new(),
             compare_only: false,
             rooted,
+            prioritized,
+            plan_index,
         };
         self.write(&job)?;
         Ok(job)
@@ -1251,11 +1265,29 @@ impl Store {
             return Ok(None);
         }
         let compare_only_donor = self.compare_only.contains(donor);
-        let Some(mut job) = jobs.into_iter().find(|job| {
-            job.state == JobState::Queued
-                && job.compare_only == compare_only_donor
-                && !job.declined_by.iter().any(|name| name == donor)
-        }) else {
+        // Claim order (#1008): prioritized jobs first, then plan order, with
+        // job age (id) as the tiebreak. Jobs recorded before claim order
+        // existed carry neither value and sort by id among themselves.
+        let Some(mut job) = jobs
+            .into_iter()
+            .filter(|job| {
+                job.state == JobState::Queued
+                    && job.compare_only == compare_only_donor
+                    && !job.declined_by.iter().any(|name| name == donor)
+            })
+            .min_by(|a, b| {
+                (
+                    std::cmp::Reverse(a.prioritized),
+                    a.plan_index.unwrap_or(usize::MAX),
+                    &a.id,
+                )
+                    .cmp(&(
+                        std::cmp::Reverse(b.prioritized),
+                        b.plan_index.unwrap_or(usize::MAX),
+                        &b.id,
+                    ))
+            })
+        else {
             return Ok(None);
         };
         job.state = JobState::Leased;
@@ -3721,6 +3753,8 @@ mod unit {
                 &validator,
                 &tool,
                 rooted,
+                false,
+                None,
             )
             .unwrap()
     }
@@ -4550,6 +4584,8 @@ mod unit {
                 &validator,
                 &tool,
                 false,
+                false,
+                None,
             )
             .unwrap();
         let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
@@ -4589,6 +4625,8 @@ mod unit {
                 &validator,
                 &tool,
                 false,
+                false,
+                None,
             )
             .unwrap();
         let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
@@ -4612,6 +4650,107 @@ mod unit {
             "{:?}",
             done.history
         );
+    }
+
+    /// Publish a job with claim order and a controlled id (age), returning it.
+    fn publish_ordered(
+        store: &Store,
+        commit: &str,
+        prioritized: bool,
+        plan_index: Option<usize>,
+        id: &str,
+    ) -> Job {
+        let validator = validator();
+        let tool = ToolIdentity {
+            validator_digest: validator_digest(&validator).unwrap(),
+            tools: BTreeMap::new(),
+            merge_queue: Some(crate::build_info::Revision {
+                commit: "a".repeat(40),
+                dirty: false,
+            }),
+        };
+        let mut job = store
+            .publish(
+                commit,
+                "tree0",
+                "base0",
+                &Selection::of([TestId::step("a")]),
+                &BTreeSet::new(),
+                &validator,
+                &tool,
+                false,
+                prioritized,
+                plan_index,
+            )
+            .unwrap();
+        let old_path = store.job_path(&job.id).unwrap();
+        job.id = id.to_owned();
+        store.write(&job).unwrap();
+        std::fs::remove_file(old_path).unwrap();
+        job
+    }
+
+    #[test]
+    fn claims_follow_priority_then_plan_order_then_age() {
+        let store = Store::new(&temp("claim-order"));
+        // Published in age order 1, 2, 3; plan order and priority disagree.
+        let first_by_age = publish_ordered(
+            &store,
+            "c1",
+            false,
+            Some(1),
+            "20260101T000000000-c11111111111-00000001",
+        );
+        let second_by_age = publish_ordered(
+            &store,
+            "c2",
+            false,
+            Some(0),
+            "20260101T000000000-c22222222222-00000002",
+        );
+        let prioritized = publish_ordered(
+            &store,
+            "c3",
+            true,
+            Some(2),
+            "20260101T000000000-c33333333333-00000003",
+        );
+        // A prioritized job published last is claimed first; then plan order
+        // beats age.
+        let claim = |store: &Store| store.claim("d1", "h1", 10).unwrap().expect("a job").id;
+        assert_eq!(claim(&store), prioritized.id);
+        assert_eq!(claim(&store), second_by_age.id);
+        assert_eq!(claim(&store), first_by_age.id);
+    }
+
+    #[test]
+    fn claims_without_recorded_order_keep_age_order() {
+        let store = Store::new(&temp("claim-order-old"));
+        // Job files written before claim order was recorded deserialize with
+        // no priority and no plan index.
+        let made = publish_ordered(
+            &store,
+            "c1",
+            false,
+            None,
+            "20260101T000000000-c11111111111-00000001",
+        );
+        let mut value = serde_json::to_value(&made).unwrap();
+        value.as_object_mut().unwrap().remove("prioritized");
+        value.as_object_mut().unwrap().remove("plan_index");
+        let old: Job = serde_json::from_value(value).unwrap();
+        assert!(!old.prioritized && old.plan_index.is_none());
+        let newer = publish_ordered(
+            &store,
+            "c2",
+            false,
+            None,
+            "20260101T000000000-c22222222222-00000002",
+        );
+        // Equal (absent) priority keeps oldest-first.
+        let claim = |store: &Store| store.claim("d1", "h1", 10).unwrap().expect("a job").id;
+        assert_eq!(claim(&store), made.id);
+        assert_eq!(claim(&store), newer.id);
     }
 
     #[test]

@@ -3689,6 +3689,26 @@ impl<'a> Runner<'a> {
                 report.base_start.clone()
             }
         };
+        // Claim order (#1008): the job records whether any of its changes is
+        // prioritized, and its batch's plan index, so a claim leases in plan
+        // order instead of publication order. No planned batch matches a
+        // remainder or a prefix probe exactly: those keep age order.
+        let (prioritized, plan_index) = {
+            let report = lock(&self.report);
+            let plan = &report.plan;
+            let plan_index = plan
+                .batches
+                .iter()
+                .find(|batch| batch.prs == job.prs)
+                .map(|batch| batch.index);
+            let prioritized = job.prs.iter().any(|pr| {
+                plan.items
+                    .iter()
+                    .find(|item| item.pr == *pr)
+                    .is_some_and(|item| item.prioritized)
+            });
+            (prioritized, plan_index)
+        };
         let published = donors.store.publish(
             &job.commit,
             &tree,
@@ -3698,6 +3718,8 @@ impl<'a> Runner<'a> {
             &self.config.validator,
             &donors.tool,
             job.rooted,
+            prioritized,
+            plan_index,
         )?;
         lock(&donors.published).push((published.id.clone(), job.commit.clone()));
         Ok(published.id)
