@@ -37,7 +37,7 @@ Named in the #827 readout of 2026-11-05. #866 latency-tests-cpu-budget is closed
 
 Filed by mu-validate on 2026-11-05 from the #827 gate-flake readout (local number 900); renumbered to 905 on landing by the coordinator, since 900 was taken on main.
 
-# Design decision and measurement (mu-validate, 2026-11-06)
+## Design decision and measurement (mu-validate, 2026-11-06)
 
 Load method (reproducible, bounded): the test and `stress --cpu 6` share one
 `systemd-run --user --scope -p CPUQuota=200%` scope, so the browser's own

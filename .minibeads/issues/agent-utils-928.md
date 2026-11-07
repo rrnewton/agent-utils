@@ -1,11 +1,12 @@
 ---
 title: 'native-session-collision: several agent records bound to one native session block revive'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-salvage
 created_at: 2026-11-06T12:40:00.000000000+00:00
-updated_at: 2026-11-06T12:40:00.000000000+00:00
+updated_at: 2026-11-07T02:15:00.000000000+00:00
+closed_at: 2026-11-07T02:15:00.000000000+00:00
 ---
 
 # Description
@@ -27,3 +28,7 @@ In one consumer registry, four killed lanes all record the same native session i
 # Notes
 
 Reported 2026-11-06 by the lead coordinator, from a consumer's coordinator. That consumer's registry is read-only for this work; coordinate through the coordinator.
+
+## Resolution
+
+[watermelon-full-preview mu-salvage] Outcome. Landed as 76e1d1be. The collision came from older lanes started before #916 recorded native sessions, sharing one cwd and process tree, so a later discovery bound the one live session into several records. Capture now runs a guard (guard_duplicate_capture): a session already bound to a live record is left unknown on the new record, naming the owner and the bind-session remedy. Explicit bind-session works offline on a positively dead record (including agent_not_found), and the revive duplicate error names the bind-session remedy. Tests cover the capture collision, the dead-record repair, and revive after repair. Gate on the final commit passed every selected step (shared 38/39 with python.agentctl.shard-0 passing on exclusive rerun, exclusive phase 6/6).

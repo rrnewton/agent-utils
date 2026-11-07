@@ -34,7 +34,7 @@ The owner wants to talk to sub-agents directly from the chat channel, through ow
 
 Owner request 169, relayed by the lead on 2026-11-05 at 9:04 PM ET (P1). A lane on the lead host (Muse ultra) is designing it and implements it there once that host can create slots again. It touches chat_runtime.rs, the same area as #852 D and #900 (cl-start), so coordinate.
 
-# Resolution
+## Resolution
 
 Landed on main as b6fb7609 (step 1: !help/!who + pinned), 9e9b1bdb
 (step 2: !@NAME threads + one parent notice), 53bd4459 (step 3: !end,
