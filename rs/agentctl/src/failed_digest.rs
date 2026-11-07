@@ -42,6 +42,11 @@ pub const MAX_NAMED: usize = 5;
 pub const FIRST_LINE_CHARS: usize = 80;
 /// Hard bound on one digest's length, in characters.
 pub const DIGEST_CHARS: usize = 1_000;
+/// The first line a digest is typed under: agentctl's own framing, so a digest typed into a
+/// composer is attributable there and flushable with one Enter.
+pub const DIGEST_HEADER: &str = "[agentctl failed-digest]";
+/// The labels a digest line opens with, as [`FailedEntry::label`] spells them.
+const LABELS: [&str; 2] = ["may have arrived", "may not have reached you"];
 
 /// One `failed/` entry as a digest or listing names it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -156,71 +161,148 @@ pub fn failed_entries(root: &Path) -> Vec<FailedEntry> {
         })
         .collect();
     paths.sort();
-    let mut entries = Vec::new();
-    for path in paths {
-        let Some(id) = path
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
+    let mut entries: Vec<FailedEntry> = paths.iter().filter_map(|path| entry_at(path)).collect();
+    entries.sort_by(|a, b| b.failed_at.cmp(&a.failed_at).then_with(|| b.id.cmp(&a.id)));
+    entries
+}
+
+/// The failed entry the record at `path` is, with its `.error` sidecar beside it; `None` for a
+/// digest item or a path without a file name. An item whose JSON cannot be read is still an
+/// entry, named from its raw text.
+fn entry_at(path: &Path) -> Option<FailedEntry> {
+    let id = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())?;
+    let sidecar = fs::read_to_string(format!("{}.error", path.display()))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or(Value::Null);
+    let raw = fs::read_to_string(path).unwrap_or_default();
+    let document = serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned());
+    if id.starts_with(DIGEST_ID_PREFIX)
+        || document
+            .as_ref()
+            .is_some_and(|doc| doc.get(DIGEST_FLAG) == Some(&Value::Bool(true)))
+    {
+        return None;
+    }
+    let (sender, first_line, failed_at) = match &document {
+        Some(doc) => {
+            let text = doc.get("text").and_then(Value::as_str).unwrap_or("");
+            (
+                sender_of(doc, text),
+                first_line_of(text),
+                read_failed_at(&sidecar, doc, path),
+            )
+        }
+        None => (
+            "unknown".to_owned(),
+            first_line_of(&raw),
+            read_failed_at(&sidecar, &serde_json::Map::new(), path),
+        ),
+    };
+    let error = sidecar
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            document.as_ref().and_then(|doc| {
+                doc.get("delivery_error")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+        })
+        .unwrap_or_default();
+    Some(FailedEntry {
+        id,
+        sender,
+        first_line,
+        label: if may_have_arrived(&error) {
+            LABELS[0].to_owned()
+        } else {
+            LABELS[1].to_owned()
+        },
+        error,
+        failed_at,
+    })
+}
+
+/// The record of failed message `id`: in `failed/`, or in a `failed-archive-<date>/` an
+/// acknowledgement moved it to.
+fn failed_record(root: &Path, id: &str) -> Option<PathBuf> {
+    let name = format!("{id}.json");
+    let failed = root.join(agent_queue::queue::FAILED).join(&name);
+    if failed.is_file() {
+        return Some(failed);
+    }
+    fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("failed-archive-")
+        })
+        .map(|entry| entry.path().join(&name))
+        .find(|path| path.is_file())
+}
+
+/// The failed messages a composer draft names, when the draft is a digest agentctl typed (#989
+/// agentctl-own-draft-submit). A pass that could not confirm a digest withdraws its record, so a
+/// digest a busy pane left in its composer can outlive the only record of its own text. The
+/// messages it names keep theirs: the draft is that digest when every message it names is one a
+/// digest was recorded as naming ([`SHOWN_FILE`]) and the draft, its header and any count of
+/// further entries aside, is the start of the digest lines those messages' records give, label
+/// for label or with the other label. Each named message's ID and record path, in the order
+/// named; `None` for any other draft, a person's included.
+pub(crate) fn digest_draft_entries(root: &Path, draft: &str) -> Option<Vec<(String, PathBuf)>> {
+    let shown = shown_ids(root);
+    let mut named = Vec::new();
+    let mut lines = Vec::new();
+    for row in draft.lines() {
+        let Some(rest) = LABELS
+            .iter()
+            .find_map(|label| row.trim().strip_prefix(label)?.strip_prefix(": "))
         else {
             continue;
         };
-        let sidecar = fs::read_to_string(format!("{}.error", path.display()))
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .unwrap_or(Value::Null);
-        let raw = fs::read_to_string(&path).unwrap_or_default();
-        let document = serde_json::from_str::<Value>(&raw)
-            .ok()
-            .and_then(|value| value.as_object().cloned());
-        if id.starts_with(DIGEST_ID_PREFIX)
-            || document
-                .as_ref()
-                .is_some_and(|doc| doc.get(DIGEST_FLAG) == Some(&Value::Bool(true)))
-        {
-            continue;
+        let id = rest.split_whitespace().next()?;
+        if !shown.contains_key(id) {
+            return None;
         }
-        let (sender, first_line, failed_at) = match &document {
-            Some(doc) => {
-                let text = doc.get("text").and_then(Value::as_str).unwrap_or("");
-                (
-                    sender_of(doc, text),
-                    first_line_of(text),
-                    read_failed_at(&sidecar, doc, &path),
-                )
-            }
-            None => (
-                "unknown".to_owned(),
-                first_line_of(&raw),
-                read_failed_at(&sidecar, &serde_json::Map::new(), &path),
-            ),
-        };
-        let error = sidecar
-            .get("error")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                document.as_ref().and_then(|doc| {
-                    doc.get("delivery_error")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-            })
-            .unwrap_or_default();
-        entries.push(FailedEntry {
-            id,
-            sender,
-            first_line,
-            label: if may_have_arrived(&error) {
-                "may have arrived".to_owned()
-            } else {
-                "may not have reached you".to_owned()
-            },
-            error,
-            failed_at,
-        });
+        let path = failed_record(root, id)?;
+        lines.push(digest_line(&entry_at(&path)?));
+        named.push((id.to_owned(), path));
     }
-    entries.sort_by(|a, b| b.failed_at.cmp(&a.failed_at).then_with(|| b.id.cmp(&a.id)));
-    entries
+    if named.is_empty() {
+        return None;
+    }
+    let comparable = |text: &str| {
+        LABELS
+            .iter()
+            .fold(crate::submission::compact(text), |text, label| {
+                text.replace(&crate::submission::compact(label), "\u{0}")
+            })
+    };
+    let mut wanted = comparable(draft);
+    if let Some(rest) = wanted.strip_prefix(&crate::submission::compact(DIGEST_HEADER)) {
+        wanted = rest.to_owned();
+    }
+    // `+N more failed entries in this queue; ...` closes a digest that named its maximum.
+    if let Some(at) = wanted.rfind("morefailed") {
+        if let Some(head) = wanted[..at]
+            .trim_end_matches(|character: char| character.is_ascii_digit())
+            .strip_suffix('+')
+        {
+            wanted = head.to_owned();
+        }
+    }
+    comparable(&lines.join("\n"))
+        .starts_with(&wanted)
+        .then_some(named)
 }
 
 fn shown_path(root: &Path) -> PathBuf {
@@ -513,9 +595,7 @@ fn queue_digest_locked(root: &Path, now: f64) -> Result<Option<String>, String> 
         |id| {
             json!({
                 "id": id,
-                // Agentctl's own framing, so a digest typed into a composer
-                // is attributable there and flushable with one Enter.
-                "text": format!("[agentctl failed-digest]\n{text}"),
+                "text": format!("{DIGEST_HEADER}\n{text}"),
                 DIGEST_FLAG: true,
                 "failed_ids": named,
                 "queued_at": now,
@@ -551,18 +631,19 @@ pub fn discard_unconfirmed(root: &Path, id: &str) -> Result<bool, String> {
     use agent_queue::queue::MessageState;
     match agent_queue::queue::message_state(root, id).map_err(|e| e.to_string())? {
         Some(MessageState::Pending) => {
-            // A stranded pending digest was typed: leave it pending so the
-            // stranded path can flush it Enter-only. Withdrawing would
-            // delete the only record that can attribute its draft.
+            // A pending digest that was typed, stranded or with its paste
+            // started, is left pending so the stranded path can flush it
+            // Enter-only. Withdrawing would delete the only record that can
+            // attribute its draft (#989 agentctl-own-draft-submit).
             for lane in [agent_queue::queue::INBOX, agent_queue::queue::INBOX_V2] {
                 let path = root.join(lane).join(format!("{id}.json"));
                 let Ok(raw) = fs::read_to_string(&path) else {
                     continue;
                 };
-                let stranded = serde_json::from_str::<Value>(&raw)
-                    .ok()
-                    .is_some_and(|doc| doc.get("stranded_at").is_some());
-                if stranded {
+                let typed = serde_json::from_str::<Value>(&raw).ok().is_some_and(|doc| {
+                    doc.get("stranded_at").is_some() || doc.get("paste_started_at").is_some()
+                });
+                if typed {
                     return Ok(false);
                 }
                 break;

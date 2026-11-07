@@ -443,7 +443,9 @@ pub(crate) fn find(
     records.sort_by(|left, right| right.0.total_cmp(&left.0));
     let mut times: Vec<f64> = records.iter().map(|record| record.0).collect();
     times.dedup();
-    let &oldest = times.get(deliveries - 1).or(times.last())?;
+    let Some(&oldest) = times.get(deliveries - 1).or(times.last()) else {
+        return digest_without_record(queue, draft);
+    };
     records.retain(|record| record.0 >= oldest);
     for (_, path, document) in &records {
         let digest = digest_record(path, document);
@@ -484,6 +486,9 @@ pub(crate) fn find(
         if matched {
             return Some(typed_prompt(path, document, Vec::new()));
         }
+    }
+    if let Some(found) = digest_without_record(queue, draft) {
+        return Some(found);
     }
     let Draft::Text(rows) = draft else {
         return None;
@@ -697,6 +702,24 @@ fn typed_prompt(
         sender: sender_of(document),
         typed_at: typed_at(document),
     }
+}
+
+/// A digest agentctl typed whose own record is gone, found by the failed messages it names,
+/// whose records remain (#989 agentctl-own-draft-submit). Those records are quarantined, so the
+/// draft is submitted and never retyped, and the recovery is noted on them.
+fn digest_without_record(queue: &Path, draft: &Draft) -> Option<TypedPrompt> {
+    let Draft::Text(rows) = draft else {
+        return None;
+    };
+    let mut named = crate::failed_digest::digest_draft_entries(queue, rows)?;
+    let (id, path) = named.pop()?;
+    Some(TypedPrompt {
+        id,
+        path,
+        others: named,
+        sender: None,
+        typed_at: None,
+    })
 }
 
 /// Record on the queue record of each prompt the draft held that it was found left unsent in
@@ -1068,6 +1091,91 @@ message number {index:02}"
             now
         )
         .is_none());
+    }
+
+    /// A queue whose failed message `id`, sent by lane-a with `body`, failed with `error` and was
+    /// named by a digest, its record in `phase` (`failed`, or an archive directory).
+    fn failed_and_digested(queue: &Path, phase: &str, id: &str, body: &str, error: &str) {
+        let text = format!("[from lane-a via agentctl · reply: agentctl send lane-a]\n{body}");
+        record(queue, phase, id, &json!({"id": id, "text": text}));
+        fs::write(
+            queue.join(phase).join(format!("{id}.json.error")),
+            json!({"error": error}).to_string(),
+        )
+        .unwrap();
+        let shown_file = queue.join(crate::failed_digest::SHOWN_FILE);
+        let mut state: Value = fs::read_to_string(&shown_file)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_else(|| json!({"shown": {}}));
+        state["shown"][id] = json!(1.0);
+        fs::write(shown_file, state.to_string()).unwrap();
+    }
+
+    const LEFT: &str = "prompt left the composer without visible submission evidence";
+    const UNSEEN: &str = "prompt was submitted but never showed in pane p1 within 5s";
+
+    #[test]
+    fn a_digest_whose_record_is_gone_is_found_by_the_messages_it_names() {
+        // #989 agentctl-own-draft-submit: a pass that could not confirm a digest withdrew its
+        // record, but the digest stayed in a busy pane's composer. The messages it names keep
+        // their records, in failed/ or in an archive an acknowledgement moved them to.
+        let directory = Scratch::new("digest-gone");
+        let queue = directory.0.as_path();
+        failed_and_digested(queue, "failed", "msg-1", "memory at 64 GiB, not 48", LEFT);
+        failed_and_digested(
+            queue,
+            "failed-archive-2026-11-06",
+            "msg-2",
+            "hold the commit until the review",
+            UNSEEN,
+        );
+        let now = SystemTime::now();
+        for draft in [
+            "may have arrived: msg-1 lane-a memory at 64 GiB, not 48".to_owned(),
+            "[agentctl failed-digest]\nmay not have reached you: msg-2 lane-a hold the commit \
+             until the review"
+                .to_owned(),
+            // Two lines, the second cut short where the composer stops drawing it.
+            "may have arrived: msg-1 lane-a memory at 64 GiB, not 48\nmay not have reached \
+             you: msg-2 lane-a hold the com"
+                .to_owned(),
+        ] {
+            for vouching in [Vouching::Unproven, Vouching::Recent] {
+                let found = find(queue, &Draft::Text(draft.clone()), vouching, now)
+                    .unwrap_or_else(|| panic!("not found: {draft}"));
+                assert!(["msg-1", "msg-2"].contains(&found.id.as_str()), "{draft}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_digest_prefix_on_other_text_or_a_persons_draft_is_not_ours() {
+        let directory = Scratch::new("digest-foreign");
+        let queue = directory.0.as_path();
+        failed_and_digested(queue, "failed", "msg-1", "memory at 64 GiB, not 48", LEFT);
+        record(
+            queue,
+            "failed",
+            "msg-3",
+            &json!({"id": "msg-3", "text": "never digested"}),
+        );
+        let now = SystemTime::now();
+        for draft in [
+            // The prefix and a named message, with words that are not that message's.
+            "may have arrived: msg-1 lane-a memory at 32 GiB",
+            // A message no digest named.
+            "may not have reached you: msg-3 unknown never digested",
+            // A message the queue does not hold.
+            "may have arrived: msg-9 lane-a memory at 64 GiB, not 48",
+            // A person typing.
+            "let me check the memory figure first",
+        ] {
+            assert!(
+                find(queue, &Draft::Text(draft.to_owned()), Vouching::Recent, now).is_none(),
+                "{draft}"
+            );
+        }
     }
 
     #[test]

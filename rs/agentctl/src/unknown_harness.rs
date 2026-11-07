@@ -207,6 +207,16 @@ pub fn submit(
         Ok(screen) => screen,
         Err(reason) => return refuse(reason),
     };
+    match flush_own_agentterm_draft(terminal, pane_id, &before, runtime) {
+        Ok(Some(evidence)) => {
+            return refuse(format!(
+                "pane {pane_id}: {evidence}; this prompt waits for the next delivery; nothing was \
+                 typed"
+            ))
+        }
+        Ok(None) => {}
+        Err(error) => return refuse(format!("pane {pane_id}: {error}; nothing was typed")),
+    }
     if let Some(reason) = agentterm_refusal(pane_id, &before, text, runtime) {
         return refuse(reason);
     }
@@ -432,6 +442,44 @@ fn agentterm_refusal(
         "pane {pane_id} composer already holds unsubmitted text {preview:?}; refusing to append \
          to it; nothing was typed"
     ))
+}
+
+/// Submit, with one Enter, a draft in an idle agentterm composer that agentctl itself typed (#989
+/// agentctl-own-draft-submit): a prompt the queue records as typed, or a failed-queue digest
+/// found by the messages it names. It is never retyped, the recovery is noted on its record, and
+/// the prompt being delivered waits for the next pass, behind the turn the draft starts. `None`
+/// for any other screen or draft, which [`agentterm_refusal`] refuses as before.
+fn flush_own_agentterm_draft(
+    terminal: &dyn PromptTerminal,
+    pane_id: &str,
+    screen: &str,
+    runtime: &dyn AgentRuntime,
+) -> Result<Option<String>> {
+    use crate::harness::agentterm::{self, FrameState};
+    let Some(frame) = agentterm::frame(screen) else {
+        return Ok(None);
+    };
+    let (FrameState::Idle, Some(draft)) = (&frame.state, frame.draft) else {
+        return Ok(None);
+    };
+    let Some(queue) = runtime.typed_prompts_queue() else {
+        return Ok(None);
+    };
+    let Some(prompt) = crate::stale_draft::find(
+        &queue,
+        &crate::stale_draft::Draft::Text(draft),
+        crate::stale_draft::Vouching::Unproven,
+        std::time::SystemTime::now(),
+    ) else {
+        return Ok(None);
+    };
+    terminal.send_keys(pane_id, "Enter")?;
+    let evidence = format!(
+        "submitted an unsent draft {} that agentterm had left in its composer (1 Enter key press)",
+        prompt.describe()
+    );
+    crate::stale_draft::note_recovered(&prompt, &evidence, agent_queue::queue::unix_seconds());
+    Ok(Some(evidence))
 }
 
 /// Clear an idle agentterm composer that holds nothing but terminal query replies (#900

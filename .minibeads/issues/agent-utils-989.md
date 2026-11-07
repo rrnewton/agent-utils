@@ -1,11 +1,12 @@
 ---
 title: 'agentctl-own-draft-submit: drain refuses a composer holding text agentctl itself typed, so every later message waits'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-sync
 created_at: 2026-11-07T01:20:00.000000000+00:00
-updated_at: 2026-11-07T01:20:00.000000000+00:00
+updated_at: 2026-11-07T09:59:02.724828000+00:00
+closed_at: 2026-11-07T09:59:02.724828000+00:00
 ---
 
 # Description
@@ -30,3 +31,16 @@ Seen 3 times in about 20 minutes on one host on 2026-11-06, in two Claude lanes 
 # Notes
 
 Reported 2026-11-06 by the lead coordinator, from another harness's issue tracker. Related: #953 (busy-pane delivery verdicts), 46e81a3b (collapsed paste recognised on the first attempt, never retyped).
+
+## Resolution
+
+The stuck drafts were failed-queue digests ("may not have reached you: ..." / "may have arrived: ...") typed into a busy Claude Code pane. The pass that typed one could not confirm it and withdrew the pending digest, deleting its record, because only a digest marked stranded was kept; the text stayed in the composer, nothing in the queue matched it any more, and every later send refused to append to it.
+
+- A pending digest whose paste was started is kept, as a stranded one is, so the stranded path can flush it with one Enter.
+- A draft no record vouches for is recognised as a digest agentctl typed when every message it names is one a digest was recorded as naming and the draft, its header aside, is the start of the digest lines those messages' own records give (in `failed/`, or the archive an acknowledgement moved them to). It is submitted with one Enter, never retyped, and the recovery is noted on the failed message's record. The Claude Code and Codex composer path, the watcher's draft sweep and the chat runtime all go through this match; the agentterm path flushes such a draft the same way before it would refuse.
+- A prefix on other words, a message no digest named, a message the queue does not hold, or a person's draft still refuses, and nothing is typed.
+
+Tests: a digest without its record is submitted with one Enter by the next drain, for both labels, and the next prompt is delivered; a digest whose message was archived is found; the refusals above.
+
+Not covered: a digest that Claude Code collapsed to a `[Pasted text #N +M lines]` placeholder shows no words to match.
+

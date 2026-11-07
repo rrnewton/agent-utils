@@ -5407,6 +5407,63 @@ mod tests {
         );
     }
 
+    /// #989 agentctl-own-draft-submit: a failed-queue digest a pass typed into a busy Claude
+    /// Code pane stayed in its composer after the pass withdrew the digest's record, and every
+    /// later drain refused to append to it. The digest names a failed message whose record
+    /// remains, so the next drain submits it with one Enter, never retyped, and then delivers
+    /// its own prompt; for both labels.
+    #[test]
+    fn a_digest_left_in_the_composer_without_its_record_is_submitted_by_the_next_drain() {
+        for (label, error) in [
+            (
+                "may have arrived",
+                "prompt left the composer without visible submission evidence",
+            ),
+            (
+                "may not have reached you",
+                "prompt was submitted but never showed in pane w1:p1",
+            ),
+        ] {
+            let queue = TypedQueue::new("digest-without-record");
+            let message = format!("{LANE}\nmemory at 64 GiB, not 48");
+            let failed = queue.0.join("failed");
+            crate::agent::atomic_json(
+                &failed.join("msg-1.json"),
+                &serde_json::json!({"id": "msg-1", "text": message}),
+            )
+            .unwrap();
+            std::fs::write(
+                failed.join("msg-1.json.error"),
+                serde_json::json!({"error": error}).to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                queue.0.join(crate::failed_digest::SHOWN_FILE),
+                serde_json::json!({"shown": {"msg-1": 1.0}}).to_string(),
+            )
+            .unwrap();
+            let digest = format!("{label}: msg-1 lane-a memory at 64 GiB, not 48");
+            let screen = FakeScreen::new("claude", false);
+            screen.leave_draft(&digest);
+            let owner = format!("{OWNER}\nstatus?");
+            receipt(submit_following(&screen, &queue, &owner, Some("Enter")));
+            assert_eq!(taken(&screen), [digest.clone(), owner], "{label}");
+            assert_eq!(screen.state().keys, ["Enter", "Enter"], "{label}");
+            assert_eq!(
+                screen.state().pastes.len(),
+                1,
+                "{label}: the digest is never retyped"
+            );
+            let record: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(failed.join("msg-1.json")).unwrap())
+                    .unwrap();
+            assert!(
+                record["draft_recovered_at"].is_number(),
+                "{label}: {record}"
+            );
+        }
+    }
+
     /// #825 agentctl-stranded-multi-paste: two prompts a working Claude
     /// Code pane had queued came back as two concatenated placeholders.
     /// Both labels are recorded deliveries, so the next drain submits the
