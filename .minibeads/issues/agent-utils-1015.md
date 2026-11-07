@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-pre-claim-check: a donor runs a configured per-candidate check before fetching a job, and gives it back when the check fails'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-11-07T14:45:00.000000000+00:00
-updated_at: 2026-11-07T14:45:00.000000000+00:00
+updated_at: 2026-11-07T15:10:00.000000000+00:00
 ---
 
 # Description
@@ -60,3 +60,15 @@ the checked resource is per-candidate, so no image or digest is
 named in the config; the command resolves it from the candidate
 itself. Consumers are named generically here, as everywhere in
 this tree.
+
+## Resolution
+
+Landed: `ValidatorConfig.pre_claim_check` and
+`pre_claim_timeout_secs` (default 120 s), run by a donor per job
+after the digest check and before fetch with `MQ_CANDIDATE`,
+`MQ_REPO` and `MQ_BASE` set. A failure or timeout gives the job back
+without declining and without a refused receipt, with the first
+stderr line (or the timeout reason) as the release reason. Covered
+by `rs/merge-queue/tests/cli_pre_claim.rs` (passing check with its
+environment, failing check released and offered again, timeout, and
+absent config).

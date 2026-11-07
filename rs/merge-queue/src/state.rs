@@ -178,6 +178,22 @@ pub struct ValidatorConfig {
     /// [`DEFAULT_SUSPECT_FLAKE_TIMEOUT_SECS`].
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub suspect_flake_timeout_secs: u64,
+    /// Shell command a donor runs for each job before it fetches the
+    /// candidate, with `MQ_CANDIDATE`, `MQ_REPO` and `MQ_BASE` in the
+    /// environment: the command resolves whatever the candidate needs on
+    /// that host (an image, a tool, a licence) and exits 0 only when the
+    /// host has it. A non-zero exit gives the job back (never a decline,
+    /// never a refused receipt) with the first stderr line as the reason.
+    /// Empty (the default) means no check. Setting it changes the
+    /// validator digest, so the queue host and its donors must upgrade
+    /// together.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub pre_claim_check: String,
+    /// Wall limit in seconds of `pre_claim_check`; 0 means
+    /// [`DEFAULT_PRE_CLAIM_TIMEOUT_SECS`]. A timeout gives the job back
+    /// like a failed check.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub pre_claim_timeout_secs: u64,
 }
 
 /// Default wall limit of a suspect-flake rerun.
@@ -626,6 +642,15 @@ impl ValidatorConfig {
         self.green_flaky == "land"
     }
 
+    /// Resolved wall limit of the pre-claim check.
+    pub fn pre_claim_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(if self.pre_claim_timeout_secs == 0 {
+            DEFAULT_PRE_CLAIM_TIMEOUT_SECS
+        } else {
+            self.pre_claim_timeout_secs
+        })
+    }
+
     /// Resolved GREEN_FLAKY hold bound in seconds.
     pub fn green_flaky_hold(&self) -> u64 {
         if self.green_flaky_hold_secs == 0 {
@@ -642,6 +667,8 @@ pub const DEFAULT_REFUSAL_MAX_RETRIES: usize = 3;
 pub const DEFAULT_REFUSAL_BACKOFF_SECS: u64 = 2;
 /// Default GREEN_FLAKY hold bound in seconds (two hours for a ruling).
 pub const DEFAULT_GREEN_FLAKY_HOLD_SECS: u64 = 7200;
+/// Default wall limit in seconds of a donor's pre-claim check.
+pub const DEFAULT_PRE_CLAIM_TIMEOUT_SECS: u64 = 120;
 
 /// How a validated candidate reaches the base branch.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

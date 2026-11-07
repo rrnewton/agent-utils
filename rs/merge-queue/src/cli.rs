@@ -2155,6 +2155,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     },
                     tool_identity,
                     tool_refresh,
+                    pre_claim_check: String::new(),
+                    pre_claim_timeout_secs: 0,
                 },
                 value_ordering,
                 disjoint_root_min_red_percent,

@@ -1034,6 +1034,16 @@ An **item record** (`items/<pr>.json`) has these fields:
   failed only on suspect tests and reruns them beside the run (see "Suspect flakes"). Absent (the
   default) means off. A binary older than this field refuses a config that has it.
 - `suspect_flake_timeout_secs`: wall limit of one suspect-flake rerun (absent or `0`: `1800`).
+- `pre_claim_check`: a shell command a donor runs for each job before it fetches the
+  candidate, in its clone, with `MQ_CANDIDATE` (the candidate commit), `MQ_REPO` (the clone's
+  origin URL) and `MQ_BASE` (the job's base commit) in the environment. The command resolves
+  whatever the candidate needs on that host and exits 0 only when the host has it. Any other
+  exit gives the job back — never a decline, never a refused receipt — with the first stderr
+  line as the reason and the donor's usual back-off. Absent (the default) means no check.
+  Setting it changes the validator digest, so the queue host and its donors must upgrade
+  together. A binary older than this field refuses a config that has it.
+- `pre_claim_timeout_secs`: wall limit of `pre_claim_check` (absent or `0`: `120`). A timeout
+  gives the job back with the reason `pre_claim_check timed out`.
 
 **`donors`** fields (only read when `validator.offload` is not off; absent means the defaults):
 

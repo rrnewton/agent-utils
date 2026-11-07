@@ -2789,6 +2789,90 @@ impl Worker<'_> {
         }
     }
 
+    /// The job's configured pre-claim check (`validator.pre_claim_check`):
+    /// run it in the clone with the candidate, repository and base in the
+    /// environment, and say why it failed when it does. The command
+    /// resolves whatever the candidate needs on this host itself; the
+    /// queue has no notion of what is being checked.
+    fn pre_claim_check(&self, job: &Job) -> Result<(), String> {
+        let check = job.validator.pre_claim_check.trim();
+        if check.is_empty() {
+            return Ok(());
+        }
+        let repo = std::process::Command::new("git")
+            .args([
+                "-C",
+                &self.options.clone.display().to_string(),
+                "remote",
+                "get-url",
+                "origin",
+            ])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| self.options.clone.display().to_string());
+        let stderr_path = self
+            .options
+            .work
+            .join(format!("pre-claim-{}.log", job.id.replace('/', "-")));
+        if let Some(parent) = stderr_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let stderr_file = std::fs::File::create(&stderr_path)
+            .map_err(|error| format!("pre_claim_check could not start: {error}"))?;
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(check)
+            .current_dir(&self.options.clone)
+            .env("MQ_CANDIDATE", &job.commit)
+            .env("MQ_REPO", &repo)
+            .env("MQ_BASE", &job.base)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr_file);
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("pre_claim_check could not start: {error}"))?;
+        let timeout = job.validator.pre_claim_timeout();
+        let started = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() <= timeout => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("pre_claim_check timed out".to_owned());
+                }
+            }
+        };
+        if status.success() {
+            return Ok(());
+        }
+        let text = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        let reason = text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(crate::validate::cut_line)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!(
+                    "pre_claim_check exited {}",
+                    status
+                        .code()
+                        .map_or_else(|| "on a signal".to_owned(), |code| code.to_string())
+                )
+            });
+        Err(reason)
+    }
+
     /// Stop claiming for the mismatch back-off.
     fn back_off(&self, backoff: &Mutex<Option<std::time::Instant>>) {
         *backoff
@@ -3094,6 +3178,13 @@ impl Worker<'_> {
                 "validator settings digest {digest} is not the job's {}",
                 job.tool.validator_digest
             )));
+        }
+        // The configured pre-claim check gates taking the job at all: a
+        // host that cannot run this candidate gives it back (never a
+        // decline, never a refused receipt), with back-off.
+        if let Err(reason) = self.pre_claim_check(job) {
+            self.back_off(backoff);
+            return Err(Unreported::Released(reason));
         }
         self.fetch(job, token)?;
         let slot = loop {
