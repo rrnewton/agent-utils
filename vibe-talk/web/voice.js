@@ -2086,7 +2086,7 @@ function chooseMajorView(view) {
   showView(view);
   // The cards name what a press would reach; once seen they go, so they never cover the bar.
   clearTimeout(viewCardsTimer);
-  viewCardsTimer = setTimeout(() => documentsSelector.hideCards(), 2500);
+  viewCardsTimer = setTimeout(() => documentsSelector.hideCards(), 700);
   if (view === "discord") {
     readEnteredChannel(viewScroll.restored());
     return;
@@ -2127,6 +2127,12 @@ document.addEventListener("keydown", (event) => {
 document.addEventListener("pointerdown", (event) => {
   const target = /** @type {{closest?: (selector: string) => unknown} | null} */ (event.target || null);
   if (target && typeof target.closest === "function" && (target.closest("#view-cards") || target.closest("#view-switch"))) return;
+  clearTimeout(viewCardsTimer);
+  documentsSelector.hideCards();
+}, true);
+
+// And so does scrolling a list: the cards are a moment's signpost, not a cover.
+document.addEventListener("scroll", () => {
   clearTimeout(viewCardsTimer);
   documentsSelector.hideCards();
 }, true);
@@ -2607,6 +2613,8 @@ function showView(name) {
   // The chips belong to the list you are looking at, and you are now looking at a different one.
   renderScrollTools();
   renderChannelFreshness();
+  // A channel word ("fetching the channel…") is not the Documents reader's news.
+  if (name === "docs") dismissStatus();
   // Leaving the channel takes the reading with it: audio that goes on playing over the transcript
   // is audio the reader cannot see the source of, on a list where the next thing it does is
   // archive a message.

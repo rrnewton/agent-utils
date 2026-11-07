@@ -12,7 +12,10 @@
 .view-cards {
   position: absolute;
   bottom: calc(100% + 6px);
-  right: 0;
+  /* Inside the viewport, right-aligned with the switch, as wide as it (polish on
+     #1022 documents-view-client: on a phone the stack ran off the right edge). */
+  right: 8px;
+  width: min(10.5rem, calc(100vw - 16px));
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -70,6 +73,11 @@
   flex: 1;
   margin: 0;
   font-size: 1.05em;
+}
+
+/* In the reader the floating search glass would sit on Read; it is the list's, not the reader's. */
+#screen-main:has(#docs-reader:not([hidden])) #search-float {
+  display: none;
 }
 
 /* The reader: rendered document body in the reading width, tables scroll in their box. */
