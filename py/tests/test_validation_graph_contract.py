@@ -1021,9 +1021,12 @@ def test_the_app_page_suite_runs_once_beside_the_rust_suites() -> None:
         assert len(shard) == 1, f"{tag} runs the page suite without naming exactly one slice"
         slices.append(shard[0])
         # Nothing built: the slices are node over the checked-out page, beside the builds. The
-        # one allowed dep is the Node 22 provisioning step (#865): the slices run node itself,
-        # so they wait for the pinned toolchain, never for a build.
-        assert set(step.deps) <= {"vibe-talk.setup.node22"}, f"{tag} waits on {step.deps}"
+        # allowed deps are provisioning only: the Node 22 step (#865), because the slices run node
+        # itself, and the contract tools, because the page build inside a slice needs the pinned
+        # esbuild. They wait for the pinned toolchain, never for a build.
+        assert set(step.deps) <= {"vibe-talk.setup.node22", "vibe-talk.setup.contract-tools"}, (
+            f"{tag} waits on {step.deps}"
+        )
         assert tag not in by_tag["vibe-talk.test.unit"].deps
     assert slices, "no step runs the page suite"
     count = len(slices)

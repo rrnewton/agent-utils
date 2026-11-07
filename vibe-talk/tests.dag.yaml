@@ -2236,11 +2236,14 @@ steps:
   # 1 GiB, a slice peaked at 0.86 GiB and ran faster (46 s against 55 s), and four of them starting
   # beside the builds no longer ask for 11 GiB. A slice that ever needs more fails as out of memory,
   # by name.
+  #
+  # Each slice builds the page with the pinned esbuild, so it waits for setup.contract-tools: in a
+  # fresh checkout with no vibe-talk/contract/node_modules yet, a slice otherwise raced the install.
   - group: test
     job: page-0
     desc: the app page's suite, slice 0 of four, node over web/voice.js
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    deps: [setup.node22]
+    deps: [setup.node22, setup.contract-tools]
     cmd: >-
       cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
       VOICE_PAGE_SHARD=0/4 ../scripts/with-node22 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
@@ -2261,7 +2264,7 @@ steps:
     job: page-1
     desc: the app page's suite, slice 1 of four, node over web/voice.js
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    deps: [setup.node22]
+    deps: [setup.node22, setup.contract-tools]
     cmd: >-
       cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
       VOICE_PAGE_SHARD=1/4 ../scripts/with-node22 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
@@ -2282,7 +2285,7 @@ steps:
     job: page-2
     desc: the app page's suite, slice 2 of four, node over web/voice.js
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    deps: [setup.node22]
+    deps: [setup.node22, setup.contract-tools]
     cmd: >-
       cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
       VOICE_PAGE_SHARD=2/4 ../scripts/with-node22 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
@@ -2303,7 +2306,7 @@ steps:
     job: page-3
     desc: the app page's suite, slice 3 of four, node over web/voice.js
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    deps: [setup.node22]
+    deps: [setup.node22, setup.contract-tools]
     cmd: >-
       cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
       VOICE_PAGE_SHARD=3/4 ../scripts/with-node22 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
