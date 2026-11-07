@@ -4300,6 +4300,33 @@ impl<'a> Runner<'a> {
                         .find(|line| line.contains("cancelled:"))
                         .map(|line| line.as_str())
                         .unwrap_or("cancelled outside this run");
+                    // A stale cancellation is not a refusal: the candidate
+                    // can never land as published, so retrying it as a
+                    // refusal (see `refused_again`) republishes the identical
+                    // stale candidate, which the stale sweep cancels again.
+                    // Return a cancelled result instead: the flight is then
+                    // recomposed on the current base at its decision, like
+                    // any stale root.
+                    let base_now = lock(&self.base).clone();
+                    let stale = why.contains("stale: the base moved")
+                        || (!base_now.is_empty()
+                            && !self.git.is_ancestor(&base_now, &job.commit).unwrap_or(true));
+                    if stale {
+                        self.event(
+                            "donor",
+                            &format!(
+                                "v{id}: donor job {published} was cancelled as stale \
+                                 ({why}); no verdict, the batch is recomposed on the \
+                                 current base"
+                            ),
+                        );
+                        let mut ran = stopped(true, None);
+                        ran.cannot_execute = Some(format!(
+                            "stale: donor job {published} was cancelled ({why}); \
+                             recomposed on the current base"
+                        ));
+                        return Ok(ran);
+                    }
                     self.event(
                         "donor",
                         &format!(
@@ -6593,6 +6620,44 @@ impl<'a> Runner<'a> {
                             self.start_again(scope, &tx, &head, job, delay);
                             flights.push_front(head);
                             break;
+                        }
+                        // A batch whose donor job was cancelled as stale
+                        // (its candidate no longer contains the base) is
+                        // recomposed on the current base, never retried or
+                        // decided on the stale candidate.
+                        let stale_cancelled = matches!(
+                            &head.result,
+                            Some(Ok((_, ran))) if ran.cancelled && ran.interrupted.is_none()
+                        ) && {
+                            let marked = matches!(
+                                &head.result,
+                                Some(Ok((_, ran))) if ran
+                                    .cannot_execute
+                                    .as_deref()
+                                    .is_some_and(|detail| detail.contains("stale:"))
+                            );
+                            let base_now = lock(&self.base).clone();
+                            marked
+                                || (!base_now.is_empty()
+                                    && !self
+                                        .git
+                                        .is_ancestor(&base_now, &head.candidate.tip)
+                                        .unwrap_or(true))
+                        };
+                        if stale_cancelled {
+                            if head.stacked {
+                                discard(&mut flights, &rx, pending);
+                            }
+                            self.event(
+                                "stale-cancelled",
+                                &format!(
+                                    "{} was cancelled as stale on the base it was built \
+                                     on; recomposed on the current base",
+                                    list(&head.candidate.prs)
+                                ),
+                            );
+                            pending.push_front(head.candidate.prs.clone());
+                            continue;
                         }
                         // A batch holding a change withdrawn while it
                         // validated is decided as withdrawn, whatever its

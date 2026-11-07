@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-stale-cancel-retry: a donor job cancelled as stale is retried as the identical candidate instead of recomposed on the current base'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-07T13:50:00.000000000+00:00
-updated_at: 2026-11-07T13:50:00.000000000+00:00
+updated_at: 2026-11-07T14:20:00.000000000+00:00
 ---
 
 # Description
@@ -62,3 +62,15 @@ Reported 2026-11-07 by the operator lane of a consuming project's
 merge queue and traced there; verified against this tree. Not covered
 by #1010 merge-queue-withdrawn-batches, whose `refused_again` guard is
 withdrawn-only.
+
+## Resolution
+
+Landed: a stale-marked outside cancellation in `donor_validate`
+returns a cancelled result (marked stale in its reason) instead of a
+refused one, so `refused_again` never republishes the identical stale
+candidate; at its decision the batch is recomposed on the current
+base (`stale-cancelled`). Covered by
+`rs/merge-queue/tests/cli_stale_cancel.rs`: a stale outside
+cancellation is recomposed and lands with no refused validation
+(fails before the fix), and a stale-cancelled kept root is recomposed
+on the new base with exactly one job for the stale candidate.
