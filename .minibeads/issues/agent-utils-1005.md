@@ -4,7 +4,7 @@ status: open
 priority: 1
 issue_type: bug
 created_at: 2026-11-07T04:46:35.000000000+00:00
-updated_at: 2026-11-07T04:46:35.000000000+00:00
+updated_at: 2026-11-07T04:50:00.000000000+00:00
 ---
 
 # Description
@@ -32,13 +32,23 @@ That queue's isolation tests fail when several validations share one host,
 so the race turned into four false reds in one run. The operator capped the
 local donor at 1 with `donor run --cap-file` as a stopgap.
 
+The queue host's own stamp can be stale too. At every claim, `donor claim`
+answers `validator.tool_identity` on the queue host (cli.rs, the
+"Answer the tool identity now" step) and re-stamps queued jobs, but the queue
+host never runs `validator.tool_refresh`; only donors do. So its answer is as
+old as the last fetch of its tool checkout, which on that host happens when
+its own donor refreshes at a claim. While that donor was busy with 3 jobs, the
+answer stayed about 18 minutes behind the tool repository's main. Jobs were
+stamped behind, and every refreshed remote donor saw itself as newer. The
+operator now fetches the tool checkout every 60 s as a stopgap.
+
 # Design
 
 Keep the exact-tools rule; a job is still validated only with the tools it
 names. Two changes, either sufficient:
 
-1. Stamp at lease time: `donor claim` refreshes the queue host's tools and
-   re-stamps the job before it hands out the lease, so the stamp is as new as
+1. Stamp at lease time: `donor claim` runs the queue host's `tool_refresh`
+   (rate-limited) and re-stamps the job before it hands out the lease, so the stamp is as new as
    the donor's refresh, short of a race within seconds.
 2. After a "donor is newer than the job" decline, re-stamp and reserve the job
    for the declining donor for one claim interval before any other donor may
