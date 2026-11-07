@@ -178,8 +178,23 @@ def _run_gate(tmp_path: Path, env: dict[str, str], *args: str) -> subprocess.Com
     )
 
 
-def test_blackout_refuses_a_start_inside_the_window(tmp_path: Path) -> None:
-    result = _run_gate(tmp_path, _blackout_env(tmp_path, _BLACKOUT, _INSIDE))
+def test_blackout_queues_a_start_inside_the_window_until_it_ends(tmp_path: Path) -> None:
+    """A start requested inside a window waits it out in the queue rather than
+    being refused, so the lane need not resubmit; nothing runs meanwhile."""
+    marker = tmp_path / "ran"
+    result = subprocess.run(
+        [PY, str(GATE), "--wait-timeout", "2", "--", PY, "-c",
+         f"open({str(marker)!r}, 'w').close()"],
+        env=_blackout_env(tmp_path, _BLACKOUT, _INSIDE), capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 75, result.stdout  # gave up waiting: never admitted
+    assert "waits out blackout 00:15-04:00 America/New_York" in result.stdout
+    assert "starts resume 2026-11-06 04:00 EST" in result.stdout
+    assert not marker.exists()
+
+
+def test_no_wait_blackout_refuses_a_start_inside_the_window(tmp_path: Path) -> None:
+    result = _run_gate(tmp_path, _blackout_env(tmp_path, _BLACKOUT, _INSIDE), "--no-wait-blackout")
     assert result.returncode == 78, result.stdout
     assert "00:15-04:00 America/New_York" in result.stdout
     assert "neighbour nightly job" in result.stdout
@@ -196,7 +211,8 @@ def test_blackout_window_crossing_midnight(tmp_path: Path) -> None:
         'end = "04:00"', 'end = "02:00"'
     )
     # 2026-11-06T04:30Z is 23:30 EST on Nov 5: inside a 23:00-02:00 window.
-    result = _run_gate(tmp_path, _blackout_env(tmp_path, config, "2026-11-06T04:30:00+00:00"))
+    result = _run_gate(tmp_path, _blackout_env(tmp_path, config, "2026-11-06T04:30:00+00:00"),
+                       "--no-wait-blackout")
     assert result.returncode == 78, result.stdout
     assert "next allowed start 2026-11-06 02:00 EST" in result.stdout
     # 2026-11-06T08:00Z is 03:00 EST: outside it.
@@ -243,6 +259,49 @@ def test_blackout_help_documents_config_and_flag(tmp_path: Path) -> None:
     assert "~/.local/etc/agent-utils/gate.toml" in result.stdout
     assert "[[blackout]]" in result.stdout
     assert "--ignore-blackout" in result.stdout
+    assert "--no-wait-blackout" in result.stdout
+    assert "--rerun" in result.stdout
+
+
+def test_a_rerun_ticket_jumps_ordinary_queued_gates(tmp_path: Path) -> None:
+    """A --rerun ticket sorts ahead of every ordinary queued ticket and is
+    granted as soon as the running gate finishes."""
+    order = tmp_path / "order.txt"
+
+    def note(tag: str) -> str:
+        return f"open({str(order)!r}, 'a').write({tag!r} + '\\n')"
+
+    gate = tmp_path / "release"
+    running = _start(tmp_path, "--exclusive", "--", PY, "-c",
+                     f"import os, time\nwhile not os.path.exists({str(gate)!r}): time.sleep(0.05)")
+    _wait_for_runs(tmp_path, 1)
+    queue = tmp_path / "admission" / "queue"
+
+    def wait_queued(count: int) -> None:
+        deadline = time.time() + 10
+        while len(list(queue.glob("*.json"))) < count:
+            assert time.time() < deadline, "tickets did not queue"
+            time.sleep(0.05)
+
+    ordinary = _start(tmp_path, "--", PY, "-c", note("ordinary"))
+    wait_queued(1)
+    rerun = _start(tmp_path, "--rerun", "--", PY, "-c", note("rerun"), "--selected", "a.step")
+    wait_queued(2)
+    gate.write_text("")
+    for proc in (running, ordinary, rerun):
+        out, _ = proc.communicate(timeout=30)
+        assert proc.returncode == 0, out
+    assert order.read_text().split() == ["rerun", "ordinary"]
+
+
+def test_a_rerun_must_name_a_few_selected_steps(tmp_path: Path) -> None:
+    none = subprocess.run([PY, str(GATE), "--rerun", "--", PY, "-c", "pass"],
+                          env=_env(tmp_path), capture_output=True, text=True, timeout=30)
+    assert none.returncode == 2 and "--selected" in none.stdout
+    many = subprocess.run([PY, str(GATE), "--rerun", "--", PY, "-c", "pass",
+                           "--selected", "a,b,c,d,e"],
+                          env=_env(tmp_path), capture_output=True, text=True, timeout=30)
+    assert many.returncode == 2 and "at most 4" in many.stdout
 
 
 def test_a_dead_queue_ticket_never_blocks_admission(tmp_path: Path) -> None:

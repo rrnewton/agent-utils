@@ -45,12 +45,19 @@ from a per-host file that is never synced between hosts
     reason = "neighbour nightly job"
 
 With no file there is no blackout; a malformed file refuses every start with
-a clear error. A start inside a window is refused (exit 78) naming the
-window, its reason and the next allowed start; --ignore-blackout overrides
-and is recorded in the ledger. A ticket queued before a window begins keeps
-its place and is granted only when the window ends (a nested gate invoked by
-an already-running gate therefore waits rather than refusing). Running
-gates are never touched. $GATE_BLACKOUT_NOW (ISO 8601) overrides the clock
+a clear error. A gate requested inside a window queues and waits it out,
+starting when the window ends, so nothing runs in the window and the lane need
+not resubmit; --no-wait-blackout refuses instead (exit 78), naming the window,
+its reason and the next allowed start. --ignore-blackout overrides and is
+recorded in the ledger. A ticket queued before a window begins likewise keeps
+its place and is granted only when the window ends. Running gates are never
+touched.
+
+Rerun tickets: --rerun marks a short solo rerun of a few already-run steps
+(an exclusive run of at most RERUN_MAX_STEPS `--selected` steps). It sorts
+ahead of every ordinary ticket (FIFO among reruns) and still waits for running
+gates to finish, so a two-minute rerun no longer waits behind every gate queued
+after the one it repeats. $GATE_BLACKOUT_NOW (ISO 8601) overrides the clock
 for tests.
 """
 from __future__ import annotations
@@ -96,6 +103,9 @@ def state_dir() -> Path:
 
 #: Exit status for a start refused by a blackout window (#907).
 BLACKOUT_EXIT = 78
+
+#: A --rerun ticket may name at most this many `--selected` steps.
+RERUN_MAX_STEPS = 4
 
 DEFAULT_BLACKOUT_CONFIG = Path("~/.local/etc/agent-utils/gate.toml")
 
@@ -280,11 +290,13 @@ class Admission:
                     path.unlink(missing_ok=True)
 
     def tickets(self) -> list[tuple[Path, dict[str, object]]]:
+        """Queued tickets in grant order: reruns first, then FIFO."""
         out = []
         for path in sorted((self.root / "queue").glob("*.json")):
             data = self._read(path)
             if data is not None:
                 out.append((path, data))
+        out.sort(key=lambda item: 0 if item[1].get("rerun") else 1)
         return out
 
     def runs(self) -> list[dict[str, object]]:
@@ -295,11 +307,11 @@ class Admission:
                 out.append(data)
         return out
 
-    def enqueue(self, cls: str, command: list[str]) -> tuple[str, Path]:
+    def enqueue(self, cls: str, command: list[str], rerun: bool = False) -> tuple[str, Path]:
         run_id = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
         ticket: dict[str, object] = {
             "id": run_id, "pid": os.getpid(), "class": cls,
-            "queued_at": time.time(), "command": command,
+            "queued_at": time.time(), "command": command, "rerun": rerun,
         }
         self._locked()
         try:
@@ -389,6 +401,23 @@ def _refuse_blackout(window: BlackoutWindow, instant: dt.datetime) -> int:
     return BLACKOUT_EXIT
 
 
+def _rerun_problem(command: list[str]) -> str | None:
+    """Why `command` is not a short rerun of named steps, or None if it is."""
+
+    selected: list[str] = []
+    for index, word in enumerate(command):
+        if word == "--selected" and index + 1 < len(command):
+            selected.extend(command[index + 1].split(","))
+        elif word.startswith("--selected="):
+            selected.extend(word.split("=", 1)[1].split(","))
+    selected = [step for step in selected if step]
+    if not selected:
+        return "a rerun names its steps with --selected A,B"
+    if len(selected) > RERUN_MAX_STEPS:
+        return f"{len(selected)} steps selected; a rerun takes at most {RERUN_MAX_STEPS}"
+    return None
+
+
 def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     try:
         windows = load_blackout_windows(getattr(args, "blackout_config", None))
@@ -404,8 +433,15 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     # shells), and those are fresh starts the blackout still refuses.
     nested = bool(parent_run) and (state_dir() / "runs" / f"{parent_run}.json").is_file()
     active = active_blackout(windows, now)
-    if active is not None and not ignore and not nested:
+    if active is not None and not ignore and not nested and getattr(args, "no_wait_blackout", False):
         return _refuse_blackout(active, now)
+    rerun = bool(getattr(args, "rerun", False))
+    if rerun:
+        problem = _rerun_problem(command)
+        if problem:
+            print(f"gate: --rerun refused: {problem}", flush=True)
+            return 2
+        args.cls = "exclusive"
     adm = Admission(state_dir(), args.slots)
     # A gate invoked from inside an admitted gate (validate.py running its
     # gate-exclusive steps) must not queue behind its own parent: the parent
@@ -415,7 +451,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     # blocks new ones, with no deadlock.
     if parent_run:
         adm.finish(parent_run)
-    run_id, _ = adm.enqueue(args.cls, command)
+    run_id, _ = adm.enqueue(args.cls, command, rerun)
     queued_at = time.time()
     last_pos = -1
     blackout_noted: BlackoutWindow | None = None
@@ -1099,8 +1135,9 @@ def main(argv: list[str] | None = None) -> int:
             '  timezone = "America/New_York"\n  reason = "neighbour nightly job"\n'
             "An end at or before the start crosses midnight. With no file there is no "
             "blackout; a malformed file refuses every start (exit 2). A start inside a "
-            "window is refused with exit 78, naming the next allowed start; a ticket "
-            "queued before a window waits it out. --ignore-blackout overrides a window "
+            "window queues and starts when the window ends (--no-wait-blackout refuses "
+            "with exit 78 instead, naming the next allowed start); a ticket queued "
+            "before a window waits it out too. --ignore-blackout overrides a window "
             "and is recorded in the ledger. $GATE_BLACKOUT_NOW (ISO 8601) overrides "
             "the clock for tests."
         ),
@@ -1115,6 +1152,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="blackout config path (default $GATE_BLACKOUT_CONFIG or ~/.local/etc/agent-utils/gate.toml)")
     parser.add_argument("--ignore-blackout", action="store_true",
                         help="start even inside a blackout window; the override is recorded in the ledger")
+    parser.add_argument("--no-wait-blackout", action="store_true",
+                        help="refuse a start inside a blackout window (exit 78) instead of queueing until it ends")
+    parser.add_argument("--rerun", action="store_true",
+                        help=f"a short solo rerun of at most {RERUN_MAX_STEPS} already-run steps named with "
+                             "--selected: runs exclusive and sorts ahead of every ordinary queued ticket "
+                             "(FIFO among reruns); it still waits for running gates. "
+                             "Example: gate.py --rerun -- common/bin/dagrun run --dag validation.dag.yaml "
+                             "--keep-going --selected vibe-talk.check.fold-latency-browser")
     parser.add_argument("--ledger", default=None,
                         help="durable ledger path (default ~/.local/state/agent-utils/gate-ledger.jsonl, or $GATE_LEDGER)")
     parser.add_argument("--no-prune", action="store_true",
