@@ -1,10 +1,11 @@
 ---
 title: 'vibe-talk-spark-summarizer: summarise with Muse Spark 1.3 through the AI gateway'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-07T21:41:55.000000000+00:00
-updated_at: 2026-11-07T21:41:55.000000000+00:00
+updated_at: 2026-11-07T22:22:34.000000000+00:00
+closed_at: 2026-11-07T22:22:34.000000000+00:00
 ---
 
 # Description
@@ -34,4 +35,24 @@ The owner (2026-11-07), on vibe-talk's summaries running on `claude-haiku-4-5`: 
 
 ## Resolution
 
-Pending: gateway reachability, latency and quality numbers land here with the implementation.
+[watermelon-full-preview] Implemented by mu-spark. There was no blocker: the gateway Muse itself uses serves `muse-spark-1.3-internal` directly from this host, including to the client identity vibe-talk already runs with (mutual TLS, no key and no bearer token; with no client certificate the handshake is refused, as it should be). Its wire shape is chat completions, not Messages, so this landed as designed: a `meta_gateway` backend in `vibe-talk/src/summarize/meta_gateway.rs` behind the `Summarizer` trait, for summaries and thread names alike, sharing the Messages backend's client, identity reload, rate limiter, retry policy and cache. No `muse exec` fallback was needed or built. Existing sections keep their behaviour and their cache keys byte for byte (a golden test pins the pre-existing policy version).
+
+Measured 2026-11-07 on this host, sequentially, with vibe-talk's verbatim prompts and fence, over 33 synthetic real-shaped inputs (27 long messages, 247–2,391 characters, plus 6 thread excerpts; no live chat content). Spark went through the gateway at `max_tokens = 1024`; the Haiku column is the current live path at its configured `max_tokens = 120`. Every call succeeded on both sides (33/33, all clean stops):
+
+| Path | p50 | p95 | Mean |
+|---|---|---|---|
+| Spark 1.3, `reasoning_effort = low` (the shipped default) | 4.04 s | 5.59 s | 4.24 s |
+| Spark 1.3, `reasoning_effort = minimal` | 1.78 s | 2.71 s | 1.93 s |
+| Haiku 4.5, current path | 0.83 s | 1.06 s | 0.87 s |
+
+By kind at the default effort: messages p50 3.83 s / p95 5.28 s against Haiku's 0.84 s / 1.28 s; thread names p50 5.46 s / p95 6.62 s against 0.82 s / 0.87 s. Spark is roughly five times slower than Haiku and roughly seven times faster than the bake-off's `muse exec` figure, comfortably inside the 30-second request timeout; thread names are background work regardless. At low effort the model averaged about 600 reasoning tokens per answer and peaked at 954 of the 1,024 ceiling, which is why the shipped `max_tokens` default for this backend is 2,048: the budget is a ceiling the model stops short of, and longer real messages with context need the headroom. A budget spent entirely on reasoning returns no text and is a named shape error, never an empty summary.
+
+Quality read (mu-spark judging): Spark's message answers fit the brief — one sentence under the 160-character target every time (median 121 characters, 0 of 27 over) where Haiku's median was 221 characters with 25 of 27 over target, still one sentence but a long one to hear read aloud. Haiku kept more figures (see the experiment example: its extra clause is worth having and Spark's terser line drops it), and nothing on either side invented a fact on the message inputs; the injection-shaped input was reported, not obeyed, by both. On thread names every Spark slug was valid (12 of 12 across both efforts) where Haiku produced one five-word slug the name parser must reject, and one sentence with the rollout days transposed. Five examples, inputs shortened to their opening:
+
+1. Incident note (build queue stuck since 02:40, lone runner hung). Spark: "The overnight builds are stuck because one machine stopped responding, delaying nightlies but yesterday's release still works." Haiku: "An arm64 build runner stopped responding overnight, blocking the build queue since 02:40, and the team is capturing a thread dump before restarting it to assess losing six hours of cached build artifacts." Both right; Spark's is the one a driver can absorb.
+2. Deploy log dump ending in rollback. Spark: "A production deployment failed on the export feature and was automatically rolled back after briefly affecting users." Haiku opens "Build 4821 deployment to host two failed after triggering 500 errors…", quoting identifiers the prompt expressly forbids quoting.
+3. Experiment readout (setup completion 54% to 71%). Spark: "New accounts using the shorter setup finished more often, so the team plans to roll it out to everyone and make invites skippable." Haiku keeps the percentages Spark drops, at about twice the length — the clearest point in Haiku's favour on this sample.
+4. Thread: flaky checkout test. Spark: `checkout-banner-flake` / "swapping flat two-second wait for network-response wait after load pushed timing to 2.2s, fifty loaded runs green". Haiku: `checkout-flow-flaky-banner-wait` — five words, so the naming would fail validation outright — with a sound sentence behind it.
+5. Thread: staged rollout (internal Monday, ten percent Wednesday 10:00). Spark: `sync-rollout-plan` / "starting with internal accounts Monday, then ten percent Wednesday at 10:00 with flag rollback and error-rate graphs at each step." Haiku: `sync-rollout-schedule` / "Wednesday morning launch for internal accounts, then ten percent…" — the Wednesday step attached to the wrong cohort.
+
+Unverified here: gateway behaviour under sustained production rate (the client-side limit and 429 handling are the shipped ones, tested against a local mock), and long-run certificate rotation in service (the reload is the Messages backend's, likewise mock-tested; the live switch is the coordinator's deploy, not this change's). No live configuration was edited and nothing was restarted.

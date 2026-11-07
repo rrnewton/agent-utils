@@ -975,7 +975,7 @@ Two things are worth knowing before you begin, because they shape everything els
 | Discord read + post behind a trait | **written, unit-tested; never run against live Discord** |
 | In-memory Discord for tests and `--fake-discord` | **works** |
 | Digest (`/digest`) | **works**, extractive and deterministic (no model call). This is the whole-channel digest, not the per-message summary below. |
-| **Per-message summaries and thread names, from one Messages API call** (`[summaries.llm]`) | **written, tested against a local mock Messages API only; never yet run against a live model provider.** One plain HTTP request per summary or thread name, with no agent harness and no tools, in the Anthropic API's dialect or Google Vertex's. See [Summaries](#summaries). |
+| **Per-message summaries and thread names, from one direct HTTP call** (`[summaries.llm]`) | **written, tested against local mocks.** One plain HTTP request per summary or thread name, with no agent harness and no tools: a Messages API call in the Anthropic API's dialect or Google Vertex's, or — with `backend = "meta_gateway"` — a chat-completions call to an AI gateway authenticated by client certificate. See [Summaries](#summaries). |
 | Per-message summaries, from the ElevenLabs agent | **written, unit- and integration-tested offline, NEVER RUN AGAINST LIVE ELEVENLABS — and it is what runs when `[summaries.llm]` is absent.** Asks the configured conversational agent in text over its own WebSocket, on a pooled conversation recycled every eight summaries. The frames were read out of the vendor's SDK; the offline tests drive the real socket client against this repository's own mock, which was written from the same reading, so the two agree with each other and not yet with ElevenLabs. The extractive truncating summariser that used to be the default has been **deleted**, so there is nothing to fall back to: a deployment without ElevenLabs credentials still starts, and shows every long message as a **failed** summary — a red row — instead of handing you its opening lines and calling that a summary. |
 | Message cache on the server's disk (`[message_cache]`) | **off by default; when an operator turns it on, it is filled, and it answers reads only with `serve = true` as well.** It is filled from write-scope and server-owned reads, and is never filled by the read token. The owner can turn it off or erase it in Settings. It counts what it served and what it would have served, checked against the provider. It has been tested against temporary files and in-memory providers only. The acceptance run on a real deployment, a day of fills with no writer drops, has not been done yet. See [The message cache](#the-message-cache). |
 | Semantic random access (`resolve`) | **works**, lexical ranking behind a `Ranker` trait |
@@ -2292,13 +2292,14 @@ framework. The default model is `claude-haiku-4-5`, a small fast model whose nam
 
 ### Choosing the summariser
 
-* **`[summaries.llm]` present** — summaries and thread names come from **one plain Messages API
-  call apiece**. This is the recommended setup.
+* **`[summaries.llm]` present** — summaries and thread names come from **one plain HTTP call
+  apiece**: a Messages API call by default, or an AI-gateway call when the section says
+  `backend = "meta_gateway"` (see below). This is the recommended setup.
 * **absent** — summaries come from the ElevenLabs conversational agent in `[elevenlabs]`, and
   threads are not named. Without ElevenLabs credentials either, every summary fails visibly
   (a red row, `503 summarizer_not_configured`) rather than falling back to truncation.
 
-The startup log names the summariser, the dialect and the model, never a credential.
+The startup log names the summariser, its backend or dialect and the model, never a credential.
 
 ### The Anthropic API
 
@@ -2352,28 +2353,64 @@ certificate rotated on disk is picked up without a restart. The CA bundle is add
 public roots, never instead of them. A gateway's plain-text error, and its error-code header, are
 reported in the failure.
 
+### An AI gateway that speaks chat completions
+
+Some organisations put models behind an HTTPS gateway that serves an OpenAI-compatible
+chat-completions path and authenticates callers by **client certificate** alone — no API key, no
+bearer token. Name it with `backend` (`#1027 vibe-talk-spark-summarizer`):
+
+```toml
+[summaries.llm]
+backend = "meta_gateway"
+base_url = "https://models.gateway.example/v1"     # required: no gateway address is built in
+model = "my-gateway-model"                         # required: no model name is built in either
+client_identity_file = "/path/to/identity.pem"     # certificate chain + private key; required
+ca_bundle_file = "/path/to/private-root.pem"       # only if the gateway chains to a private root
+# reasoning_effort = "low"                         # the default; minimal|low|medium|high|xhigh|max
+# max_tokens = 2048                                # this backend's default; reasoning spends it too
+
+[summaries.llm.extra_headers]
+x-client-name = "vibe-talk"                    # only if the gateway asks callers to identify themselves
+```
+
+Sent as `POST {base_url}/chat/completions` with a system turn and one user turn, the configured
+`model`, `max_tokens` and `reasoning_effort` — and, as everywhere in this section, no field that
+could offer the model a tool. A gateway model **reasons out of the same budget it writes from**,
+which is why this backend's `max_tokens` default is larger and the effort is a setting of its
+own: an answer that stops at the budget with no text (all of it spent reasoning) fails by name
+rather than summarising to nothing, and the failure says which of the two settings to move. The
+identity file is re-read on rotation exactly as above. Settings that belong to the Messages
+backend (`dialect`, `project`, `region`, `api_key_file`, the bearer settings) are refused by
+name here, and `reasoning_effort` is refused there: a section copied from one backend to the
+other fails loudly instead of half-applying. A section with no `backend` at all keeps meaning
+the Messages API summariser, byte for byte — including its cache keys.
+
 ### Every setting
 
 | Setting | Default | Notes |
 |---|---|---|
-| `dialect` | `anthropic` | `anthropic` or `vertex` |
-| `base_url` | per dialect | `https://` only; plain `http://` is accepted for a loopback address (a local mock or sidecar). No credentials, query or fragment |
-| `model` | `claude-haiku-4-5` | letters, digits, `-`, `.`, `_`, `@`. Never taken from `summaries.model` |
+| `backend` | `messages_api` | `messages_api` or `meta_gateway`; absent means `messages_api`, as before |
+| `dialect` | `anthropic` | `messages_api` only: `anthropic` or `vertex` |
+| `base_url` | per dialect | `https://` only; plain `http://` is accepted for a loopback address (a local mock or sidecar). No credentials, query or fragment. **Required for `meta_gateway`** |
+| `model` | `claude-haiku-4-5` | letters, digits, `-`, `.`, `_`, `@`. Never taken from `summaries.model`. **Required for `meta_gateway`** (no default) |
+| `reasoning_effort` | `low` | `meta_gateway` only: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` |
 | `project`, `region` | — | Vertex only, and required there |
-| `api_key_file` | — | **required for `anthropic`**; on `vertex`, sent only when set |
+| `api_key_file` | — | **required for `anthropic`**; on `vertex`, sent only when set; refused on `meta_gateway` |
 | `bearer_token_file` | — | Vertex only; re-read on every call |
 | `bearer_token_command` | — | Vertex only; an argument list, run without a shell, 20-second limit; not with `bearer_token_file` |
-| `client_identity_file` | — | PEM certificate chain and private key; re-read when it changes |
+| `client_identity_file` | — | PEM certificate chain and private key; re-read when it changes. **Required for `meta_gateway`** |
 | `ca_bundle_file` | — | PEM roots to trust in addition to the public ones |
 | `extra_headers` | none | a table of headers sent on every call; **not for secrets**: the headers this server sets itself (`x-api-key`, `authorization`, `anthropic-version`, `content-type`, …) are refused, and so is any name containing `auth`, `cookie`, `credential`, `key`, `passwd`, `password`, `secret`, `session`, `signature` or `token` |
-| `max_tokens` | `120` | output budget per call, `1`–`4096` |
+| `max_tokens` | `120` (`2048` for `meta_gateway`) | output budget per call, `1`–`4096`; on the gateway it also pays for reasoning |
 | `timeout_secs` | `30` | per HTTP request, `1`–`600`; also how long, in all, a summary may wait for rate-limit slots |
 | `requests_per_minute` | `15` | client-side ceiling across summaries and thread names; at least `1` |
 | `burst` | `3` | calls that may go out back to back before the pace applies; at least `1` |
 
 Every path must be absolute. **Secrets are only ever read from files or a command, at call time,
 and never logged**; writing `api_key` or `bearer_token` inline is refused at startup by name. Of
-this section, only `dialect`, `model` and `max_tokens` are part of the summary cache key: changing
+this section, only the settings that change the wording are part of the summary cache key —
+`dialect`, `model` and `max_tokens` for `messages_api`; `model`, `max_tokens` and
+`reasoning_effort` for `meta_gateway` (whose backend slug is in the key besides): changing
 one re-derives every summary and thread sentence (thread names are kept; see below), while
 rotating a credential or moving an endpoint does not. Of the other `[summaries]` settings, every
 one that changes what a summary says is part of the key too; `threshold_chars`,
@@ -2383,10 +2420,11 @@ one that changes what a summary says is part of the key too; `threshold_chars`,
 ### No tools, by construction
 
 Summarising is "here is some text, say what it is", so the request is one system instruction and
-one user turn — and the request type in `src/summarize/messages_api.rs` **has no `tools` or
-`tool_choice` field at all**, so nothing can attach one, and a test asserts the serialized body
-carries neither. Everything another person wrote travels inside the untrusted-content fence, never
-in the instruction. A model offered no tool cannot call one, whatever the channel text asks of it.
+one user turn — and the request types in `src/summarize/messages_api.rs` and
+`src/summarize/meta_gateway.rs` **have no `tools` or `tool_choice` field at all**, so nothing can
+attach one, and tests assert the serialized bodies carry neither. Everything another person
+wrote travels inside the untrusted-content fence, never in the instruction. A model offered no
+tool cannot call one, whatever the channel text asks of it.
 
 ### The rate limit
 
@@ -2506,8 +2544,9 @@ was reloaded, the server restarted, or a setting changed that changes no word of
   seconds can still have its stored summary shown — the same window read-aloud accepts.
 * **Only a change of wording makes a summary unreachable.** The cache key's policy version hashes
   the prompt and whatever the summariser adds to it, the backend, `model`, `target_chars`,
-  `context_messages`, `max_per_socket`, `socket_idle_seconds`, and `[summaries.llm]`'s `dialect`,
-  `model` and `max_tokens`. `threshold_chars` (which messages are summarised),
+  `context_messages`, `max_per_socket`, `socket_idle_seconds`, and `[summaries.llm]`'s wording
+  settings (`dialect`, `model` and `max_tokens`; for `meta_gateway`, `model`, `max_tokens` and
+  `reasoning_effort`). `threshold_chars` (which messages are summarised),
   `reply_timeout_seconds` (how long one is waited for) and `thread_naming_interval_seconds` (when a
   thread is named) are not in it, and neither is the length an answer is cut at. The version is
   `v2-…`; the first start after this change re-keys every summary filed under the previous `v1-…`
@@ -2625,8 +2664,8 @@ model provider or a real gateway.
 | Summary width | `summaries.target_chars` | — | default `160` |
 | Summary context | `summaries.context_messages` | — | preceding messages shown as context, default `3` |
 | Summary model | `summaries.model` | `VIBE_TALK_SUMMARY_MODEL` | nothing reads it (`[summaries.llm]` names its own `model`); it only moves the cache key |
-| Summariser | `[summaries.llm]` | — | present: one Messages API call per summary and thread name, see [Summaries](#summaries); absent: the ElevenLabs agent in `[elevenlabs]`. `summaries.backend` / `VIBE_TALK_SUMMARY_BACKEND` were removed with the extractive summariser: `extractive` is now refused at startup by name, `elevenlabs_agent` starts with a loud warning that it selects nothing, and anything else is refused as unknown. Delete the line |
-| Messages API summariser | `summaries.llm.*` | — | dialect, endpoint, model, credentials **from files only**, timeout and rate limit; every key is in [Summaries](#summaries) |
+| Summariser | `[summaries.llm]` | — | present: one direct HTTP call per summary and thread name (`backend` selects Messages API or AI gateway), see [Summaries](#summaries); absent: the ElevenLabs agent in `[elevenlabs]`. `summaries.backend` / `VIBE_TALK_SUMMARY_BACKEND` were removed with the extractive summariser: `extractive` is now refused at startup by name, `elevenlabs_agent` starts with a loud warning that it selects nothing, and anything else is refused as unknown. Delete the line |
+| Direct HTTP summarisers | `summaries.llm.*` | — | backend, dialect, endpoint, model, reasoning effort (gateway), credentials **from files only**, timeout and rate limit; every key is in [Summaries](#summaries) |
 | Agent conversation budget | `summaries.max_per_socket` | — | summaries one conversation serves before it is recycled, default `8`, minimum 1 |
 | Agent conversation idle close | `summaries.socket_idle_seconds` | — | default `30` |
 | Agent turn deadline | `summaries.reply_timeout_seconds` | — | one turn, and one opening handshake, default `30`, minimum 1 |

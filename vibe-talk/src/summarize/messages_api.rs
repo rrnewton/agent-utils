@@ -550,7 +550,7 @@ impl MessagesApiSummarizer {
 /// readily as between words; unmarked, its cut reached the page as a sentence ending in half a word
 /// with nothing to say so. `#257 summary-truncation`. The last word is dropped unless the text
 /// already ends between words; with no whole word before it, the text is kept as it came.
-fn marked_as_cut(text: &str) -> String {
+pub(crate) fn marked_as_cut(text: &str) -> String {
     let trimmed = text.trim_end();
     let whole = if trimmed.len() < text.len() {
         trimmed
@@ -680,7 +680,11 @@ async fn run_token_command(argv: &[String]) -> Result<Secret, SummaryError> {
 }
 
 /// A file's modification time and length, or `None` when no file is configured.
-fn stamp(
+///
+/// `pub(crate)` since `#1027 vibe-talk-spark-summarizer`: the gateway backend shares this
+/// module's transport (client building, identity reload, bounded reads, failure reporting), so
+/// the two HTTP summarisers cannot drift apart in how a call travels.
+pub(crate) fn stamp(
     path: Option<&std::path::Path>,
     setting: &'static str,
 ) -> Result<Option<(SystemTime, u64)>, SummaryError> {
@@ -700,7 +704,7 @@ fn stamp(
 /// Build the HTTP client: the bundled public roots, plus the CA bundle and the client identity
 /// when they are configured. Redirects are not followed: a credential header must not be carried
 /// anywhere the operator did not name.
-fn build_client(config: &LlmConfig) -> Result<reqwest::Client, SummaryError> {
+pub(crate) fn build_client(config: &LlmConfig) -> Result<reqwest::Client, SummaryError> {
     let mut builder = crate::egress::client_builder()
         .user_agent(concat!("vibe-talk/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none());
@@ -745,7 +749,7 @@ fn build_client(config: &LlmConfig) -> Result<reqwest::Client, SummaryError> {
 
 /// An error and every cause under it, on one line: reqwest's own message for a TLS failure is
 /// "builder error", and the reason is two sources down.
-fn causes(error: &dyn std::error::Error) -> String {
+pub(crate) fn causes(error: &dyn std::error::Error) -> String {
     let mut line = error.to_string();
     let mut next = error.source();
     while let Some(cause) = next {
@@ -758,7 +762,7 @@ fn causes(error: &dyn std::error::Error) -> String {
 
 /// `Retry-After`, in seconds. An HTTP-date form is not trusted against a clock that may disagree
 /// with the provider's, and falls back to the backoff.
-fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+pub(crate) fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     headers
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
@@ -770,7 +774,7 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 }
 
 /// A gateway's error code, from any response header whose name says it carries one.
-fn error_code(headers: &reqwest::header::HeaderMap) -> Option<String> {
+pub(crate) fn error_code(headers: &reqwest::header::HeaderMap) -> Option<String> {
     headers.iter().find_map(|(name, value)| {
         let name = name.as_str();
         (name.ends_with("error-code") || name.ends_with("error_code"))
@@ -780,7 +784,7 @@ fn error_code(headers: &reqwest::header::HeaderMap) -> Option<String> {
 }
 
 /// Read a response body, refusing one larger than any answer this server asked for.
-async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>, SummaryError> {
+pub(crate) async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>, SummaryError> {
     let mut body = Vec::new();
     loop {
         match response.chunk().await {
@@ -805,7 +809,11 @@ async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>, Summar
 /// One line saying what a failed response said: the status, a gateway's error code, and the
 /// provider's message — from a JSON error body when there is one, else the first words of a
 /// plain-text one.
-fn describe_failure(status: reqwest::StatusCode, code: Option<&str>, body: &[u8]) -> String {
+pub(crate) fn describe_failure(
+    status: reqwest::StatusCode,
+    code: Option<&str>,
+    body: &[u8],
+) -> String {
     let message = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|json| {

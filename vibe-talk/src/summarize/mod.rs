@@ -1,11 +1,15 @@
 //! Turning one long channel message into one short line, behind a trait — and a cache key that
 //! knows when it has gone stale.
 //!
-//! There are TWO shipped summarisers, and [`summarizer_for`] picks one:
+//! There are THREE shipped summarisers, and [`summarizer_for`] picks one:
 //!
-//! * [`messages_api::MessagesApiSummarizer`], when `[summaries.llm]` is configured: one plain
-//!   Messages API call per summary, with no agent harness and no tools, in the Anthropic API's
-//!   dialect or Google Vertex's. It also names threads. `#233 llm-summarizer`.
+//! * [`messages_api::MessagesApiSummarizer`], when `[summaries.llm]` is configured without a
+//!   `backend` of its own: one plain Messages API call per summary, with no agent harness and
+//!   no tools, in the Anthropic API's dialect or Google Vertex's. It also names threads.
+//!   `#233 llm-summarizer`.
+//! * [`meta_gateway::MetaGatewaySummarizer`], when `[summaries.llm]` says
+//!   `backend = "meta_gateway"`: one plain AI-gateway chat-completions call per summary, on the
+//!   same terms. It also names threads. `#1027 vibe-talk-spark-summarizer`.
 //! * otherwise [`agent::AgentSummarizer`], which asks the deployment's ElevenLabs conversational
 //!   agent.
 //!
@@ -62,6 +66,7 @@ pub mod agent;
 pub mod counters;
 pub mod fake;
 pub mod messages_api;
+pub mod meta_gateway;
 pub mod rate_limit;
 pub mod threads;
 
@@ -76,8 +81,10 @@ use crate::model::Message;
 /// Build the summariser this server actually runs.
 ///
 /// **The one construction point**, called by `main` and by the tests that have to reproduce what
-/// `main` built. `[summaries.llm]`, when present, selects the direct Messages API summariser;
-/// otherwise it is the deployment's ElevenLabs agent, which fails per request, by name, when its
+/// `main` built. `[summaries.llm]`, when present, selects one of the direct HTTP summarisers —
+/// its `backend` says which, and an absent `backend` is the Messages API summariser every
+/// section written before `#1027 vibe-talk-spark-summarizer` already gets; otherwise it is the
+/// deployment's ElevenLabs agent, which fails per request, by name, when its
 /// credentials are absent. The reason this is a function rather than a few lines at the call site
 /// is the cache key: [`policy_version_for`] takes both of its halves off the summariser, so a test
 /// that rebuilt the summariser by hand and got one detail wrong would compute a key the binary
@@ -93,7 +100,14 @@ pub fn summarizer_for(
     chats: Arc<dyn TextChatProvider>,
 ) -> Arc<dyn Summarizer> {
     if let Some(llm) = &summaries.llm {
-        return Arc::new(messages_api::MessagesApiSummarizer::new(llm.clone()));
+        return match llm.backend {
+            crate::config::LlmBackend::MessagesApi => {
+                Arc::new(messages_api::MessagesApiSummarizer::new(llm.clone()))
+            }
+            crate::config::LlmBackend::MetaGateway => {
+                Arc::new(meta_gateway::MetaGatewaySummarizer::new(llm.clone()))
+            }
+        };
     }
     Arc::new(agent::AgentSummarizer::new(
         chats,
@@ -400,7 +414,8 @@ pub fn policy_version_of(prompt: &str, config: &SummariesConfig, backend: &str) 
 ///
 /// That is the prompt (with whatever the backend adds, [`Summarizer::policy_input`]), the backend,
 /// `model`, `target_chars`, `context_messages`, `max_per_socket`, `socket_idle_seconds`, and the
-/// `[summaries.llm]` dialect, model and output budget. Four settings are deliberately NOT here:
+/// `[summaries.llm]` wording inputs (dialect, model and output budget for `messages_api`; model,
+/// output budget and reasoning effort for `meta_gateway`). Four settings are deliberately NOT here:
 ///
 /// * `threshold_chars` decides WHICH messages are summarised, not what a summary says;
 /// * `reply_timeout_seconds` decides how long one is waited for;
@@ -417,11 +432,23 @@ pub fn policy_version_of(prompt: &str, config: &SummariesConfig, backend: &str) 
 pub fn policy_version_v2(prompt: &str, config: &SummariesConfig, backend: &str) -> String {
     // `[summaries.llm]`: only what changes the WORDING — see `LlmConfig` for why endpoints,
     // credentials, timeouts and the rate limit are deliberately not here. Hashed ONLY when the
-    // section is present.
-    let llm = config
-        .llm
-        .as_ref()
-        .map(|llm| format!("{}|{}|{}", llm.dialect.as_str(), llm.model, llm.max_tokens));
+    // section is present. The `messages_api` form is byte for byte the one every existing
+    // deployment already filed under, so adding the gateway backend moved no existing key; the
+    // `meta_gateway` form names its backend and folds in the reasoning effort, which decides
+    // how much of the budget is left for the sentence itself.
+    // `#1027 vibe-talk-spark-summarizer`.
+    let llm = config.llm.as_ref().map(|llm| match llm.backend {
+        crate::config::LlmBackend::MessagesApi => {
+            format!("{}|{}|{}", llm.dialect.as_str(), llm.model, llm.max_tokens)
+        }
+        crate::config::LlmBackend::MetaGateway => format!(
+            "{}|{}|{}|{}",
+            llm.backend.as_str(),
+            llm.model,
+            llm.max_tokens,
+            llm.reasoning_effort.as_str()
+        ),
+    });
     let mut hash = FNV_OFFSET;
     for part in [
         prompt,
@@ -558,9 +585,11 @@ mod tests {
     /// A complete `[summaries.llm]`, as the loader would resolve one.
     pub(crate) fn llm() -> crate::config::LlmConfig {
         crate::config::LlmConfig {
+            backend: crate::config::LlmBackend::MessagesApi,
             dialect: crate::config::LlmDialect::Anthropic,
             base_url: crate::config::DEFAULT_ANTHROPIC_BASE_URL.to_owned(),
             model: crate::config::DEFAULT_LLM_MODEL.to_owned(),
+            reasoning_effort: crate::config::ReasoningEffort::DEFAULT,
             project: None,
             region: None,
             api_key_file: Some("/run/secrets/model-key".into()),
@@ -791,7 +820,15 @@ mod tests {
         // move the key; the rest is how the call travels, and moving the key for it would throw
         // every summary away on a key rotation.
         let base = policy_version(&with_llm(|_| {}), messages_api::BACKEND);
+        // GOLDEN for every section written before `#1027 vibe-talk-spark-summarizer`: adding
+        // the gateway backend must not move a `messages_api` key, or every summary an existing
+        // deployment holds becomes unreachable on upgrade and is paid for again.
+        assert_eq!(base, "v2-messages-api-w3-c160-7bf76715f159bcf9");
         for (what, changed) in [
+            (
+                "backend",
+                with_llm(|l| l.backend = crate::config::LlmBackend::MetaGateway),
+            ),
             (
                 "dialect",
                 with_llm(|l| l.dialect = crate::config::LlmDialect::Vertex),
@@ -846,6 +883,29 @@ mod tests {
         assert_ne!(
             policy_version_for(&with_llm(|_| {}), &haiku),
             policy_version_for(&with_llm(|_| {}), &other)
+        );
+        // `#1027 vibe-talk-spark-summarizer`. The reasoning effort is wording for the gateway
+        // backend (it is sent, and it changes how much budget the sentence gets) and transport
+        // — in fact, nothing at all — for `messages_api`, which never sends it.
+        let gateway = with_llm(|l| l.backend = crate::config::LlmBackend::MetaGateway);
+        let gateway_base = policy_version(&gateway, meta_gateway::BACKEND);
+        let gateway_thinking = with_llm(|l| {
+            l.backend = crate::config::LlmBackend::MetaGateway;
+            l.reasoning_effort = crate::config::ReasoningEffort::High;
+        });
+        assert_ne!(
+            gateway_base,
+            policy_version(&gateway_thinking, meta_gateway::BACKEND),
+            "changing llm.reasoning_effort left a meta_gateway cache key unchanged"
+        );
+        let messages_thinking = with_llm(|l| {
+            l.reasoning_effort = crate::config::ReasoningEffort::High;
+        });
+        assert_eq!(
+            base,
+            policy_version(&messages_thinking, messages_api::BACKEND),
+            "changing llm.reasoning_effort moved a messages_api cache key, though that backend \
+             never sends it"
         );
     }
 

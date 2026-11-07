@@ -688,6 +688,75 @@ impl Default for SummariesConfig {
     }
 }
 
+/// Which summariser a [`LlmConfig`] builds. `#1027 vibe-talk-spark-summarizer`.
+///
+/// `messages_api` is the summariser `#233 llm-summarizer` shipped and stays the default, so a
+/// section written before this key existed means exactly what it always meant. `meta_gateway`
+/// is the AI-gateway caller in [`crate::summarize::meta_gateway`], whose wire shape is not a
+/// Messages API dialect at all — which is why this is a key of its own rather than a third
+/// [`LlmDialect`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmBackend {
+    /// One Messages API call per summary, in the [`LlmDialect`] named beside it.
+    MessagesApi,
+    /// One AI-gateway chat-completions call per summary, authenticated by client certificate.
+    MetaGateway,
+}
+
+impl LlmBackend {
+    /// The spelling used in the configuration file, the startup log and the cache key.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MessagesApi => "messages_api",
+            Self::MetaGateway => "meta_gateway",
+        }
+    }
+}
+
+/// How hard a gateway model thinks before it writes, as the gateway spells it.
+/// `#1027 vibe-talk-spark-summarizer`.
+///
+/// A reasoning model spends its output budget on reasoning first, so the effort is part of what
+/// a summary SAYS (and of whether any text survives the budget at all), not transport. Only the
+/// `meta_gateway` backend sends it; naming it on `messages_api` is refused at load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// The least reasoning the gateway accepts.
+    Minimal,
+    /// A little reasoning: the default, for one-sentence work.
+    Low,
+    /// The gateway's middle setting.
+    Medium,
+    /// More reasoning than a one-sentence summary can use.
+    High,
+    /// More still.
+    Xhigh,
+    /// The most the gateway accepts.
+    Max,
+}
+
+impl ReasoningEffort {
+    /// The effort a `meta_gateway` section asks for when it names none: enough to read the
+    /// message, little enough that the answer is not mostly reasoning.
+    pub const DEFAULT: Self = Self::Low;
+
+    /// The spelling sent to the gateway and folded into the cache key.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
 /// Which wire dialect of the Messages API a [`LlmConfig`] speaks. `#233 llm-summarizer`.
 ///
 /// One request body, two ways of addressing it: see [`crate::summarize::messages_api`].
@@ -720,20 +789,32 @@ impl LlmDialect {
 /// disk is picked up without a restart and nothing secret sits in a file that is shared, copied
 /// into a ticket or printed by `--help`. A key written inline is refused by name at load.
 ///
-/// Only [`LlmConfig::dialect`], [`LlmConfig::model`] and [`LlmConfig::max_tokens`] change what a
-/// summary SAYS, and only they are folded into the cache key (through the summariser's
-/// [`crate::summarize::Summarizer::policy_input`]). Everything else here is transport: endpoints,
-/// credentials, timeouts and the rate limit. Folding those in would throw every cached summary
-/// away on a key rotation, and would write a deployment's file layout into a cache key on disk.
+/// Only what changes the WORDING is folded into the cache key (through the summariser's
+/// [`crate::summarize::Summarizer::policy_input`]): for `messages_api` that is dialect, model
+/// and output budget, exactly as before `#1027 vibe-talk-spark-summarizer`; for `meta_gateway`
+/// it is model, output budget and reasoning effort. Everything else here is transport:
+/// endpoints, credentials, timeouts and the rate limit. Folding those in would throw every
+/// cached summary away on a key rotation, and would write a deployment's file layout into a
+/// cache key on disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LlmConfig {
-    /// Which wire dialect to speak.
+    /// Which summariser this section builds. Default [`LlmBackend::MessagesApi`].
+    pub backend: LlmBackend,
+    /// Which wire dialect to speak. `messages_api` only: a `meta_gateway` section that names
+    /// one is refused at load, and the value held here for that backend is never read.
     pub dialect: LlmDialect,
     /// Where the API lives, without a trailing slash. Defaults per dialect: the Anthropic API, or
-    /// the public Google Vertex endpoint for [`LlmConfig::region`].
+    /// the public Google Vertex endpoint for [`LlmConfig::region`]. The `meta_gateway` backend
+    /// has NO default: a deployment names the gateway it may call, so no gateway address is
+    /// baked into the binary.
     pub base_url: String,
-    /// The model to ask. Default [`DEFAULT_LLM_MODEL`], which is a valid name in both dialects.
+    /// The model to ask. Default [`DEFAULT_LLM_MODEL`], which is a valid name in both Messages
+    /// dialects. The `meta_gateway` backend has no default either — no model name is valid on
+    /// every gateway — so a section using it names its model.
     pub model: String,
+    /// How hard the model reasons before writing. `meta_gateway` only; held at
+    /// [`ReasoningEffort::DEFAULT`] and never sent by `messages_api`.
+    pub reasoning_effort: ReasoningEffort,
     /// Google Cloud project. Vertex only, and required there.
     pub project: Option<String>,
     /// Google Cloud region, or `global`. Vertex only, and required there.
@@ -772,6 +853,16 @@ pub const DEFAULT_LLM_MODEL: &str = "claude-haiku-4-5";
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 /// Default output budget: a slug and a sentence, or one sentence, with room to spare.
 pub const DEFAULT_LLM_MAX_TOKENS: u32 = 120;
+/// Default output budget for the `meta_gateway` backend. `#1027 vibe-talk-spark-summarizer`.
+///
+/// Larger because a reasoning model spends this budget thinking before it writes: at the
+/// Messages budget a trivial prompt can return no text at all, its whole allowance spent on
+/// reasoning. On the sample measured for `#1027 vibe-talk-spark-summarizer` a one-sentence
+/// summary at the default effort averaged a few hundred reasoning tokens and peaked near a
+/// thousand on short inputs, so the default leaves that peak — and a longer real message with
+/// its context — room to spare. The budget is a ceiling, not a target: the model stops when
+/// the sentence is written.
+pub const DEFAULT_META_GATEWAY_MAX_TOKENS: u32 = 2048;
 /// Default ceiling on one call, in seconds.
 pub const DEFAULT_LLM_TIMEOUT_SECS: u64 = 30;
 /// Default client-side rate limit: conservative, because a thread list can ask for dozens of
@@ -1825,9 +1916,11 @@ struct FileSummaries {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileLlm {
+    backend: Option<LlmBackend>,
     dialect: Option<LlmDialect>,
     base_url: Option<String>,
     model: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
     project: Option<String>,
     region: Option<String>,
     api_key_file: Option<String>,
@@ -3082,9 +3175,40 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
             ));
         }
     }
+    // `#1027 vibe-talk-spark-summarizer`. Absent means the summariser every existing section
+    // already gets; each backend refuses the other's keys by name below, so a section copied
+    // from one to the other fails loudly instead of half-applying.
+    let backend = file.backend.unwrap_or(LlmBackend::MessagesApi);
+    let reasoning_effort = file.reasoning_effort.unwrap_or(ReasoningEffort::DEFAULT);
+    if backend == LlmBackend::MessagesApi && file.reasoning_effort.is_some() {
+        return Err(invalid(
+            "reasoning_effort",
+            "is a meta_gateway setting and this section does not say backend = \"meta_gateway\"; \
+             the messages_api backend sends no reasoning effort"
+                .to_owned(),
+        ));
+    }
+    if backend == LlmBackend::MetaGateway && file.dialect.is_some() {
+        return Err(invalid(
+            "dialect",
+            "names a messages_api wire dialect and this section says backend = \"meta_gateway\"; \
+             the gateway backend has one wire shape, so delete this line"
+                .to_owned(),
+        ));
+    }
     let dialect = file.dialect.unwrap_or(LlmDialect::Anthropic);
     let text = |value: Option<String>| value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
-    let model = text(file.model).unwrap_or_else(|| DEFAULT_LLM_MODEL.to_owned());
+    let model = match text(file.model) {
+        Some(model) => model,
+        None if backend == LlmBackend::MetaGateway => {
+            return Err(ConfigError::Missing(
+                "summaries.llm.model (the meta_gateway backend has no default model; name the \
+                 model the gateway should be asked for)"
+                    .to_owned(),
+            ));
+        }
+        None => DEFAULT_LLM_MODEL.to_owned(),
+    };
     // Each of these is spliced into a URL path on the Vertex dialect, so each is held to the
     // characters its real values use. Anything else is a typo at best and a path injection at worst.
     let identifier = |field: &str, value: &str, extra: &str| -> Result<(), ConfigError> {
@@ -3143,67 +3267,103 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
         other => other,
     };
 
-    match dialect {
-        LlmDialect::Anthropic => {
-            for (field, set) in [
-                ("project", project.is_some()),
-                ("region", region.is_some()),
-                ("bearer_token_file", bearer_token_file.is_some()),
-                ("bearer_token_command", bearer_token_command.is_some()),
-            ] {
-                if set {
-                    return Err(invalid(
-                        field,
-                        "is a Vertex setting and this section says dialect = \"anthropic\""
-                            .to_owned(),
-                    ));
-                }
-            }
-            if api_key_file.is_none() {
-                return Err(ConfigError::Missing(
-                    "summaries.llm.api_key_file (the anthropic dialect authenticates with an API \
-                     key read from a file)"
+    if backend == LlmBackend::MetaGateway {
+        // The gateway authenticates by client certificate and nothing else: a key or a bearer
+        // token configured here would never be sent, and a credential that is read but unused
+        // is a lie in the configuration file.
+        for (field, set) in [
+            ("project", project.is_some()),
+            ("region", region.is_some()),
+            ("api_key_file", api_key_file.is_some()),
+            ("bearer_token_file", bearer_token_file.is_some()),
+            ("bearer_token_command", bearer_token_command.is_some()),
+        ] {
+            if set {
+                return Err(invalid(
+                    field,
+                    "is a messages_api setting and this section says backend = \"meta_gateway\"; \
+                     the gateway backend authenticates with client_identity_file alone"
                         .to_owned(),
                 ));
             }
         }
-        LlmDialect::Vertex => {
-            if project.is_none() {
-                return Err(ConfigError::Missing(
+        if client_identity_file.is_none() {
+            return Err(ConfigError::Missing(
+                "summaries.llm.client_identity_file (the meta_gateway backend authenticates by \
+                 client certificate, from a PEM file holding the certificate chain and its key)"
+                    .to_owned(),
+            ));
+        }
+    } else {
+        match dialect {
+            LlmDialect::Anthropic => {
+                for (field, set) in [
+                    ("project", project.is_some()),
+                    ("region", region.is_some()),
+                    ("bearer_token_file", bearer_token_file.is_some()),
+                    ("bearer_token_command", bearer_token_command.is_some()),
+                ] {
+                    if set {
+                        return Err(invalid(
+                            field,
+                            "is a Vertex setting and this section says dialect = \"anthropic\""
+                                .to_owned(),
+                        ));
+                    }
+                }
+                if api_key_file.is_none() {
+                    return Err(ConfigError::Missing(
+                    "summaries.llm.api_key_file (the anthropic dialect authenticates with an API \
+                     key read from a file)"
+                        .to_owned(),
+                ));
+                }
+            }
+            LlmDialect::Vertex => {
+                if project.is_none() {
+                    return Err(ConfigError::Missing(
                     "summaries.llm.project (the vertex dialect addresses a Google Cloud project)"
                         .to_owned(),
                 ));
-            }
-            if region.is_none() {
-                return Err(ConfigError::Missing(
+                }
+                if region.is_none() {
+                    return Err(ConfigError::Missing(
                     "summaries.llm.region (the vertex dialect addresses a region, or \"global\")"
                         .to_owned(),
                 ));
-            }
-            if bearer_token_file.is_some() && bearer_token_command.is_some() {
-                return Err(invalid(
+                }
+                if bearer_token_file.is_some() && bearer_token_command.is_some() {
+                    return Err(invalid(
                     "bearer_token_command",
                     "set bearer_token_file OR bearer_token_command, not both: two sources for one \
                      credential is a question about which one won"
                         .to_owned(),
                 ));
-            }
-            if bearer_token_file.is_none()
-                && bearer_token_command.is_none()
-                && client_identity_file.is_none()
-                && api_key_file.is_none()
-            {
-                return Err(ConfigError::Missing(
-                    "a credential for summaries.llm: bearer_token_file, bearer_token_command, \
+                }
+                if bearer_token_file.is_none()
+                    && bearer_token_command.is_none()
+                    && client_identity_file.is_none()
+                    && api_key_file.is_none()
+                {
+                    return Err(ConfigError::Missing(
+                        "a credential for summaries.llm: bearer_token_file, bearer_token_command, \
                      client_identity_file or api_key_file"
-                        .to_owned(),
-                ));
+                            .to_owned(),
+                    ));
+                }
             }
         }
     }
 
     let base_url = match text(file.base_url) {
         Some(url) => url.trim_end_matches('/').to_owned(),
+        None if backend == LlmBackend::MetaGateway => {
+            return Err(ConfigError::Missing(
+                "summaries.llm.base_url (the meta_gateway backend has no default gateway; name \
+                 the base URL of the AI gateway this deployment may call)"
+                    .to_owned(),
+            ));
+        }
         None => match dialect {
             LlmDialect::Anthropic => DEFAULT_ANTHROPIC_BASE_URL.to_owned(),
             LlmDialect::Vertex => vertex_base_url(region.as_deref().unwrap_or("global")),
@@ -3275,7 +3435,10 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
         extra_headers.insert(lower, value);
     }
 
-    let max_tokens = file.max_tokens.unwrap_or(DEFAULT_LLM_MAX_TOKENS);
+    let max_tokens = file.max_tokens.unwrap_or(match backend {
+        LlmBackend::MessagesApi => DEFAULT_LLM_MAX_TOKENS,
+        LlmBackend::MetaGateway => DEFAULT_META_GATEWAY_MAX_TOKENS,
+    });
     if !(1..=4096).contains(&max_tokens) {
         return Err(invalid(
             "max_tokens",
@@ -3305,9 +3468,11 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
         ));
     }
     Ok(LlmConfig {
+        backend,
         dialect,
         base_url,
         model,
+        reasoning_effort,
         project,
         region,
         api_key_file,

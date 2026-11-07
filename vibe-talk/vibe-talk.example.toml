@@ -691,18 +691,21 @@ enabled = true
 # when a thread is named, never what, so it is not in the cache key.
 # thread_naming_interval_seconds = 30   # 0 to 3600; 0 does not space the reads
 
-# [summaries.llm] — SUMMARIES AND THREAD NAMES FROM ONE PLAIN MESSAGES API CALL APIECE.
+# [summaries.llm] — SUMMARIES AND THREAD NAMES FROM ONE PLAIN HTTP CALL APIECE.
 # No agent harness and NO TOOLS: the request type cannot carry one. Each long message becomes one
 # sentence, and each thread gets a short hyphenated name (chosen once, then kept) and a sentence
 # refreshed at 1, 2, 4 and 8 messages and then every 10. Thread names are made in the background
-# after a thread list is read with the write token, never on the read itself.
+# after a thread list is read with the write token, never on the read itself. `backend` picks the
+# caller — "messages_api" (the default, and what a section with no `backend` has always meant) or
+# "meta_gateway" (an AI gateway that speaks chat completions, below).
 #
 # THE TEXT OF THE MESSAGES BEING SUMMARISED IS SENT TO THE MODEL PROVIDER CONFIGURED HERE.
 #
 # Secrets come ONLY from files (or, for a bearer token, a command's output), read at call time and
-# never logged; `api_key = "..."` inline is refused. Every path must be absolute. Only dialect,
-# model and max_tokens reach the cache key. The full list of keys is in the README's Summaries
-# section. A host that shares this file with another can keep its own [summaries.llm] in an
+# never logged; `api_key = "..."` inline is refused. Every path must be absolute. Only the keys
+# that change the wording reach the cache key (dialect, model and max_tokens; for the gateway
+# backend, model, max_tokens and reasoning_effort). The full list of keys is in the README's
+# Summaries section. A host that shares this file with another can keep its own [summaries.llm] in an
 # overlay: `--config-overlay /etc/vibe-talk/this-host.toml` (or VIBE_TALK_CONFIG_OVERLAY). An
 # overlay that names [summaries.llm] REPLACES this section whole — nothing here, a key file
 # included, is inherited — so write the complete section there.
@@ -734,6 +737,19 @@ enabled = true
 # ca_bundle_file = "/path/to/private-root.pem"     # if it chains to a private root
 # [summaries.llm.extra_headers]
 # x-client-name = "vibe-talk"                  # not for secrets
+#
+# An AI gateway that speaks chat completions and authenticates by client certificate alone:
+# [summaries.llm]
+# backend = "meta_gateway"
+# base_url = "https://models.gateway.example/v1"   # required; no gateway address is built in
+# model = "my-gateway-model"                       # required; no model name is built in either
+# client_identity_file = "/path/to/identity.pem"   # required: cert chain + key, re-read on change
+# ca_bundle_file = "/path/to/private-root.pem"     # if it chains to a private root
+# reasoning_effort = "low"                         # default; reasoning spends max_tokens too
+# max_tokens = 2048                                # this backend's default
+# timeout_secs = 30
+# requests_per_minute = 15
+# burst = 3
 
 [replay]
 # RESUMING A CONVERSATION ACROSS A HANG-UP. The vendor cannot resume a closed conversation, so

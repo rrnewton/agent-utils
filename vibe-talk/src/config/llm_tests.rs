@@ -486,3 +486,113 @@ fn an_extra_header_named_like_a_credential_is_refused_and_its_value_never_repeat
         "vibe-talk"
     );
 }
+
+#[test]
+fn a_meta_gateway_section_takes_its_own_defaults_and_no_other() {
+    // `#1027 vibe-talk-spark-summarizer`. No default gateway and no default model: both are
+    // named here, and the only credential is the client identity.
+    let cfg = load(
+        "[summaries.llm]\nbackend = \"meta_gateway\"\n\
+         base_url = \"https://models.gateway.example/v1\"\nmodel = \"test-gateway-model\"\n\
+         client_identity_file = \"/run/secrets/identity.pem\"\n\
+         ca_bundle_file = \"/run/secrets/ca.pem\"\n",
+    )
+    .expect("valid");
+    let llm = cfg.summaries.llm.expect("the section is read");
+    assert_eq!(llm.backend, LlmBackend::MetaGateway);
+    assert_eq!(llm.base_url, "https://models.gateway.example/v1");
+    assert_eq!(llm.model, "test-gateway-model");
+    assert_eq!(llm.reasoning_effort, ReasoningEffort::DEFAULT);
+    assert_eq!(llm.max_tokens, DEFAULT_META_GATEWAY_MAX_TOKENS);
+    assert_eq!(llm.timeout_secs, DEFAULT_LLM_TIMEOUT_SECS);
+    assert_eq!(llm.requests_per_minute, DEFAULT_LLM_REQUESTS_PER_MINUTE);
+    assert_eq!(llm.burst, DEFAULT_LLM_BURST);
+    assert_eq!(llm.project, None);
+    assert_eq!(llm.region, None);
+    assert_eq!(llm.api_key_file, None);
+    assert_eq!(llm.bearer_token_file, None);
+    assert_eq!(llm.bearer_token_command, None);
+    assert_eq!(
+        llm.client_identity_file.as_deref(),
+        Some(Path::new("/run/secrets/identity.pem"))
+    );
+    // An effort and a budget of its own are taken as written.
+    let cfg = load(
+        "[summaries.llm]\nbackend = \"meta_gateway\"\n\
+         base_url = \"https://models.gateway.example/v1\"\nmodel = \"test-gateway-model\"\n\
+         reasoning_effort = \"minimal\"\nmax_tokens = 512\n\
+         client_identity_file = \"/run/secrets/identity.pem\"\n",
+    )
+    .expect("valid");
+    let llm = cfg.summaries.llm.expect("read");
+    assert_eq!(llm.reasoning_effort, ReasoningEffort::Minimal);
+    assert_eq!(llm.max_tokens, 512);
+    // …and the backend the section always meant still says so in so many words, with the
+    // Messages defaults an existing deployment already runs on.
+    let cfg =
+        load("[summaries.llm]\nbackend = \"messages_api\"\napi_key_file = \"/run/secrets/k\"\n")
+            .expect("valid");
+    let llm = cfg.summaries.llm.expect("read");
+    assert_eq!(llm.backend, LlmBackend::MessagesApi);
+    assert_eq!(llm.dialect, LlmDialect::Anthropic);
+    assert_eq!(llm.model, DEFAULT_LLM_MODEL);
+    assert_eq!(llm.max_tokens, DEFAULT_LLM_MAX_TOKENS);
+}
+
+#[test]
+fn each_llm_backend_refuses_the_others_keys_and_the_gateway_has_no_defaults_to_guess() {
+    let gateway = "backend = \"meta_gateway\"\nbase_url = \"https://models.gateway.example/v1\"\n\
+                   model = \"test-gateway-model\"\n\
+                   client_identity_file = \"/run/secrets/identity.pem\"";
+    for (field, text) in [
+        (
+            "summaries.llm.dialect",
+            format!("{gateway}\ndialect = \"vertex\""),
+        ),
+        (
+            "summaries.llm.api_key_file",
+            format!("{gateway}\napi_key_file = \"/run/secrets/k\""),
+        ),
+        (
+            "summaries.llm.project",
+            format!("{gateway}\nproject = \"p\""),
+        ),
+        (
+            "summaries.llm.bearer_token_file",
+            format!("{gateway}\nbearer_token_file = \"/t\""),
+        ),
+        (
+            "summaries.llm.reasoning_effort",
+            "api_key_file = \"/run/secrets/k\"\nreasoning_effort = \"low\"".to_owned(),
+        ),
+    ] {
+        assert_eq!(
+            invalid_field(load(&format!("[summaries.llm]\n{text}\n"))),
+            field,
+            "{text}"
+        );
+    }
+    for (setting, text) in [
+        (
+            "summaries.llm.base_url",
+            "backend = \"meta_gateway\"\nmodel = \"test-gateway-model\"\n\
+             client_identity_file = \"/run/secrets/identity.pem\"",
+        ),
+        (
+            "summaries.llm.model",
+            "backend = \"meta_gateway\"\nbase_url = \"https://models.gateway.example/v1\"\n\
+             client_identity_file = \"/run/secrets/identity.pem\"",
+        ),
+        (
+            "summaries.llm.client_identity_file",
+            "backend = \"meta_gateway\"\nbase_url = \"https://models.gateway.example/v1\"\n\
+             model = \"test-gateway-model\"",
+        ),
+    ] {
+        let err = load(&format!("[summaries.llm]\n{text}\n")).expect_err(setting);
+        assert!(
+            matches!(&err, ConfigError::Missing(what) if what.contains(setting)),
+            "{setting}: {err}"
+        );
+    }
+}

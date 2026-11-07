@@ -784,7 +784,12 @@ fn summaries(state: &AppState) -> Check {
                 "summaries and thread names are produced by {} ({}, model {}), under policy \
                  version {}",
                 state.summarizer.describe(),
-                llm.dialect.as_str(),
+                // `#1027 vibe-talk-spark-summarizer`: the gateway backend has no dialect to
+                // name; naming the placeholder it carries would describe a wire never spoken.
+                match llm.backend {
+                    crate::config::LlmBackend::MessagesApi => llm.dialect.as_str(),
+                    crate::config::LlmBackend::MetaGateway => llm.backend.as_str(),
+                },
                 llm.model,
                 state.summary_version
             )),

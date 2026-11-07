@@ -597,19 +597,35 @@ async fn main() -> anyhow::Result<()> {
     let summaries_possible = summaries_unavailable.is_none();
     // `#233 llm-summarizer`. Which provider, which dialect and which model — never a credential,
     // and never a credential's path, which says more about a host than this line needs to.
+    // `#1027 vibe-talk-spark-summarizer` adds the gateway backend beside it, with its own line:
+    // the Messages line must never describe a gateway deployment, or vice versa.
     if let Some(llm) = &config.summaries.llm {
-        tracing::info!(
-            dialect = llm.dialect.as_str(),
-            model = %llm.model,
-            base_url = %llm.base_url,
-            max_tokens = llm.max_tokens,
-            requests_per_minute = llm.requests_per_minute,
-            burst = llm.burst,
-            client_identity = llm.client_identity_file.is_some(),
-            bearer_token = llm.bearer_token_file.is_some() || llm.bearer_token_command.is_some(),
-            "summaries and thread names come from one Messages API call apiece, with NO tools; the \
-             text of the messages being summarised is sent to this model provider"
-        );
+        match llm.backend {
+            vibe_talk::config::LlmBackend::MessagesApi => tracing::info!(
+                dialect = llm.dialect.as_str(),
+                model = %llm.model,
+                base_url = %llm.base_url,
+                max_tokens = llm.max_tokens,
+                requests_per_minute = llm.requests_per_minute,
+                burst = llm.burst,
+                client_identity = llm.client_identity_file.is_some(),
+                bearer_token = llm.bearer_token_file.is_some() || llm.bearer_token_command.is_some(),
+                "summaries and thread names come from one Messages API call apiece, with NO tools; the \
+                 text of the messages being summarised is sent to this model provider"
+            ),
+            vibe_talk::config::LlmBackend::MetaGateway => tracing::info!(
+                backend = llm.backend.as_str(),
+                model = %llm.model,
+                base_url = %llm.base_url,
+                max_tokens = llm.max_tokens,
+                reasoning_effort = llm.reasoning_effort.as_str(),
+                requests_per_minute = llm.requests_per_minute,
+                burst = llm.burst,
+                client_identity = llm.client_identity_file.is_some(),
+                "summaries and thread names come from one AI gateway call apiece, with NO tools; the \
+                 text of the messages being summarised is sent to this gateway"
+            ),
+        }
     }
     let summary_version =
         vibe_talk::summarize::policy_version_for(&config.summaries, summarizer.as_ref());
