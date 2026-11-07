@@ -817,10 +817,95 @@ pub trait Fetcher: Send + Sync {
     async fn current_version(&self, entry: &Entry) -> Result<Option<String>, FetchError>;
 }
 
-/// The GitHub fetcher: raw content over HTTPS, with an optional file token.
+/// Where the GitHub fetcher's bearer token comes from.
+pub enum TokenSource {
+    /// No token.
+    None,
+    /// A token read once (from `github_token_file`).
+    Static(String),
+    /// A command printing the token (`github_token_command`), cached in memory.
+    Command {
+        /// The argv, run without a shell.
+        argv: Vec<String>,
+        /// The cached token and when it was fetched.
+        cache: std::sync::Mutex<Option<(String, std::time::Instant)>>,
+    },
+}
+
+/// How long a command token is reused before the command runs again.
+const TOKEN_COMMAND_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// How long a token command may run.
+const TOKEN_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run a token command and return its trimmed stdout. The token is never logged;
+/// a failure names only the first line of its stderr.
+async fn run_token_command(argv: &[String]) -> Result<String, FetchError> {
+    let Some((program, args)) = argv.split_first() else {
+        return Err(FetchError::Failed(
+            "token command failed: no command configured".to_owned(),
+        ));
+    };
+    let output = tokio::time::timeout(
+        TOKEN_COMMAND_TIMEOUT,
+        tokio::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| FetchError::Failed("token command failed: timed out".to_owned()))?
+    .map_err(|e| FetchError::Failed(format!("token command failed: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr.lines().next().unwrap_or("").trim();
+        return Err(FetchError::Failed(format!("token command failed: {first}")));
+    }
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if token.is_empty() {
+        return Err(FetchError::Failed(
+            "token command failed: it printed no token".to_owned(),
+        ));
+    }
+    Ok(token)
+}
+
+impl TokenSource {
+    /// The bearer token, running (and caching) the command when configured.
+    async fn token(&self) -> Result<Option<String>, FetchError> {
+        match self {
+            TokenSource::None => Ok(None),
+            TokenSource::Static(token) => Ok(Some(token.clone())),
+            TokenSource::Command { argv, cache } => {
+                if let Some((token, at)) = cache.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+                    if at.elapsed() < TOKEN_COMMAND_TTL {
+                        return Ok(Some(token));
+                    }
+                }
+                let token = run_token_command(argv).await?;
+                *cache.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some((token.clone(), std::time::Instant::now()));
+                Ok(Some(token))
+            }
+        }
+    }
+
+    /// Forget a cached command token (after a 401/403, so it is re-run).
+    fn invalidate(&self) {
+        if let TokenSource::Command { cache, .. } = self {
+            *cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+
+    /// Whether this source can produce a fresh token after a refusal.
+    fn is_command(&self) -> bool {
+        matches!(self, TokenSource::Command { .. })
+    }
+}
+
+/// The GitHub fetcher: raw content over HTTPS, with an optional token.
 pub struct GithubFetcher {
     client: reqwest::Client,
-    token: Option<String>,
+    token: TokenSource,
     raw_base: String,
 }
 
@@ -828,11 +913,7 @@ impl GithubFetcher {
     /// A fetcher against `raw_base` (default `https://raw.githubusercontent.com`).
     /// `https_proxy`, when set, applies to this client only.
     #[must_use]
-    pub fn new(
-        token: Option<String>,
-        raw_base: Option<String>,
-        https_proxy: Option<String>,
-    ) -> Self {
+    pub fn new(token: TokenSource, raw_base: Option<String>, https_proxy: Option<String>) -> Self {
         let mut builder = reqwest::Client::builder();
         if let Some(proxy) = https_proxy.as_deref().filter(|p| !p.trim().is_empty()) {
             if let Ok(proxy) = reqwest::Proxy::https(proxy) {
@@ -864,16 +945,31 @@ impl GithubFetcher {
         }
     }
 
+    /// One GET, with a fresh command token retried once after a 401/403.
+    async fn send_get(&self, url: &str) -> Result<reqwest::Response, FetchError> {
+        for attempt in 0..2 {
+            let token = self.token.token().await?;
+            let mut request = self.client.get(url).header("user-agent", "vibe-talk");
+            if let Some(token) = &token {
+                request = request.bearer_auth(token);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|e| FetchError::Failed(e.to_string()))?;
+            let refused = matches!(response.status().as_u16(), 401 | 403);
+            if refused && attempt == 0 && self.token.is_command() {
+                self.token.invalidate();
+                continue;
+            }
+            return Ok(response);
+        }
+        unreachable!("the retry loop always returns");
+    }
+
     async fn get(&self, entry: &Entry) -> Result<FetchedRaw, FetchError> {
         let url = self.url(entry)?;
-        let mut request = self.client.get(&url).header("user-agent", "vibe-talk");
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        }
-        let mut response = request
-            .send()
-            .await
-            .map_err(|e| FetchError::Failed(e.to_string()))?;
+        let mut response = self.send_get(&url).await?;
         if !response.status().is_success() {
             return Err(FetchError::Failed(format!(
                 "GitHub answered {}",
@@ -906,14 +1002,7 @@ impl GithubFetcher {
 
     async fn etag(&self, entry: &Entry) -> Result<Option<String>, FetchError> {
         let url = self.url(entry)?;
-        let mut request = self.client.get(&url).header("user-agent", "vibe-talk");
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| FetchError::Failed(e.to_string()))?;
+        let response = self.send_get(&url).await?;
         if !response.status().is_success() {
             return Err(FetchError::Failed(format!(
                 "GitHub answered {}",
@@ -1089,12 +1178,23 @@ pub fn service_from_config(config: &crate::config::DocumentsConfig) -> Arc<Servi
         ),
         None => Arc::new(Index::new(config.paste_url_prefixes.clone())),
     };
-    let token = config
-        .github_token_file
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|t| t.trim().to_owned())
-        .filter(|t| !t.is_empty());
+    let token = if !config.github_token_command.is_empty() {
+        TokenSource::Command {
+            argv: config.github_token_command.clone(),
+            cache: std::sync::Mutex::new(None),
+        }
+    } else {
+        match config
+            .github_token_file
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty())
+        {
+            Some(token) => TokenSource::Static(token),
+            None => TokenSource::None,
+        }
+    };
     let mut fetchers: Vec<Arc<dyn Fetcher>> = vec![Arc::new(GithubFetcher::new(
         token,
         config.github_raw_base.clone(),
@@ -1557,5 +1657,45 @@ mod tests {
         let listed = index.list();
         let keys: Vec<&str> = listed.iter().map(|e| e.key.as_str()).collect();
         assert!(keys[0].ends_with("a.md") && keys[1].ends_with("b.md"));
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn token_command_token_is_trimmed_and_cached() {
+        let source = TokenSource::Command {
+            argv: vec!["/bin/echo".to_owned(), "tok-123".to_owned()],
+            cache: std::sync::Mutex::new(None),
+        };
+        let first = block_on(source.token()).expect("token");
+        let second = block_on(source.token()).expect("cached token");
+        assert_eq!(first.as_deref(), Some("tok-123"));
+        assert_eq!(second.as_deref(), Some("tok-123"));
+        source.invalidate();
+        let third = block_on(source.token()).expect("refreshed token");
+        assert_eq!(third.as_deref(), Some("tok-123"));
+    }
+
+    #[test]
+    fn token_command_failure_names_only_the_first_stderr_line() {
+        let argv: Vec<String> = [
+            "/bin/sh",
+            "-c",
+            "echo first-problem >&2; echo second >&2; exit 3",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let error = block_on(run_token_command(&argv)).expect_err("must fail");
+        let FetchError::Failed(detail) = error else {
+            panic!("wrong failure: {error}");
+        };
+        assert_eq!(detail, "token command failed: first-problem");
     }
 }

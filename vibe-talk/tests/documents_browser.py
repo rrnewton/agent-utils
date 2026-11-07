@@ -17,6 +17,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+from typing import cast
 
 from playwright.sync_api import sync_playwright
 
@@ -27,28 +28,31 @@ WRITE_TOKEN = "documents-check-write-token-not-a-real-credential"
 PASTE_BODY = "# Demo deployment report\n\nThe **nightly** run finished green.\n\n- one\n- two\n"
 
 
-def check(condition, message):
+def check(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
 
 
-def free_port():
+def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+        port: int = sock.getsockname()[1]
+        return port
 
 
-def call(base, method, path, token, body=None):
+def call(base: str, method: str, path: str, token: str, body: dict[str, object] | None = None) -> dict[str, object]:
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(base + path, data=data, method=method)
     req.add_header("Authorization", f"Bearer {token}")
     if data:
         req.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(req, timeout=15) as res:
-        return json.loads(res.read() or b"null")
+        parsed: object = json.loads(res.read() or b"null")
+    assert isinstance(parsed, dict)
+    return parsed
 
 
-def main():
+def main() -> int:
     port = free_port()
     base = f"http://127.0.0.1:{port}"
     with tempfile.TemporaryDirectory(prefix="documents-check-") as tmp:
@@ -87,7 +91,8 @@ def main():
             deadline = time.time() + 30
             while time.time() < deadline:
                 call(base, "GET", f"/api/v1/channels/{CHANNEL}/page?limit=10&render=html", WRITE_TOKEN)
-                docs = call(base, "GET", "/api/v1/documents?limit=10", READ_TOKEN)["documents"]
+                answer = call(base, "GET", "/api/v1/documents?limit=10", READ_TOKEN)
+                docs = cast(list[dict[str, object]], answer["documents"])
                 if len(docs) == 2:
                     break
                 time.sleep(0.5)
@@ -104,7 +109,7 @@ def main():
                 page.goto(base + "/?v=docs", wait_until="load")
                 page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
                 check(page.locator("#documents-list .doc-card").count() == 2, "the list did not draw both rows")
-                check("demo-doc" in page.locator("#documents-list").text_content(),
+                check("demo-doc" in (page.locator("#documents-list").text_content() or ""),
                       "the list does not name its document")
 
                 # Fetch recent: a visible result (fetched count or the reason none arrived).
@@ -115,9 +120,10 @@ def main():
                 # The paste row: a real touch fetches it from the server and opens the reader.
                 paste_card = page.locator("#documents-list .doc-card", has_text="demo-doc")
                 box = paste_card.bounding_box()
+                assert box is not None
                 page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
                 page.wait_for_selector("#doc-body h1", timeout=20_000)
-                check("Demo deployment report" in page.text_content("#doc-body"),
+                check("Demo deployment report" in (page.text_content("#doc-body") or ""),
                       "the reader did not render the fetched document")
                 check(page.locator("#control-pane").is_hidden(), "the call controls show over the reader")
                 page.tap("#doc-back")
@@ -127,6 +133,7 @@ def main():
                 # port), and the row says why instead of doing nothing.
                 gh_card = page.locator("#documents-list .doc-card", has_text="guide.md")
                 box = gh_card.bounding_box()
+                assert box is not None
                 page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
                 page.wait_for_function(
                     "() => [...document.querySelectorAll('#documents-list .doc-card')]"

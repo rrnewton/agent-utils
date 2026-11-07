@@ -227,6 +227,8 @@ pub struct Config {
 pub struct DocumentsConfig {
     /// File holding the least-privilege GitHub token, when private repos are fetched.
     pub github_token_file: Option<PathBuf>,
+    /// Command printing the GitHub token on stdout (an alternative to the file).
+    pub github_token_command: Vec<String>,
     /// Raw-content base for GitHub fetches (a fake in tests).
     pub github_raw_base: Option<String>,
     /// HTTPS proxy for the documents fetcher only (e.g. `http://fwdproxy:8080` on a
@@ -249,6 +251,7 @@ impl Default for DocumentsConfig {
     fn default() -> Self {
         Self {
             github_token_file: None,
+            github_token_command: Vec::new(),
             github_raw_base: None,
             https_proxy: None,
             paste_url_prefixes: Vec::new(),
@@ -1593,6 +1596,8 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 struct FileDocuments {
     github_token_file: Option<String>,
+    #[serde(default)]
+    github_token_command: Vec<String>,
     github_raw_base: Option<String>,
     https_proxy: Option<String>,
     #[serde(default)]
@@ -2353,8 +2358,15 @@ fn documents_config(file: FileDocuments) -> Result<DocumentsConfig, ConfigError>
             )),
         }
     };
+    if file.github_token_file.is_some() && !file.github_token_command.is_empty() {
+        return Err(invalid(
+            "github_token_command",
+            "set github_token_file OR github_token_command, not both".to_owned(),
+        ));
+    }
     Ok(DocumentsConfig {
         github_token_file: path("github_token_file", file.github_token_file)?,
+        github_token_command: file.github_token_command,
         github_raw_base: file
             .github_raw_base
             .map(|v| v.trim().to_owned())
@@ -4601,6 +4613,25 @@ label = "team"
 writable = true
 provider = "slack"
 "#;
+
+    #[test]
+    fn documents_token_sources_are_alternatives() {
+        let base = format!(
+            "{FULL}\n[documents]\ngithub_token_command = [\"/bin/echo\", \"tok\"]\nhttps_proxy = \"http://fwdproxy:8080\"\n"
+        );
+        let cfg = Config::from_toml_and_env(&base, &env(&[])).expect("valid");
+        assert_eq!(cfg.documents.github_token_command, ["/bin/echo", "tok"]);
+        assert_eq!(
+            cfg.documents.https_proxy.as_deref(),
+            Some("http://fwdproxy:8080")
+        );
+        let both = format!("{base}github_token_file = \"/tmp/token\"\n");
+        let error = Config::from_toml_and_env(&both, &env(&[])).expect_err("both refused");
+        assert!(
+            error.to_string().contains("github_token_command"),
+            "{error}"
+        );
+    }
 
     /// `#408 copy-upstream-link`: the two settings a message's own link is formed from load on
     /// their own kinds, are refused on the other, and a value no link can be formed from is

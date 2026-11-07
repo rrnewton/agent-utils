@@ -500,6 +500,7 @@ enabled = true
 # persists beside [storage] path as documents-index.json unless index_path names another
 # absolute path. Fetched copies live in a bounded in-memory cache.
 # github_token_file = "/run/secrets/github-documents-token"
+# github_token_command = ["gh", "auth", "token"]  # alternative to the file; never both
 # github_raw_base = "https://raw.githubusercontent.com"
 # HTTPS proxy for the documents fetcher only, on hosts with no direct egress.
 # https_proxy = "http://fwdproxy:8080"

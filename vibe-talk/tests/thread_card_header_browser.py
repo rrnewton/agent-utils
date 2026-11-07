@@ -680,6 +680,8 @@ def into_list_thread(desk: Desk, thread_id: str, tap: bool = False) -> None:
     selector = f"#side-cards > li[data-id='{thread_id}'] .side-card-open"
     if tap:
         box = desk.page.locator(selector).bounding_box()
+        desk.check(box is not None, f"the replies button of {thread_id} is not drawn")
+        assert box is not None
         desk.page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
     else:
         desk.page.click(selector)
