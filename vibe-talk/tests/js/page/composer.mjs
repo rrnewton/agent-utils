@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 
 import { BOTTOM_SLACK_PX, CSS_CODE, DESKTOP_QUERY, HTML, HTML_CODE, PAGE_CODE, PAGE_IDS, SCRIPT,
-  SCRIPT_CODE, THREADS_MAIN_STORAGE, atBottomOf, cardIds, cardOf, compose, cssBlock, cssBlockIn,
+  THREADS_MAIN_STORAGE, atBottomOf, cardIds, cardOf, compose, cssBlock, cssBlockIn,
   cssBlockOutside, cssRulesElsewhere, enterKey, errorResponse, focusName, focusOn, focused,
   inTwoColumns, inlineAnchors, json, keyboardMedia, keyboardSaid, litCards, mainMessagesPage,
   markupHolds, message, newPage, nodeIn, openReplyOn, pickThread, press, reloadPage, replyBoxAt,
@@ -73,8 +73,10 @@ test("composer-no-autofill: the token's password field has a form of its own, an
     assert.doesNotMatch(field.attributes, /\bform="/, `#${field.id} names a form`);
   }
   // Send is a click or a key, never a form's submission: the one submit listener is the sign-in
-  // form's, and all it does is refuse.
-  const submits = [...SCRIPT_CODE.matchAll(/el\("([\w-]+)"\)\.addEventListener\("submit"/g)].map((m) => m[1]);
+  // form's, and all it does is refuse. Heard in the page script, or by a mount's `listen` since
+  // `#624 voice-page-modularity` moved the wiring into the modules (view/settings/signincontrols.ts).
+  const submits = [...PAGE_CODE.matchAll(/el\("([\w-]+)"\)\.addEventListener\("submit"|listen<Event>\(el\("([\w-]+)"\), "submit"/g)]
+    .map((m) => m[1] || m[2]);
   assert.deepEqual(submits, ["signin-form"]);
   assert.doesNotMatch(PAGE_CODE, /createElement\("form"\)|\.submit\(\)|requestSubmit/);
 });

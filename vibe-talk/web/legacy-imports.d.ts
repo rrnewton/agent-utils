@@ -437,6 +437,7 @@ declare const mountDismissedSends: LegacyImports["mountDismissedSends"];
 declare const mountServerCache: LegacyImports["mountServerCache"];
 declare const mountIdentityList: LegacyImports["mountIdentityList"];
 declare const mountPairing: LegacyImports["mountPairing"];
+declare const mountSignInControls: LegacyImports["mountSignInControls"];
 declare const mountSaveTokenButton: LegacyImports["mountSaveTokenButton"];
 declare const mountReadingWidth: LegacyImports["mountReadingWidth"];
 declare const restoreStoredSettings: LegacyImports["restoreStoredSettings"];

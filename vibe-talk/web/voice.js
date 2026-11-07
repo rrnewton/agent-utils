@@ -30552,19 +30552,18 @@ function startSettingsSync() { settingsSyncView().start(); }
 // once a token has signed in. A password field holding the token, in one form with every message box, is
 // what made a phone's password manager take a send for a sign-in and offer to save it (see #signin-form
 // in web/voice.html). The saved token lives in localStorage only, and Save with the field empty tries it
-// again. The form is never submitted; should something submit it, nothing happens.
-el("signin-form").addEventListener("submit", (event) => event.preventDefault());
-el("save-token").addEventListener("click", guardQuietly(saveToken));
-el("forget-token").addEventListener("click", forgetToken);
-el("pair-submit").addEventListener("click", guardQuietly(() => devicePairing.redeemInput()));
-el("pair-confirm").addEventListener("click", guardQuietly(() => devicePairing.redeem()));
-el("pair-dismiss").addEventListener("click", () => devicePairing.decline());
-// A second link opened in a tab already showing the app is a navigation within the page: the
-// script does not run again, so the fragment is taken here, as at load, and offered.
-window.addEventListener("hashchange", () => {
-  const code = takePairingCode();
-  if (code === null) return;
-  devicePairing.opened(code);
+// again. The form is never submitted; should something submit it, nothing happens. Sign-in's and pairing's listeners,
+// a second pairing link opened in this tab included: one owner in web/src/view/settings/signincontrols.ts (`#624
+// voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's teardown.
+mountSignInControls({
+  lookup: (id) => el(id),
+  saveToken: guardQuietly(saveToken),
+  forgetToken: () => forgetToken(),
+  redeemPairingInput: guardQuietly(() => devicePairing.redeemInput()),
+  redeemPairing: guardQuietly(() => devicePairing.redeem()),
+  declinePairing: () => devicePairing.decline(),
+  takePairingCode: () => takePairingCode(),
+  pairingOpened: (code) => devicePairing.opened(code),
 });
 
 // Settings' switches and choices, each restored as kept before it is heard, since the controls carry the live truth

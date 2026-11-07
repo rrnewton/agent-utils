@@ -292,3 +292,40 @@ test("`#624 voice-page-modularity`: every setting is restored as kept, once, in 
   assert.equal(restoreStoredSettings(deps), undefined);
   assert.deepStrictEqual(log, order, "a setting was restored out of the page's order, twice, or handed something");
 });
+
+test("`#624 voice-page-modularity`: sign-in's and pairing's listeners mount in the page's order, a submitted form doing nothing and a second link offered, and come down again", () => {
+  const { mountSignInControls } = VIEW_SETTINGS;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type, event = {}) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener(event));
+  const act = (name) => (...args) => { log.push(`${name}${args.length ? ` ${args.join(" ")}` : ""}`); return name; };
+  const codes = ["CODE-2", null];
+  const was = globalThis.window;
+  globalThis.window = target("window");
+  try {
+    const controls = mountSignInControls({
+      lookup: (id) => target(id),
+      saveToken: act("save"), forgetToken: act("forget"), redeemPairingInput: act("redeem input"), redeemPairing: act("redeem"),
+      declinePairing: act("decline"), takePairingCode: () => { log.push("take code"); return codes.shift(); }, pairingOpened: act("offer"),
+    });
+    assert.deepStrictEqual(log, ["listen signin-form submit", "listen save-token click", "listen forget-token click", "listen pair-submit click",
+      "listen pair-confirm click", "listen pair-dismiss click", "listen window hashchange"], "a listener was added out of the page's order");
+    log.length = 0;
+    let prevented = 0;
+    fire("signin-form", "submit", { preventDefault: () => { prevented += 1; } });
+    assert.equal(prevented, 1, "a submitted form was let through");
+    assert.deepStrictEqual(["save-token", "forget-token", "pair-submit", "pair-confirm", "pair-dismiss"].flatMap((id) => fire(id, "click")),
+      ["save", "forget", "redeem input", "redeem", "decline"], "what an act answers did not reach the dispatcher");
+    // A link with a code is offered; a fragment change without one offers nothing.
+    fire("window", "hashchange");
+    fire("window", "hashchange");
+    assert.deepStrictEqual(log, ["save", "forget", "redeem input", "redeem", "decline", "take code", "offer CODE-2", "take code"]);
+    controls.unmount();
+    assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+  } finally {
+    globalThis.window = was;
+  }
+});
