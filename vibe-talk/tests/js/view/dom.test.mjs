@@ -2316,3 +2316,30 @@ test("`#892 voice-page-optimistic-done`: key timing runs every key, times it onl
     chordOf({ key: "ArrowDown", shiftKey: true }), chordOf({ key: "l", metaKey: true, shiftKey: false })],
   ["?", "Ctrl+k", "Shift+ArrowDown", "Cmd+l"]);
 });
+
+test("`#624 voice-page-modularity`: the page's last document listeners are mounted in the page's order, each answering its own act, then all come down", () => {
+  const { mountDocumentListeners } = VIEW_SHELL;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener({ type }));
+  const act = (name) => (...args) => { log.push(`${name} ${args.length}`); return name; };
+  const was = globalThis.document;
+  globalThis.document = target("document");
+  try {
+    const mounted = mountDocumentListeners({
+      root: () => target("root"),
+      onVisibility: act("visibility"), closeRowMenuOutside: act("menu"), onPointerLeavePage: act("leave"),
+    });
+    assert.deepStrictEqual(log, ["listen document visibilitychange", "listen document pointerdown", "listen root pointerleave"]);
+    log.length = 0;
+    fire("document", "visibilitychange"); fire("document", "pointerdown"); fire("root", "pointerleave");
+    assert.deepStrictEqual(log, ["visibility 1", "menu 1", "leave 1"]);
+    mounted.unmount();
+    assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+  } finally {
+    globalThis.document = was;
+  }
+});

@@ -57,6 +57,8 @@ export { chordOf, createKeyTiming, keyTimingLine } from "./keytiming.ts";
 export type { KeyTiming, KeyTimingDependencies, KeyTimingEntry, TimedKey } from "./keytiming.ts";
 export { mountKeyListeners } from "./keylisteners.ts";
 export type { KeyListeners, KeyListenersDependencies, ListenedPane } from "./keylisteners.ts";
+export { mountDocumentListeners } from "./documentlisteners.ts";
+export type { DocumentListeners, DocumentListenersDependencies } from "./documentlisteners.ts";
 export { mountPageListeners } from "./pagelisteners.ts";
 export type { PageListeners, PageListenersDependencies } from "./pagelisteners.ts";
 export { mountMenuOpeners } from "./menuopeners.ts";

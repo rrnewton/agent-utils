@@ -3539,7 +3539,7 @@ test("NO CHECKBOX, no second phase: the box holds one choice, Save, and the one-
   assert.doesNotMatch(box, /type="checkbox"/);
   assert.equal(PAGE_ELEMENTS.has("upstream-clear-now"), false);
   assert.equal(PAGE_ELEMENTS.has("upstream-clear-now-label"), false);
-  assert.match(SCRIPT_CODE, /el\("upstream-clear-push"\)/);
+  assert.match(PAGE_CODE, /el\("upstream-clear-push"\)/);
   assert.doesNotMatch(SCRIPT_CODE, /clear_now|upstream-clear-now/);
   assert.equal(PAGE_ELEMENTS.get("upstream-clear-push").tag, "button");
   assert.ok(markupHolds("upstream-clear", "upstream-clear-push"));

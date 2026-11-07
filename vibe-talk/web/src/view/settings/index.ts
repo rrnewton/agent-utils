@@ -57,5 +57,7 @@ export { mountSettingsSyncView } from "./sync.ts";
 export type { SettingsSyncView, SettingsSyncViewDependencies } from "./sync.ts";
 export { mountConnectionReadouts, mountMessagePreferences, mountResumePreference } from "./preferences.ts";
 export type { ConnectionReadouts, ConnectionReadoutsDependencies, MessagePreferences, MessagePreferencesDependencies, ResumePreference, ResumePreferenceDependencies } from "./preferences.ts";
+export { mountChannelBoxListeners } from "./channelboxlisteners.ts";
+export type { ChannelBoxListeners, ChannelBoxListenersDependencies } from "./channelboxlisteners.ts";
 export { mountSaveTokenButton } from "./savetoken.ts";
 export type { SaveTokenButton, SaveTokenButtonDependencies } from "./savetoken.ts";

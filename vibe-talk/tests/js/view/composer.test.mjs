@@ -427,3 +427,65 @@ test("`#624 voice-page-modularity`: a message box keeps what is written, sends f
   mountMessageBox({ box: call, onKey: (event) => log.push(`key ${event.key}`), watchBoxInsertions: (watched) => log.push(`watch ${watched.id}`) });
   assert.deepStrictEqual(log, ["listen compose-text keydown", "watch compose-text"]);
 });
+
+test("`#624 voice-page-modularity`: the keyboard's listeners are mounted in the page's order with their guards, the first measure taken, then all come down", () => {
+  const { mountKeyboardListeners } = VIEW_COMPOSER;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener, options) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}${options && options.capture ? " capture" : ""}${options && options.passive ? " passive" : ""}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type, event = { type }) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener(event));
+  const act = (name) => (...args) => { log.push(`${name} ${args.length}`); return name; };
+  const was = globalThis.document;
+  globalThis.document = target("document");
+  try {
+    const keys = mountKeyboardListeners({
+      lookup: (id) => target(id), leftLookup: (id) => target(`left:${id}`),
+      windowTarget: () => target("window"), visualViewport: () => target("viewport"), virtualKeyboard: () => target("virtual"),
+      columnsResizeAsk: act("columns"), noteKeyboard: act("note"), noteKeyboardReader: act("reader"),
+      settleOnScroll: act("settle"), applyKeyboardDebug: act("debug"), keyboardDebugChecked: () => { log.push("checked 0"); return true; },
+      showKeyboardDebug: act("show debug"), afterThisTask: (run) => { log.push("later 0"); run(); },
+    });
+    assert.deepStrictEqual(log, ["listen window resize", "listen viewport resize", "listen viewport scroll",
+      "listen left:scroll-area scroll passive", "listen left:side-scroll scroll passive", "listen window scroll passive",
+      "listen document touchstart capture passive", "listen document pointerdown capture passive",
+      "listen document wheel capture passive", "listen keyboard-debug change", "show debug 0", "listen virtual geometrychange",
+      "listen document focusin", "listen document focusout", "note 0"], "mounted out of the page's order");
+    log.length = 0;
+    fire("window", "resize"); fire("viewport", "scroll"); fire("left:scroll-area", "scroll"); fire("document", "wheel");
+    fire("keyboard-debug", "change"); fire("virtual", "geometrychange"); fire("document", "focusin");
+    assert.deepStrictEqual(log, ["columns 0", "note 0", "settle 0", "reader 0", "checked 0", "debug 1", "note 0", "later 0", "note 0"]);
+    keys.unmount();
+    assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+  } finally {
+    globalThis.document = was;
+  }
+});
+
+test("`#624 voice-page-modularity`: with no visual viewport the keyboard hears the window's resize, and with no window nothing at all", () => {
+  const { mountKeyboardListeners } = VIEW_COMPOSER;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const idle = () => {};
+  const was = globalThis.document;
+  globalThis.document = target("document");
+  try {
+    const deps = (over) => ({ lookup: (id) => target(id), leftLookup: (id) => target(`left:${id}`),
+      windowTarget: () => target("window"), visualViewport: () => null, virtualKeyboard: () => null,
+      columnsResizeAsk: idle, noteKeyboard: () => log.push("note"), noteKeyboardReader: idle, settleOnScroll: idle,
+      applyKeyboardDebug: idle, keyboardDebugChecked: () => false, showKeyboardDebug: idle, afterThisTask: (run) => run(), ...over });
+    const keys = mountKeyboardListeners(deps({}));
+    assert.deepStrictEqual(log.filter((line) => line.startsWith("listen window")), ["listen window resize", "listen window resize", "listen window scroll"]);
+    keys.unmount();
+    log.length = 0;
+    const none = mountKeyboardListeners(deps({ windowTarget: () => null }));
+    assert.deepStrictEqual(log.filter((line) => line.startsWith("listen window")), []);
+    none.unmount();
+  } finally {
+    globalThis.document = was;
+  }
+});

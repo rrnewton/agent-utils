@@ -30665,11 +30665,16 @@ mountScreenControls({
   gripKey: (event) => readingWidthControl.gripKey(event),
 });
 
-// `#54 resume-recovery`. The one signal a browser gives for "this page went away": it is what
-// distinguishes a socket that died because the reader switched apps from one that died because
-// something is broken.
-document.addEventListener("visibilitychange", onVisibility);
-document.addEventListener("pointerdown", closeRowMenuOutside);
+// The page's last document-level listeners (`#54 resume-recovery`, `#280 scroll-stability`): the page
+// going away or coming back, a pointer down outside a row's menu, and the mouse leaving the window.
+// One owner in web/src/view/shell/documentlisteners.ts (`#624 voice-page-modularity`), mounted here,
+// in the page's order; its `unmount` waits for the ordered boot's teardown.
+mountDocumentListeners({
+  root: () => document.documentElement,
+  onVisibility: () => onVisibility(),
+  closeRowMenuOutside: (event) => closeRowMenuOutside(event),
+  onPointerLeavePage: (event) => onPointerLeavePage(event),
+});
 // The keys' and the selection's listeners (`#224 keyboard-shortcuts`, `#344 search-shortcut`, `#296
 // copy-highlighted-message`, `#239 single-selection`): every key heard in one place, the chords that act whatever
 // holds the focus heard first, a copy with nothing selected, the single-key switch (restored first, so the keys are
@@ -30691,8 +30696,6 @@ mountKeyListeners({
   onPointerMove: (event) => onPointerMove(event),
   onPointerDown: (event) => onPointerDown(event),
 });
-// `#280 scroll-stability`. The mouse leaving the window drops the wait before a glide between the columns.
-document.documentElement.addEventListener("pointerleave", onPointerLeavePage);
 // The quoted words' and the quick-reply box's listeners: words selected in one message make its Reply a Quote reply
 // (`#267 quote-reply`); the selection chip and its twin in the paused read's strip, pressed without taking the
 // selection or the focus from the words they quote (`#726 vt-selection-chip`, `#819
@@ -31109,9 +31112,6 @@ const columnsResize = createOncePerFrame(() => {
   // `#846 draft-chip-honest`. One column or two shows other boxes.
   renderDraftChip();
 }, () => (typeof requestAnimationFrame === "function" ? requestAnimationFrame : null));
-if (typeof window.addEventListener === "function") {
-  window.addEventListener("resize", () => columnsResize.ask());
-}
 // --- the on-screen keyboard ------------------------------------------------------------------------
 //
 // `#429 keyboard-hides-bar`. The owner, writing in the channel view on a phone: the open keyboard, the
@@ -31167,22 +31167,6 @@ const screenKeyboard = createOnScreenKeyboard({
 });
 const { noteKeyboard, noteKeyboardReader, settleOnScroll, showKeyboardDebug, renderKeyboardDebug } = screenKeyboard;
 
-if (window.visualViewport && typeof window.visualViewport.addEventListener === "function") {
-  window.visualViewport.addEventListener("resize", () => noteKeyboard());
-  // `#575 mobile-keyboard-compose`. Safari pans the page up over its keyboard by scrolling the visual
-  // viewport, after the resize: in the jump's moment (`#610`), the jump is made again to the new top.
-  window.visualViewport.addEventListener("scroll", () => noteKeyboard());
-} else if (typeof window.addEventListener === "function") {
-  window.addEventListener("resize", () => noteKeyboard());
-}
-// `#610 mobile-keyboard-compose`. Safari also scrolls the list itself, or the document, to show the focused box
-// as its keyboard comes up. In the jump's moment that is the browser's, not the reader's (theirs begins
-// with a touch), and the jump is made again; after it, a scroll is nobody's business here.
-for (const id of ["scroll-area", "side-scroll"]) leftEl(id).addEventListener("scroll", settleOnScroll, { passive: true });
-if (typeof window.addEventListener === "function") window.addEventListener("scroll", settleOnScroll, { passive: true });
-for (const type of ["touchstart", "pointerdown", "wheel"]) {
-  document.addEventListener(type, () => noteKeyboardReader(), { capture: true, passive: true });
-}
 
 // --- the keyboard's numbers, on screen -----------------------------------------------------------------
 //
@@ -31211,22 +31195,28 @@ function applyKeyboardDebug(on) {
 // Drawing the readout and its switch, and keeping it redrawn while it is drawn, are the keyboard owner's
 // (`showKeyboardDebug`, `renderKeyboardDebug`, above).
 
-el("keyboard-debug").addEventListener("change", () => applyKeyboardDebug(el("keyboard-debug").checked));
-showKeyboardDebug(storedKeyboardDebug());
-if (navigator.virtualKeyboard && typeof navigator.virtualKeyboard.addEventListener === "function") {
-  navigator.virtualKeyboard.addEventListener("geometrychange", () => noteKeyboard());
-}
-// A focus that moves is decided once the tap that moved it is over, from where the focus went. A tap
-// moves the focus at its `mousedown`, and Chromium hit-tests the same tap's `click` afterwards: the bars
-// coming back in between moved Stop out from under the finger, and the click landed on the tile around
-// it (measured in tests/keyboard_hides_bar_browser.py). A row tapped in the list would move the same
-// way, and in reading mode that tap reads it. From one field to another the focus has arrived by then,
-// and nothing comes back for the moment between them.
-for (const type of ["focusin", "focusout"]) {
-  document.addEventListener(type, () => setTimeout(() => noteKeyboard(), 0));
-}
-// The window as it loads, which is the first measure of its tallest.
-noteKeyboard();
+// The keyboard's and the columns' listeners (`#429 keyboard-hides-bar`, `#575`/`#610
+// mobile-keyboard-compose`, `#340 composer-grow-box`, `#846 draft-chip-honest`): the window resized,
+// the visual viewport over the keyboard, the lists scrolled in the jump's moment, the reader's touch,
+// the debug readout's switch, the keyboard's geometry, and the focus once its tap is over — then the
+// first measure. One owner in web/src/view/composer/keyboardlisteners.ts (`#624
+// voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered
+// boot's teardown.
+mountKeyboardListeners({
+  lookup: (id) => el(id),
+  leftLookup: (id) => leftEl(id),
+  windowTarget: () => (typeof window.addEventListener === "function" ? window : null),
+  visualViewport: () => (window.visualViewport && typeof window.visualViewport.addEventListener === "function" ? window.visualViewport : null),
+  virtualKeyboard: () => (navigator.virtualKeyboard && typeof navigator.virtualKeyboard.addEventListener === "function" ? navigator.virtualKeyboard : null),
+  columnsResizeAsk: () => columnsResize.ask(),
+  noteKeyboard: () => noteKeyboard(),
+  noteKeyboardReader: () => noteKeyboardReader(),
+  settleOnScroll: () => settleOnScroll(),
+  applyKeyboardDebug: (on) => applyKeyboardDebug(on),
+  keyboardDebugChecked: () => el("keyboard-debug").checked,
+  showKeyboardDebug: () => showKeyboardDebug(storedKeyboardDebug()),
+  afterThisTask: (act) => { setTimeout(act, 0); },
+});
 // Before the first channel read, so the very first list of rows is already filtered rather
 // than appearing unfiltered for a frame and then rearranging under the reader.
 whoIsWho.load();
@@ -31385,98 +31375,85 @@ function changeSelectedChannel() {
   startChannelStream(selectedChannelId());
   return loadDiscord(saved && screens.view() === "discord" ? { keepPosition: true, reason: "enter" } : { reason: "enter" });
 }
-// `#624 voice-page-modularity`. A channel the reader chose on the picker is the selection's first,
-// before anything that reads it hears of the change.
-el("discord-channel").addEventListener("change", () => selectionOwner().selectChannel(el("discord-channel").value));
-el("discord-channel").addEventListener("change", guardQuietly(changeSelectedChannel));
-// `#224 keyboard-shortcuts`. After the change above has started: a channel chosen from Ctrl+K.
-el("discord-channel").addEventListener("change", channelPicked);
-// `#39 channel-alias`. Pointing the editor at another channel shows THAT channel's name; it does
-// not change which channel the Discord view is reading, which is the picker on the bar.
-// Changing channel closes whatever was open: the panels belong to the channel that was chosen
-// when they were opened, and carrying a half-typed name across to a different one is worse than
-// losing it.
-// `#355 provider-grouped-channels`. Another service: its channels, its facts, its Add, Browse and hidden list.
-el("settings-service").addEventListener("change", () => channelSettings.chooseSettingsService(el("settings-service").value));
-el("settings-channel").addEventListener("change", () => {
-  channelSettings.showChannelPanel(null);
-  // Everything in this box is about the channel the picker is on, or about all of them
-  // (`#349 channel-settings-all`).
-  channelSettings.renderChannelBox();
+// The channel box's listeners (`#349 channel-settings-all`, `#355 provider-grouped-channels`, `#232
+// upstream-mark-read`, `#602 history-settings-and-limits`, `#39 channel-alias`, `#208
+// persistent-cache`): the pickers (a channel chosen is the selection's first, before anything that
+// reads it hears of the change; Ctrl+K's word after the change has started, `#224`), Clear unread and
+// History, Rename and Add and Browse, Remove and the alias, the noise rules, the voice agent's
+// editors and prefix, and the message cache. One owner in
+// web/src/view/settings/channelboxlisteners.ts (`#624 voice-page-modularity`), mounted here, in the
+// page's order; its `unmount` waits for the ordered boot's teardown. The guarded acts are evaluated
+// here, at mount, as they were.
+mountChannelBoxListeners({
+  lookup: (id) => el(id),
+  selectChannel: () => selectionOwner().selectChannel(el("discord-channel").value),
+  changeSelectedChannel: guardQuietly(changeSelectedChannel),
+  channelPicked: () => channelPicked(),
+  chooseSettingsService: () => channelSettings.chooseSettingsService(el("settings-service").value),
+  changeSettingsChannel: () => {
+    channelSettings.showChannelPanel(null);
+    // Everything in this box is about the channel the picker is on, or about all of them
+    // (`#349 channel-settings-all`).
+    channelSettings.renderChannelBox();
+  },
+  renderClearChoice: () => upstreamClearBox.renderChoice(),
+  saveClear: () => upstreamClearBox.save(),
+  renderHistoryChoice: () => channelHistoryBox.renderChoice(),
+  saveHistory: () => channelHistoryBox.save(),
+  prioritizeHistory: () => channelHistoryBox.prioritize(),
+  pushClear: () => upstreamClearBox.push(),
+  openRename: () => {
+    channelSettings.showChannelPanel("rename-fields");
+    el("channel-alias").focus();
+  },
+  cancelRename: () => {
+    // Back to what the server says, not to what was typed. Cancel means the typing did not happen.
+    channelSettings.renderAliasEditor();
+    channelSettings.showChannelPanel(null);
+  },
+  openAddChannel: () => {
+    channelSettings.showChannelPanel("add-channel-fields");
+    el("new-channel-id").focus();
+  },
+  cancelAddChannel: () => {
+    el("new-channel-id").value = "";
+    el("new-channel-label").value = "";
+    el("new-channel-writable").checked = false;
+    el("add-channel-state").textContent = "";
+    channelSettings.showChannelPanel(null);
+  },
+  addChannel: guardQuietly(channelSettings.addChannel),
+  openBrowse: guardQuietly(() => channelDirectoryBox.open()),
+  closeBrowse: () => channelSettings.showChannelPanel(null),
+  scheduleDirectorySearch: () => channelDirectoryBox.scheduleSearch(),
+  directorySearchKey: (event) => {
+    if (event && event.key === "Enter") {
+      if (typeof event.preventDefault === "function") event.preventDefault();
+      guardQuietly(() => channelDirectoryBox.search())();
+    }
+  },
+  directoryMore: guardQuietly(() => channelDirectoryBox.load(true)),
+  directoryRetry: guardQuietly(() => channelDirectoryBox.retry()),
+  removeChannel: guardQuietly(channelSettings.removeChannel),
+  saveAlias: guardQuietly(channelSettings.saveAlias),
+  addNoiseRule: guardQuietly(noiseSettings.add),
+  saveSendSetting: guardQuietly(agentSettings.saveSendSetting),
+  renderPrompt: () => agentSettings.renderPrompt(),
+  saveInstructions: guardQuietly(() => agentSettings.savePrompt("instructions", el("voice-instructions").value)),
+  saveSystemPrompt: guardQuietly(() => agentSettings.savePrompt("system_prompt", el("voice-system-prompt").value)),
+  restoreSystemPrompt: guardQuietly(agentSettings.restoreSystemPrompt),
+  renderPrefix: () => agentPrefix.render(),
+  savePrefix: guardQuietly(() => agentPrefix.save(false)),
+  resetPrefix: guardQuietly(() => agentPrefix.save(true)),
+  cacheSwitched: guardQuietly(() => serverCacheBox.switched()),
+  askErase: () => serverCacheBox.ask("erase"),
+  answerEraseYes: guardQuietly(() => serverCacheBox.answer(true)),
+  answerEraseNo: guardQuietly(() => serverCacheBox.answer(false)),
+  noiseRuleKey: (event) => {
+    if (event.key === "Enter") guardQuietly(noiseSettings.add)();
+  },
+  clearAlias: guardQuietly(channelSettings.clearChannelAlias),
 });
-// `#232 upstream-mark-read`. Choosing a mode only shows what Save would do; Save is the decision.
-el("upstream-clear-mode").addEventListener("change", () => upstreamClearBox.renderChoice());
-el("upstream-clear-save").addEventListener("click", () => upstreamClearBox.save());
-el("channel-history-mode").addEventListener("change", () => channelHistoryBox.renderChoice());
-el("channel-history-save").addEventListener("click", () => channelHistoryBox.save());
-el("channel-history-prioritize").addEventListener("click", () => channelHistoryBox.prioritize());
-el("upstream-clear-push").addEventListener("click", () => upstreamClearBox.push());
-el("rename-channel").addEventListener("click", () => {
-  channelSettings.showChannelPanel("rename-fields");
-  el("channel-alias").focus();
-});
-el("cancel-rename").addEventListener("click", () => {
-  // Back to what the server says, not to what was typed. Cancel means the typing did not happen.
-  channelSettings.renderAliasEditor();
-  channelSettings.showChannelPanel(null);
-});
-el("open-add-channel").addEventListener("click", () => {
-  channelSettings.showChannelPanel("add-channel-fields");
-  el("new-channel-id").focus();
-});
-el("cancel-add-channel").addEventListener("click", () => {
-  el("new-channel-id").value = "";
-  el("new-channel-label").value = "";
-  el("new-channel-writable").checked = false;
-  el("add-channel-state").textContent = "";
-  channelSettings.showChannelPanel(null);
-});
-el("add-channel").addEventListener("click", guardQuietly(channelSettings.addChannel));
-el("open-browse-channels").addEventListener("click", guardQuietly(() => channelDirectoryBox.open()));
-el("close-browse-channels").addEventListener("click", () => channelSettings.showChannelPanel(null));
-el("channel-directory-search").addEventListener("input", () => channelDirectoryBox.scheduleSearch());
-el("channel-directory-search").addEventListener("keydown", (event) => {
-  if (event && event.key === "Enter") {
-    if (typeof event.preventDefault === "function") event.preventDefault();
-    guardQuietly(() => channelDirectoryBox.search())();
-  }
-});
-el("channel-directory-more").addEventListener(
-  "click",
-  guardQuietly(() => channelDirectoryBox.load(true))
-);
-el("channel-directory-retry").addEventListener(
-  "click",
-  // Retry what failed: the next page when rows are already showing, otherwise the first.
-  guardQuietly(() => channelDirectoryBox.retry())
-);
-el("remove-channel").addEventListener("click", guardQuietly(channelSettings.removeChannel));
-el("save-alias").addEventListener("click", guardQuietly(channelSettings.saveAlias));
-el("add-noise-rule").addEventListener("click", guardQuietly(noiseSettings.add));
-el("voice-ask-before-send").addEventListener("change", guardQuietly(agentSettings.saveSendSetting));
-el("voice-instructions").addEventListener("input", agentSettings.renderPrompt);
-el("voice-system-prompt").addEventListener("input", agentSettings.renderPrompt);
-el("save-voice-instructions").addEventListener(
-  "click",
-  guardQuietly(() => agentSettings.savePrompt("instructions", el("voice-instructions").value))
-);
-el("save-voice-system-prompt").addEventListener(
-  "click",
-  guardQuietly(() => agentSettings.savePrompt("system_prompt", el("voice-system-prompt").value))
-);
-el("restore-voice-system-prompt").addEventListener("click", guardQuietly(agentSettings.restoreSystemPrompt));
-el("voice-post-prefix").addEventListener("input", agentPrefix.render);
-el("save-voice-post-prefix").addEventListener("click", guardQuietly(() => agentPrefix.save(false)));
-el("reset-voice-post-prefix").addEventListener("click", guardQuietly(() => agentPrefix.save(true)));
-// `#208 persistent-cache`. Off and Erase only ask; the question's own button is what sends.
-el("message-cache-enabled").addEventListener("change", guardQuietly(() => serverCacheBox.switched()));
-el("message-cache-erase").addEventListener("click", () => serverCacheBox.ask("erase"));
-el("message-cache-confirm-yes").addEventListener("click", guardQuietly(() => serverCacheBox.answer(true)));
-el("message-cache-confirm-no").addEventListener("click", guardQuietly(() => serverCacheBox.answer(false)));
-el("noise-rule-new").addEventListener("keydown", (event) => {
-  if (event.key === "Enter") guardQuietly(noiseSettings.add)();
-});
-el("clear-alias").addEventListener("click", guardQuietly(channelSettings.clearChannelAlias));
 // The list's tools (`#65`, `#262 search-load-older`, `#605`-`#608 server-side-search`, `#221 read-modes`, `#564
 // message-summary-toggle`, `#820 voice-page-action-menu`, `#880 voice-page-menu-placement`): the ways further back,
 // the search's ways wider, the action menu's items closing it after their own acts, and the chips over the list. One

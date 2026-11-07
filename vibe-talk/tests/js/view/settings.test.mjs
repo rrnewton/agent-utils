@@ -376,3 +376,52 @@ test("`#624 voice-page-modularity`: Help is closed, opened at its top, and opene
   links.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
+
+test("`#624 voice-page-modularity`: the channel box's listeners are mounted in the page's order, each answering its own act, then all come down", () => {
+  const { mountChannelBoxListeners } = VIEW_SETTINGS;
+  const log = [];
+  const nodes = {};
+  const target = (id) => (nodes[id] ||= { id, listeners: [],
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
+    removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
+  const fire = (id, type, event = { type }) => nodes[id].listeners.filter((one) => one.type === type).map((one) => one.listener(event));
+  const act = (name) => (...args) => { log.push(`${name} ${args.length}`); return name; };
+  const box = mountChannelBoxListeners({
+    lookup: (id) => target(id),
+    selectChannel: act("select"), changeSelectedChannel: act("change channel"), channelPicked: act("picked"),
+    chooseSettingsService: act("service"), changeSettingsChannel: act("settings channel"),
+    renderClearChoice: act("clear choice"), saveClear: act("save clear"), renderHistoryChoice: act("history choice"),
+    saveHistory: act("save history"), prioritizeHistory: act("prioritize"), pushClear: act("push clear"),
+    openRename: act("open rename"), cancelRename: act("cancel rename"), openAddChannel: act("open add"),
+    cancelAddChannel: act("cancel add"), addChannel: act("add"), openBrowse: act("open browse"),
+    closeBrowse: act("close browse"), scheduleDirectorySearch: act("schedule search"), directorySearchKey: act("search key"),
+    directoryMore: act("more"), directoryRetry: act("retry"), removeChannel: act("remove"), saveAlias: act("save alias"),
+    clearAlias: act("clear alias"), addNoiseRule: act("add noise"), noiseRuleKey: act("noise key"),
+    saveSendSetting: act("ask before send"), renderPrompt: act("prompt"), saveInstructions: act("save instructions"),
+    saveSystemPrompt: act("save system"), restoreSystemPrompt: act("restore system"), renderPrefix: act("prefix"),
+    savePrefix: act("save prefix"), resetPrefix: act("reset prefix"), cacheSwitched: act("cache switched"),
+    askErase: act("ask erase"), answerEraseYes: act("erase yes"), answerEraseNo: act("erase no"),
+  });
+  assert.deepStrictEqual(log, ["listen discord-channel change", "listen discord-channel change", "listen discord-channel change",
+    "listen settings-service change", "listen settings-channel change", "listen upstream-clear-mode change",
+    "listen upstream-clear-save click", "listen channel-history-mode change", "listen channel-history-save click",
+    "listen channel-history-prioritize click", "listen upstream-clear-push click", "listen rename-channel click",
+    "listen cancel-rename click", "listen open-add-channel click", "listen cancel-add-channel click",
+    "listen add-channel click", "listen open-browse-channels click", "listen close-browse-channels click",
+    "listen channel-directory-search input", "listen channel-directory-search keydown", "listen channel-directory-more click",
+    "listen channel-directory-retry click", "listen remove-channel click", "listen save-alias click",
+    "listen add-noise-rule click", "listen voice-ask-before-send change", "listen voice-instructions input",
+    "listen voice-system-prompt input", "listen save-voice-instructions click", "listen save-voice-system-prompt click",
+    "listen restore-voice-system-prompt click", "listen voice-post-prefix input", "listen save-voice-post-prefix click",
+    "listen reset-voice-post-prefix click", "listen message-cache-enabled change", "listen message-cache-erase click",
+    "listen message-cache-confirm-yes click", "listen message-cache-confirm-no click", "listen noise-rule-new keydown",
+    "listen clear-alias click"], "mounted out of the page's order");
+  log.length = 0;
+  fire("discord-channel", "change"); fire("settings-channel", "change"); fire("rename-channel", "click");
+  fire("channel-directory-search", "keydown", { key: "Enter" }); fire("noise-rule-new", "keydown", { key: "Enter" });
+  fire("voice-instructions", "input"); fire("clear-alias", "click");
+  assert.deepStrictEqual(log, ["select 0", "change channel 0", "picked 0", "settings channel 0", "open rename 0",
+    "search key 1", "noise key 1", "prompt 0", "clear alias 0"]);
+  box.unmount();
+  assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
+});
