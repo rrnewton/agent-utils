@@ -1537,9 +1537,9 @@ test("a list the filters empty is shown from its head, where it says why, and fi
     "  if (listEmptied()) {\n    area.scrollTop = 0;", "  if (listEmptied()) {\n    void 0;"));
   await tapKind(unplaced, "pr");
   assert.ok(unplaced.el("scroll-area").scrollTop > 0, "the test cannot see a reader left below the sentence");
-  const jumping = await run(brokenScript(
-    "    shown = !listEmptied() && (inScrollback[screens.view()] || jumpNewestWanted[screens.view()] !== false);",
-    "    shown = inScrollback[screens.view()] || jumpNewestWanted[screens.view()] !== false;"));
+  const jumping = await run(await brokenModule([{ file: "src/view/channel/folding.ts",
+    find: "      shown = !deps.listEmptied() && (Boolean((inScrollback as Record<string, boolean>)[deps.view()]) || (jumpNewestWanted as Record<string, boolean | number>)[deps.view()] !== false);",
+    replace: "      shown = Boolean((inScrollback as Record<string, boolean>)[deps.view()]) || (jumpNewestWanted as Record<string, boolean | number>)[deps.view()] !== false;" }]));
   await tapKind(jumping, "pr");
   await jumping.el("scroll-area").dispatch("scroll");
   assert.equal(jumping.el("jump-newest").hidden, false, "the test cannot see a jump offered over an emptied list");

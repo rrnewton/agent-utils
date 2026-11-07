@@ -2275,7 +2275,7 @@ test("the jump does not flicker at its boundary: it comes at one distance and go
   ]);
 
   // THE CONTROL: one distance instead of two. It toggles inside the band, and this has to see it.
-  const control = await run(brokenScript("    } else if (gap > SCROLLBACK_PX) {", "    } else {"));
+  const control = await run(await brokenModule([{ file: "src/view/channel/folding.ts", find: "      } else if (gap > SCROLLBACK_PX) {", replace: "      } else {" }]));
   assert.ok(control.slice(8).includes("up"), "the test cannot tell one distance from two");
 });
 

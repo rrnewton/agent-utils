@@ -3537,6 +3537,7 @@ mod tests {
             "src/present/call",
             "src/core/speech",
             "src/view/channel/scrollkeep.ts",
+            "src/view/channel/folding.ts",
         ])
     }
 

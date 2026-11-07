@@ -120,7 +120,7 @@ export function insertNewline(field: HTMLElement): void {
   box.setSelectionRange(start + 1, start + 1);
   box.dispatchEvent(typeof InputEvent === "function"
     ? new InputEvent("input", { bubbles: true, inputType: "insertLineBreak" })
-    : ({ type: "input", inputType: "insertLineBreak", target: box } as unknown as Event));
+    : Object.assign(typeof Event === "function" ? new Event("input", { bubbles: true }) : { type: "input", bubbles: true, target: box }, { inputType: "insertLineBreak" }) as Event);
 }
 
 /**

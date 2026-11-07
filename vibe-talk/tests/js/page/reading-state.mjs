@@ -4974,14 +4974,14 @@ test("`#243 filter-keeps-selection`: the reader's own act ends what the change h
     keptAt(page, "28", before, `the message whose fold the reader opened${pressFirst ? ", pressed first" : ""}`);
   }
   // The press alone ends the hold, the fold's own act aside...
-  const pressed = await run(brokenScript(
-    "    readerActed();\n    preservingScroll(() => setFolded(entry, !isFolded(entry)));",
-    "    preservingScroll(() => setFolded(entry, !isFolded(entry)));"), true);
+  const pressed = await run(await brokenModule([{ file: "src/view/channel/folding.ts",
+    find: "      deps.readerActed();\n      deps.preservingScroll(() => setFolded(entry, !isFolded(entry)));",
+    replace: "      deps.preservingScroll(() => setFolded(entry, !isFolded(entry)));" }]), true);
   keptAt(pressed.page, "28", pressed.before, "the message whose fold the reader pressed and opened");
   // THE CONTROL: with neither, the message the reader opened is pushed up by the held pin.
-  const held = await run(brokenScript(
-    "    readerActed();\n    preservingScroll(() => setFolded(entry, !isFolded(entry)));",
-    "    preservingScroll(() => setFolded(entry, !isFolded(entry)));"), false);
+  const held = await run(await brokenModule([{ file: "src/view/channel/folding.ts",
+    find: "      deps.readerActed();\n      deps.preservingScroll(() => setFolded(entry, !isFolded(entry)));",
+    replace: "      deps.preservingScroll(() => setFolded(entry, !isFolded(entry)));" }]), false);
   assert.ok(yOf(held.page, "28") < held.before - 1, "the test cannot see the held pin move the message opened");
 });
 

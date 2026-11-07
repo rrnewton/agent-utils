@@ -178,7 +178,7 @@ export function createHighlightCopy<Message>(deps: HighlightCopyDependencies<Mes
     if (!pane || !row || row.parentNode !== pane.list() || !deps.rowShown(row)) return [];
     if (row.getAttribute("data-read-run") === "head") return [];
     if (row.hasAttribute("data-card")) {
-      const root = (row as unknown as { cardRoot?: Message }).cardRoot;
+      const root = (row as { cardRoot?: Message | null }).cardRoot;
       return root ? [root] : [];
     }
     return deps.rowMessages(row);

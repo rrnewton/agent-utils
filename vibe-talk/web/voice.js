@@ -3000,678 +3000,14 @@ function onTimeKey(event) {
 //
 // 280 characters is about four lines at phone width — comfortably past the three the fold shows by
 // default, so a folded message ordinarily has something behind it.
-const COLLAPSE_OVER_CHARS = 280;
-
-const FOLD_MORE = "More";
-const FOLD_LESS = "Less";
-
-// --- how much a fold is hiding --------------------------------------------------------------------
-//
-// `#244 elision-word-count`. The owner: "when messages are collapsed I have no idea if they're big
-// huge messages or just barely over the limit". So a folded message says, under its last line, how
-// much the fold is keeping back: "(~240 more words)". The model that counts is web/src/present/rows
-// (`foldPieces`, `foldShows`, `elisionLabels`, `FOLD_WIDTHS_EM`); web/src/view/channel reads a drawn body
-// for it (`foldRuns`) and draws the labels it gives (`elisionLine`, `foldedTextLine`).
-//
-//   * NEVER MORE THAN IS HIDDEN. The fold is a CSS clamp of the reader's lines, so where the cut falls
-//     depends on how wide the row's lines are, the text size, and how the browser breaks them. This
-//     file asks the layout engine none of that: a read per long row on every redraw is the forced
-//     layout `#226` took out of the redraw path. It works the count out once, when the row is built,
-//     from what the row draws, AT EVERY WIDTH A LINE CAN BE (`FOLD_WIDTHS_EM`), and the stylesheet
-//     shows the one for the width the row has. The label is a size container of its own, as wide as
-//     the text above it and in that text's em, so its container query picks the class from the row
-//     as drawn — a phone, a desk's column, one of two columns, a reply's inset, the reader's text
-//     size — and nothing is measured (web/voice.css, `.elided`). An earlier count assumed a phone's
-//     line everywhere, and on a desk said words were hidden under a message that fitted in three
-//     lines.
-//   * EACH COUNT IS A FLOOR: worked out at the WIDEST line of its class, with every character at the
-//     narrow end of what the common interface fonts draw (`glyphEm`). So it may say fewer words than
-//     are hidden, and never more; and under `ELIDED_MIN_WORDS` it says nothing, because a floor that
-//     close to nothing cannot say that anything at all is hidden. The "~" says it is an estimate.
-//   * ROUNDED DOWN as such a floor should be: exact under twenty, to five under a hundred, to ten
-//     under a thousand, to a hundred above. "~312" would claim a precision the number does not have.
-//   * WORDS ARE WHAT THE ROW SHOWS, split on white space: the drawn text of a channel row (never
-//     its markup, and a link counts as the words it shows), the spoken text of a transcript turn.
-//     On a row with a rich header (`#242 rich-headers`) the words the header restates are hidden
-//     from the text while it shows, so they are counted out, and back in where the switch is off.
-//   * NOT EVERYTHING IN A MESSAGE IS PROSE, and the clamp does not treat it all as lines
-//     (`foldRuns`). A TABLE scrolls sideways in a box of its own (web/voice.css, `.md table`), and
-//     the clamp counts no line inside such a box: it draws the table whole and goes on counting
-//     below it, so a table counts as shown, all of it, when it starts inside the shown lines, and
-//     hidden when it starts below them. From review: counted as a line per cell, a folded table said
-//     "(~95 more words)" with every word of it on the screen. A CODE BLOCK's lines are its own, in a
-//     monospaced face at its smaller size (`MONO_EM`), and where the clamp's last line is one of
-//     them the block's own padding shows the top of the next, which the reader can see, so it counts
-//     as shown. A list is lines like any other, each item starting one. Anything the model has no
-//     rule for gets NO label at all: what it takes up cannot be known without laying it out, and a
-//     guess is a label that can claim words the reader is looking at. (An image never reaches here:
-//     the server sends a message's image as a link, its words.)
-//   * TEXT POOR IN SPACES IS COUNTED IN CHARACTERS. Chinese or Japanese has no spaces to count words
-//     by, and a long bare address is one "word": counted in words, a clamp hiding most of either
-//     would hide nothing. Where what is hidden runs to more than `SPACE_POOR_CHARS` characters a
-//     word, the label counts its characters instead — "(~400 more characters)" — and says nothing
-//     under `ELIDED_MIN_CHARS`. A character of those scripts is a place a line may break, as the
-//     browser breaks there.
-//   * "MORE", and no "…" of its own: the clamp has already ended the last line with one, and the
-//     label continues it. "More" is what says these are the words still hidden, not the total.
-/**
- * `#425 collapsed-lines`. The lines a fold shows: the reader's own count, per device, three until
- * they say otherwise. 0 is the header alone, 8 a generous opening; past that the fold is barely a
- * fold. The stylesheet reads the same count as `--collapsed-lines` (web/voice.css), and this model
- * counts hidden words against it, so the two cannot disagree about where the cut falls — which is
- * what the fixed three this replaces held by being one number in two files.
- */
-
-/**
- * The collapsed-lines count in force, with what was stored, putting a count on the page and keeping it: one
- * owner in web/src/core/settings/messagelimits.ts (`#624 voice-page-modularity`). Its `apply` is the
- * count's only writer; Settings' slider draws it.
- *
- * @type {import("./src/core/settings/index.ts").CollapsedLines}
- */
+// Folds, summaries and the chips over the list are web/src/view/channel's now (`createFolding`,
+// `#624 voice-page-modularity`): which messages are folded and opened, summaries asked for as you
+// scroll, the jump to the newest message, the scroll tools' pass, and ; / : stepping. Why each
+// behaves as it does is told there.
 const collapsedLines = createCollapsedLines({
   deviceSettings: () => deviceSettings(),
   render: (n) => messagePreferences.collapsedLines.render(n),
 });
-
-// The glyph widths the fold model counts lines by (`WIDE_SCRIPT`, `glyphEm`, `SPACE_EM`, `MONO_EM`,
-// `monoEm`) are a module now: web/src/foundation/ (`#624 voice-page-modularity`).
-
-// A message with a fold control carries its fold on its own row, `li.foldEntry` (`foldable`), and
-// whatever acts on the folds of a list reads them off the list's rows (`foldsOf`). NO LIST OF FOLDS
-// IS KEPT BESIDE THE ROWS. One was, pruned of rows gone from the page only when something read it,
-// and it was wrong both ways (`#301 semicolon-expand-cycle`): a view the page held while another
-// showed lost its folds from it and came back with nothing for the chips, the keys or Summaries to
-// act on; and once Expand all stopped reading it, each poll's rebuild of the channel added an entry
-// per long message, each holding its thrown-away row, for as long as the page stayed open — a
-// thousand a poll on a long channel — while the row being read aloud was looked for through all of
-// them on every draw. The rows are the record: a row thrown away takes its fold with it, and a
-// row drawn again brings its fold back.
-
-/** The lists a message with a fold control is drawn in: the call's transcript, and the channel's in both columns. */
-const FOLD_LISTS = ["transcript", "discord-log", "pinned-log", "side-log", "side-pinned-log"];
-
-/**
- * The folds of the messages in `list`, in its order: each row's own.
- *
- * @param {Element | null} list
- * @returns {any[]}
- */
-function foldsOf(list) {
-  if (!list) return [];
-  return /** @type {any[]} */ ([...list.children]).filter((li) => li.foldEntry).map((li) => li.foldEntry);
-}
-
-/**
- * Which messages the reader has OPENED, by message id.
- *
- * The channel re-reads itself every DISCORD_POLL_MS and `applyNewestPage` rebuilds every row, and a
- * freshly built row starts folded — so a message opened by hand collapsed itself under the reader
- * within forty-five seconds, repeatedly, while they were still reading it. The row being read
- * aloud was given a special case for this; every other row was left with the bug.
- *
- * A SET OF IDS rather than a flag on the row, because the row is the thing being thrown away. The
- * id is what survives a rebuild, so the id is what has to carry the state.
- *
- * Session-only and unbounded within the session: a reader who opens two hundred messages has two
- * hundred short strings, and forgetting one of them is the bug.
- */
-const expandedIds = new Set();
-
-function setFolded(entry, folded) {
-  // Recorded BEFORE anything is drawn, so every path that folds a row -- the control, the tap, the
-  // read-aloud auto-open -- feeds the same record without having to remember to.
-  if (entry.id) {
-    if (folded) {
-      expandedIds.delete(entry.id);
-    } else {
-      expandedIds.add(entry.id);
-    }
-  }
-  entry.li.setAttribute("data-collapsed", folded ? "true" : "false");
-  // `#49 cached-summaries`. A summary REPLACES the clamped opening lines; it never sits above
-  // them. Two condensations of the same message stacked on one row is not a shorter row, and it
-  // would make the fold control ambiguous about which of the two "More" opens.
-  //
-  // ONLY when a summary is actually in hand — `ready`, not merely asked for. Turning the mode on
-  // used to swap every foldable row at once, before a single answer had come back: the markdown
-  // body was hidden and a bare "summarising…" put in its place, so pressing the control appeared
-  // to break rendering across the whole view and then never finish. A row with nothing to show
-  // yet is a row that has nothing to show, and it keeps its own rendered opening lines until the
-  // moment it does.
-  const summarised = folded && summaryRows.mode() && entry.note !== null && entry.summaryState === "ready";
-  entry.body.hidden = summarised;
-  // What the STYLING keys off. A summary is not the message: it is a machine's reading of it, in
-  // plain text where the message was markdown, and the row has to say so on its own — without it,
-  // the only difference a reader can see is that the formatting stopped working.
-  entry.li.setAttribute("data-summarised", summarised ? "true" : "false");
-  // `#564 message-summary-toggle`. In its thread's colour, as the card's edge and the bridge are,
-  // never a fixed accent; a message in no thread has none to match (web/voice.css).
-  const hueThread = summarised ? summaryThread(entry) : null;
-  if (hueThread !== null) {
-    entry.li.style.setProperty("--summary-hue", String(threadHue(hueThread)));
-    entry.li.setAttribute("data-summary-hue", "");
-  } else if (entry.li.hasAttribute("data-summary-hue")) {
-    entry.li.removeAttribute("data-summary-hue");
-    entry.li.style.removeProperty("--summary-hue");
-  }
-  entry.body.className = folded ? "body clamped" : "body";
-  // A row whose summary FAILED shows its note AS WELL AS the message — the one case where the two
-  // are on the row together. The note is appended after the body, so those words read UNDER the
-  // message they are about; the tint and the bar are what catch the eye, and the words are what
-  // say which of the several things a coloured row can mean this one is.
-  //
-  // It is not a second condensation, so it does not reopen the ambiguity the paragraph above
-  // closes: the note carries two words saying the summary did not arrive and nothing else —
-  // `.summary-text` is empty. Taking those words away would leave the failure as a tint and a data
-  // attribute, and a screen reader can say neither.
-  //
-  // Written HERE for visibility only. Which rows are failed, and the mark itself, are decided in
-  // `applySummaryState`; see the reason there.
-  if (entry.note) {
-    entry.note.hidden = !(summarised || (summaryRows.mode() && entry.summaryState === "failed"));
-  }
-  entry.fold.textContent = folded ? FOLD_MORE : FOLD_LESS;
-  entry.fold.setAttribute("aria-expanded", folded ? "false" : "true");
-  // `#244 elision-word-count`. Under the clamped lines only: an open message hides nothing, and a
-  // summary standing in for the lines is not the text the count is about.
-  if (entry.elided) entry.elided.hidden = !folded || summarised;
-  // `#249 search-highlight`. The search's line of hits beyond the fold, while it is folded: open, they
-  // are in the text.
-  const marked = entry.li.searchMarks;
-  if (marked && marked.excerpt) marked.excerpt.hidden = !folded;
-}
-
-const isFolded = (entry) => entry.li.getAttribute("data-collapsed") === "true";
-
-/**
- * The thread a summarised row's colour is taken from: the one it is unpacked under, or its own
- * message's, or null for a message in no thread — and for the conversation a single-conversation
- * channel is, which is the channel itself rather than a thread with a colour.
- */
-function summaryThread(entry) {
-  const thread = entry.li.getAttribute("data-unpack-thread") || threadOf(rowMessages(entry.li)[0]);
-  return thread && thread !== channelStore.current().scope ? thread : null;
-}
-
-/**
- * Fold this message if it is long enough to be worth folding.
- *
- * Called from both message lists with the pieces each of them has already built, so the control,
- * the class and the attribute are identical in the transcript and in the channel. Returns the
- * button, or null when the message is short and gets none.
- *
- * `messageId` is the channel's, and it is what makes a row summarisable: a voice turn has no
- * server-side identity and nothing to key a cached summary under, so the transcript passes
- * nothing and gets no summary line. `#49 cached-summaries` deliberately hangs off THIS function
- * rather than beside it — "long enough to be worth folding" and "long enough to be worth
- * summarising" have to be the same sentence, or the page would grow a second definition of short.
- */
-function foldable(li, meta, body, text, messageId, alsoIds = []) {
-  if (String(text === null || text === undefined ? "" : text).length <= COLLAPSE_OVER_CHARS) {
-    return null;
-  }
-  const fold = document.createElement("button");
-  fold.className = "fold";
-  fold.setAttribute("type", "button");
-  const entry = {
-    li,
-    body,
-    fold,
-    // `#425 collapsed-lines`. Held so the count under the fold can be worked out again when the
-    // reader's lines change, without rebuilding the row: a drawn body is read for its runs, and
-    // a spoken turn's count is from this text alone (`foldedTextLine`).
-    foldText: text,
-    id: messageId || null,
-    also: alsoIds,
-    note: null,
-    mark: null,
-    said: null,
-    elided: null,
-  };
-  // `#244 elision-word-count`. Counted once, here, from what the row shows; see `foldedTextLine`.
-  // Straight after the text, ahead of the summary line below and of the reactions the channel row
-  // moves under both, so it reads as the end of the folded message.
-  entry.elided = foldedTextLine(body, text, collapsedLines.current());
-  if (entry.elided) li.append(entry.elided);
-  if (entry.id) {
-    entry.note = document.createElement("div");
-    entry.note.className = "summary";
-    const mark = document.createElement("span");
-    mark.className = "summary-mark";
-    // On every summarised row, not once at the top: the reader scrolls, the note at the head of
-    // the view scrolls away with it, and a short line with nothing marking it reads as the
-    // message itself rather than as something written about the message.
-    mark.textContent = SUMMARY_MARK;
-    // Held, because the word CHANGES: a row whose summary failed says so here, in words, and a
-    // data attribute is invisible to anything that is not a stylesheet.
-    entry.mark = mark;
-    entry.said = document.createElement("span");
-    entry.said.className = "summary-text";
-    // A summary is a model's reading of third-party text and is third-party text itself.
-    // `textContent`, never the markdown renderer the body gets.
-    entry.said.textContent = "";
-    entry.note.append(mark, entry.said);
-    li.append(entry.note);
-    applySummaryState(entry);
-  }
-  // The row's fold, the one record of it (`foldsOf`), for everything that acts on folds — the line
-  // the search puts under a folded message (`#249 search-highlight`) among them.
-  li.foldEntry = entry;
-  // Folded UNLESS the reader had already opened this message. The rebuild is invisible to them;
-  // a message that was open before the poll is open after it.
-  setFolded(entry, !(entry.id !== null && expandedIds.has(entry.id)));
-  // Toggling changes the height of something that may be far above the viewport, which is the one
-  // case the browser's own scroll anchoring does not cover.
-  fold.addEventListener("click", inThisColumn(() => {
-    // The reader's own act: measured from where they are, not from a message a filter change held.
-    // `#243 filter-keeps-selection`.
-    readerActed();
-    preservingScroll(() => setFolded(entry, !isFolded(entry)));
-    renderScrollTools();
-  }));
-  meta.append(fold);
-  return fold;
-}
-
-// --- summaries, asked for as you scroll -----------------------------------------------------------
-//
-// `#49 cached-summaries`. The server half of this landed on its own and had NOTHING reading it:
-// `GET /api/v1/channels/{id}/messages/{id}/summary` answers with a summary, the store caches it
-// under a policy-versioned key, a startup sweep collects the entries a changed policy orphaned —
-// and no view showed one, no control asked for one, and this file did not mention it. A cache
-// nobody spends is a cost with no benefit.
-//
-// The half a person can see is deliberately small, and every decision in it is the issue's:
-//
-//   * COLLAPSING TO A PREFIX STAYS THE DEFAULT. Summaries are a MODE the reader turns on, so the
-//     ordinary case still costs nothing at all.
-//   * SHORT IS DEFINED ONCE. A row is summarisable exactly when it is foldable, which is
-//     `COLLAPSE_OVER_CHARS` in `foldable` above and nowhere else. The server has its own,
-//     stricter, threshold and answers `below_threshold` when a message clears ours and not its —
-//     which is not a failure and not a summary, so the row simply keeps its opening lines.
-//   * ONE REQUEST PER MESSAGE, EVER. The owner's `summariesAsked` (web/src/core/channels/summaries.ts)
-//     is the record, and it is consulted before the fetch rather than after it, so a hundred scroll
-//     events over one row are one request.
-//   * ONLY WHAT YOU ARE LOOKING AT. Nothing is spent on rows the reader never reaches.
-//   * THE MODE IS THE OWNER'S SETTING, OFF UNLESS HE TURNS IT ON (`#564 message-summary-toggle`).
-//     It was once session-only, an act rather than a preference. The owner, 2026-10-26: "I'm
-//     actually really NOT liking the summaries of collapsed messages ... I also want a toggle to
-//     turn summarization off on messages. But I want to keep summarization on for thread cards."
-//     So it is "Summarize collapsed messages" in Settings > Messages, synced like its neighbours,
-//     and the Summaries chip is the same switch. Off, nothing is asked and the server refuses
-//     anything that asks anyway (`summaries_off`); thread cards are the thread namer's and are
-//     untouched.
-//   * A FAILURE IS SHOWN, ON THE ROW IT HAPPENED TO. Every summary is now a paid round trip to a
-//     vendor, so "no summary arrived" is a thing that happens and a thing that costs. The row
-//     says `summary failed` in small muted words and KEEPS ITS MESSAGE, its read state and its
-//     Done (`#564 message-summary-toggle`: it used to turn red); the page never puts an apology
-//     where the content should be. The failures in one turn are counted and said once, and a
-//     server with no summariser at all is stated as a standing sentence rather than as fifty
-//     identical pills. See `summaryFailed` in web/src/core/channels/summaries.ts.
-//
-// What is NOT here, and is the server's job rather than this file's: deciding whether an answer
-// came from the cache. The page asks the same way either way and is told which happened; acting
-// on the difference would be the page second-guessing a cache it cannot see.
-
-// How far beyond the viewport a row is still worth summarising. The point is that the line is
-// there when the reader arrives at it rather than appearing under their eye.
-const SUMMARY_LOOKAHEAD_PX = 600;
-
-/**
- * What the server has said about each row's summary, which rows have been asked about, the requests
- * waiting and on the wire, and whether this server can summarise at all: web/src/core/channels's
- * (`createSummaries`, `#624 voice-page-modularity`). The marks, the chip's labels and the note's
- * words are web/src/present/rows's.
- */
-const summaryRows = createSummaries({
-  clock: clockOnUse(),
-  channel: () => selectedChannelId(),
-  threadOf: (id) => threadForMessageId(id),
-  // The rest of the glommed row, so the server summarises what the reader is actually looking at.
-  // Absent entirely for an ordinary single-message row, which keeps that URL exactly as it was.
-  fetch: (channel, id, alsoIds, thread) => {
-    const also = alsoIds.length
-      ? `?with=${encodeURIComponent(alsoIds.join(","))}`
-      : "";
-    return api(
-      withThreadQuery(`/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/summary${also}`, thread)
-    );
-  },
-  render: () => renderSummaries(),
-  failuresReported: (count, why) => setStatus(summaryFailureWords(count, why)),
-  askAgain: () => requestVisibleSummaries(),
-});
-
-/**
- * Turn "Summarize collapsed messages" on or off, keep it, and put the mode in step. The chip over
- * the list and the switch in Settings are the one setting (`#564 message-summary-toggle`).
- */
-function applySummarizeCollapsed(on) {
-  const wanted = Boolean(on);
-  messagePreferences.summaries.render(wanted);
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.summarizeCollapsed, wanted);
-  } catch (_error) {
-    // A browser that refuses storage still honours the choice for this session.
-  }
-  if (wanted !== summaryRows.mode()) setSummaryMode(wanted);
-}
-
-/** What was stored. ABSENT MEANS OFF: every summary is a paid model call, and the owner asked. */
-function storedSummarizeCollapsed() {
-  // A browser refusing storage reads as off (`DEVICE_SETTINGS.summarizeCollapsed.refused`).
-  return deviceSettings().get(DEVICE_SETTINGS.summarizeCollapsed);
-}
-
-/**
- * The server's settings were read or written: if it now holds summaries on, the rows it refused
- * while it held them off are asked again. Called by the settings sync (`landed`), after every read,
- * write and stream frame.
- */
-function summariesSettingLanded() {
-  const heldOn = () => {
-    const held = settingsSync().agreed(SUMMARIZE_COLLAPSED_KEY);
-    return Boolean(held) && held.value === "1";
-  };
-  if (!summaryRows.settingLanded(heldOn)) return;
-  requestVisibleSummaries();
-  inOtherColumn(requestVisibleSummaries);
-}
-
-/**
- * Put one row into the state the map says it is in.
- *
- * THIS function writes the failure mark, and the reason is the REBUILD, not this function's call
- * sites. The channel throws every `<li>` away and builds it again every DISCORD_POLL_MS, so a mark
- * written once where the failure is FIRST OBSERVED — in the owner's `summaryFailed`, the obvious
- * place — lives until the next poll and then quietly disappears. For a failure that is the worst behaviour
- * available: the reader sees a red row, looks away, and finds an ordinary one when they look back.
- * So it has to be written by something the rebuild runs, from the map that outlives the row.
- *
- * An earlier version of this comment claimed this was the ONLY function called from both the
- * row-build and redraw paths. That is not true — `setFolded` is called from both as well, and from
- * three other places besides — so no test can tell the two locations apart, and moving these writes
- * there passes. What IS pinned, by `A FAILED ROW STAYS RED THROUGH MORE, LESS, AND THE POLL THAT
- * REBUILDS IT`, is that they are not written once at observation time. Do not restore the stronger
- * claim without a test that can actually fail.
- */
-function applySummaryState(entry) {
-  if (!entry.note) {
-    return;
-  }
-  const held = summaryRows.held(summaryKey(entry));
-  const failed = held !== undefined && held.failed === true;
-  if (held === undefined) {
-    // Nothing has come back yet. The text is staged so the row is ready the instant it does, but
-    // `setFolded` will not show it — a row still waiting keeps its rendered body. See there.
-    entry.summaryState = "waiting";
-    entry.said.textContent = SUMMARY_WAITING;
-  } else if (failed) {
-    // ASKED ABOUT, AND IT DID NOT COME. The row KEEPS ITS MESSAGE — the body is never replaced,
-    // because the message is the one thing the reader still has and an apology where the content
-    // should be is strictly worse than the row they would have had with the mode off. What
-    // changes is the SURFACE: red, with two words saying why, and the server's own sentence on the
-    // row's title. Everything a failure states is stated here, so the poll cannot undo it.
-    entry.summaryState = "failed";
-    entry.said.textContent = "";
-  } else if (held.text === null) {
-    // Nothing to show, so show the message. This is the SERVER'S OWN THRESHOLD — it read the
-    // message and decided a shortened copy of something already short would be a claim that work
-    // was done. It is an answer, not a failure, and reddening it would tell the reader something
-    // is broken about the most ordinary case there is.
-    entry.summaryState = "none";
-    entry.said.textContent = "";
-  } else {
-    entry.summaryState = "ready";
-    entry.said.textContent = held.text;
-  }
-  // Written on EVERY path, in both directions, so a row that failed and was then answered stops
-  // being red — a state that can only be entered is not a state, it is a stain.
-  entry.mark.textContent = entry.summaryState === "failed" ? SUMMARY_FAILED_MARK : SUMMARY_MARK;
-  entry.li.setAttribute("data-summary-failed", failed && summaryRows.mode() ? "true" : "false");
-  // The REASON, which the two-word mark deliberately does not carry: one row's failure and the
-  // whole server being unconfigured look identical on the surface and are not the same problem.
-  entry.li.setAttribute("title", failed && summaryRows.mode() ? String(held.why || "") : "");
-}
-
-/** Every row's summary line brought back into agreement with what the server has said. */
-function renderSummaries() {
-  preservingScroll(() => {
-    for (const entry of FOLD_LISTS.flatMap((id) => foldsOf(leftEl(id)))) {
-      applySummaryState(entry);
-      setFolded(entry, isFolded(entry));
-    }
-    const note = el("summary-note");
-    const on = summaryRows.mode();
-    note.hidden = !on;
-    note.textContent = on ? summaryNoteWords(summaryRows.unavailable(), summaryRows.backend(), summaryRows.times()) : "";
-    // ...and it is DRAWN as a problem, not as a hint. The owner's report on the sentence this
-    // replaces is that they had been reading it for weeks without noticing what it said, because
-    // a quiet grey line at the head of a view is exactly what the eye is trained to skip.
-    note.setAttribute("data-unavailable", on && summaryRows.unavailable() ? "true" : "false");
-  });
-  renderScrollTools();
-}
-
-/**
- * The rows worth asking about right now: foldable, in the channel list, and near the viewport.
- *
- * `#scroll-area`'s own rectangle is the frame — `scrollAnchor` measures against the same edge —
- * and `clientHeight` is its bottom, because the element's box is the viewport while its
- * `scrollHeight` is the whole history behind it.
- */
-function summaryTargets() {
-  // `#211 link-filter`. A summary stands in for a row's text, and under the Links filter that text
-  // is not on screen: a summary asked for there is one paid for and never seen.
-  if (!summaryRows.mode() || screens.view() !== "discord" || (searchField.open() && searchField.links())) {
-    return [];
-  }
-  // A server that has said it has no summariser will say it again for every row, and each of
-  // those refusals costs this server a full Discord window fetch to arrive at. One request found
-  // out; the note says so; scrolling through the rest of the channel buys nothing.
-  if (summaryRows.unavailable()) {
-    return [];
-  }
-  const area = el("scroll-area");
-  const top = area.getBoundingClientRect().top - SUMMARY_LOOKAHEAD_PX;
-  const bottom = top + (area.clientHeight || 0) + 2 * SUMMARY_LOOKAHEAD_PX;
-  return foldsOf(shownChannelList()).filter((entry) => {
-    // Not a row of a collapsed run of read messages, which is not on screen. `#221 read-modes`.
-    if (!entry.id || entry.li.hasAttribute("data-read-run")) {
-      return false;
-    }
-    const box = entry.li.getBoundingClientRect();
-    return box.bottom > top && box.top < bottom;
-  });
-}
-
-/**
- * Ask about the rows on screen that have not been asked about.
- *
- * `limit` is how many requests this pass may issue. It is `Infinity` everywhere except the ONE
- * caller that is re-checking a server which last said it had no summariser at all: that reader
- * pressed a button, and answering them costs one request rather than one per visible row.
- */
-function requestVisibleSummaries(limit = Infinity) {
-  summaryRows.ask(summaryTargets(), limit);
-}
-
-function setSummaryMode(on) {
-  const { entered, recheck } = summaryRows.setMode(on);
-  if (!entered) return;
-  el("summarise").setAttribute("aria-pressed", on ? "true" : "false");
-  el("summarise-label").textContent = on ? SUMMARY_MODE_ON : SUMMARY_MODE_OFF;
-  // Both columns' rows. `#229 desktop-two-column`. A re-check is one request, wherever it is asked.
-  eachColumn(renderSummaries);
-  requestVisibleSummaries(recheck ? 1 : Infinity);
-  if (!recheck) inOtherColumn(requestVisibleSummaries);
-}
-
-// --- the chips over the list ----------------------------------------------------------------
-//
-// All of them are ABSENT unless there is something for them to do, for the same reason Hang up is
-// absent when there is no call: a control that is always there and usually inert teaches the eye
-// to skip the corner it lives in.
-
-// PER LIST, not per page. Both lists live in one #scroll-area, so a single flag would raise the
-// chip for a voice turn while the reader is looking at the channel — offering to jump them to the
-// bottom of a list nothing arrived in — and would leave a channel arrival with no chip at all.
-// The chip belongs to the list it is about.
-//
-// `#207 scrollback-jump` made it say HOW MUCH arrived, so it holds one of three things: `false`,
-// nothing arrived below the reader; a number, that many new messages did; or `true`, something
-// did that cannot be counted. A number never grows out of `true`: unknown plus three is still
-// unknown, and "3 new" over sixty would be a lie. The number can be 0: something changed below
-// that is not a new message — a turn still being spoken, a seam — and the jump says only "New"
-// until a message that can be counted arrives after it.
-/**
- * A column's own record of where its list stands against its newest message (`#624
- * voice-page-modularity`, plan step 15, as `freshOlderPages`): `jumpWanted`, the channel list's entry
- * of `jumpNewestWanted`; `inScrollback`, its entry of `inScrollback`. The voice list's entries are the
- * page's, there being one voice list.
- *
- * @returns {{jumpWanted: boolean | number, inScrollback: boolean}}
- */
-function freshScrollPlace() {
-  return { jumpWanted: false, inScrollback: false };
-}
-
-/** The column being worked on's record of where its list stands (`freshScrollPlace`). */
-function scrollPlace() {
-  return columnWork.active().place;
-}
-
-/**
- * By list, the arrival its jump to the newest message is for. The channel list's (`discord`) is the
- * column worked on's (`scrollPlace`), reached through the property so every `[view]` lookup reads it.
- *
- * @type {{voice: boolean | number, discord: boolean | number}}
- */
-const jumpNewestWanted = {
-  voice: false,
-  get discord() { return scrollPlace().jumpWanted; },
-  set discord(value) { scrollPlace().jumpWanted = value; },
-};
-
-/**
- * Raise or lower the arrival on one list's jump. `arrived` is how many new messages it was for:
- * 0 for a change below that is not a new message (a turn still being spoken, a seam), `null` for
- * messages that cannot be counted.
- */
-function setJumpNewest(wanted, view = screens.view(), arrived = 0) {
-  const held = jumpNewestWanted[view];
-  if (!wanted) jumpNewestWanted[view] = false;
-  else if (arrived === null || held === true) jumpNewestWanted[view] = true;
-  else jumpNewestWanted[view] = (held || 0) + arrived;
-  renderScrollTools();
-}
-
-/**
- * `#207 scrollback-jump`. The jump to the newest message is offered whenever the list on screen is
- * scrolled away from it — not only when something arrives — because the reader who has wandered
- * up the history is the one who wants the way back, whether or not anything new is waiting there.
- *
- * TWO DISTANCES, NOT ONE, so it cannot flicker. It goes away at `BOTTOM_SLACK_PX`, the page's own
- * "at the newest" — the line `followIfPinned` follows from, so a reader it is offered to is a
- * reader the page has stopped following — and comes back only past this, further up. In between
- * it keeps whatever it was showing: a thumb resting on the boundary, or a fling decaying through
- * it, crosses one of them once and does not toggle the control frame by frame.
- *
- * Measured against the very end of the list, as `atBottom` is, and so in the channel the composer
- * below the newest message counts: tapping the jump lands on both, and that is where it lands.
- */
-const SCROLLBACK_PX = 64;
-
-/**
- * Whether each list is in its scrollback, as the jump last decided it. See `SCROLLBACK_PX`. The channel
- * list's (`discord`) is the column worked on's (`scrollPlace`), as `jumpNewestWanted`'s is.
- *
- * @type {{voice: boolean, discord: boolean}}
- */
-const inScrollback = {
-  voice: false,
-  get discord() { return scrollPlace().inScrollback; },
-  set discord(value) { scrollPlace().inScrollback = value; },
-};
-
-/** The largest count the jump spells out; past it, "99+ new". A wider chip says nothing more. */
-const JUMP_COUNT_MAX = 99;
-
-/**
- * Show, hide and word the jump for the list on screen, from where that list is scrolled now.
- *
- * Cheap on purpose, because the scroll listener calls it on every event: a few reads of a layout
- * the scroll has already computed, and a write only when something changed. Every programmatic
- * placement of the reader ends in it as well — `renderScrollTools`, `restoreScroll`,
- * `scrollToNewest` — so a restore that lands on the newest message never shows it, and one that
- * lands up the history shows it at once rather than waiting for a scroll event to say so. So does
- * a change in the list's size that moves its end without a scroll: see the observer beside the
- * scroll listener.
- */
-function renderJumpNewest() {
-  const button = el("jump-newest");
-  let shown = false;
-  let unsent = null;
-  // Only over a list on screen. Anywhere else #scroll-area is hidden and measures nothing at all,
-  // and taking that zero for "at the newest" would forget where the list was left.
-  if (screens.screen() === "main") {
-    const area = el("scroll-area");
-    // `#338 column-overscroll`. From the foot of the rows, the room past it fitted to them first: a reader
-    // in that room is at the newest, and is offered no way down to where they already are.
-    if (columnWork.side()) fitOverscroll(area);
-    const gap = footGap(area);
-    if (gap <= BOTTOM_SLACK_PX) {
-      // At the newest, which is also all of a list too short to scroll. Nothing is below to jump
-      // to, and nothing that arrived is still unseen.
-      inScrollback[screens.view()] = false;
-      jumpNewestWanted[screens.view()] = false;
-      // ...nor a reply that did not go, whose outbox row is down here (`#277 reply-in-column`). Only
-      // from a list with a height: a column not drawn is at no foot.
-      if ((area.clientHeight || 0) > 0 && screens.view() === "discord") unseenColumnReplies[columnWork.active().name] = null;
-    } else if (gap > SCROLLBACK_PX) {
-      inScrollback[screens.view()] = true;
-    }
-    // ...and never over a list the filters emptied (`#212 link-filter`, from review). Every row in
-    // it is hidden, so there is no newest message to go to: the jump would only take the reader past
-    // the sentence saying why to the composer under it, which `placeFilterAnchor` scrolled them up from.
-    shown = !listEmptied() && (inScrollback[screens.view()] || jumpNewestWanted[screens.view()] !== false);
-    // `#277 reply-in-column`. A reply sent from this column that did not go raises it too, over the same
-    // lists: the way down is the way to its Retry.
-    if (screens.view() === "discord") unsent = unseenColumnReply();
-    if (unsent !== null && !shown) shown = !listEmptied();
-  }
-  // The arrival changes what the ONE control says, rather than raising a second one beside it.
-  const arrived = jumpNewestWanted[screens.view()];
-  const count = typeof arrived === "number" && arrived > 0 ? arrived : 0;
-  const many = count > JUMP_COUNT_MAX ? `${JUMP_COUNT_MAX}+` : String(count);
-  // `#277 reply-in-column`. So does a reply sent from this column that did not go, before anything
-  // else: the way down is the way to its Retry. In the orange of the outbox row it leads to.
-  const failed = unsent !== null && unsent.state === "failed";
-  // `#269 approval-card-inline`. A draft waiting below is what the jump goes to, so it says so.
-  const draft = unsent === null && shown && voiceTranscript().draftBelowView();
-  const label = unsent !== null ? (failed ? "Reply not sent" : "Reply unconfirmed")
-    : draft ? "Draft to send" : arrived === false ? "Newest" : count ? `${many} new` : "New";
-  const name = unsent !== null
-    ? `Jump to your reply, which ${failed ? "was not sent" : "may not have been posted"}, at the foot of the list`
-    : draft
-      ? "Jump to the draft waiting to be sent"
-      : arrived === false
-        ? "Jump to the newest message"
-        : `Jump to the newest message, ${count ? `${many} new` : "something new below"}`;
-  if (button.hidden === shown) button.hidden = !shown;
-  if (el("jump-newest-label").textContent !== label) el("jump-newest-label").textContent = label;
-  if (button.getAttribute("aria-label") !== name) button.setAttribute("aria-label", name);
-  if (button.hasAttribute("data-arrivals") === (arrived === false)) {
-    button.toggleAttribute("data-arrivals", arrived !== false);
-  }
-  if (button.hasAttribute("data-unsent") !== (unsent !== null)) button.toggleAttribute("data-unsent", unsent !== null);
-  // `#240 reading-bookmark`. The chip beside it, on the same occasions: every scroll, restore and
-  // screen change asks this one.
-  renderJumpBookmark();
-  // `#837 voice-page-jump-to-reading`. And the way back to the message being read: its rows may be new.
-  readingJump.refresh();
-}
 
 /**
  * `#837 voice-page-jump-to-reading`. The chip back to the message being read aloud (web/src/view/voice
@@ -3680,348 +3016,98 @@ function renderJumpNewest() {
 const readingJump = createReadingJump({
   chip: () => leftEl("jump-reading"),
   rows: () => {
-    // Read-aloud as it stands: a page that has read nothing has no owner to make for this.
     if (screens.screen() !== "main" || !pageReadAloud) return [];
     const rows = pageReadAloud.readingRowsShown();
-    // The Threads view lays the chips' row out hidden (`visibility`), with the list: no chip to show there.
     const tools = leftEl("scroll-tools");
     return rows.length > 0 && typeof window.getComputedStyle === "function" &&
       window.getComputedStyle(tools).visibility === "hidden" ? [] : rows;
   },
 });
 
-/**
- * The folds in the list actually on screen. Collapse all acts on what you are looking at — and
- * while the Links filter is on, no row's text is on screen to fold, so there are none
- * (`#211 link-filter`): Expand all and Collapse all would change only what cannot be seen.
- */
-function visibleFolds() {
-  if (searchField.open() && searchField.links()) return [];
-  // In the right column while it shows the cards, not its thread's rows, which are not on screen, but
-  // the cards' list: the messages unpacked under them, which are folded as a thread's are (`#407
-  // unpack-row-parity`), and none where nothing is unpacked, a card being no fold. `#301
-  // semicolon-expand-cycle`, whose keys work in either column.
-  const list = columnWork.side() && columns.side.mode !== "thread" ? leftEl("side-cards") : visibleList();
-  // Nor the rows of a collapsed run of read messages, whose text is behind its line. `#221 read-modes`.
-  return foldsOf(list).filter((entry) => !entry.li.hasAttribute("data-read-run"));
-}
-
-/**
- * A column's own record of its scroll tools' pass (`#624 voice-page-modularity`, plan step 15, as
- * `freshOlderPages`): `held`, how many redraws are under way that pass over the scroll tools once, at
- * their end (`#226`); `owed`, whether a pass over them was asked for inside one.
- *
- * @returns {{held: number, owed: boolean}}
- */
-function freshScrollTools() {
-  return { held: 0, owed: false };
-}
-
-/** The column being worked on's record of its scroll tools' pass (`freshScrollTools`). */
-function scrollTools() {
-  return columnWork.active().tools;
-}
-
-/**
- * Run `draw`, a redraw that ends with a pass over the scroll tools, passing over them once, at its
- * end, however often it asks. `#226 page-energy-profile`. A refresh asked three times — following
- * the newest line, putting its jump down, and as its last step — and each pass runs the search over
- * every row and decides every reply's arrow again.
- */
-function holdingScrollTools(draw) {
-  scrollTools().held += 1;
-  try {
-    return draw();
-  } finally {
-    scrollTools().held -= 1;
-    if (scrollTools().held === 0 && scrollTools().owed) renderScrollTools();
-  }
-}
-
-function renderScrollTools() {
-  if (scrollTools().held > 0) {
-    scrollTools().owed = true;
-    return;
-  }
-  scrollTools().owed = false;
-  // `#229 desktop-two-column`. The right column's chip is its jump to the newest message. The rest
-  // float over the left column and act on it.
-  if (columnWork.side()) {
-    applySearch();
-    // `#240 reading-bookmark`. The right column draws the line only on the anchor's thread.
-    placeBookmarkLine();
-    renderJumpNewest();
-    keepSelection();
-    return;
-  }
-  // ONE snapshot for all three chips, so they cannot disagree about a list that changed between
-  // two queries.
-  const folds = visibleFolds();
-  // Collapse and Expand are a PAIR: each appears only when it has work to do. Everything arrives
-  // folded, so at rest only Expand is offered; once every fold is open only Collapse is; in
-  // between, both. Expand was missing, which made the fold a one-way door at the list level.
-  el("collapse-all").hidden = !folds.some((entry) => !isFolded(entry));
-  el("expand-all").hidden = !folds.some((entry) => isFolded(entry));
-  // ...and summary mode only where a summary can exist at all: the channel, with something long
-  // enough in it to be worth condensing. Offering it over the voice transcript would be offering
-  // a mode that changes nothing, since a voice turn has no message id to key a summary under.
-  el("summarise").hidden =
-    screens.view() !== "discord" || !folds.some((entry) => entry.id !== null);
-  el("summarise").disabled = summaryRows.disabledByServer() !== "";
-  el("summarise").title = summaryRows.disabledByServer()
-    ? `Summaries are unavailable on this server: ${summaryRows.disabledByServer()}`
-    : "Show a one-line summary in place of each long message.";
-  // `#204 reply-arrow`. The other way back: to the reply a jump left, while it is off screen.
-  el("back-to-reply").hidden = screens.view() !== "discord" || replyReturnRow() === null;
-  // `#820 voice-page-action-menu`. Those three are the action menu's items: its empty line follows them.
-  if (actionMenu.open()) actionMenu.render();
-  // `#193 compose-draft-loss`. The way back from a Dismiss in the outbox, on the channel only.
-  renderSendUndo();
-  // `#420 bookmark-clear`. ...and from taking the bookmark away, in its own channel.
-  renderBookmarkUndo();
-  // `#129 message-search`. Re-derived from the lists, exactly like everything above it: whatever
-  // just changed a list has to leave the filter true of it. See `applySearch` for why this hangs
-  // off the one function every mutation already ends with rather than off its own call sites.
-  applySearch();
-  // `#240 reading-bookmark`. After the filter, which decides whether the list draws the line at all,
-  // and before the jump, which says whether the line is on screen.
-  placeBookmarkLine();
-  // LAST: it measures how far the list runs below the reader, and the filter just above can have
-  // taken most of the list away. `#207 scrollback-jump`.
-  renderJumpNewest();
-  // `#224 keyboard-shortcuts`. A redraw that took the selected message's row away puts the selection
-  // on its new one, the focus with it.
-  keepSelection();
-}
-
-/**
- * Fold or unfold every message in the list being looked at.
- *
- * ONE function for both directions rather than two that drift apart: the scroll-preservation, the
- * choice of list and the redraw afterwards are identical, and only the boolean differs. Expanding
- * is the direction that was missing — Collapse all shipped without it, which made folding a
- * one-way door at the list level.
- */
-function setAllFolded(folded) {
-  // Only ever the reader's own act, by a button. `#243 filter-keeps-selection`.
-  readerActed();
-  preservingScroll(() => {
-    for (const entry of visibleFolds()) {
-      setFolded(entry, folded);
+const folding = createFolding({
+  clock: clockOnUse(),
+  collapsedLines,
+  byId: el,
+  leftById: leftEl,
+  inThisColumn,
+  inOtherColumn,
+  eachColumn,
+  readerActed,
+  preservingScroll,
+  threadHue,
+  threadOf,
+  rowMessages,
+  currentScope: () => channelStore.current().scope,
+  renderSummariesSetting: (on) => messagePreferences.summaries.render(on),
+  keepSummarize: (on) => {
+    try {
+      deviceSettings().keep(DEVICE_SETTINGS.summarizeCollapsed, on);
+    } catch (_error) {
+      // A browser that refuses storage still honours the choice for this session.
     }
-  });
-  // The chips are two of the steps ; and : go round, and the keys go on from them: over the channel's
-  // lists, where the keys work, and never over the call's transcript. `#301`.
-  if (channelOnScreen()) foldSteps.set(foldStepKey(), folded ? "collapse" : "expand");
-  renderScrollTools();
-}
-
-// --- ; and : step round three ways of showing the long messages -------------------------------
-//
-// `#301 semicolon-expand-cycle`. The owner, 2026-10-14: replace the ; and : pair, Expand all and
-// Collapse all, with a rotation on one key — (1) expand all, (2) expand every unread message and
-// collapse every read one, (3) collapse all, then (1) again — each press going on from the step it
-// last applied in that view; : goes round the other way. The two chips stay as they were.
-//
-// WHAT IT COVERS is what the chips cover (`visibleFolds`): the long messages of the list on screen,
-// each folded to its first lines, or under Summaries to its summary. Not the thread cards, which stay
-// contracted but for the one highlighted (`#277 thread-card-focus`), nor the runs of read messages
-// behind their lines under Fold read, which `h` opens and shuts.
-//
-//   * READ is `rowIsRead`, the one rule Hide read, Fold read and a thread's landing share: a row is
-//     read when every message it stands for is.
-//   * EACH LIST KEEPS ITS OWN STEP, for the session: Main, All, a thread, the right column's thread, the
-//     Pinned list, each by its pane's own name for it (`foldStepKey`). A press goes on from the step that
-//     list was left at, whatever has been opened or shut by hand since. The FIRST press in a list goes
-//     to the first step its way round — ; to Expand all, : to Collapse all, as the two keys did before —
-//     unless that would change nothing, and then on round to the first step that changes something:
-//     (2), or past it to the third when (2) would leave the list as it is too, as it does a list all
-//     open with nothing in it read. No first press does nothing. The chips, pressed, are (1) and (3) of
-//     Main's list (`setAllFolded`).
-//   * FROM ANYWHERE AS A CHORD. The owner, 2026-10-14, of ;: "I also want 'Cmd-;' bound to the same
-//     thing so it works more reliably irrespective of what's highlighted or where the cursor is". So
-//     Ctrl+; and Ctrl+: (Cmd+; and Cmd+:, which is Cmd+Shift+;, on a Mac; either on every platform, as
-//     every chord here) step too, and as chords they fire in a message box and in the search, where the
-//     bare keys are typed and never fire. Their default is kept from the browser: in Chrome on a Mac
-//     they are Check Document Now and Show Spelling and Grammar, menu items Chrome hands the page first
-//     (they are no Chrome command, so none it reserves), and in a text field the first would run a spell
-//     check. A held chord's repeats are taken too and do nothing, as Ctrl+S's are.
-//   * IN THE COLUMN THE KEYS ARE IN, as every key on the messages is (`keyDispatch.onPageKey`): the column of the
-//     field the focus is in for a chord pressed in one — the channel's box steps Main's list, the
-//     right column's box its thread — and for the search, which belongs to no column, the column the
-//     keys moved last.
-//   * THE READER STAYS PUT (`#280 scroll-stability`): the selected message while any of it shows, else
-//     the first message showing, keeps its top where it was, as far as the list's ends allow, and is
-//     then held as a filter change holds its message (`placeFilterAnchor`) — the chips changing height
-//     under the list, a message arriving, a reader at the foot of the right column (`footKeeper`) move
-//     it no further — until the reader scrolls or acts in the list. Not the newest line for a reader on
-//     it, as `preservingScroll` would: opening everything under a reader at the foot leaves them on the
-//     message they were reading. Folding what is under it near the list's end can leave too little
-//     below it to keep it there: the browser scrolls no further than the end, and it comes down by the
-//     difference, held where it lands; near the head, folding what is above it, likewise up. A row
-//     whose top was above the floating line, folded so short that none of it would show where it stood,
-//     comes back under the floating line with its head showing, where reading it starts.
-//   * A CHORD PRESSED IN A MESSAGE BOX SHOWING IN THE LIST keeps THAT BOX where it is instead
-//     (`foldStepField`). From review: Ctrl+; in the channel's box at the foot held the message the
-//     reader was on, and everything opening between the two took the box being typed in off the
-//     screen. The box is the last thing in its list, so a box at the list's end stays at the end, the
-//     messages opening or folding above it, and nothing is held after: the list follows its end as for
-//     a reader on the newest line, through the chips changing height and the right column's keeper. A
-//     box scrolled out of sight, the search and a reply open at a column's foot (under its list, not in
-//     it) leave the reader's row the one kept.
-//   * SAID, briefly and politely, on the status line: "Long messages: all expanded", "Long messages: unread
-//     expanded, read collapsed", "Long messages: all collapsed". A list with no long message in it says so,
-//     and keeps its step. `#432 read-mode-unify`: they said "Expanded unread, collapsed read" until the
-//     owner took that for the read mode's own notice (Show, Fold, Hide read, key h), which they never touch.
-
-/** The steps, in the order ; goes round them. */
-const FOLD_STEPS = ["expand", "unread", "collapse"];
-
-/** What the status line says once each is applied. */
-const FOLD_STEP_WORDS = {
-  expand: "Long messages: all expanded", unread: "Long messages: unread expanded, read collapsed",
-  collapse: "Long messages: all collapsed",
-};
-
-/** What it says where there is nothing to fold or open. */
-const FOLD_STEP_NONE = "No long messages here to expand or collapse.";
-
-/**
- * By list (`foldStepKey`), the step last applied there by ; or :, or by a chip. Session-only, one
- * short entry per list folded, for the reason `expandedIds` gives.
- *
- * @type {Map<string, string>}
- */
-const foldSteps = new Map();
-
-/** The list of the column being worked on, as its pane names it: the column, and what it shows. */
-function foldStepKey() {
-  const pane = columnWork.side() ? sidePane : channelPane;
-  return `${pane.name}|${pane.context()}`;
-}
-
-/** Whether `entry` is open once `step` is applied. */
-const openAtStep = (step, entry) => step === "expand" || (step === "unread" && !rowIsRead(entry.li));
-
-/** Whether applying `step` would open or fold any of `folds`. */
-const stepChangesAny = (step, folds) => folds.some((entry) => isFolded(entry) === openAtStep(step, entry));
-
-/**
- * The step a press going `way` round (1 for ;, -1 for :) applies, from `from`, the step the list was
- * left at, or null for a list it has never been applied in: then the first step that way round, or
- * when that would leave every fold in `folds` as it is, the next step on round that would not. Expand
- * all and Collapse all cannot both change nothing in a list with a fold in it, so one of the three
- * always changes something.
- *
- * @param {string | null} from
- * @param {number} way
- * @param {any[]} folds
- */
-function nextFoldStep(from, way, folds) {
-  const after = (step) => FOLD_STEPS[(FOLD_STEPS.indexOf(step) + way + FOLD_STEPS.length) % FOLD_STEPS.length];
-  if (from !== null) return after(from);
-  let step = way > 0 ? "expand" : "collapse";
-  for (let tried = 1; tried < FOLD_STEPS.length && !stepChangesAny(step, folds); tried += 1) step = after(step);
-  return step;
-}
-
-/**
- * The reader's row in the column being worked on, as a filter change's anchor (`anchorAt`): the selected
- * message while any of it shows, else the first message showing. Its top, never a part of a combined
- * row inside it, which a fold may cut off. Null with no row showing.
- */
-function foldStepAnchor() {
-  const pane = columnWork.side() ? sidePane : channelPane;
-  const chosen = markedRow(pane, markOf(pane));
-  const row = chosen && rowInView(pane, chosen) ? chosen : paneRows(pane).find((one) => rowInView(pane, one));
-  return row ? anchorAt(row) : null;
-}
-
-/**
- * The message box a chord was pressed in, `target`, while any of it shows in the list of the column
- * being worked on — the channel's box at the foot of its list, the right column's at the foot of its
- * thread — else null: a key pressed on the list, the search, which floats over no list, a reply open
- * at a column's foot, which is under its list and not in it, or a box scrolled out of sight.
- *
- * @param {EventTarget | null | undefined} target
- * @returns {HTMLElement | null}
- */
-function foldStepField(target) {
-  const node = /** @type {HTMLElement | null} */ (target || null);
-  const pane = columnWork.side() ? sidePane : channelPane;
-  const area = pane.scroller();
-  if (!node || !isTextField(node) || !nodeWithin(area, node)) return null;
-  const box = node.getBoundingClientRect();
-  const foot = area.getBoundingClientRect().top + (area.clientHeight || 0);
-  return box.bottom > pane.head() && box.top < foot ? node : null;
-}
-
-/**
- * Apply `step` to `folds`, the folds of the list on screen in the column being worked on, the reader's
- * row kept where it is and held there — or, for a chord pressed in a message box showing in that list,
- * `field`, the box kept where it is (see the head of this section).
- *
- * @param {string} step
- * @param {any[]} folds
- * @param {HTMLElement | null} [field]
- */
-function applyFoldStep(step, folds, field = null) {
-  // The reader's own act: whatever an earlier change held is let go, and this measures from here.
-  readerActed();
-  if (field) {
-    // A landing a thread's entry made, or still owes, is spent, as a filter change spends it: nothing
-    // is held here to stand in its way.
-    entryState().landing = null;
-    entryState().threadOwed = null;
-    entryState().threadAwaitsRead = false;
-    const area = (columnWork.side() ? sidePane : channelPane).scroller();
-    const top = field.getBoundingClientRect().top;
-    for (const entry of folds) setFolded(entry, !openAtStep(step, entry));
-    area.scrollTop += field.getBoundingClientRect().top - top;
-    renderScrollTools();
-    return;
-  }
-  const anchor = foldStepAnchor();
-  for (const entry of folds) setFolded(entry, !openAtStep(step, entry));
-  if (anchor) {
-    placeFilterAnchor(anchor);
-    const row = anchor.row;
-    const head = (columnWork.side() ? sidePane : channelPane).head();
-    if (filterState().hold !== null && filterState().hold.row === row && row.getBoundingClientRect().bottom <= head) {
-      const area = el("scroll-area");
-      area.scrollTop += row.getBoundingClientRect().top - head;
-      filterState().hold = { ...filterState().hold, at: area.scrollTop,
-        offset: row.getBoundingClientRect().top - listPlaceTop(area) };
-    }
-  }
-  renderScrollTools();
-}
-
-/**
- * ; and :, and Ctrl+; and Ctrl+: (Cmd on a Mac): the next step `way` round (1 or -1) in the list on
- * screen of the column the keys are in. A held chord's repeats are taken, so that none reaches the
- * browser's own default for the chord, and do nothing; a held bare key's are left alone, as before.
- *
- * @param {number} way
- * @param {import("./src/view/shell/index.ts").DispatchedKey} [event]
- * @param {EventTarget | null} [target] Where the focus was: a message box showing in the list is kept
- *   where it is through the step (`foldStepField`).
- */
-function foldStepFromKeyboard(way, event, target = null) {
-  if (!channelOnScreen()) return false;
-  if (event && event.repeat) return modHeld(event);
-  const folds = visibleFolds();
-  if (folds.length === 0) {
-    setStatus(FOLD_STEP_NONE);
-    return true;
-  }
-  const key = foldStepKey();
-  const step = nextFoldStep(foldSteps.get(key) || null, way, folds);
-  applyFoldStep(step, folds, foldStepField(target));
-  foldSteps.set(key, step);
-  setStatus(FOLD_STEP_WORDS[step]);
-  return true;
-}
+  },
+  storedSummarize: () => deviceSettings().get(DEVICE_SETTINGS.summarizeCollapsed),
+  summarizeHeldOn: () => {
+    const held = settingsSync().agreed(SUMMARIZE_COLLAPSED_KEY);
+    return Boolean(held) && held.value === "1";
+  },
+  api,
+  withThreadQuery,
+  selectedChannelId,
+  threadForMessageId,
+  setStatus,
+  view: () => screens.view(),
+  screen: () => screens.screen(),
+  searchLinks: () => searchField.open() && searchField.links(),
+  activePlace: () => columnWork.active().place,
+  activeTools: () => columnWork.active().tools,
+  activeName: () => columnWork.active().name,
+  side: () => columnWork.side(),
+  sideMode: () => columns.side.mode,
+  sidePane: () => sidePane,
+  channelPane: () => channelPane,
+  fitOverscroll,
+  footGap,
+  bottomSlackPx: BOTTOM_SLACK_PX,
+  unseenReplies: unseenColumnReplies,
+  unseenReply: unseenColumnReply,
+  listEmptied,
+  draftBelowView: () => voiceTranscript().draftBelowView(),
+  renderJumpBookmark,
+  refreshReadingJump: () => readingJump.refresh(),
+  visibleList,
+  shownChannelList,
+  applySearch,
+  placeBookmarkLine,
+  keepSelection: (...args) => keepSelection(...args),
+  replyReturnRow,
+  actionMenuOpen: () => actionMenu.open(),
+  renderActionMenu: () => actionMenu.render(),
+  renderSendUndo,
+  renderBookmarkUndo,
+  channelOnScreen: (...args) => channelOnScreen(...args),
+  rowIsRead,
+  markedRow: (pane, mark) => markedRow(/** @type {any} */ (pane), /** @type {any} */ (mark)),
+  markOf: (pane) => markOf(/** @type {any} */ (pane)),
+  rowInView: (pane, row) => rowInView(/** @type {any} */ (pane), row),
+  paneRows: (pane) => paneRows(/** @type {any} */ (pane)),
+  anchorAt,
+  isTextField,
+  nodeWithin,
+  entryState,
+  placeFilterAnchor,
+  filterHold: () => filterState().hold,
+  setFilterHold: (hold) => { filterState().hold = hold; },
+  listPlaceTop,
+  modHeld: (event) => modHeld(event),
+});
+const {
+  summaryRows, jumpNewestWanted, inScrollback,
+  foldsOf, setFolded, isFolded, foldable, applySummarizeCollapsed, storedSummarizeCollapsed,
+  summariesSettingLanded, renderSummaries, requestVisibleSummaries, setSummaryMode,
+  setJumpNewest, renderJumpNewest,
+  holdingScrollTools, renderScrollTools, setAllFolded, foldStepFromKeyboard,
+} = folding;
 
 // --- searching what is on screen --------------------------------------------------------------
 //
@@ -8554,6 +7640,38 @@ const messageCache = createMessageCache({
  */
 function freshLoadState() {
   return { freshness: "fresh", freshAt: 0, refreshing: false, lineTimer: null, generation: 0 };
+}
+
+/**
+ * A column's own record of where its list stands against its newest message (`#624
+ * voice-page-modularity`, plan step 15): `jumpWanted`, the arrival its jump is for;
+ * `inScrollback`, whether it is in its scrollback. The folds owner reads them
+ * (web/src/view/channel/folding.ts).
+ *
+ * @returns {{jumpWanted: boolean | number, inScrollback: boolean}}
+ */
+function freshScrollPlace() {
+  return { jumpWanted: false, inScrollback: false };
+}
+
+/**
+ * A column's own record of its scroll tools' pass: `held`, how many redraws are under way that
+ * pass over the scroll tools once, at their end; `owed`, whether a pass was asked for inside one.
+ *
+ * @returns {{held: number, owed: boolean}}
+ */
+function freshScrollTools() {
+  return { held: 0, owed: false };
+}
+
+/** The column being worked on's record of where its list stands (`freshScrollPlace`). */
+function scrollPlace() {
+  return columnWork.active().place;
+}
+
+/** The column being worked on's record of its scroll tools' pass (`freshScrollTools`). */
+function scrollTools() {
+  return columnWork.active().tools;
 }
 
 /** The column being worked on's record of its reads' state (`freshLoadState`). */

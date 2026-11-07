@@ -2839,9 +2839,9 @@ test("`#301 semicolon-expand-cycle` x `#280 scroll-stability`: AT THE FOOT OF TH
   assert.deepStrictEqual(real, { said: FOLD_SAID.expand, stepScrolled: false, moved: 0 });
   // THE CONTROL: the row placed but not held. The keeper takes the reader to the new foot, by the height of
   // the three replies opened under them.
-  const unheld = await run(brokenScript("    placeFilterAnchor(anchor);\n",
-    "    { const area = el(\"scroll-area\"); area.scrollTop += anchor.row.getBoundingClientRect().top - " +
-    "area.getBoundingClientRect().top - anchor.offset; }\n"));
+  const unheld = await run(await brokenModule([{ file: "src/view/channel/folding.ts", find: "      deps.placeFilterAnchor(anchor);\n",
+    replace: "      { const area = el(\"scroll-area\"); area.scrollTop += anchor.row.getBoundingClientRect().top - " +
+    "area.getBoundingClientRect().top - (anchor as { offset: number }).offset; }\n" }]));
   assert.equal(unheld.stepScrolled, false);
   assert.ok(unheld.moved < -100, `the keeper left an unheld reader at ${unheld.moved}px, so this cannot see it`);
 });
@@ -2898,9 +2898,9 @@ test("`#301 semicolon-expand-cycle` x `#226 page-energy-profile`: NOTHING THE PA
   assert.deepStrictEqual(real.grew, [], "something the page keeps grew with every poll of a channel that did not change");
   // Neither a fixture too small to see it nor a list this test does not read: THE CONTROL keeps a list of
   // folds beside the rows again, never pruned, and the test names it.
-  const kept = brokenScript("const FOLD_LISTS = [", "const foldsKept = [];\nconst FOLD_LISTS = [")
-    .replace("  meta.append(fold);\n  return fold;\n", "  meta.append(fold);\n  foldsKept.push(entry);\n  return fold;\n");
-  assert.ok(kept.includes("foldsKept.push(entry)"), "the control no longer finds where a fold is made");
+  const kept = brokenScript("const folding = createFolding({", "const foldsKept = [];\nconst folding = createFolding({")
+    .replace("  const fold = foldable(li, meta, body, text,", "  foldsKept.push(li);\n  const fold = foldable(li, meta, body, text,");
+  assert.ok(kept.includes("foldsKept.push(li)"), "the control no longer finds where a fold is made");
   const leaky = await run(kept);
   assert.equal(leaky.grew.length, 1, `the control grew ${leaky.grew.join(", ")}`);
   assert.match(leaky.grew[0], /^foldsKept \d+ -> \d+$/);
@@ -3234,7 +3234,7 @@ test("`#301 semicolon-expand-cycle` x `#280 scroll-stability`: A CHORD IN THE CH
   assert.ok(Math.abs(first.getBoundingClientRect().top - firstAt) <= 1, "Ctrl+; in a box out of sight did not keep the first message showing");
   // THE CONTROL: the reader's row kept for a chord in the box too. The first step opens the selected
   // message, unread, under its top, and the box goes below the screen.
-  const unkept = await run(brokenScript("applyFoldStep(step, folds, foldStepField(target));", "applyFoldStep(step, folds, null);"));
+  const unkept = await run(await brokenModule([{ file: "src/view/channel/folding.ts", find: "applyFoldStep(step, folds, foldStepField(target));", replace: "applyFoldStep(step, folds, null);" }]));
   assert.equal(unkept.steps[0].said, FOLD_SAID.unread);
   assert.equal(unkept.steps[0].shows, false, `with the reader's row kept the box still showed, ${unkept.steps[0].moved}px down, so this cannot see it`);
 });

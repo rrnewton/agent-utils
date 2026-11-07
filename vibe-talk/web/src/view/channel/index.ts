@@ -141,3 +141,5 @@ export { LINKED_MARK_WORDS, createLinkedMark } from "./linkedmark.ts";
 export type { LinkedMark, LinkedMarkDependencies, LinkedMessage } from "./linkedmark.ts";
 export { createTimelineView } from "./readcore.ts";
 export type { TimelineAbandonedRead, TimelineColumn, TimelineColumnSteps, TimelineEntryState, TimelineFoldRead, TimelineLoadState, TimelineOlderPages, TimelineReadOptions, TimelineReaderLike, TimelineRows, TimelineSelection, TimelineView, TimelineViewDependencies } from "./readcore.ts";
+export { COLLAPSE_OVER_CHARS, FOLD_LESS, FOLD_LISTS, FOLD_MORE, SCROLLBACK_PX, SUMMARY_LOOKAHEAD_PX, createFolding } from "./folding.ts";
+export type { FoldEntry, FoldPane, Folding, FoldingDependencies, ScrollPlace, ScrollToolsPass } from "./folding.ts";

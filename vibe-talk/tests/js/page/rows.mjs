@@ -2899,10 +2899,10 @@ test("...and the anchoring is real: the same page without it fails that test", a
   // anything -- which is exactly what a layout model with no renderer would do by default.
   const page = newPage(
     new Map(),
-    brokenScript(
-      "function renderSummaries() {\n  preservingScroll(() => {",
-      "function renderSummaries() {\n  ((run) => run())(() => {"
-    )
+    await brokenModule([{ file: "src/view/channel/folding.ts",
+      find: "  function renderSummaries(): void {\n    deps.preservingScroll(() => {",
+      replace: "  function renderSummaries(): void {\n    ((run: () => void) => run())(() => {"
+    }])
   );
   await signIn(page);
   await showDiscord(page, tallChannel(40));

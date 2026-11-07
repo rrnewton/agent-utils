@@ -293,7 +293,9 @@ def old_shell_root(source: Path, into: Path) -> tuple[Path, str, str]:
     if not (source / "assets.json").is_file():
         raise SystemExit(f"the old-shell part needs a page build to serve, and {source} is not one")
     shutil.copytree(source, into)
-    script = page_sources.source_text(source, "voice.js").encode()
+    # The hash that shell named its script by: the page's code as a whole, so the name survives
+    # the code moving out of voice.js (`#624 voice-page-modularity`).
+    script = page_sources.page_code(source).encode()
     build = hashlib.sha256(script).hexdigest()[:32]
     shell = page_sources.source_text(source, "voice.html")
     tag = '<script src="/voice.js"></script>'

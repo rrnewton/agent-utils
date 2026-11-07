@@ -152,7 +152,7 @@ export function createSelectionKeys<Pane extends SteppedPane>(deps: SelectionKey
         if (kid.hidden) continue;
         const tag = String(kid.tagName).toUpperCase();
         if ((tag === "BUTTON" && kid !== menu.button) || tag === "A") items.push(kid);
-        else walk(kid as unknown as MenuNode);
+        else walk(kid as MenuNode);
       }
     };
     walk(menu.root as MenuNode);
