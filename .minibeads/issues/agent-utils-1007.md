@@ -7,6 +7,9 @@ created_at: 2026-11-07T06:20:00.000000000+00:00
 updated_at: 2026-11-07T06:20:00.000000000+00:00
 ---
 
+Consumer report: dh-da7cz (filed in the consumer harness, with event diffs
+and cli.py references).
+
 # Description
 
 Wrkslots writes every scoped operation journal event-first: `_write_journal`
