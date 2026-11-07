@@ -245,3 +245,101 @@ fn a_stale_green_overlapping_what_landed_does_not_stack() {
     );
     let _ = r;
 }
+
+/// The seeded fixture with a generated file, `gen/index` (the sorted names of the test files),
+/// committed on the base and declared in `regenerate.paths` with the command that writes it.
+fn seeded_with_generated_index(tag: &str) -> Fixture {
+    let fx = seeded(tag);
+    git(&fx.dev(), &["pull", "-q", "--ff-only", "origin", "main"]);
+    fx.write("gen/index", "g0\nt0\n");
+    fx.commit_all("generated index");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    set_config(
+        &fx,
+        &[(
+            "regenerate",
+            serde_json::json!({
+                "paths": ["gen/index"],
+                "command": "ls tests | sort > gen/index",
+                "when": "always",
+            }),
+        )],
+    );
+    fx
+}
+
+fn stale_green_stacked_names(events: &str, pr: i64) -> bool {
+    events.lines().any(|line| {
+        serde_json::from_str::<Value>(line).is_ok_and(|e| {
+            e["kind"] == "stale-green-stacked"
+                && e["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(&format!("#{pr}"))
+        })
+    })
+}
+
+#[test]
+fn a_stale_green_sharing_only_a_generated_file_stacks() {
+    // Each change adds a test and commits its regenerated index, so every pair of changes
+    // conflicts in gen/index and nowhere else. The regenerate step rewrites gen/index on
+    // every candidate, so that shared file is not overlap and the stale greens stack.
+    let fx = seeded_with_generated_index("stale-green-generated");
+    fx.branch("a", &[("tests/a", "ok\n"), ("gen/index", "a\ng0\nt0\n")]);
+    fx.branch("b", &[("tests/b", "ok\n"), ("gen/index", "b\ng0\nt0\n")]);
+    fx.branch("c", &[("tests/c", "ok\n"), ("gen/index", "c\ng0\nt0\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    let out = fx.mq_ok(&["run", "--json"]);
+    let r = report(&out);
+    assert_eq!(status(&fx, 1), "landed", "{r}");
+    assert_eq!(status(&fx, 2), "landed", "{r}");
+    assert_eq!(status(&fx, 3), "landed", "{r}");
+    let events = events(&fx);
+    assert!(
+        events.contains("\"stale-green-stacked\""),
+        "a stale green whose only overlap is a generated file stacks: {events}"
+    );
+    let c_validations = r["validations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v["prs"] == serde_json::json!([3]) && v["cancelled"] == false)
+        .count();
+    assert!(c_validations <= 2, "c validated {c_validations} times: {r}");
+    // The landed tree's generated file is the regenerated one, not any change's copy.
+    git(&fx.dev(), &["fetch", "-q", "origin", "main"]);
+    assert_eq!(
+        git(&fx.dev(), &["show", "origin/main:gen/index"]),
+        "a\nb\nc\ng0\nt0"
+    );
+}
+
+#[test]
+fn a_stale_green_sharing_a_hand_written_file_still_rebuilds_with_regeneration_on() {
+    // Same generated index, plus a hand-written file both A and B edit on different lines:
+    // the merge is clean, so both validate as disjoint roots, but the shared hand-written path
+    // is real overlap and B, stale after A lands, is never stacked as a stale green.
+    let fx = seeded_with_generated_index("stale-green-generated-overlap");
+    fx.write("tests/shared", "1\n2\n3\n4\n5\n");
+    fx.write("gen/index", "g0\nshared\nt0\n");
+    fx.commit_all("shared file");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.branch("a", &[("tests/shared", "a\n2\n3\n4\n5\n")]);
+    fx.branch("b", &[("tests/shared", "1\n2\n3\n4\nb\n")]);
+    fx.branch(
+        "c",
+        &[("tests/c", "ok\n"), ("gen/index", "c\ng0\nshared\nt0\n")],
+    );
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    let out = fx.mq_ok(&["run", "--json"]);
+    let r = report(&out);
+    assert_eq!(status(&fx, 1), "landed", "{r}");
+    assert_eq!(status(&fx, 2), "landed", "{r}");
+    let events = events(&fx);
+    assert!(!stale_green_stacked_names(&events, 2), "{events}");
+}

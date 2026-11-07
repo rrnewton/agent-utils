@@ -1226,9 +1226,10 @@ impl<'a> Runner<'a> {
 
     /// Whether `prs` may stack on `stack_tip` despite the stack gate: every
     /// change was green on the immediately previous base in this run, its
-    /// files share no path with what landed since, and merging its green
-    /// candidate onto the stack head is clean. Returns the previous green
-    /// base and the landed changes it was checked against.
+    /// files share no hand-written path with what landed since, and merging
+    /// its green candidate onto the stack head conflicts in generated paths
+    /// at most. Returns the previous green base and the landed changes it was
+    /// checked against.
     fn stale_green_stack(&self, prs: &[i64], stack_tip: &str) -> Option<(String, Vec<i64>)> {
         let greens = lock(&self.stale_greens).clone();
         let first = greens.get(prs.first()?)?;
@@ -1252,21 +1253,33 @@ impl<'a> Runner<'a> {
             .difference(&first.landed_before)
             .copied()
             .collect();
-        let candidate_files = self
-            .git
-            .changed_files(&first.green_base, &first.green_tip)
-            .ok()?;
-        let landed_files = self
-            .git
-            .changed_files(&first.green_base, &current_base)
-            .ok()?;
+        // Generated paths (`regenerate.paths`) are not overlap: the combination settles their
+        // conflicts on the target's side and the regenerate command rewrites them on every
+        // candidate, so sharing one says nothing about whether the green still holds.
+        let regenerate = &self.config.regenerate;
+        let hand_written = |paths: BTreeSet<String>| -> BTreeSet<String> {
+            paths
+                .into_iter()
+                .filter(|path| !regenerate.covers(path))
+                .collect()
+        };
+        let candidate_files = hand_written(
+            self.git
+                .changed_files(&first.green_base, &first.green_tip)
+                .ok()?,
+        );
+        let landed_files = hand_written(
+            self.git
+                .changed_files(&first.green_base, &current_base)
+                .ok()?,
+        );
         if !candidate_files.is_disjoint(&landed_files) {
             return None;
         }
         if !self
             .git
             .merge_conflicts(stack_tip, &first.green_tip)
-            .is_ok_and(|paths| paths.is_empty())
+            .is_ok_and(|paths| paths.iter().all(|path| regenerate.covers(path)))
         {
             return None;
         }

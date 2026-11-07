@@ -1784,11 +1784,15 @@ One exception below the gate: a candidate that was green on the immediately prev
 went stale only because unrelated changes landed — its files share no path with what landed
 since its green, and merging its green candidate onto the current stack head is clean — is
 stacked on that head anyway, so it lands in the same round instead of rebuilding as another
-disjoint root on the new base. The run records a `stale-green-stacked` event (the candidate,
-the previous green base, and the landed changes it was checked against). Fresh candidates
-still wait for the gate, a candidate whose paths overlap what landed or whose merge conflicts
-rebuilds as today, and a stacked validation that comes back red is handled as an ordinary
-red, with no strike beyond the normal one.
+disjoint root on the new base. Generated paths (`regenerate.paths`) do not count for either
+test: a shared generated file is not overlap, and a merge that conflicts only in generated
+files counts as clean, because the combination settles those conflicts on the target's side
+and the regenerate command rewrites them on the candidate. The run records a
+`stale-green-stacked` event (the candidate, the previous green base, and the landed changes it
+was checked against). Fresh candidates still wait for the gate, a candidate whose hand-written
+paths overlap what landed or whose merge conflicts outside the generated paths rebuilds as
+today, and a stacked validation that comes back red is handled as an ordinary red, with no
+strike beyond the normal one.
 
 ## The precheck
 
