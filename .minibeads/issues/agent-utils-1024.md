@@ -1,0 +1,34 @@
+---
+title: 'herdr-server-thread-growth: the herdr server accumulates tokio worker threads over days'
+status: open
+priority: 2
+issue_type: bug
+assignee: cl-start
+created_at: 2026-11-07T21:50:00.000000000+00:00
+updated_at: 2026-11-07T21:50:00.000000000+00:00
+---
+
+# Description
+
+The long-running `herdr server` gains threads steadily:
+
+- One host: 492 threads after 27 h (RSS 277 MB). On 2026-11-05 the previous server there had 525 threads and 23 GB RSS after 23 days, with CPU spikes of about 72 cores.
+- Another host, 2026-11-07: `herdr-0.8.0 server` with 493 threads after 5 days 5 h (RSS 412 MB). By thread name: 413 `tokio-rt-worker`, 73 `herdr-pty` (exactly one per live pane: 73 panes across 7 workspaces), 3 `herdr-api-conn`, and 4 others.
+
+So the pty threads track live panes, but `tokio-rt-worker` threads keep growing. A tokio blocking pool caps at 512 by default and lets idle threads exit after a keep-alive, so hundreds that persist are most likely blocking calls that never return: per-connection or per-pane readers, or `herdr pane run` / herdr-run tabs whose blocking reads are never joined or cancelled.
+
+# Design
+
+- Sample the thread count and names over an hour on a busy host while herdr-run tabs and agentctl sends come and go. Take stacks of the `tokio-rt-worker` threads (gdb `thread apply all bt`, or tokio-console if available) and find which call they block in.
+- Tie the growth to an event (an API connection, a pane run, a tab close) with a reproduction loop.
+- Fix it in herdr: cancel or join the blocking work when its connection or pane goes away, or move it off the blocking pool. The owner's rule is that herdr fixes go as a pull request on rrnewton/herdr; this issue tracks it from agent-utils.
+
+# Acceptance Criteria
+
+- A diagnosis naming the call the accumulating threads block in, and the event that leaks one, reported before the fix.
+- A reproduction loop that grows the thread count on the current release and not with the fix.
+- The herdr pull request link recorded here, and the thread count after a day on a fixed server.
+
+# Notes
+
+Filed by the devbig030 coordinator at the lead's request. Thread names from /proc/<pid>/task/*/comm.
