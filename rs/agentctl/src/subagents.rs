@@ -3840,6 +3840,25 @@ fn input_occurrences(screen: &str, text: &str) -> usize {
         .sum()
 }
 
+/// Rows of a target's screen that a `not-seen` read-back row keeps.
+const SCREEN_TAIL_ROWS: usize = 12;
+/// Characters of each such row it keeps.
+const SCREEN_TAIL_WIDTH: usize = 200;
+
+/// The last [`SCREEN_TAIL_ROWS`] rows of `screen` that hold text, each cut to
+/// [`SCREEN_TAIL_WIDTH`] characters.
+fn screen_tail(screen: &str) -> Vec<String> {
+    let mut rows: Vec<String> = screen
+        .lines()
+        .rev()
+        .filter(|row| !row.trim().is_empty())
+        .take(SCREEN_TAIL_ROWS)
+        .map(|row| row.trim_end().chars().take(SCREEN_TAIL_WIDTH).collect())
+        .collect();
+    rows.reverse();
+    rows
+}
+
 /// The key, never a pane ID, under which a read-back baseline keeps how often the prompt
 /// showed where typed input lands in the target itself (#704 misroute-shared-text).
 const TARGET_INPUT: &str = "\0target-input";
@@ -4046,9 +4065,12 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     /// countermanded there. A target that printed the prompt, or newly shows it where typed
     /// input lands, received it whatever the peers show (#704 misroute-shared-text). Otherwise
     /// a prompt in several peers, or a peer whose last occurrence moved nearer the end without
-    /// a new one, cannot be told apart: the message is quarantined without a note. A verified submission that the target never
-    /// shows is quarantined too; a native prompt goes on to Herdr's working-state
-    /// confirmation, and is logged as not seen.
+    /// a new one, cannot be told apart: the message is quarantined without a note. A receipt
+    /// that saw the prompt taken from the target's composer into the queue of a turn it was
+    /// already running places it in the target as a printed one does: such a prompt is
+    /// delivered, and the row says the receipt proved it (#953). Any other verified submission
+    /// that the target never shows is quarantined too; a native prompt goes on to Herdr's
+    /// working-state confirmation, and is logged as not seen.
     fn read_back(
         &self,
         pane_id: &str,
@@ -4072,8 +4094,16 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             }
         };
         recipient_holds()?;
-        let in_target = matches!(submission, Submission::Verified(receipt) if receipt.printed)
-            || self.seen_in_target(pane_id, text, before, runtime)?;
+        // A receipt that saw the prompt printed in the target places it there. So does one that
+        // saw it staged in the target's composer and then taken into the queue of the turn the
+        // target was already running: a busy Claude Code draws a queued prompt only once its turn
+        // reaches the input, often long after the read-back limit, so the screen alone missed
+        // delivered prompts (#953 agentctl-busy-claude-false-possibly-submitted).
+        let receipt_in_target = matches!(
+            submission,
+            Submission::Verified(receipt) if receipt.printed || (receipt.queued && receipt.settled)
+        );
+        let in_target = receipt_in_target || self.seen_in_target(pane_id, text, before, runtime)?;
         recipient_holds()?;
         let states = self.peer_states(pane_id, text, before, runtime)?;
         let fresh: Vec<&String> = states
@@ -4098,7 +4128,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         // sent there too, or still on its screen from earlier, are no evidence against that,
         // and quarantining a delivered prompt invites a duplicate on retry (#704
         // misroute-shared-text).
-        let typed_in_target = matches!(submission, Submission::Verified(receipt) if receipt.printed)
+        let typed_in_target = receipt_in_target
             || (in_target
                 && self.client.read_scrollback(pane_id).is_ok_and(|screen| {
                     input_occurrences(&screen, text)
@@ -4129,11 +4159,41 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             )));
         }
         if in_target {
+            if let Submission::Verified(receipt) = submission {
+                if !receipt.printed && receipt.queued {
+                    // The record says the receipt, not a sighting, proved this delivery.
+                    self.log_readback(
+                        pane_id,
+                        text,
+                        "queued",
+                        &json!({"receipt": true, "evidence": receipt.evidence}),
+                    );
+                }
+            }
             return Ok(());
         }
-        // A confirmation without target evidence proves nothing about the recipient.
-        let verified = matches!(submission, Submission::Verified(_));
-        let logged = self.log_readback(pane_id, text, "not-seen", &json!({"receipt": verified}));
+        // A confirmation without target evidence proves nothing about the recipient. The row
+        // keeps what the receipt said and the target's last rows, so a screen that should have
+        // proved delivery can become a fixture (#953).
+        let receipt = match submission {
+            Submission::Verified(receipt) => json!({
+                "queued": receipt.queued,
+                "settled": receipt.settled,
+                "evidence": receipt.evidence,
+            }),
+            _ => json!(false),
+        };
+        let screen = self
+            .client
+            .read_scrollback(pane_id)
+            .map(|screen| screen_tail(&screen))
+            .unwrap_or_default();
+        let logged = self.log_readback(
+            pane_id,
+            text,
+            "not-seen",
+            &json!({"receipt": receipt, "screen_tail": screen}),
+        );
         Err(AdapterError::unavailable(format!(
             "prompt for agent {} was submitted but never showed in pane {pane_id} within {}s; \
              delivery is unproven{}",
@@ -14808,6 +14868,7 @@ pub(crate) mod tests {
                     ended: Mutex::new(Vec::new()),
                     fail_ready_once: AtomicBool::new(false),
                     fail_start_once: AtomicBool::new(false),
+                    receipt: Mutex::new(None),
                 },
                 root,
                 registry_name: "registry",
@@ -15308,6 +15369,9 @@ pub(crate) mod tests {
         pub(crate) fail_ready_once: AtomicBool,
         /// Fail the next native harness start before anything starts: it never comes up.
         pub(crate) fail_start_once: AtomicBool,
+        /// The receipt a verified submission returns, as the composer path proves one; `None`
+        /// leaves submissions unconfirmed.
+        pub(crate) receipt: Mutex<Option<crate::submission::SubmissionReceipt>>,
     }
     /// How a read that [`Fake::hold_reads`] holds ends.
     #[derive(Clone)]
@@ -15788,6 +15852,19 @@ pub(crate) mod tests {
         }
     }
     impl ManagedApi for Fake {
+        fn prompt_guarded(
+            &self,
+            pane: &str,
+            text: &str,
+            terminal: &dyn GuardedInput,
+            _runtime: &dyn agent::AgentRuntime,
+        ) -> crate::error::Result<Submission> {
+            terminal.native_prompt(pane, text)?;
+            Ok(match self.receipt.lock().unwrap().clone() {
+                Some(receipt) => Submission::Verified(receipt),
+                None => Submission::Unconfirmed,
+            })
+        }
         fn process_liveness(&self, expected: &CustomProcessIdentity) -> ProcessLiveness {
             if self.liveness_unknown.load(Ordering::Relaxed) {
                 return ProcessLiveness::Unknown;

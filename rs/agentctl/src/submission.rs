@@ -962,6 +962,27 @@ fn transcript_count(view: &ComposerView, text: &str) -> usize {
     compact(&view.transcript).matches(&suffix(text, 40)).count()
 }
 
+/// Characters of a prompt, blanks aside, that must show unbroken above the composer for it to
+/// count as drawn there when its ends do not show.
+const TAKEN_RUN: usize = 120;
+
+/// Whether `transcript` shows an unbroken run of [`TAKEN_RUN`] characters of `text`, blanks
+/// aside (#953 agentctl-busy-claude-false-possibly-submitted). Claude Code draws a prompt it
+/// takes at a tool boundary among that tool's result rows, cut at both ends: without its first
+/// rows and without its last, so the tail [`transcript_count`] looks for never shows. A run that
+/// long of a prompt typed into this pane alone is that prompt, not a coincidence.
+fn shows_run_of(transcript: &str, text: &str) -> bool {
+    let prompt: Vec<char> = compact(text).chars().collect();
+    let Some(last) = prompt.len().checked_sub(TAKEN_RUN) else {
+        return false;
+    };
+    let shown = compact(transcript);
+    (0..=last)
+        .step_by(TAKEN_RUN / 4)
+        .chain([last])
+        .any(|start| shown.contains(&prompt[start..start + TAKEN_RUN].iter().collect::<String>()))
+}
+
 fn corroborated(before: &ComposerView, after: &ComposerView, text: &str) -> Option<String> {
     if transcript_count(after, text) > transcript_count(before, text) {
         return Some("prompt text appeared above the composer".to_owned());
@@ -1407,7 +1428,9 @@ pub fn submit_verified(
                 crate::stale_draft::pasted_line_count_pub(label)
                     .is_some_and(|count| expected_line_counts(text).contains(&count))
             });
-        if in_transcript {
+        // Taken at a tool boundary: drawn among the tool's result rows, cut at both ends (#953).
+        let taken_into_turn = !in_transcript && shows_run_of(&before.transcript, text);
+        if in_transcript || taken_into_turn {
             return Ok(Submission::Verified(SubmissionReceipt {
                 key: "Enter",
                 key_presses: 0,
@@ -1415,12 +1438,16 @@ pub fn submit_verified(
                 evidence: if queued_area {
                     "stranded prompt is in the agent's queued messages (queue marker visible)"
                         .to_owned()
+                } else if taken_into_turn {
+                    "stranded prompt was taken into the running turn (part of it shows above the \
+                     composer)"
+                        .to_owned()
                 } else {
                     "stranded prompt appeared above the composer".to_owned()
                 },
                 printed: true,
                 settled: true,
-                queued: queued_area,
+                queued: queued_area || taken_into_turn,
             }));
         }
         let waited = runtime
@@ -3915,6 +3942,86 @@ mod tests {
         );
         assert!(screen.state().pastes.is_empty(), "nothing typed again");
         assert!(screen.state().keys.is_empty());
+    }
+
+    /// A prompt as long as the messages agents send each other, one line of it per item.
+    const LONG_STRANDED: &str = concat!(
+        "[from coordinator via agentctl · reply: agentctl send coordinator]\n",
+        "Coordinator: the evidence for the busy-pane issue, without screens but with rows:\n",
+        "- every false failure today is a receipt-backed not-seen row on the coordinator pane,\n",
+        "  each from the liaison or the watcher while the coordinator ran a long tool call;\n",
+        "- six acknowledged entries in the failed archive, every one of which did arrive;\n",
+        "Pattern: all arrived mid-turn, so the five-second check ran while input was queued.\n",
+        "Repro: keep a Claude pane busy with a long tool call and send two or three prompts.",
+    );
+
+    /// A busy Claude Code screen that drew `prompt`, taken at a tool boundary, among the result
+    /// rows of the tool it ran: without its first two rows and its last, as captured live.
+    fn taken_at_tool_boundary(prompt: &str) -> String {
+        let lines: Vec<&str> = prompt.lines().collect();
+        let mut rows = vec![
+            "● Bash(grep -n receipt src/read_back.rs)".to_owned(),
+            "  ⎿  113:pub struct SubmissionReceipt {".to_owned(),
+            "     … +17 lines (ctrl+o to expand)".to_owned(),
+        ];
+        rows.extend(
+            lines[2..lines.len() - 1]
+                .iter()
+                .map(|line| format!("  {line}")),
+        );
+        rows.push(String::new());
+        rows.push("● Reading the rest of the receipt.".to_owned());
+        claude_screen(
+            &rows.iter().map(String::as_str).collect::<Vec<_>>(),
+            "",
+            BUSY_STATUS,
+        )
+    }
+
+    #[test]
+    fn a_stranded_prompt_taken_at_a_tool_boundary_is_delivered_never_lost() {
+        // #953 agentctl-busy-claude-false-possibly-submitted: Claude Code took the stranded
+        // prompt into its running turn at a tool boundary and drew it among that tool's result
+        // rows, cut at both ends, so neither its tail nor the whole prompt ever showed. Once
+        // the late-paste window passed, it was reported lost though it had arrived.
+        let screen = taken_at_tool_boundary(LONG_STRANDED);
+        let replay = Replay::new(screen.clone(), screen.clone(), screen);
+        let clock = stranded_clock((STAGE_TIMEOUT + STAGE_GRACE).as_secs_f64() + 5.0);
+        let outcome = submit_verified(
+            &replay,
+            "w1:p1",
+            "claude",
+            LONG_STRANDED,
+            in_lock_timeouts(),
+            &clock,
+        );
+        let receipt = receipt(outcome);
+        assert!(receipt.queued, "{receipt:?}");
+        assert!(
+            receipt.evidence.contains("taken into the running turn"),
+            "{receipt:?}"
+        );
+        assert!(replay.pastes.lock().unwrap().is_empty(), "never retyped");
+        assert!(replay.keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_short_run_of_a_stranded_prompt_above_the_composer_is_not_delivery() {
+        // Words a prompt shares with other text, such as its sender header, prove nothing.
+        let shared = "[from coordinator via agentctl · reply: agentctl send coordinator]";
+        assert!(!shows_run_of(shared, LONG_STRANDED));
+        let screen = claude_screen(&["● Done.", shared], "", BUSY_STATUS);
+        let replay = Replay::new(screen.clone(), screen.clone(), screen);
+        let clock = stranded_clock((STAGE_TIMEOUT + STAGE_GRACE).as_secs_f64() + 5.0);
+        let outcome = submit_verified(
+            &replay,
+            "w1:p1",
+            "claude",
+            LONG_STRANDED,
+            in_lock_timeouts(),
+            &clock,
+        );
+        assert!(is_late_paste_lost(&refusal(outcome)));
     }
 
     #[test]

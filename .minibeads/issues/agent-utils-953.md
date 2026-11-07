@@ -1,10 +1,12 @@
 ---
 title: 'agentctl-busy-claude-false-possibly-submitted: sends to a busy Claude Code pane are retained as failed although the prompt was delivered'
-status: open
+status: closed
+assignee: cl-sync
 priority: 2
 issue_type: bug
 created_at: 2026-11-06T19:08:27.000000000+00:00
-updated_at: 2026-11-06T19:08:27.000000000+00:00
+updated_at: 2026-11-07T01:25:24.447252000+00:00
+closed_at: 2026-11-07T01:25:24.447252000+00:00
 ---
 
 # Description
@@ -32,3 +34,12 @@ Message ids from the first pane, for its readback.jsonl: 01793989429469075785-19
 # Notes
 
 Reported 2026-11-06 by the lead coordinator.
+
+## Resolution
+
+Two paths reported delivered prompts as failed while a Claude Code pane ran a long turn.
+
+- Read-back. A prompt that leaves the composer of a pane already inside a turn gets a receipt marked queued, and settled once the composer stays clear. Read-back ignored that receipt and waited five seconds for the prompt to show; Claude Code draws a queued prompt only when its turn reaches the input, so the row said `not-seen` and the message was kept as failed. Every false failure on both coordinators was such a row (`receipt: true`). Decision: a queued, settled receipt places the prompt in the target as a printed receipt does, so the receipt wins over the missing sighting; the row says `queued`. An unsettled receipt (the prompt may be back in the composer) or one from a pane that ran no turn stays unproven. A `not-seen` row now keeps the receipt's fields and the target's last twelve screen rows, so the next screen that should have proved delivery can become a fixture.
+- Late paste. A prompt an earlier pass typed into a busy pane was reported `late_paste_lost` after 300 s although it had arrived. Captured on a live pane: Claude Code draws a prompt it takes at a tool boundary among that tool's result rows, without its header and first rows and cut before its end, so neither its tail nor its whole text ever showed. An unbroken run of 120 characters of the prompt above the composer now counts as taken into the turn.
+
+Tests: three prompts sent in quick succession to a busy Claude screen are delivered with no failed record; an unsettled and a not-queued receipt still quarantine; a queued receipt outweighs an old copy in another pane; a stranded prompt drawn as captured is delivered and never retyped; a shared header alone is not. The Python edition has no queued receipt and is unchanged.

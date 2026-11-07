@@ -1676,6 +1676,150 @@ fn a_later_prompt_printed_after_the_read_back_limit_stays_unproven() {
     );
 }
 
+// #953 agentctl-busy-claude-false-possibly-submitted: a Claude Code pane in the middle of a turn
+// running tools takes a prompt into its queue and draws it only when the turn reaches it.
+
+/// A busy Claude Code pane as the read-back sees it while a long tool call runs: the running
+/// tool, the status row under it, and an empty composer (frames captured from a live pane).
+fn busy_claude_screen() -> Vec<String> {
+    let rule = "─".repeat(60);
+    [
+        "● Bash(python3 restart.py --apply lane-a lane-b lane-c)",
+        "  ⎿  Running… (3m 52s · timeout 10m)",
+        "     (ctrl+b to run in background)",
+        "",
+        "✻ Working… (running PreToolUse hooks…)",
+        "",
+        rule.as_str(),
+        "❯ ",
+        rule.as_str(),
+        "  ⏵⏵ bypass permissions on · 1 shell · esc to interrupt · ← 1 agent · ↓ to manage",
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
+/// The receipt the composer path returns when a prompt leaves the composer of a pane that was
+/// already running a turn, without the pane printing it before the print grace ran out.
+fn taken_into_queue(settled: bool) -> crate::submission::SubmissionReceipt {
+    crate::submission::SubmissionReceipt {
+        key: "Enter",
+        key_presses: 1,
+        elapsed: Duration::from_millis(400),
+        evidence: "prompt left the composer".to_owned(),
+        printed: false,
+        settled,
+        queued: true,
+    }
+}
+
+/// A started worker whose pane is a busy Claude Code that never draws a sent prompt within the
+/// read-back limit, and whose submissions return `receipt`.
+fn busy_worker(receipt: crate::submission::SubmissionReceipt) -> Fixture {
+    TEST_READBACK.with(|limit| limit.set(Some(Duration::from_millis(100))));
+    let fixture = Fixture::new();
+    fixture.start(None);
+    fixture
+        .client
+        .scrollback
+        .lock()
+        .unwrap()
+        .insert("owned".to_owned(), busy_claude_screen());
+    *fixture.client.print_after.lock().unwrap() = Some(Duration::MAX);
+    *fixture.client.receipt.lock().unwrap() = Some(receipt);
+    fixture
+}
+
+fn readback_rows(fixture: &Fixture, agent_name: &str) -> Vec<Value> {
+    fs::read_to_string(agent_directory(fixture, agent_name).join("readback.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn prompts_a_busy_claude_takes_into_its_queue_are_delivered_before_they_show() {
+    // Three prompts in quick succession while a long tool call runs: each left the composer
+    // into the turn's queue, none is drawn within the read-back limit, and each was delivered.
+    let fixture = busy_worker(taken_into_queue(true));
+    let prompts = [
+        "[from liaison via agentctl] a long enough first status for the busy coordinator",
+        "[from liaison via agentctl] a long enough second status for the busy coordinator",
+        "[agentctl watch-agents] a long enough notice that one lane finished its turn",
+    ];
+    for prompt in prompts {
+        send(&fixture, "worker", prompt).expect("delivered into the queue");
+    }
+    assert_eq!(runs(&fixture), prompts);
+    assert!(failed_documents(&fixture, "worker").is_empty());
+    let rows = readback_rows(&fixture, "worker");
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    for row in rows {
+        assert_eq!(row["result"], "queued", "{row}");
+        assert_eq!(row["evidence"]["receipt"], true, "{row}");
+    }
+}
+
+#[test]
+fn a_prompt_not_proven_to_stay_out_of_a_busy_composer_is_still_unproven() {
+    // An unsettled receipt did not see the composer stay clear: the prompt may be back in it,
+    // so it is quarantined, and the row keeps the receipt and the screen for a fixture.
+    let fixture = busy_worker(taken_into_queue(false));
+    let error = send(&fixture, "worker", LONG).expect_err("quarantined");
+    assert_eq!(
+        error.outcome(),
+        Some(agent::QueueOutcome::PossiblySubmitted),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("never showed in pane"),
+        "{error}"
+    );
+    let rows = readback_rows(&fixture, "worker");
+    let row = rows.last().unwrap();
+    assert_eq!(row["result"], "not-seen", "{row}");
+    assert_eq!(row["evidence"]["receipt"]["queued"], true, "{row}");
+    assert_eq!(row["evidence"]["receipt"]["settled"], false, "{row}");
+    let screen = row["evidence"]["screen_tail"].to_string();
+    assert!(screen.contains("running PreToolUse hooks"), "{row}");
+}
+
+#[test]
+fn a_prompt_that_left_an_idle_composer_unseen_is_still_unproven() {
+    // Leaving the composer of a pane that ran no turn queues nothing: without a sighting the
+    // receipt proves nothing about the recipient.
+    let fixture = busy_worker(crate::submission::SubmissionReceipt {
+        queued: false,
+        ..taken_into_queue(true)
+    });
+    let error = send(&fixture, "worker", LONG).expect_err("quarantined");
+    assert_eq!(
+        error.outcome(),
+        Some(agent::QueueOutcome::PossiblySubmitted),
+        "{error}"
+    );
+    assert_eq!(failed_documents(&fixture, "worker").len(), 1);
+}
+
+#[test]
+fn a_prompt_queued_in_the_target_outweighs_an_old_copy_in_a_peer() {
+    // The receipt saw the prompt staged in the target's own composer before it was queued, so
+    // a peer still showing an old copy cannot make it unattributable (#704 misroute-shared-text).
+    let fixture = busy_worker(taken_into_queue(true));
+    add_bystander(&fixture);
+    fixture
+        .client
+        .scrollback
+        .lock()
+        .unwrap()
+        .insert("peer".to_owned(), vec![typed(LONG)]);
+    send(&fixture, "worker", LONG).expect("attributed to the target");
+    assert!(failed_documents(&fixture, "worker").is_empty());
+    let rows = readback_rows(&fixture, "worker");
+    assert_eq!(rows.last().unwrap()["result"], "attributed", "{rows:?}");
+}
+
 #[test]
 fn a_prompt_printed_without_its_markdown_markup_is_delivered() {
     // Claude prints `code` without backticks and **bold** without asterisks.
