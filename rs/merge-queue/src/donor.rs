@@ -423,6 +423,10 @@ pub struct Store {
     /// Consecutive probe-pass/launch-refuse cycles after which a host fault escalates:
     /// a probe pass alone no longer clears it, only an admitted validation does.
     pub host_fault_escalate_after: usize,
+    /// Repository in which tool identities can be resolved to git objects for the
+    /// descendant check (receipt acceptance), when the queue host has one. `None`
+    /// keeps receipt tool checks exact.
+    pub tool_repo: Option<PathBuf>,
 }
 
 /// The store's lock, held only for one short operation.
@@ -714,6 +718,128 @@ pub fn refresh_tools_with_timeout(
 /// been upgraded or its tools have moved.
 pub const LEGACY_MISMATCH_DECLINE: &str = "this donor's tools differ from the queue host's: ";
 
+/// Most first-parent commits searched for a job's stamped tool tree when proving a
+/// donor's newer tree descends from it (bounded descendant acceptance, #1005).
+pub const TOOL_WALK_BOUND: usize = 1024;
+
+/// Whether `value` is a full-length hex object name (SHA-1 or SHA-256).
+fn full_hex(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The `<ref>` and path of a `git rev-parse <ref>:<path>` identity command, or
+/// `None` for any other shape. `git -C <dir> rev-parse origin/main:ci-hub` and
+/// `<ref>^{tree}` (the root tree, empty path) are recognised.
+fn rev_parse_spec(command: &str) -> Option<(String, String)> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let at = words.iter().position(|word| *word == "rev-parse")?;
+    let spec = words.get(at + 1)?;
+    if let Some(reference) = spec.strip_suffix("^{tree}") {
+        return Some((reference.to_owned(), String::new()));
+    }
+    let (reference, path) = spec.split_once(':')?;
+    Some((reference.to_owned(), path.to_owned()))
+}
+
+/// The repository an identity command names: its `git -C <dir>` directory
+/// resolved against `base` (an absolute `<dir>` stands), or `base` itself when
+/// the command names none.
+pub fn tool_repo_of(command: &str, base: &Path) -> PathBuf {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    for pair in words.windows(2) {
+        if pair[0] == "-C" {
+            let dir = Path::new(pair[1]);
+            return if dir.is_absolute() {
+                dir.to_path_buf()
+            } else {
+                base.join(dir)
+            };
+        }
+    }
+    base.to_path_buf()
+}
+
+/// Whether the donor's tool answer `have` for `name` provably descends from the
+/// job's stamp in `repo` (bounded descendant acceptance, #1005). Commit answers
+/// prove by ancestry directly. Tree answers (for example `git rev-parse
+/// origin/main:ci-hub`) prove through commits: the donor commit is re-derived
+/// from the identity command's ref, its tree at the path must equal `have`, and
+/// a bounded first-parent walk must reach a commit whose tree at the path is
+/// the stamp. Anything unprovable — non-git answers, missing objects, unrelated
+/// trees — is `false`, and the caller keeps the exact-match behaviour.
+pub fn tool_descends_from(
+    validator: &ValidatorConfig,
+    name: &str,
+    stamp: &str,
+    have: &str,
+    repo: &Path,
+) -> bool {
+    if stamp == have {
+        return true;
+    }
+    if !full_hex(stamp) || !full_hex(have) {
+        return false;
+    }
+    let repo = &validator
+        .tool_identity
+        .get(name)
+        .map_or_else(|| repo.to_path_buf(), |command| tool_repo_of(command, repo));
+    let Ok(stamp_kind) = git_in(repo, &["cat-file", "-t", stamp]) else {
+        return false;
+    };
+    let Ok(have_kind) = git_in(repo, &["cat-file", "-t", have]) else {
+        return false;
+    };
+    let git = crate::git::Git::new(repo);
+    match (stamp_kind.as_str(), have_kind.as_str()) {
+        ("commit", "commit") => git.is_ancestor(stamp, have).unwrap_or(false),
+        ("tree", "tree") => {
+            let Some(command) = validator.tool_identity.get(name) else {
+                return false;
+            };
+            let Some((reference, path)) = rev_parse_spec(command) else {
+                return false;
+            };
+            let Ok(donor_commit) = git_in(repo, &["rev-parse", &format!("{reference}^{{commit}}")])
+            else {
+                return false;
+            };
+            let at_path = if path.is_empty() {
+                format!("{donor_commit}^{{tree}}")
+            } else {
+                format!("{donor_commit}:{path}")
+            };
+            if git_in(repo, &["rev-parse", &at_path]).ok().as_deref() != Some(have) {
+                return false;
+            }
+            let bound = (TOOL_WALK_BOUND + 1).to_string();
+            let Ok(walk) = git_in(
+                repo,
+                &[
+                    "rev-list",
+                    "--first-parent",
+                    &format!("--max-count={bound}"),
+                    &donor_commit,
+                ],
+            ) else {
+                return false;
+            };
+            for commit in walk.lines().take(TOOL_WALK_BOUND) {
+                let at_path = if path.is_empty() {
+                    format!("{commit}^{{tree}}")
+                } else {
+                    format!("{commit}:{path}")
+                };
+                if git_in(repo, &["rev-parse", &at_path]).ok().as_deref() == Some(stamp) {
+                    return git.is_ancestor(commit, &donor_commit).unwrap_or(false);
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// How the donor's tools differ from the job's, or `None` when they agree.
 pub fn tool_mismatch(
     wanted: &BTreeMap<String, String>,
@@ -742,6 +868,7 @@ impl Store {
             current_tools: None,
             compare_only: std::collections::BTreeSet::new(),
             host_fault_escalate_after: DEFAULT_HOST_FAULT_ESCALATE_AFTER,
+            tool_repo: None,
         }
     }
 
@@ -1197,6 +1324,72 @@ impl Store {
         self.write(&job)
     }
 
+    /// The receipt's tool refusal, if any, with acceptance notes for tools the
+    /// donor ran newer than the stamp. The settings digest and the merge-queue
+    /// revision must match exactly; each tool must match the stamp or provably
+    /// descend from it in [`Store::tool_repo`] (bounded descendant acceptance,
+    /// #1005). Without a tool repository the tools must match exactly.
+    fn tool_check(&self, job: &Job, receipt: &Receipt) -> (Option<String>, Vec<String>) {
+        if receipt.tool.validator_digest != job.tool.validator_digest {
+            return (
+                Some(format!(
+                    "the receipt's tool identity {:?} is not the job's {:?}",
+                    receipt.tool, job.tool
+                )),
+                Vec::new(),
+            );
+        }
+        if receipt.tool.merge_queue != job.tool.merge_queue {
+            return (
+                Some(format!(
+                    "the receipt's tool identity {:?} is not the job's {:?}",
+                    receipt.tool, job.tool
+                )),
+                Vec::new(),
+            );
+        }
+        let mut notes = Vec::new();
+        let recorded = &receipt.tool.tools;
+        let stamped = &job.tool.tools;
+        if recorded.len() != stamped.len()
+            || recorded.keys().any(|name| !stamped.contains_key(name))
+        {
+            return (
+                Some(format!(
+                    "the receipt's tool identity {:?} is not the job's {:?}",
+                    receipt.tool, job.tool
+                )),
+                Vec::new(),
+            );
+        }
+        for (name, stamp) in stamped {
+            let have = &recorded[name];
+            if have == stamp {
+                continue;
+            }
+            let descends = self
+                .tool_repo
+                .as_ref()
+                .is_some_and(|repo| tool_descends_from(&job.validator, name, stamp, have, repo));
+            if descends {
+                notes.push(format!(
+                    "accepted with descendant tool {name} ({} -> {})",
+                    crate::plan::short(stamp),
+                    crate::plan::short(have)
+                ));
+            } else {
+                return (
+                    Some(format!(
+                        "the receipt's tool {name} {have:?} neither matches the job's \
+                         stamp {stamp:?} nor provably descends from it"
+                    )),
+                    Vec::new(),
+                );
+            }
+        }
+        (None, notes)
+    }
+
     /// Accept `receipt` for job `id` under lease `token`, or refuse it with the reason (which
     /// is also recorded on the job).
     pub fn report(&self, id: &str, token: &str, receipt: Receipt) -> Result<(), String> {
@@ -1220,6 +1413,7 @@ impl Store {
             claimed_unix: 0,
             expires_unix: 0,
         });
+        let (tool_refusal, tool_notes) = self.tool_check(&job, &receipt);
         let refusal = if receipt.schema != RECEIPT_SCHEMA {
             Some(format!("unknown receipt schema {:?}", receipt.schema))
         } else if receipt.job != job.id {
@@ -1239,11 +1433,8 @@ impl Store {
                 "the receipt validated tree {}, not the job's tree {}",
                 receipt.tree, job.tree
             ))
-        } else if receipt.tool != job.tool {
-            Some(format!(
-                "the receipt's tool identity {:?} is not the job's {:?}",
-                receipt.tool, job.tool
-            ))
+        } else if let Some(reason) = tool_refusal {
+            Some(reason)
         } else {
             None
         };
@@ -1367,6 +1558,9 @@ impl Store {
                 "the receipt says validation could not run ({detail}); no verdict, the job is \
                  queued again"
             ));
+        }
+        for note in &tool_notes {
+            job.history.push(format!("{}: {note}", now()));
         }
         job.state = JobState::Done;
         job.lease = None;
@@ -2717,17 +2911,41 @@ impl Worker<'_> {
             have =
                 tool_answers(&job.validator, &self.options.clone).map_err(Unreported::Declined)?;
             if let Some(after) = tool_mismatch(&job.tool.tools, &have) {
-                // Still different after a refresh: this donor is newer than the job, or
-                // unrelated to it. Give the job back (with the back-off above) rather than
-                // decline it: a decline would bar this donor until the queue re-stamps the
-                // job, and the re-stamped job may never return here. As a release it is
-                // offered again once the queue re-stamps it, and other donors may take it
-                // meanwhile (#1005 merge-queue-donor-restamp-race).
-                self.back_off(backoff);
-                return Err(Unreported::Released(format!(
-                    "this donor's tools still differ from the job's after refreshing them \
-                     ({after}), so this donor is newer than the job or unrelated to it"
-                )));
+                // Bounded descendant acceptance (#1005): when every differing tool
+                // provably descends from the job's stamp, run the job under this
+                // donor's newer tools; the receipt records them (`have`), and the
+                // queue accepts it only after the same proof in its own repository.
+                let differing_now = mismatched_tools(&job.tool.tools, &have);
+                let descendant = differing_now.iter().all(|name| {
+                    tool_descends_from(
+                        &job.validator,
+                        name,
+                        &job.tool.tools[name],
+                        &have[name],
+                        &self.options.clone,
+                    )
+                });
+                if descendant {
+                    eprintln!(
+                        "merge-queue donor {}: tools newer than {}'s stamp descend from \
+                         it ({}); running it under this donor's tools",
+                        self.options.name, job.id, after
+                    );
+                } else {
+                    // Still different after a refresh, and not a provable descendant:
+                    // this donor is newer in an unrelated way, or unrelated to the
+                    // job. Give the job back (with the back-off above) rather than
+                    // decline it: a decline would bar this donor until the queue
+                    // re-stamps the job, and the re-stamped job may never return
+                    // here. As a release it is offered again once the queue
+                    // re-stamps it, and other donors may take it meanwhile (#1005
+                    // merge-queue-donor-restamp-race).
+                    self.back_off(backoff);
+                    return Err(Unreported::Released(format!(
+                        "this donor's tools still differ from the job's after refreshing them \
+                         ({after}), so this donor is newer than the job or unrelated to it"
+                    )));
+                }
             }
             eprintln!(
                 "merge-queue donor {}: refreshed {} for {}; its tools now match ({before} before)",
@@ -4098,6 +4316,120 @@ mod unit {
         assert!(store.claim("d2", "h2", 1).unwrap().is_none());
         let job = store.read(&first.id).unwrap();
         assert_eq!(job.tool.tools, moved, "a leased job is not re-stamped");
+    }
+
+    /// A git repo with two commits touching `ci-hub/tool` (v1 then v2) on top of
+    /// an unrelated third commit; returns (repo, v1 commit, v1 tree, v2 commit,
+    /// v2 tree, unrelated tree).
+    fn tool_repo(tag: &str) -> (PathBuf, String, String, String, String, String) {
+        let repo = temp(tag);
+        let git = |args: &[&str]| git_in(&repo, args).unwrap();
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "dev@example.com"]);
+        git(&["config", "user.name", "Dev"]);
+        std::fs::create_dir_all(repo.join("ci-hub")).unwrap();
+        std::fs::write(repo.join("ci-hub/tool"), "v1\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        let c1 = git(&["rev-parse", "HEAD"]);
+        let t1 = git(&["rev-parse", "HEAD:ci-hub"]);
+        std::fs::write(repo.join("ci-hub/tool"), "v2\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v2"]);
+        let c2 = git(&["rev-parse", "HEAD"]);
+        let t2 = git(&["rev-parse", "HEAD:ci-hub"]);
+        std::fs::write(repo.join("ci-hub/tool"), "other\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "other"]);
+        let unrelated = git(&["rev-parse", "HEAD:ci-hub"]);
+        git(&["reset", "-q", "--hard", &c2]);
+        (repo, c1, t1, c2, t2, unrelated)
+    }
+
+    fn git_validator() -> ValidatorConfig {
+        let mut validator = validator();
+        validator.tool_identity = [(
+            "ci-hub".to_owned(),
+            "git rev-parse origin/main:ci-hub".to_owned(),
+        )]
+        .into();
+        validator
+    }
+
+    #[test]
+    fn descendant_tools_prove_by_commit_and_by_tree() {
+        let (repo, c1, t1, c2, t2, unrelated) = tool_repo("descendant");
+        git_in(&repo, &["update-ref", "refs/remotes/origin/main", &c2]).unwrap();
+        let validator = git_validator();
+        // Commit form: c2 descends from c1, not the other way round.
+        assert!(tool_descends_from(&validator, "ci-hub", &c1, &c2, &repo));
+        assert!(!tool_descends_from(&validator, "ci-hub", &c2, &c1, &repo));
+        // Tree form: t2 descends from t1 through origin/main; unrelated proves nothing.
+        assert!(tool_descends_from(&validator, "ci-hub", &t1, &t2, &repo));
+        assert!(!tool_descends_from(
+            &validator, "ci-hub", &t1, &unrelated, &repo
+        ));
+        // Non-git answers and missing objects never prove.
+        assert!(!tool_descends_from(
+            &validator, "ci-hub", "1.90", "1.91", &repo
+        ));
+        assert!(!tool_descends_from(
+            &validator,
+            "ci-hub",
+            &"f".repeat(40),
+            &t2,
+            &repo
+        ));
+    }
+
+    #[test]
+    fn a_receipt_with_a_descendant_tool_is_accepted_and_an_unrelated_one_refused() {
+        let (repo, _c1, t1, _c2, t2, unrelated) = tool_repo("receipt-tools");
+        git_in(&repo, &["update-ref", "refs/remotes/origin/main", &_c2]).unwrap();
+        let mut store = Store::new(&temp("receipt-tools-store"));
+        store.tool_repo = Some(repo.clone());
+        let validator = git_validator();
+        let tool = ToolIdentity {
+            validator_digest: validator_digest(&validator).unwrap(),
+            tools: [("ci-hub".to_owned(), t1.clone())].into(),
+            merge_queue: Some(crate::build_info::Revision {
+                commit: "a".repeat(40),
+                dirty: false,
+            }),
+        };
+        let job = store
+            .publish(
+                "cand",
+                "tree0",
+                "base0",
+                &Selection::of([TestId::step("a")]),
+                &BTreeSet::new(),
+                &validator,
+                &tool,
+                false,
+            )
+            .unwrap();
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        // Unrelated tree: refused, job stays leased.
+        let mut bad = receipt(&claimed, "d1");
+        bad.tool.tools.insert("ci-hub".to_owned(), unrelated);
+        let error = store.report(&job.id, &token, bad).unwrap_err();
+        assert!(error.contains("descends"), "{error}");
+        assert_eq!(store.read(&job.id).unwrap().state, JobState::Leased);
+        // Descendant tree: accepted, history names the descendant tool.
+        let mut good = receipt(&claimed, "d1");
+        good.tool.tools.insert("ci-hub".to_owned(), t2);
+        store.report(&job.id, &token, good).unwrap();
+        let done = store.read(&job.id).unwrap();
+        assert_eq!(done.state, JobState::Done);
+        assert!(
+            done.history
+                .join("\n")
+                .contains("accepted with descendant tool ci-hub"),
+            "{:?}",
+            done.history
+        );
     }
 
     #[test]

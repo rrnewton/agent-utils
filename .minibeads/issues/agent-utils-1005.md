@@ -44,19 +44,31 @@ operator now fetches the tool checkout every 60 s as a stopgap.
 
 # Design
 
-Keep the exact-tools rule; a job is still validated only with the tools it
-names. Two changes, either sufficient:
+As landed (two landings):
 
-1. Stamp at lease time: `donor claim` runs the queue host's `tool_refresh`
-   (rate-limited) and re-stamps the job before it hands out the lease, so the stamp is as new as
-   the donor's refresh, short of a race within seconds.
-2. After a "donor is newer than the job" decline, re-stamp and reserve the job
-   for the declining donor for one claim interval before any other donor may
-   lease it.
+1. Interim: a donor whose tools still differ after a refresh gives the job
+   back with its mismatch back-off instead of declining it, so the queue
+   re-offers it after a re-stamp and other donors may take it meanwhile. The
+   queue host also runs `validator.tool_refresh` before it answers tool
+   identity at claim time, bounded (30 s per tool) and rate-limited (one
+   attempt a minute, recorded on failure too), falling back to its current
+   answers on failure. Re-stamping at lease time alone still lags: a donor
+   may have refreshed past the queue host's own tree, so this alone does not
+   fix the race.
+2. Bounded descendant acceptance: when, for each tool that differs, the
+   donor's answer provably descends from the job's stamp (git ancestry in
+   the tool's checkout; tree answers prove through a bounded first-parent
+   walk of the identity ref's commits), the donor runs the job and records
+   its own tool identity in the receipt. The queue accepts that receipt
+   only when the recorded answer likewise descends from the stamp, proved
+   in the queue host's own repository. Unrelated trees, and donors older
+   than the stamp that cannot catch up, behave as before. The earlier
+   proposals (reserve the re-stamped job for the declining donor) are not
+   needed once the donor can run the job itself.
 
 # Acceptance
 
 - A test with a remote donor whose refreshed tools are newer than the job's
-  stamp: after its decline and the re-stamp, that donor gets the job on its
-  next claim even while the local donor is idle. It fails on the current code.
+  stamp: that donor gets the job even while the local donor is idle. It
+  fails on the pre-fix code.
 - The USER_GUIDE donor section states which donor gets a re-stamped job.

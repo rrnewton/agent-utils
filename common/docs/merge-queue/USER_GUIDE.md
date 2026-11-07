@@ -154,7 +154,7 @@ This command creates the state directory and writes `config.json`.
 | `--split-red-batches` | off | With `--confirm-reruns`, still send each change of a red batch of several changes back as a batch of its own instead of searching the batch's prefixes (a search holds the run for its whole length). Each red single-change batch is then confirmed by one rerun of its failed tests at the same commit before its change is ejected. No effect without `--confirm-reruns`. |
 | `--offload MODE` | `off` | Where validations run: `off` (in this process, as always), `compare` (in this process, which decides, and also on donors, whose receipts are only compared) or `decide` (on donors only; an accepted receipt is the verdict). See "Donor validators". |
 | `--tool-identity NAME=COMMAND` | none | A tool the validation depends on (repeatable): the command prints its identity, for example a tool repository's commit or a toolchain version, never a hash of a binary (builds are not byte-identical across hosts). A donor whose answer differs does not run the job (see "Tool identity and receipts"). merge-queue's own revision is always compared. |
-| `--tool-refresh NAME=COMMAND` | none | How a donor brings the tool `NAME` (one of `--tool-identity`) up to date, for example a fetch of the tool repository (repeatable). A donor whose answer differs runs it once and asks again: an older donor then takes the job, and one that still differs declines it. |
+| `--tool-refresh NAME=COMMAND` | none | How a donor brings the tool `NAME` (one of `--tool-identity`) up to date, for example a fetch of the tool repository (repeatable). A donor whose answer differs runs it once and asks again: an older donor then takes the job; one that still differs runs it when its tools provably descend from the job's stamp, and otherwise gives the job back. |
 | `--timeout SECS` | `0` | Seconds before one validation is killed (its whole process group) and its selected tests count as errors. `0` means no limit. |
 | `--clean-ignored` | off | Also delete ignored files (build caches) from a reused checkout before each validation. By default they are kept, which makes validations fast but trusts the build to be hermetic with respect to them. |
 | `--land DRIVER` | `push` | `push` or `command` (see "Land drivers"). |
@@ -1518,14 +1518,20 @@ certain it can never match it. Otherwise it gives the job back and is offered it
 - **A different tool answer**: the donor runs the tool's `validator.tool_refresh` command (for
   example a fetch of the tool repository; `init --tool-refresh NAME=COMMAND`) once and asks
   again. A donor that was older than the job now matches, and runs it. A donor that still
-  differs is newer than the job, or unrelated to it, and declines. It is offered the job again
-  only when the job is re-stamped, after the queue host's tools move. A tool with no refresh
-  command, or whose refresh fails, cannot be put in order, so the donor gives the job back
-  instead of declining it. Refreshes run only on a mismatch, never on a timer, and each is
-  bounded at 120 s.
+  differs runs the job anyway when every differing tool provably descends from the job's
+  stamp (bounded descendant acceptance: commit answers by git ancestry, tree answers such
+  as `git rev-parse <ref>:<path>` through a bounded first-parent walk of the ref's
+  commits); the receipt then records the donor's own tool answers. Otherwise the donor
+  gives the job back: it is offered the job again once the queue re-stamps it, and another
+  donor may take it meanwhile. A tool with no refresh command, or whose refresh fails,
+  likewise gives the job back. Refreshes run only on a mismatch, never on a timer, and
+  each is bounded at 120 s.
 
 A queued job is re-stamped with the queue host's current answers at every claim (when the
-queue host can answer them), so every queued job carries the same stamp. A decline with the reason a donor built before this rule
+queue host can answer them), so every queued job carries the same stamp. Before answering,
+the queue host runs `validator.tool_refresh` itself, bounded at 30 s per tool and at most
+once a minute, so stamps do not go stale while every donor is busy; a failed or timed-out
+refresh keeps the current answers and is logged. A decline with the reason a donor built before this rule
 gave for a mismatch (`this donor's tools differ from the queue host's: ...`) is recorded as a
 release.
 
@@ -1553,7 +1559,10 @@ The receipt (`merge-queue-receipt/v1`) names:
 The queue accepts it only if all of these hold:
 - the lease is live and the token and donor name match;
 - the commit and tree are the job's;
-- the tool identity equals the one the queue computed when it published the job.
+- the tool identity equals the one the queue computed when it published the job, or each
+  differing tool in it provably descends from that stamp in the queue host's repository
+  (the same bounded descendant proof the donor ran); the settings digest and the
+  merge-queue revision must always equal it.
 
 Every refusal is recorded in the job's history. Validation timeouts are the validator's own
 (`validator.timeout_secs`), enforced on the donor exactly as locally.

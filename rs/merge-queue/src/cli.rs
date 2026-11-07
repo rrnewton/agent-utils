@@ -536,6 +536,7 @@ fn read_token() -> Result<String, String> {
 
 fn donor_store(state: &State, config: &Config) -> crate::donor::Store {
     let mut store = crate::donor::Store::new(&state.root);
+    store.tool_repo = Some(config.repo.clone());
     store.lease_secs = config.donors.lease();
     store.could_not_run_limit = config.donors.could_not_run_limit();
     store.host_fault_escalate_after = config.donors.host_fault_escalate_after();
@@ -727,6 +728,24 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
                 .map_err(|error| format!("cannot read the report from stdin: {error}"))?;
             let report: crate::donor::Report = serde_json::from_str(&text)
                 .map_err(|error| format!("unreadable report: {error}"))?;
+            // A receipt that ran newer descendant tools names objects this host
+            // may not have fetched yet: fetch once, outside the store lock, so
+            // the descendant proof can resolve them (#1005).
+            if let Ok(jobs) = store.jobs() {
+                if let Some(stored) = jobs.iter().find(|stored| stored.id == job) {
+                    if stored.tool.tools != report.receipt.tool.tools {
+                        let git = crate::git::Git::new(&config.repo);
+                        let _ = git.run(&["fetch", "--quiet", &config.remote]);
+                        for command in config.validator.tool_identity.values() {
+                            let tool_repo = crate::donor::tool_repo_of(command, &config.repo);
+                            if tool_repo != config.repo {
+                                let git = crate::git::Git::new(&tool_repo);
+                                let _ = git.run(&["fetch", "--quiet", "origin"]);
+                            }
+                        }
+                    }
+                }
+            }
             store.report(&job, &report.token, report.receipt)?;
             print_json_reply(&serde_json::json!({"accepted": true}))?;
             Ok(0)

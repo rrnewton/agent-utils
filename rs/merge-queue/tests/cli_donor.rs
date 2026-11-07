@@ -616,6 +616,115 @@ fn the_queue_host_refreshes_a_stale_stamp_before_claim() {
     assert!(job.get("declined_by").is_none(), "{job}");
 }
 
+/// A tool repository beside the queue and donor clones: `tool-remote.git`
+/// seeded with `ci-hub/tool` v1, cloned as `tool/` inside the queue repo and
+/// inside `clone`. Returns the v1 `ci-hub` tree.
+fn tool_clones(fx: &Fixture, clone: &Path) -> String {
+    git(&fx.root, &["init", "-q", "--bare", "tool-remote.git"]);
+    git(&fx.root, &["clone", "-q", "tool-remote.git", "tool-seed"]);
+    let seed = fx.root.join("tool-seed");
+    std::fs::create_dir_all(seed.join("ci-hub")).unwrap();
+    std::fs::write(seed.join("ci-hub/tool"), "v1\n").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-q", "-m", "tool v1"]);
+    git(&seed, &["push", "-q", "origin", "HEAD:main"]);
+    git(
+        &fx.root,
+        &["clone", "-q", "tool-remote.git", "queue-tool-tmp"],
+    );
+    std::fs::rename(fx.root.join("queue-tool-tmp"), fx.queue().join("tool")).unwrap();
+    git(
+        &fx.root,
+        &["clone", "-q", "tool-remote.git", "donor-tool-tmp"],
+    );
+    std::fs::rename(fx.root.join("donor-tool-tmp"), clone.join("tool")).unwrap();
+    git(
+        &fx.queue().join("tool"),
+        &["rev-parse", "origin/main:ci-hub"],
+    )
+}
+
+/// Advance the tool repository to v2 (only `ci-hub/tool` changes).
+fn advance_tool(fx: &Fixture) {
+    let seed = fx.root.join("tool-seed");
+    std::fs::write(seed.join("ci-hub/tool"), "v2\n").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-q", "-m", "tool v2"]);
+    git(&seed, &["push", "-q", "origin", "HEAD:main"]);
+}
+
+#[test]
+fn a_remote_donor_with_newer_descendant_tools_gets_the_job() {
+    // #1005 acceptance: the job is stamped with the queue host's tool tree;
+    // the remote donor refreshes to a descendant tree and runs the job under
+    // its own tools, even though the stamp never moved. The receipt records
+    // the donor's tree, and the queue accepts it after the same proof.
+    let fx = Fixture::new("donor-descendant");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "decide",
+        "--tool-identity",
+        "ci-hub=git -C tool rev-parse origin/main:ci-hub",
+        "--tool-refresh",
+        "ci-hub=git -C tool fetch -q origin",
+    ]);
+    two_changes(&fx);
+    let clone = donor_clone(&fx, "donor-host");
+    let v1_tree = tool_clones(&fx, &clone);
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    assert_eq!(
+        jobs(&fx)[0]["tool"]["tools"]["ci-hub"],
+        v1_tree,
+        "the job starts stamped with the queue host's tree"
+    );
+    // Keep the queue host from re-stamping at claim time, so the donor itself
+    // meets the descendant mismatch this test is about.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        state_dir(&fx).join("donor").join("tool-refresh-at"),
+        now.to_string(),
+    )
+    .unwrap();
+    advance_tool(&fx);
+    // The donor host has already fetched the newer tools (its refresh at claim
+    // time will fetch again and stay there); the queue host has not.
+    git(&clone.join("tool"), &["fetch", "-q", "origin"]);
+    let v2_tree = git(&fx.root.join("tool-seed"), &["rev-parse", "HEAD:ci-hub"]);
+    let out = donor(&fx, &clone, "d1", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("descend from"), "{stderr}");
+    let (code, report, _) = finish(run);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        report["landed"][0]["prs"],
+        serde_json::json!([1, 2]),
+        "{report}"
+    );
+    let job = &jobs(&fx)[0];
+    assert_eq!(job["state"], "done", "{job}");
+    assert_eq!(job["tool"]["tools"]["ci-hub"], v1_tree, "{job}");
+    assert_eq!(job["receipt"]["tool"]["tools"]["ci-hub"], v2_tree, "{job}");
+    assert!(job.get("declined_by").is_none(), "{job}");
+    assert!(
+        job["history"]
+            .to_string()
+            .contains("accepted with descendant tool ci-hub"),
+        "{job}"
+    );
+}
+
 #[test]
 fn a_bundle_over_the_limit_is_refused_and_the_donor_declines() {
     let fx = Fixture::new("donor-bundle-limit");
