@@ -270,3 +270,145 @@ fn a_non_fast_forward_push_still_rebuilds_on_the_moved_base() {
     let files = git(&fx.remote(), &["ls-tree", "-r", "--name-only", "main"]);
     assert!(files.lines().any(|line| line == "tests/a"), "{files}");
 }
+
+/// Rewrite the kept validations as rooted prefix entries: every entry's
+/// parent is the original base and its changes are the cumulative prefix,
+/// as a stopped run with rooted prefix validations leaves them. Returns
+/// the validation count so far.
+fn seed_rooted_prefixes(fx: &Fixture) -> PathBuf {
+    let kept_path = fx.queue().join(".git/merge-queue/kept-validations.json");
+    let kept: Value = serde_json::from_str(&std::fs::read_to_string(&kept_path).unwrap()).unwrap();
+    let entry = &kept[0];
+    let tip = entry["tip"].as_str().unwrap().to_owned();
+    let parent = entry["parent"].as_str().unwrap().to_owned();
+    let changes = entry["changes"].as_array().unwrap().clone();
+    // Prefix commits: the kept tip's ancestors, one change at a time.
+    let mut prefixes = vec![tip.clone()];
+    let mut cursor = tip.clone();
+    for _ in 1..changes.len() {
+        cursor = git(&fx.queue(), &["rev-parse", &format!("{cursor}^")]);
+        prefixes.push(cursor.clone());
+    }
+    prefixes.reverse();
+    let seeded: Vec<Value> = changes
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let mut claim = entry["claim"].clone();
+            claim["commit"] = serde_json::json!(prefixes[index]);
+            serde_json::json!({
+                "tip": prefixes[index],
+                "parent": parent,
+                "changes": changes[..=index],
+                "claim": claim,
+                "run": entry["run"],
+                "validation": index + 1,
+            })
+        })
+        .collect();
+    std::fs::write(&kept_path, serde_json::to_string_pretty(&seeded).unwrap()).unwrap();
+    kept_path
+}
+
+fn kept_setup(tag: &str) -> (Fixture, PathBuf, PathBuf) {
+    let (fx, validated, pushes) = setup(tag);
+    set_wrapper(
+        &fx,
+        format!(
+            r#"for a in "$@"; do if [ "$a" = push ]; then echo push >> '{p}'; echo 'remote: fatal error in commit_refs while verifying commit graph' >&2; echo ' ! [remote rejected] main (commit_refs)' >&2; exit 1; fi; done; exec "$@""#,
+            p = pushes.display()
+        ),
+    );
+    (fx, validated, pushes)
+}
+
+fn clear_fault(fx: &Fixture) {
+    edit_config(fx, |value| {
+        value["net_wrapper"] = serde_json::json!([]);
+    });
+}
+
+#[test]
+fn kept_greens_land_in_sequence_when_the_landed_part_is_the_validated_prefix() {
+    let (fx, validated, _pushes) = kept_setup("kept-prefix-sequence");
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    fx.mq(&["run"]);
+    assert_eq!(count(&validated), 1, "one batch validation, then the stop");
+    seed_rooted_prefixes(&fx);
+    clear_fault(&fx);
+    let out = fx.mq(&["run"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(status(&fx, 1), "landed");
+    assert_eq!(status(&fx, 2), "landed");
+    assert_eq!(status(&fx, 3), "landed");
+    assert_eq!(
+        count(&validated),
+        1,
+        "each kept green landed on its validated prefix, none re-validated"
+    );
+}
+
+#[test]
+fn a_kept_green_whose_change_moved_head_is_validated_again() {
+    let (fx, validated, _pushes) = kept_setup("kept-prefix-moved-head");
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    fx.mq(&["run"]);
+    seed_rooted_prefixes(&fx);
+    // Force-push change 2: a new head the kept validation never saw.
+    fx.branch("b2", &[("tests/b", "changed\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b2"]);
+    clear_fault(&fx);
+    let out = fx.mq(&["run"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(status(&fx, 2), "landed");
+    assert!(
+        count(&validated) > 1,
+        "the moved head was validated again, not landed on the kept green"
+    );
+}
+
+#[test]
+fn kept_greens_resume_in_order_and_stop_at_the_first_mismatch() {
+    let (fx, validated, _pushes) = kept_setup("kept-prefix-mismatch");
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.branch("d", &[("tests/d", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    fx.mq_ok(&["submit", "4", "--head", "d"]);
+    fx.mq(&["run"]);
+    let kept_path = seed_rooted_prefixes(&fx);
+    // Corrupt the third entry: its tip is the second prefix's commit, so
+    // rebuilding its remainder can never match the validated tree.
+    let mut seeded: Value =
+        serde_json::from_str(&std::fs::read_to_string(&kept_path).unwrap()).unwrap();
+    seeded[2]["tip"] = seeded[1]["tip"].clone();
+    std::fs::write(&kept_path, serde_json::to_string_pretty(&seeded).unwrap()).unwrap();
+    clear_fault(&fx);
+    let out = fx.mq(&["run"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    for pr in 1..=4 {
+        assert_eq!(status(&fx, pr), "landed", "change {pr} lands in the end");
+    }
+    assert!(
+        count(&validated) > 1,
+        "the mismatched green and everything after it were validated again"
+    );
+    let events = latest_events(&fx);
+    assert!(
+        events.contains("no longer builds to the kept validated tree"),
+        "{events}"
+    );
+}

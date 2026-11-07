@@ -296,8 +296,9 @@ impl HeldCandidate {
 
 /// A green batch validation a stopped run kept for the next run (see
 /// [`crate::state::State::kept_validations`]): the next run lands it without
-/// validating again while the base has not moved under it, checked by the
-/// validated tree, the changes' heads, and the selection.
+/// validating again while what has landed since its base is exactly its
+/// validated prefix, checked by the validated tree, the changes' heads,
+/// and the selection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KeptValidation {
     /// The validated commit.

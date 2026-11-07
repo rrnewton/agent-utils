@@ -1899,26 +1899,36 @@ impl<'a> Runner<'a> {
             .collect();
         let ejected: BTreeSet<i64> = report.ejected.iter().map(|ejection| ejection.pr).collect();
         let items = lock(&self.items).clone();
-        let still_valid = |kept: &KeptValidation| {
-            kept.changes.iter().all(|change| {
-                items.get(&change.pr).is_some_and(|item| {
-                    item.status == ItemStatus::Queued
-                        && item.head == change.head
-                        && item.held_candidate.is_none()
-                        && item.hold_verdict.is_empty()
-                        && item.flaky_hold_until.is_empty()
-                })
+        let change_still_valid = |change: &HeldChange| {
+            items.get(&change.pr).is_some_and(|item| {
+                item.status == ItemStatus::Queued
+                    && item.head == change.head
+                    && item.held_candidate.is_none()
+                    && item.hold_verdict.is_empty()
+                    && item.flaky_hold_until.is_empty()
             })
         };
+        let still_valid = |kept: &KeptValidation| kept.changes.iter().all(change_still_valid);
         let mut kept: Vec<KeptValidation> = match self.state.kept_validations() {
             Ok(kept) => kept
                 .into_iter()
                 .filter(|entry| {
-                    still_valid(entry)
-                        && !entry
-                            .prs()
-                            .iter()
-                            .any(|pr| landed.contains(pr) || ejected.contains(pr))
+                    // A kept entry survives a prefix of its changes landing:
+                    // landed changes at the validated head are its validated
+                    // prefix, the rest must still be validly queued, and at
+                    // least one change must remain (else the entry is spent).
+                    entry.changes.iter().all(|change| {
+                        change_still_valid(change)
+                            || items.get(&change.pr).is_some_and(|item| {
+                                item.status == ItemStatus::Landed && item.head == change.head
+                            })
+                    }) && entry
+                        .changes
+                        .iter()
+                        .any(|change| !landed.contains(&change.pr))
+                        && !entry.changes.iter().any(|change| {
+                            !landed.contains(&change.pr) && ejected.contains(&change.pr)
+                        })
                 })
                 .collect(),
             Err(error) => {
@@ -1987,12 +1997,17 @@ impl<'a> Runner<'a> {
     }
 
     /// Land the green validations kept by an earlier stopped run, without
-    /// validating again, while the base has not moved under them: an entry is
-    /// used only when every change is still queued at the validated head, the
-    /// candidate rebuilt on the current base has exactly the validated tree,
-    /// and the selection is the validated one. Entries that no longer match
-    /// are dropped (their changes are planned and validated as usual); the
-    /// rest stay kept. Returns why the run must stop, when a landing did.
+    /// validating again. Entries are checked in kept order. An entry is
+    /// used when its already-landed changes are exactly an in-order prefix
+    /// of its validated changes (each at the validated head), every other
+    /// change is still queued at the validated head, the candidate rebuilt
+    /// from the rest on the current base has exactly the validated tree,
+    /// and the selection is the validated one. The tree check is the
+    /// soundness check: what lands is a tree that was validated. Entries
+    /// that no longer match are dropped (their changes are planned and
+    /// validated as usual), as is any later entry whose remaining changes
+    /// overlap a failed entry's; the rest stay kept. Returns why the run
+    /// must stop, when a landing did.
     fn land_kept(&self) -> Result<Option<String>, String> {
         if self.simulating()
             || self.options.dry_run
@@ -2009,30 +2024,83 @@ impl<'a> Runner<'a> {
             kept.retain(|entry| {
                 entry.changes.iter().all(|change| {
                     items.get(&change.pr).is_some_and(|item| {
-                        item.status == ItemStatus::Queued && item.head == change.head
+                        item.head == change.head
+                            && matches!(item.status, ItemStatus::Queued | ItemStatus::Landed)
                     })
                 }) && self.git.has_commit(&entry.tip)
             });
         }
+        // Changes of an entry that failed its checks in this pass: a later
+        // entry carrying any of them cannot match its validated prefix
+        // either, so it goes to normal planning without being built.
+        let mut failed: BTreeSet<i64> = BTreeSet::new();
         loop {
             if kept.is_empty() {
                 break;
             }
             let base = self.current_base()?;
-            let base_tree = self.git.tree_of(&base)?;
-            let Some(index) = kept.iter().position(|entry| {
-                self.git
-                    .tree_of(&entry.parent)
-                    .is_ok_and(|tree| tree == base_tree)
-            }) else {
-                break;
+            let entry = kept.remove(0);
+            // Split the validated changes into the landed prefix and the
+            // queued remainder.
+            let (prefix, prs): (Vec<i64>, Vec<i64>) = {
+                let items = lock(&self.items);
+                let mut prefix = Vec::new();
+                let mut rest = Vec::new();
+                let mut broken = false;
+                for change in &entry.changes {
+                    let landed_here = items.get(&change.pr).is_some_and(|item| {
+                        item.status == ItemStatus::Landed && item.head == change.head
+                    });
+                    if rest.is_empty() && !broken && landed_here {
+                        prefix.push(change.pr);
+                    } else {
+                        rest.push(change.pr);
+                        if landed_here {
+                            broken = true;
+                        }
+                    }
+                }
+                if broken {
+                    (Vec::new(), entry.prs())
+                } else {
+                    (prefix, rest)
+                }
             };
-            let entry = kept.remove(index);
-            let prs = entry.prs();
+            if prs.is_empty() {
+                // Fully landed already: the entry is spent.
+                self.state.save_kept_validations(&kept)?;
+                continue;
+            }
+            let usable = {
+                let items = lock(&self.items);
+                !prs.iter().any(|pr| failed.contains(pr))
+                    && prs.iter().all(|pr| {
+                        items.get(pr).is_some_and(|item| {
+                            item.status == ItemStatus::Queued
+                                && entry
+                                    .changes
+                                    .iter()
+                                    .find(|change| change.pr == *pr)
+                                    .is_some_and(|change| item.head == change.head)
+                        })
+                    })
+            };
+            if !usable {
+                failed.extend(prs.iter().copied());
+                self.event(
+                    "kept-validations",
+                    &format!(
+                        "{} no longer matches its kept validated prefix; validating it again",
+                        list(&entry.prs())
+                    ),
+                );
+                self.state.save_kept_validations(&kept)?;
+                continue;
+            }
             let (candidate, _) = match self.build(&base, &prs) {
                 Ok(built) => built,
                 Err(error) => {
-                    kept.insert(index, entry);
+                    kept.insert(0, entry);
                     self.state.save_kept_validations(&kept)?;
                     return Err(error);
                 }
@@ -2040,6 +2108,7 @@ impl<'a> Runner<'a> {
             if candidate.prs != prs
                 || self.git.tree_of(&candidate.tip)? != self.git.tree_of(&entry.tip)?
             {
+                failed.extend(prs.iter().copied());
                 self.event(
                     "kept-validations",
                     &format!(
@@ -2052,6 +2121,7 @@ impl<'a> Runner<'a> {
             }
             let chosen = self.select(&candidate.tip, &candidate.parent)?;
             if chosen.selection != entry.claim.selection {
+                failed.extend(prs.iter().copied());
                 self.event(
                     "kept-validations",
                     &format!(
@@ -2067,11 +2137,22 @@ impl<'a> Runner<'a> {
                 entry.claim.policy.clone(),
                 candidate.tip.clone(),
             );
-            let note = format!(
-                "validated in run {} as v{} and kept from that run; the base has not moved \
-                 under it and its tree and selection are unchanged",
-                entry.run, entry.validation
-            );
+            let note = if prefix.is_empty() {
+                format!(
+                    "validated in run {} as v{} and kept from that run; the base has not moved \
+                     under it and its tree and selection are unchanged",
+                    entry.run, entry.validation
+                )
+            } else {
+                format!(
+                    "validated in run {} as v{} and kept from that run; its validated prefix \
+                     {} has landed and the rest builds to the validated tree with the \
+                     validated selection",
+                    entry.run,
+                    entry.validation,
+                    list(&prefix)
+                )
+            };
             match self.land_with(&candidate, claim, Vec::new(), BTreeSet::new(), Some(&note))? {
                 BatchOutcome::Done => {
                     self.event(
