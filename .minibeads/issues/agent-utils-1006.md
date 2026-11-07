@@ -65,7 +65,7 @@ Run the probe as an ordinary window batch, not synchronously inside
   back the decision of every batch that jumped over the red one, so it is worth
   more than a new batch.
 
-# Acceptance
+# Acceptance Criteria
 
 - A test whose probe donor job stays queued. Before the probe returns, the run
   applies a recorded submit at a free slot, starts that batch, and decides a

@@ -36,7 +36,7 @@ line it saw would turn those into ejections.
 - Independent of `disable_early_red`. Donors run the same code, so a donor's
   receipt arrives early too.
 
-# Acceptance
+# Acceptance Criteria
 
 - validate.rs unit tests: the verdict stops the run and fails the named test,
   keeping the streamed passes; it works with the early-red watch off; without

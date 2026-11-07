@@ -46,7 +46,7 @@ all: today only `agentctl watch` runs it, and a registry with only
 `watch-agents` or from start/revive/restart/restore, or whether an
 `agentctl watch` unit should be added, and recommend one.
 
-# Edition parity note (Python)
+## Edition parity note (Python)
 
 The liaison-first ranking is Rust-edition behaviour. The Python edition
 has no tab-order or hygiene logic: its `watch`, `restore` and

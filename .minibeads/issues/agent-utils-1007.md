@@ -7,10 +7,10 @@ created_at: 2026-11-07T06:20:00.000000000+00:00
 updated_at: 2026-11-07T06:20:00.000000000+00:00
 ---
 
+# Description
+
 Consumer report: dh-da7cz (filed in the consumer harness, with event diffs
 and cli.py references).
-
-# Description
 
 Wrkslots writes every scoped operation journal event-first: `_write_journal`
 appends an `operation-progress-recorded` event to the append-only log, then
@@ -69,7 +69,7 @@ the same strict check, but its recover path deliberately leaves partial-update
 recovery with the Python edition (it ignores `discard_partial`), so this fix
 lands in Python and the Rust divergence is documented rather than duplicated.
 
-# Acceptance
+# Acceptance Criteria
 
 - Exact sequence: crash after the event temp file is written, before the
   rename and the journal rewrite; then `recover --discard-partial`; then
@@ -82,7 +82,9 @@ lands in Python and the Rust divergence is documented rather than duplicated.
   "differs from append-only progress evidence" and leave the journal
   untouched.
 
-# Resolution
+# Notes
+
+## Resolution
 
 Landed as dd825eee49383c1776b5e6c5847550455ee9d7af. `recover` rolls a scoped
 create or finish journal forward when it is exactly one progress step behind

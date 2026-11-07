@@ -26,7 +26,7 @@ On a consumer host at load about 50, `remove-agent-batch` refused all 7 dead slo
 
 Reported 2026-11-06 by the lead coordinator from a consumer registry. Part 1 of 3 with #955 and #956. Queued for mu-wrkslots after #950.
 
-# Measurements appended by #943 gate-flake-wrkslots-proc-scan (mu-flakes)
+## Measurements appended by #943 gate-flake-wrkslots-proc-scan (mu-flakes)
 
 Independent confirmation from the differential remove tests
 (test_remove_matches_python and siblings, bounded contention):

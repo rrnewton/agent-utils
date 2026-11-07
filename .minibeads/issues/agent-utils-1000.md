@@ -34,7 +34,7 @@ paths counts as clean. Hand-written overlap still rebuilds. No configuration
 change; a queue without `regenerate` behaves exactly as before (covers() is
 false when regeneration is not configured).
 
-# Acceptance
+# Acceptance Criteria
 
 - cli_stale_green: a stale green sharing only a generated file with what
   landed stacks (fails on the old code), and one sharing a hand-written file

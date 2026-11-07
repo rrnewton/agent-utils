@@ -66,7 +66,7 @@ As landed (two landings):
    proposals (reserve the re-stamped job for the declining donor) are not
    needed once the donor can run the job itself.
 
-# Acceptance
+# Acceptance Criteria
 
 - A test with a remote donor whose refreshed tools are newer than the job's
   stamp: that donor gets the job even while the local donor is idle. It

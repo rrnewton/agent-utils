@@ -18,7 +18,7 @@ updated_at: 2026-11-07T07:10:00.000000000+00:00
 - Backward compatible: jobs published before this field exists carry neither value and sort by job id among themselves, as today.
 - Local and remote donors claim through the same `Store::claim`, so both follow the same order.
 
-# Acceptance
+# Acceptance Criteria
 
 - A prioritized job published last is claimed first.
 - Equal priority keeps oldest-first.
