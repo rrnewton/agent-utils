@@ -21,7 +21,9 @@ PY = sys.executable
 def _env(tmp_path: Path) -> dict[str, str]:
     return {**os.environ, "GATE_ADMISSION_DIR": str(tmp_path / "admission"),
             "GATE_LEDGER": str(tmp_path / "ledger.jsonl"), "GATE_PRUNE_TARGETS": "off",
-            "GATE_SLOTS_CONFIG": str(tmp_path / "gate-slots.toml")}
+            "GATE_SLOTS_CONFIG": str(tmp_path / "gate-slots.toml"),
+            # The real preflight runs validation steps; these tests give it a stand-in.
+            "GATE_PREFLIGHT_COMMAND": "true"}
 
 
 def _start(tmp_path: Path, *args: str) -> subprocess.Popen[str]:
@@ -341,6 +343,99 @@ def test_a_rerun_must_name_a_few_selected_steps(tmp_path: Path) -> None:
                            "--selected", "a,b,c,d,e"],
                           env=_env(tmp_path), capture_output=True, text=True, timeout=30)
     assert many.returncode == 2 and "at most 4" in many.stdout
+
+
+FAILING_PREFLIGHT = (
+    "echo '[x.check] ✗ FAIL   content check'; "
+    "echo '[x.check] E  CheckError: public docstring model.py:1 is not standalone'; "
+    "echo '[y.check] ✓ PASS   other check'; exit 1"
+)
+
+
+def _ledger_rows(tmp_path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
+
+
+def test_a_failing_preflight_refuses_to_queue_and_shows_the_failure(tmp_path: Path) -> None:
+    """A deterministic content failure is reported before the run takes a
+    ticket: the command never runs, nothing is queued, and the ledger records
+    the refusal apart from gates."""
+    ran = tmp_path / "ran"
+    env = {**_env(tmp_path), "GATE_PREFLIGHT_COMMAND": FAILING_PREFLIGHT}
+    done = subprocess.run([PY, str(GATE), "--", PY, "-c", f"open({str(ran)!r}, 'w')"],
+                          env=env, capture_output=True, text=True, timeout=30)
+    assert done.returncode == 65, done.stdout
+    assert "preflight FAILED" in done.stdout and "not queued" in done.stdout
+    assert "[x.check] E  CheckError: public docstring model.py:1" in done.stdout
+    assert "[y.check]" not in done.stdout, "only the failing steps' lines are shown"
+    assert not ran.exists()
+    assert not list((tmp_path / "admission" / "queue").glob("*.json"))
+    assert not list((tmp_path / "admission" / "runs").glob("*.json"))
+    [row] = _ledger_rows(tmp_path)
+    assert row["kind"] == "preflight-refused" and row["preflight"] == "failed"
+    assert row["failed_steps"] == ["x.check"] and row["exit_code"] == 65
+    stats = subprocess.run([PY, str(GATE), "stats"], env=env, capture_output=True, text=True)
+    assert "0 first-run gate(s)" in stats.stdout, stats.stdout
+    assert "preflight refused 1 run(s) before they queued" in stats.stdout
+
+
+def test_a_passing_preflight_prints_one_line_and_is_recorded(tmp_path: Path) -> None:
+    done = subprocess.run([PY, str(GATE), "--", PY, "-c", "print('validate: OK')"],
+                          env=_env(tmp_path), capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stdout
+    [line] = [line for line in done.stdout.splitlines() if "preflight" in line]
+    assert line.startswith("gate: preflight passed in "), done.stdout
+    [row] = _ledger_rows(tmp_path)
+    assert row["kind"] == "gate" and row["preflight"] == "passed"
+
+
+def test_skip_preflight_queues_anyway_and_is_recorded(tmp_path: Path) -> None:
+    env = {**_env(tmp_path), "GATE_PREFLIGHT_COMMAND": FAILING_PREFLIGHT}
+    done = subprocess.run([PY, str(GATE), "--skip-preflight", "--", PY, "-c", "pass"],
+                          env=env, capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stdout
+    assert "preflight" not in done.stdout
+    [row] = _ledger_rows(tmp_path)
+    assert row["preflight"] == "skipped: --skip-preflight"
+    stats = subprocess.run([PY, str(GATE), "stats"], env=env, capture_output=True, text=True)
+    assert "1 run(s) passed --skip-preflight" in stats.stdout, stats.stdout
+
+
+def test_a_rerun_and_a_nested_gate_skip_the_preflight(tmp_path: Path) -> None:
+    """Both run on a tree that already passed the preflight."""
+    env = {**_env(tmp_path), "GATE_PREFLIGHT_COMMAND": FAILING_PREFLIGHT}
+    rerun = subprocess.run([PY, str(GATE), "--rerun", "--", PY, "-c", "pass", "--selected", "a.step"],
+                           env=env, capture_output=True, text=True, timeout=30)
+    assert rerun.returncode == 0, rerun.stdout
+    nested_script = (
+        "import subprocess, sys\n"
+        f"done = subprocess.run([sys.executable, {str(GATE)!r}, '--exclusive', '--', "
+        "sys.executable, '-c', 'pass'])\n"
+        "sys.exit(done.returncode)\n"
+    )
+    outer = subprocess.run([PY, str(GATE), "--skip-preflight", "--", PY, "-c", nested_script],
+                           env=env, capture_output=True, text=True, timeout=60)
+    assert outer.returncode == 0, outer.stdout
+    rows = _ledger_rows(tmp_path)
+    assert [row["preflight"] for row in rows] == [
+        "skipped: rerun", "skipped: nested gate", "skipped: --skip-preflight"]
+
+
+def test_the_preflight_runs_named_validation_steps() -> None:
+    """The default preflight runs real steps of the validation graph, so it can
+    never drift from what the gate itself checks."""
+    gate = _gate_module()
+    env = {key: value for key, value in os.environ.items() if key != "GATE_PREFLIGHT_COMMAND"}
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("GATE_PREFLIGHT_COMMAND", raising=False)
+        command = gate.preflight_command()
+    assert command[command.index("--selected") + 1] == ",".join(gate.PREFLIGHT_STEPS)
+    root = GATE.parents[1]
+    listed = subprocess.run([PY, str(root / "scripts" / "validate.py"), "--list"], cwd=root, env=env,
+                            capture_output=True, text=True, timeout=120)
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    steps = {line.split()[1] for line in listed.stdout.splitlines() if line.strip().startswith("STEP ")}
+    assert set(gate.PREFLIGHT_STEPS) <= steps, sorted(set(gate.PREFLIGHT_STEPS) - steps)
 
 
 def test_a_dead_queue_ticket_never_blocks_admission(tmp_path: Path) -> None:

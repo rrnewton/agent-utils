@@ -63,6 +63,18 @@ ahead of every ordinary ticket (FIFO among reruns) and still waits for running
 gates to finish, so a two-minute rerun no longer waits behind every gate queued
 after the one it repeats. $GATE_BLACKOUT_NOW (ISO 8601) overrides the clock
 for tests.
+
+Preflight: before a top-level run takes a ticket, it runs the repository's
+deterministic content checks on this checkout (PREFLIGHT_STEPS: the
+client-name guard and the package contract, whose standalone-docs rules and
+test censuses fail the same way every time) through the validation graph, in
+about 20 seconds. If either fails, the run never queues: the failing steps'
+lines are printed, the refusal is recorded in the ledger, and gate.py exits
+PREFLIGHT_EXIT. Without the preflight, a lane learned of a one-word docstring
+violation only after waiting for a ticket and running a full gate. A nested
+gate and a --rerun ticket skip it, because their tree already passed it.
+--skip-preflight skips it too, and the ledger records that it did.
+$GATE_PREFLIGHT_COMMAND (a shell command) replaces the checks, for tests.
 """
 from __future__ import annotations
 
@@ -110,6 +122,17 @@ BLACKOUT_EXIT = 78
 
 #: A --rerun ticket may name at most this many `--selected` steps.
 RERUN_MAX_STEPS = 4
+
+#: The validation steps a top-level run passes before it may queue: checks of
+#: the tree's content that fail identically on every run, so a failure can never
+#: be load or luck, and finding it after a full gate wastes the gate.
+PREFLIGHT_STEPS = (
+    "repository.hygiene.client-names",
+    "python.repository-infrastructure.package-contract",
+)
+
+#: Exit status for a run refused by the preflight (EX_DATAERR).
+PREFLIGHT_EXIT = 65
 
 DEFAULT_BLACKOUT_CONFIG = Path("~/.local/etc/agent-utils/gate.toml")
 
@@ -465,6 +488,42 @@ def _rerun_problem(command: list[str]) -> str | None:
     return None
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def preflight_command() -> list[str]:
+    """The preflight's command: PREFLIGHT_STEPS through the validation graph, or
+    $GATE_PREFLIGHT_COMMAND run by the shell."""
+
+    override = os.environ.get("GATE_PREFLIGHT_COMMAND")
+    if override:
+        return ["/bin/sh", "-c", override]
+    root = _repo_root()
+    return [str(root / "common" / "bin" / "dagrun"), "run",
+            "--dag", str(root / "validation.dag.yaml"), "--keep-going", "--no-profile",
+            "--selected", ",".join(PREFLIGHT_STEPS)]
+
+
+def run_preflight() -> tuple[bool, float, list[str], list[str]]:
+    """Run the preflight in this checkout: (passed, seconds, failed steps, lines to show)."""
+
+    started = time.time()
+    try:
+        proc = subprocess.run(preflight_command(), cwd=_repo_root(), stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, errors="replace")
+        returncode, lines = proc.returncode, proc.stdout.splitlines()
+    except OSError as exc:
+        returncode, lines = 127, [f"gate: preflight could not start: {exc}"]
+    seconds = time.time() - started
+    if returncode == 0:
+        return True, seconds, [], []
+    failed = sorted({m.group(1) for line in lines if (m := _FAILED_STEP.search(line))})
+    shown = [line for line in lines
+             if any(line.startswith(f"[{step}]") for step in failed) and "elapsed, no test" not in line]
+    return False, seconds, failed, shown or lines[-40:]
+
+
 def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     try:
         windows = load_blackout_windows(getattr(args, "blackout_config", None))
@@ -489,6 +548,26 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             print(f"gate: --rerun refused: {problem}", flush=True)
             return 2
         args.cls = "exclusive"
+    if nested:
+        preflight = "skipped: nested gate"
+    elif rerun:
+        preflight = "skipped: rerun"
+    elif getattr(args, "skip_preflight", False):
+        preflight = "skipped: --skip-preflight"
+    else:
+        passed, seconds, failed, shown = run_preflight()
+        if not passed:
+            print(f"gate: preflight FAILED in {seconds:.0f}s, so this run was not queued; "
+                  "fix these and run the gate again (--skip-preflight overrides, recorded):",
+                  flush=True)
+            for line in shown:
+                print(line, flush=True)
+            now_s = time.time()
+            _record_ledger(args, command, now_s, now_s, PREFLIGHT_EXIT, set(), set(failed),
+                           "FAILED", kind="preflight-refused", preflight="failed")
+            return PREFLIGHT_EXIT
+        print(f"gate: preflight passed in {seconds:.0f}s ({', '.join(PREFLIGHT_STEPS)})", flush=True)
+        preflight = "passed"
     adm = Admission(state_dir(), args.slots)
     # A gate invoked from inside an admitted gate (validate.py running its
     # gate-exclusive steps) must not queue behind its own parent: the parent
@@ -577,7 +656,8 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             sys.stdout.write(last_line if last_line.endswith("\n") else last_line + "\n")
             sys.stdout.flush()
         _record_ledger(args, command, started, finished, rc,
-                       passed_steps, failed_steps, verdict_word, pruned, queued_at)
+                       passed_steps, failed_steps, verdict_word, pruned, queued_at,
+                       preflight=preflight)
     return rc
 
 
@@ -592,11 +672,16 @@ def _record_ledger(
     verdict_word: str | None,
     pruned: dict[str, int | None] | None = None,
     queued: float | None = None,
+    *,
+    kind: str | None = None,
+    preflight: str | None = None,
 ) -> None:
     """Append one durable ledger line for the finished run (#827). Best effort:
     a ledger failure must never change the gate's own result. `queued_utc` and
     `wait_s` record the time spent in the queue before admission, which
-    `started_utc` alone cannot show."""
+    `started_utc` alone cannot show. `preflight` says whether the preflight
+    passed or why it was skipped; a run it refused is a `preflight-refused`
+    line, which stats counts apart from gates."""
 
     try:
         base: str | None = None
@@ -605,7 +690,8 @@ def _record_ledger(
         verdict = {"OK": "pass", "PARTIAL": "partial", "FAILED": "fail"}.get(
             verdict_word or "", "pass" if rc == 0 else "fail"
         )
-        kind = "exclusive-rerun" if args.cls == "exclusive" else "gate"
+        if kind is None:
+            kind = "exclusive-rerun" if args.cls == "exclusive" else "gate"
         line = {
             "queued_utc": _utc(queued) if queued is not None else None,
             "wait_s": round(started - queued, 2) if queued is not None else None,
@@ -622,6 +708,7 @@ def _record_ledger(
             "verdict": verdict,
             "exit_code": rc,
             "blackout_ignored": bool(getattr(args, "ignore_blackout", False)),
+            "preflight": preflight,
             "log_path": None,
             "target_bytes_before": (pruned or {}).get("target_bytes_before"),
             "target_bytes_after": (pruned or {}).get("target_bytes_after"),
@@ -704,6 +791,11 @@ def show_stats(args: argparse.Namespace) -> int:
           f"({args.since or 'all time'}, ledger {path})")
     print(f"gate stats: {sum(1 for r in reruns if r.get('rerun_passed'))}/{len(reruns)} "
           "exclusive rerun(s) passed")
+    refused = sum(1 for row in rows if row.get("kind") == "preflight-refused")
+    skipped = sum(1 for row in rows if row.get("preflight") == "skipped: --skip-preflight")
+    if refused or skipped:
+        print(f"gate stats: preflight refused {refused} run(s) before they queued; "
+              f"{skipped} run(s) passed --skip-preflight")
     waits = sorted(float(w) for w in (row.get("wait_s") for row in rows)
                    if isinstance(w, (int, float)))
     if waits:
@@ -1214,6 +1306,13 @@ def main(argv: list[str] | None = None) -> int:
                              "(FIFO among reruns); it still waits for running gates. "
                              "Example: gate.py --rerun -- common/bin/dagrun run --dag validation.dag.yaml "
                              "--keep-going --selected vibe-talk.check.fold-latency-browser")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="queue without the preflight. Before queueing, a top-level run checks "
+                             "this checkout with the validation steps " + " and ".join(PREFLIGHT_STEPS)
+                             + " (no consuming-project names; standalone package docs and complete "
+                             "test censuses), ~20 s, and refuses to queue (exit "
+                             f"{PREFLIGHT_EXIT}) if either fails, printing the failing lines. A nested "
+                             "gate and --rerun skip it. The skip is recorded in the ledger")
     parser.add_argument("--ledger", default=None,
                         help="durable ledger path (default ~/.local/state/agent-utils/gate-ledger.jsonl, or $GATE_LEDGER)")
     parser.add_argument("--no-prune", action="store_true",
