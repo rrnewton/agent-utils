@@ -494,7 +494,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             sys.stdout.write(last_line if last_line.endswith("\n") else last_line + "\n")
             sys.stdout.flush()
         _record_ledger(args, command, started, finished, rc,
-                       passed_steps, failed_steps, verdict_word, pruned)
+                       passed_steps, failed_steps, verdict_word, pruned, queued_at)
     return rc
 
 
@@ -508,9 +508,12 @@ def _record_ledger(
     failed_steps: set[str],
     verdict_word: str | None,
     pruned: dict[str, int | None] | None = None,
+    queued: float | None = None,
 ) -> None:
     """Append one durable ledger line for the finished run (#827). Best effort:
-    a ledger failure must never change the gate's own result."""
+    a ledger failure must never change the gate's own result. `queued_utc` and
+    `wait_s` record the time spent in the queue before admission, which
+    `started_utc` alone cannot show."""
 
     try:
         base: str | None = None
@@ -521,6 +524,8 @@ def _record_ledger(
         )
         kind = "exclusive-rerun" if args.cls == "exclusive" else "gate"
         line = {
+            "queued_utc": _utc(queued) if queued is not None else None,
+            "wait_s": round(started - queued, 2) if queued is not None else None,
             "started_utc": _utc(started),
             "finished_utc": _utc(finished),
             "base": base,
@@ -611,6 +616,12 @@ def show_stats(args: argparse.Namespace) -> int:
           f"({args.since or 'all time'}, ledger {path})")
     print(f"gate stats: {sum(1 for r in reruns if r.get('rerun_passed'))}/{len(reruns)} "
           "exclusive rerun(s) passed")
+    waits = sorted(float(w) for w in (row.get("wait_s") for row in rows)
+                   if isinstance(w, (int, float)))
+    if waits:
+        print(f"gate stats: queue wait over {len(waits)} run(s): median "
+              f"{waits[len(waits) // 2] / 60:.1f} min, max {waits[-1] / 60:.1f} min, "
+              f"total {sum(waits) / 3600:.1f} h")
     for step, count in failures.most_common(10):
         print(f"gate stats: failing step {step}: {count}")
     return 0

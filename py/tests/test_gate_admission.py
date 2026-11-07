@@ -65,12 +65,16 @@ def test_finished_runs_append_to_the_durable_ledger(tmp_path: Path) -> None:
     assert rows[1]["failed_steps"] == ["b.step"] and rows[1]["kind"] == "gate"
     assert rows[2]["kind"] == "exclusive-rerun" and rows[2]["rerun_passed"] is True
     assert rows[0]["head_sha"] and rows[0]["finished_utc"].endswith("Z")
+    assert all(row["queued_utc"].endswith("Z") for row in rows)
+    assert all(row["queued_utc"] <= row["started_utc"] for row in rows)
+    assert all(isinstance(row["wait_s"], float) and row["wait_s"] >= 0 for row in rows)
 
     stats = subprocess.run([PY, str(GATE), "stats"], env=env, capture_output=True, text=True)
     assert stats.returncode == 0, stats.stdout
     assert "first-run pass rate 50.0%" in stats.stdout
     assert "failing step b.step: 1" in stats.stdout
     assert "1/1 exclusive rerun(s) passed" in stats.stdout
+    assert "queue wait over 3 run(s): median" in stats.stdout
 
 
 def test_shared_gates_run_up_to_the_cap_and_queue_the_rest(tmp_path: Path) -> None:
