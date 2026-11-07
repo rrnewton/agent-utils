@@ -1760,6 +1760,18 @@ mod unit {
     }
 
     #[test]
+    fn wrkslots_live_journal_busy_is_a_retryable_busy_refusal() {
+        // #992: wrkslots prints this (exit 75) when a non-create mutation
+        // is live; the donor must treat it as busy (requeue, no host
+        // fault), not as a wedged host.
+        let log = "BUSY: busy: live 'finish' mutation ACTIVE.node-a.journal by pid 4242; retry\nCOULD_NOT_RUN";
+        assert!(could_not_run_busy(log));
+        assert!(!could_not_run_busy(
+            "interrupted 'finish' mutation ACTIVE.node-a.journal cannot coexist\nCOULD_NOT_RUN"
+        ));
+    }
+
+    #[test]
     fn empty_red_is_could_not_run_only_when_configured() {
         let tmp = TempDir::new("validate-empty-red");
         // Default (`red`): an empty red is a red with no recorded result, and

@@ -256,6 +256,12 @@ block a local classification, a foreign row is skipped and reported under `skipp
 `--all-machines` opts back into the cross-machine behaviour. Nothing is ever written to another
 machine's event log.
 
+A non-create journal (for example a live `finish`) whose recorded owner process is still alive
+is not an interrupted mutation: `classify-create-journals` reports it as retryable busy — exit
+75, with JSON `{"status": "busy", "busy": {"kind": ..., "pid": ..., "journal": ...}}` — so a
+caller such as the merge-queue donor waits and retries instead of losing its job. A dead or
+indeterminate owner keeps the hard `interrupted ... cannot coexist` refusal.
+
 A registered row whose slot directory is absent -- `lstat` reports that nothing exists at the path
 -- is reported as `RECOVERABLE` rather than `BLOCKED` when absence is its only remaining reason
 after the same liveness, owner, heartbeat, handoff, and process/path census checks that make a

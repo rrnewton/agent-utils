@@ -379,6 +379,57 @@ fn ownerless_cargo_home_journal_is_unrelated(
         .any(|candidate| within(candidate, &requested) || within(&requested, candidate))
 }
 
+/// The first live process identity a non-create journal records, if any
+/// (mirrors the Python `_live_journal_owner` candidate keys).
+fn live_journal_owner(raw: &Map<String, Value>) -> Option<crate::status_state::Identity> {
+    let mut candidates: Vec<&Value> = vec![
+        raw.get("owner").unwrap_or(&Value::Null),
+        raw.get("coordinator_lease").unwrap_or(&Value::Null),
+        raw.get("coordinator").unwrap_or(&Value::Null),
+        raw.get("actor").unwrap_or(&Value::Null),
+    ];
+    if let Some(record) = raw.get("record").and_then(Value::as_object) {
+        candidates.push(record.get("owner").unwrap_or(&Value::Null));
+        candidates.push(record.get("coordinator_lease").unwrap_or(&Value::Null));
+    }
+    for candidate in candidates {
+        if !candidate.is_object() {
+            continue;
+        }
+        if let Some(identity) = crate::status_state::identity_from_value(candidate) {
+            if process_state(Some(&identity)).0 == "live" {
+                return Some(identity);
+            }
+        }
+    }
+    None
+}
+
+/// A retryable busy result (#992), distinct from a hard refusal.
+#[derive(Debug)]
+pub(crate) enum ClassifyError {
+    Busy {
+        kind: String,
+        pid: i64,
+        journal: String,
+    },
+    Other(String),
+}
+
+impl std::fmt::Display for ClassifyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClassifyError::Busy { kind, pid, journal } => {
+                write!(
+                    formatter,
+                    "busy: live '{kind}' mutation {journal} by pid {pid}; retry"
+                )
+            }
+            ClassifyError::Other(message) => write!(formatter, "{message}"),
+        }
+    }
+}
+
 fn classify_one(
     cfg: &Cfg,
     config: &Value,
@@ -408,6 +459,13 @@ fn classify_one(
         if ownerless_cargo_home_journal_is_unrelated(cfg, &raw, requested_slot, requested_slot_type)
         {
             return Ok(None);
+        }
+        if let Some(owner) = live_journal_owner(&raw) {
+            return Err(format!(
+                "busy: live '{kind}' mutation {} by pid {}; retry",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                owner.pid
+            ));
         }
         return Err(format!(
             "interrupted {kind:?} mutation {} cannot coexist with an operation that permits only verified disjoint create journals",
@@ -770,6 +828,72 @@ fn classify_one(
 
 /// Classify outstanding create journals for the requested slot.
 pub(crate) fn classify_create_journals(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    slot: &str,
+    slot_type: &str,
+    agent: &str,
+    format_json: bool,
+    all_machines: bool,
+) -> std::result::Result<String, ClassifyError> {
+    // Pre-scan (#992): a non-create journal with a live owner is a
+    // retryable busy result, not an interrupted refusal. Shape-invalid
+    // journals are left for the inner classification to report.
+    if let Ok((cfg, _selected)) = load_cfg(root, machine_override) {
+        let machines: Option<BTreeSet<String>> = if all_machines {
+            None
+        } else {
+            Some(BTreeSet::from([cfg.machine.clone()]))
+        };
+        if let Ok(paths) = outstanding(&cfg.control, machines.as_ref()) {
+            for path in &paths {
+                let Ok((bytes, _identity)) = read_identity(path) else {
+                    continue;
+                };
+                let Ok(raw) = strict_obj(&bytes) else {
+                    continue;
+                };
+                let filename = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                if validate_journal_shape(&cfg, &filename, &raw).is_err() {
+                    continue;
+                }
+                let kind = raw
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if kind == "create"
+                    || ownerless_cargo_home_journal_is_unrelated(&cfg, &raw, slot, slot_type)
+                {
+                    continue;
+                }
+                if let Some(owner) = live_journal_owner(&raw) {
+                    return Err(ClassifyError::Busy {
+                        kind,
+                        pid: owner.pid,
+                        journal: filename,
+                    });
+                }
+            }
+        }
+    }
+    classify_create_journals_inner(
+        root,
+        machine_override,
+        slot,
+        slot_type,
+        agent,
+        format_json,
+        all_machines,
+    )
+    .map_err(ClassifyError::Other)
+}
+
+fn classify_create_journals_inner(
     root: Option<&Path>,
     machine_override: Option<&str>,
     slot: &str,

@@ -2428,6 +2428,18 @@ pub fn run() -> u8 {
                 print!("{text}");
                 return 0;
             }
+            Err(crate::classify_journals::ClassifyError::Busy { kind, pid, journal }) => {
+                // Retryable busy (#992): exit 75 (TEMPFAIL), not a refusal.
+                if format == "json" {
+                    println!(
+                        "{{\"blocking\":true,\"busy\":{{\"journal\":{},\"kind\":{},\"pid\":{pid}}},\"status\":\"busy\"}}",
+                        serde_json::to_string(&journal).unwrap_or_default(),
+                        serde_json::to_string(&kind).unwrap_or_default(),
+                    );
+                }
+                eprintln!("BUSY: busy: live '{kind}' mutation {journal} by pid {pid}; retry");
+                return 75;
+            }
             Err(error) => {
                 eprintln!("wrkslotsd: {error}");
                 return 1;

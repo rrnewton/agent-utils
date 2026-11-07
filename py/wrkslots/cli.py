@@ -1014,6 +1014,18 @@ class _TargetStorageDrift(StateError):
         self.record = record
 
 
+class _JournalBusy(Refusal):
+    """A non-create journal's owner is live: retryable busy, not interrupted."""
+
+    def __init__(self, *, kind: object, pid: int, journal: str) -> None:
+        super().__init__(
+            f"busy: live {kind!r} mutation {journal} by pid {pid}; retry"
+        )
+        self.kind = str(kind)
+        self.pid = pid
+        self.journal = journal
+
+
 class _LockBusy(Refusal):
     """A bounded lock wait elapsed without acquiring the requested lock."""
 
@@ -10508,6 +10520,39 @@ def _create_journal_owner_state(
     return _process_state(owner)
 
 
+def _live_journal_owner(raw: Mapping[str, object]) -> ProcessIdentity | None:
+    """The first live process identity a non-create journal records, if any.
+
+    Journals record their acting process under different keys by kind:
+    a top-level ``owner``/``coordinator_lease``/``coordinator``, an
+    identity ``actor``, or the owner of the embedded ``record``. A
+    malformed candidate proves nothing, so it is skipped and the
+    journal keeps its hard refusal.
+    """
+
+    candidates: list[object] = [
+        raw.get("owner"),
+        raw.get("coordinator_lease"),
+        raw.get("coordinator"),
+        raw.get("actor"),
+    ]
+    record = raw.get("record")
+    if isinstance(record, Mapping):
+        candidates.extend(
+            [record.get("owner"), record.get("coordinator_lease")]
+        )
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        try:
+            identity = _identity_from_obj(candidate, "journal owner")
+        except (Refusal, StateError, KeyError, TypeError, ValueError):
+            continue
+        if identity is not None and _process_state(identity)[0] == "live":
+            return identity
+    return None
+
+
 def _classify_create_journal(
     config: Config,
     path: Path,
@@ -10534,6 +10579,11 @@ def _classify_create_journal(
             if skipped_paths is not None and path not in skipped_paths:
                 skipped_paths.append(path)
             return None
+        live_owner = _live_journal_owner(raw)
+        if live_owner is not None:
+            raise _JournalBusy(
+                kind=raw.get("kind"), pid=live_owner.pid, journal=path.name
+            )
         raise Refusal(
             f"interrupted {raw.get('kind')!r} mutation {path.name} cannot coexist "
             "with an operation that permits only verified disjoint create journals"
@@ -66146,7 +66196,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "Read and verify every outstanding create journal, its exact process "
             "generations, Git worktrees, and dirty state without taking a mutation lock "
             "or changing registry, journal, or checkout bytes. Missing, malformed, "
-            "ambiguous, non-create, or overlapping state refuses."
+            "ambiguous, or overlapping state refuses. A non-create journal whose "
+            "recorded owner is live is retryable busy (exit 75, JSON status \"busy\" "
+            "naming the kind and PID), not an interrupted refusal; a dead or "
+            "indeterminate owner keeps the interrupted refusal."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -67983,6 +68036,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = handler(args)
     except Refusal as exc:
         remedy = _refusal_remedy(args, exc)
+        if isinstance(exc, _JournalBusy):
+            # Retryable busy (#992): a live non-create mutation, not an
+            # interrupted one. Exit 75 (TEMPFAIL) so callers such as the
+            # merge-queue donor retry instead of losing the job.
+            if getattr(args, "format", None) == "json":
+                print(
+                    json.dumps(
+                        {
+                            "blocking": True,
+                            "busy": {
+                                "journal": exc.journal,
+                                "kind": exc.kind,
+                                "pid": exc.pid,
+                            },
+                            "status": "busy",
+                        },
+                        sort_keys=True,
+                    )
+                )
+            print(f"BUSY: {exc}", file=sys.stderr)
+            return 75
         # A caller that asked for JSON parses stdout; with only the stderr
         # text it sees a malformed result, not a lock someone else holds.
         if isinstance(exc, _LockBusy) and getattr(args, "format", None) == "json":

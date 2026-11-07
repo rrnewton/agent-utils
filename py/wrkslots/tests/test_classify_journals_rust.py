@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import json
 import os
 import re
 import subprocess
@@ -23,6 +24,11 @@ from wrkslots import cli as wrkslots_cli
 
 from wrkslots.tests.rust_binary import rust_wrkslotsd
 from wrkslots.tests.test_create_text_rust import _fixture, _repo
+from wrkslots.tests.test_transfer_owner_write_rust import (
+    _dead_identity,
+    _fixture as _transfer_fixture,
+    _live_identity,
+)
 
 
 AU_ROOT = Path(__file__).resolve().parents[3]
@@ -103,6 +109,75 @@ def test_classify_journals_json_matches_python(tmp_path: Path) -> None:
     def scrub(text: str) -> str:
         return re.sub(r'"journal_identity": \{[^}]*\}', '"journal_identity": {}', text)
     assert scrub(_norm(result.stdout, rust_root)) == scrub(_norm(out, oracle_root))
+
+
+def _write_import_journal(root: Path, owner: dict[str, object]) -> Path:
+    active = root / "worktrees" / "ACTIVE.node-a.json"
+    document = json.loads(active.read_text(encoding="utf-8"))
+    record = document["slots"][0]
+    record["owner"] = owner
+    record["coordinator_lease"] = owner
+    journal = root / "worktrees" / "ACTIVE.node-a.journal"
+    journal.write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "kind": "import-existing",
+                "machine": "node-a",
+                "slot": "slot-a",
+                "record": record,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return journal
+
+
+def test_live_non_create_journal_is_busy_in_both_editions(tmp_path: Path) -> None:
+    rust_root = _transfer_fixture(tmp_path / "rust", None)
+    oracle_root = _transfer_fixture(tmp_path / "oracle", None)
+    _write_import_journal(rust_root, _live_identity(os.getpid()))
+    _write_import_journal(oracle_root, _live_identity(os.getpid()))
+    with pytest.raises(wrkslots_cli._JournalBusy) as caught:
+        _python_classify(oracle_root, fmt="json")
+    assert caught.value.kind == "import-existing"
+    assert caught.value.pid == os.getpid()
+    assert "busy" in str(caught.value) and "interrupted" not in str(caught.value)
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(io.StringIO()):
+        main_rc = wrkslots_cli.main(
+            [
+                "--project-root", str(oracle_root), "--machine", "node-a",
+                "classify-create-journals", "slot-c", "--agent", "agent-other",
+                "--slot-type", "agent", "--format", "json",
+            ]
+        )
+    assert main_rc == 75
+    assert json.loads(buffer.getvalue())["status"] == "busy"
+    result = _rust_classify(rust_root, fmt="json")
+    assert result.returncode == 75, result.stderr
+    assert "busy" in result.stderr and "import-existing" in result.stderr
+    assert str(os.getpid()) in result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "busy"
+    assert payload["busy"]["kind"] == "import-existing"
+    assert payload["busy"]["pid"] == os.getpid()
+
+
+def test_dead_non_create_journal_still_refuses_in_both_editions(
+    tmp_path: Path,
+) -> None:
+    rust_root = _transfer_fixture(tmp_path / "rust", None)
+    oracle_root = _transfer_fixture(tmp_path / "oracle", None)
+    _write_import_journal(rust_root, _dead_identity())
+    _write_import_journal(oracle_root, _dead_identity())
+    with pytest.raises(wrkslots_cli.Refusal) as caught:
+        _python_classify(oracle_root, fmt="json")
+    assert not isinstance(caught.value, wrkslots_cli._JournalBusy)
+    assert "interrupted" in str(caught.value)
+    result = _rust_classify(rust_root, fmt="json")
+    assert result.returncode == 1, result.stderr
+    assert "interrupted" in result.stderr
 
 
 def test_classify_journals_empty_matches_python(tmp_path: Path) -> None:

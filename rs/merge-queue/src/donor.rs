@@ -3877,6 +3877,24 @@ mod unit {
             .history
             .join("\n")
             .contains("busy admission refusal: never a host fault"));
+        // #992: a wrkslots live-journal busy receipt is the same retryable
+        // busy, never a host fault, and the job is queued again.
+        publish(&store, "c3");
+        let claimed = store.claim("d1", "h1", 3).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        let error = store
+            .report(
+                &claimed.id,
+                &token,
+                refused_receipt(
+                    &claimed,
+                    "d1",
+                    "BUSY: busy: live 'finish' mutation ACTIVE.testhost.journal by pid 4242; retry\nCOULD_NOT_RUN",
+                ),
+            )
+            .unwrap_err();
+        assert!(error.contains("queued again"), "{error}");
+        assert!(store.host_fault_list().is_empty());
     }
 
     #[test]
