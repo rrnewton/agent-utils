@@ -6226,12 +6226,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// Re-pin a hand-restarted harness without an operator (R1b): only when
     /// the recorded pane and terminal still match and the foreground argv
     /// resumes the record's own session. Anything else keeps refusing.
-    fn auto_repin_resumed(&self, agent_name: &str) {
+    pub(crate) fn auto_repin_resumed(&self, agent_name: &str) -> bool {
         let Ok(record) = self.load(agent_name) else {
-            return;
+            return false;
         };
         let Some(pane) = record.pane_id.clone() else {
-            return;
+            return false;
         };
         let identity = if record.anchors_with_harness_identity() {
             record.harness_anchor().cloned()
@@ -6239,20 +6239,20 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             record.custom_process_identity.clone()
         };
         let Some(identity) = identity else {
-            return;
+            return false;
         };
         if self.client.process_liveness(&identity) == ProcessLiveness::Alive {
-            return;
+            return false;
         }
         let Ok(info) = self.client.pane_info(&pane) else {
-            return;
+            return false;
         };
         if record
             .terminal_id
             .as_deref()
             .is_some_and(|terminal| Some(terminal) != info.terminal_id.as_deref())
         {
-            return;
+            return false;
         }
         let recorded = record
             .native_session
@@ -6261,7 +6261,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .or_else(|| record.session_value.clone())
             .or_else(|| record.resume.clone());
         let Some(recorded) = recorded else {
-            return;
+            return false;
         };
         if self
             .client
@@ -6271,9 +6271,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .as_deref()
             != Some(&recorded)
         {
-            return;
+            return false;
         }
-        let _ = self.anchor(agent_name, true, Some(&recorded));
+        self.anchor(agent_name, true, Some(&recorded)).is_ok()
     }
 
     fn send_holding_no_lock_while_waiting(

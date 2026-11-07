@@ -2397,6 +2397,22 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
     // still pending past the stale threshold is a finding naming its age.
     if herdr_up {
         if let Ok(manager) = ManagedAgents::new(client, registry) {
+            // R1b on the watch pass too: a harness hand-restarted in its
+            // recorded pane with its recorded session is re-pinned here,
+            // not only when someone sends to it.
+            if !options.check_only {
+                for name in crate::subagents::restore_agent_names(registry) {
+                    if manager.auto_repin_resumed(&name) {
+                        findings.push(finding(
+                            "repin",
+                            &name,
+                            true,
+                            "re-pinned a hand-restarted harness in its recorded pane",
+                            Value::Null,
+                        ));
+                    }
+                }
+            }
             let now_millis = (host.now() * 1000.0) as u64;
             for row in manager.drain_pending(options.queue_stale, options.check_only, now_millis) {
                 let name = row["name"].as_str().unwrap_or("?").to_owned();

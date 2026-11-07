@@ -151,6 +151,105 @@ fn restart_drains_prompts_queued_during_the_restart_window() {
     );
 }
 
+/// Simulate a hand restart in the recorded pane: a new harness process
+/// whose argv resumes `session`, while the record still pins the old pid.
+fn hand_restarted(fixture: &Fixture, old: &AgentRecord, session: &str) {
+    let pane = old.pane_id.clone().unwrap();
+    let new_pid = 987_654_u64;
+    fixture.client.dead_panes.lock().unwrap().remove(&pane);
+    fixture.client.started.store(true, Ordering::Relaxed);
+    fixture.client.custom_alive.store(true, Ordering::Relaxed);
+    fixture
+        .client
+        .harness_pids
+        .lock()
+        .unwrap()
+        .insert(pane.clone(), new_pid);
+    fixture.client.custom_processes.lock().unwrap().insert(
+        pane,
+        CustomProcessIdentity {
+            version: 1,
+            boot_id: "22222222-3333-4444-5555-666666666666".to_owned(),
+            pid: new_pid,
+            starttime_ticks: new_pid,
+            executable_device: 5,
+            executable_inode: 6,
+        },
+    );
+    fixture.client.command_lines.lock().unwrap().insert(
+        new_pid,
+        vec![
+            "/usr/local/bin/muse".to_owned(),
+            "--model".to_owned(),
+            "m".to_owned(),
+            "resume".to_owned(),
+            session.to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn auto_repin_repins_a_hand_restarted_harness_and_refuses_mismatches() {
+    // Positive: same pane, same terminal, argv resumes the recorded session.
+    let (fixture, mut old) = recoverable("muse", false);
+    old.session_agent = Some("muse".to_owned());
+    old.session_value = Some("sess-1".to_owned());
+    old.arguments = vec!["--model".to_owned(), "m".to_owned()];
+    fixture.manager().save(&old).unwrap();
+    let old_pid = old.custom_process_identity.clone().unwrap().pid;
+    hand_restarted(&fixture, &old, "sess-1");
+    assert!(fixture.manager().auto_repin_resumed("worker"));
+    let repinned = fixture.manager().load("worker").unwrap();
+    assert_ne!(
+        repinned
+            .custom_process_identity
+            .as_ref()
+            .map(|identity| identity.pid),
+        Some(old_pid),
+        "the record now pins the new harness"
+    );
+
+    // Refusal: the running argv resumes a different session.
+    let (fixture, mut old) = recoverable("muse", false);
+    old.session_agent = Some("muse".to_owned());
+    old.session_value = Some("sess-1".to_owned());
+    old.arguments = vec!["--model".to_owned(), "m".to_owned()];
+    fixture.manager().save(&old).unwrap();
+    let before = fixture.manager().load("worker").unwrap();
+    hand_restarted(&fixture, &old, "someone-elses-session");
+    assert!(!fixture.manager().auto_repin_resumed("worker"));
+    assert_eq!(fixture.manager().load("worker").unwrap(), before);
+
+    // Refusal: the pane's terminal is not the recorded terminal.
+    let (fixture, mut old) = recoverable("muse", false);
+    old.session_agent = Some("muse".to_owned());
+    old.session_value = Some("sess-1".to_owned());
+    old.terminal_id = Some("term-not-the-panes".to_owned());
+    old.arguments = vec!["--model".to_owned(), "m".to_owned()];
+    fixture.manager().save(&old).unwrap();
+    let before = fixture.manager().load("worker").unwrap();
+    hand_restarted(&fixture, &old, "sess-1");
+    assert!(!fixture.manager().auto_repin_resumed("worker"));
+    assert_eq!(fixture.manager().load("worker").unwrap(), before);
+
+    // Refusal: a foreign program holds the pane (no resume argv at all).
+    let (fixture, mut old) = recoverable("muse", false);
+    old.session_agent = Some("muse".to_owned());
+    old.session_value = Some("sess-1".to_owned());
+    old.arguments = vec!["--model".to_owned(), "m".to_owned()];
+    fixture.manager().save(&old).unwrap();
+    let before = fixture.manager().load("worker").unwrap();
+    hand_restarted(&fixture, &old, "sess-1");
+    fixture
+        .client
+        .command_lines
+        .lock()
+        .unwrap()
+        .insert(987_654, vec!["bash".to_owned()]);
+    assert!(!fixture.manager().auto_repin_resumed("worker"));
+    assert_eq!(fixture.manager().load("worker").unwrap(), before);
+}
+
 fn journal_path(fixture: &Fixture, record: &AgentRecord) -> PathBuf {
     fixture
         .root
