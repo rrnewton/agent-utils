@@ -92,12 +92,16 @@ mod recover_validate_write;
 mod release_write;
 mod remove_write;
 mod replay;
+#[allow(dead_code)] // wired into cli.rs dispatch by the shared core (P9, mu-rsimg)
+mod sandbox_state;
 mod schema;
 mod shell_command_state;
 mod status_state;
 mod storage_state;
 mod transfer_write;
 mod unpushed_state;
+#[allow(dead_code)] // wired into cli.rs dispatch by the shared core (P8, mu-rsimg)
+mod worktrees_image;
 mod yamlconfig;
 
 use std::error::Error;
