@@ -193,13 +193,18 @@ def test_screenshot_shards_cover_every_profile_once() -> None:
     }
     assert shards, "no screenshot shard steps"
     covered: list[str] = []
+    ports: list[str] = []
     for tag, step in shards.items():
         assert step.hint.resources.get("browser") == 1, tag
         named = _flag_values(step.cmd, "--profiles")
         assert len(named) == 1, f"{tag} passes --profiles {named}, not one list"
         covered += named[0].split(",")
+        port = re.search(r"VIBE_TALK_SHOTS_PORT=(\d+)", step.cmd)
+        assert port is not None, f"{tag} names no server port base"
+        ports.append(port.group(1))
     assert sorted(covered) == sorted(profiles), \
         f"shards cover {sorted(covered)}, the harness has {sorted(profiles)}"
+    assert len(set(ports)) == len(ports), f"shard port bases collide: {ports}"
 
 
 def test_wrkslots_shards_cover_eight_way_partition() -> None:
