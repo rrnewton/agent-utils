@@ -9,6 +9,9 @@
 
 use serde_json::{json, Map, Value};
 
+/// Key-ordering callback shared by the document emitters.
+pub(crate) type KeyOrder<'a> = &'a dyn Fn(&[String], &[String]) -> Vec<String>;
+
 /// One refused document; `line` is 1-based when known.
 #[derive(Debug)]
 pub(crate) struct YamlError {
@@ -942,7 +945,7 @@ pub(crate) fn emit_document(
     header: &str,
     footer: &str,
     comments: &std::collections::HashMap<Vec<String>, String>,
-    order: &dyn Fn(&[String], &[String]) -> Vec<String>,
+    order: KeyOrder<'_>,
 ) -> std::result::Result<String, String> {
     let object = value
         .as_object()
@@ -965,7 +968,7 @@ fn emit_mapping(
     path: &[String],
     indent: usize,
     comments: &std::collections::HashMap<Vec<String>, String>,
-    order: &dyn Fn(&[String], &[String]) -> Vec<String>,
+    order: KeyOrder<'_>,
     out: &mut Vec<String>,
 ) -> std::result::Result<(), String> {
     let keys: Vec<String> = node.keys().cloned().collect();
@@ -992,7 +995,7 @@ fn emit_entry(
     indent: usize,
     prefix: &str,
     comments: &std::collections::HashMap<Vec<String>, String>,
-    order: &dyn Fn(&[String], &[String]) -> Vec<String>,
+    order: KeyOrder<'_>,
     out: &mut Vec<String>,
 ) -> std::result::Result<(), String> {
     if is_scalar_value(item) {
@@ -1022,7 +1025,7 @@ fn emit_sequence(
     path: &[String],
     indent: usize,
     comments: &std::collections::HashMap<Vec<String>, String>,
-    order: &dyn Fn(&[String], &[String]) -> Vec<String>,
+    order: KeyOrder<'_>,
     out: &mut Vec<String>,
 ) -> std::result::Result<(), String> {
     for item in items {

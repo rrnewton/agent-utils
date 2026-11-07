@@ -2613,7 +2613,7 @@ pub fn run() -> u8 {
         },
         Command::Lifecycle(inner) => match inner {
             Lifecycle::Quickstart => {
-                print!("{QUICKSTART}\n");
+                println!("{QUICKSTART}");
                 return 0;
             }
             Lifecycle::RetirementQueue {

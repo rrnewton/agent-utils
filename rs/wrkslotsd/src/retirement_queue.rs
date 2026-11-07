@@ -168,8 +168,8 @@ fn resolve_artifact(
         .and_then(Value::as_i64)
         .unwrap_or(0);
     let slot_path = slot_directory(cfg, slot, slot_type)?;
-    let sidecar = match load_sidecar_artifact(cfg, selected, slot, slot_type, generation) {
-        Ok(found) => found.map(|artifact| {
+    let sidecar =
+        load_sidecar_artifact(cfg, selected, slot, slot_type, generation)?.map(|artifact| {
             let value = artifact.value;
             Artifact {
                 path: sidecar_path(&cfg.control, selected, slot, generation)
@@ -197,9 +197,7 @@ fn resolve_artifact(
                     .unwrap_or_default()
                     .to_string(),
             }
-        }),
-        Err(error) => return Err(error),
-    };
+        });
     let published = publication(events, slot, generation);
     if sidecar.is_none() {
         if let Some((_sequence, done)) = published {
@@ -513,14 +511,14 @@ pub(crate) fn retirement_queue(
         let owner_release = release_obj(&cfg, record, &events)?;
         let last_attempt = last_attempts
             .iter()
-            .filter(|(key, _)| {
+            .rev()
+            .find(|(key, _)| {
                 key.0 == slot
                     && key.1 == generation
                     && key.2 == latest.sha256
                     && key.3 == latest.sequence
             })
-            .map(|(_, sequence)| *sequence)
-            .last();
+            .map(|(_, sequence)| *sequence);
         candidates.push(Candidate {
             machine: selected.clone(),
             slot,
