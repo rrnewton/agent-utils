@@ -96,11 +96,14 @@ class Translation:
 class ProcTable(Protocol):
     """Read access to this namespace's process table."""
 
-    def processes(self) -> Mapping[int, LocalProcess] | None: ...
+    def processes(self) -> Mapping[int, LocalProcess] | None:
+        """Every process in this namespace by PID, or None when unreadable."""
 
-    def open_files(self, pid: int) -> tuple[str, ...] | None: ...
+    def open_files(self, pid: int) -> tuple[str, ...] | None:
+        """Paths `pid` holds open, or None when unreadable."""
 
-    def cwd(self, pid: int) -> str | None: ...
+    def cwd(self, pid: int) -> str | None:
+        """Working directory of `pid`, or None when unreadable."""
 
 
 class ProcfsTable:
@@ -110,6 +113,7 @@ class ProcfsTable:
         self._root = root
 
     def processes(self) -> Mapping[int, LocalProcess] | None:
+        """Every process under the procfs root by PID, or None when unreadable."""
         try:
             entries = [entry for entry in os.listdir(self._root)
                        if entry.isascii() and entry.isdigit()]
@@ -151,6 +155,7 @@ class ProcfsTable:
         return LocalProcess(pid, ppid, pgrp, tpgid, comm, argv, executable)
 
     def open_files(self, pid: int) -> tuple[str, ...] | None:
+        """Paths `pid` holds open under the procfs root, or None when unreadable."""
         directory = os.path.join(self._root, str(pid), "fd")
         try:
             names = os.listdir(directory)
@@ -167,6 +172,7 @@ class ProcfsTable:
         return tuple(links)
 
     def cwd(self, pid: int) -> str | None:
+        """Working directory of `pid` under the procfs root, or None when unreadable."""
         try:
             return os.readlink(os.path.join(self._root, str(pid), "cwd"))
         except OSError:
@@ -369,6 +375,7 @@ class PidNamespaceView:
 
     @classmethod
     def probe(cls, socket_path: str) -> "PidNamespaceView":
+        """Classify the Herdr server at `socket_path` as local or foreign to this PID namespace."""
         visible = server_pid_visible(socket_path)
         if visible is None or visible:
             return cls(foreign=False)
