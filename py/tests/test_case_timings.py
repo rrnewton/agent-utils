@@ -547,6 +547,97 @@ def test_run_cargo_against_a_real_crate(tmp_path: Path) -> None:
     assert timed.duration_s is not None and timed.duration_s >= 0
 
 
+def test_run_cargo_kill_keeps_completed_binaries_visible(tmp_path: Path) -> None:
+    # #1051: when the gate CPU-kills run-cargo mid-suite, the output must
+    # already name every completed test/binary and the one in flight, or the
+    # kill reads as "0 test(s) completed" however far the suite got. A fake
+    # cargo + fake libtest binaries make the kill deterministic: binary one
+    # completes, binary two starts a test and sleeps; the wrapper is killed
+    # by process group, as dagrun kills it.
+    import signal
+    import threading
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    def fake_binary(name: str, body: str) -> Path:
+        path = bin_dir / name
+        path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    one = fake_binary(
+        "fake-one",
+        'if [ "$1" = "--list" ]; then echo "alpha: test"; exit 0; fi\n'
+        'echo \'{"type":"test","event":"started","name":"alpha"}\'\n'
+        'echo \'{"type":"test","event":"ok","name":"alpha"}\'\n',
+    )
+    two = fake_binary(
+        "fake-two",
+        'if [ "$1" = "--list" ]; then echo "gamma: test"; exit 0; fi\n'
+        'echo \'{"type":"test","event":"started","name":"gamma"}\'\n'
+        "exec sleep 120\n",
+    )
+    artifact = (
+        '{{"executable": "{exe}", "profile": {{"test": true}}, '
+        '"target": {{"name": "{name}"}}, "package_id": "fake 0.1.0"}}\n'
+    )
+    cargo = fake_binary(
+        "cargo",
+        'for arg in "$@"; do if [ "$arg" = "--doc" ]; then exit 0; fi; done\n'
+        + "".join(
+            f"printf '%s\\n' '{artifact.format(exe=exe, name=name)}'\n"
+            for exe, name in ((one, "one"), (two, "two"))
+        ),
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(SCRIPTS / "case_timings.py"),
+            "run-cargo",
+            "--gate",
+            "rust.probe.test",
+            "--",
+            str(cargo),
+            "test",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    lines: list[str] = []
+
+    def collect() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            lines.append(line)
+
+    reader = threading.Thread(target=collect, daemon=True)
+    reader.start()
+    import time
+
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and not (
+        any(line.startswith("##TEST-END fake/one::alpha") for line in lines)
+        and any(line.startswith("##TEST-START fake/two::gamma") for line in lines)
+    ):
+        time.sleep(0.05)
+    seen_before_kill = list(lines)
+    os.killpg(process.pid, signal.SIGTERM)
+    process.wait(timeout=20)
+    reader.join(timeout=20)
+    # Binary one's attestation was on the wire BEFORE the kill, and binary
+    # two's in-flight test is named: a CPU kill can no longer read as zero
+    # test events.
+    assert any(
+        line.startswith("##TEST-END fake/one::alpha ok") for line in seen_before_kill
+    ), seen_before_kill
+    assert any(
+        line.startswith("##TEST-START fake/two::gamma") for line in seen_before_kill
+    ), seen_before_kill
+
+
 def test_examples_harness_emits_a_verifiable_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

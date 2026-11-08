@@ -803,10 +803,24 @@ def _run_cargo(argv: Sequence[str], *, gate: str | None) -> int:
                     parsed = None
             if isinstance(parsed, dict):
                 events.append((arrived, parsed))
+                # Attest progress as it happens (#1051): translate each
+                # test event into the explicit boundary lines dagrun's
+                # tracker recognizes, flushed at once, so a CPU/wall kill
+                # still shows every completed test and the ones in flight
+                # instead of "0 test(s) completed". The events themselves
+                # stay the timing record's only input; these lines are
+                # output-only and precede the final summary line.
+                if parsed.get("type") == "test" and isinstance(parsed.get("name"), str):
+                    boundary_name = f"{prefix}{parsed['name']}"
+                    boundary_kind = parsed.get("event")
+                    if boundary_kind == "started":
+                        print(f"##TEST-START {boundary_name}", flush=True)
+                    elif boundary_kind in ("ok", "failed", "ignored"):
+                        print(f"##TEST-END {boundary_name} {boundary_kind}", flush=True)
                 if parsed.get("event") == "failed" and isinstance(parsed.get("stdout"), str):
                     failures.append(f"{prefix}{parsed.get('name')}:\n{parsed['stdout']}")
             elif line:
-                print(line)
+                print(line, flush=True)
         process.wait()
         if process.returncode != 0:
             status = 1

@@ -290,12 +290,21 @@ steps:
   - group: merge-queue
     job: test
     desc: merge-queue Rust tests (local bare-repository fixtures)
+    # CPU budget (#1051): solo whole-suite runs measure 738-875 CPU-s in
+    # tests alone (about 75% sys: git/donor/queue subprocess churn across
+    # 51 binaries) and up to 1189 CPU-s including recompilation, against
+    # the old 1200 cap — the step died CPU-TIMEOUT in a full gate before
+    # finishing. 2400 is roughly twice the worst completed run. The wall
+    # ceiling deliberately does not follow the file's usual 8x pairing:
+    # measured wall is ~420-600 s solo, so 3600 keeps a loaded run's
+    # starvation headroom (2400 CPU-s at well under a core) without
+    # letting a real hang hold a gate slot for 5+ hours.
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
       RUST_TEST_THREADS=4 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p merge-queue ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-merge-queue]
-    timeout: 9600
-    cpu_timeout: 1200
+    timeout: 3600
+    cpu_timeout: 2400
     hint: *rust_test_hint

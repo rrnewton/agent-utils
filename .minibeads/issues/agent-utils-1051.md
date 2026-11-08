@@ -1,10 +1,10 @@
 ---
 title: 'gate-merge-queue-cpu-budget: the merge-queue test step outgrew its 1200 CPU-s budget'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-08T08:37:43.000000000+00:00
-updated_at: 2026-11-08T08:37:43.000000000+00:00
+updated_at: 2026-11-08T08:52:00.000000000+00:00
 ---
 
 # Description
@@ -63,3 +63,16 @@ Measurements by mu-archive during #1045 merge-queue-donor-tool-identity
 timing flakes the runs separated from this). Requested by the
 graph owner after the CPU-cap finding was relayed; the gate's
 shared phase otherwise passed 237 steps.
+
+Landed by mu-archive in the commit closing this issue:
+`cpu_timeout: 2400` on `rust.merge-queue.test` only, with the
+wall ceiling set to 3600 rather than the file's usual 8x
+pairing (measured-reason comment above the step), and
+`scripts/case_timings.py` translates each libtest
+JSON test event into a flushed `##TEST-START`/`##TEST-END`
+boundary line as it arrives (the shapes dagrun's tracker
+recognizes), so a CPU/wall kill names completed and in-flight
+tests instead of "0 test(s) completed". Covered by
+`test_run_cargo_kill_keeps_completed_binaries_visible` (fake
+cargo + fake binaries, process-group SIGTERM; fails on the
+pre-fix wrapper for the right reason).
