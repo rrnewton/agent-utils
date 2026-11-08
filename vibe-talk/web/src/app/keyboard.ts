@@ -237,6 +237,8 @@ export interface KeyboardCompositionDependencies<
   putOutLitCard(): boolean;
   clearAllThreadFocus(): boolean;
   clearLinkedMark(): boolean;
+  /** Quote the selected words (`quoteSelectionNow` of the quoting owner). */
+  quoteFromKeyboard(): unknown;
   // The keymap's remaining acts.
   modKeyName(): string;
   manyChatServices(): boolean;
@@ -795,6 +797,7 @@ export function createKeyboardComposition<
     threadStripFromKeyboard: (target) => deps.threadStripFromKeyboard(target),
     columnFromKeyboard: (right) => columnFromKeyboard(right),
     replyFromKeyboard: (target) => replyFromKeyboard(target),
+    quoteFromKeyboard: () => deps.quoteFromKeyboard(),
     menuFromKeyboard: (target) => menuFromKeyboard(target),
     readFromKeyboard: (target) => readFromKeyboard(target),
     detailsFromKeyboard: (target) => detailsFromKeyboard(target),

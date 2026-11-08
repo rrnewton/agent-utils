@@ -2030,6 +2030,7 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
     "keyContext", "keysFromKeyboard", "listEdge", "mainRowsFromKeyboard", "menuFromKeyboard", "newestFromComposer",
     "nextUnreadFromKeyboard", "onEscape", "openFromKeyboard", "orderFromKeyboard", "packFromKeyboard", "pickChannel",
     "placeFromKeyboard", "pressRowButton", "readCollapseFromKeyboard", "readFromKeyboard", "readModeFromKeyboard",
+    "quoteFromKeyboard",
     "replyFromKeyboard", "searchFromAnywhere", "searchFromKeyboard", "settingsFromKeyboard", "stepChannel", "stepFromKeyboard",
     "threadFromKeyboard", "threadOutFromKeyboard", "threadStripFromKeyboard", "undoFromKeyboard", "unpackFromKeyboard",
     "viewFromKeyboard", "voiceFromKeyboard", "writeFromKeyboard"];

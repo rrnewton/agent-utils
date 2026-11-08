@@ -91,6 +91,7 @@ export interface KeymapActs<Target> {
   threadStripFromKeyboard(target: Target): unknown;
   columnFromKeyboard(right: boolean): unknown;
   replyFromKeyboard(target: Target): unknown;
+  quoteFromKeyboard(): unknown;
   menuFromKeyboard(target: Target): unknown;
   readFromKeyboard(target: Target): unknown;
   detailsFromKeyboard(target: Target): unknown;
@@ -134,7 +135,7 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
     modKeyName, manyChatServices, chatServiceName, threadOrderWords, minCollapsedLines, maxCollapsedLines, keyContext,
     pressRowButton, onEscape, placeFromKeyboard, listEdge, jumpList, searchFromAnywhere, searchFromKeyboard,
     settingsFromKeyboard, keysFromKeyboard, stepFromKeyboard, stepChannel, pickChannel, openFromKeyboard,
-    threadFromKeyboard, threadOutFromKeyboard, threadStripFromKeyboard, columnFromKeyboard, replyFromKeyboard,
+    threadFromKeyboard, threadOutFromKeyboard, threadStripFromKeyboard, columnFromKeyboard, replyFromKeyboard, quoteFromKeyboard,
     menuFromKeyboard, readFromKeyboard, detailsFromKeyboard, copyLinkFromKeyboard, deepLinkFromKeyboard, standalone,
     copyChordFromKeyboard, copyFromKeyboard, nextUnreadFromKeyboard, doneFromKeyboard, readCollapseFromKeyboard, foldOneFromKeyboard,
     foldStepFromKeyboard, collapsedLinesFromKeyboard, packFromKeyboard, unpackFromKeyboard, bookmarkFromKeyboard,
@@ -375,6 +376,13 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
         "with them quoted",
       rowControls: ["reply-button"],
       run: (_event, target) => replyFromKeyboard(target),
+    },
+    {
+      group: KEYS_MESSAGE, chords: [{ key: "q" }],
+      does: "Quote reply, with words of a message selected: the reply starts with them quoted, as the Quoted " +
+        "reply button does. With nothing selected, nothing",
+      controls: ["selection-chip"],
+      run: () => quoteFromKeyboard(),
     },
     {
       group: KEYS_MESSAGE, chords: [{ key: "p" }],

@@ -3354,6 +3354,7 @@ const keyboard = createKeyboardComposition({
   putOutLitCard: () => putOutLitCard(),
   clearAllThreadFocus: () => clearAllThreadFocus(),
   clearLinkedMark: () => linkedMark.clearOnEscape(),
+  quoteFromKeyboard: () => quoteOwner.quoteSelectionNow(),
   modKeyName: () => modKeyName(),
   manyChatServices: () => channelDirectory.providers().size > 1,
   chatServiceName: () => chatServiceName(),

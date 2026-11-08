@@ -1104,6 +1104,27 @@ def main() -> int:
                 browser_version = context.browser.version if context.browser else "Chromium"
                 context.close()
 
+            # 7b. q quotes a real mouse selection (quote-reply-key), and types in the box.
+            for q_width, q_height, q_mobile in [(393, 852, True), (1280, 800, False)]:
+              with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
+                context, page = open_page(profile, q_width, q_height, q_mobile)
+                body = page.locator(f'#discord-log > li[data-id="{LONG}"] .body')
+                box = body.bounding_box()
+                check(box is not None, "the long message is not drawn for q")
+                assert box is not None
+                page.mouse.move(box["x"] + 10, box["y"] + 10)
+                page.mouse.down()
+                page.mouse.move(box["x"] + 160, box["y"] + 10)
+                page.mouse.up()
+                page.keyboard.press("q")
+                page.wait_for_selector("#quick-reply", state="visible", timeout=10_000)
+                check("quick-reply-text" in (page.evaluate("() => document.activeElement && document.activeElement.id") or ""),
+                      "q did not focus the quick reply box")
+                page.keyboard.type("q")
+                check("q" in page.input_value("#quick-reply-text"), "q in the box did not type a q")
+                check(not errors, f"the page threw: {errors}")
+                context.close()
+
             # 8. On a desk, with a voice that generates faster than it speaks: the strip is there,
             # the boundaries have no gap at all, and Next moves the read.
             api.pace = AHEAD_PACE

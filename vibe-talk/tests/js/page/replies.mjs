@@ -4234,6 +4234,27 @@ test("`#727 vt-selection-quick-reply`: the chip opens a box floating under the w
   }
 });
 
+test("quote-reply-key: q quotes the selected words, and types a q in a box", async () => {
+  for (const desk of [false, true]) {
+    const page = await quickPage({ desk });
+    // With nothing selected, q does nothing.
+    await press(page, page.el("scroll-area"), "q");
+    await page.settle();
+    assert.equal(page.el("quick-reply").hidden, true, "q with no selection opened a quick reply");
+    // With words selected, q opens the quick reply on them, as the chip does.
+    await page.selectText(wordsIn(rowWithId(page, QUICK_LONG)), null, QUICK_SENTENCES[2]);
+    await press(page, page.el("scroll-area"), "q");
+    await page.settle();
+    assert.equal(page.el("quick-reply").hidden, false, "q did not open the quick reply");
+    assert.equal(page.el("quick-reply-quote").textContent, QUICK_SENTENCES[2]);
+    // In the box, q is a letter: the page leaves the key to the browser.
+    page.el("quick-reply-text").value = "";
+    const typed = await press(page, page.el("quick-reply-text"), "q");
+    await page.settle();
+    assert.equal(typed.defaulted, true, "q in the box was taken by the page");
+  }
+});
+
 test("`#727 vt-selection-quick-reply`: Send posts the quoted reply in the message's thread and closes the box; neither it nor what arrives moves the list", async () => {
   const run = async (script = SCRIPT, desk = false) => {
     const page = await quickPage({ script, desk });
