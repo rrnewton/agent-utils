@@ -2729,7 +2729,7 @@ pub(crate) struct ValidatedJournal {
     pub(crate) raw: Value,
 }
 
-fn journal_legacy_path(cfg: &Cfg, machine: &str) -> PathBuf {
+pub(crate) fn journal_legacy_path(cfg: &Cfg, machine: &str) -> PathBuf {
     cfg.control.join(format!("ACTIVE.{machine}.journal"))
 }
 
@@ -2860,7 +2860,7 @@ fn pending_operations(
     Ok(pending)
 }
 
-fn pending_journal_for_path(
+pub(crate) fn pending_journal_for_path(
     cfg: &Cfg,
     events_by_machine: &BTreeMap<String, Vec<Value>>,
     path: &Path,

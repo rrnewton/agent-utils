@@ -10567,6 +10567,116 @@ def _live_journal_owner(raw: Mapping[str, object]) -> ProcessIdentity | None:
     return owner if _process_state(owner)[0] == "live" else None
 
 
+def _registry_writer_lock_holder(config: Config) -> int | None:
+    """The PID holding the registry's exclusive writer lock, if any.
+
+    This only reads ``/proc/locks``. It never acquires the lock, so the
+    lock-free classification path stays lock-free. A caller that already
+    holds the mutation locks is not another operation's writer.
+    """
+
+    global_subject = config.control / "ACTIVE"
+    if _holds_lock(global_subject) or _holds_lock(_active_path(config)):
+        return None
+    lock_path = _lock_path(global_subject)
+    try:
+        metadata = lock_path.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    wanted = (
+        os.major(metadata.st_dev),
+        os.minor(metadata.st_dev),
+        metadata.st_ino,
+    )
+    try:
+        lines = Path("/proc/locks").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 6 or fields[1] != "FLOCK" or fields[3] != "WRITE":
+            continue
+        device = fields[5].split(":")
+        if len(device) != 3:
+            continue
+        try:
+            observed = (
+                int(device[0], 16),
+                int(device[1], 16),
+                int(device[2]),
+            )
+            pid = int(fields[4])
+        except ValueError:
+            continue
+        if observed == wanted:
+            return pid
+    # A boxed step's /proc/locks can hide a holder in another PID
+    # namespace; the holder's own descriptors still name the lock file.
+    try:
+        processes = list(Path("/proc").iterdir())
+    except OSError:
+        return None
+    for process in processes:
+        if not process.name.isdigit():
+            continue
+        try:
+            descriptors = list((process / "fd").iterdir())
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                target = os.stat(descriptor)
+            except OSError:
+                continue
+            if (target.st_dev, target.st_ino) == (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                return int(process.name)
+    return None
+
+
+def _standalone_mismatch_busy(
+    config: Config, path: Path, error: StateError
+) -> _JournalBusy | None:
+    """Busy for a standalone provenance mismatch whose operation is live.
+
+    A standalone journal that differs from append-only evidence while its
+    writer is mid-flight is the #1033 race: the operation will publish
+    its completion and the journal will agree or vanish. An operation is
+    in flight only when the registry writer lock is held, or when the
+    journal carries a task scope whose recorded owner is still live in
+    that scope. A merely live slot owner or coordinator proves neither:
+    both routinely outlive the operation that wrote the journal. With no
+    such proof the same mismatch is real corruption and keeps refusing.
+    """
+
+    if str(error) != (
+        "standalone recovery journal differs from append-only operation evidence"
+    ):
+        return None
+    try:
+        contents, _identity = _read_regular_file_identity(
+            path, "recovery journal", 1024 * 1024
+        )
+        raw = _strict_json_object(contents, "recovery journal")
+    except (Refusal, StateError, OSError):
+        return None
+    holder = _registry_writer_lock_holder(config)
+    if holder is not None:
+        return _JournalBusy(kind=raw.get("kind"), pid=holder, journal=path.name)
+    record = raw.get("record")
+    record_map = record if isinstance(record, Mapping) else {}
+    if raw.get("task_scope", record_map.get("task_scope")) is None:
+        return None
+    owner = _live_journal_owner(raw)
+    if owner is None:
+        return None
+    return _JournalBusy(kind=raw.get("kind"), pid=owner.pid, journal=path.name)
+
+
 def _classify_create_journal(
     config: Config,
     path: Path,
@@ -10577,9 +10687,15 @@ def _classify_create_journal(
     requested_slot_type: str = "agent",
     skipped_paths: list[Path] | None = None,
 ) -> _CreateJournalClassification | None:
-    raw, identity, completed = _read_stable_physical_journal(
-        config, path, states
-    )
+    try:
+        raw, identity, completed = _read_stable_physical_journal(
+            config, path, states
+        )
+    except StateError as error:
+        busy = _standalone_mismatch_busy(config, path, error)
+        if busy is not None:
+            raise busy from error
+        raise
     if raw.get("kind") != "create":
         if (
             requested_slot is not None
@@ -10732,7 +10848,13 @@ def _assert_create_journal_classifications_stable(
         if identity != row.file_identity:
             raise Refusal(f"create journal changed while it was classified: {row.path}")
         raw = _strict_json_object(contents, "recovery journal")
-        completed = _validate_journal_provenance(config, row.path, raw, states)
+        try:
+            completed = _validate_journal_provenance(config, row.path, raw, states)
+        except StateError as error:
+            busy = _standalone_mismatch_busy(config, row.path, error)
+            if busy is not None:
+                raise busy from error
+            raise
         if completed != (row.state == "completed-create"):
             raise Refusal(
                 f"create journal completion changed while it was classified: {row.path}"

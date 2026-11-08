@@ -564,6 +564,139 @@ fn seal_blocking_reasons(cfg: &Cfg) -> Vec<Value> {
     reasons
 }
 
+fn lock_device_major(device: u64) -> u32 {
+    (((device >> 32) & 0xffff_f000) | ((device >> 8) & 0xfff)) as u32
+}
+
+fn lock_device_minor(device: u64) -> u32 {
+    (((device >> 12) & 0xfff_ff00) | (device & 0xff)) as u32
+}
+
+/// The PID holding the registry's exclusive writer lock, if any. This
+/// only reads `/proc/locks`; it never acquires the lock.
+fn registry_writer_lock_holder(cfg: &Cfg) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let lock_path = cfg.control.join("ACTIVE.global.lock");
+    let metadata = std::fs::metadata(lock_path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let wanted = (
+        lock_device_major(metadata.dev()),
+        lock_device_minor(metadata.dev()),
+        metadata.ino(),
+    );
+    let lines = std::fs::read_to_string("/proc/locks").ok()?;
+    for line in lines.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 6 || fields[1] != "FLOCK" || fields[3] != "WRITE" {
+            continue;
+        }
+        let device: Vec<&str> = fields[5].split(':').collect();
+        if device.len() != 3 {
+            continue;
+        }
+        let observed = (
+            u32::from_str_radix(device[0], 16).ok()?,
+            u32::from_str_radix(device[1], 16).ok()?,
+            device[2].parse::<u64>().ok()?,
+        );
+        if observed == wanted {
+            return fields[4].parse::<i64>().ok();
+        }
+    }
+    // A boxed step's /proc/locks can hide a holder in another PID
+    // namespace; the holder's own descriptors still name the lock file.
+    let processes = std::fs::read_dir("/proc").ok()?;
+    for process in processes.flatten() {
+        let name = process.file_name();
+        let Some(pid) = name.to_str().and_then(|name| name.parse::<i64>().ok()) else {
+            continue;
+        };
+        let Ok(descriptors) = std::fs::read_dir(process.path().join("fd")) else {
+            continue;
+        };
+        for descriptor in descriptors.flatten() {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let Ok(target) = std::fs::metadata(descriptor.path()) else {
+                continue;
+            };
+            if (target.dev(), target.ino()) == (metadata.dev(), metadata.ino()) {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+enum StandaloneMismatch {
+    Busy(i64),
+    Refuse,
+}
+
+impl StandaloneMismatch {
+    fn message(&self, raw: &Map<String, Value>, path: &Path) -> String {
+        match self {
+            StandaloneMismatch::Busy(pid) => format!(
+                "busy: live '{}' mutation {} by pid {}; retry",
+                raw.get("kind").and_then(Value::as_str).unwrap_or_default(),
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                pid
+            ),
+            StandaloneMismatch::Refuse => {
+                "standalone recovery journal differs from append-only operation evidence".to_owned()
+            }
+        }
+    }
+}
+
+/// The standalone-journal provenance check the classify path applies
+/// (#1033, mirroring Python's `_standalone_mismatch_busy`): a physical
+/// journal that differs from append-only evidence is retryable busy
+/// only while its writer lock is held, or while a task scope it carries
+/// still verifies for its recorded owner. A merely live slot owner or
+/// coordinator proves neither. With no such proof the same mismatch is
+/// real corruption and keeps refusing.
+fn standalone_mismatch(
+    cfg: &Cfg,
+    path: &Path,
+    raw: &Map<String, Value>,
+    machine: &str,
+) -> Option<StandaloneMismatch> {
+    if path != crate::journal_state::journal_legacy_path(cfg, machine) {
+        return None;
+    }
+    let mut events_by_machine = std::collections::BTreeMap::new();
+    let events = crate::global_state::load_event_chain(
+        &cfg.control.join(format!("EVENTS.{machine}")),
+        machine,
+    )
+    .ok()?;
+    events_by_machine.insert(machine.to_owned(), events);
+    let pending =
+        crate::journal_state::pending_journal_for_path(cfg, &events_by_machine, path).ok()?;
+    let pending = pending?;
+    if crate::journal_state::json_equal(&Value::Object(raw.clone()), &Value::Object(pending)) {
+        return None;
+    }
+    if let Some(holder) = registry_writer_lock_holder(cfg) {
+        return Some(StandaloneMismatch::Busy(holder));
+    }
+    let record = raw.get("record").and_then(Value::as_object);
+    let scoped = raw.get("task_scope").is_some_and(|scope| !scope.is_null())
+        || record
+            .and_then(|record| record.get("task_scope"))
+            .is_some_and(|scope| !scope.is_null());
+    if scoped {
+        if let Some(owner) = live_journal_owner(raw) {
+            return Some(StandaloneMismatch::Busy(owner.pid));
+        }
+    }
+    Some(StandaloneMismatch::Refuse)
+}
+
 fn classify_one(
     cfg: &Cfg,
     config: &Value,
@@ -589,6 +722,9 @@ fn classify_one(
             .unwrap_or_default(),
         &raw,
     )?;
+    if let Some(mismatch) = standalone_mismatch(cfg, path, &raw, &machine_s) {
+        return Err(mismatch.message(&raw, path));
+    }
     if kind != "create" {
         if ownerless_cargo_home_journal_is_unrelated(cfg, &raw, requested_slot, requested_slot_type)
         {
@@ -1000,6 +1136,23 @@ pub(crate) fn classify_create_journals(
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                // A standalone journal mid-write by a live operation
+                // is busy (or a hard provenance refusal), never an
+                // interrupted classification (#1033).
+                let machine = raw
+                    .get("machine")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if let Some(mismatch) = standalone_mismatch(&cfg, path, &raw, machine) {
+                    if let StandaloneMismatch::Busy(pid) = mismatch {
+                        return Err(ClassifyError::Busy {
+                            kind: kind.clone(),
+                            pid,
+                            journal: filename.clone(),
+                        });
+                    }
+                    return Err(ClassifyError::Other(mismatch.message(&raw, path)));
+                }
                 if kind == "create"
                     || ownerless_cargo_home_journal_is_unrelated(&cfg, &raw, slot, slot_type)
                 {

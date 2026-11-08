@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import io
 import json
 import os
 import re
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -377,6 +379,93 @@ def test_classify_unknown_and_other_kind_seals_match_python(
         reason = json.loads(result.stdout)["blocking_reasons"][0]
         assert reason["kind"] == want_kind, label
         assert reason["actor_state"] == want_state, label
+def _write_mismatched_import_journal(
+    root: Path, owner: dict[str, object]
+) -> Path:
+    """A standalone journal whose append-only evidence says otherwise.
+
+    The pending operation in the event log carries the same journal with
+    one field altered, so the physical journal provably differs from the
+    durable evidence: provenance's standalone mismatch (#1033).
+    """
+    journal = _write_import_journal(root, owner)
+    physical = json.loads(journal.read_text(encoding="utf-8"))
+    pending = json.loads(json.dumps(physical))
+    pending["record"]["purpose"] = "altered after append-only publication"
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    wrkslots_cli._ensure_event_log(config, "node-a")
+    wrkslots_cli._write_event_file(
+        config,
+        "node-a",
+        "operation-progress-recorded",
+        {
+            "slot": "slot-a",
+            "operation": "import-existing",
+            "journal": pending,
+        },
+    )
+    return journal
+
+
+def _hold_writer_lock(root: Path) -> contextlib.AbstractContextManager[None]:
+    """Hold a registry's exclusive writer lock as an in-flight operation."""
+
+    @contextlib.contextmanager
+    def hold() -> Iterator[None]:
+        path = root / "worktrees" / "ACTIVE.global.lock"
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    return hold()
+
+
+def test_mismatched_standalone_journal_with_live_owner_is_busy_in_both_editions(
+    tmp_path: Path,
+) -> None:
+    # #1033: the reclaim race. A standalone journal that differs from
+    # append-only evidence while its writer lock is held is retryable
+    # busy, never the hard provenance refusal. A merely live recorded
+    # owner would prove nothing: owners routinely outlive operations.
+    rust_root = _transfer_fixture(tmp_path / "rust", None)
+    oracle_root = _transfer_fixture(tmp_path / "oracle", None)
+    _write_mismatched_import_journal(rust_root, _live_identity(os.getpid()))
+    _write_mismatched_import_journal(oracle_root, _live_identity(os.getpid()))
+    with _hold_writer_lock(oracle_root):
+        with pytest.raises(wrkslots_cli._JournalBusy) as caught:
+            _python_classify(oracle_root, fmt="json")
+    assert caught.value.kind == "import-existing"
+    assert caught.value.pid == os.getpid()
+    with _hold_writer_lock(rust_root):
+        result = _rust_classify(rust_root, fmt="json")
+    assert result.returncode == 75, result.stderr
+    assert "busy" in result.stderr and "import-existing" in result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "busy"
+    assert payload["busy"]["kind"] == "import-existing"
+    assert payload["busy"]["pid"] == os.getpid()
+
+
+def test_mismatched_standalone_journal_with_no_live_operation_still_refuses(
+    tmp_path: Path,
+) -> None:
+    # The same mismatch with nothing running is real corruption.
+    rust_root = _transfer_fixture(tmp_path / "rust", None)
+    oracle_root = _transfer_fixture(tmp_path / "oracle", None)
+    _write_mismatched_import_journal(rust_root, _dead_identity())
+    _write_mismatched_import_journal(oracle_root, _dead_identity())
+    with pytest.raises(
+        wrkslots_cli.StateError, match="differs from append-only"
+    ):
+        _python_classify(oracle_root, fmt="json")
+    result = _rust_classify(rust_root, fmt="json")
+    assert result.returncode == 1, result.stderr
+    assert "standalone recovery journal differs" in result.stderr
+    assert "busy" not in result.stdout
 
 
 def test_classify_journals_empty_matches_python(tmp_path: Path) -> None:
