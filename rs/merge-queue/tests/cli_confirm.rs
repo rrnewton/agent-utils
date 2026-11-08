@@ -345,7 +345,13 @@ exit $rc"#,
         .map(|(_, detail)| detail)
         .collect();
     assert!(
-        !planned.is_empty() && planned.iter().all(|detail| detail.contains("#3 then #4")),
+        !planned.is_empty()
+            && planned.iter().all(|detail| {
+                detail
+                    .find("#3")
+                    .zip(detail.find("#4"))
+                    .is_some_and(|(three, four)| three < four)
+            }),
         "{planned:?}"
     );
     assert!(

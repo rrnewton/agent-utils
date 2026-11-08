@@ -729,6 +729,66 @@ struct Flight {
     red_outcome: Option<BatchOutcome>,
 }
 
+/// One in-flight batch as the intake planner needs to see it to name a
+/// planned batch's parent: its changes, candidate tip and parent, and
+/// how it was built.
+#[derive(Clone, Debug)]
+struct FlightView {
+    prs: Vec<i64>,
+    tip: String,
+    parent: String,
+    rooted: bool,
+    stacked: bool,
+    /// Counts toward the window (see `occupied`).
+    counts_occupied: bool,
+    /// Its validation already came back green (it has not landed yet).
+    green: bool,
+}
+
+/// The pipeline's window state at one intake point, for naming planned
+/// parents (see `Runner::describe_planned_batches`).
+#[derive(Clone, Debug)]
+struct IntakeView {
+    flights: Vec<FlightView>,
+    window: usize,
+    stack_allowed: bool,
+    wide_allowed: bool,
+    recent_red_rate: Option<f64>,
+}
+
+fn intake_view(
+    flights: &VecDeque<Flight>,
+    window: usize,
+    stack_allowed: bool,
+    wide_allowed: bool,
+    recent_red_rate: Option<f64>,
+) -> IntakeView {
+    IntakeView {
+        flights: flights
+            .iter()
+            .map(|flight| FlightView {
+                prs: flight.candidate.prs.clone(),
+                tip: flight.candidate.tip.clone(),
+                parent: flight.candidate.parent.clone(),
+                rooted: flight.rooted,
+                stacked: flight.stacked,
+                counts_occupied: flight.stacked
+                    || flight.rooted
+                    || flight.probe_for.is_some()
+                    || flight.red_work.is_some(),
+                green: flight
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result.as_ref().is_ok_and(|(_, ran)| ran.green())),
+            })
+            .collect(),
+        window,
+        stack_allowed,
+        wide_allowed,
+        recent_red_rate,
+    }
+}
+
 /// Observations of one prefix during a culprit search.
 #[derive(Clone, Debug, Default)]
 struct Obs {
@@ -5474,6 +5534,7 @@ impl<'a> Runner<'a> {
         in_flight: &BTreeSet<i64>,
         max_batch: usize,
         pending: &mut VecDeque<Vec<i64>>,
+        view: &IntakeView,
     ) -> Result<(), String> {
         let Some(writer) = self.writer else {
             return Ok(());
@@ -5576,11 +5637,11 @@ impl<'a> Runner<'a> {
                 );
             }
         }
-        if let Err(error) = self.plan_intake(tip, busy, max_batch, pending) {
+        if let Err(error) = self.plan_intake(tip, busy, max_batch, pending, view) {
             self.event(
                 "plan-intake",
                 &format!(
-                    "cannot plan on top of {}: {error}; the changes wait for the next run",
+                    "cannot plan against {}: {error}; the changes wait for the next run",
                     short(tip)
                 ),
             );
@@ -5639,6 +5700,7 @@ impl<'a> Runner<'a> {
         busy: &BTreeSet<i64>,
         max_batch: usize,
         pending: &mut VecDeque<Vec<i64>>,
+        view: &IntakeView,
     ) -> Result<(), String> {
         let records = self.state.items()?;
         {
@@ -5665,22 +5727,257 @@ impl<'a> Runner<'a> {
         let batches = self.isolate_solo(plan.batches.iter().map(|batch| batch.prs.clone()));
         self.event(
             "plan-intake",
-            &format!(
-                "{} batch(es) on top of {} (carrying {}): {}; {} held",
-                batches.len(),
-                short(tip),
-                list(&carried.iter().copied().collect::<Vec<_>>()),
+            &self.describe_planned_batches(&batches, view, plan.held.len()),
+        );
+        self.ask_background(batches.iter().flatten().copied());
+        *pending = batches;
+        Ok(())
+    }
+
+    /// Name each planned batch's parent the way the fill loop will choose it
+    /// from `view` (the window at this intake point): a root on the base, or
+    /// stacked on an in-flight (or earlier-planned) candidate. This mirrors
+    /// the fill loop's decision — dependency first, then stale-green stacking,
+    /// then the disjoint-root rule — over a simulated window, so the event
+    /// never claims a batch sits on a candidate it will not be built on.
+    /// Batches the fill loop cannot reach yet (window full, every root slot
+    /// taken below the stack gate, dependencies spread over several flights,
+    /// a root deferred behind a green root) are counted, not named: their
+    /// parents are decided when they launch, and the build events name them
+    /// then.
+    fn describe_planned_batches(
+        &self,
+        batches: &VecDeque<Vec<i64>>,
+        view: &IntakeView,
+        held: usize,
+    ) -> String {
+        struct Sim {
+            prs: Vec<i64>,
+            tip: Option<String>,
+            parent: String,
+            rooted: bool,
+            stacked: bool,
+            counts_occupied: bool,
+            green: bool,
+        }
+        enum Kind {
+            Root,
+            Stacked(Vec<i64>),
+            Waiting,
+        }
+        let base = lock(&self.base).clone();
+        let root_on = if base.is_empty() {
+            "root on the base".to_owned()
+        } else {
+            format!("root on {}", short(&base))
+        };
+        // Below the batch gate the fill loop launches singles whatever the
+        // plan made of them.
+        let expanded: Vec<Vec<i64>> = if view.wide_allowed {
+            batches.iter().cloned().collect()
+        } else {
+            batches
+                .iter()
+                .flat_map(|batch| batch.iter().map(|pr| vec![*pr]))
+                .collect()
+        };
+        let total = expanded.len();
+        let plain = |batches: &[Vec<i64>]| {
+            format!(
+                "{} batch(es) planned: {}; {} held",
+                total,
                 batches
                     .iter()
                     .map(|prs| list(prs))
                     .collect::<Vec<_>>()
                     .join(" then "),
-                plan.held.len()
-            ),
-        );
-        self.ask_background(batches.iter().flatten().copied());
-        *pending = batches;
-        Ok(())
+                held
+            )
+        };
+        if total == 0 {
+            return plain(&expanded);
+        }
+        let deps = lock(&self.deps).clone();
+        let prioritized = |batch: &[i64]| -> bool {
+            let report = lock(&self.report);
+            let items = lock(&self.items);
+            !batch.is_empty()
+                && batch.iter().all(|pr| {
+                    report
+                        .plan
+                        .items
+                        .iter()
+                        .any(|item| item.pr == *pr && item.prioritized)
+                        || items.get(pr).is_some_and(|item| item.prioritized)
+                })
+        };
+        let max_roots = self.config.roots.max(1);
+        let mut sim: Vec<Sim> = view
+            .flights
+            .iter()
+            .map(|flight| Sim {
+                prs: flight.prs.clone(),
+                tip: Some(flight.tip.clone()),
+                parent: flight.parent.clone(),
+                rooted: flight.rooted,
+                stacked: flight.stacked,
+                counts_occupied: flight.counts_occupied,
+                green: flight.green,
+            })
+            .collect();
+        let mut described: Vec<String> = Vec::new();
+        let undecided = |from: usize, described: &mut Vec<String>| {
+            for rest in &expanded[from..] {
+                described.push(format!("{} (parent decided at launch)", list(rest)));
+            }
+        };
+        'batches: for (index, prs) in expanded.iter().enumerate() {
+            let occupied_now = sim.iter().filter(|f| f.counts_occupied).count();
+            if occupied_now >= view.window {
+                undecided(index, &mut described);
+                break;
+            }
+            let roots_now = sim.iter().filter(|f| f.rooted && !f.stacked).count();
+            // The stack head for a stale green: the stack top, or a rooted
+            // flight on the current base (as in the fill loop).
+            let stale_at = sim.iter().rposition(|flight| flight.stacked).or_else(|| {
+                sim.iter()
+                    .rposition(|flight| flight.rooted && flight.parent == base)
+            });
+            let stale_tip: Option<String> = stale_at.and_then(|at| sim[at].tip.clone());
+            let front_stale = !view.stack_allowed
+                && stale_tip
+                    .as_deref()
+                    .is_some_and(|tip| self.stale_green_stack(prs, tip).is_some());
+            if !view.stack_allowed && !front_stale && !sim.is_empty() && roots_now >= max_roots {
+                undecided(index, &mut described);
+                break;
+            }
+            // Transitive `--after` dependencies, as the fill loop computes them.
+            let mut wanted: BTreeSet<i64> = BTreeSet::new();
+            let mut queue: Vec<i64> = prs.clone();
+            while let Some(pr) = queue.pop() {
+                if let Some(beneath) = deps.get(&pr) {
+                    for dep in beneath {
+                        if wanted.insert(*dep) {
+                            queue.push(*dep);
+                        }
+                    }
+                }
+            }
+            let dep_at: Vec<usize> = sim
+                .iter()
+                .enumerate()
+                .filter(|(_, flight)| flight.prs.iter().any(|pr| wanted.contains(pr)))
+                .map(|(at, _)| at)
+                .collect();
+            let kind = if dep_at.len() > 1 {
+                Kind::Waiting
+            } else if let [only] = dep_at.as_slice() {
+                Kind::Stacked(sim[*only].prs.clone())
+            } else {
+                let in_flight: Vec<i64> = sim.iter().flat_map(|f| f.prs.iter().copied()).collect();
+                let front_disjoint = self.batch_disjoint(prs, &in_flight);
+                let rooted0 = !self.config.disable_disjoint_root
+                    && (self.config.disjoint_root_min_red_percent == 0
+                        || view.recent_red_rate.is_some_and(|rate| {
+                            rate * 100.0 >= self.config.disjoint_root_min_red_percent as f64
+                        }))
+                    && !sim.is_empty()
+                    && roots_now < max_roots
+                    && front_disjoint
+                    && (max_roots > 1 || (view.window >= 3 && occupied_now + 1 >= view.window));
+                let stale_stack = if !view.stack_allowed {
+                    stale_tip
+                        .as_deref()
+                        .and_then(|tip| self.stale_green_stack(prs, tip))
+                } else {
+                    None
+                };
+                let stale_rooted = stale_stack.is_some() && roots_now < max_roots && {
+                    let head_prs: &[i64] = stale_at.map_or(&[], |at| sim[at].prs.as_slice());
+                    prioritized(prs)
+                        && !prioritized(head_prs)
+                        && (head_prs.is_empty() || self.batch_disjoint(prs, head_prs))
+                };
+                if stale_rooted {
+                    Kind::Root
+                } else if stale_stack.is_some() {
+                    match stale_at {
+                        Some(at) => Kind::Stacked(sim[at].prs.clone()),
+                        None => Kind::Root,
+                    }
+                } else if rooted0 {
+                    Kind::Root
+                } else if let Some(later) = expanded[index + 1..]
+                    .iter()
+                    .find(|batch| batch.iter().any(|pr| wanted.contains(pr)))
+                {
+                    // The fill loop brings the dependency's batch forward and
+                    // builds this one on it once it launches.
+                    Kind::Stacked(later.clone())
+                } else {
+                    match sim.iter().rposition(|flight| flight.stacked) {
+                        Some(top) => Kind::Stacked(sim[top].prs.clone()),
+                        None => Kind::Root,
+                    }
+                }
+            };
+            match kind {
+                Kind::Waiting => {
+                    described.push(format!(
+                        "{} (waiting for its dependencies to land)",
+                        list(prs)
+                    ));
+                    undecided(index + 1, &mut described);
+                    break 'batches;
+                }
+                Kind::Root => {
+                    if let Some(green) = sim.iter().find(|flight| flight.rooted && flight.green) {
+                        described.push(format!(
+                            "{} (root on the base, waiting for green root {} to land first)",
+                            list(prs),
+                            list(&green.prs)
+                        ));
+                        undecided(index + 1, &mut described);
+                        break 'batches;
+                    }
+                    described.push(format!("{} ({root_on})", list(prs)));
+                    sim.push(Sim {
+                        prs: prs.clone(),
+                        tip: None,
+                        parent: base.clone(),
+                        rooted: true,
+                        stacked: false,
+                        counts_occupied: true,
+                        green: false,
+                    });
+                }
+                Kind::Stacked(parent_prs) => {
+                    described.push(format!(
+                        "{} (stacked on {}'s candidate)",
+                        list(prs),
+                        list(&parent_prs)
+                    ));
+                    sim.push(Sim {
+                        prs: prs.clone(),
+                        tip: None,
+                        parent: String::new(),
+                        rooted: false,
+                        stacked: true,
+                        counts_occupied: true,
+                        green: false,
+                    });
+                }
+            }
+        }
+        if described.is_empty() {
+            return plain(&expanded);
+        }
+        format!(
+            "{total} batch(es) planned: {}; {held} held",
+            described.join(" then ")
+        )
     }
 
     /// Hand `prs`, in order, to the background precheck worker, so that each verdict is usually
@@ -6024,7 +6321,20 @@ impl<'a> Runner<'a> {
                                 Some(last) => last.candidate.tip.clone(),
                                 None => self.current_base()?,
                             };
-                            self.take_intake(&tip, &busy, &in_flight, max_batch, pending)?;
+                            self.take_intake(
+                                &tip,
+                                &busy,
+                                &in_flight,
+                                max_batch,
+                                pending,
+                                &intake_view(
+                                    &flights,
+                                    window,
+                                    stack_allowed,
+                                    wide_allowed,
+                                    recent_red_rate,
+                                ),
+                            )?;
                             // A ruling taken in just now is acted on at once, not at the end
                             // of the run, when other batches may have moved the base.
                             let rulings = self.accepted_rulings(&busy);
@@ -6046,13 +6356,23 @@ impl<'a> Runner<'a> {
                                     Some(last) => last.candidate.tip.clone(),
                                     None => self.current_base()?,
                                 };
-                                if let Err(error) =
-                                    self.plan_intake(&tip, &busy, max_batch, pending)
-                                {
+                                if let Err(error) = self.plan_intake(
+                                    &tip,
+                                    &busy,
+                                    max_batch,
+                                    pending,
+                                    &intake_view(
+                                        &flights,
+                                        window,
+                                        stack_allowed,
+                                        wide_allowed,
+                                        recent_red_rate,
+                                    ),
+                                ) {
                                     self.event(
                                         "plan-intake",
                                         &format!(
-                                            "cannot plan on top of {}: {error}; the changes wait \
+                                            "cannot plan against {}: {error}; the changes wait \
                                              for the next run",
                                             short(&tip)
                                         ),
