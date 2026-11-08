@@ -5,7 +5,7 @@ priority: 2
 issue_type: bug
 assignee: cl-start
 created_at: 2026-11-07T21:50:00.000000000+00:00
-updated_at: 2026-11-07T21:50:00.000000000+00:00
+updated_at: 2026-11-08T04:00:00.000000000+00:00
 ---
 
 # Description
@@ -32,3 +32,13 @@ So the pty threads track live panes, but `tokio-rt-worker` threads keep growing.
 # Notes
 
 Filed by the devbig030 coordinator at the lead's request. Thread names from /proc/<pid>/task/*/comm.
+
+## 2026-11-07 progress (cl-start)
+
+- Diagnosis: there is no leak. The server holds one tokio worker per CPU (316 here), because the runtime builder sets no worker count, plus two threads per live pane: a `herdr-pty` reader and a blocking-pool thread parked in `wait4`, running the pane's `spawn_blocking(child.wait())`. The count stayed flat over an hourly sample (493-496 total, pane threads tracking 73-75 live panes).
+- Two PRs on the fork, against `upstream-main` (upstream master ee5bfb50), opened by the lead as rrnewton. Neither is merged or deployed; the owner picks the restart time.
+  - https://github.com/rrnewton/herdr/pull/3 (a) fix(server): bound the tokio runtime's worker threads. Threads at 0/10/40 panes: 319/339/399 on the deployed 0.9.5, 11/31/92 with the PR.
+  - https://github.com/rrnewton/herdr/pull/4 (b) fix(pane): reap pane children on one thread instead of one blocking thread each. It uses one pidfd+epoll reaper thread and no SIGCHLD handler. Threads: 319/330/360 with 0 wait4 threads.
+- PR descriptions: hosts/devbig030/handoffs/2026-11-07-herdr-pr-{a,b}.md in the harness repo.
+- RSS growth is tracked separately in #1028 herdr-server-rss-growth.
+
