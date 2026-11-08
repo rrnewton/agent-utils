@@ -1600,16 +1600,16 @@ test("`#624 voice-page-modularity`: the reply box's listeners are mounted in the
     });
     assert.deepStrictEqual(log, ["listen reply-cancel click", "listen reply-discard-yes click", "listen reply-discard-no click",
       "listen left:scroll-area scroll passive", "listen left:side-scroll scroll passive", "listen reply-send click", "listen reply-text keydown",
-      "watch reply-text", "listen reply-branch change", "listen reply-text input", "listen reply-compose focusout",
+      "watch reply-text", "listen reply-branch change", "listen reply-to-main change", "listen reply-text input", "listen reply-compose focusout",
       "listen document focusin", "observe left:column-reply", "observe left:side-reply", "listen view-switch click"], "mounted out of the page's order");
     log.length = 0;
     fire("reply-cancel", "click"); fire("reply-discard-yes", "click"); fire("reply-discard-no", "click");
     fire("left:scroll-area", "scroll"); fire("left:side-scroll", "scroll"); fire("reply-send", "click");
     assert.deepStrictEqual(fire("reply-text", "keydown", { key: "Enter" }), ["key"], "the box's keys answered what its act did not");
-    fire("reply-branch", "change"); fire("reply-text", "input"); fire("reply-compose", "focusout"); fire("document", "focusin"); fire("view-switch", "click");
+    fire("reply-branch", "change"); fire("reply-to-main", "change"); fire("reply-text", "input"); fire("reply-compose", "focusout"); fire("document", "focusin"); fire("view-switch", "click");
     watchers[0].report();
     assert.deepStrictEqual(log, ["cancel 0", "discard 1", "discard 1", "chip 0", "chip 0", "send 0", "key 1", "remember 0",
-      "destination 0", "remember 0", "focus leaving 1", "focus in 0", "view 0", "fit 0"]);
+      "destination 0", "destination 0", "remember 0", "focus leaving 1", "focus in 0", "view 0", "fit 0"]);
     box.unmount();
     assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
     assert.ok(watchers[0].disconnected, "the size watcher outlived unmount");
@@ -1658,8 +1658,9 @@ test("quoteSelectionNow opens the quick reply for held words, and does nothing w
   });
   const byIdMap = new Map();
   for (const id of ["quick-reply", "quick-reply-quote", "quick-reply-text", "quick-reply-state",
+    "quick-reply-to-main", "quick-reply-to-main-row",
     "selection-chip", "read-steer-quote", "scroll-area", "side-scroll", "discord-log"]) {
-    byIdMap.set(id, el());
+    byIdMap.set(id, el(id === "quick-reply-to-main" ? { checked: false } : {}));
   }
   const quoting = createQuoting({
     byId: (id) => byIdMap.get(id),

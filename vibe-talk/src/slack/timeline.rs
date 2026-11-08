@@ -1417,6 +1417,37 @@ impl HttpSlackClient {
             .await
     }
 
+    /// [`crate::chat::ChatClient::post_message_top_level_keyed`], without the provider label
+    /// (`#1052 post-to-main`): no `thread_ts` is sent, even on a channel narrowed to one
+    /// thread, so the post lands on the conversation itself and starts its own thread.
+    /// `reply_to` travels only in the post's metadata, as `thread_post` already carries it,
+    /// and no read places it first: the answered message may live in a thread, where
+    /// [`Self::reply_thread`] would refuse it as a destination, which is exactly the post
+    /// this one is not.
+    pub(super) async fn post_top_level(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+    ) -> Result<Message, ChatError> {
+        let _in_flight = self.write_in_flight();
+        ReadReason::Write
+            .scope(async {
+                let target = Self::channel_ref(channel)?;
+                self.post_raw(
+                    channel,
+                    target.conversation.as_str(),
+                    content,
+                    None,
+                    reply_to,
+                    key,
+                )
+                .await
+            })
+            .await
+    }
+
     /// The thread a reply to `id` belongs in: its own, or the one it roots.
     async fn reply_thread(&self, conversation: &str, id: &MessageId) -> Result<String, ChatError> {
         let micros = cursor_micros(id)?;

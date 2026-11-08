@@ -1936,6 +1936,23 @@ impl ChatClient for ProfiledClient {
         .await
     }
 
+    async fn post_message_top_level_keyed(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+    ) -> Result<Message, ChatError> {
+        self.timed(
+            "post_message_top_level_keyed",
+            Direction::Other,
+            About::channel(channel),
+            self.inner
+                .post_message_top_level_keyed(channel, content, reply_to, key),
+        )
+        .await
+    }
+
     async fn post_in_thread_keyed(
         &self,
         channel: &ChannelId,

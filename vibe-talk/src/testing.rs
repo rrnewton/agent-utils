@@ -1456,6 +1456,21 @@ impl crate::chat::ChatClient for CountingChat {
         .await
     }
 
+    async fn post_message_top_level_keyed(
+        &self,
+        channel: &crate::model::ChannelId,
+        content: &str,
+        reply_to: Option<&crate::model::MessageId>,
+        key: Option<&str>,
+    ) -> Result<crate::model::Message, crate::chat::ChatError> {
+        self.counted(
+            call_in("post_message_top_level_keyed", channel),
+            self.inner
+                .post_message_top_level_keyed(channel, content, reply_to, key),
+        )
+        .await
+    }
+
     async fn post_in_thread_keyed(
         &self,
         channel: &crate::model::ChannelId,

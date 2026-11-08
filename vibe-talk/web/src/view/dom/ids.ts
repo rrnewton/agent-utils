@@ -401,6 +401,8 @@ export interface ElementById {
   "quick-reply-send": HTMLButtonElement;
   "quick-reply-state": HTMLParagraphElement;
   "quick-reply-text": HTMLTextAreaElement;
+  "quick-reply-to-main": HTMLInputElement;
+  "quick-reply-to-main-row": HTMLLabelElement;
   "quote-read-percent": HTMLInputElement;
   "quote-read-percent-larger": HTMLButtonElement;
   "quote-read-percent-smaller": HTMLButtonElement;
@@ -457,6 +459,8 @@ export interface ElementById {
   "reply-state": HTMLParagraphElement;
   "reply-target-meta": HTMLParagraphElement;
   "reply-text": HTMLTextAreaElement;
+  "reply-to-main": HTMLInputElement;
+  "reply-to-main-row": HTMLLabelElement;
   "reset-voice-post-prefix": HTMLButtonElement;
   "restore-voice-system-prompt": HTMLButtonElement;
   "resume-state": HTMLParagraphElement;

@@ -1863,6 +1863,18 @@ impl ChatClient for HttpSlackClient {
             .await
             .map_err(|error| error.with_provider(&self.provider_name))
     }
+
+    async fn post_message_top_level_keyed(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+    ) -> Result<Message, ChatError> {
+        self.post_top_level(channel, content, reply_to, key)
+            .await
+            .map_err(|error| error.with_provider(&self.provider_name))
+    }
 }
 
 /// The `event_type` vibe-talk's operation-key metadata is filed under. `#465

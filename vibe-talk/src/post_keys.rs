@@ -66,6 +66,11 @@ pub struct Fingerprint {
     thread: Option<String>,
     reply_to: Option<String>,
     text: String,
+    /// The post was asked to land top-level, its reply-to an edge only (`#1052 post-to-main`):
+    /// the same words under the same key with the other destination are another post. Absent
+    /// from records filed before it existed, which name ordinary posts.
+    #[serde(default)]
+    top_level: bool,
 }
 
 impl Fingerprint {
@@ -84,7 +89,15 @@ impl Fingerprint {
             thread: thread.map(str::to_owned),
             reply_to: reply_to.map(str::to_owned),
             text: text.to_owned(),
+            top_level: false,
         }
+    }
+
+    /// This post, asked to land top-level with its reply-to an edge only (`#1052 post-to-main`).
+    #[must_use]
+    pub fn top_level(mut self) -> Self {
+        self.top_level = true;
+        self
     }
 }
 

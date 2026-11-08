@@ -1850,6 +1850,47 @@ test("Reply offers a new thread only on a main-channel message the chat service 
     { text: "an answer in the thread", reply_to: "202", thread_id: data.threads[0].id });
 });
 
+test("Post to main sends an in-thread reply to the main channel as a new thread, unticked every open", async () => {
+  // `#1052 post-to-main`: promoting one point of a status thread into its own clean discussion.
+  const page = newPage();
+  page.threadingSupported = true;
+  const data = threadData();
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  distinctReplies(page);
+  await page.el("channel-view-flat").click();
+  await page.settle();
+  const offered = () => !page.el("reply-to-main-row").hidden;
+  const send = async (text) => {
+    await page.el("reply-text").setValue(text);
+    await page.el("reply-send").click();
+    await page.settle();
+    return sentWithoutKey(page.repliesPosted.at(-1).body);
+  };
+
+  // In All, a thread reply is offered the main channel instead, off, beside the in-thread note.
+  await replyButton(rowOf(page, "202")).click();
+  assert.ok(offered(), "no Post to main choice on a thread reply");
+  assert.equal(page.el("reply-to-main").checked, false, "Post to main was the default");
+  assert.match(page.el("reply-destination").textContent, /thread this message belongs to/);
+  page.el("reply-to-main").checked = true;
+  await page.el("reply-to-main").dispatch("change");
+  assert.match(page.el("reply-destination").textContent, /main channel as a new thread/);
+  assert.deepEqual(await send("a point promoted to its own discussion"),
+    { text: "a point promoted to its own discussion", reply_to: "202", post_to_main: true });
+
+  // The choice is made each time: the next reply opens unticked and goes to the thread.
+  await replyButton(rowOf(page, "202")).click();
+  assert.equal(page.el("reply-to-main").checked, false, "the last reply's choice carried over");
+  assert.deepEqual(await send("an ordinary answer in the thread"),
+    { text: "an ordinary answer in the thread", reply_to: "202", thread_id: data.threads[0].id });
+
+  // A main-channel message has no thread to leave, so nothing is offered.
+  await replyButton(rowOf(page, "200")).click();
+  assert.equal(offered(), false, "Post to main was offered on a main-channel reply");
+});
+
 test("Reply offers no new thread on a root the page has since learnt was answered, whatever its row says", async () => {
   // A row keeps the copy it was drawn from. Drawn while nobody had answered the root, that copy
   // still says 0 replies after the store has read otherwise — and ticking "Start a new thread"
@@ -4293,6 +4334,42 @@ test("`#727 vt-selection-quick-reply`: Send posts the quoted reply in the messag
   // THE CONTROL: a list not held for the quick reply follows the newest message down as it arrives.
   const control = await run(brokenScript("  if (quickReplyHolds(area)) return false;\n", ""));
   assert.notEqual(control.openArrivedTop, control.top, "with the list not held it stayed put anyway, so this test cannot see it");
+});
+
+test("`#1052 post-to-main`: the quick reply's tick posts its quoted reply to the main channel", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  const data = threadData();
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  // In All by default: select words of the in-thread message and press the chip.
+  await page.selectText(wordsIn(rowWithId(page, "202")), null, "thread answer");
+  await page.el("selection-chip").click();
+  await page.settle();
+  assert.equal(page.el("quick-reply").hidden, false, "the chip opened no quick reply");
+  assert.equal(page.el("quick-reply-to-main-row").hidden, false, "no Post to main choice in the box");
+  assert.equal(page.el("quick-reply-to-main").checked, false, "Post to main was the default");
+  page.el("quick-reply-to-main").checked = true;
+  await page.el("quick-reply-text").setValue("taking this point to main");
+  await page.el("quick-reply-send").click();
+  await page.settle();
+  const posted = page.repliesPosted.at(-1).body;
+  assert.equal(posted.reply_to, "202");
+  assert.equal(posted.post_to_main, true, JSON.stringify(posted));
+  assert.equal("thread_id" in posted, false, JSON.stringify(posted));
+  assert.match(posted.text, /^> thread answer\n\ntaking this point to main$/);
+  // Reopened on the same words, the tick is off again and the send joins the thread.
+  await page.selectText(wordsIn(rowWithId(page, "202")), null, "thread answer");
+  await page.el("selection-chip").click();
+  await page.settle();
+  assert.equal(page.el("quick-reply-to-main").checked, false, "the last send's choice carried over");
+  await page.el("quick-reply-text").setValue("staying in the thread");
+  await page.el("quick-reply-send").click();
+  await page.settle();
+  const stayed = page.repliesPosted.at(-1).body;
+  assert.equal(stayed.thread_id, data.threads[0].id, JSON.stringify(stayed));
+  assert.equal("post_to_main" in stayed, false, JSON.stringify(stayed));
 });
 
 test("`#727 vt-selection-quick-reply`: a tap outside puts what was written back under its message, open and shown; with nothing written it just closes", async () => {

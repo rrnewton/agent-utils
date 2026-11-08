@@ -5184,7 +5184,7 @@ pub async fn reply(
     text: &str,
     reply_to: Option<&str>,
 ) -> Result<(ChannelInfo, Message, Vec<Message>), OpError> {
-    reply_scoped(state, channel_id, text, reply_to, None, None).await
+    reply_scoped(state, channel_id, text, reply_to, None, false, None).await
 }
 
 /// Post to the channel or to one of its threads, preserving write policy and partial progress.
@@ -5212,6 +5212,7 @@ pub async fn reply_scoped(
     text: &str,
     reply_to: Option<&str>,
     thread_id: Option<&str>,
+    post_to_main: bool,
     idempotency_key: Option<&str>,
 ) -> Result<(ChannelInfo, Message, Vec<Message>), OpError> {
     let post = Post {
@@ -5219,6 +5220,7 @@ pub async fn reply_scoped(
         text,
         reply_to,
         thread_id,
+        post_to_main,
         idempotency_key,
     };
     post_settled(state, post, None).await.0
@@ -5233,6 +5235,7 @@ pub async fn reply_accepted(
     text: &str,
     reply_to: Option<&str>,
     thread_id: Option<&str>,
+    post_to_main: bool,
     idempotency_key: &str,
 ) -> Result<(u64, usize), OpError> {
     let started = std::time::Instant::now();
@@ -5241,6 +5244,7 @@ pub async fn reply_accepted(
         text,
         reply_to,
         thread_id,
+        post_to_main,
         idempotency_key: Some(idempotency_key),
     };
     let (posting, turn) = match ready_to_post(state, post).await {
@@ -5329,6 +5333,7 @@ fn binding_post(binding: &crate::post_gate::Binding) -> Post<'_> {
         text: &binding.text,
         reply_to: binding.reply_to.as_deref(),
         thread_id: None,
+        post_to_main: false,
         idempotency_key: None,
     }
 }
@@ -5362,6 +5367,10 @@ struct Post<'a> {
     text: &'a str,
     reply_to: Option<&'a str>,
     thread_id: Option<&'a str>,
+    /// Land as a new top-level message answering `reply_to` by edge only, never in its thread
+    /// (`#1052 post-to-main`). Names the opposite destination from `thread_id`; the two together
+    /// are refused in [`ready_to_post`].
+    post_to_main: bool,
     idempotency_key: Option<&'a str>,
 }
 
@@ -5448,6 +5457,7 @@ async fn ready_to_post(state: &AppState, post: Post<'_>) -> Result<Ready, OpErro
         text,
         reply_to,
         thread_id,
+        post_to_main,
         idempotency_key,
     } = post;
     let info = allowed(state, channel_id).await?;
@@ -5456,6 +5466,13 @@ async fn ready_to_post(state: &AppState, post: Post<'_>) -> Result<Ready, OpErro
     }
     if let Some(thread) = thread_id {
         validate_thread_id(thread)?;
+    }
+    // `#1052 post-to-main`. Top-level and in-a-thread are opposite destinations for one post;
+    // naming both is a caller that has not decided, and posting either would lie about it.
+    if post_to_main && thread_id.is_some() {
+        return Err(OpError::Chat(ChatError::Refused(
+            "post_to_main posts to the channel itself; it cannot also name a thread".to_owned(),
+        )));
     }
     if let Some(key) = idempotency_key {
         validate_idempotency_key(key)?;
@@ -5492,6 +5509,11 @@ async fn ready_to_post(state: &AppState, post: Post<'_>) -> Result<Ready, OpErro
                 reply_to.as_ref().map(|id| id.0.as_str()),
                 asked,
             );
+            let fingerprint = if post_to_main {
+                fingerprint.top_level()
+            } else {
+                fingerprint
+            };
             match claim_post(state, fingerprint).await? {
                 Ok(pending) => Some(pending),
                 Err(outcome) => return Ok(Ready::Known(outcome)),
@@ -5511,6 +5533,7 @@ async fn ready_to_post(state: &AppState, post: Post<'_>) -> Result<Ready, OpErro
         keys,
         reply_to,
         thread_id: thread_id.map(str::to_owned),
+        post_to_main,
         limit,
         defuse,
         claim,
@@ -5653,12 +5676,14 @@ fn to_remember(
 ///
 /// As [`reply_scoped`] for a post that landed in part; [`OpError::ChannelNotAllowed`] and the
 /// other refusals of a channel or key that could never have been posted.
+#[allow(clippy::too_many_arguments)]
 pub async fn post_outcome(
     state: &AppState,
     channel_id: &str,
     text: &str,
     reply_to: Option<&str>,
     thread_id: Option<&str>,
+    post_to_main: bool,
     idempotency_key: &str,
     wait: std::time::Duration,
 ) -> Result<PostOutcome, OpError> {
@@ -5675,6 +5700,11 @@ pub async fn post_outcome(
         reply_to,
         text,
     );
+    let fingerprint = if post_to_main {
+        fingerprint.top_level()
+    } else {
+        fingerprint
+    };
     let waiting = match state.post_keys.lookup(&fingerprint) {
         crate::post_keys::Lookup::Known(outcome) => {
             return Ok(PostOutcome::Settled(Box::new(remembered_answer(&outcome))))
@@ -5772,6 +5802,8 @@ struct Posting {
     keys: Option<Vec<String>>,
     reply_to: Option<MessageId>,
     thread_id: Option<String>,
+    /// Land top-level, answering `reply_to` by edge only (`#1052 post-to-main`).
+    post_to_main: bool,
     limit: crate::chat::PostLimit,
     /// Whether the post was defused as it was cut; see [`cut_post`].
     defuse: bool,
@@ -5851,6 +5883,7 @@ async fn post_each(
         keys,
         reply_to,
         thread_id,
+        post_to_main,
         limit,
         defuse,
         claim: _,
@@ -5888,6 +5921,14 @@ async fn post_each(
                 state
                     .chat
                     .post_in_thread_keyed(&info.id, thread, part, parent, key)
+                    .await
+            }
+            // `#1052 post-to-main`: only the first part can take this arm with the flag set;
+            // the rest of a long post continue in the new root's thread as ever.
+            None if post_to_main => {
+                state
+                    .chat
+                    .post_message_top_level_keyed(&info.id, part, parent, key)
                     .await
             }
             None => {

@@ -2748,6 +2748,11 @@ pub struct ReplyRequest {
     pub reply_to: Option<String>,
     /// The destination thread; absent posts directly to the configured channel.
     pub thread_id: Option<String>,
+    /// Post as a new top-level message answering `reply_to` by reply-to edge only, never in
+    /// its thread (`#1052 post-to-main`). Naming a thread as well is refused: the two name
+    /// opposite destinations. Absent is the ordinary post.
+    #[serde(default)]
+    pub post_to_main: bool,
     /// Names this post across attempts, so sending it again cannot post it twice where the
     /// provider honours that. `#195 send-resilience`; see [`ops::reply_scoped`].
     ///
@@ -2915,6 +2920,7 @@ pub async fn reply(
                 &request.text,
                 request.reply_to.as_deref(),
                 request.thread_id.as_deref(),
+                request.post_to_main,
                 key,
             )
             .await?;
@@ -2936,6 +2942,7 @@ pub async fn reply(
         &request.text,
         request.reply_to.as_deref(),
         request.thread_id.as_deref(),
+        request.post_to_main,
         request.idempotency_key.as_deref(),
     )
     .await;
@@ -3041,6 +3048,7 @@ pub async fn reply_outcome(
         &request.text,
         request.reply_to.as_deref(),
         request.thread_id.as_deref(),
+        request.post_to_main,
         key,
         wait,
     )

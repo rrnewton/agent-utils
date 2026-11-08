@@ -165,7 +165,12 @@ test("`#624 voice-page-modularity`: an outbox entry read back from the device, f
     wire: { text: "w", replyTo: "", threadId: "t" }, serverMs: "12", upstreamMs: "soon", sentAt: 9 }, now);
   assert.deepStrictEqual(
     [reply.marksRead, reply.originView, reply.parts, reply.observedParts, reply.wire, reply.serverMs, reply.upstreamMs, reply.sentAt],
-    ["r", "thread", [{ id: "p", content: "a" }], ["p"], { text: "w", replyTo: null, threadId: "t" }, 12, null, 9]);
+    ["r", "thread", [{ id: "p", content: "a" }], ["p"], { text: "w", replyTo: null, threadId: "t", postToMain: false }, 12, null, 9]);
+  // `#1052 post-to-main`: a saved top-level ask reads back as one; absent is an ordinary post.
+  assert.equal(reply.postToMain, false);
+  assert.equal(outgoingFromSaved({ ...base, postToMain: true }, now).postToMain, true);
+  assert.deepStrictEqual(savedWire({ text: "w", postToMain: true }),
+    { text: "w", replyTo: null, threadId: null, postToMain: true });
   assert.equal(outgoingFromSaved({ ...base, replyTo: "r", marksRead: null }, now).marksRead, null);
   assert.equal(savedWire({ text: 3 }), null);
 });

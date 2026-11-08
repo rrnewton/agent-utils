@@ -8316,17 +8316,22 @@ async function dispatchOutgoingMessage(entry, job) {
     // which only the first part carries.
     let replyTo = entry.replyTo && !entry.continueIn ? entry.replyTo : null;
     let threadId = entry.continueIn || entry.threadId || null;
+    // `#1052 post-to-main`: asked to land top-level, answering by edge only. The rest of a post
+    // cut in parts continues in the new root's thread as ever, so this rides only until then.
+    let postToMain = entry.postToMain === true && !entry.continueIn;
     // `#448 send-dedupe`. Where these words go is decided by the first attempt that sends them, and
     // every later one says the same, across reloads: the server answers a repeat under the key with
     // the post it made, and a page that has since drawn the reply into the thread it started must
     // not ask for it somewhere else. Only the unsent rest of a 207 is new words, placed afresh.
     if (entry.wire && entry.wire.text === entry.remaining) {
       ({ replyTo, threadId } = entry.wire);
+      postToMain = entry.wire.postToMain === true && !entry.continueIn;
     } else {
-      entry.wire = { text: entry.remaining, replyTo, threadId };
+      entry.wire = { text: entry.remaining, replyTo, threadId, postToMain: entry.postToMain === true };
     }
     if (replyTo) body.reply_to = replyTo;
     if (threadId) body.thread_id = threadId;
+    if (postToMain) body.post_to_main = true;
     // The entry's id names this post on every attempt, across reloads, so the server can tell a
     // retry from a second message. `#448 send-dedupe`: sent to every provider, since the server
     // itself answers a repeat of a post that landed, or is landing, with that post. Only a provider
@@ -13912,6 +13917,10 @@ function openReply(messages, from = null, quote = "", focus = true) {
   replyState.routing = replyRoute(message, bound);
   el("reply-branch").checked = Boolean(replyState.routing.branch) && bound;
   el("reply-branch-row").hidden = !replyState.routing.branch;
+  // `#1052 post-to-main`: offered only where this reply would join a thread, and never ticked
+  // on open — no draft brings it back either, so the destination is chosen each time.
+  el("reply-to-main").checked = false;
+  el("reply-to-main-row").hidden = !(replyState.routing.thread || replyState.routing.into);
   replyState.column = columnWork.active();
   el("reply-target-meta").textContent = `to ${
     message.author_is_bot ? `${message.author} (bot)` : String(message.author)
@@ -13946,11 +13955,13 @@ function openReply(messages, from = null, quote = "", focus = true) {
  */
 function renderReplyDestination() {
   const note = el("reply-destination");
-  note.textContent = replyState.routing.branch
-    ? el("reply-branch").checked
-      ? "Posts in a new thread on this message, as its first reply."
-      : "Posts in the main channel as a reply to this message."
-    : replyState.routing.note;
+  note.textContent = !el("reply-to-main-row").hidden && el("reply-to-main").checked
+    ? "Posts in the main channel as a new thread, as a reply to this message."
+    : replyState.routing.branch
+      ? el("reply-branch").checked
+        ? "Posts in a new thread on this message, as its first reply."
+        : "Posts in the main channel as a reply to this message."
+      : replyState.routing.note;
   note.hidden = note.textContent === "";
 }
 
@@ -14038,14 +14049,18 @@ async function sendReply() {
   }
   rememberDraft();
   const branch = route.branch && el("reply-branch").checked ? route.branch : null;
+  // `#1052 post-to-main`: ticked where offered, the reply lands in the main channel as a new
+  // thread answering this message, so it draws there, not in place under it here.
+  const toMain = !el("reply-to-main-row").hidden && el("reply-to-main").checked;
   const completion = queueOutgoingMessage({
-    channel, threadId: branch || route.into || route.thread, replyTo: String(target.id), text,
+    channel, threadId: toMain ? null : branch || route.into || route.thread, replyTo: String(target.id), text,
+    ...(toMain ? { postToMain: true } : {}),
     // `#467 inline-send-in-place`. Sent from the box in the stream: its row is drawn where that box was,
     // under the message it answers, until the reply itself is drawn (`placeOutgoingInPlace`).
-    ...(replyState.docked ? { inPlace: String(target.id) } : {}),
+    ...(replyState.docked && !toMain ? { inPlace: String(target.id) } : {}),
     // `#500 sent-receipts-pile-up`. And in which list: the Threads view's cards, where Main may draw the
     // same message on the left.
-    ...(replyState.docked && replyState.list === leftEl("side-cards") ? { inCards: true } : {}),
+    ...(replyState.docked && !toMain && replyState.list === leftEl("side-cards") ? { inCards: true } : {}),
     // `#300 reply-marks-read`. A targeted reply marks the message it answers, wherever it goes, unless
     // its quote covers too little of it (`#728 vt-quote-read-threshold`).
     marksRead: replyMarksRead(target, text),
@@ -14926,6 +14941,10 @@ function followReplyStore() {
       moved = true;
     }
   }
+  // `#1052 post-to-main`: the offer follows the settled route, as the branch offer does; a
+  // route that no longer joins a thread takes the tick away with the offer.
+  el("reply-to-main-row").hidden = !(replyState.routing.thread || replyState.routing.into);
+  if (el("reply-to-main-row").hidden) el("reply-to-main").checked = false;
   renderReplyDestination();
   if (moved) rememberDraft();
 }

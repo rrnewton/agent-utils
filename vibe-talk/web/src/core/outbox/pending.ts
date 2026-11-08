@@ -10,6 +10,8 @@ export interface PendingSend {
   readonly continueIn?: unknown;
   readonly threadId?: unknown;
   readonly replyTo?: unknown;
+  /** Asked to land top-level, so it counts in no thread (`#1052 post-to-main`). */
+  readonly postToMain?: unknown;
   readonly channel: string;
   readonly state?: string;
   readonly remaining?: unknown;
@@ -62,6 +64,9 @@ export function createPendingThreads<Message>(deps: PendingThreadsDependencies<M
   function outgoingThreadOf(entry: PendingSend): string | null {
     if (entry.continueIn) return String(entry.continueIn);
     if (entry.threadId) return String(entry.threadId);
+    // `#1052 post-to-main`: asked to land top-level, so no thread counts it — not even the
+    // answered message's, though on a replies-in-thread provider a plain reply counts there.
+    if (entry.postToMain === true) return null;
     const viewing = String(deps.channel());
     if (!entry.replyTo || entry.channel !== viewing || deps.store().channel !== viewing ||
         !deps.repliesInThread(entry.channel)) return null;

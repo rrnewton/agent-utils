@@ -1,10 +1,11 @@
 ---
 title: 'post-to-main: a quote-reply checkbox that starts a clean top-level thread'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-11-08T10:06:03.000000000+00:00
-updated_at: 2026-11-08T10:06:03.000000000+00:00
+updated_at: 2026-11-08T11:05:49.000000000+00:00
+closed_at: 2026-11-08T11:05:49.000000000+00:00
 ---
 
 # Description
@@ -33,4 +34,8 @@ Wanted, in the owner's words: "when I click quote reply and I get a compose box 
 
 ## Resolution
 
-Pending.
+[watermelon-full-preview] Implemented by mu-spark in both composers. The stream reply box and the floating quick-reply box each offer **Post to main** left of Send/Cancel exactly where the reply would join a thread, unticked on every open and never kept with a draft; the destination note follows the tick. Ticked, Send queues the reply with no thread and `postToMain`, which the outbox wire, saved entries and pending-thread counts all carry as a main-channel destination, so retries and reloads keep it.
+
+The server takes an explicit `post_to_main` on `POST /reply` (refused together with `thread_id`, part of the send-dedupe fingerprint and the outcome lookup). Ops, storage and read-back needed no change — a root carrying a cross-thread reply-to was already carried end to end, and the reply arrow already follows it across views — but providers did: a new `ChatClient::post_message_top_level_keyed` posts without a native reply reference by default (the edge is filed vibe-talk-side as for any post), Slack overrides it to post with no `thread_ts` and the edge in metadata only, never broadcast. No per-model or per-provider branch was added in ops; switching destination stays configuration of the send, not code.
+
+Tests: page tests for both boxes (offered only in-thread, unticked each open, checked body is `{reply_to, post_to_main}` with no `thread_id`, unticked control unchanged), outbox/saved and listener-order unit updates, an API test (top-level landing answering an in-thread message, both-destinations refused posting nothing), a Slack provider test (no `thread_ts`, edge in metadata, roots its own thread), and a real-Chromium walk (tick left of Send/Cancel, new root in the list, arrow lands on the quoted message). Unverified: a live Discord post's upstream acceptance is no longer in question for this path — no native reference is sent top-level — but no live provider was posted to here; the fake and loopback harnesses are the evidence.

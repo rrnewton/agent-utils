@@ -1248,6 +1248,19 @@ impl ChatClient for ChatRouter {
             .await
     }
 
+    async fn post_message_top_level_keyed(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+    ) -> Result<Message, ChatError> {
+        self.route(channel)?
+            .client
+            .post_message_top_level_keyed(channel, content, reply_to, key)
+            .await
+    }
+
     async fn mark_read_upstream(
         &self,
         channel: &ChannelId,

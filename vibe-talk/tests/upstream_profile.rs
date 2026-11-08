@@ -621,6 +621,16 @@ impl ChatClient for Recorder {
         self.note("post_message_keyed");
         Ok(self.message.clone())
     }
+    async fn post_message_top_level_keyed(
+        &self,
+        _channel: &ChannelId,
+        _content: &str,
+        _reply_to: Option<&MessageId>,
+        _key: Option<&str>,
+    ) -> Result<Message, ChatError> {
+        self.note("post_message_top_level_keyed");
+        Ok(self.message.clone())
+    }
     async fn post_in_thread_keyed(
         &self,
         _channel: &ChannelId,
@@ -936,6 +946,11 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
         .await
         .expect("keyed post");
     ran("post_message_keyed");
+    client
+        .post_message_top_level_keyed(&channel, "hi", None, Some("k"))
+        .await
+        .expect("keyed top-level post");
+    ran("post_message_top_level_keyed");
     client
         .post_in_thread_keyed(&channel, "t", "hi", None, Some("k"))
         .await

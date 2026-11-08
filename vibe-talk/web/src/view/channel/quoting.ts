@@ -155,6 +155,8 @@ export interface QuickReplySend {
   readonly text: string;
   readonly marksRead: string | null;
   readonly placement?: "unknown";
+  /** Land top-level answering `replyTo` by edge only (`#1052 post-to-main`); absent is ordinary. */
+  readonly postToMain?: boolean;
 }
 
 /** Where the quick replies' drafts are kept, by key, as the page's draft stores keep theirs. */
@@ -512,6 +514,11 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     const form = deps.byId("quick-reply");
     setTextIfChanged(deps.byId("quick-reply-quote"), quote);
     deps.byId("quick-reply-text").value = quickReplyDrafts.get(key) || "";
+    // `#1052 post-to-main`: offered only where this reply would join a thread; never ticked
+    // on open, draft or none, so the destination is chosen each time.
+    const route = deps.replyRoute(message, true);
+    deps.byId("quick-reply-to-main").checked = false;
+    setHiddenIfChanged(deps.byId("quick-reply-to-main-row"), !(route.thread || route.into));
     setTextIfChanged(deps.byId("quick-reply-state"), "");
     setHiddenIfChanged(form, false);
     placeQuickReply();
@@ -579,6 +586,8 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
       return;
     }
     // Into the stream's draft first, and only then let go of its own (`#819`): never in neither.
+    // A Post to main tick is not carried with it: the stream box opens unticked, as every open
+    // does, and the destination is chosen there (`#1052 post-to-main`).
     deps.toStream(open.row, open.message, `${quoteBlock(open.quote)}${written}`);
     deps.byId("quick-reply-text").value = "";
     closeQuickReply();
@@ -602,14 +611,18 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
       setTextIfChanged(deps.byId("quick-reply-state"), "Not sent: the message you are answering was removed from the channel.");
       return;
     }
+    // `#1052 post-to-main`: ticked (and offered, which opening the box settled), the reply
+    // lands in the main channel as a new thread answering this message; its destination is
+    // known, so nothing is left for the send to place.
+    const toMain = !deps.byId("quick-reply-to-main-row").hidden && deps.byId("quick-reply-to-main").checked;
     const text = `${quoteBlock(open.quote)}${written.trim()}`;
     // The list stays held from here until the reader moves it: the reply, and what answers it, land
     // without moving the words they read (see the note at the head of this file).
     if (!quickReplyHold) holdQuickReplyList(listOf(open.row));
     const completion = deps.queueOutgoingMessage({
-      channel: open.channel, threadId: route.branch || route.into || route.thread, replyTo: String(open.message.id), text,
+      channel: open.channel, threadId: toMain ? null : route.branch || route.into || route.thread, replyTo: String(open.message.id), text,
       marksRead: deps.replyMarksRead(open.message, text),
-      ...(route.unknown ? { placement: "unknown" as const } : {}),
+      ...(toMain ? { postToMain: true as const } : route.unknown ? { placement: "unknown" as const } : {}),
     });
     deps.byId("quick-reply-text").value = "";
     closeQuickReply();

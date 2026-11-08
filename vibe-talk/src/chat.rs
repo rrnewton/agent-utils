@@ -1387,6 +1387,26 @@ pub trait ChatClient: Send + Sync {
         self.post_message(channel, content, reply_to).await
     }
 
+    /// Post `content` as a NEW top-level message answering `reply_to` only as a vibe-talk
+    /// reply-to edge (`#1052 post-to-main`): it starts its own thread instead of joining the
+    /// answered message's, on every provider. The caller files the edge itself
+    /// ([`crate::reply_pointers`]), as for any post, so the default simply withholds the native
+    /// reply reference that would nest or thread the post upstream. A provider whose own
+    /// metadata can carry the edge invisibly (Slack) overrides this to carry it there instead.
+    ///
+    /// # Errors
+    ///
+    /// As [`ChatClient::post_message`].
+    async fn post_message_top_level_keyed(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        _reply_to: Option<&MessageId>,
+        key: Option<&str>,
+    ) -> Result<Message, ChatError> {
+        self.post_message_keyed(channel, content, None, key).await
+    }
+
     /// [`ChatClient::post_in_thread`], carrying the idempotency key for this one part.
     ///
     /// # Errors

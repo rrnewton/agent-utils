@@ -51,6 +51,11 @@ unticked, inside the window and above Send -> a press ticks it, the note under t
 the reply now goes, the message stays where it was with the box directly under it (one low on the
 screen too), and Send is on screen -> Send posts the reply into that message's thread.
 
+`#1052 post-to-main`. Then on a channel holding one answered thread: Reply on the in-thread
+message offers Post to main left of Send/Cancel, unticked -> press ticks it, the note follows ->
+Send posts top-level answering it (post_to_main, no thread_id), the new root reaches the list
+carrying its reply arrow, and the arrow lands on the quoted message.
+
 Pass --screenshots DIR to keep a PNG of the open reply for each case; --web-root DIR to run the
 same walk against another copy of the page.
 """
@@ -1368,6 +1373,86 @@ def quote_layout_walk(walk: Walk) -> None:
                           f"{short} Quote at Reply's width; {len(counted_peer)} of {long_peer} with a count)")
 
 
+def threaded_messages() -> list[Json]:
+    """The post-to-main walk's channel: one answered thread among main messages (`#1052`)."""
+    held = [message(index) for index in range(12)]
+    root = {"id": thread_of(message_id(8)), "root_message_id": message_id(8),
+            "is_root": True, "reply_count": 1, "reply_count_exact": True}
+    held[8]["thread"] = root
+    held[9]["content"] = "Message 9, an answer inside the thread, with a point worth promoting."
+    held[9]["thread"] = {**root, "is_root": False}
+    return held
+
+
+def post_to_main_walk(walk: Walk) -> None:
+    """`#1052 post-to-main`: Reply on the in-thread message offers Post to main left of
+    Send/Cancel, unticked; ticked, Send posts a new top-level root answering it, whose reply
+    arrow lands on the quoted message in its thread."""
+    page = walk.page
+    page.fill("#api-token", TOKEN)
+    page.click("#save-token")
+    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.click("#view-switch")
+    count = len(walk.api.messages)
+    walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {count}",
+                  "post-to-main: the channel did not open")
+    walk.settled()
+    target = message_id(9)
+    walk.page.evaluate("(selector) => document.querySelector(selector).click()",
+                       f"#discord-log > li[data-id='{target}'] .reply-button")
+    walk.wait_for(OPEN, "post-to-main: Reply did not open the box in the list")
+    walk.settled()
+    walk.check(page.evaluate("() => !document.getElementById('reply-to-main-row').hidden"),
+               "post-to-main: no Post to main choice on a thread reply")
+    walk.check(page.evaluate("() => document.getElementById('reply-to-main').checked") is False,
+               "post-to-main: the box was ticked before anyone ticked it")
+    boxes: object = page.evaluate("""() => {
+      const box = (id) => { const r = document.getElementById(id).getBoundingClientRect();
+        return {left: r.left, right: r.right, top: r.top, bottom: r.bottom}; };
+      return {choice: box('reply-to-main-row'), cancel: box('reply-cancel'), send: box('reply-send'),
+        width: window.innerWidth};
+    }""")
+    assert isinstance(boxes, dict)
+    walk.check(float(boxes["choice"]["right"]) <= float(boxes["cancel"]["left"]) + 1,
+               f"post-to-main: the choice is not left of Cancel: {boxes}")
+    walk.check(float(boxes["choice"]["left"]) >= 0 and float(boxes["send"]["right"]) <= float(boxes["width"]) + 0.5,
+               f"post-to-main: the actions run off the window: {boxes}")
+    walk.press("#reply-to-main-row")
+    walk.wait_for("() => document.getElementById('reply-to-main').checked",
+                  "post-to-main: a press did not tick the box")
+    walk.check("main channel as a new thread" in str(page.evaluate(
+        "() => document.getElementById('reply-destination').textContent")),
+        "post-to-main: ticked, the note does not say where it goes")
+    walk.shot("post-to-main")
+    page.fill("#reply-text", "promoted point, from the browser check")
+    sent = len(walk.api.replies)
+    rows = int(num(page.evaluate(
+        "() => document.querySelectorAll('#discord-log > li[data-id]').length")))
+    walk.press("#reply-send")
+    walk.wait_for(CLOSED, "post-to-main: Send did not put the box away")
+    posted = walk.posted_since(sent, "post-to-main")
+    walk.check(len(posted) == 1 and posted[0].get("post_to_main") is True
+               and posted[0].get("reply_to") == target and "thread_id" not in posted[0],
+               f"post-to-main: what left the browser was {posted}")
+    walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length > {rows}",
+                  "post-to-main: the new root never reached the list")
+    walk.settled()
+    new_id = message_id(count)
+    arrow: object = page.evaluate("""(id) => {
+      const row = [...document.querySelectorAll('#discord-log > li[data-id]')]
+        .find((li) => li.dataset.id === id);
+      return row ? {replyTo: row.dataset.replyTo || null, arrow: Boolean(row.querySelector('.reply-jump'))} : null;
+    }""", new_id)
+    walk.check(isinstance(arrow, dict) and arrow.get("replyTo") == target and arrow.get("arrow") is True,
+               f"post-to-main: the new root carries no reply arrow to the quoted message: {arrow}")
+    page.locator(f"#discord-log > li[data-id='{new_id}'] .reply-jump").first.click()
+    walk.wait_for(f"() => document.querySelector('#discord-log > li[data-id=\"{target}\"]')"
+                  ".getAttribute('data-landed') === 'true'",
+                  "post-to-main: the arrow did not land on the quoted message")
+    walk.notes.append("Post to main ticked left of Send/Cancel; the send landed top-level "
+                      "answering the in-thread message, and its arrow lands on it")
+
+
 def light_walk(walk: Walk) -> None:
     """The light scheme: the tint is there too, and differs from the page; a picture of it."""
     page = walk.page
@@ -1440,12 +1525,15 @@ def main() -> int:
         # `#819 voice-page-quoted-reply-and-draft-chip`, a draft in each place, found again by the Draft chip.
         ("1280x800-drafts", 1280, 800, False, "dark"),
         ("412x915-drafts", 412, 915, True, "dark"),
+        # `#1052 post-to-main`, on a channel holding one answered thread.
+        ("1280x800-post-to-main", 1280, 800, False, "dark"),
     )
     report: list[str] = []
     with sync_playwright() as playwright:
         for label, width, height, phone, scheme in runs:
             api = (FakeApi(messages=layout_messages()) if label.endswith("quote-layout")
                    else FakeApi(messages=quick_messages(), reply_author=OWNER) if label.endswith(("quick-reply", "drafts"))
+                   else FakeApi(messages=threaded_messages()) if label.endswith("post-to-main")
                    else FakeApi(empty_threads=label.endswith("new-thread")))
             server, thread, url = serve(api, web_root)
             try:
@@ -1474,6 +1562,8 @@ def main() -> int:
                         quick_reply_walk(walk)
                     elif label.endswith("drafts"):
                         drafts_walk(walk)
+                    elif label.endswith("post-to-main"):
+                        post_to_main_walk(walk)
                     elif api.empty_threads:
                         new_thread_walk(walk)
                     elif scheme == "dark":

@@ -837,6 +837,49 @@ async fn posting_escapes_room_pings_and_a_reply_goes_into_the_targets_thread() {
 }
 
 #[tokio::test]
+async fn a_top_level_post_answering_a_thread_reply_sends_no_thread_ts() {
+    // `#1052 post-to-main`: the same in-thread target an ordinary reply refuses above is
+    // answered top-level on request — no thread_ts, so Slack starts no thread and joins
+    // none; the answered message travels only in the post's metadata, where reads draw the
+    // reply arrow from. Ordinary replies keep threading exactly as before.
+    let (state, [r1, _, _]) = three_threads();
+    let fake = Fake::start(state, 20).await;
+    let client = fake.client();
+    let in_thread = ts(901, 0);
+    let posted = client
+        .post_message_top_level_keyed(
+            &channel(),
+            "promoted to its own discussion",
+            Some(&mid(&in_thread)),
+            None,
+        )
+        .await
+        .expect("top-level post");
+    let sent = fake.requests("chat.postMessage");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        !sent[0].contains_key("thread_ts"),
+        "no thread_ts is sent: {sent:?}"
+    );
+    assert!(sent[0].contains_key("metadata"), "{sent:?}");
+    let metadata: serde_json::Value =
+        serde_json::from_str(sent[0]["metadata"].as_str()).expect("metadata");
+    assert_eq!(
+        metadata["event_payload"]["reply_to"],
+        serde_json::json!(mid(&in_thread).0),
+        "{metadata}"
+    );
+    let membership = posted.thread.as_ref().expect("membership");
+    assert!(membership.is_root, "the post is a root: {posted:?}");
+    assert_eq!(
+        membership.id,
+        ts_from_message_id(&posted.id).expect("a Slack-encoded id"),
+        "the post roots its own thread: {posted:?}"
+    );
+    assert_ne!(r1, in_thread);
+}
+
+#[tokio::test]
 async fn thread_posts_and_lookups_verify_the_thread_first() {
     let (state, [r1, _, r3]) = three_threads();
     let fake = Fake::start(state, 20).await;

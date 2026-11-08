@@ -63,6 +63,8 @@ export function mountReplyBox(deps: ReplyBoxDependencies): ReplyBox {
     deps.rememberDraft();
     deps.renderReplyDestination();
   });
+  // The Post to main tick is NOT the draft's (`#1052 post-to-main`): never kept, only said.
+  listen<Event>(deps.lookup("reply-to-main"), "change", () => deps.renderReplyDestination());
   // A draft survives leaving the screen without sending, so it is written as it is typed.
   listen<Event>(deps.lookup("reply-text"), "input", () => deps.rememberDraft());
   listen<FocusEvent>(deps.lookup("reply-compose"), "focusout", (event) => deps.noteFocusLeaving(event));

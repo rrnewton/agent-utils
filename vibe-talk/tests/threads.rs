@@ -51,7 +51,9 @@ fn message(id: &str, content: &str, thread: bool) -> Message {
     }
 }
 
-type RecordedPost = (String, Option<String>, String, Option<String>);
+/// Channel, destination thread, text, reply-to, and whether the post was asked to land
+/// top-level (`#1052 post-to-main`).
+type RecordedPost = (String, Option<String>, String, Option<String>, bool);
 
 #[derive(Default)]
 struct ThreadBackend {
@@ -80,11 +82,23 @@ impl ThreadBackend {
         content: &str,
         reply: Option<&MessageId>,
     ) -> Message {
+        self.record(channel, thread, content, reply, false)
+    }
+
+    fn record(
+        &self,
+        channel: &ChannelId,
+        thread: Option<&str>,
+        content: &str,
+        reply: Option<&MessageId>,
+        top_level: bool,
+    ) -> Message {
         self.posts.lock().unwrap().push((
             channel.0.clone(),
             thread.map(str::to_owned),
             content.to_owned(),
             reply.map(|id| id.0.clone()),
+            top_level,
         ));
         let mut posted = message("30", content, thread.is_some());
         posted.reply_to = reply.cloned();
@@ -185,6 +199,16 @@ impl ChatClient for ThreadBackend {
         reply: Option<&MessageId>,
     ) -> Result<Message, ChatError> {
         Ok(self.post(channel, None, content, reply))
+    }
+
+    async fn post_message_top_level_keyed(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply: Option<&MessageId>,
+        _key: Option<&str>,
+    ) -> Result<Message, ChatError> {
+        Ok(self.record(channel, None, content, reply, true))
     }
 
     async fn post_in_thread(
@@ -314,6 +338,56 @@ async fn standalone_and_thread_composers_route_without_inventing_reply_targets()
     assert_eq!(posts[0].1, None);
     assert_eq!(posts[1].1.as_deref(), Some(THREAD));
     assert!(posts.iter().all(|p| p.3.is_none()));
+}
+
+#[tokio::test]
+async fn a_post_to_main_lands_top_level_answering_a_thread_message() {
+    // `#1052 post-to-main`: message 11 lives in THREAD; the post answering it is asked to land
+    // in the channel itself, its reply-to edge kept.
+    let (app, backend) = harness();
+    let path = format!("/api/v1/channels/{WRITE_CHANNEL}/reply");
+    let (status, body) = call(
+        &app,
+        "POST",
+        &path,
+        Some(WRITE_TOKEN),
+        Some(json!({"text":"promoted point","reply_to":"11","post_to_main":true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["posted"]["reply_to"], "11", "{body}");
+    assert_eq!(body["posted"]["thread"], Value::Null, "{body}");
+    // The ordinary in-thread reply to the same message is unchanged beside it.
+    let (status, _) = call(
+        &app,
+        "POST",
+        &path,
+        Some(WRITE_TOKEN),
+        Some(json!({"text":"in thread","thread_id":THREAD,"reply_to":"11"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Both destinations at once name opposite places and are refused, posting nothing.
+    let (status, _) = call(
+        &app,
+        "POST",
+        &path,
+        Some(WRITE_TOKEN),
+        Some(json!({"text":"both","thread_id":THREAD,"reply_to":"11","post_to_main":true})),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK);
+    let posts = backend.posts.lock().unwrap();
+    assert_eq!(posts.len(), 2, "{posts:?}");
+    assert_eq!(
+        posts[0].1, None,
+        "post-to-main went to no thread: {posts:?}"
+    );
+    assert_eq!(posts[0].3.as_deref(), Some("11"));
+    assert!(posts[0].4, "asked of the provider as top-level: {posts:?}");
+    assert_eq!(posts[1].1.as_deref(), Some(THREAD));
+    assert_eq!(posts[1].3.as_deref(), Some("11"));
+    assert!(!posts[1].4, "{posts:?}");
 }
 
 #[tokio::test]

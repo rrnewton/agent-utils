@@ -692,6 +692,13 @@
                   </label>
                   <p id="reply-destination" class="hint" hidden></p>
                   <div class="row reply-actions">
+                    <!-- `#1052 post-to-main`: Send posts a new top-level message answering this one,
+                         instead of a reply in its thread. Offered only where the reply would go into a
+                         thread, and never ticked on open: the destination is chosen each time. -->
+                    <label id="reply-to-main-row" class="toggle" hidden>
+                      <input id="reply-to-main" type="checkbox" />
+                      Post to main
+                    </label>
                     <button id="reply-cancel" class="secondary" type="button">Cancel</button>
                     <button id="reply-send" type="button">Send reply</button>
                     <!-- `#410 inline-reply-editor`, `#340 composer-grow-box`: the composers' Grow, the one
@@ -3797,6 +3804,11 @@
       <textarea id="quick-reply-text" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="2" aria-label="Your reply to the quoted words" placeholder="Reply to these words"></textarea>
       <div class="quick-reply-actions">
         <p id="quick-reply-state" class="hint" aria-live="polite"></p>
+        <!-- `#1052 post-to-main`: as the stream reply's Post to main (#reply-to-main). -->
+        <label id="quick-reply-to-main-row" class="toggle" hidden>
+          <input id="quick-reply-to-main" type="checkbox" />
+          Post to main
+        </label>
         <button id="quick-reply-cancel" class="secondary" type="button">Cancel</button>
         <button id="quick-reply-send" type="button">Send</button>
       </div>
