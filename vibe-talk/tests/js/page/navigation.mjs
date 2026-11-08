@@ -3765,11 +3765,10 @@ test("`#304 back-gesture-in-app`: A REPLY OPEN AT THE FOOT OF THE RIGHT COLUMN i
   const unlevelled = await dockedReplyWalk(await brokenModule([{ file: "src/view/shell/navigation.ts", find: '    if (deps.replyDocked()) levels.push("reply");\n', replace: "\n" }]));
   assert.deepStrictEqual(unlevelled.docked.facts, { depth: 1, tag: "side" }, "the control with no reply level pushed an entry for it");
   assert.equal(unlevelled.gesture.cards, true, "the control with no reply level kept the right column's thread on the gesture");
-  const untold = await dockedReplyWalk(brokenScript(
-    "  // `#304 back-gesture-in-app`. A reply open in the stream is a level of its own.\n  scheduleBackSync();\n", ""));
+  const untold = await dockedReplyWalk(await brokenModule([{ file: "src/view/channel/replysession.ts", find: "    // `#304 back-gesture-in-app`. A reply open in the stream is a level of its own.\n    deps.scheduleBackSync();\n", replace: "" }]));
   assert.deepStrictEqual(untold.docked.facts, { depth: 1, tag: "side" }, "the control never told a reply opened pushed an entry for it");
-  const undocked = await dockedReplyWalk(brokenScript("  voiceTranscript().markCardBesideReply();\n  scheduleBackSync();\n  // `#846 draft-chip-honest`.",
-    "  voiceTranscript().markCardBesideReply();\n  // `#846 draft-chip-honest`."));
+  const undocked = await dockedReplyWalk(await brokenModule([{ file: "src/view/channel/replysession.ts", find: "    deps.markCardBesideReply();\n    // `#304 back-gesture-in-app`. A reply open in the stream is a level of its own.\n    deps.scheduleBackSync();\n",
+    replace: "    deps.markCardBesideReply();\n" }]));
   assert.deepStrictEqual(undocked.cancelled.asked, [], "the control never told the reply was put down went back through its entry");
 });
 

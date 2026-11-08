@@ -4682,9 +4682,9 @@ test("`#277 reply-in-column`: in two columns Reply opens its box in the column i
   }
 
   // THE CONTROL: every reply opened in the left column's place. The walk above sees it.
-  const { page: control } = await replyColumnsPage(brokenScript(
-    '  return nodeWithin(leftEl("side-column"), list) ? leftEl("side-reply") : leftEl("column-reply");',
-    '  return leftEl("column-reply");'));
+  const { page: control } = await replyColumnsPage(await brokenModule([{ file: "src/view/channel/replysession.ts",
+    find: '    return deps.nodeWithin(deps.leftEl("side-column"), list) ? deps.leftEl("side-reply") : deps.leftEl("column-reply");',
+    replace: '    return deps.leftEl("column-reply");' }]));
   await replyButton(sideRow(control, "202")).click();
   assert.equal(replyBoxAt(control), "left", "the control opened the right column's reply on the right, so this test cannot see it");
 });
@@ -5066,7 +5066,8 @@ test("`#277 reply-in-column`: Escape on the other column's list does what it doe
 });
 
 /** A page that opens the reply's box in the stream and leaves the column's own box drawn beside it. */
-const TWO_BOXES = ['  for (const id of ["channel-composer", "side-composer"]) leftEl(id).hidden = true;\n', ""];
+const TWO_BOXES = [{ file: "src/view/channel/replysession.ts",
+  find: '    for (const id of ["channel-composer", "side-composer"]) deps.leftEl(id).hidden = true;\n', replace: "" }];
 
 test("`#410 inline-reply-editor`: in one column Reply opens the box in the list under the message, the channel's box hidden; putting it down brings that box back, each draft kept where it was", async () => {
   const page = await scatteredPage();
@@ -5104,7 +5105,7 @@ test("`#410 inline-reply-editor`: in one column Reply opens the box in the list 
   assert.equal(page.el("channel-compose-text").value, "for the whole channel");
 
   // THE CONTROL: the reply's box beside the column's own, two boxes. The walk above sees it.
-  const control = newPage(new Map(), brokenScript(...TWO_BOXES));
+  const control = newPage(new Map(), await brokenModule(TWO_BOXES));
   const data = scatteredThread();
   control.threadingSupported = true;
   control.threads = data.threads;
@@ -5285,8 +5286,8 @@ test("`#410 inline-reply-editor`: a reply open under a row unpacked among the ca
 // window had no end. A reply to a message removed upstream is now refused, and says so.
 
 /** A negative control: the reply route taking a message removed upstream for whatever its copy says. */
-const ROUTE_IGNORES_REMOVAL = [
-  "  if (removedUpstream(message.id)) return { ...route, unknown: true, removed: true, note: REPLY_TO_REMOVED };\n", ""];
+const ROUTE_IGNORES_REMOVAL = [{ file: "src/view/channel/replysession.ts",
+  find: "    if (deps.removedUpstream(message.id)) return { ...route, unknown: true, removed: true, note: REPLY_TO_REMOVED };\n", replace: "" }];
 
 /**
  * The channel read in Main, on a server with a change record: the bridge's reply pushed with no thread
@@ -5369,7 +5370,7 @@ for (const reads of ["held", "failing"]) {
 
     // THE CONTROL, as #308 left it: the bare copy reads as a message on the main channel, and the reply
     // goes there, naming the removed message, with no read first.
-    const control = await run(brokenScript(...ROUTE_IGNORES_REMOVAL));
+    const control = await run(await brokenModule(ROUTE_IGNORES_REMOVAL));
     assert.deepStrictEqual(control.sent.posted, [{ text: "an answer to a message that is gone", reply_to: "300" }],
       "without the check the reply still did not go to the main channel, so this test cannot see it");
     assert.deepStrictEqual(control.sent.placing, []);

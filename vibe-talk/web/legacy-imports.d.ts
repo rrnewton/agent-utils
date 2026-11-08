@@ -220,7 +220,7 @@ declare const createCardPlaces: LegacyImports["createCardPlaces"];
 declare const createColumnWork: LegacyImports["createColumnWork"];
 declare const createColumns: LegacyImports["createColumns"];
 declare const COLUMN_IDS: LegacyImports["COLUMN_IDS"];
-declare const createReplyState: LegacyImports["createReplyState"];
+declare const createReplySession: LegacyImports["createReplySession"];
 declare const createFilterChanges: LegacyImports["createFilterChanges"];
 declare const createRowDrawing: LegacyImports["createRowDrawing"];
 declare const createUnderLists: LegacyImports["createUnderLists"];

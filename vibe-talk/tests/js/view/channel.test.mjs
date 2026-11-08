@@ -1703,3 +1703,70 @@ test("`#624 voice-page-modularity`: the two columns are made fresh, each with it
   assert.equal(COLUMN_IDS["scroll-area"], "side-scroll");
   assert.equal(COLUMN_IDS["column-reply"], "side-reply");
 });
+
+test("`#624 voice-page-modularity`: the reply session routes, words the destination, and sends a ticked Post to main top-level with its answer kept", async () => {
+  const { createReplySession } = CHANNEL_VIEW;
+  const log = [];
+  const queued = [];
+  const elements = {};
+  const element = (id) => (elements[id] ||= { id, checked: false, hidden: false, value: "", textContent: "", children: [],
+    classList: { contains: () => false }, setAttribute() {}, getAttribute: () => null, focus() {}, append() {},
+    getBoundingClientRect: () => ({ top: 0, bottom: 10 }) });
+  const message = { id: "m1", author: "Ann", thread: { is_root: true } };
+  const defaults = {
+    el: element, leftEl: element,
+    mainColumn: { name: "main", composer: { key: "" } },
+    columns: { main: { name: "main", composer: { key: "" } }, side: { name: "side", composer: { key: "" } } },
+    columnWork: { active: () => ({ name: "main", composer: { key: "" } }), side: () => false },
+    inColumn: (_c, act) => act(), eachColumn: (act) => act({ name: "main" }), inThisColumn: (fn) => fn,
+    screens: { screen: () => "main", view: () => "discord" },
+    selection: () => ({ view: "main", threadId: null }),
+    selectedChannelId: () => "C1",
+    channelStore: { current: () => ({ scope: "", threads: new Map(), unplaced: new Map(), messages: [] }) },
+    providerFacts: { threading: () => true },
+    threadOf: () => "t1", heldThreadRecord: () => ({ id: "t1", is_root: true }),
+    unansweredThread: () => false, channelRepliesInThread: () => false, removedUpstream: () => false,
+    threadReplies: () => ({ count: 2 }), openThreadRootId: () => null,
+    knownChannel: () => ({ writable: true }), setStatus: (t) => log.push(`status:${t}`),
+    setTextIfChanged() {}, setHiddenIfChanged() {},
+    replyDrafts: { get: () => "", set() {}, delete() {}, has: () => false, ids: () => [], startsThread: () => false, setStartsThread() {}, save: () => true, load() {} },
+    draftLedger: { has: () => false, touch() {}, drop() {}, save() {} },
+    draftQueries: { draftsHere: () => [], draftHeld: () => false, draftLive: () => null },
+    draftRound: { next: () => null }, replySight: { keep() {}, crossed: () => false },
+    quoteOwner: () => ({ quickDraftMessage: () => "", quickReplyOpenKey: () => null, quickReplyOpen: () => false, openQuickDraft() {}, openSentenceReply() {}, closeQuickReply() {} }),
+    dictation: { stop() {}, quietKeyboard() {}, start() {}, showKeyboard() {} },
+    queueOutgoingMessage: (entry) => { queued.push(entry); return Promise.resolve(); },
+    replyMarksRead: () => null, quoteBlock: (q) => q, fitGrowingBox() {}, scheduleBackSync: () => log.push("back"),
+    markCardBesideReply() {}, voiceTranscript: () => ({ markCardBesideReply() {} }),
+    gatherState: () => ({ gathered: null }), gatheredParent: () => null, putRepliesBack() {},
+    rowsChosen: () => false, renderChannelRows() {}, renderScrollTools() {}, renderOutgoingEverywhere() {},
+    renderOutgoingMessages() {}, outbox: { storageOkay: () => true, values: () => [] },
+    openThread() {}, closeThread() {}, jumpToMessageLink: () => Promise.resolve(),
+    focusAtEnd() {}, focusList() {}, followFoot() {}, restoreScroll() {}, captureScroll: () => null,
+    atBottom: () => true, shownNode: () => true, sideShowing: () => false, sideColumnUp: () => false,
+    layoutShown: { columns: () => false }, pinsView: () => ({ only: false }),
+    channelContexts: { values: () => [] }, rowMessages: () => [message], idsOf: () => ["m1"],
+    rowShown: () => true, paneRowFor: () => null, nodeWithin: () => false, paneColumn: () => null,
+    gatherReport: () => ({ gathered: 0 }), channelContextKey: () => "k", repliesTo: () => new Set(),
+    focusLost: () => false, isComposer: () => false,
+    channelPane: {}, sidePane: {}, rowIn: () => null,
+  };
+  const session = createReplySession(defaults);
+  const route = session.replyRoute(message, true);
+  assert.equal(route.into, "t1", "an answered thread was not routed into");
+  session.replyState.routing = route;
+  session.replyState.target = message;
+  session.replyState.channelId = "C1";
+  session.renderReplyDestination();
+  assert.equal(elements["reply-destination"].textContent,
+    "Posts in this message's thread, as you chose. It has a reply already, so yours will not be the first.");
+  element("reply-to-main-row").hidden = false;
+  element("reply-to-main").checked = true;
+  session.renderReplyDestination();
+  assert.equal(elements["reply-destination"].textContent,
+    "Posts in the main channel as a new thread, as a reply to this message.");
+  element("reply-text").value = "promoted";
+  await session.sendReply();
+  assert.deepStrictEqual(queued, [{ channel: "C1", threadId: null, postToMain: true, replyTo: "m1",
+    text: "promoted", marksRead: null }], "the ticked send did not go top-level with its answer kept");
+});

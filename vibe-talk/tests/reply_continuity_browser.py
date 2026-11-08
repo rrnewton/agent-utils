@@ -1449,8 +1449,21 @@ def post_to_main_walk(walk: Walk) -> None:
     walk.wait_for(f"() => document.querySelector('#discord-log > li[data-id=\"{target}\"]')"
                   ".getAttribute('data-landed') === 'true'",
                   "post-to-main: the arrow did not land on the quoted message")
+    # `#624 voice-page-modularity` (step 17 move 4): reopening Reply on the same message after
+    # the ticked send offers the choice again, unticked — the tick is chosen each time.
+    walk.page.evaluate("(selector) => document.querySelector(selector).click()",
+                       f"#discord-log > li[data-id='{target}'] .reply-button")
+    walk.wait_for(OPEN, "post-to-main: Reply did not reopen after the ticked send")
+    walk.settled()
+    walk.check(page.evaluate("() => !document.getElementById('reply-to-main-row').hidden"),
+               "post-to-main: the choice is not offered again on reopening")
+    walk.check(page.evaluate("() => document.getElementById('reply-to-main').checked") is False,
+               "post-to-main: the tick came back ticked from the last send")
+    walk.press("#reply-cancel")
+    walk.wait_for(CLOSED, "post-to-main: Cancel did not put the reopened box away")
     walk.notes.append("Post to main ticked left of Send/Cancel; the send landed top-level "
-                      "answering the in-thread message, and its arrow lands on it")
+                      "answering the in-thread message, and its arrow lands on it; "
+                      "reopened, the tick is unticked again")
 
 
 def light_walk(walk: Walk) -> None:

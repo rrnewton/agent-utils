@@ -5830,9 +5830,9 @@ test("`#277 reply-in-column` with `#269 approval-card-inline`: a reply open at t
   assert.equal(page.el("reply-text").value, "still writing");
 
   // THE CONTROL: the card not told when a reply opens in a column. The walk above sees it.
-  const control = await draftInTwoColumns(brokenScript(
-    '  for (const id of ["channel-composer", "side-composer"]) leftEl(id).hidden = true;\n  renderReplyingMarks();\n  voiceTranscript().markCardBesideReply();\n',
-    '  for (const id of ["channel-composer", "side-composer"]) leftEl(id).hidden = true;\n  renderReplyingMarks();\n'));
+  const control = await draftInTwoColumns(await brokenModule([{ file: "src/view/channel/replysession.ts",
+    find: '    for (const id of ["channel-composer", "side-composer"]) deps.leftEl(id).hidden = true;\n    renderReplyingMarks();\n    deps.markCardBesideReply();\n',
+    replace: '    for (const id of ["channel-composer", "side-composer"]) deps.leftEl(id).hidden = true;\n    renderReplyingMarks();\n' }]));
   await replyButton(rowWithId(control, "200")).click();
   await control.settle();
   assert.equal(control.el("post-confirm").hasAttribute("data-beside-reply"), false,
