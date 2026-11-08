@@ -19,7 +19,7 @@ from wrkviz.build_store import (
     ingested_team_slugs,
     migrate_build_state,
 )
-from wrkviz.agent_scope import AGENT_SCOPES, ALL_AGENTS
+from wrkviz.agent_scope import AGENT_SCOPES, ALL_AGENTS, describe_selection
 from wrkviz.project_rollup import plan_project_weekly, summarize_project_weekly
 from wrkviz.archive import as_array, as_object, read_json
 from wrkviz.archive_gc import collect, format_gc_report
@@ -1442,6 +1442,9 @@ class _PlanOverBudget(Exception):
 def _print_plan(plan: SummaryPlan) -> None:
     for line in plan.lines():
         print(line, flush=True)
+    selection = (plan.request or {}).get("agent_scope_selection")
+    if selection is not None:
+        print(f"  {describe_selection(selection)}", flush=True)
 
 
 def _summary_models(backend: str, raw_model: object, raw_rollup: object) -> tuple[str, str]:
@@ -1897,6 +1900,8 @@ def _print_summaries(report: SummarizeReport) -> None:
         f"{report.glossary_definitions} glossary definitions; "
         f"catalog {report.catalog_artifacts} immutable artifacts"
     )
+    if report.agent_scope_selection is not None:
+        print(report.agent_scope_selection.describe())
     if report.carried_forward_rollups:
         print(
             f"rollups carried forward: {report.carried_forward_rollups} (what they summarize is "

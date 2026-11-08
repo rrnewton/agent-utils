@@ -132,3 +132,17 @@ def test_cli_plans_then_writes(tmp_path: Path, capsys: pytest.CaptureFixture[str
     assert "ghost-team" in capsys.readouterr().err
     for slug in TEAMS:
         assert not (tmp_path / "teams" / slug / "summary_data").exists()
+
+
+def test_a_rollup_recording_another_scope_is_refused(tmp_path: Path) -> None:
+    week = _archive(tmp_path)
+    path = (
+        tmp_path / "teams" / TEAMS[0] / "summary_scopes" / "coordinator" / "rollups" / "weekly"
+        / f"{week}.json"
+    )
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["agent_scope"] == "coordinator"
+    path.write_text(json.dumps(dict(data, agent_scope="all")), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="records agent scope 'all'"):
+        load_weekly_inputs(tmp_path, TEAMS, week, "coordinator")

@@ -135,6 +135,10 @@ def load_weekly_inputs(
             obj.get("key"), f"{path}.key"
         ) != week:
             raise ValueError(f"{path}: not the weekly rollup for {week}")
+        recorded_scope = obj.get("agent_scope")
+        if recorded_scope is not None and recorded_scope != agent_scope:
+            # Rollups written before the field existed carry their scope only in the path.
+            raise ValueError(f"{path}: records agent scope {recorded_scope!r}, not {agent_scope!r}")
         technical = _summary_from_json(obj.get("technical_summary"), f"{path}.technical_summary")
         if technical.prompt_version == _PRESENTATION_FALLBACK_VERSION:
             missing.append(f"{slug} ({path.relative_to(archive)} holds no model summary)")

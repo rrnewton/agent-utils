@@ -9,14 +9,18 @@ from pathlib import Path
 import pytest
 
 from tests.test_timeline_pipeline import CHILD, ROOT, START, _team, _write_team
+from tests.test_timeline_claude_history import _write_history
 from wrkviz.agent_scope import (
     COORDINATOR_SCOPE_NOTE,
     coordinator_thread_ids,
     restrict_to_agent_scope,
+    select_agent_scope,
 )
+from wrkviz.claude_history import load_claude_history_team
 from wrkviz.cli import main as timeline_main
 from wrkviz.model import Agent, Edge, Event, TeamData
-from wrkviz.pipeline import plan_summaries, summarize_archive
+from wrkviz.pipeline import _summary_root, plan_summaries, summarize_archive
+from wrkviz.window import parse_date_window
 
 CONTINUATION = "00000000-0000-0000-0000-000000000003"
 CONTINUATION_CHILD = "00000000-0000-0000-0000-000000000004"
@@ -130,9 +134,12 @@ def test_coordinator_scope_drops_child_phases_and_keeps_its_own_tree(tmp_path: P
         (team_dir / "summary_data" / "summarize_state.json").read_text(encoding="utf-8")
     )
     assert "agent_scope" not in full_state["request"]
-    # Separate trees mean separate caches: the full run paid for every phase it needed itself
-    # (the heuristic backend still records a cache entry per generated summary).
-    assert full.cache_misses > 0
+    # Separate trees mean separate caches: the full run generated every summary it needed itself,
+    # including the coordinator phases the narrowed run had already written in its own tree.
+    assert full.cache_hits == 0
+    assert full.cache_misses == (
+        full.phases + 2 * full.rollups + full.agent_names + full.project_overviews
+    )
     assert _phase_agents(scope_root / "phases") == {ROOT, CONTINUATION}
 
 
@@ -186,3 +193,117 @@ def test_plan_and_cli_accept_the_scope(
     assert receipt["summaries"]["agent_scope"] == "coordinator"
     with pytest.raises(SystemExit):
         timeline_main([*common, "--agent-scope", "children"])
+
+
+def _tree_digest(root: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_coordinator_run_after_a_full_run_leaves_summary_data_untouched(tmp_path: Path) -> None:
+    team = _continued_team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    full_root = _summary_root(tmp_path, team.team_slug)
+    before = _tree_digest(full_root)
+
+    narrowed = summarize_archive(
+        tmp_path, team.team_slug, "heuristic", "test-model", agent_scope="coordinator",
+        rollup_kinds=("daily",),
+    )
+
+    assert narrowed.phases == 2
+    assert _tree_digest(full_root) == before
+    rollups = sorted((_summary_root(tmp_path, team.team_slug, "coordinator") / "rollups").rglob("*.json"))
+    assert rollups
+    for path in rollups:
+        assert json.loads(path.read_text(encoding="utf-8"))["agent_scope"] == "coordinator"
+    for path in sorted((full_root / "rollups").rglob("*.json")):
+        assert "agent_scope" not in json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_the_kept_selection_is_reported_and_recorded(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    team = _continued_team()
+    _write_team(tmp_path, team)
+
+    _, selection = select_agent_scope(team, "coordinator")
+    assert selection is not None
+    assert selection.kept_thread_ids == (ROOT, CONTINUATION)
+    assert selection.total_agents == 4
+    assert select_agent_scope(team, "all") == (team, None)
+
+    common = [
+        "summarize", "--output", str(tmp_path), "--team", team.team_slug,
+        "--backend", "heuristic", "--rollup-kind", "daily", "--agent-scope", "coordinator",
+    ]
+    line = f"agent scope coordinator: kept 2 of 4 agents ({ROOT}, {CONTINUATION})"
+    assert timeline_main([*common, "--plan"]) == 0
+    assert line in capsys.readouterr().out
+    assert timeline_main(common) == 0
+    assert line in capsys.readouterr().out
+    receipt = json.loads(sorted((tmp_path / "runs").glob("*.json"))[-1].read_text(encoding="utf-8"))
+    recorded = receipt["summaries"]["agent_scope_selection"]
+    assert recorded == {
+        "agent_scope": "coordinator",
+        "kept_agents": 2,
+        "total_agents": 4,
+        "kept_thread_ids": [ROOT, CONTINUATION],
+    }
+    state_path = _summary_root(tmp_path, team.team_slug, "coordinator") / "summarize_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["request"]["agent_scope_selection"] == recorded
+    # The default scope records none of it.
+    assert timeline_main(common[:-2]) == 0
+    capsys.readouterr()
+    receipt = json.loads(sorted((tmp_path / "runs").glob("*.json"))[-1].read_text(encoding="utf-8"))
+    assert "agent_scope_selection" not in receipt["summaries"]
+
+
+def test_a_team_without_its_root_among_its_agents_is_refused(tmp_path: Path) -> None:
+    team = replace(_continued_team(), root_thread_id="not-an-agent")
+
+    with pytest.raises(ValueError, match="root thread not-an-agent is not among its 4 agents"):
+        select_agent_scope(team, "coordinator")
+    # Only the narrowed scope needs the root; `all` is still the identity.
+    assert restrict_to_agent_scope(team, "all") is team
+
+
+def test_claude_history_teams_are_refused_by_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    history = _write_history(tmp_path / "history.jsonl")
+    team, _ = load_claude_history_team(history, "history-team", "UTC", project_pattern="widget")
+    # Every session is a parentless root with no edges: following continuation edges from the
+    # first one would silently keep only the oldest session.
+    assert len([agent for agent in team.agents if agent.parent_thread_id is None]) > 1
+    with pytest.raises(ValueError, match="claude-history team"):
+        select_agent_scope(team, "coordinator")
+
+    _write_team(tmp_path, team)
+    status = timeline_main([
+        "summarize", "--output", str(tmp_path), "--team", "history-team",
+        "--backend", "heuristic", "--agent-scope", "coordinator",
+    ])
+    assert status != 0
+    assert "claude-history team" in capsys.readouterr().err
+    assert not (tmp_path / "teams" / "history-team" / "summary_scopes").exists()
+
+
+def test_a_coordinator_idle_in_the_window_is_not_refused(tmp_path: Path) -> None:
+    team = _continued_team()
+    _write_team(tmp_path, team)
+    idle_window = parse_date_window("2031-01-01", "2031-01-08", "UTC")
+
+    report = summarize_archive(
+        tmp_path, team.team_slug, "heuristic", "test-model", agent_scope="coordinator",
+        summary_window=idle_window, rollup_kinds=("daily",),
+    )
+
+    assert report.phases == 0
+    assert report.agent_scope_selection is not None
+    assert report.agent_scope_selection.kept_thread_ids == (ROOT, CONTINUATION)

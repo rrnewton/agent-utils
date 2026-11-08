@@ -65,15 +65,23 @@ Remaining wrkviz work, ordered:
 
 1. Schema-2 timeline reader for `query`/`inspect` (refuses at
    `rs/wrkviz/src/query.rs:493`): L, ~1.5-3k Rust LOC + differentials.
-   This is the only true Python-only command surface left.
-2. `--userguide` divergence (invalid-args subcommand after
+   This was the only true Python-only command surface left until item 2.
+2. Added 2026-11-08, Python-only: `summarize --agent-scope coordinator`
+   (coordinator-only summary tree under `summary_scopes/coordinator/`)
+   and the `summarize-project` subcommand (project weekly from team
+   weeklies). The Rust edition prints the same help and usage but refuses
+   both by name with exit 2. A recurring coordinator-only weekly run
+   breaks at the A3 default flip unless these are ported first, or that
+   run pins `WRKVIZ_ENGINE=python`: M, summary tree plumbing plus
+   differentials.
+3. `--userguide` divergence (invalid-args subcommand after
    `--userguide`): S, ~50-150 LOC.
-3. Accepted gaps (non-finite/oversized-int JSON, lone surrogates,
+4. Accepted gaps (non-finite/oversized-int JSON, lone surrogates,
    Python `re` features, codec wording): M, piecemeal, none falls back.
-4. Edition flip to Rust-primary with a `WRKVIZ_ENGINE=rust` soak first:
+5. Edition flip to Rust-primary with a `WRKVIZ_ENGINE=rust` soak first:
    S in code, gated on coordinator/owner approval; static site assets
    carry over in the same step.
-5. Python archive (60,889 LOC) only after the flip soaks.
+6. Python archive (60,889 LOC) only after the flip soaks.
 
 ## #723: shared schemas
 

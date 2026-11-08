@@ -179,7 +179,7 @@ def _phase_markdown(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _rollup_markdown(
+def rollup_markdown(
     team: TeamData,
     period: Period,
     summary: SummaryResult,
@@ -187,6 +187,8 @@ def _rollup_markdown(
     audience: str,
     scope_note: str | None = None,
 ) -> str:
+    """One calendar rollup page; *scope_note*, when given, labels a narrowed agent scope."""
+
     lines = [
         f"# {period_heading(period, team.display_timezone)} {team.team_slug} "
         f"{period.kind} {audience} summary",
@@ -228,7 +230,9 @@ def _rollup_markdown(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _plain_language_path(period: Period) -> str:
+def plain_language_path(period: Period) -> str:
+    """Where a period's plain-language rollup page goes, beside its technical one."""
+
     if not period.relative_path.endswith(".md"):
         raise ValueError(f"rollup Markdown path lacks .md suffix: {period.relative_path}")
     return period.relative_path[:-3] + "-plain-language.md"
@@ -1247,23 +1251,23 @@ def render_archive(
         stats = rollup_stats[period_key]
         technical_path = period.relative_path if summary.summary_available else ""
         plain_path = (
-            _plain_language_path(period) if plain_summary.summary_available else ""
+            plain_language_path(period) if plain_summary.summary_available else ""
         )
         rollup_paths[period_key] = (technical_path, plain_path)
         if technical_path:
             changed += write_text_with_gzip_invalidation(
                 _generated_path(archive, technical_path),
-                _rollup_markdown(team, period, summary, stats, "technical"),
+                rollup_markdown(team, period, summary, stats, "technical"),
             )
             published_summary_paths.add(technical_path)
         else:
             changed += _remove_generated_file(archive, period.relative_path)
-        expected_plain_path = _plain_language_path(period)
+        expected_plain_path = plain_language_path(period)
         compressible_paths.update((period.relative_path, expected_plain_path))
         if plain_path:
             changed += write_text_with_gzip_invalidation(
                 _generated_path(archive, plain_path),
-                _rollup_markdown(
+                rollup_markdown(
                     team, period, plain_summary, stats, "plain-language"
                 ),
             )

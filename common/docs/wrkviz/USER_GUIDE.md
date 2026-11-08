@@ -653,13 +653,26 @@ answer.
 `--agent-scope coordinator` summarizes a team's coordinator alone: its root session and the
 sessions that explicitly continue it, without the children it started in-session (Claude Agent
 and workflow subagents, Codex-spawned threads). The coordinator's own transcript still records
-what it dispatched and what came back. A coordinator-only summary is a different artifact, so the
-run writes its whole tree (caches, phase and rollup data, run state, and rollup Markdown whose
-heading and first line say "coordinator only") under `teams/<slug>/summary_scopes/coordinator/`
-and never touches `summary_data/`. `build` and `export` read only `summary_data/`, so the website
-always shows full-team coverage. The run receipt and `summarize_state.json` record
-`"agent_scope": "coordinator"`. The default, `--agent-scope all`, writes exactly what it wrote
-before the option existed.
+what it dispatched and what came back. The option belongs to `summarize` only, works one team at
+a time like every summarize run, and is not offered by the `refresh` family, which goes on to
+build the website.
+
+A coordinator-only summary is a different artifact, so the run writes its whole tree (caches,
+phase and rollup data, run state, and rollup Markdown) under
+`teams/<slug>/summary_scopes/coordinator/`, with the pages under `summaries/<kind>/` there, and
+never touches `summary_data/`. Each page's heading says "coordinator-only" and its first line is a
+"coordinator only" scope note; each JSON rollup carries `"agent_scope": "coordinator"`. `build`
+and `export` read only `summary_data/`, so the website never shows a coordinator-only summary as
+team coverage; it shows full-team summaries once a full-scope `summarize` has run, and a
+coordinator-only run alone gives it nothing new.
+
+The run says what it kept: "agent scope coordinator: kept N of M agents (ids)", printed with
+`--plan` and after the run, and recorded under `agent_scope_selection` in the run receipt and in
+`summarize_state.json`. It refuses a team whose root thread is not among its agents, and it
+refuses Claude prompt-history (`claude-history`) teams, where every session is its own parentless
+root and nothing identifies a coordinator; summarize those with `--agent-scope all`. A coordinator
+with no activity in the window is not an error: its rollups say there was no activity. The
+default, `--agent-scope all`, writes exactly what it wrote before the option existed.
 
 Calendar rollups stop at the team. `wrkviz summarize-project` adds one level above them: a
 project weekly written from the named teams' own weekly technical rollups, run through the same

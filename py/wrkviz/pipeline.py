@@ -137,7 +137,8 @@ from wrkviz.orc import (
 from wrkviz.agent_scope import (
     ALL_AGENTS,
     COORDINATOR_SCOPE_NOTE,
-    restrict_to_agent_scope,
+    ScopeSelection,
+    select_agent_scope,
     validate_agent_scope,
 )
 from wrkviz.periods import (
@@ -153,7 +154,7 @@ from wrkviz.phases import (
     build_phases,
     phase_agent_ids,
 )
-from wrkviz.render import _plain_language_path, _rollup_markdown, render_archive
+from wrkviz.render import plain_language_path, render_archive, rollup_markdown
 from wrkviz.snapshot_store import (
     SnapshotLocation,
     ensure_snapshot_store,
@@ -518,6 +519,7 @@ class SummarizeReport:
     files_changed: int
     carried_forward_rollups: int = 0
     agent_scope: str = ALL_AGENTS
+    agent_scope_selection: ScopeSelection | None = None
 
     def to_json_obj(self) -> dict[str, JsonValue]:
         """Return the summarization report as a JSON-serializable object."""
@@ -554,6 +556,8 @@ class SummarizeReport:
         # the receipts written before agent scopes existed.
         if self.agent_scope != ALL_AGENTS:
             result["agent_scope"] = self.agent_scope
+        if self.agent_scope_selection is not None:
+            result["agent_scope_selection"] = self.agent_scope_selection.to_json_obj()
         return result
 
 
@@ -4170,6 +4174,7 @@ class _SummaryTree:
     periods: tuple[Period, ...]
     teams_dir: Path
     agent_scope: str = ALL_AGENTS
+    scope_selection: ScopeSelection | None = None
 
 
 def _summary_tree(
@@ -4186,7 +4191,7 @@ def _summary_tree(
     team = load_archived_team(archive, team_slug)
     if summary_window is not None:
         team = apply_date_window(team, summary_window)
-    team = restrict_to_agent_scope(team, agent_scope)
+    team, scope_selection = select_agent_scope(team, agent_scope)
     summary_root = _summary_root(archive, team_slug, agent_scope)
     phases = tuple(
         build_phases(
@@ -4223,6 +4228,7 @@ def _summary_tree(
         ),
         teams_dir=archive / "teams",
         agent_scope=agent_scope,
+        scope_selection=scope_selection,
     )
 
 
@@ -4253,6 +4259,8 @@ def _request_json(
         request["rollup_model"] = rollup_model
     if tree.agent_scope != ALL_AGENTS:
         request["agent_scope"] = tree.agent_scope
+    if tree.scope_selection is not None:
+        request["agent_scope_selection"] = tree.scope_selection.to_json_obj()
     return request
 
 
@@ -4752,6 +4760,9 @@ def _run_summary_tree(
             "technical_summary": _summary_json(result),
             "plain_language_summary": _summary_json(plain_result),
         }
+        if tree.agent_scope != ALL_AGENTS:
+            # The scope is in the path too, but a copied rollup must still say what it covers.
+            obj["agent_scope"] = tree.agent_scope
         changed += int(
             write_json_if_changed(
                 summary_root / "rollups" / period.kind / f"{period.key}.json",
@@ -4826,6 +4837,7 @@ def _run_summary_tree(
         files_changed=changed,
         carried_forward_rollups=carried_forward,
         agent_scope=tree.agent_scope,
+        agent_scope_selection=tree.scope_selection,
     )
 
 
@@ -4850,7 +4862,7 @@ def _write_scoped_rollup_markdown(
     changed = 0
     for relative, summary, audience in (
         (period.relative_path, technical, "coordinator-only technical"),
-        (_plain_language_path(period), plain, "coordinator-only plain-language"),
+        (plain_language_path(period), plain, "coordinator-only plain-language"),
     ):
         if not relative.startswith(prefix):
             raise ValueError(f"rollup Markdown path outside the team summaries: {relative}")
@@ -4859,7 +4871,7 @@ def _write_scoped_rollup_markdown(
         changed += int(
             write_text_if_changed(
                 summary_root / "summaries" / relative[len(prefix) :],
-                _rollup_markdown(
+                rollup_markdown(
                     team, period, summary, stats, audience, COORDINATOR_SCOPE_NOTE
                 ),
             )
