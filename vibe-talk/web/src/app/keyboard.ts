@@ -100,7 +100,6 @@ export interface KeyboardReadMark {
 export interface KeyboardCompositionDependencies<
   Column extends KeyboardColumn = KeyboardColumn,
   Message extends KeyboardMessage = KeyboardMessage,
-  FoldEntry extends KeyboardFoldEntry = KeyboardFoldEntry,
   ReadMark extends KeyboardReadMark = KeyboardReadMark,
 > {
   // Elements, screens and columns.
@@ -166,8 +165,8 @@ export interface KeyboardCompositionDependencies<
   statusSays(text: string): boolean;
   dismissStatus(): void;
   showingLinks(row: HTMLElement): boolean;
-  isFolded(entry: FoldEntry): boolean;
-  setFolded(entry: FoldEntry, folded: boolean): void;
+  isFolded(entry: KeyboardFoldEntry): boolean;
+  setFolded(entry: KeyboardFoldEntry, folded: boolean): void;
   atBottom(area: HTMLElement): boolean;
   preservingScroll(act: () => void): void;
   renderScrollTools(): void;
@@ -375,7 +374,7 @@ export function createKeyboardComposition<
   Message extends KeyboardMessage = KeyboardMessage,
   FoldEntry extends KeyboardFoldEntry = KeyboardFoldEntry,
   ReadMark extends KeyboardReadMark = KeyboardReadMark,
->(deps: KeyboardCompositionDependencies<Column, Message, FoldEntry, ReadMark>): KeyboardComposition<Column> {
+>(deps: KeyboardCompositionDependencies<Column, Message, ReadMark>): KeyboardComposition<Column> {
   const channelPane: KeyPane = {
     name: "channel",
     scroller: () => deps.leftEl("scroll-area"),
