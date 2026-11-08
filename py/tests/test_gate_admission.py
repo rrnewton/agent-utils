@@ -434,7 +434,8 @@ def test_the_preflight_runs_named_validation_steps() -> None:
         command = gate.preflight_command()
     assert command[command.index("--selected") + 1] == ",".join(gate.PREFLIGHT_STEPS)
     root = GATE.parents[1]
-    listed = subprocess.run([PY, str(root / "scripts" / "validate.py"), "--list"], cwd=root, env=env,
+    # --all: check against the whole graph, not this checkout's diff-selected plan.
+    listed = subprocess.run([PY, str(root / "scripts" / "validate.py"), "--all", "--list"], cwd=root, env=env,
                             capture_output=True, text=True, timeout=120)
     assert listed.returncode == 0, listed.stdout + listed.stderr
     steps = {line.split()[1] for line in listed.stdout.splitlines() if line.strip().startswith("STEP ")}
