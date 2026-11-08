@@ -7450,11 +7450,18 @@ pub async fn fetch_document(
         .filter(|k| !k.trim().is_empty())
         .ok_or_else(|| ApiError::bad_request("give a document key"))?;
     if state.documents.index.get(&key).is_none() {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "unknown_document",
-            "no such document",
-        ));
+        // Admission (`#1081 documents-relative-links`): a document followed
+        // from another document may never have been mentioned in chat. A key
+        // that canonicalises under this deployment's recognised kinds
+        // registers (mention-less) and fetches below; anything else is
+        // refused and never indexed. Fetching still spends the deployment's
+        // credentials, so this stays behind the WRITE scope above — a read
+        // token is refused by the extractor before any of this runs.
+        if state.documents.index.register_key(&key).is_none() {
+            return Err(ApiError::bad_request(
+                "not a document key this server can fetch",
+            ));
+        }
     }
     let fetched = if body.refresh.unwrap_or(false) {
         state.documents.fetch_one_refresh(&key).await

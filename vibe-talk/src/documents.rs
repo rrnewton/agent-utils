@@ -7,6 +7,13 @@
 //! cached (live, backfill, edit, delete) and rebuilt or loaded at startup. It caches
 //! `document key -> mentions (when/where)`, never document contents; fetched contents
 //! live in a separate bounded cache. The list path reads only the fold result.
+//!
+//! One admission sits beside the fold (`#1081 documents-relative-links`): a
+//! write-scope fetch naming a canonical key no message has mentioned registers
+//! a mention-less entry ([`Index::register_key`]), so a link followed from one
+//! document to another can open. Canonicalisation is [`parse_key`], which goes
+//! through [`recognize_url`] under the live configuration — never a free-form
+//! address fetch.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -290,6 +297,58 @@ pub fn recognize_url(
                 ));
             }
         }
+    }
+    None
+}
+
+/// Canonicalise a document key: what [`recognize_url`] would mint, read back.
+///
+/// The inverse of key minting, and deliberately no more permissive: the key's
+/// parts are put back into the address form `recognize_url` accepts (a GitHub
+/// blob address; a paste address under each configured `paste_prefixes`), and
+/// the key is admitted only when that recognition mints the very same key.
+/// So an unparseable key, a key of a kind this deployment does not recognise
+/// (a paste with no paste source configured), and a caller-supplied address
+/// wearing a key's clothes are all refused by the one check. Used only by the
+/// write-scope fetch admission ([`Index::register_key`]); never a fetch of an
+/// arbitrary caller address.
+#[must_use]
+pub fn parse_key(key: &str, paste_prefixes: &[String]) -> Option<Recognized> {
+    if key.len() > MAX_ADDRESS
+        || key
+            .bytes()
+            .any(|b| b == b'\\' || b == b' ' || b.is_ascii_control())
+    {
+        return None;
+    }
+    if let Some(rest) = key.strip_prefix("github:") {
+        let (owner, rest) = rest.split_once('/')?;
+        let (repo, rest) = rest.split_once('@')?;
+        let (r#ref, path) = rest.split_once(':')?;
+        if owner.is_empty()
+            || repo.is_empty()
+            || r#ref.is_empty()
+            || path.is_empty()
+            || r#ref.contains('/')
+        {
+            return None;
+        }
+        let url = format!("https://github.com/{owner}/{repo}/blob/{ref}/{path}");
+        let rec = recognize_url(&url, None, paste_prefixes)?;
+        return (rec.key == key).then_some(rec);
+    }
+    if let Some(id) = key.strip_prefix("paste:") {
+        if id.is_empty() {
+            return None;
+        }
+        for prefix in paste_prefixes {
+            if let Some(rec) = recognize_url(&format!("{prefix}{id}"), None, paste_prefixes) {
+                if rec.key == key {
+                    return Some(rec);
+                }
+            }
+        }
+        return None;
     }
     None
 }
@@ -691,6 +750,41 @@ impl Index {
                 .then_with(|| a.key.cmp(&b.key))
         });
         entries
+    }
+
+    /// Admit a document by canonical key alone (`#1081
+    /// documents-relative-links`): register a mention-less entry for `key`
+    /// when [`parse_key`] canonicalises it under this index's configuration,
+    /// and return the entry; `None` — and nothing indexed — otherwise. An
+    /// already-known key returns its entry unchanged.
+    ///
+    /// A mention-less entry lists with no mentions (mention order puts it with
+    /// the oldest, so it never displaces a mentioned document) and takes part
+    /// in sync like any other change. It is in no message's slot, so folding
+    /// messages out never removes it; if a message later mentions it, it is an
+    /// ordinary entry from then on.
+    pub fn register_key(&self, key: &str) -> Option<Entry> {
+        if let Some(entry) = self.get(key) {
+            return Some(entry);
+        }
+        let rec = parse_key(key, &self.paste_prefixes)?;
+        let mut fold = self.fold.write().unwrap_or_else(|p| p.into_inner());
+        if !fold.docs.contains_key(&rec.key) {
+            fold.docs.insert(
+                rec.key.clone(),
+                Entry {
+                    key: rec.key.clone(),
+                    kind: rec.kind,
+                    locator: rec.locator.clone(),
+                    file_name: rec.file_name.clone(),
+                    label: None,
+                    mentions: Vec::new(),
+                },
+            );
+            Self::bump(&mut fold, std::slice::from_ref(&rec.key));
+            self.persist(&fold);
+        }
+        fold.docs.get(&rec.key).cloned()
     }
 
     /// One document by key.
@@ -1874,6 +1968,99 @@ mod tests {
         assert_eq!(rec[0].kind, DocKind::Paste);
         assert_eq!(rec[0].key, "paste:Ab12");
         assert_eq!(DocKind::GoogleDoc.as_str(), "google_doc");
+    }
+
+    #[test]
+    fn parse_key_round_trips_minted_keys() {
+        // Every key recognize_url mints parses back to the same recognition.
+        for url in [
+            "https://github.com/octo/widgets/blob/main/docs/report.md",
+            "https://github.com/octo/widgets/blob/main/data/x.json",
+            "https://raw.githubusercontent.com/octo/widgets/main/docs/a.markdown",
+            "https://github.com/o/r/blob/feature/x/docs/a.md",
+            "https://paste.example/Ab12",
+        ] {
+            let minted = recognize_url(url, None, &prefixes()).expect("minted");
+            let parsed = parse_key(&minted.key, &prefixes()).expect("parsed back");
+            assert_eq!(parsed.key, minted.key, "{url}");
+            assert_eq!(parsed.kind, minted.kind, "{url}");
+            assert_eq!(parsed.locator.path, minted.locator.path, "{url}");
+        }
+        let md = parse_key("github:octo/widgets@main:docs/a.md", &prefixes()).expect("md");
+        assert_eq!(md.kind, DocKind::GithubMarkdown);
+        assert_eq!(md.locator.owner.as_deref(), Some("octo"));
+        assert_eq!(md.locator.ref_name.as_deref(), Some("main"));
+        let file = parse_key("github:octo/widgets@main:src/lib.rs", &prefixes()).expect("file");
+        assert_eq!(file.kind, DocKind::GithubFile);
+    }
+
+    #[test]
+    fn parse_key_refuses_what_recognition_would_not_mint() {
+        for key in [
+            // Not keys at all — including an address wearing a key's clothes:
+            // admission is by canonical key, never a free-form fetch.
+            "not a key",
+            "https://github.com/octo/widgets/blob/main/docs/a.md",
+            "example:thing",
+            "google_doc:DocId123",
+            // Broken GitHub shapes.
+            "github:octo/widgets@main:",
+            "github:octo/widgets@:docs/a.md",
+            "github:octo/@main:docs/a.md",
+            "github:/widgets@main:docs/a.md",
+            "github:octo/widgets@main:docs//a.md",
+            "github:octo/widgets@main:../escape.md",
+            "github:octo/widgets@main:docs/%2e%2e/escape.md",
+            "github:octo/widgets@main:docs/a.md#fragment",
+            "github:octo/widgets@main:docs/a.md?plain=1",
+            "github:octo/widgets@feat/ure:docs/a.md",
+            // Broken paste shapes.
+            "paste:",
+            "paste:bad/id",
+            "paste:bad id",
+            "paste:-leading",
+        ] {
+            assert!(parse_key(key, &prefixes()).is_none(), "admitted {key}");
+        }
+        // A paste key with no paste source configured is an unconfigured kind.
+        assert!(parse_key("paste:Ab12", &[]).is_none());
+    }
+
+    #[test]
+    fn register_key_admits_mention_less_and_refuses_the_rest() {
+        let index = Index::new(prefixes());
+        let entry = index
+            .register_key("github:octo/widgets@main:docs/linked.md")
+            .expect("admitted");
+        assert!(entry.mentions.is_empty());
+        assert_eq!(index.len(), 1);
+        // Re-registering is a no-op returning the same entry.
+        let before = index.revision();
+        assert!(index
+            .register_key("github:octo/widgets@main:docs/linked.md")
+            .is_some());
+        assert_eq!(index.revision(), before);
+        // What does not canonicalise is never indexed.
+        assert!(index.register_key("github:octo/widgets@main:").is_none());
+        assert!(index.register_key("https://example.com/x").is_none());
+        assert_eq!(index.len(), 1);
+        // A later mention lands on the admitted entry like any other.
+        index.apply_message(
+            "c",
+            "m1",
+            Some(7),
+            "a",
+            None,
+            "https://github.com/octo/widgets/blob/main/docs/linked.md",
+        );
+        assert_eq!(
+            index
+                .get("github:octo/widgets@main:docs/linked.md")
+                .expect("entry")
+                .mentions
+                .len(),
+            1
+        );
     }
 
     #[test]

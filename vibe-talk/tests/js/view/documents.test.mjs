@@ -796,3 +796,281 @@ test("documents reader: a document with no headings hides the Outline button ent
     assert.equal(els["doc-outline-pop"].hidden, true, "the pop-up opened with nothing to list");
   });
 });
+
+// ---- 5. in-document links (#1081 documents-relative-links) -------------------------------------
+
+const GUIDE_KEY = "github:octo/widgets@main:docs/guide/intro.md";
+const GUIDE_URL = "https://github.com/octo/widgets/blob/main/docs/guide/intro.md";
+
+test("documents links: relative references resolve against the open GitHub document", () => {
+  const { resolveDocumentHref } = requireModule(RENDER, "src/view/documents/render.ts");
+  assert.equal(typeof resolveDocumentHref, "function", "render does not export resolveDocumentHref");
+  const doc = (key, path, anchor = null) => ({
+    kind: "document",
+    key,
+    url: `https://github.com/octo/widgets/blob/main/${path}${anchor === null ? "" : `#${anchor}`}`,
+    anchor,
+  });
+  const at = (href, key = GUIDE_KEY, url = GUIDE_URL) => resolveDocumentHref(key, href, url);
+  // Sibling, ./, nested, and ../ climbs that stay inside the repository.
+  assert.deepEqual(at("sibling.md"), doc("github:octo/widgets@main:docs/guide/sibling.md", "docs/guide/sibling.md"));
+  assert.deepEqual(at("./sibling.md"), doc("github:octo/widgets@main:docs/guide/sibling.md", "docs/guide/sibling.md"));
+  assert.deepEqual(at("sub/deep.md"), doc("github:octo/widgets@main:docs/guide/sub/deep.md", "docs/guide/sub/deep.md"));
+  assert.deepEqual(at("../other.md"), doc("github:octo/widgets@main:docs/other.md", "docs/other.md"));
+  assert.deepEqual(at("../../README.md"), doc("github:octo/widgets@main:README.md", "README.md"));
+  assert.deepEqual(at("a/./b/../c.md"), doc("github:octo/widgets@main:docs/guide/a/c.md", "docs/guide/a/c.md"));
+  // A leading / is the repository root, as on GitHub.
+  assert.deepEqual(at("/CHANGELOG.md"), doc("github:octo/widgets@main:CHANGELOG.md", "CHANGELOG.md"));
+  assert.deepEqual(at("/docs/x.md"), doc("github:octo/widgets@main:docs/x.md", "docs/x.md"));
+  // Climbing above the repository root is refused, in either spelling.
+  assert.deepEqual(at("../../../escape.md"), { kind: "text" });
+  assert.deepEqual(at("/../escape.md"), { kind: "text" });
+  assert.deepEqual(at("%2e%2e/%2e%2e/%2e%2e/escape.md"), { kind: "text" });
+  assert.deepEqual(at(".../escape.md"), { kind: "text" });
+  // Anchors split off; a bare fragment names the open document's own heading.
+  assert.deepEqual(at("other.md#install"), doc("github:octo/widgets@main:docs/guide/other.md", "docs/guide/other.md", "install"));
+  assert.deepEqual(at("#local-heading"), doc(GUIDE_KEY, "docs/guide/intro.md", "local-heading"));
+  assert.deepEqual(at("#"), { kind: "text" });
+  // Percent-escapes are carried verbatim, never decoded.
+  assert.deepEqual(at("my%20file.md"), doc("github:octo/widgets@main:docs/guide/my%20file.md", "docs/guide/my%20file.md"));
+  // A query does not name another file; the fragment still applies.
+  assert.deepEqual(at("other.md?plain=1#top"), doc("github:octo/widgets@main:docs/guide/other.md", "docs/guide/other.md", "top"));
+  // The document's own directory alone, and empty references, name no document.
+  assert.deepEqual(at("../.."), { kind: "text" });
+  assert.deepEqual(at(""), { kind: "text" });
+  assert.deepEqual(at("a\\b.md"), { kind: "text" });
+  // The external address is derived from the open document's own address: a
+  // document linked in raw form keeps the raw form for its relative links.
+  assert.deepEqual(
+    at("sibling.md", GUIDE_KEY, "https://raw.githubusercontent.com/octo/widgets/main/docs/guide/intro.md"),
+    { kind: "document", key: "github:octo/widgets@main:docs/guide/sibling.md",
+      url: "https://raw.githubusercontent.com/octo/widgets/main/docs/guide/sibling.md", anchor: null },
+  );
+  // With no address to derive from (or one that does not end with the open
+  // document's path), a relative reference stays text rather than fabricate
+  // a destination.
+  assert.deepEqual(at("sibling.md", GUIDE_KEY, null), { kind: "text" });
+  assert.deepEqual(at("sibling.md", GUIDE_KEY, "https://example.com/elsewhere"), { kind: "text" });
+});
+
+test("documents links: absolute GitHub addresses mint the server's key, blob and raw alike", () => {
+  const { resolveDocumentHref } = requireModule(RENDER, "src/view/documents/render.ts");
+  const cases = [
+    ["https://github.com/octo/widgets/blob/main/docs/a.md", "github:octo/widgets@main:docs/a.md"],
+    ["https://raw.githubusercontent.com/octo/widgets/main/docs/a.md", "github:octo/widgets@main:docs/a.md"],
+    ["https://www.github.com/octo/widgets/blob/main/docs/a.markdown", "github:octo/widgets@main:docs/a.markdown"],
+    ["http://github.com/octo/widgets/blob/main/src/lib.rs", "github:octo/widgets@main:src/lib.rs"],
+    ["HTTPS://GITHUB.COM/Octo/Widgets/blob/Main/Docs/A.md", "github:Octo/Widgets@Main:Docs/A.md"],
+    ["https://github.com/octo/widgets/blob/main/docs/a.md?plain=1#L3", "github:octo/widgets@main:docs/a.md"],
+    ["https://github.com/octo/widgets/blob/feature-x/docs/a.md", "github:octo/widgets@feature-x:docs/a.md"],
+  ];
+  for (const [href, key] of cases) {
+    const resolved = resolveDocumentHref(null, href);
+    assert.equal(resolved.kind, "document", `${href} did not resolve as a document`);
+    assert.equal(resolved.key, key, `${href} minted the wrong key`);
+    assert.equal(resolved.url, href, "the external address was rewritten");
+  }
+  assert.deepEqual(
+    resolveDocumentHref(null, "https://github.com/octo/widgets/blob/main/docs/a.md#part"),
+    { kind: "document", key: "github:octo/widgets@main:docs/a.md", url: "https://github.com/octo/widgets/blob/main/docs/a.md#part", anchor: "part" },
+  );
+  // Shapes the server refuses stay ordinary external links, never documents.
+  for (const href of [
+    "https://github.com/octo/widgets",
+    "https://github.com/octo/widgets/tree/main/docs",
+    "https://github.com/octo/widgets/blob/main/../secret.md",
+    "https://github.com/octo/widgets/blob/main/docs//a.md",
+    "https://raw.githubusercontent.com/octo/widgets/main",
+  ]) {
+    assert.deepEqual(resolveDocumentHref(null, href), { kind: "external", url: href }, `${href} became a document`);
+  }
+});
+
+test("documents links: non-document, non-GitHub-document, and unsafe targets keep today's behaviour", () => {
+  const { resolveDocumentHref } = requireModule(RENDER, "src/view/documents/render.ts");
+  // Other hosts and the in-app forms stay external links.
+  assert.deepEqual(resolveDocumentHref(GUIDE_KEY, "https://example.com/plan"), { kind: "external", url: "https://example.com/plan" });
+  assert.deepEqual(resolveDocumentHref(GUIDE_KEY, "#/in-app"), { kind: "external", url: "#/in-app" });
+  assert.deepEqual(resolveDocumentHref(GUIDE_KEY, "docs:some/path"), { kind: "external", url: "docs:some/path" });
+  // Unsafe schemes and protocol-relative addresses stay text.
+  for (const href of ["javascript:alert(1)", "JaVaScRiPt:alert(1)", "data:text/html,hi", "vbscript:x",
+    "mailto:a@example.com", "//github.com/octo/widgets/blob/main/a.md", "https://exa mple.com/x"]) {
+    assert.deepEqual(resolveDocumentHref(GUIDE_KEY, href), { kind: "text" }, `${href} became a link`);
+  }
+  // A paste document has no directory: relative references stay text, while an
+  // absolute GitHub document link still opens as a document.
+  assert.deepEqual(resolveDocumentHref("paste:Ab12", "sibling.md"), { kind: "text" });
+  assert.deepEqual(resolveDocumentHref("paste:Ab12", "/root.md"), { kind: "text" });
+  assert.deepEqual(resolveDocumentHref("paste:Ab12", "#heading"), { kind: "text" });
+  assert.equal(resolveDocumentHref("paste:Ab12", "https://github.com/o/r/blob/main/a.md").kind, "document");
+  assert.deepEqual(resolveDocumentHref("paste:Ab12", "https://example.com/x"), { kind: "external", url: "https://example.com/x" });
+  // Without any open document, relative references have nothing to resolve against.
+  assert.deepEqual(resolveDocumentHref(null, "sibling.md"), { kind: "text" });
+  assert.deepEqual(resolveDocumentHref(null, "#heading"), { kind: "text" });
+});
+
+test("documents render: document links carry data-doc with the external href intact, others do not", () => {
+  const { renderDocumentMarkdown } = requireModule(RENDER, "src/view/documents/render.ts");
+  const markdown = [
+    "# Index",
+    "",
+    "See [the sibling](sibling.md), [the plan](https://example.com/plan),",
+    "[an anchored part](../other.md#install-steps), [a script](javascript:alert(1)),",
+    "![a picture](pic.png) and ![a hosted picture](https://example.com/pic.png).",
+  ].join("\n");
+  const html = htmlOf(renderDocumentMarkdown(markdown, GUIDE_KEY, GUIDE_URL));
+  assert.ok(
+    html.includes('<a href="https://github.com/octo/widgets/blob/main/docs/guide/sibling.md" '
+      + 'data-doc="github:octo/widgets@main:docs/guide/sibling.md" '
+      + 'title="Opens here — https://github.com/octo/widgets/blob/main/docs/guide/sibling.md" '
+      + 'rel="noopener noreferrer">the sibling</a>'),
+    `the relative document link was not rendered as a marked document link:\n${html}`,
+  );
+  assert.ok(
+    html.includes('data-doc="github:octo/widgets@main:docs/other.md" data-doc-anchor="install-steps"'),
+    "the anchored document link carries no scroll fragment",
+  );
+  assert.ok(
+    html.includes('<a href="https://example.com/plan" rel="noopener noreferrer">the plan</a>'),
+    "the external link changed shape",
+  );
+  assert.ok(!html.toLowerCase().includes("javascript:"), "an unsafe scheme reached the page");
+  assert.ok(html.includes("a script"), "the unsafe link's label vanished instead of staying text");
+  // Images keep the image discipline: relative as alt text, hosted as a plain
+  // link, and never marked as documents.
+  assert.ok(!html.includes("pic.png\" data-doc"), "an image was marked as a document");
+  assert.ok(html.includes('<a href="https://example.com/pic.png" rel="noopener noreferrer">a hosted picture</a>'));
+  assert.equal((html.match(/data-doc=/g) || []).length, 2, "data-doc landed on a non-document link");
+  // Without a key, the same source renders as it did before relative links.
+  const bare = htmlOf(renderDocumentMarkdown(markdown));
+  assert.ok(!bare.includes("data-doc"), "a keyless render marked a document link");
+  assert.ok(bare.includes("the sibling") && !bare.includes("docs/guide/sibling.md\""), "a keyless render resolved a relative link");
+});
+
+// One reader over fakes whose body can hold marked anchors, recording doc opens.
+async function withLinkedReader(options, run) {
+  const mod = requireModule(READER, "src/view/documents/reader.ts");
+  const els = {};
+  for (const id of ["doc-title", "doc-outline", "doc-outline-pop", "doc-outline-open",
+    "doc-back", "doc-read", "doc-body", "scroll-area"]) els[id] = readerEl("div");
+  const headings = options.headings || [];
+  els["doc-body"].querySelectorAll = () => headings;
+  const opened = [];
+  const reader = mod.createDocumentsReader({
+    api: options.api || (async () => ({
+      document: { title: "Intro" },
+      content: "# Intro\n\nLinked body.\n",
+      outline: [],
+    })),
+    byId: (id) => {
+      assert.ok(id in els, `reader looked up an element the test did not provide: ${id}`);
+      return els[id];
+    },
+    speak: () => {},
+    onBack: () => {},
+    // Stand in for the view's open path: record, then really open through the
+    // reader so current() and the drawn headings move as they would in the page.
+    onOpenDocument: options.onOpenDocument === null ? undefined
+      : async (key) => { opened.push(key); await reader.open(key); },
+  });
+  const savedDocument = globalThis.document;
+  globalThis.document = { createElement: (tag) => readerEl(tag) };
+  try {
+    await reader.open(options.key || GUIDE_KEY);
+    const anchor = (key, fragment) => {
+      const a = readerEl("a");
+      a.setAttribute("href", "https://github.com/octo/widgets/blob/main/docs/guide/sibling.md");
+      a.setAttribute("data-doc", key);
+      if (fragment) a.setAttribute("data-doc-anchor", fragment);
+      const label = readerEl("span");
+      a.appendChild(label);
+      els["doc-body"].appendChild(a);
+      return { a, label };
+    };
+    await run({ reader, els, opened, anchor, headings });
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+  }
+}
+
+test("documents reader links: a plain tap opens in the reader; modifiers and middle-click do not", async () => {
+  await withLinkedReader({}, async ({ els, opened, anchor }) => {
+    const { a, label } = anchor("github:octo/widgets@main:docs/guide/sibling.md");
+    const prevented = [];
+    const tap = (event) => dispatchClick(els["doc-body"], { preventDefault: () => prevented.push(true), ...event });
+    // A tap on the formatted label inside the anchor still finds the anchor.
+    await flush(tap({ target: label }));
+    assert.deepEqual(opened, ["github:octo/widgets@main:docs/guide/sibling.md"]);
+    assert.equal(prevented.length, 1, "the plain tap was not held from the browser");
+    for (const event of [{ target: a, ctrlKey: true }, { target: a, metaKey: true },
+      { target: a, shiftKey: true }, { target: a, altKey: true }, { target: a, button: 1 }]) {
+      await flush(tap(event));
+    }
+    assert.equal(opened.length, 1, "a modifier or middle click was intercepted");
+    assert.equal(prevented.length, 1, "a modifier click was held from the browser");
+    // A tap elsewhere in the body opens nothing.
+    await flush(tap({ target: els["doc-body"] }));
+    assert.equal(opened.length, 1, "a tap off any link opened a document");
+  });
+});
+
+test("documents reader links: a same-document fragment scrolls; a cross-document one scrolls after opening", async () => {
+  const headings = [headingEl(2, "doc-install-steps", "Install steps")];
+  await withLinkedReader({ headings }, async ({ els, opened, anchor }) => {
+    const own = anchor(GUIDE_KEY, "install-steps");
+    await flush(dispatchClick(els["doc-body"], { target: own.a }));
+    assert.equal(opened.length, 0, "a same-document fragment reopened the document");
+    assert.equal(headings[0].scrolls.length, 1, "a same-document fragment did not scroll");
+    const other = anchor("github:octo/widgets@main:docs/other.md", "install-steps");
+    await flush(dispatchClick(els["doc-body"], { target: other.a }));
+    assert.deepEqual(opened, ["github:octo/widgets@main:docs/other.md"]);
+    assert.equal(headings[0].scrolls.length, 2, "the opened document was not scrolled to its fragment");
+  });
+});
+
+test("documents reader: an unindexed key falls through to fetch, other failures still fail at once", async () => {
+  const key = "github:octo/widgets@main:docs/never-mentioned.md";
+  const calls = [];
+  let indexed = false;
+  const api = async (path, options = {}) => {
+    calls.push(`${options.method || "GET"} ${path}`);
+    if ((options.method || "GET") === "POST") { indexed = true; return { fetched: [] }; }
+    if (!indexed) {
+      throw Object.assign(new Error("HTTP 404 unknown_document: no such document"), { code: "unknown_document" });
+    }
+    return { document: { title: "Never mentioned" }, content: "# Never mentioned\n\nBody.\n", outline: [] };
+  };
+  await withLinkedReader({ key, api }, async ({ reader }) => {
+    assert.equal(reader.current()?.key, key, "the unindexed document did not open");
+    assert.deepEqual(calls, [
+      `GET /api/v1/documents/${encodeURIComponent(key)}`,
+      "POST /api/v1/documents/fetch",
+      `GET /api/v1/documents/${encodeURIComponent(key)}`,
+    ]);
+  });
+  // A different failure is not mistaken for an unindexed key: no fetch is spent.
+  const refused = [];
+  const failing = async (path, options = {}) => {
+    refused.push(`${options.method || "GET"} ${path}`);
+    throw Object.assign(new Error("HTTP 403 forbidden: no"), { code: "forbidden" });
+  };
+  const mod = requireModule(READER, "src/view/documents/reader.ts");
+  const els = {};
+  for (const id of ["doc-title", "doc-outline", "doc-outline-pop", "doc-outline-open",
+    "doc-back", "doc-read", "doc-body", "scroll-area"]) els[id] = readerEl("div");
+  els["doc-body"].querySelectorAll = () => [];
+  const statuses = [];
+  const reader = mod.createDocumentsReader({
+    api: failing, byId: (id) => els[id], speak: () => {}, onBack: () => {},
+    onStatus: (text) => statuses.push(text),
+  });
+  const savedDocument = globalThis.document;
+  globalThis.document = { createElement: (tag) => readerEl(tag) };
+  try {
+    await assert.rejects(reader.open(key), /forbidden/);
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+  }
+  assert.deepEqual(refused, [`GET /api/v1/documents/${encodeURIComponent(key)}`]);
+  assert.deepEqual(statuses, ["Could not load the document."]);
+});

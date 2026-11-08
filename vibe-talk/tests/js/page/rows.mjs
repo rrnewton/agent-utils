@@ -1427,7 +1427,7 @@ test("the page has ONE html sink, and only a message's content_html ever reaches
   // `documents-view-client`: the Documents reader is the one other sink, fed solely by its
   // sanitizer (`renderDocumentMarkdown` in view/documents), never by raw document text.
   assert.equal((PAGE_CODE.match(/innerHTML/g) || []).length, 2, "a third innerHTML sink appeared");
-  assert.match(PAGE_CODE, /body\.innerHTML = renderDocumentMarkdown\(markdown\);/,
+  assert.match(PAGE_CODE, /body\.innerHTML = renderDocumentMarkdown\(markdown, key, sourceUrl\);/,
     "the documents sink no longer passes the sanitizer's output");
   // `insertSanitizedHtml` is web/src/view/channel/body.ts's now (`#624 voice-page-modularity`), typed.
   const sink = /function insertSanitizedHtml\(parent[^)]*\)(?:: void)? \{([\s\S]*?)\n\}/.exec(PAGE_CODE);

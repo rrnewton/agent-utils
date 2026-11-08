@@ -59,6 +59,10 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     stopSpeaking: deps.stopSpeaking,
     onBack: () => showList(),
     onStatus: deps.onStatus,
+    // A document opened from a document (`#1081 documents-relative-links`)
+    // goes through this same `openDocument` entry a list tap uses — the one
+    // open path `#1082 documents-back-chain` builds its chain on.
+    onOpenDocument: (key) => openDocument(key),
   });
   const list = createDocumentsList({
     api: deps.api,

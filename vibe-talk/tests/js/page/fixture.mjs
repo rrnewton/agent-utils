@@ -5236,6 +5236,11 @@ const TUNING_BANDS = {
     "how deep a document's inline formatting may nest before the rest is plain text " +
     "(documents-view-client): 0 would render no emphasis at all, and no cap would let a crafted " +
     "document nest the renderer until it overflows"],
+  MAX_ADDRESS: [2048, 2048,
+    "the longest address the server recognises as a document, mirrored so the reader's link " +
+    "resolution mints the server's keys (#1081 documents-relative-links): not a tuning at all — " +
+    "any other value has the page mark document links the server would refuse, or render links " +
+    "it would serve as plain text (MAX_ADDRESS in src/documents.rs)"],
   HERE_SLACK_PX: [0, 32,
     "how far below the scroller's top a document heading still counts as the current section " +
     "(#1038 documents-outline-popup): past a line's height a heading the reader has not reached " +

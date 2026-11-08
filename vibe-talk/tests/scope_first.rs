@@ -727,10 +727,19 @@ fn harness() -> Harness {
     );
     let (state, _chat, _voice) = vibe_talk::testing::state_from_toml(&text);
     let tickets = std::sync::Arc::clone(&state.speech_tickets);
+    // This sweep reads headers, never documents: since `#1081
+    // documents-relative-links` a fetch naming a canonical key admits and
+    // really fetches it, so the production fetcher would spend a network
+    // round trip (or hang without egress) on a headers probe. The same index
+    // over an unfetchable fetcher answers at once.
+    let documents = std::sync::Arc::new(vibe_talk::documents::Service::unfetchable(
+        std::sync::Arc::clone(&state.documents.index),
+    ));
     // Every refused redemption here counts against one client, and this file sends far more than
     // the shipped limit allows: the limit's own answer is `tests/pairing.rs`'s business.
     let state = vibe_talk::state::AppState {
         pairing: std::sync::Arc::new(vibe_talk::pairing::Pairing::with_failure_limit(u32::MAX)),
+        documents,
         ..state
     };
     Harness {

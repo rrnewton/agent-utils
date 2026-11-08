@@ -1,12 +1,17 @@
 """The Documents view against the REAL server (`documents-view-client` owner-bug check).
 
 Starts the release binary with --fake-discord (a real server; only the chat
-upstream is fake), seeds a paste link and a GitHub link through the reply route,
-reads the channel so the fold registers both, then drives the page at 393x852
-with real touch: an unfetched row fetches (the paste command serves a local
-file) and opens the reader; a GitHub row whose fetcher cannot connect shows
-its error on the row; Fetch recent reports a result. No documents API is
-stubbed: list, fetch and render all go through the server under test.
+upstream is fake), seeds a paste link and GitHub links through the reply
+route, reads the channel so the fold registers them, then drives the page at
+393x852 with real touch: an unfetched row fetches (the paste command serves
+a local file) and opens the reader; Fetch recent reports a result. The
+GitHub raw base points at a local stub HTTP server the test starts, serving
+an index document whose links are relative (`#1081 documents-relative-links`):
+a tap on one opens the linked document in the reader though no message ever
+mentioned it, a ctrl+click leaves for GitHub, a non-document link still
+leaves the app, and a GitHub row the stub answers with an error shows that
+error on the row. No documents API is stubbed: list, fetch and render all go
+through the server under test.
 
 The reader steps also cover `#1038 documents-outline-popup`: the seeded paste
 is long enough to scroll several viewports, and at 393x852 (touch) and again
@@ -20,8 +25,10 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
 
@@ -44,6 +51,50 @@ PASTE_BODY = (
     + "The final line.\n"
 )
 OUTLINE_TEXTS = ["Demo deployment report", "Setup", "Setup details", "Finish"]
+
+# The GitHub-shaped documents the local raw stub serves (`#1081`): an index
+# whose links are relative, and the document they name. The linked document
+# is never mentioned in chat, so only the reader's fetch-by-key admission can
+# open it.
+GUIDE_BODY = (
+    "# Guide index\n\nStart with [the next document](next.md), or jump to "
+    "[its second part](next.md#part-two).\n\nElsewhere: "
+    "[an example](https://example.com/elsewhere).\n"
+)
+NEXT_BODY = (
+    "# Next document\n\nOpened from the guide.\n\n" + _FILLER * 6
+    + "## Part two\n\nThe anchored part.\n"
+)
+RAW_FILES: dict[str, str] = {
+    "/octo/widgets/main/docs/guide.md": GUIDE_BODY,
+    "/octo/widgets/main/docs/next.md": NEXT_BODY,
+}
+NEXT_KEY = "github:octo/widgets@main:docs/next.md"
+NEXT_URL = "https://github.com/octo/widgets/blob/main/docs/next.md"
+
+
+class RawHandler(BaseHTTPRequestHandler):
+    """A raw-content host: the seeded files, an error for broken.md, else 404."""
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's API
+        path = self.path.split("?", 1)[0]
+        body = RAW_FILES.get(path)
+        if body is not None:
+            self.reply(200, body.encode())
+        elif path.endswith("/docs/broken.md"):
+            self.reply(500, b"broken upstream")
+        else:
+            self.reply(404, b"not found")
+
+    def reply(self, status: int, data: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "text/markdown")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - the base name
+        pass
 
 
 def check(condition: bool, message: str) -> None:
@@ -115,6 +166,9 @@ def tap_card(page: object, card: object) -> None:
 def main() -> int:
     port = free_port()
     base = f"http://127.0.0.1:{port}"
+    raw = ThreadingHTTPServer(("127.0.0.1", 0), RawHandler)
+    threading.Thread(target=raw.serve_forever, daemon=True).start()
+    raw_base = f"http://127.0.0.1:{raw.server_address[1]}"
     with tempfile.TemporaryDirectory(prefix="documents-check-") as tmp:
         work = Path(tmp)
         (work / "demo-doc").write_text(PASTE_BODY)
@@ -128,7 +182,7 @@ def main() -> int:
             '[documents]\n'
             'paste_url_prefixes = ["https://paste.example/"]\n'
             'paste_command = ["/bin/cat", "--", "{}"]\n'
-            'github_raw_base = "http://127.0.0.1:9"\n'
+            f'github_raw_base = "{raw_base}"\n'
         )
         server = subprocess.Popen(
             [str(ROOT / "target/release/vibe-talk"), "--config", str(work / "vibe-talk.toml"),
@@ -146,17 +200,18 @@ def main() -> int:
                     time.sleep(0.25)
             call(base, "POST", f"/api/v1/channels/{CHANNEL}/reply", WRITE_TOKEN,
                  {"text": "Report: https://paste.example/demo-doc and the "
-                          "[guide](https://github.com/octo/widgets/blob/main/docs/guide.md)"})
+                          "[guide](https://github.com/octo/widgets/blob/main/docs/guide.md) "
+                          "plus https://github.com/octo/widgets/blob/main/docs/broken.md"})
             docs = []
             deadline = time.time() + 30
             while time.time() < deadline:
                 call(base, "GET", f"/api/v1/channels/{CHANNEL}/page?limit=10&render=html", WRITE_TOKEN)
                 answer = call(base, "GET", "/api/v1/documents?limit=10", READ_TOKEN)
                 docs = cast(list[dict[str, object]], answer["documents"])
-                if len(docs) == 2:
+                if len(docs) == 3:
                     break
                 time.sleep(0.5)
-            check(len(docs) == 2, f"the fold registered {len(docs)} documents, not 2: {docs}")
+            check(len(docs) == 3, f"the fold registered {len(docs)} documents, not 3: {docs}")
             by_file = {d["file_name"]: d for d in docs}
             check(by_file["demo-doc"]["fetched"] is False, "the paste starts fetched")
 
@@ -168,7 +223,7 @@ def main() -> int:
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                 page.goto(base + "/?v=docs", wait_until="load")
                 page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
-                check(page.locator("#documents-list .doc-card").count() == 2, "the list did not draw both rows")
+                check(page.locator("#documents-list .doc-card").count() == 3, "the list did not draw every row")
                 check("demo-doc" in (page.locator("#documents-list").text_content() or ""),
                       "the list does not name its document")
 
@@ -292,9 +347,43 @@ def main() -> int:
                 page.tap("#doc-back")
                 page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
 
-                # The GitHub row: its fetcher cannot connect (raw base is a closed
-                # port), and the row says why instead of doing nothing.
-                gh_card = page.locator("#documents-list .doc-card", has_text="guide.md")
+                # The index document (`#1081`): its relative links render as
+                # in-app document links, and a tap opens the linked document
+                # in the reader though no message ever mentioned it (the
+                # reader's fetch admits it by key).
+                guide_card = page.locator("#documents-list .doc-card", has_text="guide.md")
+                tap_card(page, guide_card)
+                page.wait_for_selector("#doc-body h1", timeout=20_000)
+                check("Guide index" in (page.text_content("#doc-body") or ""),
+                      "the reader did not render the guide")
+                next_link = page.locator("#doc-body a", has_text="the next document")
+                check(next_link.get_attribute("data-doc") == NEXT_KEY,
+                      "the relative link carries no document key")
+                check(next_link.get_attribute("href") == NEXT_URL,
+                      "the relative link does not carry its GitHub address")
+                anchored = page.locator("#doc-body a", has_text="its second part")
+                check(anchored.get_attribute("data-doc-anchor") == "part-two",
+                      "the anchored link carries no scroll fragment")
+                external = page.locator("#doc-body a", has_text="an example")
+                check(external.get_attribute("data-doc") is None,
+                      "a non-document link was marked as a document")
+                next_link.tap()
+                page.wait_for_function(
+                    "() => (document.getElementById('doc-body')?.textContent || '')"
+                    ".includes('Next document')",
+                    timeout=20_000)
+                listed = cast(list[dict[str, object]],
+                              call(base, "GET", "/api/v1/documents?limit=10", READ_TOKEN)["documents"])
+                admitted = [d for d in listed if d["key"] == NEXT_KEY]
+                check(len(admitted) == 1 and admitted[0]["mention_count"] == 0
+                      and admitted[0]["fetched"] is True,
+                      f"the linked document was not admitted mention-less and fetched: {listed}")
+                page.tap("#doc-back")
+                page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+
+                # The broken GitHub row: the raw stub answers an error, and
+                # the row says why instead of doing nothing.
+                gh_card = page.locator("#documents-list .doc-card", has_text="broken.md")
                 tap_card(page, gh_card)
                 page.wait_for_function(
                     "() => [...document.querySelectorAll('#documents-list .doc-card')]"
@@ -330,14 +419,53 @@ def main() -> int:
                 dpage.keyboard.press("Escape")
                 dpage.wait_for_function(
                     "() => document.getElementById('doc-outline-pop').hidden", timeout=20_000)
+
+                # At desktop size (`#1081`): a ctrl+click on an in-document
+                # link follows its GitHub address in a new page, and a plain
+                # click on a non-document link still leaves the app. Both
+                # destinations are fulfilled locally, never really fetched.
+                dpage.click("#doc-back")
+                dpage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                github_requests: list[str] = []
+
+                def abort_github(route: Route) -> None:
+                    github_requests.append(route.request.url)
+                    route.abort()
+
+                dctx.route("https://github.com/**", abort_github)
+                dctx.route("https://example.com/**",
+                           lambda route: route.fulfill(status=200, body="example stub"))
+                dpage.locator("#documents-list .doc-card", has_text="guide.md").click()
+                dpage.wait_for_selector("#doc-body h1", timeout=20_000)
+                with dctx.expect_page(timeout=20_000) as popup_info:
+                    dpage.locator("#doc-body a", has_text="the next document") \
+                        .click(modifiers=["Control"])
+                popup = popup_info.value
+                deadline = time.time() + 10
+                while not github_requests and popup.url == "about:blank" and time.time() < deadline:
+                    time.sleep(0.1)
+                check(github_requests == [NEXT_URL] or popup.url == NEXT_URL,
+                      f"the ctrl+click opened {popup.url!r} (requests: {github_requests}), "
+                      "not the GitHub page")
+                popup.close()
+                check("Guide index" in (dpage.text_content("#doc-body") or ""),
+                      "the ctrl+click moved the reader")
+                dpage.locator("#doc-body a", has_text="an example").click()
+                dpage.wait_for_url("https://example.com/elsewhere", timeout=20_000)
+                dpage.go_back()
+                # The app's own Back handling takes the return from there;
+                # what matters is being back in the app, in Documents.
+                dpage.wait_for_function(
+                    "() => !document.getElementById('pane-docs').hidden", timeout=20_000)
                 dctx.close()
                 browser.close()
             print("documents browser check: real-server list, touch fetch, reader, outline pop-up, "
-                  "source link, and fetch error all seen")
+                  "source link, fetch error, and in-document links all seen")
             return 0
         finally:
             server.terminate()
             server.wait(timeout=10)
+            raw.shutdown()
 
 
 if __name__ == "__main__":

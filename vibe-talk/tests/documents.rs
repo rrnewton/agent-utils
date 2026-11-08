@@ -481,6 +481,179 @@ async fn bounded_cache_evicts_oldest() {
     );
 }
 
+/// `#1081 documents-relative-links`: a canonical key no message mentioned is
+/// admitted by the write-scope fetch (registered mention-less, then fetched);
+/// the read path stays read-only, and what does not canonicalise under this
+/// deployment's kinds is refused without ever being indexed.
+#[tokio::test]
+async fn fetch_admits_an_unmentioned_document_by_key() {
+    const LINKED: &str = "github:octo/widgets@main:docs/never-mentioned.md";
+    let (app, github) = harness();
+    github.put(
+        LINKED,
+        "# Never Mentioned\n\nlinked only from a document\n",
+        "v1",
+    );
+    let uri = format!("/api/v1/documents/{}", encoded(LINKED));
+
+    // GET stays read-only: an unindexed key is unknown until admitted.
+    let (status, body) = call(&app, "GET", &uri, Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "unknown_document", "{body}");
+
+    // A read token still may not fetch — admission included.
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/api/v1/documents/fetch",
+        Some(READ_TOKEN),
+        Some(serde_json::json!({ "key": LINKED })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = call(&app, "GET", &uri, Some(READ_TOKEN), None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a read-token fetch admitted it"
+    );
+
+    // The write-scope fetch registers and fetches it, exactly once.
+    let before = *github.fetches.lock().expect("lock");
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/v1/documents/fetch",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "key": LINKED })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["fetched"][0]["title"], "Never Mentioned");
+    assert_eq!(*github.fetches.lock().expect("lock"), before + 1);
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/api/v1/documents/fetch",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "key": LINKED })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        *github.fetches.lock().expect("lock"),
+        before + 1,
+        "the second fetch was not served from the cache"
+    );
+
+    // It reads back mention-less, and lists without disturbing mention order.
+    let (status, body) = call(&app, "GET", &uri, Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["content"]
+        .as_str()
+        .expect("content")
+        .contains("Never Mentioned"));
+    assert_eq!(body["document"]["mention_count"], 0);
+    assert!(body["document"]["mentions"]
+        .as_array()
+        .expect("mentions")
+        .is_empty());
+    assert_eq!(body["document"]["fetched"], true);
+
+    let (status, body) = call(&app, "GET", "/api/v1/documents", Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], 3, "{body}");
+    let docs = body["documents"].as_array().expect("documents");
+    let mentioned: Vec<&str> = docs
+        .iter()
+        .filter(|d| d["mention_count"].as_u64().expect("count") > 0)
+        .map(|d| d["key"].as_str().expect("key"))
+        .collect();
+    assert_eq!(mentioned.len(), 2, "{body}");
+    assert!(
+        mentioned[0].ends_with("other.md"),
+        "mention order moved: {body}"
+    );
+    assert_eq!(mentioned[1], KEY, "mention order moved: {body}");
+
+    // Keys that do not canonicalise are refused and never indexed: malformed,
+    // an address rather than a key, and a paste with no paste source
+    // configured in this harness (an unconfigured kind).
+    for bad in [
+        "not a key",
+        "github:octo/widgets@main:",
+        "github:octo/widgets@main:../escape.md",
+        "https://github.com/octo/widgets/blob/main/docs/a.md",
+        "https://example.com/anything",
+        "paste:Ab12",
+        "google_doc:DocId123",
+    ] {
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/documents/fetch",
+            Some(WRITE_TOKEN),
+            Some(serde_json::json!({ "key": bad })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "admitted {bad}: {body}");
+    }
+    let (status, body) = call(&app, "GET", "/api/v1/documents", Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 3, "a refused key was indexed: {body}");
+}
+
+/// The same admission for a paste, under its configured prefix.
+#[tokio::test]
+async fn fetch_admits_an_unmentioned_paste_under_its_prefix() {
+    let (mut state, _discord) = testing::state();
+    let index = Arc::new(Index::new(vec!["https://paste.example/".to_owned()]));
+    state.documents = Arc::new(Service::new(
+        index,
+        Arc::new(vibe_talk::documents::PasteFetcher::new(vec![
+            "/bin/echo".to_owned(),
+            "--".to_owned(),
+            "{}".to_owned(),
+        ])),
+        10,
+        1 << 20,
+    ));
+    let app = router(state);
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/v1/documents/fetch",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "key": "paste:Ab12" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/documents/{}", encoded("paste:Ab12")),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["content"].as_str().expect("content").contains("Ab12"));
+    assert_eq!(body["document"]["mention_count"], 0);
+    // A malformed paste key is refused, not indexed.
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/api/v1/documents/fetch",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "key": "paste:bad/id" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = call(&app, "GET", "/api/v1/documents", Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 1, "{body}");
+}
+
 // --- moved-document fallback, against a fake GitHub over HTTP ----------------
 
 /// A one-thread HTTP GitHub: raw paths and one tree answer, both canned.

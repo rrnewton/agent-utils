@@ -16,7 +16,7 @@
 // http(s) one, and plain text otherwise.
 
 import { createListening } from "../dom/index.ts";
-import { renderDocumentMarkdown } from "./render.ts";
+import { documentHeadingId, renderDocumentMarkdown } from "./render.ts";
 
 /** What the reader asks of the page. */
 export interface DocumentsReaderDependencies {
@@ -26,6 +26,14 @@ export interface DocumentsReaderDependencies {
   stopSpeaking?(): unknown;
   onBack(): unknown;
   onStatus?(text: string): unknown;
+  /**
+   * Open the document `key` in the reader, through the view's one open path
+   * (the same entry a list tap uses), for a tap on a marked in-document link
+   * (`#1081 documents-relative-links`). May return a promise, awaited so a
+   * `#fragment` can scroll once the document is drawn. Without it, the reader
+   * opens the document itself.
+   */
+  onOpenDocument?(key: string): unknown;
 }
 
 /**
@@ -76,6 +84,19 @@ function asAnswer(value: unknown): DocumentAnswer {
 function stringsOf(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((entry): entry is string => typeof entry === "string");
+}
+
+/**
+ * Whether an `api` failure is the server's `unknown_document` answer: the key
+ * is not in its index yet (a link followed from another document, before any
+ * message mentioned it). The page's API client keeps the server's error code
+ * on the thrown error; the message carries it too.
+ */
+function isUnknownDocument(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const record = error as { code?: unknown; message?: unknown };
+  if (record.code === "unknown_document") return true;
+  return typeof record.message === "string" && record.message.includes("unknown_document");
 }
 
 /** Characters that may not appear in an address the title may link to (render.ts's discipline). */
@@ -220,13 +241,33 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
   let hereIndex = -1;
   let observer: IntersectionObserver | null = null;
 
-  /** Scroll the rendered heading `id` into view, where it was drawn. */
-  function scrollToHeading(id: string): void {
+  /** Scroll the rendered heading `id` into view; say whether it was drawn. */
+  function scrollToHeading(id: string): boolean {
     const body = deps.byId("doc-body");
     const found = Array.from(body.querySelectorAll("h1, h2, h3, h4, h5, h6")).find((el) => el.id === id);
     const target = found === undefined ? null : (found as HTMLElement);
     if (target !== null && typeof target.scrollIntoView === "function") {
       target.scrollIntoView({ block: "start" });
+      return true;
+    }
+    return target !== null;
+  }
+
+  /**
+   * Scroll to the heading a link's `#fragment` names: a GitHub fragment is the
+   * heading's slug, and the rendered id is that slug `doc-` prefixed (or the
+   * renderer's own slug of the decoded fragment text). Best effort: a fragment
+   * naming no heading leaves the reader at the document's top.
+   */
+  function scrollToAnchor(fragment: string): void {
+    const candidates = [`doc-${fragment}`, documentHeadingId(fragment)];
+    try {
+      candidates.push(documentHeadingId(decodeURIComponent(fragment)));
+    } catch {
+      // An undecodable fragment keeps the candidates already gathered.
+    }
+    for (const id of candidates) {
+      if (scrollToHeading(id)) return;
     }
   }
 
@@ -423,10 +464,111 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     deps.stopSpeaking?.();
   }
 
+  /**
+   * A tap in the document body (`#1081 documents-relative-links`): a plain tap
+   * on an anchor the renderer marked `data-doc` opens that document here,
+   * through the view's one open path where the page gave one; a modifier or
+   * middle click is left to the browser, which follows the anchor's external
+   * GitHub address. The walk from the tap's target up to the body finds the
+   * marked anchor around formatted label text. A `#fragment` on the open
+   * document's own key only scrolls; on another document it scrolls once that
+   * document is drawn.
+   */
+  async function onBodyClick(event: MouseEvent): Promise<void> {
+    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || (event.button || 0) > 0) return;
+    const body = deps.byId("doc-body");
+    let docKey: string | null = null;
+    let anchor: string | null = null;
+    let node: unknown = event.target;
+    while (node !== null && typeof node === "object") {
+      const element = node as { getAttribute?: unknown; parentNode?: unknown };
+      if (typeof element.getAttribute === "function") {
+        const get = element.getAttribute as (name: string) => string | null;
+        const found = get.call(element, "data-doc");
+        if (typeof found === "string" && found !== "") {
+          docKey = found;
+          const fragment = get.call(element, "data-doc-anchor");
+          anchor = typeof fragment === "string" && fragment !== "" ? fragment : null;
+          break;
+        }
+      }
+      if (node === (body as unknown)) break;
+      node = element.parentNode ?? null;
+    }
+    if (docKey === null) return;
+    if (typeof event.preventDefault === "function") event.preventDefault();
+    if (anchor !== null && currentDoc !== null && docKey === currentDoc.key) {
+      scrollToAnchor(anchor);
+      return;
+    }
+    try {
+      if (deps.onOpenDocument) await deps.onOpenDocument(docKey);
+      else await open(docKey);
+    } catch {
+      // The open already said what happened; stay on this document.
+      return;
+    }
+    if (anchor !== null && currentDoc !== null && currentDoc.key === docKey) scrollToAnchor(anchor);
+  }
+
+  /** Fetch the document `key` (fetching its content first if uncached) and draw it. */
+  async function open(key: string): Promise<void> {
+    wire();
+    currentDoc = null;
+    setOutlineOpen(false);
+    stopWatching();
+    const path = `/api/v1/documents/${encodeURIComponent(key)}`;
+    let answer: DocumentAnswer;
+    try {
+      try {
+        answer = asAnswer(await deps.api(path));
+      } catch (error) {
+        // Unindexed (followed from another document, never mentioned in chat):
+        // the fetch route admits a canonical key, registering then fetching
+        // it, so read again after it. Any other failure keeps today's shape.
+        if (!isUnknownDocument(error)) throw error;
+        await deps.api("/api/v1/documents/fetch", { method: "POST", body: { key } });
+        answer = asAnswer(await deps.api(path));
+      }
+      if (typeof answer.content !== "string") {
+        await deps.api("/api/v1/documents/fetch", { method: "POST", body: { key } });
+        answer = asAnswer(await deps.api(path));
+      }
+    } catch (error) {
+      deps.onStatus?.("Could not load the document.");
+      throw error;
+    }
+    markdown = typeof answer.content === "string" ? answer.content : null;
+    const body = deps.byId("doc-body");
+    if (markdown !== null) {
+      // The documents sink: fed solely by the sanitizer above, never raw text.
+      // The document's own address (backend data) is the base its relative
+      // links derive their external destinations from.
+      const sourceUrl = typeof answer.document?.url === "string" ? answer.document.url : undefined;
+      body.innerHTML = renderDocumentMarkdown(markdown, key, sourceUrl);
+    } else {
+      body.textContent = "This document is not available yet.";
+      deps.onStatus?.("This document is not available yet.");
+    }
+    drawOutline();
+    const outline = stringsOf(answer.outline);
+    const rawTitle = answer.document?.title;
+    const docTitle = typeof rawTitle === "string" ? rawTitle : "";
+    const titleText = docTitle !== "" ? docTitle : (outline[0] ?? entries[0]?.text ?? key);
+    drawTitle(titleText, answer.document?.url);
+    const movedTo = answer.document?.moved_to;
+    if (typeof movedTo === "string" && movedTo !== "") deps.onStatus?.(`Moved to ${movedTo}`);
+    if (markdown !== null) currentDoc = { key, title: titleText, outline, markdown };
+    startWatching();
+  }
+
   /** Add the Back, Read and Outline listeners, the first time the reader is opened. */
   function wire(): void {
     if (wired) return;
     wired = true;
+    listening.listen<MouseEvent>(deps.byId("doc-body"), "click", (event) => {
+      void onBodyClick(event);
+    });
     listening.listen(deps.byId("doc-back"), "click", () => {
       stopOwnReading();
       deps.onBack();
@@ -458,43 +600,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
   }
 
   return {
-    async open(key: string): Promise<void> {
-      wire();
-      currentDoc = null;
-      setOutlineOpen(false);
-      stopWatching();
-      const path = `/api/v1/documents/${encodeURIComponent(key)}`;
-      let answer: DocumentAnswer;
-      try {
-        answer = asAnswer(await deps.api(path));
-        if (typeof answer.content !== "string") {
-          await deps.api("/api/v1/documents/fetch", { method: "POST", body: { key } });
-          answer = asAnswer(await deps.api(path));
-        }
-      } catch (error) {
-        deps.onStatus?.("Could not load the document.");
-        throw error;
-      }
-      markdown = typeof answer.content === "string" ? answer.content : null;
-      const body = deps.byId("doc-body");
-      if (markdown !== null) {
-        // The documents sink: fed solely by the sanitizer above, never raw text.
-        body.innerHTML = renderDocumentMarkdown(markdown);
-      } else {
-        body.textContent = "This document is not available yet.";
-        deps.onStatus?.("This document is not available yet.");
-      }
-      drawOutline();
-      const outline = stringsOf(answer.outline);
-      const rawTitle = answer.document?.title;
-      const docTitle = typeof rawTitle === "string" ? rawTitle : "";
-      const titleText = docTitle !== "" ? docTitle : (outline[0] ?? entries[0]?.text ?? key);
-      drawTitle(titleText, answer.document?.url);
-      const movedTo = answer.document?.moved_to;
-      if (typeof movedTo === "string" && movedTo !== "") deps.onStatus?.(`Moved to ${movedTo}`);
-      if (markdown !== null) currentDoc = { key, title: titleText, outline, markdown };
-      startWatching();
-    },
+    open,
     current(): OpenDocument | null {
       return currentDoc;
     },

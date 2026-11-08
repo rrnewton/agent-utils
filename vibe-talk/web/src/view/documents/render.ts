@@ -45,20 +45,222 @@ export function documentHeadingId(text: string): string {
 const UNSAFE_URL_CHARS = /[\s"<>\u0000-\u001f\u007f]/;
 
 /**
- * The `href` for a link to `url`, or null where the URL is not one the page will
- * follow: only `http://`, `https://`, and the in-app `#/` and `docs:` forms are
- * links at all. Every other scheme (`javascript:`, `data:`, `vbscript:`, and the
- * rest), protocol-relative and relative addresses alike, renders as plain text.
- * The URL comes from already-escaped text, so it holds no quote that could close
- * the attribute; the character check fails closed regardless.
+ * Where a document link goes (`#1081 documents-relative-links`): a GitHub document
+ * the reader can open in-app (its canonical server key, its external GitHub
+ * address, and the `#fragment` to scroll to after opening, when given), an
+ * ordinary external address, or nowhere (the label renders as plain text).
  */
-function allowedLinkHref(url: string): string | null {
-  const trimmed = url.trim();
-  if (trimmed === "" || UNSAFE_URL_CHARS.test(trimmed)) return null;
-  const lower = trimmed.toLowerCase();
-  if (lower.startsWith("http://") || lower.startsWith("https://")) return trimmed;
-  if (trimmed.startsWith("#/") || lower.startsWith("docs:")) return trimmed;
+export type ResolvedDocumentHref =
+  | { kind: "document"; key: string; url: string; anchor: string | null }
+  | { kind: "external"; url: string }
+  | { kind: "text" };
+
+/** The longest address the server recognises (`documents.rs MAX_ADDRESS`). */
+const MAX_ADDRESS = 2048;
+
+/** `text` with the escaping entities folded back, as `documentHeadingId` folds them. */
+function foldEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+/** An owner/repository name as the server's `valid_name` accepts it. */
+function validName(part: string): boolean {
+  return part.length >= 1 && part.length <= 100 && /^[A-Za-z0-9._+\-]+$/.test(part);
+}
+
+/**
+ * How many dots the segment is made of (`.` and `%2e` spellings), or -1 where it
+ * is anything else: the server's `dot_segment` suspicion, counted, so `.`/`..`
+ * navigation and a refused `...` read off the same walk.
+ */
+function dotCount(segment: string): number {
+  let rest = segment;
+  let dots = 0;
+  while (rest !== "") {
+    if (rest.startsWith(".")) {
+      rest = rest.slice(1);
+      dots += 1;
+    } else if (rest.slice(0, 3).toLowerCase() === "%2e") {
+      rest = rest.slice(3);
+      dots += 1;
+    } else {
+      return -1;
+    }
+  }
+  return segment === "" ? -1 : dots;
+}
+
+/**
+ * The canonical document key for an absolute GitHub address, or null where the
+ * server would not recognise it as a document. A step-for-step mirror of the
+ * blob and raw arms of `recognize_url` in `src/documents.rs` (strict scheme and
+ * host, no decoding, dot segments refused), so a key minted here is byte-for-byte
+ * the key the server mints from the same address: `github:owner/repo@ref:path`.
+ */
+function githubKeyForUrl(address: string): string | null {
+  if (address.length > MAX_ADDRESS || /[\\ \u0000-\u001f\u007f]/.test(address)) return null;
+  const lower = address.toLowerCase();
+  let rest: string;
+  if (lower.startsWith("https://")) rest = address.slice("https://".length);
+  else if (lower.startsWith("http://")) rest = address.slice("http://".length);
+  else return null;
+  const hostEnd = rest.search(/[/?#]/);
+  const host = (hostEnd === -1 ? rest : rest.slice(0, hostEnd)).toLowerCase();
+  let tail = hostEnd === -1 ? "" : rest.slice(hostEnd);
+  tail = tail.split("#")[0] ?? "";
+  let path = tail.split("?")[0] ?? "";
+  if (path.startsWith("/")) path = path.slice(1);
+  if (path.endsWith("/")) path = path.slice(0, -1);
+  const segments = path === "" ? [] : path.split("/");
+  if (segments.some((segment) => segment === "" || dotCount(segment) !== -1)) return null;
+  if (host === "github.com" || host === "www.github.com") {
+    const [owner, repo, blob, ref, ...file] = segments;
+    if (owner === undefined || repo === undefined || ref === undefined || blob !== "blob") return null;
+    if (!validName(owner) || !validName(repo) || file.length === 0) return null;
+    return `github:${owner}/${repo}@${ref}:${file.join("/")}`;
+  }
+  if (host === "raw.githubusercontent.com") {
+    const [owner, repo, ref, ...file] = segments;
+    if (owner === undefined || repo === undefined || ref === undefined) return null;
+    if (!validName(owner) || !validName(repo) || file.length === 0) return null;
+    return `github:${owner}/${repo}@${ref}:${file.join("/")}`;
+  }
   return null;
+}
+
+/** The parts of a `github:owner/repo@ref:path` key (delimiters read as the server minted them). */
+interface GithubKeyParts {
+  owner: string;
+  repo: string;
+  ref: string;
+  path: string;
+}
+
+/** Parse a canonical GitHub document key, or null where `key` is not one. */
+function parseGithubKey(key: string): GithubKeyParts | null {
+  if (!key.startsWith("github:")) return null;
+  const rest = key.slice("github:".length);
+  const slash = rest.indexOf("/");
+  const at = slash === -1 ? -1 : rest.indexOf("@", slash + 1);
+  const colon = at === -1 ? -1 : rest.indexOf(":", at + 1);
+  if (slash <= 0 || at <= slash + 1 || colon <= at + 1 || colon === rest.length - 1) return null;
+  const parts = {
+    owner: rest.slice(0, slash),
+    repo: rest.slice(slash + 1, at),
+    ref: rest.slice(at + 1, colon),
+    path: rest.slice(colon + 1),
+  };
+  if (parts.ref.includes("/")) return null;
+  if (!validName(parts.owner) || !validName(parts.repo)) return null;
+  return parts;
+}
+
+/**
+ * The external address of the document at `resolvedPath`, derived from the open
+ * document's own address as the server gave it: swap the open document's
+ * in-repository path at the address's tail for the resolved one, which works
+ * for the blob and raw forms alike. The page names no vendor destination of
+ * its own (destinations arrive as backend data), so where the address is
+ * missing or does not end with the open document's path, there is nothing
+ * honest to point a modifier-click at and the caller leaves the reference as
+ * text rather than fabricate one.
+ */
+function externalUrlFor(
+  currentUrl: string | null,
+  currentPath: string,
+  resolvedPath: string,
+  anchor: string | null,
+): string | null {
+  if (currentUrl === null) return null;
+  const trimmed = currentUrl.trim();
+  const lower = trimmed.toLowerCase();
+  if (!lower.startsWith("http://") && !lower.startsWith("https://")) return null;
+  if (UNSAFE_URL_CHARS.test(trimmed) || trimmed.includes("\\")) return null;
+  const hash = trimmed.indexOf("#");
+  const noFragment = hash === -1 ? trimmed : trimmed.slice(0, hash);
+  const query = noFragment.indexOf("?");
+  let base = query === -1 ? noFragment : noFragment.slice(0, query);
+  if (base.endsWith("/")) base = base.slice(0, -1);
+  if (!base.endsWith(`/${currentPath}`)) return null;
+  const url = `${base.slice(0, base.length - currentPath.length)}${resolvedPath}`;
+  return anchor === null ? url : `${url}#${anchor}`;
+}
+
+/**
+ * Resolve a link written in the document `currentKey` (null where no document
+ * context is known). Pure over strings, so the resolution table is testable
+ * without a DOM.
+ *
+ * Absolute GitHub blob/raw addresses name documents whatever the open document
+ * is; relative and leading-`/` references resolve against the open GitHub
+ * document's directory (a leading `/` is the repository root, as on GitHub),
+ * with `.`/`..` normalised and any climb above the repository root refused.
+ * Percent-escapes are carried verbatim, never decoded, matching the server.
+ * Non-GitHub documents (paste, google_doc) have no directory to resolve
+ * against, so their relative references stay text, as they did before.
+ * `http(s)` non-document addresses and the in-app `#/`/`docs:` forms stay
+ * ordinary links; every other scheme, protocol-relative addresses included,
+ * stays text. A resolved document's external address is derived from
+ * `currentUrl` — the open document's address as the server gave it — and a
+ * relative reference whose external address cannot be derived stays text.
+ */
+export function resolveDocumentHref(
+  currentKey: string | null,
+  href: string,
+  currentUrl: string | null = null,
+): ResolvedDocumentHref {
+  const trimmed = href.trim();
+  if (trimmed === "" || UNSAFE_URL_CHARS.test(trimmed) || trimmed.includes("\\")) return { kind: "text" };
+  if (trimmed.startsWith("#/")) return { kind: "external", url: trimmed };
+  const lower = trimmed.toLowerCase();
+  if (lower.startsWith("docs:")) return { kind: "external", url: trimmed };
+  if (trimmed.startsWith("//")) return { kind: "text" };
+  const isHttp = lower.startsWith("http://") || lower.startsWith("https://");
+  if (!isHttp && /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)) return { kind: "text" };
+  const hash = trimmed.indexOf("#");
+  const noFragment = hash === -1 ? trimmed : trimmed.slice(0, hash);
+  const rawAnchor = hash === -1 ? null : trimmed.slice(hash + 1);
+  const anchor = rawAnchor === "" ? null : rawAnchor;
+  const query = noFragment.indexOf("?");
+  const pathPart = query === -1 ? noFragment : noFragment.slice(0, query);
+  if (isHttp) {
+    const key = githubKeyForUrl(noFragment);
+    return key === null ? { kind: "external", url: trimmed } : { kind: "document", key, url: trimmed, anchor };
+  }
+  const base = currentKey === null ? null : parseGithubKey(currentKey);
+  if (base === null || currentKey === null) return { kind: "text" };
+  if (pathPart === "") {
+    // A bare `#heading` (or query-only reference): the open document itself.
+    if (anchor === null) return { kind: "text" };
+    const own = externalUrlFor(currentUrl, base.path, base.path, anchor);
+    return own === null ? { kind: "text" } : { kind: "document", key: currentKey, url: own, anchor };
+  }
+  const segments: string[] = pathPart.startsWith("/") ? [] : base.path.split("/").slice(0, -1);
+  for (const segment of pathPart.split("/")) {
+    if (segment === "") continue;
+    const dots = dotCount(segment);
+    if (dots === 1) continue;
+    if (dots === 2) {
+      if (segments.length === 0) return { kind: "text" };
+      segments.pop();
+      continue;
+    }
+    if (dots > 2) return { kind: "text" };
+    segments.push(segment);
+  }
+  if (segments.length === 0) return { kind: "text" };
+  const parts: GithubKeyParts = { owner: base.owner, repo: base.repo, ref: base.ref, path: segments.join("/") };
+  const key = `github:${parts.owner}/${parts.repo}@${parts.ref}:${parts.path}`;
+  // The minted key rides in an attribute the reader trusts: fail closed on
+  // anything that could break out of it or that the server would never mint.
+  if (key.length > MAX_ADDRESS || UNSAFE_URL_CHARS.test(key) || key.includes("\\")) return { kind: "text" };
+  const url = externalUrlFor(currentUrl, base.path, parts.path, anchor);
+  return url === null ? { kind: "text" } : { kind: "document", key, url, anchor };
 }
 
 /** The `href` for an image's alt-text link: `http(s)` only, never an in-app form. */
@@ -113,10 +315,19 @@ const MAX_INLINE_DEPTH = 8;
 
 /**
  * Inline formatting over already-escaped text: code spans verbatim, bold and
- * italic, and links and images held to the URL allowlists above. Anything this
- * does not recognise is copied through as the (escaped) text it is.
+ * italic, and links and images held to the URL disciplines above. Anything this
+ * does not recognise is copied through as the (escaped) text it is. `currentKey`
+ * is the open document's key, the base its relative links resolve against;
+ * a resolved document link is marked `data-doc` with this module's own minted
+ * key (never raw source text), its external GitHub address as the `href`, so a
+ * modifier-click, middle-click, or copy-link still goes to GitHub.
  */
-function renderInline(text: string, depth: number): string {
+function renderInline(
+  text: string,
+  depth: number,
+  currentKey: string | null,
+  currentUrl: string | null,
+): string {
   if (depth > MAX_INLINE_DEPTH) return text;
   let out = "";
   let at = 0;
@@ -137,7 +348,7 @@ function renderInline(text: string, depth: number): string {
       const span = parseBracket(text, at + 1);
       if (span !== null) {
         const href = allowedImageHref(span.url);
-        const label = renderInline(span.label, depth + 1);
+        const label = renderInline(span.label, depth + 1, currentKey, currentUrl);
         out += href === null ? label : `<a href="${href}" rel="noopener noreferrer">${label}</a>`;
         at = span.end;
         continue;
@@ -149,9 +360,19 @@ function renderInline(text: string, depth: number): string {
     if (ch === "[") {
       const span = parseBracket(text, at);
       if (span !== null) {
-        const href = allowedLinkHref(span.url);
-        const label = renderInline(span.label, depth + 1);
-        out += href === null ? label : `<a href="${href}" rel="noopener noreferrer">${label}</a>`;
+        const resolved = resolveDocumentHref(currentKey, foldEntities(span.url), currentUrl);
+        const label = renderInline(span.label, depth + 1, currentKey, currentUrl);
+        if (resolved.kind === "text") {
+          out += label;
+        } else if (resolved.kind === "document") {
+          const anchorAttr =
+            resolved.anchor === null ? "" : ` data-doc-anchor="${escapeHtml(resolved.anchor)}"`;
+          out +=
+            `<a href="${escapeHtml(resolved.url)}" data-doc="${escapeHtml(resolved.key)}"${anchorAttr} ` +
+            `title="Opens here — ${escapeHtml(resolved.url)}" rel="noopener noreferrer">${label}</a>`;
+        } else {
+          out += `<a href="${escapeHtml(resolved.url)}" rel="noopener noreferrer">${label}</a>`;
+        }
         at = span.end;
         continue;
       }
@@ -162,7 +383,7 @@ function renderInline(text: string, depth: number): string {
     if (ch === "*" && text.charAt(at + 1) === "*") {
       const end = text.indexOf("**", at + 2);
       if (end > at + 2) {
-        out += `<strong>${renderInline(text.slice(at + 2, end), depth + 1)}</strong>`;
+        out += `<strong>${renderInline(text.slice(at + 2, end), depth + 1, currentKey, currentUrl)}</strong>`;
         at = end + 2;
         continue;
       }
@@ -173,7 +394,7 @@ function renderInline(text: string, depth: number): string {
     if (ch === "*") {
       const end = italicClose(text, at + 1);
       if (end > at + 1) {
-        out += `<em>${renderInline(text.slice(at + 1, end), depth + 1)}</em>`;
+        out += `<em>${renderInline(text.slice(at + 1, end), depth + 1, currentKey, currentUrl)}</em>`;
         at = end + 1;
         continue;
       }
@@ -222,11 +443,16 @@ function startsBlock(lines: string[], at: number): boolean {
 /**
  * Render a document's raw Markdown as a safe HTML string: the source escaped
  * whole, then formatted. Headings, paragraphs, bold and italic, inline and
- * fenced code, lists, quotes, rules, tables, and allowlisted links; no raw HTML,
+ * fenced code, lists, quotes, rules, tables, and resolved links; no raw HTML,
  * no script-bearing element, and no event handler can appear in the result,
  * because the source's own angle brackets never survive the first step.
+ * `currentKey` is the key of the document being rendered and `currentUrl` its
+ * address as the server gave it: its relative links resolve against them, and
+ * its GitHub-document links are marked for the reader to open in-app
+ * (`resolveDocumentHref`). Without them, only absolute document links are
+ * marked and relative references stay text.
  */
-export function renderDocumentMarkdown(markdown: string): string {
+export function renderDocumentMarkdown(markdown: string, currentKey?: string, currentUrl?: string): string {
   const escaped = escapeHtml(markdown.replace(/\u0000/g, "").replace(/\r\n?/g, "\n"));
   const lines = escaped.split("\n");
   const blocks: string[] = [];
@@ -257,7 +483,7 @@ export function renderDocumentMarkdown(markdown: string): string {
       const seen = headingCounts.get(base) ?? 0;
       headingCounts.set(base, seen + 1);
       const id = seen === 0 ? base : `${base}-${seen + 1}`;
-      blocks.push(`<h${marks.length} id="${id}">${renderInline(text, 0)}</h${marks.length}>`);
+      blocks.push(`<h${marks.length} id="${id}">${renderInline(text, 0, currentKey ?? null, currentUrl ?? null)}</h${marks.length}>`);
       at += 1;
       continue;
     }
@@ -276,9 +502,9 @@ export function renderDocumentMarkdown(markdown: string): string {
         rows.push(tableCells(row));
         at += 1;
       }
-      const head = header.map((cell) => `<th>${renderInline(cell, 0)}</th>`).join("");
+      const head = header.map((cell) => `<th>${renderInline(cell, 0, currentKey ?? null, currentUrl ?? null)}</th>`).join("");
       const body = rows
-        .map((row) => `<tr>${row.map((cell) => `<td>${renderInline(cell, 0)}</td>`).join("")}</tr>`)
+        .map((row) => `<tr>${row.map((cell) => `<td>${renderInline(cell, 0, currentKey ?? null, currentUrl ?? null)}</td>`).join("")}</tr>`)
         .join("");
       blocks.push(`<table><thead><tr>${head}</tr></thead>${body === "" ? "" : `<tbody>${body}</tbody>`}</table>`);
       continue;
@@ -291,7 +517,7 @@ export function renderDocumentMarkdown(markdown: string): string {
         quoted.push(quoteLine.replace(/^&gt;\s?/, ""));
         at += 1;
       }
-      blocks.push(`<blockquote><p>${renderInline(quoted.join(" "), 0)}</p></blockquote>`);
+      blocks.push(`<blockquote><p>${renderInline(quoted.join(" "), 0, currentKey ?? null, currentUrl ?? null)}</p></blockquote>`);
       continue;
     }
     const unordered = /^[-*+]\s+(.*)$/.exec(line);
@@ -308,7 +534,7 @@ export function renderDocumentMarkdown(markdown: string): string {
         at += 1;
       }
       const tag = isOrdered ? "ol" : "ul";
-      blocks.push(`<${tag}>${items.map((item) => `<li>${renderInline(item, 0)}</li>`).join("")}</${tag}>`);
+      blocks.push(`<${tag}>${items.map((item) => `<li>${renderInline(item, 0, currentKey ?? null, currentUrl ?? null)}</li>`).join("")}</${tag}>`);
       continue;
     }
     const paragraph: string[] = [];
@@ -319,7 +545,7 @@ export function renderDocumentMarkdown(markdown: string): string {
       paragraph.push(text);
       at += 1;
     }
-    blocks.push(`<p>${renderInline(paragraph.join("\n"), 0)}</p>`);
+    blocks.push(`<p>${renderInline(paragraph.join("\n"), 0, currentKey ?? null, currentUrl ?? null)}</p>`);
   }
   return blocks.join("\n");
 }
