@@ -5,7 +5,7 @@ priority: 1
 issue_type: bug
 assignee: mu-wrkslots
 created_at: 2026-11-08T00:20:00.000000000+00:00
-updated_at: 2026-11-08T00:20:00.000000000+00:00
+updated_at: 2026-11-08T00:25:00.000000000+00:00
 ---
 
 # Description
@@ -33,3 +33,9 @@ The Rust edition has the same refusal in rs/wrkslotsd/src/journal_state.rs (near
 # Notes
 
 Order for mu-wrkslots: after #993, ahead of #1029 clean-caches-skip-running-gate.
+
+## Concurrent operation (reported by the consumer, 2026-11-07)
+
+- The concurrent mutation was a wrkslots reclaim/finish of one of the consumer's slots, EVENTS 43965-43977: prepared 00:02:28Z, fenced 00:02:44-00:03:09Z, removed 00:03:11Z, completed 00:03:21Z (2026-11-08 UTC). The refusal window overlaps the prepared-to-fenced span.
+- The standalone journal compared mid-flight was worktrees/ACTIVE.<machine>.journal (cli.py _journal_path), live for that reclaim. By 00:04:30Z it was absent and classify said NONBLOCKING, journals=0.
+- Repro suggestion: run a slot reclaim (prepare -> fence -> remove) concurrently with classify-create-journals.
