@@ -1,11 +1,12 @@
 ---
 title: 'predict-false-examples: training keeps decided examples for changes that had already landed'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-predict
 created_at: 2026-11-08T15:52:20.000000000+00:00
-updated_at: 2026-11-08T15:52:20.000000000+00:00
+updated_at: 2026-11-08T23:49:35.000000000+00:00
+closed_at: 2026-11-08T23:49:35.000000000+00:00
 ---
 
 # Description
@@ -30,3 +31,7 @@ Decided predictor examples can be false. On a live queue, an intake bug re-queue
 # Notes
 
 Reported 2026-11-08 from a live queue (the false example came from an intake re-queue after landing). Companion to the disjoint-root stacking work filed the same day; separable because this is predictor label hygiene with no scheduling effect.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 612c9b57 (range tip e0b5769ff5f137c270b5806fbdf8b2b3ac480b44). `predict::dropped_landed` keys false instances by `(run, validation, pr)` from earlier real landings of the same `(pr, head)` (shadow landings ignored, empty heads fail open, landing validation kept); `examples` drops them per change in both polarities with history folding unchanged, and `Model.excluded_landed` counts them through the same helper, mutually exclusive with the red-class counter. Tests cover cross-run and same-run drops, new heads, mixed-batch siblings, shadow sources, and counter exclusivity; the submit-time-vector equality test still passes. Gate evidence as in the disjoint-root-stacking resolution.
