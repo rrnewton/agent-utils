@@ -6,12 +6,15 @@
 //! This module covers record types and read/validate: [`ProcessIdentity`],
 //! [`HarnessRecord`], [`parse_harness_record`], and [`HarnessRecord::document`],
 //! plus the kernel evidence those records are checked against:
-//! [`current_boot_id`], [`read_stat`], and [`scan_processes`]. Process pinning
-//! via pidfds, harness-tree cleanup, and cgroup containment live elsewhere.
+//! [`current_boot_id`], [`read_stat`], and [`scan_processes`], and pidfd
+//! pinning ([`pin`], [`PinnedProcess`], [`stop_process`]). Harness-tree
+//! cleanup and cgroup containment live elsewhere.
 
 use std::fmt;
 use std::io::Read as _;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use super::procstat::{parse_process_stat, ProcessStat};
 
@@ -46,6 +49,10 @@ impl ForeignOwnershipError {
             code: "runner_identity_unknown",
             message,
         }
+    }
+
+    fn new(code: &'static str, message: String) -> Self {
+        Self { code, message }
     }
 }
 
@@ -282,6 +289,405 @@ pub fn scan_processes_at(proc_root: &Path) -> Result<Vec<ProcessStat>, ForeignOw
         }
     }
     Ok(found)
+}
+
+/// Process states that are positive death certificates (`_DEAD_STATES`).
+const DEAD_STATES: [&str; 3] = ["Z", "X", "x"];
+
+/// True when this host provides `pidfd_open` and `pidfd_send_signal`.
+#[cfg(target_os = "linux")]
+pub fn pidfds_supported() -> bool {
+    open_pidfd(std::process::id() as i64)
+        .map(|descriptor| descriptor.is_some())
+        .unwrap_or(false)
+}
+
+/// True when this host provides `pidfd_open` and `pidfd_send_signal`.
+#[cfg(not(target_os = "linux"))]
+pub fn pidfds_supported() -> bool {
+    false
+}
+
+/// Open a pidfd; `None` when the number names no process.
+#[cfg(target_os = "linux")]
+fn open_pidfd(pid: i64) -> std::io::Result<Option<OwnedFd>> {
+    for _attempt in 0..4 {
+        // SAFETY: pidfd_open takes scalar arguments and returns a fresh descriptor.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0_u32) };
+        if descriptor >= 0 {
+            let descriptor = i32::try_from(descriptor).map_err(|_| {
+                std::io::Error::other("pidfd_open returned an out-of-range descriptor")
+            })?;
+            // SAFETY: the successful syscall returned a fresh descriptor owned here.
+            return Ok(Some(unsafe { OwnedFd::from_raw_fd(descriptor) }));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "pidfd_open was interrupted repeatedly",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_pidfd(_pid: i64) -> std::io::Result<Option<OwnedFd>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "pidfds are Linux-only",
+    ))
+}
+
+/// Poll one descriptor for readability; `None` waits without bound.
+fn fd_readable(descriptor: &OwnedFd, timeout: Option<Duration>) -> bool {
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    loop {
+        let millis = match deadline {
+            None => -1,
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX)
+            }
+        };
+        let mut poll = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd, retained for the call.
+        let result = unsafe { libc::poll(&raw mut poll, 1, millis) };
+        if result > 0 {
+            return poll.revents != 0;
+        }
+        if result == 0 {
+            return false;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return false;
+        }
+    }
+}
+
+/// One exact process generation held by a pidfd.
+#[derive(Debug)]
+pub struct PinnedProcess {
+    pid: i64,
+    starttime: u64,
+    descriptor: OwnedFd,
+}
+
+impl PinnedProcess {
+    /// The pinned process number.
+    pub fn pid(&self) -> i64 {
+        self.pid
+    }
+
+    /// The kernel start ticks proved when the process was pinned.
+    pub fn starttime(&self) -> u64 {
+        self.starttime
+    }
+
+    /// The open pidfd.
+    pub fn descriptor(&self) -> &OwnedFd {
+        &self.descriptor
+    }
+
+    /// True once the process has exited (it may still await its parent's reap).
+    pub fn exited(&self) -> bool {
+        fd_readable(&self.descriptor, Some(Duration::ZERO))
+    }
+
+    /// Wait up to `timeout` (`None`: without bound) for exit; true when it exited.
+    pub fn wait(&self, timeout: Option<Duration>) -> bool {
+        fd_readable(&self.descriptor, timeout)
+    }
+
+    /// Signal exactly this process; false when it has exited or refuses the
+    /// signal. A refusal must not abort a cleanup halfway; the member is
+    /// then reported as remaining.
+    #[cfg(target_os = "linux")]
+    pub fn send(&self, signum: i32) -> bool {
+        // SAFETY: the pidfd addresses a stable process identity; null siginfo
+        // is the documented ordinary signal form.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.descriptor.as_raw_fd(),
+                signum,
+                std::ptr::null::<libc::siginfo_t>(),
+                0_u32,
+            )
+        };
+        result >= 0
+    }
+
+    /// Signal exactly this process; pidfds are Linux-only.
+    #[cfg(not(target_os = "linux"))]
+    pub fn send(&self, _signum: i32) -> bool {
+        false
+    }
+
+    /// Release the pidfd.
+    pub fn close(self) {}
+}
+
+/// Whether [`pin`] proved the recorded process alive, gone, or neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinVerdict {
+    /// The pidfd holds the recorded process (`ALIVE`).
+    Alive,
+    /// Positive death certificate (`GONE`).
+    Gone,
+    /// Neither proved; never authorizes a signal (`UNPROVEN`).
+    Unproven,
+}
+
+/// Outcome of pinning one recorded identity.
+#[derive(Debug)]
+pub struct Pin {
+    /// The pin verdict.
+    pub verdict: PinVerdict,
+    /// Why this verdict, for operator-facing errors.
+    pub reason: String,
+    /// The held process, for [`PinVerdict::Alive`] only.
+    pub process: Option<PinnedProcess>,
+}
+
+fn gone(reason: String) -> Pin {
+    Pin {
+        verdict: PinVerdict::Gone,
+        reason,
+        process: None,
+    }
+}
+
+fn unproven(reason: String) -> Pin {
+    Pin {
+        verdict: PinVerdict::Unproven,
+        reason,
+        process: None,
+    }
+}
+
+/// Proof callback for a record without a boot identity (`legacy_proof`).
+pub type LegacyProof<'a> = &'a dyn Fn(i64, &ProcessStat) -> bool;
+
+/// Pin a recorded process, or prove it gone, or say why neither is possible.
+///
+/// [`PinVerdict::Gone`] is a positive death certificate: a different boot, no
+/// such process, a newer process under the number, or an exited one.
+/// [`PinVerdict::Unproven`] never authorizes a signal. A record without a boot
+/// identity is pinned only when `legacy_proof` accepts the process.
+pub fn pin(
+    identity: &ProcessIdentity,
+    legacy_proof: Option<LegacyProof<'_>>,
+) -> Result<Pin, ForeignOwnershipError> {
+    pin_at(Path::new(PROC), identity, legacy_proof)
+}
+
+/// [`pin`] against an explicit procfs root (for tests). The pidfd itself
+/// always names the real process.
+pub fn pin_at(
+    proc_root: &Path,
+    identity: &ProcessIdentity,
+    legacy_proof: Option<LegacyProof<'_>>,
+) -> Result<Pin, ForeignOwnershipError> {
+    let pid = identity.pid;
+    if !(2..=MAX_PROCESS_ID).contains(&pid) {
+        return Ok(unproven(format!(
+            "recorded pid {pid} is not a valid process number"
+        )));
+    }
+    let boot = current_boot_id_at(proc_root)?;
+    if let Some(recorded_boot) = &identity.boot_id {
+        if !valid_boot_id(recorded_boot) {
+            return Ok(unproven(format!(
+                "pid {pid} has a malformed recorded boot identity"
+            )));
+        }
+        if *recorded_boot != boot {
+            if current_boot_id_at(proc_root)? == boot {
+                return Ok(gone(format!(
+                    "pid {pid} was recorded during an earlier boot"
+                )));
+            }
+            return Ok(unproven(
+                "the boot identity changed while it was read".to_owned(),
+            ));
+        }
+    }
+    if let Some(started_at) = &identity.started_at {
+        if !valid_ticks(started_at) {
+            return Ok(unproven(format!(
+                "pid {pid} has an unreadable recorded start time '{started_at}'"
+            )));
+        }
+    }
+    if !pidfds_supported() {
+        let current = read_stat_at(proc_root, pid)?;
+        let mismatch = match (&current, &identity.started_at) {
+            (None, _) => true,
+            (Some(current), Some(started_at)) => current.starttime.to_string() != *started_at,
+            (Some(_), None) => false,
+        };
+        if mismatch {
+            return Ok(gone(format!(
+                "pid {pid} no longer names the recorded process"
+            )));
+        }
+        return Ok(unproven(
+            "this host does not provide pidfds, so the process cannot be pinned".to_owned(),
+        ));
+    }
+    let descriptor = open_pidfd(pid).map_err(|error| {
+        ForeignOwnershipError::runner_identity_unknown(format!(
+            "cannot open a pidfd for pid {pid}: {error}"
+        ))
+    })?;
+    let Some(descriptor) = descriptor else {
+        if current_boot_id_at(proc_root)? == boot {
+            return Ok(gone(format!("pid {pid} has exited")));
+        }
+        return Ok(unproven(
+            "the boot identity changed while it was read".to_owned(),
+        ));
+    };
+    let current = read_stat_at(proc_root, pid)?;
+    let Some(current) = current else {
+        if fd_readable(&descriptor, Some(Duration::ZERO)) {
+            return Ok(gone(format!("pid {pid} has exited")));
+        }
+        return Ok(unproven(format!(
+            "pid {pid} vanished from procfs while its pidfd was open"
+        )));
+    };
+    let Some(started_at) = &identity.started_at else {
+        return Ok(unproven(format!(
+            "pid {pid} has no recorded start time, so its generation is unknown"
+        )));
+    };
+    if current.starttime.to_string() != *started_at {
+        return Ok(gone(format!("pid {pid} now names a newer process")));
+    }
+    if DEAD_STATES.contains(&current.state.as_str()) {
+        return Ok(gone(format!("pid {pid} has exited")));
+    }
+    if identity.boot_id.is_none() && !legacy_proof.is_some_and(|proof| proof(pid, &current)) {
+        return Ok(unproven(format!(
+            "pid {pid} has a legacy record without a boot identity and is not proven"
+        )));
+    }
+    if fd_readable(&descriptor, Some(Duration::ZERO)) {
+        return Ok(gone(format!("pid {pid} has exited")));
+    }
+    Ok(Pin {
+        verdict: PinVerdict::Alive,
+        reason: format!("pid {pid} is the recorded process"),
+        process: Some(PinnedProcess {
+            pid,
+            starttime: current.starttime,
+            descriptor,
+        }),
+    })
+}
+
+/// How long a cleanup waits for SIGKILLed processes to disappear. A process
+/// in uninterruptible sleep outlives this bound and is reported, not
+/// forgotten. (`$SUBAGENTS_HARNESS_KILL_WAIT`, default 10 seconds, as in
+/// Python's `KILL_WAIT_S`; read per call rather than at import.)
+fn default_kill_wait() -> Duration {
+    std::env::var("SUBAGENTS_HARNESS_KILL_WAIT")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(|seconds| Duration::from_secs_f64(seconds.max(0.0)))
+        .unwrap_or(Duration::from_secs(10))
+}
+
+/// Python's `f"{bound:g}s"` shape for a seconds bound.
+fn format_seconds(bound: Duration) -> String {
+    let seconds = bound.as_secs_f64();
+    if seconds.fract() == 0.0 {
+        format!("{}", seconds as i64)
+    } else {
+        let text = format!("{seconds:.6}");
+        text.trim_end_matches('0').trim_end_matches('.').to_owned()
+    }
+}
+
+/// SIGTERM, then after `grace` SIGKILL, one pinned process.
+///
+/// Returns false when the process was already gone. An unprovable identity
+/// errors with `runner_identity_unproven` (or `pidfd_unsupported`) without a
+/// signal, and a process that outlives SIGKILL by `kill_wait` (default:
+/// [`default_kill_wait`]) errors with `runner_stop_incomplete`.
+pub fn stop_process(
+    identity: &ProcessIdentity,
+    grace: Duration,
+    legacy_proof: Option<LegacyProof<'_>>,
+    kill_wait: Option<Duration>,
+    label: &str,
+) -> Result<bool, ForeignOwnershipError> {
+    stop_process_at(
+        Path::new(PROC),
+        identity,
+        grace,
+        legacy_proof,
+        kill_wait,
+        label,
+    )
+}
+
+/// [`stop_process`] against an explicit procfs root (for tests).
+pub fn stop_process_at(
+    proc_root: &Path,
+    identity: &ProcessIdentity,
+    grace: Duration,
+    legacy_proof: Option<LegacyProof<'_>>,
+    kill_wait: Option<Duration>,
+    label: &str,
+) -> Result<bool, ForeignOwnershipError> {
+    let result = pin_at(proc_root, identity, legacy_proof)?;
+    if result.verdict == PinVerdict::Gone {
+        return Ok(false);
+    }
+    let Some(process) = result.process else {
+        let code = if pidfds_supported() {
+            "runner_identity_unproven"
+        } else {
+            "pidfd_unsupported"
+        };
+        return Err(ForeignOwnershipError::new(
+            code,
+            format!("refusing to signal {label}: {}", result.reason),
+        ));
+    };
+    process.send(libc::SIGTERM);
+    if process.wait(Some(grace)) {
+        return Ok(true);
+    }
+    process.send(libc::SIGKILL);
+    let bound = kill_wait.unwrap_or_else(default_kill_wait);
+    if process.wait(Some(bound)) {
+        return Ok(true);
+    }
+    let state = quiet_stat_at(proc_root, process.pid());
+    Err(ForeignOwnershipError::new(
+        "runner_stop_incomplete",
+        format!(
+            "{label} pid {} is still present {}s after SIGKILL{}",
+            process.pid(),
+            format_seconds(bound),
+            state.map_or(String::new(), |state| format!(" (state {})", state.state))
+        ),
+    ))
 }
 
 fn process_number(value: Option<&serde_json::Value>) -> Option<i64> {
@@ -668,5 +1074,204 @@ mod tests {
         let stat = read_stat(own).unwrap().unwrap();
         assert_eq!(stat.pid, own);
         assert!(scan_processes().unwrap().iter().any(|s| s.pid == own));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_sleep() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .expect("spawn sleep child")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn identity_of(pid: i64) -> ProcessIdentity {
+        let stat = read_stat(pid).unwrap().unwrap();
+        ProcessIdentity::new(
+            pid,
+            Some(stat.starttime.to_string()),
+            Some(current_boot_id().unwrap()),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reap(child: &mut std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pin_requires_the_recorded_boot_and_start_tick() {
+        if !pidfds_supported() {
+            return;
+        }
+        let mut child = spawn_sleep();
+        let pid = i64::from(child.id());
+        let exact = identity_of(pid);
+
+        let pinned = pin(&exact, None).unwrap();
+        assert_eq!(pinned.verdict, PinVerdict::Alive);
+        let process = pinned.process.unwrap();
+        assert_eq!(process.pid(), pid);
+        assert!(!process.exited());
+        process.close();
+
+        let stale = ProcessIdentity::new(
+            pid,
+            Some((exact.started_at.as_deref().unwrap().parse::<u64>().unwrap() + 1).to_string()),
+            exact.boot_id.clone(),
+        );
+        assert_eq!(pin(&stale, None).unwrap().verdict, PinVerdict::Gone);
+
+        let other_boot = ProcessIdentity::new(
+            pid,
+            exact.started_at.clone(),
+            Some("00000000-0000-4000-8000-000000000000".to_owned()),
+        );
+        let result = pin(&other_boot, None).unwrap();
+        assert_eq!(result.verdict, PinVerdict::Gone);
+        assert!(result.reason.contains("earlier boot"), "{}", result.reason);
+
+        let legacy = ProcessIdentity::new(pid, exact.started_at.clone(), None);
+        assert_eq!(pin(&legacy, None).unwrap().verdict, PinVerdict::Unproven);
+        let proof = |candidate: i64, _stat: &ProcessStat| candidate == pid;
+        let proven = pin(&legacy, Some(&proof)).unwrap();
+        assert_eq!(proven.verdict, PinVerdict::Alive);
+        proven.process.unwrap().close();
+
+        let without_start = ProcessIdentity::new(pid, None, exact.boot_id.clone());
+        assert_eq!(
+            pin(&without_start, None).unwrap().verdict,
+            PinVerdict::Unproven
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child must be untouched"
+        );
+        reap(&mut child);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pin_rejects_invalid_recorded_values() {
+        for identity in [
+            ProcessIdentity::new(1, Some("1".to_owned()), Some(BOOT.to_owned())),
+            ProcessIdentity::new(4242, Some("1".to_owned()), Some("nope".to_owned())),
+            // The boot check runs before the ticks check (as in Python), so
+            // the unreadable-ticks case needs this host's real boot identity.
+            ProcessIdentity::new(
+                4242,
+                Some("01".to_owned()),
+                Some(current_boot_id().unwrap()),
+            ),
+        ] {
+            assert_eq!(
+                pin(&identity, None).unwrap().verdict,
+                PinVerdict::Unproven,
+                "identity: {identity:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_process_never_signals_a_reused_pid_or_an_earlier_boot() {
+        if !pidfds_supported() {
+            return;
+        }
+        let mut child = spawn_sleep();
+        let pid = i64::from(child.id());
+        let exact = identity_of(pid);
+        for recorded in [
+            ProcessIdentity::new(
+                pid,
+                Some(
+                    (exact.started_at.as_deref().unwrap().parse::<u64>().unwrap() - 1).to_string(),
+                ),
+                exact.boot_id.clone(),
+            ),
+            ProcessIdentity::new(
+                pid,
+                exact.started_at.clone(),
+                Some("00000000-0000-4000-8000-000000000000".to_owned()),
+            ),
+        ] {
+            assert!(!stop_process(&recorded, Duration::ZERO, None, None, "runner").unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child must be untouched"
+        );
+        reap(&mut child);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_process_terminates_then_kills_through_the_pidfd() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::ExitStatusExt as _;
+        if !pidfds_supported() {
+            return;
+        }
+        // A cooperative child dies on SIGTERM.
+        let mut coop = spawn_sleep();
+        let coop_identity = identity_of(i64::from(coop.id()));
+        assert!(
+            stop_process(&coop_identity, Duration::from_secs(2), None, None, "runner").unwrap()
+        );
+        assert_eq!(coop.wait().unwrap().signal(), Some(libc::SIGTERM));
+
+        // A stubborn child ignores SIGTERM and dies on SIGKILL after grace.
+        let mut stubborn = std::process::Command::new("bash")
+            .args([
+                "-c",
+                "trap '' TERM; echo ready; while true; do sleep 1; done",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn stubborn child");
+        let mut line = String::new();
+        std::io::BufReader::new(stubborn.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "ready");
+        let stubborn_identity = identity_of(i64::from(stubborn.id()));
+        let started = Instant::now();
+        assert!(stop_process(
+            &stubborn_identity,
+            Duration::from_millis(300),
+            None,
+            Some(Duration::from_secs(5)),
+            "runner"
+        )
+        .unwrap());
+        assert_eq!(stubborn.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_process_refuses_an_unproven_identity_without_a_signal() {
+        if !pidfds_supported() {
+            return;
+        }
+        let mut child = spawn_sleep();
+        let pid = i64::from(child.id());
+        let exact = identity_of(pid);
+        let legacy = ProcessIdentity::new(pid, exact.started_at.clone(), None);
+        let err = stop_process(&legacy, Duration::ZERO, None, None, "runner").unwrap_err();
+        assert_eq!(err.code, "runner_identity_unproven");
+        assert!(
+            err.message.contains("refusing to signal"),
+            "{}",
+            err.message
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child must be untouched"
+        );
+        reap(&mut child);
     }
 }

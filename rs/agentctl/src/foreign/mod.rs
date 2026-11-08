@@ -4,7 +4,8 @@
 //! `ai_docs/transient/2026-11-07-rust-primary/herdr-subagents-port-map.md`).
 //! Slice B3-1 covers the shared ownership/identity core types in
 //! [`ownership`]; slice B3-2 adds the kernel evidence they are checked
-//! against ([`procstat`] plus the procfs readers in [`ownership`]). No CLI
+//! against ([`procstat`] plus the procfs readers in [`ownership`]); slice
+//! B3-3 adds pidfd pinning and `stop_process` in [`ownership`]. No CLI
 //! wiring yet.
 
 pub mod ownership;
