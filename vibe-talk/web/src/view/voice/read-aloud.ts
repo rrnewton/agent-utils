@@ -9,7 +9,7 @@ import { childByClass } from "../../view/dom/index.ts";
 import type { Message } from "../../contract/index.ts";
 import type { ApiRequestOptions } from "../../core/api/index.ts";
 import type { DeviceSettings, ReadAudioSource } from "../../core/settings/index.ts";
-import type { PreparedBlock, SpeechMoment } from "../../core/speech/index.ts";
+import type { PreparedBlock, PreparedEntry, SpeechMoment } from "../../core/speech/index.ts";
 import type { AudioPort, SpeechSynthesisPort } from "../../ports/index.ts";
 import type { ElementById } from "../dom/index.ts";
 
@@ -2878,138 +2878,20 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   }
 
   /**
-   * Read one ROW aloud, and archive everything in it when the audio finishes.
-   *
-   * Tapping the message that is already playing STOPS it, so the same gesture is its own cancel and
-   * the reader is never stuck listening to something they have finished with.
-   *
-   * A COMBINED ROW IS READ WHOLE, in parts, in order. The server speaks one Discord message per
-   * request — it reads the message's OWN text and will not be handed a string, which is what stops
-   * this route from becoming a way to spend the operator's vendor balance on anything at all — so a
-   * row of two messages is two requests played back to back. Buffered parts are all fetched before
-   * any is played: a gap in the middle of what the reader hears as one message, while the second
-   * half is synthesised, is exactly the seam this feature exists to remove. A streamed part is
-   * requested as soon as the one before it has audio, which queues it behind that part on the
-   * server's session in order, and generation keeps ahead of playback.
-   *
-   * @param {Array<string>} ids the row's Discord ids, oldest first.
+   * Play a read whose parts are prepared (`ready`) or fetched whole (`objectUrls`): the players,
+   * one a segment, asked for one ahead and scheduled end to end, with the read's ticket, recovery
+   * and failure rules as `readAloud` has always run them. `onEnded` is the read heard to its end:
+   * the caller's, because what an ending does is the caller's business. Extracted unchanged from
+   * `readAloud` for `#1039 documents-read-parity`, so a document read can play by the same rules.
    */
-  async function readAloud(ids: string[], from: ReadFrom | null = null) {
-    const tapBegan = speechTimingNow();
-    const parts = ids.map(String);
-    // THE ROW'S IDENTITY is its first message, everywhere: the highlight, the pending mark and the
-    // ticket all key on it, so that "which row is speaking" is one question with one answer.
-    const id = parts[0]!;
-    // A SECOND TAP IS AN ABORT, whether or not the audio has started. Pending counts: the wait is
-    // where a mis-tap is noticed — the message is long, the reader realises they did not want it,
-    // and the only thing they can do is tap the thing they just tapped. Checking `nowPlaying` alone
-    // made that start a SECOND read instead of cancelling the first.
-    //
-    // `#376 read-aloud-blocks`. Not a JUMP: `from` moves a read to another of its blocks.
-    const already = from === null && ((nowPlaying !== null && nowPlaying!.id === id) || pendingRead === id);
-    // Also cancels anything still being fetched, so a double tap cannot end in two players.
-    stopReading();
-    if (already || parts.length === 0) {
-      return;
-    }
-    const channel = deps.selectedChannelId();
-    if (!channel) {
-      return;
-    }
-    const ticket = readingTicket;
-    // BEFORE the await, and this is the point: everything below is remote, and the reader is owed an
-    // answer now rather than when ElevenLabs is finished.
-    pendingRead = id;
-    setReadState("working");
-    // In both columns: the row asked for may be in either. `#229 desktop-two-column`.
-    deps.eachColumn(deps.renderChannelRows);
-    if (readAloudPlayback !== "audio") {
-      try {
-        if (readAloudPlayback !== "browser") throw new Error("This speech playback method is not supported by this page.");
-        readWithBrowserSpeech(parts, id, ticket);
-      } catch (error) {
-        if (ticket === readingTicket) {
-          stopReading();
-          setReadState("failed");
-          deps.setStatus((error as Error).message);
-        }
-        throw error;
-      }
-      return;
-    }
-    // Still inside the tap, before anything is awaited: the only moment a browser lets audio start.
-    readAloudAudioContext();
-    primeReadAloudKeeper();
-    // `#376 read-aloud-blocks`. A read in blocks asks for its last block minutes after the tap, so a
-    // ticket with little life left is prepared again now rather than failing part-way through.
-    for (const part of parts) {
-      const entry = preparedEntry(part);
-      if (entry && entry.blocks && ticketTooShortForBlocks(entry, speechDeadlineNow())) preparedSpeech.forget(part);
-    }
-    // THE FAST PATH, and the whole point of preparing: every part already has a URL that streams, so
-    // there is nothing to fetch and nothing to wait for. The player is handed the URL and the browser
-    // starts playing against a response the server is still writing.
-    // `#290 speech-ticket-refresh`: a URL whose ticket has ended is not ready, and is prepared again below.
-    let ready = parts.map((part) => preparedEntry(part));
-    let streamed = ready.every((entry) => entry && typeof entry.url === "string" && entry.url.length > 0);
-    // Turning Read on starts preparing the whole screen in the background. A tap that comes before
-    // that reaches this row does NOT wait for it: it prepares this row alone and reads it, and the
-    // batch for the rest carries on behind. `#191 read-aloud-first-lag`.
-    if (!streamed) {
-      await prepareSpeechFor(parts);
-      if (ticket !== readingTicket) return;
-      ready = parts.map((part) => preparedEntry(part));
-      streamed = ready.every((entry) => entry && typeof entry.url === "string" && entry.url.length > 0);
-      deps.guardQuietly(prepareSpeech)();
-    }
-    let blobs;
-    if (streamed) {
-      blobs = null;
-    } else {
-    try {
-      blobs = await Promise.all(parts.map((part) => fetchSpeech(channel, part)));
-    } catch (error) {
-      if (ticket === readingTicket) {
-        pendingRead = null;
-        setReadState("failed");
-        deps.eachColumn(deps.renderChannelRows);
-      }
-      // BOTH places, and this one is why it is caught here at all: `guardQuietly` puts the reason in
-      // the standing error panel, which is right for a background failure and wrong for a tap. The
-      // reader touched a specific message and is waiting to hear it; the answer belongs on the line
-      // under their thumb as well. Rethrown, so the panel still gets it.
-      deps.setStatus(`could not read that message aloud: ${(error as Error).message}`);
-      throw error;
-    }
-    }
-    // THE TICKET CHECK, and it is the whole fix. Anything that happened while this was in flight --
-    // another tap, a stop, leaving the view -- has already moved the ticket on, and this audio is
-    // something nobody is waiting for any more. Dropped before a player exists, because a player
-    // that exists is a player that can be heard.
-    if (ticket !== readingTicket) {
-      return;
-    }
-    // The wait is over: it is being READ now, not merely asked for.
-    pendingRead = null;
-    // `objectUrls` is what has to be REVOKED later, and a streamed URL is not one of them: it belongs
-    // to the server and revoking it would be meaningless. Keeping the two apart is what stops the
-    // cleanup either leaking blobs or throwing on something it does not own.
-    const objectUrls = streamed ? [] : blobs!.map((blob) => URL.createObjectURL(blob));
-    const selection = speechSelection();
-    // `#376 read-aloud-blocks`. What is played, in order: every block of every message in the row, or
-    // the whole message where it is one block or was not prepared in blocks.
-    const segments = streamed ? speechSegments(ready) : parts.map((_part, part) => ({ part, block: null }));
-    const sources = streamed
-      ? segments.map((segment) => `${ready[segment.part]!.url}?selection=${selection}` +
-        (segment.block === null ? "" : `&block=${segment.block}`))
-      : objectUrls;
-    // Where this read starts: the block a jump asked for, else the first.
-    const first = from === null ? 0 : Math.max(0, segments.findIndex((segment) =>
-      segment.part === from.part && (from.block === null || segment.block === null || segment.block >= from.block)));
+  async function playPreparedRead(read: {
+    id: string; parts: string[]; ticket: number; tapBegan: number; streamed: boolean;
+    ready: (PreparedEntry | null)[]; objectUrls: string[]; segments: SpeechSegment[];
+    sources: string[]; first: number; recovery: number; hold: boolean; onEnded: () => void;
+  }) {
+    const { id, parts, ticket, tapBegan, streamed, ready, objectUrls, segments, sources, first, hold, onEnded } = read;
+    let { recovery } = read;
     const clock = readClock();
-    // `#487 read-aloud-recovery`. How many times this read has been started again after a part failed
-    // on the way, since a part last played to its end.
-    let recovery = from !== null && Number.isInteger(from.recovery) ? from.recovery! : 0;
     // The blocks the read was prepared in travel with it, so a pace change that forgets what was
     // prepared does not take the light off the read in progress.
     const blocks = ready.map((entry) => (entry && entry.blocks) || null);
@@ -3165,12 +3047,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
           startNext(at + 1);
           return;
         }
-        // `#886 voice-page-autoplay`: what reads next is found before the archive can redraw the list.
-        const next = deps.nextAfterRead ? deps.nextAfterRead(parts) : null;
-        endReadGoingOn(next !== null);
-        // EVERY constituent. A row read to the end is a row the reader has heard all of, and
-        // archiving only the first would leave its own tail in the queue.
-        goOnAfterRead(next, deps.guardQuietly(() => deps.dismissMessages({ messages: parts }))());
+        onEnded();
       });
       audio.addEventListener("error", (why: unknown, detail?: unknown) => {
         if (ticket !== readingTicket) {
@@ -3270,8 +3147,155 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // A jump made while held cues this block up held (`#434 read-aloud-pause`): the hold lands in
     // the same tick the player starts, before a streamed part's cushion or an element's first
     // sound can be heard.
-    if (from !== null && from.hold === true) pauseReading();
+    if (hold) pauseReading();
     await begun;
+  }
+
+  /**
+   * Read one ROW aloud, and archive everything in it when the audio finishes.
+   *
+   * Tapping the message that is already playing STOPS it, so the same gesture is its own cancel and
+   * the reader is never stuck listening to something they have finished with.
+   *
+   * A COMBINED ROW IS READ WHOLE, in parts, in order. The server speaks one Discord message per
+   * request — it reads the message's OWN text and will not be handed a string, which is what stops
+   * this route from becoming a way to spend the operator's vendor balance on anything at all — so a
+   * row of two messages is two requests played back to back. Buffered parts are all fetched before
+   * any is played: a gap in the middle of what the reader hears as one message, while the second
+   * half is synthesised, is exactly the seam this feature exists to remove. A streamed part is
+   * requested as soon as the one before it has audio, which queues it behind that part on the
+   * server's session in order, and generation keeps ahead of playback.
+   *
+   * @param {Array<string>} ids the row's Discord ids, oldest first.
+   */
+  async function readAloud(ids: string[], from: ReadFrom | null = null) {
+    const tapBegan = speechTimingNow();
+    const parts = ids.map(String);
+    // THE ROW'S IDENTITY is its first message, everywhere: the highlight, the pending mark and the
+    // ticket all key on it, so that "which row is speaking" is one question with one answer.
+    const id = parts[0]!;
+    // A SECOND TAP IS AN ABORT, whether or not the audio has started. Pending counts: the wait is
+    // where a mis-tap is noticed — the message is long, the reader realises they did not want it,
+    // and the only thing they can do is tap the thing they just tapped. Checking `nowPlaying` alone
+    // made that start a SECOND read instead of cancelling the first.
+    //
+    // `#376 read-aloud-blocks`. Not a JUMP: `from` moves a read to another of its blocks.
+    const already = from === null && ((nowPlaying !== null && nowPlaying!.id === id) || pendingRead === id);
+    // Also cancels anything still being fetched, so a double tap cannot end in two players.
+    stopReading();
+    if (already || parts.length === 0) {
+      return;
+    }
+    const channel = deps.selectedChannelId();
+    if (!channel) {
+      return;
+    }
+    const ticket = readingTicket;
+    // BEFORE the await, and this is the point: everything below is remote, and the reader is owed an
+    // answer now rather than when ElevenLabs is finished.
+    pendingRead = id;
+    setReadState("working");
+    // In both columns: the row asked for may be in either. `#229 desktop-two-column`.
+    deps.eachColumn(deps.renderChannelRows);
+    if (readAloudPlayback !== "audio") {
+      try {
+        if (readAloudPlayback !== "browser") throw new Error("This speech playback method is not supported by this page.");
+        readWithBrowserSpeech(parts, id, ticket);
+      } catch (error) {
+        if (ticket === readingTicket) {
+          stopReading();
+          setReadState("failed");
+          deps.setStatus((error as Error).message);
+        }
+        throw error;
+      }
+      return;
+    }
+    // Still inside the tap, before anything is awaited: the only moment a browser lets audio start.
+    readAloudAudioContext();
+    primeReadAloudKeeper();
+    // `#376 read-aloud-blocks`. A read in blocks asks for its last block minutes after the tap, so a
+    // ticket with little life left is prepared again now rather than failing part-way through.
+    for (const part of parts) {
+      const entry = preparedEntry(part);
+      if (entry && entry.blocks && ticketTooShortForBlocks(entry, speechDeadlineNow())) preparedSpeech.forget(part);
+    }
+    // THE FAST PATH, and the whole point of preparing: every part already has a URL that streams, so
+    // there is nothing to fetch and nothing to wait for. The player is handed the URL and the browser
+    // starts playing against a response the server is still writing.
+    // `#290 speech-ticket-refresh`: a URL whose ticket has ended is not ready, and is prepared again below.
+    let ready = parts.map((part) => preparedEntry(part));
+    let streamed = ready.every((entry) => entry && typeof entry.url === "string" && entry.url.length > 0);
+    // Turning Read on starts preparing the whole screen in the background. A tap that comes before
+    // that reaches this row does NOT wait for it: it prepares this row alone and reads it, and the
+    // batch for the rest carries on behind. `#191 read-aloud-first-lag`.
+    if (!streamed) {
+      await prepareSpeechFor(parts);
+      if (ticket !== readingTicket) return;
+      ready = parts.map((part) => preparedEntry(part));
+      streamed = ready.every((entry) => entry && typeof entry.url === "string" && entry.url.length > 0);
+      deps.guardQuietly(prepareSpeech)();
+    }
+    let blobs;
+    if (streamed) {
+      blobs = null;
+    } else {
+    try {
+      blobs = await Promise.all(parts.map((part) => fetchSpeech(channel, part)));
+    } catch (error) {
+      if (ticket === readingTicket) {
+        pendingRead = null;
+        setReadState("failed");
+        deps.eachColumn(deps.renderChannelRows);
+      }
+      // BOTH places, and this one is why it is caught here at all: `guardQuietly` puts the reason in
+      // the standing error panel, which is right for a background failure and wrong for a tap. The
+      // reader touched a specific message and is waiting to hear it; the answer belongs on the line
+      // under their thumb as well. Rethrown, so the panel still gets it.
+      deps.setStatus(`could not read that message aloud: ${(error as Error).message}`);
+      throw error;
+    }
+    }
+    // THE TICKET CHECK, and it is the whole fix. Anything that happened while this was in flight --
+    // another tap, a stop, leaving the view -- has already moved the ticket on, and this audio is
+    // something nobody is waiting for any more. Dropped before a player exists, because a player
+    // that exists is a player that can be heard.
+    if (ticket !== readingTicket) {
+      return;
+    }
+    // The wait is over: it is being READ now, not merely asked for.
+    pendingRead = null;
+    // `objectUrls` is what has to be REVOKED later, and a streamed URL is not one of them: it belongs
+    // to the server and revoking it would be meaningless. Keeping the two apart is what stops the
+    // cleanup either leaking blobs or throwing on something it does not own.
+    const objectUrls = streamed ? [] : blobs!.map((blob) => URL.createObjectURL(blob));
+    const selection = speechSelection();
+    // `#376 read-aloud-blocks`. What is played, in order: every block of every message in the row, or
+    // the whole message where it is one block or was not prepared in blocks.
+    const segments = streamed ? speechSegments(ready) : parts.map((_part, part) => ({ part, block: null }));
+    const sources = streamed
+      ? segments.map((segment) => `${ready[segment.part]!.url}?selection=${selection}` +
+        (segment.block === null ? "" : `&block=${segment.block}`))
+      : objectUrls;
+    // Where this read starts: the block a jump asked for, else the first.
+    const first = from === null ? 0 : Math.max(0, segments.findIndex((segment) =>
+      segment.part === from.part && (from.block === null || segment.block === null || segment.block >= from.block)));
+    // `#487 read-aloud-recovery`. How many times this read has been started again after a part failed
+    // on the way, since a part last played to its end.
+    const recovery = from !== null && Number.isInteger(from.recovery) ? from.recovery! : 0;
+    await playPreparedRead({
+      id, parts, ticket, tapBegan, streamed, ready, objectUrls, segments, sources, first, recovery,
+      // A jump made while held cues its block up held (`#434 read-aloud-pause`).
+      hold: from !== null && from.hold === true,
+      onEnded: () => {
+        // `#886 voice-page-autoplay`: what reads next is found before the archive can redraw the list.
+        const next = deps.nextAfterRead ? deps.nextAfterRead(parts) : null;
+        endReadGoingOn(next !== null);
+        // EVERY constituent. A row read to the end is a row the reader has heard all of, and
+        // archiving only the first would leave its own tail in the queue.
+        goOnAfterRead(next, deps.guardQuietly(() => deps.dismissMessages({ messages: parts }))());
+      },
+    });
   }
   return {
   initializeReadSteerOffset,
