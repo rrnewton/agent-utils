@@ -479,6 +479,52 @@ impl std::fmt::Display for ClassifyError {
     }
 }
 
+/// Name the journal that blocks host-wide classification (#1086),
+/// mirroring `_journal_classification_refusal`: absolute path, slot,
+/// agent and age best-effort from the journal bytes, inner reason kept.
+fn journal_refusal(path: &Path, inner: &str) -> String {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let parsed: Option<Value> = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let slot = parsed
+        .as_ref()
+        .and_then(|value| value.get("slot"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let agent = parsed
+        .as_ref()
+        .and_then(|value| value.get("agent"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|value| value.get("record"))
+                .and_then(|record| record.get("agent"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("unknown")
+        .to_string();
+    let age = match std::fs::metadata(path).and_then(|meta| meta.modified()) {
+        Ok(modified) => match modified.elapsed() {
+            Ok(elapsed) => format!("{}s", elapsed.as_secs()),
+            Err(_) => "0s".to_string(),
+        },
+        Err(_) => "unknown".to_string(),
+    };
+    format!(
+        "host fault: journal {} (slot {slot:?}, agent {agent:?}, age={age}) blocks create-journal classification: {inner}. remedy: recover or discard the named journal with 'wrkslots recover', then rerun classify-create-journals",
+        absolute.display()
+    )
+}
+
 /// Whether the seal at `path` was left by a process proven dead,
 /// mirroring `_validate_batch_seal_orphaned`: valid seal, actor on
 /// this host and boot, process dead, and no finish journal paired
@@ -1151,7 +1197,10 @@ pub(crate) fn classify_create_journals(
                             journal: filename.clone(),
                         });
                     }
-                    return Err(ClassifyError::Other(mismatch.message(&raw, path)));
+                    return Err(ClassifyError::Other(journal_refusal(
+                        path,
+                        &mismatch.message(&raw, path),
+                    )));
                 }
                 if kind == "create"
                     || ownerless_cargo_home_journal_is_unrelated(&cfg, &raw, slot, slot_type)
@@ -1269,9 +1318,19 @@ fn classify_create_journals_inner(
     for path in &paths {
         // Only create journals are classified; other kinds refuse in
         // classify_one, except a validated ownerless cargo-home removal
-        // disjoint from the requested slot, which is skipped.
-        if let Some(row) = classify_one(&cfg, &config, path, &states, &archives, &slot, slot_type)?
-        {
+        // disjoint from the requested slot, which is skipped.  A busy
+        // result stays bare and retryable; every other per-journal
+        // refusal names its journal as a host fault (#1086).
+        let row = classify_one(&cfg, &config, path, &states, &archives, &slot, slot_type).map_err(
+            |error| {
+                if error.starts_with("busy:") {
+                    error
+                } else {
+                    journal_refusal(path, &error)
+                }
+            },
+        )?;
+        if let Some(row) = row {
             rows.push(row);
         }
     }
@@ -1280,15 +1339,18 @@ fn classify_create_journals_inner(
         let mut seen_agents: BTreeSet<String> = BTreeSet::new();
         for row in &rows {
             if !seen_slots.insert((row.machine.clone(), row.slot.clone())) {
-                return Err(ClassifyError::Other(format!(
-                    "multiple interrupted creates claim {}/{}",
-                    row.machine, row.slot
+                return Err(ClassifyError::Other(journal_refusal(
+                    &row.journal,
+                    &format!(
+                        "multiple interrupted creates claim {}/{}",
+                        row.machine, row.slot
+                    ),
                 )));
             }
             if row.slot_type == "agent" && !seen_agents.insert(row.agent.clone()) {
-                return Err(ClassifyError::Other(format!(
-                    "multiple interrupted creates claim agent {:?}",
-                    row.agent
+                return Err(ClassifyError::Other(journal_refusal(
+                    &row.journal,
+                    &format!("multiple interrupted creates claim agent {:?}", row.agent),
                 )));
             }
         }

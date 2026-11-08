@@ -13401,6 +13401,91 @@ def test_indeterminate_create_process_state_refuses_classification(
     )
 
 
+def test_orphan_create_with_archive_claim_refuses_classification_host_wide(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#1086: a dead-owner create journal whose slot also has an archive
+    record refuses classification for every other slot on the host.
+
+    The lone orphan alone is non-blocking (dead-incomplete-create); the
+    archive claim is the second condition that turns it into a host-wide
+    refusal.  The refusal must name the journal as a host fault.
+    """
+    project, _repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86
+    journal = create_journal_path(project)
+    raw = json.loads(journal.read_text(encoding="utf-8"))
+    config = wrkslots._load_config(str(project), "testhost")
+    finished = "2026-09-02T00:00:00Z"
+    entry: dict[str, object] = {
+        "archive_id": f"testhost:slot01:1:{finished}",
+        "slot": "slot01",
+        "agent": "codex-1",
+        "task": "task-slot01",
+        "purpose": "test slot01",
+        "machine": "testhost",
+        "generation": 1,
+        "created_at": "2026-09-02T00:00:00Z",
+        "finished_at": finished,
+        "mode": "remove",
+        "actor": "coordinator",
+        "physical_storage": "removed",
+        "validation": ["archived before the interrupted create"],
+        "limitations": [],
+        "continuation": "none needed",
+        "checkouts": raw["created"],
+    }
+    archive = wrkslots._load_archive(config)
+    wrkslots._write_archive_state(
+        config,
+        wrkslots.ArchiveState(
+            archive.machine, archive.revision + 1, (*archive.records, entry)
+        ),
+        action="slot-archived",
+        slot="slot01",
+        evidence={"archive_id": entry["archive_id"]},
+    )
+    real_process_state = wrkslots._process_state
+
+    def dead_process_state(
+        identity: wrkslots.ProcessIdentity | None,
+    ) -> tuple[str, str]:
+        if identity is not None and identity.pid == os.getpid():
+            return "dead", f"PID {identity.pid} generation exited"
+        return real_process_state(identity)
+
+    monkeypatch.setattr(wrkslots, "_process_state", dead_process_state)
+    before = journal.read_bytes()
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "classify-create-journals",
+            "slot02",
+            "--slot-type",
+            "validate",
+            "--agent",
+            "validate-slot02",
+            "--format",
+            "json",
+        ]
+    )
+    err = capsys.readouterr().err
+    assert rc == 3
+    assert "host fault" in err
+    assert str(journal) in err
+    assert "slot01" in err and "codex-1" in err
+    assert "age=" in err
+    assert "conflicts with an archive" in err
+    assert "wrkslots recover" in err
+    assert journal.read_bytes() == before
+
+
 def test_matching_legacy_create_event_is_trusted_by_every_consumer(
     tmp_path: Path,
 ) -> None:

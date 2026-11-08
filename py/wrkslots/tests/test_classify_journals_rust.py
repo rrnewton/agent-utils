@@ -477,3 +477,88 @@ def test_classify_journals_empty_matches_python(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert _norm(result.stdout, rust_root) == _norm(out, oracle_root)
     assert "journals=0" in result.stdout
+
+
+def _orphan_archive_claim(root: Path) -> Path:
+    """An interrupted create for slot-b plus an archive record for it.
+
+    #1086: the interrupted create alone classifies non-blocking; the
+    archive claim on the same slot is the second condition that makes
+    classification refuse for every unrelated slot on the host.
+    """
+    _interrupted(root)
+    journal = next((root / "worktrees").glob("CREATE.*.journal"))
+    raw = json.loads(journal.read_text(encoding="utf-8"))
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    finished = "2026-10-26T02:00:00Z"
+    entry: dict[str, object] = {
+        "archive_id": f"node-a:slot-b:1:{finished}",
+        "slot": "slot-b",
+        "agent": "agent-new",
+        "task": "task-1",
+        "purpose": "testing",
+        "machine": "node-a",
+        "generation": 1,
+        "created_at": "2026-10-26T00:00:00Z",
+        "finished_at": finished,
+        "mode": "remove",
+        "actor": "coordinator",
+        "physical_storage": "removed",
+        "validation": ["archived before the interrupted create"],
+        "limitations": [],
+        "continuation": "none needed",
+        "checkouts": raw["created"],
+    }
+    archive = wrkslots_cli._load_archive(config)
+    wrkslots_cli._write_archive_state(
+        config,
+        wrkslots_cli.ArchiveState(
+            archive.machine, archive.revision + 1, (*archive.records, entry)
+        ),
+        action="slot-archived",
+        slot="slot-b",
+        evidence={"archive_id": entry["archive_id"]},
+    )
+    return journal
+
+
+def test_orphan_archive_claim_refusal_names_journal_in_both_editions(
+    tmp_path: Path,
+) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    rust_journal = _orphan_archive_claim(rust_root)
+    oracle_journal = _orphan_archive_claim(oracle_root)
+    rc, _out, err = _python_main_classify(oracle_root)
+    assert rc == 3, err
+    for needle in (
+        "host fault",
+        str(oracle_journal),
+        "slot-b",
+        "agent-new",
+        "conflicts with an archive",
+        "wrkslots recover",
+        "classify-create-journals",
+    ):
+        assert needle in err, needle
+    assert re.search(r"age=\d+s", err), err
+    result = _rust_classify(rust_root, fmt="json")
+    assert result.returncode == 1, result.stderr
+    for needle in (
+        "host fault",
+        str(rust_journal),
+        "slot-b",
+        "agent-new",
+        "conflicts with an archive",
+        "wrkslots recover",
+        "classify-create-journals",
+    ):
+        assert needle in result.stderr, needle
+    assert re.search(r"age=\d+s", result.stderr), result.stderr
+
+    def scrub(text: str, root: Path) -> str:
+        text = text.split("host fault:", 1)[-1]
+        text = _norm(text.strip(), root).replace('"', "'")
+        return re.sub(r"age=\d+s", "age=Ns", text)
+
+    assert scrub(result.stderr, rust_root) == scrub(err.splitlines()[0], oracle_root)

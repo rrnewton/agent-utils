@@ -85,3 +85,87 @@ Reported 2026-11-08 by the lead coordinator from the consumer's merge
 queue. The consumer is not named, per repository policy. Investigation was
 read-only on the consumer side. Do not start a fix until the lead approves
 the verdict.
+
+## 2026-11-08 redirect (a): second condition named
+
+Verdict: a real authority gap, not a budget expiry. The lead's queue record
+gives the full line: 9.720 s classifying, 0.000 s waiting for registry
+locks, ending in a failed `classify-create-journals`. The host-scope
+recording was correct (exit 75, requeued, no red).
+
+Mechanism, reproduced: `_classify_create_journals` scans every outstanding
+journal on the host (`_outstanding_journals`) with no per-journal
+isolation, so the first per-journal `Refusal`/`StateError` aborts the
+whole classification for every unrelated requested slot. A lone orphan
+CREATE journal with dead owners is not enough: it classifies
+`dead-incomplete-create` and classification returns 0 (reproduced in both
+editions). A second condition on that journal is required. All three
+candidate conditions were fixture-reproduced against an unrelated
+requested slot, each refusing host-wide:
+
+1. archive-claim conflict: `create journal for slot 'slot-b' conflicts
+   with an archive` (`StateError` from `_create_journal_items`);
+2. ACTIVE-row claim: `create journal for slot 'slot-b' has already
+   reached ACTIVE publication` (`StateError` from `_create_journal_items`);
+3. indeterminate owner: `create journal for slot 'slot-b' process state
+   is indeterminate: owner=...; coordinator=...` (`Refusal` from
+   `_classify_create_journal`).
+
+Named second condition: the archive-claim conflict. It is the condition
+consistent with the recorded facts — a dead-owner orphan that persisted
+from 18:55:37Z until it was cleared by removing the journal and its two
+events by hand. Indeterminate liveness is a transient read condition:
+it neither persists for hours nor is it cured by deletion. An ACTIVE-row
+claim would have left a live registry row claiming the slot, not a mere
+orphaned journal. The journal bytes were not captured before the
+hand-removal, so this names the condition by elimination from the
+recorded facts; after (b) below, every such refusal names its journal
+and inner site directly, and no future incident needs elimination.
+
+Reproduction kept as tests:
+test_orphan_create_with_archive_claim_refuses_classification_host_wide
+in `py/wrkslots/tests/test_lifecycle.py` and
+test_orphan_archive_claim_refusal_names_journal_in_both_editions
+in `py/wrkslots/tests/test_classify_journals_rust.py`.
+
+## 2026-11-08 (b) delivered: the refusal names its journal
+
+`_classify_create_journals` now wraps every per-journal refusal (except
+the retryable live-owner `_JournalBusy`, exit 75, unchanged) with
+`_journal_classification_refusal`, preserving the `Refusal`/`StateError`
+type and the inner reason; the Rust reader mirrors it with
+`journal_refusal` in `rs/wrkslotsd/src/classify_journals.rs`, including
+the standalone-mismatch pre-scan and the duplicate-claim checks. The new
+refusal text (Python, exit 3; Rust keeps its established exit 1 for
+`ClassifyError::Other`):
+
+> REFUSED: host fault: journal /abs/path/CREATE.6.node-a.6.slot-b.journal
+> (slot 'slot-b', agent 'agent-new', age=0s) blocks create-journal
+> classification: create journal for slot 'slot-b' conflicts with an
+> archive. remedy: recover or discard the named journal with 'wrkslots
+> recover', then rerun classify-create-journals
+
+So the refusal gives the absolute journal path, slot, agent, and age
+(journal mtime), says it is a host fault, keeps the inner site text, and
+gives the remedy. No budget or retry bounds changed. This issue stays
+open: (c) below is a proposal only.
+
+## (c) Safe-quarantine proposal — not implemented, awaiting lead approval
+
+Quarantine a stranded CREATE journal only when every one of these is
+proved: owner and coordinator are both proven dead via `_process_state`
+(never indeterminate or disagreeing); the journal's file identity is
+stable across two reads; its mtime is older than the longest legitimate
+create bound; and no checkout claim overlaps any live registry row —
+that is, precisely the `dead-incomplete-create` classification.
+
+Action: move, never delete, the journal into the journal directory's own
+`quarantine/` subdirectory, named by timestamp plus the original
+filename; append a tombstone operation-log event recording the move and
+the journal content hashes; retain quarantined journals under a stated
+retention before any pruning. It must never auto-quarantine
+indeterminate or dead-disagreeing owners, never quarantine a journal
+whose claims overlap a live row, never act under the registry lock
+mid-mutation, and never double-act with a concurrent manual
+`wrkslots recover`. Reversible by moving the file back verbatim.
+Implement only once the lead approves.

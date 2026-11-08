@@ -10925,6 +10925,49 @@ def _classify_create_journal(
     )
 
 
+def _journal_classification_refusal(path: Path, error: Refusal) -> Refusal:
+    """Name the journal that blocks host-wide classification (#1086).
+
+    Classification scans every outstanding journal, so one stranded
+    journal refuses unrelated work host-wide.  That refusal is a host
+    fault, never a fault in the requested slot, and must name the
+    journal to recover: its absolute path, slot, agent, and age,
+    best-effort from the journal bytes, with the inner reason kept.
+    """
+    slot = "unknown"
+    agent = "unknown"
+    try:
+        raw: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raw = None
+    if isinstance(raw, dict):
+        named_slot = raw.get("slot")
+        if isinstance(named_slot, str):
+            slot = named_slot
+        named_agent = raw.get("agent")
+        record = raw.get("record")
+        if not isinstance(named_agent, str) and isinstance(record, dict):
+            named_agent = record.get("agent")
+        if isinstance(named_agent, str):
+            agent = named_agent
+    try:
+        age = f"{max(0, int(time.time() - path.stat().st_mtime))}s"
+    except OSError:
+        age = "unknown"
+    message = (
+        f"host fault: journal {path.absolute()} "
+        f"(slot {slot!r}, agent {agent!r}, age={age}) blocks "
+        f"create-journal classification: {error}. remedy: recover or "
+        "discard the named journal with 'wrkslots recover', then rerun "
+        "classify-create-journals"
+    )
+    if type(error) is StateError:
+        return StateError(message, remedy=error.remedy)
+    if type(error) is Refusal:
+        return Refusal(message, remedy=error.remedy)
+    return error
+
+
 def _classify_create_journals(
     config: Config,
     states: Sequence[ActiveState],
@@ -10936,12 +10979,12 @@ def _classify_create_journals(
     skipped_paths: list[Path] | None = None,
     machines: AbstractSet[str] | None = None,
 ) -> tuple[_CreateJournalClassification, ...]:
-    rows = tuple(
-        row
-        for path in _outstanding_journals(config, machines)
-        if path not in excluded_paths
-        for row in (
-            _classify_create_journal(
+    classified: list[_CreateJournalClassification] = []
+    for path in _outstanding_journals(config, machines):
+        if path in excluded_paths:
+            continue
+        try:
+            row = _classify_create_journal(
                 config,
                 path,
                 states,
@@ -10949,21 +10992,33 @@ def _classify_create_journals(
                 requested_slot=requested_slot,
                 requested_slot_type=requested_slot_type,
                 skipped_paths=skipped_paths,
-            ),
-        )
-        if row is not None
-    )
+            )
+        except _JournalBusy:
+            raise
+        except Refusal as error:
+            raise _journal_classification_refusal(path, error) from error
+        if row is not None:
+            classified.append(row)
+    rows = tuple(classified)
     seen_slots: set[tuple[str, str]] = set()
     seen_agents: set[str] = set()
     for row in rows:
         key = (row.machine, row.slot)
         if key in seen_slots:
-            raise StateError(
-                f"multiple interrupted creates claim {row.machine}/{row.slot}"
+            raise _journal_classification_refusal(
+                row.path,
+                StateError(
+                    f"multiple interrupted creates claim {row.machine}/{row.slot}"
+                ),
             )
         seen_slots.add(key)
         if row.slot_type == "agent" and row.agent in seen_agents:
-            raise StateError(f"multiple interrupted creates claim agent {row.agent!r}")
+            raise _journal_classification_refusal(
+                row.path,
+                StateError(
+                    f"multiple interrupted creates claim agent {row.agent!r}"
+                ),
+            )
         if row.slot_type == "agent":
             seen_agents.add(row.agent)
     return rows
