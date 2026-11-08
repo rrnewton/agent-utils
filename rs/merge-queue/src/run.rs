@@ -6097,6 +6097,62 @@ impl<'a> Runner<'a> {
                             && front_disjoint
                             && (max_roots > 1 || (window >= 3 && occupied(&flights) + 1 >= window));
                         let mut prs = pending.pop_front().unwrap_or_default();
+                        // `--after` is a composition dependency, not only a
+                        // landing order: this batch must be built on its
+                        // dependency's candidate, or wait for it. Find the
+                        // flight carrying a (transitive) dependency.
+                        let wanted: BTreeSet<i64> = {
+                            let deps = lock(&self.deps).clone();
+                            let mut wanted: BTreeSet<i64> = BTreeSet::new();
+                            let mut queue: Vec<i64> = prs.clone();
+                            while let Some(pr) = queue.pop() {
+                                if let Some(beneath) = deps.get(&pr) {
+                                    for dep in beneath {
+                                        if wanted.insert(*dep) {
+                                            queue.push(*dep);
+                                        }
+                                    }
+                                }
+                            }
+                            wanted
+                        };
+                        let dep_flights: Vec<usize> = flights
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, flight)| {
+                                flight.candidate.prs.iter().any(|pr| wanted.contains(pr))
+                            })
+                            .map(|(index, _)| index)
+                            .collect();
+                        let dep_tip: Option<String> = match dep_flights.as_slice() {
+                            [only] => Some(flights[*only].candidate.tip.clone()),
+                            [] => None,
+                            // Dependencies in more than one flight cannot
+                            // share one parent yet: wait for one to land.
+                            _ => {
+                                pending.push_front(prs);
+                                break;
+                            }
+                        };
+                        if dep_tip.is_none() {
+                            // No dependency in flight: if its batch is
+                            // still pending (a discard requeue can scramble
+                            // the planner's order), bring that batch to the
+                            // front and start it first. (A landed dependency
+                            // is in the base; an ejected one drops this
+                            // batch through the planner.)
+                            let dep_batch = pending.iter().position(|batch| {
+                                batch
+                                    .iter()
+                                    .any(|pr| wanted.contains(pr) && !prs.contains(pr))
+                            });
+                            if let Some(position) = dep_batch {
+                                let batch = pending.remove(position).expect("positioned batch");
+                                pending.push_front(prs);
+                                pending.push_front(batch);
+                                break;
+                            }
+                        }
                         // A stale green stacks on the stack head even
                         // below the gate (its previous green, disjointness
                         // and a clean merge were just checked); a fresh
@@ -6111,14 +6167,56 @@ impl<'a> Runner<'a> {
                                     .find(|flight| flight.rooted && flight.candidate.parent == base)
                                     .map(|flight| flight.candidate.tip.clone())
                             });
-                        let stale_stack = if !stack_allowed {
+                        let stale_stack = if !stack_allowed && dep_tip.is_none() {
                             stale_tip
                                 .as_ref()
                                 .and_then(|tip| self.stale_green_stack(&prs, tip))
                         } else {
                             None
                         };
-                        let rooted = stale_stack.is_none() && rooted;
+                        // A prioritized stale green disjoint from the stack
+                        // head never stacks under a non-prioritized head: it
+                        // rebuilds as its own root on the base instead.
+                        let stale_root_green_base: Option<String> = stale_stack
+                            .as_ref()
+                            .map(|(green_base, _)| green_base.clone());
+                        let stale_rooted = stale_stack.is_some()
+                            && dep_tip.is_none()
+                            && roots_in_flight < max_roots
+                            && {
+                                // The head the stale green would stack on:
+                                // the flight whose tip it was checked
+                                // against (stack top or rooted fallback).
+                                let head_prs: Vec<i64> = stale_tip
+                                    .as_ref()
+                                    .and_then(|tip| {
+                                        flights.iter().find(|flight| &flight.candidate.tip == tip)
+                                    })
+                                    .map(|flight| flight.candidate.prs.clone())
+                                    .unwrap_or_default();
+                                let (batch_prioritized, head_prioritized) = {
+                                    let report = lock(&self.report);
+                                    let items = lock(&self.items);
+                                    let prioritized =
+                                        |batch: &[i64]| {
+                                            !batch.is_empty()
+                                                && batch.iter().all(|pr| {
+                                                    report.plan.items.iter().any(|item| {
+                                                        item.pr == *pr && item.prioritized
+                                                    }) || items
+                                                        .get(pr)
+                                                        .is_some_and(|item| item.prioritized)
+                                                })
+                                        };
+                                    (prioritized(&prs), prioritized(&head_prs))
+                                };
+                                batch_prioritized
+                                    && !head_prioritized
+                                    && (head_prs.is_empty() || self.batch_disjoint(&prs, &head_prs))
+                            };
+                        let stale_stack = if stale_rooted { None } else { stale_stack };
+                        let rooted = dep_tip.is_none()
+                            && (stale_rooted || (stale_stack.is_none() && rooted));
                         // A new root built on the base now goes stale the
                         // moment another root that is already green lands:
                         // its whole validation is thrown away and rebuilt.
@@ -6192,7 +6290,9 @@ impl<'a> Runner<'a> {
                                 pending.push_front(vec![pr]);
                             }
                         }
-                        let parent = if stale_stack.is_some() {
+                        let parent = if let Some(tip) = &dep_tip {
+                            tip.clone()
+                        } else if stale_stack.is_some() {
                             stale_tip.clone().unwrap_or_default()
                         } else if rooted {
                             let base = self.current_base()?;
@@ -6223,6 +6323,18 @@ impl<'a> Runner<'a> {
                                     short(green_base),
                                     short(&parent),
                                     list(landed_since)
+                                ),
+                            );
+                        }
+                        if stale_rooted {
+                            self.event(
+                                "stale-green-rooted",
+                                &format!(
+                                    "{} was green at {}; prioritized and disjoint from the \
+                                     stack head, so it rebuilds as its own root on {}",
+                                    list(&candidate.prs),
+                                    short(stale_root_green_base.as_deref().unwrap_or_default()),
+                                    short(&parent)
                                 ),
                             );
                         }
@@ -6591,9 +6703,8 @@ impl<'a> Runner<'a> {
                                                     "green-stale-root",
                                                     format!(
                                                         "green at {} (the base it was built on); \
-                                                         requeued at the front to be rebuilt on {}",
-                                                        short(&parent),
-                                                        short(&base)
+                                                         requeued at the front to be rebuilt",
+                                                        short(&parent)
                                                     ),
                                                 );
                                                 let _ = self.state.save_item(item);
@@ -6604,13 +6715,17 @@ impl<'a> Runner<'a> {
                                         "stale-root-green",
                                         &format!(
                                             "{} was green at {} after the base moved; \
-                                             requeued at the front to be rebuilt on {}",
+                                             requeued at the front to be rebuilt",
                                             list(&stale.candidate.prs),
-                                            short(&parent),
-                                            short(&base)
+                                            short(&parent)
                                         ),
                                     );
                                     self.record_stale_green(&stale.candidate);
+                                    // Batches built on the stale candidate
+                                    // (a dependent stacked on it, say) cannot
+                                    // decide on it either: discard them back
+                                    // to pending, as for a discarded head.
+                                    discard(&mut flights, &rx, pending);
                                     pending.push_front(stale.candidate.prs.clone());
                                     continue;
                                 }

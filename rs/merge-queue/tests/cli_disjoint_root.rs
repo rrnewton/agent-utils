@@ -91,6 +91,16 @@ fn a_disjoint_root_survives_a_red_stack_head() {
     assert!(stacked_runs.len() >= 2, "{report}");
 }
 
+fn config_path(fx: &Fixture) -> PathBuf {
+    let common = git(&fx.queue(), &["rev-parse", "--git-common-dir"]);
+    let common = if std::path::Path::new(&common).is_absolute() {
+        PathBuf::from(common)
+    } else {
+        fx.queue().join(common)
+    };
+    common.join("merge-queue").join("config.json")
+}
+
 fn latest_report(fx: &Fixture) -> Value {
     let runs = fx.queue().join(".git/merge-queue/runs");
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(runs)
@@ -427,6 +437,7 @@ fn a_new_root_waits_for_a_green_root_to_land_before_choosing_its_base() {
     let mut config: Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
     config["roots"] = serde_json::json!(2);
+    config["keep_stale_roots"] = serde_json::json!(true);
     std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
     fx.branch("a", &[("tests/a", "FAIL\n")]);
     fx.mq_ok(&["submit", "1", "--head", "a"]);
@@ -683,4 +694,92 @@ fn a_disjoint_root_is_cancelled_the_moment_the_head_lands() {
     );
     assert_eq!(root_runs[0]["parent"], report["base_start"], "{report}");
     assert_ne!(root_runs[1]["parent"], report["base_start"], "{report}");
+}
+
+#[test]
+fn an_after_change_is_composed_on_its_dependency_not_the_stack() {
+    // Change 3 must land after change 2 (--after): it must also be
+    // COMPOSED on change 2's candidate. Change 2 validates as a disjoint
+    // root, so the stack top is change 1's candidate; composing change 3
+    // there would validate it without its declared dependency.
+    let fx = Fixture::new("after-composed-on-dependency");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    let validator = r#"ok=1; for f in tests/*; do [ -f "$f" ] || continue; if grep -qx FAIL "$f"; then echo "{\"id\":\"x\",\"outcome\":\"fail\"}" >> "$MQ_RESULTS"; ok=0; fi; done; [ $ok -eq 1 ]"#;
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        validator,
+    ]);
+    // Two root slots, so change 2 can validate as a disjoint root.
+    let path = config_path(&fx);
+    let mut config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    config["roots"] = serde_json::json!(2);
+    config["keep_stale_roots"] = serde_json::json!(true);
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    fx.branch("u", &[("tests/u", "ok\n")]);
+    fx.branch("x", &[("tests/x", "ok\n")]);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "u"]);
+    fx.mq_ok(&["submit", "2", "--head", "x"]);
+    fx.mq_ok(&["submit", "3", "--head", "a", "--after", "2"]);
+    let out = fx.mq(&["run", "--json", "--depth", "3", "--max-batch", "1"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let report = latest_report(&fx);
+    let x_tip = batch_validations(&report, 2)[0]["commit"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let a_runs = batch_validations(&report, 3);
+    assert!(!a_runs.is_empty(), "{report}");
+    // Every candidate change 3 validated on contains a change-2 candidate
+    // (its parent is one, or it descends from one): change 2 may itself
+    // have been rebuilt, so any of its candidates counts.
+    let x_tips: Vec<String> = batch_validations(&report, 2)
+        .iter()
+        .map(|run| run["commit"].as_str().unwrap().to_owned())
+        .collect();
+    let is_ancestor = |ancestor: &str, tip: &str| {
+        Command::new("git")
+            .arg("-C")
+            .arg(fx.queue())
+            .args(["merge-base", "--is-ancestor", ancestor, tip])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    for run in &a_runs {
+        let tip = run["commit"].as_str().unwrap();
+        assert!(
+            x_tips.iter().any(|x| is_ancestor(x, tip)),
+            "change 3 composed without its dependency: {report}"
+        );
+    }
+    assert_eq!(
+        a_runs[0]["parent"], x_tip,
+        "change 3 first composed on its dependency's candidate: {report}"
+    );
+    let landed: Vec<i64> = report["landed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|batch| {
+            batch["prs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|pr| pr.as_i64().unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        landed.iter().position(|pr| *pr == 2) < landed.iter().position(|pr| *pr == 3),
+        "change 3 lands after change 2: {landed:?}"
+    );
 }

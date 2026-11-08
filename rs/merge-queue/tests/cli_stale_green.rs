@@ -6,6 +6,8 @@
 mod support;
 
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use support::{git, Fixture};
@@ -342,4 +344,130 @@ fn a_stale_green_sharing_a_hand_written_file_still_rebuilds_with_regeneration_on
     assert_eq!(status(&fx, 2), "landed", "{r}");
     let events = events(&fx);
     assert!(!stale_green_stacked_names(&events, 2), "{events}");
+}
+
+fn spawn_run(fx: &Fixture) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_merge-queue"));
+    command
+        .args(["run", "--json"])
+        .current_dir(fx.queue())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("TESTTMP", "1")
+        .env_remove("MERGE_QUEUE_STATE")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.spawn().unwrap()
+}
+
+fn wait_for(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if check() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[test]
+fn a_prioritized_stale_green_roots_instead_of_stacking_under_a_plain_head() {
+    // Change 2 arrives by intake, prioritized, and validates slowly as a
+    // root; change 3 lands meanwhile, so change 2 comes back green on a
+    // stale base. Disjoint from the stack head (change 4, not
+    // prioritized, still validating), it must rebuild as its own root
+    // on the new base, never stacked under change 4's candidate.
+    let fx = seeded("stale-green-prioritized");
+    let path = config_path(&fx);
+    let mut value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    // Gate-driven, not sleep-driven: candidates holding tests/p or
+    // tests/b wait for `release`; candidates holding tests/d wait for
+    // `release-d`, so the ordering below holds at any host speed.
+    let gates = fx.root.join("gates");
+    std::fs::create_dir_all(&gates).unwrap();
+    value["validator"]["run"] = serde_json::json!(format!(
+        r#"gates='{gates}'
+if [ -f tests/d ]; then gate="$gates/release-d"; elif [ -f tests/p ] || [ -f tests/b ]; then gate="$gates/release"; else gate=""; fi
+if [ -n "$gate" ]; then i=0; while [ ! -e "$gate" ] && [ $i -lt 2400 ]; do sleep 0.05; i=$((i+1)); done; [ -e "$gate" ] || exit 1; fi
+ok=1; for f in tests/*; do [ -f "$f" ] || continue; if grep -qx FAIL "$f"; then echo "{{\"id\":\"x\",\"outcome\":\"fail\"}}" >> "$MQ_RESULTS"; ok=0; fi; done; [ $ok -eq 1 ]"#,
+        gates = gates.display()
+    ));
+    std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.branch("d", &[("tests/d", "ok\n")]);
+    fx.branch("p", &[("tests/p", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "3", "--head", "b"]);
+    fx.mq_ok(&["submit", "4", "--head", "d"]);
+    let run = spawn_run(&fx);
+    // Both first validations are out; only then does the prioritized
+    // change arrive, so it cannot front the first wave.
+    wait_for("the first validations", Duration::from_secs(60), || {
+        events(&fx).matches("\"kind\":\"validate\"").count() >= 2
+    });
+    let recorded = fx.mq(&["submit", "2", "--head", "p", "--prioritized"]);
+    // Change 3 and the prioritized change are both gated out; release
+    // them together: change 3 lands first and moves the base under the
+    // prioritized change's candidate.
+    wait_for("the prioritized validation", Duration::from_secs(60), || {
+        events(&fx).matches("\"kind\":\"validate\"").count() >= 3
+    });
+    std::fs::write(gates.join("release"), "").unwrap();
+    // Once the prioritized change is requeued as a stale green, let the
+    // stack head (change 4) finish; the rebuild must not wait for it.
+    wait_for("the stale requeue", Duration::from_secs(60), || {
+        events(&fx).contains("stale-root-green")
+    });
+    std::fs::write(gates.join("release-d"), "").unwrap();
+    let out = run.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let _ = recorded;
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(status(&fx, 1), "landed", "{r}");
+    assert_eq!(status(&fx, 2), "landed", "{r}");
+    assert_eq!(status(&fx, 3), "landed", "{r}");
+    assert_eq!(status(&fx, 4), "landed", "{r}");
+    let events = events(&fx);
+    assert!(
+        events.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|e| {
+                e["kind"] == "stale-green-rooted"
+                    && e["detail"].as_str().unwrap_or_default().contains("#2")
+            })
+        }),
+        "prioritized stale green rooted: {events}"
+    );
+    assert!(
+        !events.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|e| {
+                e["kind"] == "stale-green-stacked"
+                    && e["detail"].as_str().unwrap_or_default().contains("#2")
+            })
+        }),
+        "prioritized stale green must not stack: {events}"
+    );
+    // Its rebuild sat on the base as it was just before change 2
+    // landed (the previous landed batch's tip), not on a candidate.
+    let landed = r["landed"].as_array().unwrap();
+    let position = landed
+        .iter()
+        .position(|batch| batch["prs"] == serde_json::json!([2]))
+        .expect("change 2 landed");
+    let landed_tip = landed[position - 1]["tip"].as_str().unwrap();
+    let rebuilds: Vec<&Value> = r["validations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v["prs"] == serde_json::json!([2]) && v["cancelled"] != true)
+        .collect();
+    let last = rebuilds
+        .last()
+        .unwrap_or_else(|| panic!("change 2 rebuilt: {r}"));
+    assert_eq!(last["parent"], landed_tip, "{r}");
 }
