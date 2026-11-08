@@ -1,11 +1,12 @@
 ---
 title: 'clean-caches-skip-running-gate: never delete build output from a slot whose gate is running'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-wrkslots
-created_at: 2026-11-07T22:50:00.000000000+00:00
-updated_at: 2026-11-07T22:50:00.000000000+00:00
+created_at: 2026-11-07T22:50:00+00:00
+updated_at: 2026-11-08T12:36:13.623509856+00:00
+closed_at: 2026-11-08T12:36:13.623509746+00:00
 ---
 
 # Description

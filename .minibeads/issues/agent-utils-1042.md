@@ -1,11 +1,12 @@
 ---
 title: 'clean-caches-nested-targets: clean-caches misses cargo target dirs below the slot root'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-wrkslots
-created_at: 2026-11-08T02:40:00.000000000+00:00
-updated_at: 2026-11-08T09:30:00.000000000+00:00
+created_at: 2026-11-08T02:40:00+00:00
+updated_at: 2026-11-08T12:36:13.624073456+00:00
+closed_at: 2026-11-08T12:36:13.624073316+00:00
 ---
 
 # Description

@@ -43075,8 +43075,9 @@ def _cmd_remove_in_scope(
                 # Only the authority's exact "no record of this agent" can be
                 # stood in for, and only for an owner generation proven dead.
                 # A registered agent the authority cannot verify (an active
-                # record that was never stopped, an incomplete rename, an
-                # occupied pane) keeps refusing: it may still be running.
+                # record that was never stopped, an incomplete rename) keeps
+                # refusing: it may still be running. A verdict resting on
+                # unattributed panes is scoped to this slot instead (#993).
                 attestable = (
                     answer.unregistered
                     and owner_state == "dead"
@@ -43128,7 +43129,26 @@ def _cmd_remove_in_scope(
                             "time-to-live, process-use, Git and salvage checks "
                             "still run"
                         )
-                    _refuse_registered_liveness(answer.state, answer.detail)
+                    if answer.state == "unverifiable" and "pane" in answer.detail.lower():
+                        # #993 (criteria 1-2): a verdict that rests on panes
+                        # the authority cannot attribute to any registered
+                        # agent vetoes this removal only if a live process
+                        # actually references this slot. The slot-scoped
+                        # census is the same proof the absent-row extension
+                        # (28f01ef0) uses; every other storage-side guard
+                        # (owner generation, time-to-live, handoff, direct
+                        # use, salvage) still runs unchanged below.
+                        _assert_pane_verdict_slot_unused(config, record, agent_batch)
+                        if attest_agent is not None:
+                            print(
+                                "NOTE: --attest-agent-stopped was not needed: the "
+                                "unattributed-pane verdict does not reference this "
+                                "slot, so no attestation was recorded",
+                                file=sys.stderr,
+                            )
+                        consent_liveness = (answer.state, answer.detail)
+                    else:
+                        _refuse_registered_liveness(answer.state, answer.detail)
                 elif attest_agent is None:
                     _refuse_registered_liveness(
                         answer.state, answer.detail, attest_agent=record.agent
@@ -55563,6 +55583,52 @@ def _in_initial_pid_namespace() -> bool:
         return os.readlink("/proc/self/ns/pid") == _INITIAL_PID_NAMESPACE_LINK
     except OSError:
         return False
+
+
+def _assert_pane_verdict_slot_unused(
+    config: Config,
+    record: ActiveRecord,
+    agent_batch: _AgentRemoveBatchContext | None,
+) -> None:
+    """Refuse only if a live process references ``record``'s slot (#993).
+
+    An unattributed-pane liveness verdict says some live pane runs an
+    agent-capable process no registry claims; it does not say the pane
+    has anything to do with this slot. Held references (cwd, root,
+    descriptors, mappings, mounts) are judged by the same direct-use
+    check removal itself runs, and argv or environ naming the slot by
+    the same target-naming match the absent-row census uses. A match
+    refuses, naming the process; no match means the pane verdict is
+    not evidence about this slot and removal proceeds to its ordinary
+    guards.
+    """
+
+    slot_path = _slot_directory(config, record.slot, record.slot_type)
+    try:
+        _assert_slot_unused(slot_path, None, agent_batch=agent_batch)
+    except Refusal as exc:
+        raise Refusal(
+            f"the unattributed pane may be using slot {record.slot}: {exc}. "
+            "state: REFUSED -- no checkout was salvaged or removed"
+        ) from exc
+    budget = _ReadOnlyCommandBudget.start(
+        timeout_seconds=_ABSENT_PROCESS_CENSUS_SECONDS,
+        stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
+        stderr_limit=64 * 1024,
+        input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+    )
+    processes = _absent_validate_process_snapshot()
+    matches = _same_uid_target_naming_matches(
+        processes, {slot_path: str(slot_path)}, budget
+    )
+    if matches:
+        pid, _slot, kind, detail = matches[0]
+        raise Refusal(
+            f"the unattributed pane may be using slot {record.slot}: live "
+            f"process {pid} names the slot in its {kind}: {detail}. "
+            "state: REFUSED -- no checkout was salvaged or removed. remedy: "
+            "stop that process, then rerun remove"
+        )
 
 
 def _assert_absent_agent_registered_liveness(

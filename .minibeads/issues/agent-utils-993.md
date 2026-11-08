@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-unattributed-pane-scope: one unregistered agent pane anywhere vetoes every recordless agent-slot removal'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-wrkslots
-created_at: 2026-11-07T02:05:00.000000000+00:00
-updated_at: 2026-11-07T02:05:00.000000000+00:00
+created_at: 2026-11-07T02:05:00+00:00
+updated_at: 2026-11-08T12:36:13.622888087+00:00
+closed_at: 2026-11-08T12:36:13.622887727+00:00
 ---
 
 # Description
@@ -34,3 +35,5 @@ On 2026-11-06 a consumer's removals of three such slots were all refused because
 # Notes
 
 Reported 2026-11-06 by the lead coordinator from a consumer's cleanup lane (full refusal texts kept on the lead's host). Related: #954, #955, #956 (other remove refusals), #994.
+
+Closed: the absent-storage extension landed as 28f01ef0; criteria 1-2 (remove-path pane scoping with storage present) landed in the commit that carries this close, in both editions with paired tests.

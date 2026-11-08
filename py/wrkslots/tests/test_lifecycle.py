@@ -26763,6 +26763,86 @@ def write_liveness_output(project: Path, stdout: bytes, stderr: bytes, status: i
     )
 
 
+PANE_VERDICT = (
+    b"unverifiable agent=codex-1 rc=2 reason=unattributed-panes: "
+    b"1 live herdr pane(s) run an agent-capable process, but no record "
+    b"claims them: w1:p9 (bash, codex)\n"
+)
+
+
+def prepared_removable_slot(tmp_path: Path) -> tuple[Path, Path, Path]:
+    project, repository, remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    write_liveness_output(project, PANE_VERDICT, b"", 2)
+    return project, repository, remote
+
+
+def test_remove_unrelated_pane_does_not_block_recordless_removal(
+    tmp_path: Path,
+) -> None:
+    """#993 (test 1): an agent-capable pane referencing nothing of the
+    slot does not veto removal of a recordless agent slot with storage."""
+
+    project, _repository, _remote = prepared_removable_slot(tmp_path)
+    bystander = subprocess.Popen(["sleep", "60"], cwd=tmp_path, text=True)
+    try:
+        removed = remove(project)
+    finally:
+        bystander.kill()
+        bystander.wait()
+    assert removed.returncode == 0, removed.stderr
+    assert not checkout(project).exists()
+    assert active_slots(project) == []
+
+
+def test_remove_pane_with_cwd_in_slot_blocks_naming_pid(tmp_path: Path) -> None:
+    """#993 (test 2): a pane whose process works inside the slot vetoes
+    removal, and the refusal names that process."""
+
+    project, _repository, _remote = prepared_removable_slot(tmp_path)
+    user = subprocess.Popen(["sleep", "60"], cwd=checkout(project), text=True)
+    try:
+        refused = remove(project)
+    finally:
+        user.kill()
+        user.wait()
+    assert refused.returncode == 3, refused.stderr
+    assert str(user.pid) in refused.stderr
+    assert checkout(project).is_dir()
+    assert len(active_slots(project)) == 1
+
+
+def test_remove_with_pane_verdict_still_bundles_unpushed_work(
+    tmp_path: Path,
+) -> None:
+    """#993 (test 3): storage-side protections are unchanged on the
+    pane-scoped path: unpushed work is salvaged before removal."""
+
+    project, repository, remote = prepared_removable_slot(tmp_path)
+    tree = checkout(project)
+    local_commit = commit_local(tree, "local.txt", "local commit\n", "local")
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    receipt = archive["records"][0]["salvage"][0]
+    assert receipt["source_head"] == local_commit
+    assert receipt["disposition"] == "salvaged"
+    assert (
+        git(remote, "rev-parse", receipt["remote_ref"]).stdout.strip()
+        == receipt["salvage_commit"]
+    )
+
+
 def test_remove_treats_a_crashed_liveness_probe_as_unverifiable(tmp_path: Path) -> None:
     """An uncaught exception exits 1, the same status as alive, and says nothing.
 

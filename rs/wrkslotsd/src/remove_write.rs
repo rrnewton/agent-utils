@@ -413,6 +413,43 @@ fn own_ancestry() -> BTreeSet<i64> {
     result
 }
 
+/// A live process whose argv or environ names `slot_path` (#993),
+/// mirroring the oracle's target-naming match: `(pid, kind, token)`.
+fn process_naming_slot(slot_path: &Path) -> Option<(i64, String, String)> {
+    let needle = slot_path.to_string_lossy().into_owned();
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let mut pids: Vec<i64> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<i64>().ok())
+        .collect();
+    pids.sort_unstable();
+    for pid in pids {
+        if pid == std::process::id() as i64 {
+            continue;
+        }
+        for (kind, name) in [("argv", "cmdline"), ("environ", "environ")] {
+            let Ok(raw) = std::fs::read(PathBuf::from("/proc").join(pid.to_string()).join(name))
+            else {
+                continue;
+            };
+            for token in raw.split(|byte| *byte == 0) {
+                if token.is_empty() {
+                    continue;
+                }
+                let text = String::from_utf8_lossy(token).into_owned();
+                let value = text.split('=').nth(1).unwrap_or(&text);
+                let hit = value
+                    .split(':')
+                    .any(|part| part == needle || part.starts_with(&format!("{needle}/")));
+                if hit {
+                    return Some((pid, kind.to_string(), text));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn link_points_into(link: &Path, slot_path: &Path, slot_device: u64) -> Result<bool> {
     // Mirrors the Python census (#618): a readlink failure is proven
     // foreign only when stat (which follows the descriptor anyway)
@@ -1545,10 +1582,25 @@ pub(crate) fn remove_slot(
                         .to_string(),
                 );
             }
-            return Err(format!(
-                "registered liveness authority is {}: {}; unknown ownership is not a free slot",
-                answer.state, answer.detail
-            ));
+            // #993: a verdict resting on unattributed panes vetoes
+            // removal only if a live process references this slot.
+            // The held-reference census (assert_slot_unused, below)
+            // and the argv/environ naming scan here are that scoped
+            // proof; every other guard still runs unchanged.
+            let pane_scoped =
+                answer.state == "unverifiable" && answer.detail.to_lowercase().contains("pane");
+            if !pane_scoped {
+                return Err(format!(
+                    "registered liveness authority is {}: {}; unknown ownership is not a free slot",
+                    answer.state, answer.detail
+                ));
+            }
+            let pane_slot_path = slot_directory(&cfg, slot, &slot_type)?;
+            if let Some((pid, kind, token)) = process_naming_slot(&pane_slot_path) {
+                return Err(format!(
+                    "the unattributed pane may be using slot {slot}: live process {pid} names the slot in its {kind}: {token}; stop it and retry"
+                ));
+            }
         }
         if owner_state != "dead" && !owner_absent {
             return Err(format!(

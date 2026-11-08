@@ -251,10 +251,15 @@ By default `audit`, like `status` and `doctor`, reads only the local machine's s
 recorded by another machine (a stale copy, usually) is named in a NOTE -- with its machine and
 modification time, and in the JSON payload's `foreign_shards` -- but never read, so it cannot skew
 a local verdict; pass `--all-machines` to include every machine's rows as before.
-`classify-create-journals` and `clean-caches` follow the same rule: a foreign journal does not
-block a local classification, a foreign row is skipped and reported under `skipped_foreign`, and
-`--all-machines` opts back into the cross-machine behaviour. Nothing is ever written to another
-machine's event log.
+`classify-create-journals`, `clean-caches` and `retire-pending` follow the same rule: a foreign
+journal does not block a local classification, a foreign row is skipped and reported under
+`skipped_foreign`, and `--all-machines` opts back into the cross-machine behaviour where the
+command accepts it. Nothing is ever written to another machine's event log. Strict consumers of
+`retire-pending --format json` should expect its top-level fields `schema`, `limit`, `removed`,
+`retained`, `deferred`, `could_not_determine`, `skipped_foreign` and `recovery_required` (plus
+`actions` when expired-unhanded candidates are included): `skipped_foreign` rows carry
+`machine`, `slot`, `generation` and `reason`, and are also printed as `SKIPPED_FOREIGN:` lines
+in the human report.
 
 A non-create journal (for example a live `finish`) whose recorded owner process is still alive
 is not an interrupted mutation: `classify-create-journals` reports it as retryable busy — exit
@@ -955,6 +960,14 @@ process-use census, the owner-cgroup evidence, salvage before deletion, and the 
 path fence. `--archive-drifted-checkouts` still needs the command's own "dead", so a drifted
 checkout must be restored first. When the command does answer "dead", the flags are not needed:
 the removal proceeds on that answer, says so, and records no attestation.
+
+Separately, an unverifiable verdict that rests on unattributed panes (live panes running an
+agent-capable process that no registry claims) vetoes removal only when a live process actually
+references the slot: working inside it, holding a descriptor or mapping under it, or naming it
+in its command line or environment. That slot-scoped census runs before the ordinary guards,
+which still apply in full; a referencing process refuses the removal and is named by pid. A
+pane that references nothing of the slot (a hand-started session elsewhere on the host) is not
+evidence about the slot's agent and does not block its removal.
 
 The no-record answer speaks only for the registry the command reads, normally this project's. An
 agent registered in another registry looks unregistered here; the attestation is the coordinator's

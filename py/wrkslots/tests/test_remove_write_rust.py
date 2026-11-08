@@ -633,6 +633,45 @@ def test_remove_liveness_alive_despite_dead_owner_refuses(tmp_path: Path) -> Non
     assert (rust_root / "worktrees" / "slot-a").exists()
 
 
+PANE_VERDICT_SCRIPT = (
+    "import sys\n"
+    "print('unverifiable agent=agent-slot-a rc=2 reason=unattributed-panes: "
+    "1 live herdr pane(s) run an agent-capable process, but no record "
+    "claims them: w1:p9 (bash, codex)', file=sys.stderr)\n"
+    "sys.exit(2)\n"
+)
+
+
+def test_remove_unrelated_pane_verdict_removes(tmp_path: Path) -> None:
+    """#993: a pane verdict referencing nothing of the slot does not
+    veto Rust removal either."""
+
+    rust_root = _fixture(tmp_path / "rust")
+    (rust_root / "live.py").write_text(PANE_VERDICT_SCRIPT)
+    result = _rust_remove(rust_root)
+    assert result.returncode == 0, result.stderr
+    assert not (rust_root / "worktrees" / "slot-a").exists()
+
+
+def test_remove_pane_process_in_slot_refuses(tmp_path: Path) -> None:
+    """#993: a live process working inside the slot vetoes Rust
+    removal, naming the pid."""
+
+    rust_root = _fixture(tmp_path / "rust")
+    (rust_root / "live.py").write_text(PANE_VERDICT_SCRIPT)
+    user = subprocess.Popen(
+        ["sleep", "60"], cwd=rust_root / "worktrees" / "slot-a" / "repo", text=True
+    )
+    try:
+        result = _rust_remove(rust_root)
+    finally:
+        user.kill()
+        user.wait()
+    assert result.returncode == 1, result.stderr
+    assert str(user.pid) in result.stderr
+    assert (rust_root / "worktrees" / "slot-a").exists()
+
+
 def test_remove_invalid_sidecar_refuses(tmp_path: Path) -> None:
     rust_root = _fixture(tmp_path / "rust")
     sidecar = rust_root / "worktrees" / "HANDOFF.6.node-a.6.slot-a.1.json"
