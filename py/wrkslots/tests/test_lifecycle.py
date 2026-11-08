@@ -53443,6 +53443,52 @@ def test_current_incomplete_frozen_requires_pristine_recursive_checkout(
 
 @pytest.mark.ordinary_environment
 @pytest.mark.parametrize("action", ("recover", "classify"))
+def test_current_incomplete_frozen_allows_hermetic_split_target_residue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], action: str,
+) -> None:
+    # The hermetic split build writes its Cargo target inside the checkout
+    # (ignored/hermetic/split/target); that residue alone is not authored
+    # content and must not make the checkout non-pristine.
+    project, source, checkout, record, _sidecar = prepare_current_incomplete_frozen_checkout(tmp_path, monkeypatch)
+    target = checkout / "ignored/hermetic/split/target/debug"
+    target.mkdir(parents=True)
+    (target / "build-output").write_text("cargo build residue\n")
+    assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
+    row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
+    assert row["blocks_entry"] is False, row
+    if action == "classify":
+        assert row["state"] == "current-incomplete-retained"
+    assert "no-result remain retained" in str(row["reason"])
+    assert checkout.is_dir()
+    assert (target / "build-output").read_text() == "cargo build residue\n"
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("action", ("recover", "classify"))
+@pytest.mark.parametrize("extra", ("ignored/stray.log", "ignored/hermetic/split/cargo-home-marker", "ignored/hermetic/other.log"))
+def test_current_incomplete_frozen_preserves_extra_ignored_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], action: str, extra: str,
+) -> None:
+    # Any ignored/ content outside the split target may be evidence; its
+    # presence keeps the checkout preserved even alongside build residue.
+    project, source, checkout, record, _sidecar = prepare_current_incomplete_frozen_checkout(tmp_path, monkeypatch)
+    target = checkout / "ignored/hermetic/split/target/debug"
+    target.mkdir(parents=True)
+    (target / "build-output").write_text("cargo build residue\n")
+    extra_path = checkout / extra
+    extra_path.parent.mkdir(parents=True, exist_ok=True)
+    extra_path.write_text("possible evidence\n")
+    assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
+    row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
+    assert row["blocks_entry"] is True, row
+    assert checkout.is_dir()
+    assert extra_path.read_text() == "possible evidence\n"
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("action", ("recover", "classify"))
 @pytest.mark.parametrize("mutation", ("sidecar", "sidecar-replace", "schema", "record", "child-index", "child-file", "child-head", "source-head", "source-index", "source-remote"))
 def test_current_incomplete_frozen_rechecks_after_fresh_census(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -53634,6 +53680,7 @@ def test_current_incomplete_frozen_binds_initial_facts_to_recursive_snapshot(
     changed = False
     def observe(
         repository: Path, *, pristine: bool, cache_globs: Sequence[str] = (),
+        build_residue: bool = False,
     ) -> wrkslots._RetainedValidationGitState:
         nonlocal changed
         if repository == checkout and not changed:
@@ -53643,7 +53690,7 @@ def test_current_incomplete_frozen_binds_initial_facts_to_recursive_snapshot(
             else:
                 for path in (checkout, source):
                     git(path, "remote", "set-url", "origin", str(tmp_path / "changed.git"))
-        return original(repository, pristine=pristine, cache_globs=cache_globs)
+        return original(repository, pristine=pristine, cache_globs=cache_globs, build_residue=build_residue)
     monkeypatch.setattr(wrkslots, "_retained_validation_git_state", observe)
     assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
     row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
