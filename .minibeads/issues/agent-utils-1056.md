@@ -1,11 +1,12 @@
 ---
 title: 'predict-first-submission: first submissions get the model base rate instead of a real prediction'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-predict
 created_at: 2026-11-08T11:52:16.000000000+00:00
-updated_at: 2026-11-08T11:52:16.000000000+00:00
+updated_at: 2026-11-08T15:37:10.000000000+00:00
+closed_at: 2026-11-08T15:37:10.000000000+00:00
 ---
 
 # Description
@@ -29,3 +30,9 @@ With `Config::predict` on, `decisions::from_report` scores a change only from `p
 # Notes
 
 Reported 2026-11-08 from live queues that had just enabled the predictor built on 2026-11-05. Out of scope: new features such as pin or risk-path signals, and any change to the expected-value planner or scheduling.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 23dcec839c296cdbc00bb4ab4bb7460e38ba54d6 (gated commit 0338a76d on the 7577cf67 budget fix, replayed onto a99c66ca). Training and serving share `predict::feature_vector`; `predict::ServeContext` (pre-run history snapshot plus head times) replaces `Sources::model_vectors`, the base-rate fallback arm is gone, and resubmissions count `head` signals strictly before the scored validation in both constructions. The one intended train/serve difference - serving fixes its snapshot before the run while training folds each decision before later ones - is documented on `ServeContext`. The expected-value planner is code-untouched (`latest_vectors` remains for it alone; its values can shift from the causal resubmissions fix). Operators should retrain (`merge-queue model train`) after taking the new binary, since an old `model.json` was fit with the previous resubmission counts.
+
+Evidence: the new `from_report` test failed on the old code with exactly the base rate and passes after; a decided change's submit-time vector equals its training vector (including causal resubmissions); first submissions spread off the base rate with a better Brier than the old fallback. On a 60-first-submission fixture with old and new binaries, `model.json` and `model eval` were identical (Brier 0.001 - eval re-derives training vectors, which is why the bug hid), while served `predicted_pass` went from 60 at base rate 0.5 (Brier 0.250) to 0.027-0.990 (Brier 0.001). Full gate: main phase 234 passed with 4 unrelated single-test failures (agentctl, vibe-talk, wrkslots lifecycle), all passing on an exclusive rerun; `rust.merge-queue.test` passed (598 s wall, 1432 CPU-s under the 2400 budget); the exclusive cross-differential phase was waived for this merge-queue-only diff.
