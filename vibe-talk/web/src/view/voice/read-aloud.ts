@@ -2439,7 +2439,15 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   function stepReading(delta: number) {
     const playing = nowPlaying;
     if (playing === null || !playing.segments) return false;
-    if (delta > 0 && playing.segment! + 1 >= playing.segments!.length) return false;
+    if (delta > 0 && playing.segment! + 1 >= playing.segments!.length) {
+      // Next on the last block finishes the message, exactly as hearing it out
+      // does (owner reply 205): stop, and archive it as read. Autoplay's next
+      // read is consulted the same way, so with Autoplay on the read goes on.
+      const next = deps.nextAfterRead ? deps.nextAfterRead(playing.parts) : null;
+      endReadGoingOn(next !== null);
+      goOnAfterRead(next, deps.guardQuietly(() => deps.dismissMessages({ messages: playing.parts }))());
+      return true;
+    }
     return jumpReading(playing.segment! + delta);
   }
 

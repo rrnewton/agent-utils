@@ -1079,6 +1079,19 @@ def main() -> int:
                 wait_for(lambda: {"messages": [LONG]} in api.dismissed, 3, "the message heard to its end was not archived")
                 check(lit_element(page) == "", f"a block is still lit after the read: {lit_element(page)!r}")
 
+                # 6b. Next on the last block finishes at once (owner reply 205): the
+                # message is archived without being heard out, Autoplay off.
+                api.dismissed.clear()
+                press(page, f'#discord-log > li[data-id="{LONG}"] .body', True)
+                wait_position(page, "1 of 7")
+                for _ in range(6):
+                    press(page, "#read-next", True)
+                wait_position(page, "7 of 7")
+                page.evaluate("() => window.mediaProbe.handlers.nexttrack({action: 'nexttrack'})")
+                wait_for(lambda: {"messages": [LONG]} in api.dismissed, 3,
+                         "Next on the last block did not finish the message")
+                wait_for(lambda: position(page) == "", 3, "the finished read kept its strip")
+
                 # 7. A message of one block reads whole, as before: no strip, no block asked for.
                 press(page, f'#discord-log > li[data-id="{SHORT}"] .body', True)
                 wait_for(lambda: api.reads_of(SHORT), 3, "the short message was not read")

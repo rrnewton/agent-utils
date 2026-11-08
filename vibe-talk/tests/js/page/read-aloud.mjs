@@ -1146,10 +1146,6 @@ test("Previous and Next move the read a block at a time; Previous on the first b
   await page.el("read-next").click();
   await page.settle();
   assert.equal(page.el("read-steer-count").text(), "3 of 3");
-  const before = page.audioStreams.length;
-  await page.el("read-next").click();
-  await page.settle();
-  assert.equal(page.audioStreams.length, before, "Next past the last block asked for something");
   await page.el("read-prev").click();
   await page.settle();
   assert.equal(page.el("read-steer-count").text(), "2 of 3");
@@ -1159,6 +1155,18 @@ test("Previous and Next move the read a block at a time; Previous on the first b
   await page.settle();
   assert.equal(page.el("read-steer-count").text(), "1 of 3");
   assert.equal(blockOf(page.audioStreams.at(-1).url), "0", "Previous on the first block did not start it again");
+  // Next on the last block finishes the message (owner reply 205): with Autoplay
+  // off it stops and marks the message read, asking for nothing more.
+  await page.el("read-next").click();
+  await page.settle();
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "3 of 3");
+  const dismissedBefore = page.dismissCalls.length;
+  await page.el("read-next").click();
+  await page.settle();
+  assert.ok(page.dismissCalls.length > dismissedBefore, "Next on the last block did not finish the message");
+  assert.equal(page.el("read-steer").hidden, true, "the strip outlived the finished read");
 });
 
 // --- `#627 scrubber-thumb-arrows`: the fat arrows step a section, the thin ones a block -------------
