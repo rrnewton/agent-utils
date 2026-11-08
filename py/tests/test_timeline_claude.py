@@ -548,6 +548,8 @@ def _file_read_fixture(
     *,
     repeat_file: dict[str, object] | None = None,
     repeat_message: dict[str, object] | None = None,
+    first_content: str = "# Guide\n\nThe whole file.\n",
+    repeat_type: str = "text",
 ) -> Path:
     """A root that reads a file, then a resume re-appending that result with its text changed."""
 
@@ -558,7 +560,7 @@ def _file_read_fixture(
     first_user = next(record for record in records if record["uuid"] == "root-user-1")
     read_file: dict[str, object] = {
         "filePath": "/work/guide.md",
-        "content": "# Guide\n\nThe whole file.\n",
+        "content": first_content,
         "numLines": 3,
         "startLine": 1,
         "totalLines": 3,
@@ -573,7 +575,7 @@ def _file_read_fixture(
         slug="quiet-river",
         promptId="resumed-prompt",
         toolUseResult={
-            "type": "text",
+            "type": repeat_type,
             "file": dict(read_file, content=repeat_content, **(repeat_file or {})),
         },
     )
@@ -594,17 +596,22 @@ def test_resumed_file_read_with_elided_text_is_the_same_record(tmp_path: Path) -
 
 
 @pytest.mark.parametrize(
-    ("content", "file_change", "message"),
+    ("content", "file_change", "message", "first", "result_type"),
     [
         # Different text that is not blanked is a different read.
-        ("# Guide\n\nA different file.\n", None, None),
+        ("# Guide\n\nA different file.\n", None, None, None, "text"),
         # Blanked, but not the same file, or not the same slice of it.
-        ("", {"filePath": "/work/other.md"}, None),
-        ("", {"numLines": 4}, None),
-        ("", {"startLine": 2}, None),
-        ("", {"totalLines": 9}, None),
+        ("", {"filePath": "/work/other.md"}, None, None, "text"),
+        ("", {"numLines": 4}, None, None, "text"),
+        ("", {"startLine": 2}, None, None, "text"),
+        ("", {"totalLines": 9}, None, None, "text"),
         # Blanked, but what the model was shown differs.
-        ("", None, {"role": "user", "content": "A different request."}),
+        ("", None, {"role": "user", "content": "A different request."}, None, "text"),
+        # The blank copy came first and the full one second: keeping the first would lose
+        # the text, so this is not the elision the parser accepts.
+        ("# Guide\n\nThe whole file.\n", None, None, "", "text"),
+        # Blanked, but a different kind of tool result.
+        ("", None, None, None, "image"),
     ],
 )
 def test_resumed_file_read_that_is_not_only_elided_still_refuses(
@@ -612,9 +619,16 @@ def test_resumed_file_read_that_is_not_only_elided_still_refuses(
     content: str,
     file_change: dict[str, object] | None,
     message: dict[str, object] | None,
+    first: str | None,
+    result_type: str,
 ) -> None:
     root = _file_read_fixture(
-        tmp_path, content, repeat_file=file_change, repeat_message=message
+        tmp_path,
+        content,
+        repeat_file=file_change,
+        repeat_message=message,
+        repeat_type=result_type,
+        **({} if first is None else {"first_content": first}),
     )
     with pytest.raises(ClaudeParseError, match="conflicting duplicate UUID root-read-result"):
         load_claude_team(root, "claude-fixture", "UTC")

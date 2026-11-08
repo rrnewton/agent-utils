@@ -10,13 +10,20 @@ import pytest
 
 from tests.test_timeline_pipeline import _team, _write_team
 from wrkviz.cli import main as timeline_main
-from wrkviz.pipeline import summarize_archive
+from wrkviz.pipeline import (
+    _PRESENTATION_FALLBACK_VERSION,
+    _result_artifact_key,
+    summarize_archive,
+)
 from wrkviz.project_rollup import (
+    _plain_job,
     load_weekly_inputs,
     project_root,
     project_weekly_jobs,
     summarize_project_weekly,
 )
+from wrkviz.summary_registry import PLAIN_LANGUAGE_ROLLUP_STYLE, TECHNICAL_ROLLUP_STYLE
+from wrkviz.terminology import plain_language_context_text
 
 TEAMS = ("alpha-team", "beta-team")
 
@@ -56,6 +63,11 @@ def test_project_weekly_reads_only_the_team_weeklies_and_lists_them(tmp_path: Pa
         assert f"Team {slug} weekly:" in line
     assert "Alpha shipped the parser." in job.transcript
     assert "Beta fixed the scheduler." in job.transcript
+    # No other channel carries evidence: no prior weeks, no glossary, no extra facts, no stats.
+    assert (job.prior_context, job.glossary, job.factual_context) == ("", "", "")
+    assert job.stats == {}
+    assert job.summary_style == TECHNICAL_ROLLUP_STYLE
+    assert job.dependency_keys == tuple(_result_artifact_key(item.technical) for item in inputs)
 
     report = summarize_project_weekly(
         tmp_path,
@@ -84,10 +96,21 @@ def test_project_weekly_reads_only_the_team_weeklies_and_lists_them(tmp_path: Pa
         inputs_section = text.split("## Inputs", 1)[1]
         for slug in TEAMS:
             assert f"`{slug}`" in inputs_section
-    # Week-level items have no meaningful time of day, so the pages give none.
-    assert "## Work summary\n\n- **" not in report.technical_markdown.read_text(encoding="utf-8")
     run = json.loads(report.run_path.read_text(encoding="utf-8"))
     assert [item["team"] for item in run["inputs"]] == list(TEAMS)
+    # The plain-language weekly reads the same lines plus the technical result, and nothing else.
+    plain_job = _plain_job(job, report.technical, week)
+    assert plain_job.summary_style == PLAIN_LANGUAGE_ROLLUP_STYLE
+    assert plain_job.transcript == job.transcript
+    assert plain_job.prior_context == ""
+    assert plain_job.glossary == plain_language_context_text("", [])
+    assert plain_job.factual_context.startswith(
+        f"[{inputs[0].start_ms}] Authoritative technical weekly summary:"
+    )
+    assert report.technical.paragraph in plain_job.factual_context
+    assert plain_job.stats == {}
+    # Week-level items have no meaningful time of day, so the pages give none.
+    assert "## Work summary\n\n- **" not in report.technical_markdown.read_text(encoding="utf-8")
     # A second run is served from the project rollup's own cache.
     again = summarize_project_weekly(
         tmp_path, "example-project", TEAMS, week, "heuristic", "test-model",
@@ -147,4 +170,32 @@ def test_a_rollup_recording_another_scope_is_refused(tmp_path: Path) -> None:
     path.write_text(json.dumps(dict(data, agent_scope="all")), encoding="utf-8")
 
     with pytest.raises(ValueError, match="records agent scope 'all'"):
+        load_weekly_inputs(tmp_path, TEAMS, week, "coordinator")
+
+
+def _team_weekly(tmp_path: Path, week: str, slug: str) -> Path:
+    return (
+        tmp_path / "teams" / slug / "summary_scopes" / "coordinator" / "rollups" / "weekly"
+        / f"{week}.json"
+    )
+
+
+def test_rollups_for_different_intervals_are_refused(tmp_path: Path) -> None:
+    week = _archive(tmp_path)
+    path = _team_weekly(tmp_path, week, TEAMS[1])
+    data = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(json.dumps(dict(data, start_ms=data["start_ms"] + 3_600_000)), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cover different intervals"):
+        load_weekly_inputs(tmp_path, TEAMS, week, "coordinator")
+
+
+def test_a_rollup_holding_no_model_summary_is_refused_by_name(tmp_path: Path) -> None:
+    week = _archive(tmp_path)
+    path = _team_weekly(tmp_path, week, TEAMS[0])
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["technical_summary"]["prompt_version"] = _PRESENTATION_FALLBACK_VERSION
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=f"{TEAMS[0]} .* holds no model summary"):
         load_weekly_inputs(tmp_path, TEAMS, week, "coordinator")

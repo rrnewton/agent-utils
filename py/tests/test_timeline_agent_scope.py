@@ -258,7 +258,8 @@ def test_the_kept_selection_is_reported_and_recorded(
     assert timeline_main([*common, "--plan"]) == 0
     assert line in capsys.readouterr().out
     assert timeline_main(common) == 0
-    assert line in capsys.readouterr().out
+    # Once under the plan the run prints before its first model call, once after the run.
+    assert capsys.readouterr().out.count(line) == 2
     receipt = json.loads(sorted((tmp_path / "runs").glob("*.json"))[-1].read_text(encoding="utf-8"))
     recorded = receipt["summaries"]["agent_scope_selection"]
     assert recorded == {
