@@ -749,10 +749,16 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
                 .map_err(|error| format!("unreadable report: {error}"))?;
             // A receipt that ran newer descendant tools names objects this host
             // may not have fetched yet: fetch once, outside the store lock, so
-            // the descendant proof can resolve them (#1005).
+            // the descendant proof can resolve them (#1005). The trees the
+            // validator attested in-run (#1045) can need the same proof.
             if let Ok(jobs) = store.jobs() {
                 if let Some(stored) = jobs.iter().find(|stored| stored.id == job) {
-                    if stored.tool.tools != report.receipt.tool.tools {
+                    let ran_newer = report.receipt.ran_tools.iter().any(|(name, values)| {
+                        values
+                            .iter()
+                            .any(|value| stored.tool.tools.get(name) != Some(value))
+                    });
+                    if stored.tool.tools != report.receipt.tool.tools || ran_newer {
                         let git = crate::git::Git::new(&config.repo);
                         let _ = git.run(&["fetch", "--quiet", &config.remote]);
                         for command in config.validator.tool_identity.values() {
@@ -1194,13 +1200,16 @@ enum Command {
         offload: String,
         /// A tool the validation depends on, as NAME=COMMAND (repeatable): the command prints
         /// its identity (a tool repository's commit, a toolchain version; never a hash of a
-        /// binary, since builds differ byte for byte across hosts). A donor whose answer
+        /// binary, since builds differ byte for byte across hosts). It identifies exactly
+        /// what the validator executes; the validator attests that tree from inside the run
+        /// with `merge-queue-tool-identity: <tool> <40-hex value>` lines. A donor whose answer
         /// differs from the queue host's refuses the job. merge-queue's own revision (the
         /// second line of --version) is always compared.
         #[arg(long, value_name = "NAME=COMMAND")]
         tool_identity: Vec<String>,
         /// How the tool NAME (one of --tool-identity) is brought up to date, as
-        /// NAME=COMMAND (repeatable), for example a fetch of the tool repository. A donor whose
+        /// NAME=COMMAND (repeatable), for example a fetch of the tool repository; it must
+        /// update what the validator loads, not only what the identity command reads. A donor whose
         /// answer differs from the job's runs it once and asks again: an older donor then takes
         /// the job; one that still differs gives the job back (and is offered it again after a
         /// re-stamp). The queue host runs it too, bounded and rate-limited, at claim time.

@@ -16,7 +16,7 @@
 //! Both share the selection policy: a shell command printing test IDs for the checkout at
 //! `$MQ_HEAD` relative to `$MQ_BASE`, or `all` when none is configured.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -140,6 +140,15 @@ const SUSPECT_SHAPES: [&str; 2] = ["timeout", "no-verdict"];
 /// counts the red as confirmed on that one observation instead of spending a rerun on it; see
 /// [`Ran::deterministic_red`].
 pub const RERUN_EXEMPT_MARKER: &str = "RERUN-EXEMPT";
+
+/// Marker line a validator prints from inside the run to attest the tree it actually
+/// loaded for one tool (`merge-queue-tool-identity: <tool> <40-hex value>`, one line per
+/// configured `validator.tool_identity` tool; print them before running tests so an
+/// early-stopped run still attests). `validator.tool_identity` identifies exactly what
+/// `validator.run` executes, and `validator.tool_refresh` updates that; these lines are
+/// how a donor proves the identification and the execution were the same tree (#1045).
+/// See [`Ran::printed_tool_identity`].
+pub const TOOL_IDENTITY_MARKER: &str = "merge-queue-tool-identity";
 
 /// Environment variable set to `1` for a candidate validation when `validator.fail_fast` is on:
 /// the runner may stop at the first red step and report the steps it skipped as `skip`.
@@ -267,6 +276,40 @@ fn name_the_failures_of_a_red_run(results: &mut TestResults, log_text: &str) {
     }
 }
 
+/// The validator's in-run tool attestations in `log_text`
+/// ([`TOOL_IDENTITY_MARKER`]): tool name -> every value it printed, in order.
+/// Only a line that (trimmed) starts with the marker attests; text merely
+/// mentioning the marker does not. A marker line that is not `<tool> <value>`
+/// is kept under the empty name as malformed evidence, never dropped:
+/// the queue refuses it as identity-mismatch rather than guess (#1045).
+pub fn printed_tool_identity(log_text: &str) -> BTreeMap<String, Vec<String>> {
+    let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for line in log_text.lines() {
+        let Some(rest) = line.trim().strip_prefix(TOOL_IDENTITY_MARKER) else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        match (words.next(), words.next(), words.next()) {
+            (Some(tool), Some(value), None) => {
+                found
+                    .entry(tool.to_owned())
+                    .or_default()
+                    .push(value.to_owned());
+            }
+            _ => {
+                found
+                    .entry(String::new())
+                    .or_default()
+                    .push(rest.trim().to_owned());
+            }
+        }
+    }
+    found
+}
+
 /// The test IDs on every `MARKER: id1,id2` line of `log_text`.
 fn marker_ids(log_text: &str, marker: &str) -> Vec<TestId> {
     let mut found = Vec::new();
@@ -363,6 +406,12 @@ pub struct Ran {
     /// [`EARLY_VERDICT_ENV`]). Its results are the verdicts seen so far; unreported tests carry
     /// no outcome. Never also `cancelled`.
     pub early_red: bool,
+    /// Tool trees the validator attested from inside this run
+    /// ([`TOOL_IDENTITY_MARKER`] lines, see [`printed_tool_identity`]): the trees it
+    /// actually loaded, as opposed to the pre-run `validator.tool_identity` answers.
+    /// A donor copies these onto its receipt; the queue refuses the receipt as
+    /// identity-mismatch when they do not match (or descend from) the job's stamp (#1045).
+    pub printed_tool_identity: BTreeMap<String, Vec<String>>,
 }
 
 /// What one culprit-search probe actually observed.
@@ -1200,6 +1249,7 @@ impl Validator for CommandValidator {
                 cpu: None,
                 donor: None,
                 early_red: true,
+                printed_tool_identity: printed_tool_identity(&log_text),
             });
         }
         if results.results.is_empty() {
@@ -1307,6 +1357,11 @@ impl Validator for CommandValidator {
             cpu: finished.cpu,
             donor: None,
             early_red: false,
+            printed_tool_identity: if refused {
+                BTreeMap::new()
+            } else {
+                printed_tool_identity(&log_text)
+            },
         })
     }
 }
@@ -1509,6 +1564,7 @@ impl Validator for DagrunValidator {
                     cpu: None,
                     donor: None,
                     early_red: false,
+                    printed_tool_identity: BTreeMap::new(),
                 });
             }
             argv.push("--selected".to_owned());
@@ -1584,6 +1640,7 @@ impl Validator for DagrunValidator {
                 cpu: None,
                 donor: None,
                 early_red: true,
+                printed_tool_identity: printed_tool_identity(&log_text),
             });
         }
         results.require(whole_steps.as_ref().unwrap_or(selection));
@@ -1634,6 +1691,11 @@ impl Validator for DagrunValidator {
             cpu: finished.cpu,
             donor: None,
             early_red: false,
+            printed_tool_identity: if refused {
+                BTreeMap::new()
+            } else {
+                printed_tool_identity(&log_text)
+            },
         })
     }
 }
@@ -2398,6 +2460,39 @@ dagrun: PASS - 1 passed";
         assert!(rerun_exempt(Some(1), "RERUN-EXEMPT check.paths\n").is_empty());
     }
 
+    #[test]
+    fn printed_tool_identity_reads_attestation_lines_and_keeps_conflicts() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let log = format!(
+            "noise\nmerge-queue-tool-identity: ci-hub {a}\n\
+             a test mentioning merge-queue-tool-identity: ci-hub {b} mid-line\n\
+             merge-queue-tool-identity: toolchain 1.90\nmore\n"
+        );
+        let printed = printed_tool_identity(&log);
+        assert_eq!(printed["ci-hub"], vec![a.clone()]);
+        assert_eq!(printed["toolchain"], vec!["1.90".to_owned()]);
+        assert_eq!(printed.len(), 2, "{printed:?}");
+        // The same value twice is one attestation; two values stay two, so the
+        // queue can refuse the conflict instead of picking a winner.
+        let log = format!(
+            "merge-queue-tool-identity: ci-hub {a}\n\
+             merge-queue-tool-identity: ci-hub {b}\n\
+             merge-queue-tool-identity: other {a}\n\
+             merge-queue-tool-identity: other {a}\n"
+        );
+        let printed = printed_tool_identity(&log);
+        assert_eq!(printed["ci-hub"], vec![a.clone(), b.clone()]);
+        assert_eq!(printed["other"], vec![a.clone(), a.clone()]);
+        // A line that starts with the marker but is not `<tool> <value>` is
+        // kept as malformed evidence under the empty name, never dropped.
+        let printed = printed_tool_identity(
+            "merge-queue-tool-identity: ci-hub\nmerge-queue-tool-identity:\n",
+        );
+        assert_eq!(printed[""], vec!["ci-hub".to_owned(), String::new()]);
+        assert!(printed_tool_identity("no markers\n").is_empty());
+    }
+
     /// A finished run with these outcomes, exit status and `RERUN-EXEMPT:` steps.
     fn ran_with(outcomes: &[(&str, Outcome)], exit: Option<i32>, exempt: &[&str]) -> Ran {
         let mut results = TestResults::default();
@@ -2428,6 +2523,7 @@ dagrun: PASS - 1 passed";
             cpu: None,
             donor: None,
             early_red: false,
+            printed_tool_identity: BTreeMap::new(),
         }
     }
 
@@ -2493,6 +2589,7 @@ dagrun: PASS - 1 passed";
                 cpu: None,
                 donor: None,
                 early_red: false,
+                printed_tool_identity: BTreeMap::new(),
             };
             assert_eq!(ran.probe_observation(), ProbeObservation::Unknown);
             assert_ne!(ran.probe_observation(), ProbeObservation::Pass);

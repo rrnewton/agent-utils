@@ -676,6 +676,15 @@ fn a_remote_donor_with_newer_descendant_tools_gets_the_job() {
     two_changes(&fx);
     let clone = donor_clone(&fx, "donor-host");
     let v1_tree = tool_clones(&fx, &clone);
+    // The validator attests, from inside the run, the tree in the donor's
+    // tool clone it loaded (#1045): after the donor's refresh that is v2.
+    let attest = format!(
+        "echo merge-queue-tool-identity: ci-hub $(git -C {} rev-parse origin/main:ci-hub); exit 0",
+        clone.join("tool").display()
+    );
+    set_config(&fx, |config| {
+        config["validator"]["run"] = serde_json::json!(attest);
+    });
     let run = spawn_run(&fx, &[]);
     wait_for("a published job", Duration::from_secs(30), || {
         !jobs(&fx).is_empty()
@@ -716,6 +725,11 @@ fn a_remote_donor_with_newer_descendant_tools_gets_the_job() {
     assert_eq!(job["state"], "done", "{job}");
     assert_eq!(job["tool"]["tools"]["ci-hub"], v1_tree, "{job}");
     assert_eq!(job["receipt"]["tool"]["tools"]["ci-hub"], v2_tree, "{job}");
+    assert_eq!(
+        job["receipt"]["ran_tools"]["ci-hub"],
+        serde_json::json!([v2_tree]),
+        "{job}"
+    );
     assert!(job.get("declined_by").is_none(), "{job}");
     assert!(
         job["history"]
@@ -723,6 +737,63 @@ fn a_remote_donor_with_newer_descendant_tools_gets_the_job() {
             .contains("accepted with descendant tool ci-hub"),
         "{job}"
     );
+}
+
+#[test]
+fn a_donor_whose_validator_ran_a_stale_tree_is_refused_as_identity_mismatch() {
+    // #1045, the observed failure shape: identity answers read the fresh
+    // origin/main tree on both hosts, but the validator on the donor loads
+    // the stale v1 tree and says so from inside the run. Pre-fix this receipt
+    // landed the batch; now the queue refuses it and nothing lands on it.
+    let fx = Fixture::new("donor-ran-stale");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "decide",
+        "--tool-identity",
+        "ci-hub=git -C tool rev-parse origin/main:ci-hub",
+        "--tool-refresh",
+        "ci-hub=git -C tool fetch -q origin",
+    ]);
+    set_config(&fx, |config| {
+        config["donors"] = serde_json::json!({"claim_timeout_secs": 4, "lease_secs": 30})
+    });
+    two_changes(&fx);
+    let clone = donor_clone(&fx, "donor-host");
+    let v1_tree = tool_clones(&fx, &clone);
+    advance_tool(&fx);
+    // Both hosts' identity answers are fresh (v2)...
+    git(&fx.queue().join("tool"), &["fetch", "-q", "origin"]);
+    git(&clone.join("tool"), &["fetch", "-q", "origin"]);
+    // ...but the validator attests the stale tree it actually loaded.
+    let attest_stale = format!("echo merge-queue-tool-identity: ci-hub {v1_tree}; exit 0");
+    set_config(&fx, |config| {
+        config["validator"]["run"] = serde_json::json!(attest_stale);
+    });
+    let mut run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let out = donor(&fx, &clone, "d1", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    wait_for(
+        "the identity-mismatch refusal",
+        Duration::from_secs(30),
+        || {
+            jobs(&fx)[0]["history"]
+                .to_string()
+                .contains("identity-mismatch")
+        },
+    );
+    let job = &jobs(&fx)[0];
+    assert_ne!(job["state"], "done", "{job}\n{stderr}");
+    assert!(job.get("receipt").is_none_or(|r| r.is_null()), "{job}");
+    run.kill().unwrap();
+    run.wait().unwrap();
 }
 
 #[test]

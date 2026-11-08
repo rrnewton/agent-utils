@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-donor-tool-identity: the donor runs the tree it identifies'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-08T04:13:13.000000000+00:00
-updated_at: 2026-11-08T04:13:13.000000000+00:00
+updated_at: 2026-11-08T04:25:35.000000000+00:00
 ---
 
 # Description
@@ -75,3 +75,35 @@ commits stale); print format agreed with it the same day. The
 queue host's own local validator runs share the parsing but
 enforcement is donor/receipt-side, where the attestation crosses
 a trust boundary.
+
+Landed by mu-archive: `printed_tool_identity` parses the lines
+for both validator kinds, the donor records them as receipt
+`ran_tools`, `Store::tool_check` refuses missing/malformed/extra/
+conflicting/stale/unrelated attestations as identity-mismatch
+(equal-or-descendant, refused runs exempt), the report route
+fetches tool repos for the attestation proof too, and the user
+guide + config docs carry the contract. Regression coverage:
+parser unit test, receipt unit test, and the cli_donor
+stale-tree integration test (verified to fail with the check
+neutered).
+
+## Resolution (validation evidence and the two named flakes)
+
+The full `--all` gate's shared phase passed 237 steps and failed
+only `rust.merge-queue.test` (CPU-TIMEOUT >1200s cpu, zero test
+events). Five qualifying solo runs of that exact step command
+(551 cases each; this issue's own tests green in every run):
+two all-pass (549) and three at 548 whose sole failure was a
+named pre-existing timing flake outside this diff —
+`cli_donor::a_dead_donor_loses_its_lease_and_its_late_receipt_is_refused`
+(lease_secs=2 vs sleep(3) race; attempts 3 vs 2 under load; 5/5
+isolated passes) and
+`cli_stale_green::a_prioritized_stale_green_roots_instead_of_stacking_under_a_plain_head`
+(60 s wait_for under load; fails on the unmodified base at a
+similar rate; fixed deterministically by the #1014 lane).
+Solo CPU (compile cached) was 738-873 CPU-s, ~75% sys — the
+suite sits at roughly two-thirds of the step's 1200 CPU-s cap
+before compile and gate contention, which is the named cause
+(filed separately as gate-merge-queue-cpu-budget). The gate's
+exclusive phase was waived by the coordinator as unobservable
+by a merge-queue-only diff.

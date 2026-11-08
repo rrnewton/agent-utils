@@ -1002,9 +1002,14 @@ An **item record** (`items/<pr>.json`) has these fields:
 - `timeout_secs`: `0` means no limit.
 - `clean_ignored`: also delete ignored files from reused checkouts (default `false`).
 - `offload`: `off` (or absent; the default), `compare` or `decide` (see "Donor validators").
-- `tool_identity`: `{name: command}`, the tools a validation depends on, checked on donors.
+- `tool_identity`: `{name: command}`, the tools a validation depends on, checked on donors. It
+  identifies exactly what `run` executes; the validator attests the loaded tree from inside
+  the run with `merge-queue-tool-identity: <tool> <40-hex value>` lines (see "Tool identity
+  and receipts").
 - `tool_refresh`: `{name: command}`, how a donor brings each of those tools up to date when its
-  answer differs from a job's (see "Tool identity and receipts").
+  answer differs from a job's (see "Tool identity and receipts"). It must update what `run`
+  loads, not only what the identity command reads: a fetch-only refresh under a
+  working-tree-loading validator identifies one tree and runs another.
 - `max_deferrals`: deferrals before a change is escalated to its owner (absent or `0`: `3`).
 - `red_without_probe`: `hold` holds a red change whose probe cannot run for its owner; absent
   (the default) ejects it.
@@ -1520,6 +1525,13 @@ the queue host) and the tool identity, which has three parts:
 - the answers of the configured `validator.tool_identity` commands, for example the commit of
   each tool repository and the pinned toolchain.
 
+The contract, stated once: **`tool_identity` identifies exactly what `validator.run`
+executes, and `tool_refresh` updates that.** An identity command that answers from a ref
+(for example `git -C tool rev-parse origin/main:ci-hub`) while the validator loads files from
+the tool's working tree breaks the contract unless the refresh also moves that working tree
+(a fetch alone does not): the donor would identify one tree and run another, which is how a
+validation came to run a tool checkout hundreds of commits old under a fresh stamp.
+
 The commands run in the queue's repository on the queue host and in the donor's clone on the
 donor. A donor that does not match the job names each difference, backs off claiming for
 `--mismatch-backoff-secs`, and does not run the job. It declines the job only when it is
@@ -1537,6 +1549,18 @@ certain it can never match it. Otherwise it gives the job back and is offered it
   donor may take it meanwhile. A tool with no refresh command, or whose refresh fails,
   likewise gives the job back. Refreshes run only on a mismatch, never on a timer, and
   each is bounded at 120 s.
+
+Because only the validator knows what it loaded, it attests from inside the run: it prints
+one line per configured tool, `merge-queue-tool-identity: <tool> <40-hex value>`, naming the
+tree it actually executed. Print the lines before running tests, so a run stopped early still
+attests. The donor records them on the receipt as `ran_tools`, beside the pre-run answers,
+and the queue holds them to the same rule as those answers: each attested tree must equal
+the job's stamp or provably descend from it, and a missing, malformed, extra, conflicting,
+stale-ancestor or unrelated attestation refuses the receipt as `identity-mismatch` (the job
+stays leased; nothing lands on that receipt). A tool stamped with a non-hex answer (a
+version string) cannot descend: an attestation line for it is optional and must then equal
+the stamp. A refused run (validation never ran) owes no attestation. With no
+`validator.tool_identity` configured there is nothing to attest.
 
 A queued job is re-stamped with the queue host's current answers at every claim (when the
 queue host can answer them), so every queued job carries the same stamp. Before answering,

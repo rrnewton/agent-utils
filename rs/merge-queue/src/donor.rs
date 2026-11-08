@@ -403,6 +403,13 @@ pub struct Receipt {
     pub tree: String,
     /// Tool identity the donor checked before it ran.
     pub tool: ToolIdentity,
+    /// Tool trees the validator attested from inside the run (its
+    /// `merge-queue-tool-identity:` lines, #1045): tool name -> every value
+    /// printed. Receipts written before this field existed parse with it
+    /// empty — and a validation that ran then owes an attestation it cannot
+    /// show, so the queue refuses it as identity-mismatch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ran_tools: BTreeMap<String, Vec<String>>,
     /// The donor's merge-queue version.
     pub merge_queue_version: String,
     /// Selection actually run, when the runner collapsed the requested one.
@@ -1514,7 +1521,9 @@ impl Store {
     /// donor ran newer than the stamp. The settings digest and the merge-queue
     /// revision must match exactly; each tool must match the stamp or provably
     /// descend from it in [`Store::tool_repo`] (bounded descendant acceptance,
-    /// #1005). Without a tool repository the tools must match exactly.
+    /// #1005). Without a tool repository the tools must match exactly. The same
+    /// rule then binds the trees the validator attested from inside the run
+    /// (`ran_tools`, #1045): a full-hex stamp owes exactly one attested tree.
     fn tool_check(&self, job: &Job, receipt: &Receipt) -> (Option<String>, Vec<String>) {
         if receipt.tool.validator_digest != job.tool.validator_digest {
             return (
@@ -1574,6 +1583,111 @@ impl Store {
                     )),
                     Vec::new(),
                 );
+            }
+        }
+        // The trees the validator itself attested from inside the run (#1045):
+        // the pre-run answers above say what the donor identified, these say
+        // what actually ran, and the two must agree (or descend, #1005) or the
+        // receipt certifies a validation nobody can name. A refused receipt
+        // never ran, so it owes no attestation.
+        if !stamped.is_empty()
+            && !receipt.refused
+            && receipt.exit != Some(crate::validate::REFUSAL_EXIT)
+        {
+            for name in receipt.ran_tools.keys() {
+                if !stamped.contains_key(name) {
+                    return (
+                        Some(format!(
+                            "identity-mismatch: the receipt's validator attested tool \
+                             {name:?}, which the job does not stamp"
+                        )),
+                        Vec::new(),
+                    );
+                }
+            }
+            for (name, stamp) in stamped {
+                let mut printed: Vec<&String> = Vec::new();
+                if let Some(values) = receipt.ran_tools.get(name) {
+                    for value in values {
+                        if !printed.contains(&value) {
+                            printed.push(value);
+                        }
+                    }
+                }
+                if full_hex(stamp) {
+                    match printed.as_slice() {
+                        [] => {
+                            return (
+                                Some(format!(
+                                    "identity-mismatch: the receipt's validator printed no \
+                                     {} line for tool {name}, so the tree it ran is unattested",
+                                    crate::validate::TOOL_IDENTITY_MARKER
+                                )),
+                                Vec::new(),
+                            );
+                        }
+                        [value] if *value == stamp => {}
+                        [value] if full_hex(value) => {
+                            let descends = match &self.tool_repo {
+                                Some(repo) => match tool_descends_from(
+                                    &job.validator,
+                                    name,
+                                    stamp,
+                                    value,
+                                    repo,
+                                ) {
+                                    Ok(descends) => descends,
+                                    Err(error) => return (Some(error), Vec::new()),
+                                },
+                                None => false,
+                            };
+                            if descends {
+                                notes.push(format!(
+                                    "accepted with descendant ran tool {name} ({} -> {})",
+                                    crate::plan::short(stamp),
+                                    crate::plan::short(value)
+                                ));
+                            } else {
+                                return (
+                                    Some(format!(
+                                        "identity-mismatch: the receipt's validator ran tool \
+                                         {name} at {value:?}, which neither matches the job's \
+                                         stamp {stamp:?} nor provably descends from it"
+                                    )),
+                                    Vec::new(),
+                                );
+                            }
+                        }
+                        [value] => {
+                            return (
+                                Some(format!(
+                                    "identity-mismatch: the receipt's validator ran tool \
+                                     {name} at {value:?}, not the full hex tree the job \
+                                     stamps ({stamp:?})"
+                                )),
+                                Vec::new(),
+                            );
+                        }
+                        values => {
+                            return (
+                                Some(format!(
+                                    "identity-mismatch: the receipt's validator attested \
+                                     tool {name} at {} different trees {values:?}",
+                                    values.len()
+                                )),
+                                Vec::new(),
+                            );
+                        }
+                    }
+                } else if !printed.is_empty() && printed != [stamp] {
+                    return (
+                        Some(format!(
+                            "identity-mismatch: the receipt's validator ran tool {name} \
+                             at {printed:?}, not the job's stamp {stamp:?}"
+                        )),
+                        Vec::new(),
+                    );
+                }
             }
         }
         (None, notes)
@@ -3362,6 +3476,7 @@ impl Worker<'_> {
                     tools: have.clone(),
                     merge_queue: revision.clone(),
                 },
+                ran_tools: ran.printed_tool_identity.clone(),
                 merge_queue_version: env!("CARGO_PKG_VERSION").to_owned(),
                 effective_selection: ran.effective_selection.clone(),
                 exit: ran.exit,
@@ -3979,6 +4094,12 @@ mod unit {
             commit: job.commit.clone(),
             tree: job.tree.clone(),
             tool: job.tool.clone(),
+            ran_tools: job
+                .tool
+                .tools
+                .iter()
+                .map(|(name, value)| (name.clone(), vec![value.clone()]))
+                .collect(),
             merge_queue_version: env!("CARGO_PKG_VERSION").to_owned(),
             exit: Some(0),
             ..Receipt::default()
@@ -4980,6 +5101,86 @@ mod unit {
             "{:?}",
             done.history
         );
+    }
+
+    #[test]
+    fn a_receipt_whose_validator_ran_another_tree_is_refused_as_identity_mismatch() {
+        // #1045: the pre-run answers are fresh, but the validator attests from
+        // inside the run that it loaded something else (or nothing): the queue
+        // must refuse, however fresh the pre-run answers look.
+        let (repo, _c1, t1, c2, t2, unrelated) = tool_repo("receipt-ran-tools");
+        git_in(&repo, &["update-ref", "refs/remotes/origin/main", &c2]).unwrap();
+        let validator = git_validator();
+        let publish_git = |store: &Store, stamp: &str| {
+            let tool = ToolIdentity {
+                validator_digest: validator_digest(&validator).unwrap(),
+                tools: [("ci-hub".to_owned(), stamp.to_owned())].into(),
+                merge_queue: Some(crate::build_info::Revision {
+                    commit: "a".repeat(40),
+                    dirty: false,
+                }),
+            };
+            store
+                .publish(
+                    "cand",
+                    "tree0",
+                    "base0",
+                    &Selection::of([TestId::step("a")]),
+                    &BTreeSet::new(),
+                    &validator,
+                    &tool,
+                    false,
+                    false,
+                    None,
+                )
+                .unwrap()
+        };
+        // Stamp t1 (the older tree): missing, unrelated and extra attestations
+        // refuse; a descendant attestation accepts.
+        let mut store = Store::new(&temp("receipt-ran-tools-store"));
+        store.tool_repo = Some(repo.clone());
+        let job = publish_git(&store, &t1);
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        let mut missing = receipt(&claimed, "d1");
+        missing.ran_tools.clear();
+        let error = store.report(&job.id, &token, missing).unwrap_err();
+        assert!(error.contains("identity-mismatch"), "{error}");
+        let mut wrong = receipt(&claimed, "d1");
+        wrong.ran_tools = [("ci-hub".to_owned(), vec![unrelated.clone()])].into();
+        let error = store.report(&job.id, &token, wrong).unwrap_err();
+        assert!(error.contains("identity-mismatch"), "{error}");
+        let mut extra = receipt(&claimed, "d1");
+        extra
+            .ran_tools
+            .insert("surprise".to_owned(), vec![t1.clone()]);
+        let error = store.report(&job.id, &token, extra).unwrap_err();
+        assert!(error.contains("identity-mismatch"), "{error}");
+        assert_eq!(store.read(&job.id).unwrap().state, JobState::Leased);
+        let mut descendant = receipt(&claimed, "d1");
+        descendant.ran_tools = [("ci-hub".to_owned(), vec![t2.clone()])].into();
+        store.report(&job.id, &token, descendant).unwrap();
+        assert_eq!(store.read(&job.id).unwrap().state, JobState::Done);
+        // Stamp t2 (fresh): the devbig176 shape — validator ran the stale
+        // ancestor t1. And a refused receipt (validation never ran) owes no
+        // attestation at all.
+        let mut store = Store::new(&temp("receipt-ran-stale-store"));
+        store.tool_repo = Some(repo);
+        store.could_not_run_limit = 99;
+        let job = publish_git(&store, &t2);
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        let mut stale = receipt(&claimed, "d1");
+        stale.ran_tools = [("ci-hub".to_owned(), vec![t1])].into();
+        let error = store.report(&job.id, &token, stale).unwrap_err();
+        assert!(error.contains("identity-mismatch"), "{error}");
+        assert_eq!(store.read(&job.id).unwrap().state, JobState::Leased);
+        let mut refused = receipt(&claimed, "d1");
+        refused.refused = true;
+        refused.exit = Some(75);
+        refused.ran_tools.clear();
+        let error = store.report(&job.id, &token, refused).unwrap_err();
+        assert!(!error.contains("identity-mismatch"), "{error}");
     }
 
     /// Publish a job with claim order and a controlled id (age), returning it.

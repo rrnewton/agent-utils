@@ -102,7 +102,10 @@ pub struct ValidatorConfig {
     pub offload: String,
     /// Commands naming the tools a validation depends on, by name (for example the commit of
     /// each tool repository, or a toolchain version). The queue host runs them when it
-    /// publishes a donor job; a donor whose answers differ refuses the job.
+    /// publishes a donor job; a donor whose answers differ refuses the job. Contract:
+    /// `tool_identity` identifies exactly what `validator.run` executes, and `tool_refresh`
+    /// updates that; the validator attests the loaded tree from inside the run with
+    /// `merge-queue-tool-identity: <tool> <40-hex value>` lines (#1045).
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub tool_identity: std::collections::BTreeMap<String, String>,
     /// Commands that bring a tool named in `tool_identity` up to date (for example a
@@ -110,7 +113,9 @@ pub struct ValidatorConfig {
     /// differs from the job's runs that tool's command once and asks again. An older donor then
     /// matches and runs the job. A donor that still differs is newer than the job, or unrelated
     /// to it, and gives the job back (it is offered the job again after a re-stamp). A tool
-    /// without a command, or whose command fails, likewise gives the job back. The queue host
+    /// without a command, or whose command fails, likewise gives the job back. A refresh must
+    /// update what `run` loads, not only what the identity command reads: a fetch-only refresh
+    /// under a working-tree-loading validator identifies one tree and runs another. The queue host
     /// also runs these commands, bounded and rate-limited, before it answers tool identity at
     /// claim time, so stamps do not go stale while every donor is busy.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]

@@ -4236,6 +4236,7 @@ impl<'a> Runner<'a> {
             cpu: None,
             donor: None,
             early_red: false,
+            printed_tool_identity: std::collections::BTreeMap::new(),
         };
         loop {
             if let Err(why) = crate::interrupt::check("a donor receipt arrived") {
@@ -8959,6 +8960,7 @@ fn receipt_ran(receipt: &crate::donor::Receipt, dir: &std::path::Path) -> Result
         cpu: receipt.cpu_ms.map(Duration::from_millis),
         donor: Some(format!("{}@{}", receipt.donor.name, receipt.donor.host)),
         early_red: receipt.early_red,
+        printed_tool_identity: receipt.ran_tools.clone(),
     })
 }
 
