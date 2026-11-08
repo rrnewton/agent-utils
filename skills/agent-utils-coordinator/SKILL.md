@@ -135,7 +135,11 @@ it with `--body-file` or `--from-file`; then read back what was stored.
 - Report substance, not motion. Not "closed five tasks" but what each change does and why it
   matters. Name the exact flag, file, or test. Give numbers with their provenance (how long did
   validation take, and has that changed?).
-- Cite issues and pull requests as full links or as `#<number> <slug>`, never a bare number.
+- **No bare issue or pull-request numbers.** Every issue or pull request you mention to the owner
+  is a full link plus a short slug or title, e.g. `[#5275 strict-replay](https://github.com/OWNER/REPO/pull/5275)`,
+  never `5275` or `#5275` alone. This holds wherever the owner reads: status lists, roll calls,
+  cron and nightly posts, chat replies. The link lets renderers find the repository (vibe-talk adds
+  the current title on its own); the slug lets the owner read the line without opening anything.
 - Say what is unverified. "Done" means delivered and checked.
 - When something you publish leaves the conversation (a commit body, an issue or pull-request
   comment), mark that it came from an agent and which one, unless the repository's rules say
