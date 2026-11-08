@@ -13,7 +13,7 @@
 //! first submission is scored from its own size, components and claims
 //! rather than the model base rate (#1056 predict-first-submission).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -89,6 +89,11 @@ pub struct Model {
     /// `infra` / `false-red` / `host`); 0 when no reclassification exists.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub excluded_labels: usize,
+    /// Change-instances excluded as false examples: their exact head had
+    /// already landed before the validation ran (#1072
+    /// predict-false-examples); mutually exclusive with `excluded_labels`.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub excluded_landed: usize,
     /// Overall green share of the training labels.
     pub base_rate: f64,
     /// Feature means used for standardisation.
@@ -434,6 +439,93 @@ impl ServeContext {
     }
 }
 
+/// Whether a decision is excluded by red-class label hygiene: a red whose
+/// effective class (record or reclassification) is `infra` / `false-red` /
+/// `host` is not evidence about its changes (composition reds stay).
+fn red_excluded(decision: &Decision, red_classes: &BTreeMap<(String, usize), String>) -> bool {
+    let effective_class = red_classes
+        .get(&(decision.run.clone(), decision.validation))
+        .map(String::as_str)
+        .or(decision.red_class.as_deref());
+    decision.outcome == "red" && matches!(effective_class, Some("infra" | "false-red" | "host"))
+}
+
+/// Change-instances that are false examples because their exact head had
+/// already landed before their validation ran (#1072
+/// predict-false-examples), as `(run, validation, pr)` keys: an earlier
+/// decision landed the same `(pr, head)`, in an earlier validation of the
+/// same run or with a landing time before this validation started.
+/// Simulated shadow landings never count; empty heads never match (fail
+/// open, as before); the landing validation itself is never dropped.
+pub fn dropped_landed(decisions: &[Decision]) -> BTreeSet<(String, usize, i64)> {
+    // (landing time, run, validation, pr, head) per recorded real landing.
+    let mut landings: Vec<(String, &str, usize, i64, &str)> = Vec::new();
+    for decision in decisions {
+        if decision.mode == "shadow" {
+            continue;
+        }
+        let Some(landed) = &decision.landed else {
+            continue;
+        };
+        let at = landed.at.clone().unwrap_or_else(|| decision.at.clone());
+        for pr in &landed.prs {
+            let head = decision
+                .changes
+                .iter()
+                .find(|change| change.pr == *pr)
+                .map(|change| change.head.as_str())
+                .unwrap_or_default();
+            if !head.is_empty() {
+                landings.push((at.clone(), &decision.run, decision.validation, *pr, head));
+            }
+        }
+    }
+    let mut dropped = BTreeSet::new();
+    for decision in decisions {
+        if decision.outcome != "green" && decision.outcome != "red" {
+            continue;
+        }
+        for change in &decision.changes {
+            if change.head.is_empty() {
+                continue;
+            }
+            let already = landings.iter().any(|(at, run, validation, pr, head)| {
+                *pr == change.pr
+                    && *head == change.head
+                    && ((*run == decision.run && *validation < decision.validation)
+                        || at.as_str() < decision.started_at.as_str())
+            });
+            if already {
+                dropped.insert((decision.run.clone(), decision.validation, change.pr));
+            }
+        }
+    }
+    dropped
+}
+
+/// How many change-instances [`examples`] drops as already landed,
+/// excluding any already dropped by red-class hygiene (the two model
+/// counters stay mutually exclusive).
+pub fn dropped_landed_count(
+    decisions: &[Decision],
+    red_classes: &BTreeMap<(String, usize), String>,
+) -> usize {
+    let dropped = dropped_landed(decisions);
+    decisions
+        .iter()
+        .filter(|decision| !red_excluded(decision, red_classes))
+        .flat_map(|decision| {
+            decision
+                .changes
+                .iter()
+                .map(move |change| (decision, change.pr))
+        })
+        .filter(|(decision, pr)| {
+            dropped.contains(&(decision.run.clone(), decision.validation, *pr))
+        })
+        .count()
+}
+
 /// Build training examples from decided decisions, walking chronologically so
 /// every history feature sees only the past. Batch outcome is the shared
 /// label (weight 1/width); signal attribution, when present for the exact
@@ -461,6 +553,7 @@ pub fn examples(
             attribution.insert((*pr, run.to_owned(), validation as usize), kind.to_owned());
         }
     }
+    let dropped = dropped_landed(decisions);
     let mut sorted: Vec<&Decision> = decisions
         .iter()
         .filter(|d| d.outcome == "green" || d.outcome == "red")
@@ -474,15 +567,7 @@ pub fn examples(
         // evidence about the change; they never become training examples
         // (composition reds stay: they are the P_conf signal). History
         // folding below still counts the validation as taken part in.
-        let effective_class = red_classes
-            .get(&(decision.run.clone(), decision.validation))
-            .cloned()
-            .or_else(|| decision.red_class.clone());
-        let excluded = decision.outcome == "red"
-            && matches!(
-                effective_class.as_deref(),
-                Some("infra" | "false-red" | "host")
-            );
+        let excluded = red_excluded(decision, red_classes);
         let batch_green = decision.outcome == "green";
         for change in &decision.changes {
             let author = items
@@ -512,7 +597,11 @@ pub fn examples(
                     1.0 / decision.width.max(1) as f64,
                 ),
             };
-            if !excluded {
+            // A change whose exact head already landed is a false example
+            // whatever this validation said; drop only that change.
+            let already_landed =
+                dropped.contains(&(decision.run.clone(), decision.validation, change.pr));
+            if !excluded && !already_landed {
                 out.push(Example {
                     at: decision.at.clone(),
                     pr: change.pr,
@@ -704,6 +793,7 @@ pub fn train(examples: &[Example], trained_at: &str) -> Result<Model, String> {
         trained_at: trained_at.to_owned(),
         samples: examples.len(),
         excluded_labels: 0,
+        excluded_landed: 0,
         base_rate,
         means,
         sds,
@@ -742,20 +832,12 @@ pub fn train_from_state(state_root: &Path) -> Result<Model, String> {
     let examples = examples(&decisions, &signals, &items, &red_classes);
     let excluded_labels = decisions
         .iter()
-        .filter(|d| {
-            d.outcome == "red"
-                && matches!(
-                    red_classes
-                        .get(&(d.run.clone(), d.validation))
-                        .map(String::as_str)
-                        .or(d.red_class.as_deref()),
-                    Some("infra" | "false-red" | "host")
-                )
-        })
+        .filter(|d| red_excluded(d, &red_classes))
         .map(|d| d.changes.len())
         .sum();
     let mut model = train(&examples, &crate::model::now())?;
     model.excluded_labels = excluded_labels;
+    model.excluded_landed = dropped_landed_count(&decisions, &red_classes);
     model.pair_conf = pair_rates(&decisions, &red_classes);
     let text = serde_json::to_string_pretty(&model).map_err(|e| e.to_string())?;
     std::fs::write(path(state_root), text)
@@ -843,6 +925,12 @@ pub fn render(model: &Model) -> String {
         out.push_str(&format!(
             "label hygiene: {} change-instance(s) excluded as infra/false-red/host reds\n",
             model.excluded_labels
+        ));
+    }
+    if model.excluded_landed > 0 {
+        out.push_str(&format!(
+            "label hygiene: {} change-instance(s) excluded as already landed before their validation\n",
+            model.excluded_landed
         ));
     }
     out.push_str("features by |weight| (positive raises predicted pass):\n");
@@ -1178,6 +1266,132 @@ mod unit {
         ));
         assert!(small > model.base_rate + 0.05, "small {small}");
         assert!(huge < model.base_rate - 0.05, "huge {huge}");
+    }
+
+    fn landed_decision(at: &str, pr: i64, head: &str) -> Decision {
+        let mut decision = decided(at, pr, "green", sized_features(10, 2, true));
+        decision.changes[0].head = head.to_owned();
+        decision.landed = Some(crate::decisions::LandedBy {
+            at: Some(at.to_owned()),
+            prs: vec![pr],
+        });
+        decision
+    }
+
+    #[test]
+    fn already_landed_heads_are_dropped_but_new_heads_and_siblings_train() {
+        // Pre-landing example, the landing validation itself, a false
+        // post-landing example at the same head, and a later new head.
+        let mut pre = decided(
+            "2026-01-01T00:00:00Z",
+            7,
+            "green",
+            sized_features(10, 2, true),
+        );
+        pre.changes[0].head = "h1".to_owned();
+        let landing = landed_decision("2026-01-02T00:00:00Z", 7, "h1");
+        let mut stale = decided(
+            "2026-01-03T00:00:00Z",
+            7,
+            "red",
+            sized_features(10, 2, true),
+        );
+        stale.changes[0].head = "h1".to_owned();
+        let mut fresh = decided(
+            "2026-01-04T00:00:00Z",
+            7,
+            "green",
+            sized_features(10, 2, true),
+        );
+        fresh.changes[0].head = "h2".to_owned();
+        // Mixed batch: the landed head drops, its sibling still trains.
+        let mut mixed = decided(
+            "2026-01-05T00:00:00Z",
+            7,
+            "red",
+            sized_features(10, 2, true),
+        );
+        mixed.changes[0].head = "h1".to_owned();
+        let mut sibling = mixed.changes[0].clone();
+        sibling.pr = 8;
+        sibling.head = "h8".to_owned();
+        mixed.changes.push(sibling);
+        mixed.width = 2;
+        let decisions = vec![pre, landing, stale, fresh, mixed];
+        let trained = examples(
+            &decisions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        let kept: Vec<(i64, &str)> = trained.iter().map(|e| (e.pr, e.at.as_str())).collect();
+        assert_eq!(
+            kept,
+            [
+                (7, "2026-01-01T00:00:00Z"),
+                (7, "2026-01-02T00:00:00Z"),
+                (7, "2026-01-04T00:00:00Z"),
+                (8, "2026-01-05T00:00:00Z"),
+            ],
+            "only the already-landed instances drop"
+        );
+        assert_eq!(dropped_landed_count(&decisions, &BTreeMap::new()), 2);
+    }
+
+    #[test]
+    fn same_run_later_validation_drops_and_shadow_landings_do_not_count() {
+        let run = "20260102T000000Z";
+        let mut earlier = decided(
+            "2026-01-02T00:00:00Z",
+            7,
+            "green",
+            sized_features(10, 2, true),
+        );
+        earlier.run = run.to_owned();
+        earlier.validation = 1;
+        earlier.changes[0].head = "h1".to_owned();
+        let mut landing = landed_decision("2026-01-02T01:00:00Z", 7, "h1");
+        landing.run = run.to_owned();
+        landing.validation = 2;
+        let mut later = decided(
+            "2026-01-02T02:00:00Z",
+            7,
+            "red",
+            sized_features(10, 2, true),
+        );
+        later.run = run.to_owned();
+        later.validation = 3;
+        later.changes[0].head = "h1".to_owned();
+        // A shadow landing of the same head must not drop real examples.
+        let mut shadow = landed_decision("2026-01-01T00:00:00Z", 9, "h9");
+        shadow.mode = "shadow".to_owned();
+        let mut real = decided(
+            "2026-01-03T00:00:00Z",
+            9,
+            "red",
+            sized_features(10, 2, true),
+        );
+        real.changes[0].head = "h9".to_owned();
+        // An infra red for the landed head is already excluded by class:
+        // the landed counter must not double-count it.
+        let mut infra = decided(
+            "2026-01-04T00:00:00Z",
+            7,
+            "red",
+            sized_features(10, 2, true),
+        );
+        infra.changes[0].head = "h1".to_owned();
+        infra.red_class = Some("infra".to_owned());
+        let decisions = vec![shadow, earlier, landing, later, real, infra];
+        let trained = examples(
+            &decisions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        let kept: Vec<i64> = trained.iter().map(|e| e.pr).collect();
+        assert_eq!(kept, [9, 7, 7, 9], "v3 dropped, infra excluded, rest kept");
+        assert_eq!(dropped_landed_count(&decisions, &BTreeMap::new()), 1);
     }
 
     #[test]
