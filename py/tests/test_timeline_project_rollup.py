@@ -84,6 +84,8 @@ def test_project_weekly_reads_only_the_team_weeklies_and_lists_them(tmp_path: Pa
         inputs_section = text.split("## Inputs", 1)[1]
         for slug in TEAMS:
             assert f"`{slug}`" in inputs_section
+    # Week-level items have no meaningful time of day, so the pages give none.
+    assert "## Work summary\n\n- **" not in report.technical_markdown.read_text(encoding="utf-8")
     run = json.loads(report.run_path.read_text(encoding="utf-8"))
     assert [item["team"] for item in run["inputs"]] == list(TEAMS)
     # A second run is served from the project rollup's own cache.

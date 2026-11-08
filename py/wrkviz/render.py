@@ -179,6 +179,24 @@ def _phase_markdown(
     return "\n".join(lines).rstrip() + "\n"
 
 
+#: Rollup kinds whose inputs are whole days or longer. A work item in one of them is anchored at
+#: the start of the lower period it came from (the model sees each input tagged with that start),
+#: so a time of day there is invented. Pages that opt in give the local date instead; the site's
+#: own pages keep their established format, which the other edition renders identically.
+_DATE_ONLY_ROLLUP_KINDS = frozenset({"weekly", "monthly", "quarterly"})
+
+
+def _rollup_item_stamp(
+    at_ms: int, period: Period, display_timezone: str, date_only: bool
+) -> str:
+    if not date_only or period.kind not in _DATE_ONLY_ROLLUP_KINDS:
+        return _local_time(at_ms, display_timezone)
+    local = datetime.fromtimestamp(at_ms / 1000, tz=timezone.utc).astimezone(
+        ZoneInfo(display_timezone)
+    )
+    return local.strftime("%Y-%m-%d %a")
+
+
 def rollup_markdown(
     team: TeamData,
     period: Period,
@@ -186,8 +204,14 @@ def rollup_markdown(
     stats: PhaseStats,
     audience: str,
     scope_note: str | None = None,
+    *,
+    date_only_above_daily: bool = False,
 ) -> str:
-    """One calendar rollup page; *scope_note*, when given, labels a narrowed agent scope."""
+    """One calendar rollup page; *scope_note*, when given, labels a narrowed agent scope.
+
+    With *date_only_above_daily*, a weekly or longer page stamps its items with the local date
+    only, since their times are period starts rather than when the work happened.
+    """
 
     lines = [
         f"# {period_heading(period, team.display_timezone)} {team.team_slug} "
@@ -201,7 +225,8 @@ def rollup_markdown(
     ]
     if summary.work_summary:
         lines.extend(
-            f"- **{_local_time(item.at_ms, team.display_timezone)}** — {item.text}"
+            f"- **{_rollup_item_stamp(item.at_ms, period, team.display_timezone, date_only_above_daily)}**"
+            f" — {item.text}"
             for item in summary.work_summary
         )
     else:

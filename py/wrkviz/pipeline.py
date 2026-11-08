@@ -4872,7 +4872,13 @@ def _write_scoped_rollup_markdown(
             write_text_if_changed(
                 summary_root / "summaries" / relative[len(prefix) :],
                 rollup_markdown(
-                    team, period, summary, stats, audience, COORDINATOR_SCOPE_NOTE
+                    team,
+                    period,
+                    summary,
+                    stats,
+                    audience,
+                    COORDINATOR_SCOPE_NOTE,
+                    date_only_above_daily=True,
                 ),
             )
         )

@@ -262,10 +262,9 @@ def _markdown(
         "## Work summary",
         "",
     ]
-    lines.extend(
-        f"- **{_local(item.at_ms, display_timezone)}** — {item.text}"
-        for item in summary.work_summary
-    )
+    # Every input reaches the model tagged with the week's start, so an item's time is that
+    # start, not when the work happened; the page lists the items without one.
+    lines.extend(f"- {item.text}" for item in summary.work_summary)
     if not summary.work_summary:
         lines.append("_No substantive work item was recorded in this range._")
     lines.extend(["", "## Inputs", ""])

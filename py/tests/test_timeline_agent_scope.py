@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -165,6 +166,18 @@ def test_coordinator_rollup_markdown_says_it_is_not_full_team(tmp_path: Path) ->
         heading, _, note = text.splitlines()[:3]
         assert "coordinator-only" in heading
         assert note == f"> {COORDINATOR_SCOPE_NOTE}"
+    # A weekly item is anchored at the start of the day it came from, so its page gives the date
+    # only; a daily item keeps the phase time it came from.
+    for page in weekly:
+        items = [line for line in page.read_text(encoding="utf-8").splitlines() if line.startswith("- **")]
+        assert items and all(re.match(r"- \*\*\d{4}-\d{2}-\d{2} \w{3}\*\* — ", line) for line in items)
+    daily_items = [
+        line
+        for page in daily
+        for line in page.read_text(encoding="utf-8").splitlines()
+        if line.startswith("- **")
+    ]
+    assert daily_items and all(re.match(r"- \*\*\S+ \d{2}:\d{2}:\d{2} ", line) for line in daily_items)
     # The website build never sees the scoped tree.
     assert not (tmp_path / "teams" / team.team_slug / "summaries").exists()
 
