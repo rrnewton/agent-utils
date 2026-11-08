@@ -259,6 +259,8 @@ fn simulate_command(
         roots: window.max(1),
         stack_allowed: true,
         solo_cost_s,
+        root_discards: false,
+        root_stack_min_pass_percent: 0,
     };
     println!(
         "simulate: {} changes, solo cost {:.0}s, window {}, max_batch {}, {} trials/policy",
@@ -1180,6 +1182,12 @@ enum Command {
         /// decided as usual.
         #[arg(long)]
         keep_stale_roots: bool,
+        /// Stack a would-be disjoint root on a batch it jumps over when
+        /// that batch is likely to land first (prioritized, already green,
+        /// or predicted to pass at or above this percent), instead of
+        /// rooting it on the base (0, the default, always roots).
+        #[arg(long, default_value_t = 0)]
+        root_stack_min_pass_percent: u32,
         /// Build on the stack top only when the recent pass rate is at
         /// least this percent (0, the default, always stacks).
         #[arg(long, default_value_t = 0)]
@@ -2024,6 +2032,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             green_flaky,
             roots,
             keep_stale_roots,
+            root_stack_min_pass_percent,
             stack_min_pass_percent,
             batch_min_pass_percent,
             max_deferrals,
@@ -2213,6 +2222,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 disjoint_root_min_red_percent,
                 roots,
                 keep_stale_roots,
+                root_stack_min_pass_percent,
                 stack_min_pass_percent,
                 batch_min_pass_percent,
                 conflict_prior: crate::state::ConflictPriorConfig {

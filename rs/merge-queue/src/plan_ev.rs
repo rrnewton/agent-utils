@@ -40,6 +40,15 @@ pub struct Caps {
     pub stack_allowed: bool,
     /// Expected solo validation wall seconds (`C`).
     pub solo_cost_s: f64,
+    /// In [`simulate`] only: model base-move root discards - a root whose
+    /// jumped-over build lands first in its epoch wastes its validation
+    /// and rebuilds (#1071 disjoint-root-stacking). Off keeps the
+    /// historical simulate semantics (roots always usable) exactly.
+    pub root_discards: bool,
+    /// With `root_discards`, the predicted pass percent at or above which
+    /// a landed build rescues a later root in [`simulate`] by stacking it
+    /// (0: never rescued). Mirrors `Config::root_stack_min_pass_percent`.
+    pub root_stack_min_pass_percent: u32,
 }
 
 /// One chosen build and why.
@@ -76,6 +85,33 @@ pub fn batch_p_pass(prs: &[i64], p: &BTreeMap<i64, f64>, model: Option<&Model>) 
         }
     }
     pass.clamp(0.01, 0.99)
+}
+
+/// Why an in-flight batch counts as likely to land first for the disjoint
+/// root choice (#1071 disjoint-root-stacking), or `None` when a would-be
+/// root keeps today's behaviour: the feature is off while
+/// `min_pass_percent` is 0, and otherwise a batch that is prioritized,
+/// already green awaiting decision, or predicted to pass at or above the
+/// threshold qualifies. Shared by the run loop and unit tests so the
+/// live decision has one definition.
+pub fn likely_landing_reason(
+    p_pass: f64,
+    prioritized: bool,
+    already_green: bool,
+    min_pass_percent: u32,
+) -> Option<&'static str> {
+    if min_pass_percent == 0 {
+        return None;
+    }
+    if already_green {
+        Some("already green")
+    } else if prioritized {
+        Some("prioritized")
+    } else if p_pass * 100.0 >= f64::from(min_pass_percent) {
+        Some("predicted pass")
+    } else {
+        None
+    }
 }
 
 /// Expected total validate seconds to land a batch's changes, pricing the
@@ -226,6 +262,9 @@ pub struct SimResult {
     pub wasted_hours: f64,
     /// Landed per validate-hour.
     pub landed_per_hour: f64,
+    /// Roots discarded because a jumped-over build landed first and moved
+    /// their base; only counted with `Caps::root_discards`, else 0.
+    pub discarded_roots: usize,
 }
 
 struct Rng(u64);
@@ -301,17 +340,33 @@ pub fn simulate(
             break;
         }
         // Resolve in order: a stacked build is wasted when any build below
-        // it in this epoch did not land.
+        // it in this epoch did not land. With `root_discards`, a root is
+        // likewise wasted when an earlier build already landed in this
+        // epoch (its base moved under it), unless a landed build at or
+        // above the stack threshold rescues it by stacking it.
         let mut below_landed = true;
+        let mut landed_any = false;
+        let mut landed_best_p = 0.0f64;
         let mut landed_this_epoch: Vec<i64> = Vec::new();
         for build in &builds {
             result.validations += 1;
             result.validate_hours += cost_h;
-            let usable = build.rooted || below_landed;
+            let rescued = caps.root_discards
+                && build.rooted
+                && landed_any
+                && caps.root_stack_min_pass_percent > 0
+                && landed_best_p * 100.0 >= f64::from(caps.root_stack_min_pass_percent);
+            if caps.root_discards && build.rooted && landed_any && !rescued {
+                result.wasted_hours += cost_h;
+                result.discarded_roots += 1;
+                continue;
+            }
+            let usable = build.rooted || below_landed || rescued;
             if !usable {
                 result.wasted_hours += cost_h;
                 continue;
             }
+            let landed_before = landed_this_epoch.len();
             let green = rng.next_f64() < batch_p_pass(&build.prs, truth_p, None);
             if green {
                 landed_this_epoch.extend(build.prs.iter().copied());
@@ -325,6 +380,10 @@ pub fn simulate(
                         landed_this_epoch.push(*pr);
                     }
                 }
+            }
+            if landed_this_epoch.len() > landed_before {
+                landed_any = true;
+                landed_best_p = landed_best_p.max(build.p_pass);
             }
         }
         let landed_set: BTreeSet<i64> = landed_this_epoch.iter().copied().collect();
@@ -353,6 +412,8 @@ mod unit {
             roots: 6,
             stack_allowed: true,
             solo_cost_s: 1500.0,
+            root_discards: false,
+            root_stack_min_pass_percent: 0,
         }
     }
 
@@ -391,6 +452,70 @@ mod unit {
         assert_eq!(should_abort(&[0.4, 0.9], 0.5), Some(0));
         assert_eq!(should_abort(&[0.4, 0.9], 0.4), None);
         assert_eq!(should_abort(&[], 1.0), None);
+    }
+
+    #[test]
+    fn likely_landing_needs_the_feature_on() {
+        assert_eq!(likely_landing_reason(1.0, true, true, 0), None);
+        assert_eq!(
+            likely_landing_reason(0.1, false, true, 80),
+            Some("already green")
+        );
+        assert_eq!(
+            likely_landing_reason(0.1, true, false, 80),
+            Some("prioritized")
+        );
+        assert_eq!(
+            likely_landing_reason(0.8, false, false, 80),
+            Some("predicted pass"),
+            "the threshold is inclusive"
+        );
+        assert_eq!(likely_landing_reason(0.79, false, false, 80), None);
+    }
+
+    #[test]
+    fn simulate_reproduces_two_root_discards_and_stacking_rescues_them() {
+        // Three certain changes as single-change roots, window 3: the
+        // first lands and moves the base under the other two; the second
+        // then lands and moves it under the third again - the third
+        // change is discarded twice before it lands, as in #1071.
+        let truth: BTreeMap<i64, f64> = (1..=3).map(|pr| (pr, 1.0)).collect();
+        let order: Vec<i64> = (1..=3).collect();
+        let mut base_caps = caps(1);
+        base_caps.window = 3;
+        base_caps.root_discards = true;
+        let rooted = simulate(&truth, &order, Policy::Kroots, &base_caps, &truth, None, 7);
+        assert_eq!(rooted.landed, 3);
+        assert_eq!(
+            rooted.discarded_roots, 3,
+            "epoch 1 discards roots 2+3, epoch 2 discards root 3 again"
+        );
+        assert!(rooted.wasted_hours > 0.0);
+        let mut stacked_caps = base_caps;
+        stacked_caps.root_stack_min_pass_percent = 50;
+        let stacked = simulate(
+            &truth,
+            &order,
+            Policy::Kroots,
+            &stacked_caps,
+            &truth,
+            None,
+            7,
+        );
+        assert_eq!(stacked.landed, 3);
+        assert_eq!(stacked.discarded_roots, 0);
+        assert_eq!(stacked.wasted_hours, 0.0);
+        assert!(
+            stacked.validate_hours < rooted.validate_hours,
+            "stacking {}h must beat rooting {}h",
+            stacked.validate_hours,
+            rooted.validate_hours
+        );
+        // Gated off, simulate keeps its historical semantics exactly:
+        // roots are usable and nothing is counted as discarded.
+        let historical = simulate(&truth, &order, Policy::Kroots, &caps(1), &truth, None, 7);
+        assert_eq!(historical.discarded_roots, 0);
+        assert_eq!(historical.validate_hours, stacked.validate_hours);
     }
 
     #[test]

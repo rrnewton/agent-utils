@@ -1160,6 +1160,15 @@ pub struct Config {
     /// red one is decided as usual. Off (the default) cancels it at once.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_stale_roots: bool,
+    /// Stack a would-be disjoint root on a batch it jumps over when that
+    /// batch is likely to land first (prioritized, already green awaiting
+    /// decision, or predicted to pass at or above this percent from the
+    /// trained model or historical rates), instead of rooting it on a
+    /// base that landing would move under it (#1071
+    /// disjoint-root-stacking). 0 (the default) is off: roots always
+    /// build on the base, exactly as today.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub root_stack_min_pass_percent: u32,
     /// Build a batch on the stack top only when the recent pass rate (the
     /// green share of the last 20 decided validations) is at least this
     /// percent; below it, build a root on the base instead when `roots`
@@ -1306,6 +1315,7 @@ impl Default for Config {
             disjoint_root_min_red_percent: 0,
             roots: 1,
             keep_stale_roots: false,
+            root_stack_min_pass_percent: 0,
             stack_min_pass_percent: 0,
             batch_min_pass_percent: 0,
             predict: false,

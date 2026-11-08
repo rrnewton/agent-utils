@@ -774,6 +774,44 @@ fn a_disjoint_root_is_cancelled_the_moment_the_head_lands() {
 }
 
 #[test]
+fn a_root_stacks_on_a_prioritized_head_when_configured() {
+    // #1071: with root_stack_min_pass_percent on, the would-be root over a
+    // prioritized head stacks on the stack top instead of rooting on the
+    // base that head is about to move, so it validates once and lands
+    // behind it. At the default 0 the same run roots (see
+    // a_disjoint_root_is_cancelled_the_moment_the_head_lands).
+    let (fx, started, gates) = gated_setup("disjoint-root-stacked-likely");
+    let path = config_path(&fx);
+    let mut config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    config["root_stack_min_pass_percent"] = serde_json::json!(50);
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a", "--prioritized"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    let mut daemon = Daemon::start(&fx);
+    wait_for("the window to fill", &started, |lines| lines.len() >= 3);
+    assert_eq!(
+        started_lines(&started)[..3],
+        ["a_t0_", "a_b_t0_", "a_b_c_t0_"],
+        "change 3 composed on the stack, never as a root"
+    );
+    open(&gates, "a_t0_");
+    open(&gates, "a_b_t0_");
+    open(&gates, "a_b_c_t0_");
+    assert_eq!(daemon.exit_code(Duration::from_secs(90)), Some(0));
+    assert_eq!(status(&fx, 1), "landed");
+    assert_eq!(status(&fx, 2), "landed");
+    assert_eq!(status(&fx, 3), "landed");
+    let report = latest_report(&fx);
+    let root_runs = batch_validations(&report, 3);
+    assert_eq!(root_runs.len(), 1, "{report}");
+    assert_ne!(root_runs[0]["parent"], report["base_start"], "{report}");
+}
+
+#[test]
 fn an_after_change_is_composed_on_its_dependency_not_the_stack() {
     // Change 3 must land after change 2 (--after): it must also be
     // COMPOSED on change 2's candidate. Change 2 validates as a disjoint

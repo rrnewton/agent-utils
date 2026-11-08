@@ -6324,13 +6324,11 @@ impl<'a> Runner<'a> {
             } else {
                 None
             };
-            // Expected-value context (Config::ev_planner): the trained model
-            // when present, else the historical rates as p; solo cost is the
-            // median decided width-1 wall. Stable for the run.
-            let ev: Option<(Option<crate::predict::Model>, BTreeMap<i64, f64>, f64)> = if self
-                .config
-                .ev_planner
-            {
+            // Per-change predicted pass probabilities: the trained model
+            // when present, else the historical rates. Shared by the EV
+            // context and the disjoint-root likely-landing check; building
+            // it enables neither one's scheduling on its own.
+            let predicted_p = || {
                 let model = crate::predict::load(&self.state.root);
                 let mut p: BTreeMap<i64, f64> = BTreeMap::new();
                 if let Some(model) = &model {
@@ -6346,22 +6344,41 @@ impl<'a> Runner<'a> {
                         let _ = global;
                     }
                 }
-                let mut walls: Vec<f64> = crate::predict::read_decisions(&self.state.root)
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|d| d.width == 1 && (d.outcome == "green" || d.outcome == "red"))
-                    .map(|d| d.cost.wall_s)
-                    .collect();
-                walls.sort_by(f64::total_cmp);
-                let solo = walls
-                    .get(walls.len() / 2)
-                    .copied()
-                    .unwrap_or(1500.0)
-                    .max(1.0);
-                Some((model, p, solo))
-            } else {
-                None
+                (model, p)
             };
+            // Expected-value context (Config::ev_planner); solo cost is the
+            // median decided width-1 wall. Stable for the run.
+            let ev: Option<(Option<crate::predict::Model>, BTreeMap<i64, f64>, f64)> =
+                if self.config.ev_planner {
+                    let (model, p) = predicted_p();
+                    let mut walls: Vec<f64> = crate::predict::read_decisions(&self.state.root)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|d| d.width == 1 && (d.outcome == "green" || d.outcome == "red"))
+                        .map(|d| d.cost.wall_s)
+                        .collect();
+                    walls.sort_by(f64::total_cmp);
+                    let solo = walls
+                        .get(walls.len() / 2)
+                        .copied()
+                        .unwrap_or(1500.0)
+                        .max(1.0);
+                    Some((model, p, solo))
+                } else {
+                    None
+                };
+            // Likely-landing estimates for the disjoint-root choice
+            // (`Config::root_stack_min_pass_percent`): reuse the EV context
+            // when it exists, else build the same map for this check only.
+            let root_stack_p: Option<(Option<crate::predict::Model>, BTreeMap<i64, f64>)> =
+                if self.config.root_stack_min_pass_percent > 0 {
+                    Some(match &ev {
+                        Some((model, p, _)) => (model.clone(), p.clone()),
+                        None => predicted_p(),
+                    })
+                } else {
+                    None
+                };
             // Recent red rate for the optional disjoint-root gate (see
             // `Config::disjoint_root_min_red_percent`); decision records are only
             // appended at the end of a run, so this is stable for the run.
@@ -6887,8 +6904,70 @@ impl<'a> Runner<'a> {
                                     && (head_prs.is_empty() || self.batch_disjoint(&prs, &head_prs))
                             };
                         let stale_stack = if stale_rooted { None } else { stale_stack };
-                        let rooted = dep_tip.is_none()
+                        let mut rooted = dep_tip.is_none()
                             && (stale_rooted || (stale_stack.is_none() && rooted));
+                        // A root that jumps over a batch likely to land
+                        // first stacks on it instead, when configured
+                        // (`root_stack_min_pass_percent`): its green would
+                        // otherwise be discarded the moment that batch
+                        // lands and moves the base (#1071
+                        // disjoint-root-stacking). Encoded below as an
+                        // ordinary stacked flight, never a root on a
+                        // non-base parent.
+                        let mut root_stacked: Option<(String, Vec<i64>, &'static str, f64)> = None;
+                        if rooted && stack_allowed && stale_stack.is_none() && !stale_rooted {
+                            if let Some((model, p)) = &root_stack_p {
+                                let prioritized_of = |batch: &[i64]| {
+                                    let report = lock(&self.report);
+                                    let items = lock(&self.items);
+                                    !batch.is_empty()
+                                        && batch.iter().all(|pr| {
+                                            report
+                                                .plan
+                                                .items
+                                                .iter()
+                                                .any(|item| item.pr == *pr && item.prioritized)
+                                                || items
+                                                    .get(pr)
+                                                    .is_some_and(|item| item.prioritized)
+                                        })
+                                };
+                                for flight in flights
+                                    .iter()
+                                    .filter(|f| f.probe_for.is_none() && f.red_work.is_none())
+                                {
+                                    let already_green =
+                                        flight.result.as_ref().is_some_and(|result| {
+                                            result.as_ref().is_ok_and(|(_, ran)| ran.green())
+                                        });
+                                    let p_pass = crate::plan_ev::batch_p_pass(
+                                        &flight.candidate.prs,
+                                        p,
+                                        model.as_ref(),
+                                    );
+                                    if let Some(reason) = crate::plan_ev::likely_landing_reason(
+                                        p_pass,
+                                        prioritized_of(&flight.candidate.prs),
+                                        already_green,
+                                        self.config.root_stack_min_pass_percent,
+                                    ) {
+                                        let tip = stack_top(&flights)
+                                            .map(|top| top.candidate.tip.clone())
+                                            .unwrap_or_else(|| flight.candidate.tip.clone());
+                                        root_stacked = Some((
+                                            tip,
+                                            flight.candidate.prs.clone(),
+                                            reason,
+                                            p_pass,
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if root_stacked.is_some() {
+                            rooted = false;
+                        }
                         // A new root built on the base now goes stale the
                         // moment another root that is already green lands:
                         // its whole validation is thrown away and rebuilt.
@@ -6964,6 +7043,8 @@ impl<'a> Runner<'a> {
                         }
                         let parent = if let Some(tip) = &dep_tip {
                             tip.clone()
+                        } else if let Some((tip, _, _, _)) = &root_stacked {
+                            tip.clone()
                         } else if stale_stack.is_some() {
                             stale_tip.clone().unwrap_or_default()
                         } else if rooted {
@@ -7034,6 +7115,17 @@ impl<'a> Runner<'a> {
                         scope.spawn(move || {
                             let _ = tx.send((id, self.validate_one(job, &flag)));
                         });
+                        if let Some((_, likely_prs, reason, p_pass)) = &root_stacked {
+                            self.event(
+                                "disjoint-root-stacked",
+                                &format!(
+                                    "{} stacks on {} ({reason}, predicted pass {p_pass:.2}) \
+                                     instead of rooting on the base it is likely to move",
+                                    list(&candidate.prs),
+                                    list(likely_prs)
+                                ),
+                            );
+                        }
                         if rooted {
                             self.event(
                                 "disjoint-root",
