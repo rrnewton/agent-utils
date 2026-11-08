@@ -415,9 +415,11 @@ ok=1; for f in tests/*; do [ -f "$f" ] || continue; if grep -qx FAIL "$f"; then 
     // Change 3 and the prioritized change are both gated out; release
     // them together: change 3 lands first and moves the base under the
     // prioritized change's candidate.
-    wait_for("the prioritized validation", Duration::from_secs(60), || {
-        events(&fx).matches("\"kind\":\"validate\"").count() >= 3
-    });
+    wait_for(
+        "the prioritized validation",
+        Duration::from_secs(60),
+        || events(&fx).matches("\"kind\":\"validate\"").count() >= 3,
+    );
     std::fs::write(gates.join("release"), "").unwrap();
     // Once the prioritized change is requeued as a stale green, let the
     // stack head (change 4) finish; the rebuild must not wait for it.
