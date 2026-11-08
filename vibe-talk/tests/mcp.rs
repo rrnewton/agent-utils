@@ -1714,6 +1714,7 @@ impl Fetcher for DocSource {
         Ok(FetchedRaw {
             content,
             version: Some("v1".to_owned()),
+            moved_to: None,
         })
     }
 
