@@ -768,7 +768,7 @@ pub fn accept_flaky(
 /// Probe options for one queue: the persistent cache in the state
 /// directory, the configured concurrency bound, and a hash of everything
 /// besides commit IDs that can change a probe result.
-fn probe_options_for(state: &State, config: &Config, git: &Git) -> ProbeOptions {
+fn probe_options_for(state: &State, config: &Config, git: &Git, items: &[Item]) -> ProbeOptions {
     // Probe results depend only on commit IDs and the merge configuration, so they are
     // cached in the state directory across runs; misses run under the configured bound.
     let config_material = format!(
@@ -810,6 +810,13 @@ fn probe_options_for(state: &State, config: &Config, git: &Git) -> ProbeOptions 
                 command: config.peripheral.command.clone(),
                 timeout_secs: config.peripheral.timeout(),
             }),
+        // The base verdict must predict the configured combine (see plan.rs).
+        combine: config.combine,
+        exact: items
+            .iter()
+            .filter(|item| item.status == ItemStatus::Queued && item.exact)
+            .map(|item| item.pr)
+            .collect(),
     }
 }
 
@@ -918,7 +925,7 @@ pub fn plan(state: &State, config: &Config, max_batch: usize) -> Result<Plan, St
                 || (recount && path == crate::recount::PIN_PATH)
                 || pins.iter().any(|pin| pin.covers(path))
         },
-        probe_options_for(state, config, &git),
+        probe_options_for(state, config, &git, &items),
     )?;
     probe.external = peer_holds(config, &items)?;
     Ok(make_plan(
@@ -978,7 +985,7 @@ pub fn plan_on(
                 || (recount && path == crate::recount::PIN_PATH)
                 || pins.iter().any(|pin| pin.covers(path))
         },
-        probe_options_for(state, config, &git),
+        probe_options_for(state, config, &git, &items),
     )?;
     probe.external = peer_holds(config, &items)?;
     Ok(make_plan(
@@ -1090,7 +1097,7 @@ pub fn plan_staged(
     let regenerate = config.regenerate.clone();
     let recount = config.recount_pins;
     let pins = config.pins.clone();
-    let probe_options = probe_options_for(state, config, &git);
+    let probe_options = probe_options_for(state, config, &git, &items);
     let mut probe = probe_first_stage(
         &git,
         &base_sha,

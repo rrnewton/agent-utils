@@ -1,9 +1,11 @@
 //! Order and chunk queued changes into batches.
 //!
 //! The plan is bound to one exact base commit and one exact head per change. It is built from
-//! three kinds of evidence, all probed locally with `git merge-tree` (the landing planner's
-//! exact-conflict method): conflicts with the base, pairwise conflicts between queued heads, and
-//! ancestry (a change stacked on another must land after it).
+//! three kinds of evidence, all probed locally: conflicts with the base (decided the way the
+//! queue combines — a replay under `combine=rebase`, a plain `git merge-tree` under
+//! `combine=merge`; exact changes are not merge-probed at all, because landing tests them
+//! with `lands_exactly`, never a merge), pairwise conflicts between queued heads (merge-tree),
+//! and ancestry (a change stacked on another must land after it).
 //!
 //! Without repair, two changes that textually conflict cannot both land this round: once one
 //! lands, the other conflicts with the base and needs a rebase. The plan therefore picks a
@@ -23,7 +25,7 @@ use std::sync::Mutex;
 use pr_landing_planner::graph::connected_components;
 use pr_landing_planner::model::ConflictEdge;
 
-use crate::git::{Git, Regenerable};
+use crate::git::{CombineMode, Combined, Git, Regenerable};
 use crate::model::{
     now, Conflict, Held, Item, ItemStatus, Plan, PlannedBatch, PlannedItem, PLAN_SCHEMA,
 };
@@ -120,6 +122,17 @@ pub struct ProbeOptions {
     /// Path in the repository of the test-footprints JSON (`{test id: [paths]}`),
     /// read at the base; `None` disables the conflict prior.
     pub footprints: Option<String>,
+    /// How the queue combines changes onto the base: the base-conflict verdict must
+    /// predict that combine, so under `Rebase` it replays (a commit whose patch is
+    /// already on the base drops out, as the combine step drops it) and under
+    /// `Merge` it is the plain merge-tree verdict.
+    pub combine: CombineMode,
+    /// Changes submitted exact (`submit --exact`): never merge-probed against the
+    /// base. Landing tests them with `lands_exactly` (first parent is the base, or
+    /// a linear fast-forward) when their candidate is built, which ejects a moved
+    /// base as `not-fast-forward`; a merge-tree verdict here would instead hold
+    /// them `conflicts-with-base` for a merge that will never happen.
+    pub exact: BTreeSet<i64>,
 }
 
 impl Default for ProbeOptions {
@@ -130,6 +143,9 @@ impl Default for ProbeOptions {
             config_hash: None,
             peripheral: None,
             footprints: None,
+            // The historical probe verdict; queue callers pass the configured mode.
+            combine: CombineMode::Merge,
+            exact: BTreeSet::new(),
         }
     }
 }
@@ -144,6 +160,8 @@ impl ProbeOptions {
             config_hash: None,
             peripheral: None,
             footprints: None,
+            combine: CombineMode::Merge,
+            exact: BTreeSet::new(),
         }
     }
 }
@@ -337,13 +355,26 @@ fn probe_impl(
         .collect();
     let mut stats = ProbeStats::default();
 
+    // An exact head's cached entry must never answer for (or be answered by) the
+    // same head probed as a combining change: the verdicts differ by construction.
+    let base_key_for = |pr: i64, head: &str| {
+        let key = ProbeCache::base_key(&config_hash, base_sha, head);
+        if options.exact.contains(&pr) {
+            format!("{key}:exact")
+        } else {
+            key
+        }
+    };
+
     // Phase 1, per head: files touched and the commits the head adds over the base (one
     // `rev-list BASE..HEAD`, which answers every pairwise ancestry question for that head).
-    // The head's conflicts with the base join the merge batch below.
+    // Under merge combine the head's conflicts with the base join the merge batch below;
+    // under rebase the fetch job replays the head onto the base for its verdict, and an
+    // exact head resolves to no probe conflicts (build's `lands_exactly` decides).
     let mut entries: BTreeMap<i64, BaseEntry> = BTreeMap::new();
     let mut base_missing: Vec<(i64, String)> = Vec::new();
     for (pr, head) in &live {
-        match cache.base(&ProbeCache::base_key(&config_hash, base_sha, head)) {
+        match cache.base(&base_key_for(*pr, head)) {
             Some(entry) => {
                 stats.base_hits += 1;
                 entries.insert(*pr, entry.clone());
@@ -355,24 +386,45 @@ fn probe_impl(
         }
     }
     let (fetched, base_peak) = run_bounded(base_missing.len(), options.parallelism, |index| {
-        let head = &base_missing[index].1;
+        let (pr, head) = &base_missing[index];
+        // A verdict decided here, without the merge batch below: an exact head is
+        // never merge-probed (build's `lands_exactly` decides, ejecting a moved
+        // base as not-fast-forward), and under rebase the verdict is the replay
+        // itself, through the same code path that will combine the candidate.
+        let verdict = if options.exact.contains(pr) {
+            Some(Vec::new())
+        } else if options.combine == CombineMode::Rebase {
+            Some(
+                match git.combine_with(CombineMode::Rebase, base_sha, head, &[], "", regenerable)? {
+                    Combined::Conflict(paths) => paths,
+                    Combined::Clean(_) | Combined::NeedsRegen(..) => Vec::new(),
+                },
+            )
+        } else {
+            None
+        };
         Ok((
             git.changed_files(base_sha, head)?,
             git.range(base_sha, head)?,
+            verdict,
         ))
     });
     let mut merges: Vec<(String, String)> = Vec::new();
+    let mut merge_missing: Vec<(i64, String)> = Vec::new();
     for ((pr, head), result) in base_missing.iter().zip(fetched) {
-        let (files, range) = result?;
-        entries.insert(
-            *pr,
-            BaseEntry {
-                files: files.into_iter().collect(),
-                conflicts: Vec::new(),
-                range: range.into_iter().collect(),
-            },
-        );
-        merges.push((base_sha.to_owned(), head.clone()));
+        let (files, range, verdict) = result?;
+        let entry = BaseEntry {
+            files: files.into_iter().collect(),
+            conflicts: verdict.clone().unwrap_or_default(),
+            range: range.into_iter().collect(),
+        };
+        if verdict.is_some() {
+            cache.put_base(base_key_for(*pr, head), entry.clone());
+        } else {
+            merges.push((base_sha.to_owned(), head.clone()));
+            merge_missing.push((*pr, head.clone()));
+        }
+        entries.insert(*pr, entry);
     }
 
     // Phase 2, per pair: ancestry from the ranges (no git), then a merge only when the two
@@ -476,17 +528,15 @@ fn probe_impl(
         }
     }
 
-    // Record and assemble.
-    for (pr, head) in &base_missing {
+    // Record and assemble. Only merge-combine heads are still undecided here:
+    // rebase replays and exact heads arrived with their verdicts (and cache rows).
+    for (pr, head) in &merge_missing {
         let entry = entries.get_mut(pr).ok_or("probe lost a base entry")?;
         entry.conflicts = answers
             .get(&(base_sha.to_owned(), head.clone()))
             .cloned()
             .ok_or("probe lost a base merge")?;
-        cache.put_base(
-            ProbeCache::base_key(&config_hash, base_sha, head),
-            entry.clone(),
-        );
+        cache.put_base(base_key_for(*pr, head), entry.clone());
     }
     for (pr, entry) in &entries {
         let paths = real(&entry.conflicts);
@@ -1525,6 +1575,8 @@ mod unit {
             config_hash: None,
             peripheral: Some(hook.clone()),
             footprints: None,
+            combine: CombineMode::Merge,
+            exact: BTreeSet::new(),
         };
         let first = probe_with_options(
             &git,
@@ -1589,6 +1641,8 @@ mod unit {
         assert!(plain.prior.is_empty() && plain.stats.pairs_skipped >= 1);
         let options = ProbeOptions {
             footprints: Some("ci/test-footprints.json".to_owned()),
+            combine: CombineMode::Merge,
+            exact: BTreeSet::new(),
             ..ProbeOptions::default()
         };
         let probed = probe_with_options(
@@ -1713,6 +1767,101 @@ mod unit {
         );
     }
 
+    #[test]
+    fn probe_base_verdict_follows_combine_mode_and_skips_exact() {
+        use crate::git::testrepo::*;
+        let tmp = TempDir::new("probe-rebase-base");
+        let git = init(&tmp.0);
+        write(&tmp.0, "f.txt", "1\n2\n3\n");
+        git_commit(&tmp.0);
+        // The bottom change appends A; the stacked change appends B after it.
+        branch(&tmp.0, "a", "main", &[("f.txt", "1\n2\n3\nA\n")]);
+        let stacked = branch(&tmp.0, "b", "a", &[("f.txt", "1\n2\n3\nA\nB\n")]);
+        // A real conflict: appends X where the landed change appends A.
+        let real = branch(&tmp.0, "c", "main", &[("f.txt", "1\n2\n3\nX\n")]);
+        // The bottom change lands as a rebased commit: same patch, new parent.
+        write(&tmp.0, "other.txt", "o\n");
+        git_commit(&tmp.0);
+        write(&tmp.0, "f.txt", "1\n2\n3\nA\n");
+        git_commit(&tmp.0);
+        let base = git.rev_parse("main").unwrap();
+        let heads: BTreeMap<i64, Option<String>> = [(2, Some(stacked)), (3, Some(real))].into();
+
+        // Merge combine: plain merge-tree holds both (the reported bug).
+        let merged = probe_with_options(
+            &git,
+            &base,
+            &heads,
+            &crate::git::nothing_regenerable,
+            ProbeOptions::sequential_uncached(),
+        )
+        .unwrap();
+        assert_eq!(
+            merged.base_conflicts[&2],
+            vec!["f.txt".to_owned()],
+            "{merged:?}"
+        );
+        assert_eq!(
+            merged.base_conflicts[&3],
+            vec!["f.txt".to_owned()],
+            "{merged:?}"
+        );
+
+        // Rebase combine: the replay drops the already-landed patch, so the
+        // stacked change is clean; the real conflict still conflicts.
+        let rebased = probe_with_options(
+            &git,
+            &base,
+            &heads,
+            &crate::git::nothing_regenerable,
+            ProbeOptions {
+                combine: CombineMode::Rebase,
+                ..ProbeOptions::sequential_uncached()
+            },
+        )
+        .unwrap();
+        assert!(!rebased.base_conflicts.contains_key(&2), "{rebased:?}");
+        assert_eq!(
+            rebased.base_conflicts[&3],
+            vec!["f.txt".to_owned()],
+            "{rebased:?}"
+        );
+
+        // Exact: never merge-probed, whatever the mode (build's lands_exactly
+        // decides), and the cached non-exact verdict must not answer for it.
+        let cache_tmp = TempDir::new("probe-exact-cache");
+        let cached_merge = ProbeOptions {
+            cache_dir: Some(cache_tmp.0.clone()),
+            config_hash: Some("cfg".to_owned()),
+            ..ProbeOptions::sequential_uncached()
+        };
+        let first = probe_with_options(
+            &git,
+            &base,
+            &heads,
+            &crate::git::nothing_regenerable,
+            cached_merge.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            first.base_conflicts[&3],
+            vec!["f.txt".to_owned()],
+            "{first:?}"
+        );
+        let exact = probe_with_options(
+            &git,
+            &base,
+            &heads,
+            &crate::git::nothing_regenerable,
+            ProbeOptions {
+                exact: BTreeSet::from([3]),
+                ..cached_merge
+            },
+        )
+        .unwrap();
+        assert!(!exact.base_conflicts.contains_key(&3), "{exact:?}");
+    }
+
     /// A fixture queue: conflicting, clean and stacked branches over one base.
     /// Returns the repository, its git handle, the base and `(pr, head)` pairs.
     fn fixture_queue(
@@ -1786,6 +1935,8 @@ mod unit {
                 config_hash: None,
                 peripheral: None,
                 footprints: None,
+                combine: CombineMode::Merge,
+                exact: BTreeSet::new(),
             },
         )
         .unwrap();
@@ -1822,6 +1973,8 @@ mod unit {
             config_hash: None,
             peripheral: None,
             footprints: None,
+            combine: CombineMode::Merge,
+            exact: BTreeSet::new(),
         };
         let first = probe_with_options(
             &git,
@@ -1863,6 +2016,8 @@ mod unit {
             config_hash: Some("cfg-a".to_owned()),
             peripheral: None,
             footprints: None,
+            combine: CombineMode::Merge,
+            exact: BTreeSet::new(),
         };
         let first = probe_with_options(
             &git,
@@ -1937,6 +2092,8 @@ mod unit {
                     config_hash: None,
                     peripheral: None,
                     footprints: None,
+                    combine: CombineMode::Merge,
+                    exact: BTreeSet::new(),
                 },
             )
             .unwrap();
@@ -1958,6 +2115,8 @@ mod unit {
             config_hash: None,
             peripheral: None,
             footprints: None,
+            combine: CombineMode::Merge,
+            exact: BTreeSet::new(),
         };
         // The first stage leaves no pair unknown: an optimistic first batch could pair two
         // conflicting changes (ejecting one the plan would only hold) or a change stacked on a
@@ -2013,6 +2172,8 @@ mod unit {
             config_hash: None,
             peripheral: None,
             footprints: None,
+            combine: CombineMode::Merge,
+            exact: BTreeSet::new(),
         };
         let warm = probe_with_options(
             &git,
@@ -2081,6 +2242,8 @@ mod unit {
                 config_hash: None,
                 peripheral: None,
                 footprints: None,
+                combine: CombineMode::Merge,
+                exact: BTreeSet::new(),
             },
         )
         .unwrap();
@@ -2097,6 +2260,8 @@ mod unit {
                 config_hash: None,
                 peripheral: None,
                 footprints: None,
+                combine: CombineMode::Merge,
+                exact: BTreeSet::new(),
             },
         )
         .unwrap();
@@ -2164,6 +2329,8 @@ mod unit {
                     config_hash: None,
                     peripheral: None,
                     footprints: None,
+                    combine: CombineMode::Merge,
+                    exact: BTreeSet::new(),
                 },
             )
             .unwrap();
@@ -2177,6 +2344,8 @@ mod unit {
                 config_hash: None,
                 peripheral: None,
                 footprints: None,
+                combine: CombineMode::Merge,
+                exact: BTreeSet::new(),
             };
             let cpu0 = cpu_ticks();
             let start = std::time::Instant::now();

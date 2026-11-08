@@ -46,7 +46,7 @@ pub enum Combined {
 }
 
 /// Paths the caller can regenerate, so conflicts in them do not block a combination.
-pub type Regenerable<'a> = &'a dyn Fn(&str) -> bool;
+pub type Regenerable<'a> = &'a (dyn Fn(&str) -> bool + Sync);
 
 /// Nothing is regenerable.
 pub fn nothing_regenerable(_: &str) -> bool {

@@ -3,7 +3,7 @@
 mod support;
 
 use serde_json::Value;
-use support::Fixture;
+use support::{git, Fixture};
 
 #[test]
 fn plan_orders_batches_and_holds_conflicts() {
@@ -101,6 +101,53 @@ fn plan_orders_batches_and_holds_conflicts() {
     fx.mq_ok(&["withdraw", "2"]);
     let all = fx.mq_ok(&["list", "--all"]);
     assert!(all.contains("withdrawn"), "{all}");
+}
+
+/// One stacked-on-landed-rebased scenario, planned under the given combine
+/// mode: `a` appends a line, `b` appends another on top of it, then main
+/// lands `a`'s patch as a rebased commit (same patch, new parent) before
+/// `b` is submitted.
+fn stacked_on_landed_rebased_plan(tag: &str, combine: Option<&str>) -> Value {
+    let fx = Fixture::new(tag);
+    let mut args = vec!["init", "--remote", "origin", "--base", "main"];
+    if let Some(combine) = combine {
+        args.extend(["--combine", combine]);
+    }
+    fx.mq_ok(&args);
+    fx.branch("a", &[("shared.txt", "1\n2\n3\n4\n5\nA\n")]);
+    fx.branch_from("b", "a", &[("shared.txt", "1\n2\n3\n4\n5\nA\nB\n")]);
+    fx.write("other.txt", "o\n");
+    fx.commit_all("advance main");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.write("shared.txt", "1\n2\n3\n4\n5\nA\n");
+    fx.commit_all("land a rebased");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    serde_json::from_str(&fx.mq_ok(&["plan", "--json"])).unwrap()
+}
+
+#[test]
+fn stacked_on_landed_rebased_is_held_only_under_merge_combine() {
+    // #1053: under rebase combine the replay drops the landed patch, so the
+    // stacked change plans clean; under merge combine merge-tree holds it.
+    let plan = stacked_on_landed_rebased_plan("probe-rebase", None);
+    assert!(plan["held"].as_array().unwrap().is_empty(), "{plan}");
+    assert_eq!(plan["batches"][0]["prs"], serde_json::json!([2]), "{plan}");
+
+    let plan = stacked_on_landed_rebased_plan("probe-merge", Some("merge"));
+    assert!(plan["batches"].as_array().unwrap().is_empty(), "{plan}");
+    let held = plan["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1, "{plan}");
+    assert_eq!(held[0]["pr"], 2, "{plan}");
+    assert_eq!(held[0]["kind"], "conflicts-with-base", "{plan}");
+    assert!(
+        held[0]["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "shared.txt"),
+        "{plan}"
+    );
 }
 
 #[test]
