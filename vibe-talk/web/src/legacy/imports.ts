@@ -24,7 +24,7 @@ export {
 export { speechHoldFrom } from "../core/speech/index.ts";
 export { createApi, createServerFacts, isSlowFailure, readableFailure } from "../core/api/index.ts";
 
-export { allReachesThread, answerUnplaced, answeredThread, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createPlainReach, createProviderFacts, createRemovals, createThreadPresence, createTodoView, createUnpackReads, emptyTally, exactReplyCount, heldAsSent, heldNow, inTimeOrder, markDoneIn, newerPage, noteReplyGapsIn, placeFromPageIn, refreshFailed, replyTallyOf, savedTimelineOf, settleDoneIn, tallyRecord, threadOf, timeOf, unplacedToAsk, unseenRepliesIn, upsertThreadSummary } from "../core/channels/index.ts";
+export { channelPostsOnce, allReachesThread, answerUnplaced, answeredThread, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createPlainReach, createProviderFacts, createRemovals, createThreadPresence, createTodoView, createUnpackReads, emptyTally, exactReplyCount, heldAsSent, heldNow, inTimeOrder, markDoneIn, newerPage, noteReplyGapsIn, placeFromPageIn, refreshFailed, replyTallyOf, savedTimelineOf, settleDoneIn, tallyRecord, threadOf, timeOf, unplacedToAsk, unseenRepliesIn, upsertThreadSummary } from "../core/channels/index.ts";
 export { createReadLedger } from "../core/annotations/index.ts";
 export { REOPENED_VIEWS, UI_STATE_CHARS, UI_STATE_KEY, UI_STATE_VERSION, createBackStack, createDeepLinks, createLayoutChoice, createLinkJumps, createNavigation, createUiState, createViewPlaces, createVisits, deepLinkQuery, visitKey } from "../core/navigation/index.ts";
 export {

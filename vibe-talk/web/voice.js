@@ -16019,15 +16019,9 @@ const outboxDispatch = createOutboxDispatch({
   originView: () => selection().view, persist: () => persistOutgoingMessages(),
   renderOutgoing: () => renderOutgoingEverywhere(), renderRows: () => eachColumn(renderChannelRows),
   placeReplyTarget,
-  postsOnce: (channel) => {
-    // With several providers each channel answers for its own; a channel the server described no
-    // provider for is not given another provider's guarantee.
-    if (channelDirectory.providers().size) {
-      const provider = providerOfChannel(channel);
-      return Boolean(provider && provider.idempotent_posts_supported === true);
-    }
-    return channelDirectory.capabilities().idempotentPosts;
-  },
+  // Per channel, by its own provider where several are described (`#195 send-resilience`): one
+  // owner in web/src/core/channels/providerfacts.ts (`channelPostsOnce`, `#624 voice-page-modularity`).
+  postsOnce: (channel) => channelPostsOnce(channel, providerOfChannel, channelDirectory.providers().size, channelDirectory.capabilities()),
   serviceOf: (channel) => chatServiceOf(channel), readableFailure, readableCause, refusalWords, redact,
   threadOf, noteOwnSent: (ids) => ownPosts.noteSent(ids), armSentReceipt,
   selectedChannel: () => String(selectedChannelId()),

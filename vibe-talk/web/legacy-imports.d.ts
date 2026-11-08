@@ -392,3 +392,5 @@ declare const createThreadList: LegacyImports["createThreadList"];
 declare const createOfflineCache: LegacyImports["createOfflineCache"];
 declare const createReadRunLines: LegacyImports["createReadRunLines"];
 declare const createThreadStrip: LegacyImports["createThreadStrip"];
+
+declare const channelPostsOnce: LegacyImports["channelPostsOnce"];

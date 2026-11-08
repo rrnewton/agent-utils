@@ -840,3 +840,20 @@ test("`#624 voice-page-modularity`: the saved rows' envelope is scoped to its to
   cache.dropMessageCache();
   assert.equal(store.has(MESSAGE_CACHE_KEY), false, "dropping the cache left the envelope on the device");
 });
+
+test("channelPostsOnce: each channel answers by its own provider, else the deployment's", () => {
+  const { channelPostsOnce } = CHANNELS;
+  const deployment = (idempotentPosts) => ({ threading: true, upstreamReadMark: false, upstreamClear: false,
+    idempotentPosts, repliesInThread: false, liveDelivery: "poll", livePollSeconds: 30 });
+  const providers = new Map([["slack", { idempotent_posts_supported: true }], ["chat", { idempotent_posts_supported: false }]]);
+  const ofChannel = (channel) => providers.get(channel);
+  assert.equal(channelPostsOnce("slack", ofChannel, providers.size, deployment(false)), true,
+    "a described provider that posts once was not believed");
+  assert.equal(channelPostsOnce("chat", ofChannel, providers.size, deployment(true)), false,
+    "a described provider without the guarantee borrowed the deployment's");
+  assert.equal(channelPostsOnce("other", ofChannel, providers.size, deployment(true)), false,
+    "a channel with no provider described was given another provider's guarantee");
+  assert.equal(channelPostsOnce("slack", ofChannel, 0, deployment(true)), true,
+    "no providers described: the deployment did not speak");
+  assert.equal(channelPostsOnce("slack", ofChannel, 0, deployment(false)), false);
+});

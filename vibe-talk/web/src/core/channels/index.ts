@@ -66,7 +66,7 @@ export { createTodoView } from "./todo.ts";
 export type { TodoRead, TodoState, TodoView } from "./todo.ts";
 export { createPlainReach } from "./plainreach.ts";
 export type { PlainReach } from "./plainreach.ts";
-export { createProviderFacts } from "./providerfacts.ts";
+export { channelPostsOnce, createProviderFacts } from "./providerfacts.ts";
 export type { DescribedProvider, FactsConfig, ProviderFacts } from "./providerfacts.ts";
 export { createThreadPresence } from "./threadpresence.ts";
 export type { ThreadPresence } from "./threadpresence.ts";

@@ -12,6 +12,7 @@ export interface DescribedProvider {
   readonly upstream_read_mark_supported?: unknown;
   readonly live_delivery?: unknown;
   readonly live_poll_seconds?: unknown;
+  readonly idempotent_posts_supported?: unknown;
 }
 
 /** The client-config answer, as far as these facts are read. */
@@ -81,4 +82,23 @@ export function createProviderFacts(): ProviderFacts {
         : capabilities.livePollSeconds;
     },
   };
+}
+
+/**
+ * Whether a post to `channel` is posted once: with several providers each channel answers for its
+ * own — the provider the server described for it, and a channel it described no provider for is
+ * not given another provider's guarantee; with none described, the deployment's capability.
+ * (`#195 send-resilience`; the dispatch's retry rule reads it per channel when a send fails.)
+ */
+export function channelPostsOnce(
+  channel: string,
+  providerOfChannel: (channel: string) => DescribedProvider | undefined,
+  providerCount: number,
+  capabilities: Readonly<DeploymentCapabilities>,
+): boolean {
+  if (providerCount) {
+    const provider = providerOfChannel(channel);
+    return Boolean(provider && provider.idempotent_posts_supported === true);
+  }
+  return capabilities.idempotentPosts;
 }
