@@ -234,6 +234,9 @@ def parser() -> argparse.ArgumentParser:
     revive.add_argument("--all", action="store_true", help="consider every registered name; continue past blocked records")
     revive.add_argument("--dry-run", action="store_true", help="print recovery plans without changing registry files, locks, tabs, or processes")
     revive.add_argument("--expected-token", metavar="TOKEN", help="require this old record generation; applies only with NAME")
+    revive.add_argument("--refresh-profile", action="store_true",
+        help="relaunch from the launch profile's current definition instead of the recorded launch "
+        "(the Rust edition only; this edition refuses it)")
     revive.add_argument("--startup-timeout", type=_ascii_float, default=30.0, metavar="SECONDS",
         help="replacement harness startup deadline, greater than 0 and at most 300 seconds (default: 30)")
 
@@ -250,6 +253,9 @@ def parser() -> argparse.ArgumentParser:
         help="restart every agent managed by the caller (AGENTCTL_AGENT, else the designated coordinator), workers first, never the caller")
     restart.add_argument("--stop-background-tasks", action="store_true",
         help="accept Claude's exit-dialog stop-tasks choice (only when the agent confirms the listed tasks are stale)")
+    restart.add_argument("--refresh-profile", action="store_true",
+        help="relaunch from the launch profile's current definition instead of the recorded launch "
+        "(the Rust edition only; this edition refuses it)")
     restart.add_argument("--when-idle", action="store_true",
         help="wait until the agent finishes its turn and is idle with nothing queued, instead of refusing")
     restart.add_argument("--wait-idle", type=_ascii_float, default=3600.0, metavar="SECONDS",
@@ -585,6 +591,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "rename":
             result = sessions.rename(name, args.new_name)
         elif args.command == "revive":
+            if args.refresh_profile:
+                raise ValueError("--refresh-profile is implemented only by the Rust edition")
             if args.startup_timeout > 300:
                 raise ValueError("startup-timeout must be greater than 0 and at most 300 seconds")
             if bool(name) == args.all:
@@ -598,6 +606,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = sessions.revive(name, dry_run=args.dry_run, expected_token=args.expected_token,
                                      startup_timeout=args.startup_timeout)
         elif args.command == "restart":
+            if args.refresh_profile:
+                raise ValueError("--refresh-profile is implemented only by the Rust edition")
             if args.team:
                 import os as _os
                 caller = _os.environ.get("AGENTCTL_AGENT") or ""

@@ -1024,6 +1024,9 @@ struct Revive {
     /// Mark an interrupted revive's candidate failed even when agentctl cannot prove it dead, then launch again; refused while a harness process runs for the candidate. A candidate proved dead (its pane gone, or holding only an idle shell) is abandoned without this flag. The attempt is kept under REGISTRY/.revives/.abandoned/ with the evidence. Applies only to a named revive
     #[arg(long, requires = "name", conflicts_with_all = ["archived", "fresh"])]
     abandon_candidate: bool,
+    /// Relaunch from the launch profile's current definition (argv, environment, model, reasoning effort) instead of the recorded launch, keeping the conversation, queue and token; for a profile edited since the agent started. Refused when the profile now names another harness or mode. Applies only to a named revive
+    #[arg(long, requires = "name", conflicts_with_all = ["dry_run", "archived", "abandon_candidate"])]
+    refresh_profile: bool,
     /// Startup-readiness deadline in seconds, greater than 0 and at most 300 (default: 30)
     #[arg(long, default_value = "30", value_parser = startup_seconds, value_name = "SECONDS")]
     startup_timeout: f64,
@@ -1047,6 +1050,9 @@ struct Restart {
     /// Accept Claude's exit-dialog stop-tasks choice (only when the agent confirms the listed tasks are stale)
     #[arg(long)]
     stop_background_tasks: bool,
+    /// Relaunch from the launch profile's current definition (argv, environment, model, reasoning effort) instead of the recorded launch, keeping the conversation, queue and token. Checked before the harness exits; refused when the profile now names another harness or mode
+    #[arg(long, conflicts_with = "team")]
+    refresh_profile: bool,
     /// How long --when-idle may wait in seconds, greater than 0 and at most 3600 (default: 3600)
     #[arg(long, default_value = "3600", value_name = "SECONDS")]
     wait_idle: f64,
@@ -4320,6 +4326,16 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 manager
                     .mark_fresh_revive(name, "the operator asked for a fresh revive (--fresh)")?;
                 manager.revive(name, false, value.expected_token.as_deref(), timeout)?
+            } else if value.refresh_profile {
+                let name = value
+                    .name
+                    .as_deref()
+                    .expect("clap requires NAME with --refresh-profile");
+                let refreshed = manager.refresh_profile(name)?;
+                let mut result =
+                    manager.revive(name, false, value.expected_token.as_deref(), timeout)?;
+                result["profile_refresh"] = refreshed["changed"].clone();
+                result
             } else {
                 manager.revive_with(
                     value.name.as_deref().expect("clap requires NAME or --all"),
@@ -4381,6 +4397,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     Duration::from_secs_f64(value.wait_idle),
                     Duration::from_secs_f64(value.startup_timeout),
                     value.stop_background_tasks,
+                    value.refresh_profile,
                 )?;
                 manager.bring_coordinator_tab_forward(name, tab_socket);
                 result

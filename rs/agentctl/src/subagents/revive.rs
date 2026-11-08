@@ -1217,6 +1217,13 @@ fn policy_arguments(record: &AgentRecord, native: &NativeSession) -> Result<Vec<
 pub(super) const FRESH_REVIVE: &str = "fresh_revive";
 const FRESH_REVIVE_SCHEMA: &str = "agentctl-fresh-revive/v1";
 
+/// How long a restart waits, once the pane shows its shell, for the exited harness process to
+/// end by itself before ending its tree (#1023).
+#[cfg(not(test))]
+const HARNESS_EXIT_GRACE: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const HARNESS_EXIT_GRACE: Duration = Duration::from_millis(300);
+
 /// The fresh conversation (session, reason) a record asks its next revive to start.
 pub(super) fn fresh_revive(record: &AgentRecord) -> Option<(String, String)> {
     let marker = record
@@ -2598,11 +2605,20 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         wait_timeout: Duration,
         startup_timeout: Duration,
     ) -> Result<Value> {
-        self.restart_stopping(agent_name, when_idle, wait_timeout, startup_timeout, false)
+        self.restart_stopping(
+            agent_name,
+            when_idle,
+            wait_timeout,
+            startup_timeout,
+            false,
+            false,
+        )
     }
 
     /// [`Self::restart`], optionally accepting Claude's exit-dialog
-    /// stop-tasks choice for operator-confirmed stale tasks (lesson 18).
+    /// stop-tasks choice for operator-confirmed stale tasks (lesson 18),
+    /// and optionally relaunching from the profile's current definition
+    /// instead of the recorded launch (#1023 agentctl-restart-profile-refresh).
     pub fn restart_stopping(
         &self,
         agent_name: &str,
@@ -2610,6 +2626,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         wait_timeout: Duration,
         startup_timeout: Duration,
         stop_background_tasks: bool,
+        refresh_profile: bool,
     ) -> Result<Value> {
         let record = self.load(agent_name)?;
         if record.agentcloud.is_some() {
@@ -2663,7 +2680,16 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "agent '{agent_name}' has an interrupted revive; run `agentctl revive {agent_name}` to finish it before restarting"
             )));
         }
-        self.revive_launch_plan(&record, startup_timeout, Some(pane.clone()))?;
+        // With --refresh-profile, preflight the launch the refreshed record asks for: the same
+        // profile read that rewrites the record once the harness is out.
+        let profile_changes = if refresh_profile {
+            let (refreshed, changed) = self.refreshed_from_profile(&record)?;
+            self.revive_launch_plan(&refreshed, startup_timeout, Some(pane.clone()))?;
+            Some(changed)
+        } else {
+            self.revive_launch_plan(&record, startup_timeout, Some(pane.clone()))?;
+            None
+        };
         let identity = if record.anchors_with_harness_identity() {
             record.harness_anchor().cloned()
         } else {
@@ -2684,6 +2710,27 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .registry
             .join(".restarts")
             .join(format!("{}.json", record.token));
+        // A journal naming this agent under an earlier generation's token is left from a
+        // restart that a revive or a new start finished: it can never resume, so it goes.
+        if let Ok(entries) = fs::read_dir(self.registry.join(".restarts")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path == journal_path {
+                    continue;
+                }
+                let stale = fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .is_some_and(|doc| {
+                        doc["schema"] == "agentctl-restart/v1"
+                            && doc["name"] == agent_name
+                            && doc["old_token"] != record.token.as_str()
+                    });
+                if stale {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
         let resumed_exited = fs::read(&journal_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -2723,8 +2770,27 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             )?;
             write_journal("exited")?;
         }
+        // The pane shows its shell before a Muse runtime has ended, and revive refuses a pinned
+        // process it still sees alive: wait for the harness to be provably gone (#1023).
+        if alive || resumed_exited {
+            if let Some(identity) = identity.as_ref() {
+                self.await_harness_gone(agent_name, identity)?;
+            }
+        }
         let old_pid = identity.as_ref().map(|id| id.pid);
-        let result = self.revive(agent_name, false, Some(&record.token), startup_timeout)?;
+        // The harness is out from here on: a relaunch that fails says so and how to finish,
+        // rather than leaving a bare shell behind a raw revive error (#1023).
+        let relaunch = || -> Result<Value> {
+            if profile_changes.is_some() {
+                self.refresh_profile(agent_name)?;
+            }
+            self.revive(agent_name, false, Some(&record.token), startup_timeout)
+        };
+        let result = relaunch().map_err(|error| {
+            fail(format!(
+                "restart of '{agent_name}' exited its harness but could not relaunch it, so its pane holds a shell: {error}; once the cause is fixed, `agentctl revive {agent_name}` finishes the restart"
+            ))
+        })?;
         // Drain, never archive (R1 gap 3): prompts that reached the old
         // generation during the restart window were archived by revive;
         // re-enqueue their text into the restarted session under fresh
@@ -2873,10 +2939,41 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "slot_owner": slot,
             "notified": notified,
             "restart_journal": restart_journal,
+            "profile_refresh": profile_changes,
             "replayed_prompts": replayed,
             "drain": drain_report,
             "peers": peers,
         }))
+    }
+
+    /// Wait for the pinned harness process `identity` to be provably dead after its pane returned
+    /// to a shell. A process still alive after a grace period has left its pane, so its tree is
+    /// ended, runtime first, as a resume restart does (#920). Refused, with the harness already
+    /// out of the pane, when its death cannot be proved (#1023 agentctl-restart-profile-refresh).
+    fn await_harness_gone(&self, agent_name: &str, identity: &CustomProcessIdentity) -> Result<()> {
+        let settle = |within: Duration| {
+            let deadline = std::time::Instant::now() + within;
+            loop {
+                let liveness = self.client.process_liveness(identity);
+                if liveness == ProcessLiveness::Dead || std::time::Instant::now() >= deadline {
+                    return liveness;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        };
+        if settle(HARNESS_EXIT_GRACE) == ProcessLiveness::Dead {
+            return Ok(());
+        }
+        self.client.end_harness(identity, Duration::from_secs(15))?;
+        match settle(Duration::from_secs(5)) {
+            ProcessLiveness::Dead => Ok(()),
+            liveness => Err(fail(format!(
+                "'{agent_name}' left its pane, but its harness process {} is {} after being ended; \
+                 its pane holds a shell; once it is gone, `agentctl revive {agent_name}` finishes the restart",
+                identity.pid,
+                if liveness == ProcessLiveness::Alive { "still alive" } else { "of unprovable state" },
+            ))),
+        }
     }
 
     /// Exit every running agent at an idle turn boundary and record what
@@ -4113,6 +4210,156 @@ fn publish_candidate(
 }
 
 impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
+    /// `record` with its launch policy rebuilt from its profile's current definition (#1023
+    /// agentctl-restart-profile-refresh): model, reasoning effort, environment names, and a launch
+    /// spec whose argv is what `start --profile` would launch now. The native session, queue,
+    /// token and everything else stay. The second value names each field that changed, empty
+    /// when the record already matches. Refused for a record with no profile, or a profile that
+    /// now names another harness or mode, or an agentcloud profile: those need a new start.
+    pub(super) fn refreshed_from_profile(
+        &self,
+        record: &AgentRecord,
+    ) -> Result<(AgentRecord, Vec<&'static str>)> {
+        let profile_name = record.profile.as_deref().ok_or_else(|| {
+            fail(format!(
+                "agent {:?} was not started from a launch profile, so there is none to refresh from",
+                record.name
+            ))
+        })?;
+        let cwd = fs::canonicalize(&record.cwd)
+            .map_err(|_| fail("recorded starting directory is unavailable"))?;
+        let root = crate::profiles::configuration_root(&cwd, &self.registry, false)?;
+        let (_, profiles) = crate::profiles::load_profiles(&root, false)?;
+        let profile = profiles.get(profile_name).ok_or_else(|| {
+            fail(format!(
+                "launch profile {profile_name:?} is no longer defined"
+            ))
+        })?;
+        if profile.harness != record.harness
+            || profile.mode != record.mode
+            || profile.cloud.is_some()
+        {
+            return Err(fail(format!(
+                "launch profile {profile_name:?} now names another harness or mode; stop the agent and start it again"
+            )));
+        }
+        crate::profiles::validate_structured_harness_argument_conflicts(
+            "refreshed profile",
+            &record.harness,
+            &profile.argv,
+            profile.model.is_some(),
+            profile.reasoning_effort.is_some(),
+            true,
+        )?;
+        let mut structured = crate::profiles::reasoning_arguments(
+            &record.harness,
+            profile.reasoning_effort.as_deref(),
+        )?;
+        structured.extend(profile.argv.iter().cloned());
+        // As `start` does: a Codex under a launch environment that needs it runs no login shell.
+        if record.harness == "codex"
+            && self
+                .project_launch_env()?
+                .as_ref()
+                .is_some_and(crate::profiles::LaunchEnv::codex_needs_non_login_shell)
+            && !profile
+                .argv
+                .iter()
+                .any(|argument| argument.contains("allow_login_shell"))
+        {
+            structured.extend(["-c".to_owned(), "allow_login_shell=false".to_owned()]);
+        }
+        let argv = harness_arguments(&record.harness, profile.model.as_deref(), None, &structured)?;
+        let names = environment_names(&profile.environment);
+        let old_spec = record.launch_spec.as_ref();
+        let session = old_spec
+            .and_then(|spec| spec["native_session"]["value"].as_str().map(str::to_owned))
+            .or_else(|| record.effective_native_session().map(|native| native.value));
+        let old_argv = spec_arguments(record).unwrap_or_else(|| record.arguments.clone());
+        let mut changed = Vec::new();
+        if record.model != profile.model {
+            changed.push("model");
+        }
+        if record.reasoning_effort != profile.reasoning_effort {
+            changed.push("reasoning_effort");
+        }
+        if record.environment_names != names {
+            changed.push("environment_names");
+        }
+        if launch_spec::same_launch_rest(&record.harness, &old_argv, &argv) {
+            // Same arguments apart from the conversation selector.
+        } else {
+            changed.push("argv");
+        }
+        let mut refreshed = record.clone();
+        refreshed.model = profile.model.clone();
+        refreshed.reasoning_effort = profile.reasoning_effort.clone();
+        refreshed.environment_names = names;
+        let label = old_spec.and_then(|spec| spec["workspace_label"].as_str());
+        refreshed.launch_spec = Some(launch_spec::build(launch_spec::SpecFields {
+            // What the next revive launches; a source both editions already read.
+            source: "revive",
+            captured_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0.0, |elapsed| elapsed.as_secs_f64()),
+            harness: &refreshed.harness,
+            executable: old_spec.and_then(|spec| spec["executable"].as_str()),
+            argv: &argv,
+            cwd: &refreshed.cwd,
+            profile: refreshed.profile.as_deref(),
+            environment_names: &refreshed.environment_names,
+            slot: refreshed.slot.as_deref(),
+            slot_project: refreshed.slot_project.as_deref(),
+            slot_isolation: refreshed.slot_isolation.as_deref(),
+            workspace_label: label,
+            native_session: session.as_deref().map(|value| (value, "asserted")),
+        })?);
+        Ok((refreshed, changed))
+    }
+
+    /// Rewrite a stopped agent's launch policy from its profile's current definition, so the
+    /// next revive launches what the profile says now, on the same conversation (#1023
+    /// agentctl-restart-profile-refresh). Refused while the harness still runs (restart it
+    /// with `--refresh-profile`) or while a revive is unfinished.
+    pub fn refresh_profile(&self, agent_name: &str) -> Result<Value> {
+        let _lock = self.lock(agent_name)?;
+        if journals(&self.registry)?
+            .iter()
+            .any(|journal| journal.name == agent_name)
+        {
+            return Err(fail(format!(
+                "agent '{agent_name}' has an interrupted revive; run `agentctl revive {agent_name}` to finish it first"
+            )));
+        }
+        let record = self.load(agent_name)?;
+        if self.revive_liveness(&record) == ProcessLiveness::Alive {
+            return Err(fail(format!(
+                "agent '{agent_name}' still runs its harness; use `agentctl restart {agent_name} --refresh-profile`"
+            )));
+        }
+        let (refreshed, changed) = self.refreshed_from_profile(&record)?;
+        self.save(&refreshed)?;
+        Ok(json!({
+            "name": agent_name,
+            "profile": refreshed.profile,
+            "changed": changed,
+        }))
+    }
+
+    /// The fields in which `record`'s launch policy differs from its profile's current
+    /// definition, with the command that moves it onto the profile; `None` while they agree,
+    /// for a record with no profile, or when the profile cannot be read (#1023).
+    pub(super) fn profile_drift(&self, record: &AgentRecord) -> Option<Value> {
+        record.profile.as_ref()?;
+        let (_, changed) = self.refreshed_from_profile(record).ok()?;
+        (!changed.is_empty()).then(|| {
+            json!({
+                "fields": changed,
+                "fix": format!("agentctl restart {} --refresh-profile", record.name),
+            })
+        })
+    }
+
     pub(super) fn retire_revive_preflight(
         &self,
         record: &AgentRecord,

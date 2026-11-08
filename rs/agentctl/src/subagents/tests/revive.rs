@@ -105,6 +105,85 @@ fn restart_resumes_from_an_exited_journal_without_exiting_again() {
 }
 
 #[test]
+fn a_restart_waits_out_a_harness_that_outlives_its_exit_and_drops_stale_journals() {
+    // #1023: Muse prints its resume hint and the pane shows a shell while its runtime lives on;
+    // the restart ends that leftover instead of letting revive refuse a live harness.
+    let (fixture, mut old) = recoverable("muse", false);
+    old.session_agent = Some("muse".to_owned());
+    old.session_value = Some("sess-1".to_owned());
+    fixture.manager().save(&old).unwrap();
+    let pane = old.pane_id.clone().unwrap();
+    fixture.client.dead_panes.lock().unwrap().remove(&pane);
+    fixture.client.started.store(true, Ordering::Relaxed);
+    fixture.client.custom_alive.store(true, Ordering::Relaxed);
+    fixture.client.exit_to_shell.store(true, Ordering::Relaxed);
+    fixture
+        .client
+        .linger_after_exit
+        .store(true, Ordering::Relaxed);
+    // A journal an earlier generation's restart left at "exited".
+    let restarts = fixture.root.join("registry/.restarts");
+    agent::create_private_directory(&restarts, "test restart journals", false, false).unwrap();
+    let stale = restarts.join("1794000000000000000-1.json");
+    fs::write(
+        &stale,
+        json!({
+            "schema": "agentctl-restart/v1", "name": "worker",
+            "old_token": "1794000000000000000-1", "session": "sess-0",
+            "phase": "exited", "started_at": 0.0,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let result = fixture
+        .manager()
+        .restart("worker", false, Duration::from_secs(30), TIMEOUT)
+        .unwrap();
+    assert_eq!(result["action"], "restarted", "{result}");
+    let pinned = old.custom_process_identity.as_ref().unwrap().pid;
+    assert!(fixture.client.ended.lock().unwrap().contains(&pinned));
+    assert!(!stale.exists(), "a stale restart journal is dropped");
+}
+
+#[test]
+fn a_restart_whose_relaunch_fails_says_the_harness_exited_and_how_to_finish() {
+    // #1023: the harness exits, then the relaunch fails; the error says so and names the
+    // command that finishes it, and the restart journal is left at "exited".
+    let (fixture, mut old) = recoverable("muse", false);
+    old.session_agent = Some("muse".to_owned());
+    old.session_value = Some("sess-1".to_owned());
+    fixture.manager().save(&old).unwrap();
+    let pane = old.pane_id.clone().unwrap();
+    fixture.client.dead_panes.lock().unwrap().remove(&pane);
+    fixture.client.started.store(true, Ordering::Relaxed);
+    fixture.client.custom_alive.store(true, Ordering::Relaxed);
+    fixture.client.exit_to_shell.store(true, Ordering::Relaxed);
+    fixture
+        .client
+        .fail_ready_once
+        .store(true, Ordering::Relaxed);
+    let error = fixture
+        .manager()
+        .restart("worker", false, Duration::from_secs(30), TIMEOUT)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("exited its harness but could not relaunch it"),
+        "{error}"
+    );
+    assert!(
+        error.contains("`agentctl revive worker` finishes the restart"),
+        "{error}"
+    );
+    let journal = fixture
+        .root
+        .join("registry/.restarts")
+        .join(format!("{}.json", old.token));
+    let phase = serde_json::from_slice::<Value>(&fs::read(&journal).unwrap()).unwrap();
+    assert_eq!(phase["phase"], "exited");
+}
+
+#[test]
 fn restart_drains_prompts_queued_during_the_restart_window() {
     let (fixture, mut old) = recoverable("muse", false);
     old.session_agent = Some("muse".to_owned());
@@ -2165,6 +2244,100 @@ fn revive_without_a_spec_refuses_profile_model_effort_argv_and_environment_name_
             .is_err());
         assert_eq!(fixture.client.environments.lock().unwrap().len(), 1);
     }
+}
+
+// #1023 agentctl-restart-profile-refresh: an operator can move a stopped or restarted agent onto
+// its profile's current definition without a new start.
+
+/// Give the fixture's profile a new environment variable and new argv, as an operator editing
+/// profiles.json does.
+fn edit_profile(path: &Path) {
+    let mut config = agent::read_private_json(path).unwrap();
+    let profile = &mut config["profiles"]["claude-recovery"];
+    profile["argv"] = json!(["--allowedTools", "Read,Write"]);
+    profile["env"] = json!({"RECOVERY_MODE": "profile-private-value", "ULTRA_MODE": "on"});
+    agent::atomic_json(path, &config).unwrap();
+}
+
+#[test]
+fn revive_with_a_refreshed_profile_launches_its_new_environment_on_the_same_conversation() {
+    let (fixture, old, path) = profile_fixture();
+    let manager = fixture.manager();
+    assert!(manager.status("worker").unwrap()["profile_drift"].is_null());
+    edit_profile(&path);
+    let drift = &manager.status("worker").unwrap()["profile_drift"];
+    assert_eq!(
+        drift["fields"],
+        json!(["environment_names", "argv"]),
+        "{drift}"
+    );
+    assert_eq!(drift["fix"], "agentctl restart worker --refresh-profile");
+    let refreshed = manager.refresh_profile("worker").unwrap();
+    assert_eq!(refreshed["changed"], json!(["environment_names", "argv"]));
+    assert!(!refreshed.to_string().contains("profile-private-value"));
+    manager.revive("worker", false, None, TIMEOUT).unwrap();
+    assert_eq!(
+        fixture.client.environments.lock().unwrap()[1],
+        ["RECOVERY_MODE=profile-private-value", "ULTRA_MODE=on"]
+    );
+    let new = manager.load("worker").unwrap();
+    assert_eq!(
+        new.resume,
+        old.native_session
+            .as_ref()
+            .map(|native| native.value.clone())
+    );
+    assert!(new
+        .arguments
+        .windows(2)
+        .any(|pair| pair == ["--allowedTools", "Read,Write"]));
+    assert_eq!(new.environment_names, ["RECOVERY_MODE", "ULTRA_MODE"]);
+    assert!(manager.status("worker").unwrap()["profile_drift"].is_null());
+}
+
+#[test]
+fn restart_with_a_refreshed_profile_relaunches_from_it() {
+    let (fixture, _old, path) = profile_fixture();
+    edit_profile(&path);
+    let result = fixture
+        .manager()
+        .restart_stopping(
+            "worker",
+            false,
+            Duration::from_secs(30),
+            TIMEOUT,
+            false,
+            true,
+        )
+        .unwrap();
+    assert_eq!(result["action"], "restarted", "{result}");
+    assert_eq!(
+        result["profile_refresh"],
+        json!(["environment_names", "argv"])
+    );
+    assert_eq!(
+        fixture.client.environments.lock().unwrap()[1],
+        ["RECOVERY_MODE=profile-private-value", "ULTRA_MODE=on"]
+    );
+}
+
+#[test]
+fn a_profile_refresh_refuses_a_running_harness_and_a_profile_that_changed_harness() {
+    let (fixture, old, path) = profile_fixture();
+    let manager = fixture.manager();
+    let pane = old.pane_id.clone().unwrap();
+    fixture.client.dead_panes.lock().unwrap().remove(&pane);
+    fixture.client.started.store(true, Ordering::Relaxed);
+    fixture.client.custom_alive.store(true, Ordering::Relaxed);
+    let error = manager.refresh_profile("worker").unwrap_err().to_string();
+    assert!(error.contains("--refresh-profile"), "{error}");
+    kill_owned(&fixture, &old);
+    let mut config = agent::read_private_json(&path).unwrap();
+    config["profiles"]["claude-recovery"]["harness"] = json!("codex");
+    agent::atomic_json(&path, &config).unwrap();
+    let error = manager.refresh_profile("worker").unwrap_err().to_string();
+    assert!(error.contains("another harness or mode"), "{error}");
+    assert_eq!(manager.load("worker").unwrap(), old);
 }
 
 #[test]
