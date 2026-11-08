@@ -1992,18 +1992,18 @@ const folding = createFolding({
   unseenReply: unseenColumnReply,
   listEmptied: () => listEmptied(),
   draftBelowView: () => voiceTranscript().draftBelowView(),
-  renderJumpBookmark,
+  renderJumpBookmark: () => renderJumpBookmark(),
   refreshReadingJump: () => readingJump.refresh(),
   visibleList,
   shownChannelList,
   applySearch: () => applySearch(),
-  placeBookmarkLine,
+  placeBookmarkLine: () => placeBookmarkLine(),
   keepSelection: (...args) => keepSelection(...args),
   replyReturnRow,
   actionMenuOpen: () => actionMenu.open(),
   renderActionMenu: () => actionMenu.render(),
   renderSendUndo,
-  renderBookmarkUndo,
+  renderBookmarkUndo: () => renderBookmarkUndo(),
   channelOnScreen: (...args) => channelOnScreen(...args),
   rowIsRead: (row) => rowIsRead(row),
   markedRow: (pane, mark) => markedRow(/** @type {any} */ (pane), /** @type {any} */ (mark)),
@@ -4219,29 +4219,6 @@ const cardMaxLines = createCardMaxLines({
   },
 });
 
-/** The slider, or − and +: K applied with the cards held where the reader is, and kept. */
-function cardMaxLinesChanged(value) {
-  let n = DEFAULT_CARD_MAX_LINES;
-  keepingCardPlace(() => { n = cardMaxLines.apply(value); });
-  messagePreferences.cardMaxLines.saved(n);
-  return n;
-}
-
-/** One line fewer (-1) or more (+1), as `stepCollapsedLines` steps its count. */
-function stepCardMaxLines(direction) {
-  messagePreferences.cardMaxLines.step(direction);
-}
-
-// --- how much a quote must cover to mark read (#728 vt-quote-read-threshold) ---------------------
-//
-// `#728 vt-quote-read-threshold`. The owner, 2026-11-01: a reply that quotes one sentence of a long
-// message is an answer to that sentence, not to the message, and marking the whole message read
-// (`#300 reply-marks-read`) loses the rest of it. So a reply whose quote covers less than a share of
-// the message's words, 5% until the owner says otherwise, leaves it unread: no Done, no read marker
-// moved in the chat service. A reply that quotes nothing, or more than that, marks it read as
-// before. The share is a setting under Messages, kept on the server for every device; 0 marks every
-// reply's message read, as the page always did. Decided when the reply is queued, like `marksRead`.
-
 /** The device's copy of the share, kept on the server for every device (`#457 settings-server-side`). */
 const QUOTE_READ_PERCENT_KEY = DEVICE_SETTINGS.quoteReadPercent.key;
 
@@ -4257,260 +4234,6 @@ const quoteReadPercent = createQuoteReadPercent({
   render: (n) => messagePreferences.quoteReadPercent.render(n),
 });
 
-/** The slider, or − and +: the share applied, and kept, read back as private browsing keeps nothing. */
-function quoteReadPercentChanged(value) {
-  return messagePreferences.quoteReadPercent.changed(value);
-}
-
-/** One percent less (-1) or more (+1), as `stepCardMaxLines` steps its lines. */
-function stepQuoteReadPercent(direction) {
-  messagePreferences.quoteReadPercent.step(direction);
-}
-
-/**
- * What a reply to `target` with text `text` marks read once sent (`#300 reply-marks-read`): the message
- * itself, or null where its quote covers less of it than the share in force.
- *
- * @param {{id: unknown, content: string}} target
- * @param {string} text
- */
-function replyMarksRead(target, text) {
-  return quoteMarksRead(quoteShare(text, rawTextOf(target)), quoteReadPercent.current()) ? String(target.id) : null;
-}
-
-/** Whether `root` is longer than a card shows: more than K card lines of its text, as the server counts. */
-function rootOverflowsCard(root) {
-  return Boolean(root) && cardProxyLines(proxyLinesOf(rawTextOf(root))) > cardMaxLines.current();
-}
-
-// `#528 thread-card-markdown-and-cap`. The owner, 2026-10-26: "a long message with markdown
-// formatting loses its formatting when it is promoted to a thread card", and of #522's split: "I
-// wanted to split only at the line granularity and always retain markdown formatting of course."
-//
-//   * THE CARD IS THE ROOT'S OWN BODY, drawn as its row draws it (`messageBody`): its lists, line
-//     breaks, code and links, where `#489 card-root-lines` drew plain lines. A link on the card looks
-//     like one but is not one (`unlinkCardBody`): the card is a button, and a press on it is the card's.
-//   * IT STOPS ONLY BETWEEN UNITS (`cardUnits`): a block at the top of the body, an item of a list
-//     there, or a line of a paragraph — never inside a line, an item, a code block, a quote or a table.
-//     A numbered list cut between items goes on, under the card, numbered from where it stopped
-//     (`start`), and the continuation is the same body from that unit on, formatted as the row is.
-//   * K HOLDS FOR WHAT THE CARD DRAWS, each unit counted by the proxy (a list's items and a quote at a
-//     narrower line, `CARD_INDENTED_CHARS`), so no raw card is ever longer than K lines however its
-//     text reached the page. A first unit longer than K on its own, one long paragraph, has no line to
-//     stop at: the card shows its first K lines, clamped (`data-card-clamp`), and the root goes inward
-//     whole as under a summary, so nothing is cut out or said by halves.
-//   * `#533 card-split-atomic-blocks`. A TABLE, A CODE BLOCK OR A QUOTE IS ONE UNIT, counted by the lines
-//     it draws: a table a line a row, code a line a line of it (both scroll sideways rather than wrap), a
-//     quote by the proxy. One too tall for the card that comes first is not clamped — a clamp cannot cut a
-//     table or code between its lines, and drew a giant card — but stood for on the card by one line
-//     (`cardStubText`: "Table (7 columns × 6 rows)", or its first line) and "…", and drawn whole, as
-//     itself, at the head of the continuation under it: the split view, as a long root has.
-//   * A SUMMARY ON ITS WAY IS WAITED FOR IN THE SUMMARY'S LAYOUT (`cardPending`): a root too long for
-//     its card is named from its first reply, so where the server names threads the card says the
-//     root's first lines meanwhile and the root goes inward whole at once. When the summary lands only
-//     the card's words change; the rows under it stay where they are. The Threads list is read again
-//     at short steps meanwhile (`watchPendingSummaries`), past its once-a-minute spacing, because that
-//     read is what both queues the thread for naming and brings the name. A summary that has not come
-//     within `SUMMARY_WAIT_MS` of the thread's last activity is not waited for: the card splits.
-
-/** How long after a thread's last activity a summary on its way is waited for in the summary's layout. */
-const SUMMARY_WAIT_MS = 60000;
-
-/** When, after a thread's last activity, the Threads list is read again for the summary on its way. */
-const SUMMARY_READ_STEPS_MS = [2000, 5000, 10000, 20000, 40000];
-
-// Whether this server names threads (`thread_names_supported`), so whether a summary may be on its way, is the
-// server facts' (`ServerFacts.threadNames`).
-
-
-
-
-/**
- * Each root's cut as last worked out, the K it was worked out at, and the card's words for it: a card
- * asks several times a pass (its words, its mark, its block's signature and its block). A root read
- * again is a new object, and is worked out afresh.
- *
- * @type {WeakMap<object, {lines: number, cut: {head: number, whole: boolean} | null, text: string}>}
- */
-const cardCuts = new WeakMap();
-
-/**
- * Where a card stops in `root`: after its first `head` units (`cardUnits`), when its drawn body is
- * longer than K card lines; null where it fits, or where all it would leave over is one line, which
- * the card shows instead (`#522`: a row of its own for one line is less compact than the line).
- * `whole` where even its first unit is longer than K: the card shows that unit clamped and the root
- * goes inward whole.
- *
- * @returns {{head: number, whole: boolean} | null}
- */
-function cardCut(root) {
-  return cardCutEntry(root).cut;
-}
-
-/** `cardCut`'s answer for `root` and the card's words with it, worked out once per root and K. */
-function cardCutEntry(root) {
-  const held = cardCuts.get(root);
-  if (held && held.lines === cardMaxLines.current()) return held;
-  const units = cardUnits(messageBody(root));
-  const cut = cutForCard(units.map((unit) => unit.lines), units.map((unit) => unit.mark), units.map((unit) => unit.whole),
-    units.map((unit) => unit.heading));
-  const entry = { lines: cardMaxLines.current(), cut, text: foldedCardText(renderedText(cardHead(root, cut))) };
-  cardCuts.set(root, entry);
-  return entry;
-}
-
-/**
- * `cardCut`'s work on the card lines of a root's units, in order, at the K in force; `marks`, the
- * line each unit's "…" would take of its own (`cardUnits`), so the "…" never takes the card past K;
- * `wholes`, which units are blocks never cut into nor clamped. A first unit longer than K is clamped
- * (`whole`), but such a block, which is stood for on the card by one line (`stub`, `cardHead`) and goes
- * whole into the continuation: a cut before it (`#533 card-split-atomic-blocks`). `headings`, which
- * units are headings: a card never ends on one, which would head nothing there, so the cut moves back
- * before it and the heading opens the continuation with its part (`#551 headings-real-headings`).
- *
- * @returns {{head: number, whole: boolean, stub?: boolean} | null}
- */
-function cutForCard(lines, marks = [], wholes = [], headings = []) {
-  const total = lines.reduce((sum, n) => sum + n, 0);
-  if (total <= cardMaxLines.current()) return null;
-  let head = 0;
-  let used = 0;
-  while (head < lines.length && used + lines[head] <= cardMaxLines.current()) {
-    used += lines[head];
-    head += 1;
-  }
-  while (head > 0 && used + (marks[head - 1] || 0) > cardMaxLines.current()) {
-    head -= 1;
-    used -= lines[head];
-  }
-  while (head > 1 && headings[head - 1]) {
-    head -= 1;
-    used -= lines[head];
-  }
-  if (head === 0) return wholes[0] ? { head: 0, whole: false, stub: true } : { head: 1, whole: true };
-  if (total - used < 2) return null;
-  return { head, whole: false };
-}
-
-/** The card's body for `root` cut at `cut`: its first units and "…", or the whole root where it fits. */
-function cardHead(root, cut) {
-  const box = messageBody(root);
-  if (cut && cut.stub) {
-    // A first block too tall for the card, stood for by one line: the block itself is the continuation's.
-    const block = cardUnits(box)[0].nodes[0];
-    const line = document.createElement("p");
-    line.className = "card-stub";
-    line.append(document.createTextNode(`${cardStubText(block)} `), cardEllipsis());
-    box.replaceChildren(line);
-    return box;
-  }
-  if (cut) {
-    keepCardUnits(box, (at) => at < cut.head);
-    if (!cut.whole) appendCardEllipsis(box);
-  }
-  unlinkCardBody(box);
-  return box;
-}
-
-/**
- * The root's row as its continuation under a split card: the root itself, its body drawn from the
- * unit the card stopped before (`messageBody` reads `cardRestFrom`), starting "…". The same message —
- * its id, author, time and reactions — so whatever is done from the row is done to the root.
- */
-function continuationOf(root, cut) {
-  // Its body is built as the card's was, from the root's own heading (`plainParagraphs` marks the words
-  // a heading restates, and where that mark ends decides the units), though the row shows no heading.
-  const heading = headingOf(root);
-  return { ...root, heading: null, cardRestFrom: cut.head, cardRestCut: heading ? heading.cut : 0 };
-}
-
-/**
- * Whether thread `choice`'s summary is on its way: the server names threads, its root is too long for
- * a card by the server's count (so it is named from its first reply), it has a reply, its card is cut,
- * and its last activity is within `SUMMARY_WAIT_MS`.
- */
-function cardPending(choice) {
-  if (!serverFacts.threadNames() || !choice || !choice.root || cardIsSummarized(choice)) return false;
-  if (!Number.isFinite(choice.at) || Date.now() - choice.at >= SUMMARY_WAIT_MS) return false;
-  if (!cardCut(choice.root) || !rootOverflowsCard(choice.root)) return false;
-  return knownReplies(choice) > 0;
-}
-
-/** How many replies thread `choice` is known to have: reported, held, or on their way from here. */
-function knownReplies(choice) {
-  const reported = typeof choice.count === "number" ? choice.count : 0;
-  if (reported > 0) return reported;
-  const pending = pendingInto(choice.id);
-  if (pending > 0) return pending;
-  return channelStore.current().messages.filter((held) => threadOf(held) === choice.id && held.thread.is_root !== true).length;
-}
-
-/**
- * What thread `choice`'s card draws, and how its root is laid out under it. `mode` is "summary" (the
- * summariser's name and sentence; the root inward), "pending" (a summary on its way, `cardPending`:
- * the root's first lines, the root inward), "clamped" (a first unit longer than K, clamped; the root
- * inward), "split" (the root's first units and "…", the rest its continuation), "root" (the whole
- * root, short enough) or "name" (no words of a root to show). `text` is the card's words as text,
- * which it is searched and signed by; `body()` a fresh element of its formatted words, or null where
- * its words are that text.
- *
- * @returns {{mode: string, text: string, cut: {head: number, whole: boolean} | null, body: () => HTMLElement | null}}
- */
-function cardView(choice) {
-  const words = threadWords(choice);
-  if (words.named && words.said) return { mode: "summary", text: `${words.named}: ${words.said}`, cut: null, body: () => null };
-  const root = choice.root;
-  const entry = root ? cardCutEntry(root) : null;
-  if (!entry || !entry.text) return { mode: "name", text: threadName(choice, Infinity), cut: null, body: () => null };
-  const { cut, text } = entry;
-  const mode = cut === null ? "root" : cardPending(choice) ? "pending" : cut.whole ? "clamped" : "split";
-  return { mode, text, cut, body: () => cardHead(root, cut) };
-}
-
-/** Whether thread `choice`'s root goes inward, whole, as its card's first child (`#405`, `#528`). */
-const rootInward = (choice) => ["summary", "pending", "clamped"].includes(cardView(choice).mode);
-
-/**
- * Thread `choice`'s cut when its card is split, its root's rest the continuation under it
- * (`#522 thread-card-max-lines`); null for every other layout.
- *
- * @returns {{head: number, whole: boolean} | null}
- */
-function cardSplit(choice) {
-  if (!choice) return null;
-  const view = cardView(choice);
-  return view.mode === "split" ? view.cut : null;
-}
-
-/**
- * The one timer for the next moment a summary on its way is owed something — a read, or the end of its
- * wait — over every source that draws cards (web/src/view/channel `createSummaryWatch`).
- */
-const summaryWatch = createSummaryWatch({
-  setTimer: (run, ms) => setTimeout(run, ms),
-  clearTimer: (timer) => clearTimeout(/** @type {any} */ (timer)),
-  fired: () => guardQuietly(summaryWatchFired)(),
-});
-
-/**
- * Arm one timer for the next moment any card waiting for a summary (`cardPending`) is owed something:
- * a read of the Threads list at one of `SUMMARY_READ_STEPS_MS` after its thread's last activity, or the
- * end of its wait, when its card splits. `choices` are what `source` draws now; the timer is for the
- * soonest of every source's, and is armed again only where that moment changed.
- *
- * @param {Array<ReturnType<typeof threadChoice>>} choices
- * @param {string} source
- */
-function watchPendingSummaries(choices, source) {
-  const now = Date.now();
-  let owed = Infinity;
-  for (const choice of choices) {
-    if (!cardPending(choice)) continue;
-    const step = SUMMARY_READ_STEPS_MS.map((ms) => choice.at + ms).find((at) => at > now);
-    owed = Math.min(owed, step === undefined ? choice.at + SUMMARY_WAIT_MS : step);
-  }
-  summaryWatch.owe(source, owed, now);
-}
 
 /** A summary on its way is owed a read: the Threads list read now, past its spacing, and the cards drawn again. */
 async function summaryWatchFired() {
@@ -4522,6 +4245,49 @@ async function summaryWatchFired() {
   // A thread open across the window: its root row is the card's inward child or not by the card's layout.
   if (selection().view === "thread") renderReplyLinks();
 }
+
+// Thread card lines and how much a quote must cover are web/src/view/channel's now
+// (`createCardLines`, `#624 voice-page-modularity`): where a card stops, its head and
+// continuation, summaries on their way, and what a reply marks read. K and the share stay
+// their settings owners', instantiated above and handed in.
+const cardLinesOwner = createCardLines({
+  cardMaxLines,
+  quoteReadPercent,
+  bodies: () => messageBodies,
+  rawTextOf,
+  headingOf,
+  threadNames: () => serverFacts.threadNames(),
+  cardIsSummarized: (choice) => cardIsSummarized(choice),
+  pendingInto,
+  heldMessages: () => channelStore.current().messages,
+  threadOf,
+  threadWords,
+  threadName,
+  setTimer: (run, ms) => setTimeout(run, ms),
+  clearTimer: (timer) => clearTimeout(/** @type {any} */ (timer)),
+  guardQuietly,
+  view: () => screens.view(),
+  selectedChannelId,
+  forgetCards: () => cardsDrawn.forget(),
+  clearThreadCards: () => threadCardsDrawn.clear(),
+  redrawCards: () => {
+    if (sideColumnUp()) renderSideColumn();
+    if (selection().view === "thread") renderThreadHeading();
+    if (selection().view === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
+  },
+  keepingCardPlace,
+  savedLines: (n) => messagePreferences.cardMaxLines.saved(n),
+  stepLines: (direction) => messagePreferences.cardMaxLines.step(direction),
+  quotePercentChanged: (value) => messagePreferences.quoteReadPercent.changed(value),
+  stepPercent: (direction) => messagePreferences.quoteReadPercent.step(direction),
+  renderedText,
+  summaryWatchFired,
+});
+const {
+  cardMaxLinesChanged, stepCardMaxLines, quoteReadPercentChanged, stepQuoteReadPercent,
+  replyMarksRead, rootOverflowsCard, cardCut, cardHead, continuationOf, cardPending,
+  cardView, rootInward, cardSplit, cutForCard, watchPendingSummaries,
+} = cardLinesOwner;
 
 /**
  * Ctrl+( and Ctrl+) (Cmd on a Mac): one collapsed line fewer or more, and the status line says the
@@ -4950,8 +4716,7 @@ function clearChannelScreen() {
   // of for the read that follows (`noteBookmark`). Only another credential forgets them
   // (`forgetBookmarks`). The rows the line was drawn on are gone.
   forgetPins();
-  bookmarkDrawn.main = null;
-  bookmarkDrawn.side = null;
+  readingBookmark.forgetDrawn();
   el("pinned-log").replaceChildren();
   renderOlderControl();
   loadState().freshAt = 0;
@@ -10432,48 +10197,15 @@ function storedRichHeaders() {
 
 // --- who is speaking in the channel -------------------------------------------------------------
 //
-// Who is who — the reader's choices, everyone seen in each channel, the accounts this server posts
-// as and the owner's own, and the bucket each author falls in — is web/src/core/channels's
-// (`createIdentities`, `#624 voice-page-modularity`), with why there are four buckets and why they
-// are keyed on the account. What is here is the page's: the redraw a newly learned account of ours
-// needs, which channel a message is from, and Settings' list, which reads the owner.
-
-/** Who is who. Nothing known until `load`, at start-up. */
+// Who is who is web/src/core/channels's (`createIdentities`); noting our own account and which
+// channel a message is from are web/src/view/channel's (`createSpeakers`, `#624
+// voice-page-modularity`). Settings' list stays mounted here, reading the owner.
 const whoIsWho = createIdentities({
   storage: () => deviceStorage(),
   identityKey: IDENTITY_KEY,
   providerOf: (channelId) => providerOfChannel(channelId),
 });
 
-/** Record that this id is the account this bridge posts as, and redraw what that changes. */
-function noteSelfAuthor(id) {
-  if (!whoIsWho.noteSelfAuthor(id)) {
-    return;
-  }
-  renderChannelRows();
-  identityList.render();
-}
-
-/**
- * Which channel a message is from, preferring what the message itself says.
- *
- * The to-do queue is the reason this is not simply the picker's value: it is served by its own
- * route and is free to carry rows from more than one channel, so asking the picker would price a
- * row against a census it was never part of. A message with no `channel_id` falls back to what is
- * being viewed, which is where it must have come from.
- */
-function messageChannel(message) {
-  return String((message && message.channel_id) || selectedChannelId() || "");
-}
-
-/**
- * `#402 who-is-who-channel-box`. Settings' list of who is who, one row per account seen in the channel
- * the channel box's picker is on, saying what it is and letting that be changed (web/src/view/settings
- * `mountIdentityList`, `#624 voice-page-modularity`). It reads the census and the buckets through the
- * owner's `IdentityReader`.
- *
- * @type {import("./src/view/settings/index.ts").IdentityList}
- */
 const identityList = mountIdentityList({
   lookup: (id) => el(id),
   allChannels: () => ALL_CHANNELS,
@@ -10483,6 +10215,14 @@ const identityList = mountIdentityList({
   choose: (id, bucket) => whoIsWho.choose(id, bucket),
   renderChannelRows: () => renderChannelRows(),
 });
+
+const speakers = createSpeakers({
+  whoIsWho,
+  renderChannelRows,
+  renderIdentityList: () => identityList.render(),
+  selectedChannelId,
+});
+const { noteSelfAuthor, messageChannel } = speakers;
 
 // --- the inbox view -------------------------------------------------------------------------
 
@@ -10641,641 +10381,81 @@ function renderChannelRows() {
  * `textContent` throughout — an author name and a channel's own timestamp are third-party text,
  * and this is the one place they are shown in full.
  */
-// --- the reading bookmark -----------------------------------------------------------------------
-//
-// `#240 reading-bookmark`. The owner, catching up on a long backlog: "I want to be able to mark my
-// place, reply to messages, jump back to where I was reading in the transcript before my reply,
-// mark as done when I'm done, and advance the bookmark." So each channel has ONE bookmark: a line
-// in the accent colour drawn across the list just above one message. Shift+B puts it above the
-// selected message (and takes it away when pressed on the message right under it); b, or m, the key
-// of the place marker it replaces, goes back to it, and so does the Bookmark chip beside Newest.
-//
-// KEPT ON THE SERVER, so it follows the owner between his phone and his desk. Every channel read
-// carries it, and this page keeps a copy per channel that it changes at once and writes behind the
-// Done writes (`queueInboxWrite`). A write that fails is taken back; a conditional one that lost to a
-// move made on the other device takes where the server says the bookmark is now.
-//
-// IT MARKS NOTHING, AND ONLY THE OWNER MOVES IT. Setting it never marks a message Done. Besides his
-// Shift+B, the one thing that moves it is a Done of his own: on the message right under the line,
-// which slides it down to the next message still to read (`singleDoneBump`), or a Done through here
-// at or below it (`throughBump`); in a thread, never past a message of Main's still to read
-// (`heldBackByMain`). Those moves are conditional (`if_revision`), so they can never
-// undo a move made on the other device meanwhile, and Undo takes them back too. A message arriving
-// never moves it, and nor does putting one back.
-//
-// It replaces the place marker this browser kept in localStorage under `MARKER_KEY`, which moved
-// itself past read rows on every redraw. One left over is moved to the server once, the first time
-// its message is drawn in a channel with no bookmark (`adoptLegacyMarker`).
-
-/**
- * Each channel's bookmark as this page holds it, and the bookkeeping of this page's writes of it
- * (web/src/core/annotations `createBookmarks`, `HeldBookmark`), private to its owner; the epoch both
- * the bookmark's and Done's writes move is this page's (`readStateEpoch`). Here where the maps stood.
- *
- * @typedef {import("./src/core/annotations/index.ts").HeldBookmark} HeldBookmark
- */
-const bookmarkStore = createBookmarks({ bumpEpoch: () => readLedger.bump() });
-
-/** The row each column draws the line on, and on which side of it, or null. */
-const bookmarkDrawn = { main: null, side: null };
-
-/**
- * The id the old place marker left in this browser, read from the device here as the page starts, and the
- * channel reads that have looked for its message, up to `LEGACY_MARKER_READS` (web/src/core/annotations
- * `createLegacyMarker`, `#624 voice-page-modularity`).
- */
-const legacyMarker = createLegacyMarker({ storage: deviceStorageOnUse() });
-
-/** This channel's bookmark as held, or null. */
-function heldBookmark(channel = currentChannelId()) {
-  return bookmarkStore.held(String(channel));
-}
-
-/** Where this channel's line is, or null when it has none. */
-function bookmarkAnchor(channel = currentChannelId()) {
-  const held = heldBookmark(channel);
-  return held ? held.anchor : null;
-}
-
-// `sameAnchor`, `isBookmarkState` and `anchorOfMessage` are web/src/core/annotations's.
-
-/**
- * Forget every channel's bookmark: another credential. The writes on their way are still counted
- * (`bookmarkWrites`): the server keeps one bookmark whoever asks, so a read sent before one of them
- * settles does not speak for it, whichever credential sent the read.
- */
-function forgetBookmarks() {
-  bookmarkStore.forget();
-  bookmarkDrawn.main = null;
-  bookmarkDrawn.side = null;
-  // Nor is a removal of the other credential's put back under this one (`#420 bookmark-clear`).
-  endBookmarkUndo();
-}
-
-/** Redraw the line and the chip in every column, after the bookmark changed. */
-function redrawBookmark() {
-  eachColumn(renderScrollTools);
-}
-
-/**
- * A read said where this channel's bookmark is. Taken as the truth unless a write of this page's is
- * on its way, or settled after the read was sent: then the read answers for the state before it.
- * A read with no bookmark at all (an older server, or a store that cannot say) changes nothing.
- */
-function noteBookmark(payload) {
-  if (!payload || !isBookmarkState(payload.bookmark)) return;
-  legacyMarker.noteRead();
-  const channel = String((payload.channel && payload.channel.id) || currentChannelId());
-  const moved = bookmarkStore.note(channel, payload.bookmark, sentEpochOf(payload));
-  if (moved && channel === currentChannelId()) redrawBookmark();
-}
-
-/**
- * This channel's bookmark for the device's saved copy of the channel (`saveChannelScope`), so a page
- * opened offline draws the line before any read: the server's last word, or a move of the owner's
- * on its way. Undefined, and so not saved, while the server has said nothing of it.
- */
-function bookmarkToSave(channel) {
-  return bookmarkStore.toSave(channel);
-}
-
-/**
- * A saved copy's bookmark (`bookmarkToSave`), for a channel drawn from the device before any read:
- * shown until the first read says where it is now. Never over one this page holds already, which
- * is newer: a read's, or the owner's own move. Not `known`: it is not the server speaking now.
- */
-function restoreSavedBookmark(channel, saved) {
-  bookmarkStore.restoreSaved(channel, saved);
-}
-
-/**
- * Change this channel's bookmark here, at once, ahead of the write that tells the server: what every
- * change starts with. Answers the change, for `sendBookmark` to write.
- */
-function stageBookmark(channel, anchor) {
-  return bookmarkStore.stage(channel, anchor);
-}
-
-/**
- * Writing a staged bookmark change to the server, in order behind the Done writes, and settling and saying
- * what came of it (web/src/core/annotations `createBookmarkWrites`, `#624 voice-page-modularity`).
- */
-const bookmarkWrites = createBookmarkWrites({
-  bookmarks: bookmarkStore,
-  queue: (write) => queueInboxWrite(write),
-  put: (channel, body) => apiDecoded("BookmarkResponse", `/api/v1/channels/${encodeURIComponent(channel)}/bookmark`,
+// The reading bookmark is web/src/view/channel's now (`createReadingBookmark`, `#624
+// voice-page-modularity`): each channel's line, its chip, its slides on a Done, and its Undo.
+const readingBookmark = createReadingBookmark({
+  byId: (id) => /** @type {any} */ (el(id)),
+  leftById: (id) => /** @type {any} */ (leftEl(id)),
+  bumpEpoch: () => readLedger.bump(),
+  deviceStorage: deviceStorageOnUse,
+  queueWrite: (write) => queueInboxWrite(write),
+  putBookmark: (channel, body) => apiDecoded("BookmarkResponse", `/api/v1/channels/${encodeURIComponent(channel)}/bookmark`,
     { method: "PUT", body }),
-  remove: (channel, revision) => {
+  removeBookmark: (channel, revision) => {
     const route = `/api/v1/channels/${encodeURIComponent(channel)}/bookmark`;
     return apiDecoded("BookmarkResponse", revision === null ? route : `${route}?if_revision=${revision}`, { method: "DELETE" });
   },
-  isAnswer: (body) => VibeTalkContract.is("BookmarkResponse", body),
-  channel: () => currentChannelId(),
-  anchor: (channel) => bookmarkAnchor(channel),
-  same: (one, other) => sameAnchor(one, other),
-  redraw: () => redrawBookmark(),
-  save: () => {
-    if (!columnWork.side()) saveChannelScope();
-  },
-  status: (text) => setStatus(text),
-  error: (text) => showError(text),
+  isBookmarkAnswer: (body) => VibeTalkContract.is("BookmarkResponse", body),
+  currentChannelId: () => currentChannelId(),
+  eachColumn,
+  renderScrollTools,
+  side: () => columnWork.side(),
+  activeName: () => columnWork.active().name,
+  inColumn,
+  mainColumn: () => columns.main,
+  inThisColumn,
+  sentEpochOf,
+  saveChannelScope,
+  setStatus,
+  showError,
+  pinsOnly: () => pinsView().only,
+  readRunsSuspended: () => readRunsSuspended(),
+  threading: () => providerFacts.threading(),
+  selectionView: () => selection().view,
+  selectionThreadId: () => selection().threadId,
+  hidingRead: () => hidingRead(),
+  todoHoldsFrom: (at, channel) => todoView.holdsFrom(at, channel),
+  fromGatheredThread,
+  preservingScroll,
+  screen: () => screens.screen(),
+  view: () => screens.view(),
+  paneHead: () => channelPane.head(),
+  takeRow,
+  channelPane: () => channelPane,
+  sidePane: () => sidePane,
+  replyLandingGapPx: () => REPLY_LANDING_GAP_PX,
+  threadListOnScreen: () => threadListOnScreen(),
+  readerActed,
+  seekMessage,
+  guardQuietly,
+  channelOnScreen,
+  keyContext,
+  rowForAct,
+  drawnBy,
+  anchorOfRow,
+  nextUndoAt,
+  stillToDo,
+  archived: () => doneState().archived,
+  dismissed: () => channelStore.current().dismissed,
+  heldMessages: () => channelStore.current().messages,
+  heldViews: () => channelStore.current().views,
+  viewKey,
+  inView: (m, view, thread) => inView(m, view, /** @type {any} */ (thread)),
+  threadOf,
+  timeOf,
+  currentChannel: () => channelStore.current().channel,
+  rowHolding,
+  clock: () => clockOnUse(),
 });
-
-/**
- * Write a staged change, in order behind the Done writes (`BookmarkWrites.send`). `conditional` sends the
- * revision held when the write goes, so it is refused if another device moved the bookmark since this page
- * last heard. `after`, when given, is the Done write this one follows: when that fails, this one is not
- * sent and the change is taken back with it. Never throws: a failure is taken back and said.
- *
- * @param {{channel: string, before: VibeTalk.BookmarkAnchor | null, anchor: VibeTalk.BookmarkAnchor | null, token: object}} move
- * @param {{conditional?: boolean, after?: Promise<boolean> | null, quiet?: boolean}} [options]
- * @returns {Promise<"saved" | "moved" | "failed" | "cancelled">}
- */
-function sendBookmark(move, options = {}) {
-  return bookmarkWrites.send(move, options);
-}
-
-/** Whether the list in the column being worked on draws a bookmark at all, and if not, why not. */
-function bookmarkListRefusal(anchor) {
-  if (pinsView().only) return "The bookmark is not in Pinned.";
-  if (readRunsSuspended()) return "Close the search to see the bookmark.";
-  if (!providerFacts.threading()) return "";
-  if (selection().view === "main" || selection().view === "flat") return "";
-  if (selection().view === "thread") {
-    return anchor.thread_id && String(anchor.thread_id) === String(selection().threadId)
-      ? "" : "Your bookmark is not in this thread.";
-  }
-  return "The bookmark is in Main and All.";
-}
-
-/**
- * Whether Hide read's list, in a channel without threads, holds every message still to do from time
- * `at` on: the server's to-do list is the recent window less what is dealt with, so a message it
- * leaves out from when the window starts is dealt with, and so is everything between it and the
- * list. Older than the window, nothing is known.
- */
-function todoWindowHolds(at) {
-  return readModes.hiding() && !providerFacts.threading() && todoView.holdsFrom(at, currentChannelId());
-}
-
-/**
- * Where the column being worked on draws its bookmark line: `{row, place}`, the line going above
- * that row, or below it when it is the last; null when the list draws none.
- *
- * ONE RULE FOR EVERY LIST. The line goes before the first row shown at or after the anchor (strictly
- * after, for a bookmark below its message), or after the last row when none is. "At or after" is
- * measured by the anchor's own row when the list holds it, shown or not, and otherwise by when its
- * message was sent: so Main places a bookmark on a thread reply it never shows, and Hide read, or a
- * collapsed run, moves the line down to the next row shown. Every row it moves past is read, which
- * is what makes that safe. An anchor older than everything loaded draws nothing: the chip and b walk
- * back to it. Hide read's list without threads leaves read messages out altogether, and there an
- * anchor older than every row still goes above the first when the list's window reaches it
- * (`todoWindowHolds`). A row is one box, so the line never goes inside one: before the row holding
- * any message at or after the anchor.
- */
-function bookmarkTarget() {
-  const anchor = bookmarkAnchor();
-  if (!anchor || bookmarkListRefusal(anchor) !== "") return null;
-  // Not a thread's replies a reply gathered into Main (`#410 inline-reply-editor`): the line is Main's.
-  const rows = /** @type {HTMLElement[]} */ ([...el("discord-log").children])
-    .filter((row) => row.hasAttribute("data-id") && !row.hasAttribute("data-card") && !fromGatheredThread(row));
-  // Which row, is web/src/present/rows' `bookmarkSpot`, from what each row holds and when.
-  const spot = bookmarkSpot(rows.map((row) => ({
-    ids: idsOf(row), sentMs: rowSentMs(row), newestMs: rowNewestMs(row), shown: rowShown(row),
-  })), anchor, todoWindowHolds);
-  return spot ? { row: rows[spot.index], place: spot.place } : null;
-}
-
-/**
- * Draw the line where `bookmarkTarget` says, in the column being worked on, and nowhere else in it.
- * The line is a child of the row it is drawn on, positioned in a margin that row keeps above its
- * tile (web/voice.css), so the list still holds nothing but message rows: every caller that walks a
- * list's rows walks only messages. Idempotent, and cheap when nothing moved, because it runs with
- * every redraw.
- */
-function placeBookmarkLine() {
-  const target = bookmarkTarget();
-  const list = el("discord-log");
-  const drawn = /** @type {HTMLElement[]} */ ([...list.children]).filter((row) => row.hasAttribute("data-bookmark"));
-  const settled = target && drawn.length === 1 && drawn[0] === target.row &&
-    target.row.getAttribute("data-bookmark") === target.place && target.row.bookmarkLine &&
-    target.row.bookmarkLine.parentNode === target.row;
-  bookmarkDrawn[columnWork.active().name] = target;
-  if (!columnWork.side()) adoptLegacyMarker();
-  if (settled || (!target && drawn.length === 0)) return;
-  // The line moved, and each row's ⋯ item saying what it will do, by web/src/view/channel.
-  const apply = () => drawBookmarkLine(drawn, target);
-  // The reader does not move: a line drawn or taken away above them changes the height above them.
-  if (!columnWork.side() && screens.screen() === "main" && screens.view() === "discord") preservingScroll(apply);
-  else apply();
-}
-
-/** Forget the old place marker, here and in the browser's storage (`LegacyMarker.drop`). */
-function dropLegacyMarker() {
-  legacyMarker.drop();
-}
-
-/**
- * The old place marker, moved to the server: the first time its message is drawn in a channel the
- * server says has no bookmark, the bookmark goes above it, and the browser's copy is dropped. Found
- * in a channel that has one already, it is simply dropped: the owner has a place there. Not found
- * within `LEGACY_MARKER_READS` channel reads (web/src/core/annotations), it is dropped too: its message is
- * no longer read.
- */
-function adoptLegacyMarker() {
-  if (legacyMarker.id() === null) return;
-  const channel = currentChannelId();
-  const held = heldBookmark(channel);
-  if (!held || !held.known || bookmarkStore.writing(channel)) return;
-  const row = rowHolding(legacyMarker.id());
-  if (!row) {
-    if (legacyMarker.exhausted()) dropLegacyMarker();
-    return;
-  }
-  const id = legacyMarker.id();
-  dropLegacyMarker();
-  if (held.anchor) return;
-  const messages = rowMessages(row);
-  const at = Math.max(0, messages.findIndex((message) => String(message.id) === id));
-  const message = messages[at];
-  if (!message) return;
-  const move = stageBookmark(channel, anchorOfMessage(message, "above"));
-  redrawBookmark();
-  guardQuietly(() => sendBookmark(move, { conditional: true, quiet: true }))();
-}
-
-/**
- * The Bookmark chip, beside Newest: shown while this channel has a bookmark and its line is off the
- * screen, with its arrow toward the line, or up when the bookmark is older than what is loaded.
- * Cheap, because the scroll listener calls it through `renderJumpNewest`: one rectangle. Measured
- * against the list's own edges rather than the chips', so showing the chip cannot change the answer.
- */
-function renderJumpBookmark() {
-  if (columnWork.side()) return;
-  const chip = leftEl("jump-bookmark");
-  /** @type {"up" | "down" | null} */
-  let direction = null;
-  const anchor = bookmarkAnchor();
-  if (screens.screen() === "main" && screens.view() === "discord" && anchor && bookmarkListRefusal(anchor) === "" &&
-      !bookmarksOffScreen()) {
-    const target = bookmarkDrawn.main;
-    if (!target) {
-      direction = [...el("discord-log").children].some((row) => row.hasAttribute("data-id")) ? "up" : null;
-    } else if (target.row.bookmarkLine) {
-      const area = leftEl("scroll-area");
-      const box = target.row.bookmarkLine.getBoundingClientRect();
-      const top = channelPane.head();
-      const bottom = area.getBoundingClientRect().top + (area.clientHeight || 0);
-      if (box.bottom <= top) direction = "up";
-      else if (box.top >= bottom) direction = "down";
-    }
-  }
-  if (chip.hidden === (direction !== null)) chip.hidden = direction === null;
-  if (direction === null) return;
-  if (chip.getAttribute("data-direction") !== direction) {
-    chip.setAttribute("data-direction", direction);
-    chip.setAttribute("aria-label", `Jump to your bookmark, ${direction === "up" ? "above" : "below"}`);
-  }
-}
-
-/**
- * Take the reader to the line in the left column: the line at the top of the list, under the pill,
- * and the message below it selected. False when the list draws no line.
- */
-function landOnBookmark() {
-  if (columnWork.side()) return inColumn(columns.main, landOnBookmark);
-  const target = bookmarkDrawn.main;
-  if (!target || !target.row.bookmarkLine || target.row.parentNode !== el("discord-log")) return false;
-  const area = el("scroll-area");
-  const line = target.row.bookmarkLine;
-  area.scrollTop += line.getBoundingClientRect().top - channelPane.head() - REPLY_LANDING_GAP_PX;
-  takeRow(channelPane, target.row, true);
-  renderScrollTools();
-  setStatus(target.place === "below" ? "Bookmark: below the newest message." : "Back at your bookmark.");
-  return true;
-}
-
-// `#584 thread-view-bookmark-chip`. The owner, 2026-10-27: in the Threads view b and Shift+B said "Back at
-// your bookmark", where no bookmark is drawn. The thread list on its own is the right column across the
-// window, and b worked in the left column behind it, landing on Main's line out of sight. The bookmark
-// is a line between messages of Main and All, and cards are threads: so over the thread list, and on a
-// card or a message unpacked under one, every way in — b, the Bookmark chip, Shift+B, the ⋯ item and the
-// details sheet — says so instead, and sets, moves or jumps to nothing.
-
-/** What every bookmark key says where the cards are: there is no line among them. */
-const NO_BOOKMARK_IN_THREADS = "No bookmarks in thread view.";
-
-/** Whether `row` is among the cards: a card, or a message unpacked under one (`#407 unpack-row-parity`). */
-function rowAmongCards(row) {
-  const list = row ? row.parentNode : null;
-  return Boolean(row) && (row.hasAttribute("data-card") || list === leftEl("side-cards") || list === el("thread-list"));
-}
-
-/**
- * Whether the view on screen is the thread list, where no bookmark is drawn: on its own across the
- * window, or the Threads view of one column.
- */
-const bookmarksOffScreen = () => threadListOnScreen() ||
-  (screens.view() === "discord" && !columnWork.side() && providerFacts.threading() && selection().view === "threads");
-
-/** b, m and the chip: back to the bookmark, walking back through older pages when it is further back. */
-async function jumpToBookmark() {
-  if (bookmarksOffScreen()) {
-    setStatus(NO_BOOKMARK_IN_THREADS);
-    return;
-  }
-  if (columnWork.side()) return inColumn(columns.main, jumpToBookmark);
-  // A jump the reader asks for lets go of a filter change's held message (#243 filter-keeps-selection),
-  // as Newest and the reply arrow do, whether it came from b, m or the Bookmark chip.
-  readerActed();
-  const anchor = bookmarkAnchor();
-  if (!anchor) {
-    setStatus("No bookmark here. Shift+B sets one.");
-    return;
-  }
-  const refusal = bookmarkListRefusal(anchor);
-  if (refusal) {
-    setStatus(refusal);
-    return;
-  }
-  if (landOnBookmark()) return;
-  await seekMessage(String(anchor.message_id), landOnBookmark, () => false);
-}
-
-/** b and m: `jumpToBookmark`, for the left column, whichever column the keys are in. */
-function bookmarkJumpFromKeyboard() {
-  if (bookmarksOffScreen()) {
-    setStatus(NO_BOOKMARK_IN_THREADS);
-    return true;
-  }
-  if (columnWork.side()) return inColumn(columns.main, bookmarkJumpFromKeyboard);
-  if (!channelOnScreen()) return false;
-  guardQuietly(jumpToBookmark)();
-  return true;
-}
-
-/** Whether the line is drawn right above `row`, in the column being worked on. */
-function bookmarkAbove(row) {
-  const target = bookmarkTarget();
-  return Boolean(target) && target.place === "above" && target.row === row;
-}
-
-/**
- * Shift+B, the row's ⋯ item and its details sheet: the bookmark above `row`, moved there from
- * wherever it was; or, on the row right under it, taken away. The owner's own act, so it is written
- * whatever another device did meanwhile.
- */
-function toggleBookmarkAt(row) {
-  const channel = currentChannelId();
-  if (!channel || !row) return;
-  if (rowAmongCards(row) || bookmarksOffScreen()) {
-    setStatus(NO_BOOKMARK_IN_THREADS);
-    return;
-  }
-  if (row.parentNode === el("discord-log") && bookmarkAbove(row)) {
-    removeBookmark(channel);
-    return;
-  }
-  const anchor = anchorOfRow(row, "above");
-  if (!anchor) return;
-  const move = stageBookmark(channel, anchor);
-  // A bookmark set since a removal is the one kept: Undo has nothing left to put back.
-  const undo = bookmarkUndos.current();
-  if (undo && undo.channel === channel) endBookmarkUndo();
-  redrawBookmark();
-  setStatus("Bookmarked. b comes back here.");
-  guardQuietly(() => sendBookmark(move))();
-}
-
-// `#420 bookmark-clear`. The owner, 2026-10-22: "Right now if we place a bookmark I don't see any way
-// to remove it. It should have a little X on the bookmark line." Shift+B and the row's ⋯ item took it
-// away already, on the message right under the line only; the X is on the line itself. Every removal
-// offers Undo for BOOKMARK_UNDO_MS, the way a Dismiss in the outbox does (`renderSendUndo`): an X a
-// thumb can reach is an X a thumb can hit by accident, and the place it marked is the reader's.
-
-/** The X's name, its tooltip too. */
-const BOOKMARK_CLEAR_NAME = "Remove bookmark";
-
-// The line itself, made once on its row and kept, is web/src/view/channel's (`createBookmarkLines`,
-// `#624 voice-page-modularity`); its X takes the bookmark away here.
-const { drawBookmarkLine } = createBookmarkLines({
-  clearName: BOOKMARK_CLEAR_NAME,
-  clearListener: (row, clear) => inThisColumn((event) => {
-    // The row's own tap would fold the message or read it aloud; this tap is the X's.
-    if (event) event.stopPropagation();
-    const focused = document.activeElement === clear;
-    removeBookmark(currentChannelId());
-    // The X goes with the line, and the focus would fall to the page's top: it goes to the message the
-    // line was above, ringed, as a key or the mouse selects. Not after a tap, which selects silently
-    // (`drawnBy`) and leaves no ring.
-    if (focused && drawnBy() && row.parentNode === el("discord-log") && rowShown(row)) {
-      takeRow(columnWork.side() ? sidePane : channelPane, row, true);
-    }
-  }),
-});
-/**
- * The removal the Undo chip takes back while it is up — the channel, where the line was, the removal's own
- * staged change (`stageBookmark`) — and the chip's timer (`BOOKMARK_UNDO_MS`): web/src/core/annotations's
- * (`createBookmarkUndo`, `#624 voice-page-modularity`).
- */
-const bookmarkUndos = createBookmarkUndo({ clock: clockOnUse(), ended: () => renderBookmarkUndo() });
-
-/**
- * Take this channel's bookmark away, here at once and then on the server, with Undo offered: the X on
- * the line, Shift+B and the ⋯ item on the message right under it. The reader stays where they are:
- * the line goes as every redraw of it does (`placeBookmarkLine`).
- */
-function removeBookmark(channel) {
-  const before = bookmarkAnchor(channel);
-  if (!channel || !before) return;
-  const move = stageBookmark(channel, null);
-  bookmarkUndos.offer({ channel, anchor: before, token: move.token, at: nextUndoAt() });
-  redrawBookmark();
-  renderBookmarkUndo();
-  setStatus("Bookmark removed. Undo puts it back.");
-  guardQuietly(async () => {
-    // Not saved, and so taken back already (`sendBookmark`): there is nothing to undo.
-    const outcome = await sendBookmark(move);
-    const undo = bookmarkUndos.current();
-    if (outcome !== "saved" && undo && undo.token === move.token) endBookmarkUndo();
-  })();
-}
-
-/** End the Undo offer, if one is up, and draw the chip again. */
-function endBookmarkUndo() {
-  bookmarkUndos.end();
-}
-
-/** The Undo chip for a removed bookmark: up while it can be put back, in the channel it was in. */
-function renderBookmarkUndo() {
-  const chip = leftEl("undo-bookmark");
-  const undo = bookmarkUndos.current();
-  const shown = undo !== null && screens.view() === "discord" && undo.channel === currentChannelId();
-  if (chip.hidden === shown) chip.hidden = !shown;
-}
-
-/**
- * Undo: the bookmark back where it was, unless one has been set since. Conditional, so it never moves
- * a bookmark another device set meanwhile; that one is kept, and said (`sendBookmark`).
- */
-function undoBookmarkRemoval() {
-  const undo = bookmarkUndos.current();
-  if (!undo) return;
-  endBookmarkUndo();
-  if (bookmarkAnchor(undo.channel)) {
-    setStatus("A bookmark was set since; it stays.");
-    return;
-  }
-  const move = stageBookmark(undo.channel, undo.anchor);
-  redrawBookmark();
-  setStatus("Bookmark put back.");
-  guardQuietly(() => sendBookmark(move, { conditional: true }))();
-}
-
-/** Shift+B on the selected message. */
-function bookmarkFromKeyboard(target) {
-  // On a card, which `rowForAct` hands no row for, and over the thread list: said, never a silent key.
-  const { row: under } = keyContext(target);
-  if (bookmarksOffScreen() || rowAmongCards(under)) {
-    setStatus(NO_BOOKMARK_IN_THREADS);
-    return true;
-  }
-  const { pane, row, took } = rowForAct(target);
-  if (!pane || !row) return took;
-  toggleBookmarkAt(row);
-  return true;
-}
-
-/** Whether every message `row` stands for is read once `done` is Done: `rowIsRead`, looking ahead. */
-function rowReadWith(row, done) {
-  const held = rowMessages(row);
-  return held.length > 0 && held.every((message) => !stillToDo(message, done));
-}
-
-/** The anchor the line slides to past `rows[at]`: above the next row still to read, else below the last. */
-function slideTarget(rows, at, done) {
-  const next = rows.slice(at + 1).find((row) => !rowReadWith(row, done));
-  return next ? anchorOfRow(next, "above") : anchorOfRow(rows[rows.length - 1], "below");
-}
-
-/**
- * From when the page holds every message Main shows: by Main's own cover, or All's, which holds
- * Main's messages too. -Infinity for the whole history; Infinity when no cover says.
- */
-function mainHeldFrom() {
-  let from = Infinity;
-  for (const key of [viewKey("main"), viewKey("flat")]) {
-    const cover = channelStore.current().views.get(key);
-    if (!cover) continue;
-    if (!cover.more) return -Infinity;
-    if (cover.floor !== null) from = Math.min(from, cover.floor);
-  }
-  return from;
-}
-
-/**
- * A slide worked out in a THREAD, held back so it never carries Main's line past a message of Main's
- * still to read. Null when the store cannot say what Main holds there; `to` itself everywhere else.
- *
- * A thread is not the channel. Its rows skip every message posted to the channel itself between
- * them, and Main draws the same line among those by time (`bookmarkTarget`): a Done on a root in its
- * thread that slid the line to a reply posted an hour later put Main's line an hour on, past every
- * unread message of that hour, which the Done in Main would have stopped at. So the slide stops at
- * the first message of Main's, from the line to where the thread's rows took it, that is still to
- * read — Main's read state is the store's (`replyTally`), with the Done itself — and the line goes
- * above it, which takes it out of the thread and leaves it where the reader of Main left off. When
- * none is, the slide stands and the thread keeps its line. Main and All need nothing of the sort:
- * All holds every message, and Main is the list the others are measured against.
- *
- * @param {VibeTalk.BookmarkAnchor | null} to the slide over the thread's own rows
- * @param {{row: HTMLElement, place: string}} target where the line is drawn in the thread now
- * @param {HTMLElement[]} rows the thread's rows
- * @param {Set<string>} done the read state the slide was worked out with
- * @returns {VibeTalk.BookmarkAnchor | null}
- */
-function heldBackByMain(to, target, rows, done) {
-  if (!to || !providerFacts.threading() || selection().view !== "thread") return to;
-  if (channelStore.current().channel !== currentChannelId()) return null;
-  const anchor = bookmarkAnchor();
-  const times = [Date.parse(String(anchor ? anchor.timestamp : "")), rowSentMs(target.row)].filter(Number.isFinite);
-  const until = Date.parse(String(to.timestamp));
-  if (times.length === 0 || !Number.isFinite(until)) return null;
-  const from = Math.min(...times);
-  // Messages of Main's older than its covers reach may be missing from the store, unread or not.
-  if (from < mainHeldFrom()) return null;
-  const thread = String(selection().threadId);
-  const mine = new Set(rows.flatMap(idsOf));
-  const read = new Set([...channelStore.current().dismissed, ...done]);
-  const passed = (at) => at >= from && (to.place === "below" ? at <= until : at < until);
-  const stop = channelStore.current().messages.find((message) => inView(message, "main", null) &&
-    threadOf(message) !== thread && !mine.has(String(message.id)) &&
-    passed(timeOf(message, "timestamp")) && stillToDo(message, read));
-  return stop ? anchorOfMessage(stop, "above") : to;
-}
-
-/**
- * A Done on `ids`, with the line right above the row they make Done: the line slides down past
- * every row already read and stops above the first still to read — the row e selects next
- * (`unreadAfter` in web/src/view/shell/donekeys.ts), so the bookmark and the selection stay together —
- * or below the last row; in a thread, no further than Main's next message still to read (`heldBackByMain`). Null when the line
- * is anywhere else, or the row is not wholly Done by this.
- */
-function singleDoneBump(ids) {
-  const channel = currentChannelId();
-  const target = bookmarkTarget();
-  if (!channel || !target || target.place !== "above") return null;
-  const marking = new Set(ids.map(String));
-  const done = new Set([...doneState().archived, ...marking]);
-  if (!idsOf(target.row).some((id) => marking.has(id)) || !rowReadWith(target.row, done)) return null;
-  const rows = /** @type {HTMLElement[]} */ ([...el("discord-log").children]).filter((row) => row.hasAttribute("data-id") && rowShown(row));
-  const at = rows.indexOf(target.row);
-  if (at < 0) return null;
-  const to = heldBackByMain(slideTarget(rows, at, done), target, rows, done);
-  return to ? { channel, from: bookmarkAnchor(channel), to } : null;
-}
-
-/**
- * Done through `row`, with the line at or above it: the line slides as for one Done and lands below
- * `row`, past every row the act makes Done — in a thread, no further than Main's next message still
- * to read, which it does not mark (`heldBackByMain`). A line below `row` stays where it is.
- */
-function throughBump(row) {
-  const channel = currentChannelId();
-  const list = el("discord-log");
-  const target = bookmarkTarget();
-  if (!channel || !target || row.parentNode !== list) return null;
-  const rows = /** @type {HTMLElement[]} */ ([...list.children])
-    .filter((one) => one.hasAttribute("data-id") && rowShown(one) && !fromGatheredThread(one));
-  const at = rows.indexOf(row);
-  const line = target.place === "above" ? rows.indexOf(target.row) : rows.length;
-  if (at < 0 || line < 0 || line > at) return null;
-  const all = [...list.children];
-  const done = new Set([...doneState().archived, ...all.slice(0, all.indexOf(row) + 1).flatMap(idsOf)]);
-  const to = heldBackByMain(slideTarget(rows, at, done), target, rows, done);
-  return to ? { channel, from: bookmarkAnchor(channel), to } : null;
-}
-
-/**
- * Undo, for a Done that moved the bookmark: back where it was, unless something has moved it since.
- * Staged now, written once the Done is put back, conditionally.
- */
-async function undoBookmarkBump(bump, restoring) {
-  const back = sameAnchor(bookmarkAnchor(bump.channel), bump.to) ? stageBookmark(bump.channel, bump.from) : null;
-  if (back) redrawBookmark();
-  let restored = false;
-  try {
-    await restoring;
-    restored = true;
-  } catch (error) {
-    // Some of it put back: those messages are to read again, above the line where the Done moved
-    // it, so the line goes back above them as well. Above messages still Done is safe; below
-    // messages to read is not.
-    restored = Boolean(error && error.landed > 0);
-    throw error;
-  } finally {
-    if (back) await sendBookmark(back, { conditional: true, after: Promise.resolve(restored), quiet: true });
-  }
-}
+const {
+  heldBookmark, bookmarkAnchor, forgetBookmarks, noteBookmark, bookmarkToSave,
+  restoreSavedBookmark, stageBookmark, sendBookmark, placeBookmarkLine, renderJumpBookmark,
+  toggleBookmarkAt, bookmarkFromKeyboard, bookmarkJumpFromKeyboard, singleDoneBump,
+  throughBump, undoBookmarkBump, removeBookmark, undoBookmarkRemoval, renderBookmarkUndo,
+  endBookmarkUndo, bookmarkAbove, bookmarkUndosCurrent,
+  jumpToBookmark,
+} = readingBookmark;
+const bookmarkUndos = { current: bookmarkUndosCurrent };
 
 // --- following a reply up to what it answers --------------------------------------------------
 //

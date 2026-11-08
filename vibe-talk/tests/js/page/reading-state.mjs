@@ -5403,9 +5403,9 @@ test("`#728 vt-quote-read-threshold`: a reply quoting under 5% of a message leav
   assert.deepStrictEqual(short.dismissCalls, [{ messages: ["1000000000000000001"] }]);
 
   // THE CONTROL: every reply marking what it answers, the one-sentence quote marks the message.
-  const control = await longMessagePage(new Map(), brokenScript(
-    "  return quoteMarksRead(quoteShare(text, rawTextOf(target)), quoteReadPercent.current()) ? String(target.id) : null;",
-    "  return String(target.id);"));
+  const control = await longMessagePage(new Map(), await brokenModule([{ file: "src/view/channel/cardlines.ts",
+    find: "    return quoteMarksRead(quoteShare(text, deps.rawTextOf(target as Message)) as never, deps.quoteReadPercent.current()) ? String(target.id) : null;",
+    replace: "    return String(target.id);" }]));
   await replyAndSend(control, LONG_ID, one);
   assert.deepStrictEqual(control.dismissCalls, [{ messages: [LONG_ID] }],
     "with the share ignored the reply still left the message unread, so this test cannot see it");
