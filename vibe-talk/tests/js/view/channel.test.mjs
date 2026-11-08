@@ -1614,3 +1614,39 @@ test("`#624 voice-page-modularity`: the reply box's discard answers carry their 
     globalThis.document = was;
   }
 });
+
+test("quoteSelectionNow opens the quick reply for held words, and does nothing with none", () => {
+  globalThis.document = { documentElement: { clientWidth: 800 } };
+  globalThis.window = { innerHeight: 800, visualViewport: undefined };
+  const { createQuoting } = CHANNEL_VIEW;
+  const el = (extra = {}) => ({
+    style: {}, hidden: true, textContent: "", value: "",
+    getBoundingClientRect: () => ({ top: 0, bottom: 40, left: 0, right: 300, width: 300, height: 40 }),
+    focus() {}, ...extra,
+  });
+  const byIdMap = new Map();
+  for (const id of ["quick-reply", "quick-reply-quote", "quick-reply-text", "quick-reply-state",
+    "selection-chip", "read-steer-quote", "scroll-area", "side-scroll", "discord-log"]) {
+    byIdMap.set(id, el());
+  }
+  const quoting = createQuoting({
+    byId: (id) => byIdMap.get(id),
+    inputKind: () => "touch",
+    drawReplyLabel() {},
+    selectedChannelId: () => "c1",
+    replyRoute: () => ({ thread: null, branch: null, into: null, unknown: false, removed: false }),
+    readOnly: () => false,
+    replyMarksRead: () => null,
+    queueOutgoingMessage: async () => {},
+    toStream() {},
+    drafts: { get: () => undefined, set() {}, delete() {}, save: () => true },
+    noteDraft() {},
+    closed() {},
+  });
+  assert.equal(quoting.quoteSelectionNow(), false, "q with nothing held did something");
+  const row = el({ messages: [{ id: "m1" }], replyButton: el({ isConnected: true }) });
+  quoting.holdQuote({ row, button: row.replyButton, text: "held words", timer: null });
+  assert.equal(quoting.quoteSelectionNow(), true, "q with held words did not open the quick reply");
+  assert.equal(quoting.quickReplyOpen(), true);
+  assert.equal(byIdMap.get("quick-reply-quote").textContent, "held words");
+});

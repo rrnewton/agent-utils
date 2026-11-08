@@ -217,6 +217,8 @@ export interface Quoting {
   placeSelectionChip(): void;
   /** A press of the chip: the quick reply to the words it stands under. */
   pressSelectionChip(): void;
+  /** The `q` key: the chip's act without the chip. False with nothing held. */
+  quoteSelectionNow(): boolean;
   /** Whether `area` is held still for a quick reply. */
   quickReplyHolds(area: unknown): boolean;
   /** The held list moved (`target` scrolled): an open box goes with its words, a closed one lets go. */
@@ -636,8 +638,19 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     openQuickReplyFor(row, message, quote, { top, bottom: top + QUICK_REPLY_GAP_PX * 3, left: rect.left, right: rect.right });
   }
 
+  /** The `q` key's act: quote what is held, as the chip's press does. */
+  function quoteSelectionNow(): boolean {
+    noteQuoteSelection();
+    const held = quoteHeld;
+    if (!held) return false;
+    if (held.button && held.button.isConnected === false) return false;
+    openQuickReply(held);
+    return quickReply !== null;
+  }
+
   return {
     held: () => quoteHeld, holdQuote, noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip,
+    quoteSelectionNow,
     quickReplyHolds, quickReplyListMoved, quickReplyOpen: () => quickReply !== null,
     quickReplyOpenKey: () => (quickReply ? quickReply.key : null), placeQuickReply,
     closeQuickReply, putDownQuickReply, sendQuickReply, noteQuickReplyInput, openQuickDraft, openSentenceReply,

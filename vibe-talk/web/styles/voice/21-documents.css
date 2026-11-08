@@ -154,8 +154,9 @@
   font-size: 1.05em;
 }
 
-/* In the reader the floating search glass would sit on Read; it is the list's, not the reader's. */
-#screen-main:has(#docs-reader:not([hidden])) #search-float {
+/* In Documents the floating search glass would sit on the top card's fetch
+   button (and on Read in the reader); it is the channel's, not this view's. */
+#screen-main:has(#pane-docs:not([hidden])) #search-float {
   display: none;
 }
 
