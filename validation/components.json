@@ -326,6 +326,7 @@
         "scripts/rebase-delta-guard",
         "scripts/run_component_tests.py",
         "scripts/run_pytest_shard.py",
+        "scripts/sweep_test_mounts.py",
         "scripts/validate.py",
         "setup",
         "validation.dag.yaml",

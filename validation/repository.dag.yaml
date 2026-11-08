@@ -44,6 +44,19 @@ steps:
       hard_mem_max_bytes: 268435456
 
   - group: hygiene
+    job: sweep-test-mounts-self-test
+    desc: the test-mount sweep releases only proven test leftovers, one entry at a time
+    cmd: python3 scripts/sweep_test_mounts.py --self-test
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
+
+  - group: hygiene
     job: editions-self-test
     desc: prove the editions mirror-state guard can fail
     cmd: python3 scripts/check_editions.py --self-test

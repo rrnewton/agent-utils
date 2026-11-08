@@ -381,6 +381,106 @@ def test_image_lifecycle_relocate_and_destroy(tmp_path: Path) -> None:
             slotimage.destroy(leftover, allow_content=True)
 
 
+_MID_MOUNT_FAILURE = """
+from pathlib import Path
+
+from wrkslots import cli, slotimage
+
+
+def test_fails_after_both_images_are_mounted(tmp_path: Path) -> None:
+    control = tmp_path / "control"
+    (control / "slots").mkdir(parents=True)
+    slotimage.register_layout(control, lambda _slot_type, slot: control / "slots" / slot)
+    original = slotimage._prepare_fresh_root
+
+    def fail_on_the_state_image(image_file, mount_point, anchor=None):
+        if mount_point.name == slotimage.STATE_MOUNT_NAME:
+            raise RuntimeError("forced failure mid-mount")
+        return original(image_file, mount_point, anchor)
+
+    slotimage._prepare_fresh_root = fail_on_the_state_image
+    slotimage.provision(
+        control, "agent", "s1", control / "slots" / "s1",
+        slotimage.ImageSettings(ceiling_bytes=2 * cli.GIB, backend="{backend}"),
+    )
+"""
+
+
+def test_a_test_failing_mid_mount_leaves_no_mount_or_loop_device(tmp_path: Path) -> None:
+    """#1064 test-temp-and-mount-leaks: the teardown releases what a failed test mounted.
+
+    The inner test fails inside provisioning, after both images are mounted and
+    before anything could clean them up, so only the teardown hook can.
+    """
+
+    from wrkslots.tests import image_teardown
+
+    backend = _backend_or_skip()
+    inner = tmp_path / "test_mid_mount_failure.py"
+    inner.write_text(_MID_MOUNT_FAILURE.replace("{backend}", backend), encoding="utf-8")
+    basetemp = tmp_path / "inner-base"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "-p", "wrkslots.tests.image_teardown", "--basetemp", str(basetemp), str(inner)],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert "forced failure mid-mount" in output
+    assert "1 failed" in output and "error" not in output.splitlines()[-1], output
+    images = sorted(basetemp.rglob("*.img"))
+    assert [image.name for image in images] == ["slot.img", "state.img"], output
+    assert image_teardown.mounts_under(basetemp) == []
+    for image in images:
+        assert slotimage.still_attached(image) == ()
+
+
+def test_teardown_unmounts_only_recorded_images_under_the_test_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deepest first, state and slot images alike; foreign mounts are reported, never touched."""
+
+    from wrkslots.tests import image_teardown
+
+    control = tmp_path / "project" / "worktrees"
+    directory = control / "slot-images" / "agent" / "slot01"
+    directory.mkdir(parents=True)
+    location = control / "slot01"
+    location.mkdir()
+    (directory / slotimage.RECORD_NAME).write_text(json.dumps({"location": str(location)}), encoding="utf-8")
+    foreign = tmp_path / "foreign"
+    elsewhere = tmp_path.parent / "elsewhere"
+    table = [
+        slotimage.MountEntry(elsewhere, "ext4", "/dev/loop7"),
+        slotimage.MountEntry(location, "ext4", "/dev/loop1"),
+        slotimage.MountEntry(directory / slotimage.STATE_MOUNT_NAME, "ext4", "/dev/loop2"),
+        slotimage.MountEntry(foreign, "tmpfs", "tmpfs"),
+    ]
+    released: list[tuple[str, Path]] = []
+
+    def fake_unmount(image_file: Path, mount_point: Path) -> list[str]:
+        released.append((image_file.name, mount_point))
+        table[:] = [entry for entry in table if entry.mount_point != mount_point]
+        return []
+
+    monkeypatch.setattr(slotimage, "verification_table", lambda: list(table))
+    monkeypatch.setattr(slotimage, "unmount", fake_unmount)
+
+    problems = image_teardown.release_images_under(tmp_path)
+
+    assert released == [
+        ("state.img", directory / slotimage.STATE_MOUNT_NAME),
+        ("slot.img", location),
+    ]
+    assert problems == [f"{foreign} is still mounted (tmpfs from tmpfs)"]
+    assert [entry.mount_point for entry in table] == [elsewhere, foreign]
+
+
 def _sandbox_host_or_skip(isolation: str) -> None:
     if shutil.which("systemd-run") is None or shutil.which("busctl") is None:
         pytest.skip("needs a systemd user manager")

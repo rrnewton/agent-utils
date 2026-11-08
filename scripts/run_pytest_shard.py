@@ -21,6 +21,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import math
@@ -42,6 +43,15 @@ import pytest
 
 
 _CANCELLATION_SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+#: Each shard's private pytest basetemp: ``<tmp>/agent-utils-pytest-<pid>-<shard>-<random>``,
+#: with the wrapper's owner lock beside it in ``<basetemp>.owner`` (not inside: pytest empties
+#: its basetemp when it starts).
+_TEMP_PREFIX = "agent-utils-pytest-"
+_OWNER_SUFFIX = ".owner"
+#: Keep a failed shard's basetemp for inspection when this is set to 1; it is removed otherwise.
+KEEP_ENV = "AGENT_UTILS_KEEP_PYTEST_BASETEMP"
+#: How long an unowned basetemp from an older wrapper, or a kept one, survives the sweep.
+_STALE_SECONDS = 24 * 3600
 _POLL_SECONDS = 0.01
 _TERM_GRACE_SECONDS = 1.0
 _SignalHandler = Callable[[int, FrameType | None], object] | int | None
@@ -296,6 +306,98 @@ def _remove_temp_root(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def _mounts_under(path: Path, mountinfo: Path = Path("/proc/self/mountinfo")) -> list[str]:
+    """Mount points inside ``path``: a test killed mid-way can leave a slot image mounted there.
+
+    Removing such a tree would delete the files inside the mounted image and then fail on the
+    mount point, so it is left for ``scripts/sweep_test_mounts.py``, which releases the mount.
+    """
+
+    prefixes = {f"{os.path.abspath(path)}/", f"{os.path.realpath(path)}/"}
+    try:
+        lines = mountinfo.read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+    except OSError:
+        return []
+    points = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) > 4:
+            point = fields[4].replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\")
+            if any(point.startswith(prefix) for prefix in prefixes):
+                points.append(point)
+    return points
+
+
+def _hold_owner_lock(temp_root: Path) -> int:
+    """Lock ``<temp_root>.owner`` for as long as this wrapper lives; return its descriptor."""
+
+    descriptor = os.open(
+        f"{temp_root}{_OWNER_SUFFIX}", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600
+    )
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    return descriptor
+
+
+def _sweep_stale_temp_roots(directory: Path, now: float | None = None) -> list[Path]:
+    """Remove basetemps whose wrapper is gone; return what was removed.
+
+    A wrapper that is killed outright (SIGKILL, as a cancelled or timed-out validation step
+    is) never reaches its cleanup, so its basetemp outlives it (#1064
+    test-temp-and-mount-leaks: one host had 347 of them, 22 GiB). The lock on ``.owner`` dies
+    with the wrapper, so a free lock proves the owner is gone. A basetemp kept after a failure
+    (``.owner`` reads ``kept``), and one from a wrapper older than the owner lock, are removed
+    only once older than a day. Only this user's directories with this wrapper's prefix are
+    considered.
+    """
+
+    now = time.time() if now is None else now
+    removed: list[Path] = []
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return removed
+    for entry in entries:
+        if not entry.name.startswith(_TEMP_PREFIX) or entry.name.endswith(_OWNER_SUFFIX):
+            continue
+        try:
+            info = entry.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            continue
+        owner = Path(f"{entry}{_OWNER_SUFFIX}")
+        old = now - info.st_mtime > _STALE_SECONDS
+        try:
+            descriptor = os.open(owner, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            if not old:
+                continue  # an older wrapper's, or one between creating it and locking it
+            descriptor = None
+        except OSError:
+            continue
+        try:
+            if descriptor is not None:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue  # its wrapper is alive
+                if os.read(descriptor, 4) == b"kept" and not old:
+                    continue
+            if _mounts_under(entry):
+                continue  # a dead test's mount; the mount sweep releases it first
+            try:
+                _remove_temp_root(entry)
+                owner.unlink(missing_ok=True)
+            except OSError:
+                continue
+            removed.append(entry)
+            print(f"run_pytest_shard: removed stale basetemp {entry}", file=sys.stderr)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+    return removed
+
+
 def _signal_worker_group(process: subprocess.Popen[bytes], signum: int) -> None:
     """Signal only the private worker session created by this wrapper."""
 
@@ -324,6 +426,8 @@ def _run_supervised(index: int, count: int, pytest_args: Sequence[str]) -> int:
     pending: list[int] = []
     process: subprocess.Popen[bytes] | None = None
     temp_root: Path | None = None
+    owner: int | None = None
+    keep = False
     previous_handlers: dict[signal.Signals, _SignalHandler] = {}
 
     def record_cancellation(signum: int, _frame: FrameType | None) -> None:
@@ -336,9 +440,9 @@ def _run_supervised(index: int, count: int, pytest_args: Sequence[str]) -> int:
         previous_handlers[signum] = signal.getsignal(signum)
         signal.signal(signum, record_cancellation)
     try:
-        temp_root = Path(
-            tempfile.mkdtemp(prefix=f"agent-utils-pytest-{os.getpid()}-{index}-")
-        )
+        _sweep_stale_temp_roots(Path(tempfile.gettempdir()))
+        temp_root = Path(tempfile.mkdtemp(prefix=f"{_TEMP_PREFIX}{os.getpid()}-{index}-"))
+        owner = _hold_owner_lock(temp_root)
         if pending:
             return 128 + pending[0]
         command = [
@@ -351,7 +455,9 @@ def _run_supervised(index: int, count: int, pytest_args: Sequence[str]) -> int:
             "--",
             *pytest_args,
         ]
-        process = subprocess.Popen(command, start_new_session=True)
+        # The worker holds the owner lock too, so a worker that outlives a killed wrapper keeps
+        # its basetemp from the sweep.
+        process = subprocess.Popen(command, start_new_session=True, pass_fds=(owner,))
         shutdown_started: float | None = None
         hard_killed = False
         while True:
@@ -371,6 +477,7 @@ def _run_supervised(index: int, count: int, pytest_args: Sequence[str]) -> int:
                     _signal_worker_group(process, signal.SIGKILL)
                     hard_killed = True
             elif returncode is not None:
+                keep = returncode != 0 and os.environ.get(KEEP_ENV) == "1"
                 return _normalize_returncode(returncode)
             time.sleep(_POLL_SECONDS)
     finally:
@@ -381,8 +488,25 @@ def _run_supervised(index: int, count: int, pytest_args: Sequence[str]) -> int:
             except subprocess.TimeoutExpired:
                 _signal_worker_group(process, signal.SIGKILL)
                 process.wait()
-        if temp_root is not None:
+        if temp_root is not None and keep and owner is not None:
+            os.ftruncate(owner, 0)
+            os.write(owner, b"kept")
+            print(
+                f"run_pytest_shard: kept the failed shard's basetemp at {temp_root} "
+                f"({KEEP_ENV}=1); a later shard removes it after a day",
+                file=sys.stderr,
+            )
+        elif temp_root is not None and (mounts := _mounts_under(temp_root)):
+            print(
+                f"run_pytest_shard: left {temp_root} in place: {len(mounts)} mount(s) inside it "
+                f"(first {mounts[0]}); scripts/sweep_test_mounts.py releases them",
+                file=sys.stderr,
+            )
+        elif temp_root is not None:
             _remove_temp_root(temp_root)
+            Path(f"{temp_root}{_OWNER_SUFFIX}").unlink(missing_ok=True)
+        if owner is not None:
+            os.close(owner)
         for signum, previous in previous_handlers.items():
             signal.signal(signum, previous)
 
@@ -422,7 +546,11 @@ def test_block_until_cancelled():
 """,
         encoding="utf-8",
     )
+    # A private TMPDIR: the wrapper's startup sweep must never act on the host's real one here.
+    private_tmp = fixture_root / "tmp"
+    private_tmp.mkdir()
     environment = os.environ.copy()
+    environment["TMPDIR"] = str(private_tmp)
     environment["SHARD_SIGNAL_TEST_MARKER"] = str(marker)
     wrapper: subprocess.Popen[str] | None = None
     child_identity: tuple[str, int, int] | None = None
@@ -450,8 +578,8 @@ def test_block_until_cancelled():
         while time.monotonic() < deadline:
             matches = [
                 path
-                for path in Path(tempfile.gettempdir()).iterdir()
-                if path.name.startswith(prefix)
+                for path in private_tmp.iterdir()
+                if path.name.startswith(prefix) and path.is_dir()
             ]
             if len(matches) == 1:
                 temp_root = matches[0]
@@ -474,6 +602,8 @@ def test_block_until_cancelled():
         output = wrapper.communicate(timeout=5.0)[0]
         assert wrapper.returncode == 128 + signal.SIGTERM, output
         assert not temp_root.exists(), f"SIGTERM left basetemp behind: {temp_root}"
+        owner_file = Path(f"{temp_root}{_OWNER_SUFFIX}")
+        assert not owner_file.exists(), f"SIGTERM left the owner lock behind: {owner_file}"
 
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
@@ -500,6 +630,98 @@ def test_block_until_cancelled():
                         os.killpg(pgid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+        _remove_temp_root(fixture_root)
+
+
+def _self_test_sweep() -> None:
+    """The sweep removes exactly the basetemps whose wrapper is gone (#1064)."""
+
+    root = Path(tempfile.mkdtemp(prefix="agent-utils-sharder-sweep-test-"))
+    try:
+        now = time.time()
+        day_old = now - _STALE_SECONDS - 60
+
+        def basetemp(name: str, owner: bytes | None, *, age: float = now) -> Path:
+            path = root / f"{_TEMP_PREFIX}{name}"
+            path.mkdir()
+            (path / "state").write_text("fixture\n", encoding="utf-8")
+            if owner is not None:
+                Path(f"{path}{_OWNER_SUFFIX}").write_bytes(owner)
+            os.utime(path, (age, age))
+            return path
+
+        live = basetemp("live", b"")
+        live_lock = _hold_owner_lock(live)
+        dead = basetemp("dead", b"")
+        legacy_fresh = basetemp("legacy-fresh", None)
+        legacy_old = basetemp("legacy-old", None, age=day_old)
+        kept_fresh = basetemp("kept-fresh", b"kept")
+        kept_old = basetemp("kept-old", b"kept", age=day_old)
+        other = root / "unrelated-dir"
+        other.mkdir()
+        try:
+            removed = set(_sweep_stale_temp_roots(root, now))
+        finally:
+            os.close(live_lock)
+        assert removed == {dead, legacy_old, kept_old}, sorted(map(str, removed))
+        for path in (dead, legacy_old, kept_old):
+            assert not path.exists() and not Path(f"{path}{_OWNER_SUFFIX}").exists(), path
+        for path in (live, legacy_fresh, kept_fresh, other):
+            assert path.exists(), path
+        # Once its wrapper is gone, the live one goes too.
+        assert _sweep_stale_temp_roots(root, now) == [live]
+    finally:
+        _remove_temp_root(root)
+
+
+def _self_test_mounts_under() -> None:
+    """A basetemp holding a mount is recognised, by either spelling of its path."""
+
+    fixture_root = Path(tempfile.mkdtemp(prefix="run-pytest-shard-mounts-self-test-"))
+    try:
+        root = fixture_root / "agent-utils-pytest-1-0-abcdefgh"
+        root.mkdir()
+        info = fixture_root / "mountinfo"
+        info.write_text(
+            f"36 25 7:7 / {root}/test_x0/project/worktrees/a\\040b rw - ext4 /dev/loop7 rw\n"
+            f"37 25 7:8 / {root}-other/slot rw - ext4 /dev/loop8 rw\n",
+            encoding="utf-8",
+        )
+        assert _mounts_under(root, info) == [f"{root}/test_x0/project/worktrees/a b"]
+        assert _mounts_under(fixture_root / "elsewhere", info) == []
+    finally:
+        _remove_temp_root(fixture_root)
+
+
+def _self_test_keep_on_failure() -> None:
+    """A failed shard's basetemp is removed unless KEEP_ENV asks to keep it (#1064)."""
+
+    fixture_root = Path(tempfile.mkdtemp(prefix="agent-utils-sharder-keep-test-"))
+    tmp = fixture_root / "tmp"
+    tmp.mkdir()
+    test_file = fixture_root / "test_fails.py"
+    test_file.write_text("def test_fails(tmp_path):\n    assert False\n", encoding="utf-8")
+    try:
+        for keep in (False, True):
+            environment = {**os.environ, "TMPDIR": str(tmp)}
+            environment.pop(KEEP_ENV, None)
+            if keep:
+                environment[KEEP_ENV] = "1"
+            run = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--shard", "0/1", "--",
+                 "-q", "-p", "no:cacheprovider", str(test_file)],
+                cwd=fixture_root, env=environment, capture_output=True, text=True, timeout=120,
+            )
+            assert run.returncode != 0, run.stdout + run.stderr
+            left = sorted(path for path in tmp.iterdir() if path.name.startswith(_TEMP_PREFIX))
+            if keep:
+                assert len(left) == 2 and "kept the failed shard's basetemp" in run.stderr, left
+                assert Path(f"{left[0]}{_OWNER_SUFFIX}").read_bytes() == b"kept"
+                for path in left:
+                    _remove_temp_root(path) if path.is_dir() else path.unlink()
+            else:
+                assert left == [], f"a failed shard left {left} without {KEEP_ENV}"
+    finally:
         _remove_temp_root(fixture_root)
 
 
@@ -586,6 +808,9 @@ def _self_test() -> int:
     assert len({plugin, twin, plugin}) == 2
     assert plugin != twin
     _self_test_sigterm_cleanup()
+    _self_test_sweep()
+    _self_test_mounts_under()
+    _self_test_keep_on_failure()
     print("run_pytest_shard --self-test: PASSED")
     return 0
 

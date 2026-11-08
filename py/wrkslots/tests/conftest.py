@@ -20,6 +20,10 @@ os.environ.setdefault("WRKSLOTS_INIT_REPRESENTATION", "worktree")
 
 import pytest  # noqa: E402
 
+# After each test, unmount any slot image it left mounted in its tmp_path
+# (#1064 test-temp-and-mount-leaks).
+from wrkslots.tests.image_teardown import pytest_runtest_teardown  # noqa: E402,F401
+
 
 @pytest.fixture(autouse=True)
 def idle_validation_run_host(
