@@ -38,7 +38,9 @@ use crate::handoff_state::{
 };
 use crate::handoff_write::publication;
 use crate::hold_write::{active_document, current_hold, validate_global};
-use crate::remove_write::{assert_slot_unused, liveness_answer};
+use crate::remove_write::{
+    assert_slot_unused_snapshot, capture_process_snapshot, liveness_answer, ProcessSnapshot,
+};
 use crate::status_state::process_state;
 
 type Result<T> = std::result::Result<T, String>;
@@ -5481,6 +5483,7 @@ fn audit_record(
     sealed_generation: Option<i64>,
     validation_paths: &[PathBuf],
     measurement: &CacheMeasurement,
+    process_census: &mut Option<std::result::Result<ProcessSnapshot, String>>,
 ) -> Result<(Value, bool)> {
     let slot = record
         .get("slot")
@@ -5689,14 +5692,33 @@ fn audit_record(
             "recorded owner is {owner_state}: {owner_detail}; the recover-absent commands require the recorded owner generation to be dead"
         ));
     }
+    let mut process_census_unknown = false;
     if (release_honoured
         || (heartbeat_expired && liveness.state == "dead" && owner_state == "dead"))
         && reasons.is_empty()
         && !slot_absent
     {
-        if let Err(error) = assert_slot_unused(&slot_path, std::process::id() as i64) {
-            reasons.push(error);
-            agent_running = true;
+        // One shared census for the whole audit, captured only when
+        // a row can use it (single attempt, fail-closed like Python).
+        if process_census.is_none() {
+            *process_census = Some(capture_process_snapshot(std::process::id() as i64));
+        }
+        match process_census.as_ref().expect("census captured") {
+            Err(error) => {
+                reasons.push(format!("process/path census failed: {error}"));
+                process_census_unknown = true;
+            }
+            Ok(snapshot) => {
+                if let Err(error) = assert_slot_unused_snapshot(snapshot, &slot_path) {
+                    if error.starts_with("process use is indeterminate") {
+                        reasons.push(format!("process/path census failed: {error}"));
+                        process_census_unknown = true;
+                    } else {
+                        reasons.push(error);
+                        agent_running = true;
+                    }
+                }
+            }
         }
     }
     if slot_absent {
@@ -5721,7 +5743,9 @@ fn audit_record(
     if cache_status == "partial" && !slot_absent {
         reasons.push("cache inspection incomplete: bounded census is partial".to_string());
     }
-    let verdict = if slot_absent {
+    let verdict = if process_census_unknown {
+        "UNKNOWN"
+    } else if slot_absent {
         if reasons.len() == 1 {
             "RECOVERABLE"
         } else {
@@ -6375,6 +6399,7 @@ pub(crate) fn parse_audit(
             .collect::<String>()
     };
     let census_measurements = cache_census(&cfg, &census_subjects, &census, &registry_revision)?;
+    let mut process_census: Option<std::result::Result<ProcessSnapshot, String>> = None;
     let mut rows: Vec<Value> = Vec::new();
     let mut running_agent_count: i64 = 0;
     for (index, record) in records.iter().enumerate() {
@@ -6399,6 +6424,7 @@ pub(crate) fn parse_audit(
             sealed.map(|(generation, _path)| *generation),
             &validation_paths,
             &census_measurements[index],
+            &mut process_census,
         )?;
         running_agent_count += i64::from(running);
         if let Some((generation, _path)) = sealed {

@@ -450,44 +450,117 @@ fn process_naming_slot(slot_path: &Path) -> Option<(i64, String, String)> {
     None
 }
 
-fn link_points_into(link: &Path, slot_path: &Path, slot_device: u64) -> Result<bool> {
-    // Mirrors the Python census (#618): a readlink failure is proven
-    // foreign only when stat (which follows the descriptor anyway)
-    // lands on a different filesystem device; a same-device target
-    // stays indeterminate rather than failing open.
+/// One process link as observed by a shared process snapshot.
+enum LinkObservation {
+    Target(PathBuf),
+    NoEvidence,
+    Undecided { error: String, device: Option<u64> },
+}
+
+struct ProcessLinks {
+    pid: i64,
+    links: Vec<(&'static str, LinkObservation)>,
+}
+
+/// One enumeration of `/proc` link targets, captured once and
+/// consulted for every slot a caller checks (the audit's shared
+/// process census). Capture itself makes no slot decision.
+pub(crate) struct ProcessSnapshot {
+    processes: Vec<ProcessLinks>,
+}
+
+fn observe_link(link: &Path) -> LinkObservation {
     use std::os::unix::fs::MetadataExt as _;
     match std::fs::read_link(link) {
         Ok(target) => {
             let shown = target.to_string_lossy().into_owned();
-            let target = PathBuf::from(shown.trim_end_matches(" (deleted)"));
-            Ok(target == slot_path || target.starts_with(slot_path))
+            LinkObservation::Target(PathBuf::from(shown.trim_end_matches(" (deleted)")))
         }
         Err(error) => {
             // Errnos the Python census treats as no evidence.
             if matches!(error.raw_os_error(), Some(1 | 2 | 3 | 13 | 22)) {
-                return Ok(false);
+                return LinkObservation::NoEvidence;
             }
-            match std::fs::metadata(link) {
-                Ok(metadata) => {
-                    if metadata.dev() != slot_device {
-                        Ok(false)
-                    } else {
-                        Err(format!(
-                            "process use is indeterminate because {} failed: {error}",
-                            link.display()
-                        ))
-                    }
-                }
-                Err(_) => Err(format!(
+            LinkObservation::Undecided {
+                error: format!(
                     "process use is indeterminate because {} failed: {error}",
                     link.display()
-                )),
+                ),
+                device: std::fs::metadata(link).ok().map(|metadata| metadata.dev()),
             }
         }
     }
 }
 
-pub(crate) fn assert_slot_unused(slot_path: &Path, coordinator_pid: i64) -> Result<()> {
+fn observation_points_into(
+    observation: &LinkObservation,
+    slot_path: &Path,
+    slot_device: u64,
+) -> Result<bool> {
+    // Mirrors the Python census (#618): a readlink failure is proven
+    // foreign only when stat (which follows the descriptor anyway)
+    // lands on a different filesystem device; a same-device target
+    // stays indeterminate rather than failing open.
+    match observation {
+        LinkObservation::Target(target) => Ok(target == slot_path || target.starts_with(slot_path)),
+        LinkObservation::NoEvidence => Ok(false),
+        LinkObservation::Undecided { error, device } => {
+            if device.is_some_and(|device| device != slot_device) {
+                Ok(false)
+            } else {
+                Err(error.clone())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn link_points_into(link: &Path, slot_path: &Path, slot_device: u64) -> Result<bool> {
+    observation_points_into(&observe_link(link), slot_path, slot_device)
+}
+
+/// Capture one shared process snapshot (a single attempt set; no
+/// whole-capture retry), excluding this process's ancestry and the
+/// coordinator. Enumeration failure stays fail-closed.
+pub(crate) fn capture_process_snapshot(coordinator_pid: i64) -> Result<ProcessSnapshot> {
+    let ignored = own_ancestry();
+    let entries = std::fs::read_dir("/proc")
+        .map_err(|error| format!("process use is indeterminate because /proc failed: {error}"))?;
+    let mut processes: Vec<ProcessLinks> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!("process use is indeterminate because /proc failed: {error}")
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(pid) = name.parse::<i64>() else {
+            continue;
+        };
+        if ignored.contains(&pid) || pid == coordinator_pid {
+            continue;
+        }
+        let base = PathBuf::from("/proc").join(&name);
+        let mut links: Vec<(&'static str, LinkObservation)> = Vec::new();
+        for (label, link) in [
+            ("working directory", base.join("cwd")),
+            ("executable", base.join("exe")),
+        ] {
+            links.push((label, observe_link(&link)));
+        }
+        if let Ok(fds) = std::fs::read_dir(base.join("fd")) {
+            for fd in fds.flatten() {
+                links.push(("descriptor", observe_link(&fd.path())));
+            }
+        }
+        processes.push(ProcessLinks { pid, links });
+    }
+    Ok(ProcessSnapshot { processes })
+}
+
+/// Assert no process in `snapshot` uses `slot_path`.
+pub(crate) fn assert_slot_unused_snapshot(
+    snapshot: &ProcessSnapshot,
+    slot_path: &Path,
+) -> Result<()> {
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot establish the current working directory: {error}"))?;
     let cwd = cwd.canonicalize().unwrap_or(cwd);
@@ -508,49 +581,28 @@ pub(crate) fn assert_slot_unused(slot_path: &Path, coordinator_pid: i64) -> Resu
                 )
             })?
     };
-    let ignored = own_ancestry();
-    let entries = std::fs::read_dir("/proc")
-        .map_err(|error| format!("process use is indeterminate because /proc failed: {error}"))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            format!("process use is indeterminate because /proc failed: {error}")
-        })?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Ok(pid) = name.parse::<i64>() else {
-            continue;
-        };
-        if ignored.contains(&pid) || pid == coordinator_pid {
-            continue;
-        }
-        let base = PathBuf::from("/proc").join(&name);
+    for process in &snapshot.processes {
         let mut via: Option<String> = None;
-        for (label, link) in [
-            ("working directory", base.join("cwd")),
-            ("executable", base.join("exe")),
-        ] {
-            if link_points_into(&link, slot_path, slot_device)? {
+        for (label, observation) in &process.links {
+            if observation_points_into(observation, slot_path, slot_device)? {
                 via = Some(label.to_string());
                 break;
             }
         }
-        if via.is_none() {
-            if let Ok(fds) = std::fs::read_dir(base.join("fd")) {
-                for fd in fds.flatten() {
-                    if link_points_into(&fd.path(), slot_path, slot_device)? {
-                        via = Some("descriptor".to_string());
-                        break;
-                    }
-                }
-            }
-        }
         if let Some(via) = via {
             return Err(format!(
-                "live process {pid} uses slot {} ({via}); stop it and retry",
+                "live process {} uses slot {} ({via}); stop it and retry",
+                process.pid,
                 slot_path.display()
             ));
         }
     }
     Ok(())
+}
+
+pub(crate) fn assert_slot_unused(slot_path: &Path, coordinator_pid: i64) -> Result<()> {
+    let snapshot = capture_process_snapshot(coordinator_pid)?;
+    assert_slot_unused_snapshot(&snapshot, slot_path)
 }
 
 fn repair_registration(repository: &Path, checkout_path: &Path) -> Result<()> {
@@ -2285,7 +2337,7 @@ pub(crate) fn remove_slot(
 
 #[cfg(test)]
 mod link_tests {
-    use super::link_points_into;
+    use super::{assert_slot_unused_snapshot, capture_process_snapshot, link_points_into};
 
     #[test]
     fn link_points_into_cases() {
@@ -2309,6 +2361,32 @@ mod link_tests {
         let regular = base.join("regular");
         std::fs::write(&regular, b"x").unwrap();
         assert!(!link_points_into(&regular, &slot, device).unwrap());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn shared_snapshot_detects_live_use_and_allows_unused() {
+        let base = std::env::temp_dir().join(format!("wrkslots-snap-{}", std::process::id()));
+        let slot = base.join("slot");
+        let unused = base.join("unused");
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::create_dir_all(&unused).unwrap();
+        let slot = slot.canonicalize().unwrap();
+        let unused = unused.canonicalize().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&slot)
+            .spawn()
+            .unwrap();
+        let snapshot = capture_process_snapshot(std::process::id() as i64).unwrap();
+        // One shared capture serves every slot check in an audit.
+        assert!(assert_slot_unused_snapshot(&snapshot, &unused).is_ok());
+        let error = assert_slot_unused_snapshot(&snapshot, &slot).unwrap_err();
+        assert!(error.contains(&format!("live process {} uses slot", child.id())));
+        let error = assert_slot_unused_snapshot(&snapshot, &slot).unwrap_err();
+        assert!(error.contains("working directory"));
+        child.kill().unwrap();
+        child.wait().unwrap();
         std::fs::remove_dir_all(&base).unwrap();
     }
 }
