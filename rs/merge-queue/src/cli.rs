@@ -811,6 +811,20 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
                 count(crate::donor::JobState::Done),
                 count(crate::donor::JobState::Cancelled)
             );
+            let stale_unadmitted = jobs
+                .iter()
+                .filter(|j| {
+                    j.history
+                        .iter()
+                        .any(|line| line.contains("stale_unadmitted_cancel"))
+                })
+                .count();
+            if stale_unadmitted > 0 {
+                println!(
+                    "stale_unadmitted_cancel: {stale_unadmitted} job(s) cancelled as stale \
+                     before any donor admitted them (validator never started)"
+                );
+            }
             // Each donor's cap as its last claim gave it (#918 donor-cap-file).
             let now = crate::donor::unix_seconds();
             for (donor, jobs, seen) in store.donor_cap_list() {

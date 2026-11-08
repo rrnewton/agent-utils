@@ -1039,11 +1039,14 @@ An **item record** (`items/<pr>.json`) has these fields:
   failed only on suspect tests and reruns them beside the run (see "Suspect flakes"). Absent (the
   default) means off. A binary older than this field refuses a config that has it.
 - `suspect_flake_timeout_secs`: wall limit of one suspect-flake rerun (absent or `0`: `1800`).
-- `pre_claim_check`: a shell command a donor runs for each job before it fetches the
+- `pre_claim_check`: a shell command a donor runs for each job after it fetches the
   candidate, in its clone, with `MQ_CANDIDATE` (the candidate commit), `MQ_REPO` (the clone's
-  origin URL) and `MQ_BASE` (the job's base commit) in the environment. The command resolves
+  origin URL) and `MQ_BASE` (the job's base commit) in the environment. Because it runs after
+  the fetch, the candidate tree exists in the clone and the check may read it (for example
+  `git show $MQ_CANDIDATE:<path>`). The command resolves
   whatever the candidate needs on that host and exits 0 only when the host has it. Any other
-  exit gives the job back — never a decline, never a refused receipt — with the first stderr
+  exit gives the job back — never a decline, never a refused receipt, and never an admission
+  report — with the first stderr
   line as the reason and the donor's usual back-off. Absent (the default) means no check.
   Setting it changes the validator digest, so the queue host and its donors must upgrade
   together. A binary older than this field refuses a config that has it.
@@ -1637,7 +1640,13 @@ moves to a commit the candidate does not contain, the job can never land as publ
 queue cancels it as `stale: the base moved to <base>, which its candidate does not contain`
 when a run settles its jobs, and a claim sweeps stale jobs before leasing anything, so a
 donor never spends its setup on one. Stale is not a donor failure and counts toward no
-could-not-run bound.
+could-not-run bound. When the cancelled job had never been admitted by any donor (it was
+queued, or leased but had not reached validator start), its history also carries a
+`stale_unadmitted_cancel` marker, and `donor status` prints a `stale_unadmitted_cancel: N`
+line counting those jobs, so how often the base moving under not-yet-started work costs a
+requeue is watchable. A batch cancelled this way is recomposed on the current base; its
+replacement job is republished fresh and keeps the change's place in claim order
+(prioritised, then plan index, then age).
 
 ## Using it on a repository validated by a dagrun DAG
 

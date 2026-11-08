@@ -118,6 +118,10 @@ fn item_status(fx: &Fixture, pr: i64) -> String {
 /// A decided queue with one change, its validator configured by `edit`
 /// (called with the fixture root, so checks can name fixture files).
 fn setup(tag: &str, edit: impl FnOnce(&Path, &mut Value)) -> Fixture {
+    setup_files(tag, &[("a.txt", "a\n")], edit)
+}
+
+fn setup_files(tag: &str, files: &[(&str, &str)], edit: impl FnOnce(&Path, &mut Value)) -> Fixture {
     let fx = Fixture::new(tag);
     fx.mq_ok(&[
         "init",
@@ -134,7 +138,7 @@ fn setup(tag: &str, edit: impl FnOnce(&Path, &mut Value)) -> Fixture {
     let mut config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     edit(&fx.root, &mut config);
     std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
-    fx.branch("a", &[("a.txt", "a\n")]);
+    fx.branch("a", files);
     fx.mq_ok(&["submit", "1", "--head", "a"]);
     fx
 }
@@ -177,6 +181,48 @@ fn a_passing_pre_claim_check_claims_and_lands_with_the_job_env() {
     assert_eq!(parts[0], job["commit"].as_str().unwrap(), "{env}");
     assert!(parts[1].contains("remote.git"), "{env}");
     assert_eq!(parts[2], job["base"].as_str().unwrap(), "{env}");
+}
+
+#[test]
+fn a_remote_donor_reads_the_candidate_tree_in_its_pre_claim_check() {
+    // The candidate exists in a remote donor clone only after the
+    // queue's bundle is fetched. Its check reads a pin from the
+    // candidate tree itself: base carries a different pin, and only
+    // the candidate carries the expected one.
+    let fx = setup_files(
+        "pre-claim-remote-tree",
+        &[("pin.txt", "candidate-pin\n")],
+        |root, config| {
+            config["validator"]["pre_claim_check"] = serde_json::json!(format!(
+                "pin=$(git show \"$MQ_CANDIDATE:pin.txt\" 2>/dev/null || true); \
+                 [ \"$pin\" = candidate-pin ] || {{ echo \"pin not in candidate\" >&2; exit 1; }}; \
+                 printf '%s' \"$pin\" > '{}/seen-pin'",
+                root.display()
+            ));
+        },
+    );
+    let seen = fx.root.join("seen-pin");
+    let clone = donor_clone(&fx, "donor-host");
+    let run = spawn_run(&fx);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let out = donor(&fx, &clone, "d1");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (code, report, stderr) = finish(run);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(item_status(&fx, 1), "landed", "{report}");
+    assert_eq!(std::fs::read_to_string(seen).unwrap(), "candidate-pin");
+    let done = jobs(&fx)[0].clone();
+    assert_eq!(done["state"], "done", "{done}");
+    assert!(
+        done["history"].to_string().contains("admitted by d1"),
+        "{done}"
+    );
 }
 
 #[test]

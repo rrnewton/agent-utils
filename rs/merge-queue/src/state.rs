@@ -183,8 +183,10 @@ pub struct ValidatorConfig {
     /// [`DEFAULT_SUSPECT_FLAKE_TIMEOUT_SECS`].
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub suspect_flake_timeout_secs: u64,
-    /// Shell command a donor runs for each job before it fetches the
-    /// candidate, with `MQ_CANDIDATE`, `MQ_REPO` and `MQ_BASE` in the
+    /// Shell command a donor runs for each job after it fetches the
+    /// candidate (so the candidate tree exists in its clone, and the
+    /// check may read it, e.g. `git show $MQ_CANDIDATE:<path>`), with
+    /// `MQ_CANDIDATE`, `MQ_REPO` and `MQ_BASE` in the
     /// environment: the command resolves whatever the candidate needs on
     /// that host (an image, a tool, a licence) and exits 0 only when the
     /// host has it. A non-zero exit gives the job back (never a decline,

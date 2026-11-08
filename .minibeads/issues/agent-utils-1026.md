@@ -84,3 +84,22 @@ deliberately: it encoded lease-equals-started, and now accepts a
 cancellation only for a never-claimed or never-admitted job, with
 the deterministic admitted/unadmitted branches asserted in the
 companion kept-roots test.
+
+Queue position (from the follow-up question): a batch cancelled
+as stale-unadmitted returns to the front of `pending`; its
+replacement donor job is republished fresh with `prioritised` from
+the item and its new plan index, and claim order (prioritised,
+plan index, age) leases it as before. It keeps its relative
+priority.
+
+Visibility: the job history records "cancelled: stale: the base
+moved to ..., which its candidate does not contain"; the run
+records `stale-cancelled` / `disjoint-root-cancelled` events and a
+cancelled validation record. Decision `stats` counts that record
+as a validation but has no distinct unadmitted counter, so the
+pre-claim fetch-order change adds one where the cancellation
+actually happens: a stale cancellation of a job no donor had
+admitted (queued, or leased but not yet at validator start) also
+records a `stale_unadmitted_cancel` marker line in the job
+history, and `donor status` prints a `stale_unadmitted_cancel: N`
+line counting marked jobs.

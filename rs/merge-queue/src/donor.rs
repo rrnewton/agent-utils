@@ -1923,9 +1923,21 @@ impl Store {
             .filter(|lease| lease.host == host_name())
             .cloned();
         let commit = job.commit.clone();
+        // A stale cancellation of a job no donor ever admitted (queued, or
+        // leased but not yet at validator start) gets its own marker, so
+        // `donor status` can count how often the base moving under a job
+        // that never started costs a requeue (#1026).
+        let stale_unadmitted = reason.starts_with("stale:") && !job.was_admitted();
         job.state = JobState::Cancelled;
         job.lease = None;
         job.history.push(format!("{}: cancelled: {reason}", now()));
+        if stale_unadmitted {
+            job.history.push(format!(
+                "{}: stale_unadmitted_cancel: cancelled as stale before any donor \
+                 admitted it; the validator never started",
+                now()
+            ));
+        }
         self.write(&job)?;
         if local_lease.is_some() {
             let (stopped, left) = stop_local_validation_units(id, &commit);
@@ -3368,14 +3380,18 @@ impl Worker<'_> {
                 job.tool.validator_digest
             )));
         }
-        // The configured pre-claim check gates taking the job at all: a
-        // host that cannot run this candidate gives it back (never a
-        // decline, never a refused receipt), with back-off.
+        self.fetch(job, token)?;
+        // The configured pre-claim check gates taking the job: it runs
+        // after fetch, so the candidate tree exists in this clone on
+        // every donor (a check may read the candidate itself, e.g.
+        // `git show $MQ_CANDIDATE:<path>`). A host that cannot run this
+        // candidate gives it back (never a decline, never a refused
+        // receipt, never an admission), with back-off. One bundle fetch
+        // per released job is the accepted cost; releases are rare.
         if let Err(reason) = self.pre_claim_check(job) {
             self.back_off(backoff);
             return Err(Unreported::Released(reason));
         }
-        self.fetch(job, token)?;
         let slot = loop {
             if let Some(slot) = self
                 .slots
@@ -4689,6 +4705,13 @@ mod unit {
         let job = store.read(&unadmitted.id).unwrap();
         assert_eq!(job.state, JobState::Cancelled);
         assert!(job.could_not_run.is_empty(), "stale is not a donor failure");
+        assert!(
+            job.history
+                .iter()
+                .any(|line| line.contains("stale_unadmitted_cancel")),
+            "an unadmitted stale cancel carries the marker: {:?}",
+            job.history
+        );
 
         let admitted = publish_rooted(&store, "c2", true);
         let claimed = store
@@ -4705,6 +4728,29 @@ mod unit {
             .is_empty());
         assert_eq!(store.read(&admitted.id).unwrap().state, JobState::Leased);
         let _ = token;
+
+        // An admitted job that is swept anyway (not rooted, so admission
+        // does not protect it) was started: no marker.
+        let started = publish_rooted(&store, "c3", false);
+        let claimed = store
+            .claim_reporting("d2", "h1", 1, true)
+            .unwrap()
+            .expect("an unrooted job");
+        assert_eq!(claimed.id, started.id);
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        store.admit(&claimed.id, &token).unwrap();
+        let cancelled = store
+            .sweep_stale("base99", &|commit| commit == "fresh", true)
+            .unwrap();
+        assert_eq!(cancelled, vec![started.id.clone()]);
+        let job = store.read(&started.id).unwrap();
+        assert!(
+            !job.history
+                .iter()
+                .any(|line| line.contains("stale_unadmitted_cancel")),
+            "an admitted stale cancel carries no marker: {:?}",
+            job.history
+        );
     }
 
     #[test]
