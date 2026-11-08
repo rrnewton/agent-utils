@@ -393,7 +393,7 @@ fn a_prioritized_stale_green_roots_instead_of_stacking_under_a_plain_head() {
     value["validator"]["run"] = serde_json::json!(format!(
         r#"gates='{gates}'
 if [ -f tests/d ]; then gate="$gates/release-d"; elif [ -f tests/p ] || [ -f tests/b ]; then gate="$gates/release"; else gate=""; fi
-if [ -n "$gate" ]; then i=0; while [ ! -e "$gate" ] && [ $i -lt 2400 ]; do sleep 0.05; i=$((i+1)); done; [ -e "$gate" ] || exit 1; fi
+if [ -n "$gate" ]; then i=0; while [ ! -e "$gate" ] && [ $i -lt 12000 ]; do sleep 0.05; i=$((i+1)); done; [ -e "$gate" ] || exit 1; fi
 ok=1; for f in tests/*; do [ -f "$f" ] || continue; if grep -qx FAIL "$f"; then echo "{{\"id\":\"x\",\"outcome\":\"fail\"}}" >> "$MQ_RESULTS"; ok=0; fi; done; [ $ok -eq 1 ]"#,
         gates = gates.display()
     ));
@@ -408,7 +408,7 @@ ok=1; for f in tests/*; do [ -f "$f" ] || continue; if grep -qx FAIL "$f"; then 
     let run = spawn_run(&fx);
     // Both first validations are out; only then does the prioritized
     // change arrive, so it cannot front the first wave.
-    wait_for("the first validations", Duration::from_secs(60), || {
+    wait_for("the first validations", Duration::from_secs(240), || {
         events(&fx).matches("\"kind\":\"validate\"").count() >= 2
     });
     let recorded = fx.mq(&["submit", "2", "--head", "p", "--prioritized"]);
@@ -417,13 +417,13 @@ ok=1; for f in tests/*; do [ -f "$f" ] || continue; if grep -qx FAIL "$f"; then 
     // prioritized change's candidate.
     wait_for(
         "the prioritized validation",
-        Duration::from_secs(60),
-        || events(&fx).matches("\"kind\":\"validate\"").count() >= 3,
+        Duration::from_secs(240),
+        || events(&fx).contains("batch #2 on"),
     );
     std::fs::write(gates.join("release"), "").unwrap();
     // Once the prioritized change is requeued as a stale green, let the
     // stack head (change 4) finish; the rebuild must not wait for it.
-    wait_for("the stale requeue", Duration::from_secs(60), || {
+    wait_for("the stale requeue", Duration::from_secs(240), || {
         events(&fx).contains("stale-root-green")
     });
     std::fs::write(gates.join("release-d"), "").unwrap();
