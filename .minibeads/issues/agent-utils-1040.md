@@ -1,11 +1,12 @@
 ---
 title: 'documents-voice-agent: let the voice agent read and answer questions about the open document'
-status: open
+status: closed
 priority: 1
 issue_type: task
 assignee: mu-docreader
-created_at: 2026-11-08T01:19:06.000000000+00:00
-updated_at: 2026-11-08T15:18:42.000000000+00:00
+created_at: 2026-11-08T01:19:06+00:00
+updated_at: 2026-11-08T15:34:19.979446035+00:00
+closed_at: 2026-11-08T15:34:19.979445844+00:00
 ---
 
 # Description
@@ -86,3 +87,7 @@ words"), 9-section outline.
 - Unverified, named: the private S2S bridge's tool-calling (above); a spoken
   (ASR) yes rather than a typed one; answer wording/citations (content-free
   harness). Recommended: close, with those as the recorded residue.
+
+Closed: live acceptance recorded above (landed as 4a0a2e40); the residue —
+private S2S bridge tool-calling, a spoken-yes number, and a content-checked
+citation — is tracked as #1069 s2s-bridge-tool-verification.
