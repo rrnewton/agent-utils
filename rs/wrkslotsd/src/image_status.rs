@@ -87,7 +87,14 @@ fn gib(value: Option<&Value>) -> String {
 fn display(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(text)) => text.clone(),
-        Some(Value::Bool(flag)) => flag.to_string(),
+        // Python renders booleans capitalized in the human form.
+        Some(Value::Bool(flag)) => {
+            if *flag {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
+        }
         Some(other) => other.to_string(),
         None => "-".to_string(),
     }

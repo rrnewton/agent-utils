@@ -76,6 +76,8 @@ mod image_ops;
 mod image_record;
 #[allow(dead_code)] // wired into cli.rs dispatch by the shared core (P8, mu-rsimg)
 mod image_status;
+#[allow(dead_code)] // wired into cli.rs dispatch by the shared core (P8, mu-rsimg)
+mod imagecmd;
 mod index;
 mod journal_state;
 mod journals_state;
