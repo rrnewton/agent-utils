@@ -98,3 +98,5 @@ export type { OrderedCard, ThreadOrder, ThreadOrderChoice, ThreadOrderDependenci
 export { upstreamAppUrlOf, upstreamUrlOf } from "./upstream.ts";
 export { BOUNDED_ALL_NOTICE, allNoticeWords, staleWords } from "./noticetext.ts";
 export type { AllNoticeFacts } from "./noticetext.ts";
+export { headingLength, headingOf } from "./heading.ts";
+export type { MessageHeading } from "./heading.ts";

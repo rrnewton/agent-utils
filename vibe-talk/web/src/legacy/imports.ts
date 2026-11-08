@@ -94,12 +94,10 @@ export {
   pressedBySpace,
   scrollsItself,
   setAttributeIfChanged,
-  setClassNameIfChanged,
   setClassWord,
   setHiddenIfChanged,
   setTextIfChanged,
   shownNode,
-  tagNameOf,
 } from "../view/dom/index.ts";
 export { SCREEN_TITLES, createActionMenu, createChipsOverComposer, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createUndoOffer, createUndoStamps, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow } from "../view/shell/index.ts";
 export {
@@ -118,13 +116,13 @@ export {
   watchBoxInsertions as watchInsertions,
   wireNewlineKey,
 } from "../view/composer/index.ts";
-export { HTTP_ADDRESS, createSerialQueue, linksIn, sentenceStart } from "../foundation/index.ts";
+export { createSerialQueue, sentenceStart } from "../foundation/index.ts";
 
 export { briefAge, fullLocalAt, fullLocalTime, stamp } from "../present/time/index.ts";
 
 export { doneReadWords, failureWords, fmtDuration, localReadWords, messagesWords, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, repliesWalkWords, searchMomentWords, serviceReadWords } from "../present/notices/index.ts";
 export { LINK_KINDS_KEY, READ_MODES, READ_MODE_KEY, READ_MODE_SAID, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, bookmarkSpot, cardGapWords, cardProxyLines, cardRunText, collapsedLinesWords, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, createReadRuns, createThreadOrder, editedDrawn, firstLineOf, foldedCardText, forgetElisionCounts, gapWords, inThreadOrder, isNoise, mainRunsAmong, messageLook, proxyLinesOf, quoteBlock, quoteMarksRead, quoteShare, rawTextOf, reactionsDrawn, readRunText, renderedHtmlOf, replyMarkerName, rowEdited, savedReadMode, threadChoice, threadFacts, threadOrderAfter, undoLabel, undoName, upstreamUrlOf } from "../present/rows/index.ts";
-export { COLUMN_IDS, DAY_TITLED, PULL_WAIT_MS, QUOTE_REPLY_TITLE, RESTATED_CLASS, anchorOfRow, authorLabel, authorPasses, cardMarkTarget, cardRunIds, cardStubText, cardUnits, createArming, createBookmarkLines, createCardFlight, createCardPlaces, createCardsDrawn, createColumnLinks, createColumnWork, createColumns, createFilterChanges, createFootRooms, createLayoutShown, createLinkedMark, createPackSlides, createPinSync, createPullToRefresh, createQuoting, createReplyState, createRowDrawing, createRowGestures, createScrollKeeping, createSummaryWatch, createThreadHues, createUnderLists, createUnpackWatch, doneButtonOf, fillCardText, foldedTextLine, freshenDayTitle, fromGatheredThread, gutterPiece, idsOf, isMessageRow, keepCardUnits, markCardLayout, messageTop, mountChannelViewControls, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, pointerOn, quoteLabelFits, renderedText, rowIn, rowMessages, rowNewestMs, rowSentMs, rowShown, rowTimeTabStop, sameCardPlace, setArrowReach, setMarkerLift, shownRowFor, stackUnder, standingRow } from "../view/channel/index.ts";
+export { COLUMN_IDS, DAY_TITLED, PULL_WAIT_MS, QUOTE_REPLY_TITLE, anchorOfRow, authorPasses, cardRunIds, cardStubText, cardUnits, createArming, createBookmarkLines, createCardFlight, createCardPlaces, createCardsDrawn, createColumnLinks, createColumnWork, createColumns, createFilterChanges, createFootRooms, createLayoutShown, createLinkedMark, createPackSlides, createPinSync, createPullToRefresh, createQuoting, createReplyState, createRowDrawing, createRowGestures, createScrollKeeping, createSummaryWatch, createThreadHues, createUnderLists, createUnpackWatch, fillCardText, foldedTextLine, freshenDayTitle, fromGatheredThread, gutterPiece, idsOf, isMessageRow, keepCardUnits, markCardLayout, messageTop, mountChannelViewControls, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, pointerOn, quoteLabelFits, renderedText, rowIn, rowMessages, rowNewestMs, rowSentMs, rowShown, rowTimeTabStop, sameCardPlace, setArrowReach, setMarkerLift, shownRowFor, stackUnder, standingRow } from "../view/channel/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
 
@@ -137,7 +135,42 @@ export const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged 
 
 export { createAutoplay, createReadAloud, createReadingJump, createVoiceCall, createVoiceTranscript, mountCallComposer, mountCallControls, mountPageButtons, mountReadControls } from "../view/voice/index.ts";
 
-export { CANNED_PROMPTS, mountAgentPrefix, mountAgentSettings, mountAudioDevices, mountBarPlacement, mountCannedPrompts, mountChannelBoxListeners, mountChannelDirectory, mountChannelHistory, mountChannelSettings, mountConnectionReadouts, mountDismissedSends, mountHelpFolds, mountHelpLinks, mountIdentityList, mountMessagePreferences, mountMicrophoneSettings, mountNoiseRules, mountOwnReadApply, mountPairing, mountPreferenceSwitches, mountReadingWidth, mountResumePreference, mountSaveTokenButton, mountScreenControls, mountServerCache, mountSettingsFolds, mountSettingsReadouts, mountSettingsSwitches, mountSettingsSyncView, mountSignInControls, mountTextSize, mountUpstreamClear, restoreStoredSettings } from "../view/settings/index.ts";
+export {
+  CANNED_PROMPTS,
+  mountAgentPrefix,
+  mountAgentSettings,
+  mountAudioDevices,
+  mountBarPlacement,
+  mountCannedPrompts,
+  mountChannelBoxListeners,
+  mountChannelDirectory,
+  mountChannelHistory,
+  mountChannelSettings,
+  mountConnectionReadouts,
+  mountDismissedSends,
+  mountHelpFolds,
+  mountHelpLinks,
+  mountIdentityList,
+  mountMessagePreferences,
+  mountMicrophoneSettings,
+  mountNoiseRules,
+  mountOwnReadApply,
+  mountPairing,
+  mountPreferenceSwitches,
+  mountReadingWidth,
+  mountResumePreference,
+  mountSaveTokenButton,
+  mountScreenControls,
+  mountServerCache,
+  mountSettingsFolds,
+  mountSettingsReadouts,
+  mountSettingsSwitches,
+  mountSettingsSyncView,
+  mountSignInControls,
+  mountTextSize,
+  mountUpstreamClear,
+  restoreStoredSettings,
+} from "../view/settings/index.ts";
 export { blankResumeLast, createAudioRoute, createCallResume, createVoiceProvider } from "../core/call/index.ts";
 
 // read core (#624 mu-readcore)
@@ -152,5 +185,6 @@ export { createTimelineView } from "../view/channel/index.ts";
 export { COLLAPSE_OVER_CHARS, FOLD_LESS, FOLD_LISTS, FOLD_MORE, createFolding } from "../view/channel/index.ts";
 export { DISMISS_BATCH, createChannelRows } from "../view/channel/index.ts";
 export { createSearchRows } from "../view/channel/index.ts";
-export { SEARCH_OLDER_HITS, SEARCH_OLDER_MS, SEARCH_OLDER_PAGES, SEARCH_OLDER_TAP_MS, createCardGaps, createChannelRefresh, createLiveStream, createPackControls, createUnpackBlock, mountOlderWalks } from "../view/channel/index.ts";
+export { SEARCH_OLDER_HITS, SEARCH_OLDER_MS, SEARCH_OLDER_PAGES, SEARCH_OLDER_TAP_MS, createCardGaps, createChannelRefresh, createLiveStream, createMessageBodies, createPackControls, createRowDress, createUnpackBlock, mountOlderWalks } from "../view/channel/index.ts";
 export { createRowLinks } from "../view/channel/index.ts";
+export { headingLength, headingOf } from "../present/rows/index.ts";

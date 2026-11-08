@@ -406,3 +406,14 @@ test("`#624 voice-page-modularity`: how fresh the rows are said to be, and All's
   assert.equal(allNoticeWords(notice, { threading: false, view: "flat", messages: [], tally: () => ({ threads: new Map() }) }), notice);
   assert.equal(allNoticeWords("other words", { threading: true, view: "flat", messages: [], tally: () => ({ threads: new Map() }) }), "other words");
 });
+
+test("`#624 voice-page-modularity`: a heading restates the body's first words or is not shown, from the module alone", () => {
+  const { headingOf, headingLength } = ROWS;
+  const message = { content: "Deploy at dawn\nWe ship the thing.", heading: { tag: "Ops", time: "07:00", title: "Deploy at dawn", cut: 14 } };
+  const heading = headingOf(message);
+  assert.equal(heading.title, "Deploy at dawn");
+  assert.equal(heading.cut, 14);
+  assert.equal(headingOf({ content: "short", heading: { tag: "", time: "", title: "", cut: 0 } }), null);
+  assert.equal(headingOf({ content: "short" }), null);
+  assert.match(headingLength(heading), /^(16|24|32|40|48|56|64|72|80|88|96|long)$/);
+});

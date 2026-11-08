@@ -1429,11 +1429,13 @@ test("the page has ONE html sink, and only a message's content_html ever reaches
   assert.equal((PAGE_CODE.match(/innerHTML/g) || []).length, 2, "a third innerHTML sink appeared");
   assert.match(PAGE_CODE, /body\.innerHTML = renderDocumentMarkdown\(markdown\);/,
     "the documents sink no longer passes the sanitizer's output");
-  const sink = /function insertSanitizedHtml\(parent, contentHtml\) \{([\s\S]*?)\n\}/.exec(SCRIPT_CODE);
+  // `insertSanitizedHtml` is web/src/view/channel/body.ts's now (`#624 voice-page-modularity`), typed.
+  const sink = /function insertSanitizedHtml\(parent[^)]*\)(?:: void)? \{([\s\S]*?)\n\}/.exec(PAGE_CODE);
   assert.ok(sink && /template\.innerHTML = contentHtml;/.test(sink[1]), "innerHTML moved out of insertSanitizedHtml");
-  const calls = [...SCRIPT_CODE.matchAll(/insertSanitizedHtml\(([^)]*)\)/g)].map((m) => m[1]);
-  assert.deepStrictEqual(calls, ["parent, contentHtml", "box, html"], "insertSanitizedHtml gained a caller");
-  assert.match(SCRIPT_CODE, /const html = renderedHtmlOf\(message\);\s*if \(html !== ""\) \{\s*insertSanitizedHtml\(box, html\);/,
+  const calls = [...PAGE_CODE.matchAll(/insertSanitizedHtml\(([^)]*)\)/g)].map((m) => m[1]);
+  // The signature twice (interface + implementation in body.ts), then the one call.
+  assert.deepStrictEqual(calls, ["parent: HTMLElement, contentHtml: string", "parent: HTMLElement, contentHtml: string", "box, html"], "insertSanitizedHtml gained a caller");
+  assert.match(PAGE_CODE, /const html = renderedHtmlOf\(message\);\s*if \(html !== ""\) \{\s*insertSanitizedHtml\(box, html\);/,
     "the one caller no longer passes a message's content_html");
   // `renderedHtmlOf` is web/src/present/rows' now (`#624 voice-page-modularity`), typed.
   assert.match(PAGE_CODE, /const renderedHtmlOf = \(message[^)]*\)(?:: string)? =>\s*message && typeof message\.content_html === "string" \? message\.content_html : "";/);

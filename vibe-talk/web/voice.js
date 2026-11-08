@@ -2077,8 +2077,8 @@ const searchRows = createSearchRows({
   currentChannel: () => channelStore.current().channel,
   selectedChannelId,
   threadOf,
-  messageText,
-  messageLinks,
+  messageText: (message) => messageText(message),
+  messageLinks: (message) => messageLinks(message),
   selectionView: () => selection().view,
   authorChoosing: () => authorChoosing(),
   authorPasses,
@@ -2725,7 +2725,7 @@ const LINK_RAW_KEY = DEVICE_SETTINGS.linksRaw.key;
 const rowLinksOwner = createRowLinks({
   linkKinds,
   byId: el,
-  messageLinks,
+  messageLinks: (message) => messageLinks(message),
   renderedHtmlOf,
   rawTextOf,
   searchOpen: () => searchField.open(),
@@ -4322,47 +4322,8 @@ const SUMMARY_READ_STEPS_MS = [2000, 5000, 10000, 20000, 40000];
 // Whether this server names threads (`thread_names_supported`), so whether a summary may be on its way, is the
 // server facts' (`ServerFacts.threadNames`).
 
-/** "…", marked so the stylesheet may draw it apart from the words. */
-const cardEllipsis = () => styled("span", "card-ellipsis", "…");
 
-/** "…" at the end of `box`: on its last line, or on a line of its own after a block that has no line to end. */
-function appendCardEllipsis(box) {
-  const into = cardMarkTarget(box, true);
-  if (into) {
-    into.append(cardEllipsis());
-    return;
-  }
-  const line = document.createElement("p");
-  line.append(cardEllipsis());
-  box.append(line);
-}
 
-/** "…" at the start of `box`, as `appendCardEllipsis` puts it at the end. */
-function prependCardEllipsis(box) {
-  const into = cardMarkTarget(box, false);
-  if (into) {
-    into.insertBefore(cardEllipsis(), into.firstChild);
-    return;
-  }
-  const line = document.createElement("p");
-  line.append(cardEllipsis());
-  box.insertBefore(line, box.firstChild);
-}
-
-/** Every link in `node` drawn as a link's words, not a link: the card it is on is a button. */
-function unlinkCardBody(node) {
-  for (const kid of [...node.childNodes]) {
-    if (kid.nodeType !== 1) continue;
-    if (tagNameOf(kid) !== "a") {
-      unlinkCardBody(kid);
-      continue;
-    }
-    const words = document.createElement("span");
-    words.className = "card-link";
-    words.append(...kid.childNodes);
-    kid.replaceWith(words);
-  }
-}
 
 /**
  * Each root's cut as last worked out, the K it was worked out at, and the card's words for it: a card
@@ -10413,162 +10374,14 @@ async function sendChannelMessage() {
 // the server leaves the field empty when rendering would change nothing. It is also a saved
 // message from before the field existed, which is drawn as the text it is and never as markup.
 
-/**
- * Put a body the SERVER rendered and sanitized into `parent`.
- *
- * THE ONLY PLACE THIS PAGE PARSES A STRING AS HTML, and the string is always a message's
- * `content_html`: the output of the server's sanitizer and nothing else. Never message text, never
- * a draft, never anything typed here. The page suite holds this to one call site.
- *
- * Through a `<template>`, whose contents are inert while they are parsed — no script runs and
- * nothing is fetched — and then moved into the document.
- */
-function insertSanitizedHtml(parent, contentHtml) {
-  const template = document.createElement("template");
-  template.innerHTML = contentHtml;
-  parent.append(...template.content.childNodes);
-}
 
-/**
- * Text as plain paragraphs: each run of lines that are not blank is a paragraph, and the lines in
- * it are separated by line breaks. Exactly the shape the server compares against before it decides
- * a body needs no HTML (`plain_html` in src/render.rs), so a message drawn this way looks as it
- * would have with its rendering. Every line through a text node.
- *
- * `#242 rich-headers`. With a `cut`, the first `cut` characters of the first line are the words a
- * heading restates, and are marked as the server marks them in a rendered body (`mark_restated` in
- * src/render.rs): in a `span.rh-src`, which also holds the line break after them when they are the
- * whole line, or as the paragraph's own class when that line is the whole paragraph. Marking adds
- * no character and moves none, so the body reads the same with the mark as without it.
- */
-function plainParagraphs(parent, text, cut = 0) {
-  let paragraph = null;
-  // The restated words, while they are the whole of the paragraph so far.
-  let lead = null;
-  // The paragraph ends while it is only the restated line: the paragraph carries the mark itself.
-  const close = () => {
-    if (lead && paragraph) {
-      paragraph.className = RESTATED_CLASS;
-      paragraph.replaceChildren(...lead.childNodes);
-    }
-    lead = null;
-    paragraph = null;
-  };
-  String(text).split("\n").forEach((line, index) => {
-    if (/^[ \t]*$/.test(line)) {
-      close();
-      return;
-    }
-    if (paragraph) {
-      (lead || paragraph).append(document.createElement("br"));
-      lead = null;
-    } else {
-      paragraph = document.createElement("p");
-      parent.append(paragraph);
-    }
-    if (index === 0 && cut > 0) {
-      const words = document.createElement("span");
-      words.className = RESTATED_CLASS;
-      words.append(document.createTextNode(line.slice(0, cut)));
-      paragraph.append(words);
-      if (line.length > cut) paragraph.append(document.createTextNode(line.slice(cut)));
-      else lead = words;
-      return;
-    }
-    paragraph.append(document.createTextNode(line));
-  });
-  close();
-}
 
-/**
- * One message's body, as a `.md` box: the server's rendering when there is one, its text as plain
- * paragraphs otherwise. Every message on the page is drawn through here.
- */
-function messageBody(message) {
-  const box = document.createElement("div");
-  box.className = "md";
-  const html = renderedHtmlOf(message);
-  if (html !== "") {
-    insertSanitizedHtml(box, html);
-    // `#543 in-app-message-links`. A link to a message in a channel this app reads opens it here.
-    wireMessageLinks(box);
-  } else {
-    const heading = headingOf(message);
-    const cut = typeof message.cardRestCut === "number" ? message.cardRestCut : heading ? heading.cut : 0;
-    plainParagraphs(box, rawTextOf(message), cut);
-  }
-  // `#528 thread-card-markdown-and-cap`. A split root's continuation (`continuationOf`): the same
-  // body from the unit its card stopped before, formatted as the whole root is.
-  if (typeof message.cardRestFrom === "number") {
-    const from = message.cardRestFrom;
-    keepCardUnits(box, (at) => at >= from);
-    prependCardEllipsis(box);
-  }
-  return box;
-}
 
-/** An element of `tag` holding `text`, assigned as text. */
-function styled(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) {
-    node.className = className;
-  }
-  node.textContent = text;
-  return node;
-}
 
-/** A body drawn from text alone: a draft being sent, which no server has rendered yet. */
-function textBody(text) {
-  const box = document.createElement("div");
-  box.className = "md";
-  plainParagraphs(box, text);
-  return box;
-}
 
-/** Every link a drawn body holds, in order, as `{href, name}`: only the ones it really draws. */
-function anchorsIn(node) {
-  const found = [];
-  const walk = (at) => {
-    for (const kid of at.childNodes) {
-      if (kid.nodeType !== 1) continue;
-      const href = String(kid.tagName).toLowerCase() === "a" ? kid.getAttribute("href") : null;
-      if (href && HTTP_ADDRESS.test(href)) {
-        found.push({ href, name: renderedText(kid) || href });
-      } else {
-        walk(kid);
-      }
-    }
-  };
-  walk(node);
-  return found;
-}
 
-/**
- * What one message says, as text, kept per message object: a thread's name asks on every draw of
- * the selector, and a row's message objects are replaced, never edited, when a read brings a newer
- * copy.
- */
-const textByMessage = new WeakMap();
-function messageText(message) {
-  if (!message || typeof message !== "object") return "";
-  if (!textByMessage.has(message)) textByMessage.set(message, renderedText(messageBody(message)));
-  return textByMessage.get(message);
-}
 
-/**
- * The links one message draws. A rendered body's links are its anchors — what the reader can tap,
- * exactly — and a body drawn from text has none drawn, so its links are read from the text as the
- * voice transcript's are.
- */
-function messageLinks(message) {
-  return renderedHtmlOf(message) !== "" ? anchorsIn(messageBody(message)) : linksIn(rawTextOf(message));
-}
 
-/** Draw a row's messages into its body, one `.md` box each, in order. */
-function renderBodyInto(parent, messages) {
-  for (const message of messages) parent.append(messageBody(message));
-  return parent;
-}
 
 // --- rich headers ---------------------------------------------------------------------------------
 //
@@ -10613,62 +10426,9 @@ function storedRichHeaders() {
   return deviceSettings().get(DEVICE_SETTINGS.richHeaders);
 }
 
-/**
- * A message's heading as `{tag, time, title, cut}`, or null when it has none this page can draw: no
- * piece to show, or a `cut` that is not inside the first line of the text it is cut from.
- */
-function headingOf(message) {
-  const heading = message && message.heading;
-  if (!heading || typeof heading !== "object") return null;
-  const piece = (value) => (typeof value === "string" ? value : "");
-  const [tag, time, title] = [piece(heading.tag), piece(heading.time), piece(heading.title)];
-  const cut = heading.cut;
-  if (!(tag || time || title) || !Number.isInteger(cut) || cut <= 0) return null;
-  const content = rawTextOf(message);
-  if (cut > content.length || content.slice(0, cut).includes("\n")) return null;
-  return { tag, time, title, cut };
-}
 
-/**
- * Whether a drawn body begins with the mark on the words its heading restates: its first paragraph
- * marked, or that paragraph's first child. A heading whose words are not marked is not shown, so a
- * body can never lose words to a heading that does not restate them.
- */
-function restatedMarked(box) {
-  const first = box.childNodes[0];
-  if (!first || first.nodeType !== 1 || String(first.tagName).toLowerCase() !== "p") return false;
-  if (first.className === RESTATED_CLASS) return true;
-  const lead = first.childNodes[0];
-  return Boolean(lead && lead.nodeType === 1 && String(lead.tagName).toLowerCase() === "span" &&
-    lead.className === RESTATED_CLASS);
-}
 
-/**
- * How long a heading reads, as the stylesheet's length class: its characters of tag, title and time,
- * rounded up to a multiple of eight from 16 to 96, or `long` past that. Counted from the strings,
- * never measured on the screen; web/voice.css says how wide a list each class needs. `extra` is the
- * characters the row's time says beyond the hour and minute the classes were measured with: its
- * weekday or date (`#729 vt-older-message-dates`), which take the same line.
- */
-function headingLength(heading, extra = 0) {
-  const characters = [...`${heading.tag}${heading.title}${heading.time ? `@${heading.time}` : ""}`].length + extra;
-  const bucket = Math.max(16, Math.ceil(characters / 8) * 8);
-  return bucket <= 96 ? String(bucket) : "long";
-}
 
-/**
- * The heading's pieces for the row's header line: the tag, the title, and the time after an `@`,
- * each a span of its own and every one of them text. No separators: the gap between them is the
- * stylesheet's.
- */
-function headingPieces(heading) {
-  const head = document.createElement("span");
-  head.className = "rh-head";
-  if (heading.tag) head.append(styled("span", "rh-tag", heading.tag));
-  if (heading.title) head.append(styled("span", "rh-title", heading.title));
-  if (heading.time) head.append(styled("span", "rh-time", `@${heading.time}`));
-  return head;
-}
 
 // --- who is speaking in the channel -------------------------------------------------------------
 //
@@ -10773,156 +10533,7 @@ const identityList = mountIdentityList({
  */
 // A row's own part, found by walking the row (`childByClass`), is web/src/view/dom's.
 
-/**
- * The messages some row of `rows` answers, by their ids, with those a reply sent from here answers
- * once its post is acknowledged: what dims a row as replied to (`dressChannelRow`).
- *
- * EVERY pointer a row carries, not only its own: a message combined into a row still answered whatever
- * it answered. See `data-answers` in `discordNode`. A positive acknowledgement is already evidence of a
- * reply, even while a slower history read has not returned its provider ID. Pending or wholly
- * unconfirmed sends are not that evidence.
- *
- * @param {Element[]} rows
- * @param {string} viewing The channel the rows are of.
- * @returns {Set<string>}
- */
-function answeredBy(rows, viewing) {
-  const answered = new Set();
-  for (const entry of outbox.values()) {
-    if (entry.channel === viewing && entry.replyTo &&
-        (entry.state === "sent" || entry.postedCount > 0)) answered.add(entry.replyTo);
-  }
-  for (const row of rows) {
-    for (const parent of String(row.getAttribute("data-answers") || "").split(" ").filter(Boolean)) answered.add(parent);
-  }
-  return answered;
-}
 
-/**
- * Draw one channel row's state from what the page holds now: its thread chips, replied to, its speaker,
- * Done, pinned, noise, read automatically, being read aloud, and its author line and Done button's word.
- * What every pass over the rows does for every row it draws (`renderChannelRows`), and what an unpacked
- * block does for its rows (`unpackBlock`, `#407 unpack-row-parity`): one dress for a message row, in
- * whichever list it stands.
- *
- * `pass` is what the pass worked out once for all its rows: `tally` (`replyTally`), `answered`
- * (`answeredBy`), `viewing`, the channel, and whether the row is one of Main's own list (`inMain`) or
- * All's (`inAll`), which draw a root's unread replies and the thread strips.
- *
- * @param {Element} row
- * @param {{tally: ReplyTally, answered: Set<string>, viewing: string, inMain: boolean, inAll: boolean}} pass
- */
-function dressChannelRow(row, { tally, answered, viewing, inMain, inAll }) {
-  const id = row.getAttribute("data-id") || "";
-  drawThreadChips(row, tally, inMain, inAll);
-  // Every message the row stands for. One of them on an ordinary row; see the combining note.
-  const ids = idsOf(row);
-  // DIMS, never hides. See the note at the head of this section: this is derived from what
-  // happens to be loaded, and evidence that admits it is incomplete must not remove anything.
-  setAttributeIfChanged(row, "data-replied", ids.some((one) => answered.has(one)) ? "true" : "false");
-  // The speaker treatment, on the same pass and from the same census. `me` and `coder` are drawn
-  // as the transcript's two speakers; see web/voice.css.
-  setAttributeIfChanged(row, "data-who",
-    whoIsWho.bucketFor(
-      row.getAttribute("data-author-id"),
-      row.getAttribute("data-author-bot") === "true",
-      viewing
-    )
-  );
-  // GREYS, never hides, and that is the whole distinction between this and the To do filter.
-  // Being archived is DECLARED by the reader, so unlike `data-replied` it is not evidence that
-  // might be incomplete — but a channel view that removed the row would leave the reader no way
-  // to see what they had archived, and no way to change their mind about it.
-  const who = row.getAttribute("data-who");
-  // EVERY constituent, or not at all. A row half of whose messages have been archived shows as
-  // UNREAD: the other reading files an unseen message away behind one the reader has dealt with,
-  // and the whole point of the archive is that it says what is left.
-  const isArchived = ids.length > 0 && ids.every((one) => doneState().archived.has(one));
-  setAttributeIfChanged(row, "data-archived", isArchived ? "true" : "false");
-  // `#245 done-feedback`. The moment of a Done, on whichever row now stands for the message.
-  drawDoneFlash(row);
-  drawRowPin(row);
-  // `#196 auto-read-noise`. Read automatically, by the server's verdict on EVERY constituent —
-  // `joinsGroup` keeps a placeholder out of a real message's row, so a mixed row is not one the
-  // reader should be told is noise. Dimmed, never hidden, here: hiding is Hide read's job, and
-  // a row that vanished could not be rescued from a rule that caught it by mistake.
-  const held = rowMessages(row);
-  const isNoiseRow = held.length > 0 && held.every(isNoise);
-  setAttributeIfChanged(row, "data-noise", !isArchived && isNoiseRow ? "true" : "false");
-  const rescue = notNoiseButtonOf(row);
-  if (rescue) setHiddenIfChanged(rescue, !isNoiseRow);
-  // `#549 own-read-stored`. The reader's own words are no case of their own here: "Mark my own
-  // messages as read" decides where their read state STARTS, on the server, and the row is drawn from
-  // that state like any other — archived, with Unarchive, or not, with Done.
-  const isReading = readAloudOwner().nowPlaying !== null && readAloudOwner().nowPlaying.id === id;
-  // ASKED FOR, but not yet speaking. Distinct from `data-reading` on purpose: this one the
-  // reader can still change their mind about, and it is the only thing on screen during a wait
-  // that is entirely somebody else's network.
-  setAttributeIfChanged(row, "data-pending", readAloudOwner().pendingRead === id ? "true" : "false");
-  // IS THIS MESSAGE ITSELF AN ANSWER? The opposite direction from `data-replied`, and the more
-  // reliable one: that is derived from whatever happens to be loaded and misses an answer
-  // further back than the window, whereas the pointer for this is ON the message. Correct
-  // whether or not the message it answers is anywhere on screen.
-  setAttributeIfChanged(row, "data-is-reply", row.getAttribute("data-reply-to") ? "true" : "false");
-  // WHICH ROW IS SPEAKING. Without it the reader taps, waits, and has nothing but the sound to
-  // tell them which message they hit — on a list where the next act archives it.
-  setAttributeIfChanged(row, "data-reading", isReading ? "true" : "false");
-  // THE ROW BEING READ STAYS OPEN.
-  //
-  // The owner watched a message he was listening to collapse mid-read and assumed a stray tap.
-  // It was not: the channel re-reads itself every DISCORD_POLL_MS, `applyNewestPage` rebuilds
-  // every row, and a freshly built row starts folded. So a long message being read aloud folded
-  // itself on the next poll, every time, while its own audio was still playing. Hearing the
-  // whole message and being shown a clamped third of it is the wrong pair.
-  // The row's own fold, on a row drawn again from a held view as on one just built. `#301`.
-  const entry = /** @type {any} */ (row).foldEntry;
-  if (isReading && entry && isFolded(entry)) {
-    setFolded(entry, false);
-  }
-
-  // The row's own way back, labelled for what it will DO rather than for what the row is. In the
-  // To do filter an archived row is never on screen, so this only ever reads "Done" there.
-  // WHO, printed only where the colour cannot say it. `me` and `coder` are drawn as the
-  // transcript's two speakers, so their names are a line of chrome restating what the row's own
-  // colour already said. A third party is one of many and has to be named.
-  // THE AUTHOR LINE, decided ONCE. It used to be set twice — the name here and `reading` in a
-  // later block — and the later write is the one that lost, so the row being read never said so.
-  //
-  // While the audio runs, `reading` replaces the name: that is the fact the reader wants at a
-  // glance on a list where the next thing that happens is the row archiving itself. It is shown
-  // even for a principal whose colour already names them, because hiding it would leave the row
-  // saying nothing at all.
-  const named = childByClass(row, "msg-author");
-  if (named) {
-    setClassNameIfChanged(named, isReading ? "msg-author reading-mark" : "msg-author");
-    // `#376 read-aloud-blocks`: and how far through, "reading 2 of 5", in a read of several parts.
-    setTextIfChanged(named, isReading ? readAloudOwner().readingLabel() : authorLabel(row));
-    setHiddenIfChanged(named, !isReading && (who === "me" || who === "coder"));
-    // `#377 compact-collapsed-rows`. Where the header line has no room for the whole name it shows a
-    // prefix and an ellipsis (web/voice.css); the whole name is here, for a pointer resting on it.
-    const whole = isReading ? "" : authorLabel(row);
-    if ((named.getAttribute("title") || "") !== whole) {
-      if (whole) named.setAttribute("title", whole);
-      else named.removeAttribute("title");
-    }
-  }
-  // The block being read, lit again on a row the poll has just rebuilt. `#376`.
-  readAloudOwner().markReadingBlock(row);
-  const done = doneButtonOf(row);
-  if (done) {
-    // Written every time, unlike the rest of this dress (`#532 shift-o-latency`): with this text too left
-    // alone where unchanged, a reply's Send moved its row down the list by the box it closed
-    // (tests/reply_continuity_browser.py). The place the Done keeps (`markRowDone`) depends on it.
-    done.textContent = isArchived ? "Unarchive" : "Done";
-    setAttributeIfChanged(
-      done,
-      "title",
-      isArchived
-        ? "Put this back in the list. This does not change the source chat service."
-        : "Mark as dealt with here. This does not change the source chat service."
-    );
-  }
-}
 
 function renderChannelRows() {
   // `#206 pin-message`. The Pinned filter's list first, so that the pass below derives its rows as
@@ -10964,7 +10575,7 @@ function renderChannelRows() {
   const inAll = drawingAll();
   markListView();
   for (const row of [...rows, ...el("pinned-log").children]) {
-    dressChannelRow(row, { tally, answered, viewing,
+    dressChannelRow(/** @type {any} */ (row), { tally, answered, viewing,
       inMain: selection().view === "main" && mainList.has(row), inAll: inAll && mainList.has(row) });
   }
   // `#214 reply-arrow` and `#215 reply-coalesce`. Each reply's gutter, from the rows now around it
@@ -11011,21 +10622,6 @@ function renderChannelRows() {
   else if (replyState.pending) reopenPendingReply();
 }
 
-/**
- * Dress every message row unpacked under the cards again from what the page holds now
- * (`dressChannelRow`), in the right column they were built in. Nothing while none are on screen.
- */
-function dressUnpackedRows() {
-  if (!unpackOnScreen()) return;
-  inColumn(columns.side, () => {
-    const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
-      .filter((row) => row.hasAttribute("data-unpack-thread") && row.hasAttribute("data-id"));
-    if (rows.length === 0) return;
-    const viewing = String(selectedChannelId());
-    const pass = { tally: replyTally(), answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
-    for (const row of rows) dressChannelRow(row, pass);
-  });
-}
 
 /**
  * Swipe a row away, on a device that has swipes.
@@ -13518,6 +13114,30 @@ const rowGestures = createRowGestures({
   },
 });
 const { tapRow, actOnRow, foldOnTap, swipeable } = rowGestures;
+/**
+ * One message's body as DOM (web/src/view/channel `createMessageBodies`,
+ * `#624 voice-page-modularity`): the server's rendering inserted as nodes, plain text as
+ * paragraphs, the heading's restated mark, and what a body links to.
+ *
+ * @type {import("./src/view/channel/index.ts").MessageBodies}
+ */
+const messageBodies = createMessageBodies({ wireMessageLinks });
+const { insertSanitizedHtml, plainParagraphs, messageBody, styled, textBody, anchorsIn, messageText, messageLinks, renderBodyInto, restatedMarked, headingPieces, cardEllipsis, appendCardEllipsis, prependCardEllipsis, unlinkCardBody } = messageBodies;
+/**
+ * One channel row's dress (web/src/view/channel `createRowDress`, `#624 voice-page-modularity`).
+ *
+ * @type {import("./src/view/channel/index.ts").RowDress}
+ */
+const rowDress = createRowDress({
+  outboxEntries: () => outbox.values(),
+  drawThreadChips, drawDoneFlash, drawRowPin, whoBucket: (authorId, bot, viewing) => whoIsWho.bucketFor(authorId, bot, viewing),
+  archivedIds: () => doneState().archived, isNoise, notNoiseButtonOf,
+  readAloudNow: () => { const owner = readAloudOwner(); return { nowPlaying: owner.nowPlaying, pendingRead: owner.pendingRead, readingLabel: () => owner.readingLabel(), markReadingBlock: (row) => owner.markReadingBlock(row) }; },
+  unpackOnScreen: () => unpackOnScreen(), inColumn, replyTally, selectedChannelId, idsOf, rowMessages, columns, leftEl,
+  isFolded: (entry) => isFolded(/** @type {any} */ (entry)), setFolded: (entry, folded) => setFolded(/** @type {any} */ (entry), folded),
+});
+const { answeredBy, dressChannelRow, dressUnpackedRows } = rowDress;
+
 // Drawing a channel row is web/src/view/channel's now (`createChannelRows`, `#624
 // voice-page-modularity`): empty messages, split posts as one, the row and everything on it,
 // its menu, marking read through it, copying, and the channel summary line. Opening a reply

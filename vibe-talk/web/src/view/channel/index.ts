@@ -161,3 +161,7 @@ export { createLiveStream } from "./livestream.ts";
 export type { LiveFrame, LiveStream, LiveStreamDependencies } from "./livestream.ts";
 export { createRowLinks } from "./rowlinks.ts";
 export type { LinkKindsLike, RowLinks, RowLinksDependencies } from "./rowlinks.ts";
+export { createMessageBodies } from "./body.ts";
+export type { MessageBodies, MessageBodyDependencies } from "./body.ts";
+export { createRowDress } from "./rowdress.ts";
+export type { DressPass, RowDress, RowDressDependencies } from "./rowdress.ts";
