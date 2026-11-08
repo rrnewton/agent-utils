@@ -2344,6 +2344,68 @@ fn retain_only_sweeps_every_channel_and_provider_off_the_list() {
     assert_eq!(fx.cache.counts().served().expect("counts").messages, 0);
 }
 
+#[test]
+fn a_snapshot_missing_a_provider_with_an_account_record_keeps_its_rows() {
+    // `#1070 cache-account-mismatch-guard`: a snapshot that does not name a provider key at
+    // all (a renamed key, a fake router pointed at a real file) must not sweep that provider's
+    // rows out of the file while the file holds an account record for it. They stay, unserved,
+    // until a later snapshot names the key again.
+    let fx = Fixture::new("cache-retain-keeps-known-provider");
+    fx.cache.set_account("p", "U1", None);
+    fx.list(vec![m(1), m(2)], T0, None);
+    fx.settle();
+    assert_eq!(fx.cache.counts().served().expect("counts").messages, 2);
+
+    let capture = crate::testing::LogCapture::start();
+    fx.cache.retain_only(RouteSnapshot::new(
+        [ChanKey::new("q", "D1")],
+        ["q".to_owned()],
+    ));
+    fx.settle();
+    assert_eq!(
+        fx.cache.counts().served().expect("counts").messages,
+        2,
+        "a snapshot missing the provider key keeps every row"
+    );
+    assert!(fx
+        .cache
+        .account("p")
+        .served()
+        .flatten()
+        .expect("the account record is kept too")
+        .is("U1", None));
+    assert_eq!(
+        fx.cache.newest(&fx.chan, &Scope::Main, 10),
+        Read::Blocked,
+        "kept rows are not served while their provider is unnamed"
+    );
+    let logged = capture.text();
+    assert!(
+        logged.contains("does not name a provider") && logged.contains("provider=\"p\""),
+        "a loud line names the kept provider and why: {logged}"
+    );
+    drop(capture);
+
+    // Named again, the kept rows return to service: nothing was lost.
+    fx.cache
+        .retain_only(RouteSnapshot::new([fx.chan.clone()], ["p".to_owned()]));
+    fx.settle();
+    assert_eq!(fx.ids(&Scope::Main), ids(&["m1", "m2"]));
+
+    // An account record alone does not protect a provider the snapshot names: ordinary
+    // removal of a channel under the named key still sweeps exactly as before.
+    fx.cache.retain_only(RouteSnapshot::new(
+        [ChanKey::new("p", "C2")],
+        ["p".to_owned()],
+    ));
+    fx.settle();
+    assert_eq!(
+        fx.cache.counts().served().expect("counts").messages,
+        0,
+        "a channel removed under its own provider key is still swept"
+    );
+}
+
 // ---- access in doubt ---------------------------------------------------------------------------
 
 /// Channel `C1` holding main rows `m1`..`m3`, `m1` the root of thread `m1` with replies `r1` and

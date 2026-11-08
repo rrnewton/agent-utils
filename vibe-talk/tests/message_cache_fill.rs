@@ -306,7 +306,10 @@ async fn a_channel_taken_out_of_the_configuration_is_swept_at_the_next_start() {
 }
 
 #[tokio::test]
-async fn a_renamed_provider_key_leaves_nothing_behind_under_the_old_one() {
+async fn a_renamed_provider_key_keeps_the_old_ones_rows_until_it_is_named_again() {
+    // `#1070 cache-account-mismatch-guard`: a snapshot that does not name a provider key the
+    // file holds an account record for — a renamed key is the common shape — must not sweep
+    // that provider's rows away. They stay, unserved, and return when the key does.
     let dir = TempDir::new("cache-sweep-rename");
     let clock = ManualClock::at(T0 + HOUR);
     {
@@ -322,17 +325,46 @@ async fn a_renamed_provider_key_leaves_nothing_behind_under_the_old_one() {
     let read = summary(&state, READ_CHANNEL, "1000000000000000001", "row 1");
     let write = summary(&state, WRITE_CHANNEL, "1000000000000000002", "row 2");
     file_summaries(&store, &[&read, &write]).await;
+    let capture = testing::LogCapture::start();
     let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
     let cache = state.message_cache.cache().expect("installed");
     assert_eq!(
         held(&cache),
-        0,
-        "the same channels under a provider key the configuration no longer has are gone"
+        7,
+        "the same channels under a provider key the configuration no longer has are kept"
     );
+    assert!(
+        matches!(
+            cache.newest(&ChanKey::new("first", READ_CHANNEL), &CacheScope::Main, 10),
+            vibe_talk::cache::Read::Blocked
+        ),
+        "and not served while their key is unnamed"
+    );
+    let logged = capture.text();
+    assert!(
+        logged.contains("does not name a provider") && logged.contains("provider=\"first\""),
+        "a loud line names the kept provider and why: {logged}"
+    );
+    drop(capture);
     settled(&state).await;
     assert!(
         kept(&store, &read).await && kept(&store, &write).await,
         "the store keys summaries by channel alone, and both channels are still listed"
+    );
+    close(&state, cache);
+
+    // The key named again (the rename reverted): the kept rows return to service.
+    let (state, _fake) = keyed_deployment("first");
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    let cache = state.message_cache.cache().expect("installed");
+    assert_eq!(held(&cache), 7, "nothing was lost to the rename");
+    assert_eq!(
+        cache
+            .newest(&ChanKey::new("first", READ_CHANNEL), &CacheScope::Main, 10)
+            .served()
+            .expect("served again")
+            .len(),
+        3
     );
 }
 
@@ -2588,7 +2620,7 @@ async fn with_the_cache_off_no_summary_is_deleted() {
 }
 
 #[tokio::test]
-async fn the_sweep_forgets_a_channel_off_the_list_but_not_one_still_listed_under_another_key() {
+async fn the_sweep_forgets_nothing_of_a_channel_whose_provider_key_vanished_with_it() {
     let clock = ManualClock::at(T0 + HOUR);
     for cache_on in [true, false] {
         let dir = TempDir::new("cache-sweep-summaries");
@@ -2620,17 +2652,21 @@ async fn the_sweep_forgets_a_channel_off_the_list_but_not_one_still_listed_under
             kept(&store, &renamed).await,
             "cache {cache_on}: the same channel, still listed under the new key"
         );
-        assert_eq!(
+        // The removed channel's rows sit under the vanished key, not the new one: the guard
+        // (`#1070 cache-account-mismatch-guard`) keeps them, so the sweep erases nothing and
+        // the summaries task forgets nothing either. A channel removed while its own key
+        // stays named is still swept and forgotten, as
+        // `a_channel_taken_out_of_the_configuration_is_swept_at_the_next_start` holds.
+        assert!(
             kept(&store, &removed).await,
-            !cache_on,
-            "cache {cache_on}: a channel off the list is forgotten only by the cache's sweep"
+            "cache {cache_on}: a channel whose provider key vanished with it is kept whole"
         );
         assert!(
             kept(&store, &name).await,
             "cache {cache_on}: thread names stay"
         );
         if let Some(cache) = state.message_cache.cache() {
-            assert_eq!(held(&cache), 0);
+            assert_eq!(held(&cache), 7);
         }
     }
 }

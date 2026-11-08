@@ -10,7 +10,12 @@
 //! The cache may hold rows only for the channels the server answers for, each under the provider
 //! that owns it. [`Sink::set_routes`] is told that list every time it changes
 //! (`AppState::refresh_routes`), and turns it into the [`RouteSnapshot`] the cache's writer gates
-//! on and sweeps to: every channel and provider key off it is erased from the file.
+//! on and sweeps to: every channel and provider key off it is erased from the file — except the
+//! rows of a provider the snapshot does not name at all while the file holds an account record
+//! for it, which are kept, unserved and unfilled, until a snapshot names the key again or the
+//! file is erased (`#1070 cache-account-mismatch-guard`; see [`MessageCache::retain_only`]). A
+//! snapshot missing a whole key says nothing reliable about that provider's rows: a renamed key
+//! and a foreign configuration pointed at this file look exactly like a provider retired.
 //!
 //! A sweep is only as good as the list it sweeps to. At startup the list is put together from the
 //! configuration AND from the store (the channels added in the app, and the configured ones the
@@ -49,16 +54,25 @@
 //!
 //! - no account recorded yet: this one is written, and fills begin once it reads back;
 //! - the same account (and, where the provider has workspaces, the same workspace): fills begin;
-//! - another account: everything the file holds for the provider is erased first, then the new
-//!   account is written;
+//! - another account: the provider is quarantined ([`Verification::Mismatched`]) — nothing of it
+//!   is served or filled, the recorded account is not written over, and nothing is erased
+//!   (`#1070 cache-account-mismatch-guard`). A credential that works but belongs to someone
+//!   else (a valid token for another workspace, a test configuration pointed at the real file)
+//!   says nothing against the rows the recorded account read, which may be their only copy. It
+//!   is asked again every [`SUSPENDED_RECHECK`]: the quarantine ends when the recorded account
+//!   answers again, or when the owner erases the cache file (the erase switch), after which
+//!   the answering account is recorded on the fresh file like any first start. Those are the
+//!   only two ways out, deliberately: an account change the owner truly means is the erase,
+//!   and a configuration slip the owner fixes needs no action at all;
 //! - no answer (a transport failure, a 5xx, anything that is not an account): nothing is erased
 //!   and nothing filled, and it is asked again after a wait that doubles each time, up to
 //!   [`VERIFY_RETRY_CAP`].
 //!
 //! **Deletions are the exception.** A deletion pushed by the live feed, or reported by a complete
 //! delta, writes nothing an account could have read: it only takes a message out. So it is offered
-//! whatever is known of the account (unchecked, suspended, or the sink not armed), and a mismatch
-//! found later erases the provider anyway. Leaving it out would leave the deleted message in the
+//! whatever is known of the account (unchecked, suspended, mismatched, or the sink not armed):
+//! a quarantined provider's kept rows still lose the messages their own feed deletes, exactly
+//! as a suspended provider's do. Leaving it out would leave the deleted message in the
 //! file, to be served once the account is checked. Everything else such a fill would have offered
 //! is dropped, and the channel is marked suspect ([`MessageCache::mark_suspect`]), in memory and in
 //! the file: what was dropped may have been an edit, a deletion or a creation, so no row of the
@@ -88,6 +102,16 @@
 //!   ends when the answer matches the file (or is recorded, the file holding none). Slack's
 //!   `account_inactive` or `token_revoked`, or a refusal still heard [`CREDENTIAL_GRACE`] after the
 //!   first, erases everything held for the provider.
+//!
+//! That erase is kept, deliberately, and it is not the mismatch above (`#1070
+//! cache-account-mismatch-guard`). The two are told apart by what the provider itself said: a
+//! mismatch is a credential the provider *accepts* and names as another account — it never
+//! refused this server anything, so it erases nothing. A revocation is the provider *refusing
+//! this credential* as gone for good (`token_revoked`, `account_inactive`), or refusing it
+//! without pause for a day: the rows were read under a credential the provider has cut off,
+//! and keeping a copy the provider itself has withdrawn access to is the privacy harm the
+//! erase exists to prevent. A mismatched provider that later starts refusing its credential
+//! is suspended like any other, and revoked under the same rule.
 //!
 //! # The store's summaries
 //!
@@ -323,6 +347,11 @@ enum Standing {
         since: tokio::time::Instant,
         erased: bool,
     },
+    /// The credential works, but the provider says it is another account than the one the file
+    /// records (`#1070 cache-account-mismatch-guard`): quarantined — nothing of the provider
+    /// is served or filled, and nothing is erased — until the account asked of it matches the
+    /// file again, or the file is erased.
+    Mismatched,
 }
 
 /// Whether one provider's channels may be filled: its account has been checked against the file.
@@ -336,6 +365,10 @@ pub enum Verification {
     /// The provider refused the credential: nothing of it is served or filled until its account
     /// is checked again.
     Suspended,
+    /// The credential works but is another account's than the one the file's rows were read as:
+    /// nothing of it is served or filled, and nothing is erased (`#1070
+    /// cache-account-mismatch-guard`).
+    Mismatched,
 }
 
 impl Verification {
@@ -346,6 +379,7 @@ impl Verification {
             Self::Unverified => "unverified",
             Self::Verified => "verified",
             Self::Suspended => "suspended",
+            Self::Mismatched => "account_mismatch",
         }
     }
 }
@@ -394,7 +428,8 @@ pub struct CacheReport {
 pub struct ProviderStanding {
     /// The provider key, as in the configuration.
     pub provider: String,
-    /// `verified`, `unverified` or `suspended`: see [`Verification`].
+    /// `verified`, `unverified`, `suspended` or `account_mismatch`: see [`Verification`]. The
+    /// word is the why, next to the provider it names, for a quarantined provider especially.
     pub verification: &'static str,
 }
 
@@ -1917,7 +1952,9 @@ impl Sink {
 
     /// The channels the server answers for have changed to `channels`: name each under the
     /// provider `router` routes it to, and, once armed, send the cache the new snapshot, which
-    /// sweeps every other channel and every provider key `router` does not have out of the file.
+    /// sweeps every other channel and every provider key `router` does not have out of the file
+    /// (a provider key missing whole, with an account record in the file, keeps its rows: see
+    /// the module documentation).
     ///
     /// A channel the router routes to no provider is left out: nothing can be read from it, so
     /// nothing may be kept for it either. Hidden channels are not in `channels` at all. A channel
@@ -1991,7 +2028,7 @@ impl Sink {
     /// answers for.
     ///
     /// When the sink is not armed, or the provider's account has not been checked against the
-    /// file open now (or the provider is suspended), the fill offers deletions alone
+    /// file open now (or the provider is suspended, or mismatched), the fill offers deletions alone
     /// ([`Fill::writes_rows`] is `false`): see the module documentation.
     #[must_use]
     pub fn begin(&self, grant: &FillGrant, channel: &ChannelId) -> Option<Fill> {
@@ -2274,7 +2311,8 @@ impl Sink {
 
     /// Search what the cache holds of `channel` (`#605 server-side-search`), under the rules a serve
     /// keeps ([`Sink::try_serve`]): a cache open, serving on, the channel on the server's list,
-    /// its provider's account checked against the file and not suspended, and the view's scope not
+    /// its provider's account checked against the file, not suspended and not mismatched, and
+    /// the view's scope not
     /// blocked (in doubt, or being erased). A reply whose own thread is blocked is left out
     /// ([`super::search::SearchOutcome::withheld`]). The gates are checked again after the read,
     /// as a serve's are. The view is the channel's whole list: a bridge's Flat, and anywhere else
@@ -2308,6 +2346,7 @@ impl Sink {
             match sink.verification(&route.key) {
                 Verification::Verified => Ok((cache, route)),
                 Verification::Suspended => Err(SearchRefusal::Suspended),
+                Verification::Mismatched => Err(SearchRefusal::AccountMismatch),
                 Verification::Unverified => Err(SearchRefusal::Unverified),
             }
         };
@@ -2918,6 +2957,7 @@ impl Sink {
             orphans_dropped = stats.orphans_dropped,
             providers_verified = standing("verified"),
             providers_suspended = standing("suspended"),
+            providers_mismatched = standing("account_mismatch"),
             blocked = report.blocked,
             shadow_asked = shadow.asked,
             shadow_would_serve = shadow.would_serve,
@@ -2947,14 +2987,14 @@ impl Sink {
     /// Whether `provider_key`'s account has been checked against the cache behind the sink.
     #[must_use]
     pub fn verification(&self, provider_key: &str) -> Verification {
-        let suspended = matches!(
-            self.state.identities().providers.get(provider_key),
-            Some(Standing::Suspended { .. })
-        );
-        match self.cache() {
-            _ if suspended => Verification::Suspended,
-            Some(cache) if self.state.standing(provider_key, &cache) => Verification::Verified,
-            _ => Verification::Unverified,
+        let standing = self.state.identities().providers.get(provider_key).copied();
+        match standing {
+            Some(Standing::Suspended { .. }) => Verification::Suspended,
+            Some(Standing::Mismatched) => Verification::Mismatched,
+            _ => match self.cache() {
+                Some(cache) if self.state.standing(provider_key, &cache) => Verification::Verified,
+                _ => Verification::Unverified,
+            },
         }
     }
 
@@ -3088,7 +3128,8 @@ impl State {
         false
     }
 
-    /// Start verification over: every provider unverified (a suspended one stays suspended), and,
+    /// Start verification over: every provider unverified (a suspended one stays suspended, a
+    /// mismatched one stays mismatched until its fresh check says otherwise), and,
     /// with a cache behind an armed sink and a runtime to run on, one task per provider asking its
     /// own client which account it is. Tasks of an earlier round see the round has moved and stop.
     fn verify_all(state: &Arc<Self>) {
@@ -3100,9 +3141,9 @@ impl State {
         let round = {
             let mut identities = state.identities();
             identities.round += 1;
-            identities
-                .providers
-                .retain(|_, standing| matches!(standing, Standing::Suspended { .. }));
+            identities.providers.retain(|_, standing| {
+                matches!(standing, Standing::Suspended { .. } | Standing::Mismatched)
+            });
             identities.running.clear();
             identities.round
         };
@@ -3159,6 +3200,48 @@ impl State {
         )
     }
 
+    /// Whether `provider_key` is quarantined for answering as another account.
+    fn mismatched_now(&self, provider_key: &str) -> bool {
+        matches!(
+            self.identities().providers.get(provider_key),
+            Some(Standing::Mismatched)
+        )
+    }
+
+    /// `provider_key` answered, in `round`, as another account than the file records:
+    /// quarantine it. Nothing of it is served (as with a suspension) or filled (it never
+    /// verifies), the recorded account is left as it stands, and nothing is erased
+    /// (`#1070 cache-account-mismatch-guard`). Told of once, on entering the standing: the
+    /// check that keeps asking would otherwise say it every recheck.
+    fn mismatched(&self, round: u64, cache: &Arc<MessageCache>, provider_key: &str) {
+        if !self.holds(cache) {
+            return;
+        }
+        let entered = {
+            let mut identities = self.identities();
+            if identities.round != round {
+                return;
+            }
+            let entered = !matches!(
+                identities.providers.get(provider_key),
+                Some(Standing::Mismatched)
+            );
+            identities
+                .providers
+                .insert(provider_key.to_owned(), Standing::Mismatched);
+            entered
+        };
+        cache.suspend_provider(provider_key);
+        if entered {
+            tracing::warn!(
+                provider = provider_key,
+                "the message cache holds messages read as another account of this provider; \
+                 keeping them, serving and filling nothing of this provider, until the \
+                 credential is the recorded account's again or the cache file is erased"
+            );
+        }
+    }
+
     /// `provider_key` matched the file at `generation`, in `round`: fills may begin, and a
     /// suspension ends.
     fn verified(&self, round: u64, cache: &Arc<MessageCache>, provider_key: &str, generation: u64) {
@@ -3183,7 +3266,8 @@ impl State {
     }
 
     /// Listen to the router's access signals while a cache is behind an armed sink, and stop
-    /// otherwise. On starting, what is in doubt or suspended is blocked in the cache afresh: a
+    /// otherwise. On starting, what is in doubt, suspended or mismatched is blocked in the
+    /// cache afresh: a
     /// cache opened since holds no blocks.
     fn listen(state: &Arc<Self>) {
         let (router, armed) = {
@@ -3201,7 +3285,9 @@ impl State {
             .identities()
             .providers
             .iter()
-            .filter(|(_, standing)| matches!(standing, Standing::Suspended { .. }))
+            .filter(|(_, standing)| {
+                matches!(standing, Standing::Suspended { .. } | Standing::Mismatched)
+            })
             .map(|(key, _)| key.clone())
             .collect();
         for key in &suspended {
@@ -3348,6 +3434,9 @@ pub async fn log_every_hour(sink: Arc<Sink>) {
 enum Checked {
     /// The account matches the file, which was at this generation throughout.
     Matched(u64),
+    /// The account is another one than the file records: quarantine, and ask again on the
+    /// suspended schedule (`#1070 cache-account-mismatch-guard`).
+    Mismatched,
     /// Nothing to check against any more: no file is open, or the cache behind the sink, or the
     /// round, has moved on.
     Off,
@@ -3384,11 +3473,18 @@ async fn verify(
                 }
                 break;
             }
+            Checked::Mismatched => {
+                if let Some(cache) = state.in_round(round, &cache) {
+                    state.mismatched(round, &cache, &provider_key);
+                }
+            }
             Checked::Off => break,
             Checked::Unanswered => {}
         }
-        // A suspended provider is asked on its own schedule, which a refusal does not shorten.
-        if state.suspended(&provider_key) {
+        // A suspended or mismatched provider is asked on its own schedule, which neither a
+        // refusal nor another account's answer shortens: what ends either is the recorded
+        // account answering again, or the file being erased under it.
+        if state.suspended(&provider_key) || state.mismatched_now(&provider_key) {
             tokio::time::sleep(SUSPENDED_RECHECK).await;
         } else {
             tokio::time::sleep(wait).await;
@@ -3431,14 +3527,11 @@ async fn check(
     let wrote = match stored_account(cache, provider_key).await {
         Stored::Read(Some(account)) if account.is(&identity.id, workspace) => false,
         Stored::Read(Some(_)) => {
-            tracing::warn!(
-                provider = provider_key,
-                "the message cache holds messages read as another account of this provider; \
-                 erasing them"
-            );
-            cache.erase_provider(provider_key);
-            cache.set_account(provider_key, &identity.id, workspace);
-            true
+            // Another account's credential, and it works: never an erase, and the recorded
+            // account is not written over. The rows may be the recorded account's only copy,
+            // and a working credential for someone else says nothing against them
+            // (`#1070 cache-account-mismatch-guard`).
+            return Checked::Mismatched;
         }
         Stored::Read(None) => {
             cache.set_account(provider_key, &identity.id, workspace);

@@ -1169,6 +1169,10 @@ pub(crate) struct Shared {
     pub(crate) erase_failed: Mutex<Refused>,
     /// What may not be served while access to it is in doubt: see [`MessageCache::block_channel`].
     pub(crate) blocks: Mutex<Blocks>,
+    /// Providers already told of in the log as kept though the latest route snapshot does not
+    /// name them (`#1070 cache-account-mismatch-guard`): each is warned of once, until a
+    /// snapshot names it again.
+    pub(crate) unnamed_kept: Mutex<HashSet<String>>,
     /// Where the writer sends its [`WriterEvent`]s, once something has subscribed. Bounded, and
     /// only ever `try_send`: the writer never waits on it.
     pub(crate) events: Mutex<Option<tokio::sync::mpsc::Sender<WriterEvent>>>,
@@ -1461,6 +1465,7 @@ impl MessageCache {
             sweep: Mutex::new(None),
             erase_failed: Mutex::new(Refused::default()),
             blocks: Mutex::new(Blocks::default()),
+            unnamed_kept: Mutex::new(HashSet::new()),
             events: Mutex::new(None),
             #[cfg(test)]
             read_hook: Mutex::new(None),
@@ -1549,8 +1554,41 @@ impl MessageCache {
         self.shared.fed_since_ms.load(Ordering::SeqCst)
     }
 
+    /// Tell of each provider `routes` does not name that the file holds an account record and
+    /// rows for: the sweep keeps those rows (`#1070 cache-account-mismatch-guard`), and keeping
+    /// them silently would be its own surprise. Each provider is told of once, until a snapshot
+    /// names it again. The writer makes the same reckoning from the account table when it
+    /// applies the sweep; this reckoning, read as the snapshot arrives, is only the telling.
+    fn note_unnamed_kept(&self, routes: &RouteSnapshot) {
+        let known = self
+            .read(None, reader::known_providers)
+            .served()
+            .unwrap_or_default();
+        let mut warned = lock(&self.shared.unnamed_kept);
+        warned.retain(|key| !routes.has_provider(key));
+        for (key, channels, messages) in known {
+            if routes.has_provider(&key) || channels == 0 || !warned.insert(key.clone()) {
+                continue;
+            }
+            tracing::warn!(
+                provider = key.as_str(),
+                channels,
+                messages,
+                "the route snapshot does not name a provider the message cache holds an \
+                 account and saved messages for; keeping them, unserved and unfilled, until \
+                 it is named again or the file is erased"
+            );
+        }
+    }
+
     /// Replace the route snapshot the writer gates on, and sweep every channel and provider not
-    /// in it out of the file.
+    /// in it out of the file — with one exception (`#1070 cache-account-mismatch-guard`): a
+    /// provider the snapshot does not name at all, but the file holds an account record for,
+    /// keeps its rows and its account, unserved and unfilled while unnamed, until a snapshot
+    /// names it again or the file is erased. A missing key is as often a renamed key or a
+    /// foreign configuration pointed at this file as a provider truly retired, and a sweep
+    /// cannot tell those apart; a channel removed under a provider the snapshot does name is
+    /// swept exactly as before.
     ///
     /// Every channel leaving the snapshot has its epoch bumped at once, so a fill already running
     /// for it is dropped. Until the writer has applied the sweep, a channel is readable only if it
@@ -1558,7 +1596,8 @@ impl MessageCache {
     /// the sweep is about to erase, and they must not be served in between. Before the first
     /// sweep of a process has landed, no channel is readable at all. A sweep the file refuses
     /// still erases, once the file takes it, every channel it left out, even one a later snapshot
-    /// names again, and blocks each until then ([`Refused::sweeps`]).
+    /// names again, and blocks each until then ([`Refused::sweeps`]) — the unnamed-provider
+    /// exception above aside, whose rows no sweep erases, refused or not.
     ///
     /// The live feed's changes for a channel off the list reach nothing: the sink offers nothing
     /// for it, and the ingest route refuses an adapter's pushes for it. So every channel this
@@ -1569,6 +1608,7 @@ impl MessageCache {
     /// starts the feed's vouching window ([`MessageCache::fed_since_ms`]).
     pub fn retain_only(&self, routes: RouteSnapshot) {
         let routes = Arc::new(routes);
+        self.note_unnamed_kept(&routes);
         let previous = self
             .shared
             .routes

@@ -1867,6 +1867,7 @@ async fn the_hourly_message_cache_line_is_numbers_and_never_an_id_or_a_word() {
         "orphans_dropped=0",
         "providers_verified=1",
         "providers_suspended=0",
+        "providers_mismatched=0",
         "shadow_asked=2",
         "shadow_would_serve=1",
         "shadow_extra_rows=0",

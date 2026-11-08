@@ -464,7 +464,7 @@ async fn read_main(state: &AppState, channel: &str) -> StatusCode {
 // ---- §6.2: whose account the rows were read as ------------------------------------------------
 
 #[tokio::test]
-async fn the_first_start_records_each_account_and_another_account_erases_only_its_provider() {
+async fn the_first_start_records_each_account_and_another_account_quarantines_only_its_provider() {
     let dir = TempDir::new("cache-access-identity");
     let clock = ManualClock::at(T0 + HOUR);
     {
@@ -487,30 +487,85 @@ async fn the_first_start_records_each_account_and_another_account_erases_only_it
         d.close();
     }
 
-    // The next start: the first provider's credential is now another account's.
+    // The next start: the first provider's credential is now another account's, and it works.
+    // `#1070 cache-account-mismatch-guard`: quarantined, never erased.
+    let capture = testing::LogCapture::start();
     let d = upstream(10, "UA2", "UB1");
-    let state = testing::with_message_cache(d.state.clone(), dir.path(), clock.clone()).await;
+    let state = testing::with_message_cache_unverified(d.state.clone(), dir.path(), clock.clone());
     let d = Deployment { state, ..d };
     let cache = d.cache();
+    settle_until(
+        "the first provider is quarantined, the second verified",
+        || {
+            d.state.message_cache.verification(FIRST) == Verification::Mismatched
+                && d.state.message_cache.verification(SECOND) == Verification::Verified
+        },
+    )
+    .await;
     assert_eq!(
-        held(&cache, &first_chan()),
-        0,
-        "what was read as another account is erased"
+        total(&cache),
+        20,
+        "what was read as another account is kept, not erased"
     );
     assert!(stored_account(&cache, FIRST)
-        .expect("the new account")
-        .is("UA2", None));
+        .expect("the recorded account is not written over")
+        .is("UA1", None));
+    assert!(
+        blocked(&cache, &first_chan(), &CacheScope::Main),
+        "nothing of the quarantined provider is served"
+    );
     assert_eq!(
         held(&cache, &second_chan()),
         10,
-        "the other provider's account matched: nothing of it is erased"
+        "the other provider's account matched: served as before"
     );
     assert!(stored_account(&cache, SECOND)
         .expect("kept")
         .is("UB1", None));
-    // And the first provider fills again, as its new account.
+    // Diagnostics name the quarantined provider and why, and no channel or message ids.
+    let report = d
+        .state
+        .message_cache
+        .report()
+        .await
+        .expect("a diagnostics report");
+    assert!(
+        report
+            .providers
+            .iter()
+            .any(|p| p.provider == FIRST && p.verification == "account_mismatch"),
+        "the report names the provider and the mismatch: {:?}",
+        report.providers
+    );
+    // Nothing is filled for it either: a fresh upstream message reads fine and is not filed.
+    d.fake
+        .seed_at(&id(READ_CHANNEL), "Ada", "a new one", T0 + 30 * MINUTE);
     assert_eq!(read_main(&d.state, READ_CHANNEL).await, StatusCode::OK);
-    assert_eq!(held(&cache, &first_chan()), 10);
+    assert_eq!(total(&cache), 20, "nothing filled while quarantined");
+    let logged = capture.text();
+    assert!(
+        logged.contains("read as another account of this provider")
+            && logged.contains(&format!("provider=\"{FIRST}\"")),
+        "a loud line names the quarantined provider and that its rows are kept: {logged}"
+    );
+    drop(capture);
+
+    // The credential is the recorded account's again (the slip is fixed): asked again on the
+    // suspended schedule, it verifies, and the kept rows are served and filled once more.
+    tokio::time::pause();
+    d.first.answer(Ok(account("UA1")));
+    tokio::time::advance(SUSPENDED_RECHECK + PAST).await;
+    settle_until("the first provider is verified again", || {
+        d.state.message_cache.verification(FIRST) == Verification::Verified
+    })
+    .await;
+    assert_eq!(
+        held(&cache, &first_chan()),
+        10,
+        "the kept rows, served again"
+    );
+    assert_eq!(read_main(&d.state, READ_CHANNEL).await, StatusCode::OK);
+    assert_eq!(held(&cache, &first_chan()), 11, "and filled again");
 }
 
 #[tokio::test]
@@ -674,12 +729,19 @@ async fn slack_deployment(
     slack_deployment_and_store(fake, dir, clock).await.0
 }
 
-/// [`slack_deployment`], and the store behind it.
-async fn slack_deployment_and_store(
+/// A Slack server whose provider's account is not waited for: for a start whose check must
+/// not verify (a quarantined mismatch never does).
+fn slack_deployment_unverified(
     fake: &slack_fake::Fake,
     dir: &TempDir,
     clock: &Arc<ManualClock>,
-) -> (AppState, Arc<FakeStore>) {
+) -> AppState {
+    let (state, _store) = slack_state(fake);
+    testing::with_message_cache_unverified(state, dir.path(), clock.clone())
+}
+
+/// The state and store of a Slack server against `fake`, no cache behind it yet.
+fn slack_state(fake: &slack_fake::Fake) -> (AppState, Arc<FakeStore>) {
     let text = format!(
         r#"
 [auth]
@@ -703,6 +765,16 @@ writable = true
     let (mut state, _discord, store) = testing::state_with_store_from_toml(&text);
     let router = ChatRouter::from_config(&state.config).expect("providers build");
     state.replace_providers(Arc::new(router));
+    (state, store)
+}
+
+/// [`slack_deployment`], and the store behind it.
+async fn slack_deployment_and_store(
+    fake: &slack_fake::Fake,
+    dir: &TempDir,
+    clock: &Arc<ManualClock>,
+) -> (AppState, Arc<FakeStore>) {
+    let (state, store) = slack_state(fake);
     (
         testing::with_message_cache(state, dir.path(), clock.clone()).await,
         store,
@@ -726,7 +798,7 @@ fn slack_history() -> slack_fake::FakeState {
 }
 
 #[tokio::test]
-async fn slacks_workspace_is_auth_tests_team_id_and_another_workspace_erases_the_provider() {
+async fn slacks_workspace_is_auth_tests_team_id_and_another_workspace_quarantines_the_provider() {
     let fake = slack_fake::Fake::start(slack_history(), 10).await;
     let dir = TempDir::new("cache-access-slack-team");
     let clock = ManualClock::at(slack_ms(3_600));
@@ -744,14 +816,23 @@ async fn slacks_workspace_is_auth_tests_team_id_and_another_workspace_erases_the
         drop(state.message_cache.uninstall());
     }
 
-    // The same user id, in another workspace: another account.
+    // The same user id, in another workspace: another account. Quarantined, not erased
+    // (`#1070 cache-account-mismatch-guard`).
     fake.with(|state| state.team = Some("T0000OTHER".to_owned()));
-    let state = slack_deployment(&fake, &dir, &clock).await;
+    let state = slack_deployment_unverified(&fake, &dir, &clock);
     let cache = state.message_cache.cache().expect("installed");
-    assert_eq!(held(&cache, &chan), 0, "read in another workspace: erased");
-    let recorded = stored_account(&cache, SLACK).expect("written");
+    settle_until("the provider is quarantined", || {
+        state.message_cache.verification(SLACK) == Verification::Mismatched
+    })
+    .await;
+    assert_eq!(total(&cache), 6, "read in another workspace: kept");
+    assert!(
+        blocked(&cache, &chan, &CacheScope::Main),
+        "and not served while quarantined"
+    );
+    let recorded = stored_account(&cache, SLACK).expect("the record stands");
     assert_eq!(recorded.account_id, slack_fake::SELF_USER);
-    assert_eq!(recorded.workspace_id.as_deref(), Some("T0000OTHER"));
+    assert_eq!(recorded.workspace_id.as_deref(), Some(slack_fake::TEAM));
 }
 
 // ---- §6.3: access signals -----------------------------------------------------------------------

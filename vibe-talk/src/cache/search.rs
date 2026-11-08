@@ -344,6 +344,9 @@ pub enum SearchRefusal {
     Unverified,
     /// The provider refused the server's credential.
     Suspended,
+    /// The credential works but is another account's than the one the saved rows were read as:
+    /// quarantined, kept but unserved (`#1070 cache-account-mismatch-guard`).
+    AccountMismatch,
     /// Access to the channel is in doubt, or an erase of it is waiting.
     Blocked,
     /// The caller holds the read token, which is never answered from the server's copy.
@@ -360,6 +363,7 @@ impl SearchRefusal {
             Self::NotRouted => "not_kept",
             Self::Unverified => "unverified",
             Self::Suspended => "suspended",
+            Self::AccountMismatch => "account_mismatch",
             Self::Blocked => "in_doubt",
             Self::ReadScope => "read_scope",
         }

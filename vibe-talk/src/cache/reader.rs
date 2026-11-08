@@ -733,6 +733,39 @@ pub(crate) fn thread_list(
     })
 }
 
+/// Every provider the file holds an account record for, with how many channels and messages it
+/// holds for it: the providers a route snapshot that does not name them must not sweep away
+/// (`#1070 cache-account-mismatch-guard`). Detached channels of an erase in progress answer to
+/// no provider key, so they are not counted.
+pub(crate) fn known_providers(
+    connection: &Connection,
+) -> rusqlite::Result<Vec<(String, u64, u64)>> {
+    let mut statement = connection.prepare(
+        "SELECT a.provider_key, COUNT(DISTINCT c.chan), COUNT(m.chan)
+         FROM account a
+         LEFT JOIN channel c ON c.provider_key = a.provider_key
+         LEFT JOIN message m ON m.chan = c.chan
+         GROUP BY a.provider_key",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    rows.map(|row| {
+        row.map(|(key, channels, messages)| {
+            (
+                key,
+                u64::try_from(channels).unwrap_or(0),
+                u64::try_from(messages).unwrap_or(0),
+            )
+        })
+    })
+    .collect()
+}
+
 pub(crate) fn account(
     connection: &Connection,
     provider_key: &str,

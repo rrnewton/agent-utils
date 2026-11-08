@@ -1,10 +1,11 @@
 ---
 title: 'cache-account-mismatch-guard: a mismatched provider account or route snapshot must not erase the message cache'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-08T15:41:55.055152415+00:00
-updated_at: 2026-11-08T15:42:08.355726530+00:00
+updated_at: 2026-11-08T16:14:45.000000000+00:00
+closed_at: 2026-11-08T16:14:45.000000000+00:00
 ---
 
 # Description
@@ -29,3 +30,11 @@ Deliberately decide the revoked-credential path (credential_refused in sink.rs, 
 # Notes
 
 Evidence and provenance: #1058 pr-name-enrichment reindex measurement, 2026-11-08, mu-prnames reporting to coordb. The destructive run was against a reflink copy in /tmp; the deployed store at ~/.local/share/vibe-talk was never opened by the measurement binary and its file is unchanged (20,672,512 bytes before and after). Log proof in the measurement run: cache opened at the copy path, provider identified as the fake discord account, and no erase warning was printed before cache-stats read 0 messages - the retain sweep erases without a log line of its own, which is part of the silence this issue asks to fix. The account-mismatch erase in fn check does WARN (the message cache holds messages read as another account of this provider; erasing them). Searched before filing: no open duplicate - nearest are closed #297 cache-coverage-races and #364 message-cache-test-flakes (both name account-check tests), and open #208 persistent-cache, #356 provider-namespace-per-key, #521 server-side-search, none of which cover mismatch-triggered erasure. Filed only, deliberately not fixed here; coordb assigns.
+
+## Resolution
+
+[muse watermelon-full-preview] Fixed in the delivering commit that carries this close. Both trigger points now refuse instead of deleting. (1) Account check (`cache/sink.rs` `check`): a working credential that answers as another account (or another workspace) than the file records quarantines the provider under a new `Verification::Mismatched` standing (`account_mismatch` in `CacheReport`, with the provider named and no channel or message ids; `providers_mismatched` in the hourly line; `SearchRefusal::AccountMismatch` at the search gate). Nothing of the provider is served or filled, the recorded account is not written over, and nothing is erased. One WARN names the provider and that its rows are kept. The provider is re-asked every `SUSPENDED_RECHECK`; the quarantine ends only when the recorded account answers again, or when the owner erases the cache file (the existing erase switch), after which the answering account is recorded on the fresh file as at a first start. (2) Route snapshot sweep (`MessageCache::retain_only`, enforced in the writer): a snapshot that does not name a provider key at all while the file holds an account record for it keeps that provider's rows and account record, unserved and unfilled while unnamed, returning to service when a later snapshot names the key again; one WARN per provider names it with its channel and message counts. A channel removed under a provider the snapshot does name is swept exactly as before, and sweeps no longer delete any account row (only `erase_provider` and a file erase do).
+
+Revoked-credential decision: KEPT unchanged, deliberately. It is told apart from a mismatch by what the provider itself said. A mismatch is a credential the provider accepts and names as another account; it never refused this server anything, so it erases nothing. A revocation is the provider refusing this credential as gone for good (`token_revoked`, `account_inactive`), or refusing it without pause for `CREDENTIAL_GRACE` (24 h): those rows were read under a credential the provider has cut off, and keeping a copy the provider has withdrawn access to is the privacy harm the erase prevents. The rule and the distinction are documented in the `cache/sink.rs` module documentation. `a_revoked_credential_erases_at_once_and_a_refusal_lasting_a_day_erases` passes unmodified.
+
+Reproduced first, on fixtures only (never a real store): the new unit test `a_snapshot_missing_a_provider_with_an_account_record_keeps_its_rows` failed before the fix with the file's messages going 2 to 0, and the flipped `the_first_start_records_each_account...` access test failed with the file's total going 20 to 10. After: both keep every row; the account test also holds the diagnostics word, the loud log line, serving and filling stopped, and recovery when the recorded account answers again; the Slack workspace variant quarantines the same way; `a_renamed_provider_key_keeps_the_old_ones_rows_until_it_is_named_again` covers the renamed-key shape end to end including the log line and return to service. Existing tests that encoded the old erasure were updated to the new contract (the two access tests above, the renamed-key fill test, and the sweep/summaries test whose removed channel's rows sit under the vanished key). Ordinary channel removal under a named key, the owner erase switch, and the off switch erase as before, with their tests green.

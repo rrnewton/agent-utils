@@ -976,8 +976,9 @@ impl Writer<'_> {
                 account_id,
                 workspace_id,
             } => {
-                // As rows are: a provider the snapshot does not configure is about to be swept,
-                // and its account row with it.
+                // As rows are: no account is written for a provider the snapshot does not
+                // configure. An account row already held for such a provider is kept, with
+                // its rows (`#1070 cache-account-mismatch-guard`).
                 if !self.routed_provider(&provider_key) {
                     Stats::add(&self.shared.stats.ops_unrouted, 1);
                     return;
@@ -2608,20 +2609,41 @@ impl Writer<'_> {
     }
 
     /// Sweep the file to `routes`, when given, and carry out the sweeps to `refused` the file
-    /// refused before: erase every channel any of them leaves out, and the account of every
-    /// provider `routes` does not configure.
+    /// refused before: erase every channel any of them leaves out — except the channels of a
+    /// provider a snapshot does not name at all while the file holds an account record for it
+    /// (`#1070 cache-account-mismatch-guard`). Those rows, and the account record that spares
+    /// them, are kept: a snapshot missing a whole provider key is as often a renamed key or a
+    /// foreign configuration pointed at this file as a provider truly retired, and the sweep
+    /// cannot tell those apart. Only [`Writer::erase_provider`] and a file erase take a
+    /// provider's account row; a channel removed under a provider the snapshot names is
+    /// erased exactly as before.
     fn retain_only(
         &mut self,
         routes: Option<&RouteSnapshot>,
         refused: &[Arc<RouteSnapshot>],
     ) -> rusqlite::Result<()> {
+        let accounts: Vec<String> = {
+            let mut statement = self.conn.prepare("SELECT provider_key FROM account")?;
+            let keys = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            keys
+        };
+        // Whether one snapshot spares a channel the guard covers: the snapshot names neither
+        // the channel nor its provider, and the file holds that provider's account.
+        let spared = |snapshot: &RouteSnapshot, chan: &ChanKey| {
+            !snapshot.has_provider(&chan.provider_key)
+                && accounts.iter().any(|key| key == &chan.provider_key)
+        };
         let doomed: Vec<ChanKey> = self
             .channels()?
             .into_iter()
             .map(|(_, chan)| chan)
             .filter(|chan| {
-                routes.is_some_and(|routes| !routes.allows(chan))
-                    || refused.iter().any(|routes| !routes.allows(chan))
+                routes.is_some_and(|routes| !routes.allows(chan) && !spared(routes, chan))
+                    || refused
+                        .iter()
+                        .any(|routes| !routes.allows(chan) && !spared(routes, chan))
             })
             .collect();
         // Including channels this process never stamped: a fill that started before the sweep,
@@ -2630,20 +2652,6 @@ impl Writer<'_> {
             self.shared.epochs.bump_channel(chan);
         }
         self.detach(&doomed)?;
-        let Some(routes) = routes else {
-            return Ok(());
-        };
-        let accounts: Vec<String> = {
-            let mut statement = self.conn.prepare("SELECT provider_key FROM account")?;
-            let keys = statement
-                .query_map([], |row| row.get(0))?
-                .collect::<rusqlite::Result<Vec<String>>>()?;
-            keys
-        };
-        for key in accounts.iter().filter(|key| !routes.has_provider(key)) {
-            self.conn
-                .execute("DELETE FROM account WHERE provider_key = ?1", [key])?;
-        }
         Ok(())
     }
 
