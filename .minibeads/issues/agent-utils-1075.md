@@ -28,3 +28,26 @@ A consumer reported (2026-11-08) an `agentctl goal <agent> --file F` process, st
 # Notes
 
 Reported by a consumer's coordinator through the lead coordinator. Related: #1061 (another long-lived process ignoring SIGTERM).
+
+## 2026-11-08 findings (cl-start)
+
+Mechanism of the reported process: it was not a goal wait. agentctl runs each bounded Herdr control command through the chat-subscription plugin's `ProcessPluginChild`, which clone3s an atomic supervisor. The supervisor keeps its host's command line (so it showed as `agentctl goal <agent> --file F`), blocks every blockable signal and sits in `pause()`. Until #1061 chat-launch-outer-kill-leak (d83ae91c, landed 2026-11-08), a supervisor whose host was killed mid-command (for example by an outer timeout's SIGKILL) was never taken down: it was re-parented to the user manager, ignored SIGTERM and stayed parked indefinitely. That matches every reported symptom. The reporter's binary, f8b834e5, predates d83ae91c (checked with `git merge-base --is-ancestor`). Since d83ae91c the supervisor polls `getppid()` every 0.5 s and SIGKILLs its group once its host is gone. **Consumers must refresh their agentctl past d83ae91c.**
+
+The same mechanism explains the test watchers the coordinator killed before removing a slot on 2026-11-08: `agentctl-service-stop-*` and `w870.*` watch-agents from 11-04 and 11-07, and a `test_launch_bridge_killed_first` chat run from 11-03. All of them predate d83ae91c. The service-stop tests kill the watch-agents process group, but the supervisor leads a private group of its own, so the group kill missed it. A run of `rs/agentctl/tests/service_stop.rs` on current main leaves no process naming its scratch registry.
+
+What current main still waited on without bound: `goal` took the agent's lifecycle lock with no limit, while `send` bounds the same lock by its send deadline (#702).
+
+Changes:
+
+- `goal` takes the lock through `delivery_lock` under the send deadline, as `send` does, and passes the remaining deadline to the delivery.
+- `goal` gains `--deadline` (default: `send_deadline_seconds` in the registry's settings.json, else 600 s), documented in its help.
+
+An archive or stop of the target needs the same lock. So, while waiting, `goal` either gives up at the deadline (exit 75, nothing recorded) or, once the archive releases the lock, exits at once with `unknown agent "<name>"`. It never recreates the archived record.
+
+Tests are in `rs/agentctl/tests/goal_bounds.rs`:
+
+- a held lock gives up at `--deadline 2`; with the fix reverted the test hangs;
+- an agent archived mid-wait gives a prompt `unknown agent` error, with no record recreated;
+- the help documents `--deadline` and its default;
+- SIGTERM during a hung Herdr command ends `goal` within 2 s and leaves no process behind;
+- SIGKILL during a hung Herdr command leaves no supervisor behind.

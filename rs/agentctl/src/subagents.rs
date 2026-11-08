@@ -13253,7 +13253,9 @@ its drain would also type, so it was not queued",
         if text.trim().is_empty() || text.contains(['\n', '\r']) {
             return Err(fail("goal must be a nonempty single line"));
         }
-        let _lock = self.lock(agent_name)?;
+        // The lock and the delivery share the send deadline (#1075 agentctl-goal-wait-unbounded):
+        // a goal never waits without bound behind a stop, an archive or another send.
+        let (_lock, options) = self.delivery_lock(agent_name, options, None, false)?;
         let mut record = self.load(agent_name)?;
         record.input_allowed()?;
         if record.adapter == "herdr-relay" && record.harness == "codex" {

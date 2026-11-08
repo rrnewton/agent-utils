@@ -324,7 +324,7 @@ enum Commands {
     Wait(Wait),
     /// Inspect a goal or set an ongoing objective (native /goal for Codex)
     #[command(
-        after_help = "Examples:\n  agentctl goal reviewer\n  agentctl goal reviewer 'Complete the review and report blockers'"
+        after_help = "Examples:\n  agentctl goal reviewer\n  agentctl goal reviewer 'Complete the review and report blockers'\n  agentctl goal reviewer --file goal.txt --deadline 120\n\nSetting a goal is bounded like a send: the wait for the agent's lock, the queue and pane locks,\nand readiness all end by --deadline (default: send_deadline_seconds in the registry's\nsettings.json, else 600 s), with exit 75 and the goal's prompt left pending. A stop or archive\nof the agent waits for that lock too, so it proceeds once the goal is typed or gives up.\nSIGTERM, SIGINT and SIGHUP end the command at once, and a Herdr command it was running ends\nwith it."
     )]
     Goal(Goal),
     /// Bind an explicitly known native conversation ID to a verified agent pane
@@ -1550,6 +1550,9 @@ struct Goal {
     /// JSON argv array for a native Codex goal-reader command
     #[arg(long, value_name = "JSON", value_parser = command_json)]
     goal_command_json: Option<GoalCommand>,
+    /// Hard wall-clock limit in seconds for setting the goal, counted from its start: the wait for the agent's lock (held, for example, by a stop, an archive or another send), the queue and pane locks, and readiness all end by then, and a goal still untyped then gives up with exit 75, leaving its prompt pending. A prompt being typed is finished first (bounded by --working-timeout). Interactive agents only (default: send_deadline_seconds in the registry's settings.json, else 600)
+    #[arg(long, value_name = "SECONDS", value_parser = positive_seconds)]
+    deadline: Option<f64>,
     #[command(flatten)]
     delivery: Delivery,
 }
@@ -4657,7 +4660,10 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Commands::Goal(value) => manager.goal(
             &value.agent.name,
             value.prompt.read().map_err(Failure::Usage)?.as_deref(),
-            value.delivery.options(),
+            DrainOptions {
+                deadline: value.deadline.map(Duration::from_secs_f64),
+                ..value.delivery.options()
+            },
             value
                 .goal_command_json
                 .as_ref()
