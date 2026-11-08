@@ -248,8 +248,11 @@ impl SearchText {
     /// glued tables repaired (`markdown-tables-render`). `render-3`: a line end at each block's
     /// edge and each `<br>`, and only web links' addresses, as the page reads a body (`#604
     /// server-side-search`). `render-4`: a README link labelled by its folder (`#620
-    /// link-url-chip`).
-    pub const VERSION: &'static str = "render-4";
+    /// link-url-chip`). `render-5`: a link written as a bare reference to its own thread
+    /// (`#5275`, `PR 5275`) drawn by that thread's `REPO#N` label (`#1058 pr-name-enrichment`);
+    /// the name a page label may also carry is never indexed, so no fetched text is in this
+    /// version's key and rebuilding under it fetches nothing.
+    pub const VERSION: &'static str = "render-5";
 
     /// The rendering for every provider `config` names, each with its own markup.
     #[must_use]
@@ -279,8 +282,14 @@ impl SearchText {
         bot: bool,
         mentions: &[MentionName],
     ) -> crate::cache::Rendered {
-        let (html, _heading) =
-            headed_body_by(render_named, text, markup, bot, &|_| false, mentions);
+        let (html, _heading) = headed_body_by(
+            render_named_for_index,
+            text,
+            markup,
+            bot,
+            &|_| false,
+            mentions,
+        );
         if html.is_empty() {
             return crate::cache::Rendered {
                 text: text.to_owned(),
@@ -710,11 +719,30 @@ pub fn to_html_named(text: &str, markup: Markup, mentions: &[MentionName]) -> St
     html
 }
 
+/// Whether one render draws thread names (`#1058 pr-name-enrichment`, [`crate::pr_names`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Names {
+    /// A body for the page: a held name is drawn in its thread's label, and a thread with
+    /// none is wanted by the background learner. Only a real read renders this way.
+    Page,
+    /// A body drawn to be read back as text — the search index, the read-aloud blocks: no
+    /// name is drawn and none is wanted, so what it draws depends only on its source, and an
+    /// index rebuild or a read-aloud prefetch can never queue a fetch.
+    TextOnly,
+}
+
 /// [`to_html_named`] without the cache: neither read nor written. For the message cache's
 /// full-text index, which renders every message it holds when it rebuilds, and would otherwise
 /// push the bodies the timeline is reading out of [`RENDERED`] with old ones.
 fn render_named(text: &str, markup: Markup, mentions: &[MentionName]) -> String {
-    render_visiting(text, markup, mentions, |_, _| ()).0
+    render_visiting(text, markup, mentions, Names::Page, |_, _| ()).0
+}
+
+/// [`render_named`] for the search index: drawn as the page draws it but for thread names,
+/// which are neither drawn nor wanted ([`Names::TextOnly`]), so the index's text stays a
+/// function of the message alone and rebuilding it fetches nothing.
+fn render_named_for_index(text: &str, markup: Markup, mentions: &[MentionName]) -> String {
+    render_visiting(text, markup, mentions, Names::TextOnly, |_, _| ()).0
 }
 
 /// The bytes one generation of [`RENDERED`] holds before it becomes the old one: its bodies' text
@@ -726,8 +754,10 @@ pub const RENDERED_GENERATION_BYTES: usize = 8 * 1024 * 1024;
 /// code block costs milliseconds, and the timeline sends the same window again on every refresh.
 ///
 /// What a body renders to depends only on its text, its markup, the single-newline rule it is drawn
-/// under and the names of its mentions, so those are the key, compared in full: a hash only finds
-/// the candidates. Two generations, each
+/// under, the names of its mentions and the stamp of the thread names it was drawn with
+/// ([`crate::pr_names::stamp`]: a name learned in the background is in a body from its next
+/// read, not whenever this cache happens to drop it), so those are the key, compared in full: a
+/// hash only finds the candidates. Two generations, each
 /// bounded by [`RENDERED_GENERATION_BYTES`]: a body is put in the young one, and when that is full
 /// it becomes the old one and the oldest are dropped. A body found in the old generation moves to
 /// the young one, so what is still being read stays.
@@ -751,6 +781,8 @@ struct RenderedBody {
     rule: SingleNewline,
     text: String,
     mentions: Vec<MentionName>,
+    /// The thread-name stamp this body was drawn under ([`crate::pr_names::stamp`]).
+    names_stamp: u64,
     html: String,
 }
 
@@ -761,8 +793,13 @@ impl RenderedBody {
         markup: Markup,
         rule: SingleNewline,
         mentions: &[MentionName],
+        names_stamp: u64,
     ) -> bool {
-        self.markup == markup && self.rule == rule && self.text == text && self.mentions == mentions
+        self.markup == markup
+            && self.rule == rule
+            && self.text == text
+            && self.mentions == mentions
+            && self.names_stamp == names_stamp
     }
 
     /// What the entry holds, counted generously: its strings, its mentions, and a fixed allowance
@@ -806,6 +843,7 @@ impl RenderCache {
         mentions: &[MentionName],
     ) -> Option<String> {
         let key = self.key(text, markup, rule, mentions);
+        let names_stamp = crate::pr_names::stamp();
         let mut generations = self
             .generations
             .lock()
@@ -813,14 +851,14 @@ impl RenderCache {
         if let Some(found) = generations.young.get(&key).and_then(|bodies| {
             bodies
                 .iter()
-                .find(|body| body.is(text, markup, rule, mentions))
+                .find(|body| body.is(text, markup, rule, mentions, names_stamp))
         }) {
             return Some(found.html.clone());
         }
         let bodies = generations.old.get_mut(&key)?;
         let at = bodies
             .iter()
-            .position(|body| body.is(text, markup, rule, mentions))?;
+            .position(|body| body.is(text, markup, rule, mentions, names_stamp))?;
         let body = bodies.swap_remove(at);
         let html = body.html.clone();
         generations.insert(key, body);
@@ -841,6 +879,7 @@ impl RenderCache {
             rule,
             text: text.to_owned(),
             mentions: mentions.to_vec(),
+            names_stamp: crate::pr_names::stamp(),
             html: html.to_owned(),
         };
         self.generations
@@ -853,10 +892,15 @@ impl RenderCache {
 impl Generations {
     fn insert(&mut self, key: u64, body: RenderedBody) {
         let bodies = self.young.entry(key).or_default();
-        if bodies
-            .iter()
-            .any(|have| have.is(&body.text, body.markup, body.rule, &body.mentions))
-        {
+        if bodies.iter().any(|have| {
+            have.is(
+                &body.text,
+                body.markup,
+                body.rule,
+                &body.mentions,
+                body.names_stamp,
+            )
+        }) {
             return;
         }
         self.young_bytes += body.bytes();
@@ -871,7 +915,7 @@ impl Generations {
 /// [`to_html`] under the single-newline rule `rule`, whatever this process was configured with.
 #[must_use]
 pub fn to_html_as(text: &str, markup: Markup, rule: SingleNewline) -> String {
-    render_visiting_as(text, markup, &[], rule, |_, _| ()).0
+    render_visiting_as(text, markup, &[], rule, Names::Page, |_, _| ()).0
 }
 
 /// [`to_html_named`], handing the parsed and adjusted tree, and the text it was parsed from, to
@@ -881,9 +925,17 @@ fn render_visiting<T>(
     text: &str,
     markup: Markup,
     mentions: &[MentionName],
+    names: Names,
     visit: impl for<'a> FnOnce(&'a AstNode<'a>, &str) -> T,
 ) -> (String, Option<T>) {
-    render_visiting_as(text, markup, mentions, newline_rule(text, markup), visit)
+    render_visiting_as(
+        text,
+        markup,
+        mentions,
+        newline_rule(text, markup),
+        names,
+        visit,
+    )
 }
 
 /// [`render_visiting`] under the single-newline rule `rule`.
@@ -892,6 +944,7 @@ fn render_visiting_as<T>(
     markup: Markup,
     mentions: &[MentionName],
     rule: SingleNewline,
+    names: Names,
     visit: impl for<'a> FnOnce(&'a AstNode<'a>, &str) -> T,
 ) -> (String, Option<T>) {
     if text.len() > MAX_RENDERED_BYTES {
@@ -928,7 +981,7 @@ fn render_visiting_as<T>(
             }
         }
     }
-    let linked = adjust(&arena, root, &source, &inserted, markup, mentions);
+    let linked = adjust(&arena, root, &source, &inserted, markup, mentions, names);
     // Measured again: nesting the lists the writer indented makes the tree deeper than it parsed.
     if deeper_than(root, MAX_DEPTH) {
         return (plain_html(text), None);
@@ -1069,12 +1122,15 @@ pub struct SourceBlock {
 /// One block, the whole text, when the tree and the HTML disagree about the blocks.
 #[must_use]
 pub fn source_blocks(text: &str, markup: Markup, mentions: &[MentionName]) -> Vec<SourceBlock> {
-    let (html, walked) = render_visiting(text, markup, mentions, |root, source| {
-        let lines = line_starts(source);
-        let mut found = Vec::new();
-        tree_blocks(root, source, &lines, Walk::Blocks, &mut found);
-        found
-    });
+    // Read-aloud blocks are cut from the source, and a prefetch of them is no page read:
+    // drawn without thread names ([`Names::TextOnly`]), which the block kinds never depended on.
+    let (html, walked) =
+        render_visiting(text, markup, mentions, Names::TextOnly, |root, source| {
+            let lines = line_starts(source);
+            let mut found = Vec::new();
+            tree_blocks(root, source, &lines, Walk::Blocks, &mut found);
+            found
+        });
     let Some(blocks) = walked.filter(|_| html != plain_html(text)) else {
         // Drawn as plain paragraphs, by the page from the text itself.
         return plain_blocks(text);
@@ -2358,6 +2414,7 @@ fn adjust<'a>(
     inserted: &[usize],
     markup: Markup,
     mentions: &[MentionName],
+    names: Names,
 ) -> usize {
     let lines = line_starts(source);
     nest_lists(
@@ -2437,7 +2494,7 @@ fn adjust<'a>(
             }
             NodeValue::Link(_) => {
                 drop(ast);
-                label_link(node);
+                label_link(node, names);
             }
             NodeValue::Text(text) => {
                 let pieces = mention_pieces(text, mentions);
@@ -2581,19 +2638,28 @@ fn unwrap_link<'a>(
     note
 }
 
-/// Give a link whose visible text is its own address a short label, when
+/// Give a link whose visible text says nothing but where it goes a short label, when
 /// [`crate::link_labels`] has one for it, and the address as its `title`. `#227
-/// github-link-abbrev`.
+/// github-link-abbrev`, and `#1058 pr-name-enrichment` for the name a thread's label carries.
 ///
 /// ON THE PARSED TREE, never the source, so what is a link is comrak's answer: a bare address, an
 /// address in angle brackets, and the chat services' `<address|address>` once [`Markup::prepare`]
 /// has made that a link. Code is never a link, so no code is ever relabelled. A link its writer
 /// named keeps the name — the label replaces only text that said nothing but where the link goes —
-/// and `www.example` is its own address as much as `http://www.example` is.
+/// and `www.example` is its own address as much as `http://www.example` is. Text that is only a
+/// bare reference to the very thread the address names says as little: `5275`, `#5275`, `PR 5275`,
+/// `REPO#5275` ([`crate::link_labels::bare_reference`]), so it is labelled the same way, while a
+/// reference to any other thread, repository or kind keeps its writer's words.
+///
+/// A thread's name, when this render may draw one ([`Names::Page`]), comes from
+/// [`crate::pr_names`] by a memory lookup that never waits: held, it is in the label; unheld,
+/// the plain `REPO#N` stands and the thread is wanted by the background learner. The name is a
+/// text node here, escaped as text is drawn, and never an attribute — the only attribute this
+/// sets is the `title`, and that is the address itself.
 ///
 /// Every other link loses any title the message gave it, as it always has: the sanitizer keeps a
 /// link's title now, and the only one it may keep is the one written here.
-fn label_link<'a>(node: &'a AstNode<'a>) {
+fn label_link<'a>(node: &'a AstNode<'a>, names: Names) {
     let mut ast = node.data.borrow_mut();
     let NodeValue::Link(link) = &mut ast.value else {
         return;
@@ -2606,11 +2672,29 @@ fn label_link<'a>(node: &'a AstNode<'a>) {
             _ => return,
         }
     }
-    let address = crate::link_labels::strip_scheme(&link.url).unwrap_or(&link.url);
-    if shown.is_empty() || crate::link_labels::strip_scheme(&shown).unwrap_or(&shown) != address {
+    if shown.is_empty() {
         return;
     }
-    let Some(label) = crate::link_labels::short_label(&link.url) else {
+    let address = crate::link_labels::strip_scheme(&link.url).unwrap_or(&link.url);
+    let thread = crate::link_labels::thread_ref(&link.url);
+    let is_address = crate::link_labels::strip_scheme(&shown).unwrap_or(&shown) == address;
+    if !is_address
+        && !thread
+            .as_ref()
+            .is_some_and(|thread| crate::link_labels::bare_reference(&shown, thread))
+    {
+        return;
+    }
+    let name = match (names, &thread) {
+        (Names::Page, Some(thread)) => crate::pr_names::name_for(thread, true),
+        _ => None,
+    };
+    let label = match &name {
+        Some(name) => crate::link_labels::named_label(&link.url, name)
+            .or_else(|| crate::link_labels::short_label(&link.url)),
+        None => crate::link_labels::short_label(&link.url),
+    };
+    let Some(label) = label else {
         return;
     };
     link.title = link.url.clone();
@@ -4141,6 +4225,119 @@ mod tests {
         );
     }
 
+    // --- links written as their number, and a thread's name: `#1058 pr-name-enrichment` -----
+
+    #[test]
+    fn a_link_written_as_its_number_is_labelled_like_its_address() {
+        let pull = format!("{REPO}/pull/12");
+        for text in [
+            format!("[12]({pull})"),
+            format!("[#12]({pull})"),
+            format!("[PR 12]({pull})"),
+            format!("[PR #12]({pull})"),
+            format!("[widgets#12]({pull})"),
+            format!("[octo/widgets#12]({pull})"),
+        ] {
+            assert_eq!(
+                html(&text),
+                format!("<p>{}</p>\n", short(&pull, "widgets#12")),
+                "{text:?}"
+            );
+        }
+        // Words of the writer's, another thread's number, another repository, another kind:
+        // all keep the text they were given, title and all (that is, none).
+        for text in [
+            format!("[the fix]({pull})"),
+            format!("[the fix in #12]({pull})"),
+            format!("[#13]({pull})"),
+            format!("[PR 13]({pull})"),
+            format!("[gizmos#12]({pull})"),
+            format!("[issue 12]({pull})"),
+        ] {
+            let shown = text
+                .strip_prefix('[')
+                .and_then(|rest| rest.split(']').next())
+                .expect("the text between the brackets");
+            assert_eq!(
+                html(&text),
+                format!("<p>{}</p>\n", anchor(&pull, shown)),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_thread_name_is_drawn_and_an_unheld_one_is_only_wanted() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let names = Arc::new(crate::pr_names::Names::new(HashMap::new()));
+        let _installed = crate::pr_names::NamesGuard::set(Arc::clone(&names));
+        let pull = format!("{REPO}/pull/12");
+        let text = format!("landed [#12]({pull}) and the rest");
+        // Nothing held: the plain label of before, and the thread is wanted in the
+        // background. Rendering itself asked nobody anything — there is no fetcher on this
+        // path to ask, so a queue entry is the whole of the evidence needed.
+        assert_eq!(
+            html(&text),
+            format!(
+                "<p>landed {} and the rest</p>\n",
+                short(&pull, "widgets#12")
+            )
+        );
+        assert_eq!(names.wanted_len(), 1);
+        // The name lands; the SAME body, read again, carries it (the render cache keys on
+        // the names' generation, so the cached plain body is not served past it).
+        let thread = crate::link_labels::thread_ref(&pull).expect("a thread");
+        names.learn(&thread, "Repair the sprocket");
+        assert_eq!(
+            html(&text),
+            format!(
+                "<p>landed {} and the rest</p>\n",
+                short(&pull, "widgets#12 Repair the sprocket")
+            )
+        );
+        // A bare address carries it too, and a named link still keeps its writer's words.
+        assert_eq!(
+            html(&format!("landed {pull}")),
+            format!(
+                "<p>landed {}</p>\n",
+                short(&pull, "widgets#12 Repair the sprocket")
+            )
+        );
+        assert_eq!(
+            html(&format!("[the fix]({pull})")),
+            format!("<p>{}</p>\n", anchor(&pull, "the fix"))
+        );
+    }
+
+    #[test]
+    fn a_malicious_thread_name_is_text_and_never_markup() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let names = Arc::new(crate::pr_names::Names::new(HashMap::new()));
+        let _installed = crate::pr_names::NamesGuard::set(Arc::clone(&names));
+        let pull = format!("{REPO}/pull/12");
+        let thread = crate::link_labels::thread_ref(&pull).expect("a thread");
+        names.learn(
+            &thread,
+            "<script>alert(1)</script> \" onmouseover=\"x \u{202e}evil\u{202c}",
+        );
+        let drawn = html(&format!("landed {pull}"));
+        assert!(!drawn.contains("<script>"), "{drawn}");
+        assert!(drawn.contains("&lt;script&gt;"), "{drawn}");
+        assert!(
+            !drawn.contains('\u{202e}'),
+            "no bidi control rides in a name: {drawn}"
+        );
+        // The name is in no attribute: the title is the address, character for character,
+        // and the href goes where it always went.
+        assert!(
+            drawn.contains(&format!("href=\"{pull}\" title=\"{pull}\"")),
+            "{drawn}"
+        );
+        assert!(!drawn.contains("onmouseover=\"x \">"), "{drawn}");
+    }
+
     #[test]
     fn each_kind_of_github_page_has_its_label_in_a_rendered_body() {
         // The rules are `link_labels`'s and tested there; here, that every shape reaches the page.
@@ -5016,6 +5213,10 @@ mod search_text_tests {
             false,
         ),
         (
+            "landed [#12](https://github.com/octo/widgets/pull/12), [PR 12](https://github.com/octo/widgets/pull/12) and [the fix](https://github.com/octo/widgets/pull/12)",
+            false,
+        ),
+        (
             "the notes: https://github.com/octo/widgets/blob/main/docs/README.md",
             false,
         ),
@@ -5053,6 +5254,10 @@ mod search_text_tests {
             "render-4",
             "e71d6f3dadae6759ba0a1337712afa3711f92a6e875e7eff62578e4e610de1d9",
         ),
+        (
+            "render-5",
+            "0380ec298f8053549b6d60cb5338b9516226c992700a82d8fa781910810b704c",
+        ),
     ];
 
     fn corpus_digest() -> String {
@@ -5068,6 +5273,34 @@ mod search_text_tests {
         }
         let digest = ring::digest::digest(&ring::digest::SHA256, all.as_bytes());
         digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// `#1058 pr-name-enrichment`, a condition of its landing: the index path is not a read,
+    /// so drawing the whole corpus for it — the work a `render-5` reindex does over every
+    /// cached message — wants no name fetched and indexes none, held or not.
+    #[test]
+    fn drawing_the_corpus_for_the_index_wants_and_indexes_no_thread_name() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let names = Arc::new(crate::pr_names::Names::new(HashMap::new()));
+        let _installed = crate::pr_names::NamesGuard::set(Arc::clone(&names));
+        for markup in [Markup::Discord, Markup::GoogleChat, Markup::Slack] {
+            for (body, bot) in CORPUS {
+                let _ = SearchText::drawn(body, markup, *bot);
+            }
+        }
+        assert_eq!(
+            names.wanted_len(),
+            0,
+            "indexing must never queue a name fetch"
+        );
+        // A held name changes no index text either: the label is the number's, as drawn.
+        let pull = "https://github.com/octo/widgets/pull/12";
+        let thread = crate::link_labels::thread_ref(pull).expect("a thread");
+        names.learn(&thread, "Repair the sprocket");
+        let drawn = SearchText::drawn(&format!("landed [#12]({pull})"), Markup::Discord, false);
+        assert_eq!(drawn.text, "landed widgets#12");
+        assert_eq!(names.wanted_len(), 0);
     }
 
     #[test]

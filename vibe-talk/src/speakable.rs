@@ -634,17 +634,21 @@ fn link_at(
     }
     let end = parens.from(chars, close + 2)?;
     let label: String = chars[start + 1..close].iter().collect();
+    let target: String = chars[close + 2..end].iter().collect();
+    let target = target.split_whitespace().next().unwrap_or_default();
+    let target = target.trim_start_matches('<').trim_end_matches('>');
     let said = if label.trim().is_empty() {
         // Nothing to say but where it goes: `[](https://…)`, or Discord's `[](<https://…>)`.
-        let target: String = chars[close + 2..end].iter().collect();
-        let target = target.split_whitespace().next().unwrap_or_default();
-        let target = target.trim_start_matches('<').trim_end_matches('>');
         let chars: Vec<char> = target.chars().collect();
         if address_prefix_at(&chars, 0).is_some() {
             say_address(target)
         } else {
             "a link".to_owned()
         }
+    } else if bare_reference_said(&label, target) {
+        // A label that is only the thread's number (`[#5275](…)`) is said as the page it goes
+        // to, name and all, exactly as the bare address is.
+        say_address(target)
     } else {
         // The label wins over the address, and is prose like any other: emphasis comes off it,
         // and an address written as the label is said as what it is.
@@ -676,12 +680,27 @@ fn angle_address_at(chars: &[char], start: usize) -> Option<(String, usize)> {
     if address.chars().any(char::is_whitespace) {
         return None;
     }
-    let said = if label.is_empty() {
+    let said = if label.is_empty() || bare_reference_said(label, address) {
         say_address(address)
     } else {
         strip_inline(label)
     };
     Some((said, close + 1 - start))
+}
+
+/// Whether `label` says nothing but which thread `target` goes to, so the target is said as
+/// its page instead of the label being read out as a number. `#1058 pr-name-enrichment`; the
+/// rule is [`crate::link_labels::bare_reference`]'s, the same one the page labels by.
+fn bare_reference_said(label: &str, target: &str) -> bool {
+    let with_scheme;
+    let address = if crate::link_labels::strip_scheme(target).is_some() {
+        target
+    } else {
+        with_scheme = format!("https://{target}");
+        &with_scheme
+    };
+    crate::link_labels::thread_ref(address)
+        .is_some_and(|thread| crate::link_labels::bare_reference(label, &thread))
 }
 
 /// One of Discord's `<…>` forms, and how many characters it took.
@@ -733,6 +752,15 @@ fn say_address(address: &str) -> String {
         with_scheme = format!("https://{address}");
         &with_scheme
     };
+    // A thread whose name is already held is said with it (`#1058 pr-name-enrichment`). Held
+    // is the whole of it: speech only ever looks a name up, it never wants one fetched.
+    if let Some(thread) = crate::link_labels::thread_ref(address) {
+        if let Some(name) = crate::pr_names::cached_name(&thread) {
+            if let Some(said) = crate::link_labels::named_spoken_label(address, &name) {
+                return said;
+            }
+        }
+    }
     if let Some(said) = crate::link_labels::spoken_label(address) {
         return said;
     }
@@ -1564,6 +1592,46 @@ mod tests {
         // An address in angle brackets is said whatever its length.
         let long = format!("open <https://example.com/{}> now", "a".repeat(300));
         assert_eq!(say(&long), "open a link on example.com now");
+    }
+
+    #[test]
+    fn a_thread_whose_name_is_held_is_said_with_it_and_speech_wants_nothing() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let names = Arc::new(crate::pr_names::Names::new(HashMap::new()));
+        let _installed = crate::pr_names::NamesGuard::set(Arc::clone(&names));
+        let pull = format!("{WIDGETS}/pull/41");
+        // Nothing held: said as before, and saying it wanted nothing fetched — speech is not
+        // a page read, and a read-aloud prefetch must never queue work.
+        assert_eq!(
+            say(&format!("landed {pull}")),
+            "landed widgets pull request 41"
+        );
+        assert_eq!(
+            say(&format!("landed [#41]({pull})")),
+            "landed widgets pull request 41",
+            "a label that is only the number is said as its page, unheld name or not"
+        );
+        assert_eq!(names.wanted_len(), 0);
+        // Held: the name is part of what the page is, every way the link is written.
+        let thread = crate::link_labels::thread_ref(&pull).expect("a thread");
+        names.learn(&thread, "Repair the sprocket");
+        for text in [
+            format!("landed {pull}"),
+            format!("landed [PR 41]({pull})"),
+            format!("landed [widgets#41]({pull})"),
+            format!("landed <{pull}>"),
+            format!("landed <{pull}|#41>"),
+        ] {
+            assert_eq!(
+                say(&text),
+                "landed widgets pull request 41, Repair the sprocket",
+                "{text}"
+            );
+        }
+        // A writer's own words still win, name held or not.
+        assert_eq!(say(&format!("[the fix]({pull})")), "the fix");
+        assert_eq!(names.wanted_len(), 0);
     }
 
     #[test]

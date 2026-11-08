@@ -591,7 +591,12 @@ impl Default for SpeakableConfig {
 /// `${name}`, for example `{ pattern = '\bD([0-9]{6,})\b', url = 'https://review.example.invalid/D$1'
 /// }`. Empty by default; a rule that cannot be used refuses the configuration when it loads. See
 /// [`crate::render::references`].
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+///
+/// `pr_names` (on unless `false`) lets a GitHub thread drawn as `REPO#N` carry the thread's
+/// name, learned in the background and cached beside the store; `pr_names_file` names an
+/// operator's file of curated short names that win over fetched titles. See
+/// [`crate::pr_names`].
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RenderConfig {
     /// What a single newline inside a paragraph is. Defaults to soft.
@@ -600,6 +605,29 @@ pub struct RenderConfig {
     /// Reference ids drawn as links, checked when the configuration loads. Defaults to none.
     #[serde(default)]
     pub reference_links: Vec<crate::render::references::ReferenceLinkRule>,
+    /// Whether a GitHub thread link drawn as `REPO#N` also carries the thread's name
+    /// (`#1058 pr-name-enrichment`): the server learns names in the background through the
+    /// `[documents]` GitHub token and proxy, under a strict request budget. On by default,
+    /// and off-network safe either way — a name not yet learned is the plain label of
+    /// `#227 github-link-abbrev`. Off means no name is ever looked up, fetched or drawn;
+    /// the address-derived short labels stand either way.
+    #[serde(default = "yes")]
+    pub pr_names: bool,
+    /// A file of curated short names for threads, a JSON object from `OWNER/REPO#N` to a
+    /// name, winning over any fetched title. Read at startup, never written by the server.
+    #[serde(default)]
+    pub pr_names_file: Option<PathBuf>,
+}
+
+impl Default for RenderConfig {
+    fn default() -> Self {
+        Self {
+            single_newline: crate::render::SingleNewline::default(),
+            reference_links: Vec::new(),
+            pr_names: true,
+            pr_names_file: None,
+        }
+    }
 }
 
 /// `[render]` as the file says it, once every reference link rule is one the renderer can use.

@@ -791,6 +791,15 @@ async fn main() -> anyhow::Result<()> {
         config.elevenlabs.clone(),
     );
     let documents = vibe_talk::documents::service_for(&config);
+    // `#1058 pr-name-enrichment`: thread names for the labels `REPO#N` carries, installed
+    // where the renderer's other configuration is, and learned in the background through the
+    // documents fetcher's token under its own request budget. Off (`[render] pr_names =
+    // false`) installs nothing and fetches nothing.
+    if let Some(names) = vibe_talk::pr_names::service_for(&config) {
+        vibe_talk::pr_names::install(Arc::clone(&names));
+        let fetcher = vibe_talk::pr_names::fetcher_for(&config);
+        tokio::spawn(names.run(fetcher));
+    }
     let live_limit = config.chat.default_fetch_limit;
     // remote-ops-audit W5: at most one thread-naming read per channel per this many seconds.
     let thread_names = Arc::new(vibe_talk::summarize::threads::ThreadNames::with_interval(

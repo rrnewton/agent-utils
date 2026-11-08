@@ -698,7 +698,14 @@ mod tests {
             runs[runs.len() / 2]
         }
         fn uncached(text: &str) -> String {
-            crate::render::render_visiting(text, Markup::Discord, &[], |_, _| ()).0
+            crate::render::render_visiting(
+                text,
+                Markup::Discord,
+                &[],
+                crate::render::Names::TextOnly,
+                |_, _| (),
+            )
+            .0
         }
 
         // Two hundred lines of real Rust: this file's own.

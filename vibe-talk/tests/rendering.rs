@@ -563,6 +563,61 @@ async fn a_status_line_of_pull_request_addresses_reaches_the_page_as_short_links
     }
 }
 
+#[tokio::test]
+async fn a_thread_whose_name_is_held_reaches_the_page_with_it() {
+    // `#1058 pr-name-enrichment`, end to end over HTTP: with the names of two threads held in
+    // the installed cache, a bare address and a link written as its number both arrive as
+    // REPO#N and the name, while a link its writer named keeps its words. A repository no
+    // other test in this file mentions, so installing the service here names nothing else's.
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let curated = std::collections::HashMap::from([
+            (
+                "octo/doohickey#77".to_owned(),
+                "repair the sprocket".to_owned(),
+            ),
+            (
+                "octo/doohickey#78".to_owned(),
+                "name the threads".to_owned(),
+            ),
+        ]);
+        vibe_talk::pr_names::install(std::sync::Arc::new(vibe_talk::pr_names::Names::new(
+            curated,
+        )));
+    });
+    let (router, discord) = threaded(&vibe_talk::testing::config_toml());
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let bare = "https://github.com/octo/doohickey/pull/77";
+    let numbered = "https://github.com/octo/doohickey/pull/78";
+    let text =
+        format!("Landed {bare} and [#78]({numbered}), per [the plan]({bare}) and #79 in words");
+    discord.seed(&channel, "an agent", &text);
+    let body = get_json(
+        &router,
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/timeline?view=flat"),
+    )
+    .await;
+    let message = with_text(&body, &text);
+    let html = message["content_html"].as_str().expect("rendered");
+    for (address, label) in [
+        (bare, "doohickey#77 repair the sprocket"),
+        (numbered, "doohickey#78 name the threads"),
+    ] {
+        let link = format!(
+            "<a href=\"{address}\" title=\"{address}\" target=\"_blank\" \
+             rel=\"noopener noreferrer nofollow\">{label}</a>"
+        );
+        assert!(html.contains(&link), "no {label} in {html}");
+    }
+    assert!(
+        html.contains(&format!(">{}</a>", "the plan")),
+        "a named link keeps its words: {html}"
+    );
+    // A plain-text number with no link names no repository, and is left as written in P1.
+    assert!(html.contains("and #79 in words"), "{html}");
+    assert_eq!(message["content"], text.as_str());
+}
+
 /// A response's body length, and its `content-encoding`.
 async fn fetched(
     router: &axum::Router,

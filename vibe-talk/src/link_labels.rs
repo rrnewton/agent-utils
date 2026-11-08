@@ -64,6 +64,24 @@
 //! ANOTHER repository. An address holding any of these, or a control character or a space a
 //! browser would drop or trip over, is left as written.
 //!
+//! # A thread's name (`#1058 pr-name-enrichment`)
+//!
+//! `REPO#N` says which thread, and a dozen of them in a status line still read as a dozen
+//! numbers. So a thread page's label may carry the thread's own name after its number —
+//! `widgets#41 repair the sprocket` — and a voice says it too. The name is the one part of a
+//! label not copied from its address: it comes from the thread the address itself names
+//! ([`thread_ref`], looked up by [`crate::pr_names`]), is only ever appended to the `REPO#N`
+//! the address gives, and is made plain and bounded first ([`shorten_name`]). The address, its
+//! target and its `title` are untouched, so a named label can be plainer or richer but never
+//! point somewhere else.
+//!
+//! A name replaces only text that said nothing but which thread it is. Beside a text that IS
+//! the address, [`crate::render`] now also labels a link whose text is a bare reference to the
+//! same thread — `5275`, `#5275`, `PR 5275`, `REPO#5275` ([`bare_reference`]) — because that
+//! text, too, is only a number the reader would have to open to understand. Text with a word
+//! of the writer's own in it, and text that names a different number, repository or kind than
+//! its address, keeps the words it was given.
+//!
 //! # Spoken
 //!
 //! `#187 speakable-ids-urls`. Read aloud, an address is a minute of "h t t p s colon slash slash"
@@ -107,10 +125,19 @@ struct Host {
     label: Writer,
     /// How a voice says an address on it, from its parts: only where `label` has a label.
     spoken: Writer,
+    /// The label with a thread's name in it: only for the addresses [`Host::thread`] names.
+    named: NamedWriter,
+    /// How a voice says an address with its thread's name in it.
+    named_spoken: NamedWriter,
+    /// The thread an address names, when it is a page that holds one.
+    thread: fn(&Address<'_>) -> Option<ThreadRef>,
 }
 
 /// What a host's label, or its spoken form, is written by.
 type Writer = fn(&Address<'_>) -> Option<String>;
+
+/// What a host's label with a thread's name in it, or its spoken form, is written by.
+type NamedWriter = fn(&Address<'_>, &str) -> Option<String>;
 
 /// Every host that has short labels. See the module note on adding one.
 const HOSTS: [Host; 1] = [Host {
@@ -118,6 +145,9 @@ const HOSTS: [Host; 1] = [Host {
     reserved: &GITHUB_RESERVED,
     label: github,
     spoken: github_spoken,
+    named: github_named,
+    named_spoken: github_named_spoken,
+    thread: github_thread,
 }];
 
 /// GitHub's top-level words that no account may take, under which a path is GitHub's own and not
@@ -168,8 +198,203 @@ pub fn spoken_label(address: &str) -> Option<String> {
     read(address, |host| host.spoken)
 }
 
+/// The label for `address` with the name of the thread it names in it, `widgets#41 repair the
+/// sprocket`, or `None` when the address is not a thread page this labels. `#1058
+/// pr-name-enrichment`: the name is the one part of a label not copied from the address — it is
+/// the thread's own name, looked up by the caller ([`crate::pr_names`]) under the very
+/// [`ThreadRef`] this address parses to — and it is only ever APPENDed to the `REPO#N` the
+/// address itself gives, so a label still cannot name the wrong thread. The name is made plain
+/// and bounded by [`shorten_name`] before it is shown; one that leaves nothing shows the plain
+/// label instead.
+#[must_use]
+pub fn named_label(address: &str, name: &str) -> Option<String> {
+    let (host, parsed) = parse(address)?;
+    (host.named)(&parsed, name)
+}
+
+/// How a voice says `address` with the name of its thread in it, `widgets pull request 41,
+/// repair the sprocket`, or `None` under the same rule as [`named_label`].
+#[must_use]
+pub fn named_spoken_label(address: &str, name: &str) -> Option<String> {
+    let (host, parsed) = parse(address)?;
+    (host.named_spoken)(&parsed, name)
+}
+
+/// What kind of thread a thread page holds: the three pages GitHub writes `REPO#N` for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ThreadKind {
+    /// `/pull/N` and its tabs.
+    Pull,
+    /// `/issues/N`.
+    Issue,
+    /// `/discussions/N`.
+    Discussion,
+}
+
+/// The thread an address names, as written in it: the account, the repository and the number a
+/// name is looked up by. `#1058 pr-name-enrichment`. Only the thread pages (a pull request, an
+/// issue, a discussion, and a pull request's tabs) have a name to look up; every other labelled
+/// page answers `None` here.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ThreadRef {
+    /// The account that owns the repository, as the address writes it. A label never shows it;
+    /// a name lookup cannot do without it.
+    pub owner: String,
+    /// The repository's name, as the address writes it: the `REPO` of `REPO#N`.
+    pub repo: String,
+    /// The thread's number, as the address writes it.
+    pub number: String,
+    /// Which of the three thread pages it is.
+    pub kind: ThreadKind,
+}
+
+/// The thread `address` names, under every check a label passes, or `None` when it is not a
+/// thread page. See [`ThreadRef`].
+#[must_use]
+pub fn thread_ref(address: &str) -> Option<ThreadRef> {
+    let (host, parsed) = parse(address)?;
+    (host.thread)(&parsed)
+}
+
+/// Whether `shown`, the visible text of a link to `thread`'s page, says nothing but which
+/// thread it is: `5275`, `#5275`, `PR 5275`, `PR #5275`, `issue 5275`, `REPO#5275` or
+/// `OWNER/REPO#5275`. `#1058 pr-name-enrichment`.
+///
+/// Such text may be replaced by the thread's label (and its name) without losing a word the
+/// writer wrote. The number must be the thread's own, a written repository (and owner) must be
+/// the thread's, and a written kind word — `PR`, `pull request`, `issue`, `discussion` — must
+/// name the thread's kind: text that disagrees with its address means something else, and any
+/// further word at all is the writer describing the thread. Both are left as written.
+#[must_use]
+pub fn bare_reference(shown: &str, thread: &ThreadRef) -> bool {
+    let shown = shown.trim();
+    if shown.is_empty() {
+        return false;
+    }
+    if let Some((owner, rest)) = shown.split_once('/') {
+        return owner_name(owner)
+            && owner.eq_ignore_ascii_case(&thread.owner)
+            && repo_hash_number(rest, thread);
+    }
+    if repo_hash_number(shown, thread) {
+        return true;
+    }
+    if let Some(digits) = shown.strip_prefix('#') {
+        return same_number(digits, &thread.number);
+    }
+    for (word, kind) in [
+        ("pull request", ThreadKind::Pull),
+        ("pr", ThreadKind::Pull),
+        ("issue", ThreadKind::Issue),
+        ("discussion", ThreadKind::Discussion),
+    ] {
+        if let Some(rest) = after_keyword(shown, word) {
+            // A kind word that names another kind of thread disagrees with the address.
+            return kind == thread.kind
+                && same_number(rest.strip_prefix('#').unwrap_or(rest), &thread.number);
+        }
+    }
+    same_number(shown, &thread.number)
+}
+
+/// Whether `text` is `REPO#N` for `thread`: its repository's name, a `#`, and its number.
+fn repo_hash_number(text: &str, thread: &ThreadRef) -> bool {
+    let Some((repo, digits)) = text.split_once('#') else {
+        return false;
+    };
+    repo_name(repo)
+        && repo.eq_ignore_ascii_case(&thread.repo)
+        && same_number(digits, &thread.number)
+}
+
+/// What follows `word` at the head of `text`, in any case, when the word ends at a boundary a
+/// reference may end a word at — a space or the `#` of `PR#5275` — with the spaces after it gone.
+fn after_keyword<'t>(text: &'t str, word: &str) -> Option<&'t str> {
+    let head = text.get(..word.len())?;
+    if !head.eq_ignore_ascii_case(word) {
+        return None;
+    }
+    let rest = &text[word.len()..];
+    if !rest.is_empty() && !rest.starts_with([' ', '#']) {
+        return None;
+    }
+    Some(rest.trim_start_matches(' '))
+}
+
+/// Whether two numbers as written are the same number: digits, leading zeros aside.
+fn same_number(shown: &str, thread_number: &str) -> bool {
+    number(shown) && shown.trim_start_matches('0') == thread_number.trim_start_matches('0')
+}
+
+/// The most of a thread's name a label shows, in characters, the ellipsis that marks the cut
+/// counted in it. A name identifies a thread among its neighbours on the screen; the whole of a
+/// long title is the thread page's business, one tap away.
+pub const MAX_NAME_CHARS: usize = 48;
+
+/// A thread's name made fit to show in a label or to say aloud. `#1058 pr-name-enrichment`.
+///
+/// A name is text another system holds, so it is made plain before it is shown: control
+/// characters are gone, the characters that can turn the text around them (the bidirectional
+/// controls and marks) and the ones no eye can see (zero-width characters) are gone, every run
+/// of whitespace is one space, and what is left is cut at a word boundary to [`MAX_NAME_CHARS`]
+/// characters with an ellipsis — a single word longer than that is cut where it stands. Nothing
+/// is decoded and nothing is escaped here: a label is a text node, escaped as text is when it
+/// is drawn, and this only decides which characters it holds.
+#[must_use]
+pub fn shorten_name(raw: &str) -> String {
+    let plain: String = raw
+        .chars()
+        .filter_map(|c| {
+            // Whitespace first: a newline or a tab is a space between words, not a character
+            // to drop for being a control, or the words it stood between would join.
+            if c.is_whitespace() {
+                Some(' ')
+            } else if unshowable(c) {
+                None
+            } else {
+                Some(c)
+            }
+        })
+        .collect();
+    let plain = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    if plain.chars().count() <= MAX_NAME_CHARS {
+        return plain;
+    }
+    // One character of the allowance is the ellipsis itself.
+    let keep = MAX_NAME_CHARS - 1;
+    let mut cut: String = plain.chars().take(keep).collect();
+    if let Some(space) = cut.rfind(' ') {
+        if space > 0 {
+            cut.truncate(space);
+        }
+    }
+    cut.push('\u{2026}');
+    cut
+}
+
+/// Whether a character may not be shown in a name: a control, a bidirectional control or mark
+/// that could reorder the words around it, or a zero-width character.
+fn unshowable(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061c}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        )
+}
+
 /// `address` cut into its parts and given to the writer `pick` chooses from its host's row.
 fn read(address: &str, pick: fn(&Host) -> Writer) -> Option<String> {
+    let (host, parsed) = parse(address)?;
+    pick(host)(&parsed)
+}
+
+/// `address` read as far as its host and its parts: everything every writer shares.
+fn parse(address: &str) -> Option<(&'static Host, Address<'_>)> {
     if address.len() > MAX_ADDRESS || address.bytes().any(unresolved) {
         return None;
     }
@@ -211,11 +436,14 @@ fn read(address: &str, pick: fn(&Host) -> Writer) -> Option<String> {
     }) {
         return None;
     }
-    pick(entry)(&Address {
-        segments,
-        query,
-        fragment,
-    })
+    Some((
+        entry,
+        Address {
+            segments,
+            query,
+            fragment,
+        },
+    ))
 }
 
 /// Whether a browser could read `byte` as other than what it shows: a backslash, which it treats
@@ -398,6 +626,21 @@ fn github_page(
     address: &Address<'_>,
     write: impl Fn(&Route, &str, &[String], Option<&str>) -> Option<String>,
 ) -> Option<String> {
+    let page = matched_page(address)?;
+    write(page.route, page.repo, &page.captures, page.fragment)
+}
+
+/// One page an address on GitHub has been read as: its route, and what its path captured.
+struct MatchedPage<'a> {
+    route: &'static Route,
+    owner: &'a str,
+    repo: &'a str,
+    captures: Vec<String>,
+    fragment: Option<&'a str>,
+}
+
+/// `address` read as one of GitHub's labelled pages, or `None` when it is not one of them.
+fn matched_page<'a>(address: &'a Address<'a>) -> Option<MatchedPage<'a>> {
     let [owner, repo, route @ ..] = address.segments.as_slice() else {
         return None;
     };
@@ -409,8 +652,62 @@ fn github_page(
     }
     GITHUB_ROUTES.iter().find_map(|candidate| {
         let captures = captured(candidate.path, route)?;
-        write(candidate, repo, &captures, address.fragment)
+        // A route whose captures cannot be shown is not this address's page, so the routes
+        // after it still get their chance, as a `write` answering `None` used to give them.
+        written(candidate.shape, repo, &captures, address.fragment)?;
+        Some(MatchedPage {
+            route: candidate,
+            owner,
+            repo,
+            captures,
+            fragment: address.fragment,
+        })
     })
+}
+
+/// Which kind of thread a route's page holds, from the word GitHub routes it by, or `None` when
+/// the page holds no thread.
+fn thread_kind(route: &Route) -> Option<ThreadKind> {
+    match (route.shape, route.path.first()) {
+        (Shape::Thread | Shape::ThreadPart(_), Some(Segment::Word("pull"))) => {
+            Some(ThreadKind::Pull)
+        }
+        (Shape::Thread, Some(Segment::Word("issues"))) => Some(ThreadKind::Issue),
+        (Shape::Thread, Some(Segment::Word("discussions"))) => Some(ThreadKind::Discussion),
+        _ => None,
+    }
+}
+
+/// The thread an address on GitHub names: only a page [`thread_kind`] names, and only where it
+/// is labelled, as a spoken label is.
+fn github_thread(address: &Address<'_>) -> Option<ThreadRef> {
+    let page = matched_page(address)?;
+    Some(ThreadRef {
+        owner: page.owner.to_owned(),
+        repo: page.repo.to_owned(),
+        number: page.captures.first()?.clone(),
+        kind: thread_kind(page.route)?,
+    })
+}
+
+/// The label for an address on GitHub, with the name of its thread in it.
+fn github_named(address: &Address<'_>, name: &str) -> Option<String> {
+    let page = matched_page(address)?;
+    thread_kind(page.route)?;
+    written_named(
+        page.route.shape,
+        page.repo,
+        &page.captures,
+        page.fragment,
+        name,
+    )
+}
+
+/// How a voice says an address on GitHub, with the name of its thread in it.
+fn github_named_spoken(address: &Address<'_>, name: &str) -> Option<String> {
+    let page = matched_page(address)?;
+    thread_kind(page.route)?;
+    said_named(page.route, page.repo, &page.captures, page.fragment, name)
 }
 
 /// What `segments` captures under `pattern`, when it matches the whole of it.
@@ -480,6 +777,30 @@ fn written(
                 None => name,
             }
         }
+    })
+}
+
+/// The label of `shape` with its thread's `name` in it: after the number, before the suffix
+/// that says where on the page the address points, `REPO#N name (files)`. Only the thread
+/// shapes have a name; every other shape is written as it always is. A name that
+/// [`shorten_name`] leaves empty is no name at all, and the plain label stands.
+fn written_named(
+    shape: Shape,
+    repo: &str,
+    captures: &[String],
+    fragment: Option<&str>,
+    name: &str,
+) -> Option<String> {
+    let name = shorten_name(name);
+    let first = captures.first()?;
+    Some(match shape {
+        Shape::Thread if !name.is_empty() => {
+            format!("{repo}#{first} {name}{}", thread_suffix(fragment))
+        }
+        Shape::ThreadPart(part) if !name.is_empty() => {
+            format!("{repo}#{first} {name} ({part})")
+        }
+        _ => written(shape, repo, captures, fragment)?,
     })
 }
 
@@ -577,6 +898,49 @@ fn said(route: &Route, repo: &str, captures: &[String], fragment: Option<&str>) 
                 None => page,
             }
         }
+    })
+}
+
+/// How a voice says the page of `route` with its thread's `name` in it: the page as [`said`]
+/// says it, with the name after the number — `widgets pull request 41, repair the sprocket`,
+/// and `a comment on` still around the whole of it. A name that [`shorten_name`] leaves empty
+/// is said as no name at all.
+fn said_named(
+    route: &Route,
+    repo: &str,
+    captures: &[String],
+    fragment: Option<&str>,
+    name: &str,
+) -> Option<String> {
+    let name = shorten_name(name);
+    if name.is_empty() {
+        return said(route, repo, captures, fragment);
+    }
+    let first = captures.first()?;
+    let section = match route.path.first() {
+        Some(Segment::Word(word)) => *word,
+        _ => "",
+    };
+    let repo = repo.replace('_', " ");
+    Some(match route.shape {
+        Shape::Thread => {
+            let noun = match section {
+                "pull" => "pull request",
+                "issues" => "issue",
+                _ => "discussion",
+            };
+            let page = format!("{repo} {noun} {}, {name}", spoken_number(first));
+            match thread_note(fragment) {
+                Some("review") => format!("a review of {page}"),
+                Some(note) => format!("a {note} on {page}"),
+                None => page,
+            }
+        }
+        Shape::ThreadPart(part) => format!(
+            "the {part} of {repo} pull request {}, {name}",
+            spoken_number(first)
+        ),
+        _ => return said(route, &repo, captures, fragment),
     })
 }
 
@@ -1310,5 +1674,195 @@ mod tests {
         assert_eq!(strip_scheme("ftp://a.test"), None);
         assert_eq!(strip_scheme("http:/a.test"), None);
         assert_eq!(strip_scheme("h\u{e9}"), None);
+    }
+
+    // --- a thread's name: `#1058 pr-name-enrichment` ---------------------------------------
+
+    use super::{
+        bare_reference, named_label, named_spoken_label, shorten_name, thread_ref, ThreadKind,
+        MAX_NAME_CHARS,
+    };
+
+    #[test]
+    fn a_thread_page_names_the_thread_it_holds_and_no_other_page_does() {
+        let pull = thread_ref(&format!("{REPO}/pull/41/files")).expect("a pull request tab");
+        assert_eq!(
+            (
+                pull.owner.as_str(),
+                pull.repo.as_str(),
+                pull.number.as_str(),
+                pull.kind
+            ),
+            ("octo", "widgets", "41", ThreadKind::Pull)
+        );
+        assert_eq!(
+            thread_ref(&format!("{REPO}/issues/7#issuecomment-9")).map(|t| t.kind),
+            Some(ThreadKind::Issue)
+        );
+        assert_eq!(
+            thread_ref(&format!("{REPO}/discussions/3")).map(|t| t.kind),
+            Some(ThreadKind::Discussion)
+        );
+        for address in [
+            format!("{REPO}/commit/{SHA}"),
+            format!("{REPO}/pull/41/commits/{SHA}"),
+            format!("{REPO}/actions/runs/9"),
+            format!("{REPO}/blob/main/src/a.rs"),
+            format!("{REPO}/tree/main"),
+            REPO.to_owned(),
+            // Not labelled at all, so never named either.
+            format!("{REPO}/pull/41?notification_referrer_id=x"),
+            "https://github.com/orgs/octo/discussions/3".to_owned(),
+            "github.com/octo/widgets/pull/41".to_owned(),
+            "https://example.com/octo/widgets/pull/41".to_owned(),
+        ] {
+            assert_eq!(thread_ref(&address), None, "{address}");
+        }
+    }
+
+    #[test]
+    fn a_named_label_puts_the_name_after_the_number_and_before_the_suffix() {
+        let name = "repair the sprocket";
+        assert_eq!(
+            named_label(&format!("{REPO}/pull/41"), name).as_deref(),
+            Some("widgets#41 repair the sprocket")
+        );
+        assert_eq!(
+            named_label(&format!("{REPO}/pull/41#issuecomment-9"), name).as_deref(),
+            Some("widgets#41 repair the sprocket (comment)")
+        );
+        assert_eq!(
+            named_label(&format!("{REPO}/pull/41/files"), name).as_deref(),
+            Some("widgets#41 repair the sprocket (files)")
+        );
+        assert_eq!(
+            named_label(&format!("{REPO}/issues/7"), name).as_deref(),
+            Some("widgets#7 repair the sprocket")
+        );
+        // Not a thread page: no name is attached to a commit, a file or a run.
+        assert_eq!(named_label(&format!("{REPO}/commit/{SHA}"), name), None);
+        assert_eq!(named_label(&format!("{REPO}/blob/main/a.rs"), name), None);
+        // A name with nothing showable in it leaves the plain label standing.
+        assert_eq!(
+            named_label(&format!("{REPO}/pull/41"), " \u{202e}\n").as_deref(),
+            Some("widgets#41")
+        );
+        // And the spoken page carries the name the same way.
+        assert_eq!(
+            named_spoken_label(&format!("{REPO}/pull/41"), name).as_deref(),
+            Some("widgets pull request 41, repair the sprocket")
+        );
+        assert_eq!(
+            named_spoken_label(&format!("{REPO}/pull/41#pullrequestreview-7"), name).as_deref(),
+            Some("a review of widgets pull request 41, repair the sprocket")
+        );
+        assert_eq!(
+            named_spoken_label(&format!("{REPO}/pull/41/files"), name).as_deref(),
+            Some("the files of widgets pull request 41, repair the sprocket")
+        );
+        assert_eq!(
+            named_spoken_label(&format!("{REPO}/issues/7"), name).as_deref(),
+            Some("widgets issue 7, repair the sprocket")
+        );
+        assert_eq!(
+            named_spoken_label(&format!("{REPO}/commit/{SHA}"), name),
+            None
+        );
+    }
+
+    #[test]
+    fn a_bare_reference_is_the_same_thread_written_as_a_number() {
+        let pull = thread_ref(&format!("{REPO}/pull/5275")).expect("a pull request");
+        for shown in [
+            "5275",
+            "#5275",
+            "PR 5275",
+            "PR #5275",
+            "PR#5275",
+            "pr 5275",
+            "Pull Request 5275",
+            "pull request #5275",
+            "widgets#5275",
+            "Widgets#5275",
+            "octo/widgets#5275",
+            "OCTO/Widgets#5275",
+            " #5275 ",
+        ] {
+            assert!(bare_reference(shown, &pull), "{shown:?}");
+        }
+        let issue = thread_ref(&format!("{REPO}/issues/5275")).expect("an issue");
+        for shown in ["5275", "#5275", "issue 5275", "Issue #5275", "widgets#5275"] {
+            assert!(bare_reference(shown, &issue), "{shown:?}");
+        }
+    }
+
+    #[test]
+    fn words_of_the_writers_and_other_threads_are_not_bare_references() {
+        let pull = thread_ref(&format!("{REPO}/pull/5275")).expect("a pull request");
+        for shown in [
+            // The writer describing the thread: any further word at all.
+            "the fix",
+            "the fix in #5275",
+            "PR 5275 fix",
+            "fix for 5275",
+            "#5275 (files)",
+            "5275.",
+            // Another thread than the address names.
+            "5276",
+            "#5276",
+            "PR 5276",
+            "widgets#5276",
+            // Another repository, or another account's.
+            "gizmos#5275",
+            "other/widgets#5275",
+            "octo/gizmos#5275",
+            // A kind word that names another kind of thread.
+            "issue 5275",
+            "discussion 5275",
+            // Not a reference shape at all.
+            "",
+            "PR5275",
+            "PR",
+            "#",
+            "widgets#",
+            "octo/widgets",
+            "0x1234",
+        ] {
+            assert!(!bare_reference(shown, &pull), "{shown:?}");
+        }
+        // A pull request called an issue by its own link is left as written, above; the same
+        // words on an issue's link are a bare reference.
+        let issue = thread_ref(&format!("{REPO}/issues/5275")).expect("an issue");
+        assert!(!bare_reference("PR 5275", &issue));
+    }
+
+    #[test]
+    fn a_name_is_made_plain_and_cut_at_a_word_boundary() {
+        assert_eq!(
+            shorten_name("  repair   the\nsprocket\t"),
+            "repair the sprocket"
+        );
+        // Bidirectional controls, zero-width characters and controls cannot ride in a name.
+        assert_eq!(
+            shorten_name("fix\u{202e} the\u{200b} sprocket\u{2066}now\u{0007}"),
+            "fix the sprocketnow"
+        );
+        assert_eq!(shorten_name("\u{202e}\u{feff} \n"), "");
+        let long = "repair the sprocket and the widget and the gizmo and the doohickey too";
+        let cut = shorten_name(long);
+        assert!(cut.chars().count() <= MAX_NAME_CHARS, "{cut:?}");
+        assert!(cut.ends_with('\u{2026}'), "{cut:?}");
+        assert!(
+            long.starts_with(cut.trim_end_matches('\u{2026}')) && !cut.ends_with(" \u{2026}"),
+            "{cut:?} is not cut at a word boundary"
+        );
+        // One long word is cut where it stands, still within the bound.
+        let word = "x".repeat(90);
+        let cut = shorten_name(&word);
+        assert_eq!(cut.chars().count(), MAX_NAME_CHARS);
+        assert!(cut.ends_with('\u{2026}'));
+        // Exactly at the bound, nothing is cut and no ellipsis is invented.
+        let exact = "y".repeat(MAX_NAME_CHARS);
+        assert_eq!(shorten_name(&exact), exact);
     }
 }

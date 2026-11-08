@@ -5,7 +5,7 @@ priority: 1
 issue_type: feature
 assignee: mu-prnames
 created_at: 2026-11-08T12:56:33.951743014+00:00
-updated_at: 2026-11-08T12:56:41.893685782+00:00
+updated_at: 2026-11-08T13:03:33.588825310+00:00
 ---
 
 # Description
@@ -20,6 +20,8 @@ P1, all server-side Rust; web/src/legacy/voice.js untouched (#624 voice-page mod
 - Fetching never on the render path: render does a memory lookup only; a miss records the thread in a bounded wanted set. A background task drains it (batch of 20, 100ms apart, backs off on rate-limit answers), calling GET /repos/OWNER/REPO/issues/N through the documents GithubFetcher (same github_token_file/github_token_command token and https_proxy, api.github.com base, 401-retry). Rendered HTML is produced per read, and the in-memory render cache key gains the name-cache generation, so a name shows on the next read after it is fetched; the on-screen copy is not patched live. The search index path renders WITHOUT names (its text stays a function of the source; the bare-reference labels are address-derived, so SearchText::VERSION bumps once). Spoken form (src/speakable.rs via link_labels spoken_label) appends the name when cached.
 - Config: [render] pr_names (bool, default on) disables enrichment and fetching wholesale; pr_names_file names the curated file. Off-network safety needs no config: unreachable GitHub renders today labels.
 - Tests: label heuristic and named-label unit tests; cache bound/TTL/negative/persistence unit tests with an explicit clock; an offline render test proving render performs no fetch and records wanted instead; a render-level test that a bare PR URL and a #N link show the name and descriptive text is untouched; spoken-form test.
+
+Coordinator conditions on approval (2026-11-08): (1) the fetcher is rate-limited by a token bucket, about 1 request/s sustained with a small burst and a hard 600/hour ceiling, one log line per throttle episode; the wanted set is bounded and newest-first so what is on screen wins over old history. (2) Only real page reads queue fetches: the search-index path, the post-bump reindex, summaries, speakable/read-aloud, and startup/backfill renders never add to the wanted set; a test renders the whole index corpus and asserts wanted stays empty. (3) The landing states what the render-5 reindex costs on the real devbig014 store (message count, time, background or not). (4) Titles are untrusted: escaped as text, never in attributes, bidi/control characters stripped, with a malicious-title test.
 
 # Acceptance Criteria
 

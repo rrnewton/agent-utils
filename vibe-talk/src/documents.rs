@@ -1001,6 +1001,32 @@ impl TokenSource {
     }
 }
 
+/// What GitHub answered when asked for one thread's title. `#1058 pr-name-enrichment`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IssueTitle {
+    /// The thread's title as GitHub holds it, and whether it has the thread closed.
+    Found {
+        /// The title, unshortened: shortening it for a label is the caller's rule.
+        title: String,
+        /// Whether the thread is closed (a merged pull request reads closed here).
+        closed: bool,
+    },
+    /// No such thread, or none the token may see: GitHub answers 404 to both.
+    NotFound,
+    /// GitHub asked for a pause (429, or a 403 carrying its rate-limit headers).
+    RateLimited,
+}
+
+/// Whether a 403's headers say it is a rate limit rather than a refusal: a `retry-after`, or
+/// no requests left in the window.
+fn rate_limited(headers: &reqwest::header::HeaderMap) -> bool {
+    headers.contains_key(reqwest::header::RETRY_AFTER)
+        || headers
+            .get("x-ratelimit-remaining")
+            .and_then(|value| value.to_str().ok())
+            == Some("0")
+}
+
 /// The GitHub fetcher: raw content over HTTPS, with an optional token.
 pub struct GithubFetcher {
     client: reqwest::Client,
@@ -1241,6 +1267,49 @@ impl GithubFetcher {
         })
     }
 
+    /// The title of one issue or pull request — the API's issues endpoint answers for both,
+    /// their numbers being one sequence in a repository — and whether GitHub has it closed.
+    /// `#1058 pr-name-enrichment`: the name a thread's label may carry. The one API read here
+    /// besides the tree walk, and through the same token and proxy as the rest.
+    ///
+    /// `owner`, `repo` and `number` come from an address [`crate::link_labels`] has already
+    /// read as a thread page, so each is made only of the characters that part may hold.
+    pub async fn issue_title(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: &str,
+    ) -> Result<IssueTitle, FetchError> {
+        let url = format!("{}/repos/{owner}/{repo}/issues/{number}", self.api_base);
+        let response = self.send_get(&url).await?;
+        let status = response.status().as_u16();
+        if status == 404 {
+            // Also what a thread the token may not see answers; the two are one answer to us.
+            return Ok(IssueTitle::NotFound);
+        }
+        if status == 429 || (status == 403 && rate_limited(response.headers())) {
+            return Ok(IssueTitle::RateLimited);
+        }
+        if !response.status().is_success() {
+            return Err(FetchError::Failed(format!(
+                "GitHub answered {}",
+                response.status()
+            )));
+        }
+        let (body, _) = self.read_body(response).await?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| FetchError::Failed(e.to_string()))?;
+        let Some(title) = parsed.get("title").and_then(serde_json::Value::as_str) else {
+            return Err(FetchError::Failed(
+                "GitHub's answer held no title".to_owned(),
+            ));
+        };
+        Ok(IssueTitle::Found {
+            title: title.to_owned(),
+            closed: parsed.get("state").and_then(serde_json::Value::as_str) == Some("closed"),
+        })
+    }
+
     async fn etag(&self, entry: &Entry) -> Result<Option<String>, FetchError> {
         let url = self.url(entry)?;
         let response = self.send_get(&url).await?;
@@ -1405,6 +1474,30 @@ struct CacheState {
     max_bytes: usize,
 }
 
+/// The GitHub token `[documents]` configures, as every fetcher asking GitHub on this server
+/// shares it: the command that prints one when it is set, else the file read once here, else
+/// none. `#1058 pr-name-enrichment` asks through the same source.
+#[must_use]
+pub fn token_source_from_config(config: &crate::config::DocumentsConfig) -> TokenSource {
+    if !config.github_token_command.is_empty() {
+        TokenSource::Command {
+            argv: config.github_token_command.clone(),
+            cache: std::sync::Mutex::new(None),
+        }
+    } else {
+        match config
+            .github_token_file
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty())
+        {
+            Some(token) => TokenSource::Static(token),
+            None => TokenSource::None,
+        }
+    }
+}
+
 /// Build the service from `[documents]` configuration: load the persisted
 /// fold when a path is configured, and wire the GitHub and paste fetchers.
 #[must_use]
@@ -1423,23 +1516,7 @@ pub fn service_from_config(config: &crate::config::DocumentsConfig) -> Arc<Servi
         ),
         None => Arc::new(Index::new(config.paste_url_prefixes.clone())),
     };
-    let token = if !config.github_token_command.is_empty() {
-        TokenSource::Command {
-            argv: config.github_token_command.clone(),
-            cache: std::sync::Mutex::new(None),
-        }
-    } else {
-        match config
-            .github_token_file
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|t| t.trim().to_owned())
-            .filter(|t| !t.is_empty())
-        {
-            Some(token) => TokenSource::Static(token),
-            None => TokenSource::None,
-        }
-    };
+    let token = token_source_from_config(config);
     let mut fetchers: Vec<Arc<dyn Fetcher>> = vec![Arc::new(GithubFetcher::new(
         token,
         config.github_raw_base.clone(),
@@ -2083,5 +2160,71 @@ next body
         assert_eq!(word_count("one  two\nthree\tfour "), 4);
         assert_eq!(word_count(""), 0);
         assert_eq!(word_count(SLICING_DOC), 21);
+    }
+
+    /// Serve each of `responses` once, in order, on a loopback port, and answer its address:
+    /// the whole of what an `issue_title` test needs of the GitHub API.
+    fn serve_once_each(responses: Vec<String>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = format!("http://{}", listener.local_addr().expect("address"));
+        std::thread::spawn(move || {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        address
+    }
+
+    fn http(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn an_issue_title_is_read_from_the_issues_endpoint() {
+        let api = serve_once_each(vec![
+            http(
+                "200 OK",
+                "",
+                r#"{"title":"Repair the sprocket","state":"closed","pull_request":{}}"#,
+            ),
+            http("404 Not Found", "", r#"{"message":"Not Found"}"#),
+            http(
+                "403 Forbidden",
+                "retry-after: 60\r\nx-ratelimit-remaining: 0\r\n",
+                r#"{"message":"API rate limit exceeded"}"#,
+            ),
+            http("403 Forbidden", "", r#"{"message":"Forbidden"}"#),
+            http("200 OK", "", r#"{"state":"open"}"#),
+        ]);
+        let fetcher = GithubFetcher::new(TokenSource::Static("tok".to_owned()), None, None)
+            .with_api_base(api);
+        assert_eq!(
+            block_on(fetcher.issue_title("octo", "widgets", "41")).expect("title"),
+            IssueTitle::Found {
+                title: "Repair the sprocket".to_owned(),
+                closed: true,
+            }
+        );
+        assert_eq!(
+            block_on(fetcher.issue_title("octo", "widgets", "42")).expect("missing"),
+            IssueTitle::NotFound
+        );
+        assert_eq!(
+            block_on(fetcher.issue_title("octo", "widgets", "43")).expect("limited"),
+            IssueTitle::RateLimited
+        );
+        // A plain refusal is a failure, not a pause and not an absence.
+        assert!(block_on(fetcher.issue_title("octo", "widgets", "44")).is_err());
+        // And an answer with no title in it is a failure, never an empty name.
+        assert!(block_on(fetcher.issue_title("octo", "widgets", "45")).is_err());
     }
 }

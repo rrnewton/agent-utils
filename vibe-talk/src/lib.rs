@@ -89,6 +89,7 @@ pub mod post_gate;
 pub mod post_keys;
 pub mod post_lanes;
 pub mod post_prefix;
+pub mod pr_names;
 pub mod probe;
 pub mod providers;
 pub mod read_ahead;

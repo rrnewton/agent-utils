@@ -357,6 +357,17 @@ backend = "elevenlabs"
 #   { pattern = '\bD([0-9]{6,})\b', url = 'https://review.example.invalid/D$1' },
 #   { pattern = '\bT([0-9]{6,})\b', url = 'https://tasks.example.invalid/T$1' },
 # ]
+# A GitHub pull request, issue or discussion drawn as REPO#N also carries the thread's name
+# (#1058 pr-name-enrichment): a bare address or a link written only as its number ("#5275",
+# "PR 5275", "REPO#5275") reads "REPO#5275 repair-the-sprocket". Names are learned in the
+# background from GitHub's API through the [documents] token and proxy, at about one request
+# a second and at most 600 an hour, and cached beside the store (pr-names-cache.json); a
+# thread whose name is not learned yet, or cannot be, draws as plain REPO#N. On by default;
+# false turns the learning and the names off, and the short labels stand as they were.
+# pr_names = true
+# Curated short names that win over fetched titles: a JSON object from "OWNER/REPO#N" to a
+# name, read at startup and never written by the server.
+# pr_names_file = "/var/lib/vibe-talk/pr-names.json"
 
 [speakable]
 # Rewrite message bodies before anything says them out loud. ON when this section is absent.
