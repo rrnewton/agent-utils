@@ -897,8 +897,12 @@ def run(
     # would silently skip force-added differentials that carry no
     # `validation-cross` label while the caller still expects their
     # coverage records (#1067 cross-differential-load-aware).
-    phases_given = gate_exclusive_phases is not None
-    main_tags, exclusive_tags = gate_exclusive_phases if phases_given else ([], [])
+    if gate_exclusive_phases is not None:
+        phases_given = True
+        main_tags, exclusive_tags = gate_exclusive_phases
+    else:
+        phases_given = False
+        main_tags, exclusive_tags = [], []
     result = 0
     if exclusive_tags:
         # Steps labelled gate-exclusive run afterwards, one at a time under
