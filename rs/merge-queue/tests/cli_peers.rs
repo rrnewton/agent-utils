@@ -410,3 +410,102 @@ fn a_merge_head_without_exact_is_still_replayed_as_its_own_commits() {
         );
     }
 }
+
+/// The listed item for `pr`.
+fn listed(fx: &Fixture, pr: i64) -> Value {
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["pr"] == pr)
+        .cloned()
+        .unwrap()
+}
+
+#[test]
+fn exact_inherits_on_a_plain_resubmission_and_clears_with_no_exact() {
+    // #1094: exact is clearable. A plain resubmission keeps it (and says
+    // so); `--no-exact` clears it, after which a moved base replays the
+    // change instead of ejecting it as not-fast-forward.
+    let fx = seeded("exact-clear");
+    init(&fx, &[]);
+    let help = fx.mq_ok(&["submit", "--help"]);
+    assert!(help.contains("--no-exact"), "{help}");
+    fx.branch("work", &[("tests/work", "ok\n")]);
+
+    let out = fx.mq_ok(&["submit", "5", "--head", "work", "--exact"]);
+    assert!(
+        out.contains("exact: yes (submitted --exact)"),
+        "receipt names the source: {out}"
+    );
+    assert_eq!(listed(&fx, 5)["exact"], true);
+
+    let out = fx.mq_ok(&["submit", "5", "--head", "work"]);
+    assert!(
+        out.contains("exact: yes (inherited from an earlier submission; --no-exact clears it)"),
+        "receipt names the inherited exact: {out}"
+    );
+    assert_eq!(
+        listed(&fx, 5)["exact"],
+        true,
+        "a plain resubmission inherits"
+    );
+
+    fx.mq_ok(&["submit", "5", "--head", "work", "--no-exact"]);
+    let item = listed(&fx, 5);
+    assert!(item.get("exact").is_none(), "exact cleared: {item}");
+    let history = item["history"].to_string();
+    assert!(history.contains("exact cleared"), "{history}");
+
+    // The base moves: no longer exact, the change replays and lands.
+    fx.write("unrelated", "x\n");
+    fx.commit_all("unrelated");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    let r: Value = serde_json::from_str(&fx.mq_ok(&["run", "--json"])).unwrap();
+    assert_eq!(r["landed"][0]["prs"], serde_json::json!([5]), "{r}");
+    assert_eq!(status(&fx, 5), "landed");
+}
+
+#[test]
+fn a_peer_requirement_holds_exact_against_no_exact_until_the_head_moves() {
+    // #1094: `--requires PEER#PR` pins the peer change's exact head, so
+    // a local `--no-exact` keeps exact (and says so) while that head is
+    // the item's head; a new head is not pinned and can clear.
+    let peer = seeded("peer-lib-held");
+    let main = seeded("peer-app-held");
+    init(&peer, &[]);
+    let peer_state = peer.queue().join(".git/merge-queue");
+    init(&main, &["--peer", &format!("lib={}", peer_state.display())]);
+
+    let lib_head = peer.branch("lib-feature", &[("tests/lib", "ok\n")]);
+    peer.mq_ok(&["submit", "7", "--head", "lib-feature"]);
+    main.branch("app-feature", &[("tests/app", "ok\n")]);
+    main.mq_ok(&[
+        "submit",
+        "1",
+        "--head",
+        "app-feature",
+        "--requires",
+        "lib#7",
+    ]);
+    let item = listed(&peer, 7);
+    assert_eq!(item["exact"], true, "{item}");
+    assert_eq!(item["exact_peer_head"], lib_head, "{item}");
+
+    let out = peer.mq_ok(&["submit", "7", "--head", "lib-feature", "--no-exact"]);
+    assert!(
+        out.contains(
+            "exact: yes (another repository requires its exact head; --no-exact cannot clear it)"
+        ),
+        "receipt says the peer requirement holds exact: {out}"
+    );
+    assert_eq!(listed(&peer, 7)["exact"], true, "the pin holds");
+
+    // A new head is not the pinned commit: the clear applies.
+    peer.branch("lib-feature-2", &[("tests/lib2", "ok\n")]);
+    peer.mq_ok(&["submit", "7", "--head", "lib-feature-2", "--no-exact"]);
+    let item = listed(&peer, 7);
+    assert!(item.get("exact").is_none(), "new head cleared: {item}");
+    assert!(item.get("exact_peer_head").is_none(), "{item}");
+}

@@ -1236,6 +1236,7 @@ mod unit {
             prioritized: false,
             claim: None,
             exact: false,
+            exact_peer_head: String::new(),
             requires: vec![],
             source: String::new(),
             close_pending: false,

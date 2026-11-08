@@ -722,6 +722,7 @@ mod unit {
             solo: false,
             prioritized: false,
             exact: false,
+            exact_peer_head: String::new(),
             requires: vec![],
             claim: None,
             source: String::new(),

@@ -174,9 +174,16 @@ pub struct Submission {
     /// A priority change: planned ahead of all other work, validated alone.
     pub prioritized: bool,
     /// Land the head exactly as submitted (`submit --exact`): a merge keeps both parents, and
-    /// the change is never replayed. Sets the item's `exact`, which then stays set.
+    /// the change is never replayed. Sets the item's `exact`; a later plain resubmission
+    /// keeps it, and only an explicit clear (`submit --no-exact`, or `sync` without the
+    /// exact label) removes it.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub exact: bool,
+    /// Clear a recorded `exact` (`submit --no-exact`; `sync` sets this when its entry is
+    /// not exact, so the label is followed both ways). Refused together with `exact`.
+    /// A peer requirement pinning the current head holds `exact` against the clear.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_exact: bool,
     /// Submitter's validation claim.
     pub claim: Option<ValidationClaim>,
     /// `sync` source that produced this submission; empty for a direct `submit`.
@@ -230,6 +237,31 @@ pub fn check_exact_merge(config: &Config, state: &State, git: &Git, head: &str) 
     }
 }
 
+/// The submission receipt's exact clause: the effective value and where it
+/// came from, empty when the change is not exact. Shared by the `submit`
+/// output and the item's submission record so the two cannot disagree.
+pub fn exact_note(exact: bool, peer_holds: bool, submitted: bool, source: &str) -> String {
+    if !exact {
+        return String::new();
+    }
+    if peer_holds && !submitted {
+        return "exact: yes (another repository requires its exact head; \
+                --no-exact cannot clear it)"
+            .to_owned();
+    }
+    if submitted && !source.is_empty() {
+        return if source.starts_with("file:") {
+            "exact: yes (sync ready file)".to_owned()
+        } else {
+            "exact: yes (sync label)".to_owned()
+        };
+    }
+    if submitted {
+        return "exact: yes (submitted --exact)".to_owned();
+    }
+    "exact: yes (inherited from an earlier submission; --no-exact clears it)".to_owned()
+}
+
 /// Submit (or resubmit) a change. Returns the stored item.
 pub fn submit(state: &State, config: &Config, submission: Submission) -> Result<Item, String> {
     submit_many(state, config, vec![submission])?
@@ -276,6 +308,12 @@ fn submit_resolved(
     }
     if submission.head_ref.is_empty() {
         return Err("a head branch or ref is required".to_owned());
+    }
+    if submission.exact && submission.clear_exact {
+        return Err(format!(
+            "#{}: --exact with --no-exact is refused: give only one",
+            submission.pr
+        ));
     }
     let current = current.ok_or_else(|| {
         format!(
@@ -341,6 +379,28 @@ fn submit_resolved(
     let existing_head = existing
         .as_ref()
         .map_or_else(String::new, |old| old.head.clone());
+    // Exactness: `--exact` sets it, a plain resubmission inherits it, and
+    // only an explicit clear removes it, so an omitted flag never silently
+    // changes how a change lands. A peer requirement pins the head it
+    // resolved to, so it holds exact against a clear while that head is
+    // still the item's head; a resubmission at a new head is not pinned.
+    let old_exact = existing.as_ref().is_some_and(|old| old.exact);
+    let peer_holds = same_head
+        && existing
+            .as_ref()
+            .is_some_and(|old| old.peer_requires_exact_head());
+    let exact = submission.exact || peer_holds || (old_exact && !submission.clear_exact);
+    let exact_peer_head = if peer_holds {
+        current.clone()
+    } else {
+        String::new()
+    };
+    let from_sync = !submission.source.is_empty();
+    // The receipt names the effective exact and where it came from, so an
+    // inherited (or peer-held) exact is never invisible to the operator.
+    let exact_note = exact_note(exact, peer_holds, submission.exact, &submission.source);
+    let exact_cleared = old_exact && !exact;
+    let clear_blocked = submission.clear_exact && peer_holds;
     let mut item = Item {
         pr: submission.pr,
         head_ref: submission.head_ref,
@@ -357,7 +417,8 @@ fn submit_resolved(
         solo: submission.solo,
         prioritized: submission.prioritized,
         claim: submission.claim,
-        exact: submission.exact || existing.as_ref().is_some_and(|old| old.exact),
+        exact,
+        exact_peer_head,
         requires: submission.requires,
         source: submission.source,
         close_pending: false,
@@ -442,8 +503,8 @@ fn submit_resolved(
         ),
         None => format!("head {current}; no submitter validation claim"),
     };
-    if submission.exact {
-        detail.push_str("; exact: lands as submitted, never replayed");
+    if exact {
+        detail.push_str(&format!("; {exact_note}"));
         if !exact_warn.is_empty() {
             detail.push_str(&format!("; warn: exact merge: {exact_warn}"));
         }
@@ -501,6 +562,21 @@ fn submit_resolved(
         }
     }
     item.log("submitted", detail);
+    if exact_cleared {
+        item.log(
+            "exact",
+            if from_sync {
+                "exact cleared by sync (no longer marked exact)"
+            } else {
+                "exact cleared by submit --no-exact"
+            },
+        );
+    } else if clear_blocked {
+        item.log(
+            "exact",
+            "exact not cleared: another repository requires its exact head",
+        );
+    }
     if let Some((text, kept)) = refusal {
         // Ejected before any batch is built, and the submitter hears of it now rather than
         // when the run holding the queue ends.
@@ -1182,9 +1258,16 @@ pub fn resolve_requirement(config: &Config, spec: &str) -> Result<Requirement, S
                     .state
                     .item(pr)?
                     .ok_or_else(|| format!("{name} has no change #{pr} in its queue"))?;
-                if !item.exact {
+                if !item.exact || item.exact_peer_head != item.head {
+                    // Record the pinned head even for an already-exact
+                    // change, so a later local clear can tell a peer
+                    // requirement holds it; log only the transition.
+                    let was_exact = item.exact;
                     item.exact = true;
-                    item.log("exact", "another repository requires its exact head");
+                    item.exact_peer_head = item.head.clone();
+                    if !was_exact {
+                        item.log("exact", "another repository requires its exact head");
+                    }
                     peer.state.save_item(&item)?;
                 }
                 item

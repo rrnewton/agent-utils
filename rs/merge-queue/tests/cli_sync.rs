@@ -364,6 +364,28 @@ fn the_configured_exact_label_marks_a_change_exact_and_resubmits_on_change() {
     let r = sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
     assert_eq!(r["submitted"], serde_json::json!([2]));
     assert_eq!(item(&items(&fx), 2)["exact"], true);
+    // The submission record names the label as the exact source (#1094).
+    let history = item(&items(&fx), 2)["history"].to_string();
+    assert!(history.contains("exact: yes (sync label)"), "{history}");
+    // Removing the label clears exact on the next reconcile: sync
+    // follows the label both ways, as for the priority label (#1094).
+    std::fs::write(
+        &gh.list,
+        listing(&[(1, &h1, false, &["MQ-Exact"]), (2, &h2, false, &["ready"])]),
+    )
+    .unwrap();
+    let r = sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
+    assert_eq!(r["submitted"], serde_json::json!([2]));
+    let cleared = item(&items(&fx), 2).clone();
+    assert!(cleared.get("exact").is_none(), "exact cleared: {cleared}");
+    assert!(
+        cleared["history"].to_string().contains("exact cleared"),
+        "{}",
+        cleared["history"]
+    );
+    // Settled now: a further sync makes no submission.
+    let r = sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
+    assert_eq!(r["submitted"], serde_json::json!([]));
 }
 
 #[test]

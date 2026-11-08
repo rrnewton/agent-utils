@@ -412,7 +412,10 @@ pub fn reconcile(
                 && item.head.starts_with(&entry.head)
                 && item.priority == entry.priority
                 && item.prioritized == entry.prioritized
-                && item.exact == entry.exact
+                // A peer requirement holds exact against the label's
+                // removal; that item is settled here, not resubmitted
+                // every cycle for a clear that cannot apply.
+                && (item.exact == entry.exact || item.peer_requires_exact_head())
         });
         let settled = current.is_some_and(|item| {
             matches!(item.status, ItemStatus::Landed)
@@ -444,6 +447,10 @@ pub fn reconcile(
             solo: entry.solo,
             prioritized: entry.prioritized,
             exact: entry.exact,
+            // Sync follows the exact marking both ways, as it follows
+            // the priority label: an entry that is not exact clears a
+            // recorded exact (subject to a peer requirement's hold).
+            clear_exact: !entry.exact,
             claim: None,
             source: tag.clone(),
             requires: Vec::new(),

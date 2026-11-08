@@ -186,6 +186,12 @@ pub struct Item {
     /// repository pins one of them. Implies a batch of its own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exact: bool,
+    /// Head another repository requires to land exactly: its `submit --requires PEER#PR`
+    /// marked this change exact for that commit. While it names the item's current head,
+    /// exact cannot be cleared locally (`submit --no-exact`, sync label removal): the
+    /// dependent pins that commit. Empty when no peer requirement holds this change.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub exact_peer_head: String,
     /// Peer commits that must be on their repositories' bases first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<Requirement>,
@@ -393,6 +399,32 @@ impl Item {
         self.status == ItemStatus::Queued
             && !self.next_retry_at.is_empty()
             && self.next_retry_at.as_str() > at
+    }
+
+    /// Whether a peer requirement pins this item's current head, holding `exact` against a
+    /// local clear. Records written before `exact_peer_head` carry the mark only in
+    /// history (an `exact` event from another repository's requirement, with no later
+    /// clear), which counts the same: a clear must never silently override a pin the
+    /// record only mentions in prose.
+    pub fn peer_requires_exact_head(&self) -> bool {
+        if !self.exact {
+            return false;
+        }
+        if !self.exact_peer_head.is_empty() {
+            return self.exact_peer_head == self.head;
+        }
+        let marked = self.history.iter().rposition(|event| {
+            event.kind == "exact"
+                && event
+                    .detail
+                    .contains("another repository requires its exact head")
+        });
+        let Some(marked) = marked else {
+            return false;
+        };
+        !self.history[marked + 1..]
+            .iter()
+            .any(|event| event.kind == "exact" && event.detail.starts_with("exact cleared"))
     }
 
     /// Append a history event stamped now.

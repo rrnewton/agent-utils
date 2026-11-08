@@ -1331,9 +1331,16 @@ enum Command {
         /// a fast-forward of the base: linear on top of it, or a merge whose first parent IS
         /// the base. When the base moves first, the change is refused (not-fast-forward):
         /// rebuild it on the new base and resubmit. Lands in a batch of its own; the queue never
-        /// rewrites it (pins, recount, regeneration). Stays set on resubmission.
-        #[arg(long, visible_alias = "preserve-merge")]
+        /// rewrites it (pins, recount, regeneration). Stays set on a plain resubmission;
+        /// `--no-exact` clears it.
+        #[arg(long, visible_alias = "preserve-merge", conflicts_with = "no_exact")]
         exact: bool,
+        /// Clear a recorded `--exact` (or sync label) from an earlier submission, so the queue
+        /// may replay this change onto a moved base again. Logged as `exact cleared`. A peer
+        /// requirement pinning the current head (`--requires PEER#PR` from another queue)
+        /// holds exact against this: the change stays exact and the receipt says so.
+        #[arg(long)]
+        no_exact: bool,
         /// Who is submitting (agent or person).
         #[arg(long, default_value = "")]
         by: String,
@@ -2281,6 +2288,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             solo,
             prioritized,
             exact,
+            no_exact,
             by,
             title,
             tested_with,
@@ -2317,6 +2325,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 solo,
                 prioritized,
                 exact,
+                clear_exact: no_exact,
                 claim,
                 source: String::new(),
                 requires: requires
@@ -2376,8 +2385,19 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 ),
                 None => String::new(),
             };
+            let exact_note = ops::exact_note(
+                item.exact,
+                item.peer_requires_exact_head(),
+                exact,
+                &item.source,
+            );
+            let exact_note = if exact_note.is_empty() {
+                String::new()
+            } else {
+                format!("; {exact_note}")
+            };
             println!(
-                "queued #{} at {} (priority {}{}){claim}",
+                "queued #{} at {} (priority {}{}){claim}{exact_note}",
                 item.pr,
                 short(&item.head),
                 item.priority,

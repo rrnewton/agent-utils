@@ -519,16 +519,20 @@ fn perform(state: &State, config: &Config, entry: &Entry) -> Result<String, Stri
                     short(&item.head)
                 ));
             }
-            if item.exact {
+            if item.exact && item.exact_peer_head == item.head {
                 return Ok(format!("#{pr} is already exact"));
             }
+            let was_exact = item.exact;
             item.exact = true;
-            item.log(
-                "exact",
-                format!(
-                    "another repository requires its exact head (recorded at {recorded}                      while another writer held the queue)"
-                ),
-            );
+            item.exact_peer_head = item.head.clone();
+            if !was_exact {
+                item.log(
+                    "exact",
+                    format!(
+                        "another repository requires its exact head (recorded at {recorded}                      while another writer held the queue)"
+                    ),
+                );
+            }
             state.save_item(&item)?;
             Ok(format!("#{pr} is exact at {}", short(&item.head)))
         }
