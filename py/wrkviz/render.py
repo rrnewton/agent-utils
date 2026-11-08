@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from importlib.resources import files
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -189,12 +189,28 @@ _DATE_ONLY_ROLLUP_KINDS = frozenset({"weekly", "monthly", "quarterly"})
 def _rollup_item_stamp(
     at_ms: int, period: Period, display_timezone: str, date_only: bool
 ) -> str:
+    """Label a rollup item by the local day, week or month holding it, not by a time of day.
+
+    A week-level-or-longer item's timestamp is normally the start of the input period it was rolled
+    up from, so its time of day says nothing. A weekly page therefore gives the local date; a
+    monthly page gives the ISO week and that week's first day inside the month (``Week 45 ·
+    Nov 2``); a quarterly page gives the month (``November 2026``).
+    """
+
     if not date_only or period.kind not in _DATE_ONLY_ROLLUP_KINDS:
         return _local_time(at_ms, display_timezone)
-    local = datetime.fromtimestamp(at_ms / 1000, tz=timezone.utc).astimezone(
-        ZoneInfo(display_timezone)
+    zone = ZoneInfo(display_timezone)
+    local = datetime.fromtimestamp(at_ms / 1000, tz=timezone.utc).astimezone(zone)
+    if period.kind == "weekly":
+        return local.strftime("%Y-%m-%d %a")
+    if period.kind == "quarterly":
+        return local.strftime("%B %Y")
+    day = local.date()
+    period_start = (
+        datetime.fromtimestamp(period.start_ms / 1000, tz=timezone.utc).astimezone(zone).date()
     )
-    return local.strftime("%Y-%m-%d %a")
+    first = max(day - timedelta(days=day.weekday()), period_start)
+    return f"Week {day.isocalendar()[1]} · {first.strftime('%b')} {first.day}"
 
 
 def rollup_markdown(
@@ -209,8 +225,9 @@ def rollup_markdown(
 ) -> str:
     """One calendar rollup page; *scope_note*, when given, labels a narrowed agent scope.
 
-    With *date_only_above_daily*, a weekly or longer page stamps its items with the local date
-    only, since their times are period starts rather than when the work happened.
+    With *date_only_above_daily*, a weekly or longer page labels its items by the local day, week
+    or month holding them (see :func:`_rollup_item_stamp`), since their times are normally
+    input-period starts rather than when the work happened.
     """
 
     lines = [

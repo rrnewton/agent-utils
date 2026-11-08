@@ -9,7 +9,7 @@ updated_at: 2026-11-08T17:18:34.760237943+00:00
 
 # Description
 
-[opus 5.5] Calendar rollup pages print each work item with a time of day, but a weekly, monthly or quarterly rollup model sees every lower-level input tagged with that period's start, so the items carry midnight of the day (or the week's start) rather than when the work happened. Pages written for a narrowed --agent-scope already stamp week-level items with the local date only (render._rollup_item_stamp, date_only_above_daily). The site's own pages (summary_data/, build and export) still print the invented times, because the Rust edition renders them byte-identically and test_wrkviz_build_rust requires the two to match.
+[opus 5.5] Calendar rollup pages print each work item with a time of day, but a weekly, monthly or quarterly rollup model sees every lower-level input tagged with that period's start, so the items carry midnight of the day (or the week's start) rather than when the work happened. Pages written for a narrowed --agent-scope already label each item by the local day, week or month holding it (render._rollup_item_stamp, date_only_above_daily): weekly items by day (`2026-11-04 Wed`), monthly items by ISO week (`Week 45 · Nov 2`), quarterly items by month (`November 2026`). The site's own pages (summary_data/, build and export) still print the invented times, because the Rust edition renders them byte-identically and test_wrkviz_build_rust requires the two to match.
 
 # Acceptance Criteria
 

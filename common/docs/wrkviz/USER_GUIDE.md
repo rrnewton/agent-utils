@@ -681,7 +681,11 @@ A coordinator-only summary is a different artifact, so the run writes its whole 
 phase and rollup data, run state, and rollup Markdown) under
 `teams/<slug>/summary_scopes/coordinator/`, with the pages under `summaries/<kind>/` there, and
 never touches `summary_data/`. Each page's heading says "coordinator-only" and its first line is a
-"coordinator only" scope note; each JSON rollup carries `"agent_scope": "coordinator"`. `build`
+"coordinator only" scope note; each JSON rollup carries `"agent_scope": "coordinator"`. A
+weekly or longer page labels each item by the local day, week or month holding it rather than
+by a time of day, since that time is normally the start of the period the item was rolled up
+from: weekly items by day (`2026-11-04 Wed`), monthly items by ISO week and that week's first day
+in the month (`Week 45 · Nov 2`), quarterly items by month (`November 2026`). `build`
 and `export` read only `summary_data/`, so the website never shows a coordinator-only summary as
 team coverage; it shows full-team summaries once a full-scope `summarize` has run, and a
 coordinator-only run alone gives it nothing new.

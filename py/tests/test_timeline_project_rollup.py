@@ -13,6 +13,7 @@ from wrkviz.cli import main as timeline_main
 from wrkviz.pipeline import (
     _PRESENTATION_FALLBACK_VERSION,
     _result_artifact_key,
+    _result_line,
     summarize_archive,
 )
 from wrkviz.project_rollup import (
@@ -104,13 +105,27 @@ def test_project_weekly_reads_only_the_team_weeklies_and_lists_them(tmp_path: Pa
     assert plain_job.transcript == job.transcript
     assert plain_job.prior_context == ""
     assert plain_job.glossary == plain_language_context_text("", [])
+    # Its one extra fact is the technical result, as the line the model reads for a team weekly,
+    # and its cache depends on exactly the team weeklies plus that result.
+    assert plain_job.factual_context == _result_line(
+        report.technical, "Authoritative technical weekly summary", job.start_ms
+    )
     assert plain_job.factual_context.startswith(
         f"[{inputs[0].start_ms}] Authoritative technical weekly summary:"
     )
     assert report.technical.paragraph in plain_job.factual_context
+    for bullet in report.technical.work_summary:
+        assert bullet.text in plain_job.factual_context
+    assert plain_job.dependency_keys == (
+        *(_result_artifact_key(item.technical) for item in inputs),
+        _result_artifact_key(report.technical),
+    )
     assert plain_job.stats == {}
-    # Week-level items have no meaningful time of day, so the pages give none.
-    assert "## Work summary\n\n- **" not in report.technical_markdown.read_text(encoding="utf-8")
+    # Week-level items have no meaningful time of day, so neither page gives one.
+    for path in (report.technical_markdown, report.plain_markdown):
+        work = path.read_text(encoding="utf-8").split("## Work summary\n\n", 1)[1]
+        items = [line for line in work.split("\n\n", 1)[0].splitlines() if line.startswith("- ")]
+        assert items and not any(line.startswith("- **") for line in items)
     # A second run is served from the project rollup's own cache.
     again = summarize_project_weekly(
         tmp_path, "example-project", TEAMS, week, "heuristic", "test-model",

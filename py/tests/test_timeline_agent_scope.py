@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,10 @@ from wrkviz.claude_history import load_claude_history_team
 from wrkviz.cli import main as timeline_main
 from wrkviz.model import Agent, Edge, Event, TeamData
 from wrkviz.pipeline import _summary_root, plan_summaries, summarize_archive
+from wrkviz.periods import Period
+from wrkviz.render import _local_time, _rollup_item_stamp
 from wrkviz.window import parse_date_window
+from zoneinfo import ZoneInfo
 
 CONTINUATION = "00000000-0000-0000-0000-000000000003"
 CONTINUATION_CHILD = "00000000-0000-0000-0000-000000000004"
@@ -158,19 +162,35 @@ def test_coordinator_rollup_markdown_says_it_is_not_full_team(tmp_path: Path) ->
     )
 
     summaries = tmp_path / "teams" / team.team_slug / "summary_scopes" / "coordinator" / "summaries"
-    weekly = sorted((summaries / "weekly").rglob("*-weekly.md"))
+    weekly_pages = sorted((summaries / "weekly").rglob("*.md"))
     daily = sorted((summaries / "daily").rglob("*.md"))
-    assert weekly and daily
-    for page in (*weekly, *daily):
+    assert weekly_pages and daily
+    assert any(page.name.endswith("-weekly-plain-language.md") for page in weekly_pages)
+    for page in (*weekly_pages, *daily):
         text = page.read_text(encoding="utf-8")
         heading, _, note = text.splitlines()[:3]
         assert "coordinator-only" in heading
         assert note == f"> {COORDINATOR_SCOPE_NOTE}"
-    # A weekly item is anchored at the start of the day it came from, so its page gives the date
-    # only; a daily item keeps the phase time it came from.
-    for page in weekly:
-        items = [line for line in page.read_text(encoding="utf-8").splitlines() if line.startswith("- **")]
-        assert items and all(re.match(r"- \*\*\d{4}-\d{2}-\d{2} \w{3}\*\* — ", line) for line in items)
+    # A weekly item is anchored at the start of the day it came from, so both of its pages give
+    # that local date, item by item; a daily item keeps the phase time it came from.
+    zone = ZoneInfo(team.display_timezone)
+    rollups = _summary_root(tmp_path, team.team_slug, "coordinator") / "rollups" / "weekly"
+    checked = 0
+    for rollup_path in sorted(rollups.glob("*.json")):
+        rollup = json.loads(rollup_path.read_text(encoding="utf-8"))
+        for audience, key in (("weekly", "technical_summary"), ("weekly-plain-language", "plain_language_summary")):
+            (page,) = [path for path in weekly_pages if path.name.endswith(f"-{audience}.md")
+                       and path.name.startswith(rollup["key"])]
+            stamps = re.findall(r"^- \*\*(.+?)\*\* — ", page.read_text(encoding="utf-8"), re.MULTILINE)
+            expected = [
+                datetime.fromtimestamp(item["at_ms"] / 1000, tz=timezone.utc)
+                .astimezone(zone)
+                .strftime("%Y-%m-%d %a")
+                for item in rollup[key]["work_summary"]
+            ]
+            assert stamps and stamps == expected
+            checked += 1
+    assert checked == 2 * len(list(rollups.glob("*.json"))) > 0
     daily_items = [
         line
         for page in daily
@@ -321,3 +341,60 @@ def test_a_coordinator_idle_in_the_window_is_not_refused(tmp_path: Path) -> None
     assert report.phases == 0
     assert report.agent_scope_selection is not None
     assert report.agent_scope_selection.kept_thread_ids == (ROOT, CONTINUATION)
+
+
+def _period(kind: str, start: datetime, end: datetime) -> Period:
+    return Period(kind, kind, kind, int(start.timestamp() * 1000), int(end.timestamp() * 1000), "", False)
+
+
+def _ms(zone: ZoneInfo, year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> int:
+    return int(datetime(year, month, day, hour, minute, tzinfo=zone).timestamp() * 1000)
+
+
+def test_week_level_items_are_labelled_by_the_day_week_or_month_holding_them() -> None:
+    tz = "America/New_York"
+    zone = ZoneInfo(tz)
+
+    def ms(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> int:
+        return _ms(zone, year, month, day, hour, minute)
+
+    week = _period("weekly", datetime(2026, 11, 2, tzinfo=zone), datetime(2026, 11, 9, tzinfo=zone))
+    october = _period("monthly", datetime(2026, 10, 1, tzinfo=zone), datetime(2026, 11, 1, tzinfo=zone))
+    month = _period("monthly", datetime(2026, 11, 1, tzinfo=zone), datetime(2026, 12, 1, tzinfo=zone))
+    quarter = _period("quarterly", datetime(2026, 10, 1, tzinfo=zone), datetime(2027, 1, 1, tzinfo=zone))
+    day = _period("daily", datetime(2026, 11, 4, tzinfo=zone), datetime(2026, 11, 5, tzinfo=zone))
+
+    # A weekly page: the local day holding the item.
+    assert _rollup_item_stamp(ms(2026, 11, 4), week, tz, True) == "2026-11-04 Wed"
+    # A monthly page: the ISO week holding the item, by that week's first day in the month,
+    # whatever day of the week the item itself falls on...
+    assert _rollup_item_stamp(ms(2026, 11, 2), month, tz, True) == "Week 45 · Nov 2"
+    assert _rollup_item_stamp(ms(2026, 11, 4, 15), month, tz, True) == "Week 45 · Nov 2"
+    assert _rollup_item_stamp(ms(2026, 10, 29, 14), october, tz, True) == "Week 44 · Oct 26"
+    assert _rollup_item_stamp(ms(2026, 11, 30), month, tz, True) == "Week 49 · Nov 30"
+    # ...clipped to the month when the week began before it...
+    assert _rollup_item_stamp(ms(2026, 11, 1, 10, 30), month, tz, True) == "Week 44 · Nov 1"
+    # ...and in local time: Sunday evening in New York is already Monday in UTC.
+    assert _rollup_item_stamp(ms(2026, 11, 8, 20), month, tz, True) == "Week 45 · Nov 2"
+    # A quarterly page: the local month holding the item.
+    assert _rollup_item_stamp(ms(2026, 11, 1), quarter, tz, True) == "November 2026"
+    assert _rollup_item_stamp(ms(2026, 12, 1), quarter, tz, True) == "December 2026"
+    assert _rollup_item_stamp(ms(2026, 12, 31, 19, 30), quarter, tz, True) == "December 2026"
+    # Daily items, and every page outside a narrowed scope, keep the time the item carries.
+    at = ms(2026, 11, 4, 14, 5)
+    assert _rollup_item_stamp(at, day, tz, True) == _local_time(at, tz)
+    for period in (week, month, quarter):
+        assert _rollup_item_stamp(at, period, tz, False) == _local_time(at, tz)
+
+
+def test_week_level_labels_east_of_utc_use_the_local_calendar() -> None:
+    tz = "Asia/Tokyo"
+    zone = ZoneInfo(tz)
+    month = _period("monthly", datetime(2026, 11, 1, tzinfo=zone), datetime(2026, 12, 1, tzinfo=zone))
+    quarter = _period("quarterly", datetime(2026, 10, 1, tzinfo=zone), datetime(2027, 1, 1, tzinfo=zone))
+
+    # Each of these Tokyo times is still the previous day in UTC: Nov 1 00:00 and 01:00 JST are
+    # October 31, and Nov 2 00:00 JST is Sunday Nov 1, in the previous ISO week.
+    assert _rollup_item_stamp(_ms(zone, 2026, 11, 1), quarter, tz, True) == "November 2026"
+    assert _rollup_item_stamp(_ms(zone, 2026, 11, 2), month, tz, True) == "Week 45 · Nov 2"
+    assert _rollup_item_stamp(_ms(zone, 2026, 11, 1, 1), month, tz, True) == "Week 44 · Nov 1"

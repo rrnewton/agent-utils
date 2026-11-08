@@ -76,7 +76,7 @@ Remaining wrkviz work, ordered:
    differentials. Tracked as #1077 rust-wrkviz-agent-scope-port.
    Related, both editions: #1076 site-weekly-item-stamps (the site's
    week-level rollup pages still print invented times of day; pages for
-   a narrowed scope already stamp the date only).
+   a narrowed scope already label items by day, ISO week or month).
 3. `--userguide` divergence (invalid-args subcommand after
    `--userguide`): S, ~50-150 LOC.
 4. Accepted gaps (non-finite/oversized-int JSON, lone surrogates,
