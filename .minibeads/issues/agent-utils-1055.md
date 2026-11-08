@@ -1,11 +1,12 @@
 ---
 title: 'documents-browser-release-dep: the Documents browser check rebuilds the release binary inside its own memory cap'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-tsconv
 created_at: 2026-11-08T10:50:00.000000000+00:00
-updated_at: 2026-11-08T10:50:00.000000000+00:00
+updated_at: 2026-11-08T10:54:00.000000000+00:00
+closed_at: 2026-11-08T10:54:00.000000000+00:00
 ---
 
 # Description
@@ -26,3 +27,12 @@ updated_at: 2026-11-08T10:50:00.000000000+00:00
 # Notes
 
 Found by the devbig030 coordinator while landing the browser cap change (2532f6b2); filed at the lead's request.
+
+## Resolution
+
+[muse watermelon] `vibe-talk.check.documents-browser` now depends on `vibe-talk.build.release`
+and no longer builds the release binary in-step. `py/tests/test_validation_graph_contract.py`
+gains `test_only_the_release_build_step_builds_the_release_binary`: no vibe-talk step other than
+`build.release` runs `cargo build --release`, and documents-browser depends on it (failed before
+the fix, passes after). Proven by solo reruns on a stale tree (binary removed, then a source
+touched): the build step rebuilds once under its own cap and the check passes.

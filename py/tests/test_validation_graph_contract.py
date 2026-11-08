@@ -169,6 +169,19 @@ def test_rust_and_cross_nodes_cover_their_registries_once() -> None:
     assert agentctl_shards == ["0/3", "1/3", "2/3"]
 
 
+def test_only_the_release_build_step_builds_the_release_binary() -> None:
+    # #1055: a check that builds the release binary inside its own memory cap is
+    # OOM-killed on a stale tree; every consumer depends on the one build step.
+    config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
+    builders = [
+        step.tag for step in config.steps
+        if step.tag.startswith("vibe-talk.") and "cargo build --release" in step.cmd
+    ]
+    assert builders == ["vibe-talk.build.release"], builders
+    documents = config.by_tag()["vibe-talk.check.documents-browser"]
+    assert "vibe-talk.build.release" in documents.deps
+
+
 def test_timing_browser_steps_hold_every_browser_slot() -> None:
     config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
     by_tag = config.by_tag()

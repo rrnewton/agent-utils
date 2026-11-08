@@ -1084,9 +1084,9 @@ steps:
     job: documents-browser
     desc: the Documents list, a touch fetch into the reader, and a fetch error on its row, against the real server (fake chat upstream) in current Chromium at 393x852
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && cargo build --release --locked && python3 tests/documents_browser.py
+    cmd: cd vibe-talk && python3 tests/documents_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [build.release, setup.contract-tools]
     timeout: 480
     cpu_timeout: 120
     hint:
