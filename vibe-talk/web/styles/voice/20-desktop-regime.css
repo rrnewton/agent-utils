@@ -422,7 +422,7 @@
      the channel's that ends in the ellipsis, and nothing is pushed out of the pack. */
   #discord-channel {
     flex-shrink: 0;
-    max-width: min(24rem, 100% - 5rem - 2 * 2.25rem - 3 * 0.4rem);
+    max-width: min(24rem, 100% - 5rem - 2 * 2.25rem - 3 * 0.3rem);
   }
 
   /* The row's height, and a little less air inside it: at the default column the switch is what
@@ -808,7 +808,8 @@
     display: flex;
     min-width: 2rem;
     padding: 0;
-    margin-inline-start: -0.4rem;
+    /* Joined to the picker: cancels exactly the pack's gap (`#1078` made it 0.3rem). */
+    margin-inline-start: -0.3rem;
     border-start-start-radius: 0;
     border-end-start-radius: 0;
   }
@@ -821,7 +822,7 @@
   /* The channel's picker is capped at what the pack leaves once the others are at their floors
      (`#218 desktop-dock`), and the layout button is one more of them: 2rem, with no gap. */
   #bar-pack:has(> #column-toggle:not([hidden])) > #discord-channel {
-    max-width: min(24rem, 100% - 5rem - 2.25rem - 2rem - 2 * 0.4rem);
+    max-width: min(24rem, 100% - 5rem - 2.25rem - 2rem - 2 * 0.3rem);
   }
 
   #column-toggle[aria-pressed="true"] {
