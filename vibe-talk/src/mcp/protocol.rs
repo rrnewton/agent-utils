@@ -611,7 +611,10 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
             // `post_reply` says FIRST whether anything reached the channel, in both modes, so a
             // model has no reading of a failure in which it was sent. `#264 voice-send-approval`.
             let prefix = if tool.name == "post_reply" {
-                crate::send_approval::failure_prefix(&error)
+                match &error {
+                    ToolError::Op(op) => crate::send_approval::failure_prefix(op),
+                    ToolError::Refused { .. } => "",
+                }
             } else {
                 ""
             };
@@ -619,10 +622,57 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
             // A model that named a channel wrongly needs the right names to try again, not a
             // dead end. The REST routes keep the bare refusal; this caller is authenticated and
             // could list the same channels with `list_channels` anyway, so nothing is disclosed.
-            if matches!(error, OpError::UnknownChannel) {
+            if matches!(error, ToolError::Op(OpError::UnknownChannel)) {
                 text.push_str(&format!(". {}", channel_choices(state).await));
             }
             Outcome::Reply(Box::new(RpcResponse::ok(id, text_result(text, true))))
+        }
+    }
+}
+
+/// Why a tool call produced a tool error rather than its normal result.
+///
+/// Mostly an [`OpError`] from the shared operations layer. The document tools
+/// refuse in ways that have no REST meaning — an unknown document key, a
+/// heading the outline does not carry — so those carry their own stable code
+/// and model-facing sentence here instead of growing the shared error type
+/// both transports map exhaustively.
+enum ToolError {
+    /// A refusal from the operations layer.
+    Op(OpError),
+    /// A tool-local refusal with its own stable code.
+    Refused {
+        /// Stable machine-readable code, as the access log and result carry.
+        code: &'static str,
+        /// The sentence the model is told.
+        message: String,
+    },
+}
+
+impl ToolError {
+    fn refused(code: &'static str, message: String) -> Self {
+        Self::Refused { code, message }
+    }
+
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Op(error) => error.code(),
+            Self::Refused { code, .. } => code,
+        }
+    }
+}
+
+impl From<OpError> for ToolError {
+    fn from(error: OpError) -> Self {
+        Self::Op(error)
+    }
+}
+
+impl std::fmt::Display for ToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Op(error) => write!(f, "{error}"),
+            Self::Refused { message, .. } => write!(f, "{message}"),
         }
     }
 }
@@ -633,19 +683,26 @@ async fn run_named(
     scope: Scope,
     name: &str,
     args: &Value,
-) -> Option<Result<String, OpError>> {
+) -> Option<Result<String, ToolError>> {
     Some(match name {
         "list_channels" => Ok(list_channels_text(state).await),
         // Each read runs under the credential's scope: what a read-scope one sees is never
         // written to the message cache.
-        "recent_activity" => run_activity(state, scope, args).await,
-        "digest_channel" => run_digest(state, scope, args).await,
-        "read_page" => run_page(state, scope, args).await,
-        "count_messages" => run_count(state, scope, args).await,
-        "find_message" => run_find(state, scope, args).await,
-        "read_message" => run_read(state, scope, args).await,
-        "post_reply" => run_post(state, args).await,
-        "mark_read" => run_mark_read(state, args).await,
+        "recent_activity" => run_activity(state, scope, args)
+            .await
+            .map_err(ToolError::from),
+        "digest_channel" => run_digest(state, scope, args)
+            .await
+            .map_err(ToolError::from),
+        "read_page" => run_page(state, scope, args).await.map_err(ToolError::from),
+        "count_messages" => run_count(state, scope, args).await.map_err(ToolError::from),
+        "find_message" => run_find(state, scope, args).await.map_err(ToolError::from),
+        "read_message" => run_read(state, scope, args).await.map_err(ToolError::from),
+        // `#1040 documents-voice-agent`: cache-only, so no scope reaches a fetcher.
+        "fetch_document" => run_fetch_document(state, args),
+        "fetch_document_section" => run_fetch_document_section(state, args),
+        "post_reply" => run_post(state, args).await.map_err(ToolError::from),
+        "mark_read" => run_mark_read(state, args).await.map_err(ToolError::from),
         _ => return None,
     })
 }
@@ -1849,6 +1906,225 @@ async fn run_read(state: &AppState, caller: Scope, args: &Value) -> Result<Strin
         info.display_name(),
         untrusted::render_for_model_read(&[message], &crate::owner::Owner::of(state), &read)
     ))
+}
+
+/// How much document text one `fetch_document` result carries, in bytes.
+/// `#1040 documents-voice-agent`: a ~4000-word document is several results,
+/// each small enough for a voice turn; a cut names how to continue.
+const DOCUMENT_RESULT_CAP: usize = 12 * 1024;
+
+/// How many outline entries a refused heading lists before it counts the rest.
+const OUTLINE_LIST_CAP: usize = 100;
+
+/// A third-party string on a server line of a document result: defused and one line.
+fn document_field(text: &str) -> String {
+    untrusted::one_line(&untrusted::neutralize(text))
+}
+
+/// The first line of a document result, naming what the fenced text is.
+fn document_header(
+    fetched: &crate::documents::Fetched,
+    what: &str,
+    first_word: usize,
+    last_word: usize,
+    total_words: usize,
+) -> String {
+    format!(
+        "Document \"{}\" (key {}, version {}), {what}, words {first_word}-{last_word} of {total_words}:",
+        document_field(&fetched.title),
+        document_field(&fetched.key),
+        document_field(&fetched.version),
+    )
+}
+
+/// `text` cut to [`DOCUMENT_RESULT_CAP`] at a line boundary when one is in
+/// the back half, and whether anything was cut.
+fn cut_document_text(text: &str) -> (&str, bool) {
+    if text.len() <= DOCUMENT_RESULT_CAP {
+        return (text, false);
+    }
+    let mut end = DOCUMENT_RESULT_CAP;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if let Some(newline) = text[..end].rfind('\n') {
+        if newline >= DOCUMENT_RESULT_CAP / 2 {
+            end = newline;
+        }
+    }
+    (&text[..end], true)
+}
+
+/// What a document tool can read: the fetched copy, or the linked entry whose
+/// copy the reader has not fetched yet. Never a fetch: `#1040` tools read
+/// only the in-process cache and spend no source credential.
+enum DocumentLookup {
+    Fetched(crate::documents::Fetched),
+    NotFetched(crate::documents::Entry),
+}
+
+fn lookup_document(state: &AppState, args: &Value) -> Result<DocumentLookup, ToolError> {
+    let key = arg_str(args, "document_key").unwrap_or_default();
+    let entry = state.documents.index.get(key.trim()).ok_or_else(|| {
+        ToolError::refused(
+            "unknown_document",
+            "that document_key does not name a document linked in the chat this server reads"
+                .to_owned(),
+        )
+    })?;
+    Ok(match state.documents.cached(&entry.key) {
+        Some(fetched) => DocumentLookup::Fetched(fetched),
+        None => DocumentLookup::NotFetched(entry),
+    })
+}
+
+/// A document the reader has linked but not fetched: a plain result, as a
+/// proposal refusal is — there is nothing to retry until the reader fetches it.
+fn document_not_fetched_text(entry: &crate::documents::Entry) -> String {
+    format!(
+        "Document \"{}\" (key {}) has not been fetched by the reader yet, so this server holds \
+         no text for it. It is fetched by opening it in the reader; this tool never fetches it \
+         itself.",
+        document_field(entry.display_name()),
+        document_field(&entry.key),
+    )
+}
+
+/// The outline as retry choices, mirroring the channel choices a wrong
+/// channel gets: a model that named a heading wrongly needs the right ones.
+fn document_outline_choices(outline: &[String]) -> String {
+    if outline.is_empty() {
+        return "It has no headings in its outline.".to_owned();
+    }
+    let mut listed = outline
+        .iter()
+        .take(OUTLINE_LIST_CAP)
+        .map(|heading| format!("\"{}\"", document_field(heading)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if outline.len() > OUTLINE_LIST_CAP {
+        listed.push_str(&format!(", and {} more", outline.len() - OUTLINE_LIST_CAP));
+    }
+    format!("Its sections are: {listed}.")
+}
+
+fn unknown_heading_error(fetched: &crate::documents::Fetched, heading: &str) -> ToolError {
+    let named: String = document_field(heading).chars().take(200).collect();
+    ToolError::refused(
+        "unknown_heading",
+        format!(
+            "document \"{}\" has no section headed \"{named}\". {} Call \
+             fetch_document_section again with one of those headings, exactly as written.",
+            document_field(&fetched.title),
+            document_outline_choices(&fetched.outline),
+        ),
+    )
+}
+
+/// How a cut whole-document result says to read on, by section.
+fn document_cut_tail(fetched: &crate::documents::Fetched, cut_end: usize) -> String {
+    let all = crate::documents::headings(&fetched.content);
+    let heads: Vec<&crate::documents::Heading> =
+        all.iter().filter(|heading| heading.level <= 2).collect();
+    let containing = heads.iter().rev().find(|heading| heading.start < cut_end);
+    let next = heads.iter().find(|heading| heading.start >= cut_end);
+    match (containing, next) {
+        (Some(own), Some(after)) => format!(
+            "[truncated by this server: the document goes on past what is shown. Continue \
+             with fetch_document_section heading \"{}\" for the rest of that section, then \
+             heading \"{}\" for the section after it.]\n",
+            document_field(&own.text),
+            document_field(&after.text),
+        ),
+        (Some(own), None) => format!(
+            "[truncated by this server: the document goes on past what is shown. Continue \
+             with fetch_document_section heading \"{}\" for the rest of that section.]\n",
+            document_field(&own.text),
+        ),
+        (None, Some(after)) => format!(
+            "[truncated by this server: the document goes on past what is shown. Continue \
+             with fetch_document_section heading \"{}\" to read on from its first section.]\n",
+            document_field(&after.text),
+        ),
+        (None, None) => "[truncated by this server: the document goes on past what is shown, \
+             and it has no headings, so no fetch_document_section call can reach the rest.]\n"
+            .to_owned(),
+    }
+}
+
+/// How a cut section result says to read on: the next outline heading.
+fn section_cut_tail(fetched: &crate::documents::Fetched, heading: &str) -> String {
+    let next = fetched
+        .outline
+        .iter()
+        .position(|entry| entry == heading)
+        .and_then(|index| fetched.outline.get(index + 1));
+    match next {
+        Some(next) => format!(
+            "[truncated by this server: this section goes on past what is shown. Continue \
+             with fetch_document_section heading \"{}\" for the next section.]\n",
+            document_field(next),
+        ),
+        None => "[truncated by this server: this section goes on past what is shown, and no \
+             section follows it in the outline.]\n"
+            .to_owned(),
+    }
+}
+
+/// `fetch_document`: the whole fetched copy, capped. `#1040 documents-voice-agent`.
+fn run_fetch_document(state: &AppState, args: &Value) -> Result<String, ToolError> {
+    let fetched = match lookup_document(state, args)? {
+        DocumentLookup::Fetched(fetched) => fetched,
+        DocumentLookup::NotFetched(entry) => return Ok(document_not_fetched_text(&entry)),
+    };
+    let total = crate::documents::word_count(&fetched.content);
+    let (chunk, truncated) = cut_document_text(&fetched.content);
+    let shown = crate::documents::word_count(chunk);
+    let header = document_header(
+        &fetched,
+        "whole document",
+        usize::from(shown > 0),
+        shown,
+        total,
+    );
+    let mut result = format!("{header}\n{}", untrusted::fenced(chunk));
+    if truncated {
+        result.push_str(&document_cut_tail(&fetched, chunk.len()));
+    }
+    Ok(result)
+}
+
+/// `fetch_document_section`: one outline heading's section, capped.
+fn run_fetch_document_section(state: &AppState, args: &Value) -> Result<String, ToolError> {
+    let fetched = match lookup_document(state, args)? {
+        DocumentLookup::Fetched(fetched) => fetched,
+        DocumentLookup::NotFetched(entry) => return Ok(document_not_fetched_text(&entry)),
+    };
+    let heading = arg_str(args, "heading").unwrap_or_default();
+    // Exact outline text, case-sensitive: the outline is what the model was
+    // given to choose from, and a free invention gets it listed back.
+    if !fetched.outline.iter().any(|entry| entry == &heading) {
+        return Err(unknown_heading_error(&fetched, &heading));
+    }
+    let Some(section) = crate::documents::section_of(&fetched.content, &heading) else {
+        return Err(unknown_heading_error(&fetched, &heading));
+    };
+    let total = crate::documents::word_count(&fetched.content);
+    let before = crate::documents::word_count(&fetched.content[..section.start]);
+    let (chunk, truncated) = cut_document_text(section.text);
+    let shown = crate::documents::word_count(chunk);
+    let header = document_header(
+        &fetched,
+        &format!("section \"{}\"", document_field(&heading)),
+        if shown > 0 { before + 1 } else { before },
+        before + shown,
+        total,
+    );
+    let mut result = format!("{header}\n{}", untrusted::fenced(chunk));
+    if truncated {
+        result.push_str(&section_cut_tail(&fetched, &heading));
+    }
+    Ok(result)
 }
 
 /// `post_reply`, as the owner's setting says. `#264 voice-send-approval`.

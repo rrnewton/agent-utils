@@ -428,6 +428,74 @@ pub fn tool_manifest_with_services(
             mcp_exposed: true,
             listed: true,
         },
+        // `#1040 documents-voice-agent`. Cache-only reads of a document the reader already
+        // fetched: neither tool ever fetches upstream or spends a source credential.
+        ToolDescriptor {
+            name: "fetch_document",
+            description: "Read a chat-linked document that the reader has already fetched, in \
+                          full. Use it when the session says a document is open and the user \
+                          wants it read or answered from as a whole: a filler line fetches \
+                          nothing, so if you speak one, this call must be in that same response. \
+                          It reads only this server's already-fetched copy; it never fetches \
+                          the document itself, so a document the reader has not fetched yet is \
+                          reported as such. The result names the document and the words it \
+                          carries; a long document is cut at this server, and the cut says \
+                          which section to continue with through fetch_document_section."
+                .to_owned(),
+            method: "GET",
+            path: "/api/v1/documents/{key}",
+            approval: ApprovalMode::Automatic,
+            arguments: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "document_key": {
+                        "type": "string",
+                        "description": "The document_key this server gave for the document, \
+                                        exactly as given (it is named in the session context \
+                                        when a document is open)."
+                    }
+                },
+                "required": ["document_key"]
+            }),
+            mutates: false,
+            mcp_exposed: true,
+            listed: true,
+        },
+        ToolDescriptor {
+            name: "fetch_document_section",
+            description: "Read ONE section of a chat-linked document that the reader has \
+                          already fetched: the text from its heading to the next heading of \
+                          the same level or higher, subsections included. Use it to continue a \
+                          cut fetch_document result, and to answer a question about one part of \
+                          a document without reading all of it. Give the heading exactly as the \
+                          outline writes it; a heading that matches nothing is refused with the \
+                          document's outline, so call again with one of those headings. It \
+                          reads only this server's already-fetched copy and never fetches the \
+                          document itself."
+                .to_owned(),
+            method: "GET",
+            path: "/api/v1/documents/{key}",
+            approval: ApprovalMode::Automatic,
+            arguments: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "document_key": {
+                        "type": "string",
+                        "description": "The document_key this server gave for the document, \
+                                        exactly as given."
+                    },
+                    "heading": {
+                        "type": "string",
+                        "description": "The section's heading text, exactly as the document's \
+                                        outline writes it (case-sensitive, without the # marks)."
+                    }
+                },
+                "required": ["document_key", "heading"]
+            }),
+            mutates: false,
+            mcp_exposed: true,
+            listed: true,
+        },
         // `#649 voice-agent-tools` item 7. A change to this server's own record only, made on the
         // user's own explicit ask, which the server checks against what the voice page heard.
         ToolDescriptor {

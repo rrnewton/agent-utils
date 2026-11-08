@@ -87,7 +87,7 @@ pub const PROMPT_ID: &str = "voice-agent-system";
 
 /// Bump this whenever any of the five prompt files changes, and update every pinned fingerprint
 /// below to match. The test that compares them is what makes the version mean something.
-pub const PROMPT_VERSION: u32 = 14;
+pub const PROMPT_VERSION: u32 = 15;
 
 /// The [`fingerprint`] of [`OWNER_INSTRUCTIONS_HEADING`] at [`PROMPT_VERSION`]. It reaches the
 /// agent only with the owner's instructions, so it is pinned on its own rather than inside a
@@ -95,13 +95,13 @@ pub const PROMPT_VERSION: u32 = 14;
 pub const PINNED_OWNER_HEADING_FINGERPRINT: &str = "fnv1a64:946b5fc6e4828976";
 
 /// The [`fingerprint`] of the read-only prompt at [`PROMPT_VERSION`].
-pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:e90ae65969b17b73";
+pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:3c7aaeb5c64649e4";
 
 /// The [`fingerprint`] of the sending prompt that asks first, at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:6960c86cbe4420f7";
+pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:d4f7f3a93389d578";
 
 /// The [`fingerprint`] of the sending prompt that posts at once, at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:66ce8f42bd9aac80";
+pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:f3bdcc90bab23977";
 
 /// Which instructions follow the base: what this caller can do, and how the owner wants sends
 /// confirmed.
@@ -800,6 +800,29 @@ mod tests {
             "you do not need list_channels first",
             "Prefer one call that answers the question over several calls in a row",
             "never look up the current time",
+        ] {
+            assert!(
+                flat.contains(rule),
+                "the base prompt lost the rule containing {rule:?}"
+            );
+        }
+    }
+
+    /// `#1040 documents-voice-agent`. With a document open, the agent asks
+    /// before ingesting it, fetches it on the yes, and answers from what it
+    /// fetched, naming the section.
+    #[test]
+    fn the_base_prompt_asks_before_reading_an_open_document() {
+        let flat = SYSTEM_PROMPT
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for rule in [
+            "Should I read the whole document, or just answer questions about it?",
+            "call fetch_document with that document_key in that same response",
+            "continue with fetch_document_section",
+            "Answer only from document text you have fetched",
+            "name the section the answer came from",
         ] {
             assert!(
                 flat.contains(rule),

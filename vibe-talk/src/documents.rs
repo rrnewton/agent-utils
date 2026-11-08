@@ -768,9 +768,13 @@ pub fn version_of(content: &str) -> String {
 }
 
 /// The title and outline of a Markdown document.
+///
+/// Fence-aware, like [`headings`]: a `#` line inside a fenced code block is
+/// code, not a heading, so it names no outline entry and no section. (This
+/// function used to scan raw lines; [`section_of`] and the outline now agree
+/// by construction because both read [`headings`].)
 #[must_use]
 pub fn title_and_outline(content: &str, fallback: &str) -> (String, Vec<String>) {
-    let mut outline = Vec::new();
     let mut title = None;
     let mut lines = content.lines().peekable();
     // Front matter title.
@@ -785,18 +789,109 @@ pub fn title_and_outline(content: &str, fallback: &str) -> (String, Vec<String>)
             }
         }
     }
-    for line in content.lines() {
-        let line = line.trim_end();
-        if let Some(heading) = line.strip_prefix("# ") {
-            outline.push(heading.trim().to_owned());
-            if title.is_none() {
-                title = Some(heading.trim().to_owned());
+    let mut outline = Vec::new();
+    for heading in headings(content) {
+        if heading.level <= 2 {
+            if heading.level == 1 && title.is_none() {
+                title = Some(heading.text.clone());
             }
-        } else if let Some(heading) = line.strip_prefix("## ") {
-            outline.push(heading.trim().to_owned());
+            outline.push(heading.text);
         }
     }
     (title.unwrap_or_else(|| fallback.to_owned()), outline)
+}
+
+/// One ATX heading outside any fenced code block. `#1040 documents-voice-agent`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Heading {
+    /// Heading level: 1 (`#`) to 6 (`######`).
+    pub level: usize,
+    /// The heading text, trimmed: what an outline entry carries.
+    pub text: String,
+    /// Byte offset of the heading line's first byte in the source.
+    pub start: usize,
+}
+
+/// The ATX heading a line is, as `(level, text)`, or `None`.
+///
+/// Column 0 only — the same shape the outline has always recognised — with
+/// 1 to 6 `#` then a space, a tab, or the end of the line.
+fn atx_heading(line: &str) -> Option<(usize, &str)> {
+    let level = line.bytes().take_while(|b| *b == b'#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let rest = &line[level..];
+    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    Some((level, rest.trim()))
+}
+
+/// Every ATX heading in `content`, in order, skipping fenced code blocks.
+///
+/// A fence is what [`without_code`] takes it to be: a line whose first
+/// non-space characters are ` ``` ` toggles the fenced state.
+#[must_use]
+pub fn headings(content: &str) -> Vec<Heading> {
+    let mut found = Vec::new();
+    let mut fenced = false;
+    let mut offset = 0;
+    for line in content.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        if let Some((level, text)) = atx_heading(line.trim_end_matches(['\n', '\r'])) {
+            found.push(Heading {
+                level,
+                text: text.to_owned(),
+                start,
+            });
+        }
+    }
+    found
+}
+
+/// One heading's section of a document: from its heading line to the next
+/// heading of its level or higher (a smaller level number), or to the end of
+/// the document. Deeper subsections are part of the section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Section<'a> {
+    /// The section's source, trailing blank lines removed.
+    pub text: &'a str,
+    /// Byte offset of the heading line in the source.
+    pub start: usize,
+    /// The heading's level.
+    pub level: usize,
+}
+
+/// The section headed exactly `heading` (case-sensitive; first match wins),
+/// or `None` when no heading outside a code fence carries that text.
+#[must_use]
+pub fn section_of<'a>(content: &'a str, heading: &str) -> Option<Section<'a>> {
+    let all = headings(content);
+    let (index, own) = all.iter().enumerate().find(|(_, h)| h.text == heading)?;
+    let end = all[index + 1..]
+        .iter()
+        .find(|h| h.level <= own.level)
+        .map_or(content.len(), |h| h.start);
+    Some(Section {
+        text: content[own.start..end].trim_end_matches(['\n', '\r']),
+        start: own.start,
+        level: own.level,
+    })
+}
+
+/// How many words `text` holds, counting whitespace-separated runs.
+#[must_use]
+pub fn word_count(text: &str) -> usize {
+    text.split_whitespace().count()
 }
 
 /// One source document, as a fetcher returns it before titling.
@@ -1858,5 +1953,135 @@ mod tests {
             panic!("wrong failure: {error}");
         };
         assert_eq!(detail, "token command failed: first-problem");
+    }
+
+    const SLICING_DOC: &str = "\
+# Report
+
+intro words here
+
+## Methods
+
+method body
+
+### Detail
+
+deep body
+
+## Results
+
+result body
+
+# Appendix
+
+appendix body
+";
+
+    #[test]
+    fn a_section_stops_at_the_next_heading_of_its_level_or_higher() {
+        let methods = section_of(SLICING_DOC, "Methods").expect("section");
+        assert!(methods.text.starts_with("## Methods"), "{}", methods.text);
+        assert!(methods.text.contains("method body"), "{}", methods.text);
+        assert!(
+            !methods.text.contains("result body"),
+            "the next ## ends it: {}",
+            methods.text
+        );
+        // A level-1 section runs until the next level-1 heading.
+        let report = section_of(SLICING_DOC, "Report").expect("section");
+        assert!(report.text.contains("result body"), "{}", report.text);
+        assert!(
+            !report.text.contains("appendix body"),
+            "the next # ends it: {}",
+            report.text
+        );
+        assert_eq!(report.level, 1);
+        assert_eq!(methods.level, 2);
+        assert_eq!(&SLICING_DOC[methods.start..methods.start + 2], "##");
+    }
+
+    #[test]
+    fn a_section_includes_its_deeper_subsections() {
+        let methods = section_of(SLICING_DOC, "Methods").expect("section");
+        assert!(
+            methods.text.contains("### Detail") && methods.text.contains("deep body"),
+            "{}",
+            methods.text
+        );
+    }
+
+    #[test]
+    fn the_last_section_runs_to_the_end_of_the_document() {
+        let appendix = section_of(SLICING_DOC, "Appendix").expect("section");
+        assert_eq!(appendix.text, "# Appendix\n\nappendix body");
+    }
+
+    #[test]
+    fn a_heading_inside_a_code_fence_is_not_a_section_boundary() {
+        let doc = "\
+## Real
+
+before
+
+```markdown
+## Fake
+
+code, not a heading
+```
+
+after
+
+## Next
+
+next body
+";
+        let real = section_of(doc, "Real").expect("section");
+        assert!(
+            real.text.contains("## Fake"),
+            "fenced text is kept: {}",
+            real.text
+        );
+        assert!(real.text.contains("after"), "{}", real.text);
+        assert!(
+            !real.text.contains("next body"),
+            "the real next ## still ends it: {}",
+            real.text
+        );
+        assert!(
+            section_of(doc, "Fake").is_none(),
+            "a fenced heading heads no section"
+        );
+        // The outline agrees: a fenced heading is no outline entry either.
+        let (_title, outline) = title_and_outline(doc, "fallback");
+        assert_eq!(outline, ["Real", "Next"]);
+    }
+
+    #[test]
+    fn a_missing_or_differently_cased_heading_has_no_section() {
+        assert!(section_of(SLICING_DOC, "Conclusions").is_none());
+        assert!(
+            section_of(SLICING_DOC, "methods").is_none(),
+            "heading match is case-sensitive"
+        );
+        assert!(section_of("", "Methods").is_none());
+    }
+
+    #[test]
+    fn headings_and_word_count_read_the_whole_shape() {
+        let all = headings(SLICING_DOC);
+        let shape: Vec<(usize, &str)> = all.iter().map(|h| (h.level, h.text.as_str())).collect();
+        assert_eq!(
+            shape,
+            [
+                (1, "Report"),
+                (2, "Methods"),
+                (3, "Detail"),
+                (2, "Results"),
+                (1, "Appendix")
+            ]
+        );
+        assert_eq!(word_count("one  two\nthree\tfour "), 4);
+        assert_eq!(word_count(""), 0);
+        assert_eq!(word_count(SLICING_DOC), 21);
     }
 }

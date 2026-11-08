@@ -869,6 +869,8 @@ async fn the_read_scope_tool_list_is_unchanged() {
             "count_messages",
             "find_message",
             "read_message",
+            "fetch_document",
+            "fetch_document_section",
         ]
     );
     let listing = body.to_string();

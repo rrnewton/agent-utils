@@ -5,7 +5,8 @@
 //! of this server that authenticated nothing, that let a read credential post, or that let a
 //! caller name a channel outside the allowlist would fail here rather than pass quietly.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -13,6 +14,7 @@ use http_body_util::BodyExt as _;
 use serde_json::{json, Value};
 use tower::ServiceExt as _;
 use vibe_talk::discord::fake::FakeDiscord;
+use vibe_talk::documents::{Entry, FetchError, FetchedRaw, Fetcher, Index, Service};
 use vibe_talk::http::router;
 use vibe_talk::model::ChannelId;
 use vibe_talk::testing::{READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN};
@@ -886,10 +888,12 @@ async fn a_full_handshake_then_list_then_call_works_over_the_endpoint() {
             "count_messages",
             "find_message",
             "read_message",
+            "fetch_document",
+            "fetch_document_section",
             "mark_read",
             "post_reply"
         ],
-        "the write credential is offered exactly the eight listed tools"
+        "the write credential is offered exactly the ten listed tools"
     );
 
     let (_status, found) = rpc(
@@ -1664,4 +1668,281 @@ async fn recent_activity_reads_the_channels_named_together_in_one_call() {
         none.contains("lead team (id"),
         "the choices are given: {none}"
     );
+}
+
+// --- documents (`#1040 documents-voice-agent`) ------------------------------------------------
+
+const DOC_KEY: &str = "github:octo/widgets@main:docs/report.md";
+const DOC_URL: &str = "https://github.com/octo/widgets/blob/main/docs/report.md";
+const DOC_OTHER_KEY: &str = "github:octo/widgets@main:docs/other.md";
+const DOC_CONTENT: &str = "\
+# Quarterly Report
+
+an opening line
+
+## Methods
+
+the method measured the purple anvil twice
+
+### Detail
+
+detail under methods
+
+## Results
+
+the result held for every anvil
+";
+
+/// A document source that counts its fetches, so a tool that fetched would show.
+#[derive(Default)]
+struct DocSource {
+    contents: Mutex<HashMap<String, String>>,
+    fetches: Mutex<usize>,
+}
+
+#[async_trait::async_trait]
+impl Fetcher for DocSource {
+    async fn fetch(&self, entry: &Entry) -> Result<FetchedRaw, FetchError> {
+        *self.fetches.lock().expect("lock") += 1;
+        let content = self
+            .contents
+            .lock()
+            .expect("lock")
+            .get(&entry.key)
+            .cloned()
+            .ok_or_else(|| FetchError::Failed("not found".to_owned()))?;
+        Ok(FetchedRaw {
+            content,
+            version: Some("v1".to_owned()),
+        })
+    }
+
+    async fn current_version(&self, _entry: &Entry) -> Result<Option<String>, FetchError> {
+        Ok(Some("v1".to_owned()))
+    }
+}
+
+/// A harness whose reader has linked two documents and fetched one of them.
+async fn document_harness(content: &str) -> (Harness, Arc<DocSource>) {
+    let (mut state, discord) = vibe_talk::testing::state();
+    let source = Arc::new(DocSource::default());
+    source
+        .contents
+        .lock()
+        .expect("lock")
+        .insert(DOC_KEY.to_owned(), content.to_owned());
+    let index = Arc::new(Index::new(Vec::new()));
+    index.apply_message(
+        READ_CHANNEL,
+        "1000000000000000011",
+        Some(1),
+        "agent",
+        None,
+        DOC_URL,
+    );
+    index.apply_message(
+        READ_CHANNEL,
+        "1000000000000000012",
+        Some(2),
+        "agent",
+        None,
+        "https://github.com/octo/widgets/blob/main/docs/other.md",
+    );
+    let service = Arc::new(Service::new(index, source.clone(), 100, 1 << 20));
+    service
+        .fetch_one(DOC_KEY)
+        .await
+        .expect("the reader fetched it");
+    state.documents = service;
+    (
+        Harness {
+            router: router(state),
+            discord,
+        },
+        source,
+    )
+}
+
+#[tokio::test]
+async fn fetch_document_reads_the_cached_copy_and_a_section_reads_only_that_section() {
+    let (harness, source) = document_harness(DOC_CONTENT).await;
+    let fetches = *source.fetches.lock().expect("lock");
+
+    // A read-scope token is offered both tools: reading is automatic.
+    let listed = tools(&harness, READ_TOKEN).await;
+    for wanted in ["fetch_document", "fetch_document_section"] {
+        let tool = listed
+            .iter()
+            .find(|t| t["name"] == wanted)
+            .unwrap_or_else(|| panic!("{wanted} is listed for a read token: {listed:?}"));
+        assert_eq!(tool["annotations"]["readOnlyHint"], true, "{tool}");
+    }
+
+    let (status, body) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        call("fetch_document", json!({ "document_key": DOC_KEY })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], false, "{body}");
+    let whole = tool_text(&body);
+    assert!(
+        whole.starts_with(&format!(
+            "Document \"Quarterly Report\" (key {DOC_KEY}, version v1), whole document, words 1-"
+        )),
+        "{whole}"
+    );
+    assert!(whole.contains(untrusted::FENCE), "fenced: {whole}");
+    assert!(whole.contains(untrusted::NOTICE), "{whole}");
+    assert!(
+        whole.contains("the method measured the purple anvil twice"),
+        "{whole}"
+    );
+    assert!(whole.contains("the result held for every anvil"), "{whole}");
+
+    let section = tool_call_text(
+        &harness,
+        READ_TOKEN,
+        "fetch_document_section",
+        json!({ "document_key": DOC_KEY, "heading": "Methods" }),
+    )
+    .await;
+    assert!(section.contains("section \"Methods\""), "{section}");
+    assert!(
+        section.contains("the method measured the purple anvil twice"),
+        "{section}"
+    );
+    assert!(
+        section.contains("detail under methods"),
+        "subsection kept: {section}"
+    );
+    assert!(
+        !section.contains("the result held"),
+        "another section leaked in: {section}"
+    );
+    assert!(
+        !section.contains("an opening line"),
+        "text before the section leaked in: {section}"
+    );
+
+    assert_eq!(
+        *source.fetches.lock().expect("lock"),
+        fetches,
+        "the tools read the cache only; a fetch would have spent the source"
+    );
+}
+
+#[tokio::test]
+async fn fetch_document_refuses_unknown_keys_and_headings_and_reports_unfetched_plainly() {
+    let (harness, source) = document_harness(DOC_CONTENT).await;
+    let fetches = *source.fetches.lock().expect("lock");
+
+    let (status, body) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        call(
+            "fetch_document",
+            json!({ "document_key": "github:nope/nope@main:x.md" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    let unknown = tool_text(&body);
+    assert!(unknown.starts_with("unknown_document"), "{unknown}");
+    assert!(
+        !unknown.contains(DOC_KEY),
+        "an unknown key is told nothing about the known documents: {unknown}"
+    );
+
+    // No argument at all is the same clean refusal, never a panic.
+    let (_status, body) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        call("fetch_document", json!({})),
+    )
+    .await;
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    assert!(tool_text(&body).starts_with("unknown_document"), "{body}");
+
+    // Linked but never fetched by the reader: a plain result, and no fetch.
+    let (status, body) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        call("fetch_document", json!({ "document_key": DOC_OTHER_KEY })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], false, "{body}");
+    let unfetched = tool_text(&body);
+    assert!(unfetched.contains("has not been fetched"), "{unfetched}");
+    assert!(unfetched.contains(DOC_OTHER_KEY), "{unfetched}");
+
+    // A heading the outline does not carry is refused with the outline to retry from.
+    let (_status, body) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        call(
+            "fetch_document_section",
+            json!({ "document_key": DOC_KEY, "heading": "methods" }),
+        ),
+    )
+    .await;
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    let refused = tool_text(&body);
+    assert!(refused.starts_with("unknown_heading"), "{refused}");
+    assert!(
+        refused.contains("\"Methods\""),
+        "the choices are given: {refused}"
+    );
+    assert!(refused.contains("\"Results\""), "{refused}");
+
+    assert_eq!(
+        *source.fetches.lock().expect("lock"),
+        fetches,
+        "no refusal path may fetch either"
+    );
+}
+
+#[tokio::test]
+async fn a_long_document_is_cut_with_the_section_to_continue_with() {
+    let mut content = String::from("# Big Report\n\n## Alpha\n\n");
+    content.push_str(&"anvil ".repeat(3_000));
+    content.push_str("\n\n## Beta\n\nbeta body\n");
+    let (harness, _source) = document_harness(&content).await;
+
+    let whole = tool_call_text(
+        &harness,
+        READ_TOKEN,
+        "fetch_document",
+        json!({ "document_key": DOC_KEY }),
+    )
+    .await;
+    assert!(whole.contains("truncated"), "{whole}");
+    assert!(
+        whole.contains("fetch_document_section") && whole.contains("\"Beta\""),
+        "the cut names how to read on: {}",
+        &whole[whole.len().saturating_sub(400)..]
+    );
+    assert!(
+        !whole.contains("beta body"),
+        "text past the cut was included: {}",
+        whole.len()
+    );
+    assert!(
+        whole.len() < 16_000,
+        "one result is capped near 12 KB of document text: {}",
+        whole.len()
+    );
+
+    // The named continuation really does read the rest.
+    let beta = tool_call_text(
+        &harness,
+        READ_TOKEN,
+        "fetch_document_section",
+        json!({ "document_key": DOC_KEY, "heading": "Beta" }),
+    )
+    .await;
+    assert!(beta.contains("beta body"), "{beta}");
 }

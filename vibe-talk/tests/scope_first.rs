@@ -1418,7 +1418,17 @@ mod read_scope_writes_nothing {
                 fake.seed_at(
                     &read,
                     "Ada",
-                    &format!("message {n} about lunch"),
+                    // The last one links a document (`#1040 documents-voice-agent`), so the
+                    // write-token fill folds it into the index, known but unfetched, for the
+                    // document tools below to read at read scope.
+                    &format!(
+                        "message {n} about lunch{}",
+                        if n == 11 {
+                            " https://github.com/octo/widgets/blob/main/docs/report.md"
+                        } else {
+                            ""
+                        }
+                    ),
                     T0 + n * MINUTE,
                 )
             })
@@ -1581,6 +1591,19 @@ mod read_scope_writes_nothing {
             (
                 "read_message",
                 vec![json!({"channel_id": READ_CHANNEL, "message_id": message})],
+            ),
+            // `#1040 documents-voice-agent`: the linked document is known but unfetched, so
+            // both answer from the index alone and fetch nothing.
+            (
+                "fetch_document",
+                vec![json!({"document_key": "github:octo/widgets@main:docs/report.md"})],
+            ),
+            (
+                "fetch_document_section",
+                vec![json!({
+                    "document_key": "github:octo/widgets@main:docs/report.md",
+                    "heading": "Methods"
+                })],
             ),
         ]);
         let mut offered: BTreeSet<String> =
