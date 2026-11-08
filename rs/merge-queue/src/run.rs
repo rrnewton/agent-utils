@@ -4200,6 +4200,10 @@ impl<'a> Runner<'a> {
                 ]
             })
             .unwrap_or_default();
+        // The validator is told what its candidate was built on, so a queue-mode
+        // runner can diff against the job's own base (see MQ_PARENT, crate::validate).
+        extra.push((crate::validate::BASE_ENV.to_owned(), self.job_base()));
+        extra.push((crate::validate::PARENT_ENV.to_owned(), job.parent.clone()));
         // A candidate validation may stop at its first red step (`validator.fail_fast`). The
         // complete run on the base (`widen`) never does: its record names every failure.
         if self.config.validator.fail_fast && job.purpose != "widen" {
@@ -4362,17 +4366,21 @@ impl<'a> Runner<'a> {
         Ok((id, ran))
     }
 
+    /// The base a validation is measured against (and a donor job records):
+    /// the run's starting base once known, else the current base.
+    fn job_base(&self) -> String {
+        let report = lock(&self.report);
+        if report.base_start.is_empty() {
+            lock(&self.base).clone()
+        } else {
+            report.base_start.clone()
+        }
+    }
+
     /// Publish `job` for donors; returns the donor job id.
     fn publish(&self, donors: &Donors, job: &Job) -> Result<String, String> {
         let tree = self.git.tree_of(&job.commit)?;
-        let base = {
-            let report = lock(&self.report);
-            if report.base_start.is_empty() {
-                lock(&self.base).clone()
-            } else {
-                report.base_start.clone()
-            }
-        };
+        let base = self.job_base();
         // Claim order (#1008): the job records whether any of its changes is
         // prioritized, and its batch's plan index, so a claim leases in plan
         // order instead of publication order. No planned batch matches a
@@ -4397,6 +4405,7 @@ impl<'a> Runner<'a> {
             &job.commit,
             &tree,
             &base,
+            &job.parent,
             &job.selection,
             &job.extra,
             &lock(&self.publish_validator).clone(),

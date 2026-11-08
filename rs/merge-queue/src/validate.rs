@@ -14,7 +14,9 @@
 //!   also runs each step's dependencies, and per-step verdicts come from the run journal.
 //!
 //! Both share the selection policy: a shell command printing test IDs for the checkout at
-//! `$MQ_HEAD` relative to `$MQ_BASE`, or `all` when none is configured.
+//! `$MQ_HEAD` relative to `$MQ_BASE`, or `all` when none is configured. The `run` command
+//! also receives `$MQ_BASE` (the batch's base commit) and `$MQ_PARENT` (the candidate's
+//! parent: the base for a root batch, the stacked-on candidate for a stacked one).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -201,6 +203,17 @@ pub const TOOL_IDENTITY_MARKER: &str = "merge-queue-tool-identity";
 /// Environment variable set to `1` for a candidate validation when `validator.fail_fast` is on:
 /// the runner may stop at the first red step and report the steps it skipped as `skip`.
 pub const FAIL_FAST_ENV: &str = "MQ_FAIL_FAST";
+
+/// Environment variable naming the batch's base commit (full SHA): the commit
+/// the candidate was planned and measured against (the run's base when the
+/// batch was built, as recorded on a donor job). Set for the validator `run`
+/// command as it already is for `select`, so a runner can diff against the
+/// job's own base instead of whatever its local main happens to name.
+pub const BASE_ENV: &str = "MQ_BASE";
+
+/// Environment variable naming the candidate's parent commit (full SHA): the
+/// base itself for a root batch, the stacked-on candidate for a stacked one.
+pub const PARENT_ENV: &str = "MQ_PARENT";
 
 /// Environment variable set to `1` for a validation (and its selection) whose batch is
 /// only peripheral changes: the runner's selection may then be the focused one.

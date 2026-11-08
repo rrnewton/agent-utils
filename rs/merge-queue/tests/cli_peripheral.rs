@@ -83,3 +83,56 @@ fn peripheral_changes_batch_wide_with_a_focused_selection() {
         assert_eq!(item["status"], "landed", "{item}");
     }
 }
+
+#[test]
+fn validator_run_sees_the_batch_base_and_candidate_parent() {
+    let fx = Fixture::new("validator-env");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    let base_start = git(&fx.dev(), &["rev-parse", "main"]);
+    let base_start = base_start.trim();
+    // The validator records the base and parent it was handed and passes
+    // every test in the tree.
+    let validator = format!(
+        r#"echo "base=$MQ_BASE parent=$MQ_PARENT" >> '{root}/seen'; for t in $(ls tests); do printf '{{"id":"%s","outcome":"pass"}}\n' "$t" >> "$MQ_RESULTS"; done; exit 0"#,
+        root = fx.root.display()
+    );
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        &validator,
+        "--max-batch",
+        "1",
+    ]);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.branch_from("b", "a", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+
+    let out = fx.mq(&["run", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let first_tip = report["validations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["prs"] == serde_json::json!([1]))
+        .map(|v| v["commit"].as_str().unwrap().to_owned())
+        .expect("a validation of the first batch");
+    let seen = std::fs::read_to_string(fx.root.join("seen")).unwrap();
+    assert!(
+        seen.lines()
+            .any(|line| line == format!("base={base_start} parent={base_start}")),
+        "root run did not see base as its parent: {seen}"
+    );
+    assert!(
+        seen.lines()
+            .any(|line| line == format!("base={base_start} parent={first_tip}")),
+        "stacked run did not see the first candidate as its parent: {seen}"
+    );
+}

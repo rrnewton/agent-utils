@@ -1196,6 +1196,11 @@ batch's extra tests too.
 - `$MQ_TESTS_FILE`: the IDs, one per line;
 - `$MQ_EXTRA_TESTS`: with `all`, the tests to run beyond the complete suite, space separated
   (see "Tests beyond the complete suite"; unset when there are none);
+- `$MQ_BASE`: the batch's base commit (full SHA) — the commit the candidate was planned and
+  measured against, as a donor job records it. A runner that diffs (a queue-mode validate)
+  should diff against this, never against its own checkout's main, which can be arbitrarily stale;
+- `$MQ_PARENT`: the candidate's parent commit (full SHA): the base itself for a root batch, the
+  stacked-on candidate for a stacked one;
 
 and writes one JSON object per line to `$MQ_RESULTS`:
 `{"id": "step::case", "outcome": "pass|fail|skip|error", "duration_ms": 12}`. A worse outcome

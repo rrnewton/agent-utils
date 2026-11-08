@@ -186,6 +186,12 @@ pub struct Job {
     pub tree: String,
     /// A commit on the shared remote the candidate descends from; the bundle excludes it.
     pub base: String,
+    /// The candidate's parent commit: the base itself for a root batch, the
+    /// stacked-on candidate for a stacked one. Handed to the validator as
+    /// `MQ_PARENT` (with `MQ_BASE` from `base`). Empty in job files written
+    /// before the parent was recorded; the donor then falls back to `base`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub parent: String,
     /// Tests to run.
     pub selection: Selection,
     /// Tests to run beyond the complete suite, with an `all` selection (`MQ_EXTRA_TESTS`).
@@ -1227,6 +1233,7 @@ impl Store {
         commit: &str,
         tree: &str,
         base: &str,
+        parent: &str,
         selection: &Selection,
         extra: &BTreeSet<TestId>,
         validator: &ValidatorConfig,
@@ -1249,6 +1256,7 @@ impl Store {
             commit: commit.to_owned(),
             tree: tree.to_owned(),
             base: base.to_owned(),
+            parent: parent.to_owned(),
             selection: selection.clone(),
             extra: extra.clone(),
             validator: validator.clone(),
@@ -3552,18 +3560,28 @@ impl Worker<'_> {
                     Unreported::Released(format!("cannot report admission: {error}"))
                 })?;
             let started_at = now();
-            let env: Vec<(String, String)> = if job.extra.is_empty() {
-                Vec::new()
+            // The validator is told the job's base and the candidate's parent
+            // from the job record — never whatever this clone's main names,
+            // which can be arbitrarily stale (see crate::validate).
+            let parent = if job.parent.is_empty() {
+                &job.base
             } else {
-                vec![(
+                &job.parent
+            };
+            let mut env: Vec<(String, String)> = vec![
+                (crate::validate::BASE_ENV.to_owned(), job.base.clone()),
+                (crate::validate::PARENT_ENV.to_owned(), parent.clone()),
+            ];
+            if !job.extra.is_empty() {
+                env.push((
                     crate::validate::EXTRA_TESTS_ENV.to_owned(),
                     job.extra
                         .iter()
                         .map(ToString::to_string)
                         .collect::<Vec<_>>()
                         .join(" "),
-                )]
-            };
+                ));
+            }
             let mut ran = validator
                 .run_with(&checkout, &job.selection, &out, cancel, &env)
                 .map_err(Unreported::Declined)?;
@@ -4227,6 +4245,7 @@ mod unit {
                 commit,
                 "tree0",
                 "base0",
+                "base0",
                 &Selection::of([TestId::step("a")]),
                 &BTreeSet::new(),
                 &validator,
@@ -4236,6 +4255,20 @@ mod unit {
                 None,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn a_job_file_written_before_parent_was_recorded_reads_with_no_parent() {
+        let store = Store::new(&temp("job-parent-backcompat"));
+        let job = publish(&store, "c1");
+        assert_eq!(job.parent, "base0");
+        let path = store.dir.join("jobs").join(format!("{}.json", job.id));
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(value.as_object_mut().unwrap().remove("parent").is_some());
+        let old: Job = serde_json::from_value(value).unwrap();
+        assert_eq!(old.parent, "");
+        assert_eq!(old.base, "base0");
     }
 
     fn receipt(job: &Job, donor: &str) -> Receipt {
@@ -5302,6 +5335,7 @@ mod unit {
                 "cand",
                 "tree0",
                 "base0",
+                "base0",
                 &Selection::of([TestId::step("a")]),
                 &BTreeSet::new(),
                 &validator,
@@ -5342,6 +5376,7 @@ mod unit {
             .publish(
                 "cand",
                 "tree0",
+                "base0",
                 "base0",
                 &Selection::of([TestId::step("a")]),
                 &BTreeSet::new(),
@@ -5398,6 +5433,7 @@ mod unit {
                 .publish(
                     "cand",
                     "tree0",
+                    "base0",
                     "base0",
                     &Selection::of([TestId::step("a")]),
                     &BTreeSet::new(),
@@ -5527,6 +5563,7 @@ mod unit {
             .publish(
                 commit,
                 "tree0",
+                "base0",
                 "base0",
                 &Selection::of([TestId::step("a")]),
                 &BTreeSet::new(),

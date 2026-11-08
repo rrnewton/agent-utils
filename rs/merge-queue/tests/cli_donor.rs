@@ -277,6 +277,81 @@ fn decide_mode_lands_a_candidate_on_a_donor_receipt_alone() {
 }
 
 #[test]
+fn a_donor_validator_sees_the_job_base_and_candidate_parent() {
+    let fx = Fixture::new("donor-base-parent");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    let base_start = git(&fx.dev(), &["rev-parse", "main"]);
+    let base_start = base_start.trim().to_owned();
+    let marker = fx.root.join("donor-saw-env");
+    let run_cmd = format!(
+        "echo \"base=$MQ_BASE parent=$MQ_PARENT\" >> {}; exit 0",
+        marker.display()
+    );
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        &run_cmd,
+        "--offload",
+        "decide",
+        "--max-batch",
+        "1",
+    ]);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch_from("b", "a", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    let clone = donor_clone(&fx, "donor-host");
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let (code, _report, stderr) = std::thread::scope(|scope| {
+        let (fx2, done2) = (&fx, &done);
+        let clone2 = clone.clone();
+        scope.spawn(move || {
+            while !done2.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = donor(fx2, &clone2, "d1", &[]);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let outcome = finish(run);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        outcome
+    });
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(item_status(&fx, 1), "landed");
+    assert_eq!(item_status(&fx, 2), "landed");
+    let all = jobs(&fx);
+    let first = all
+        .iter()
+        .find(|job| job["parent"] == base_start.as_str())
+        .expect("a root job recorded with the base as its parent");
+    assert_eq!(first["base"], base_start.as_str(), "{first}");
+    let first_commit = first["commit"].as_str().unwrap();
+    let stacked = all
+        .iter()
+        .find(|job| job["parent"] == first_commit)
+        .expect("a stacked job recorded on the first candidate");
+    assert_eq!(stacked["base"], base_start.as_str(), "{stacked}");
+    let seen = std::fs::read_to_string(&marker).unwrap();
+    assert!(
+        seen.lines()
+            .any(|line| line == format!("base={base_start} parent={base_start}")),
+        "root donor run did not see base as its parent: {seen}"
+    );
+    assert!(
+        seen.lines()
+            .any(|line| line == format!("base={base_start} parent={first_commit}")),
+        "stacked donor run did not see the first candidate as its parent: {seen}"
+    );
+}
+
+#[test]
 fn a_dead_donor_loses_its_lease_and_its_late_receipt_is_refused() {
     let fx = Fixture::new("donor-dead");
     fx.mq_ok(&[
