@@ -4,7 +4,7 @@ status: open
 priority: 2
 issue_type: bug
 created_at: 2026-11-07T19:41:23.000000000+00:00
-updated_at: 2026-11-07T19:41:23.000000000+00:00
+updated_at: 2026-11-08T10:36:49.000000000+00:00
 ---
 
 # Description
@@ -32,6 +32,11 @@ loaded host while the behaviour they guard is correct.
   at cli_intake_window.rs:389, then passed 5/5 solo runs (2-3 s
   each) on the same tree: the daemon's intake and validation
   scheduling starved under suite-wide CPU contention.
+- `cli_donor::a_dead_donor_loses_its_lease_and_its_late_receipt_is_refused`:
+  races `lease_secs=2` against `sleep(3)`: attempts come out 3 vs
+  the expected 2 when the donor cannot admit within one lease under
+  load. 1 failure in 2 full-suite runs on 2026-11-07; 5/5 isolated
+  passes (~5.6 s each).
 
 # Design
 
@@ -61,3 +66,11 @@ starvation, fixed and landed): these two were named there and in
 the #1017 landing work but did not reproduce in its 30-run loop
 (head_stop 0/30) or were found only once under full-suite load
 (intake_window, run 2 above, explained by 5/5 solo passes).
+
+The cli_stale_green prioritized test (landed under #1014) had the
+same disease in a stronger form: its first wait read the seed run's
+events and returned instantly, letting a submit win the writer lock
+from the starting run and then timing out at 240s. Its fix counts
+only events from the run under test, gates every ordering edge on
+files, and widens depth so intake always has a window slot; see
+#1014's Resolution for the full mechanism and mutation proof.
