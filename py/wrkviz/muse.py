@@ -35,9 +35,9 @@ import json
 from pathlib import Path, PurePosixPath
 import re
 
-from wrkviz.archive import write_text_if_changed
 from wrkviz.compressed_sources import read_source_bytes, resolve_source, source_exists
 from wrkviz.model import Agent, Edge, Event, SourceSnapshot, TeamData, ToolCall, Turn
+from wrkviz.snapshot_copy import write_snapshot_if_changed
 
 _SESSION_LOG = "session.jsonl"
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -285,7 +285,8 @@ def snapshot_muse_lineage(
             raise MuseParseError(
                 f"append-only source violation: Muse log was truncated or rewritten: {relative}"
             )
-        changed += int(write_text_if_changed(target, complete.decode("utf-8")))
+        complete.decode("utf-8")
+        changed += int(write_snapshot_if_changed(target, complete, source))
         digest = hashlib.sha256(complete).hexdigest()
         copies.append(
             MuseSourceCopy(

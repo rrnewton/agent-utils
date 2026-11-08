@@ -17,8 +17,8 @@ use crate::compressed::{
 };
 use crate::history::SourceCopy;
 use crate::json::{dump_compact, py_repr_str};
+use crate::snapshot_copy::write_snapshot_if_changed;
 use crate::team_data::{Agent, Edge, Event, SourceSnapshot, TeamData, ToolCall, Turn};
-use crate::transcript_io::write_text_if_changed;
 
 const CLASSIFICATION_VERSION: &str = "authorship-v1";
 const SCHEDULED_INPUT_PREFIXES: [&str; 3] = [
@@ -1943,7 +1943,8 @@ pub fn snapshot_claude_lineage(
                 "append-only source violation: Claude transcript was truncated or rewritten: {relative}"
             ));
         }
-        let text = std::str::from_utf8(complete).map_err(|error| {
+        // Snapshots are UTF-8 text; refuse anything else before writing.
+        std::str::from_utf8(complete).map_err(|error| {
             let position = error.valid_up_to();
             let byte = complete.get(position).copied().unwrap_or(0);
             let reason = match error.error_len() {
@@ -1953,7 +1954,7 @@ pub fn snapshot_claude_lineage(
             };
             format!("'utf-8' codec can't decode byte 0x{byte:02x} in position {position}: {reason}")
         })?;
-        if write_text_if_changed(&target, text)? {
+        if write_snapshot_if_changed(&target, complete, Some(source))? {
             changed += 1;
         }
         let digest = sha256_hex(complete);

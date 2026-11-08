@@ -38,9 +38,9 @@ from pathlib import Path, PurePosixPath
 import re
 from typing import Mapping, Sequence
 
-from wrkviz.archive import write_text_if_changed
 from wrkviz.claude import ClaudeSourceCopy
 from wrkviz.model import Agent, Event, SourceSnapshot, TeamData, Turn
+from wrkviz.snapshot_copy import write_snapshot_if_changed
 
 
 PROVIDER = "claude-history"
@@ -204,7 +204,8 @@ def snapshot_claude_history(
         raise ClaudeHistoryParseError(
             f"append-only source violation: history file was truncated or rewritten: {relative}"
         )
-    changed = int(write_text_if_changed(target, complete.decode("utf-8")))
+    complete.decode("utf-8")
+    changed = int(write_snapshot_if_changed(target, complete, history_file))
     digest = hashlib.sha256(complete).hexdigest()
     copy_updated = (
         previous.updated_at

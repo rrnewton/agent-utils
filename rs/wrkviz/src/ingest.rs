@@ -86,6 +86,9 @@ pub struct IngestReport {
     pub upstream_retired_sources: Vec<String>,
     /// Append-prefix overrides accepted this run (Orc).
     pub orc_prefix_overrides: Vec<crate::orc::AppendPrefixOverride>,
+    /// Snapshot-store bytes written, reflinked versus copied;
+    /// None for Orc, whose SQLite objects are not tallied.
+    pub snapshot_copy: Option<crate::snapshot_copy::SnapshotCopyTally>,
 }
 
 impl IngestReport {
@@ -191,6 +194,13 @@ impl IngestReport {
                     .iter()
                     .map(|s| Value::String(s.clone()))
                     .collect(),
+            ),
+        );
+        out.insert(
+            "snapshot_copy".into(),
+            self.snapshot_copy.as_ref().map_or(
+                Value::Null,
+                crate::snapshot_copy::SnapshotCopyTally::to_json,
             ),
         );
         Value::Object(out)
@@ -552,17 +562,22 @@ pub fn ingest_claude_history(
     requested_snapshot_root: Option<&Path>,
 ) -> Result<(TeamData, IngestReport), String> {
     let _lock = crate::pipeline::archive_writer_lock(archive)?;
-    ingest_claude_history_locked(
-        archive,
-        history_file,
-        team_slug,
-        display_timezone,
-        project_pattern,
-        covered_session_ids,
-        date_window,
-        identity_overrides,
-        requested_snapshot_root,
-    )
+    let (outcome, copies) = crate::snapshot_copy::counting_snapshot_copies(|| {
+        ingest_claude_history_locked(
+            archive,
+            history_file,
+            team_slug,
+            display_timezone,
+            project_pattern,
+            covered_session_ids,
+            date_window,
+            identity_overrides,
+            requested_snapshot_root,
+        )
+    });
+    let (team, mut report) = outcome?;
+    report.snapshot_copy = Some(copies);
+    Ok((team, report))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -865,17 +880,22 @@ pub fn ingest_codex(
     requested_snapshot_root: Option<&Path>,
 ) -> Result<(TeamData, IngestReport), String> {
     let _lock = crate::pipeline::archive_writer_lock(archive)?;
-    ingest_codex_locked(
-        archive,
-        sessions_root,
-        root_thread_id,
-        team_slug,
-        display_timezone,
-        date_window,
-        identity_overrides,
-        continuation_thread_ids,
-        requested_snapshot_root,
-    )
+    let (outcome, copies) = crate::snapshot_copy::counting_snapshot_copies(|| {
+        ingest_codex_locked(
+            archive,
+            sessions_root,
+            root_thread_id,
+            team_slug,
+            display_timezone,
+            date_window,
+            identity_overrides,
+            continuation_thread_ids,
+            requested_snapshot_root,
+        )
+    });
+    let (team, mut report) = outcome?;
+    report.snapshot_copy = Some(copies);
+    Ok((team, report))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1113,15 +1133,20 @@ pub fn ingest_claude(
     requested_snapshot_root: Option<&Path>,
 ) -> Result<(TeamData, IngestReport), String> {
     let _lock = crate::pipeline::archive_writer_lock(archive)?;
-    ingest_claude_locked(
-        archive,
-        session_file,
-        team_slug,
-        display_timezone,
-        date_window,
-        identity_overrides,
-        requested_snapshot_root,
-    )
+    let (outcome, copies) = crate::snapshot_copy::counting_snapshot_copies(|| {
+        ingest_claude_locked(
+            archive,
+            session_file,
+            team_slug,
+            display_timezone,
+            date_window,
+            identity_overrides,
+            requested_snapshot_root,
+        )
+    });
+    let (team, mut report) = outcome?;
+    report.snapshot_copy = Some(copies);
+    Ok((team, report))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1304,15 +1329,20 @@ pub fn ingest_muse(
     requested_snapshot_root: Option<&Path>,
 ) -> Result<(TeamData, IngestReport), String> {
     let _lock = crate::pipeline::archive_writer_lock(archive)?;
-    ingest_muse_locked(
-        archive,
-        session_dir,
-        team_slug,
-        display_timezone,
-        date_window,
-        identity_overrides,
-        requested_snapshot_root,
-    )
+    let (outcome, copies) = crate::snapshot_copy::counting_snapshot_copies(|| {
+        ingest_muse_locked(
+            archive,
+            session_dir,
+            team_slug,
+            display_timezone,
+            date_window,
+            identity_overrides,
+            requested_snapshot_root,
+        )
+    });
+    let (team, mut report) = outcome?;
+    report.snapshot_copy = Some(copies);
+    Ok((team, report))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1727,6 +1757,8 @@ pub fn ingest_orc(
         requested_snapshot_root,
     );
     crate::orc::cleanup_decompressed();
+    // Orc's SQLite backup objects are not tallied: the receipt
+    // carries null (the `None` default) rather than zeros.
     outcome
 }
 

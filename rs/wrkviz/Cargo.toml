@@ -17,6 +17,7 @@ ctrlc = "3"
 chrono-tz = "0.10"
 fs2 = "0.4"
 libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
 signal-hook = "0.4.4"
 base64 = "0.22"
 flate2 = { version = "1", default-features = false, features = ["zlib"] }

@@ -33,6 +33,7 @@ from wrkviz.model import (
     ToolCall,
     Turn,
 )
+from wrkviz.snapshot_copy import fill_snapshot
 
 
 _NESTED_TOOL_RE = re.compile(r"\btools\.([A-Za-z_][A-Za-z0-9_]*)\s*\(")
@@ -306,6 +307,8 @@ class _PendingCopy:
     source: CodexSourceCopy
     complete: bytes
     baseline: bytes | None
+    # The upstream rollout the bytes were read from, or None for a retired one.
+    origin: Path | None
 
 
 def _mapping(value: object) -> dict[str, object]:
@@ -633,6 +636,7 @@ def _write_snapshot_file(
     source_path: str,
     data: bytes,
     expected: bytes | None,
+    origin: Path | None,
 ) -> bool:
     relative = _safe_snapshot_relative(source_path)
     parent = snapshot_root.joinpath(*relative.parts[:-1])
@@ -652,15 +656,16 @@ def _write_snapshot_file(
             return False
         temp_fd = os.open(
             temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
             0o600,
             dir_fd=parent_fd,
         )
         try:
-            with os.fdopen(temp_fd, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
+            try:
+                fill_snapshot(temp_fd, data, origin)
+                os.fsync(temp_fd)
+            finally:
+                os.close(temp_fd)
             os.replace(
                 temporary,
                 name,
@@ -1049,7 +1054,7 @@ def snapshot_codex_lineage(
                 previous,
                 upstream_retired_at=previous.upstream_retired_at or updated_at,
             )
-            pending.append(_PendingCopy(source, existing, existing))
+            pending.append(_PendingCopy(source, existing, existing, None))
             continue
         baseline = existing or b""
         if len(complete) < len(baseline):
@@ -1080,7 +1085,7 @@ def snapshot_codex_lineage(
             sha256=hashlib.sha256(complete).hexdigest(),
             updated_at=source_updated_at,
         )
-        pending.append(_PendingCopy(source, complete, existing))
+        pending.append(_PendingCopy(source, complete, existing, path))
 
     continuations = _continuation_links(
         roots,
@@ -1097,6 +1102,7 @@ def snapshot_codex_lineage(
                 item.source.snapshot_path,
                 item.complete,
                 item.baseline,
+                item.origin,
             )
         )
         for item in pending

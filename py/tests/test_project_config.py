@@ -37,6 +37,7 @@ from wrkviz.project_config import (
     ingest_project,
     load_project_ingest_config,
 )
+from wrkviz.snapshot_copy import SnapshotCopyTally
 from wrkviz.transcript_export import (
     DroppedAuthorshipRule,
     PromptAuthorshipRule,
@@ -595,6 +596,8 @@ def test_project_ingest_isolates_one_failing_team(
             "provider": "claude",
             "error_type": "ClaudeParseError",
             "error": "session file ended mid-record",
+            # The fake importer wrote nothing before failing, and the receipt says zero.
+            "snapshot_copy": SnapshotCopyTally().to_json_obj(),
         }
     ]
     summary = result.failure_summary()
@@ -1466,3 +1469,34 @@ def test_ingest_project_projects_around_a_new_team_whose_first_ingest_failed(
     assert extraction["dropped_prompt_authorship_rules"] == [
         {"rule_id": "newcomer-owner", "team_slug": "newcomer"}
     ]
+
+
+def test_a_team_failing_after_its_snapshot_write_keeps_its_tally_in_the_receipt(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "sources" / "one"
+    shutil.copytree(CLAUDE_FIXTURE_ROOT, root)
+    session = root / f"{CLAUDE_SESSION_ID}.jsonl"
+    # Newline-complete UTF-8, so the snapshot is written; not JSON, so the parse after it fails.
+    session.write_bytes(session.read_bytes() + b"{ this is not a transcript\n")
+    config_path = _write_manifest(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "output": "../archive",
+            "timezone": "UTC",
+            "teams": [_claude_team("team-one", session)],
+        },
+    )
+
+    assert timeline_main(["ingest-project", "--config", str(config_path)]) == 2
+    capsys.readouterr()
+
+    run = json.loads(sorted((tmp_path / "archive" / "runs").glob("*.json"))[-1].read_text("utf-8"))
+    project = run["mechanical"]["project_ingest"]
+    (failure,) = project["failed_teams"]
+    tally = failure["snapshot_copy"]
+    written = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+    assert tally["files"] >= 1
+    assert tally["reflinked_bytes"] + tally["copied_bytes"] == written
+    assert project["snapshot_copy"] == tally

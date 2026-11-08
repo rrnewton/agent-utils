@@ -10,8 +10,8 @@ use serde_json::{Map, Value};
 use sha2::Digest as _;
 
 use crate::json::{as_array, as_object, as_string, py_repr_str, read_json};
+use crate::snapshot_copy::write_snapshot_if_changed;
 use crate::team_data::{Agent, Event, SourceSnapshot, TeamData, Turn};
-use crate::transcript_io::write_text_if_changed;
 
 /// The provider name for history teams.
 pub const PROVIDER: &str = "claude-history";
@@ -355,7 +355,8 @@ pub fn snapshot_claude_history(
             "append-only source violation: history file was truncated or rewritten: {relative}"
         ));
     }
-    let text = std::str::from_utf8(complete).map_err(|error| {
+    // Snapshots are UTF-8 text; refuse anything else before writing.
+    std::str::from_utf8(complete).map_err(|error| {
         let position = error.valid_up_to();
         let byte = complete.get(position).copied().unwrap_or(0);
         let reason = match error.error_len() {
@@ -365,7 +366,7 @@ pub fn snapshot_claude_history(
         };
         format!("'utf-8' codec can't decode byte 0x{byte:02x} in position {position}: {reason}")
     })?;
-    let changed = write_text_if_changed(&target, text)?;
+    let changed = write_snapshot_if_changed(&target, complete, Some(history_file))?;
     let digest = sha256_hex(complete);
     let copy_updated = match previous {
         Some(previous)

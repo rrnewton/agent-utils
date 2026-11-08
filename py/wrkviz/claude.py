@@ -10,7 +10,6 @@ import json
 from pathlib import Path, PurePosixPath
 import re
 
-from wrkviz.archive import write_text_if_changed
 from wrkviz.compressed_sources import (
     iter_logical_glob,
     read_source_bytes,
@@ -26,6 +25,7 @@ from wrkviz.model import (
     ToolCall,
     Turn,
 )
+from wrkviz.snapshot_copy import write_snapshot_if_changed
 
 
 _AGENT_FILE = re.compile(r"agent-(?P<agent>[A-Za-z0-9_-]+)\.jsonl\Z")
@@ -1476,8 +1476,8 @@ def snapshot_claude_lineage(
             raise ClaudeParseError(
                 f"append-only source violation: Claude transcript was truncated or rewritten: {relative}"
             )
-        text = complete.decode("utf-8")
-        changed += int(write_text_if_changed(target, text))
+        complete.decode("utf-8")
+        changed += int(write_snapshot_if_changed(target, complete, source))
         digest = hashlib.sha256(complete).hexdigest()
         copy_updated = (
             previous.updated_at

@@ -88,6 +88,8 @@ pub mod seekable;
 /// The `serve` subcommand: a loopback static server for a
 /// built archive.
 pub mod serve;
+/// Snapshot writes that share the upstream file's blocks.
+pub mod snapshot_copy;
 /// The snapshot pointer (`snapshot-root.json`) and the legacy
 /// in-archive snapshot layout.
 pub mod snapshot_store;

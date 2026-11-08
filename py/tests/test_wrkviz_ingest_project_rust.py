@@ -247,11 +247,17 @@ def _archives(shared: Path, label: str) -> dict[str, object]:
 
 def _compare(tmp_path: Path, rust_wrkviz: Path, args: list[str], *,
              orc_root: str = ORC_ROOT_ID,
+             break_codex: bool = False,
              ) -> tuple[subprocess.CompletedProcess[str],
                         subprocess.CompletedProcess[str]]:
     shared = tmp_path / "shared"
     shared.mkdir(parents=True, exist_ok=True)
-    _codex_sessions(shared)
+    rollouts = _codex_sessions(shared)
+    if break_codex:
+        # Newline-complete JSON, so the snapshot is written; not a record object, so the parse
+        # after it fails.
+        for rollout in rollouts.rglob("rollout-*.jsonl"):
+            rollout.write_bytes(rollout.read_bytes() + b"[]\n")
     _orc_source(shared)
     outcomes = {}
     for label, cmd in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
@@ -298,6 +304,19 @@ def test_project_failing_team(tmp_path: Path, rust_wrkviz: Path) -> None:
     assert oracle.returncode == 2
     assert "teams: 1 succeeded, 1 failed" in result.stdout
     assert "team orc-team (orc):" in result.stderr
+
+
+def test_project_team_failing_after_its_snapshot_write(
+        tmp_path: Path, rust_wrkviz: Path) -> None:
+    oracle, result = _compare(tmp_path, rust_wrkviz, [], break_codex=True)
+    assert oracle.returncode == 2
+    assert "teams: 1 succeeded, 1 failed" in result.stdout
+    runs = sorted((tmp_path / "shared" / "rs-out" / "runs").glob("*.json"))
+    project = json.loads(runs[-1].read_text())["mechanical"]["project_ingest"]
+    (failure,) = project["failed_teams"]
+    # Both editions carry the failed team's snapshot writes into its entry and the run total.
+    assert failure["snapshot_copy"]["files"] == 1
+    assert project["snapshot_copy"] == failure["snapshot_copy"]
 
 
 def test_project_history_team(tmp_path: Path, rust_wrkviz: Path) -> None:

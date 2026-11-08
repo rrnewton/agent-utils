@@ -548,6 +548,26 @@ and each ingest is an incremental read of the feed from the archive's last check
   same bytes or longer. Orc's SQLite databases are decoded into a private temporary copy for the
   read. This applies to upstream sources only: the archive's own snapshot store must stay
   uncompressed, and a `.zst` object there reads as missing.
+- **Snapshots share disk blocks with upstream where they can.** On a copy-on-write filesystem
+  (btrfs, XFS with reflink) a snapshot references the upstream file's blocks instead of holding a
+  second copy, so a first ingest of a large mirror costs little more than its normalized build.
+  Copy-on-write keeps it a snapshot: a later append to or rewrite of the upstream file gets new
+  blocks and leaves the archived ones alone. Ingest reads every shared range back and compares it
+  with the bytes it validated before trusting it, and writes the rest from those bytes. Where
+  sharing is impossible the snapshot is written out in full. Each team's receipt entry, failed
+  teams included, and the run as a whole carry `snapshot_copy`: `reflinked_bytes`,
+  `copied_bytes`, `refused_files`, and `copied_bytes_by_reason`:
+  - `tail`: the partial block at the cut, when the copied prefix ends before the upstream file
+    does (a prefix that is the whole file is shared to its last byte);
+  - `compressed-source`: a `.zst` upstream, whose stored bytes are not the logical ones;
+  - `no-source`: no upstream file, or one gone since it was found;
+  - `refused`: the filesystem would not share (another filesystem, no reflink support);
+  - `source-changed`: upstream no longer holds the validated bytes (it shrank, or the shared range
+    read back differently); the validated bytes are written.
+
+  A large `refused` figure means the store is quietly costing its full size again. Orc's SQLite
+  backup objects are not tallied: Orc entries carry `"snapshot_copy": null`, and the run total
+  leaves them out.
 - **Content changed in place is still refused.** If upstream bytes the archive has already
   imported now differ, or a file shrank below the checkpoint, ingest refuses that team and leaves
   its archive byte-identical, exactly as before. That is the one case retention cannot explain.

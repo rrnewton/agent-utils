@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
@@ -31,6 +31,7 @@ from wrkviz.pipeline import (
     ingest_muse,
     ingest_orc,
 )
+from wrkviz.snapshot_copy import SnapshotCopyTally, counting_snapshot_copies
 from wrkviz.transcript_export import (
     PromptAuthorshipRule,
     TranscriptExportReport,
@@ -206,6 +207,10 @@ class ProjectTeamIngestFailure:
     error_type: str
     error: str
     traceback: str | None = None
+    # What the team wrote to the snapshot store before it failed: a team that keeps failing while
+    # its log grows rewrites its snapshots every run, and those bytes belong in the receipt too.
+    # None for Orc, as on a successful Orc ingest.
+    snapshot_copy: SnapshotCopyTally | None = None
 
     def to_json_obj(self) -> dict[str, JsonValue]:
         """Return this failure as run-receipt metadata."""
@@ -215,6 +220,9 @@ class ProjectTeamIngestFailure:
             "provider": self.provider,
             "error_type": self.error_type,
             "error": self.error,
+            "snapshot_copy": (
+                None if self.snapshot_copy is None else self.snapshot_copy.to_json_obj()
+            ),
         }
         if self.traceback is not None:
             value["traceback"] = self.traceback
@@ -306,6 +314,16 @@ class ProjectIngestReport:
             failure.to_json_obj() for failure in self.failures
         ]
         accepted_values: list[JsonValue] = list(self.accept_prefix_rewrite_sessions)
+        # The run-wide total of what the per-team receipts record, failed teams included, so the
+        # store's disk cost for the whole run is one figure rather than a sum over thousands of
+        # entries. Orc entries carry no tally and add nothing.
+        snapshot_copy = SnapshotCopyTally()
+        for tally in (
+            *(team.ingest.snapshot_copy for team in self.teams),
+            *(failure.snapshot_copy for failure in self.failures),
+        ):
+            if tally is not None:
+                snapshot_copy.add(tally)
         return {
             "schema_version": PROJECT_INGEST_SCHEMA_VERSION,
             "config_sha256": self.config_sha256,
@@ -319,6 +337,7 @@ class ProjectIngestReport:
             ),
             "transcript_extraction_error": self.transcript_error,
             "accepted_prefix_rewrite_sessions": accepted_values,
+            "snapshot_copy": snapshot_copy.to_json_obj(),
             "model_calls": 0,
             "model_tokens": 0,
             "website_build_performed": False,
@@ -1001,20 +1020,28 @@ def ingest_project(
     # after them, on four consecutive runs of roughly seven minutes each, and the operator's only
     # evidence was one exception naming the one team that was already known to be broken.
     for team in selected:
-        try:
-            report = _ingest_team(
-                config.output,
-                team,
-                sorted(accepted.get(team.slug, ())),
-                config.snapshot_root,
-                config.claude_session_ids,
-            )
-        except Exception as error:  # Deliberately broad; see _team_failure.
-            # BaseException is deliberately NOT caught: a KeyboardInterrupt or SystemExit means the
-            # operator or the runtime is stopping this process, and continuing on to the next team
-            # would be ignoring that instruction, not being robust to a bad team.
-            failures.append(_team_failure(team, error))
-            continue
+        # Opened here as well as inside the importer, so the writes of a team that then fails
+        # are still counted (the importer's own tally ends with its exception).
+        with counting_snapshot_copies() as copies:
+            try:
+                report = _ingest_team(
+                    config.output,
+                    team,
+                    sorted(accepted.get(team.slug, ())),
+                    config.snapshot_root,
+                    config.claude_session_ids,
+                )
+            except Exception as error:  # Deliberately broad; see _team_failure.
+                # BaseException is deliberately NOT caught: a KeyboardInterrupt or SystemExit means
+                # the operator or the runtime is stopping this process, and continuing on to the
+                # next team would be ignoring that instruction, not being robust to a bad team.
+                failures.append(
+                    replace(
+                        _team_failure(team, error),
+                        snapshot_copy=None if team.provider == "orc" else copies,
+                    )
+                )
+                continue
         results.append(ProjectTeamIngestResult(team.slug, team.provider, report))
 
     # Always project every normalized team already in the durable archive. The projection is a

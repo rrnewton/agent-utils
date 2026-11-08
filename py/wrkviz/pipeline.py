@@ -9,7 +9,7 @@ import re
 import stat
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
@@ -155,6 +155,7 @@ from wrkviz.phases import (
     phase_agent_ids,
 )
 from wrkviz.render import plain_language_path, render_archive, rollup_markdown
+from wrkviz.snapshot_copy import SnapshotCopyTally, counting_snapshot_copies
 from wrkviz.snapshot_store import (
     SnapshotLocation,
     ensure_snapshot_store,
@@ -450,6 +451,12 @@ class IngestReport:
     # retired source is listed on every run, which makes "what is the archive the only copy of"
     # answerable from any one receipt.
     upstream_retired_sources: tuple[str, ...] = ()
+    # Bytes this ingest wrote to the snapshot store, split into those sharing the upstream file's
+    # blocks (reflinked) and those written out (copied, with the reason). On a copy-on-write
+    # filesystem a first ingest should be almost all reflinked; a large copied figure is the store
+    # silently costing its full size again, which is otherwise visible only as a full disk.
+    # None for Orc, whose SQLite backup objects are not tallied.
+    snapshot_copy: SnapshotCopyTally | None = field(default_factory=SnapshotCopyTally)
 
     def to_json_obj(self) -> dict[str, JsonValue]:
         """Return the ingest report as a JSON-serializable object."""
@@ -489,6 +496,9 @@ class IngestReport:
             "history_covered_prompts": self.history_covered_prompts,
             "history_covered_sessions": self.history_covered_sessions,
             "upstream_retired_sources": list(self.upstream_retired_sources),
+            "snapshot_copy": (
+                None if self.snapshot_copy is None else self.snapshot_copy.to_json_obj()
+            ),
         }
 
 
@@ -1592,8 +1602,8 @@ def ingest_codex(
     archive's recorded layout decides, and a brand-new archive gets ``<archive>.sources``.
     """
 
-    with archive_writer_lock(archive):
-        return _ingest_codex_locked(
+    with archive_writer_lock(archive), counting_snapshot_copies() as copies:
+        team, report = _ingest_codex_locked(
             archive,
             sessions_root,
             root_thread_id,
@@ -1604,6 +1614,7 @@ def ingest_codex(
             continuation_thread_ids,
             snapshot_root,
         )
+    return team, replace(report, snapshot_copy=copies)
 
 
 def _ingest_claude_locked(
@@ -1684,8 +1695,8 @@ def ingest_claude(
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Claude lineage as one serialized transaction."""
 
-    with archive_writer_lock(archive):
-        return _ingest_claude_locked(
+    with archive_writer_lock(archive), counting_snapshot_copies() as copies:
+        team, report = _ingest_claude_locked(
             archive,
             session_file,
             team_slug,
@@ -1694,6 +1705,7 @@ def ingest_claude(
             identity_overrides,
             snapshot_root,
         )
+    return team, replace(report, snapshot_copy=copies)
 
 
 def _load_muse_source_manifest(
@@ -1786,8 +1798,8 @@ def ingest_muse(
     *session_dir* is the directory holding ``session.jsonl``; its name is the session id.
     """
 
-    with archive_writer_lock(archive):
-        return _ingest_muse_locked(
+    with archive_writer_lock(archive), counting_snapshot_copies() as copies:
+        team, report = _ingest_muse_locked(
             archive,
             session_dir,
             team_slug,
@@ -1796,6 +1808,7 @@ def ingest_muse(
             identity_overrides,
             snapshot_root,
         )
+    return team, replace(report, snapshot_copy=copies)
 
 
 def _load_claude_history_source_manifest(
@@ -1897,8 +1910,8 @@ def ingest_claude_history(
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Claude prompt history as one serialized transaction."""
 
-    with archive_writer_lock(archive):
-        return _ingest_claude_history_locked(
+    with archive_writer_lock(archive), counting_snapshot_copies() as copies:
+        team, report = _ingest_claude_history_locked(
             archive,
             history_file,
             team_slug,
@@ -1909,6 +1922,7 @@ def ingest_claude_history(
             identity_overrides,
             snapshot_root,
         )
+    return team, replace(report, snapshot_copy=copies)
 
 
 @dataclass(frozen=True)
@@ -2262,7 +2276,7 @@ def ingest_orc(
     """
 
     with archive_writer_lock(archive):
-        return _ingest_orc_locked(
+        team, report = _ingest_orc_locked(
             archive,
             source_root,
             root_session_id,
@@ -2274,6 +2288,9 @@ def ingest_orc(
             accept_prefix_rewrite,
             snapshot_root,
         )
+    # Orc publishes SQLite backup objects, which share no blocks with upstream and are not
+    # tallied; the receipt says so with a null rather than an all-zero tally.
+    return team, replace(report, snapshot_copy=None)
 
 
 def load_archived_team(archive: Path, team_slug: str) -> TeamData:

@@ -527,6 +527,7 @@
         "py/tests/test_timeline_run_stats.py",
         "py/tests/test_timeline_search_index.py",
         "py/tests/test_timeline_shards.py",
+        "py/tests/test_timeline_snapshot_copy.py",
         "py/tests/test_timeline_snapshot_store.py",
         "py/tests/test_timeline_source_snapshots.py",
         "py/tests/test_timeline_static_delivery.py",

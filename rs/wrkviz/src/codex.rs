@@ -19,6 +19,7 @@ use crate::compressed::{
 };
 use crate::history::SourceCopy;
 use crate::json::{as_object, py_repr_str};
+use crate::snapshot_copy::fill_snapshot;
 use crate::team_data::{Agent, Edge, Event, SourceSnapshot, TeamData, ToolCall, Turn};
 
 const CLASSIFICATION_VERSION: &str = "authorship-v1";
@@ -556,6 +557,7 @@ fn write_snapshot_file(
     source_path: &str,
     data: &[u8],
     expected: Option<&[u8]>,
+    origin: Option<&Path>,
 ) -> Result<bool, String> {
     safe_snapshot_relative(source_path)?;
     let parent = parent_of(snapshot_root, source_path);
@@ -580,18 +582,18 @@ fn write_snapshot_file(
     }
     let temporary = parent.join(format!(".{name}.{}.{}", std::process::id(), random_hex8()));
     {
-        use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&temporary)
             .map_err(|error| py_os(&error, &temporary.display().to_string()))?;
-        let written = file
-            .write_all(data)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| py_os(&error, &temporary.display().to_string()));
+        let written = fill_snapshot(&file, &temporary, data, origin).and_then(|()| {
+            file.sync_all()
+                .map_err(|error| py_os(&error, &temporary.display().to_string()))
+        });
         if let Err(message) = written {
             let _ = std::fs::remove_file(&temporary);
             return Err(message);
@@ -828,6 +830,8 @@ struct PendingCopy {
     source: SourceCopy,
     complete: Vec<u8>,
     baseline: Option<Vec<u8>>,
+    /// The upstream rollout the bytes were read from; None when retired.
+    origin: Option<PathBuf>,
 }
 
 /// Copy the newline-complete lineage into *snapshot_root*
@@ -1105,6 +1109,7 @@ pub fn snapshot_codex_lineage(
                 source,
                 complete: existing.clone().unwrap(),
                 baseline: existing,
+                origin: None,
             });
             continue;
         }
@@ -1149,6 +1154,7 @@ pub fn snapshot_codex_lineage(
             },
             complete,
             baseline: existing,
+            origin: Some(path.clone()),
         });
     }
     let continuations = continuation_links(
@@ -1165,6 +1171,7 @@ pub fn snapshot_codex_lineage(
             &item.source.snapshot_path,
             &item.complete,
             item.baseline.as_deref(),
+            item.origin.as_deref(),
         )? {
             changed += 1;
         }

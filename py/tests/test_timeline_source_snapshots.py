@@ -1223,12 +1223,13 @@ def test_archive_lock_prevents_interleaved_writer_regression(
         source_path: str,
         data: bytes,
         expected: bytes | None,
+        origin: Path | None,
     ) -> bool:
         if threading.current_thread().name == "older-ingest":
             older_at_write.set()
             if not release_older.wait(timeout=5):
                 raise AssertionError("timed out releasing older ingest")
-        return real_write(snapshot_root, source_path, data, expected)
+        return real_write(snapshot_root, source_path, data, expected, origin)
 
     monkeypatch.setattr(codex_module, "_write_snapshot_file", delayed_write)
 

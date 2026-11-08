@@ -207,6 +207,9 @@ pub struct ProjectTeamIngestFailure {
     pub error_type: String,
     /// The failure message.
     pub error: String,
+    /// What the team wrote to the snapshot store before it failed;
+    /// None for Orc.
+    pub snapshot_copy: Option<crate::snapshot_copy::SnapshotCopyTally>,
 }
 
 impl ProjectTeamIngestFailure {
@@ -217,6 +220,13 @@ impl ProjectTeamIngestFailure {
         out.insert("provider".into(), Value::String(self.provider.clone()));
         out.insert("error_type".into(), Value::String(self.error_type.clone()));
         out.insert("error".into(), Value::String(self.error.clone()));
+        out.insert(
+            "snapshot_copy".into(),
+            self.snapshot_copy.as_ref().map_or(
+                Value::Null,
+                crate::snapshot_copy::SnapshotCopyTally::to_json,
+            ),
+        );
         Value::Object(out)
     }
 
@@ -345,6 +355,18 @@ impl ProjectIngestReport {
                     .collect(),
             ),
         );
+        // The run-wide total of the per-team snapshot tallies,
+        // failed teams included; Orc entries carry none.
+        let mut snapshot_copy = crate::snapshot_copy::SnapshotCopyTally::default();
+        let tallies = self
+            .teams
+            .iter()
+            .map(|team| &team.ingest.snapshot_copy)
+            .chain(self.failures.iter().map(|failure| &failure.snapshot_copy));
+        for tally in tallies.flatten() {
+            snapshot_copy.add(tally);
+        }
+        out.insert("snapshot_copy".into(), snapshot_copy.to_json());
         out.insert("model_calls".into(), 0.into());
         out.insert("model_tokens".into(), 0.into());
         out.insert("website_build_performed".into(), Value::Bool(false));
@@ -1087,6 +1109,7 @@ fn team_failure(team: &ProjectTeamConfig, error: &str) -> ProjectTeamIngestFailu
         provider: team.provider.clone(),
         error_type,
         error: error.to_string(),
+        snapshot_copy: None,
     }
 }
 
@@ -1179,19 +1202,27 @@ pub fn ingest_project(
             .map(|(_, held)| held.clone())
             .unwrap_or_default();
         sessions.sort();
-        match ingest_team(
-            &config.output,
-            team,
-            &sessions,
-            config.snapshot_root.as_deref(),
-            &claude_session_ids,
-        ) {
+        // Counted here as well as inside the importer, so the
+        // writes of a team that then fails are still counted.
+        let (outcome, copies) = crate::snapshot_copy::counting_snapshot_copies(|| {
+            ingest_team(
+                &config.output,
+                team,
+                &sessions,
+                config.snapshot_root.as_deref(),
+                &claude_session_ids,
+            )
+        });
+        match outcome {
             Ok(report) => results.push(ProjectTeamIngestResult {
                 team_slug: team.slug.clone(),
                 provider: team.provider.clone(),
                 ingest: report,
             }),
-            Err(error) => failures.push(team_failure(team, &error)),
+            Err(error) => failures.push(ProjectTeamIngestFailure {
+                snapshot_copy: (team.provider != "orc").then_some(copies),
+                ..team_failure(team, &error)
+            }),
         }
     }
     let rules = config.prompt_authorship_rules();
