@@ -281,6 +281,17 @@ def main() -> int:
                 page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
                 check(page.locator("#pane-docs").is_visible(), "Back from the mention jump left the Documents view")
 
+                # A document link in a message opens the reader in-app (reply 220).
+                page.tap("#view-switch")
+                page.tap("#view-switch")
+                page.wait_for_function("() => !document.getElementById('pane-discord').hidden", timeout=20_000)
+                page.wait_for_selector("#discord-log a[data-doc]", timeout=20_000)
+                page.tap("#discord-log a[data-doc]")
+                page.wait_for_function("() => !document.getElementById('docs-reader').hidden", timeout=20_000)
+                check(page.locator("#pane-docs").is_visible(), "the document link did not open the reader in-app")
+                page.tap("#doc-back")
+                page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+
                 # The GitHub row: its fetcher cannot connect (raw base is a closed
                 # port), and the row says why instead of doing nothing.
                 gh_card = page.locator("#documents-list .doc-card", has_text="guide.md")

@@ -993,6 +993,11 @@ fn mark_message_links(html: &str) -> String {
                 target.attribute()
             ));
         }
+        // A recognized document link is marked for the page to open in-app
+        // (reply 220); the address is untouched, as for message links.
+        if let Some(doc) = crate::documents::recognize_url(&href, None, &[]) {
+            out.push_str(&format!(" data-doc=\"{}\"", doc.key));
+        }
         rest = &rest[end + 1..];
     }
     out.push_str(rest);
@@ -4163,11 +4168,18 @@ mod tests {
             ),
         ] {
             let href = format!("{REPO}{path}");
-            assert_eq!(
-                html(&href),
-                format!("<p>{}</p>\n", short(&href, label)),
-                "{path}"
-            );
+            // A file page is also a document the reader opens in-app (reply 220).
+            let expected = if path.starts_with("/blob/") {
+                short(&href, label).replace(
+                    &format!("<a href=\"{href}\""),
+                    &format!(
+                        "<a href=\"{href}\" data-doc=\"github:octo/widgets@main:src/render.rs\""
+                    ),
+                )
+            } else {
+                short(&href, label)
+            };
+            assert_eq!(html(&href), format!("<p>{}</p>\n", expected), "{path}");
         }
     }
 
@@ -5719,6 +5731,22 @@ mod message_link_tests {
             ),
             "<p>x (slack://user?team=T0123ABCD&amp;id=U0123ABCD)</p>\n"
         );
+    }
+
+    #[test]
+    fn a_document_link_is_marked_for_the_reader() {
+        let (html, _) = headed_body(
+            "see [the guide](https://github.com/octo/widgets/blob/main/docs/guide.md) and [x](https://example.com/a.md)",
+            Markup::Discord,
+            true,
+            &|_| true,
+            &[],
+        );
+        assert!(
+            html.contains("data-doc=\"github:octo/widgets@main:docs/guide.md\""),
+            "{html}"
+        );
+        assert!(!html.contains("data-doc=\"github:example"), "{html}");
     }
 
     #[test]

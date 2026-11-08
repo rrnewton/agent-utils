@@ -845,6 +845,10 @@ const shellNavigation = createPageNavigation({
   revealRow: (row, center) => revealRow(row, center),
   idsOf: (row) => idsOf(row),
   inAppLinksOn: () => inAppLinks.current(),
+  openDocument: (key) => {
+    chooseMajorView("docs");
+    void documentsView.show(key);
+  },
   channelLabel: (channel) => channelLabel(channel),
   renderedText: (node) => renderedText(node),
   inThisColumn: (act) => inThisColumn(act),

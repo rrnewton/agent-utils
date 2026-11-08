@@ -261,6 +261,8 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   idsOf(row: HTMLElement): string[];
   // In-app links.
   inAppLinksOn(): boolean;
+  /** Open the document `key` in the in-app reader (a marked document link). */
+  openDocument(key: string): void;
   channelLabel(channel: string): string;
   renderedText(node: Element): string;
   inThisColumn<T>(act: (event: T) => void): (event: T) => void;
@@ -1017,6 +1019,17 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
         if (String(kid.tagName).toLowerCase() !== "a") {
           walk(kid);
           continue;
+        }
+        const docKey = kid.getAttribute("data-doc");
+        if (docKey) {
+          kid.addEventListener("click", deps.inThisColumn((event: Event) => {
+            const tap = event as { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean; button?: number; preventDefault?: () => void };
+            if (tap.ctrlKey || tap.metaKey || tap.shiftKey || tap.altKey || (tap.button || 0) > 0) return;
+            if (typeof tap.preventDefault === "function") tap.preventDefault();
+            deps.openDocument(docKey);
+          }));
+          kid.setAttribute("data-in-app", "");
+          kid.setAttribute("title", `Opens here — ${String(kid.getAttribute("href") || "")}`);
         }
         const ref = messageLinkRef(kid.getAttribute("data-msg"));
         if (!ref) continue;
