@@ -1,11 +1,12 @@
 ---
 title: 'disjoint-root-stacking: a root that jumps over a batch likely to land first should stack on it instead'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 assignee: mu-predict
 created_at: 2026-11-08T15:52:20.000000000+00:00
-updated_at: 2026-11-08T15:52:20.000000000+00:00
+updated_at: 2026-11-08T23:49:35.000000000+00:00
+closed_at: 2026-11-08T23:49:35.000000000+00:00
 ---
 
 # Description
@@ -30,3 +31,7 @@ Disjoint-root promotion never rescues a green whose base moved. `promote_decidab
 # Notes
 
 Reported 2026-11-08 from a live queue after the success predictor was enabled there. Related landed work: the green-root base-choice deferral (up to 60 s) already covers a jumped-over root that is green and about to land; this covers likely-to-land batches generally. Companion label-hygiene work is filed separately.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main in bde0ab8e, 52f8e1e7 and e0b5769f (tip e0b5769ff5f137c270b5806fbdf8b2b3ac480b44). `root_stack_min_pass_percent` (0 = off, byte-for-byte today's decisions) diverts a would-be root to an ordinary stacked flight on the stack top (or a likely root still on the current base) when a jumped-over batch is prioritized, already green, or predicted at/above the percent; batches already known not green never qualify. `plan_ev::simulate` models base-move root discards behind `Caps::root_discards` (historical outputs unchanged while off) with a two-discards case the stacking rescue fixes, and plan-intake leaves would-be roots parent-decided-at-launch while the knob is on instead of naming a base they will not use. Evidence: lib 231 pass; the full disjoint-root suite passes at both settings plus the configured gated run (composes stacked, one validation, lands) and the combined mid-flight intake test; full combined gate 237 passed with one environmental wrkslots failure passing on rerun; exact-tree `rust.merge-queue.test` reruns pass (587 cases, 1203.870 CPU-s on the landed tree's content).
