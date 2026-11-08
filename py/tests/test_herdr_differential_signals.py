@@ -96,6 +96,33 @@ def test_captured_children_get_canonical_dispositions_by_default() -> None:
         _set_ignored(hd, tuple(n for n in _HANDED if before & _bit(n)), ignored=True)
 
 
+def test_readiness_poll_collapse_keeps_distinct_calls_exact() -> None:
+    # How many identical readiness readings fit before a wall deadline is scheduling, so the
+    # end-to-end herdr-calls comparison collapses them; every distinct call must survive exact
+    # and in order, or a real protocol divergence would collapse away with the polls.
+    hd = _herdr_differential()
+    info = ["pane", "process-info", "--pane", "w1:p1"]
+    read = ["pane", "read", "w1:p1", "--source", "recent-unwrapped", "--lines", "4"]
+    other_info = ["pane", "process-info", "--pane", "w1:p2"]
+    listing = ["workspace", "list"]
+    run = ["pane", "run", "w1:p1", "printf x"]
+
+    def collapsed(*argvs: list[str]) -> list[object]:
+        calls = [{"argv": argv} for argv in argvs]
+        return [call["argv"] for call in hd._collapse_readiness_polls(calls)]
+
+    # A repeated reading (process-info then read) counts once, and so does a repeated single
+    # poll, however many times load let an edition repeat it.
+    assert collapsed(info, read, info, read, info, read) == [info, read]
+    assert collapsed(info, info, info) == [info]
+    # Distinct calls are not polls to collapse: another pane's poll, a repeated
+    # non-readiness call, and a reading separated by a distinct call all stay, in order.
+    assert collapsed(info, read, other_info) == [info, read, other_info]
+    assert collapsed(listing, listing) == [listing, listing]
+    assert collapsed(info, read, run, info, read) == [info, read, run, info, read]
+    assert collapsed() == []
+
+
 def test_canonical_dispositions_do_not_depend_on_what_the_parent_holds() -> None:
     hd = _herdr_differential()
     before = _own_mask()

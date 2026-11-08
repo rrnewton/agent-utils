@@ -128,6 +128,11 @@ class Outcome:
     returncode: int
     stdout: str
     stderr: str
+    #: Wall seconds the invocation took, when the harness measured it (0 when it did not, e.g. a
+    #: file read back as an Outcome). Diagnostics only, excluded from comparison: two editions'
+    #: durations legitimately differ under the CPU-progress budget (see :func:`_finish_tolerant`),
+    #: and :func:`_describe` surfaces it so a timeout failure says how long each edition ran.
+    elapsed_seconds: float = field(default=0.0, compare=False)
 
 
 @dataclass
@@ -656,29 +661,147 @@ def _ignore_sigchld() -> None:
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 
 
+#: How often :func:`_finish_tolerant` re-measures a still-running child's CPU progress.
+_POLL_SECONDS = 0.1
+
+
+def _tree_cpu_seconds(pid: int) -> float | None:
+    """User+system CPU seconds of ``pid`` and its live descendants, or None if gone.
+
+    The direct child often waits on its own children (a Herdr call, git), so only the whole
+    tree's CPU shows whether the call is making progress. Each process contributes its children's
+    waited-for CPU (``cutime``/``cstime``) as well as its own, so CPU burned by a grandchild
+    that has already exited and been reaped still counts, in its nearest live ancestor, exactly
+    once. Mirrors ``_tree_cpu_seconds`` in ``herdr_agent_differential.py``.
+    """
+    ticks_per_second = os.sysconf("SC_CLK_TCK")
+    parents: dict[int, int] = {}
+    cpu_ticks: dict[int, int] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="utf-8")
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+            continue
+        close = stat.rfind(")")
+        if close < 0:
+            continue
+        fields = stat[close + 2:].split()
+        try:
+            child_pid = int(entry.name)
+            parents[child_pid] = int(fields[1])  # ppid after comm/state
+            # utime + stime + cutime + cstime after comm/state.
+            cpu_ticks[child_pid] = (
+                int(fields[11]) + int(fields[12]) + int(fields[13]) + int(fields[14])
+            )
+        except (IndexError, ValueError):
+            continue
+    if pid not in cpu_ticks:
+        return None
+    children: dict[int, list[int]] = {}
+    for child_pid, parent_pid in parents.items():
+        children.setdefault(parent_pid, []).append(child_pid)
+    total = 0
+    stack = [pid]
+    while stack:
+        current = stack.pop()
+        total += cpu_ticks.get(current, 0)
+        stack.extend(children.get(current, ()))
+    return total / ticks_per_second
+
+
+def _finish_tolerant(
+    process: subprocess.Popen[bytes], argv: Sequence[str]
+) -> subprocess.CompletedProcess[bytes]:
+    """Wait for ``process`` under a CPU-progress budget instead of a plain wall timeout.
+
+    What an invocation is now judged on: it is a timeout -- raised as ``TimeoutExpired`` carrying
+    the output gathered so far, so every caller still maps it to rc 124 ``TIMEOUT`` exactly as
+    the old ``subprocess.run(timeout=...)`` did -- when its process tree makes no CPU progress
+    for :data:`TIMEOUT_SECONDS`, or burns more than twice that in CPU, or runs past four times
+    that in wall time. The plain wall timeout it replaces also failed an edition that was merely
+    starved of CPU on a loaded host: runnable the whole time, but rarely scheduled, it read as
+    hung at ``TIMEOUT_SECONDS`` of wall.
+
+    Why a real slowdown still fails: a genuinely slower path spends the extra time as CPU
+    (caught at twice the CPU budget) or as waiting on something that never comes (caught by the
+    idle limit, unchanged at ``TIMEOUT_SECONDS``), and nothing runs past four times the wall
+    budget. Only scheduling pauses -- wall time in which the tree burned almost no CPU because
+    the host was busy elsewhere -- no longer count against an edition. The budget mirrors
+    ``run_tolerant`` in ``herdr_agent_differential.py``; unlike ``subprocess.run``'s timeout,
+    which killed only the direct child, a timeout here kills the whole process group (every
+    caller starts the child in its own session), so grandchildren cannot leak holding the
+    captured pipes or a fixture lock. Output is drained throughout by retried ``communicate``
+    calls, which keep what was already read.
+    """
+    started = time.monotonic()
+    last_progress = started
+    last_cpu = 0.0
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=_POLL_SECONDS)
+        except subprocess.TimeoutExpired:
+            now = time.monotonic()
+            cpu = _tree_cpu_seconds(process.pid)
+            if cpu is not None and cpu > last_cpu + 0.05:
+                last_cpu = cpu
+                last_progress = now
+            if (
+                now - last_progress <= TIMEOUT_SECONDS
+                and last_cpu <= 2 * TIMEOUT_SECONDS
+                and now - started <= 4 * TIMEOUT_SECONDS
+            ):
+                continue
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                process.kill()
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(
+                list(argv), TIMEOUT_SECONDS, output=stdout, stderr=stderr
+            ) from None
+        return subprocess.CompletedProcess(list(argv), process.returncode, stdout, stderr)
+
+
 def _run_broken_stderr(argv: Sequence[str], cwd: Path, environment: Mapping[str, str]) -> Outcome:
     """Run with stderr on a pipe nobody reads; only the exit status and stdout are observed."""
     reader, writer = os.pipe()
     os.close(reader)
+    started = time.monotonic()
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             list(argv),
             cwd=cwd,
             env=dict(environment),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=writer,
-            check=False,
             start_new_session=True,
-            timeout=TIMEOUT_SECONDS,
         )
+        completed = _finish_tolerant(process, argv)
     except subprocess.TimeoutExpired as error:
-        return Outcome(124, _decode_output(error.stdout), "TIMEOUT\n")
+        return Outcome(
+            124,
+            _decode_output(error.stdout),
+            "TIMEOUT\n",
+            elapsed_seconds=time.monotonic() - started,
+        )
     except OSError as error:
-        return Outcome(127, "", f"could not invoke implementation: {error}\n")
+        return Outcome(
+            127,
+            "",
+            f"could not invoke implementation: {error}\n",
+            elapsed_seconds=time.monotonic() - started,
+        )
     finally:
         os.close(writer)
-    return Outcome(completed.returncode, _decode_output(completed.stdout), "")
+    return Outcome(
+        completed.returncode,
+        _decode_output(completed.stdout),
+        "",
+        elapsed_seconds=time.monotonic() - started,
+    )
 
 
 def _ignore_sigint() -> None:
@@ -700,32 +823,40 @@ def _run_captured(
     # state must not be what decides it (#815; see _canonical_signal_dispositions).
     if preexec is None:
         preexec = _canonical_signal_dispositions
+    started = time.monotonic()
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             list(argv),
             cwd=cwd,
             env=dict(environment),
             stdin=subprocess.DEVNULL,
-            capture_output=True,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             start_new_session=True,
-            timeout=TIMEOUT_SECONDS,
             preexec_fn=preexec,
             close_fds=close_fds,
         )
+        completed = _finish_tolerant(process, argv)
     except subprocess.TimeoutExpired as error:
         return Outcome(
             124,
             _decode_output(error.stdout),
             _decode_output(error.stderr)
             + f"\nTIMEOUT after {TIMEOUT_SECONDS} seconds\n",
+            elapsed_seconds=time.monotonic() - started,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        return Outcome(127, "", f"could not invoke implementation: {error}\n")
+        return Outcome(
+            127,
+            "",
+            f"could not invoke implementation: {error}\n",
+            elapsed_seconds=time.monotonic() - started,
+        )
     return Outcome(
         completed.returncode,
         _decode_output(completed.stdout),
         _decode_output(completed.stderr),
+        elapsed_seconds=time.monotonic() - started,
     )
 
 
@@ -733,23 +864,38 @@ def _run_redirected(
     argv: Sequence[str], cwd: Path, environment: Mapping[str, str], stdout: int
 ) -> Outcome:
     """Run with stdout on a chosen descriptor; only stderr is observed."""
+    started = time.monotonic()
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             list(argv),
             cwd=cwd,
             env=dict(environment),
             stdin=subprocess.DEVNULL,
             stdout=stdout,
             stderr=subprocess.PIPE,
-            check=False,
             start_new_session=True,
-            timeout=TIMEOUT_SECONDS,
         )
+        completed = _finish_tolerant(process, argv)
     except subprocess.TimeoutExpired as error:
-        return Outcome(124, "", _decode_output(error.stderr) + "\nTIMEOUT\n")
+        return Outcome(
+            124,
+            "",
+            _decode_output(error.stderr) + "\nTIMEOUT\n",
+            elapsed_seconds=time.monotonic() - started,
+        )
     except OSError as error:
-        return Outcome(127, "", f"could not invoke implementation: {error}\n")
-    return Outcome(completed.returncode, "", _decode_output(completed.stderr))
+        return Outcome(
+            127,
+            "",
+            f"could not invoke implementation: {error}\n",
+            elapsed_seconds=time.monotonic() - started,
+        )
+    return Outcome(
+        completed.returncode,
+        "",
+        _decode_output(completed.stderr),
+        elapsed_seconds=time.monotonic() - started,
+    )
 
 
 #: Linux's ``F_SETPIPE_SZ``; named here because older Pythons do not export it.
@@ -832,22 +978,32 @@ def _run_size_limited(argv: Sequence[str], cwd: Path, environment: Mapping[str, 
         def limit() -> None:
             resource.setrlimit(resource.RLIMIT_FSIZE, (4096, 4096))
 
+        started = time.monotonic()
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 list(argv),
                 cwd=cwd,
                 env=dict(environment),
                 stdin=subprocess.DEVNULL,
                 stdout=sink,
                 stderr=subprocess.PIPE,
-                check=False,
                 start_new_session=True,
-                timeout=TIMEOUT_SECONDS,
                 preexec_fn=limit,
             )
+            completed = _finish_tolerant(process, argv)
         except subprocess.TimeoutExpired as error:
-            return Outcome(124, "", _decode_output(error.stderr) + "\nTIMEOUT\n")
-    return Outcome(completed.returncode, "", _decode_output(completed.stderr))
+            return Outcome(
+                124,
+                "",
+                _decode_output(error.stderr) + "\nTIMEOUT\n",
+                elapsed_seconds=time.monotonic() - started,
+            )
+    return Outcome(
+        completed.returncode,
+        "",
+        _decode_output(completed.stderr),
+        elapsed_seconds=time.monotonic() - started,
+    )
 
 
 def _normalize_text(text: str, root: Path) -> str:
@@ -865,13 +1021,15 @@ def _normalize_outcome(outcome: Outcome, root: Path) -> Outcome:
         outcome.returncode,
         _normalize_text(outcome.stdout, root),
         _normalize_text(outcome.stderr, root),
+        elapsed_seconds=outcome.elapsed_seconds,
     )
 
 
 def _describe(outcome: Outcome) -> str:
+    elapsed = f", elapsed={outcome.elapsed_seconds:.2f}s" if outcome.elapsed_seconds else ""
     return (
         f"Outcome(rc={outcome.returncode}, stdout={outcome.stdout!r}, "
-        f"stderr={outcome.stderr!r})"
+        f"stderr={outcome.stderr!r}{elapsed})"
     )
 
 
@@ -2309,6 +2467,20 @@ def _spool(harness: Harness, report: Report) -> None:
             env={**os.environ, "HOME": str(root / ".home"), "GIT_CONFIG_NOSYSTEM": "1"},
         )
 
+    # The editions run the real git for this warning (`git check-ignore`), and reading the index
+    # runs whatever `core.fsmonitor` helper the host or repository configuration names, by
+    # absolute path where nothing here stubs it; a slow or noisy helper under load then reads as
+    # an edition divergence. Force it off at command scope, through the environment the editions
+    # (and so their git) are handed -- the same device `with_case_git` uses in
+    # herdr_agent_differential.py -- for these edition invocations only; the harness's own
+    # `git init` in work_tree keeps the environment it already had.
+    git_environment: dict[str, str] = {
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_0": "false",
+    }
+
     for label, spool_dir in (
         ("plain", ".herdr-run"),
         ("apostrophe-and-space", "out dir/it's"),
@@ -2319,9 +2491,8 @@ def _spool(harness: Harness, report: Report) -> None:
             {".herdr-run.yaml": f"spool_dir: {json.dumps(spool_dir)}\n"},
             setup=work_tree,
         )
-        environment = {"GIT_CONFIG_NOSYSTEM": "1"}
         python, rust = harness.invoke(
-            case, ("--agent", "a", "run", "--dry-run", "git status"), extra_env=environment
+            case, ("--agent", "a", "run", "--dry-run", "git status"), extra_env=git_environment
         )
         report.exact(f"spool/tracked-warning/{label}", python, rust, expected_rc=0)
         report.require(
@@ -2336,7 +2507,7 @@ def _spool(harness: Harness, report: Report) -> None:
     python, rust = harness.invoke(
         case,
         ("--agent", "a", "run", "--dry-run", "git status"),
-        extra_env={"GIT_CONFIG_NOSYSTEM": "1"},
+        extra_env=git_environment,
         mode="sigchld-ignored",
     )
     report.exact("spool/tracked-warning/sigchld-ignored", python, rust, expected_rc=0)
@@ -3391,6 +3562,11 @@ def _held_pipe(harness: Harness, report: Report) -> None:
     )
     elapsed = time.monotonic() - started
     report.exact("held-pipe/bounded", python, rust, expected_rc=0)
+    # Kept as a wall bound on the pair, deliberately not relaxed to match _finish_tolerant's
+    # per-invocation budget: what this compares is each edition's own ten-second bound on waiting
+    # for `git check-ignore`, so an edition that regressed to waiting the descendant's full
+    # minute (~60s for one edition alone) still fails here even on a host too loaded for the
+    # harness's CPU-progress budget to notice anything wrong.
     report.require(
         "held-pipe/within-the-bound",
         elapsed < 2 * TIMEOUT_SECONDS,
@@ -3547,7 +3723,6 @@ _E2E_BASHRC = "PS1='\\u@\\h:\\w\\$ '\n"
 #: The fake reports a busy pane's foreground as its shell's PID plus this, so the number is never
 #: another pane's shell.
 _E2E_FOREGROUND_OFFSET = 2_000_000_000
-_E2E_TIMEOUT_SECONDS = 90
 
 _E2E_TICKS = re.compile(r'(?P<prefix>"shell_start_ticks"\s*:\s*)\d+')
 #: A process identity in a reap reason, ``(identity <boot id>:<start ticks>)``: the boot is the
@@ -3642,6 +3817,62 @@ def _fake_calls(account: Path) -> list[dict[str, object]]:
     except OSError:
         return []
     return [cast(dict[str, object], json.loads(line)) for line in text.splitlines() if line]
+
+
+#: The Herdr calls one readiness reading makes, in order (``herdr_run.readiness.assess``: the
+#: process signal, then the prompt text). ``wait_ready`` repeats readings against a wall
+#: deadline, so how many readings fit is a function of host load, not of anything an edition
+#: decided differently.
+_READINESS_POLL_WORDS = frozenset({("pane", "process-info"), ("pane", "read")})
+
+
+def _is_readiness_poll(argv: Sequence[str]) -> bool:
+    return tuple(argv[:2]) in _READINESS_POLL_WORDS
+
+
+def _collapse_readiness_polls(
+    calls: Sequence[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Drop repeated consecutive readiness readings, keeping each distinct call once, in order.
+
+    What the end-to-end ``herdr-calls`` (and ``handed-to-herdr``) comparisons now compare: the
+    sequence of distinct calls each edition made, with a run of identical consecutive
+    readiness-poll argv -- one poll repeated, or a whole ``process-info`` then ``read`` reading
+    repeated with the same argv for the same pane -- counted once. Previously every poll was
+    compared, so on a loaded host the editions could differ only in how many identical readings
+    each fit before its readiness deadline, and the case failed on scheduling, not behaviour.
+
+    Why a real divergence still fails: only the multiplicity of an already-identical poll is
+    dropped. A different argv, a different pane, a distinct call in between, or any
+    non-readiness call -- repeated or not -- stays in the sequence and is compared exactly, and
+    each step's own outcome, which carries the readiness verdict the polls produced, is still
+    compared byte for byte. The refusal assertion is untouched: it reads the shim's log, not
+    this list, and ``inspect`` in :meth:`_EndToEnd.case` still receives every raw call.
+    """
+    collapsed: list[dict[str, object]] = []
+    for call in calls:
+        argv = tuple(cast(list[str], call["argv"]))
+        if _is_readiness_poll(argv) and collapsed:
+            kept = [tuple(cast(list[str], kept_call["argv"])) for kept_call in collapsed[-2:]]
+            if kept[-1] == argv:
+                continue
+            # A whole reading repeated. The single-poll rule above cannot see it, because a
+            # reading's two calls alternate: this process-info repeats the one two calls back,
+            # and the call between them is that reading's read of the same pane (process-info
+            # names it after --pane, read names it directly). Its matching read, when it comes,
+            # is then identical to the kept read and drops out by the single-poll rule.
+            if (
+                len(kept) == 2
+                and argv[:2] == ("pane", "process-info")
+                and kept[0] == argv
+                and kept[1][:2] == ("pane", "read")
+                and len(argv) > 3
+                and len(kept[1]) > 2
+                and kept[1][2] == argv[3]
+            ):
+                continue
+        collapsed.append(call)
+    return collapsed
 
 
 def _handed_line(index: int, call: Mapping[str, object]) -> str:
@@ -3839,30 +4070,42 @@ class _E2EEdition:
         shells = self.state().get("shells", {})
         return {str(k): int(v) for k, v in cast(dict[str, object], shells).items()}  # type: ignore[call-overload]
 
-    def kill_shell(self, pane: str) -> None:
-        """Kill a pane's stand-in shell, if it is still the process the fake started."""
+    def kill_shell(self, pane: str) -> bool:
+        """Kill a pane's stand-in shell, if it is still the process the fake started.
+
+        Returns whether no such shell is left running -- nothing was recorded for the pane, the
+        recorded process is already gone (or its number is another process's now), or it was
+        killed and seen gone -- so a case fails on a kill that did not take instead of reading
+        its later verdicts from a pane whose shell was supposed to be dead.
+        """
         pid = self.shells().get(pane)
-        if pid is not None and _kill_if_same(
-            pid, dict(_fake_processes(self.account)).get(pid), group=False
-        ):
-            _wait_until_gone(pid)
+        if pid is None:
+            return True
+        if not _kill_if_same(pid, dict(_fake_processes(self.account)).get(pid), group=False):
+            return True
+        return _wait_until_gone(pid)
 
     def end(self) -> None:
         """End every process the fake started for this case, and nothing else."""
         _end_fake_processes(self.account)
 
 
-def _wait_until_gone(pid: int) -> None:
-    """Wait (briefly) until ``pid`` is no longer a running process; a zombie counts as gone."""
+def _wait_until_gone(pid: int) -> bool:
+    """Wait (briefly) until ``pid`` is no longer a running process; a zombie counts as gone.
+
+    Returns whether it is gone, so a caller that killed the process on purpose fails its case
+    when the process is still there after the wait instead of proceeding as if it had ended.
+    """
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         try:
             stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         except OSError:
-            return
+            return True
         if stat_text.rsplit(") ", 1)[-1].startswith("Z"):
-            return
+            return True
         time.sleep(0.02)
+    return False
 
 
 @dataclass(frozen=True)
@@ -4084,7 +4327,10 @@ class _EndToEnd:
 
         Besides every step's outcome and every file left behind, the comparison covers each Herdr
         call twice: its argument vector, and what it was handed -- its environment, entry by entry,
-        and its ignored signals.
+        and its ignored signals. Readiness readings are collapsed first
+        (:func:`_collapse_readiness_polls`): how many identical readings fit before a wall
+        deadline is scheduling, not behaviour, while every distinct call and its place in the
+        sequence remain exact.
         """
         self.serial += 1
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-")
@@ -4119,13 +4365,19 @@ class _EndToEnd:
                             outcome.returncode,
                             _e2e_normalize(outcome.stdout, edition),
                             _e2e_normalize(outcome.stderr, edition),
+                            elapsed_seconds=outcome.elapsed_seconds,
                         )
                     )
                 recorded = _fake_calls(edition.account)
-                calls_text = "".join(json.dumps(call["argv"]) + "\n" for call in recorded)
+                # Compared (below, and for what each call was handed) with readiness readings
+                # collapsed: their multiplicity is scheduling, the distinct calls stay exact.
+                # `inspect` still receives every raw call, and the refusal check reads the
+                # shim's own log, so neither loses anything to the collapse.
+                compared = _collapse_readiness_polls(recorded)
+                calls_text = "".join(json.dumps(call["argv"]) + "\n" for call in compared)
                 calls = Outcome(0, _e2e_normalize(calls_text, edition), "")
                 handed = _normalize_text(
-                    "".join(_handed_line(index, call) for index, call in enumerate(recorded)),
+                    "".join(_handed_line(index, call) for index, call in enumerate(compared)),
                     edition.root,
                 )
                 tree = _e2e_tree(edition)
@@ -4232,11 +4484,11 @@ def _cleanup_checks_identity(harness: Harness, report: Report) -> None:
             json.dumps({"processes": [[leader.pid, leader_start]]}), encoding="utf-8"
         )
         _end_fake_processes(account)
-        _wait_until_gone(straggler)
+        gone = _wait_until_gone(straggler)
         fields = _stat_fields(straggler)
         report.require(
             "e2e/cleanup/ends-a-leaderless-group-by-identity",
-            fields is None or fields[0] == "Z",
+            gone and (fields is None or fields[0] == "Z"),
             f"a process left in the group of an exited leader was not ended: {straggler}",
         )
     finally:
@@ -4309,7 +4561,13 @@ def _e2e_run_and_report(harness: Harness, report: Report, shim: Path) -> None:
         panes = cast(list[dict[str, str]], edition.state().get("panes", []))
         for pane in panes:
             if pane.get("tab") == tab:
-                edition.kill_shell(pane["id"])
+                report.require(
+                    f"e2e/reap-verdicts/killed-bobs-shell/{edition.name}",
+                    edition.kill_shell(pane["id"]),
+                    f"bob's stand-in shell for pane {pane['id']} is still running after the "
+                    "kill, so the STALE verdict this case goes on to compare would be read "
+                    "from the wrong population",
+                )
 
     def close_alice(edition: _E2EEdition) -> None:
         tab = tab_of(edition, "alice")
