@@ -7417,9 +7417,24 @@ mod tests {
         let _ = fs::remove_file(&marker);
         let before = SystemTime::now() - Duration::from_secs(1);
         let lock = lock_target(name, "test target lock").expect("take target lock");
-        for path in &paths {
-            let modified = fs::metadata(path).and_then(|meta| meta.modified()).unwrap();
-            assert!(modified >= before, "{} was not marked used", path.display());
+        // Every test in this process shares one lock root and its marker, and other tests take
+        // target locks all the time. One of them can find the marker missing just after it is
+        // removed above, write a fresh one, and only then start touching the directory; this lock
+        // then sees the fresh marker and leaves the refresh to it. So the files are marked used by
+        // whichever sender took the due refresh, and not necessarily before this call returns:
+        // wait for it. Checking at once failed in 48% of rounds beside a thread taking target
+        // locks; with the wait, none did, the longest taking 2 ms.
+        let unmarked = || {
+            paths
+                .iter()
+                .find(|path| fs::metadata(path).and_then(|meta| meta.modified()).unwrap() < before)
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while unmarked().is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if let Some(path) = unmarked() {
+            panic!("{} was not marked used", path.display());
         }
         drop(lock);
     }
