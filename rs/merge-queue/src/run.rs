@@ -705,6 +705,17 @@ pub struct Speculation {
 
 type JobResult = Result<(usize, Ran), String>;
 
+/// A would-be root diverted to the stack (#1071): build on `tip` (the
+/// `parent_prs` batch) because `likely_prs` is likely to land first for
+/// `reason` at predicted pass `p_pass`.
+struct LikelyStack {
+    tip: String,
+    parent_prs: Vec<i64>,
+    likely_prs: Vec<i64>,
+    reason: &'static str,
+    p_pass: f64,
+}
+
 /// A batch in the rolling window.
 struct Flight {
     id: u64,
@@ -6914,7 +6925,7 @@ impl<'a> Runner<'a> {
                         // disjoint-root-stacking). Encoded below as an
                         // ordinary stacked flight, never a root on a
                         // non-base parent.
-                        let mut root_stacked: Option<(String, Vec<i64>, &'static str, f64)> = None;
+                        let mut root_stacked: Option<LikelyStack> = None;
                         if rooted && stack_allowed && stale_stack.is_none() && !stale_rooted {
                             if let Some((model, p)) = &root_stack_p {
                                 let prioritized_of = |batch: &[i64]| {
@@ -6936,6 +6947,18 @@ impl<'a> Runner<'a> {
                                     .iter()
                                     .filter(|f| f.probe_for.is_none() && f.red_work.is_none())
                                 {
+                                    // A batch already known not green is
+                                    // never likely to land, whatever its
+                                    // priority or predicted pass said.
+                                    let known_not_green = flight.red_outcome.is_some()
+                                        || matches!(flight.result, Some(Err(_)))
+                                        || matches!(
+                                            flight.result,
+                                            Some(Ok((_, ref ran))) if !ran.green()
+                                        );
+                                    if known_not_green {
+                                        continue;
+                                    }
                                     let already_green =
                                         flight.result.as_ref().is_some_and(|result| {
                                             result.as_ref().is_ok_and(|(_, ran)| ran.green())
@@ -6951,15 +6974,34 @@ impl<'a> Runner<'a> {
                                         already_green,
                                         self.config.root_stack_min_pass_percent,
                                     ) {
-                                        let tip = stack_top(&flights)
-                                            .map(|top| top.candidate.tip.clone())
-                                            .unwrap_or_else(|| flight.candidate.tip.clone());
-                                        root_stacked = Some((
+                                        // Stack on the stack top when one
+                                        // exists; with none, only on a
+                                        // likely root still on the current
+                                        // base (the stale-tip guard), never
+                                        // on a cut-out or stale tip.
+                                        let (tip, parent_prs) = match stack_top(&flights) {
+                                            Some(top) => (
+                                                top.candidate.tip.clone(),
+                                                top.candidate.prs.clone(),
+                                            ),
+                                            None if flight.rooted
+                                                && flight.candidate.parent
+                                                    == lock(&self.base).clone() =>
+                                            {
+                                                (
+                                                    flight.candidate.tip.clone(),
+                                                    flight.candidate.prs.clone(),
+                                                )
+                                            }
+                                            None => continue,
+                                        };
+                                        root_stacked = Some(LikelyStack {
                                             tip,
-                                            flight.candidate.prs.clone(),
+                                            parent_prs,
+                                            likely_prs: flight.candidate.prs.clone(),
                                             reason,
                                             p_pass,
-                                        ));
+                                        });
                                         break;
                                     }
                                 }
@@ -7043,8 +7085,8 @@ impl<'a> Runner<'a> {
                         }
                         let parent = if let Some(tip) = &dep_tip {
                             tip.clone()
-                        } else if let Some((tip, _, _, _)) = &root_stacked {
-                            tip.clone()
+                        } else if let Some(likely) = &root_stacked {
+                            likely.tip.clone()
                         } else if stale_stack.is_some() {
                             stale_tip.clone().unwrap_or_default()
                         } else if rooted {
@@ -7115,14 +7157,18 @@ impl<'a> Runner<'a> {
                         scope.spawn(move || {
                             let _ = tx.send((id, self.validate_one(job, &flag)));
                         });
-                        if let Some((_, likely_prs, reason, p_pass)) = &root_stacked {
+                        if let Some(likely) = &root_stacked {
                             self.event(
                                 "disjoint-root-stacked",
                                 &format!(
-                                    "{} stacks on {} ({reason}, predicted pass {p_pass:.2}) \
-                                     instead of rooting on the base it is likely to move",
+                                    "{} stacks on {} (likely to land first: {} - {}, \
+                                     predicted pass {:.2}) instead of rooting on the \
+                                     base it is likely to move",
                                     list(&candidate.prs),
-                                    list(likely_prs)
+                                    list(&likely.parent_prs),
+                                    list(&likely.likely_prs),
+                                    likely.reason,
+                                    likely.p_pass
                                 ),
                             );
                         }
