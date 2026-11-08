@@ -32287,9 +32287,21 @@ def _cache_slot_directories(
     for checkout in cache_slot.checkouts:
         checkout_path = _stored_path(config, checkout.path, "checkout path")
         target = checkout_path / "target"
+        # A target the per-repository globs do not select for THIS
+        # checkout stays that repository's own policy (#947): covering
+        # it by default must not override a repo_cache_globs policy
+        # that deliberately applies only to named repositories.
+        glob_covered = any(
+            target == path or _path_is_within(target, path)
+            for cache in registered
+            if cache.checkout_root == checkout_path
+            for path in (cache.path,)
+        )
         if (
             target.is_dir()
             and not target.is_symlink()
+            and not glob_covered
+            and not config.repo_cache_globs
             and not any(
                 target == path or _path_is_within(target, path)
                 for path in selected_paths
@@ -32318,10 +32330,12 @@ def _cache_slot_directories(
     nested: list[CacheDirectory] = []
     slot_root = _cache_slot_root(config, cache_slot)
     if slot_root is not None:
+        slot_identity: tuple[int, int, int] | None
         try:
-            identity = _open_directory_identity(slot_root, "slot")
+            slot_identity = _open_directory_identity(slot_root, "slot")
         except Refusal:
-            identity = None
+            slot_identity = None
+        identity = slot_identity
         if identity is not None:
             for target in _nested_cargo_targets(slot_root):
                 if any(
@@ -32335,9 +32349,9 @@ def _cache_slot_directories(
                     CacheDirectory(
                         path=target,
                         checkout_root=slot_root,
-                        checkout_device=identity[0],
-                        checkout_inode=identity[1],
-                        checkout_mount_id=identity[2],
+                        checkout_device=slot_identity[0],
+                        checkout_inode=slot_identity[1],
+                        checkout_mount_id=slot_identity[2],
                     )
                 )
                 selected_paths.append(target)
@@ -37144,7 +37158,7 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                 if cache_slot.state == "unregistered" and config.repo_cache_globs
                 else None
             )
-            skipped: list[dict[str, str]] = []
+            skipped: list[dict[str, object]] = []
             if hold is not None:
                 directories = ()
                 cache_bytes = 0
