@@ -800,6 +800,12 @@ pub trait AgentRuntime {
     fn paste_drawn_as(&self, label: &str) {
         let _ = label;
     }
+    /// The placeholder [`AgentRuntime::paste_drawn_as`] noted for the paste just typed, if the
+    /// harness drew one: read-back then accepts only that placeholder as the prompt taken (#1009
+    /// agentctl-collapsed-paste-taken). The default knows none.
+    fn drawn_paste_label(&self) -> Option<String> {
+        None
+    }
     /// Whether the prompt a queue drain is delivering was left stranded at the bottom of a TUI's
     /// screen by an earlier pass (its record carries `stranded_at`): the submission must not type
     /// it again, only press Enter until it leaves (#850 unknown-harness-mode). The default is
@@ -1031,6 +1037,9 @@ impl AgentRuntime for PasteTrackingRuntime<'_> {
     fn paste_drawn_as(&self, label: &str) {
         *self.paste_label.borrow_mut() = Some(label.to_owned());
     }
+    fn drawn_paste_label(&self) -> Option<String> {
+        self.paste_label.borrow().clone()
+    }
     fn typed_prompts_queue(&self) -> Option<PathBuf> {
         self.inner.typed_prompts_queue()
     }
@@ -1126,6 +1135,9 @@ impl AgentRuntime for BatchTrackingRuntime<'_> {
 
     fn paste_drawn_as(&self, label: &str) {
         *self.paste_label.borrow_mut() = Some(label.to_owned());
+    }
+    fn drawn_paste_label(&self) -> Option<String> {
+        self.paste_label.borrow().clone()
     }
     fn typed_prompts_queue(&self) -> Option<PathBuf> {
         self.inner.typed_prompts_queue()

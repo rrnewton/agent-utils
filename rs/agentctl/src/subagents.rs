@@ -3914,6 +3914,11 @@ fn screen_tail(screen: &str) -> Vec<String> {
     rows
 }
 
+/// The key prefix, never a pane ID, under which a read-back baseline keeps how often each
+/// numbered paste placeholder already showed in the target, such as `[Pastedtext#3+12lines]`
+/// (#1009 agentctl-collapsed-paste-taken).
+const TARGET_PLACEHOLDER: &str = "\0target-placeholder:";
+
 /// The key, never a pane ID, under which a read-back baseline keeps how often the prompt
 /// showed where typed input lands in the target itself (#704 misroute-shared-text).
 const TARGET_INPUT: &str = "\0target-input";
@@ -3960,10 +3965,22 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                     (input_occurrences(&screen, text), None)
                 }
             };
-            match read.map(count) {
-                Ok((window, target_input)) => {
+            let placeholders = |screen: &str| {
+                if pane == pane_id {
+                    crate::submission::placeholder_labels(screen)
+                } else {
+                    Vec::new()
+                }
+            };
+            match read.map(|screen| (placeholders(&screen), count(screen))) {
+                Ok((labels, (window, target_input))) => {
                     if let Some(target_input) = target_input {
                         windows.insert(TARGET_INPUT.to_owned(), target_input);
+                    }
+                    for label in labels {
+                        *windows
+                            .entry(format!("{TARGET_PLACEHOLDER}{label}"))
+                            .or_default() += 1;
                     }
                     windows.insert(pane, window);
                 }
@@ -4031,6 +4048,47 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         }
     }
 
+    /// The placeholder, without its blanks, that the target newly shows above its composer for
+    /// the prompt just sent, when Claude Code collapsed the paste and the prompt's words never
+    /// show (#1009 agentctl-collapsed-paste-taken). Exactly one placeholder must be new since the
+    /// baseline, above the composer (one still in the composer was not submitted), with a
+    /// `+M lines` count Claude Code reports for this prompt, and, when the composer drew a
+    /// placeholder for this paste, that same one. `None` otherwise, or when the target's screen
+    /// cannot be read or shows no recognisable composer.
+    fn collapsed_paste_taken(
+        &self,
+        pane_id: &str,
+        text: &str,
+        before: &BTreeMap<String, usize>,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> Option<String> {
+        let screen = self.client.read_scrollback(pane_id).ok()?;
+        let view = crate::submission::composer_view(&self.record.harness, &screen)?;
+        let mut shown = BTreeMap::<String, usize>::new();
+        for label in crate::submission::placeholder_labels(&view.transcript) {
+            *shown.entry(label).or_default() += 1;
+        }
+        let mut new = shown.into_iter().filter(|(label, count)| {
+            *count
+                > before
+                    .get(&format!("{TARGET_PLACEHOLDER}{label}"))
+                    .copied()
+                    .unwrap_or(0)
+        });
+        let (label, _) = new.next()?;
+        if new.next().is_some() {
+            return None;
+        }
+        let lines = crate::stale_draft::pasted_line_count_pub(&label)?;
+        if !crate::submission::expected_line_counts(text).contains(&lines) {
+            return None;
+        }
+        match runtime.drawn_paste_label() {
+            Some(drawn) if drawn != label => None,
+            _ => Some(label),
+        }
+    }
+
     fn peer_states(
         &self,
         pane_id: &str,
@@ -4041,7 +4099,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         let deadline = runtime.monotonic() + self.readback_limit();
         let peers: Vec<String> = before
             .keys()
-            .filter(|peer| peer.as_str() != pane_id && peer.as_str() != TARGET_INPUT)
+            .filter(|peer| peer.as_str() != pane_id && !peer.starts_with('\0'))
             .cloned()
             .collect();
         // The first look at every peer is made at once where the client can.
@@ -4159,6 +4217,12 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             Submission::Verified(receipt) if receipt.printed || (receipt.queued && receipt.settled)
         );
         let in_target = receipt_in_target || self.seen_in_target(pane_id, text, before, runtime)?;
+        let collapsed = if in_target {
+            None
+        } else {
+            self.collapsed_paste_taken(pane_id, text, before, runtime)
+        };
+        let in_target = in_target || collapsed.is_some();
         recipient_holds()?;
         let states = self.peer_states(pane_id, text, before, runtime)?;
         let fresh: Vec<&String> = states
@@ -4184,6 +4248,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         // and quarantining a delivered prompt invites a duplicate on retry (#704
         // misroute-shared-text).
         let typed_in_target = receipt_in_target
+            || collapsed.is_some()
             || (in_target
                 && self.client.read_scrollback(pane_id).is_ok_and(|screen| {
                     input_occurrences(&screen, text)
@@ -4212,6 +4277,16 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 if in_target { "shows" } else { "does not show" },
                 json!(states)
             )));
+        }
+        if let Some(label) = &collapsed {
+            // The record says a collapsed paste, not the prompt's words, proved this delivery.
+            self.log_readback(
+                pane_id,
+                text,
+                "collapsed-paste",
+                &json!({"placeholder": label}),
+            );
+            return Ok(());
         }
         if in_target {
             if let Submission::Verified(receipt) = submission {

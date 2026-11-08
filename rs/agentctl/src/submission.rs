@@ -706,7 +706,7 @@ impl ShownBefore {
 /// blanks, so that `#12` is not found inside `#123`. Claude Code numbers each paste, so the label
 /// names one paste. `[Pasted Content N chars]` names only a length that another paste can share,
 /// so it is not returned.
-fn placeholder_labels(text: &str) -> Vec<String> {
+pub(crate) fn placeholder_labels(text: &str) -> Vec<String> {
     let mut labels = Vec::new();
     let mut rest = text;
     while let Some(position) = rest.find("[Pasted ") {

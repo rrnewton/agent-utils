@@ -1,11 +1,12 @@
 ---
 title: 'agentctl-collapsed-paste-taken: a prompt Claude collapses to a pasted-text placeholder is reported not seen'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: cl-sync
 created_at: 2026-11-07T11:20:00.000000000+00:00
-updated_at: 2026-11-07T11:20:00.000000000+00:00
+updated_at: 2026-11-08T11:43:15.000000000+00:00
+closed_at: 2026-11-08T11:43:15.000000000+00:00
 ---
 
 # Description
@@ -28,3 +29,15 @@ When agentctl pastes a long, multi-line prompt (for example a failed-delivery di
 # Notes
 
 Requested 2026-11-07 by the lead coordinator. Follows #953 (queued receipt counts as delivered) and #989 (own drafts submitted, digests matched by content).
+
+## Resolution
+
+[opus 5.5 cl-sync] Rust edition: when a send's words are not seen in the target, read-back
+accepts a collapsed paste as the prompt taken only if exactly one numbered placeholder is new
+above the composer since the pre-send baseline (the baseline now records the target's
+placeholders), its `+M lines` is a count Claude reports for this prompt, and, when the composer
+drew a placeholder for this paste, it is that one. The delivery is logged as `collapsed-paste`
+with the placeholder as evidence. A placeholder still in the composer, one already on screen
+before the send, one with another count, or two new ones of this size leave the prompt unproven,
+as before. Tests in `rs/agentctl/src/subagents/tests/identity.rs`. The Python edition does not
+read placeholders at all and is unchanged.

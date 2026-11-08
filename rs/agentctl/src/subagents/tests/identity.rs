@@ -1820,6 +1820,107 @@ fn a_prompt_queued_in_the_target_outweighs_an_old_copy_in_a_peer() {
     assert_eq!(rows.last().unwrap()["result"], "attributed", "{rows:?}");
 }
 
+// #1009 agentctl-collapsed-paste-taken: Claude Code collapses a long paste to a numbered
+// placeholder, so the prompt's words never show where it took it.
+
+/// Five lines, which Claude Code reports as `+4 lines` (or `+5`) when it collapses the paste.
+const COLLAPSED: &str = "[from lane-a via agentctl · reply: agentctl send lane-a]\n\
+                         first finding of the review\nsecond finding\nthird finding\nfourth finding";
+
+/// An idle Claude Code screen whose transcript shows `rows` above an empty composer.
+fn claude_screen_showing(rows: &[&str]) -> Vec<String> {
+    let rule = "─".repeat(60);
+    let mut screen: Vec<String> = vec!["● Earlier answer.".to_owned(), String::new()];
+    screen.extend(rows.iter().map(|row| (*row).to_owned()));
+    screen.extend([
+        String::new(),
+        rule.clone(),
+        "❯ ".to_owned(),
+        rule,
+        "  ⏵⏵ bypass permissions on".to_owned(),
+    ]);
+    screen
+}
+
+/// A started Claude Code worker whose pane shows `before` until the send and `after` once it,
+/// never the prompt's words, and whose submissions prove only that the prompt left an idle
+/// composer.
+fn collapsing_worker(before: &[&str], after: &[&str]) -> Fixture {
+    TEST_READBACK.with(|limit| limit.set(Some(Duration::from_millis(100))));
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                workspace_id: Some("workspace".to_owned()),
+                harness: "claude".to_owned(),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    fixture
+        .client
+        .scrollback
+        .lock()
+        .unwrap()
+        .insert("owned".to_owned(), claude_screen_showing(before));
+    *fixture.client.scrollback_on_effect.lock().unwrap() =
+        Some(("owned".to_owned(), claude_screen_showing(after)));
+    *fixture.client.print_after.lock().unwrap() = Some(Duration::MAX);
+    *fixture.client.receipt.lock().unwrap() = Some(crate::submission::SubmissionReceipt {
+        queued: false,
+        ..taken_into_queue(true)
+    });
+    fixture
+}
+
+#[test]
+fn a_prompt_claude_collapses_to_its_placeholder_is_delivered_once() {
+    let fixture = collapsing_worker(&[], &["❯ [Pasted text #3 +4 lines]"]);
+    send(&fixture, "worker", COLLAPSED).expect("delivered as its placeholder");
+    assert_eq!(runs(&fixture), [COLLAPSED]);
+    assert!(failed_documents(&fixture, "worker").is_empty());
+    let rows = readback_rows(&fixture, "worker");
+    let row = rows.last().unwrap();
+    assert_eq!(row["result"], "collapsed-paste", "{row}");
+    assert_eq!(
+        row["evidence"]["placeholder"], "[Pastedtext#3+4lines]",
+        "{row}"
+    );
+}
+
+#[test]
+fn a_placeholder_that_cannot_be_this_paste_leaves_the_prompt_unproven() {
+    for (label, before, after) in [
+        // Another size than this prompt's.
+        ("wrong count", vec![], vec!["❯ [Pasted text #3 +9 lines]"]),
+        // On screen before the send: an earlier paste.
+        (
+            "already shown",
+            vec!["❯ [Pasted text #3 +4 lines]"],
+            vec!["❯ [Pasted text #3 +4 lines]"],
+        ),
+        // Two new pastes of this size: either could be this one.
+        (
+            "another paste",
+            vec![],
+            vec!["❯ [Pasted text #3 +4 lines]", "❯ [Pasted text #4 +4 lines]"],
+        ),
+    ] {
+        let fixture = collapsing_worker(&before, &after);
+        let error = send(&fixture, "worker", COLLAPSED).expect_err(label);
+        assert_eq!(
+            error.outcome(),
+            Some(agent::QueueOutcome::PossiblySubmitted),
+            "{label}: {error}"
+        );
+        let rows = readback_rows(&fixture, "worker");
+        assert_eq!(rows.last().unwrap()["result"], "not-seen", "{label}");
+    }
+}
+
 #[test]
 fn a_prompt_printed_without_its_markdown_markup_is_delivered() {
     // Claude prints `code` without backticks and **bold** without asterisks.
