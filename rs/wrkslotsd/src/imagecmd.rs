@@ -11,6 +11,12 @@
 //! effect of reading status (the deliberate divergence recorded in
 //! the milestone-1 inventory); on identical post-load inputs its
 //! bytes match the Python handler.
+//!
+//! Handoff: the CLI-level `test_image_status_rust.py` differential
+//! (both editions through the binary) lands with the dispatch
+//! wiring; until then the oracle differential in this module's
+//! tests (Python driven as a subprocess on the same fixture) is
+//! the byte-parity proof.
 
 use std::path::{Path, PathBuf};
 
@@ -137,14 +143,14 @@ fn render_status_json_ordered(new_slot_representation: &str, reports: &[Value]) 
                     .iter()
                     .filter_map(|key| {
                         entry.get(key).map(|value| {
-                            format!("      {}: {}", py_json_string(key), py_json_value(value, 3))
+                            format!("        {}: {}", py_json_string(key), py_json_value(value, 4))
                         })
                     })
                     .collect();
-                format!("{{\n{}\n    }}", parts.join(",\n"))
+                format!("{{\n{}\n      }}", parts.join(",\n"))
             };
             format!(
-                "  {{\n    \"name\": {},\n    \"slot_type\": {},\n    \"location\": {},\n    \"phase\": {},\n    \"slot\": {},\n    \"state\": {}\n  }}",
+                "    {{\n      \"name\": {},\n      \"slot_type\": {},\n      \"location\": {},\n      \"phase\": {},\n      \"slot\": {},\n      \"state\": {}\n    }}",
                 py_json_value(report.get("name").unwrap_or(&Value::Null), 1),
                 py_json_value(report.get("slot_type").unwrap_or(&Value::Null), 1),
                 py_json_value(report.get("location").unwrap_or(&Value::Null), 1),
@@ -295,7 +301,7 @@ mod tests {
         );
         assert_eq!(json.exit, 0);
         let expected_json = format!(
-            "{{\n  \"new_slot_representation\": \"image\",\n  \"images\": [\n  {{\n    \"name\": \"slot-a\",\n    \"slot_type\": \"agent\",\n    \"location\": \"{}\",\n    \"phase\": \"ready\",\n    \"slot\": {{\n      \"image\": \"{}\",\n      \"ceiling_bytes\": 8589934592,\n      \"host_allocated_bytes\": 0,\n      \"mounted\": false\n    }},\n    \"state\": {{\n      \"image\": \"{}\",\n      \"ceiling_bytes\": 2147483648,\n      \"host_allocated_bytes\": 0,\n      \"mounted\": false\n    }}\n  }}\n  ]\n}}\n",
+            "{{\n  \"new_slot_representation\": \"image\",\n  \"images\": [\n    {{\n      \"name\": \"slot-a\",\n      \"slot_type\": \"agent\",\n      \"location\": \"{}\",\n      \"phase\": \"ready\",\n      \"slot\": {{\n        \"image\": \"{}\",\n        \"ceiling_bytes\": 8589934592,\n        \"host_allocated_bytes\": 0,\n        \"mounted\": false\n      }},\n      \"state\": {{\n        \"image\": \"{}\",\n        \"ceiling_bytes\": 2147483648,\n        \"host_allocated_bytes\": 0,\n        \"mounted\": false\n      }}\n    }}\n  ]\n}}\n",
             root.join("slots").join("slot-a").display(),
             record.image_file().display(),
             record.state_image().display(),
@@ -329,6 +335,208 @@ mod tests {
             "{\n  \"new_slot_representation\": \"worktree\",\n  \"images\": []\n}\n"
         );
 
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    const DRIVER: &str = r####""""Differential driver: run Python _cmd_image_status on a fixture.
+
+Usage: imgstatus_driver.py ROOT CASE FORMAT
+Cases: mounted | unmounted | missing | badrecord
+Prints: <exit>\n<stdout bytes as-is> then a marker line + stderr.
+The fixture layout mirrors the Rust test's: ROOT/project with
+control at ROOT/project/worktrees and slot-images under it.
+Mount activation on config load is stubbed out: the handler under
+comparison takes post-load inputs, so both editions start there.
+"""
+
+import argparse
+import io
+import json
+import os
+import sys
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+
+sys.path.insert(0, os.environ["WRKSLOTS_PY_ROOT"])
+
+from wrkslots import cli, imagecmd, slotimage  # noqa: E402
+
+root = Path(sys.argv[1])
+case = sys.argv[2]
+fmt = sys.argv[3]
+proj = root / "project"
+control = proj / "worktrees"
+imgdir = control / "slot-images" / "agent" / "slot-a"
+location = control / "slot-a"
+
+# Post-load isolation: no mount activation, empty mount table.
+slotimage.ensure_all_mounted = lambda *a, **k: ([], [])  # type: ignore[assignment]
+cli._OWNED_REPRESENTATION_MOUNTS = frozenset()  # type: ignore[attr-defined]
+
+if case == "mounted":
+    fixed = os.statvfs_result(
+        (4096, 1024, 1000003, 400009, 300007, 70001, 20011, 20003, 0, 255)
+    )
+    slotimage.mounted_backend = (  # type: ignore[assignment]
+        lambda image_file, mount_point, table=None: "kernel"
+        if str(image_file).endswith("slot.img")
+        else None
+    )
+    os.statvfs = lambda path: fixed  # type: ignore[misc]
+elif case in ("unmounted", "missing", "badrecord"):
+    slotimage.mounted_backend = lambda *a, **k: None  # type: ignore[assignment]
+
+args = argparse.Namespace(project_root=str(proj), machine="node-a", format=fmt)
+out, err = io.StringIO(), io.StringIO()
+try:
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = imagecmd._cmd_image_status(args)
+except cli.Refusal as exc:
+    remedy = cli._refusal_remedy(
+        argparse.Namespace(command="image"), exc
+    )
+    sys.stdout.write(f"3\n{out.getvalue()}---STDERR---\nREFUSED: {exc}\nREMEDY: {remedy}\n")
+    sys.exit(0)
+sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}")
+"####;
+
+    /// Differential against the Python oracle (#1095): drive
+    /// `_cmd_image_status` as a subprocess on the same fixture with
+    /// stubbed mount observations, and compare (exit, stdout,
+    /// stderr) byte-for-byte with this handler on identical facts.
+    /// Mount activation on Python config load is stubbed in the
+    /// driver: both editions start from post-load inputs.
+    #[test]
+    fn status_matches_python_oracle() {
+        use std::io::Write as _;
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "wrkslotsd-imagecmd-diff-{}-{n}",
+            std::process::id()
+        ));
+        let proj = root.join("project");
+        let control = proj.join("worktrees");
+        let imgdir = control.join("slot-images").join("agent").join("slot-a");
+        std::fs::create_dir_all(&imgdir).expect("imgdir");
+        std::fs::create_dir_all(&proj).expect("proj");
+        std::fs::write(proj.join("live.py"), "# probe\n").expect("probe");
+        std::fs::write(
+            proj.join(".wrkslots.yml"),
+            "schema: 2\nmachine: node-a\nworktrees_dir: worktrees\ndefault_remote: origin\ndefault_landed_ref: refs/remotes/origin/main\nheartbeat_ttl_seconds: 60\nliveness_command: live.py\nslot_representation: image\n",
+        )
+        .expect("config");
+        let location = control.join("slot-a");
+        let record = ImageRecord {
+            directory: imgdir.clone(),
+            slot: "slot-a".to_string(),
+            slot_type: "agent".to_string(),
+            location: location.clone(),
+            ceiling_bytes: 3 * 1_073_741_824,
+            state_ceiling_bytes: 1_073_741_824,
+            backend: "kernel".to_string(),
+            created_at: "2026-11-07T00:00:00+00:00".to_string(),
+            phase: "ready".to_string(),
+        };
+        write_record(&record).expect("record");
+        for (file, size) in [
+            (record.image_file(), 3 * 1_073_741_824_u64),
+            (record.state_image(), 1_073_741_824_u64),
+        ] {
+            let handle = std::fs::File::create(&file).expect("image");
+            handle.set_len(size).expect("size");
+            // One written MiB in the slot image, as the Python fixture does.
+            if file == record.image_file() {
+                let mut handle = handle;
+                handle.write_all(&vec![b'x'; 1024 * 1024]).expect("write");
+            }
+        }
+
+        let driver = root.join("driver.py");
+        std::fs::write(&driver, DRIVER).expect("driver");
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf();
+        let slot_path = |_t: &str, slot: &str| control.join(slot);
+
+        let run_python = |case: &str, fmt: &str| -> (i32, String, String) {
+            let output = std::process::Command::new("python3")
+                .arg(&driver)
+                .arg(&root)
+                .arg(case)
+                .arg(fmt)
+                .env("WRKSLOTS_PY_ROOT", repo.join("py"))
+                .output()
+                .expect("python oracle runs");
+            let text = String::from_utf8(output.stdout).expect("utf8");
+            let (head, rest) = text.split_once('\n').expect("exit line");
+            let (stdout, stderr) = rest.split_once("---STDERR---\n").expect("marker");
+            (
+                head.trim().parse().expect("exit"),
+                stdout.to_string(),
+                stderr.to_string(),
+            )
+        };
+
+        // The fixture each case needs on disk.
+        let set_case = |case: &str| {
+            // Restore both images, then apply the case's damage.
+            for (file, size) in [
+                (record.image_file(), 3 * 1_073_741_824_u64),
+                (record.state_image(), 1_073_741_824_u64),
+            ] {
+                if !file.exists() {
+                    let handle = std::fs::File::create(&file).expect("restore");
+                    handle.set_len(size).expect("size");
+                }
+            }
+            let record_path = imgdir.join("IMAGE.json");
+            write_record(&record).expect("restore record");
+            match case {
+                "missing" => std::fs::remove_file(record.state_image()).expect("unlink state"),
+                "badrecord" => {
+                    std::fs::write(&record_path, "{\"schema\": \"other/v9\"}\n").expect("bad")
+                }
+                _ => {}
+            }
+        };
+
+        for (case, fmt) in [
+            ("mounted", "human"),
+            ("mounted", "json"),
+            ("unmounted", "human"),
+            ("unmounted", "json"),
+            ("missing", "json"),
+            ("badrecord", "human"),
+        ] {
+            set_case(case);
+            let (exit, stdout, stderr) = run_python(case, fmt);
+            let facts = |image_file: &Path, _: &Path| -> (Option<String>, Option<VfsFacts>) {
+                if case == "mounted" && image_file == record.image_file() {
+                    (
+                        Some("kernel".to_string()),
+                        Some(VfsFacts {
+                            used_bytes: (1_000_003 - 400_009) * 1024,
+                            free_bytes: 300_007 * 1024,
+                            used_inodes: 70_001 - 20_011,
+                        }),
+                    )
+                } else {
+                    (None, None)
+                }
+            };
+            let outcome = image_status(&control, &slot_path, "image", fmt, &[], &facts, &NoRunner);
+            assert_eq!(
+                (
+                    outcome.exit,
+                    outcome.stdout.as_str(),
+                    outcome.stderr.as_str()
+                ),
+                (exit, stdout.as_str(), stderr.as_str()),
+                "case {case} format {fmt}"
+            );
+        }
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

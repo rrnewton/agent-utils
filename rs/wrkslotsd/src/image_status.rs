@@ -41,7 +41,20 @@ fn file_entry(
             );
         }
         Err(error) => {
-            entry.insert("error".to_string(), json!(error.to_string()));
+            // Python renders `str(OSError)` as
+            // `[Errno N] <strerror>: '<path>'`; match it byte for byte.
+            let errno = error.raw_os_error().unwrap_or_default();
+            let message = error.to_string();
+            let stripped = message
+                .strip_suffix(&format!(" (os error {errno})"))
+                .unwrap_or(&message);
+            entry.insert(
+                "error".to_string(),
+                json!(format!(
+                    "[Errno {errno}] {stripped}: '{}'",
+                    image_file.display()
+                )),
+            );
         }
     }
     match backend_for(image_file, mount_point) {
