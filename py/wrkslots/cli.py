@@ -1085,6 +1085,20 @@ class _ProcessEvidenceChanged(Refusal):
     found: tuple[tuple[int, str, str, str], ...] = ()
 
 
+class _LiveEntriesVanished(_ProcessEvidenceChanged):
+    """Only live processes of their observed generation lost /proc entries mid-walk (#996).
+
+    A privileged reader walked a process's fd, cwd or root entries, or its maps, while that
+    process, still running as the same generation, closed a file or moved: ordinary churn on a
+    busy host.  ``pids`` names those processes, so the reader can read just them again instead of
+    the census discarding the whole attempt.  Every other caller discards it as before.
+    """
+
+    def __init__(self, message: str, pids: Iterable[int]) -> None:
+        super().__init__(message)
+        self.pids = frozenset(pids)
+
+
 class _ValidationRunMayUseRow(Refusal):
     """Positive evidence that a validation run may still use a row.
 
@@ -60868,6 +60882,7 @@ def _allow_only_vanished_process_diagnostics(
         raise Refusal(f"privileged {program} census diagnostics are undecodable") from exc
     pattern = _FIND_MISSING_RE if program == "find" else _GREP_MISSING_RE
     changed_diagnostic: str | None = None
+    changed_pids: set[int] = set()
     motion: list[_ProcessEvidenceChanged] = []
     for line in lines:
         if program == "find" and _long_path_diagnostic_is_foreign(
@@ -60880,14 +60895,16 @@ def _allow_only_vanished_process_diagnostics(
             raise Refusal(f"privileged {program} census produced diagnostics: {line}")
         if _observation_is_active_deferring_motion(process, motion):
             changed_diagnostic = line
+            changed_pids.add(process.pid)
     # Validate every diagnostic before classifying motion: an earlier vanished
     # FD must not hide a later permission, malformed, or unknown-path refusal.
     # The enclosing bounded retry discards this entire incomplete census.
     if motion:
         raise motion[0]
     if changed_diagnostic is not None:
-        raise _ProcessEvidenceChanged(
-            f"privileged {program} census produced diagnostics: {changed_diagnostic}"
+        raise _LiveEntriesVanished(
+            f"privileged {program} census produced diagnostics: {changed_diagnostic}",
+            changed_pids,
         )
 
 
@@ -61059,6 +61076,93 @@ def _absent_validate_find_match(
     return matches[0] if matches else None
 
 
+#: How many times one privileged batch re-reads the live processes whose entries vanished while it
+#: walked them, before the attempt is discarded as for any other evidence change (#996).
+_LIVE_ENTRY_REPROBES = 2
+
+
+def _privileged_census_output(
+    program: str,
+    run: Callable[[], tuple[int, bytes, bytes]],
+    reprobe: Callable[[Mapping[int, _AbsentProcessObservation]], tuple[int, bytes, bytes]],
+    processes: Mapping[int, _AbsentProcessObservation],
+    *,
+    target_devices: AbstractSet[int],
+) -> bytes:
+    """Return everything one privileged ``program`` batch read over ``processes``.
+
+    ``run()`` runs the batch and ``reprobe(selected)`` runs the same reader over just
+    ``selected``; each returns its exit status, output and diagnostics.  When the only diagnostics are entries that vanished
+    from processes still running as their observed generation -- a file closed or a directory left
+    while the reader walked it -- just those processes are read again, at most
+    ``_LIVE_ENTRY_REPROBES`` times, instead of the census discarding the whole attempt: on a busy
+    host one such close in each of three attempts refused the census as "relevant process evidence
+    changed" (#996).  Any other diagnostic, thread-group motion, or entries that still vanish on
+    the last re-read raise as before.
+
+    The records an interrupted walk printed for the processes read again are dropped, as a
+    discarded attempt drops them, and the re-read's records stand in their place; the records of
+    every other process in the batch come from a complete walk and are kept.  This stays
+    fail-closed: a vanished entry of a live process means it closed that reference, so it no
+    longer holds the path through it; a reference it kept, or moved to another descriptor, is read
+    by the re-probe; and a child it handed the reference to after the snapshot is a birth the
+    census never observes in any case, as for every process born after the snapshot.
+    """
+
+    outputs: list[bytes] = []
+    selected = processes
+    for attempt in range(_LIVE_ENTRY_REPROBES + 1):
+        returncode, stdout, stderr = run() if attempt == 0 else reprobe(selected)
+        outputs.append(stdout)
+        try:
+            _allow_only_vanished_process_diagnostics(
+                program, returncode, stderr, selected, target_devices=target_devices
+            )
+        except _LiveEntriesVanished as exc:
+            if attempt == _LIVE_ENTRY_REPROBES:
+                raise
+            selected = {pid: selected[pid] for pid in sorted(exc.pids) if pid in selected}
+            if not selected:
+                raise
+            outputs = [_without_records_of(program, output, selected) for output in outputs]
+            continue
+        return b"".join(outputs)
+    raise AssertionError("unreachable privileged census re-probe")
+
+
+def _without_records_of(program: str, output: bytes, pids: Iterable[int]) -> bytes:
+    """``output`` of a privileged ``program`` read without the records of ``pids``.
+
+    find prints NUL-separated (evidence path, link target) pairs and grep prints one
+    ``/proc/PID/maps:mapping`` line per match; a record whose framing cannot be read is kept, so
+    the parser still refuses it.
+    """
+
+    dropped = frozenset(pids)
+
+    def keeps(evidence: bytes) -> bool:
+        try:
+            return _pid_from_proc_evidence(Path(os.fsdecode(evidence))) not in dropped
+        except (Refusal, ValueError):
+            return True
+
+    if program == "find":
+        fields = output.split(b"\0")
+        tail = fields.pop() if fields and fields[-1] == b"" else None
+        if len(fields) % 2:
+            return output
+        kept = [
+            field
+            for index in range(0, len(fields), 2)
+            if keeps(fields[index])
+            for field in fields[index : index + 2]
+        ]
+        return b"\0".join(kept) + (b"\0" if kept and tail is not None else b"")
+    return b"".join(
+        line for line in output.splitlines(keepends=True) if keeps(line.partition(b":")[0])
+    )
+
+
 def _absent_validate_find_matches(
     processes: Sequence[_AbsentProcessObservation],
     targets: Mapping[Path, str],
@@ -61082,6 +61186,17 @@ def _absent_validate_find_matches(
     )
     observed_by_pid = {process.pid: process for process in processes}
     chunks: list[bytes] = []
+
+    def run_find(
+        selected: Mapping[int, _AbsentProcessObservation],
+    ) -> tuple[int, bytes, bytes]:
+        batches = list(
+            _argument_batches(("-P",), _process_symlink_roots(tuple(selected.values())), suffix)
+        )
+        if len(batches) != 1:
+            raise Refusal("privileged find census re-probe does not fit one command")
+        return _run_root_owned_command(Path("/usr/bin/find"), batches[0], budget=budget)
+
     for arguments in _argument_batches(("-P",), roots, suffix):
         batch_pids = {
             _pid_from_proc_evidence(Path(argument))
@@ -61090,16 +61205,23 @@ def _absent_validate_find_matches(
         batch_processes = {
             pid: observed_by_pid[pid] for pid in batch_pids if pid in observed_by_pid
         }
-        returncode, stdout, stderr = _run_root_owned_command(
-            Path("/usr/bin/find"), arguments, budget=budget
+        chunks.append(
+            _privileged_census_output(
+                "find",
+                functools.partial(
+                    _run_root_owned_command, Path("/usr/bin/find"), arguments, budget=budget
+                ),
+                run_find,
+                batch_processes,
+                target_devices=_target_devices(targets),
+            )
         )
-        _allow_only_vanished_process_diagnostics(
-            "find", returncode, stderr, batch_processes,
-            target_devices=_target_devices(targets),
+    return tuple(
+        dict.fromkeys(
+            _parse_find_path_matches(
+                b"".join(chunks), observed_by_pid, targets, census="privileged"
+            )
         )
-        chunks.append(stdout)
-    return _parse_find_path_matches(
-        b"".join(chunks), observed_by_pid, targets, census="privileged"
     )
 
 
@@ -61129,23 +61251,43 @@ def _absent_validate_maps_matches(
     pattern_input = ("\n".join(patterns) + "\n").encode("utf-8")
     observed_by_pid = {process.pid: process for process in processes}
     chunks: list[bytes] = []
-    for arguments in _argument_batches(("-F", "-H", "-f", "-", "--"), files, ()):
-        batch_pids = {_pid_from_proc_evidence(Path(argument)) for argument in arguments[5:]}
-        batch_processes = {
-            pid: observed_by_pid[pid] for pid in batch_pids if pid in observed_by_pid
-        }
+
+    def run_grep(arguments: Sequence[str]) -> tuple[int, bytes, bytes]:
         returncode, stdout, stderr = _run_root_owned_command(
             Path("/usr/bin/grep"), arguments, input_data=pattern_input, budget=budget
         )
         if returncode not in {0, 1, 2}:
             raise Refusal(f"privileged grep census refused with exit {returncode}")
-        _allow_only_vanished_process_diagnostics(
-            "grep", returncode, stderr, batch_processes,
-            target_devices=_target_devices(targets),
+        return returncode, stdout, stderr
+
+    def reprobe_grep(
+        selected: Mapping[int, _AbsentProcessObservation],
+    ) -> tuple[int, bytes, bytes]:
+        return run_grep(
+            ("-F", "-H", "-f", "-", "--",
+             *(str(Path("/proc") / str(pid) / "maps") for pid in sorted(selected)))
         )
-        chunks.append(stdout)
-    return _parse_maps_path_matches(
-        b"".join(chunks), observed_by_pid, targets, census="privileged"
+
+    for arguments in _argument_batches(("-F", "-H", "-f", "-", "--"), files, ()):
+        batch_pids = {_pid_from_proc_evidence(Path(argument)) for argument in arguments[5:]}
+        batch_processes = {
+            pid: observed_by_pid[pid] for pid in batch_pids if pid in observed_by_pid
+        }
+        chunks.append(
+            _privileged_census_output(
+                "grep",
+                functools.partial(run_grep, arguments),
+                reprobe_grep,
+                batch_processes,
+                target_devices=_target_devices(targets),
+            )
+        )
+    return tuple(
+        dict.fromkeys(
+            _parse_maps_path_matches(
+                b"".join(chunks), observed_by_pid, targets, census="privileged"
+            )
+        )
     )
 
 

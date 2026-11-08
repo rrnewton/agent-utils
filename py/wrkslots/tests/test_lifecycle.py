@@ -50940,6 +50940,143 @@ def test_process_path_census_reports_a_live_user_while_unrelated_processes_exit_
         terminate_process(user)
 
 
+class _ScriptedPrivilegedReads:
+    """Stand-in for the root-owned find/grep runner: answers each call from ``replies`` and
+    records the /proc PIDs each call named (#996)."""
+
+    def __init__(self, replies: Sequence[tuple[int, bytes, bytes]]) -> None:
+        self.replies = list(replies)
+        self.pids: list[set[int]] = []
+
+    def __call__(
+        self,
+        program: Path,
+        arguments: Sequence[str],
+        *,
+        input_data: bytes | None = None,
+        input_limit: int = 1024 * 1024,
+        budget: object = None,
+    ) -> tuple[int, bytes, bytes]:
+        self.pids.append(
+            {int(match) for match in re.findall(r"^/proc/([0-9]+)", "\n".join(arguments), re.M)}
+        )
+        return self.replies[min(len(self.pids), len(self.replies)) - 1]
+
+
+def _live_census_pair(
+    tmp_path: Path,
+) -> tuple[
+    Path, subprocess.Popen[str], subprocess.Popen[str], dict[int, wrkslots._AbsentProcessObservation]
+]:
+    """A slot, a process working in it, and an unrelated live process, with their observations."""
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    user = subprocess.Popen(["sleep", "3600"], cwd=slot, text=True)
+    other = subprocess.Popen(["sleep", "3600"], cwd=tmp_path, text=True)
+    observed = {
+        process.pid: process
+        for process in wrkslots._absent_validate_process_snapshot()
+        if process.pid in (user.pid, other.pid)
+    }
+    assert set(observed) == {user.pid, other.pid}
+    return slot, user, other, observed
+
+
+def _vanished_fd(pid: int) -> bytes:
+    return f"/usr/bin/find: '/proc/{pid}/fd/9': No such file or directory\n".encode()
+
+
+def test_find_census_rereads_only_a_live_process_whose_fd_vanished_mid_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live process closing a file mid-walk costs one re-read of it, not the attempt (#996)."""
+    slot, user, other, observed = _live_census_pair(tmp_path)
+    holder = f"/proc/{user.pid}/cwd\0{slot}\0".encode()
+    reads = _ScriptedPrivilegedReads([(1, holder, _vanished_fd(other.pid)), (0, b"", b"")])
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", reads)
+    try:
+        matches = wrkslots._absent_validate_find_matches(
+            tuple(observed.values()), {slot: "slot01"}
+        )
+        assert [pid for pid, *_rest in matches] == [user.pid]
+        assert reads.pids == [{user.pid, other.pid}, {other.pid}]
+    finally:
+        terminate_process(user)
+        terminate_process(other)
+
+
+def test_find_census_reports_a_holder_seen_only_when_it_is_read_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slot, user, other, observed = _live_census_pair(tmp_path)
+    holder = f"/proc/{user.pid}/fd/3\0{slot}/file\0".encode()
+    reads = _ScriptedPrivilegedReads([(1, b"", _vanished_fd(user.pid)), (0, holder, b"")])
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", reads)
+    try:
+        matches = wrkslots._absent_validate_find_matches(
+            tuple(observed.values()), {slot: "slot01"}
+        )
+        assert [pid for pid, *_rest in matches] == [user.pid]
+        assert reads.pids[1] == {user.pid}
+    finally:
+        terminate_process(user)
+        terminate_process(other)
+
+
+def test_find_census_drops_the_interrupted_walk_of_a_process_it_reads_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Records from the interrupted walk of a re-read process give way to the re-read (#996)."""
+    slot, user, other, observed = _live_census_pair(tmp_path)
+    walked = f"/proc/{user.pid}/cwd\0{slot}\0/proc/{other.pid}/fd/7\0{slot}/closed\0".encode()
+    reads = _ScriptedPrivilegedReads([(1, walked, _vanished_fd(other.pid)), (0, b"", b"")])
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", reads)
+    try:
+        matches = wrkslots._absent_validate_find_matches(
+            tuple(observed.values()), {slot: "slot01"}
+        )
+        assert [pid for pid, *_rest in matches] == [user.pid]
+    finally:
+        terminate_process(user)
+        terminate_process(other)
+
+
+def test_find_census_still_refuses_entries_that_keep_vanishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slot, user, other, observed = _live_census_pair(tmp_path)
+    reads = _ScriptedPrivilegedReads([(1, b"", _vanished_fd(other.pid))])
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", reads)
+    try:
+        with pytest.raises(wrkslots._ProcessEvidenceChanged, match="privileged find census produced diagnostics"):
+            wrkslots._absent_validate_find_matches(
+                tuple(observed.values()), {slot: "slot01"}
+            )
+        assert len(reads.pids) == 1 + wrkslots._LIVE_ENTRY_REPROBES
+    finally:
+        terminate_process(user)
+        terminate_process(other)
+
+
+def test_maps_census_rereads_only_a_live_process_whose_maps_vanished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slot, user, other, observed = _live_census_pair(tmp_path)
+    vanished = f"/usr/bin/grep: /proc/{other.pid}/maps: No such file or directory\n".encode()
+    holder = f"/proc/{user.pid}/maps:7f00-7f01 r--p 00000000 08:01 42 {slot}/lib.so\n".encode()
+    reads = _ScriptedPrivilegedReads([(2, holder, vanished), (1, b"", b"")])
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", reads)
+    try:
+        matches = wrkslots._absent_validate_maps_matches(
+            tuple(observed.values()), {slot: "slot01"}
+        )
+        assert [pid for pid, *_rest in matches] == [user.pid]
+        assert reads.pids == [{user.pid, other.pid}, {other.pid}]
+    finally:
+        terminate_process(user)
+        terminate_process(other)
+
+
 @pytest.mark.parametrize("overflowing_process_active", (True, False))
 def test_mountinfo_census_overflow_is_not_discarded_by_representative_fallback(
     monkeypatch: pytest.MonkeyPatch, overflowing_process_active: bool
@@ -51274,7 +51411,9 @@ def missing_path_census_control(
             return (0, b"/proc/123/fd/7\0", b"")
         elif scenario == "time":
             now = 6.0
-        # Partial find output cannot survive into the accepted attempt.
+        # Partial find output cannot survive into the accepted attempt.  The privileged lane reads
+        # a live process again within the attempt (#996); here every read of the first attempt
+        # names the vanished entry, so that attempt is still discarded.
         partial = b"/proc/123/fd/7\0" + os.fsencode(target / "partial") + b"\0"
         return (1, partial, diagnostic)
 
@@ -51304,8 +51443,9 @@ def test_missing_path_census_discards_attempt_before_complete_reobservation(
 ) -> None:
     capture, calls = missing_path_census_control(monkeypatch, lane, "once")
     census = capture()
+    first_find = ["find"] * (1 + wrkslots._LIVE_ENTRY_REPROBES) if lane == "privileged" else ["find"]
     assert calls == [
-        "snapshot", "find", "snapshot", "find", "grep", "mount",
+        "snapshot", *first_find, "snapshot", "find", "grep", "mount",
         *(["snapshot"] if lane == "same-uid" else []),
     ]
     assert len(census.processes) == 1
@@ -51321,7 +51461,8 @@ def test_missing_path_census_refuses_after_three_complete_attempts(
     with pytest.raises(wrkslots.Refusal, match="three liveness attempts") as refused:
         capture()
     assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
-    assert calls == ["snapshot", "find"] * 3
+    reads = 1 + wrkslots._LIVE_ENTRY_REPROBES if lane == "privileged" else 1
+    assert calls == ["snapshot", *["find"] * reads] * 3
 
 
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))
@@ -51335,6 +51476,9 @@ def test_missing_path_census_preserves_shared_attempt_budgets(
     assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
     if bound == "time":
         assert calls == ["snapshot", "find"]
+    elif lane == "privileged":
+        # Re-reading the live process's maps (#996) exhausts the shared grep pattern input.
+        assert calls == ["snapshot", "find", "grep"]
     else:
         # The second real command wrapper exhausts the shared grep pattern input.
         assert calls == ["snapshot", "find", "grep", "snapshot", "find"]
