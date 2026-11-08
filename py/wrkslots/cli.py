@@ -32335,8 +32335,7 @@ def _cache_slot_directories(
             slot_identity = _open_directory_identity(slot_root, "slot")
         except Refusal:
             slot_identity = None
-        identity = slot_identity
-        if identity is not None:
+        if slot_identity is not None:
             for target in _nested_cargo_targets(slot_root):
                 if any(
                     target == path or _path_is_within(target, path)
@@ -37195,7 +37194,7 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                     if not measured_list and skipped and slot in selected:
                         # Every candidate is indeterminate: preserve the
                         # original all-or-nothing refusal for this slot.
-                        raise Refusal(skipped[-1]["reason"])
+                        raise Refusal(str(skipped[-1]["reason"]))
                     # Every selected directory was measured, so its refusals
                     # (nested Git metadata, for one) have already applied.
                     kept: list[tuple[CacheDirectory, int]] = []
@@ -37316,8 +37315,11 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                 )
             )
         for row in rows:
-            for skipped in _as_list(row["skipped"], "cache row skipped"):
-                entry = _as_mapping(skipped, "cache row skipped entry")
+            row_skipped: list[dict[str, object]] = cast(
+                "list[dict[str, object]]", row["skipped"]
+            )
+            for residual in row_skipped:
+                entry = _as_mapping(residual, "cache row skipped entry")
                 if "bytes" in entry:
                     print(
                         f"RESIDUAL: {row['slot']} path={entry['path']} "
