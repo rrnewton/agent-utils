@@ -398,6 +398,11 @@ pub fn declared_decreases(message: &str) -> (Vec<Decrease>, Vec<String>) {
 /// occurrence-count shrink stays refused — which occurrence went is ambiguous).
 pub const REMOVAL_TRAILER: &str = "Count-Pin-Removed";
 
+/// Trailer a change's head commit carries to declare that the pin file
+/// itself goes away: `Count-Pins-Retired: <reason>`. Without it, a head
+/// with no pin file is refused; with it, the change recounts to nothing.
+pub const RETIRED_TRAILER: &str = "Count-Pins-Retired";
+
 /// One declared pin removal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Removal {
@@ -476,6 +481,21 @@ pub fn declared_removals(message: &str) -> (Vec<Removal>, Vec<String>) {
         }
     }
     (declared, unreadable)
+}
+
+/// The reason `message` gives for retiring the whole pin table, when it
+/// declares one with a [`RETIRED_TRAILER`] trailer. The reason must be
+/// non-empty; a bare trailer declares nothing.
+pub fn declared_retirement(message: &str) -> Option<String> {
+    for line in message.lines().map(str::trim) {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case(RETIRED_TRAILER) && !value.trim().is_empty() {
+            return Some(value.trim().to_owned());
+        }
+    }
+    None
 }
 
 fn parse_removal(value: &str) -> Option<Removal> {
@@ -808,6 +828,24 @@ mod unit {
         // An unreadable trailer is named in the refusal.
         let refused = check("x\n\nCount-Pin-Decrease: p two\n").unwrap_err();
         assert!(refused.contains("unreadable trailer(s)"), "{refused}");
+    }
+
+    #[test]
+    fn retirement_trailers_parse_a_reason() {
+        assert_eq!(
+            declared_retirement("x\n\nCount-Pins-Retired: census gating\n"),
+            Some("census gating".to_owned())
+        );
+        assert_eq!(
+            declared_retirement("x\n\ncount-pins-retired: same, lower-case key\n"),
+            Some("same, lower-case key".to_owned())
+        );
+        // A bare trailer, and no trailer at all, declare nothing.
+        assert_eq!(declared_retirement("x\n\nCount-Pins-Retired:\n"), None);
+        assert_eq!(
+            declared_retirement("x\n\nCount-Pin-Decrease: p 1 why\n"),
+            None
+        );
     }
 
     #[test]

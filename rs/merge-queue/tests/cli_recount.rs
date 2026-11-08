@@ -510,6 +510,71 @@ fn an_undeclared_mass_removal_names_every_pin_in_one_refusal() {
     }
 }
 
+/// Push `name` from main deleting the pin file in one commit under `message`.
+fn branch_deleting_pin_file(fx: &Fixture, name: &str, test_path: &str, message: &str) {
+    git(&fx.dev(), &["checkout", "-q", "-B", name, "main"]);
+    git(&fx.dev(), &["rm", "-q", PIN]);
+    fx.write(test_path, "ok\n");
+    fx.commit_all(message);
+    git(
+        &fx.dev(),
+        &["push", "-q", "-f", "origin", &format!("HEAD:{name}")],
+    );
+    git(&fx.dev(), &["checkout", "-q", "main"]);
+}
+
+#[test]
+fn an_exact_change_is_never_recounted() {
+    // The same undeclared removal as above lands untouched when submitted
+    // exact: recount would refuse it, and an exact change is never recounted
+    // or rewritten.
+    let fx = removal_fixture("recount-exact-skip");
+    branch_with_message(
+        &fx,
+        "b",
+        &[(PIN, REMOVAL_KEPT), ("tests/b", "ok\n")],
+        "Remove gone pins\n",
+    );
+    fx.mq_ok(&["submit", "1", "--head", "b", "--exact"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1]], "{r}");
+    let landed_pin = git(&fx.remote(), &["show", &format!("main:{PIN}")]);
+    assert!(!landed_pin.contains("gone."), "{landed_pin}");
+    assert!(r.get("recount_skips").is_none(), "{r}");
+}
+
+#[test]
+fn a_declared_retirement_deleting_the_pin_file_lands_and_is_recorded() {
+    let fx = removal_fixture("recount-retirement-declared");
+    branch_deleting_pin_file(
+        &fx,
+        "b",
+        "tests/b",
+        "Retire count pins for census gating\n\nCount-Pins-Retired: census gating\n",
+    );
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1]], "{r}");
+    let listed = git(&fx.remote(), &["ls-tree", "--name-only", "main", "--", PIN]);
+    assert!(listed.trim().is_empty(), "{listed}");
+    assert_eq!(
+        r["pin_retirements"],
+        serde_json::json!([{"pr": 1, "reason": "census gating"}]),
+        "{r}"
+    );
+}
+
+#[test]
+fn an_undeclared_retirement_is_refused_naming_the_trailer() {
+    let fx = removal_fixture("recount-retirement-undeclared");
+    branch_deleting_pin_file(&fx, "b", "tests/b", "Retire count pins\n");
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert!(landed(&r).is_empty(), "{r}");
+    let reason = r["recount_skips"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("Count-Pins-Retired: <reason>"), "{reason}");
+}
+
 /// Push `name` from `from` with one commit writing `files` under `message`.
 fn stacked_branch(fx: &Fixture, name: &str, from: &str, files: &[(&str, &str)], message: &str) {
     git(&fx.dev(), &["checkout", "-q", "-B", name, from]);

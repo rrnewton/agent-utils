@@ -344,6 +344,75 @@ fn exact_commit_rule_reruns_the_whole_selection_after_an_ejection() {
 /// A regeneration command that counts its invocations by appending to a file
 /// outside the checkout (a file inside it would be a stray change), then does
 /// the usual regeneration. Returns the command and the count file.
+const REGEN_IDENTITY: &[&str] = &[
+    "--regen-path",
+    "gen/",
+    "--regen-command",
+    REGEN,
+    "--identity-name",
+    "queue-bot",
+    "--identity-email",
+    "bot@example.com",
+];
+
+fn regen_args(command: &str) -> Vec<&str> {
+    vec![
+        "--regen-path",
+        "gen/",
+        "--regen-command",
+        command,
+        "--identity-name",
+        "queue-bot",
+        "--identity-email",
+        "bot@example.com",
+    ]
+}
+
+#[test]
+fn an_exact_change_with_current_generated_files_lands_untouched() {
+    let fx = setup("regen-exact-pass", REGEN_IDENTITY);
+    let head = source_change(&fx, "b");
+    fx.mq_ok(&["submit", "1", "--head", "b", "--exact"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1]], "{r}");
+    // The landed commit is the submitted head itself: the generator ran
+    // check-only and rewrote nothing.
+    assert_eq!(
+        git(&fx.remote(), &["rev-parse", "main"]).trim(),
+        head.trim()
+    );
+}
+
+#[test]
+fn an_exact_change_failing_the_generator_check_ejects_regen_check_failed() {
+    // The generator refuses any tree whose sources mention BAD; the base has
+    // none, so the failure is this change's, and as a check on an exact
+    // change it ejects as regen-check-failed, not regen-failed.
+    let check = "if grep -qr BAD src; then echo 'bad source' >&2; exit 1; fi; \
+                 mkdir -p gen && cat $(ls src/* | sort) > gen/all.txt";
+    let fx = setup("regen-exact-check", &regen_args(check));
+    git(&fx.dev(), &["checkout", "-q", "-B", "b", "main"]);
+    fx.write("src/b", "BAD\n");
+    fx.write("gen/all.txt", "a\nBAD\n");
+    fx.write("tests/b", "ok\n");
+    fx.commit_all("b: add source");
+    git(&fx.dev(), &["push", "-q", "-f", "origin", "HEAD:b"]);
+    git(&fx.dev(), &["checkout", "-q", "main"]);
+    fx.mq_ok(&["submit", "1", "--head", "b", "--exact"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert!(landed(&r).is_empty(), "{r}");
+    assert_eq!(r["ejected"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["ejected"][0]["pr"], 1);
+    assert_eq!(r["ejected"][0]["kind"], "regen-check-failed");
+    assert!(
+        r["ejected"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("bad source"),
+        "{r}"
+    );
+}
+
 fn counting_regen(fx: &Fixture) -> (String, std::path::PathBuf) {
     let count = fx.root.join("regen-count.txt");
     (

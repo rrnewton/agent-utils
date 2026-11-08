@@ -401,6 +401,9 @@ pub struct RunReport {
     /// Pin removals changes declared and their batches accepted.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pin_removals: Vec<PinRemoval>,
+    /// Whole pin-table retirements changes declared and their batches accepted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pin_retirements: Vec<PinRetirement>,
     /// Pinned commits of other repositories resolved to the descendant (`pins`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pin_resolutions: Vec<crate::pins::Resolution>,
@@ -462,6 +465,16 @@ pub struct PinRemoval {
     pub pattern: String,
     /// Pin entries removed under this declaration.
     pub removed: usize,
+    /// Why, as the trailer says.
+    pub reason: String,
+}
+
+/// A pin-table retirement a change declared and its batch accepted (see
+/// [`crate::recount::RETIRED_TRAILER`]).
+#[derive(Clone, Debug, Serialize)]
+pub struct PinRetirement {
+    /// Change that declared it.
+    pub pr: i64,
     /// Why, as the trailer says.
     pub reason: String,
 }
@@ -2930,6 +2943,7 @@ impl<'a> Runner<'a> {
                     String,
                     String,
                     Vec<crate::recount::HonouredRemoval>,
+                    Option<String>,
                 );
                 let versions = (|| -> Result<Versions, String> {
                     let mergebase = self
@@ -2991,19 +3005,62 @@ impl<'a> Runner<'a> {
                     };
                     let from_text = self.git.show_file(&reference, crate::recount::PIN_PATH)?;
                     let head_text = self.git.show_file(&head, crate::recount::PIN_PATH)?;
-                    // Removal declarations ride the head commit message, like
-                    // decrease declarations; reading them needs the message only
-                    // when the pin file actually changed across this change.
-                    let (removals, unreadable_removals) = if base_text.is_some()
-                        && from_text.is_some()
-                        && head_text.is_some()
+                    // An exact change is never recounted: it lands as submitted,
+                    // pins and all (or with none), and is never rewritten.
+                    if items[pr].exact {
+                        return Ok((
+                            BTreeMap::new(),
+                            crate::recount::values(from_text.as_deref()),
+                            crate::recount::values(head_text.as_deref()),
+                            reference,
+                            label,
+                            Vec::new(),
+                            None,
+                        ));
+                    }
+                    // Removal and retirement declarations ride the head commit
+                    // message, like decrease declarations; reading them needs
+                    // the message only when the pin file actually changed (or
+                    // went away) across this change.
+                    let (removals, unreadable_removals, retired) = if from_text.is_some()
                         && from_text != head_text
                     {
                         let message = self.git.message(&head)?;
-                        crate::recount::declared_removals(&message)
+                        let (removals, unreadable) = if base_text.is_some() && head_text.is_some() {
+                            crate::recount::declared_removals(&message)
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
+                        let retired = if head_text.is_none() {
+                            crate::recount::declared_retirement(&message)
+                        } else {
+                            None
+                        };
+                        (removals, unreadable, retired)
                     } else {
-                        (Vec::new(), Vec::new())
+                        (Vec::new(), Vec::new(), None)
                     };
+                    // The whole pin file is gone at the head: only a declared
+                    // retirement recounts that to nothing.
+                    if head_text.is_none() && from_text.is_some() {
+                        return match retired {
+                            Some(_) => Ok((
+                                BTreeMap::new(),
+                                crate::recount::values(from_text.as_deref()),
+                                crate::recount::values(head_text.as_deref()),
+                                reference,
+                                label,
+                                Vec::new(),
+                                retired,
+                            )),
+                            None => Err(format!(
+                                "pin file {} is deleted at {}; an undeclared retirement is refused: declare it with a `{}: <reason>` trailer on the head commit",
+                                crate::recount::PIN_PATH,
+                                short(&head),
+                                crate::recount::RETIRED_TRAILER
+                            )),
+                        };
+                    }
                     let (delta, honoured_removals) = crate::recount::change_deltas(
                         base_text.as_deref(),
                         from_text.as_deref(),
@@ -3018,9 +3075,10 @@ impl<'a> Runner<'a> {
                         reference,
                         label,
                         honoured_removals,
+                        None,
                     ))
                 })();
-                let (full, from_values, head_values, from, from_label, honoured_removals) =
+                let (full, from_values, head_values, from, from_label, honoured_removals, retired) =
                     match versions {
                         Ok(versions) => versions,
                         Err(detail) => {
@@ -3142,6 +3200,9 @@ impl<'a> Runner<'a> {
                             &head_values,
                         )?;
                         self.record_pin_removals(*pr, &honoured_removals)?;
+                        if let Some(reason) = &retired {
+                            self.record_pin_retirement(*pr, reason)?;
+                        }
                         accepted.insert(*pr, delta);
                         earlier.push((*pr, full, head_values, from));
                     }
@@ -3357,6 +3418,15 @@ impl<'a> Runner<'a> {
                                 }
                             }
                         }
+                        // For an exact change the generator runs check-only — its
+                        // output can never be adopted — so its failure is a failed
+                        // check on the submitted tree, reported distinctly from a
+                        // failed regeneration of a change that expected one.
+                        let kind = if item.exact {
+                            "regen-check-failed"
+                        } else {
+                            kind
+                        };
                         skipped.insert(*pr);
                         conflicts.push((*pr, kind, why));
                         continue;
@@ -3787,6 +3857,25 @@ impl<'a> Runner<'a> {
         Ok(())
     }
 
+    /// Record the pin-table retirement change `pr` declared and its batch
+    /// accepted: in the run report, the run's events and the change's history.
+    fn record_pin_retirement(&self, pr: i64, reason: &str) -> Result<(), String> {
+        let detail = format!("declared retirement of the pin table accepted: {reason}");
+        self.event("count-pins-retired", &format!("#{pr}: {detail}"));
+        lock(&self.report).pin_retirements.push(PinRetirement {
+            pr,
+            reason: reason.to_owned(),
+        });
+        if !self.simulating() {
+            let mut items = lock(&self.items);
+            if let Some(item) = items.get_mut(&pr) {
+                item.log("count-pins-retired", detail);
+                self.state.save_item(item)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Rewrite the pin counts on `tip` to `values` and commit the result;
     /// returns `tip` unchanged when the counts already match (or there is
     /// no pin file to rewrite). Only the numbers change.
@@ -3923,6 +4012,10 @@ impl<'a> Runner<'a> {
                 ),
                 "exact-regen" => format!(
                     "must land exactly as submitted (an exact change), but onto {}{context} {detail}; regenerate in the change itself and resubmit",
+                    short(parent)
+                ),
+                "regen-check-failed" => format!(
+                    "must land exactly as submitted (an exact change), but the generator's check onto {}{context} failed: {detail}; fix the generated files in the change itself and resubmit",
                     short(parent)
                 ),
                 "regen-build-failed" => format!(
@@ -9768,6 +9861,12 @@ pub fn render_report(report: &RunReport) -> String {
                 "- #{}: `{}` removed {}: {}\n",
                 removal.pr, removal.pattern, removal.removed, removal.reason
             ));
+        }
+    }
+    if !report.pin_retirements.is_empty() {
+        out.push_str("\n## Declared pin retirements\n\n");
+        for retirement in &report.pin_retirements {
+            out.push_str(&format!("- #{}: {}\n", retirement.pr, retirement.reason));
         }
     }
     if !report.pin_resolutions.is_empty() {
