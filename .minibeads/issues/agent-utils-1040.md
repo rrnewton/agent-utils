@@ -5,7 +5,7 @@ priority: 1
 issue_type: task
 assignee: mu-docreader
 created_at: 2026-11-08T01:19:06.000000000+00:00
-updated_at: 2026-11-08T01:19:06.000000000+00:00
+updated_at: 2026-11-08T15:18:42.000000000+00:00
 ---
 
 # Description
@@ -47,3 +47,42 @@ landed with this work: `voice-read-acceptance.py` document mode
 (`--document-notice-file` + `--prompt-file` as the answer, `--document-arm`
 whole/section/prefix-only; typed T0, spoken-yes recognition not modelled),
 reporting notice/answer first-audio median+p90 over ≥5 trials per arm.
+
+## Resolution (live acceptance, 2026-11-08, mu-docreader)
+
+[watermelon-full-preview] Ran on the deployed devbig014 stack (main f14a85e0,
+release f14a85e0, vibe-talk-slack service) with the harness in document mode,
+fresh single-use session tickets per trial, typed answers. Document: an
+already-linked design document fetched once into the live cache for the runs,
+3,183 words by the reader's plain-text measure (the notice says "About 3183
+words"), 9-section outline.
+
+- **Live /mcp attach PROVED on the deployed cascade.** Every whole-arm trial
+  called `fetch_document` exactly once (server access log `tools/call` +
+  `tool="fetch_document" outcome="ok" millis=0`, five calls across five
+  trials); prefix-only trials called nothing. No tool other than
+  `fetch_document` was called in any trial. This deployment's voice backend is
+  the vibe-talk-v1 websocket cascade (`tools=chat`): proved on the deployed
+  cascade; the private S2S bridge question stays open, as no deployment here
+  runs it.
+- **Yes → first spoken words** (typed T0 = answer send; first assistant
+  transcript is the speech marker because this bridge streams PCM from ~0.04 s
+  regardless, so the harness's first-PCM number, median 0.042 s, is not
+  speech): whole arm, 5 trials, median **1.75 s**, p90 **2.13 s**
+  (1.53/1.68/1.75/1.97/2.13). Notice → the opening question: median 0.98 s.
+  In trial 1 the tool call reached the server 0.93 s after the typed yes and
+  took 0 ms there (in-process ~2 ms per the earlier probe), so the ingest
+  cost is model prefill over the 12 KiB-capped fetch (~3.2k tokens), not this
+  server.
+- **Prefix-only arm** (answer "no, just summarise"), 3 trials, all pass:
+  median **0.88 s** to first words, no fetch. The whole-vs-prefix delta
+  (~+0.9 s) is the document prefill.
+- 4 of 5 whole trials passed every protocol check; one hit a mid-answer
+  `provider_error` frame after fetching and speaking 2,240 characters — no
+  evidence it relates to the document flow. Answer lengths 990–2,275 chars
+  (whole) vs 241–331 (prefix) are consistent with document-grounded answers;
+  the harness is deliberately content-free, so section citation was not
+  directly observed.
+- Unverified, named: the private S2S bridge's tool-calling (above); a spoken
+  (ASR) yes rather than a typed one; answer wording/citations (content-free
+  harness). Recommended: close, with those as the recorded residue.
