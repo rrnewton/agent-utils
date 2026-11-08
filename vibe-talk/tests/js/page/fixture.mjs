@@ -3769,13 +3769,19 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         if (page.prepareFails) {
           return json(500, { error: "nope", detail: "no" });
         }
+        // `#1039 documents-read-parity`: a document's prepare names no ids; its key is the path's,
+        // answered as its one prepared id, in this same shape.
+        const documentKey = /^\/api\/v1\/documents\/([^/]+)\/speech\/prepare$/.exec(String(path));
+        const preparedFor = (id, ticket) => ({
+          message_id: id,
+          url: `/api/v1/speech/${ticket}${page.speechTicketSuffix}`,
+          // `#376 read-aloud-blocks`: the blocks the server prepared this message as, if any.
+          ...(page.speechBlocks[id] ? { blocks: page.speechBlocks[id] } : {}),
+        });
         return json(200, {
-          prepared: (asked.ids || []).map((id) => ({
-            message_id: id,
-            url: `/api/v1/speech/ticket-for-${id}${page.speechTicketSuffix}`,
-            // `#376 read-aloud-blocks`: the blocks the server prepared this message as, if any.
-            ...(page.speechBlocks[id] ? { blocks: page.speechBlocks[id] } : {}),
-          })),
+          prepared: documentKey
+            ? [preparedFor(decodeURIComponent(documentKey[1]), `ticket-for-doc-${documentKey[1]}`)]
+            : (asked.ids || []).map((id) => preparedFor(id, `ticket-for-${id}`)),
           expires_in_seconds: page.speechTicketTtlSeconds,
         });
       }

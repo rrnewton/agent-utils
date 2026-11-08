@@ -4962,3 +4962,452 @@ test("`#847 read-aloud-table-rows`: a table whose drawn rows are not as many as 
   await page.settle();
   assert.equal(page.el("read-steer-count").text(), "2 of 3");
 });
+
+// --- `#1039 documents-read-parity`: the read-aloud owner reads a document ----------------------------
+//
+// Stage 2's entry point is exported and called by nothing on the page yet, so these drive it
+// directly through the page's owner, as the documents view will. A document read must behave like
+// a message read in every way but three: it asks after no channel or row, it archives nothing, and
+// it never goes on to anything.
+
+const DOC_BLOCKS = [
+  "Opening block of the document says hello.",
+  "Middle block first sentence stands here. Middle block second sentence follows it closely. " +
+    "Middle block third sentence keeps the same thought going for a while longer still. " +
+    "Middle block fourth sentence ends the thought at last.",
+  "Closing block of the document says goodbye.",
+];
+const DOC_KINDS = [{ kind: "paragraph", spoken: true }, { kind: "paragraph", spoken: true },
+  { kind: "paragraph", spoken: true }];
+
+/** Ask the page's owner to read `doc`, as the documents view will; the promise it answers. */
+function readDocumentNow(page, doc, from = null) {
+  return page.pure(`readAloudOwner().readDocument(${JSON.stringify(doc)}, ${JSON.stringify(from)})`);
+}
+const playingId = (page) => page.pure("readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.id : null");
+const playingKind = (page) => page.pure("readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.kind : null");
+const ownerReadState = (page) => page.pure("readAloudOwner().readState");
+const ownerPending = (page) => page.pure("readAloudOwner().pendingRead");
+/** Every speech-prepare request the page made, as it went out. */
+const prepareRequests = (page) => page.requests.filter((one) => /\/speech\/prepare$/.test(one));
+
+/** Say every queued device utterance to its end, newest last, and let the page settle. */
+async function sayAllUtterances(page) {
+  for (let at = 0; at < page.deviceSpeech.utterances.length; at += 1) {
+    page.deviceSpeech.utterances[at].end();
+  }
+  await page.settle();
+}
+
+test("`#1039 documents-read-parity`: a document by the device voice speaks at once, a block at a time, with no speech HTTP at all", async () => {
+  const page = devicePage();
+  await signIn(page);
+  await showDiscord(page, [message({ content: "a message that is never read" })]);
+  const asking = readDocumentNow(page, { key: "notes", title: "Notes", texts: DOC_BLOCKS });
+  assert.equal(page.deviceSpeech.utterances.length, 1, "the first utterance waited past the call");
+  await asking;
+  assert.equal(playingId(page), "doc:notes");
+  assert.equal(playingKind(page), "document");
+  assert.deepEqual(page.prepareCalls, [], "a device document read prepared channel speech");
+  assert.deepEqual(prepareRequests(page), [], "a device document read made a prepare request");
+  assert.deepEqual(page.speakCalls, [], "a device document read fetched speech");
+  assert.equal(page.players.length, 0, "a device document read built an audio player");
+  assert.equal(page.el("read-steer-count").text(), "1 of 3");
+  assert.equal(page.deviceSpeech.utterances[0].text, DOC_BLOCKS[0]);
+  // The first block over, the count moves with the voice: a segment a block, as a cloud read's are.
+  page.deviceSpeech.utterances[0].end();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "the count did not move to the second block");
+  await sayAllUtterances(page);
+  const said = page.deviceSpeech.utterances.map((one) => one.text);
+  for (const text of said) {
+    assert.ok(Array.from(text).length <= 180, `an utterance overruns the device chunk size: ${text.length}`);
+    assert.ok(!(/hello/.test(text) && /Middle/.test(text)), "two blocks were merged into one utterance");
+    assert.ok(!(/Middle/.test(text) && /goodbye/.test(text)), "two blocks were merged into one utterance");
+  }
+  assert.equal(said.join(" "), DOC_BLOCKS.join(" ").replace(/\s+/g, " ").trim(),
+    "what was said is not the document, block by block");
+  assert.ok(said.length > DOC_BLOCKS.length, "the long block was not cut into utterances of its own");
+  assert.deepEqual(page.dismissCalls, [], "a document heard to its end archived something");
+  assert.equal(playingId(page), null, "the read outlived its last block");
+  assert.equal(ownerReadState(page), "ready");
+  assert.equal(page.el("read-steer").hidden, true, "the strip outlived the read");
+});
+
+test("`#1039 documents-read-parity`: a document read from a block starts there and says nothing before it", async () => {
+  const page = devicePage();
+  await signIn(page);
+  await showDiscord(page, [message({ content: "a message that is never read" })]);
+  await readDocumentNow(page, { key: "notes", texts: DOC_BLOCKS }, { part: 0, block: 1 });
+  assert.equal(page.el("read-steer-count").text(), "2 of 3");
+  assert.match(page.deviceSpeech.utterances[0].text, /^Middle block/, "the read did not start at its block");
+  await sayAllUtterances(page);
+  assert.ok(!page.deviceSpeech.utterances.some((one) => /hello/.test(one.text)),
+    "a block before the one asked for was said");
+  assert.deepEqual(page.dismissCalls, []);
+});
+
+test("`#1039 documents-read-parity`: a document cued held says nothing until Resume speaks its block", async () => {
+  const page = devicePage();
+  await signIn(page);
+  await showDiscord(page, [message({ content: "a message that is never read" })]);
+  await readDocumentNow(page, { key: "notes", texts: DOC_BLOCKS }, { part: 0, block: 2, hold: true });
+  assert.equal(page.deviceSpeech.utterances.length, 0, "a cued document spoke");
+  assert.equal(page.deviceSpeech.cancellations, 0, "cueing the document touched the engine");
+  assert.equal(page.el("read-steer-count").text(), "3 of 3");
+  assert.equal(page.el("read-aloud-label").text(), "Resume", "the cued read is not held");
+  assert.equal(ownerPending(page), null, "a cued read is still pending");
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.deviceSpeech.utterances.length, 1, "Resume said nothing");
+  assert.equal(page.deviceSpeech.utterances[0].text, DOC_BLOCKS[2], "Resume did not speak the cued block");
+  await sayAllUtterances(page);
+  assert.deepEqual(page.dismissCalls, []);
+  assert.equal(ownerReadState(page), "ready");
+});
+
+test("`#1039 documents-read-parity`: pausing a document stops at its chunk and Resume says that chunk again", async () => {
+  const page = devicePage();
+  await signIn(page);
+  await showDiscord(page, [message({ content: "a message that is never read" })]);
+  await readDocumentNow(page, { key: "notes", texts: DOC_BLOCKS });
+  page.deviceSpeech.utterances[0].end();
+  await page.settle();
+  const heldChunk = page.deviceSpeech.utterances.at(-1).text;
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.deviceSpeech.pauses, 0, "Pause asked the engine for its own pause");
+  assert.equal(page.deviceSpeech.cancellations, 1, "Pause did not stop the device voice");
+  assert.equal(page.el("read-aloud-label").text(), "Resume");
+  assert.equal(page.el("read-react").disabled, true, "a held document offers a React on nothing");
+  page.deviceSpeech.utterances.at(-1).end();
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [], "the stopped chunk's end archived the held read");
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.deviceSpeech.utterances.at(-1).text, heldChunk, "Resume did not say the held chunk again");
+  await sayAllUtterances(page);
+  assert.deepEqual(page.dismissCalls, [], "a resumed document archived something at its end");
+});
+
+test("`#1039 documents-read-parity`: asking for the document already playing stops it, as a second tap stops a message", async () => {
+  const page = devicePage();
+  await signIn(page);
+  await showDiscord(page, [message({ content: "a message that is never read" })]);
+  await readDocumentNow(page, { key: "notes", texts: DOC_BLOCKS });
+  assert.equal(page.deviceSpeech.utterances.length, 1, "the premise: nothing is being said");
+  const cancellations = page.deviceSpeech.cancellations;
+  await readDocumentNow(page, { key: "notes", texts: DOC_BLOCKS });
+  await page.settle();
+  assert.equal(playingId(page), null, "the second ask left the document playing");
+  assert.equal(page.deviceSpeech.utterances.length, 1, "the second ask started the document again");
+  assert.ok(page.deviceSpeech.cancellations > cancellations, "the second ask did not stop the voice");
+  assert.equal(page.el("read-steer").hidden, true, "the strip outlived the stopped read");
+  assert.deepEqual(page.dismissCalls, []);
+});
+
+test("`#1039 documents-read-parity`: a document and a message take the voice from each other, one at a time", async () => {
+  const page = devicePage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [
+    message({ id: "1000000000000000001", content: "First message words here.", timestamp: "2026-08-19T14:00:00Z" }),
+    message({ id: "1000000000000000002", author_id: "1000000000000000012", content: "Second message words here.", timestamp: "2026-08-19T14:01:00Z" }),
+  ]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.match(page.deviceSpeech.utterances.at(-1).text, /First message/, "the premise: no message is being read");
+  const cancellations = page.deviceSpeech.cancellations;
+  await readDocumentNow(page, { key: "notes", texts: DOC_BLOCKS });
+  assert.ok(page.deviceSpeech.cancellations > cancellations, "starting the document left the message speaking");
+  assert.match(page.deviceSpeech.utterances.at(-1).text, /Opening block/, "the document did not take the voice");
+  assert.equal(playingId(page), "doc:notes");
+  assert.equal(rowState(page, 0).reading, "false", "the stopped message still looks read aloud");
+  const beforeSecond = page.deviceSpeech.cancellations;
+  await page.el("discord-log").children[1].dispatch("click", {});
+  await page.settle();
+  assert.ok(page.deviceSpeech.cancellations > beforeSecond, "starting a message left the document speaking");
+  assert.match(page.deviceSpeech.utterances.at(-1).text, /Second message/, "the message did not take the voice back");
+  // The strip is the message's now, React alone (`#828`): the document's count is gone from it.
+  assert.equal(page.el("read-steer-count").text(), "", "the document's count outlived its read");
+  assert.ok(page.el("read-steer").hasAttribute("data-react-only"), "the strip is not the message's own");
+  assert.deepEqual(page.prepareCalls, [], "the exchange prepared channel speech for the document");
+  assert.deepEqual(page.speakCalls, []);
+  assert.deepEqual(page.dismissCalls, [], "either stopped read was archived");
+});
+
+test("`#1039 documents-read-parity`: the arrows and the media keys steer a device document, claimed only past one block", async () => {
+  const page = devicePage();
+  page.enableMediaSession();
+  await signIn(page);
+  await showDiscord(page, [message({ content: "a message that is never read" })]);
+  await readDocumentNow(page, { key: "notes", title: "Field Notes", texts: DOC_BLOCKS });
+  const session = page.mediaSession;
+  assert.deepEqual(Object.keys(session.handlers).sort(), ["nexttrack", "pause", "play", "previoustrack", "stop"],
+    "a document of several blocks holds no media keys");
+  assert.equal(session.metadata.title, "Field Notes", "the lock screen does not name the document");
+  assert.equal(session.playbackState, "playing");
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "Next did not move the document");
+  assert.match(page.deviceSpeech.utterances.at(-1).text, /^Middle block/);
+  session.handlers.nexttrack();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "3 of 3", "the media Next did not move the document");
+  session.handlers.previoustrack();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "the media Previous did not move the document");
+  await page.el("read-prev").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "1 of 3", "Previous did not move the document");
+  assert.match(page.deviceSpeech.utterances.at(-1).text, /Opening block/);
+  // Every move was the owner's own rebuild: no channel speech was prepared or fetched for any of them.
+  assert.deepEqual(page.prepareCalls, [], "steering the document prepared channel speech");
+  assert.deepEqual(page.speakCalls, []);
+  session.handlers.pause();
+  await page.settle();
+  assert.equal(session.playbackState, "paused");
+  assert.equal(page.el("read-aloud-label").text(), "Resume", "a media pause left the Read button saying Pause");
+  session.handlers.play();
+  await page.settle();
+  assert.equal(session.playbackState, "playing");
+  assert.match(page.deviceSpeech.utterances.at(-1).text, /Opening block/, "a media Play did not say the held chunk again");
+  await sayAllUtterances(page);
+  assert.equal(session.playbackState, "none", "the media session outlived the document");
+  assert.equal(session.handlers.nexttrack, null, "the page kept the media keys after the document");
+  assert.equal(session.metadata, null);
+  assert.deepEqual(page.dismissCalls, []);
+
+  // One block: nowhere for the keys to steer to, none claimed, and no title of its own to show.
+  const single = devicePage();
+  single.enableMediaSession();
+  await signIn(single);
+  await showDiscord(single, [message({ content: "a message that is never read" })]);
+  await readDocumentNow(single, { key: "short", texts: ["The whole short document in one block."] });
+  assert.deepEqual(Object.keys(single.mediaSession.handlers), [], "a one-block document claimed the media keys");
+  assert.equal(single.mediaSession.metadata, null);
+  await sayAllUtterances(single);
+  await readDocumentNow(single, { key: "pair", texts: ["First of two blocks here.", "Second of two blocks here."] });
+  assert.equal(single.mediaSession.metadata.title, "Reading a document",
+    "an untitled document is not named as one on the lock screen");
+  await sayAllUtterances(single);
+});
+
+test("`#1039 documents-read-parity`: Next on the last block and the natural end archive nothing and go nowhere, Autoplay or not", async () => {
+  const page = devicePage(undefined, new Map([["vibe-talk.voice.autoplay", "1"]]));
+  await signIn(page);
+  await inReadingMode(page, [
+    message({ id: "1000000000000000001", content: "An unread message waits below.", timestamp: "2026-08-19T14:00:00Z" }),
+    message({ id: "1000000000000000002", author_id: "1000000000000000012", content: "Another unread message waits.", timestamp: "2026-08-19T14:01:00Z" }),
+  ]);
+  const twoBlocks = ["First document block to finish.", "Last document block to finish."];
+  await readDocumentNow(page, { key: "notes", texts: twoBlocks });
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 2", "the premise: the read is not on its last block");
+  const spoken = page.deviceSpeech.utterances.length;
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(playingId(page), null, "Next on the last block left the document playing");
+  assert.equal(page.deviceSpeech.utterances.length, spoken, "finishing the document read something after it");
+  assert.deepEqual(page.dismissCalls, [], "finishing the document archived a message");
+  assert.equal(ownerReadState(page), "ready");
+  assert.equal(page.el("read-steer").hidden, true);
+  // And heard to its end the ordinary way, with unread messages still waiting below it.
+  await readDocumentNow(page, { key: "notes", texts: twoBlocks });
+  await sayAllUtterances(page);
+  assert.ok(!page.deviceSpeech.utterances.some((one) => /unread message/.test(one.text)),
+    "the document's end went on to a message");
+  assert.deepEqual(page.dismissCalls, [], "the document's end archived a message");
+  assert.equal(ownerReadState(page), "ready");
+});
+
+test("`#1039 documents-read-parity`: a device document prepared in blocks skips the blocks that say nothing", async () => {
+  const page = devicePage();
+  await signIn(page);
+  await showDiscord(page, [message({ content: "a message that is never read" })]);
+  const entry = { url: "/api/v1/speech/ticket-for-doc-notes", until: { mono: 9007199254740991, wall: 9007199254740991 },
+    blocks: [{ kind: "paragraph", spoken: true, chars: 30 }, { kind: "code", spoken: false, chars: 90 },
+      { kind: "paragraph", spoken: true, chars: 32 }] };
+  const texts = ["Spoken opening of the document.", "CODE THAT MUST NOT BE SAID ALOUD", "Spoken closing of the document."];
+  await readDocumentNow(page, { key: "notes", texts, entry });
+  assert.equal(page.el("read-steer-count").text(), "1 of 2", "the unspoken block still counts as a part");
+  await sayAllUtterances(page);
+  assert.ok(!page.deviceSpeech.utterances.some((one) => /MUST NOT BE SAID/.test(one.text)),
+    "a block marked unspoken was said");
+  assert.deepEqual(page.prepareCalls, [], "a given entry was prepared again on the device voice");
+  assert.deepEqual(page.dismissCalls, []);
+});
+
+/** Play a cloud read's element players to their ends, a block at a time, as a browser reports them. */
+async function playPlayersToEnd(page, count) {
+  for (let at = 0; at < count; at += 1) {
+    const player = page.players[at];
+    assert.ok(player, `block ${at} was never handed to a player`);
+    await player.loaded();
+    await player.started();
+    await page.settle();
+    await player.end();
+    await page.settle();
+  }
+}
+
+test("`#1039 documents-read-parity`: a cloud document prepares only at its own route and plays block by block", async () => {
+  const page = newPage();
+  page.speechBlocks["notes"] = DOC_KINDS;
+  await signIn(page);
+  await showDiscord(page, [message({ content: "a message that is never read" })]);
+  await readDocumentNow(page, { key: "notes", title: "Notes", texts: DOC_BLOCKS });
+  assert.deepEqual(prepareRequests(page), ["POST /api/v1/documents/notes/speech/prepare"],
+    "the document prepared anywhere but its own route");
+  assert.equal(page.prepareCalls.length, 1);
+  assert.equal(page.prepareCalls[0].ids, undefined, "the document's prepare named channel messages");
+  assert.equal(page.prepareCalls[0].speed, null, "an unset pace was not the voice's own");
+  assert.deepEqual(page.speakCalls, [], "the document fetched channel speech");
+  assert.equal(playingId(page), "doc:notes");
+  assert.equal(playingKind(page), "document");
+  assert.equal(page.el("read-steer-count").text(), "1 of 3");
+  for (let at = 0; at < 3; at += 1) {
+    const player = page.players[at];
+    assert.ok(player, `block ${at} was never handed to a player`);
+    assert.match(player.url, /^\/api\/v1\/speech\/ticket-for-doc-notes\?selection=tap-/,
+      "a block was not asked for under the document's ticket and one selection");
+    assert.equal(blockOf(player.url), String(at), "the blocks were not asked for in order");
+    assert.equal(selectionOf(player.url), selectionOf(page.players[0].url),
+      "the blocks of one document read under two selections");
+    await player.loaded();
+    await player.started();
+    await page.settle();
+    assert.equal(page.el("read-steer-count").text(), `${at + 1} of 3`);
+    await player.end();
+    await page.settle();
+  }
+  assert.deepEqual(page.dismissCalls, [], "a cloud document heard to its end archived something");
+  assert.equal(playingId(page), null);
+  assert.equal(ownerReadState(page), "ready");
+  assert.equal(page.el("read-steer").hidden, true, "the strip outlived the read");
+});
+
+test("`#1039 documents-read-parity`: a document stopped while its cloud prepare is in flight builds no player", async () => {
+  const page = newPage();
+  page.speechBlocks["notes"] = DOC_KINDS;
+  let release = () => {};
+  page.prepareHold = () => new Promise((resolve) => { release = resolve; });
+  await signIn(page);
+  await showDiscord(page, [message({ content: "a message that is never read" })]);
+  const asking = readDocumentNow(page, { key: "notes", texts: DOC_BLOCKS });
+  await page.settle();
+  assert.equal(ownerPending(page), "doc:notes", "the premise: the document is not pending");
+  assert.equal(page.players.length, 0, "the premise: a player exists before the prepare answers");
+  // The second ask, while the first is still pending, is its abort, as a second tap is a message's.
+  await readDocumentNow(page, { key: "notes", texts: DOC_BLOCKS });
+  release();
+  await asking;
+  await page.settle();
+  assert.equal(page.players.length, 0, "the aborted prepare still built a player");
+  assert.equal(playingId(page), null);
+  assert.equal(ownerPending(page), null);
+  assert.equal(page.prepareCalls.length, 1, "the aborting ask prepared again on its way out");
+  assert.deepEqual(page.dismissCalls, []);
+});
+
+test("`#1039 documents-read-parity`: a cloud document the voice refuses is offered by the device voice, replaying its texts", async () => {
+  const page = newPage();
+  page.enableDeviceSpeech();
+  page.prepareFails = true;
+  await signIn(page);
+  await showDiscord(page, [message({ content: "a message that is never read" })]);
+  await readDocumentNow(page, { key: "notes", texts: DOC_BLOCKS });
+  await page.settle();
+  assert.equal(page.players.length, 0, "the refused document built a player");
+  assert.equal(page.deviceSpeech.utterances.length, 0, "the refused document fell back unasked");
+  assert.notEqual(page.el("error").textContent, "", "the refusal said nothing");
+  assert.equal(page.el("read-on-device").hidden, false, "the device voice was not offered");
+  assert.equal(ownerReadState(page), "failed");
+  await page.el("read-on-device").click();
+  await page.settle();
+  assert.equal(page.deviceSpeech.utterances.length, 1, "Read with device voice said nothing");
+  assert.equal(page.deviceSpeech.utterances[0].text, DOC_BLOCKS[0], "the device voice did not replay the document");
+  assert.equal(playingId(page), "doc:notes");
+  await sayAllUtterances(page);
+  assert.equal(page.deviceSpeech.utterances.map((one) => one.text).join(" "),
+    DOC_BLOCKS.join(" ").replace(/\s+/g, " ").trim(), "the fallback did not say the whole document");
+  assert.deepEqual(page.dismissCalls, [], "the fallback archived something at its end");
+  assert.deepEqual(prepareRequests(page), ["POST /api/v1/documents/notes/speech/prepare"],
+    "the fallback prepared channel speech");
+});
+
+test("`#1039 documents-read-parity`: a held cloud document past its ticket prepares the document again at its block", async () => {
+  const page = newPage();
+  page.speechBlocks["notes"] = DOC_KINDS;
+  await signIn(page);
+  await showDiscord(page, [message({ content: "a message that is never read" })]);
+  await readDocumentNow(page, { key: "notes", texts: DOC_BLOCKS });
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "the premise: the read is not on its second block");
+  assert.equal(page.prepareCalls.length, 1, "the jump prepared again instead of reusing its ticket");
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.el("read-aloud-label").text(), "Resume", "the premise: the read is not held");
+  page.speechTicketSuffix = "-again";
+  page.setClock(page.clock() + page.speechTicketTtlSeconds * 1000 + 1_000);
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.prepareCalls.length, 2, "the resume on an ended ticket prepared nothing again");
+  assert.ok(page.prepareCalls.every((call) => call.ids === undefined),
+    "the resume prepared channel speech for a document");
+  assert.deepEqual(prepareRequests(page),
+    ["POST /api/v1/documents/notes/speech/prepare", "POST /api/v1/documents/notes/speech/prepare"]);
+  const resumed = page.players.at(-1);
+  assert.match(resumed.url, /-again\?/, `the resume played the ticket that had ended: ${resumed.url}`);
+  assert.equal(blockOf(resumed.url), "1", "the resume did not restart the held block");
+  assert.equal(page.el("read-steer-count").text(), "2 of 3");
+  assert.deepEqual(page.dismissCalls, []);
+});
+
+test("`#1039 documents-read-parity`: a cloud document cut off prepares the document again and carries on from its block", async () => {
+  const page = newPage();
+  page.enableStreamedAudio();
+  page.enableAbort();
+  page.speechBlocks["notes"] = DOC_KINDS;
+  await signIn(page);
+  await showDiscord(page, [message({ content: "a message that is never read" })]);
+  await readDocumentNow(page, { key: "notes", texts: DOC_BLOCKS });
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "the premise: the read is not on its second block");
+  page.audioStreams.at(-1).controller.bytes(joined(wavHeader(1000, 1), pcm(0x2000, 0x2000)));
+  await page.settle();
+  page.speechTicketSuffix = "-after-restart";
+  page.audioStreams.at(-2).controller.fail();
+  await page.settle();
+  assert.match(page.el("status").textContent, /cut off; trying again/);
+  assert.equal(ownerPending(page), "doc:notes", "the wait does not hold the document as coming back");
+  assert.equal(page.expireTimers(SPEECH_PIECES.READ_RECOVERY_WAITS_MS[0]), 1, "nothing waited to try again");
+  await page.settle();
+  assert.equal(page.prepareCalls.length, 2, "the recovery did not prepare again");
+  assert.ok(page.prepareCalls.every((call) => call.ids === undefined),
+    "the recovery prepared channel speech for a document");
+  const resumed = page.audioStreams.at(-1);
+  assert.match(resumed.url, /-after-restart\?/, `the recovery played a ticket from before the cut: ${resumed.url}`);
+  assert.equal(blockOf(resumed.url), "1", "the recovery did not carry on from the block it was cut off in");
+  assert.equal(page.el("read-steer-count").text(), "2 of 3");
+  assert.deepEqual(page.dismissCalls, []);
+});
+
+test("`#1039 documents-read-parity`: a cloud document handed its entry plays it as given, preparing nothing", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ content: "a message that is never read" })]);
+  const entry = { url: "/api/v1/speech/ticket-for-doc-given", until: { mono: 9007199254740991, wall: 9007199254740991 },
+    blocks: [{ kind: "paragraph", spoken: true }, { kind: "paragraph", spoken: true }] };
+  await readDocumentNow(page, { key: "given", texts: ["Given first block here.", "Given second block here."], entry });
+  assert.deepEqual(page.prepareCalls, [], "a given entry was prepared again");
+  assert.deepEqual(prepareRequests(page), []);
+  assert.match(page.players[0].url, /^\/api\/v1\/speech\/ticket-for-doc-given\?selection=tap-.*&block=0$/,
+    "the given ticket was not the one played");
+  assert.equal(page.el("read-steer-count").text(), "1 of 2");
+  await playPlayersToEnd(page, 2);
+  assert.deepEqual(page.dismissCalls, [], "the given entry's read archived something at its end");
+  assert.equal(ownerReadState(page), "ready");
+});

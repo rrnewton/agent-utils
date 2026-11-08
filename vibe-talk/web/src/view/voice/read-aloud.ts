@@ -41,9 +41,25 @@ interface TransportPlayer extends ReadPlayer {
   play(): Promise<void>;
   addEventListener(type: string, fn: (...details: unknown[]) => void): void;
 }
+/**
+ * `#1039 documents-read-parity`. What a document read is of, kept whole on the read itself: a jump,
+ * a restart or a recovery rebuilds the read from `Playing` alone, and a document has no row to look
+ * its words up in. `texts` are the blocks as the device voice says them, one a block; `entry` is the
+ * prepared ticket a cloud read plays, resolved as the read starts.
+ */
+interface DocumentPayload {
+  key: string;
+  title?: string;
+  entry: PreparedEntry | null;
+  texts: readonly string[];
+}
 /** Fields are filled by the selected transport; guards retain the original read ticket and lifetime rules. */
 interface Playing {
   id: string;
+  /** `#1039 documents-read-parity`: what is being read; undefined is a message, as before documents. */
+  kind?: "message" | "document";
+  /** A document read's payload, retained for its jumps, restarts and recoveries. */
+  document?: DocumentPayload;
   audio: ReadPlayer;
   urls: string[];
   parts: string[];
@@ -312,6 +328,18 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     if (!chainDeviceTail || readAloudPlayback !== "audio") return false;
     try {
       readWithBrowserSpeech(parts, id, ticket);
+      deps.setStatus("Reading with the device voice.");
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  /** `#1039 documents-read-parity`: {@link readWithDeviceTail} for a document, from `block`. */
+  function readDocumentWithDeviceTail(payload: DocumentPayload, id: string, ticket: number, block: number | null) {
+    if (!chainDeviceTail || readAloudPlayback !== "audio") return false;
+    try {
+      readWithBrowserSpeech([id], id, ticket, { payload, from: { part: 0, block } });
       deps.setStatus("Reading with the device voice.");
       return true;
     } catch (_error) {
@@ -592,22 +620,50 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   }
 
   /** Speak the cached prepared row on the tap's own call stack, without a network request or await. */
-  function readWithBrowserSpeech(parts: string[], id: string, ticket: number) {
+  function readWithBrowserSpeech(parts: string[], id: string, ticket: number,
+      doc: { payload: DocumentPayload; from: ReadFrom | null } | null = null) {
     const problem = browserSpeechProblem();
     if (problem) throw new Error(problem);
     if (deps.session.socket && !deps.session.chat) {
       throw new Error("Hang up the voice call before reading messages with the device voice.");
     }
-    const text = parts.map((part) => {
-      const message = readableMessage(part);
-      if (!message) throw new Error("That message is no longer loaded. Refresh the channel and tap it again.");
-      // The server prepares the same body for every speech path. Device-local synthesis used to be
-      // the exception: it read `content` directly, so markdown and long ids were spoken literally
-      // even though Agent audio and Read new both used `spoken_content`.
-      return String(message.spoken_content || message.content || "");
-    }).join("\n\n");
-    const chunks = browserSpeechChunks(text);
-    if (chunks.length === 0) throw new Error("This message has no text to read.");
+    // `#1039 documents-read-parity`. A document arrives cut into the blocks it is read in, so it is
+    // chunked A BLOCK AT A TIME and steered by segments like a cloud read; a message keeps the
+    // joined-text flat chunking it has always had. Either way `flat` is what is said, in order,
+    // each chunk naming its segment (a message's all the zeroth, which nothing reads).
+    const docPayload = doc ? doc.payload : null;
+    let segments: SpeechSegment[] | undefined;
+    let listed: readonly PreparedBlock[] | undefined;
+    let flat: { segment: number; text: string }[];
+    let startAt = 0;
+    if (docPayload !== null) {
+      listed = docPayload.entry && docPayload.entry.blocks && docPayload.entry.blocks.length > 0
+        ? docPayload.entry.blocks
+        : docPayload.texts.map((said) => ({ kind: "paragraph", spoken: true, chars: said.length }));
+      segments = speechSegments([{ blocks: listed }]);
+      flat = [];
+      segments.forEach((segment, at) => {
+        const blockText = segment.block === null ? "" : (docPayload.texts[segment.block] ?? "");
+        for (const chunkText of browserSpeechChunks(blockText)) flat.push({ segment: at, text: chunkText });
+      });
+      if (flat.length === 0) throw new Error("This document has no text to read.");
+      const wanted = doc!.from && doc!.from.block !== null ? doc!.from.block : null;
+      const startSegment = wanted === null ? 0
+        : Math.max(0, segments.findIndex((segment) => segment.block === null || segment.block >= wanted));
+      startAt = flat.findIndex((one) => one.segment >= startSegment);
+      if (startAt < 0) startAt = 0;
+    } else {
+      const text = parts.map((part) => {
+        const message = readableMessage(part);
+        if (!message) throw new Error("That message is no longer loaded. Refresh the channel and tap it again.");
+        // The server prepares the same body for every speech path. Device-local synthesis used to be
+        // the exception: it read `content` directly, so markdown and long ids were spoken literally
+        // even though Agent audio and Read new both used `spoken_content`.
+        return String(message.spoken_content || message.content || "");
+      }).join("\n\n");
+      flat = browserSpeechChunks(text).map((chunkText) => ({ segment: 0, text: chunkText }));
+      if (flat.length === 0) throw new Error("This message has no text to read.");
+    }
     const engine = browserSpeechEngine()!;
     const voice = browserSpeechVoice()!;
     waitingForBrowserVoice = false;
@@ -616,12 +672,18 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // after garbage collection, which would strand the row and its remaining chunks.
     // `audio.pause` is what a STOP reaches it by: cancel, then unpause the engine — an engine left
     // paused by a held read that was stopped would swallow the next read into a paused queue.
-    nowPlaying = { id, playback: "browser",
+    nowPlaying = { id, kind: docPayload !== null ? "document" : "message", playback: "browser",
       audio: { pause: () => { engine.cancel(); if (typeof engine.resume === "function") engine.resume(); } }, urls: [],
-      utterance: null, speechTimer: null, parts, chunk: 0, paused: false, stale: false,
-      pauseTransport: null, resumeTransport: null };
+      utterance: null, speechTimer: null, parts, chunk: startAt, paused: false, stale: false,
+      pauseTransport: null, resumeTransport: null,
+      ...(docPayload !== null
+        ? { document: docPayload, segments: segments!, segment: flat[startAt]!.segment, blocks: [listed!] }
+        : {}) };
     // `#828 voice-page-read-nav-center`: its strip, React alone, from the first word.
     renderReadSteer();
+    // `#1039 documents-read-parity`: a document of several blocks holds the media keys, as a cloud
+    // read of several does; one of a single block has nowhere for them to steer to.
+    if (docPayload !== null && segments!.length > 1) claimMediaSession();
     const current = () => ticket === readingTicket && nowPlaying !== null && nowPlaying!.id === id;
     const fail = (error: unknown) => {
       if (!current()) return;
@@ -642,7 +704,14 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       // Where the read is, at chunk granularity: a resume that cannot simply resume the engine
       // speaks this chunk again, and no other (`#434 read-aloud-pause`).
       nowPlaying!.chunk = index;
-      const utterance = deps.browserPorts().speech.utterance(chunks[index]!);
+      const saying = flat[index]!;
+      // `#1039 documents-read-parity`: a document's block changes under its chunks, as a cloud
+      // read's does at its `playing` boundaries: the count and the strip move with it.
+      if (docPayload !== null && nowPlaying!.segment !== saying.segment) {
+        nowPlaying = { ...nowPlaying!, segment: saying.segment };
+        showReadingPosition();
+      }
+      const utterance = deps.browserPorts().speech.utterance(saying.text);
       utterance.voice = voice;
       utterance.lang = voice.lang;
       utterance.rate = readSpeed === null ? 1 : readSpeed / 100;
@@ -661,13 +730,19 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         if (pendingRead === id) deps.setStatus("Reading with Device voice.");
         pendingRead = null;
         setReadState("ready");
-        deps.eachColumn(deps.renderChannelRows);
+        // A document read lights no channel row: there is none of it to redraw.
+        if (docPayload === null) deps.eachColumn(deps.renderChannelRows);
       };
       utterance.onerror = (event) => { if (isCurrentPart()) fail(event.error); };
       utterance.onend = () => {
         if (!isCurrentPart()) return;
-        if (index + 1 < chunks.length) {
+        if (index + 1 < flat.length) {
           speakPart(index + 1);
+        } else if (docPayload !== null) {
+          // `#1039 documents-read-parity`: a document heard to its end archives nothing and goes
+          // on to nothing: it was never in the reader's queue to begin with.
+          endReadGoingOn(false);
+          setReadState("ready");
         } else {
           // `#886 voice-page-autoplay`: what reads next is found before the archive can redraw the list.
           const next = deps.nextAfterRead ? deps.nextAfterRead(parts) : null;
@@ -713,7 +788,16 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     };
     // An engine a stopped held read left paused must not swallow this one (see `audio.pause`).
     if (engine.paused === true && typeof engine.resume === "function") engine.resume();
-    speakPart(0);
+    if (docPayload !== null && doc!.from !== null && doc!.from.hold === true) {
+      // `#1039 documents-read-parity`, as a cloud jump's hold (`#434`): cued at its block, saying
+      // nothing, until Resume speaks that segment's first chunk (`resumeTransport` above).
+      pendingRead = null;
+      setReadState("ready");
+      nowPlaying = { ...nowPlaying!, paused: true, wasHeld: true };
+      mediaSessionState("paused");
+    } else {
+      speakPart(startAt);
+    }
     renderReadTransport();
   }
 
@@ -867,6 +951,18 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   }
 
   /**
+   * When a prepared batch's tickets may have ended: from `requestedAt`, taken before the request
+   * went, on both clocks (`#290 speech-ticket-refresh`). One rule for a channel's tickets and a
+   * document's (`#1039 documents-read-parity`): a batch that says no lifetime gives URLs that are
+   * never played — none is not forever.
+   */
+  function preparedUntil(requestedAt: SpeechMoment, batch: PrepareReply) {
+    const lifetimeMs = (Number(batch && batch.expires_in_seconds) || 0) * 1000;
+    const until = { mono: requestedAt.mono + lifetimeMs, wall: requestedAt.wall + lifetimeMs };
+    return until;
+  }
+
+  /**
    * Prepare exactly these messages, one request per thread they belong to, and keep their tickets.
    *
    * The requests go ONE AFTER ANOTHER, in the order their threads first appear in `ids`, and each
@@ -897,9 +993,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       );
       // Cancelled while it was answered: its tickets may be for a pace or a screen that has gone.
       if (signal && signal.aborted) return;
-      // A batch that says no lifetime gives URLs that are never played: none is not forever.
-      const lifetimeMs = (Number(batch && batch.expires_in_seconds) || 0) * 1000;
-      const until = { mono: requestedAt.mono + lifetimeMs, wall: requestedAt.wall + lifetimeMs };
+      const until = preparedUntil(requestedAt, batch);
       for (const entry of (batch && batch.prepared) || []) {
         // `#376 read-aloud-blocks`. The blocks the server will read the message as, when it is more
         // than one: `[{kind, spoken}]`, in drawing order.
@@ -907,6 +1001,28 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         preparedSpeech.keep(String(entry.message_id), { url: entry.url, until, blocks });
       }
     }
+  }
+
+  /**
+   * `#1039 documents-read-parity`. Prepare one document for reading: the channel prepare's twin
+   * against the document's own route, answering in the same shape with the document's key as its
+   * one prepared id. The ticket's deadline is kept on both clocks from before the request went,
+   * as a channel ticket's is (`requestPreparedSpeech`, `#290 speech-ticket-refresh`).
+   */
+  async function prepareDocumentSpeech(key: string): Promise<PreparedEntry> {
+    const requestedAt = speechDeadlineNow();
+    const batch = await deps.api(
+      `/api/v1/documents/${encodeURIComponent(key)}/speech/prepare`,
+      { method: "POST", body: { speed: readSpeed === null ? null : readSpeed / 100,
+        ...(readAudioSource === "wit" && witVoice ? { voice: witVoice } : {}) } }
+    );
+    const until = preparedUntil(requestedAt, batch);
+    const first = batch && batch.prepared ? batch.prepared[0] : null;
+    if (!first || typeof first.url !== "string" || first.url.length === 0) {
+      throw new Error("that document could not be prepared for reading");
+    }
+    const blocks = Array.isArray(first.blocks) && first.blocks.length > 1 ? first.blocks : null;
+    return { url: first.url, until, blocks };
   }
 
   /**
@@ -1177,6 +1293,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   /** The message the last failed cloud read was of, for Read with device voice; null when none. */
   let deviceRetryParts: string[] | null = null;
 
+  /** `#1039 documents-read-parity`: the document of the last failed cloud document read, and its block. */
+  let deviceRetryDocument: { payload: DocumentPayload; block: number | null } | null = null;
+
   /**
    * `#548 cloud-read-failures`. The owner, 2026-10-26: with the voice's speech access expired, the
    * page opened the scrubber and "read" through the message in silence. A cloud read the voice fails —
@@ -1194,7 +1313,27 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     deps.setStatus(text);
     deps.showError(text, { stay: true });
     deviceRetryParts = Array.isArray(parts) && parts.length > 0 ? parts.slice() : null;
+    deviceRetryDocument = null;
     deps.el("read-on-device").hidden = deviceRetryParts === null || browserSpeechEngine() === null;
+    if (report) report(reason, text);
+  }
+
+  /**
+   * `#1039 documents-read-parity`. {@link cloudReadFailed} for a document: the same stop, the same
+   * short words, and Read with device voice replaying the document's own texts from `block`. The
+   * payload is stashed apart from a message's retry parts, which name rows a document is not in.
+   */
+  function cloudDocumentFailed(reason: string, detail: unknown, payload: DocumentPayload, block: number | null,
+      report: ((reason: string, text: string) => void) | null = null) {
+    stopReading();
+    setReadState("failed");
+    if (/speech_silent/u.test(String(detail))) reason = "silent";
+    const text = cloudFailureText(reason, detail);
+    deps.setStatus(text);
+    deps.showError(text, { stay: true });
+    deviceRetryParts = null;
+    deviceRetryDocument = { payload, block };
+    deps.el("read-on-device").hidden = browserSpeechEngine() === null;
     if (report) report(reason, text);
   }
 
@@ -1203,9 +1342,24 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * voice selected stays the cloud's; the switch beside Read changes it for every read.
    */
   function readOnDevice() {
+    const retryDocument = deviceRetryDocument;
+    deviceRetryDocument = null;
     const parts = deviceRetryParts;
     deviceRetryParts = null;
     deps.clearError();
+    if (retryDocument) {
+      // `#1039 documents-read-parity`: the document again by the device voice, from its block.
+      const heldVoice = { playback: readAloudPlayback, voiceName: readAloudLabel };
+      readAloudPlayback = "browser";
+      readAloudLabel = "Device voice";
+      try {
+        deps.guardQuietly(() => readDocument(retryDocument.payload, { part: 0, block: retryDocument.block }))();
+      } finally {
+        readAloudPlayback = heldVoice.playback;
+        readAloudLabel = heldVoice.voiceName;
+      }
+      return;
+    }
     if (!parts) return;
     const held = { playback: readAloudPlayback, voiceName: readAloudLabel };
     readAloudPlayback = "browser";
@@ -1967,13 +2121,16 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     if (sentenceTimer !== null) clearTimeout(sentenceTimer);
     sentenceTimer = null;
     const playing = nowPlaying;
-    if (playing === null || !playing.segments || playing.segments!.length < 2) {
+    // No players, no timeline to time a sentence by (a device-voice document, `#1039`): stay dark.
+    if (playing === null || !playing.segments || playing.segments!.length < 2 || !playing.players) {
       clearReadingSentence();
       return;
     }
     sentenceTimer = setTimeout(showReadingSentence, SENTENCE_STEP_MS);
     const segment = playing.segments![playing.segment!]!;
-    const player = playing.players![playing.segment!]!;
+    // A device-voice document read (`#1039 documents-read-parity`) has segments and no players:
+    // the sentence light stays off, which the missing timeline below already says.
+    const player = playing.players ? playing.players[playing.segment!] : undefined;
     // `#540 read-aloud-desktop`. In every row drawn for the read — the thread list's, the right column's —
     // not only the left column's list: the same sentence of the same block in each.
     // The rows the reader can see first: the sentence is timed from the first, and a row drawn from
@@ -2062,6 +2219,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * being read, or the block, or the message's words. Null where the read draws nothing to hold.
    */
   function sentenceHeardNow(playing: Playing): { held: HeldSentence; anchor: { getBoundingClientRect(): DOMRect } | null } | null {
+    // `#1039 documents-read-parity`: a document draws no row to hold words from, so a pause of one
+    // holds nothing and React has nothing of it to reply to.
+    if (playing.kind === "document") return null;
     showReadingSentence();
     const segment = playing.segments ? playing.segments[playing.segment || 0] : null;
     // The message the words are in: a row of several reads them one part at a time, each its message's.
@@ -2381,7 +2541,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     readJumping = true;
     readJumpPending = true;
     try {
-      deps.guardQuietly(() => readAloud(playing.parts, { part: segment.part, block: segment.block, hold }))();
+      // `#1039 documents-read-parity`: a document read is rebuilt from its retained payload.
+      deps.guardQuietly(() => playing.kind === "document" && playing.document
+        ? readDocument(playing.document, { part: segment.part, block: segment.block, hold })
+        : readAloud(playing.parts, { part: segment.part, block: segment.block, hold }))();
     } finally {
       readJumping = false;
     }
@@ -2440,6 +2603,12 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     const playing = nowPlaying;
     if (playing === null || !playing.segments) return false;
     if (delta > 0 && playing.segment! + 1 >= playing.segments!.length) {
+      // `#1039 documents-read-parity`: finishing a document archives nothing and goes nowhere.
+      if (playing.kind === "document") {
+        endReadGoingOn(false);
+        setReadState("ready");
+        return true;
+      }
       // Next on the last block finishes the message, exactly as hearing it out
       // does (owner reply 205): stop, and archive it as read. Autoplay's next
       // read is consulted the same way, so with Autoplay on the read goes on.
@@ -2494,7 +2663,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       const waiting = nowPlaying === null && (readJumpPending || readRecovering);
       const hidden = nowPlaying === null && !waiting;
       if (react.hidden !== hidden) react.hidden = hidden;
-      const idle = waiting || (paused && heldSentence === null);
+      // `#1039 documents-read-parity`: a document read holds no sentence, so React waits throughout.
+      const idle = waiting || (paused && heldSentence === null) ||
+        (nowPlaying !== null && nowPlaying!.kind === "document");
       if (react.disabled !== idle) react.disabled = idle;
     }
     const button = deps.el("read-aloud");
@@ -2617,6 +2788,13 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     const audio = playing.audio;
     if (audio && audio.hearsSpeech === true &&
         (readAloudContext === null || readAloudContext.state === "closed")) return true;
+    if (playing.kind === "document") {
+      // `#1039 documents-read-parity`: a document read has the one ticket it was captured with,
+      // and nothing prepared by part id to ask after.
+      if (playing.streamed !== true || !Array.isArray(playing.tickets)) return false;
+      const onlyTicket = playing.tickets[0];
+      return onlyTicket ? ticketEnded(onlyTicket, speechDeadlineNow()) : false;
+    }
     if (playing.streamed !== true || !Array.isArray(playing.parts)) return false;
     if (!Array.isArray(playing.tickets)) {
       return playing.parts.some((part) => preparedEntry(part) === null);
@@ -2647,7 +2825,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     renderReadTransport();
     const at = playing.segment!;
     if (Array.isArray(playing.segments!) && playing.segments![at]! && jumpReading(at)) return;
-    if (Array.isArray(playing.parts) && playing.parts.length > 0) {
+    if (playing.kind === "document" && playing.document) {
+      const payload = playing.document;
+      deps.guardQuietly(() => readDocument(payload, { part: 0, block: null }))();
+    } else if (Array.isArray(playing.parts) && playing.parts.length > 0) {
       deps.guardQuietly(() => readAloud(playing.parts, { part: 0, block: null }))();
     }
   }
@@ -2673,7 +2854,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * @param {{part: number, block: number | null, recovery: number}} from
    * @param {number} wait
    */
-  function recoverRead(parts: string[], from: ReadFrom & { recovery: number }, wait: number) {
+  function recoverRead(parts: string[], from: ReadFrom & { recovery: number }, wait: number,
+      payload: DocumentPayload | null = null) {
     // Every ticket minted before this may be as dead as the one that failed.
     forgetPreparedSpeech();
     // `scrubber-full-width`: the strip stays up through the wait, as through a jump's.
@@ -2689,7 +2871,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     const id = parts[0]!;
     pendingRead = id;
     setReadState("working");
-    deps.eachColumn(deps.renderChannelRows);
+    if (payload === null) deps.eachColumn(deps.renderChannelRows);
     deps.setStatus("Reading aloud was cut off; trying again…");
     if (readRecoveryTimer !== null) clearTimeout(readRecoveryTimer);
     readRecoveryTimer = setTimeout(() => {
@@ -2700,7 +2882,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       readRecovering = false;
       let attempt;
       try {
-        attempt = readAloud(parts, from);
+        // `#1039 documents-read-parity`: a document is tried again as a document, on a fresh ticket.
+        attempt = payload !== null ? readDocument({ ...payload, entry: null }, from) : readAloud(parts, from);
       } finally {
         readJumping = false;
       }
@@ -2710,7 +2893,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         // after the last, the media keys and the audio output it held go back.
         const wait = recoveryWait(from.recovery);
         if (wait !== null) {
-          recoverRead(parts, { ...from, recovery: from.recovery + 1 }, wait);
+          recoverRead(parts, { ...from, recovery: from.recovery + 1 }, wait, payload);
         } else {
           releaseMediaSession();
           quietReadAloudContext();
@@ -2847,7 +3030,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     handle("stop", () => { stopReading(); });
     try {
       if (typeof MediaMetadata === "function") {
-        session.metadata = new MediaMetadata({ title: "Reading a message", artist: readAloudLabel });
+        const title = nowPlaying !== null && nowPlaying!.kind === "document"
+          ? (nowPlaying!.document && nowPlaying!.document.title) || "Reading a document"
+          : "Reading a message";
+        session.metadata = new MediaMetadata({ title, artist: readAloudLabel });
       }
     } catch (_error) {
       // Metadata is decoration.
@@ -2888,9 +3074,11 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     id: string; parts: string[]; ticket: number; tapBegan: number; streamed: boolean;
     ready: (PreparedEntry | null)[]; objectUrls: string[]; segments: SpeechSegment[];
     sources: string[]; first: number; recovery: number; hold: boolean; onEnded: () => void;
+    kind: "message" | "document"; payload: DocumentPayload | null;
   }) {
-    const { id, parts, ticket, tapBegan, streamed, ready, objectUrls, segments, sources, first, hold, onEnded } = read;
+    const { id, parts, ticket, tapBegan, streamed, ready, objectUrls, segments, sources, first, hold, onEnded, kind, payload } = read;
     let { recovery } = read;
+    const isDocument = kind === "document";
     const clock = readClock();
     // The blocks the read was prepared in travel with it, so a pace change that forgets what was
     // prepared does not take the light off the read in progress.
@@ -2932,6 +3120,15 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       const url = ready[segments[at]!.part] && ready[segments[at]!.part]!.url;
       reportSpeechFailure(url, reason, detail, segments[at]!.block);
     };
+    // `#1039 documents-read-parity`. A cloud failure of either kind, each to its own retry stash.
+    const failCloud = (reason: string, detail: unknown, at: number) => {
+      if (isDocument) cloudDocumentFailed(reason, detail, payload!, segments[at]!.block, reportFailure(at));
+      else cloudReadFailed(reason, detail, parts, reportFailure(at));
+    };
+    // `#1039 documents-read-parity`. The chain's device tail of either kind, from segment `at`.
+    const deviceTail = (at: number) => (isDocument
+      ? readDocumentWithDeviceTail(payload!, id, ticket, segments[at]!.block)
+      : readWithDeviceTail(parts, id, ticket));
     // `#548 cloud-read-failures`. A part with no speech arrived READ_NO_SPEECH_MS after its first audio
     // stops the read: silence slower than `drained` can say so. Counted from the first audio of a part
     // that has been started (`maybeGuardSpeech`), never from the request: a cold session or a busy
@@ -2952,7 +3149,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
           setTimeout(check, READ_NO_SPEECH_MS);
           return;
         }
-        cloudReadFailed("no_audio", "", parts, reportFailure(at));
+        failCloud("no_audio", "", at);
       };
       setTimeout(check, READ_NO_SPEECH_MS);
     };
@@ -2978,9 +3175,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         begun.catch(() => {
           // `#563 read-aloud-fallback-chain`: the device voice is the
           // chain's last resort when the configured order ends with it.
-          if (readWithDeviceTail(parts, id, ticket)) return;
+          if (deviceTail(at)) return;
           stopReading();
-          deps.setStatus("that message could not be played.");
+          deps.setStatus(isDocument ? "that document could not be played." : "that message could not be played.");
         });
       }
     };
@@ -3006,7 +3203,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         // the voice answered with silence. Going on raced the light through every block in silence and
         // then archived the message as heard; it stops here, says so, and archives nothing.
         if ("heardSpeech" in audio && !audio.heardSpeech!()) {
-          cloudReadFailed("silent", "", parts, reportFailure(at));
+          failCloud("silent", "", at);
           return;
         }
         learnSpeakingRate(audio, segments[at]!, blocks);
@@ -3083,7 +3280,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
           if (wait !== null) {
             const heard = nowPlaying !== null && nowPlaying!.id === id && !started[at] ? nowPlaying!.segment! : at;
             const segment = segments[heard] || segments[at]!;
-            recoverRead(parts, { part: segment.part, block: segment.block, recovery: recovery + 1 }, wait);
+            recoverRead(parts, { part: segment.part, block: segment.block, recovery: recovery + 1 }, wait, payload);
             return;
           }
           // `#487`: and what was prepared before a lost part with it, so the next tap prepares again
@@ -3091,7 +3288,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
           if (streamed && lost) forgetPreparedSpeech();
           // `#548 cloud-read-failures`. The voice's reason, in short words, and the device voice offered.
           if (streamed) {
-            cloudReadFailed(reason, said, parts, reportFailure(at));
+            failCloud(reason, said, at);
             return;
           }
           stopReading();
@@ -3107,7 +3304,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
           speechStreamFailure(entry && entry.url, segments[at]!.block).then((reason) => {
             if (ticket !== readingTicket) return;
             if (reason) {
-              cloudReadFailed("refused", reason, parts, reportFailure(at));
+              failCloud("refused", reason, at);
               return;
             }
             giveUpOrTryAgain();
@@ -3118,7 +3315,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         // with the device voice, it takes these parts now instead of the
         // read stopping; without it, the cloud failure flow decides
         // (offer the device voice, try again, give up).
-        if (readWithDeviceTail(parts, id, ticket)) return;
+        if (deviceTail(at)) return;
         giveUpOrTryAgain();
       });
       return audio;
@@ -3133,13 +3330,16 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // from THESE URLs, not from whatever is prepared by resume time, so a resume after a long
     // pause checks these deadlines (`heldReadStale`, `#434`).
     const tickets = ready.map((entry) => (entry && entry.until ? { url: entry.url, until: entry.until } : null));
-    nowPlaying = { id, audio: players[first]!, urls: objectUrls, players, parts, segments, segment: first, blocks, streamed, tickets, paused: false };
+    nowPlaying = { id, kind, ...(payload !== null ? { document: payload } : {}),
+      audio: players[first]!, urls: objectUrls, players, parts, segments, segment: first, blocks, streamed, tickets, paused: false };
     setReadState("ready");
-    deps.eachColumn(deps.renderChannelRows);
+    // A document read lights no channel row: there is none of it to redraw.
+    if (!isDocument) deps.eachColumn(deps.renderChannelRows);
     renderReadSteer();
     if (segments.length > 1) {
       claimMediaSession();
-      showReadingSentence();
+      // A document has no drawn sentence to light (`#1039 documents-read-parity`).
+      if (!isDocument) showReadingSentence();
     } else {
       releaseMediaSession();
     }
@@ -3285,6 +3485,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     const recovery = from !== null && Number.isInteger(from.recovery) ? from.recovery! : 0;
     await playPreparedRead({
       id, parts, ticket, tapBegan, streamed, ready, objectUrls, segments, sources, first, recovery,
+      kind: "message", payload: null,
       // A jump made while held cues its block up held (`#434 read-aloud-pause`).
       hold: from !== null && from.hold === true,
       onEnded: () => {
@@ -3294,6 +3495,89 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         // EVERY constituent. A row read to the end is a row the reader has heard all of, and
         // archiving only the first would leave its own tail in the queue.
         goOnAfterRead(next, deps.guardQuietly(() => deps.dismissMessages({ messages: parts }))());
+      },
+    });
+  }
+
+  /**
+   * `#1039 documents-read-parity`. Read one DOCUMENT aloud, by the same one-voice-at-a-time rules
+   * as a message (`readAloud`, whose prologue this mirrors): a second ask for the document already
+   * playing or pending stops it, every await is ticket-checked, and the device voice speaks
+   * synchronously inside the call. The document is ONE part, `doc:` and its key, read a block at a
+   * time from its `texts` (device) or its prepared entry's blocks (cloud).
+   *
+   * What a document read never does: ask after a channel, a row or reading mode; prepare or fetch
+   * channel speech; or, heard to its end, archive anything or go on to anything. Its payload rides
+   * on the read (`Playing.document`), so a jump, a held restart and a recovery rebuild it from the
+   * read alone. Nothing calls this yet: the documents view wires it in a later stage.
+   */
+  async function readDocument(
+    doc: { key: string; title?: string; texts: readonly string[]; entry?: PreparedEntry | null },
+    from: ReadFrom | null = null
+  ) {
+    const tapBegan = speechTimingNow();
+    const key = String(doc.key);
+    const id = `doc:${key}`;
+    const parts = [id];
+    const already = from === null && ((nowPlaying !== null && nowPlaying!.id === id) || pendingRead === id);
+    stopReading();
+    if (already) {
+      return;
+    }
+    const ticket = readingTicket;
+    pendingRead = id;
+    setReadState("working");
+    const payload: DocumentPayload = { key, title: doc.title, entry: doc.entry ?? null, texts: doc.texts };
+    if (readAloudPlayback !== "audio") {
+      try {
+        if (readAloudPlayback !== "browser") throw new Error("This speech playback method is not supported by this page.");
+        readWithBrowserSpeech(parts, id, ticket, { payload, from });
+      } catch (error) {
+        if (ticket === readingTicket) {
+          stopReading();
+          setReadState("failed");
+          deps.setStatus((error as Error).message);
+        }
+        throw error;
+      }
+      return;
+    }
+    // Still inside the gesture, before anything is awaited: the only moment a browser lets audio start.
+    readAloudAudioContext();
+    primeReadAloudKeeper();
+    let entry = payload.entry;
+    if (entry !== null && ticketEnded(entry, speechDeadlineNow())) entry = null;
+    if (entry === null) {
+      try {
+        entry = await prepareDocumentSpeech(key);
+      } catch (error) {
+        if (ticket !== readingTicket) return;
+        cloudDocumentFailed("refused", (error as Error).message, payload, from ? from.block : null);
+        return;
+      }
+      if (ticket !== readingTicket) return;
+    }
+    payload.entry = entry;
+    const ready: (PreparedEntry | null)[] = [entry];
+    const segments = speechSegments(ready);
+    if (segments.length === 0) {
+      cloudDocumentFailed("refused", "that document has nothing to read", payload, from ? from.block : null);
+      return;
+    }
+    pendingRead = null;
+    const selection = speechSelection();
+    const sources = segments.map((segment) => `${entry!.url}?selection=${selection}` +
+      (segment.block === null ? "" : `&block=${segment.block}`));
+    const first = from === null ? 0 : Math.max(0, segments.findIndex((segment) =>
+      segment.part === from.part && (from.block === null || segment.block === null || segment.block >= from.block)));
+    const recovery = from !== null && Number.isInteger(from.recovery) ? from.recovery! : 0;
+    await playPreparedRead({
+      id, parts, ticket, tapBegan, streamed: true, ready, objectUrls: [], segments, sources, first, recovery,
+      kind: "document", payload,
+      hold: from !== null && from.hold === true,
+      onEnded: () => {
+        endReadGoingOn(false);
+        setReadState("ready");
       },
     });
   }
@@ -3354,7 +3638,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   reactToHeldSentence,
   readingRowsShown,
   get heldSentence() { return heldSentence; },
-  readAloud
+  readAloud,
+  readDocument
   };
 }
 export type ReadAloud = ReturnType<typeof createReadAloud>;
