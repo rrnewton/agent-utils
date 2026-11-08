@@ -185,11 +185,13 @@ def _rollup_markdown(
     summary: SummaryResult,
     stats: PhaseStats,
     audience: str,
+    scope_note: str | None = None,
 ) -> str:
     lines = [
         f"# {period_heading(period, team.display_timezone)} {team.team_slug} "
         f"{period.kind} {audience} summary",
         "",
+        *([f"> {scope_note}", ""] if scope_note is not None else []),
         f"> **{summary.phrase}.** {summary.paragraph}",
         "",
         "## Agent work summary",

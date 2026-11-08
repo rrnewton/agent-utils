@@ -493,6 +493,7 @@
         "py/tests/test_search_bloom.py",
         "py/tests/test_seekable_jsonl.py",
         "py/tests/test_timeline_activity_bins.py",
+        "py/tests/test_timeline_agent_scope.py",
         "py/tests/test_timeline_archive_gc.py",
         "py/tests/test_timeline_artifacts.py",
         "py/tests/test_timeline_build_store.py",

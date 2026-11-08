@@ -19,6 +19,7 @@ from wrkviz.build_store import (
     ingested_team_slugs,
     migrate_build_state,
 )
+from wrkviz.agent_scope import AGENT_SCOPES, ALL_AGENTS
 from wrkviz.archive import as_array, as_object, read_json
 from wrkviz.archive_gc import collect, format_gc_report
 from wrkviz.claude import ClaudeParseError
@@ -728,6 +729,19 @@ def _parser() -> argparse.ArgumentParser:
             "--price), then exit without any model call; exits 3 when over --budget-usd"
         ),
     )
+    summarize.add_argument(
+        "--agent-scope",
+        choices=AGENT_SCOPES,
+        default=ALL_AGENTS,
+        help=(
+            "which of each team's agents to summarize: 'all' reads the coordinator and every "
+            "in-session child (subagents, spawned threads); 'coordinator' reads only the root "
+            "session and its declared continuation sessions, writes everything under "
+            "teams/<slug>/summary_scopes/coordinator/ (own caches, rollups and Markdown, "
+            "labelled coordinator-only) and leaves summary_data/ and the website untouched "
+            "(default: %(default)s)"
+        ),
+    )
     summarize.set_defaults(handler="summarize")
 
     build = sub.add_parser("build", help="regenerate Markdown/site from cached data; zero tokens", description="regenerate Markdown/site from cached data; zero tokens")
@@ -1416,6 +1430,9 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport | None:
         and backend not in ("heuristic", *ZERO_RATED_BACKENDS)
     ):
         raise ValueError("--budget-usd needs --price to turn token estimates into dollars")
+    # Only `summarize` offers --agent-scope; the refresh family always summarizes every agent,
+    # because it goes on to build the website, which shows full-team coverage only.
+    agent_scope = str(getattr(ns, "agent_scope", ALL_AGENTS))
     if bool(getattr(ns, "plan", False)):
         plan = plan_summaries(
             archive,
@@ -1435,6 +1452,7 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport | None:
             max_workers=int(ns.summary_workers),
             batch_size=int(ns.summary_batch_size),
             name_batch_size=int(ns.name_batch_size),
+            agent_scope=agent_scope,
         )
         _print_plan(plan)
         if plan.over_budget:
@@ -1463,6 +1481,7 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport | None:
         service_tier=service_tier,
         summary_window=summary_window,
         rollup_kinds=rollup_kinds,
+        agent_scope=agent_scope,
     )
 
 

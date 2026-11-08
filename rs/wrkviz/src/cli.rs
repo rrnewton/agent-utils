@@ -3522,6 +3522,7 @@ pub const SUMMARIZE_HELP: &str = r##"usage: wrkviz summarize [-h] --output OUTPU
                         [--summary-timezone SUMMARY_TIMEZONE]
                         [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]
                         [--budget-usd USD] [--price RATES] [--plan]
+                        [--agent-scope {all,coordinator}]
 
 fill structured summary cache misses
 
@@ -3605,6 +3606,16 @@ options:
   --plan                print what the run would generate and its estimated
                         tokens and cost (with --price), then exit without any
                         model call; exits 3 when over --budget-usd
+  --agent-scope {all,coordinator}
+                        which of each team's agents to summarize: 'all' reads
+                        the coordinator and every in-session child (subagents,
+                        spawned threads); 'coordinator' reads only the root
+                        session and its declared continuation sessions, writes
+                        everything under
+                        teams/<slug>/summary_scopes/coordinator/ (own caches,
+                        rollups and Markdown, labelled coordinator-only) and
+                        leaves summary_data/ and the website untouched
+                        (default: all)
 "##;
 
 fn run_query(args: &[String]) -> u8 {
@@ -4909,7 +4920,7 @@ fn run_inspect(args: &[String]) -> u8 {
     }
 }
 
-const SUMMARIZE_USAGE: &str = "usage: wrkviz summarize [-h] --output OUTPUT --team TEAM\n                        [--backend {muse,codex,claude,heuristic}]\n                        [--model MODEL] [--rollup-model ROLLUP_MODEL]\n                        [--reasoning-effort REASONING_EFFORT]\n                        [--service-tier SERVICE_TIER]\n                        [--summary-workers SUMMARY_WORKERS]\n                        [--summary-batch-size SUMMARY_BATCH_SIZE]\n                        [--name-batch-size NAME_BATCH_SIZE]\n                        [--phase-minutes PHASE_MINUTES]\n                        [--context-chars CONTEXT_CHARS]\n                        [--transcript-chars TRANSCRIPT_CHARS]\n                        [--codex-command CODEX_COMMAND]\n                        [--claude-command CLAUDE_COMMAND]\n                        [--muse-command MUSE_COMMAND]\n                        [--backend-timeout SECONDS]\n                        [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                        [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                        [--summary-timezone SUMMARY_TIMEZONE]\n                        [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                        [--budget-usd USD] [--price RATES] [--plan]";
+const SUMMARIZE_USAGE: &str = "usage: wrkviz summarize [-h] --output OUTPUT --team TEAM\n                        [--backend {muse,codex,claude,heuristic}]\n                        [--model MODEL] [--rollup-model ROLLUP_MODEL]\n                        [--reasoning-effort REASONING_EFFORT]\n                        [--service-tier SERVICE_TIER]\n                        [--summary-workers SUMMARY_WORKERS]\n                        [--summary-batch-size SUMMARY_BATCH_SIZE]\n                        [--name-batch-size NAME_BATCH_SIZE]\n                        [--phase-minutes PHASE_MINUTES]\n                        [--context-chars CONTEXT_CHARS]\n                        [--transcript-chars TRANSCRIPT_CHARS]\n                        [--codex-command CODEX_COMMAND]\n                        [--claude-command CLAUDE_COMMAND]\n                        [--muse-command MUSE_COMMAND]\n                        [--backend-timeout SECONDS]\n                        [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                        [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                        [--summary-timezone SUMMARY_TIMEZONE]\n                        [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                        [--budget-usd USD] [--price RATES] [--plan]\n                        [--agent-scope {all,coordinator}]";
 
 /// Verbatim `wrkviz build --help` text.
 pub const BUILD_HELP: &str = r##"usage: wrkviz build [-h] --output OUTPUT --team TEAM
@@ -8112,6 +8123,7 @@ fn run_summarize(args: &[String]) -> u8 {
         "--rollup-kind",
         "--budget-usd",
         "--price",
+        "--agent-scope",
     ];
     let mut values: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -8302,6 +8314,27 @@ fn run_summarize(args: &[String]) -> u8 {
             }
         },
     };
+    let agent_scope = get("--agent-scope").unwrap_or_else(|| "all".to_string());
+    if !matches!(agent_scope.as_str(), "all" | "coordinator") {
+        return argparse_error(
+            SUMMARIZE_USAGE,
+            "wrkviz summarize",
+            &format!(
+                "argument --agent-scope: invalid choice: {} (choose from 'all', 'coordinator')",
+                crate::json::py_repr_str(&agent_scope)
+            ),
+        );
+    }
+    if agent_scope != "all" {
+        // The option is mirrored so usage and help stay byte-identical to Python's; the
+        // coordinator-only summary tree is not ported yet, so the Rust edition refuses it by
+        // name rather than silently summarizing every agent.
+        eprintln!(
+            "wrkviz summarize: --agent-scope {agent_scope} is not yet in the Rust edition; \
+             use the Python engine"
+        );
+        return 2;
+    }
     let mut rollup_kinds: Vec<String> = values.get("--rollup-kind").cloned().unwrap_or_default();
     for kind in &rollup_kinds {
         if !matches!(

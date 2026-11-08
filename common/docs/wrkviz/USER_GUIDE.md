@@ -650,6 +650,17 @@ answered multi-job batches with one entry, with keys it made up, or with an extr
 entry; the narrowed schema removed those failures, and the strict parser still checks every
 answer.
 
+`--agent-scope coordinator` summarizes a team's coordinator alone: its root session and the
+sessions that explicitly continue it, without the children it started in-session (Claude Agent
+and workflow subagents, Codex-spawned threads). The coordinator's own transcript still records
+what it dispatched and what came back. A coordinator-only summary is a different artifact, so the
+run writes its whole tree (caches, phase and rollup data, run state, and rollup Markdown whose
+heading and first line say "coordinator only") under `teams/<slug>/summary_scopes/coordinator/`
+and never touches `summary_data/`. `build` and `export` read only `summary_data/`, so the website
+always shows full-team coverage. The run receipt and `summarize_state.json` record
+`"agent_scope": "coordinator"`. The default, `--agent-scope all`, writes exactly what it wrote
+before the option existed.
+
 To summarize through the Codex CLI instead:
 
 ```bash

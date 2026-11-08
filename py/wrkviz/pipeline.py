@@ -134,6 +134,12 @@ from wrkviz.orc import (
     prune_orc_snapshot_objects,
     snapshot_orc_lineage,
 )
+from wrkviz.agent_scope import (
+    ALL_AGENTS,
+    COORDINATOR_SCOPE_NOTE,
+    restrict_to_agent_scope,
+    validate_agent_scope,
+)
 from wrkviz.periods import (
     DEFAULT_ROLLUP_KINDS,
     ROLLUP_KINDS,
@@ -147,7 +153,7 @@ from wrkviz.phases import (
     build_phases,
     phase_agent_ids,
 )
-from wrkviz.render import render_archive
+from wrkviz.render import _plain_language_path, _rollup_markdown, render_archive
 from wrkviz.snapshot_store import (
     SnapshotLocation,
     ensure_snapshot_store,
@@ -511,11 +517,12 @@ class SummarizeReport:
     usage_run_paths: tuple[str, ...]
     files_changed: int
     carried_forward_rollups: int = 0
+    agent_scope: str = ALL_AGENTS
 
     def to_json_obj(self) -> dict[str, JsonValue]:
         """Return the summarization report as a JSON-serializable object."""
 
-        return {
+        result: dict[str, JsonValue] = {
             "backend": self.backend,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
@@ -543,6 +550,11 @@ class SummarizeReport:
             "files_changed": self.files_changed,
             "carried_forward_rollups": self.carried_forward_rollups,
         }
+        # Only a narrowed run says so, which keeps every all-agents receipt byte-identical to
+        # the receipts written before agent scopes existed.
+        if self.agent_scope != ALL_AGENTS:
+            result["agent_scope"] = self.agent_scope
+        return result
 
 
 def utc_now() -> str:
@@ -677,9 +689,13 @@ def _artifact_catalog_path(archive: Path, team_slug: str) -> Path:
     return _build_root(archive, team_slug) / "raw" / "artifacts.json"
 
 
-def _summary_root(archive: Path, team_slug: str) -> Path:
+def _summary_root(archive: Path, team_slug: str, agent_scope: str = ALL_AGENTS) -> Path:
     _validate_team_slug(team_slug)
-    return archive / "teams" / team_slug / "summary_data"
+    if agent_scope == ALL_AGENTS:
+        return archive / "teams" / team_slug / "summary_data"
+    # A narrower scope is a different artifact; see wrkviz.agent_scope for why it never shares
+    # summary_data/ (and therefore never shares a cache or a projection) with the full team.
+    return archive / "teams" / team_slug / "summary_scopes" / validate_agent_scope(agent_scope)
 
 
 def _summary_projection_missing(path: Path) -> bool:
@@ -3064,6 +3080,7 @@ def _write_project_overview_data(
     team_slug: str,
     source: _ProjectOverviewInput,
     summary: SummaryResult,
+    agent_scope: str = ALL_AGENTS,
 ) -> int:
     obj: dict[str, JsonValue] = {
         "schema_version": _PROJECT_OVERVIEW_SCHEMA_VERSION,
@@ -3079,7 +3096,7 @@ def _write_project_overview_data(
     }
     return int(
         write_json_if_changed(
-            _summary_root(archive, team_slug) / "project_overview.json", obj
+            _summary_root(archive, team_slug, agent_scope) / "project_overview.json", obj
         )
     )
 
@@ -3098,11 +3115,11 @@ def _knowledge_epoch_from_json(value: JsonValue, where: str) -> _KnowledgeEpoch:
 
 
 def _frozen_project_overview_input(
-    archive: Path, team: TeamData
+    archive: Path, team: TeamData, agent_scope: str = ALL_AGENTS
 ) -> _ProjectOverviewInput | None:
     """Load and validate the projected immutable project evidence epoch."""
 
-    path = _summary_root(archive, team.team_slug) / "project_overview.json"
+    path = _summary_root(archive, team.team_slug, agent_scope) / "project_overview.json"
     if not path.is_file():
         return None
     obj = as_object(read_json(path), str(path))
@@ -3311,6 +3328,7 @@ def _write_phase_data(
     team_slug: str,
     phases: Sequence[PhaseWindow],
     results: Mapping[str, SummaryResult],
+    agent_scope: str = ALL_AGENTS,
 ) -> int:
     changed = 0
     for phase in phases:
@@ -3323,7 +3341,9 @@ def _write_phase_data(
         }
         changed += int(
             write_json_if_changed(
-                _summary_root(archive, team_slug) / "phases" / f"{phase.phase_id}.json",
+                _summary_root(archive, team_slug, agent_scope)
+                / "phases"
+                / f"{phase.phase_id}.json",
                 obj,
             )
         )
@@ -3543,13 +3563,14 @@ def _write_agent_name_data(
     team_slug: str,
     jobs: Sequence[AgentNameJob],
     results: Mapping[str, AgentNameResult],
+    agent_scope: str = ALL_AGENTS,
 ) -> int:
     changed = 0
     for job in jobs:
         result = results[job.thread_id]
         changed += int(
             write_json_if_changed(
-                _summary_root(archive, team_slug)
+                _summary_root(archive, team_slug, agent_scope)
                 / "agents"
                 / f"{job.thread_id}.json",
                 _agent_name_json(job, result),
@@ -4147,6 +4168,8 @@ class _SummaryTree:
     overview_job: SummaryJob
     start_ms: int
     periods: tuple[Period, ...]
+    teams_dir: Path
+    agent_scope: str = ALL_AGENTS
 
 
 def _summary_tree(
@@ -4158,11 +4181,13 @@ def _summary_tree(
     transcript_chars: int,
     summary_window: DateWindow | None,
     rollup_kinds: tuple[str, ...],
+    agent_scope: str = ALL_AGENTS,
 ) -> _SummaryTree:
     team = load_archived_team(archive, team_slug)
     if summary_window is not None:
         team = apply_date_window(team, summary_window)
-    summary_root = _summary_root(archive, team_slug)
+    team = restrict_to_agent_scope(team, agent_scope)
+    summary_root = _summary_root(archive, team_slug, agent_scope)
     phases = tuple(
         build_phases(
             team,
@@ -4172,7 +4197,7 @@ def _summary_tree(
         )
     )
     try:
-        overview_source = _frozen_project_overview_input(archive, team)
+        overview_source = _frozen_project_overview_input(archive, team, agent_scope)
     except _ProjectOverviewSourceSetChanged as change:
         overview_source = _renewed_project_overview_input(team, change.previous_epoch)
     if overview_source is None:
@@ -4196,6 +4221,8 @@ def _summary_tree(
                 start_ms, end_ms, team.display_timezone, team.team_slug, rollup_kinds
             )
         ),
+        teams_dir=archive / "teams",
+        agent_scope=agent_scope,
     )
 
 
@@ -4224,6 +4251,8 @@ def _request_json(
     }
     if rollup_model is not None and rollup_model != model:
         request["rollup_model"] = rollup_model
+    if tree.agent_scope != ALL_AGENTS:
+        request["agent_scope"] = tree.agent_scope
     return request
 
 
@@ -4358,7 +4387,7 @@ def _plan_tree(
     )
     # Project-wide calibration (#854): sibling teams' receipts in this archive
     # price a team with no receipts of its own, instead of the built-in table.
-    teams_dir = tree.summary_root.parent.parent
+    teams_dir = tree.teams_dir
     extra_caches = tuple(
         (root / "cache", root / "name_cache")
         for root in sorted(teams_dir.glob("*/summary_data"))
@@ -4419,6 +4448,7 @@ def _summarize_archive_locked(
     muse_command: Sequence[str] = ("muse",),
     backend_timeout_seconds: float | None = None,
     rollup_model: str | None = None,
+    agent_scope: str = ALL_AGENTS,
 ) -> SummarizeReport:
     """Fill only missing/changed structured summaries; never format the website.
 
@@ -4446,6 +4476,7 @@ def _summarize_archive_locked(
         transcript_chars=transcript_chars,
         summary_window=summary_window,
         rollup_kinds=rollup_kinds,
+        agent_scope=agent_scope,
     )
     plan = _plan_tree(
         tree,
@@ -4583,7 +4614,9 @@ def _run_summary_tree(
         muse_command=muse_command,
         backend_timeout_seconds=backend_timeout_seconds,
     )
-    changed += _write_phase_data(archive, team_slug, phases, phase_results)
+    changed += _write_phase_data(
+        archive, team_slug, phases, phase_results, tree.agent_scope
+    )
     progress["stage"] = "agent names"
     name_jobs = _agent_name_jobs(team, phases, phase_results, context_chars)
     agent_names, name_stats = name_agents(
@@ -4602,7 +4635,7 @@ def _run_summary_tree(
         backend_timeout_seconds=backend_timeout_seconds,
     )
     changed += _write_agent_name_data(
-        archive, team_slug, name_jobs, agent_names
+        archive, team_slug, name_jobs, agent_names, tree.agent_scope
     )
     progress["stage"] = "project overview"
     overview_job = tree.overview_job
@@ -4644,7 +4677,7 @@ def _run_summary_tree(
             summary_available=True,
         )
     changed += _write_project_overview_data(
-        archive, team_slug, tree.overview_source, project_overview
+        archive, team_slug, tree.overview_source, project_overview, tree.agent_scope
     )
     definition_jobs: tuple[SummaryJob, ...] = ()
     definition_results: dict[str, SummaryResult] = {}
@@ -4721,13 +4754,14 @@ def _run_summary_tree(
         }
         changed += int(
             write_json_if_changed(
-                _summary_root(archive, team_slug)
-                / "rollups"
-                / period.kind
-                / f"{period.key}.json",
+                summary_root / "rollups" / period.kind / f"{period.key}.json",
                 obj,
             )
         )
+        if tree.agent_scope != ALL_AGENTS:
+            changed += _write_scoped_rollup_markdown(
+                summary_root, team, period, phases, result, plain_result
+            )
     # Preserve historical schema-3 glossary bytes for provenance. The build path ignores that
     # mechanically selected projection, and no new legacy projection is written.
     summary_results = (
@@ -4791,7 +4825,46 @@ def _run_summary_tree(
         ),
         files_changed=changed,
         carried_forward_rollups=carried_forward,
+        agent_scope=tree.agent_scope,
     )
+
+
+def _write_scoped_rollup_markdown(
+    summary_root: Path,
+    team: TeamData,
+    period: Period,
+    phases: Sequence[PhaseWindow],
+    technical: SummaryResult,
+    plain: SummaryResult,
+) -> int:
+    """Write a narrowed scope's rollup pages beside its own data, labelled with the scope.
+
+    ``build`` never reads a scoped summary tree (the website stays full-team coverage), so a
+    coordinator-only rollup would otherwise exist only as JSON. The pages use the site's own
+    rollup layout below ``<scope root>/summaries/`` and carry the scope in both the heading and
+    the first line, so a page read out of context cannot pass for full-team coverage.
+    """
+
+    prefix = f"teams/{team.team_slug}/summaries/"
+    stats = aggregate_stats(_phases_in(period, phases))
+    changed = 0
+    for relative, summary, audience in (
+        (period.relative_path, technical, "coordinator-only technical"),
+        (_plain_language_path(period), plain, "coordinator-only plain-language"),
+    ):
+        if not relative.startswith(prefix):
+            raise ValueError(f"rollup Markdown path outside the team summaries: {relative}")
+        if not summary.summary_available:
+            continue
+        changed += int(
+            write_text_if_changed(
+                summary_root / "summaries" / relative[len(prefix) :],
+                _rollup_markdown(
+                    team, period, summary, stats, audience, COORDINATOR_SCOPE_NOTE
+                ),
+            )
+        )
+    return changed
 
 
 def plan_summaries(
@@ -4813,6 +4886,7 @@ def plan_summaries(
     max_workers: int = 3,
     batch_size: int = 6,
     name_batch_size: int = 12,
+    agent_scope: str = ALL_AGENTS,
 ) -> SummaryPlan:
     """Return what :func:`summarize_archive` would do and cost, without any model call.
 
@@ -4829,6 +4903,7 @@ def plan_summaries(
             transcript_chars=transcript_chars,
             summary_window=summary_window,
             rollup_kinds=rollup_kinds,
+            agent_scope=agent_scope,
         )
         return _plan_tree(
             tree,
@@ -4871,6 +4946,7 @@ def summarize_archive(
     muse_command: Sequence[str] = ("muse",),
     backend_timeout_seconds: float | None = None,
     rollup_model: str | None = None,
+    agent_scope: str = ALL_AGENTS,
 ) -> SummarizeReport:
     """Fill structured summaries/names while serializing token-spending cache misses.
 
@@ -4903,6 +4979,7 @@ def summarize_archive(
             muse_command=muse_command,
             backend_timeout_seconds=backend_timeout_seconds,
             rollup_model=rollup_model,
+            agent_scope=agent_scope,
         )
 
 

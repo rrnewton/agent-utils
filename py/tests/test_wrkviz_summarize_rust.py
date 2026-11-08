@@ -677,3 +677,23 @@ def test_summarize_rollup_model_matches_python(tmp_path: Path, rust_wrkviz: Path
     _compare(tmp_path / "bad-timeout", rust_wrkviz, [
         "--backend", "heuristic", "--backend-timeout", "soon",
     ], expect=2)
+
+
+def test_summarize_agent_scope_all_matches_python_and_coordinator_refuses(
+    tmp_path: Path, rust_wrkviz: Path
+) -> None:
+    # `--agent-scope all` is the default spelled out: byte-identical to Python, tree included.
+    _compare(tmp_path / "all", rust_wrkviz, [
+        "--backend", "heuristic", "--model", "offline", "--rollup-kind", "daily",
+        "--agent-scope", "all",
+    ])
+    # The coordinator-only tree is Python-only for now; the Rust edition refuses it by name
+    # instead of quietly summarizing every agent.
+    archives = _ingest(tmp_path / "coord", rust_wrkviz)
+    refused = _run([str(rust_wrkviz)], [
+        "summarize", "--output", str(archives["rs"]), "--team", "widget",
+        "--backend", "heuristic", "--agent-scope", "coordinator",
+    ])
+    assert refused.returncode == 2
+    assert "--agent-scope coordinator is not yet in the Rust edition" in refused.stderr
+    assert not (archives["rs"] / "teams" / "widget" / "summary_scopes").exists()
