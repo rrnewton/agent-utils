@@ -2,7 +2,7 @@
 //!
 //! The kernel's parenthesized `comm` field is opaque bytes, not UTF-8. Only
 //! the ASCII fields following its final closing parenthesis are decoded here.
-//! Read/validate parity with `py/agentctl/procstat.py`.
+//! Read/validate with the established record semantics.
 
 /// Index of `starttime` (field 22) among the fields after `comm` (field 3).
 const STARTTIME_OFFSET: usize = 22 - 3;

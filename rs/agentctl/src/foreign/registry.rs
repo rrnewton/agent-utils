@@ -6,7 +6,7 @@
 //! `active-harness.json` ownership record through
 //! [`super::ownership::parse_harness_record`], and the registry-wide
 //! [`AgentRecord`] index with its flock-guarded read/repair/write paths —
-//! parity with the matching `py/agentctl/foreign/lib.py` functions.
+//! matching the established registry semantics.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -59,7 +59,7 @@ fn expand_home(path: PathBuf, home: Option<&std::ffi::OsStr>) -> PathBuf {
 }
 
 /// Validate an agent name for structured API callers
-/// (`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`, as in Python's `require_valid_name`).
+/// (`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`).
 pub fn require_valid_name(name: &str) -> Result<&str, ForeignOwnershipError> {
     let valid = !name.is_empty()
         && name.len() <= 64
@@ -131,8 +131,8 @@ fn random_hex6() -> String {
 
 /// Write one JSON document durably: exclusive temp file in the same
 /// directory, fsync, rename over the target, then fsync the directory
-/// (Python `_write_durable_json`; semantic parity — the bytes are compact
-/// `serde_json`, not Python's spaced `json.dump` separators).
+/// (the established durable-write contract; the bytes are compact
+/// `serde_json`, not spaced separators).
 pub fn write_durable_json(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
     let mut bytes = serde_json::to_vec(value)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -175,7 +175,7 @@ pub fn active_harness_path_at(base: &Path, name: &str) -> Result<PathBuf, Foreig
 }
 
 /// Durably record one turn's harness tree before the harness may exec.
-/// `recorded_at` is the caller's registry timestamp (Python `now_iso()`;
+/// `recorded_at` is the caller's registry timestamp (the registry timestamp;
 /// supplied by the runner slice that owns timestamp generation).
 pub fn record_active_harness_at(
     base: &Path,
@@ -227,7 +227,7 @@ pub fn read_active_harness_at(
 }
 
 /// Remove the ownership record only while it still names this generation.
-/// An unreadable record is kept, as in Python.
+/// An unreadable record is kept.
 pub fn remove_active_harness_at(
     base: &Path,
     name: &str,
@@ -263,7 +263,7 @@ pub fn remove_active_harness_at(
 /// Kill this worker's recorded harness tree through exact handles only.
 /// Returns true when a process was signalled. A tree still present after
 /// the bounded wait keeps its record and errors with
-/// `harness_cleanup_incomplete`; a legacy record is resolved without
+/// `harness_cleanup_incomplete`; a pre-boot-identity record is resolved without
 /// signalling anything it cannot prove.
 pub fn terminate_active_harness(record: &AgentRecord) -> Result<bool, ForeignOwnershipError> {
     terminate_active_harness_at(&foreign_base(), Path::new("/proc"), record)
@@ -389,7 +389,7 @@ fn registry_io(context: &str, path: &Path, error: &std::io::Error) -> ForeignOwn
     )
 }
 
-/// Python's single-quoted `repr` for the strings these errors name.
+/// Single-quoted `repr` spelling for the strings these errors name.
 fn python_repr(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('\'');
@@ -429,7 +429,7 @@ pub struct Message {
 
 impl Message {
     /// Load a queued turn, accepting records that omit optional model and
-    /// effort overrides (Python `Message.from_dict` shape).
+    /// effort overrides (the established queued-turn shape).
     pub fn from_dict(row: &Map<String, Value>) -> Result<Self, ForeignOwnershipError> {
         let required = ["seq", "text", "queued_at"]
             .into_iter()
@@ -749,7 +749,7 @@ fn optional_string(
     }
 }
 
-/// Python truthiness for the scalar fallback reads (`raw or default`).
+/// Truthiness for the scalar fallback reads (`raw or default`).
 fn truthy_scalar_string(value: Option<&Value>) -> Option<String> {
     match value {
         Some(Value::String(text)) if !text.is_empty() => Some(text.clone()),
@@ -1233,7 +1233,7 @@ pub fn read_registry_at(base: &Path) -> Result<AgentRegistry, ForeignOwnershipEr
 /// Exclusive read-modify-write guard over the registry. Call
 /// [`RegistryLock::save`] to write the (possibly mutated) mapping back;
 /// dropping the guard without saving discards changes, matching an
-/// exceptional exit from Python's `registry_lock` context manager.
+/// exceptional exit from the `registry_lock` context-manager contract.
 pub struct RegistryLock {
     base: PathBuf,
     agents: AgentRegistry,
@@ -1275,7 +1275,7 @@ pub fn registry_lock_at(base: &Path) -> Result<RegistryLock, ForeignOwnershipErr
 }
 
 /// Run `operation` under the exclusive registry lock, saving only when it
-/// succeeds (Python `with registry_lock() as agents:`).
+/// succeeds (the locked read-modify-write block).
 pub fn with_registry_lock_at<T>(
     base: &Path,
     operation: impl FnOnce(&mut AgentRegistry) -> Result<T, ForeignOwnershipError>,

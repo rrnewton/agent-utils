@@ -1,6 +1,6 @@
 //! Per-agent turn-runner dispatch core (Track B slice B3-6).
 //!
-//! Pure, independently testable pieces of `py/agentctl/foreign/agent_runner.py`:
+//! Pure, independently testable pieces of the per-agent turn runner:
 //! harness argv builders, Codex JSON event observation, Antigravity log
 //! parsing/outcome classification, and the bounded Muse JSONL validator.
 //! The daemon loop (inbox intake, transcript/event writing, registry status
@@ -15,8 +15,7 @@ use serde_json::Value;
 
 use super::registry::{agent_dir_at, AgentRecord, Message};
 
-/// Harness executable env overrides, read per call in Rust (Python reads
-/// them once at module import).
+/// Harness executable env overrides, read per call.
 pub fn codex_bin() -> String {
     std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".to_owned())
 }
@@ -49,7 +48,7 @@ pub fn codex_answer_path(base: &Path, name: &str, seq: i64) -> PathBuf {
         .join(format!("codex-answer-{seq:012}.txt"))
 }
 
-/// Build one Codex exec/resume argv (Python `_build_codex_argv`).
+/// Build one Codex exec/resume argv.
 /// `effort_env` is `$SUBAGENT_EFFORT`; the per-turn effort wins.
 pub fn build_codex_argv(
     base: &Path,
@@ -95,7 +94,7 @@ pub fn agy_turn_log_path(base: &Path, name: &str, seq: i64) -> PathBuf {
         .join(format!("agy-turn-{seq:012}.log"))
 }
 
-/// Build one Antigravity print argv (Python `_build_agy_argv`).
+/// Build one Antigravity print argv.
 pub fn build_agy_argv(
     record: &AgentRecord,
     msg: &Message,
@@ -135,7 +134,7 @@ const MUSE_RUNNER_OWNED_OPTIONS: [&str; 6] = [
 ///
 /// Muse parses options before `exec` as TUI options, so the subcommand
 /// comes immediately after the executable on every turn. Errors carry the
-/// Python `ValueError` messages verbatim.
+/// the established refusal messages verbatim.
 pub fn build_muse_argv(record: &AgentRecord, msg: &Message) -> Result<Vec<String>, String> {
     let Some(session_id) = &record.session_id else {
         return Err("Muse worker has no caller-owned session id".to_owned());
@@ -166,8 +165,8 @@ fn take_chars(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
 }
 
-/// One-line live summary lines for a Codex `--json` event (Python
-/// `_pane_echo`, returned instead of printed).
+/// One-line live summary lines for a Codex `--json` event
+/// (returned instead of printed).
 pub fn pane_echo_lines(stripped: &str) -> Vec<String> {
     if stripped.is_empty() {
         return Vec::new();
@@ -242,7 +241,7 @@ pub struct CodexTurnObserver {
 }
 
 impl CodexTurnObserver {
-    /// Observe one event line (non-JSON lines are ignored, as in Python).
+    /// Observe one event line (non-JSON lines are ignored).
     pub fn push_line(&mut self, stripped: &str) {
         if stripped.is_empty() {
             return;
@@ -373,7 +372,7 @@ pub fn agy_model_note_from_text(
     }
 }
 
-/// Read a turn log lossily; the second element is the warning line Python
+/// Read a turn log lossily; the second element is the warning line
 /// appends when the read fails.
 pub fn read_agy_turn_log(log_path: &Path) -> (String, Option<String>) {
     if !log_path.exists() {
@@ -534,15 +533,15 @@ pub fn is_muse_workspace_epilogue(
 pub enum MuseLineOutcome {
     /// Counted and valid so far; the caller writes it to the transcript.
     Written,
-    /// Protocol failure. `written` says whether Python writes the line to
+    /// Protocol failure. `written` says whether the runner writes the line to
     /// the transcript before failing (it writes before JSON parsing).
-    /// `kill` marks the failures Python stops immediately (size bounds).
+    /// `kill` marks the failures stopped immediately (size bounds).
     ProtocolError {
         /// Human-readable protocol failure.
         message: String,
         /// Whether the line reaches the transcript.
         written: bool,
-        /// Whether Python kills the harness at this point in the loop.
+        /// Whether the runner kills the harness at this point in the loop.
         kill: bool,
     },
 }
@@ -753,7 +752,7 @@ impl MuseTurnValidator {
         MuseLineOutcome::Written
     }
 
-    /// Classify the finished stream (Python outcome selection after wait).
+    /// Classify the finished stream (outcome selection after wait).
     pub fn finish(&mut self, rc: i64, timed_out: bool, stderr_tail: &str) -> MuseTurnOutcome {
         let label = if timed_out {
             "timeout".to_owned()

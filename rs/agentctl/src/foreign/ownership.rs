@@ -204,7 +204,7 @@ pub fn valid_ticks(value: &str) -> bool {
 
 /// The procfs root the kernel-evidence readers use by default.
 const PROC: &str = "/proc";
-/// A boot identity file longer than this is malformed evidence, as in Python.
+/// A boot identity file longer than this is malformed evidence.
 const MAX_BOOT_ID_BYTES: usize = 128;
 
 /// Return the canonical Linux boot UUID, refusing unreadable evidence.
@@ -829,7 +829,7 @@ pub fn pin_at(
 /// How long a cleanup waits for SIGKILLed processes to disappear. A process
 /// in uninterruptible sleep outlives this bound and is reported, not
 /// forgotten. (`$SUBAGENTS_HARNESS_KILL_WAIT`, default 10 seconds, as in
-/// Python's `KILL_WAIT_S`; read per call rather than at import.)
+/// the `KILL_WAIT_S` default; read per call rather than at import.)
 fn default_kill_wait() -> Duration {
     std::env::var("SUBAGENTS_HARNESS_KILL_WAIT")
         .ok()
@@ -838,7 +838,7 @@ fn default_kill_wait() -> Duration {
         .unwrap_or(Duration::from_secs(10))
 }
 
-/// Python's `f"{bound:g}s"` shape for a seconds bound.
+/// Compact `g`-style shape for a seconds bound.
 fn format_seconds(bound: Duration) -> String {
     let seconds = bound.as_secs_f64();
     if seconds.fract() == 0.0 {
@@ -2152,7 +2152,7 @@ pub fn kill_harness_tree_at(
 const GATE_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A failed owned-harness spawn: a structured operation error, or the
-/// `OSError`/`FileNotFoundError` the Python spawn propagates unchanged.
+/// `OSError`/`FileNotFoundError` the spawn contract propagates unchanged.
 #[derive(Debug)]
 pub enum SpawnHarnessError {
     /// Structured operation error (`harness_spawn_failed`, cgroup codes, …).
@@ -2208,7 +2208,7 @@ impl From<std::io::Error> for SpawnHarnessError {
 /// A failed wait on an owned harness process.
 #[derive(Debug)]
 pub enum OwnedWaitError {
-    /// The leader did not exit within the timeout (Python `TimeoutExpired`).
+    /// The leader did not exit within the timeout (the timeout outcome).
     Timeout(Duration),
     /// Structured cleanup/ownership error from the sweep.
     Operation(ForeignOwnershipError),
@@ -2509,7 +2509,7 @@ impl OwnedHarnessProcess {
         }
     }
 
-    /// Read stdout/stderr to EOF while waiting (Python `communicate`
+    /// Read stdout/stderr to EOF while waiting (the communicate pattern
     /// without input, or with `input` written to stdin first). Reader
     /// threads keep the pipes draining while the sweep-before-reap wait
     /// runs, so leftovers holding the pipes are killed by that sweep.
