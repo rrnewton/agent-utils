@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -30,7 +31,12 @@ def _read_active(root: Path) -> dict[str, object]:
 
 
 def _write_active(root: Path, document: dict[str, object]) -> None:
-    _active(root).write_text(json.dumps(document))
+    # Replace the registry atomically, as the product does, so an audit reading it meanwhile sees
+    # the old document or the new one, never a torn one (#997). The staged copy lives outside the
+    # control directory: one beside the registry is a partial update the product refuses.
+    staged = root / "ACTIVE.staged.json"
+    staged.write_text(json.dumps(document))
+    os.replace(staged, _active(root))
 
 
 def _add_slot_b(root: Path) -> None:
@@ -99,7 +105,7 @@ def test_audit_revision_only_change_retains_rows(
     _during_census(monkeypatch, mutate)
     payload = _python(root, tmp_path)
     rows = _rows(payload)
-    assert rows["slot-a"]["verdict"] != "UNKNOWN"
+    assert rows["slot-a"]["verdict"] != "UNKNOWN", rows["slot-a"]
     assert not any(
         "registry changed during audit" in str(reason)
         for reason in cast(list[object], rows["slot-a"]["reasons"])
@@ -126,8 +132,8 @@ def test_audit_unrelated_creation_retains_unchanged_rows(
     _during_census(monkeypatch, mutate)
     payload = _python(root, tmp_path)
     rows = _rows(payload)
-    assert rows["slot-a"]["verdict"] != "UNKNOWN"
-    assert rows["slot-b"]["verdict"] == "UNKNOWN"
+    assert rows["slot-a"]["verdict"] != "UNKNOWN", rows["slot-a"]
+    assert rows["slot-b"]["verdict"] == "UNKNOWN", rows["slot-b"]
     assert any(
         "appeared during audit" in str(reason)
         for reason in cast(list[object], rows["slot-b"]["reasons"])
@@ -157,8 +163,8 @@ def test_audit_does_not_retry_a_discarded_census(
     # budget by retrying the whole capture until a wall window ends.
     # The failure stays fail-closed for rows that needed the census.
     assert calls == 1
-    assert rows["slot-a"]["verdict"] == "UNKNOWN"
-    assert rows["slot-b"]["verdict"] == "UNKNOWN"
+    assert rows["slot-a"]["verdict"] == "UNKNOWN", rows["slot-a"]
+    assert rows["slot-b"]["verdict"] == "UNKNOWN", rows["slot-b"]
 
 
 def test_audit_skips_census_when_no_row_can_use_it(
@@ -206,12 +212,12 @@ def test_audit_own_record_change_marks_only_that_row_unknown(
     _during_census(monkeypatch, mutate)
     payload = _python(root, tmp_path)
     rows = _rows(payload)
-    assert rows["slot-a"]["verdict"] == "UNKNOWN"
+    assert rows["slot-a"]["verdict"] == "UNKNOWN", rows["slot-a"]
     assert any(
         "registry changed during audit" in str(reason)
         for reason in cast(list[object], rows["slot-a"]["reasons"])
     )
-    assert rows["slot-b"]["verdict"] != "UNKNOWN"
+    assert rows["slot-b"]["verdict"] != "UNKNOWN", rows["slot-b"]
 
 
 def test_audit_heartbeat_renewal_marks_only_that_row_unknown(
@@ -229,8 +235,8 @@ def test_audit_heartbeat_renewal_marks_only_that_row_unknown(
     _during_census(monkeypatch, mutate)
     payload = _python(root, tmp_path)
     rows = _rows(payload)
-    assert rows["slot-a"]["verdict"] == "UNKNOWN"
-    assert rows["slot-b"]["verdict"] != "UNKNOWN"
+    assert rows["slot-a"]["verdict"] == "UNKNOWN", rows["slot-a"]
+    assert rows["slot-b"]["verdict"] != "UNKNOWN", rows["slot-b"]
 
 
 def test_audit_unregistered_directory_appearing_late_is_attention(
@@ -271,5 +277,5 @@ def test_audit_seal_appearing_marks_only_affected_row_unknown(
     )
     payload = _python(root, tmp_path)
     rows = _rows(payload)
-    assert rows["slot-a"]["verdict"] == "UNKNOWN"
-    assert rows["slot-b"]["verdict"] != "UNKNOWN"
+    assert rows["slot-a"]["verdict"] == "UNKNOWN", rows["slot-a"]
+    assert rows["slot-b"]["verdict"] != "UNKNOWN", rows["slot-b"]

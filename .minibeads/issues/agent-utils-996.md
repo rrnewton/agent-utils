@@ -41,3 +41,8 @@ that could hold a target path must still discard the attempt.
 
 Filed under the #943 waiver (coordb, 2026-11-07). The reclaim
 item-budget failure from the same gates is tracked by #954, not here.
+
+Also seen 2026-11-08 under #997's load runs (cl-sync): test_audit_lock_free.py
+test_audit_own_record_change_marks_only_that_row_unknown failed once in 4 file runs and once in 15
+scenario replays (load average 40-90) because the audit's census refused with this churn text on
+every row, marking the unchanged slot-b UNKNOWN.
