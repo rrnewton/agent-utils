@@ -3499,7 +3499,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           !PAGE_READ_REASONS.includes(new URL(String(path), "http://fixture.test").searchParams.get("reason"))) {
         unexplainedReads.push(String(path));
       }
-      if (String(path).startsWith("/api/v1/documents")) {
+      // A document's speech prepare is the prepare handler's below, not this one's (`#1039`).
+      if (String(path).startsWith("/api/v1/documents") && !String(path).endsWith("/speech/prepare")) {
         // `#1040 documents-voice-agent`. The Documents list and one document, from
         // `page.documents`; fetch POSTs just mark the named document fetched.
         const rows = page.documents.map((doc) => ({
