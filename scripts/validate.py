@@ -630,16 +630,34 @@ TIMING_COMMAND_MARKERS = (
 )
 
 
-#: DAG label for steps that must run alone on the host: after the main phase,
-#: under one fresh `gate.py --exclusive` admission per gate, one step at a
-#: time. These steps assert exact outcomes of small wall clocks inside the
-#: tools they compare (agentctl's Herdr probes against a Python fake Herdr),
-#: so sharing the box with another gate's steps — not the step budgets —
-#: turns them red; exclusive reruns pass. Running the five in parallel inside
-#: the one admission also diverged (a verified-idle-composer probe timed out
-#: beside its four siblings), so the phase is serial within the admission:
-#: still one queue slot per gate. See validation/cross.dag.yaml.
+#: DAG label for steps that run alone on the host by default: after the main
+#: phase, under one fresh `gate.py --exclusive` admission per gate, one step
+#: at a time. These steps assert exact outcomes of small wall clocks inside
+#: the tools they compare (agentctl's Herdr probes against a Python fake
+#: Herdr), so sharing the box with another gate's steps — not the step
+#: budgets — turns them red; exclusive reruns pass. Running the five in
+#: parallel inside the one admission also diverged (a verified-idle-composer
+#: probe timed out beside its four siblings), so the phase is serial within
+#: the admission: still one queue slot per gate. See
+#: validation/cross.dag.yaml. #1067 cross-differential-load-aware makes the
+#: comparisons load-aware so a host may run them in the main phase instead
+#: (``CROSS_MAIN_PHASE_ENV``); the label stays as the partition's marker in
+#: both positions and never affects which steps are selected.
 GATE_EXCLUSIVE_LABEL = "gate-exclusive"
+
+#: Caller-environment switch for the five `gate-exclusive` differentials
+#: (#1067 cross-differential-load-aware). Unset, or any value other than
+#: ``"1"``, keeps today's exclusive phase, so landing the load-aware change
+#: is safe on its own. ``AGENT_UTILS_CROSS_IN_MAIN_PHASE=1`` runs the kept
+#: steps in the main (shared) phase instead; a host flips only after its own
+#: paired timing record passes. Selection is identical in both positions:
+#: a step whose component was not selected runs in neither phase.
+CROSS_MAIN_PHASE_ENV = "AGENT_UTILS_CROSS_IN_MAIN_PHASE"
+
+
+def cross_in_main_phase(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether the caller opted the gate-exclusive differentials into the main phase."""
+    return (os.environ if environ is None else environ).get(CROSS_MAIN_PHASE_ENV) == "1"
 
 
 def partition_gate_exclusive(
@@ -648,6 +666,7 @@ def partition_gate_exclusive(
     *,
     components: frozenset[str] | None = None,
     keep_all: bool = False,
+    exclusive_phase: bool | None = None,
 ) -> tuple[list[str], list[str]]:
     """Split chosen tags into the main phase and the gate-exclusive phase.
 
@@ -664,7 +683,17 @@ def partition_gate_exclusive(
     selects every group), and cross-group triggers from outside `cross/`
     (workspace manifests, shared launchers) that can change every paired
     implementation at once.
+
+    `exclusive_phase` chooses where the kept steps run, never which steps
+    are kept: the component filter and the dropped-dependent cascade are
+    identical in both positions, so a filtered-out step runs in neither
+    phase. `None` (the default) reads ``CROSS_MAIN_PHASE_ENV``: unset keeps
+    the exclusive phase; ``"1"`` puts every kept step in the main phase and
+    returns an empty exclusive list (#1067 cross-differential-load-aware).
+    Tests pass it explicitly so the ambient environment cannot flip them.
     """
+    if exclusive_phase is None:
+        exclusive_phase = not cross_in_main_phase()
 
     def labels(tag: str) -> set[str]:
         raw = steps[tag].get("labels")
@@ -704,6 +733,12 @@ def partition_gate_exclusive(
             ):
                 exclusive.add(tag)
                 changed = True
+    if not exclusive_phase:
+        # Main-phase position (#1067): every kept step — labelled or not,
+        # dependent or not — runs in the main phase in graph order. The
+        # `dropped` set above is the whole selection story in both
+        # positions, so a filtered-out step still runs nowhere.
+        return ([tag for tag in steps if tag in chosen and tag not in dropped], [])
     return (
         [
             tag
@@ -814,7 +849,10 @@ def run(
     that do not depend on it (dagrun --keep-going), so one run reports every independent
     failure. `#362 ci-failure-masking`. Steps labelled `gate-exclusive` run after the
     main phase, one at a time under one fresh `gate.py --exclusive` admission, so no
-    other gate's steps — and none of their own siblings — share the host with them.
+    other gate's steps — and none of their own siblings — share the host with them —
+    unless the caller opted them into the main phase (`CROSS_MAIN_PHASE_ENV`,
+    #1067 cross-differential-load-aware), in which case the partition puts them in
+    `main_tags` and this run is a single dagrun invocation.
     With `pytest_root`, every pytest process in the graph keeps its temp directories there
     (``pytest_temp_root``).
     """
@@ -853,8 +891,14 @@ def run(
 
     # `main` computes the phase split from the canonical graph and passes it
     # in; without it (direct callers, the graph-contract tests) the run is
-    # the historical single dagrun invocation.
-    main_tags, exclusive_tags = gate_exclusive_phases or ([], [])
+    # the historical single dagrun invocation. "Phases given" must stay
+    # distinguishable from "no phases": in the main-phase position the
+    # exclusive list is empty by design, and falling back to `--labels`
+    # would silently skip force-added differentials that carry no
+    # `validation-cross` label while the caller still expects their
+    # coverage records (#1067 cross-differential-load-aware).
+    phases_given = gate_exclusive_phases is not None
+    main_tags, exclusive_tags = gate_exclusive_phases if phases_given else ([], [])
     result = 0
     if exclusive_tags:
         # Steps labelled gate-exclusive run afterwards, one at a time under
@@ -867,7 +911,7 @@ def run(
         )
     if main_tags or not exclusive_tags:
         command = dagrun_command()
-        if exclusive_tags:
+        if exclusive_tags or (phases_given and main_tags):
             command.extend(("--selected", ",".join(main_tags)))
         elif not all_contract:
             labels = {GROUP_LABELS[group] for group in selected}
@@ -1212,12 +1256,26 @@ def self_test() -> int:
         "cross.plain": {"labels": [], "deps": []},
     }
     main_tags, exclusive_tags = partition_gate_exclusive(
-        synthetic_steps, {"cross.solo", "cross.dependent", "cross.plain"}
+        synthetic_steps,
+        {"cross.solo", "cross.dependent", "cross.plain"},
+        exclusive_phase=True,
     )
     if main_tags != ["cross.plain"] or exclusive_tags != ["cross.solo", "cross.dependent"]:
         failures.append(
             "gate-exclusive partition: a dependent of an exclusive step must "
             f"join the exclusive phase; got main={main_tags} exclusive={exclusive_tags}"
+        )
+
+    main_tags, exclusive_tags = partition_gate_exclusive(
+        synthetic_steps,
+        {"cross.solo", "cross.dependent", "cross.plain"},
+        exclusive_phase=False,
+    )
+    if main_tags != ["cross.solo", "cross.dependent", "cross.plain"] or exclusive_tags != []:
+        failures.append(
+            "gate-exclusive partition (main-phase position, #1067): every kept "
+            "step must run in the main phase in graph order; got "
+            f"main={main_tags} exclusive={exclusive_tags}"
         )
 
     scoped_steps: dict[str, dict[str, object]] = {
@@ -1230,12 +1288,35 @@ def self_test() -> int:
         scoped_steps,
         {"cross.mine", "cross.theirs", "cross.plain", "cross.blocked"},
         components=frozenset({"agentctl"}),
+        exclusive_phase=True,
     )
     if scoped_main != ["cross.plain"] or scoped_exclusive != ["cross.mine"]:
         failures.append(
             "gate-exclusive partition: a step whose component was not selected "
             "must be dropped entirely, not run in the main phase; got "
             f"main={scoped_main} exclusive={scoped_exclusive}"
+        )
+
+    scoped_main, scoped_exclusive = partition_gate_exclusive(
+        scoped_steps,
+        {"cross.mine", "cross.theirs", "cross.plain", "cross.blocked"},
+        components=frozenset({"agentctl"}),
+        exclusive_phase=False,
+    )
+    if scoped_main != ["cross.mine", "cross.plain"] or scoped_exclusive != []:
+        failures.append(
+            "gate-exclusive partition (main-phase position, #1067): selection "
+            "must not change with the phase — a step whose component was not "
+            "selected, and its dependents, must still run nowhere; got "
+            f"main={scoped_main} exclusive={scoped_exclusive}"
+        )
+
+    if cross_in_main_phase({CROSS_MAIN_PHASE_ENV: "1"}) is not True or (
+        cross_in_main_phase({}) is not False
+    ) or cross_in_main_phase({CROSS_MAIN_PHASE_ENV: "0"}) is not False:
+        failures.append(
+            "gate-exclusive switch (#1067): only "
+            f"{CROSS_MAIN_PHASE_ENV}=1 may opt into the main phase"
         )
 
     for shared_paths, want_shared in (
@@ -1877,6 +1958,12 @@ def main(argv: list[str] | None = None) -> int:
         keep_all=all_contract or cross_shared_trigger,
     )
     final_chosen = set(phases[0]) | set(phases[1])
+    if cross_in_main_phase():
+        print(
+            f"validate: {CROSS_MAIN_PHASE_ENV}=1, gate-exclusive differentials "
+            "run in the main phase (#1067 cross-differential-load-aware)",
+            flush=True,
+        )
     if args.list:
         report_selected_graph(
             selected,
@@ -1910,7 +1997,7 @@ def main(argv: list[str] | None = None) -> int:
             timing_dir=Path(timings),
             host=host,
             keep_going=args.keep_going,
-            gate_exclusive_phases=phases if phases[1] else None,
+            gate_exclusive_phases=phases,
             pytest_root=pytest_root,
         )
         if code != 0:

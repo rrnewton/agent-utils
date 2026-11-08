@@ -120,13 +120,21 @@ steps:
       hard_mem_max_bytes: 536870912
 
   # The herdr-run and agentctl differentials below carry the gate-exclusive
-  # label: scripts/validate.py runs them after the main phase, one at a
-  # time under one fresh gate.py --exclusive admission per gate. They assert
-  # exact outcomes of small wall clocks inside agentctl (Herdr probes
-  # against a Python fake Herdr, a 300 ms git check-ignore), so under
-  # shared-gate contention the two editions classify the same pane
-  # differently and the step goes red while passing every exclusive rerun
-  # (#725 validate-speed). They deliberately do NOT carry the
+  # label: by default scripts/validate.py runs them after the main phase,
+  # one at a time under one fresh gate.py --exclusive admission per gate.
+  # They assert exact outcomes of small wall clocks inside agentctl (Herdr
+  # probes against a Python fake Herdr — one fresh interpreter per call —
+  # judged against harness budgets as small as 50 ms, beside the tools' own
+  # 5 s / 10 s git check-ignore bounds), so under shared-gate contention the
+  # two editions classify the same pane differently and the step goes red
+  # while passing every exclusive rerun
+  # (#725 validate-speed). #1067 cross-differential-load-aware makes those
+  # comparisons load-aware; a host opts the kept steps into the main phase
+  # with AGENT_UTILS_CROSS_IN_MAIN_PHASE=1 (see partition_gate_exclusive in
+  # scripts/validate.py) only after its own paired timing record passes.
+  # Unset keeps the exclusive phase, so the load-aware change is safe to
+  # land on its own. The label stays in both positions — it marks the
+  # partition, not the selection. They deliberately do NOT carry the
   # validation-cross label: they are selected only when their own component
   # is selected (validation/components.json names the paths that can change
   # each tool, harness files included), when the cross group was triggered

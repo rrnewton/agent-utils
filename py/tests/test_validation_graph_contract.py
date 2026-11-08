@@ -925,6 +925,78 @@ def test_keep_going_reaches_dagrun_only_when_asked(monkeypatch: pytest.MonkeyPat
     assert [arg for arg in keep_going if arg != "--keep-going"] == eager
 
 
+def test_gate_exclusive_phases_run_argv_in_both_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1067: phases-given selects by tag in both switch positions.
+
+    Main position (empty exclusive list) must still pass ``--selected``:
+    falling back to ``--labels`` would silently skip force-added
+    differentials that carry no ``validation-cross`` label. Exclusive
+    position must run the exclusive tags afterwards under one
+    ``gate.py --exclusive`` admission, serial (``--max-steps 1``).
+    """
+    validate = _validate_module()
+    commands: list[list[str]] = []
+
+    def capture(command: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+        commands.append(list(command))
+        return subprocess.CompletedProcess(command, 0)
+
+    for name in ("VALIDATE_DAGRUN_FLAGS", "BOX_FLAGS", validate.CROSS_MAIN_PHASE_ENV):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(validate.subprocess, "run", capture)
+
+    main_tags = ["cross.agentctl.differential-0", "cross.plain"]
+    assert validate.run(
+        frozenset(), frozenset(), all_contract=False,
+        gate_exclusive_phases=(main_tags, []),
+    ) == 0
+    assert len(commands) == 1, "main position is a single dagrun invocation"
+    (only,) = commands
+    assert only[only.index("--selected") + 1] == ",".join(main_tags)
+    assert "--labels" not in only
+    assert not any(arg.endswith("gate.py") for arg in only)
+
+    commands.clear()
+    exclusive_tags = ["cross.herdr-run.differential"]
+    assert validate.run(
+        frozenset(), frozenset(), all_contract=False,
+        gate_exclusive_phases=(main_tags, exclusive_tags),
+    ) == 0
+    assert len(commands) == 2, "exclusive position adds one gate.py admission"
+    first, second = commands
+    assert first[first.index("--selected") + 1] == ",".join(main_tags)
+    assert any(arg.endswith("gate.py") for arg in second)
+    assert "--exclusive" in second
+    assert second[second.index("--selected") + 1] == ",".join(exclusive_tags)
+    assert second[second.index("--max-steps") + 1] == "1"
+
+
+def test_cross_main_phase_env_defaults_to_exclusive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1067: only ``AGENT_UTILS_CROSS_IN_MAIN_PHASE=1`` leaves the exclusive phase."""
+    validate = _validate_module()
+    steps: dict[str, dict[str, object]] = {
+        "cross.solo": {"labels": [validate.GATE_EXCLUSIVE_LABEL], "deps": []},
+        "cross.plain": {"labels": [], "deps": []},
+    }
+    chosen = {"cross.solo", "cross.plain"}
+    monkeypatch.delenv(validate.CROSS_MAIN_PHASE_ENV, raising=False)
+    assert validate.partition_gate_exclusive(steps, chosen) == (
+        ["cross.plain"], ["cross.solo"]
+    )
+    monkeypatch.setenv(validate.CROSS_MAIN_PHASE_ENV, "0")
+    assert validate.partition_gate_exclusive(steps, chosen) == (
+        ["cross.plain"], ["cross.solo"]
+    )
+    monkeypatch.setenv(validate.CROSS_MAIN_PHASE_ENV, "1")
+    assert validate.partition_gate_exclusive(steps, chosen) == (
+        ["cross.solo", "cross.plain"], []
+    )
+
+
 def test_the_keep_going_flag_reaches_the_graph_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
