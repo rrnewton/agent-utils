@@ -18,6 +18,8 @@
 
 /// Token-free activity bins.
 pub mod activity_bins;
+/// Which of a team's agents a summarize run reads.
+pub mod agent_scope;
 /// Deterministic work-output artifact extraction.
 pub mod artifacts;
 /// Deterministic gzip sidecars, glossary rendering, GitHub refs.
@@ -74,6 +76,8 @@ pub mod pipeline;
 /// The `ingest-project` manifest: strict schema-v1 config
 /// and multi-team dispatch.
 pub mod project_config;
+/// One weekly summary for a whole project, from its teams' weeklies.
+pub mod project_rollup;
 /// The `query list` subcommand over schema-3 and schema-1
 /// timelines.
 pub mod query;

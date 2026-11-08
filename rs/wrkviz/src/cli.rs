@@ -560,6 +560,7 @@ pub fn run(args: &[String]) -> u8 {
         "ingest-project" => run_ingest_project(&args[1..]),
         "ingest" => run_ingest(&args[1..]),
         "summarize" => run_summarize(&args[1..]),
+        "summarize-project" => run_summarize_project(&args[1..]),
         "build" => run_build(&args[1..]),
         "export" => run_export(&args[1..]),
         "gc" => run_gc(&args[1..]),
@@ -4925,6 +4926,68 @@ fn run_inspect(args: &[String]) -> u8 {
 
 const SUMMARIZE_USAGE: &str = "usage: wrkviz summarize [-h] --output OUTPUT --team TEAM\n                        [--backend {muse,codex,claude,heuristic}]\n                        [--model MODEL] [--rollup-model ROLLUP_MODEL]\n                        [--reasoning-effort REASONING_EFFORT]\n                        [--service-tier SERVICE_TIER]\n                        [--summary-workers SUMMARY_WORKERS]\n                        [--summary-batch-size SUMMARY_BATCH_SIZE]\n                        [--name-batch-size NAME_BATCH_SIZE]\n                        [--phase-minutes PHASE_MINUTES]\n                        [--context-chars CONTEXT_CHARS]\n                        [--transcript-chars TRANSCRIPT_CHARS]\n                        [--codex-command CODEX_COMMAND]\n                        [--claude-command CLAUDE_COMMAND]\n                        [--muse-command MUSE_COMMAND]\n                        [--backend-timeout SECONDS]\n                        [--summary-start-date SUMMARY_START_DATE | --summary-start-time SUMMARY_START_TIME]\n                        [--summary-end-date SUMMARY_END_DATE | --summary-end-time SUMMARY_END_TIME]\n                        [--summary-timezone SUMMARY_TIMEZONE]\n                        [--rollup-kind {hourly,daily,weekly,monthly,quarterly}]\n                        [--budget-usd USD] [--price RATES] [--plan]\n                        [--agent-scope {all,coordinator}]";
 
+const SUMMARIZE_PROJECT_USAGE: &str = "usage: wrkviz summarize-project [-h] --output OUTPUT --name NAME --team TEAM\n                                --week WEEK [--agent-scope {all,coordinator}]\n                                [--timezone TIMEZONE]\n                                [--backend {muse,codex,claude,heuristic}]\n                                [--model MODEL] [--rollup-model ROLLUP_MODEL]\n                                [--reasoning-effort REASONING_EFFORT]\n                                [--service-tier SERVICE_TIER]\n                                [--codex-command CODEX_COMMAND]\n                                [--claude-command CLAUDE_COMMAND]\n                                [--muse-command MUSE_COMMAND]\n                                [--backend-timeout SECONDS] [--plan]";
+
+/// Verbatim `wrkviz summarize-project --help` text.
+pub const SUMMARIZE_PROJECT_HELP: &str = r##"usage: wrkviz summarize-project [-h] --output OUTPUT --name NAME --team TEAM
+                                --week WEEK [--agent-scope {all,coordinator}]
+                                [--timezone TIMEZONE]
+                                [--backend {muse,codex,claude,heuristic}]
+                                [--model MODEL] [--rollup-model ROLLUP_MODEL]
+                                [--reasoning-effort REASONING_EFFORT]
+                                [--service-tier SERVICE_TIER]
+                                [--codex-command CODEX_COMMAND]
+                                [--claude-command CLAUDE_COMMAND]
+                                [--muse-command MUSE_COMMAND]
+                                [--backend-timeout SECONDS] [--plan]
+
+Write one project weekly (technical and plain-language) from the named teams' own weekly technical rollups, through the same weekly prompt. Nothing else is read, so it adds no evidence of its own; a named team without a weekly rollup for the week is refused by name. Run `summarize --rollup-kind weekly` for each team first. Output goes under summary_scopes/<scope>/project/<name>/.
+
+options:
+  -h, --help            show this help message and exit
+  --output OUTPUT       archive directory holding the team rollups
+  --name NAME           slug for this project rollup, for example example-
+                        project
+  --team TEAM           team whose weekly technical rollup is an input; repeat
+                        for each team
+  --week WEEK           ISO week key of the rollups to combine, e.g. 2026-W45
+  --agent-scope {all,coordinator}
+                        which team rollups to read: 'all' reads
+                        teams/<slug>/summary_data/, 'coordinator' reads
+                        teams/<slug>/summary_scopes/coordinator/ (default:
+                        all)
+  --timezone TIMEZONE   IANA timezone for times in the Markdown (default: UTC)
+  --backend {muse,codex,claude,heuristic}
+                        summary backend, as for summarize (default: muse)
+  --model MODEL         backend model; with --rollup-model unset it selects
+                        the rollup model as in summarize
+  --rollup-model ROLLUP_MODEL
+                        model that writes the project weekly (default: as for
+                        summarize's calendar rollups; muse without --model
+                        uses 'watermelon-full-preview')
+  --reasoning-effort REASONING_EFFORT
+                        backend reasoning effort, recorded in cache provenance
+                        (default: medium)
+  --service-tier SERVICE_TIER
+                        Codex service tier, as for summarize
+  --codex-command CODEX_COMMAND
+                        Codex executable (primarily for testing)
+  --claude-command CLAUDE_COMMAND
+                        Claude executable (primarily for testing)
+  --muse-command MUSE_COMMAND
+                        Muse executable (primarily for testing)
+  --backend-timeout SECONDS
+                        stop one backend call after this many seconds
+                        (default: 900.0)
+  --plan                list the inputs and whether the weekly is cached, then
+                        exit without a model call
+
+example:
+  wrkviz summarize-project --output ./archive --name example-project \
+    --team team-a --team team-b --week 2026-W45 --agent-scope coordinator \
+    --timezone America/New_York
+"##;
+
 /// Verbatim `wrkviz build --help` text.
 pub const BUILD_HELP: &str = r##"usage: wrkviz build [-h] --output OUTPUT --team TEAM
                     [--phase-minutes PHASE_MINUTES]
@@ -6946,6 +7009,9 @@ fn run_refresh(args: &[String], kind: RefreshKind) -> u8 {
                 rollup_kinds: rollup_kinds.clone(),
                 budget_usd,
                 prices,
+                // Only `summarize` offers --agent-scope; refresh always
+                // summarizes every agent.
+                agent_scope: crate::agent_scope::ALL_AGENTS.to_string(),
             };
             crate::summarize_pipeline::summarize_archive(
                 &archive,
@@ -8094,6 +8160,283 @@ fn resolve_rollup_model(
     }
 }
 
+fn print_plan_lines(plan: &crate::summary_budget::SummaryPlan) {
+    for line in plan.lines() {
+        println!("{line}");
+    }
+    if let Some(selection) = plan
+        .request
+        .as_ref()
+        .and_then(|request| request.get("agent_scope_selection"))
+    {
+        if let Ok(description) = crate::agent_scope::describe_selection(selection) {
+            println!("  {description}");
+        }
+    }
+}
+
+fn run_summarize_project(args: &[String]) -> u8 {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{SUMMARIZE_PROJECT_HELP}");
+        return 0;
+    }
+    const VALUE_OPTIONS: &[&str] = &[
+        "--output",
+        "--name",
+        "--team",
+        "--week",
+        "--agent-scope",
+        "--timezone",
+        "--backend",
+        "--model",
+        "--rollup-model",
+        "--reasoning-effort",
+        "--service-tier",
+        "--codex-command",
+        "--claude-command",
+        "--muse-command",
+        "--backend-timeout",
+    ];
+    let mut values: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut plan = false;
+    let mut extras: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (head, explicit) = match arg.split_once('=') {
+            Some((head, value)) => (head, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        if head == "--plan" {
+            if let Some(value) = &explicit {
+                return argparse_error(
+                    SUMMARIZE_PROJECT_USAGE,
+                    "wrkviz summarize-project",
+                    &format!("argument --plan: ignored explicit argument '{value}'"),
+                );
+            }
+            plan = true;
+            index += 1;
+            continue;
+        }
+        let candidates: Vec<&str> = VALUE_OPTIONS
+            .iter()
+            .copied()
+            .filter(|name| {
+                head == *name
+                    || (head.len() > 2 && head.starts_with("--") && name.starts_with(head))
+            })
+            .collect();
+        if candidates.len() > 1 && !candidates.contains(&head) {
+            return argparse_error(
+                SUMMARIZE_PROJECT_USAGE,
+                "wrkviz summarize-project",
+                &format!(
+                    "ambiguous option: {head} could match {}",
+                    candidates.join(", ")
+                ),
+            );
+        }
+        let exact = candidates.iter().find(|name| **name == head);
+        let Some(name) = exact.or_else(|| candidates.first()) else {
+            extras.push(arg.clone());
+            index += 1;
+            continue;
+        };
+        let name = (*name).to_string();
+        let value = match explicit {
+            Some(value) => value,
+            None => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => value.clone(),
+                    None => {
+                        return argparse_error(
+                            SUMMARIZE_PROJECT_USAGE,
+                            "wrkviz summarize-project",
+                            &format!("argument {name}: expected one argument"),
+                        )
+                    }
+                }
+            }
+        };
+        values.entry(name).or_default().push(value);
+        index += 1;
+    }
+    let get = |name: &str| values.get(name).and_then(|items| items.last()).cloned();
+    let missing: Vec<&str> = ["--output", "--name", "--team", "--week"]
+        .into_iter()
+        .filter(|name| get(name).is_none())
+        .collect();
+    if !missing.is_empty() {
+        return argparse_error(
+            SUMMARIZE_PROJECT_USAGE,
+            "wrkviz summarize-project",
+            &format!(
+                "the following arguments are required: {}",
+                missing.join(", ")
+            ),
+        );
+    }
+    if !extras.is_empty() {
+        return argparse_error(
+            SUMMARIZE_PROJECT_USAGE,
+            "wrkviz summarize-project",
+            &format!("unrecognized arguments: {}", extras.join(" ")),
+        );
+    }
+    let backend = get("--backend").unwrap_or_else(|| "muse".to_string());
+    if !matches!(backend.as_str(), "muse" | "codex" | "claude" | "heuristic") {
+        return argparse_error(
+            SUMMARIZE_PROJECT_USAGE,
+            "wrkviz summarize-project",
+            &format!(
+                "argument --backend: invalid choice: {} (choose from 'muse', 'codex', 'claude', 'heuristic')",
+                crate::json::py_repr_str(&backend)
+            ),
+        );
+    }
+    let agent_scope = get("--agent-scope").unwrap_or_else(|| "all".to_string());
+    if !matches!(agent_scope.as_str(), "all" | "coordinator") {
+        return argparse_error(
+            SUMMARIZE_PROJECT_USAGE,
+            "wrkviz summarize-project",
+            &format!(
+                "argument --agent-scope: invalid choice: {} (choose from 'all', 'coordinator')",
+                crate::json::py_repr_str(&agent_scope)
+            ),
+        );
+    }
+    let backend_timeout: f64 = match get("--backend-timeout") {
+        None => DEFAULT_BACKEND_TIMEOUT_SECONDS,
+        Some(raw) => match raw.parse::<f64>() {
+            Ok(value) => value,
+            Err(_) => {
+                return argparse_error(
+                    SUMMARIZE_PROJECT_USAGE,
+                    "wrkviz summarize-project",
+                    &format!(
+                        "argument --backend-timeout: invalid float value: {}",
+                        crate::json::py_repr_str(&raw)
+                    ),
+                )
+            }
+        },
+    };
+    let outcome = (|| -> Result<Option<crate::project_rollup::ProjectWeeklyReport>, String> {
+        let model = match get("--model") {
+            None => {
+                if backend == "claude" {
+                    return Err("--model is required when --backend=claude".to_string());
+                }
+                if backend == "muse" {
+                    crate::muse_backend::DEFAULT_MUSE_MODEL.to_string()
+                } else {
+                    std::env::var("WRKVIZ_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string())
+                }
+            }
+            Some(raw) => {
+                let model = crate::summarize_core::py_trim(&raw).to_string();
+                if model.is_empty() {
+                    return Err("--model must not be empty".to_string());
+                }
+                model
+            }
+        };
+        let rollup_model = resolve_rollup_model(
+            &backend,
+            get("--model").is_none(),
+            get("--rollup-model").as_deref(),
+            &model,
+        )?;
+        if backend_timeout.is_nan() || backend_timeout <= 0.0 {
+            return Err("--backend-timeout must be a positive number of seconds".to_string());
+        }
+        let archive = cli_path(&get("--output").unwrap());
+        let name = get("--name").unwrap();
+        let teams = values.get("--team").cloned().unwrap_or_default();
+        let week = get("--week").unwrap();
+        let reasoning_effort = Some(get("--reasoning-effort").unwrap_or_else(|| {
+            std::env::var("WRKVIZ_REASONING_EFFORT").unwrap_or_else(|_| "medium".to_string())
+        }));
+        let service_tier =
+            crate::token_usage::resolve_service_tier(&backend, get("--service-tier").as_deref())?;
+        if plan {
+            let (inputs, cached) = crate::project_rollup::plan_project_weekly(
+                &archive,
+                &name,
+                &teams,
+                &week,
+                &backend,
+                &rollup_model,
+                &agent_scope,
+                reasoning_effort.as_deref(),
+                service_tier.as_deref(),
+            )?;
+            println!("project weekly plan for {name} {week} ({agent_scope} scope):");
+            for item in &inputs {
+                println!("  input {}: {}", item.team_slug, item.rollup_path);
+            }
+            println!(
+                "  technical weekly: {}; plain-language weekly follows it; backend={backend} model={rollup_model}",
+                if cached { "cached" } else { "to generate" }
+            );
+            return Ok(None);
+        }
+        let mut command: Vec<String> = vec!["wrkviz".to_string(), "summarize-project".to_string()];
+        command.extend(args.iter().cloned());
+        let options = crate::project_rollup::ProjectWeeklyOptions {
+            display_timezone: get("--timezone").unwrap_or_else(|| "UTC".to_string()),
+            reasoning_effort,
+            service_tier,
+            codex_command: vec![get("--codex-command").unwrap_or_else(|| "codex".to_string())],
+            claude_command: vec![get("--claude-command").unwrap_or_else(|| "claude".to_string())],
+            muse_command: vec![get("--muse-command").unwrap_or_else(|| "muse".to_string())],
+            backend_timeout_seconds: Some(backend_timeout),
+            command,
+        };
+        crate::project_rollup::summarize_project_weekly(
+            &archive,
+            &name,
+            &teams,
+            &week,
+            &backend,
+            &rollup_model,
+            &agent_scope,
+            &options,
+        )
+        .map(Some)
+    })();
+    match outcome {
+        Ok(None) => 0,
+        Ok(Some(report)) => {
+            println!(
+                "project weekly {} {}: {} team inputs; {} cache hits, {} misses, {} backend calls",
+                report.name,
+                report.week,
+                report.inputs.len(),
+                report.cache_hits,
+                report.cache_misses,
+                report.backend_batches
+            );
+            for path in [
+                &report.rollup_path,
+                &report.technical_markdown,
+                &report.plain_markdown,
+            ] {
+                println!("wrote: {}", path.display());
+            }
+            println!("run metadata: {}", report.run_path.display());
+            0
+        }
+        Err(error) => {
+            eprintln!("wrkviz: {error}");
+            2
+        }
+    }
+}
+
 fn run_summarize(args: &[String]) -> u8 {
     crate::summarize_core::install_interrupt_handler();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -8328,16 +8671,8 @@ fn run_summarize(args: &[String]) -> u8 {
             ),
         );
     }
-    if agent_scope != "all" {
-        // The option is mirrored so usage and help stay byte-identical to Python's; the
-        // coordinator-only summary tree is not ported yet, so the Rust edition refuses it by
-        // name rather than silently summarizing every agent.
-        eprintln!(
-            "wrkviz summarize: --agent-scope {agent_scope} is not yet in the Rust edition; \
-             use the Python engine"
-        );
-        return 2;
-    }
+    // The coordinator-only tree writes under summary_scopes/coordinator/
+    // (see crate::agent_scope); summary_data and the website stay untouched.
     let mut rollup_kinds: Vec<String> = values.get("--rollup-kind").cloned().unwrap_or_default();
     for kind in &rollup_kinds {
         if !matches!(
@@ -8477,15 +8812,14 @@ fn run_summarize(args: &[String]) -> u8 {
                 rollup_kinds: rollup_kinds.clone(),
                 budget_usd,
                 prices,
+                agent_scope: agent_scope.clone(),
             };
             if plan {
                 let plan = crate::summarize_pipeline::plan_summaries(
                     &archive, &team_slug, &backend, &model, &options,
                 )
                 .map_err(|error| (error, false))?;
-                for line in plan.lines() {
-                    println!("{line}");
-                }
+                print_plan_lines(&plan);
                 if plan.over_budget() {
                     // _PlanOverBudget: exit 3 with no run record.
                     return Err((String::new(), true));
@@ -8498,11 +8832,7 @@ fn run_summarize(args: &[String]) -> u8 {
                 &backend,
                 &model,
                 &options,
-                &|plan| {
-                    for line in plan.lines() {
-                        println!("{line}");
-                    }
-                },
+                &|plan| print_plan_lines(plan),
             )
             .map_err(|error| {
                 let is_budget = error.is_budget();
@@ -8610,6 +8940,9 @@ fn print_summaries(report: &crate::summarize_pipeline::SummarizeReport) {
         report.glossary_definitions,
         report.catalog_artifacts
     );
+    if let Some(selection) = &report.agent_scope_selection {
+        println!("{}", selection.describe());
+    }
     if report.carried_forward_rollups != 0 {
         println!(
             "rollups carried forward: {} (what they summarize is unchanged; only earlier periods they read as context changed)",

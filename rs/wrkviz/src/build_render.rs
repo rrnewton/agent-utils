@@ -196,6 +196,27 @@ fn bullet_line(at_ms: i64, text: &str, tz: &str) -> Result<String, String> {
     Ok(format!("- **{}** — {}", local_time(at_ms, tz)?, text))
 }
 
+/// Rollup kinds whose inputs are whole days or longer: a work item's time
+/// of day there is invented, so opted-in pages give the local date instead.
+const DATE_ONLY_ROLLUP_KINDS: [&str; 3] = ["weekly", "monthly", "quarterly"];
+
+fn rollup_item_stamp(
+    at_ms: i64,
+    period: &Period,
+    display_timezone: &str,
+    date_only: bool,
+) -> Result<String, String> {
+    if !date_only || !DATE_ONLY_ROLLUP_KINDS.contains(&period.kind.as_str()) {
+        return local_time(at_ms, display_timezone);
+    }
+    use chrono::TimeZone as _;
+    let zone = display_timezone
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| format!("No time zone found with key {display_timezone}"))?;
+    let utc = chrono::Utc.timestamp_millis_opt(at_ms).single().unwrap();
+    Ok(utc.with_timezone(&zone).format("%Y-%m-%d %a").to_string())
+}
+
 fn rstrip(text: &str) -> String {
     text.trim_end().to_string()
 }
@@ -549,28 +570,53 @@ fn rollup_markdown(
     stats: &PhaseStats,
     audience: &str,
 ) -> Result<String, String> {
+    rollup_markdown_scoped(team, period, summary, stats, audience, None, false)
+}
+
+/// One calendar rollup page; *scope_note*, when given, labels a narrowed
+/// agent scope. With *date_only_above_daily*, a weekly or longer page
+/// stamps its items with the local date only.
+pub(crate) fn rollup_markdown_scoped(
+    team: &TeamData,
+    period: &Period,
+    summary: &SummaryResult,
+    stats: &PhaseStats,
+    audience: &str,
+    scope_note: Option<&str>,
+    date_only_above_daily: bool,
+) -> Result<String, String> {
     let tz = &team.display_timezone;
-    let mut lines: Vec<String> = vec![
-        format!(
-            "# {} {} {} {} summary",
-            period_heading(period, tz),
-            team.team_slug,
-            period.kind,
-            audience
-        ),
-        String::new(),
+    let mut lines: Vec<String> = vec![format!(
+        "# {} {} {} {} summary",
+        period_heading(period, tz),
+        team.team_slug,
+        period.kind,
+        audience
+    )];
+    lines.push(String::new());
+    if let Some(note) = scope_note {
+        lines.push(format!("> {note}"));
+        lines.push(String::new());
+    }
+    lines.extend([
         format!("> **{}.** {}", summary.phrase, summary.paragraph),
         String::new(),
         "## Agent work summary".into(),
         String::new(),
-    ];
+    ]);
     if !summary.work_summary.is_empty() {
         lines.extend(
             summary
                 .work_summary
                 .iter()
-                .map(|item| bullet_line(item.at_ms, &item.text, tz))
-                .collect::<Result<Vec<_>, _>>()?,
+                .map(|item| {
+                    Ok(format!(
+                        "- **{}** — {}",
+                        rollup_item_stamp(item.at_ms, period, tz, date_only_above_daily)?,
+                        item.text
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
         );
     } else {
         lines.push("_No substantive work item was recorded in this range._".into());
@@ -599,7 +645,7 @@ fn rollup_markdown(
     Ok(format!("{}\n", rstrip(&lines.join("\n"))))
 }
 
-fn plain_language_path(period: &Period) -> Result<String, String> {
+pub(crate) fn plain_language_path(period: &Period) -> Result<String, String> {
     period
         .relative_path
         .strip_suffix(".md")

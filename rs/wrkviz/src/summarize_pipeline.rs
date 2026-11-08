@@ -34,17 +34,38 @@ use crate::summary_registry::{
 };
 use crate::team_data::{Agent, TeamData};
 use crate::token_usage::TokenUsage;
-use crate::transcript_io::write_json_if_changed;
+use crate::transcript_io::{write_json_if_changed, write_text_if_changed};
 use crate::window::{apply_date_window, DateWindow};
 
 const OVERVIEW_CONTEXT_CHARS: usize = 48_000;
-const PRESENTATION_FALLBACK_VERSION: &str = "agent-team-timeline-presentation-fallback-v1";
+pub(crate) const PRESENTATION_FALLBACK_VERSION: &str =
+    "agent-team-timeline-presentation-fallback-v1";
 pub(crate) const PROJECT_OVERVIEW_SCHEMA_VERSION: i64 = 3;
 
 /// The summary root for one team.
 pub fn summary_root(archive: &Path, team_slug: &str) -> Result<PathBuf, String> {
+    summary_root_for_scope(archive, team_slug, crate::agent_scope::ALL_AGENTS)
+}
+
+/// The summary root for one team under an agent scope: `summary_data` for
+/// the full team, its own `summary_scopes/<scope>` tree otherwise.
+pub fn summary_root_for_scope(
+    archive: &Path,
+    team_slug: &str,
+    agent_scope: &str,
+) -> Result<PathBuf, String> {
     validate_team_slug(team_slug)?;
-    Ok(archive.join("teams").join(team_slug).join("summary_data"))
+    if agent_scope == crate::agent_scope::ALL_AGENTS {
+        return Ok(archive.join("teams").join(team_slug).join("summary_data"));
+    }
+    // A narrower scope is a different artifact; it never shares
+    // summary_data/ (and therefore never shares a cache or a projection)
+    // with the full team.
+    Ok(archive
+        .join("teams")
+        .join(team_slug)
+        .join("summary_scopes")
+        .join(crate::agent_scope::validate_agent_scope(agent_scope)?))
 }
 
 pub use crate::build_assets::GlossaryTerm;
@@ -57,7 +78,10 @@ fn glossary_prompt_text(terms: &[GlossaryTerm]) -> String {
     lines.join("\n")
 }
 
-fn plain_language_context_text(project_overview: &str, terms: &[GlossaryTerm]) -> String {
+pub(crate) fn plain_language_context_text(
+    project_overview: &str,
+    terms: &[GlossaryTerm],
+) -> String {
     let mut lines = vec![
         "Durable project overview (source-bounded):".to_string(),
         py_trim(project_overview).to_string(),
@@ -389,7 +413,16 @@ pub(crate) fn frozen_project_overview_input(
     archive: &Path,
     team: &TeamData,
 ) -> Result<FrozenOverview, String> {
-    let path = summary_root(archive, &team.team_slug)?.join("project_overview.json");
+    frozen_project_overview_input_scoped(archive, team, crate::agent_scope::ALL_AGENTS)
+}
+
+pub(crate) fn frozen_project_overview_input_scoped(
+    archive: &Path,
+    team: &TeamData,
+    agent_scope: &str,
+) -> Result<FrozenOverview, String> {
+    let path = summary_root_for_scope(archive, &team.team_slug, agent_scope)?
+        .join("project_overview.json");
     if !path.is_file() {
         return Ok(FrozenOverview::None);
     }
@@ -753,7 +786,7 @@ pub(crate) fn phases_in<'a>(period: &Period, phases: &'a [PhaseWindow]) -> Vec<&
         .collect()
 }
 
-fn result_line(result: &SummaryResult, label: &str, at_ms: i64) -> String {
+pub(crate) fn result_line(result: &SummaryResult, label: &str, at_ms: i64) -> String {
     let bullets = result
         .work_summary
         .iter()
@@ -767,7 +800,7 @@ fn result_line(result: &SummaryResult, label: &str, at_ms: i64) -> String {
     .to_string()
 }
 
-fn result_artifact_key(result: &SummaryResult) -> String {
+pub(crate) fn result_artifact_key(result: &SummaryResult) -> String {
     match &result.artifact_provenance {
         Some(provenance) => provenance.artifact_id.clone(),
         None => result.input_hash.clone(),
@@ -1431,8 +1464,7 @@ fn agent_name_json(job: &AgentNameJob, result: &AgentNameResult) -> Value {
 }
 
 fn write_phase_data(
-    archive: &Path,
-    team_slug: &str,
+    summary_root: &Path,
     phases: &[PhaseWindow],
     results: &HashMap<String, SummaryResult>,
 ) -> Result<i64, String> {
@@ -1445,7 +1477,7 @@ fn write_phase_data(
         obj.insert("end_ms".into(), phase.end_ms.into());
         obj.insert("summary".into(), summary_json(&results[&phase.summary_key]));
         if write_json_if_changed(
-            &summary_root(archive, team_slug)?
+            &summary_root
                 .join("phases")
                 .join(format!("{}.json", phase.phase_id)),
             &Value::Object(obj),
@@ -1457,15 +1489,14 @@ fn write_phase_data(
 }
 
 fn write_agent_name_data(
-    archive: &Path,
-    team_slug: &str,
+    summary_root: &Path,
     jobs: &[AgentNameJob],
     results: &HashMap<String, AgentNameResult>,
 ) -> Result<i64, String> {
     let mut changed = 0i64;
     for job in jobs {
         if write_json_if_changed(
-            &summary_root(archive, team_slug)?
+            &summary_root
                 .join("agents")
                 .join(format!("{}.json", job.thread_id)),
             &agent_name_json(job, &results[&job.thread_id]),
@@ -1517,8 +1548,7 @@ pub(crate) fn validate_project_overview(
 }
 
 fn write_project_overview_data(
-    archive: &Path,
-    team_slug: &str,
+    summary_root: &Path,
     source: &ProjectOverviewInput,
     summary: &SummaryResult,
 ) -> Result<i64, String> {
@@ -1549,7 +1579,7 @@ fn write_project_overview_data(
     obj.insert("source".into(), Value::Object(source_obj));
     obj.insert("summary".into(), summary_json(summary));
     Ok(i64::from(write_json_if_changed(
-        &summary_root(archive, team_slug)?.join("project_overview.json"),
+        &summary_root.join("project_overview.json"),
         &Value::Object(obj),
     )?))
 }
@@ -1601,6 +1631,10 @@ pub struct SummarizeReport {
     pub files_changed: i64,
     /// Carried-forward rollups.
     pub carried_forward_rollups: i64,
+    /// Which agents were summarized.
+    pub agent_scope: String,
+    /// What a narrowed scope kept.
+    pub agent_scope_selection: Option<crate::agent_scope::ScopeSelection>,
 }
 
 impl SummarizeReport {
@@ -1665,6 +1699,17 @@ impl SummarizeReport {
             "carried_forward_rollups".into(),
             self.carried_forward_rollups.into(),
         );
+        // Only a narrowed run says so, which keeps every all-agents receipt
+        // byte-identical to the receipts written before agent scopes existed.
+        if self.agent_scope != crate::agent_scope::ALL_AGENTS {
+            out.insert(
+                "agent_scope".into(),
+                Value::String(self.agent_scope.clone()),
+            );
+        }
+        if let Some(selection) = &self.agent_scope_selection {
+            out.insert("agent_scope_selection".into(), selection.to_json_obj());
+        }
         Value::Object(out)
     }
 }
@@ -1679,6 +1724,8 @@ struct SummaryTree {
     overview_job: SummaryJob,
     start_ms: i64,
     periods: Vec<Period>,
+    agent_scope: String,
+    scope_selection: Option<crate::agent_scope::ScopeSelection>,
 }
 
 pub(crate) fn period_range(team: &TeamData, phases: &[PhaseWindow]) -> Result<(i64, i64), String> {
@@ -1732,6 +1779,8 @@ pub struct SummarizeOptions {
     pub budget_usd: Option<f64>,
     /// Prices.
     pub prices: Option<Prices>,
+    /// Which of the team's agents to summarize.
+    pub agent_scope: String,
 }
 
 impl SummarizeOptions {
@@ -1759,18 +1808,21 @@ fn summary_tree(
     if options.summary_window.is_some() {
         team = apply_date_window(team, options.summary_window.as_ref());
     }
-    let root = summary_root(archive, team_slug)?;
+    let (team, scope_selection) =
+        crate::agent_scope::select_agent_scope(team, &options.agent_scope)?;
+    let root = summary_root_for_scope(archive, team_slug, &options.agent_scope)?;
     let phases = build_phases(
         &team,
         options.phase_minutes,
         options.context_chars,
         options.transcript_chars,
     )?;
-    let overview_source = match frozen_project_overview_input(archive, &team)? {
-        FrozenOverview::Current(input) => input,
-        FrozenOverview::SourceChanged(epoch) => renewed_project_overview_input(&team, &epoch),
-        FrozenOverview::None => root_overview_input(&team, None),
-    };
+    let overview_source =
+        match frozen_project_overview_input_scoped(archive, &team, &options.agent_scope)? {
+            FrozenOverview::Current(input) => input,
+            FrozenOverview::SourceChanged(epoch) => renewed_project_overview_input(&team, &epoch),
+            FrozenOverview::None => root_overview_input(&team, None),
+        };
     // Frozen may return None above via the None arm; root input covers it.
     let overview_job = project_overview_job(&team, &overview_source);
     let (start_ms, end_inclusive) = period_range(&team, &phases)?;
@@ -1791,6 +1843,8 @@ fn summary_tree(
         summary_root: root,
         phases,
         team,
+        agent_scope: options.agent_scope.clone(),
+        scope_selection,
     })
 }
 
@@ -1824,6 +1878,15 @@ fn request_json(
     // Recorded only when calendar rollups use a different model.
     if rollup_model != model {
         out.insert("rollup_model".into(), Value::String(rollup_model.into()));
+    }
+    if tree.agent_scope != crate::agent_scope::ALL_AGENTS {
+        out.insert(
+            "agent_scope".into(),
+            Value::String(tree.agent_scope.clone()),
+        );
+    }
+    if let Some(selection) = &tree.scope_selection {
+        out.insert("agent_scope_selection".into(), selection.to_json_obj());
     }
     Value::Object(out)
 }
@@ -2185,7 +2248,7 @@ fn run_summary_tree(
         options.agent_command(backend),
         guard,
     )?;
-    changed += write_phase_data(archive, team_slug, &tree.phases, &phase_results)?;
+    changed += write_phase_data(summary_root, &tree.phases, &phase_results)?;
     *progress.borrow_mut() = "agent names".to_string();
     let name_jobs_list = agent_name_jobs(team, &tree.phases, &phase_results, options.context_chars);
     let (agent_names, name_stats) = name_agents(
@@ -2201,7 +2264,7 @@ fn run_summary_tree(
         options.agent_command(backend),
         guard,
     )?;
-    changed += write_agent_name_data(archive, team_slug, &name_jobs_list, &agent_names)?;
+    changed += write_agent_name_data(summary_root, &name_jobs_list, &agent_names)?;
     *progress.borrow_mut() = "project overview".to_string();
     // Idle team: no phases in the window, so no overview model call (#854).
     let (project_overview, overview_stats) = if tree.phases.is_empty() {
@@ -2247,8 +2310,7 @@ fn run_summary_tree(
         validate_project_overview(&project_overview, "generated project overview")?;
         (project_overview, overview_stats)
     };
-    changed +=
-        write_project_overview_data(archive, team_slug, &tree.overview_source, &project_overview)?;
+    changed += write_project_overview_data(summary_root, &tree.overview_source, &project_overview)?;
 
     let mut backend_stats: Vec<SummaryRunStats> = vec![phase_stats, name_stats, overview_stats];
     let mut carried_forward = 0i64;
@@ -2337,6 +2399,13 @@ fn run_summary_tree(
         obj.insert("partial".into(), Value::Bool(period.partial));
         obj.insert("technical_summary".into(), summary_json(result));
         obj.insert("plain_language_summary".into(), summary_json(plain_result));
+        if tree.agent_scope != crate::agent_scope::ALL_AGENTS {
+            // The scope is in the path too, but a copied rollup must still say what it covers.
+            obj.insert(
+                "agent_scope".into(),
+                Value::String(tree.agent_scope.clone()),
+            );
+        }
         if write_json_if_changed(
             &summary_root
                 .join("rollups")
@@ -2345,6 +2414,16 @@ fn run_summary_tree(
             &Value::Object(obj),
         )? {
             changed += 1;
+        }
+        if tree.agent_scope != crate::agent_scope::ALL_AGENTS {
+            changed += write_scoped_rollup_markdown(
+                summary_root,
+                team,
+                period,
+                &tree.phases,
+                result,
+                plain_result,
+            )?;
         }
     }
 
@@ -2418,7 +2497,68 @@ fn run_summary_tree(
         usage_run_paths,
         files_changed: changed,
         carried_forward_rollups: carried_forward,
+        agent_scope: tree.agent_scope.clone(),
+        agent_scope_selection: tree.scope_selection.clone(),
     })
+}
+
+/// Write a narrowed scope's rollup pages beside its own data, labelled with the scope.
+///
+/// ``build`` never reads a scoped summary tree (the website stays full-team
+/// coverage), so a coordinator-only rollup would otherwise exist only as
+/// JSON. The pages use the site's own rollup layout below
+/// ``<scope root>/summaries/`` and carry the scope in both the heading and
+/// the first line, so a page read out of context cannot pass for full-team
+/// coverage.
+fn write_scoped_rollup_markdown(
+    summary_root: &Path,
+    team: &TeamData,
+    period: &Period,
+    phases: &[PhaseWindow],
+    technical: &SummaryResult,
+    plain: &SummaryResult,
+) -> Result<i64, String> {
+    let prefix = format!("teams/{}/summaries/", team.team_slug);
+    let in_period: Vec<PhaseWindow> = phases_in(period, phases).into_iter().cloned().collect();
+    let stats = aggregate_stats(&in_period);
+    let plain_path = crate::build_render::plain_language_path(period)?;
+    let mut changed = 0i64;
+    for (relative, summary, audience) in [
+        (
+            period.relative_path.as_str(),
+            technical,
+            "coordinator-only technical",
+        ),
+        (
+            plain_path.as_str(),
+            plain,
+            "coordinator-only plain-language",
+        ),
+    ] {
+        let Some(suffix) = relative.strip_prefix(&prefix) else {
+            return Err(format!(
+                "rollup Markdown path outside the team summaries: {relative}"
+            ));
+        };
+        if !summary.summary_available {
+            continue;
+        }
+        if write_text_if_changed(
+            &summary_root.join("summaries").join(suffix),
+            &crate::build_render::rollup_markdown_scoped(
+                team,
+                period,
+                summary,
+                &stats,
+                audience,
+                Some(crate::agent_scope::COORDINATOR_SCOPE_NOTE),
+                true,
+            )?,
+        )? {
+            changed += 1;
+        }
+    }
+    Ok(changed)
 }
 
 fn catalog_reference(

@@ -687,13 +687,127 @@ def test_summarize_agent_scope_all_matches_python_and_coordinator_refuses(
         "--backend", "heuristic", "--model", "offline", "--rollup-kind", "daily",
         "--agent-scope", "all",
     ])
-    # The coordinator-only tree is Python-only for now; the Rust edition refuses it by name
-    # instead of quietly summarizing every agent.
-    archives = _ingest(tmp_path / "coord", rust_wrkviz)
-    refused = _run([str(rust_wrkviz)], [
-        "summarize", "--output", str(archives["rs"]), "--team", "widget",
-        "--backend", "heuristic", "--agent-scope", "coordinator",
+    # The coordinator-only tree (own summary_scopes tree, labelled Markdown,
+    # scope fields in the receipt) is byte-identical too.
+    outcomes = _compare(tmp_path / "coord", rust_wrkviz, [
+        "--backend", "heuristic", "--model", "offline", "--rollup-kind", "daily",
+        "--agent-scope", "coordinator",
     ])
-    assert refused.returncode == 2
-    assert "--agent-scope coordinator is not yet in the Rust edition" in refused.stderr
-    assert not (archives["rs"] / "teams" / "widget" / "summary_scopes").exists()
+    assert "agent scope coordinator: kept 1 of 1 agents (root-thread)" in outcomes["rs"].stdout
+
+
+def _ingest_with_child(tmp_path: Path, rust_wrkviz: Path) -> dict[str, Path]:
+    sessions = _sessions(tmp_path)
+    root_file = sessions / "rollout-2026-01-01T00-00-00-root-thread.jsonl"
+    spawn = [
+        {"timestamp": _iso(1015), "type": "response_item", "payload": {
+            "type": "function_call", "id": "fc-spawn", "call_id": "call-spawn",
+            "namespace": "collaboration", "name": "spawn_agent",
+            "arguments": json.dumps({"task_name": "worker", "message": "review"})}},
+        {"timestamp": _iso(1015), "type": "event_msg", "payload": {
+            "type": "sub_agent_activity", "event_id": "call-spawn",
+            "occurred_at_ms": 1015000, "agent_thread_id": "child-thread",
+            "agent_path": "/root/worker", "kind": "started"}},
+    ]
+    with root_file.open("ab") as handle:
+        for item in spawn:
+            handle.write(json.dumps(item, sort_keys=True).encode() + b"\n")
+    child = [
+        {"timestamp": _iso(1020), "type": "session_meta", "payload": {
+            "id": "child-thread", "session_id": CODEX_ROOT,
+            "parent_thread_id": CODEX_ROOT, "timestamp": _iso(1020),
+            "cwd": "/work/project", "thread_source": "subagent",
+            "agent_path": "/root/worker", "agent_nickname": "Ada",
+            "source": {"subagent": {"thread_spawn": {
+                "parent_thread_id": CODEX_ROOT, "depth": 1,
+                "agent_path": "/root/worker", "agent_nickname": "Ada",
+                "agent_role": "reviewer"}}}}},
+        {"timestamp": _iso(1030), "type": "event_msg", "payload": {
+            "type": "task_started", "turn_id": "child-turn", "started_at": 1030}},
+        {"timestamp": _iso(1031), "type": "event_msg", "payload": {
+            "type": "user_message", "message": "Review the widget"}},
+        {"timestamp": _iso(1035), "type": "response_item", "payload": {
+            "type": "message", "id": "msg-child", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Child reviewed the widget"}]}},
+        {"timestamp": _iso(1040), "type": "event_msg", "payload": {
+            "type": "task_complete", "turn_id": "child-turn",
+            "started_at": 1030, "completed_at": 1040}},
+    ]
+    (sessions / "rollout-2026-01-01T00-00-01-child-thread.jsonl").write_bytes(
+        b"".join(json.dumps(item, sort_keys=True).encode() + b"\n" for item in child))
+    archives = {}
+    for label, command in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
+                           ("rs", [str(rust_wrkviz)])):
+        archive = tmp_path / f"{label}-out"
+        outcome = _run(command, [
+            "ingest", "--sessions-root", str(sessions),
+            "--root-session", CODEX_ROOT, "--team", "widget",
+            "--output", str(archive),
+        ])
+        assert outcome.returncode == 0, outcome.stderr
+        archives[label] = archive
+    return archives
+
+
+def test_summarize_coordinator_scope_excludes_spawned_child(
+    tmp_path: Path, rust_wrkviz: Path
+) -> None:
+    archives = _ingest_with_child(tmp_path, rust_wrkviz)
+    outcomes = {}
+    for label, command in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
+                           ("rs", [str(rust_wrkviz)])):
+        outcomes[label] = _run(command, [
+            "summarize", "--output", str(archives[label]), "--team", "widget",
+            "--backend", "heuristic", "--model", "offline",
+            "--rollup-kind", "daily", "--rollup-kind", "weekly",
+            "--agent-scope", "coordinator",
+        ])
+    oracle, result = outcomes["py"], outcomes["rs"]
+    assert oracle.returncode == 0, oracle.stderr
+    assert result.returncode == 0, result.stderr
+    assert "agent scope coordinator: kept 1 of 2 agents (root-thread)" in result.stdout
+    assert _normalize(result.stdout, archives["rs"]) == _normalize(
+        oracle.stdout, archives["py"])
+    assert _tree(archives["rs"]) == _tree(archives["py"])
+    scoped = archives["rs"] / "teams" / "widget" / "summary_scopes" / "coordinator"
+    assert (scoped / "rollups" / "weekly").is_dir()
+
+
+def test_summarize_project_coordinator_matches_python(
+    tmp_path: Path, rust_wrkviz: Path
+) -> None:
+    archives = _ingest_with_child(tmp_path, rust_wrkviz)
+    outcomes = {}
+    for label, command in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
+                           ("rs", [str(rust_wrkviz)])):
+        summarized = _run(command, [
+            "summarize", "--output", str(archives[label]), "--team", "widget",
+            "--backend", "heuristic", "--model", "offline",
+            "--rollup-kind", "weekly", "--agent-scope", "coordinator",
+            "--summary-timezone", "UTC",
+        ])
+        assert summarized.returncode == 0, summarized.stderr
+        planned = _run(command, [
+            "summarize-project", "--output", str(archives[label]),
+            "--name", "widget-project", "--team", "widget", "--week", "2026-W01",
+            "--agent-scope", "coordinator", "--backend", "heuristic",
+            "--model", "offline", "--plan",
+        ])
+        assert planned.returncode == 0, planned.stderr
+        outcomes[label] = _run(command, [
+            "summarize-project", "--output", str(archives[label]),
+            "--name", "widget-project", "--team", "widget", "--week", "2026-W01",
+            "--agent-scope", "coordinator", "--backend", "heuristic",
+            "--model", "offline",
+        ])
+    oracle, result = outcomes["py"], outcomes["rs"]
+    assert oracle.returncode == 0, oracle.stderr
+    assert result.returncode == 0, result.stderr
+    assert _normalize(result.stdout, archives["rs"]) == _normalize(
+        oracle.stdout, archives["py"])
+    def stamped(tree: dict[str, object]) -> dict[str, object]:
+        return {
+            re.sub(r"runs/[0-9TZ]+-", "runs/STAMP-", key): value
+            for key, value in tree.items()
+        }
+    assert stamped(_tree(archives["rs"])) == stamped(_tree(archives["py"]))
