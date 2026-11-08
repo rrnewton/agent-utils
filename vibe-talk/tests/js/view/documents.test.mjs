@@ -261,7 +261,7 @@ test("documents list: refresh renders rows in order, unfetched dimmed; clicks fe
     await list.refresh();
 
     const cards = [...(container.children.length ? container.children : container.childNodes)]
-      .filter((kid) => kid && typeof kid === "object");
+      .filter((kid) => kid && typeof kid === "object" && String(kid.className).includes("doc-card"));
     assert.equal(cards.length, 2, `refresh rendered ${cards.length} cards, not two (container HTML: ${String(container.innerHTML).slice(0, 200)})`);
     assert.ok(cards[0].textContent.includes("Alpha doc"), "first card is not the first row in order");
     assert.ok(cards[1].textContent.includes("beta.md"), "second card does not name its file");
@@ -289,7 +289,7 @@ test("documents list: refresh renders rows in order, unfetched dimmed; clicks fe
     // row redraws the list, so the first render's cards are detached by now.)
     order.length = 0; fetchCalls.length = 0; opened.length = 0;
     const fresh = [...(container.children.length ? container.children : container.childNodes)]
-      .filter((kid) => kid && typeof kid === "object");
+      .filter((kid) => kid && typeof kid === "object" && String(kid.className).includes("doc-card"));
     pending = dispatchClick(fresh[0]);
     if (pending.length === 0 && (container.listeners.click || []).length) {
       pending = dispatchClick(container, { target: fresh[0] });

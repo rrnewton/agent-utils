@@ -203,6 +203,10 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   closeHelp(): void;
   closeSettings(): void;
   closeReply(): void;
+  /** Whether a document is open in the Documents view (its back level). */
+  documentOpen(): boolean;
+  /** Close the open document, back to its list. */
+  closeDocument(): void;
   threadListBack(): void;
   leaveThread(): void;
   showScreen(name: string): void;
@@ -472,6 +476,8 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
    * and a reply open in a list. Nothing on the call's view, which waits in front of them.
    */
   function channelLevels(): string[] {
+    // A document open in the Documents view is a level of its own.
+    if (deps.screens().view() === "docs") return deps.documentOpen() ? ["document"] : [];
     if (deps.screens().view() !== "discord") return [];
     const levels: string[] = [];
     if (deps.layoutColumns()) {
@@ -515,6 +521,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     else if (tag === "side") closeSideByX();
     else if (tag === "list") deps.threadListBack();
     else if (tag === "thread") deps.leaveThread();
+    else if (tag === "document") deps.closeDocument();
     else if (tag === "jump") returnFromLinkJump();
   }
 

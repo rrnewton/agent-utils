@@ -135,6 +135,7 @@ export interface ElementById {
   "docs-fetch-since": HTMLButtonElement;
   "docs-fetch-visible": HTMLButtonElement;
   "docs-list-view": HTMLDivElement;
+  "docs-mentions": HTMLDivElement;
   "docs-reader": HTMLDivElement;
   "docs-since": HTMLDivElement;
   "docs-since-days": HTMLInputElement;

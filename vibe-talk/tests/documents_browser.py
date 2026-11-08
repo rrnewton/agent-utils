@@ -51,6 +51,18 @@ def call(base: str, method: str, path: str, token: str, body: dict[str, object] 
     assert isinstance(parsed, dict)
     return parsed
 
+def tap_card(page: object, card: object) -> None:
+    """Tap a card's centre, waiting for it to be laid out first."""
+    card.wait_for(state="visible", timeout=20_000)  # type: ignore[attr-defined]
+    box = None
+    for _ in range(50):
+        box = card.bounding_box()  # type: ignore[attr-defined]
+        if box is not None:
+            break
+        page.wait_for_timeout(200)  # type: ignore[attr-defined]
+    assert box is not None
+    page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)  # type: ignore[attr-defined]
+
 
 def main() -> int:
     port = free_port()
@@ -121,9 +133,7 @@ def main() -> int:
 
                 # The paste row: a real touch fetches it from the server and opens the reader.
                 paste_card = page.locator("#documents-list .doc-card", has_text="demo-doc")
-                box = paste_card.bounding_box()
-                assert box is not None
-                page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                tap_card(page, paste_card)
                 page.wait_for_selector("#doc-body h1", timeout=20_000)
                 check("Demo deployment report" in (page.text_content("#doc-body") or ""),
                       "the reader did not render the fetched document")
@@ -131,12 +141,30 @@ def main() -> int:
                 page.tap("#doc-back")
                 page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
 
+                # The system Back gesture: list -> document -> back to the list.
+                tap_card(page, paste_card)
+                page.wait_for_selector("#doc-body h1", timeout=20_000)
+                page.go_back()
+                page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                check(page.locator("#pane-docs").is_visible(), "Back from the reader left the Documents view")
+
+                # A mention jumps to its message; Back returns to the list.
+                mention = page.locator("#documents-list .doc-card", has_text="demo-doc").locator(".doc-mentions")
+                mention.tap()
+                page.wait_for_function("() => !document.getElementById('pane-discord').hidden", timeout=20_000)
+                page.go_back()
+                # The jump's Back lands on the call view (its sent-jump spot);
+                # the list is two switch presses away, kept as it was.
+                page.wait_for_function("() => document.getElementById('view-switch-label').textContent === 'Voice'", timeout=20_000)
+                page.tap("#view-switch")
+                page.tap("#view-switch")
+                page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                check(page.locator("#pane-docs").is_visible(), "the Documents list did not come back")
+
                 # The GitHub row: its fetcher cannot connect (raw base is a closed
                 # port), and the row says why instead of doing nothing.
                 gh_card = page.locator("#documents-list .doc-card", has_text="guide.md")
-                box = gh_card.bounding_box()
-                assert box is not None
-                page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                tap_card(page, gh_card)
                 page.wait_for_function(
                     "() => [...document.querySelectorAll('#documents-list .doc-card')]"
                     ".some((c) => c.textContent.includes('Could not fetch it.'))",

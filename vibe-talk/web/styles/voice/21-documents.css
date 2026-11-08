@@ -111,6 +111,32 @@
   cursor: pointer;
 }
 
+.doc-list-head {
+  margin: 4px 2px 8px;
+  font-size: 0.85em;
+  opacity: 0.75;
+}
+.doc-mentions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 8px;
+  padding: 6px;
+  border: 1px solid;
+  border-radius: 10px;
+}
+.docs-mentions[hidden] {
+  display: none;
+}
+.doc-mention-item {
+  text-align: left;
+  cursor: pointer;
+}
+.doc-mentions-link,
+.doc-mentions {
+  font-size: 0.85em;
+}
+
 /* The Fetch drop-up and its Fetch since… panel, above the bar at its right end. */
 .docs-menu,
 .docs-since {

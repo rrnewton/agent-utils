@@ -821,6 +821,8 @@ const shellNavigation = createPageNavigation({
   closeHelp: () => closeHelp(),
   closeSettings: () => closeSettings(),
   closeReply: () => closeReply(),
+  documentOpen: () => documentsView.reading(),
+  closeDocument: () => documentsView.showList(),
   threadListBack: () => threadListBack(),
   leaveThread: () => leaveThread(),
   showScreen: (name) => showScreen(name),
@@ -1073,6 +1075,15 @@ const documentsView = createDocumentsView({
     if (window.speechSynthesis) window.speechSynthesis.cancel();
   },
   onStatus: (text) => setStatus(text),
+  onLevelChange: () => shellNavigation.scheduleBackSync(),
+  onJumpToMention: (mention) => {
+    void shellNavigation.jumpToSentMessage({
+      service: "discord",
+      channel: mention.channel_id,
+      message: mention.message_id,
+      thread: mention.thread_id,
+    });
+  },
 });
 
 /** The three-way selector over `#view-switch`; its press is `pressViewSwitch`. */

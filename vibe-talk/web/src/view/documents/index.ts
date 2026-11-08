@@ -22,6 +22,10 @@ export interface DocumentsViewDependencies {
   speak(text: string): unknown;
   stopSpeaking?(): unknown;
   onStatus?(text: string): unknown;
+  /** The open levels changed (a document opened or closed): sync the history. */
+  onLevelChange?(): unknown;
+  /** Jump to the message that mentioned a document. */
+  onJumpToMention?(mention: import("./types.ts").DocumentMention): unknown;
 }
 
 /** The Documents view, once mounted. */
@@ -41,6 +45,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
   const listening = createListening();
   let readingNow = false;
   let wired = false;
+  let liveTimer = 0;
 
   const reader = createDocumentsReader({
     api: deps.api,
@@ -56,11 +61,40 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     onOpen: (key) => {
       void openDocument(key);
     },
+    onMentions: (row) => showMentions(row),
     onStatus: deps.onStatus,
   });
 
+  /** The mentioning messages of `row`: straight to one, a choice for several. */
+  function showMentions(row: import("./types.ts").DocumentRow): void {
+    const mentions = row.mentions ?? [];
+    if (mentions.length === 1) {
+      deps.onJumpToMention?.(mentions[0]!);
+      return;
+    }
+    if (mentions.length === 0) return;
+    const panel = deps.byId("docs-mentions");
+    panel.replaceChildren();
+    for (const mention of mentions) {
+      const item = document.createElement("button");
+      item.setAttribute("type", "button");
+      item.className = "doc-mention-item";
+      const when = mention.posted_ms !== null ? new Date(mention.posted_ms).toLocaleString() : "";
+      const snippet = (mention.label ?? "").replace(/\s+/g, " ").slice(0, 80);
+      item.textContent = `${mention.author} · ${when}${snippet ? ` — ${snippet}` : ""}`;
+      item.addEventListener("click", () => {
+        panel.hidden = true;
+        deps.onJumpToMention?.(mention);
+      });
+      panel.appendChild(item);
+    }
+    panel.hidden = false;
+  }
+
   function showList(redraw = true): void {
+    const wasReading = readingNow;
     readingNow = false;
+    if (wasReading) deps.onLevelChange?.();
     reader.close();
     deps.byId("docs-reader").hidden = true;
     deps.byId("docs-list-view").hidden = false;
@@ -72,6 +106,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     deps.byId("docs-list-view").hidden = true;
     deps.byId("docs-reader").hidden = false;
     readingNow = true;
+    deps.onLevelChange?.();
     try {
       await reader.open(key);
     } catch {
@@ -155,6 +190,14 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
   return {
     async show(key?: string): Promise<void> {
       wire();
+      // While the view stays open, keep it current (a minute's re-check).
+      if (liveTimer === 0) {
+        const tick = (): void => {
+          if (!deps.byId("pane-docs").hidden) void list.refresh().catch(() => undefined);
+          liveTimer = setTimeout(tick, 60_000) as unknown as number;
+        };
+        liveTimer = setTimeout(tick, 60_000) as unknown as number;
+      }
       if (key) {
         await openDocument(key);
         return;
@@ -169,6 +212,8 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     showList,
     reading: () => readingNow,
     unmount(): void {
+      if (liveTimer !== 0) clearTimeout(liveTimer);
+      liveTimer = 0;
       wired = false;
       listening.unmount();
       list.unmount();

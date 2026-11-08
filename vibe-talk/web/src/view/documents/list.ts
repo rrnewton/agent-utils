@@ -13,6 +13,7 @@ export interface DocumentsListDependencies {
   api(path: string, options?: { method?: string; body?: unknown }): Promise<unknown>;
   byId(id: string): HTMLElement;
   onOpen(key: string): unknown;
+  onMentions?(row: DocumentRow): unknown;
   onStatus?(text: string): unknown;
 }
 
@@ -83,6 +84,30 @@ function fetchedAgo(ms: number | null, now: number): string {
   return `fetched ${Math.floor(hours / 24)}d ago`;
 }
 
+function mentionedAgo(ms: number | null, now: number): string {
+  if (ms === null) return "";
+  const seconds = Math.max(0, Math.floor((now - ms) / 1000));
+  if (seconds < 60) return "mentioned just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `mentioned ${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `mentioned ${hours}h ago`;
+  return `mentioned ${Math.floor(hours / 24)}d ago`;
+}
+
+/** The name a card shows: the real title, unless it reads as message prose. */
+function displayTitle(row: DocumentRow): string {
+  if (!row.fetched) return row.file_name;
+  const title = row.title.trim();
+  if (title === "" || title.length > 90 || title.includes("\n")) return row.file_name;
+  return title;
+}
+
+/** Newest mention first, as thread cards sort by their last update. */
+function byNewest(a: DocumentRow, b: DocumentRow): number {
+  return (b.last_mentioned_ms ?? 0) - (a.last_mentioned_ms ?? 0);
+}
+
 export function createDocumentsList(deps: DocumentsListDependencies): DocumentsList {
   const listening = createListening();
   const busy = new Set<string>();
@@ -108,7 +133,7 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     texts.className = "doc-texts";
     const title = document.createElement("span");
     title.className = "doc-title";
-    title.textContent = row.fetched ? row.title : row.file_name;
+    title.textContent = displayTitle(row);
     const subtitle = document.createElement("span");
     subtitle.className = "doc-subtitle";
     const failed = errors.get(row.key);
@@ -116,12 +141,22 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     else if (failed) subtitle.textContent = failed;
     else if (row.moved_to) subtitle.textContent = `moved to ${row.moved_to}`;
     else {
-      subtitle.textContent = `${row.file_name} · ${row.mention_count} ${row.mention_count === 1 ? "mention" : "mentions"}`;
+      subtitle.textContent = `${row.file_name} · ${mentionedAgo(row.last_mentioned_ms, Date.now())}`;
       if (row.fetched && row.fetched_ms !== null) {
         subtitle.textContent += ` · ${fetchedAgo(row.fetched_ms, Date.now())}`;
         subtitle.title = new Date(row.fetched_ms).toLocaleString();
       }
     }
+    const mentions = document.createElement("button");
+    mentions.setAttribute("type", "button");
+    mentions.className = "doc-mentions";
+    mentions.textContent = `${row.mention_count} ${row.mention_count === 1 ? "mention" : "mentions"}`;
+    listening.listen(mentions, "click", (event: Event) => {
+      event.stopPropagation();
+      deps.onMentions?.(row);
+    });
+    subtitle.appendChild(document.createTextNode(" · "));
+    subtitle.appendChild(mentions);
     const kindLink = document.createElement("a");
     kindLink.className = "doc-kind";
     kindLink.href = row.url;
@@ -154,10 +189,60 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     return card;
   }
 
+  const outer = createListening();
+  let wiredOuter = false;
+  let loadingOlder = false;
+  let totalNow = 0;
+
+  function wireOuter(list: HTMLElement): void {
+    if (wiredOuter) return;
+    wiredOuter = true;
+    const scroller = deps.byId("scroll-area");
+    outer.listen(scroller, "scroll", () => {
+      const near = scroller.scrollTop + scroller.clientHeight > scroller.scrollHeight - 500;
+      if (near && !loadingOlder && rowsNow.length < totalNow) void loadOlder();
+    });
+    // Pull down at the top to refresh (the channel list's gesture, in kind).
+    let pullY: number | null = null;
+    outer.listen(list, "touchstart", (event: TouchEvent) => {
+      pullY = scroller.scrollTop <= 0 ? (event.touches[0]?.clientY ?? null) : null;
+    });
+    outer.listen(list, "touchend", (event: TouchEvent) => {
+      const start = pullY;
+      pullY = null;
+      const end = event.changedTouches[0]?.clientY;
+      if (start !== null && end !== undefined && end - start > 80 && scroller.scrollTop <= 0) {
+        void refresh()
+          .then(() => deps.onStatus?.("The list is current."))
+          .catch(() => undefined);
+      }
+    });
+  }
+
+  async function loadOlder(): Promise<void> {
+    const oldest = rowsNow.reduce<number | null>(
+      (min, row) => (row.last_mentioned_ms !== null && (min === null || row.last_mentioned_ms < min) ? row.last_mentioned_ms : min),
+      null,
+    );
+    if (oldest === null) return;
+    loadingOlder = true;
+    try {
+      const answer = (await deps.api(`/api/v1/documents?limit=100&before_ms=${oldest}`)) as DocumentsListAnswer;
+      const older = Array.isArray(answer?.documents) ? answer.documents : [];
+      const seen = new Set(rowsNow.map((row) => row.key));
+      render([...rowsNow, ...older.filter((row) => !seen.has(row.key))]);
+    } catch {
+      // Scrolling on is its own retry.
+    } finally {
+      loadingOlder = false;
+    }
+  }
+
   function render(rows: readonly DocumentRow[]): void {
-    rowsNow = rows;
+    rowsNow = [...rows].sort(byNewest);
     listening.unmount();
     const list = deps.byId(LIST_ID);
+    wireOuter(list);
     if (rows.length === 0) {
       const note = document.createElement("p");
       note.className = "doc-empty";
@@ -165,8 +250,11 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       list.replaceChildren(note);
       return;
     }
-    const cards = rows.map(cardFor);
-    list.replaceChildren(...cards);
+    const head = document.createElement("p");
+    head.className = "doc-list-head";
+    head.textContent = `Newest first · ${totalNow || rowsNow.length} documents`;
+    const cards = rowsNow.map(cardFor);
+    list.replaceChildren(head, ...cards);
     // Arrow keys walk the cards; Enter opens (above).
     listening.listen(list, "keydown", (event: KeyboardEvent) => {
       if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
@@ -222,6 +310,7 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
 
   async function refresh(): Promise<void> {
     const answer = (await deps.api(LIST_PATH)) as DocumentsListAnswer;
+    totalNow = typeof answer?.total === "number" ? answer.total : 0;
     render(Array.isArray(answer?.documents) ? answer.documents : []);
   }
 
@@ -290,6 +379,8 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       return cleared;
     },
     unmount(): void {
+      wiredOuter = false;
+      outer.unmount();
       listening.unmount();
     },
   };
