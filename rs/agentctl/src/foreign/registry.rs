@@ -18,8 +18,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use super::ownership::{
-    parse_harness_record, valid_boot_id, ForeignOwnershipError, HarnessRecord, ProcessIdentity,
-    RUNNER_SCHEMA,
+    kill_harness_tree_at, parse_harness_record, read_stat_at, valid_boot_id, ForeignOwnershipError,
+    HarnessRecord, ProcessIdentity, RUNNER_SCHEMA,
 };
 
 /// The foreign runtime base: `$HERDR_SUBAGENTS_HOME`, else
@@ -258,6 +258,79 @@ pub fn remove_active_harness_at(
         })?;
     }
     Ok(())
+}
+
+/// Kill this worker's recorded harness tree through exact handles only.
+/// Returns true when a process was signalled. A tree still present after
+/// the bounded wait keeps its record and errors with
+/// `harness_cleanup_incomplete`; a legacy record is resolved without
+/// signalling anything it cannot prove.
+pub fn terminate_active_harness(record: &AgentRecord) -> Result<bool, ForeignOwnershipError> {
+    terminate_active_harness_at(&foreign_base(), Path::new("/proc"), record)
+}
+
+/// [`terminate_active_harness`] against explicit foreign-base and procfs roots.
+pub fn terminate_active_harness_at(
+    base: &Path,
+    proc_root: &Path,
+    record: &AgentRecord,
+) -> Result<bool, ForeignOwnershipError> {
+    let Some(harness) = read_active_harness_at(base, &record.name)? else {
+        return Ok(false);
+    };
+    if !owned_by_record(record, &harness) {
+        return Ok(false);
+    }
+    if harness.legacy() {
+        return resolve_legacy_harness_at(base, proc_root, &record.name, &harness);
+    }
+    let report = kill_harness_tree_at(proc_root, &harness, None, false, false, None)?;
+    if !report.complete() {
+        let path = active_harness_path_at(base, &record.name)?;
+        return Err(registry_error(
+            "harness_cleanup_incomplete",
+            format!(
+                "harness pid {} of {}: {}; its ownership record {} is kept for a later attempt",
+                harness.leader.pid,
+                python_repr(&record.name),
+                report.describe(),
+                path.display()
+            ),
+        ));
+    }
+    remove_active_harness_at(base, &record.name, &harness)?;
+    Ok(report.killed > 0)
+}
+
+fn resolve_legacy_harness_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    harness: &HarnessRecord,
+) -> Result<bool, ForeignOwnershipError> {
+    let path = active_harness_path_at(base, name)?;
+    let leader = read_stat_at(proc_root, harness.leader.pid)?;
+    let stale = match leader {
+        None => true,
+        Some(leader) => {
+            harness.leader.started_at.as_deref() != Some(leader.starttime.to_string().as_str())
+                || ["Z", "X", "x"].contains(&leader.state.as_str())
+        }
+    };
+    if stale {
+        remove_missing_ok(&path)?;
+        return Ok(false);
+    }
+    Err(registry_error(
+        "harness_identity_legacy",
+        format!(
+            "harness pid {} of {} was recorded by an older runner without a boot identity or generation, so it is not signalled; stop its runner, whose own watchdog owns that group, or inspect pid {} and stop it by hand, then remove {}",
+            harness.leader.pid,
+            python_repr(name),
+            harness.leader.pid,
+            path.display()
+        ),
+    ))
 }
 
 /// The headless turn-runner mode.
@@ -1577,6 +1650,107 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(read_registry_at(&base).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminate_active_harness_kills_and_removes_the_record() {
+        use super::super::ownership::{current_boot_id, read_stat, Containment};
+        use std::os::unix::process::ExitStatusExt as _;
+        if !super::super::ownership::pidfds_supported() {
+            return;
+        }
+        let base = fake_base("terminate");
+        let mut leader = std::process::Command::new("setsid")
+            .args(["sleep", "10"])
+            .spawn()
+            .expect("spawn session leader");
+        let leader_pid = i64::from(leader.id());
+        // `setsid` may not have created the new session yet; the recorded
+        // session must be the leader's own, read only once it leads it.
+        let mut leader_stat = read_stat(leader_pid).unwrap().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while leader_stat.session != leader_pid && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            leader_stat = read_stat(leader_pid).unwrap().unwrap();
+        }
+        assert_eq!(leader_stat.session, leader_pid);
+        // The recorded runner must be its own process: using this test
+        // process would make every parallel test's children look like
+        // child-of-the-runner members to the census.
+        let mut runner_proc = std::process::Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .expect("spawn runner stand-in");
+        let runner_pid = i64::from(runner_proc.id());
+        let own_stat = read_stat(runner_pid).unwrap().unwrap();
+        let boot = current_boot_id().unwrap();
+        let harness = HarnessRecord {
+            runner: ProcessIdentity::new(
+                runner_pid,
+                Some(own_stat.starttime.to_string()),
+                Some(boot.clone()),
+            ),
+            leader: ProcessIdentity::new(
+                leader_pid,
+                Some(leader_stat.starttime.to_string()),
+                Some(boot),
+            ),
+            process_group: Some(leader_stat.session),
+            generation: Some(GEN.to_owned()),
+            containment: Containment::Process,
+            cgroup: None,
+        };
+        record_active_harness_at(&base, "worker-1", &harness, "2026-11-07T00:00:00Z").unwrap();
+        let mut record = sample_record("worker-1");
+        record.runner_pid = Some(runner_pid);
+        record.runner_started_at = Some(own_stat.starttime.to_string());
+        assert!(terminate_active_harness_at(&base, Path::new("/proc"), &record).unwrap());
+        assert!(!active_harness_path_at(&base, "worker-1").unwrap().exists());
+        assert_eq!(leader.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(
+            runner_proc.try_wait().unwrap().is_none(),
+            "runner is never a member"
+        );
+        runner_proc.kill().unwrap();
+        runner_proc.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminate_active_harness_never_signals_a_legacy_record() {
+        use super::super::ownership::read_stat;
+        let base = fake_base("terminate-legacy");
+        let mut child = std::process::Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .expect("spawn legacy leader");
+        let pid = i64::from(child.id());
+        let stat = read_stat(pid).unwrap().unwrap();
+        let path = active_harness_path_at(&base, "worker-1").unwrap();
+        std::fs::write(
+            &path,
+            json!({"pid": pid, "started_at": stat.starttime.to_string(), "runner_pid": 100})
+                .to_string(),
+        )
+        .unwrap();
+        let mut record = sample_record("worker-1");
+        record.runner_pid = Some(100);
+        record.runner_started_at = None;
+        let err = terminate_active_harness_at(&base, Path::new("/proc"), &record).unwrap_err();
+        assert_eq!(err.code, "harness_identity_legacy");
+        assert!(path.exists());
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child must be untouched"
+        );
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!terminate_active_harness_at(&base, Path::new("/proc"), &record).unwrap());
+        assert!(!path.exists(), "stale legacy record is removed");
         let _ = std::fs::remove_dir_all(&base);
     }
 

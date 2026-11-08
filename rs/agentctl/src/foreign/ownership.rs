@@ -6,14 +6,18 @@
 //! This module covers record types and read/validate: [`ProcessIdentity`],
 //! [`HarnessRecord`], [`parse_harness_record`], and [`HarnessRecord::document`],
 //! plus the kernel evidence those records are checked against:
-//! [`current_boot_id`], [`read_stat`], and [`scan_processes`], and pidfd
-//! pinning ([`pin`], [`PinnedProcess`], [`stop_process`]). Harness-tree
-//! cleanup and cgroup containment live elsewhere.
+//! [`current_boot_id`], [`read_stat`], and [`scan_processes`], pidfd
+//! pinning ([`pin`], [`PinnedProcess`], [`stop_process`]), and harness-tree
+//! cleanup ([`kill_harness_tree`], cgroup v2 helpers, [`tree_alive`]).
+//! Spawning an owned harness lives elsewhere.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::io::Read as _;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::procstat::{parse_process_stat, ProcessStat};
@@ -26,6 +30,10 @@ pub const HARNESS_SCHEMA: &str = "agentctl-headless-harness/v1";
 pub const RUNNER_SCHEMA: &str = "agentctl-headless-runner/v1";
 /// Directory-name prefix for per-turn cgroup v2 containment.
 pub const CGROUP_PREFIX: &str = "agentctl-harness-";
+/// Env var selecting per-turn cgroup containment (`off`, `auto`, `require`).
+pub const CGROUP_MODE_ENV: &str = "AGENTCTL_HEADLESS_CGROUP";
+
+const MAX_ENVIRON_BYTES: u64 = 16 * 1024 * 1024;
 
 const MAX_PROCESS_ID: i64 = (1 << 31) - 1;
 
@@ -293,6 +301,34 @@ pub fn scan_processes_at(proc_root: &Path) -> Result<Vec<ProcessStat>, ForeignOw
     Ok(found)
 }
 
+fn same_user_at(proc_root: &Path, pid: i64) -> bool {
+    std::fs::metadata(proc_root.join(pid.to_string()))
+        .map(|metadata| metadata.uid() == unsafe { libc::getuid() })
+        .unwrap_or(false)
+}
+
+/// True when the process's initial environment carries this turn's generation.
+pub fn carries_generation(pid: i64, generation: &str) -> bool {
+    carries_generation_at(Path::new(PROC), pid, generation)
+}
+
+/// [`carries_generation`] against an explicit procfs root (for tests).
+pub fn carries_generation_at(proc_root: &Path, pid: i64, generation: &str) -> bool {
+    let needle = format!("{GENERATION_ENV}={generation}").into_bytes();
+    let Ok(stream) = std::fs::File::open(proc_root.join(pid.to_string()).join("environ")) else {
+        return false;
+    };
+    let mut data = Vec::new();
+    if stream
+        .take(MAX_ENVIRON_BYTES)
+        .read_to_end(&mut data)
+        .is_err()
+    {
+        return false;
+    }
+    data.split(|byte| *byte == 0).any(|entry| entry == needle)
+}
+
 /// Process states that are positive death certificates (`_DEAD_STATES`).
 const DEAD_STATES: [&str; 3] = ["Z", "X", "x"];
 
@@ -439,6 +475,158 @@ impl PinnedProcess {
 
     /// Release the pidfd.
     pub fn close(self) {}
+}
+
+/// An unreaped direct child of this process, for hosts without pidfds.
+///
+/// Only this process can reap its child, so while `reaped` reports false the
+/// number still names the same process and a numeric signal is exact.
+pub struct ChildHandle {
+    pid: i64,
+    starttime: u64,
+    reaped: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl fmt::Debug for ChildHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChildHandle")
+            .field("pid", &self.pid)
+            .field("starttime", &self.starttime)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ChildHandle {
+    /// Hold one unreaped child; `reaped` reports when its owner reaped it.
+    pub fn new(
+        pid: i64,
+        starttime: u64,
+        reaped: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            pid,
+            starttime,
+            reaped: Box::new(reaped),
+        }
+    }
+
+    /// The held child's process number.
+    pub fn pid(&self) -> i64 {
+        self.pid
+    }
+
+    /// The kernel start ticks proved when the child was held.
+    pub fn starttime(&self) -> u64 {
+        self.starttime
+    }
+
+    /// True once the child has exited; never reaps it.
+    pub fn exited(&self) -> bool {
+        if (self.reaped)() {
+            return true;
+        }
+        // SAFETY: waitid writes only into the zeroed siginfo owned by this frame.
+        let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let status = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                libc::id_t::try_from(self.pid).unwrap_or(0),
+                &mut information,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if status != 0 {
+            // ECHILD: not our child (or already reaped elsewhere) means gone
+            // for the parent-pinned contract, as Python's ChildProcessError.
+            return std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+        }
+        // SAFETY: si_pid is valid for the SIGCHLD information waitid reports.
+        (unsafe { information.si_pid() }) != 0
+    }
+
+    /// Poll for exit up to `timeout` (`None`: without bound) without reaping.
+    pub fn wait(&self, timeout: Option<Duration>) -> bool {
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        while !self.exited() {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
+    /// Signal the child while it is provably unreaped.
+    pub fn send(&self, signum: i32) -> bool {
+        if self.exited() {
+            return false;
+        }
+        // Parent-pinned: an unreaped child keeps its number.
+        // SAFETY: kill takes only the checked child pid and signal number.
+        (unsafe { libc::kill(self.pid as libc::pid_t, signum) }) >= 0
+    }
+
+    /// Nothing to release; present for symmetry with [`PinnedProcess`].
+    pub fn close(self) {}
+}
+
+/// A held process generation: pidfd-pinned, or a runner's own unreaped child.
+#[derive(Debug)]
+pub enum ProcessHandle {
+    /// Held by a pidfd.
+    Pinned(PinnedProcess),
+    /// Held as this process's unreaped child.
+    Child(ChildHandle),
+}
+
+impl ProcessHandle {
+    /// The held process number.
+    pub fn pid(&self) -> i64 {
+        match self {
+            Self::Pinned(process) => process.pid(),
+            Self::Child(child) => child.pid(),
+        }
+    }
+
+    /// The kernel start ticks proved when the process was held.
+    pub fn starttime(&self) -> u64 {
+        match self {
+            Self::Pinned(process) => process.starttime(),
+            Self::Child(child) => child.starttime(),
+        }
+    }
+
+    /// True once the held process has exited.
+    pub fn exited(&self) -> bool {
+        match self {
+            Self::Pinned(process) => process.exited(),
+            Self::Child(child) => child.exited(),
+        }
+    }
+
+    /// Wait up to `timeout` (`None`: without bound) for exit.
+    pub fn wait(&self, timeout: Option<Duration>) -> bool {
+        match self {
+            Self::Pinned(process) => process.wait(timeout),
+            Self::Child(child) => child.wait(timeout),
+        }
+    }
+
+    /// Signal exactly the held process; false on exit or refusal.
+    pub fn send(&self, signum: i32) -> bool {
+        match self {
+            Self::Pinned(process) => process.send(signum),
+            Self::Child(child) => child.send(signum),
+        }
+    }
+
+    /// Release the handle.
+    pub fn close(self) {
+        match self {
+            Self::Pinned(process) => process.close(),
+            Self::Child(child) => child.close(),
+        }
+    }
 }
 
 /// Whether [`pin`] proved the recorded process alive, gone, or neither.
@@ -609,7 +797,7 @@ fn default_kill_wait() -> Duration {
     std::env::var("SUBAGENTS_HARNESS_KILL_WAIT")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
-        .map(|seconds| Duration::from_secs_f64(seconds.max(0.0)))
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds.max(0.0)).ok())
         .unwrap_or(Duration::from_secs(10))
 }
 
@@ -820,6 +1008,1107 @@ pub fn parse_harness_record(
         containment,
         cgroup,
     })
+}
+
+/// The configured per-turn cgroup mode: `off` (default), `auto`, or `require`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CgroupMode {
+    /// No per-turn cgroup containment.
+    Off,
+    /// Use a cgroup when one can be created, else process containment.
+    Auto,
+    /// Refuse to spawn without per-turn cgroup containment.
+    Require,
+}
+
+impl CgroupMode {
+    /// The env spelling of this mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::Require => "require",
+        }
+    }
+}
+
+/// Read [`CgroupMode`] from `$AGENTCTL_HEADLESS_CGROUP`.
+pub fn cgroup_mode() -> Result<CgroupMode, ForeignOwnershipError> {
+    cgroup_mode_from(std::env::var(CGROUP_MODE_ENV).ok().as_deref())
+}
+
+fn cgroup_mode_from(value: Option<&str>) -> Result<CgroupMode, ForeignOwnershipError> {
+    match value.unwrap_or("off") {
+        "off" => Ok(CgroupMode::Off),
+        "auto" => Ok(CgroupMode::Auto),
+        "require" => Ok(CgroupMode::Require),
+        other => Err(ForeignOwnershipError::new(
+            "invalid_cgroup_mode",
+            format!("{CGROUP_MODE_ENV} must be off, auto or require, not '{other}'"),
+        )),
+    }
+}
+
+fn cgroup2_mount_at(proc_root: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(proc_root.join("self/mountinfo")).ok()?;
+    for line in text.lines() {
+        let Some((left, right)) = line.split_once(" - ") else {
+            continue;
+        };
+        let fields: Vec<&str> = left.split_whitespace().collect();
+        if fields.len() >= 5 && right.split_whitespace().next() == Some("cgroup2") {
+            return Some(PathBuf::from(fields[4]));
+        }
+    }
+    None
+}
+
+fn cgroup_of_at(proc_root: &Path, pid: &str) -> Option<String> {
+    let text = std::fs::read_to_string(proc_root.join(pid).join("cgroup")).ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
+}
+
+/// This process's cgroup v2 directory, when the unified hierarchy is mounted.
+pub fn own_cgroup_directory() -> Option<PathBuf> {
+    own_cgroup_directory_at(Path::new(PROC))
+}
+
+/// [`own_cgroup_directory`] against an explicit procfs root (for tests).
+pub fn own_cgroup_directory_at(proc_root: &Path) -> Option<PathBuf> {
+    let mount = cgroup2_mount_at(proc_root)?;
+    let relative = cgroup_of_at(proc_root, "self")?;
+    let relative = relative.strip_prefix('/')?;
+    Some(mount.join(relative))
+}
+
+fn cgroup_relative_at(proc_root: &Path, path: &Path) -> Option<String> {
+    let mount = cgroup2_mount_at(proc_root)?;
+    path.strip_prefix(&mount)
+        .ok()
+        .map(|relative| format!("/{}", relative.display()))
+}
+
+fn cgroup_events(path: &Path) -> std::io::Result<Vec<(String, String)>> {
+    let text = std::fs::read_to_string(path.join("cgroup.events"))?;
+    Ok(text
+        .lines()
+        .map(|line| {
+            let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+            (key.to_owned(), value.trim().to_owned())
+        })
+        .collect())
+}
+
+fn cgroup_populated(path: &Path) -> std::io::Result<Option<bool>> {
+    Ok(cgroup_events(path)?
+        .into_iter()
+        .find(|(key, _)| key == "populated")
+        .map(|(_, value)| value == "1"))
+}
+
+fn cgroup_members(path: &Path) -> std::io::Result<Vec<i64>> {
+    let text = match std::fs::read_to_string(path.join("cgroup.procs")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    Ok(text
+        .split_whitespace()
+        .filter(|item| item.bytes().all(|byte| byte.is_ascii_digit()))
+        .filter_map(|item| item.parse::<i64>().ok())
+        .collect())
+}
+
+fn remove_cgroup(path: &Path) {
+    for _attempt in 0..50 {
+        match std::fs::remove_dir(path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+fn cgroup_error(context: &str, path: &Path, error: &std::io::Error) -> ForeignOwnershipError {
+    ForeignOwnershipError::new(
+        "harness_cgroup_unavailable",
+        format!("cannot {context} {}: {error}", path.display()),
+    )
+}
+
+/// Kill every process in one owned cgroup and wait for it to empty.
+/// Returns how many members it named and who remains.
+fn kill_cgroup_at(
+    proc_root: &Path,
+    path: &Path,
+    deadline: Instant,
+) -> Result<(usize, Vec<String>), ForeignOwnershipError> {
+    if !path.is_dir() {
+        return Ok((0, Vec::new()));
+    }
+    let members = cgroup_members(path).map_err(|error| cgroup_error("read", path, &error))?;
+    let populated = match cgroup_populated(path) {
+        Ok(populated) => populated.unwrap_or(false),
+        Err(_) => !members.is_empty(),
+    };
+    if populated {
+        let kill_file = path.join("cgroup.kill");
+        if kill_file.exists() {
+            std::fs::write(&kill_file, "1\n")
+                .map_err(|error| cgroup_error("write", &kill_file, &error))?;
+        } else {
+            // Kernels before 5.14 lack cgroup.kill. Membership in this
+            // generation's directory is the ownership proof; pin each member
+            // and re-check that proof after the pidfd is open.
+            let expected = cgroup_relative_at(proc_root, path);
+            for pid in &members {
+                let Some(stat) = quiet_stat_at(proc_root, *pid) else {
+                    continue;
+                };
+                if !pidfds_supported() {
+                    continue;
+                }
+                let Ok(Some(descriptor)) = open_pidfd(*pid) else {
+                    continue;
+                };
+                let process = PinnedProcess {
+                    pid: *pid,
+                    starttime: stat.starttime,
+                    descriptor,
+                };
+                let after = quiet_stat_at(proc_root, *pid);
+                if after.is_some_and(|after| after.starttime == stat.starttime)
+                    && expected.is_some()
+                    && cgroup_of_at(proc_root, &pid.to_string()) == expected
+                    && !process.exited()
+                {
+                    process.send(libc::SIGKILL);
+                }
+            }
+        }
+        while Instant::now() < deadline {
+            match cgroup_populated(path) {
+                Ok(Some(false)) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(cgroup_error("read", path, &error)),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let still = matches!(cgroup_populated(path), Ok(Some(true)));
+    let mut remaining = Vec::new();
+    if still {
+        let members = cgroup_members(path).map_err(|error| cgroup_error("read", path, &error))?;
+        for pid in members {
+            let stat = quiet_stat_at(proc_root, pid);
+            remaining.push(format!(
+                "pid {pid}{} in {}",
+                stat.map_or(String::new(), |stat| format!(" (state {})", stat.state)),
+                path.display()
+            ));
+        }
+    } else {
+        remove_cgroup(path);
+    }
+    Ok((members.len(), remaining))
+}
+
+/// What one harness-tree cleanup signalled, left behind, and could not prove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupReport {
+    /// How the tree was contained.
+    pub containment: Containment,
+    /// How many processes were signalled (SIGKILL counted once per member).
+    pub killed: usize,
+    /// Proven members still present after the bounded wait.
+    pub remaining: Vec<String>,
+    /// Candidates never signalled because ownership was unproven.
+    pub unproven: Vec<String>,
+    /// Whether the census reached a fixed point before its deadline.
+    pub converged: bool,
+}
+
+impl CleanupReport {
+    fn new(containment: Containment) -> Self {
+        Self {
+            containment,
+            killed: 0,
+            remaining: Vec::new(),
+            unproven: Vec::new(),
+            converged: true,
+        }
+    }
+
+    /// True when every proven member of the tree is gone.
+    pub fn complete(&self) -> bool {
+        self.remaining.is_empty()
+    }
+
+    /// One human-readable line for errors and transcripts.
+    pub fn describe(&self) -> String {
+        let mut parts = vec![format!("{} process(es) signalled", self.killed)];
+        if !self.remaining.is_empty() {
+            parts.push(format!(
+                "still present after SIGKILL: {}",
+                self.remaining.join(", ")
+            ));
+        }
+        if !self.converged {
+            parts.push("the census did not converge before the deadline".to_owned());
+        }
+        if !self.unproven.is_empty() {
+            parts.push(format!(
+                "not signalled because ownership is unproven: {}",
+                self.unproven.join(", ")
+            ));
+        }
+        parts.join("; ")
+    }
+}
+
+static SUBREAPER: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process has adopted its descendants' orphans
+/// ([`set_child_subreaper`]).
+pub fn is_child_subreaper() -> bool {
+    SUBREAPER.load(Ordering::SeqCst)
+}
+
+/// Make this process adopt its descendants' orphans; false when unsupported.
+///
+/// Only a runner calls this. Its children are then exactly the current
+/// harness leader and orphans adopted from that tree, which is what lets
+/// "child of the runner" prove membership. A process that is not a
+/// subreaper (a test, a CLI) never treats its own children as tree members.
+#[cfg(target_os = "linux")]
+pub fn set_child_subreaper() -> bool {
+    // SAFETY: prctl takes only scalar arguments.
+    let result = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+    SUBREAPER.store(result == 0, Ordering::SeqCst);
+    result == 0
+}
+
+/// Make this process adopt its descendants' orphans; Linux-only.
+#[cfg(not(target_os = "linux"))]
+pub fn set_child_subreaper() -> bool {
+    SUBREAPER.store(false, Ordering::SeqCst);
+    false
+}
+
+fn children_of_self_at(proc_root: &Path) -> Vec<i64> {
+    let me = i64::from(std::process::id());
+    let tasks = proc_root.join("self/task");
+    let listed = std::fs::read_dir(&tasks).and_then(|entries| {
+        let mut children = Vec::new();
+        for entry in entries.flatten() {
+            let text = std::fs::read_to_string(entry.path().join("children"))?;
+            children.extend(
+                text.split_whitespace()
+                    .filter(|item| item.bytes().all(|byte| byte.is_ascii_digit()))
+                    .filter_map(|item| item.parse::<i64>().ok()),
+            );
+        }
+        Ok(children)
+    });
+    let mut children = match listed {
+        Ok(children) => children,
+        Err(_) => scan_processes_at(proc_root)
+            .map(|stats| {
+                stats
+                    .into_iter()
+                    .filter(|stat| stat.ppid == me)
+                    .map(|stat| stat.pid)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    children.sort_unstable();
+    children.dedup();
+    children
+}
+
+/// Reap exited orphans this child subreaper adopted; never touches `exclude`.
+/// A process that is not a subreaper adopts nothing and reaps nothing.
+pub fn reap_adopted_children(exclude: &[i64]) -> usize {
+    reap_adopted_children_at(Path::new(PROC), exclude)
+}
+
+fn reap_adopted_children_at(proc_root: &Path, exclude: &[i64]) -> usize {
+    if !is_child_subreaper() {
+        return 0;
+    }
+    let mut reaped = 0;
+    for pid in children_of_self_at(proc_root) {
+        if exclude.contains(&pid) {
+            continue;
+        }
+        let Some(stat) = quiet_stat_at(proc_root, pid) else {
+            continue;
+        };
+        if !DEAD_STATES.contains(&stat.state.as_str()) {
+            continue;
+        }
+        // SAFETY: waitid writes only into the zeroed siginfo owned here.
+        let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let status = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                libc::id_t::try_from(pid).unwrap_or(0),
+                &mut information,
+                libc::WEXITED | libc::WNOHANG,
+            )
+        };
+        if status == 0 && unsafe { information.si_pid() } != 0 {
+            reaped += 1;
+        }
+    }
+    reaped
+}
+
+fn describe_handle_at(proc_root: &Path, pid: i64) -> String {
+    let stat = quiet_stat_at(proc_root, pid);
+    format!(
+        "pid {pid}{}",
+        stat.map_or(String::new(), |stat| format!(" (state {})", stat.state))
+    )
+}
+
+fn children_supported_at(proc_root: &Path) -> bool {
+    let tasks = proc_root.join("self/task");
+    let Ok(entries) = std::fs::read_dir(&tasks) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| entry.path().join("children").exists())
+}
+
+fn children_of_at(proc_root: &Path, pid: i64) -> Option<Vec<i64>> {
+    let tasks = proc_root.join(pid.to_string()).join("task");
+    let mut children = Vec::new();
+    let listed = std::fs::read_dir(&tasks).and_then(|entries| {
+        for entry in entries.flatten() {
+            let text = std::fs::read_to_string(entry.path().join("children"))?;
+            children.extend(
+                text.split_whitespace()
+                    .filter(|item| item.bytes().all(|byte| byte.is_ascii_digit()))
+                    .filter_map(|item| item.parse::<i64>().ok()),
+            );
+        }
+        Ok(())
+    });
+    match listed {
+        Ok(()) => Some(children),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if !proc_root.join("self/task").is_dir() || children_supported_at(proc_root) {
+                Some(Vec::new())
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+fn minimum_start(record: &HarnessRecord) -> u128 {
+    match record.leader.started_at.as_deref() {
+        Some(started_at) if valid_ticks(started_at) => started_at.parse::<u128>().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn tree_has_candidates_at(
+    proc_root: &Path,
+    record: &HarnessRecord,
+) -> Result<bool, ForeignOwnershipError> {
+    let leader = quiet_stat_at(proc_root, record.leader.pid);
+    if leader.is_some_and(|leader| {
+        record.leader.started_at.as_deref() == Some(leader.starttime.to_string().as_str())
+            && !DEAD_STATES.contains(&leader.state.as_str())
+    }) {
+        return Ok(true);
+    }
+    let Some(generation) = record.generation.as_deref() else {
+        return Ok(false);
+    };
+    let minimum = minimum_start(record);
+    let me = i64::from(std::process::id());
+    for stat in scan_processes_at(proc_root)? {
+        if stat.pid != me
+            && u128::from(stat.starttime) >= minimum
+            && !DEAD_STATES.contains(&stat.state.as_str())
+            && same_user_at(proc_root, stat.pid)
+            && carries_generation_at(proc_root, stat.pid, generation)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Read-only proof for one recorded process: `None` when provably gone.
+/// Returns a description when it may still run, and errors when the
+/// evidence cannot be read or trusted.
+pub fn recorded_process_alive(
+    label: &str,
+    identity: &ProcessIdentity,
+) -> Result<Option<String>, ForeignOwnershipError> {
+    recorded_process_alive_at(Path::new(PROC), label, identity)
+}
+
+/// [`recorded_process_alive`] against an explicit procfs root.
+pub fn recorded_process_alive_at(
+    proc_root: &Path,
+    label: &str,
+    identity: &ProcessIdentity,
+) -> Result<Option<String>, ForeignOwnershipError> {
+    let unknown = |message: String| ForeignOwnershipError::new("runner_identity_unknown", message);
+    if let Some(boot_id) = &identity.boot_id {
+        if !valid_boot_id(boot_id) {
+            return Err(unknown(format!("{label} has a malformed boot identity")));
+        }
+        if *boot_id != current_boot_id_at(proc_root)? {
+            return Ok(None);
+        }
+    }
+    let Some(current) = read_stat_at(proc_root, identity.pid)? else {
+        return Ok(None);
+    };
+    if DEAD_STATES.contains(&current.state.as_str()) {
+        return Ok(None);
+    }
+    let Some(started_at) = &identity.started_at else {
+        return Err(unknown(format!(
+            "{label} (pid {}) exists and has no recorded start time, so it may still be that process",
+            identity.pid
+        )));
+    };
+    if !valid_ticks(started_at) {
+        return Err(unknown(format!(
+            "{label} has an unreadable start time '{started_at}'"
+        )));
+    }
+    if *started_at != current.starttime.to_string() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "{label} (pid {}, start tick {}, state {}) is still running",
+        identity.pid, current.starttime, current.state
+    )))
+}
+
+/// Read-only: describe a live member of a recorded harness tree, or `None`.
+/// Only the per-turn cgroup and the generation prove membership without a
+/// live leader.
+pub fn tree_alive(record: &HarnessRecord) -> Result<Option<String>, ForeignOwnershipError> {
+    tree_alive_at(Path::new(PROC), record)
+}
+
+/// [`tree_alive`] against an explicit procfs root.
+pub fn tree_alive_at(
+    proc_root: &Path,
+    record: &HarnessRecord,
+) -> Result<Option<String>, ForeignOwnershipError> {
+    if record.legacy() || record.leader.boot_id.as_deref() != Some(&current_boot_id_at(proc_root)?)
+    {
+        return Ok(None);
+    }
+    if let Some(cgroup) = &record.cgroup {
+        if cgroup.is_dir() {
+            let populated = cgroup_populated(cgroup).map_err(|error| {
+                ForeignOwnershipError::new(
+                    "harness_identity_unknown",
+                    format!("cannot read {}/cgroup.events: {error}", cgroup.display()),
+                )
+            })?;
+            match populated {
+                Some(true) => {
+                    return Ok(Some(format!(
+                        "its harness cgroup {} still has processes",
+                        cgroup.display()
+                    )));
+                }
+                Some(false) => {}
+                None => {
+                    return Err(ForeignOwnershipError::new(
+                        "harness_identity_unknown",
+                        format!("{}/cgroup.events is malformed", cgroup.display()),
+                    ));
+                }
+            }
+        }
+    }
+    let Some(generation) = record.generation.as_deref() else {
+        return Ok(None);
+    };
+    let minimum = minimum_start(record);
+    for stat in scan_processes_at(proc_root)? {
+        if !DEAD_STATES.contains(&stat.state.as_str())
+            && u128::from(stat.starttime) >= minimum
+            && carries_generation_at(proc_root, stat.pid, generation)
+        {
+            return Ok(Some(format!(
+                "pid {} of its harness tree (generation {generation}) is still running",
+                stat.pid
+            )));
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Proof {
+    Session,
+    Child,
+    Generation,
+}
+
+fn pin_member_at(
+    proc_root: &Path,
+    stat: &ProcessStat,
+    reason: Proof,
+    record: &HarnessRecord,
+) -> Option<PinnedProcess> {
+    let descriptor = open_pidfd(stat.pid).ok()??;
+    let process = PinnedProcess {
+        pid: stat.pid,
+        starttime: stat.starttime,
+        descriptor,
+    };
+    let after = quiet_stat_at(proc_root, stat.pid)?;
+    let proven = after.starttime == stat.starttime
+        && !DEAD_STATES.contains(&after.state.as_str())
+        && match reason {
+            Proof::Session => Some(after.session) == record.process_group,
+            Proof::Child => after.ppid == stat.ppid,
+            Proof::Generation => record
+                .generation
+                .as_deref()
+                .is_some_and(|generation| carries_generation_at(proc_root, stat.pid, generation)),
+        }
+        && !process.exited();
+    proven.then_some(process)
+}
+
+type Members = Vec<((i64, u64), PinnedProcess)>;
+
+enum LeaderHandle<'a> {
+    Borrowed(&'a ProcessHandle),
+    Owned(PinnedProcess),
+}
+
+impl LeaderHandle<'_> {
+    fn pid(&self) -> i64 {
+        match self {
+            Self::Borrowed(handle) => handle.pid(),
+            Self::Owned(process) => process.pid(),
+        }
+    }
+
+    fn starttime(&self) -> u64 {
+        match self {
+            Self::Borrowed(handle) => handle.starttime(),
+            Self::Owned(process) => process.starttime(),
+        }
+    }
+
+    fn exited(&self) -> bool {
+        match self {
+            Self::Borrowed(handle) => handle.exited(),
+            Self::Owned(process) => process.exited(),
+        }
+    }
+
+    fn wait(&self, timeout: Option<Duration>) -> bool {
+        match self {
+            Self::Borrowed(handle) => handle.wait(timeout),
+            Self::Owned(process) => process.wait(timeout),
+        }
+    }
+
+    fn send(&self, signum: i32) -> bool {
+        match self {
+            Self::Borrowed(handle) => handle.send(signum),
+            Self::Owned(process) => process.send(signum),
+        }
+    }
+}
+
+struct Census<'a> {
+    proc_root: &'a Path,
+    record: &'a HarnessRecord,
+    leader: Option<&'a LeaderHandle<'a>>,
+    leader_unreaped: bool,
+    runner_pid: i64,
+    runner_is_self: bool,
+    runner_handle: Option<&'a PinnedProcess>,
+    minimum: u128,
+    me: i64,
+}
+
+impl Census<'_> {
+    fn leader_present(&self) -> bool {
+        self.leader
+            .is_some_and(|leader| self.leader_unreaped || !leader.exited())
+    }
+
+    fn runner_present(&self) -> bool {
+        if self.runner_is_self {
+            is_child_subreaper()
+        } else {
+            self.runner_handle.is_some_and(|runner| !runner.exited())
+        }
+    }
+
+    fn parent_present(&self, members: &Members, ppid: i64) -> bool {
+        if ppid == self.runner_pid {
+            return self.runner_present();
+        }
+        if self.leader.is_some_and(|leader| ppid == leader.pid()) {
+            return self.leader_present();
+        }
+        members
+            .iter()
+            .find(|(key, _)| key.0 == ppid)
+            .is_some_and(|(_, handle)| !handle.exited())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn consider(
+        &self,
+        stat: &ProcessStat,
+        members: &mut Members,
+        unproven: &mut HashSet<i64>,
+        found: &mut usize,
+        stop: bool,
+    ) -> bool {
+        if members
+            .iter()
+            .any(|(key, _)| key == &(stat.pid, stat.starttime))
+        {
+            return true;
+        }
+        if stat.pid == self.me || DEAD_STATES.contains(&stat.state.as_str()) {
+            return false;
+        }
+        if self
+            .leader
+            .is_some_and(|leader| stat.pid == leader.pid() && stat.starttime == leader.starttime())
+        {
+            return false;
+        }
+        if stat.pid == self.runner_pid
+            && (self.runner_is_self
+                || self.record.runner.started_at.as_deref()
+                    == Some(stat.starttime.to_string().as_str()))
+        {
+            return false;
+        }
+        let reason = if self.leader_present() && Some(stat.session) == self.record.process_group {
+            Some(Proof::Session)
+        } else if self.parent_present(members, stat.ppid) {
+            Some(Proof::Child)
+        } else if self.record.generation.as_deref().is_some_and(|generation| {
+            u128::from(stat.starttime) >= self.minimum
+                && same_user_at(self.proc_root, stat.pid)
+                && carries_generation_at(self.proc_root, stat.pid, generation)
+        }) {
+            Some(Proof::Generation)
+        } else {
+            None
+        };
+        let Some(reason) = reason else {
+            if Some(stat.session) == self.record.process_group && !self.leader_present() {
+                unproven.insert(stat.pid);
+            }
+            return false;
+        };
+        let Some(handle) = pin_member_at(self.proc_root, stat, reason, self.record) else {
+            return false;
+        };
+        // The session and parent proofs hold only while their anchor still
+        // holds its number; check after the member's own re-check.
+        if (reason == Proof::Session && !self.leader_present())
+            || (reason == Proof::Child && !self.parent_present(members, stat.ppid))
+        {
+            return false;
+        }
+        members.push(((stat.pid, stat.starttime), handle));
+        if stop {
+            members
+                .last()
+                .expect("member just pushed")
+                .1
+                .send(libc::SIGSTOP);
+        }
+        *found += 1;
+        true
+    }
+
+    fn round(
+        &self,
+        members: &mut Members,
+        report: &mut CleanupReport,
+        stop: bool,
+        scan: bool,
+    ) -> Result<usize, ForeignOwnershipError> {
+        let mut found = 0;
+        let mut unproven = HashSet::new();
+        let mut seen = HashSet::new();
+        let mut anchors: Vec<i64> = members.iter().map(|(key, _)| key.0).collect();
+        if self.runner_present() {
+            anchors.push(self.runner_pid);
+        }
+        if self.leader_present() {
+            if let Some(leader) = self.leader {
+                anchors.push(leader.pid());
+            }
+        }
+        let mut walked = HashSet::new();
+        let mut complete_walk = true;
+        while let Some(parent) = anchors.pop() {
+            if !walked.insert(parent) {
+                continue;
+            }
+            let Some(children) = children_of_at(self.proc_root, parent) else {
+                complete_walk = false;
+                continue;
+            };
+            for child in children {
+                if !seen.insert(child) {
+                    continue;
+                }
+                if let Some(stat) = quiet_stat_at(self.proc_root, child) {
+                    if self.consider(&stat, members, &mut unproven, &mut found, stop) {
+                        anchors.push(child);
+                    }
+                }
+            }
+        }
+        if scan || !complete_walk {
+            for stat in scan_processes_at(self.proc_root)? {
+                if seen.insert(stat.pid) {
+                    self.consider(&stat, members, &mut unproven, &mut found, stop);
+                }
+            }
+        }
+        let mut unproven: Vec<i64> = unproven.into_iter().collect();
+        unproven.sort_unstable();
+        for pid in unproven {
+            let entry =
+                format!("pid {pid} (the exited leader's session, without this turn's generation)");
+            if !report.unproven.contains(&entry) {
+                report.unproven.push(entry);
+            }
+        }
+        Ok(found)
+    }
+}
+
+fn peel_children_at(
+    proc_root: &Path,
+    leader: &ChildHandle,
+    report: &mut CleanupReport,
+    deadline: Instant,
+) -> Result<(), ForeignOwnershipError> {
+    report.converged = false;
+    let live_children = |proc_root: &Path| -> Vec<i64> {
+        let candidates = if is_child_subreaper() {
+            children_of_self_at(proc_root)
+        } else {
+            vec![leader.pid()]
+        };
+        candidates
+            .into_iter()
+            .filter(|pid| {
+                quiet_stat_at(proc_root, *pid)
+                    .is_some_and(|stat| !DEAD_STATES.contains(&stat.state.as_str()))
+            })
+            .collect()
+    };
+    while Instant::now() < deadline {
+        let live = live_children(proc_root);
+        if live.is_empty() {
+            report.converged = true;
+            break;
+        }
+        for pid in live {
+            if pid == leader.pid() {
+                if leader.send(libc::SIGKILL) {
+                    report.killed += 1;
+                }
+            } else {
+                // Parent-pinned: an unreaped adopted child keeps its number.
+                // SAFETY: kill takes only this adopted child's pid.
+                if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } >= 0 {
+                    report.killed += 1;
+                } else {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(ForeignOwnershipError::new(
+                            "runner_identity_unknown",
+                            format!("cannot signal adopted child pid {pid}: {error}"),
+                        ));
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        reap_adopted_children_at(proc_root, &[leader.pid()]);
+    }
+    for pid in live_children(proc_root) {
+        report.remaining.push(describe_handle_at(proc_root, pid));
+    }
+    Ok(())
+}
+
+/// Kill every proven member of one turn's harness tree, bounded in time.
+///
+/// Inside the runner, pass the runner's own `leader` handle, set
+/// `runner_is_self`, and set `leader_unreaped` while the runner has not
+/// reaped the leader (its zombie still holds the session number). Other
+/// callers pass neither; the leader and runner are pinned from the record.
+pub fn kill_harness_tree(
+    record: &HarnessRecord,
+    leader: Option<&ProcessHandle>,
+    leader_unreaped: bool,
+    runner_is_self: bool,
+    wait: Option<Duration>,
+) -> Result<CleanupReport, ForeignOwnershipError> {
+    kill_harness_tree_at(
+        Path::new(PROC),
+        record,
+        leader,
+        leader_unreaped,
+        runner_is_self,
+        wait,
+    )
+}
+
+/// [`kill_harness_tree`] against an explicit procfs root. Pidfds and signals
+/// always name real processes.
+#[allow(clippy::too_many_arguments)]
+pub fn kill_harness_tree_at(
+    proc_root: &Path,
+    record: &HarnessRecord,
+    leader: Option<&ProcessHandle>,
+    leader_unreaped: bool,
+    runner_is_self: bool,
+    wait: Option<Duration>,
+) -> Result<CleanupReport, ForeignOwnershipError> {
+    if record.legacy() {
+        return Err(ForeignOwnershipError::new(
+            "harness_identity_legacy",
+            "a legacy harness record carries no generation to prove its tree".to_owned(),
+        ));
+    }
+    let bound = wait.unwrap_or_else(default_kill_wait);
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(bound)
+        .unwrap_or_else(|| started + Duration::from_secs(60 * 60 * 24 * 365));
+    let mut report = CleanupReport::new(record.containment);
+    let boot = current_boot_id_at(proc_root)?;
+    if record.leader.boot_id.as_deref() != Some(boot.as_str()) {
+        return Ok(report);
+    }
+    if let Some(cgroup) = &record.cgroup {
+        if cgroup_relative_at(proc_root, cgroup).is_none() {
+            return Err(ForeignOwnershipError::new(
+                "harness_identity_unknown",
+                format!(
+                    "recorded harness cgroup {} is not inside the cgroup v2 hierarchy",
+                    cgroup.display()
+                ),
+            ));
+        }
+        let (killed, remaining) = kill_cgroup_at(proc_root, cgroup, deadline)?;
+        report.killed += killed;
+        report.remaining.extend(remaining);
+    }
+    if !pidfds_supported() {
+        if runner_is_self {
+            if let Some(ProcessHandle::Child(child)) = leader {
+                peel_children_at(proc_root, child, &mut report, deadline)?;
+                return Ok(report);
+            }
+        }
+        if tree_has_candidates_at(proc_root, record)? {
+            return Err(ForeignOwnershipError::new(
+                "pidfd_unsupported",
+                format!(
+                    "harness pid {} may still have live members, and this host does not provide pidfds to signal them safely",
+                    record.leader.pid
+                ),
+            ));
+        }
+        return Ok(report);
+    }
+
+    let leader_handle: Option<LeaderHandle<'_>> = match leader {
+        Some(handle) => Some(LeaderHandle::Borrowed(handle)),
+        None => {
+            let pinned = pin_at(proc_root, &record.leader, None)?;
+            match pinned.process {
+                Some(process) => {
+                    let current = quiet_stat_at(proc_root, process.pid());
+                    if current.is_some_and(|current| Some(current.session) != record.process_group)
+                    {
+                        return Err(ForeignOwnershipError::new(
+                            "harness_identity_changed",
+                            format!(
+                                "harness pid {} no longer leads its recorded session {}",
+                                record.leader.pid,
+                                record
+                                    .process_group
+                                    .map_or_else(|| "None".to_owned(), |group| group.to_string())
+                            ),
+                        ));
+                    }
+                    Some(LeaderHandle::Owned(process))
+                }
+                None => None,
+            }
+        }
+    };
+    let runner_handle: Option<PinnedProcess> = if runner_is_self {
+        None
+    } else {
+        pin_at(proc_root, &record.runner, None)?.process
+    };
+    let runner_pid = if runner_is_self {
+        i64::from(std::process::id())
+    } else {
+        record.runner.pid
+    };
+    let census = Census {
+        proc_root,
+        record,
+        leader: leader_handle.as_ref(),
+        leader_unreaped,
+        runner_pid,
+        runner_is_self,
+        runner_handle: runner_handle.as_ref(),
+        minimum: minimum_start(record),
+        me: i64::from(std::process::id()),
+    };
+    let census_no_leader = Census {
+        proc_root,
+        record,
+        leader: None,
+        leader_unreaped: false,
+        runner_pid,
+        runner_is_self,
+        runner_handle: runner_handle.as_ref(),
+        minimum: minimum_start(record),
+        me: i64::from(std::process::id()),
+    };
+
+    let mut members: Members = Vec::new();
+    let mut signalled: HashSet<(i64, u64)> = HashSet::new();
+    let mut pending_error: Option<ForeignOwnershipError> = None;
+
+    if let Some(leader) = &leader_handle {
+        if !leader.exited() {
+            leader.send(libc::SIGSTOP);
+        }
+    }
+    let census_deadline = started
+        .checked_add(bound / 2)
+        .unwrap_or_else(|| started + Duration::from_secs(60 * 60 * 24 * 365));
+    report.converged = false;
+    let scan = !runner_is_self || !is_child_subreaper();
+
+    'outer: loop {
+        let mut first = true;
+        'census: loop {
+            match census.round(&mut members, &mut report, true, scan && first) {
+                Ok(0) => {
+                    report.converged = true;
+                    break 'census;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    pending_error = Some(error);
+                    break 'outer;
+                }
+            }
+            first = false;
+            if Instant::now() >= census_deadline {
+                report.converged = false;
+                break 'census;
+            }
+        }
+        for (key, handle) in &members {
+            if signalled.insert(*key) && handle.send(libc::SIGKILL) {
+                report.killed += 1;
+            }
+        }
+        if let Some(leader) = &leader_handle {
+            let key = (leader.pid(), leader.starttime());
+            if signalled.insert(key) && !leader.exited() && leader.send(libc::SIGKILL) {
+                report.killed += 1;
+            }
+        }
+        for (_, handle) in &members {
+            handle.wait(Some(deadline.saturating_duration_since(Instant::now())));
+        }
+        if let Some(leader) = &leader_handle {
+            leader.wait(Some(deadline.saturating_duration_since(Instant::now())));
+        }
+        let before = members.len();
+        if let Err(error) = census_no_leader.round(&mut members, &mut report, true, scan) {
+            pending_error = Some(error);
+            break 'outer;
+        }
+        if members.len() == before || Instant::now() >= deadline {
+            break 'outer;
+        }
+    }
+
+    if let Some(error) = pending_error {
+        // An unexpected failure must not leave proven members stopped.
+        for (key, handle) in &members {
+            if !signalled.contains(key) {
+                handle.send(libc::SIGKILL);
+            }
+        }
+        if let Some(leader) = &leader_handle {
+            let key = (leader.pid(), leader.starttime());
+            if !signalled.contains(&key) && !leader.exited() {
+                leader.send(libc::SIGKILL);
+            }
+        }
+        return Err(error);
+    }
+
+    for (_, handle) in &members {
+        if !handle.exited() {
+            report
+                .remaining
+                .push(describe_handle_at(proc_root, handle.pid()));
+        }
+    }
+    if let Some(leader) = &leader_handle {
+        if !leader.exited() {
+            report
+                .remaining
+                .push(describe_handle_at(proc_root, leader.pid()));
+        }
+    }
+    if runner_is_self {
+        let exclude: Vec<i64> = leader_handle
+            .as_ref()
+            .map(|leader| vec![leader.pid()])
+            .unwrap_or_default();
+        reap_adopted_children_at(proc_root, &exclude);
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -1251,6 +2540,302 @@ mod tests {
         .unwrap());
         assert_eq!(stubborn.wait().unwrap().signal(), Some(libc::SIGKILL));
         assert!(started.elapsed() >= Duration::from_millis(300));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_session_sleep() -> std::process::Child {
+        std::process::Command::new("setsid")
+            .args(["sleep", "10"])
+            .spawn()
+            .expect("spawn session leader")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn harness_record(leader: ProcessIdentity, session: i64, generation: &str) -> HarnessRecord {
+        HarnessRecord {
+            runner: ProcessIdentity::new(1, Some("1".to_owned()), Some(current_boot_id().unwrap())),
+            leader,
+            process_group: Some(session),
+            generation: Some(generation.to_owned()),
+            containment: Containment::Process,
+            cgroup: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_gone(pid: i64) -> bool {
+        read_stat(pid).map_or(true, |stat| {
+            stat.is_none_or(|stat| DEAD_STATES.contains(&stat.state.as_str()))
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_gone(pid: i64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if process_gone(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        process_gone(pid)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_handle_signals_only_its_unreaped_child() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut child = spawn_sleep();
+        let pid = i64::from(child.id());
+        let exact = identity_of(pid);
+        let handle = ChildHandle::new(
+            pid,
+            exact.started_at.as_deref().unwrap().parse().unwrap(),
+            || false,
+        );
+        assert!(!handle.exited());
+        assert!(handle.send(libc::SIGTERM));
+        assert!(handle.wait(Some(Duration::from_secs(2))));
+        handle.close();
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_discovery_and_fake_kill_file() {
+        let root = fake_proc("cgroup");
+        let mount = root.join("cg");
+        std::fs::create_dir_all(mount.join("user.slice/session.scope")).unwrap();
+        std::fs::create_dir_all(root.join("self")).unwrap();
+        std::fs::write(
+            root.join("self/mountinfo"),
+            format!(
+                "36 35 0:32 / {} rw,relatime - cgroup2 cgroup rw\n",
+                mount.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("self/cgroup"), "0::/user.slice/session.scope\n").unwrap();
+        assert_eq!(
+            own_cgroup_directory_at(&root),
+            Some(mount.join("user.slice/session.scope"))
+        );
+        assert_eq!(
+            cgroup_relative_at(&root, &mount.join("user.slice/session.scope")).as_deref(),
+            Some("/user.slice/session.scope")
+        );
+        assert_eq!(cgroup_relative_at(&root, &root.join("outside")), None);
+        assert_eq!(cgroup_mode_from(None).unwrap(), CgroupMode::Off);
+        assert_eq!(
+            cgroup_mode_from(Some("require")).unwrap(),
+            CgroupMode::Require
+        );
+        assert_eq!(
+            cgroup_mode_from(Some("sometimes")).unwrap_err().code,
+            "invalid_cgroup_mode"
+        );
+
+        // A populated fake cgroup receives the kill write; its (fake)
+        // membership is reported remaining because populated stays 1.
+        let owned = mount.join(format!("{CGROUP_PREFIX}{GEN}"));
+        std::fs::create_dir_all(&owned).unwrap();
+        let me = std::process::id();
+        std::fs::write(owned.join("cgroup.events"), "populated 1\n").unwrap();
+        std::fs::write(owned.join("cgroup.procs"), format!("{me}\n")).unwrap();
+        std::fs::write(owned.join("cgroup.kill"), "").unwrap();
+        let (named, remaining) =
+            kill_cgroup_at(&root, &owned, Instant::now() + Duration::from_millis(50)).unwrap();
+        assert_eq!(named, 1);
+        assert_eq!(
+            std::fs::read_to_string(owned.join("cgroup.kill")).unwrap(),
+            "1\n"
+        );
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining[0].contains(&format!("pid {me}")), "{remaining:?}");
+
+        // An empty fake cgroup names nobody and reports nobody.
+        std::fs::write(owned.join("cgroup.events"), "populated 0\n").unwrap();
+        let (_named, remaining) =
+            kill_cgroup_at(&root, &owned, Instant::now() + Duration::from_millis(50)).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(
+            kill_cgroup_at(&root, &root.join("missing"), Instant::now()).unwrap(),
+            (0, Vec::new())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_tree_refuses_legacy_and_ignores_an_earlier_boot() {
+        let mut child = spawn_sleep();
+        let pid = i64::from(child.id());
+        let exact = identity_of(pid);
+        let session = read_stat(pid).unwrap().unwrap().session;
+
+        let legacy = HarnessRecord {
+            containment: Containment::Legacy,
+            ..harness_record(exact.clone(), session, GEN)
+        };
+        let err = kill_harness_tree(&legacy, None, false, false, Some(Duration::from_secs(1)))
+            .unwrap_err();
+        assert_eq!(err.code, "harness_identity_legacy");
+
+        let earlier = harness_record(
+            ProcessIdentity::new(
+                pid,
+                exact.started_at.clone(),
+                Some("00000000-0000-4000-8000-000000000000".to_owned()),
+            ),
+            session,
+            GEN,
+        );
+        let report =
+            kill_harness_tree(&earlier, None, false, false, Some(Duration::from_secs(1))).unwrap();
+        assert!(
+            report.complete() && report.killed == 0,
+            "{}",
+            report.describe()
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child must be untouched"
+        );
+        reap(&mut child);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_recycled_session_number_is_never_signalled() {
+        if !pidfds_supported() {
+            return;
+        }
+        let mut child = spawn_session_sleep();
+        let pid = i64::from(child.id());
+        let exact = identity_of(pid);
+        let stale = ProcessIdentity::new(
+            pid,
+            Some((exact.started_at.as_deref().unwrap().parse::<u64>().unwrap() - 1).to_string()),
+            exact.boot_id.clone(),
+        );
+        let record = harness_record(stale, pid, GEN);
+        let report =
+            kill_harness_tree(&record, None, false, false, Some(Duration::from_secs(1))).unwrap();
+        assert!(
+            report.complete() && report.killed == 0,
+            "{}",
+            report.describe()
+        );
+        assert!(
+            report
+                .unproven
+                .iter()
+                .any(|entry| entry.contains(&format!("pid {pid}"))),
+            "{:?}",
+            report.unproven
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child must be untouched"
+        );
+        reap(&mut child);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_cleanup_reaches_session_and_generation_members() {
+        use std::os::unix::process::ExitStatusExt as _;
+        if !pidfds_supported() {
+            return;
+        }
+        const TREE_GEN: &str = "fedcba9876543210fedcba9876543210";
+        let root = std::env::temp_dir().join(format!("agentctl-b3-5-{}-tree", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let out = root.join("pids");
+        let mut leader = std::process::Command::new("setsid")
+            .args([
+                "bash",
+                "-c",
+                "sleep 10 & c1=$!; setsid sleep 10 & c2=$!; printf '%s %s %s\n' \"$$\" \"$c1\" \"$c2\" > \"$1\"; wait",
+                "bash",
+                out.to_string_lossy().as_ref(),
+            ])
+            .env(GENERATION_ENV, TREE_GEN)
+            .spawn()
+            .expect("spawn tree leader");
+        let mut pids = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(&out) {
+                pids = text
+                    .split_whitespace()
+                    .filter_map(|item| item.parse::<i64>().ok())
+                    .collect();
+                if pids.len() == 3 {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(pids.len(), 3, "tree did not publish its pids");
+        assert_eq!(pids[0], i64::from(leader.id()));
+        let leader_identity = identity_of(pids[0]);
+        let session = read_stat(pids[0]).unwrap().unwrap().session;
+        let record = harness_record(leader_identity, session, TREE_GEN);
+        let report =
+            kill_harness_tree(&record, None, false, false, Some(Duration::from_secs(5))).unwrap();
+        assert!(
+            report.complete() && report.converged,
+            "{}",
+            report.describe()
+        );
+        assert!(report.killed >= 3, "{}", report.describe());
+        for pid in &pids {
+            assert!(
+                wait_gone(*pid),
+                "pid {pid} still present: {}",
+                report.describe()
+            );
+        }
+        assert_eq!(leader.wait().unwrap().signal(), Some(libc::SIGKILL));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recorded_and_tree_alive_use_only_exact_proofs() {
+        const ALIVE_GEN: &str = "abcdef0123456789abcdef0123456789";
+        let mut child = std::process::Command::new("sleep")
+            .arg("10")
+            .env(GENERATION_ENV, ALIVE_GEN)
+            .spawn()
+            .expect("spawn generation child");
+        let pid = i64::from(child.id());
+        let exact = identity_of(pid);
+        let description = recorded_process_alive("runner", &exact).unwrap().unwrap();
+        assert!(description.contains(&format!("pid {pid}")), "{description}");
+        let stale = ProcessIdentity::new(
+            pid,
+            Some((exact.started_at.as_deref().unwrap().parse::<u64>().unwrap() + 1).to_string()),
+            exact.boot_id.clone(),
+        );
+        assert_eq!(recorded_process_alive("runner", &stale).unwrap(), None);
+        let no_start = ProcessIdentity::new(pid, None, exact.boot_id.clone());
+        assert_eq!(
+            recorded_process_alive("runner", &no_start)
+                .unwrap_err()
+                .code,
+            "runner_identity_unknown"
+        );
+
+        let session = read_stat(pid).unwrap().unwrap().session;
+        let record = harness_record(exact, session, ALIVE_GEN);
+        let description = tree_alive(&record).unwrap().unwrap();
+        assert!(description.contains(&format!("pid {pid}")), "{description}");
+        reap(&mut child);
+        assert_eq!(tree_alive(&record).unwrap(), None);
     }
 
     #[cfg(target_os = "linux")]

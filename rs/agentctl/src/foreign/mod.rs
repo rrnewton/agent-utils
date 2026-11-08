@@ -7,7 +7,8 @@
 //! against ([`procstat`] plus the procfs readers in [`ownership`]); slice
 //! B3-3 adds pidfd pinning and `stop_process` in [`ownership`]; slice B3-4
 //! adds the registry layout, active-harness bridge, records, and locked
-//! persistence in [`registry`]. No CLI wiring yet.
+//! persistence in [`registry`]; slice B3-5 adds cgroup helpers and
+//! harness-tree cleanup in [`ownership`]. No CLI wiring yet.
 
 pub mod ownership;
 pub mod procstat;
