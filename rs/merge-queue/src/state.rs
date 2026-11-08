@@ -1173,9 +1173,10 @@ pub struct Config {
     pub batch_min_pass_percent: u32,
     /// Success predictor (SubmitQueue §4.2): when on, decision records carry the
     /// trained model's `predicted_pass` per change and per batch (see
-    /// `predict`), instead of only the base-rate prior. Off by default: today's
-    /// behaviour until an operator trains (`merge-queue model train`) and
-    /// enables it. Scheduling does not read it; the planner does, separately.
+    /// `predict`), instead of only the base-rate prior. Each change is scored
+    /// from its own features, first submissions included. Off by default:
+    /// today's behaviour until an operator trains (`merge-queue model train`)
+    /// and enables it. Scheduling does not read it; the planner does, separately.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub predict: bool,
     /// Expected-value planner (SubmitQueue §4/§7.1, see `plan_ev`): when on,

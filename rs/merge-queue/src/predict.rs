@@ -6,13 +6,19 @@
 //! estimates probabilities and reports how honest they are (reliability bins,
 //! Brier score, a chronological holdout). Enabled only by `Config::predict`;
 //! off, the decision log keeps the base-rate prior it has today.
+//!
+//! Training and serving share one vector construction, [`feature_vector`]:
+//! the change-local features come from the change itself and the history
+//! features from a [`History`] folded only from earlier decisions, so a
+//! first submission is scored from its own size, components and claims
+//! rather than the model base rate (#1056 predict-first-submission).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::decisions::Decision;
+use crate::decisions::{Decision, Features};
 use crate::model::Item;
 
 /// Persisted model schema.
@@ -186,9 +192,11 @@ fn pair_key(a: i64, b: i64) -> String {
 }
 
 /// Per-change history the features read, built only from records strictly
-/// before the example's own validation (no leakage from the future).
-#[derive(Default)]
-struct History {
+/// before the scored validation (no leakage from the future). Training
+/// folds each decision in only after scoring it; serving folds every
+/// decision recorded before the run whose records are being written.
+#[derive(Clone, Debug, Default)]
+pub struct History {
     validated: BTreeMap<i64, u64>,
     cleared_share: BTreeMap<i64, (u64, u64)>, // (cleared, decided)
     culprit: BTreeMap<i64, u64>,
@@ -199,7 +207,8 @@ struct History {
 }
 
 impl History {
-    fn global(&self) -> f64 {
+    /// Green share of the decided validations folded in (0.5 with none).
+    pub fn global(&self) -> f64 {
         if self.decided == 0 {
             0.5
         } else {
@@ -212,6 +221,216 @@ impl History {
             Some((g, n)) => (*g as f64 + 4.0 * global) / (*n as f64 + 4.0),
             None => global,
         }
+    }
+
+    /// Fold one decided (green/red) decision in, after it has been scored.
+    fn fold(&mut self, decision: &Decision, items: &BTreeMap<i64, Item>) {
+        let batch_green = decision.outcome == "green";
+        self.decided += 1;
+        self.green += u64::from(batch_green);
+        for change in &decision.changes {
+            *self.validated.entry(change.pr).or_default() += 1;
+            let slot = self.cleared_share.entry(change.pr).or_default();
+            slot.1 += 1;
+            slot.0 += u64::from(batch_green);
+            if decision.culprit == Some(change.pr) {
+                *self.culprit.entry(change.pr).or_default() += 1;
+            }
+            let author = items
+                .get(&change.pr)
+                .map(|item| item.submitted_by.clone())
+                .unwrap_or_default();
+            let slot = self.author_rate.entry(author).or_default();
+            slot.1 += 1;
+            slot.0 += u64::from(batch_green);
+            if let Some(component) = change.features.components.first() {
+                let slot = self.component_rate.entry(component.clone()).or_default();
+                slot.1 += 1;
+                slot.0 += u64::from(batch_green);
+            }
+        }
+    }
+
+    /// The snapshot from folding every decided decision in `decisions`,
+    /// oldest first: the history a validation scored after all of them sees.
+    pub fn from_decisions(decisions: &[Decision], items: &BTreeMap<i64, Item>) -> Self {
+        let mut sorted: Vec<&Decision> = decisions
+            .iter()
+            .filter(|d| d.outcome == "green" || d.outcome == "red")
+            .collect();
+        sorted.sort_by(|a, b| a.at.cmp(&b.at));
+        let mut history = Self::default();
+        for decision in sorted {
+            history.fold(decision, items);
+        }
+        history
+    }
+}
+
+/// The one raw feature vector for a change, in [`FEATURES`] order, shared by
+/// training ([`examples`]) and serving ([`ServeContext::vector`]) so the two
+/// cannot skew. The first nine features come from the change itself; the
+/// rest read `history`, `author` and `resubmissions`. A change with no
+/// history gets the neutral values training also used for it: prior
+/// validated and culprit counts 0, prior cleared share and the shrunk
+/// author/component rates at the snapshot global rate, and `resubmissions`
+/// as counted by [`resubmissions_before`] (0 on a first submission).
+/// New features slot in here only, never in a caller.
+pub fn feature_vector(
+    features: &Features,
+    history: &History,
+    pr: i64,
+    author: &str,
+    resubmissions: u64,
+    width: usize,
+) -> Vec<f64> {
+    let global = history.global();
+    let (cleared, decided) = history.cleared_share.get(&pr).copied().unwrap_or((0, 0));
+    vec![
+        ((features.lines_added.unwrap_or(0) + features.lines_deleted.unwrap_or(0)) as f64 + 1.0)
+            .ln(),
+        (features.files.unwrap_or(0) as f64 + 1.0).ln(),
+        features.components.len() as f64,
+        features.conflict_degree.unwrap_or(0) as f64,
+        f64::from(u8::from(features.peripheral)),
+        f64::from(u8::from(features.prioritized)),
+        f64::from(u8::from(features.ci_only)),
+        f64::from(u8::from(
+            features
+                .claim
+                .as_ref()
+                .is_some_and(|c| c.scope == "complete"),
+        )),
+        f64::from(u8::from(features.claim.as_ref().is_some_and(|c| c.at_head))),
+        (history.validated.get(&pr).copied().unwrap_or(0) as f64 + 1.0).ln(),
+        if decided == 0 {
+            global
+        } else {
+            cleared as f64 / decided as f64
+        },
+        history.culprit.get(&pr).copied().unwrap_or(0) as f64,
+        (resubmissions as f64 + 1.0).ln(),
+        History::shrunk(history.author_rate.get(author), global),
+        History::shrunk(
+            features
+                .components
+                .first()
+                .and_then(|c| history.component_rate.get(c)),
+            global,
+        ),
+        (width.max(1) as f64).ln(),
+    ]
+}
+
+/// Resubmissions of one change before `before` (an RFC 3339 validation end):
+/// its `head` signals stamped strictly before then, minus the first head.
+/// A record with no `at` counts as before (only hand-built fixtures lack
+/// one; the log always stamps it). Training and serving both count this
+/// way, so a head submitted after a validation never changes its vector.
+pub fn resubmissions_before(records: &[serde_json::Value], before: &str) -> u64 {
+    let heads = records
+        .iter()
+        .filter(|r| r.get("kind").and_then(|v| v.as_str()) == Some("head"))
+        .filter(|r| {
+            r.get("at")
+                .and_then(|v| v.as_str())
+                .is_none_or(|at| at < before)
+        })
+        .count();
+    heads.saturating_sub(1) as u64
+}
+
+/// Serving inputs for scoring changes in a new batch: the [`History`]
+/// snapshot plus each change's `head`-signal times, so
+/// `decisions::from_report` can build every change's vector from the
+/// [`Features`] it computes for that change (see
+/// `decisions::Sources::model_context`). The snapshot is the state before
+/// the scored run's own decisions are appended, fixed for the whole run:
+/// unlike training, which folds each decision before later ones, a served
+/// prediction never reads an outcome from its own run.
+#[derive(Clone, Debug, Default)]
+pub struct ServeContext {
+    history: History,
+    // `head` signal times per change (empty string when unstamped, which
+    // sorts before any validation end; see `resubmissions_before`).
+    head_times: BTreeMap<i64, Vec<String>>,
+}
+
+impl ServeContext {
+    /// From a folded snapshot and the signal records it was folded beside.
+    pub fn new(history: History, signals: &BTreeMap<i64, Vec<serde_json::Value>>) -> Self {
+        let head_times = signals
+            .iter()
+            .map(|(pr, records)| {
+                let times = records
+                    .iter()
+                    .filter(|r| r.get("kind").and_then(|v| v.as_str()) == Some("head"))
+                    .map(|r| {
+                        r.get("at")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_owned()
+                    })
+                    .collect();
+                (*pr, times)
+            })
+            .collect();
+        Self {
+            history,
+            head_times,
+        }
+    }
+
+    /// From a state root, reading its item records from disk.
+    pub fn from_state(state_root: &Path) -> Self {
+        Self::from_state_with_items(state_root, &read_items(state_root))
+    }
+
+    /// From a state root's decisions and signals, folding author history
+    /// through the caller's `items` (the same map serving looks authors up
+    /// in, so the two cannot disagree).
+    pub fn from_state_with_items(state_root: &Path, items: &BTreeMap<i64, Item>) -> Self {
+        let decisions = read_decisions(state_root).unwrap_or_default();
+        let mut signals = BTreeMap::new();
+        for pr in crate::signal::prs(state_root) {
+            if let Ok(records) = crate::signal::read(state_root, pr) {
+                signals.insert(pr, records);
+            }
+        }
+        Self::new(History::from_decisions(&decisions, items), &signals)
+    }
+
+    /// The snapshot this context scores against.
+    pub fn history(&self) -> &History {
+        &self.history
+    }
+
+    /// The submit-time vector for one change in a batch of `width`, as of
+    /// the validation ending at `before`: [`feature_vector`] over the
+    /// change's own `features`, the snapshot, and its resubmissions before
+    /// then. For a change already decided at `before`, feeding the history
+    /// folded from the decisions before it reproduces its training vector.
+    pub fn vector(
+        &self,
+        features: &Features,
+        pr: i64,
+        author: &str,
+        width: usize,
+        before: &str,
+    ) -> Vec<f64> {
+        let heads = self
+            .head_times
+            .get(&pr)
+            .map(|times| times.iter().filter(|at| at.as_str() < before).count())
+            .unwrap_or(0);
+        feature_vector(
+            features,
+            &self.history,
+            pr,
+            author,
+            heads.saturating_sub(1) as u64,
+            width,
+        )
     }
 }
 
@@ -242,18 +461,6 @@ pub fn examples(
             attribution.insert((*pr, run.to_owned(), validation as usize), kind.to_owned());
         }
     }
-    // Resubmissions per change from head events.
-    let mut resub: BTreeMap<i64, u64> = BTreeMap::new();
-    for (pr, records) in signals {
-        let heads = records
-            .iter()
-            .filter(|r| r.get("kind").and_then(|v| v.as_str()) == Some("head"))
-            .count();
-        if heads > 1 {
-            resub.insert(*pr, (heads - 1) as u64);
-        }
-    }
-
     let mut sorted: Vec<&Decision> = decisions
         .iter()
         .filter(|d| d.outcome == "green" || d.outcome == "red")
@@ -278,46 +485,22 @@ pub fn examples(
             );
         let batch_green = decision.outcome == "green";
         for change in &decision.changes {
-            let f = &change.features;
-            let global = history.global();
             let author = items
                 .get(&change.pr)
                 .map(|item| item.submitted_by.as_str())
                 .unwrap_or_default();
-            let (cleared, decided) = history
-                .cleared_share
+            let resubmissions = signals
                 .get(&change.pr)
-                .copied()
-                .unwrap_or((0, 0));
-            let x = vec![
-                ((f.lines_added.unwrap_or(0) + f.lines_deleted.unwrap_or(0)) as f64 + 1.0).ln(),
-                (f.files.unwrap_or(0) as f64 + 1.0).ln(),
-                f.components.len() as f64,
-                f.conflict_degree.unwrap_or(0) as f64,
-                f64::from(u8::from(f.peripheral)),
-                f64::from(u8::from(f.prioritized)),
-                f64::from(u8::from(f.ci_only)),
-                f64::from(u8::from(
-                    f.claim.as_ref().is_some_and(|c| c.scope == "complete"),
-                )),
-                f64::from(u8::from(f.claim.as_ref().is_some_and(|c| c.at_head))),
-                (history.validated.get(&change.pr).copied().unwrap_or(0) as f64 + 1.0).ln(),
-                if decided == 0 {
-                    global
-                } else {
-                    cleared as f64 / decided as f64
-                },
-                history.culprit.get(&change.pr).copied().unwrap_or(0) as f64,
-                (resub.get(&change.pr).copied().unwrap_or(0) as f64 + 1.0).ln(),
-                History::shrunk(history.author_rate.get(author), global),
-                History::shrunk(
-                    f.components
-                        .first()
-                        .and_then(|c| history.component_rate.get(c)),
-                    global,
-                ),
-                (decision.width.max(1) as f64).ln(),
-            ];
+                .map(|records| resubmissions_before(records, &decision.at))
+                .unwrap_or(0);
+            let x = feature_vector(
+                &change.features,
+                &history,
+                change.pr,
+                author,
+                resubmissions,
+                decision.width,
+            );
             let (y, w) = match attribution
                 .get(&(change.pr, decision.run.clone(), decision.validation))
                 .map(String::as_str)
@@ -340,29 +523,7 @@ pub fn examples(
             }
         }
         // Fold this decision into history only after scoring all its changes.
-        history.decided += 1;
-        history.green += u64::from(batch_green);
-        for change in &decision.changes {
-            *history.validated.entry(change.pr).or_default() += 1;
-            let slot = history.cleared_share.entry(change.pr).or_default();
-            slot.1 += 1;
-            slot.0 += u64::from(batch_green);
-            if decision.culprit == Some(change.pr) {
-                *history.culprit.entry(change.pr).or_default() += 1;
-            }
-            let author = items
-                .get(&change.pr)
-                .map(|item| item.submitted_by.clone())
-                .unwrap_or_default();
-            let slot = history.author_rate.entry(author).or_default();
-            slot.1 += 1;
-            slot.0 += u64::from(batch_green);
-            if let Some(component) = change.features.components.first() {
-                let slot = history.component_rate.entry(component.clone()).or_default();
-                slot.1 += 1;
-                slot.0 += u64::from(batch_green);
-            }
-        }
+        history.fold(decision, items);
     }
     out
 }
@@ -647,8 +808,11 @@ fn read_items(state_root: &Path) -> BTreeMap<i64, Item> {
     out
 }
 
-/// Latest history feature vector per change known to a state root, for
-/// scoring changes in a new batch (see `decisions::Sources::model_vectors`).
+/// Latest training feature vector per change known to a state root: each
+/// change's vector as of its last decided validation. Only the
+/// expected-value planner reads this; decision records are scored from the
+/// change itself through [`ServeContext::vector`], because a first
+/// submission has no decided validation to take a vector from.
 pub fn latest_vectors(state_root: &Path) -> BTreeMap<i64, Vec<f64>> {
     let Ok(decisions) = read_decisions(state_root) else {
         return BTreeMap::new();
@@ -835,6 +999,185 @@ mod unit {
             "infra excluded, composition + green kept"
         );
         assert!(examples.iter().any(|e| e.y == 0.0));
+    }
+
+    fn sized_features(lines: u64, files: usize, peripheral: bool) -> Features {
+        Features {
+            lines_added: Some(lines),
+            lines_deleted: Some(0),
+            files: Some(files),
+            components: vec!["rs".to_owned()],
+            peripheral,
+            ..Features::default()
+        }
+    }
+
+    fn decided(at: &str, pr: i64, outcome: &str, features: Features) -> Decision {
+        Decision {
+            schema: crate::decisions::DECISION_SCHEMA.to_owned(),
+            at: at.to_owned(),
+            started_at: at.to_owned(),
+            run: format!("run-{at}"),
+            mode: "run".to_owned(),
+            validation: 1,
+            purpose: "batch".to_owned(),
+            changes: vec![crate::decisions::DecisionChange {
+                pr,
+                head: "h".to_owned(),
+                ready_at: None,
+                ready_to_land_s: None,
+                features,
+                predicted_pass: None,
+            }],
+            commit: "c".to_owned(),
+            base: None,
+            width: 1,
+            speculation: None,
+            predicted_pass: None,
+            validator: crate::decisions::ValidatorUsed::default(),
+            cost: crate::decisions::Cost::default(),
+            selection: "all".to_owned(),
+            outcome: outcome.to_owned(),
+            red_class: None,
+            failed: Vec::new(),
+            culprit: None,
+            landed: None,
+            reconstructed: false,
+        }
+    }
+
+    #[test]
+    fn submit_time_vector_equals_training_vector_for_a_decided_change() {
+        let decisions = vec![
+            decided(
+                "2026-01-01T00:00:00Z",
+                7,
+                "green",
+                sized_features(10, 2, true),
+            ),
+            decided(
+                "2026-01-02T00:00:00Z",
+                8,
+                "red",
+                sized_features(900, 40, false),
+            ),
+            decided(
+                "2026-01-03T00:00:00Z",
+                7,
+                "green",
+                sized_features(20, 3, true),
+            ),
+        ];
+        // Two heads before the target validation (one resubmission) and one
+        // after it, which neither construction may count.
+        let signals = BTreeMap::from([(
+            7,
+            vec![
+                serde_json::json!({"kind": "head", "at": "2025-12-31T00:00:00Z"}),
+                serde_json::json!({"kind": "head", "at": "2026-01-02T12:00:00Z"}),
+                serde_json::json!({"kind": "head", "at": "2026-01-04T00:00:00Z"}),
+            ],
+        )]);
+        let items = BTreeMap::new();
+        let trained = examples(&decisions, &signals, &items, &BTreeMap::new());
+        assert_eq!(trained.len(), 3);
+        for (i, target) in decisions.iter().enumerate() {
+            let context =
+                ServeContext::new(History::from_decisions(&decisions[..i], &items), &signals);
+            let change = &target.changes[0];
+            let served = context.vector(&change.features, change.pr, "", target.width, &target.at);
+            let training = trained
+                .iter()
+                .find(|e| e.pr == change.pr && e.at == target.at)
+                .unwrap();
+            assert_eq!(
+                served, training.x,
+                "vector for {} at {}",
+                change.pr, target.at
+            );
+        }
+        let target = &trained[2];
+        assert_eq!(target.x[12], 2.0f64.ln(), "one resubmission before it");
+    }
+
+    #[test]
+    fn first_submissions_spread_off_the_base_rate_and_score_better_than_it() {
+        // Every change appears once, so under the old serving path each was
+        // a first submission with no history vector and got the base rate.
+        let decisions: Vec<Decision> = (0..60)
+            .map(|i| {
+                let big = i % 2 == 0;
+                let at = format!("2026-{:02}-{:02}T00:00:00Z", 1 + i / 28, 1 + i % 28);
+                decided(
+                    &at,
+                    100 + i as i64,
+                    if big { "red" } else { "green" },
+                    if big {
+                        sized_features(4000, 60, false)
+                    } else {
+                        sized_features(5, 1, true)
+                    },
+                )
+            })
+            .collect();
+        let items = BTreeMap::new();
+        let signals = BTreeMap::new();
+        let model = train(
+            &examples(&decisions, &signals, &items, &BTreeMap::new()),
+            "2026-03-01T00:00:00Z",
+        )
+        .unwrap();
+        // Serve each change as of just before its own decision (the model
+        // weights are in-sample; the history each vector reads is causal).
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for (i, decision) in decisions.iter().enumerate() {
+            let context =
+                ServeContext::new(History::from_decisions(&decisions[..i], &items), &signals);
+            let change = &decision.changes[0];
+            let served = context.vector(
+                &change.features,
+                change.pr,
+                "",
+                decision.width,
+                &decision.at,
+            );
+            let y = f64::from(u8::from(decision.outcome == "green"));
+            before.push((model.base_rate, y));
+            after.push((model.predict_raw(&served), y));
+        }
+        assert!(before.iter().all(|(p, _)| *p == model.base_rate));
+        let (min, max) = after.iter().fold((1.0f64, 0.0f64), |(lo, hi), (p, _)| {
+            (lo.min(*p), hi.max(*p))
+        });
+        assert!(max - min > 0.2, "predictions spread only {min}..{max}");
+        let served = evaluate(&after, model.base_rate);
+        let fallback = evaluate(&before, model.base_rate);
+        assert!(
+            served.brier < fallback.brier,
+            "served brier {} vs base-rate {}",
+            served.brier,
+            fallback.brier
+        );
+        // A brand-new change under the full history: small scores above the
+        // base rate, huge below it, neither equal to it.
+        let context = ServeContext::new(History::from_decisions(&decisions, &items), &signals);
+        let small = model.predict_raw(&context.vector(
+            &sized_features(5, 1, true),
+            999,
+            "",
+            1,
+            "2026-03-02T00:00:00Z",
+        ));
+        let huge = model.predict_raw(&context.vector(
+            &sized_features(4000, 60, false),
+            999,
+            "",
+            1,
+            "2026-03-02T00:00:00Z",
+        ));
+        assert!(small > model.base_rate + 0.05, "small {small}");
+        assert!(huge < model.base_rate - 0.05, "huge {huge}");
     }
 
     #[test]

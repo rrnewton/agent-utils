@@ -3080,7 +3080,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     classifier_policy: &config.classifier.policy,
                     prior: crate::decisions::prior_rates(&state.root),
                     model: None,
-                    model_vectors: std::collections::BTreeMap::new(),
+                    model_context: crate::predict::ServeContext::default(),
                 };
                 crate::decisions::reconstruct(&state.root, &sources, since, until)?
             } else {

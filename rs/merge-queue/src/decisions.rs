@@ -443,9 +443,11 @@ pub struct Sources<'a> {
     /// Trained success model (`Config::predict` on); wins over `prior` for
     /// `predicted_pass` when present.
     pub model: Option<crate::predict::Model>,
-    /// Latest history feature vector per change, for `model` (see
-    /// `predict::latest_vectors`); the batch width feature is patched per batch.
-    pub model_vectors: BTreeMap<i64, Vec<f64>>,
+    /// Serving inputs for `model`: the pre-run history snapshot and head
+    /// times each change's vector is built against (see
+    /// `predict::ServeContext`). The change-local features come from the
+    /// `Features` computed here, so a first submission needs no history.
+    pub model_context: crate::predict::ServeContext,
 }
 
 fn str_field<'v>(value: &'v Value, key: &str) -> &'v str {
@@ -719,24 +721,29 @@ pub fn from_report(report: &Value, sources: &Sources<'_>, reconstructed: bool) -
             })
             .collect();
         // Trained model first (Config::predict): per-change probabilities from
-        // each change's latest history vector, batch = product discounted by
-        // known pair conflicts. A change with no history vector gets the
-        // model's base rate.
+        // a vector built from each change's own features against the pre-run
+        // history snapshot (the shared `predict::feature_vector`, so a first
+        // submission is scored like any other), batch = product discounted
+        // by known pair conflicts.
         let mut changes = changes;
         let model_predicted = sources.model.as_ref().map(|model| {
-            let width_feature = (changes.len().max(1) as f64).ln();
+            let width = changes.len();
+            let before = format_time(ended);
             let mut ps: Vec<(i64, f64)> = Vec::new();
             for change in &mut changes {
-                let p = match sources.model_vectors.get(&change.pr) {
-                    Some(vector) => {
-                        let mut vector = vector.clone();
-                        if let Some(last) = vector.last_mut() {
-                            *last = width_feature;
-                        }
-                        model.predict_raw(&vector)
-                    }
-                    None => model.base_rate,
-                };
+                let author = sources
+                    .items
+                    .get(&change.pr)
+                    .map(|item| item.submitted_by.as_str())
+                    .unwrap_or_default();
+                let vector = sources.model_context.vector(
+                    &change.features,
+                    change.pr,
+                    author,
+                    width,
+                    &before,
+                );
+                let p = model.predict_raw(&vector);
                 change.predicted_pass = Some(p);
                 ps.push((change.pr, p));
             }
@@ -1832,6 +1839,59 @@ mod unit {
         assert_eq!(read(&root, since, until).unwrap(), Vec::new());
         assert_eq!(read_rulings(&root).unwrap(), vec![ruling]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn first_submission_is_scored_from_its_own_features_not_the_base_rate() {
+        // A model where many files strongly predict failure.
+        let training: Vec<crate::predict::Example> = (0..60)
+            .map(|i| {
+                let big = i % 2 == 0;
+                let mut x = vec![0.0; crate::predict::FEATURES.len()];
+                x[1] = if big { 6.0 } else { 0.5 };
+                crate::predict::Example {
+                    at: "2026-01-01T00:00:00Z".to_owned(),
+                    pr: 1,
+                    x,
+                    y: if big { 0.0 } else { 1.0 },
+                    w: 1.0,
+                }
+            })
+            .collect();
+        let model = crate::predict::train(&training, "2026-01-02T00:00:00Z").unwrap();
+        let items = BTreeMap::new();
+        let priority = PriorityConfig::default();
+        let sources = Sources {
+            items: &items,
+            git: None,
+            priority: &priority,
+            classifier_policy: "",
+            prior: None,
+            model: Some(model.clone()),
+            model_context: crate::predict::ServeContext::default(),
+        };
+        // Change 42 has never been decided: no history vector exists for it.
+        let report = serde_json::json!({
+            "run": "20261103T095000Z",
+            "mode": "run",
+            "plan": {"base_sha": "", "items": [
+                {"pr": 42, "head": "h42", "files": 500, "conflict_degree": 0, "peripheral": false}
+            ]},
+            "validations": [
+                {"id": 1, "start_ms": 0, "elapsed_ms": 1000, "prs": [42],
+                 "green": true, "purpose": "batch", "commit": "c"}
+            ],
+            "landed": [], "ejected": []
+        });
+        let decisions = from_report(&report, &sources, false);
+        assert_eq!(decisions.len(), 1);
+        let predicted = decisions[0].changes[0].predicted_pass.unwrap();
+        assert!(
+            (predicted - model.base_rate).abs() > 0.05,
+            "first submission got the base rate {} instead of a feature-based prediction",
+            model.base_rate
+        );
+        assert!(predicted < model.base_rate, "many files should lower it");
     }
 
     #[test]

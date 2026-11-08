@@ -5015,13 +5015,13 @@ impl<'a> Runner<'a> {
         let value = serde_json::to_value(report)
             .map_err(|error| format!("cannot encode the run report: {error}"))?;
         let items = lock(&self.items).clone();
-        let (model, model_vectors) = if self.config.predict {
+        let (model, model_context) = if self.config.predict {
             (
                 crate::predict::load(&self.state.root),
-                crate::predict::latest_vectors(&self.state.root),
+                crate::predict::ServeContext::from_state_with_items(&self.state.root, &items),
             )
         } else {
-            (None, std::collections::BTreeMap::new())
+            (None, crate::predict::ServeContext::default())
         };
         let sources = crate::decisions::Sources {
             items: &items,
@@ -5030,7 +5030,7 @@ impl<'a> Runner<'a> {
             classifier_policy: &self.config.classifier.policy,
             prior: crate::decisions::prior_rates(&self.state.root),
             model,
-            model_vectors,
+            model_context,
         };
         let decisions = crate::decisions::from_report(&value, &sources, false);
         crate::decisions::append(&self.state.root, &decisions, &self.config.decisions)?;
