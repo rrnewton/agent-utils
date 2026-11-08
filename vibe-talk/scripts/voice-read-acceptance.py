@@ -1537,6 +1537,328 @@ async def run_reanswer_acceptance(
     return outcomes, report_path
 
 
+def first_audio_seconds(recorder: TrialRecorder) -> float | None:
+    """Seconds from prompt send to the first PCM frame, or None where none came."""
+    for event in recorder.events:
+        if event.get("kind") == "audio":
+            at = event.get("at_seconds")
+            return float(at) if isinstance(at, (int, float)) else None
+    return None
+
+
+def percentile(values: Sequence[float], quantile: float) -> float | None:
+    """Nearest-rank percentile of `values`, or None where there are none."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    at = int(round((len(ordered) - 1) * quantile))
+    return ordered[min(at, len(ordered) - 1)]
+
+
+@dataclass
+class DocumentTrialOutcome:
+    """One two-turn document result (`#1040`): notice, then the owner's answer.
+
+    The durable form is content-free like every other outcome here: counts,
+    timings and pass booleans only. The ingest number the owner asked for is
+    the answer turn's first-audio latency (typed T0: the answer prompt's send).
+    """
+
+    index: int
+    started_at: str
+    finished_at: str
+    elapsed_seconds: float
+    greeting: bool | None
+    notice_completed: bool
+    notice_interrupted: bool
+    notice_turn: int | None
+    answer_completed: bool
+    answer_interrupted: bool
+    answer_turn: int | None
+    notice_recorder: TrialRecorder
+    answer_recorder: TrialRecorder
+    failure_code: str | None = None
+    failure_detail: str | None = None
+
+    def checks(self) -> dict[str, bool]:
+        """Every condition required for this document trial to pass."""
+        turns_consecutive = (
+            self.notice_turn is None
+            or self.answer_turn is None
+            or self.answer_turn == self.notice_turn + 1
+        )
+        return {
+            "notice_completed": self.notice_completed,
+            "notice_not_interrupted": not self.notice_interrupted,
+            "answer_completed": self.answer_completed,
+            "answer_not_interrupted": not self.answer_interrupted,
+            "answer_audio_present": self.answer_recorder.audio_bytes > 0,
+            "answer_transcript_present": self.answer_recorder.assistant_characters > 0,
+            "turns_consecutive": turns_consecutive,
+            "no_protocol_or_transport_failure": self.failure_code is None,
+        }
+
+    @property
+    def passed(self) -> bool:
+        """Whether all acceptance conditions passed."""
+        return all(self.checks().values())
+
+    def to_json(self) -> JsonObject:
+        """Machine-readable, content-free representation."""
+        checks: JsonObject = {name: value for name, value in self.checks().items()}
+        notice_first = first_audio_seconds(self.notice_recorder)
+        answer_first = first_audio_seconds(self.answer_recorder)
+        return {
+            "trial": self.index,
+            "status": "pass" if self.passed else "fail",
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "elapsed_seconds": round(self.elapsed_seconds, 6),
+            "session_greeting": self.greeting,
+            "notice_completed": self.notice_completed,
+            "notice_interrupted": self.notice_interrupted,
+            "notice_turn": self.notice_turn,
+            "notice_first_audio_seconds": (
+                round(notice_first, 6) if notice_first is not None else None
+            ),
+            "answer_completed": self.answer_completed,
+            "answer_interrupted": self.answer_interrupted,
+            "answer_turn": self.answer_turn,
+            "answer_first_audio_seconds": (
+                round(answer_first, 6) if answer_first is not None else None
+            ),
+            "answer_audio_seconds": round(self.answer_recorder.audio_seconds, 6),
+            "answer_transcript_characters": self.answer_recorder.assistant_characters,
+            "checks": checks,
+            "failure_code": self.failure_code,
+            "failure_detail": self.failure_detail,
+            "notice_events": [event for event in self.notice_recorder.events],
+            "answer_events": [event for event in self.answer_recorder.events],
+        }
+
+
+async def run_document_trial(
+    index: int,
+    url: str,
+    notice_prompt: str,
+    answer_prompt: str,
+    session_timeout_seconds: float,
+    first_audio_timeout_seconds: float,
+    turn_timeout_seconds: float,
+) -> DocumentTrialOutcome:
+    """One fresh session: the document notice, then the owner's answer."""
+    notice_recorder = TrialRecorder(save_pcm=False)
+    answer_recorder = TrialRecorder(save_pcm=False)
+    started_at = utc_now()
+    trial_started = time.monotonic()
+    socket: Socket | None = None
+    greeting: bool | None = None
+    notice_completed = False
+    notice_interrupted = False
+    notice_turn: int | None = None
+    answer_completed = False
+    answer_interrupted = False
+    answer_turn: int | None = None
+    failure_code: str | None = None
+    failure_detail: str | None = None
+    try:
+        try:
+            import websockets
+        except ImportError as error:
+            raise AcceptanceFailure(
+                "missing_dependency",
+                "the Python websockets package is not installed",
+            ) from error
+        try:
+            opened = await websockets.connect(
+                url,
+                max_size=None,
+                open_timeout=session_timeout_seconds,
+                close_timeout=2,
+            )
+            socket = cast(Socket, opened)
+        except Exception as error:  # noqa: BLE001 - connection errors vary by release
+            raise AcceptanceFailure(
+                "connect_failed",
+                f"the WebSocket could not be opened ({type(error).__name__})",
+            ) from error
+
+        greeting = await prepare_session(socket, session_timeout_seconds)
+        notice_completed, notice_interrupted, notice_turn = await measure_prompt(
+            socket,
+            notice_prompt,
+            notice_recorder,
+            first_audio_timeout_seconds,
+            turn_timeout_seconds,
+        )
+        answer_completed, answer_interrupted, answer_turn = await measure_prompt(
+            socket,
+            answer_prompt,
+            answer_recorder,
+            first_audio_timeout_seconds,
+            turn_timeout_seconds,
+        )
+        if notice_interrupted:
+            failure_code = "notice_interrupted"
+            failure_detail = "the notice completion was interrupted"
+        elif answer_interrupted:
+            failure_code = "answer_interrupted"
+            failure_detail = "the answer completion was interrupted"
+    except AcceptanceFailure as error:
+        failure_code = error.code
+        failure_detail = error.detail
+    except Exception as error:  # noqa: BLE001 - preserve partial numeric evidence
+        failure_code = "runner_error"
+        failure_detail = f"the runner failed ({type(error).__name__})"
+    finally:
+        if socket is not None:
+            await close_socket(socket)
+
+    return DocumentTrialOutcome(
+        index=index,
+        started_at=started_at,
+        finished_at=utc_now(),
+        elapsed_seconds=time.monotonic() - trial_started,
+        greeting=greeting,
+        notice_completed=notice_completed,
+        notice_interrupted=notice_interrupted,
+        notice_turn=notice_turn,
+        answer_completed=answer_completed,
+        answer_interrupted=answer_interrupted,
+        answer_turn=answer_turn,
+        notice_recorder=notice_recorder,
+        answer_recorder=answer_recorder,
+        failure_code=failure_code,
+        failure_detail=failure_detail,
+    )
+
+
+def document_summary(outcomes: Sequence[DocumentTrialOutcome]) -> JsonObject:
+    """Aggregate first-audio latencies (median/p90) and pass counts."""
+    notice_first = [
+        value
+        for outcome in outcomes
+        if (value := first_audio_seconds(outcome.notice_recorder)) is not None
+    ]
+    answer_first = [
+        value
+        for outcome in outcomes
+        if (value := first_audio_seconds(outcome.answer_recorder)) is not None
+    ]
+
+    def stats(values: Sequence[float]) -> JsonObject:
+        median = percentile(values, 0.5)
+        p90 = percentile(values, 0.9)
+        return {
+            "count": len(values),
+            "median_seconds": round(median, 6) if median is not None else None,
+            "p90_seconds": round(p90, 6) if p90 is not None else None,
+        }
+
+    return {
+        "trials_finished": len(outcomes),
+        "trials_passed": sum(outcome.passed for outcome in outcomes),
+        "trials_failed": sum(not outcome.passed for outcome in outcomes),
+        "notice_first_audio": stats(notice_first),
+        "answer_first_audio": stats(answer_first),
+        "all_passed": bool(outcomes) and all(outcome.passed for outcome in outcomes),
+    }
+
+
+def build_document_report(
+    finished: bool,
+    run_started_at: str,
+    finished_at: str | None,
+    arm: str,
+    notice_prompt: str,
+    answer_prompt: str,
+    trial_count: int,
+    session_timeout_seconds: float,
+    first_audio_timeout_seconds: float,
+    turn_timeout_seconds: float,
+    outcomes: Sequence[DocumentTrialOutcome],
+) -> JsonObject:
+    """Build a document-mode report containing no input or transcript material."""
+    return {
+        "schema_version": 2,
+        "mode": "document",
+        "finished": finished,
+        "started_at": run_started_at,
+        "finished_at": finished_at,
+        "configuration": {
+            "arm": arm,
+            "trials": trial_count,
+            "notice_prompt_characters": len(notice_prompt),
+            "notice_prompt_utf8_bytes": len(notice_prompt.encode("utf-8")),
+            "answer_prompt_characters": len(answer_prompt),
+            "answer_prompt_utf8_bytes": len(answer_prompt.encode("utf-8")),
+            "session_timeout_seconds": session_timeout_seconds,
+            "first_audio_timeout_seconds": first_audio_timeout_seconds,
+            "turn_timeout_seconds": turn_timeout_seconds,
+            "answer_t0": "typed prompt send (measure_prompt); a spoken yes adds recognition time this harness does not model",
+        },
+        "summary": document_summary(outcomes),
+        "trials": [outcome.to_json() for outcome in outcomes],
+    }
+
+
+async def run_document_acceptance(
+    url: str,
+    arm: str,
+    notice_prompt: str,
+    answer_prompt: str,
+    trial_count: int,
+    session_timeout_seconds: float,
+    first_audio_timeout_seconds: float,
+    turn_timeout_seconds: float,
+    output_dir: Path,
+) -> tuple[list[DocumentTrialOutcome], Path]:
+    """Run fresh two-turn document sessions and preserve content-free evidence."""
+    output_dir.mkdir(parents=True, exist_ok=False)
+    report_path = output_dir / "results.json"
+    run_started_at = utc_now()
+    outcomes: list[DocumentTrialOutcome] = []
+
+    def report(finished: bool, finished_at: str | None) -> JsonObject:
+        return build_document_report(
+            finished,
+            run_started_at,
+            finished_at,
+            arm,
+            notice_prompt,
+            answer_prompt,
+            trial_count,
+            session_timeout_seconds,
+            first_audio_timeout_seconds,
+            turn_timeout_seconds,
+            outcomes,
+        )
+
+    write_report(report_path, report(False, None))
+    for index in range(1, trial_count + 1):
+        outcome = await run_document_trial(
+            index,
+            url,
+            notice_prompt,
+            answer_prompt,
+            session_timeout_seconds,
+            first_audio_timeout_seconds,
+            turn_timeout_seconds,
+        )
+        outcomes.append(outcome)
+        answer_first = first_audio_seconds(outcome.answer_recorder)
+        print(
+            f"trial {index}/{trial_count}: passed={outcome.passed}; "
+            f"notice-turn={outcome.notice_turn}; answer-turn={outcome.answer_turn}; "
+            f"answer-first-audio={'n/a' if answer_first is None else f'{answer_first:.3f}s'}; "
+            f"answer-audio={outcome.answer_recorder.audio_seconds:.2f}s",
+            flush=True,
+        )
+        write_report(report_path, report(False, None))
+    write_report(report_path, report(True, utc_now()))
+    return outcomes, report_path
+
+
 def check(condition: bool, detail: str, failures: list[str]) -> None:
     """Collect one self-test failure without hiding later controls."""
     if not condition:
@@ -1677,6 +1999,55 @@ async def reanswer_protocol_self_test() -> ReanswerProtocolControl:
         follow_up_interrupted=follow_up_interrupted,
         follow_up_turn=follow_up_turn,
         comparison=comparison,
+    )
+
+
+async def document_protocol_self_test() -> tuple[
+    ScriptedSocket, TrialRecorder, TrialRecorder, bool, int | None, bool, int | None
+]:
+    """Drive the two-turn document sequence on one in-memory socket (`#1040`)."""
+    socket = ScriptedSocket(
+        frames=[
+            json.dumps({"type": "session_started", "greeting": False}),
+            json.dumps(
+                {
+                    "type": "transcript",
+                    "role": "assistant",
+                    "text": "Should I read the whole document?",
+                    "turn": 1,
+                }
+            ),
+            bytes(BYTES_PER_SECOND),
+            json.dumps({"type": "turn_complete", "turn": 1}),
+            json.dumps(
+                {
+                    "type": "transcript",
+                    "role": "assistant",
+                    "text": "Reading it now.",
+                    "turn": 2,
+                }
+            ),
+            bytes(BYTES_PER_SECOND),
+            json.dumps({"type": "turn_complete", "turn": 2}),
+        ]
+    )
+    await prepare_session(socket, 1.0)
+    notice_recorder = TrialRecorder(save_pcm=False)
+    notice_completed, _notice_interrupted, notice_turn = await measure_prompt(
+        socket, "private document notice\n", notice_recorder, 1.0, 1.0
+    )
+    answer_recorder = TrialRecorder(save_pcm=False)
+    answer_completed, _answer_interrupted, answer_turn = await measure_prompt(
+        socket, "yes\n", answer_recorder, 1.0, 1.0
+    )
+    return (
+        socket,
+        notice_recorder,
+        answer_recorder,
+        notice_completed,
+        notice_turn,
+        answer_completed,
+        answer_turn,
     )
 
 
@@ -1881,6 +2252,44 @@ def self_test() -> int:
         reanswer_control.comparison.follow_up_coverage == 1.0
         and reanswer_control.comparison.origin_coverage == 0.0,
         "ordered-word coverage did not separate the two turns",
+        failures,
+    )
+
+    (
+        document_socket,
+        _notice_recorder,
+        document_answer_recorder,
+        document_notice_done,
+        document_notice_turn,
+        document_answer_done,
+        document_answer_turn,
+    ) = asyncio.run(document_protocol_self_test())
+    document_sent = [
+        json_object(frame)
+        for frame in document_socket.sent
+        if isinstance(frame, str)
+    ]
+    check(
+        [frame.get("type") for frame in document_sent] == ["prompt", "prompt"]
+        and document_sent[0].get("text") == "private document notice\n"
+        and document_sent[1].get("text") == "yes\n",
+        "document mode did not send notice then answer exactly on one socket",
+        failures,
+    )
+    check(
+        document_notice_done
+        and document_answer_done
+        and document_notice_turn == 1
+        and document_answer_turn == 2
+        and first_audio_seconds(document_answer_recorder) is not None,
+        "document two-turn sequence did not complete as consecutive turns",
+        failures,
+    )
+    check(
+        percentile([3.0, 1.0, 2.0], 0.5) == 2.0
+        and percentile([1.0], 0.9) == 1.0
+        and percentile([], 0.5) is None,
+        "percentile helper is wrong",
         failures,
     )
 
@@ -2093,6 +2502,24 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     result.add_argument(
+        "--document-notice-file",
+        type=Path,
+        help=(
+            "UTF-8 document-notice file (turn 1, sent exactly, as the page composes it); with "
+            "--prompt-file as the owner's answer (turn 2), enables two-turn document mode "
+            "(#1040) measuring notice and answer first-audio latencies"
+        ),
+    )
+    result.add_argument(
+        "--document-arm",
+        default="whole",
+        help=(
+            "document mode: content-free arm label recorded in the report (whole, section, "
+            "prefix-only, ...); the arm is chosen by the answer text in --prompt-file "
+            "(default: whole)"
+        ),
+    )
+    result.add_argument(
         "--follow-up-prompt-file",
         type=Path,
         help=(
@@ -2277,12 +2704,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     prompt = read_private_text(args.prompt_file, "prompt")
     if not prompt.strip():
         raise AcceptanceFailure("usage", "the exact prompt must contain non-whitespace text")
+    document_mode = args.document_notice_file is not None
     reanswer_paths = (
         args.follow_up_prompt_file,
         args.source_file,
         args.follow_up_source_file,
     )
     reanswer_mode = any(path is not None for path in reanswer_paths)
+    if document_mode and reanswer_mode:
+        raise AcceptanceFailure(
+            "usage",
+            "document mode and re-answer mode are mutually exclusive",
+        )
+    if document_mode and args.wav:
+        raise AcceptanceFailure(
+            "usage",
+            "--wav is unavailable in document mode because its artifacts contain content",
+        )
     if reanswer_mode and not all(path is not None for path in reanswer_paths):
         raise AcceptanceFailure(
             "usage",
@@ -2320,6 +2758,51 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir = args.out or default_output()
     if output_dir.exists():
         raise AcceptanceFailure("usage", f"the artifact directory already exists: {output_dir}")
+    if document_mode:
+        notice_path = cast(Path, args.document_notice_file)
+        notice_prompt = read_private_text(notice_path, "document notice")
+        if not notice_prompt.strip():
+            raise AcceptanceFailure(
+                "usage",
+                "the document notice must contain non-whitespace text",
+            )
+        if notice_prompt == prompt:
+            raise AcceptanceFailure(
+                "usage", "the notice and answer files must be different"
+            )
+        document_outcomes, report_path = asyncio.run(
+            run_document_acceptance(
+                url=url,
+                arm=args.document_arm,
+                notice_prompt=notice_prompt,
+                answer_prompt=prompt,
+                trial_count=trial_count,
+                session_timeout_seconds=args.session_timeout_seconds,
+                first_audio_timeout_seconds=args.first_audio_timeout_seconds,
+                turn_timeout_seconds=args.turn_timeout_seconds,
+                output_dir=output_dir,
+            )
+        )
+        print(f"results: {report_path.resolve()}")
+        summary = document_summary(document_outcomes)
+        answer_stats = cast(JsonObject, summary["answer_first_audio"])
+        print(
+            "answer first-audio: "
+            f"median={answer_stats['median_seconds']}s p90={answer_stats['p90_seconds']}s "
+            f"(typed T0; n={answer_stats['count']})"
+        )
+        if all(outcome.passed for outcome in document_outcomes):
+            print(
+                f"PASS: {len(document_outcomes)} fresh-session document trials "
+                "met every protocol threshold"
+            )
+            return EXIT_OK
+        print(
+            f"FAIL: {sum(not outcome.passed for outcome in document_outcomes)} of "
+            f"{len(document_outcomes)} document trials failed",
+            file=sys.stderr,
+        )
+        return EXIT_ACCEPTANCE
     if reanswer_mode:
         if args.wav:
             raise AcceptanceFailure(
