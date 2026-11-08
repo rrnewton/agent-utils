@@ -32277,7 +32277,81 @@ def _cache_slot_directories(
                 budget=budget,
             )
         )
-    return (*registered, *unregistered)
+    # Every registered checkout's own <checkout>/target is covered by
+    # default (#1042): the configured globs are the project's policy for
+    # everything else, but a checkout's cargo target is regenerable by
+    # definition, and globs written for the slot root missed it while
+    # the report still printed REMOVED with 0 bytes freed.
+    selected_paths = [cache.path for cache in (*registered, *unregistered)]
+    default_targets: list[CacheDirectory] = []
+    for checkout in cache_slot.checkouts:
+        checkout_path = _stored_path(config, checkout.path, "checkout path")
+        target = checkout_path / "target"
+        if (
+            target.is_dir()
+            and not target.is_symlink()
+            and not any(
+                target == path or _path_is_within(target, path)
+                for path in selected_paths
+            )
+        ):
+            try:
+                identity = _open_directory_identity(checkout_path, "checkout")
+            except Refusal:
+                continue
+            default_targets.append(
+                CacheDirectory(
+                    path=target,
+                    checkout_root=checkout_path,
+                    checkout_device=identity[0],
+                    checkout_inode=identity[1],
+                    checkout_mount_id=identity[2],
+                )
+            )
+            selected_paths.append(target)
+    # Nested cargo targets anywhere below the slot root (#1042): the
+    # configured globs only name targets at a checkout root, so a target
+    # under <slot>/<repo>/temp/ or <slot>/temp/<x>/ stayed behind. The
+    # slot root stands in as the checkout root for the safety checks;
+    # targets already selected by a glob (or inside one) are not
+    # reported twice.
+    nested: list[CacheDirectory] = []
+    slot_root = _cache_slot_root(config, cache_slot)
+    if slot_root is not None:
+        try:
+            identity = _open_directory_identity(slot_root, "slot")
+        except Refusal:
+            identity = None
+        if identity is not None:
+            for target in _nested_cargo_targets(slot_root):
+                if any(
+                    target == path or _path_is_within(target, path)
+                    for path in selected_paths
+                ):
+                    continue
+                if any(_path_is_within(path, target) for path in selected_paths):
+                    continue
+                nested.append(
+                    CacheDirectory(
+                        path=target,
+                        checkout_root=slot_root,
+                        checkout_device=identity[0],
+                        checkout_inode=identity[1],
+                        checkout_mount_id=identity[2],
+                    )
+                )
+                selected_paths.append(target)
+    return (*registered, *unregistered, *default_targets, *nested)
+
+
+def _cache_slot_root(config: Config, cache_slot: CacheSlot) -> Path | None:
+    """The on-disk root of one cache slot, whichever layout holds it."""
+
+    for root in _slot_roots(config).values():
+        candidate = root / cache_slot.slot
+        if candidate.is_dir() and not candidate.is_symlink():
+            return candidate
+    return None
 
 
 def _validated_cache_journal(
@@ -36750,6 +36824,140 @@ def _cache_glob_names_path_literally(config: Config, cache: CacheDirectory) -> b
     )
 
 
+_CARGO_TARGET_DEPTH = 6
+"""How far below a slot root ``clean-caches`` searches for nested cargo targets."""
+
+
+def _is_cargo_target_dir(path: Path) -> bool:
+    """Whether ``path`` carries cargo's build-directory signature (#1042).
+
+    Either it holds a ``CACHEDIR.TAG`` together with a ``.fingerprint``
+    subdirectory, or one of its profile subdirectories (``debug``,
+    ``release``, ...) holds a ``.fingerprint``.
+    """
+
+    try:
+        if (path / "CACHEDIR.TAG").is_file() and (path / ".fingerprint").is_dir():
+            return True
+        profiles = {"debug", "release", "dev", "test", "bench", "check", "doc"}
+        return any(
+            child.name in profiles
+            and (child / ".fingerprint").is_dir()
+            for child in path.iterdir()
+            if child.is_dir() and not child.is_symlink()
+        )
+    except OSError:
+        return False
+
+
+def _nested_cargo_targets(
+    slot_root: Path, *, max_depth: int = _CARGO_TARGET_DEPTH
+) -> tuple[Path, ...]:
+    """Cargo target directories anywhere below ``slot_root`` (#1042).
+
+    Depth-bounded, never following symlinks and never crossing onto
+    another filesystem. A directory identified as a target is not
+    descended into, and neither is a ``.git`` directory.
+    """
+
+    if not slot_root.is_dir() or slot_root.is_symlink():
+        return ()
+    try:
+        device = slot_root.stat().st_dev
+    except OSError:
+        return ()
+    found: list[Path] = []
+    pending: list[tuple[Path, int]] = [(slot_root, 0)]
+    while pending:
+        directory, depth = pending.pop()
+        if _is_cargo_target_dir(directory):
+            if directory != slot_root:
+                found.append(directory)
+            continue
+        if depth >= max_depth:
+            continue
+        try:
+            entries = sorted(directory.iterdir(), key=lambda entry: entry.name)
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink() or not entry.is_dir():
+                    continue
+                if entry.name == ".git" or entry.stat().st_dev != device:
+                    continue
+            except OSError:
+                continue
+            pending.append((entry, depth + 1))
+    return tuple(sorted(found))
+
+
+def _gate_running_in_slot(
+    roots: Sequence[Path],
+) -> tuple[int, str] | None:
+    """A gate running or queued in one of ``roots``: ``(pid, state)`` (#1029).
+
+    The gate admission directory ($GATE_ADMISSION_DIR, default
+    /tmp/dev-agent-utils-gate-admission) names a pid in runs/*.json and
+    queue/*.json; that pid's cwd decides the slot. A queued ticket counts
+    as running: its gate will build into the slot's caches soon. Fall
+    back to any live dagrun, validate.py or cargo process whose cwd is
+    inside the slot.
+    """
+
+    resolved = tuple(root.resolve() for root in roots)
+
+    def inside(cwd: Path) -> bool:
+        return any(cwd == root or _path_is_within(cwd, root) for root in resolved)
+
+    base = Path(os.environ.get("GATE_ADMISSION_DIR") or "/tmp/dev-agent-utils-gate-admission")
+    for state, folder in (("running", "runs"), ("queued", "queue")):
+        try:
+            entries = sorted((base / folder).glob("*.json"))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                data = json.loads(entry.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            pid = data.get("pid")
+            if not isinstance(pid, int) or isinstance(pid, bool):
+                continue
+            try:
+                cwd = Path(os.readlink(f"/proc/{pid}/cwd"))
+            except OSError:
+                continue
+            if inside(cwd):
+                return pid, state
+    try:
+        proc_entries = list(Path("/proc").iterdir())
+    except OSError:
+        return None
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        try:
+            cwd = Path(os.readlink(entry / "cwd"))
+            if not inside(cwd):
+                continue
+            argv = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", "replace"
+            )
+        except OSError:
+            continue
+        if any(token in argv for token in ("dagrun", "validate.py", "gate.py")) or (
+            " cargo " in f" {argv} "
+        ):
+            return pid, "running"
+    return None
+
+
 def _clean_caches_skip_reason(config: Config, cache: CacheDirectory) -> str | None:
     """Why ``clean-caches`` keeps a directory its cache globs selected, if it does.
 
@@ -36765,8 +36973,10 @@ def _clean_caches_skip_reason(config: Config, cache: CacheDirectory) -> str | No
 
     if _cache_is_within_unpacked_cargo_package(cache):
         return "inside an unpacked Cargo package (.cargo-ok)"
-    if not _cache_glob_names_path_literally(config, cache) and not _has_build_cache_marker(
-        cache.path
+    if (
+        not _cache_glob_names_path_literally(config, cache)
+        and not _has_build_cache_marker(cache.path)
+        and not _is_cargo_target_dir(cache.path)
     ):
         return "matched by a wildcard glob, and no build tool marked it as a cache"
     return None
@@ -36866,8 +37076,35 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
         unknown = sorted(set(only) - set(cache_slots))
         if unknown:
             raise Refusal(f"unknown slot(s) for cache cleanup: {', '.join(unknown)}")
-        selected = set(cache_slots) if args.yes else set(only)
-        if getattr(args, "dry_run", False):
+        # A slot whose gate is running (or queued: it will build into
+        # the slot's caches soon) is never cleaned (#1029): deleting a
+        # running gate's build output fails its steps or makes them
+        # rebuild under memory caps. --yes skips such slots with a
+        # reason; --only refuses them outright; --force-running is the
+        # recorded override.
+        force_running = bool(getattr(args, "force_running", False))
+        gate_by_slot: dict[str, tuple[int, str]] = {}
+        if not force_running:
+            for gate_slot in sorted(cache_slots):
+                slot_root = _cache_slot_root(config, cache_slots[gate_slot])
+                gate = _gate_running_in_slot(
+                    (slot_root,) if slot_root is not None else ()
+                )
+                if gate is not None:
+                    gate_by_slot[gate_slot] = gate
+        dry_run = bool(getattr(args, "dry_run", False))
+        for gate_slot in sorted(requested & set(gate_by_slot)):
+            if not dry_run:
+                pid, gate_state = gate_by_slot[gate_slot]
+                raise Refusal(
+                    f"slot {gate_slot} has a {gate_state} gate (pid {pid}); "
+                    "refusing to clean its caches while its gate may build "
+                    "into them. remedy: wait for the gate to finish, or "
+                    "rerun with --force-running to clean it anyway"
+                )
+        planned_selected = set(cache_slots) if args.yes else set(only)
+        selected = planned_selected
+        if dry_run:
             # Report exactly what the selected run would remove, deleting
             # nothing (https://github.com/rrnewton/agent-utils/issues/297).
             selected = set()
@@ -36876,10 +37113,12 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                 "slot": slot,
                 "machine": None,
                 "cache_bytes": 0,
+                "removed_bytes": 0,
                 "action": "BLOCKED",
                 "paths": [],
                 "skipped": [],
                 "hold_reason": None,
+                "gate_reason": None,
                 "registered": False,
                 "state": "unregistered",
                 "cache_error": error,
@@ -36951,7 +37190,13 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                         if reason is None:
                             kept.append((cache, size))
                         else:
-                            skipped.append({"path": str(cache.path), "reason": reason})
+                            skipped.append(
+                                {
+                                    "path": str(cache.path),
+                                    "reason": reason,
+                                    "bytes": size,
+                                }
+                            )
                     directories = tuple(cache for cache, _size in kept)
                     cache_bytes = sum(size for _cache, size in kept)
                 except (Refusal, OSError) as exc:
@@ -36965,20 +37210,36 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                     cache_error = str(exc)
                     action = "BLOCKED"
                 else:
-                    if slot in selected:
+                    if slot in gate_by_slot and slot in planned_selected:
+                        # Skipped, not cleaned: the measured bytes stay
+                        # in the row so the operator can come back.
+                        action = "SKIPPED"
+                    elif slot in selected and directories:
                         action = "REMOVED"
                         plans[slot] = directories
+                    elif slot in selected and skipped:
+                        # Everything found was kept: naming it REMOVED
+                        # with 0 bytes freed is the dishonest report
+                        # #1042 forbids; the residuals are named below.
+                        action = "SKIPPED"
                     else:
                         action = "REPORT"
+            gate = gate_by_slot.get(slot)
             rows.append(
                 {
                     "slot": slot,
                     "machine": cache_slot.machine,
                     "cache_bytes": cache_bytes,
+                    "removed_bytes": 0,
                     "action": action,
                     "paths": [str(cache.path) for cache in directories],
                     "skipped": skipped,
                     "hold_reason": None if hold is None else hold["reason"],
+                    "gate_reason": (
+                        None
+                        if gate is None
+                        else f"gate {gate[1]} (pid {gate[0]})"
+                    ),
                     "registered": cache_slot.state == "active",
                     "state": cache_slot.state,
                     "cache_error": cache_error,
@@ -36988,8 +37249,14 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
         removed_bytes = 0
         for row in rows:
             slot = _as_str(row["slot"], "cache row slot")
+            freed = 0
             for cache in plans.get(slot, ()):
-                removed_bytes += _remove_cache_directory(config, cache)
+                freed += _remove_cache_directory(config, cache)
+            # Totals count only bytes actually freed (#1042): a row
+            # whose directories measured more, or vanished meanwhile,
+            # reports what removal really reclaimed.
+            row["removed_bytes"] = freed
+            removed_bytes += freed
     payload = {
         "schema": SCHEMA,
         "cache_globs": list(config.cache_globs),
@@ -36997,6 +37264,7 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
             name: list(patterns) for name, patterns in config.repo_cache_globs
         },
         "removed_bytes": removed_bytes,
+        "force_running": force_running,
         "slots": rows,
         "skipped_foreign": [
             {"machine": machine, "slot": slot} for machine, slot in foreign_cache_rows
@@ -37018,6 +37286,11 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                     else ""
                 )
                 + (
+                    f" reason={row['gate_reason']}"
+                    if row.get("gate_reason") is not None
+                    else ""
+                )
+                + (
                     f" error={row['cache_error']}"
                     if row["cache_error"] is not None
                     else ""
@@ -37028,6 +37301,15 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                     else ""
                 )
             )
+        for row in rows:
+            for skipped in _as_list(row["skipped"], "cache row skipped"):
+                entry = _as_mapping(skipped, "cache row skipped entry")
+                if "bytes" in entry:
+                    print(
+                        f"RESIDUAL: {row['slot']} path={entry['path']} "
+                        f"cache={_format_gib(_as_int(entry['bytes'], 'residual bytes'))} "
+                        f"reason={entry['reason']}"
+                    )
         for machine, slot in foreign_cache_rows:
             print(
                 f"SKIPPED_FOREIGN: {machine}/{slot} "
@@ -67081,7 +67363,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
     selection.add_argument(
         "--yes",
         action="store_true",
-        help="remove configured caches from every unheld active or unregistered slot",
+        help=(
+            "remove configured caches from every unheld active or unregistered slot; "
+            "a slot with a gate running or queued in it is skipped with a reason "
+            "(see --force-running)"
+        ),
     )
     clean_caches.add_argument(
         "--all-machines",
@@ -67104,6 +67390,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help=(
             "with --only or --yes, report what would be removed for the selected "
             "slots without deleting anything"
+        ),
+    )
+    clean_caches.add_argument(
+        "--force-running",
+        action="store_true",
+        help=(
+            "clean a slot even though a gate is running or queued in it (a queued "
+            "ticket counts as running: its gate will build into the slot's caches "
+            "soon). Without it, --yes skips such a slot with a reason and --only "
+            "refuses it; the override is recorded in the report"
         ),
     )
     clean_caches.set_defaults(handler=_cmd_clean_caches)

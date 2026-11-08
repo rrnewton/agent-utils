@@ -31867,6 +31867,178 @@ def test_clean_caches_dry_run_reports_without_deleting(tmp_path: Path) -> None:
     assert (tree / "target").is_dir()
 
 
+def fake_gate_admission(
+    tmp_path: Path, cwd: Path, *, queued: bool = False
+) -> tuple[dict[str, str], subprocess.Popen[str]]:
+    """A live process in ``cwd`` named by a fake gate admission ticket."""
+
+    sleeper = subprocess.Popen(["sleep", "60"], cwd=cwd, text=True)
+    admission = tmp_path / "gate-admission"
+    folder = admission / ("queue" if queued else "runs")
+    folder.mkdir(parents=True)
+    (folder / f"{sleeper.pid}.json").write_text(
+        json.dumps(
+            {"id": "ticket-1", "pid": sleeper.pid, "class": "shared", "command": ["gate"]}
+        ),
+        encoding="utf-8",
+    )
+    return {"GATE_ADMISSION_DIR": str(admission)}, sleeper
+
+
+@pytest.mark.parametrize("queued", [False, True])
+def test_clean_caches_skips_a_slot_whose_gate_is_running(
+    tmp_path: Path, queued: bool
+) -> None:
+    """#1029: --yes skips a running/queued gate's slot, --only refuses it,
+    and --force-running is the recorded override."""
+
+    project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project, slot="slot01", agent="codex-1", branch="codex/one").returncode == 0
+    assert create(project, slot="slot02", agent="codex-2", branch="codex/two").returncode == 0
+    first = checkout(project, "slot01")
+    second = checkout(project, "slot02")
+    for tree in (first, second):
+        (tree / "target" / "debug").mkdir(parents=True)
+        (tree / "target" / "debug" / "artifact").write_bytes(b"x" * 1024)
+    env, sleeper = fake_gate_admission(tmp_path, first, queued=queued)
+    try:
+        sweep = command(project, "clean-caches", "--yes", "--format", "json", env=env)
+        assert sweep.returncode == 0, sweep.stderr
+        rows = {row["slot"]: row for row in json.loads(sweep.stdout)["slots"]}
+        assert rows["slot01"]["action"] == "SKIPPED"
+        assert rows["slot01"]["gate_reason"] == (
+            f"gate {'queued' if queued else 'running'} (pid {sleeper.pid})"
+        )
+        assert rows["slot01"]["cache_bytes"] >= 1024
+        assert (first / "target").is_dir()
+        assert rows["slot02"]["action"] == "REMOVED"
+        assert not (second / "target").exists()
+
+        refused = command(project, "clean-caches", "--only", "slot01", env=env)
+        assert refused.returncode == 3, refused.stderr
+        assert "--force-running" in refused.stderr
+        assert (first / "target").is_dir()
+
+        forced = command(
+            project,
+            "clean-caches",
+            "--only",
+            "slot01",
+            "--force-running",
+            "--format",
+            "json",
+            env=env,
+        )
+        assert forced.returncode == 0, forced.stderr
+        payload = json.loads(forced.stdout)
+        assert payload["force_running"] is True
+        assert payload["slots"][0]["action"] == "REMOVED"
+        assert not (first / "target").exists()
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+
+
+def cargo_target(path: Path, *, profile_only: bool = False) -> Path:
+    """Make ``path`` a cargo-shaped target directory holding one artifact."""
+
+    if profile_only:
+        (path / "debug" / ".fingerprint").mkdir(parents=True)
+        (path / "debug" / "artifact").write_bytes(b"p" * 1024)
+    else:
+        (path / ".fingerprint").mkdir(parents=True)
+        (path / "CACHEDIR.TAG").write_bytes(
+            wrkslots._CACHEDIR_TAG_SIGNATURE + b"\n"
+        )
+        (path / "artifact").write_bytes(b"c" * 1024)
+    return path
+
+
+def test_clean_caches_finds_nested_cargo_targets(tmp_path: Path) -> None:
+    """#1042: nested targets are reported per path and cleaned; symlinks
+    out of the slot and targets beyond the depth bound are left alone."""
+
+    project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project, slot="slot01", agent="codex-1", branch="codex/one").returncode == 0
+    tree = checkout(project, "slot01")
+    slot_root = tree.parent
+    in_checkout = cargo_target(tree / "sub" / "target")
+    in_temp = cargo_target(slot_root / "temp" / "x" / "target", profile_only=True)
+    in_repo_temp = cargo_target(tree / "temp" / "cargo-target")
+    outside = cargo_target(tmp_path / "outside-target")
+    (slot_root / "linked").symlink_to(outside, target_is_directory=True)
+    deep = cargo_target(slot_root / "a" / "b" / "c" / "d" / "e" / "f" / "g" / "target")
+
+    report = command(
+        project, "clean-caches", "--only", "slot01", "--dry-run", "--format", "json"
+    )
+    assert report.returncode == 0, report.stderr
+    row = json.loads(report.stdout)["slots"][0]
+    paths = set(row["paths"])
+    assert str(in_checkout) in paths
+    assert str(in_temp) in paths
+    assert str(in_repo_temp) in paths
+    assert str(outside) not in paths
+    assert str(deep) not in paths
+    assert row["cache_bytes"] >= 3072
+    assert in_checkout.is_dir()
+
+    cleaned = command(project, "clean-caches", "--only", "slot01", "--format", "json")
+    assert cleaned.returncode == 0, cleaned.stderr
+    assert not in_checkout.exists()
+    assert not in_temp.exists()
+    assert not in_repo_temp.exists()
+    assert outside.is_dir()
+    assert deep.is_dir()
+
+
+def test_clean_caches_covers_checkout_target_by_default_and_names_residuals(
+    tmp_path: Path,
+) -> None:
+    """#1042 (lead order): a checkout's own target is covered even when no
+    glob names it, the slot's measured bytes go down when it is cleaned,
+    and a kept target is a named residual with its size, never a
+    REMOVED row claiming 0 bytes freed."""
+
+    project, _repository, _remote = make_project(
+        tmp_path, cache_globs=("node_modules",)
+    )
+    assert create(project, slot="slot01", agent="codex-1", branch="codex/one").returncode == 0
+    assert create(project, slot="slot02", agent="codex-2", branch="codex/two").returncode == 0
+    first = checkout(project, "slot01")
+    second = checkout(project, "slot02")
+    target = cargo_target(first / "target")
+    kept = second / "target"
+    (kept / "debug").mkdir(parents=True)
+    (kept / "debug" / "artifact").write_bytes(b"k" * 1024)
+
+    report = command(
+        project, "clean-caches", "--only", "slot01", "--dry-run", "--format", "json"
+    )
+    assert report.returncode == 0, report.stderr
+    row = json.loads(report.stdout)["slots"][0]
+    assert str(target) in row["paths"]
+    assert row["cache_bytes"] >= 1024
+
+    cleaned = command(project, "clean-caches", "--only", "slot01", "--format", "json")
+    assert cleaned.returncode == 0, cleaned.stderr
+    cleaned_row = json.loads(cleaned.stdout)["slots"][0]
+    assert cleaned_row["action"] == "REMOVED"
+    assert cleaned_row["removed_bytes"] >= 1024
+    assert not target.exists()
+
+    after = command(
+        project, "clean-caches", "--only", "slot01", "--dry-run", "--format", "json"
+    )
+    assert json.loads(after.stdout)["slots"][0]["cache_bytes"] == 0
+
+    residual = command(project, "clean-caches", "--only", "slot02")
+    assert residual.returncode == 0, residual.stderr
+    assert "REMOVED: slot02" not in residual.stdout
+    assert f"RESIDUAL: slot02 path={kept}" in residual.stdout
+    assert kept.is_dir()
+
+
 def test_clean_caches_not_blocked_by_stranded_absent_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -33294,8 +33466,15 @@ def test_clean_caches_keeps_cargo_package_sources_and_unmarked_wildcard_matches(
         ],
         key=lambda skip: skip["path"],
     )
-    assert sorted(reported["skipped"], key=lambda skip: skip["path"]) == expected_skips
-    assert sorted(row["skipped"], key=lambda skip: skip["path"]) == expected_skips
+    for skipped_row in (reported, row):
+        skips = sorted(skipped_row["skipped"], key=lambda skip: skip["path"])
+        assert [
+            {"path": skip["path"], "reason": skip["reason"]} for skip in skips
+        ] == expected_skips
+        # Every kept directory is a named residual with its size (#1042).
+        assert all(
+            isinstance(skip["bytes"], int) and skip["bytes"] >= 0 for skip in skips
+        )
     assert not (tree / "target").exists()
     assert not tagged.exists()
     assert not untagged.exists()

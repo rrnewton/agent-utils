@@ -240,6 +240,22 @@ def _check(root: Path, tmp_path: Path) -> dict[str, object]:
     return actual
 
 
+def test_audit_nested_cargo_target_matches_python(tmp_path: Path) -> None:
+    """#1042: a cargo target nested below the checkout is counted by both."""
+
+    root = _fixture(tmp_path)
+    target = root / "worktrees" / "slot-a" / "repo" / "temp" / "cargo-target"
+    (target / ".fingerprint").mkdir(parents=True)
+    (target / "CACHEDIR.TAG").write_bytes(
+        wrkslots_cli._CACHEDIR_TAG_SIGNATURE + b"\n"
+    )
+    (target / "artifact").write_bytes(b"x" * 4096)
+    actual = _check(root, tmp_path)
+    row = _rows(actual)[0]
+    assert row["cache_status"] == "complete"
+    assert row["cache_bytes"] == "counted"
+
+
 def test_audit_deletable_matches_python(tmp_path: Path) -> None:
     root = _fixture(tmp_path)
     actual = _check(root, tmp_path)

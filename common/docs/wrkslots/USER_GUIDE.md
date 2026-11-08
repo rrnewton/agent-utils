@@ -644,6 +644,24 @@ selected, unless a build tool marked it as a cache: a `CACHEDIR.TAG` with the st
 or Cargo's `.rustc_info.json`. A glob without wildcards names one path and keeps its plain meaning.
 JSON rows list each kept directory and its reason under `skipped`.
 
+Beyond the globs, `clean-caches` (and the audit cache census) also finds cargo target directories
+anywhere below a slot root, down to depth 6: a directory holding a `CACHEDIR.TAG` together with a
+`.fingerprint` subdirectory, or a profile subdirectory (`debug`, `release`, ...) holding one. The
+search never follows symlinks and never crosses onto another filesystem, so nested targets such as
+`<slot>/<repo>/target`, `<slot>/temp/<x>/target` and `<slot>/<repo>/temp/cargo-target` are reported
+per path and deleted like glob-selected ones; the configured globs still govern non-cargo caches.
+
+A slot whose gate is running is never cleaned: deleting a running gate's build output fails its
+steps or makes them rebuild under memory caps. Before deleting, `clean-caches` reads the gate
+admission directory named by `$GATE_ADMISSION_DIR` (the gate runner's default admission
+directory when it is unset); a
+running or queued ticket whose pid's working directory is inside the slot marks it, and so does
+any live gate, validation or cargo build process working inside it. A queued ticket counts as
+running, because its gate will build into the slot's caches soon. Under `--yes` such a slot is
+`SKIPPED` with `gate_reason` naming the pid, and its reclaimable bytes stay in the row; `--only`
+on it refuses. `--force-running` overrides the rule and is recorded as `force_running` in the
+report.
+
 With neither selector, the command is a read-only report over all visible registered, journaled, and
 unregistered slots. `--only SLOT` is a destructive selector even though it does not use `--yes`; it
 may be repeated, emits rows only for the named slots, and refuses if any name cannot be attributed.

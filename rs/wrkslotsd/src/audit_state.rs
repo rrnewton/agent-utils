@@ -831,6 +831,70 @@ fn plan_one_checkout(
 
 /// Overlapping globs must not count one directory twice: a
 /// candidate inside an already-selected candidate is dropped.
+/// Whether `path` carries cargo's build-directory signature
+/// (#1042), mirroring the oracle's `_is_cargo_target_dir`.
+fn is_cargo_target_dir(path: &Path) -> bool {
+    if path.join("CACHEDIR.TAG").is_file() && path.join(".fingerprint").is_dir() {
+        return true;
+    }
+    let profiles = ["debug", "release", "dev", "test", "bench", "check", "doc"];
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let child = entry.path();
+        profiles.contains(&entry.file_name().to_string_lossy().as_ref())
+            && !child.is_symlink()
+            && child.join(".fingerprint").is_dir()
+    })
+}
+
+/// Cargo target directories anywhere below `slot_root` (#1042),
+/// mirroring the oracle's `_nested_cargo_targets`: depth-bounded,
+/// never following symlinks, never crossing filesystems.
+fn nested_cargo_targets(slot_root: &Path) -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(root_meta) = std::fs::metadata(slot_root) else {
+        return Vec::new();
+    };
+    if slot_root.is_symlink() {
+        return Vec::new();
+    }
+    let device = root_meta.dev();
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut pending: Vec<(PathBuf, usize)> = vec![(slot_root.to_path_buf(), 0)];
+    while let Some((directory, depth)) = pending.pop() {
+        if is_cargo_target_dir(&directory) {
+            if directory != slot_root {
+                found.push(directory);
+            }
+            continue;
+        }
+        if depth >= 6 {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut children: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|child| {
+                !child.is_symlink()
+                    && child.is_dir()
+                    && child.file_name().is_some_and(|name| name != ".git")
+                    && std::fs::metadata(child).is_ok_and(|meta| meta.dev() == device)
+            })
+            .collect();
+        children.sort();
+        for child in children {
+            pending.push((child, depth + 1));
+        }
+    }
+    found.sort();
+    found
+}
+
 fn dedup_cache_roots(mut roots: Vec<CacheRoot>) -> Vec<CacheRoot> {
     roots.sort_by(|a, b| a.path.cmp(&b.path));
     let mut deduped: Vec<CacheRoot> = Vec::new();
@@ -902,6 +966,38 @@ fn cache_roots(
                 validation_complete,
                 mounts,
             ));
+        }
+        // Every registered checkout's own <checkout>/target is
+        // covered by default (#1042).
+        let target = checkout_path.join("target");
+        if target.is_dir() && !target.is_symlink() {
+            roots.push(planned_cache_root(
+                target,
+                &checkout_path,
+                validation_complete,
+                mounts,
+            ));
+        }
+    }
+    // Nested cargo targets anywhere below the slot root (#1042).
+    let slot = record
+        .get("slot")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let slot_type = record
+        .get("slot_type")
+        .and_then(Value::as_str)
+        .unwrap_or("agent");
+    if let Ok(slot_root) = crate::active_state::slot_directory(cfg, slot, slot_type) {
+        if slot_root.is_dir() && !slot_root.is_symlink() {
+            for target in nested_cargo_targets(&slot_root) {
+                roots.push(planned_cache_root(
+                    target,
+                    &slot_root,
+                    validation_complete,
+                    mounts,
+                ));
+            }
         }
     }
     (dedup_cache_roots(roots), None)
@@ -1039,6 +1135,13 @@ fn unregistered_cache_subject(
         }
         for candidate in candidates {
             planned.push(planned_cache_root(candidate, root, false, mounts));
+        }
+    }
+    // Nested cargo targets anywhere below the slot root (#1042).
+    let slot_root = cfg.worktrees.join(slot);
+    if slot_root.is_dir() && !slot_root.is_symlink() {
+        for target in nested_cargo_targets(&slot_root) {
+            planned.push(planned_cache_root(target, &slot_root, false, mounts));
         }
     }
     subject(dedup_cache_roots(planned), None)
