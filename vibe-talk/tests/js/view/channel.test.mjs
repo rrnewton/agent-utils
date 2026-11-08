@@ -603,6 +603,20 @@ test("`#624 voice-page-modularity`: the code works on the left column except ins
   assert.equal(work.inColumn(columns.main, () => "same"), "same", "the column already worked on runs as it is");
 });
 
+test("`#624 voice-page-modularity`: the ColumnWork port's reader sees the working column as it switches, and switching stays the port's", () => {
+  const { createColumnWork } = CHANNEL_VIEW;
+  const columns = { main: { name: "main", left: false }, side: { name: "side", left: false } };
+  const port = createColumnWork(columns);
+  const reader = port;
+  assert.deepStrictEqual([reader.active().name, reader.side()], ["main", false]);
+  port.inColumn(columns.side, () => {
+    assert.deepStrictEqual([reader.active().name, reader.side()], ["side", true], "the reader did not follow the switch");
+  });
+  assert.deepStrictEqual([reader.active().name, reader.side()], ["main", false]);
+  assert.deepStrictEqual(Object.keys(reader).sort(), ["active", "inColumn", "side", "useColumn"],
+    "the port grew a second way to the working column");
+});
+
 test("`#624 voice-page-modularity`: the layout on screen, and each place held for the way back, taken once", () => {
   const { createLayoutShown } = CHANNEL_VIEW;
   const shown = createLayoutShown();

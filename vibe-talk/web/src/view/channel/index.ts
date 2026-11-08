@@ -94,7 +94,7 @@ export type { CardFlight, CardFlightDependencies } from "./cardflight.ts";
 export { createArming } from "./arming.ts";
 export type { Arming, ArmingDependencies } from "./arming.ts";
 export { createColumnWork } from "./columnwork.ts";
-export type { ColumnWork, WorkedColumn } from "./columnwork.ts";
+export type { ColumnWork, ColumnWorkPort, ColumnWorkReader, WorkedColumn } from "./columnwork.ts";
 export { createLayoutShown } from "./layoutshown.ts";
 export type { Layout, LayoutShown } from "./layoutshown.ts";
 export { createCardsDrawn } from "./cardsdrawn.ts";

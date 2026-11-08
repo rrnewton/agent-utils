@@ -28,6 +28,22 @@ export interface ColumnWork<C extends WorkedColumn> {
   inColumn<T>(column: C, fn: () => T): T;
 }
 
+/**
+ * The ColumnWork port (`#624 voice-page-modularity`, step 17 move 3, published for the lanes that
+ * consume the columns): the working column's whole surface, as `createColumnWork` makes it. Owners
+ * that switch columns (the page, the column's own views) take the port; readers that must never
+ * move the working column take only `ColumnWorkReader` below. No other package reaches the
+ * captured `activeColumn`/`sideActive` behind it.
+ */
+export type ColumnWorkPort<C extends WorkedColumn> = ColumnWork<C>;
+
+/**
+ * The working column read, never switched: which column is worked on, and whether it is the right
+ * one. This is the shape consumers such as the older-pages walks already take inline; naming it
+ * here makes the port the one place that shape is defined.
+ */
+export type ColumnWorkReader<C extends WorkedColumn> = Pick<ColumnWork<C>, "active" | "side">;
+
 /** Working on the left column. */
 export function createColumnWork<C extends WorkedColumn>(columns: { readonly main: C; readonly side: C }): ColumnWork<C> {
   /** The column the code is working on now. The left one, except inside `inColumn`. */

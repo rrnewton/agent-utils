@@ -190,7 +190,7 @@ const columns = {
  * right one, for `el`, which asks on every call: one owner in web/src/view/channel/columnwork.ts (`#624
  * voice-page-modularity`). The page destructures `useColumn` and `inColumn` under their old names.
  *
- * @type {import("./src/view/channel/index.ts").ColumnWork<ColumnFields>}
+ * @type {import("./src/view/channel/index.ts").ColumnWorkPort<ColumnFields>}
  */
 const columnWork = createColumnWork(columns);
 const { useColumn, inColumn } = columnWork;
