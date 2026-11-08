@@ -99,6 +99,8 @@ mod remove_write;
 mod replay;
 mod retirement_queue;
 #[allow(dead_code)] // wired into cli.rs dispatch by the shared core (P9, mu-rsimg)
+mod sandbox_exec;
+#[allow(dead_code)] // wired into cli.rs dispatch by the shared core (P9, mu-rsimg)
 mod sandbox_state;
 mod schema;
 mod shell_command_state;
