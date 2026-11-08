@@ -159,3 +159,5 @@ export { createChannelRefresh } from "./refresh.ts";
 export type { ChannelRefresh, ChannelRefreshDependencies, RefreshPoll, RefreshReads } from "./refresh.ts";
 export { createLiveStream } from "./livestream.ts";
 export type { LiveFrame, LiveStream, LiveStreamDependencies } from "./livestream.ts";
+export { createRowLinks } from "./rowlinks.ts";
+export type { LinkKindsLike, RowLinks, RowLinksDependencies } from "./rowlinks.ts";

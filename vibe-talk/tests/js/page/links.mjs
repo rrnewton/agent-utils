@@ -1041,8 +1041,8 @@ test("a kind turned off takes its links out of each row, and a row with none lef
   assert.ok(page.el("discord-log").children.every((li) => rowLinkList(li) === undefined), "a row kept its links");
 
   // THE CONTROL: a list drawn without asking which kinds are hidden fails the first step above.
-  const control = await run(brokenScript(
-    "    const shown = drawn.links.filter((link) => !linkKinds.hidden().has(link.kind));", "    const shown = drawn.links;"));
+  const control = await run(await brokenModule([{ file: "src/view/channel/rowlinks.ts",
+    find: "      const shown = drawn.links.filter((link) => !linkKinds.hidden().has(link.kind));", replace: "      const shown = drawn.links;" }]));
   await tapKind(control, "pr");
   assert.deepStrictEqual(shownHrefs(control)["860000000000000000"], [`${REPO}/pull/41`, "https://example.com/docs/design.html"],
     "the test cannot tell a hidden pull request from a shown one");
@@ -1424,8 +1424,9 @@ test("URL writes each link under Links as its whole address and back as its name
   assert.equal(page.pure("LINK_RAW_KEY"), LINK_RAW_KEY_NAME);
 
   // THE CONTROL: with the address never written, this sees the names stay.
-  const blind = newPage(new Map(), brokenScript("    if (raw) rawAddressInto(anchor, link.href);\n    else anchor.textContent = link.name;",
-    "    anchor.textContent = link.name;"));
+  const blind = newPage(new Map(), await brokenModule([{ file: "src/view/channel/rowlinks.ts",
+    find: "      if (raw) rawAddressInto(anchor, link.href);\n      else anchor.textContent = link.name;",
+    replace: "      anchor.textContent = link.name;" }]));
   await signIn(blind);
   await showDiscord(blind, urlChannel());
   await showLinks(blind);

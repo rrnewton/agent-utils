@@ -2110,15 +2110,15 @@ const searchRows = createSearchRows({
   selectionView: () => selection().view,
   authorChoosing: () => authorChoosing(),
   authorPasses,
-  authorEmptySentence,
+  authorEmptySentence: (a, b, c) => authorEmptySentence(a, b, c),
   gatheredParent,
   putRepliesBack,
   pinsOnly: () => pinsView().only,
-  showRowLinks,
-  takeDownRowLinks,
+  showRowLinks: (row) => showRowLinks(row),
+  takeDownRowLinks: (row) => takeDownRowLinks(row),
   heldLinks: (row) => heldLinks(row),
-  hiddenKindNames,
-  renderLinkKindCounts,
+  hiddenKindNames: (counts) => hiddenKindNames(counts),
+  renderLinkKindCounts: (kinds) => renderLinkKindCounts(kinds),
   drawCardGaps: (list) => drawCardGaps(list),
   openedCardGaps: (create) => openedCardGaps(create),
   openUnpackGap: (row, below) => /** @type {any} */ (openUnpackGap(/** @type {any} */ (row), below)),
@@ -2737,403 +2737,45 @@ function showSearchOpen(open) {
   }
 }
 
-// --- the links in what is on screen -------------------------------------------------------------
-//
-// `#211 link-filter`. The owner, on his phone: "I want another little icon next to it with a
-// hyperlink symbol which filters just for hyperlinks. What I mean by that is filter down to only the
-// messages containing hyperlinks and then filter the string of the message text for only the
-// hyperlinks themselves formatted one per line and turn it into real clickable hyperlinks so that
-// clicking them opens it in a new tab." And forty seconds later: "if we find markdown formatted
-// hyperlinks that are complete and correct, then let's format those properly as a real hyperlink
-// using the name given in markdown rather than the raw URL."
-//
-// WHICH MESSAGES: the ones the search searches. Links is a filter in the search bar, beside the
-// search text, so it reads the same lists — the messages loaded in the view on screen, call or
-// channel, Main or All or a thread, with the rows Hide read leaves out already gone — and it is
-// ANDed with the text and with Pinned. A reader who types "deploy" with Links on is asking for the
-// links in the messages about the deploy, which is why the text is matched against the message and
-// not against its addresses. Nothing is fetched: a link in a message not loaded yet is not here,
-// and the count and the empty sentence say "loaded" so that is never read as "nobody posted one".
-//
-// WHAT IS A LINK: an http or https address, and nothing else ever becomes an href — `javascript:`
-// and `data:` run code, and a scheme-less string resolves against this origin. Three forms are
-// read, as people and chat services write them: a Markdown link `[name](https://…)`, the angle
-// brackets chat services send, `<https://…>` and `<https://…|name>`, and a bare address. A Markdown
-// link that is complete and well formed shows its NAME. One that is not — brackets that do not
-// pair, an empty name, a target that is not http or https — is not read as a link at all, and an address
-// written inside it is then found as a bare one: the reader gets the address, and never a name that
-// might not belong to it.
-//
-// The rows are the page's own rows, not a second list drawn beside them: each keeps its author, its
-// time and its controls, and shows its links where its text was (web/voice.css hides the text by
-// `data-links-view`). So every act on a row still works on it, and a row a poll redraws is redrawn
-// filtered by the pass that draws everything else, `applySearch`.
-
-// Whether the Links filter is on is the search field's (`SearchField.links`, web/src/core/search,
-// `#624 voice-page-modularity`): only while the search bar is open; closing it turns this off.
-
-// Finding the links in a text (linksIn, markdownLinkAt, bareLinkAt, trimAddress, HTTP_ADDRESS) is
-// web/src/foundation/'s (`#624 voice-page-modularity`).
-
-/**
- * The links each part of a row holds: every message a channel row stands for, or a turn's text.
- *
- * `#217 markdown-blocks`. A message the server rendered holds the links it DRAWS — its anchors, a
- * Markdown link by its name, a bare address as the renderer recognised it — so the Links view and
- * the row agree about what is a link. Text that no server rendered, a voice turn's or an old saved
- * message's, is read for links as it always was.
- */
-function rowLinkParts(row) {
-  if (row.messages) return row.messages.map(messageLinks);
-  return typeof row.linkText === "string" ? [linksIn(row.linkText)] : [];
-}
-
-/** What a row's links are read from, as one value: when it changes, they are read again. */
-function rowLinkKey(row) {
-  if (row.messages) return row.messages.map((m) => renderedHtmlOf(m) || rawTextOf(m)).join("\u0000");
-  return typeof row.linkText === "string" ? row.linkText : "";
-}
-
-/**
- * Every link a row holds, ONCE, in the order first written: an address repeated within a message,
- * or across the messages a combined row stands for, is one line. Its place is where it first
- * appears, and its name is the first NAME it is given: a bare address followed later by the same
- * address as a Markdown link reads as the link's name.
- *
- * Each as `{href, name, kind}`: `#212 link-filter`, the kind its address is (`linkKind`), read once
- * here with the address rather than on every redraw.
- */
-function rowLinks(row) {
-  const byAddress = new Map();
-  for (const link of rowLinkParts(row).flat()) {
-    const held = byAddress.get(link.href);
-    if (!held) {
-      byAddress.set(link.href, { ...link, kind: linkKind(link.href) });
-    } else if (held.name === held.href) {
-      held.name = link.name;
-    }
-  }
-  return [...byAddress.values()];
-}
-
-/**
- * The links themselves, one per line, each a real link that opens in a new tab. The address goes
- * in the title as well, so a named link, or one cut short to fit the screen, still says where it
- * goes when a pointer rests on it — and a long press, on a phone, shows the address it opens.
- *
- * Built as the rest of the row is, with `textContent`: a name is channel data, and so is an
- * address. The only sink that is not plain text is the href, and nothing reaches it that
- * `HTTP_ADDRESS` has not passed.
- */
-function linkList(links, raw) {
-  const list = document.createElement("div");
-  list.className = "row-links";
-  if (raw) list.setAttribute("data-raw", "");
-  for (const link of links) {
-    const anchor = document.createElement("a");
-    anchor.className = "row-link";
-    if (raw) rawAddressInto(anchor, link.href);
-    else anchor.textContent = link.name;
-    anchor.setAttribute("href", link.href);
-    anchor.setAttribute("target", "_blank");
-    anchor.setAttribute("rel", "noopener noreferrer");
-    anchor.setAttribute("title", link.href);
-    list.append(anchor);
-  }
-  return list;
-}
-
-/**
- * `#620 link-url-chip`. An address written out whole, as its own text, with a place to break after
- * every `/`, `?`, `&`, `#` and `=`: on a phone it wraps between the parts of its path, where a reader
- * looks for them. Chromium offers no break after a slash followed by a letter, and without these a
- * path broke mid-word, "vib" on one line and "e-talk" on the next; web/voice.css still breaks a part
- * too long for a line anywhere. The breaks are empty elements, so the text is the address exactly.
- */
-function rawAddressInto(anchor, href) {
-  // Matched rather than split on a lookbehind, which Safari before 16.4 cannot parse at all: one such
-  // pattern anywhere in this file would stop the whole page there.
-  for (const part of href.match(/[^/?&#=]*[/?&#=]?/g).filter(Boolean)) {
-    if (anchor.firstChild) anchor.append(document.createElement("wbr"));
-    anchor.append(document.createTextNode(part));
-  }
-}
-
-/**
- * Put a row's links straight after its text, which web/voice.css hides while they are shown. The
- * text is `.body` on a turn and a channel row, and `.msg-text` on a message still being sent.
- */
-function placeAfterBody(row, node) {
-  const kids = [...row.children];
-  const body = kids.find((kid) =>
-    String(kid.className || "").split(/\s+/).some((word) => word === "body" || word === "msg-text"));
-  if (!body) {
-    row.append(node);
-    return;
-  }
-  row.replaceChildren(...kids.flatMap((kid) => (kid === body ? [kid, node] : [kid])));
-}
-
-/**
- * Show a row's links in place of its text, and answer how many there are. Built once per row and
- * text, and kept on the row while the filter stays on: `applySearch` asks on every redraw and every
- * keystroke, and the answer only changes when the row does.
- *
- * `#212 link-filter`. ...or when the kinds of link turned off do. The links are read once per text
- * and kept, every kind of them (`heldLinks`); only the list on screen is drawn again, without the
- * kinds the reader has hidden. So the answer is how many are SHOWN, and a row whose links are all of
- * hidden kinds answers none, as a row with no link does.
- */
-function showRowLinks(row) {
-  const key = rowLinkKey(row);
-  let drawn = row.linkView;
-  if (!drawn || drawn.key !== key) {
-    if (drawn && drawn.node && drawn.node.parentNode === row) row.removeChild(drawn.node);
-    drawn = { key, links: rowLinks(row), hidden: null, raw: null, count: 0, node: null };
-    row.linkView = drawn;
-  }
-  // The set itself, not its contents: `setLinkKindShown` replaces it whole on every change. And
-  // `#620 link-url-chip`, drawn again when URL turns the addresses on or off.
-  if (drawn.hidden !== linkKinds.hidden() || drawn.raw !== linkKinds.raw()) {
-    if (drawn.node && drawn.node.parentNode === row) row.removeChild(drawn.node);
-    const shown = drawn.links.filter((link) => !linkKinds.hidden().has(link.kind));
-    drawn.hidden = linkKinds.hidden();
-    drawn.raw = linkKinds.raw();
-    drawn.count = shown.length;
-    drawn.node = shown.length > 0 ? linkList(shown, linkKinds.raw()) : null;
-  }
-  if (drawn.node && drawn.node.parentNode !== row) placeAfterBody(row, drawn.node);
-  if (drawn.count > 0) row.setAttribute("data-links-view", "true");
-  else row.removeAttribute("data-links-view");
-  return drawn.count;
-}
-
-/** Give a row its text back. Answers 0, the links it now shows. */
-function takeDownRowLinks(row) {
-  if (row.linkView) {
-    if (row.linkView.node && row.linkView.node.parentNode === row) row.removeChild(row.linkView.node);
-    row.linkView = null;
-  }
-  if (row.hasAttribute("data-links-view")) row.removeAttribute("data-links-view");
-  return 0;
-}
-
-/** Whether a row is showing its links in place of its text. */
-const showingLinks = (row) => row.getAttribute("data-links-view") === "true";
-
-/** Every link a row holds while the Links filter is on, the hidden kinds too, as `rowLinks` reads them. */
-const heldLinks = (row) => (row.linkView ? row.linkView.links : []);
-
-/** Which list the reader is in, so a place kept in one is never restored in another. */
-const filterPlace = () =>
-  [screens.view(), currentChannelId(), selection().view, selection().threadId || ""].join("\u0000");
-
-/**
- * Turn the Links filter on or off, the reader's message kept where it is on the screen — or, under
- * Links, the nearest message with a link in its place (`keepingFilterPlace`, `#243
- * filter-keeps-selection`). A reader on the newest line stays on it.
- */
-function setLinksOnly(on) {
-  if (on === searchField.links()) return;
-  keepingFilterPlace(() => liftingHideRead(() => {
-    searchField.setLinks(on);
-    el("links-filter").setAttribute("aria-pressed", on ? "true" : "false");
-    // `#212 link-filter`. The kinds of link come up under it, or go, and the room the list makes for
-    // them with them — before anything below measures the list.
-    renderLinkKinds();
-    // The rows' links drawn, or taken down, BEFORE the reader is placed: placing measures them.
-    renderScrollTools();
-    // The right column's rows too: Links filters both. `#229 desktop-two-column`.
-    inOtherColumn(renderScrollTools);
-  }));
-  // Off, the rows' text is back on screen, and summary mode asks about what is in view.
-  requestVisibleSummaries();
-}
-
-// --- whose messages: the author filter -----------------------------------------------------------
-//
-// `#251 author-filter`. The owner: "When we search we can filter on pinned, I would like to likewise
-// filter on prompts vs agent responses (me vs them). Opening search bar and filtering prompts (with no
-// search term) should give me a full view of all my prompts."
-//
-// ONE BUTTON IN THE BAR, left of Links, that cycles Everyone → Mine → Theirs, as the read mode's
-// button cycles its three. Two toggles would be a fifth and a sixth square on a 360px line that holds
-// the field, the count, Links, Pinned and the glass, and two that must never be on together are one
-// control with three states anyway.
-//
-// MINE is what the page draws as the owner's: a channel row it puts in the `me` bucket (`bucketFor`:
-// the bridge's own account, the accounts configured or chosen as his), a message of his still being
-// sent, and the call's "you". THEIRS is every other message — "me vs them", in his words — people and
-// agents alike: the coding agent's bucket is a guess that changes once a second bot speaks, and a
-// filter named for agents would hide the other people in the channel without saying so.
-//
-// ANDED with the search text, Links, Pinned and the read mode, in the one pass that applies them all
-// (`applySearch`). It chooses rows, as the text and Links do: collapsed runs open under it, the
-// bookmark is not drawn, and gathered replies go back to their places. It goes when the bar closes,
-// as the other filters in it do.
-
-// The states and their words are web/src/present/rows's; which rows are his, the filter chosen, its
-// button and its chip are web/src/view/channel's (`createAuthorFilter`, `#624 voice-page-modularity`).
-
-/** Whose messages the list shows, its button and its chip. */
-const authorFilters = createAuthorFilter({
-  lookup: (id) => el(id),
-  searchOpen: () => searchField.open(),
-});
-
-/** The author filter in force: "everyone" while the bar is shut, whatever was last chosen. */
-const authorChoosing = () => authorFilters.inForce();
-
-/**
- * Choose whose messages the list shows, the reader's message kept where it is on the screen — or,
- * when the new choice hides it, the nearest message shown in its place (`keepingFilterPlace`, `#243
- * filter-keeps-selection`). Both columns, as Links: there is one bar.
- */
-function setAuthorFilter(mode) {
-  const next = AUTHOR_FILTERS.includes(mode) ? mode : "everyone";
-  if (next === authorFilters.chosen()) return;
-  keepingFilterPlace(() => liftingHideRead(() => {
-    authorFilters.set(next);
-    renderScrollTools();
-    inOtherColumn(renderScrollTools);
-  }));
-  requestVisibleSummaries();
-}
-
-/** The button's press: the next state round the cycle, and the chip naming where it landed. */
-function cycleAuthorFilter() {
-  setAuthorFilter(nextAuthorFilter(authorFilters.chosen()));
-  authorFilters.showChip();
-}
-
-/**
- * What the list says where its rows would be when the author filter has left none of the messages
- * loaded, or "" when it has not (`authorEmptyWords`): with "Mark my own messages as read" on, Hide read
- * in the channel's view leaves his own out, and the sentence says how to see them.
- */
-function authorEmptySentence(author, searching, pinned) {
-  return authorEmptyWords(author, searching, pinned, () => screens.view() === "discord" && hidingRead() && ownReadSwitch.on());
-}
-
-// --- the kinds of link under Links ----------------------------------------------------------------
-//
-// `#212 link-filter`. The owner, on his phone, the morning after Links shipped: "When I activate this
-// link view I would like 3 buttons to pop up under the link icon I just clicked. They should be named
-// PRs Commits Actions and be toggled on by default. Unselecting them filters out all the links that
-// are just GitHub links to commits PRs etc, which match a certain URL pattern. The reason for this is
-// I usually want to look for DOCUMENTS but these are the 3 main sources of noise in my url view."
-//
-// `#266 link-filter-kinds`. The owner again, once he had used them: "Our filters for hyperlinks --
-// PRs Commits Actions is good... but we should add Issues and Files and Other... together that should
-// be all of them." and "Other is the catch all". So there are six, and between them they cover every
-// link: each link is of exactly one kind, and the numbers on the six add up to every link counted.
-//
-// WHAT A KIND IS: `linkKind`, and nothing but the address decides it. PRs, Commits, Actions, Issues
-// and Files are addresses on GitHub, inside one repository, whose path says they are a pull request,
-// a commit, a run of Actions, an issue, or a file or a folder of the code (and a file as GitHub serves
-// it raw). Other is every address none of those claims — a wiki page, a release, a repository's own
-// page, any page on any other host. The name a Markdown link gives it does not count: "the fix"
-// written over a pull request's address is a pull request.
-//
-// WHAT TURNING ONE OFF DOES: its links leave the Links view, row by row. A row left with other links
-// shows those; a row left with none goes, as a row with no link does. The count and the sentence in
-// an empty list speak for what is left, and an empty list names the kinds that emptied it.
-//
-// REMEMBERED on this device (LINK_KINDS_KEY), as the page's other view preferences are: a reader who
-// always turns them off should not have to every time. With nothing kept, every kind is on; a choice
-// kept before Issues, Files and Other existed still holds, and those three start on.
-
-// The six kinds, their words, how a count is printed, and the kinds turned off and URL, kept on this
-// device, are web/src/present/rows's (`createLinkKinds`, `#624 voice-page-modularity`); the buttons and
-// keeping the reader's place are here. `linkKind`, the kind of link an address is, and the GitHub address
-// patterns it reads are web/src/foundation's.
-
-/** The kinds the reader turned off, and whether links are written as their addresses. */
+// The links in what is on screen, whose messages, and the kinds of link are
+// web/src/view/channel's now (`createRowLinks`, `#624 voice-page-modularity`): a row's links
+// shown in place of its text, the author filter, and the kind buttons. The kinds kept on this
+// device stay present/rows' owner, instantiated here and handed in; `authorChoosing` and the
+// kinds' `hidden` keep their names for their other consumers.
 const linkKinds = createLinkKinds({
   storage: () => deviceStorage(),
-  // A browser refusing storage reads as off (`DEVICE_SETTINGS.linksRaw.refused`).
   rawStored: () => deviceSettings().get(DEVICE_SETTINGS.linksRaw),
   keepRaw: (on) => deviceSettings().keep(DEVICE_SETTINGS.linksRaw, on),
 });
 
-/**
- * Show or hide one kind, keep the choice, and redraw what is left. A reader at the newest line is
- * kept there, as one is when a message arrives; anywhere else the reader's message stays where it is
- * on the screen, as it does while the search text changes under it (`keepingFilterPlace`, `#243
- * filter-keeps-selection`), and where nothing is left the list says why from its head.
- */
-function setLinkKindShown(kind, shown) {
-  keepingFilterPlace(() => {
-    linkKinds.setShown(kind, shown);
-    renderLinkKinds();
-    renderScrollTools();
-    inOtherColumn(renderScrollTools);
-  });
-}
-
-// `#620 link-url-chip`. The owner, with Files on and every link reading "agent-utils:README.md":
-// "When we're in URL search mode I would like to have a little chip named URL alongside the other
-// filters for files and so on. When I click that it switches back to raw URLs instead of the render
-// hyperlink and that would at least let me see where these files live."
-//
-// URL changes how the links are WRITTEN, never which: on, each shows its address in full, wrapped at
-// its slashes (`rawAddressInto`); off, the name it was given or the label the server made for it.
-// It filters nothing, so it is first in the row, apart from the kinds, and never struck through. The
-// search text still matches what the messages say, addresses included, either way. KEPT with the
-// owner's other settings on the server (LINK_RAW_KEY in web/src/core/settings's `SYNCED_SETTING_KEYS`), as the kinds are, so
-// every device shows the links the same way; with nothing kept it is off.
-
 const LINK_RAW_KEY = DEVICE_SETTINGS.linksRaw.key;
 
-/** Write the links as their addresses, or as their names, keep the choice, and redraw them. */
-function setLinksRaw(on) {
-  keepingFilterPlace(() => {
-    linkKinds.setRaw(on);
-    renderLinkKinds();
-    renderScrollTools();
-    inOtherColumn(renderScrollTools);
-  });
-}
-
-/**
- * The kinds' buttons: under Links while Links is on, and at no other time — so they go when Links
- * goes and when the bar closes — each pressed while its kind is shown. #screen-main says when they
- * are up, so the list makes room for them at its head as it does for the bar (web/voice.css), and
- * the first row is never underneath them.
- */
-function renderLinkKinds() {
-  const up = searchField.links() && !el("links-filter").hidden;
-  el("link-kinds").hidden = !up;
-  if (up) el("screen-main").setAttribute("data-link-kinds", "");
-  else el("screen-main").removeAttribute("data-link-kinds");
-  for (const { kind, chip } of LINK_KINDS) {
-    el(chip).setAttribute("aria-pressed", linkKinds.hidden().has(kind) ? "false" : "true");
-  }
-  el("link-raw").setAttribute("aria-pressed", linkKinds.raw() ? "true" : "false");
-}
-
-/**
- * How many of the links in view are of each kind, beside its name: what turning it off takes away,
- * or brings back. Counted over the messages the other filters let through, every kind whether shown
- * or not (`applySearch`); every link is of one kind, so together they count every link. Blank at
- * none, so a kind with no link in view is a plain word.
- */
-function renderLinkKindCounts(kinds) {
-  for (const { kind, chip } of LINK_KINDS) {
-    el(`${chip}-count`).textContent = linkKindCountText(kinds.get(kind) || 0);
-  }
-}
-
-/**
- * The kinds turned off that took something away — `counts` holds how many links of each kind there
- * are in what the sentence speaks for — named as their buttons are and joined as a sentence joins
- * them: "PRs", "PRs and Actions", "PRs, Commits and Other links". A kind that is off but had no
- * link there is left out, because turning it back on would bring nothing back. Every name is a
- * plural — Other is said as "Other links" — so "are" and "them" fit whichever it is.
- */
-function hiddenKindNames(counts) {
-  return hiddenKindWords(linkKinds.hidden(), counts);
-}
+const rowLinksOwner = createRowLinks({
+  linkKinds,
+  byId: el,
+  messageLinks,
+  renderedHtmlOf,
+  rawTextOf,
+  searchOpen: () => searchField.open(),
+  linksOn: () => searchField.links(),
+  setLinks: (on) => searchField.setLinks(on),
+  view: () => screens.view(),
+  currentChannelId: () => currentChannelId(),
+  selectionView: () => selection().view,
+  selectionThreadId: () => selection().threadId || "",
+  keepingFilterPlace,
+  liftingHideRead,
+  renderScrollTools,
+  inOtherColumn,
+  requestVisibleSummaries,
+  hidingRead: () => hidingRead(),
+  ownReadOn: () => ownReadSwitch.on(),
+});
+const {
+  authorFilters, showRowLinks, takeDownRowLinks, heldLinks, showingLinks, filterPlace,
+  setLinksOnly, authorChoosing, setAuthorFilter, cycleAuthorFilter, authorEmptySentence,
+  setLinkKindShown, setLinksRaw, renderLinkKinds, renderLinkKindCounts, hiddenKindNames,
+} = rowLinksOwner;
 
 /**
  * Bring the whole of `box` into the view of `area`, the list it is in, as `keepComposerInView` says:
