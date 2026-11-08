@@ -393,6 +393,129 @@ test("documents list: refresh renders rows in order, unfetched dimmed; clicks fe
   }
 });
 
+// ---- 3b. list order, paging and gesture (#1079 documents-chronological) -----------------------
+
+function docRow(key, ms) {
+  return {
+    key, url: `https://example.com/${key}.md`, title: `${key} title`, file_name: `${key}.md`,
+    mention_count: 1, kind: "file", fetched: true, fetched_ms: ms, moved_to: null,
+    last_mentioned_ms: ms, mentions: [],
+  };
+}
+
+// One list over fakes with a measurable scroller: its height grows with what is drawn, so
+// anchoring arithmetic is observable. `answer(path)` says what each read returns.
+async function withList(answer, run) {
+  const mod = requireModule(LIST, "src/view/documents/list.ts");
+  assert.equal(typeof mod.createDocumentsList, "function", "list does not export createDocumentsList");
+  const listEl = fakeElement("div");
+  const scroller = fakeElement("div");
+  scroller.scrollTop = 0;
+  scroller.clientHeight = 100;
+  Object.defineProperty(scroller, "scrollHeight", { get: () => listEl.children.length * 300 });
+  const paneDocs = fakeElement("div");
+  const listView = fakeElement("div");
+  const byId = (id) => ({
+    "documents-list": listEl, "scroll-area": scroller, "pane-docs": paneDocs, "docs-list-view": listView,
+  })[id];
+  const paths = [];
+  const statuses = [];
+  const list = mod.createDocumentsList({
+    api: async (path) => { paths.push(path); return answer(path); },
+    byId,
+    onOpen: () => {},
+    onStatus: (text) => statuses.push(text),
+  });
+  const savedDocument = globalThis.document;
+  globalThis.document = {
+    createElement: (tag) => fakeElement(tag),
+    createElementNS: (_ns, tag) => fakeElement(tag),
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
+    querySelector: () => null,
+  };
+  const fire = (el, type, event = {}) => {
+    for (const listener of [...(el.listeners[type] || [])]) listener(event);
+  };
+  const keys = () => listEl.children
+    .filter((kid) => String(kid.className).includes("doc-card"))
+    .map((kid) => kid.getAttribute("data-key"));
+  try {
+    await run({ list, listEl, scroller, paths, statuses, fire, keys });
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+    list.unmount();
+  }
+}
+
+test("documents list: forward chronological, newest at the bottom, refresh follows only from the bottom", async () => {
+  const rows = [docRow("old", 100), docRow("mid", 200), docRow("new", 300)];
+  await withList(() => ({ documents: rows, total: 3 }), async ({ list, listEl, scroller, keys }) => {
+    await list.refresh();
+    assert.deepEqual(keys(), ["old", "mid", "new"], "cards are not oldest first, newest last");
+    assert.ok(listEl.children[0].textContent.includes("Oldest first"), "the heading still claims newest first");
+    // Parked at the bottom, a refresh follows to the (grown) bottom.
+    scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight;
+    await list.refresh();
+    assert.equal(scroller.scrollTop, scroller.scrollHeight, "a reader at the bottom did not follow a refresh");
+    // Reading mid-list, a refresh keeps the place.
+    scroller.scrollTop = 150;
+    await list.refresh();
+    assert.equal(scroller.scrollTop, 150, "a refresh moved a reader mid-list");
+  });
+});
+
+test("documents list: older documents page in at the top, anchored; the bottom pages nothing", async () => {
+  const first = [docRow("c", 300), docRow("d", 400), docRow("e", 500)];
+  const older = [docRow("a", 100), docRow("b", 200)];
+  await withList((path) => (path.includes("before_ms=")
+    ? { documents: older, total: 5 }
+    : { documents: first, total: 5 }), async ({ list, scroller, paths, fire, keys }) => {
+    await list.refresh();
+    assert.deepEqual(keys(), ["c", "d", "e"]);
+    // At the bottom, scrolling pages nothing: older history is at the other end now.
+    scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight;
+    fire(scroller, "scroll");
+    await flush([]);
+    assert.ok(!paths.some((path) => path.includes("before_ms=")), "scrolling at the bottom paged older documents");
+    // Near the top it pages, with the loaded window's oldest mention as the cursor, and the
+    // reader's place is kept by the height the older cards added above it.
+    scroller.scrollTop = 100;
+    fire(scroller, "scroll");
+    await flush([]);
+    assert.ok(paths.some((path) => path.includes("before_ms=300")), `no older page was fetched (paths: ${paths.join(", ")})`);
+    assert.deepEqual(keys(), ["a", "b", "c", "d", "e"], "older documents did not land above the window in order");
+    assert.equal(scroller.scrollTop, 700, "paging older in did not anchor the reader's place");
+  });
+});
+
+test("documents list: drag up parked at the bottom refreshes; other drags do not", async () => {
+  const rows = [docRow("old", 100), docRow("new", 300)];
+  await withList(() => ({ documents: rows, total: 2 }), async ({ list, listEl, scroller, paths, statuses, fire }) => {
+    await list.refresh();
+    const reads = () => paths.filter((path) => path.startsWith("/api/v1/documents?")).length;
+    const drag = (from, to) => {
+      fire(listEl, "touchstart", { touches: [{ clientY: from }] });
+      fire(listEl, "touchend", { changedTouches: [{ clientY: to }] });
+    };
+    // Parked at the bottom, dragging up past the edge refreshes.
+    scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight;
+    const before = reads();
+    drag(500, 400);
+    await flush([]);
+    assert.equal(reads(), before + 1, "drag up at the bottom refreshed nothing");
+    assert.ok(statuses.includes("The list is current."), "the refresh said nothing");
+    // Dragging down at the bottom is a scroll back into the list, not a refresh.
+    drag(400, 500);
+    await flush([]);
+    assert.equal(reads(), before + 1, "drag down at the bottom refreshed");
+    // Dragging up from mid-list is scrolling, not a pull past the edge.
+    scroller.scrollTop = 0;
+    drag(500, 400);
+    await flush([]);
+    assert.equal(reads(), before + 1, "drag up from mid-list refreshed");
+  });
+});
+
 // ---- 4. reader: the outline pop-up and the source-linked title --------------------------------
 
 // A fakeElement with the few box/focus surfaces the reader measures: focus and

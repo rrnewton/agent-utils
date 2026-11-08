@@ -1,10 +1,13 @@
 // The Documents list (`#1022 documents-view-client`, batch A): one bordered card
-// per document the fold knows, in the order the server gives them — mention
-// order, newest last. Unfetched cards are dimmed; fetched ones are full
-// saturation, with when they were fetched said quietly. A card names the
-// document only: its real title once fetched, its file name before that. The
-// kind label is the small link out to the source. All words from the server
-// are untrusted, so every visible string goes through `textContent`.
+// per document the fold knows, forward chronological like the message views
+// (`#1079 documents-chronological`) — oldest at the top, newest at the bottom,
+// opening at the bottom. Older documents page in upward; a drag up parked at
+// the bottom refreshes, the message views' gesture. Unfetched cards are
+// dimmed; fetched ones are full saturation, with when they were fetched said
+// quietly. A card names the document only: its real title once fetched, its
+// file name before that. The kind label is the small link out to the source.
+// All words from the server are untrusted, so every visible string goes
+// through `textContent`.
 
 import { createListening } from "../dom/index.ts";
 import type { DocumentRow, DocumentsListAnswer } from "./types.ts";
@@ -103,10 +106,19 @@ function displayTitle(row: DocumentRow): string {
   return title;
 }
 
-/** Newest mention first, as thread cards sort by their last update. */
-function byNewest(a: DocumentRow, b: DocumentRow): number {
-  return (b.last_mentioned_ms ?? 0) - (a.last_mentioned_ms ?? 0);
+/** Oldest mention first, newest at the bottom, as the message views run. */
+function byOldest(a: DocumentRow, b: DocumentRow): number {
+  return (a.last_mentioned_ms ?? 0) - (b.last_mentioned_ms ?? 0);
 }
+
+/** How far past the bottom a drag up must travel to refresh, in px: the channel pull's arm. */
+const REFRESH_PULL_PX = 64;
+/** How close to the true bottom counts as parked there for the pull, in px (the channel's slack). */
+const PULL_EDGE_SLACK_PX = 2;
+/** How close to the bottom counts as following the newest across a refresh, in px. */
+const FOLLOW_SLACK_PX = 24;
+/** How near the top scrolling pages older documents in, in px. */
+const OLDER_TRIGGER_PX = 500;
 
 export function createDocumentsList(deps: DocumentsListDependencies): DocumentsList {
   const listening = createListening();
@@ -194,28 +206,67 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
   let loadingOlder = false;
   let totalNow = 0;
 
+  /** The shared scroller, where the page has one; null in a host without it. */
+  function scrollerOrNull(): HTMLElement | null {
+    try {
+      return deps.byId("scroll-area") ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Whether `scroller` is parked at its bottom, within `slack` px. */
+  function atBottom(scroller: HTMLElement, slack: number): boolean {
+    return scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - slack;
+  }
+
+  /**
+   * Whether the list is the pane on screen. The scroller is shared with the other views, so
+   * its scrolling must page documents only while documents are what is being read; where the
+   * panes cannot be asked (a partial host), the list counts as on screen as it always did.
+   */
+  function listOnScreen(): boolean {
+    try {
+      const pane = deps.byId("pane-docs");
+      const view = deps.byId("docs-list-view");
+      if (pane && pane.hidden) return false;
+      if (view && view.hidden) return false;
+      return true;
+    } catch {
+      return true;
+    }
+  }
+
   function wireOuter(list: HTMLElement): void {
     if (wiredOuter) return;
     wiredOuter = true;
     const scroller = deps.byId("scroll-area");
     outer.listen(scroller, "scroll", () => {
-      const near = scroller.scrollTop + scroller.clientHeight > scroller.scrollHeight - 500;
+      if (!listOnScreen()) return;
+      const near = scroller.scrollTop < OLDER_TRIGGER_PX;
       if (near && !loadingOlder && rowsNow.length < totalNow) void loadOlder();
     });
-    // Pull down at the top to refresh (the channel list's gesture, in kind).
+    // Drag up parked at the bottom to refresh: the channel list's pull-up gesture, in kind.
+    // The list's own handling rather than the channel's owner, whose every dependency is a
+    // channel read; the meaning is the same — parked at the newest end, drag past the edge,
+    // release to refresh. The shared scroller's contained overscroll leaves the platform's
+    // own stretch showing on both views, which is the only animation either needs.
     let pullY: number | null = null;
     outer.listen(list, "touchstart", (event: TouchEvent) => {
-      pullY = scroller.scrollTop <= 0 ? (event.touches[0]?.clientY ?? null) : null;
+      pullY = atBottom(scroller, PULL_EDGE_SLACK_PX) ? (event.touches[0]?.clientY ?? null) : null;
     });
     outer.listen(list, "touchend", (event: TouchEvent) => {
       const start = pullY;
       pullY = null;
       const end = event.changedTouches[0]?.clientY;
-      if (start !== null && end !== undefined && end - start > 80 && scroller.scrollTop <= 0) {
+      if (start !== null && end !== undefined && start - end > REFRESH_PULL_PX && atBottom(scroller, PULL_EDGE_SLACK_PX)) {
         void refresh()
           .then(() => deps.onStatus?.("The list is current."))
           .catch(() => undefined);
       }
+    });
+    outer.listen(list, "touchcancel", () => {
+      pullY = null;
     });
   }
 
@@ -230,7 +281,15 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       const answer = (await deps.api(`/api/v1/documents?limit=100&before_ms=${oldest}`)) as DocumentsListAnswer;
       const older = Array.isArray(answer?.documents) ? answer.documents : [];
       const seen = new Set(rowsNow.map((row) => row.key));
+      // Older cards land ABOVE the reader: keep the card under their eye in place by the
+      // height the redraw added over it, measured across the render itself.
+      const scroller = scrollerOrNull();
+      const heightBefore = scroller ? scroller.scrollHeight : 0;
       render([...rowsNow, ...older.filter((row) => !seen.has(row.key))]);
+      if (scroller && listOnScreen()) {
+        const grew = scroller.scrollHeight - heightBefore;
+        if (grew > 0) scroller.scrollTop += grew;
+      }
     } catch {
       // Scrolling on is its own retry.
     } finally {
@@ -239,7 +298,7 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
   }
 
   function render(rows: readonly DocumentRow[]): void {
-    rowsNow = [...rows].sort(byNewest);
+    rowsNow = [...rows].sort(byOldest);
     listening.unmount();
     const list = deps.byId(LIST_ID);
     wireOuter(list);
@@ -252,7 +311,7 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     }
     const head = document.createElement("p");
     head.className = "doc-list-head";
-    head.textContent = `Newest first · ${totalNow || rowsNow.length} documents`;
+    head.textContent = `Oldest first · ${totalNow || rowsNow.length} documents · newest at the bottom`;
     const cards = rowsNow.map(cardFor);
     list.replaceChildren(head, ...cards);
     // Arrow keys walk the cards; Enter opens (above).
@@ -309,9 +368,18 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
   }
 
   async function refresh(): Promise<void> {
+    // Keep the reader's place across the redraw, as the message views do: a reader parked
+    // at the bottom follows newly appended documents there (which is also how entering the
+    // list at its newest end lands at the bottom); anyone else stays where they were.
+    const scroller = scrollerOrNull();
+    const follow = scroller !== null && listOnScreen() && atBottom(scroller, FOLLOW_SLACK_PX);
+    const top = scroller ? scroller.scrollTop : 0;
     const answer = (await deps.api(LIST_PATH)) as DocumentsListAnswer;
     totalNow = typeof answer?.total === "number" ? answer.total : 0;
     render(Array.isArray(answer?.documents) ? answer.documents : []);
+    if (scroller && listOnScreen()) {
+      scroller.scrollTop = follow ? scroller.scrollHeight : top;
+    }
   }
 
   async function fetchMany(targets: readonly DocumentRow[]): Promise<number> {
