@@ -2110,8 +2110,9 @@ function documentsDeepLinkKey() {
 }
 
 // Ctrl+5 (Cmd+5 on a Mac) for Documents, beside Ctrl+0 for the call's view.
+// Ctrl+9 (Cmd+9) goes straight there too, next to Ctrl+0 (owner, thread 214).
 document.addEventListener("keydown", (event) => {
-  if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key === "5") {
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && (event.key === "5" || event.key === "9")) {
     event.preventDefault();
     chooseMajorView("docs");
   }
@@ -2561,6 +2562,7 @@ function showView(name) {
   el("pane-voice").hidden = name !== "voice";
   el("pane-discord").hidden = name !== "discord";
   el("pane-docs").hidden = name !== "docs";
+  el("docs-fetch").hidden = name !== "docs";
   // `#269 approval-card-inline`. A waiting draft is the next message of the list now on screen, put
   // there BEFORE the place in that list is restored, which counts it.
   voiceTranscript().placePostCard();

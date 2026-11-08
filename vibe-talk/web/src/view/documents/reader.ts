@@ -31,7 +31,7 @@ export interface DocumentsReader {
 
 /** What `GET /api/v1/documents/{key}` answers, as far as the reader uses it. */
 interface DocumentAnswer {
-  document: { title?: unknown } | null;
+  document: { title?: unknown; moved_to?: unknown } | null;
   content: unknown;
   outline: unknown;
 }
@@ -42,7 +42,7 @@ function asAnswer(value: unknown): DocumentAnswer {
   const record = value as { document?: unknown; content?: unknown; outline?: unknown };
   const doc = record.document;
   return {
-    document: typeof doc === "object" && doc !== null ? (doc as { title?: unknown }) : null,
+    document: typeof doc === "object" && doc !== null ? (doc as { title?: unknown; moved_to?: unknown }) : null,
     content: record.content,
     outline: record.outline,
   };
@@ -177,6 +177,8 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       const rawTitle = answer.document?.title;
       const docTitle = typeof rawTitle === "string" ? rawTitle : "";
       deps.byId("doc-title").textContent = docTitle !== "" ? docTitle : (outline[0] ?? key);
+      const movedTo = answer.document?.moved_to;
+      if (typeof movedTo === "string" && movedTo !== "") deps.onStatus?.(`Moved to ${movedTo}`);
       const body = deps.byId("doc-body");
       if (markdown !== null) {
         // The documents sink: fed solely by the sanitizer above, never raw text.

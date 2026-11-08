@@ -713,9 +713,11 @@
                  its DOM from this file. -->
             <div id="pane-docs" hidden>
               <div id="docs-list-view">
-                <div class="row docs-toolbar">
-                  <button id="docs-fetch-recent" type="button">Fetch recent</button>
-                </div>
+                <div id="docs-since" class="docs-since" hidden>
+            <label>Days <input id="docs-since-days" type="number" value="1" min="0" max="365" autocomplete="off" data-form-type="other" data-lpignore="true" data-1p-ignore="true"></label>
+            <label>Hours <input id="docs-since-hours" type="number" value="0" min="0" max="23" autocomplete="off" data-form-type="other" data-lpignore="true" data-1p-ignore="true"></label>
+            <button id="docs-since-go" type="button">Fetch</button>
+          </div>
                 <div id="documents-list"></div>
               </div>
               <div id="docs-reader" hidden>
@@ -2678,7 +2680,7 @@
                 Ctrl+/ used to. Ctrl+0 (Cmd+0 on a Mac) goes to the voice (call)
                 view, and Ctrl+1 to Ctrl+4 (Cmd+1 to Cmd+4 on a Mac) choose the four views — Main, All,
                 the thread list and two columns — from anywhere, a box included; 1, 2 and 3 on their
-                own no longer do.
+                own no longer do. Ctrl+9 (Cmd+9 on a Mac) goes to the Documents view, as Ctrl+5 does.
               </p>
               <div id="keyboard-keys" role="group" aria-label="Keyboard shortcuts"></div>
             </details>
@@ -4132,6 +4134,16 @@
                the switch (the stylesheet lifts them there), naming the two views that are not
                showing, in the order rotating reaches them; the selector fills and wires them. -->
           <div id="view-cards" class="view-cards" hidden></div>
+          <!-- Fetching documents (`documents-view-client` batch A): on the bar in the
+               Documents view, with a drop-up of what to fetch or refresh. -->
+          <button id="docs-fetch" class="bar-button" type="button" hidden
+                  aria-haspopup="menu" aria-expanded="false">Fetch</button>
+          <div id="docs-fetch-menu" class="docs-menu" role="menu" hidden>
+            <button id="docs-fetch-visible" type="button" data-act="visible">Fetch visible</button>
+            <button id="docs-fetch-since" type="button" data-act="since">Fetch since…</button>
+            <button id="docs-fetch-refresh" type="button" data-act="refresh">Refresh</button>
+            <button id="docs-fetch-clear" type="button" data-act="clear">Clear cached documents</button>
+          </div>
         </div>
       </div>
 

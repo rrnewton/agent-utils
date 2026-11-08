@@ -36,6 +36,8 @@ export interface DocumentRow {
   version: string | null;
   /** When the cached copy was fetched, in Unix milliseconds. */
   fetched_ms: number | null;
+  /** Where the document lives now, when a moved fetch found it elsewhere. */
+  moved_to: string | null;
   /** How many messages link this document. */
   mention_count: number;
   /** First mention, in Unix milliseconds, when known. */

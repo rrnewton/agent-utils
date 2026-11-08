@@ -59,11 +59,13 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     onStatus: deps.onStatus,
   });
 
-  function showList(): void {
+  function showList(redraw = true): void {
     readingNow = false;
     reader.close();
     deps.byId("docs-reader").hidden = true;
     deps.byId("docs-list-view").hidden = false;
+    // Back from a fetch: the rows redraw with their fetched state.
+    if (redraw) void list.refresh().catch(() => undefined);
   }
 
   async function openDocument(key: string): Promise<void> {
@@ -80,25 +82,73 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
   function wire(): void {
     if (wired) return;
     wired = true;
-    listening.listen(deps.byId("docs-fetch-recent"), "click", () => {
-      const button = deps.byId("docs-fetch-recent") as HTMLButtonElement;
-      const label = button.textContent;
-      button.disabled = true;
-      button.textContent = "Fetching…";
-      void list
-        .fetchRecent()
-        .then((fetched) => {
-          deps.onStatus?.(
-            fetched > 0 ? `Fetched ${fetched} document${fetched === 1 ? "" : "s"}.` : "No new documents fetched.",
-          );
-        })
-        .catch((error: unknown) => {
-          deps.onStatus?.(error instanceof Error ? error.message : String(error));
-        })
-        .finally(() => {
-          button.disabled = false;
-          button.textContent = label;
-        });
+    const button = deps.byId("docs-fetch") as HTMLButtonElement;
+    const menu = deps.byId("docs-fetch-menu");
+    const since = deps.byId("docs-since");
+    let clearArmed = false;
+    const setBusy = (on: boolean, label?: string): void => {
+      button.disabled = on;
+      button.textContent = on ? (label ?? "Fetching…") : "Fetch";
+    };
+    const report = (run: Promise<unknown>, done: (value: never) => string): void => {
+      setBusy(true);
+      run.then(
+        (value) => deps.onStatus?.(done(value as never)),
+        (error: unknown) => deps.onStatus?.(error instanceof Error ? error.message : String(error)),
+      ).finally(() => setBusy(false));
+    };
+    listening.listen(button, "click", () => {
+      const open = menu.hidden;
+      menu.hidden = !open;
+      button.setAttribute("aria-expanded", String(open));
+      if (!open) since.hidden = true;
+    });
+    for (const item of ["docs-fetch-visible", "docs-fetch-since", "docs-fetch-refresh", "docs-fetch-clear"].map(
+      (id) => deps.byId(id),
+    )) {
+      listening.listen(item, "click", () => {
+        const act = item.getAttribute("data-act");
+        if (act !== "clear") {
+          menu.hidden = true;
+          button.setAttribute("aria-expanded", "false");
+          clearArmed = false;
+        }
+        if (act === "visible") report(list.fetchVisible(), (n) => `Fetched ${n} document${n === 1 ? "" : "s"}.`);
+        else if (act === "since") since.hidden = false;
+        else if (act === "refresh") {
+          setBusy(true, "Refreshing…");
+          list
+            .refreshFetched((doneCount, total) => {
+              if (total > 0) button.textContent = `Refreshing ${doneCount}/${total}…`;
+            })
+            .then(
+              ({ updated, current }) =>
+                deps.onStatus?.(`${updated} updated, ${current} current.`),
+              (error: unknown) => deps.onStatus?.(error instanceof Error ? error.message : String(error)),
+            )
+            .finally(() => setBusy(false));
+        } else if (act === "clear") {
+          if (!clearArmed) {
+            clearArmed = true;
+            item.textContent = "Delete every cached document?";
+            return;
+          }
+          clearArmed = false;
+          item.textContent = "Clear cached documents";
+          menu.hidden = true;
+          button.setAttribute("aria-expanded", "false");
+          report(list.clearCached(), (n) => `Deleted ${n} cached document${n === 1 ? "" : "s"}.`);
+        }
+      });
+    }
+    listening.listen(deps.byId("docs-since-go"), "click", () => {
+      const days = Number((deps.byId("docs-since-days") as HTMLInputElement).value) || 0;
+      const hours = Number((deps.byId("docs-since-hours") as HTMLInputElement).value) || 0;
+      since.hidden = true;
+      report(
+        list.fetchSince(Date.now() - ((days * 24 + hours) * 3_600_000)),
+        (n) => `Fetched ${n} document${n === 1 ? "" : "s"}.`,
+      );
     });
   }
 
@@ -109,7 +159,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
         await openDocument(key);
         return;
       }
-      showList();
+      showList(false);
       try {
         await list.refresh();
       } catch (error) {
