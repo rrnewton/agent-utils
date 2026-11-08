@@ -219,6 +219,7 @@ def _rust_create(
     agent: str = "agent-new",
     fixture: bool = True,
     authorized: bool = True,
+    representation: str = "config",
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     if fixture:
@@ -230,6 +231,7 @@ def _rust_create(
         "--agent", agent, "--task", "task-1", "--purpose", "testing",
         "--owner-pid", str(os.getpid()), "--coordinator-pid", str(os.getpid()),
         "--repo", "repo=../upstream-repo", "--branch", f"repo={branch}",
+        "--representation", representation,
         "--machine", "node-a", "--root", str(root),
     ]
     if authorized:
@@ -347,3 +349,47 @@ def test_create_refuses_without_fixture_attestation(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert "fixture-only" in result.stderr
     assert not (rust_root / "worktrees" / "slot-b").exists()
+
+
+def _assert_no_create_side_effects(root: Path) -> None:
+    assert not (root / "worktrees" / "slot-b").exists()
+    assert not list((root / "worktrees").glob("CREATE.*.journal"))
+    assert not (root / "worktrees" / "ACTIVE.node-a.json").exists()
+
+
+def test_create_config_image_refuses_without_side_effects(tmp_path: Path) -> None:
+    # config -> image must refuse, never fall through to a plain
+    # worktree (the create fail-open the resolution hook closes).
+    rust_root = _empty_fixture(tmp_path / "rust")
+    config = rust_root / ".wrkslots.yml"
+    config.write_text(config.read_text() + "slot_representation: image\n")
+    result = _rust_create(rust_root)
+    assert result.returncode == 1, result.stderr
+    assert "slot-image provisioning stays with the Python edition" in result.stderr
+    _assert_no_create_side_effects(rust_root)
+
+
+def test_create_explicit_image_refuses_without_side_effects(tmp_path: Path) -> None:
+    rust_root = _empty_fixture(tmp_path / "rust")
+    result = _rust_create(rust_root, representation="image")
+    assert result.returncode == 1, result.stderr
+    assert "slot-image provisioning stays with the Python edition" in result.stderr
+    _assert_no_create_side_effects(rust_root)
+
+
+def test_create_config_image_explicit_worktree_proceeds(tmp_path: Path) -> None:
+    rust_root = _empty_fixture(tmp_path / "rust")
+    config = rust_root / ".wrkslots.yml"
+    config.write_text(config.read_text() + "slot_representation: image\n")
+    result = _rust_create(rust_root, representation="worktree")
+    assert result.returncode == 0, result.stderr
+    checkout = rust_root / "worktrees" / "slot-b" / "repo"
+    assert (checkout / "file.txt").read_text() == "one\n"
+
+
+def test_create_invalid_representation_refuses(tmp_path: Path) -> None:
+    rust_root = _empty_fixture(tmp_path / "rust")
+    result = _rust_create(rust_root, representation="bogus")
+    assert result.returncode == 1, result.stderr
+    assert "--representation must be config, worktree, or image, not 'bogus'" in result.stderr
+    _assert_no_create_side_effects(rust_root)

@@ -72,7 +72,7 @@ mod hold_write;
 mod image_mounts;
 #[allow(dead_code)] // wired into cli.rs dispatch by the shared core (P8, mu-rsimg)
 mod image_ops;
-#[allow(dead_code)] // wired into create/finish/remove by the shared core (P7 hooks, mu-rsimg)
+#[allow(dead_code)] // create hooks wired; record/teardown surface awaits P7/P8 wiring (mu-rsimg)
 mod image_record;
 #[allow(dead_code)] // wired into cli.rs dispatch by the shared core (P8, mu-rsimg)
 mod image_status;

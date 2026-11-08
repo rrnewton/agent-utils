@@ -418,12 +418,18 @@ fn create_slot_inner(
     if !coordinator_authorized {
         return Err("worktree creation requires a coordinator assignment. state: REFUSED -- no worktree or lifecycle record was changed. remedy: ask the coordinator to assign the slot; an assigned agent may rerun with --coordinator-authorized and its own --owner-pid".to_string());
     }
-    if representation == "image" {
-        return Err(
-            "slot-image provisioning stays with the Python edition in this slice".to_string(),
-        );
-    }
     let config = load_config(root, machine_override)?;
+    // Resolve like Python `_requested_representation` before any
+    // provisioning side effect, so config -> image refuses here.
+    let config_representation = config
+        .get("slot_representation")
+        .and_then(Value::as_str)
+        .unwrap_or("worktree");
+    let resolved =
+        crate::image_record::resolve_representation(representation, config_representation)?;
+    if let Some(refusal) = crate::image_record::provision_decision(resolved) {
+        return Err(refusal.to_string());
+    }
     let (cfg, selected) = load_cfg(root, machine_override)?;
     if machine_override.is_none() && std::env::var_os("WRKSLOTS_MACHINE").is_none() {
         let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
