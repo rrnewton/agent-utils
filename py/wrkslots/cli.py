@@ -537,6 +537,7 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "cache_globs",
         "repo_cache_globs",
         "post_provision_hooks",
+        "identity",
         "salvage_push_remotes",
         "reclaimable_ignored_paths",
         "disk_advisory_bytes",
@@ -549,6 +550,11 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "worktrees_image",
     }
 )
+#: The comment above each key of the optional ``identity`` section (#1096).
+IDENTITY_DOCS: dict[str, str] = {
+    "name": "user.name for commits made in new slots.",
+    "email": "user.email for commits made in new slots.",
+}
 REQUIRED_CONFIG_KEYS = frozenset(
     {
         "schema",
@@ -600,6 +606,11 @@ CONFIG_KEY_DOCS: dict[str, str] = {
     "cache_globs": "Slot-relative globs of regenerable caches that `clean-caches` may delete.",
     "repo_cache_globs": "Per-repository cache globs: repository name to a list of globs.",
     "post_provision_hooks": "Shell commands run, in order, in every new checkout.",
+    "identity": (
+        "Git author identity ({name, email}) that create sets privately in each new slot: "
+        "`git config --worktree` in the slot's own checkout, plain `git config` in each "
+        "populated submodule. Absent means create leaves the identity alone."
+    ),
     "retire_freeze": (
         "When set, every retirement and removal on this host refuses with code retire-freeze "
         "and this reason. Managed by `wrkslots freeze`; absent means unfrozen."
@@ -1108,6 +1119,14 @@ class _ValidationRunMayUseRow(Refusal):
 
 
 @dataclasses.dataclass(frozen=True)
+class SlotIdentity:
+    """The configured Git author identity for new slots (#1096)."""
+
+    name: str
+    email: str
+
+
+@dataclasses.dataclass(frozen=True)
 class Config:
     """Validated project configuration and resolved local paths."""
 
@@ -1126,6 +1145,9 @@ class Config:
     cache_globs: tuple[str, ...] = ()
     repo_cache_globs: tuple[tuple[str, tuple[str, ...]], ...] = ()
     post_provision_hooks: tuple[str, ...] = ()
+    #: Git author identity set slot-privately in every new checkout (#1096);
+    #: None, the meaning when the key is absent, leaves identity alone.
+    identity: SlotIdentity | None = None
     #: Remote URLs salvage may push to; every other remote gets a local bundle.
     salvage_push_remotes: tuple[str, ...] = ()
     #: Checkout-relative build-output subtrees that leave a frozen clone pristine.
@@ -2124,6 +2146,47 @@ def _validate_hook(value: str) -> str:
     return value
 
 
+# One address, as Git writes it between angle brackets: no spaces, no
+# brackets, exactly one "@" with text on both sides.
+_IDENTITY_EMAIL = re.compile(r"[^\s<>@]+@[^\s<>@]+")
+_IDENTITY_MAX_CHARS = 256
+
+
+def _slot_identity(value: object, label: str) -> SlotIdentity:
+    """Validate the ``identity`` configuration section (#1096).
+
+    Git would accept, and silently rewrite, a name with angle brackets or
+    surrounding spaces; refusing them here keeps the identity a commit
+    carries exactly the one written in the configuration.
+    """
+
+    mapping = _as_mapping(value, label)
+    _exact_keys(mapping, {"name", "email"}, set(), label)
+    name = _as_str(mapping["name"], f"{label}.name")
+    email = _as_str(mapping["email"], f"{label}.email")
+    if (
+        not name.strip()
+        or name != name.strip()
+        or len(name) > _IDENTITY_MAX_CHARS
+        or any(character in name for character in "<>")
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in name)
+    ):
+        raise StateError(
+            f"{label}.name must be a non-empty name of at most {_IDENTITY_MAX_CHARS} "
+            "characters, without surrounding spaces, angle brackets, or control characters"
+        )
+    if (
+        len(email) > _IDENTITY_MAX_CHARS
+        or _IDENTITY_EMAIL.fullmatch(email) is None
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in email)
+    ):
+        raise StateError(
+            f"{label}.email must be one address such as agent@example.com: no spaces, "
+            f"angle brackets, or control characters, at most {_IDENTITY_MAX_CHARS} characters"
+        )
+    return SlotIdentity(name=name, email=email)
+
+
 def _validate_salvage_push_remote(value: str) -> str:
     if not value or value != value.strip() or "\x00" in value:
         raise Refusal("salvage push remotes must be non-empty remote URLs")
@@ -2276,6 +2339,7 @@ def _config_key_order(path: tuple[str, ...], keys: Iterable[str]) -> list[str]:
         ("sandbox", "limits"): sandbox.LIMIT_KEYS,
         ("image",): tuple(slotimage.IMAGE_DOCS),
         ("worktrees_image",): tuple(worktreesimage.WORKTREES_IMAGE_DOCS),
+        ("identity",): tuple(IDENTITY_DOCS),
     }
     known = tables.get(path)
     names = list(keys)
@@ -2291,6 +2355,7 @@ def config_comments() -> dict[tuple[str, ...], str]:
     comments.update({("sandbox", key): text for key, text in sandbox.SETTING_DOCS.items()})
     comments.update({("sandbox", "limits", key): text for key, text in sandbox.LIMIT_DOCS.items()})
     comments.update({("image", key): text for key, text in slotimage.IMAGE_DOCS.items()})
+    comments.update({("identity", key): text for key, text in IDENTITY_DOCS.items()})
     comments.update(
         {("worktrees_image", key): text for key, text in worktreesimage.WORKTREES_IMAGE_DOCS.items()}
     )
@@ -4048,6 +4113,11 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             unique=False,
         )
     )
+    identity = (
+        None
+        if "identity" not in raw
+        else _slot_identity(raw["identity"], "configuration.identity")
+    )
     salvage_push_remotes = (
         ()
         if "salvage_push_remotes" not in raw
@@ -4116,6 +4186,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         cache_globs=cache_globs,
         repo_cache_globs=repo_cache_globs,
         post_provision_hooks=post_provision_hooks,
+        identity=identity,
         salvage_push_remotes=salvage_push_remotes,
         reclaimable_ignored_paths=reclaimable_ignored_paths,
         disk_advisory_bytes=disk_values[0],
@@ -27876,6 +27947,207 @@ def _run_post_provision_hooks(
     return total
 
 
+def _assert_git_identity_supported(
+    config: Config, repositories: Iterable[Path], vcs: _GitVcs
+) -> None:
+    """Refuse, before create writes anything, a repository the identity would break (#1096).
+
+    A slot-private identity needs ``extensions.worktreeConfig`` in the
+    repository's shared config. With that extension on, Git applies a
+    ``core.bare`` or ``core.worktree`` left in the shared config to every
+    linked worktree, so each one stops being a work tree. Git's own remedy
+    is to move those settings into the main worktree's ``config.worktree``;
+    wrkslots will not rewrite shared settings, so it refuses instead.
+    """
+
+    if config.identity is None:
+        return
+    for repository in dict.fromkeys(repositories):
+        shared = vcs.common_directory(repository) / "config"
+        bare = vcs._run(
+            repository,
+            ["config", "--file", str(shared), "--type=bool", "--get", "core.bare"],
+            check=False,
+        )
+        worktree = vcs._run(
+            repository,
+            ["config", "--file", str(shared), "--get", "core.worktree"],
+            check=False,
+        )
+        found = [
+            setting
+            for setting, present in (
+                ("core.bare=true", bare.returncode == 0 and bare.stdout.strip() == "true"),
+                ("core.worktree", worktree.returncode == 0),
+            )
+            if present
+        ]
+        if found:
+            raise Refusal(
+                f"configuration.identity needs extensions.worktreeConfig in {shared}, "
+                f"which also sets {' and '.join(found)}; with the extension on, Git "
+                "applies that to every linked worktree. Move it into the main "
+                "worktree's config.worktree (see git-worktree(1), CONFIGURATION FILE) "
+                "or remove identity from the configuration"
+            )
+
+
+def _apply_slot_git_identity(
+    config: Config, created: Sequence[Checkout], journal_path: Path
+) -> None:
+    """Set the configured Git identity privately in every new checkout (#1096).
+
+    The slot's own checkout gets ``git config --worktree``, which needs
+    ``extensions.worktreeConfig`` in the shared config: an inert switch that
+    gives every worktree its own ``config.worktree`` and changes nothing
+    else. ``user.name`` and ``user.email`` themselves are never written to
+    the shared config, so the main checkout and sibling slots keep theirs.
+    Each populated submodule is a clone private to this slot, so it gets a
+    plain ``git config``. Every write is idempotent: recovery repeats the
+    step from the start.
+
+    A submodule that is initialised but not populated, or whose Git
+    directory is not private to this slot, is reported and skipped; a
+    failure to set the checkout's own identity leaves the slot for
+    inspection like a failed post-provision hook.
+    """
+
+    identity = config.identity
+    if identity is None:
+        return
+    vcs = _GitVcs()
+    # Recovery may run under a configuration edited since create checked it.
+    _assert_git_identity_supported(
+        config,
+        (_stored_repository_path(config, item.repository)[1] for item in created),
+        vcs,
+    )
+    settings = (("user.name", identity.name), ("user.email", identity.email))
+    for checkout in created:
+        path = _stored_path(config, checkout.path, "identity checkout path")
+        try:
+            enabled = vcs._run(
+                path,
+                ["config", "--type=bool", "--get", "extensions.worktreeConfig"],
+                check=False,
+            )
+            if enabled.returncode != 0 or enabled.stdout.strip() != "true":
+                shared = vcs.common_directory(path) / "config"
+                vcs._run(
+                    path,
+                    ["config", "--file", str(shared), "extensions.worktreeConfig", "true"],
+                )
+            for key, value in settings:
+                vcs._run(path, ["config", "--worktree", key, value])
+            private = vcs._run(path, ["rev-parse", "--absolute-git-dir"])
+        except Refusal as exc:
+            raise Refusal(
+                f"cannot set configuration.identity in checkout {checkout.name}: {exc}; "
+                f"slot was left for inspection with journal {journal_path}. Fix the "
+                "cause and run 'wrkslots recover'"
+            ) from exc
+        print(
+            f"identity: checkout={checkout.name} worktree config: "
+            f"{identity.name} <{identity.email}>",
+            file=sys.stderr,
+        )
+        private_roots = (Path(private.stdout.strip()).resolve(), path.resolve())
+        for relative, outcome in _set_submodule_git_identity(
+            vcs, path, private_roots, settings
+        ):
+            print(
+                f"identity: {'' if outcome == 'set' else 'WARNING '}"
+                f"checkout={checkout.name} submodule={relative}: {outcome}",
+                file=sys.stderr,
+            )
+
+
+def _set_submodule_git_identity(
+    vcs: _GitVcs,
+    checkout: Path,
+    private_roots: tuple[Path, ...],
+    settings: Sequence[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Set ``settings`` in each populated submodule below ``checkout``, recursively.
+
+    Submodules are those ``.gitmodules`` declares. One counts as
+    initialised when its parent's config has ``submodule.<name>.url``.
+    Returns (path, outcome) per initialised submodule, in declaration order.
+    """
+
+    outcomes: list[tuple[str, str]] = []
+
+    def visit(repository: Path, prefix: str) -> None:
+        modules = repository / ".gitmodules"
+        if modules.is_symlink() or not modules.is_file():
+            return
+        listed = vcs._run(
+            repository, ["config", "--file", str(modules), "-z", "--list"], check=False
+        )
+        if listed.returncode != 0:
+            outcomes.append(
+                (prefix or ".", "not set: cannot read .gitmodules: " + listed.stderr.strip())
+            )
+            return
+        declared: dict[str, str] = {}
+        for entry in listed.stdout.split("\0"):
+            key, separator, value = entry.partition("\n")
+            if not separator or not key.startswith("submodule."):
+                continue
+            name, _dot, option = key[len("submodule.") :].rpartition(".")
+            if name and option == "path":
+                declared[name] = value
+        for name, raw in declared.items():
+            display = f"{prefix}{raw}"
+            relative = Path(raw)
+            if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+                outcomes.append((display, "not set: unsafe path in .gitmodules"))
+                continue
+            url = vcs._run(
+                repository, ["config", "--get", f"submodule.{name}.url"], check=False
+            )
+            if url.returncode != 0:
+                continue
+            nested = repository / relative
+            if (
+                nested.is_symlink()
+                or not nested.is_dir()
+                or not _submodule_worktree_populated(nested)
+            ):
+                outcomes.append(
+                    (display, "not set: initialised but missing (no checkout at this path)")
+                )
+                continue
+            git_dir = vcs._run(nested, ["rev-parse", "--absolute-git-dir"], check=False)
+            common = vcs._run(
+                nested,
+                ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                check=False,
+            )
+            if git_dir.returncode != 0 or common.returncode != 0:
+                outcomes.append((display, "not set: Git cannot open this submodule"))
+                continue
+            module_dir = Path(git_dir.stdout.strip()).resolve()
+            if module_dir != Path(common.stdout.strip()).resolve() or not any(
+                module_dir.is_relative_to(root) for root in private_roots
+            ):
+                outcomes.append(
+                    (display, f"not set: its Git directory {module_dir} is not private to this slot")
+                )
+                continue
+            try:
+                for key, value in settings:
+                    vcs._run(nested, ["config", key, value])
+            except Refusal as exc:
+                outcomes.append((display, f"not set: {exc}"))
+                continue
+            outcomes.append((display, "set"))
+            visit(nested, f"{display}/")
+
+    visit(checkout, "")
+    return outcomes
+
+
 # A repository's own Git hook installer, run by 'create' after the slot is
 # registered.  See _run_setup_hook_installers for which repositories qualify.
 SETUP_HOOKS_SCRIPT = "scripts/setup-hooks.sh"
@@ -28289,6 +28561,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         plan_repositories = tuple(
             _stored_repository_path(config, item.repository)[1] for item in plan
         )
+        _assert_git_identity_supported(config, plan_repositories, vcs)
         storage_inconsistencies = _registry_storage_inconsistencies(
             config, states, additional_repositories=plan_repositories
         )
@@ -28421,6 +28694,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         hook_progress = _run_post_provision_hooks(
             config, created, journal_path, hook_journal
         )
+        _apply_slot_git_identity(config, created, journal_path)
         for checkout in created:
             _assert_checkout_identity_unchanged(config, checkout, vcs)
         _assert_create_processes(
@@ -47616,6 +47890,7 @@ def _recover_create(
     )
     if hook_progress != total_hook_steps:
         raise StateError("create recovery did not complete its post-provision hooks")
+    _apply_slot_git_identity(config, created, path)
     for checkout in created:
         _assert_checkout_identity_unchanged(config, checkout, vcs)
     record = ActiveRecord(

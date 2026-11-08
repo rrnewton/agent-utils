@@ -352,6 +352,61 @@ explicit state-path arguments remain CLI refusals. JSON reports typed CPU second
 seconds, and work counters for the registry, liveness, process-census, cache-planning,
 cache-census, registered-row, and storage phases.
 
+## Git identity in new slots
+
+Without help, an agent commits under whatever identity Git falls through to: the user's
+`~/.gitconfig`, or a host-derived one. Worse, a plain `git config user.email ...` run inside a slot
+writes the repository's shared configuration, so it changes the identity of the primary checkout
+and every sibling slot at once. A project that needs every agent commit under one identity (a
+required bot account, say) names it in `.wrkslots.yml`:
+
+```yaml
+identity:
+  name: Example Bot
+  email: bot@example.com
+```
+
+wrkslots ships no default: with no `identity` key, `create` leaves Git configuration exactly as
+before. The name must be non-empty, at most 256 characters, with no surrounding spaces, angle
+brackets, or control characters; the email must be one address with text on both sides of a single
+`@` and no spaces or angle brackets. Anything else is refused when the configuration is loaded, by
+every command.
+
+When it is set, `create` (and `recover` finishing an interrupted create) applies it after the
+post-provision hooks, so submodules those hooks initialized are included, and before the slot is
+registered:
+
+- the slot's own checkout gets `git config --worktree user.name` and `user.email`, which land in
+  that worktree's private `config.worktree`. Per-worktree configuration needs
+  `extensions.worktreeConfig=true` in the repository's shared configuration; that switch is the
+  one shared write, and it changes nothing for the primary checkout or other slots. `user.name`
+  and `user.email` are never written to the shared configuration;
+- each populated submodule below the checkout, recursively, gets plain `git config user.name` and
+  `user.email`. Such a submodule's Git directory lives under the slot's own Git directory, so that
+  configuration is private to the slot.
+
+Each step is reported on stderr:
+
+```text
+identity: checkout=product worktree config: Example Bot <bot@example.com>
+identity: checkout=product submodule=component: set
+identity: WARNING checkout=product submodule=vendor/lib: not set: initialised but missing (no checkout at this path)
+```
+
+A submodule counts as initialised when its parent's configuration has `submodule.<name>.url`. One
+that is initialised but has no checkout, or whose Git directory is not private to the slot, is
+reported and skipped; the slot is still created. A failure to set the checkout's own identity
+leaves the slot for inspection with its create journal, like a failed post-provision hook; fix the
+cause and run `wrkslots recover`, which repeats the step (every write is idempotent).
+
+With `extensions.worktreeConfig` on, Git applies a `core.bare=true` or `core.worktree` left in the
+shared configuration to every linked worktree, which then stops being a work tree. So when any
+repository in the plan has either setting in its shared configuration, `create` refuses before
+writing anything. Git's remedy is to move the setting into the primary worktree's
+`config.worktree` (git-worktree(1), "CONFIGURATION FILE"); otherwise remove `identity`.
+
+Slots created before the key was set keep the identity they had; `create` does not revisit them.
+
 ## Git hook installers in new submodules
 
 A repository can ship its own Git hook installer as an executable `scripts/setup-hooks.sh`, which

@@ -393,3 +393,82 @@ def test_create_invalid_representation_refuses(tmp_path: Path) -> None:
     assert result.returncode == 1, result.stderr
     assert "--representation must be config, worktree, or image, not 'bogus'" in result.stderr
     _assert_no_create_side_effects(rust_root)
+
+
+def _identity_fixture(base: Path, *, extra: str = "") -> Path:
+    """An empty fixture whose repository has a submodule and an identity configured (#1096)."""
+
+    root = _empty_fixture(base)
+    leaf = base / "leaf-repo"
+    _repo(leaf)
+    upstream = base / "upstream-repo"
+    _git(upstream, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(leaf), "leaf")
+    _git(upstream, "commit", "-q", "-m", "add leaf")
+    _git(upstream, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+    config = root / ".wrkslots.yml"
+    config.write_text(
+        config.read_text()
+        + "identity: {name: Slot Bot, email: slot-bot@example.invalid}\n"
+        + "post_provision_hooks:\n"
+        + "  - 'git -c protocol.file.allow=always submodule update --init --quiet'\n"
+        + extra
+    )
+    return root
+
+
+def _identity_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith("identity: ")]
+
+
+def _config_list(cwd: Path, *scope: str) -> list[str]:
+    return sorted(
+        line for line in _git(cwd, "config", *scope, "--list").splitlines()
+        if line.startswith(("user.", "extensions."))
+    )
+
+
+def test_create_identity_matches_python(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rust_root = _identity_fixture(tmp_path / "rust")
+    oracle_root = _identity_fixture(tmp_path / "oracle")
+    capsys.readouterr()
+    assert _python_create(oracle_root) == 0
+    oracle_lines = _identity_lines(capsys.readouterr().err)
+    result = _rust_create(rust_root)
+    assert result.returncode == 0, result.stderr
+    assert _identity_lines(result.stderr) == oracle_lines == [
+        "identity: checkout=repo worktree config: Slot Bot <slot-bot@example.invalid>",
+        "identity: checkout=repo submodule=leaf: set",
+    ]
+    assert _active_doc(rust_root) == _active_doc(oracle_root)
+    for root in (rust_root, oracle_root):
+        checkout = root / "worktrees" / "slot-b" / "repo"
+        shared = root.parent / "upstream-repo" / ".git" / "config"
+        assert _config_list(checkout, "--worktree") == [
+            "user.email=slot-bot@example.invalid", "user.name=Slot Bot",
+        ]
+        assert _config_list(checkout / "leaf", "--local") == [
+            "user.email=slot-bot@example.invalid", "user.name=Slot Bot",
+        ]
+        assert _config_list(checkout, "--file", str(shared)) == [
+            "extensions.worktreeconfig=true",
+        ]
+
+
+def test_create_identity_refusal_matches_python(tmp_path: Path) -> None:
+    rust_root = _identity_fixture(tmp_path / "rust")
+    oracle_root = _identity_fixture(tmp_path / "oracle")
+    for root in (rust_root, oracle_root):
+        upstream = root.parent / "upstream-repo"
+        _git(upstream, "config", "core.worktree", str(upstream))
+    with pytest.raises(Exception) as caught:
+        _python_create(oracle_root)
+    result = _rust_create(rust_root)
+    assert result.returncode == 1
+    for text in (str(caught.value), result.stderr):
+        assert "which also sets core.worktree" in text
+        assert "remove identity from the configuration" in text
+    for root in (rust_root, oracle_root):
+        assert not (root / "worktrees" / "slot-b").exists()
+        assert not list((root / "worktrees").glob("CREATE.*.journal"))

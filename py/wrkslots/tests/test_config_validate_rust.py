@@ -51,6 +51,9 @@ def _expected(root: Path) -> dict[str, object]:
         "disk_emergency_bytes": config.disk_emergency_bytes,
         "disk_provisioning_floor_bytes": config.disk_provisioning_floor_bytes,
         "heartbeat_ttl_seconds": config.heartbeat_ttl_seconds,
+        "identity": (
+            None if config.identity is None else dataclasses.asdict(config.identity)
+        ),
         "image": dataclasses.asdict(config.image_settings),
         "layout": config.layout,
         "liveness_batch_command": (
@@ -103,6 +106,7 @@ def test_validate_config_matches_python(tmp_path: Path) -> None:
 def test_validate_config_with_sections_matches_python(tmp_path: Path) -> None:
     root = _root(
         tmp_path,
+        "identity: {name: Slot Bot, email: slot-bot@example.invalid}\n"
         "image: {backend: kernel, ceiling_bytes: 2147483648}\n"
         "sandbox: {isolation: cgroup, limits: {memory_max: 32G, tasks_max: 10}}\n",
     )
@@ -120,6 +124,14 @@ def test_validate_config_with_sections_matches_python(tmp_path: Path) -> None:
         ("disk_advisory_bytes: 5\n", "must supply advisory"),
         ("sandbox: {isolation: namespace}\n", "namespace was renamed userns"),
         ("reclaimable_ignored_paths: ['../out']\n", "configuration.reclaimable_ignored_paths: cache glob must stay inside"),
+        ("identity: Slot Bot\n", "configuration.identity must be a JSON object"),
+        ("identity: {name: Slot Bot}\n", "configuration.identity has invalid fields: missing email"),
+        ("identity: {name: Slot Bot, email: x@y, key: 1}\n", "configuration.identity has invalid fields: unknown key"),
+        ("identity: {name: 'Bot <b>', email: x@y}\n", "configuration.identity.name must be"),
+        ("identity: {name: ' Bot', email: x@y}\n", "configuration.identity.name must be"),
+        ("identity: {name: Bot, email: 'a@b@c'}\n", "configuration.identity.email must be"),
+        ("identity: {name: Bot, email: 'a b@c'}\n", "configuration.identity.email must be"),
+        ("identity: {name: Bot, email: 7}\n", "configuration.identity.email must be a string"),
     ],
 )
 def test_validate_config_refusals_name_the_same_problem(tmp_path: Path, extra: str, fragment: str) -> None:

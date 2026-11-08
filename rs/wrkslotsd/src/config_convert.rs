@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::active_state::load_cfg;
 use crate::config_docs::{
-    HEADER_TEMPLATE, IMAGE_DOCS, LIMIT_DOCS, OPTIONAL_KEYS, SANDBOX_DOCS, TOP_DOCS,
+    HEADER_TEMPLATE, IDENTITY_DOCS, IMAGE_DOCS, LIMIT_DOCS, OPTIONAL_KEYS, SANDBOX_DOCS, TOP_DOCS,
     WORKTREES_IMAGE_DOCS,
 };
 use crate::config_validate::load_config;
@@ -42,6 +42,12 @@ fn comments() -> HashMap<Vec<String>, String> {
     for (key, text) in IMAGE_DOCS {
         out.insert(vec!["image".to_string(), key.to_string()], text.to_string());
     }
+    for (key, text) in IDENTITY_DOCS {
+        out.insert(
+            vec!["identity".to_string(), key.to_string()],
+            text.to_string(),
+        );
+    }
     for (key, text) in WORKTREES_IMAGE_DOCS {
         out.insert(
             vec!["worktrees_image".to_string(), key.to_string()],
@@ -58,6 +64,7 @@ fn order_for(path: &[String]) -> Option<&'static [(&'static str, &'static str)]>
         [sandbox, limits] if sandbox == "sandbox" && limits == "limits" => Some(LIMIT_DOCS),
         [image] if image == "image" => Some(IMAGE_DOCS),
         [image] if image == "worktrees_image" => Some(WORKTREES_IMAGE_DOCS),
+        [identity] if identity == "identity" => Some(IDENTITY_DOCS),
         _ => None,
     }
 }

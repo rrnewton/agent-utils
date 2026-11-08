@@ -66,6 +66,281 @@ fn git_ok(repo: &Path, args: &[&str]) -> bool {
     git(repo, args).is_ok()
 }
 
+/// Run Git like `git`, returning (success, stdout, stderr) untrimmed.
+fn git_output(repo: &Path, args: &[&str]) -> (bool, String, String) {
+    let mut command = Command::new("git");
+    command
+        .args([
+            "--no-replace-objects",
+            "-c",
+            "core.useReplaceRefs=false",
+            "-C",
+        ])
+        .arg(repo)
+        .args(args)
+        .env_clear();
+    for (key, value) in std::env::vars() {
+        if !key.starts_with("GIT_") {
+            command.env(key, value);
+        }
+    }
+    match command
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .output()
+    {
+        Ok(output) => (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ),
+        Err(error) => (false, String::new(), format!("cannot run git: {error}")),
+    }
+}
+
+/// The configured `identity` (#1096) as (name, email); None when absent.
+fn configured_author(config: &Value) -> Option<(String, String)> {
+    let section = config.get("identity")?.as_object()?;
+    Some((
+        section.get("name")?.as_str()?.to_string(),
+        section.get("email")?.as_str()?.to_string(),
+    ))
+}
+
+fn shared_config(repo: &Path) -> Result<String> {
+    let common = git(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    Ok(PathBuf::from(common)
+        .join("config")
+        .to_string_lossy()
+        .into_owned())
+}
+
+/// Refuse, before create writes anything, a repository whose shared
+/// config holds `core.bare=true` or `core.worktree`: once
+/// `extensions.worktreeConfig` is on, Git applies those to every
+/// linked worktree (#1096). Mirrors `_assert_git_identity_supported`.
+fn assert_author_supported(repositories: &[PathBuf]) -> Result<()> {
+    let mut seen: Vec<&PathBuf> = Vec::new();
+    for repository in repositories {
+        if seen.contains(&repository) {
+            continue;
+        }
+        seen.push(repository);
+        let shared = shared_config(repository)?;
+        let (bare_ok, bare, _) = git_output(
+            repository,
+            &[
+                "config",
+                "--file",
+                &shared,
+                "--type=bool",
+                "--get",
+                "core.bare",
+            ],
+        );
+        let (worktree_ok, _, _) = git_output(
+            repository,
+            &["config", "--file", &shared, "--get", "core.worktree"],
+        );
+        let mut found = Vec::new();
+        if bare_ok && bare.trim() == "true" {
+            found.push("core.bare=true");
+        }
+        if worktree_ok {
+            found.push("core.worktree");
+        }
+        if !found.is_empty() {
+            return Err(format!(
+                "configuration.identity needs extensions.worktreeConfig in {shared}, which also sets {}; with the extension on, Git applies that to every linked worktree. Move it into the main worktree's config.worktree (see git-worktree(1), CONFIGURATION FILE) or remove identity from the configuration",
+                found.join(" and ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Set the configured identity privately in every new checkout
+/// (#1096): `git config --worktree` in the slot's own checkout, plain
+/// `git config` in each populated submodule whose Git directory is
+/// private to the slot. Mirrors `_apply_slot_git_identity`.
+fn apply_author(
+    root: &Path,
+    created: &[Value],
+    author: &(String, String),
+    journal_path: &Path,
+) -> Result<()> {
+    let (name, email) = author;
+    let settings = [("user.name", name.as_str()), ("user.email", email.as_str())];
+    for checkout in created {
+        let checkout_name = checkout
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let path = root.join(
+            checkout
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        let private = (|| -> Result<String> {
+            let (enabled_ok, enabled, _) = git_output(
+                &path,
+                &["config", "--type=bool", "--get", "extensions.worktreeConfig"],
+            );
+            if !(enabled_ok && enabled.trim() == "true") {
+                let shared = shared_config(&path)?;
+                git(
+                    &path,
+                    &["config", "--file", &shared, "extensions.worktreeConfig", "true"],
+                )?;
+            }
+            for (key, value) in settings {
+                git(&path, &["config", "--worktree", key, value])?;
+            }
+            git(&path, &["rev-parse", "--absolute-git-dir"])
+        })()
+        .map_err(|error| {
+            format!(
+                "cannot set configuration.identity in checkout {checkout_name}: {error}; slot was left for inspection with journal {}. Fix the cause and run 'wrkslots recover'",
+                journal_path.display()
+            )
+        })?;
+        eprintln!("identity: checkout={checkout_name} worktree config: {name} <{email}>");
+        let canonical = |value: &Path| value.canonicalize().unwrap_or_else(|_| value.to_path_buf());
+        let roots = [canonical(Path::new(&private)), canonical(&path)];
+        let mut outcomes = Vec::new();
+        submodule_authors(&path, "", &roots, &settings, &mut outcomes);
+        for (relative, outcome) in outcomes {
+            let warning = if outcome == "set" { "" } else { "WARNING " };
+            eprintln!(
+                "identity: {warning}checkout={checkout_name} submodule={relative}: {outcome}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn submodule_authors(
+    repository: &Path,
+    prefix: &str,
+    roots: &[PathBuf],
+    settings: &[(&str, &str)],
+    outcomes: &mut Vec<(String, String)>,
+) {
+    let modules = repository.join(".gitmodules");
+    if modules.is_symlink() || !modules.is_file() {
+        return;
+    }
+    let modules_text = modules.to_string_lossy().into_owned();
+    let (listed_ok, listed, listed_err) = git_output(
+        repository,
+        &["config", "--file", &modules_text, "-z", "--list"],
+    );
+    if !listed_ok {
+        let display = if prefix.is_empty() { "." } else { prefix };
+        outcomes.push((
+            display.to_string(),
+            format!("not set: cannot read .gitmodules: {}", listed_err.trim()),
+        ));
+        return;
+    }
+    let mut declared: Vec<(String, String)> = Vec::new();
+    for entry in listed.split('\0') {
+        let Some((key, value)) = entry.split_once('\n') else {
+            continue;
+        };
+        let Some(rest) = key.strip_prefix("submodule.") else {
+            continue;
+        };
+        let Some((module, option)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        if module.is_empty() || option != "path" {
+            continue;
+        }
+        match declared.iter_mut().find(|(name, _)| name == module) {
+            Some(existing) => existing.1 = value.to_string(),
+            None => declared.push((module.to_string(), value.to_string())),
+        }
+    }
+    for (module, raw) in declared {
+        let display = format!("{prefix}{raw}");
+        let relative = Path::new(&raw);
+        if relative.is_absolute()
+            || relative.components().next().is_none()
+            || relative
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            outcomes.push((display, "not set: unsafe path in .gitmodules".to_string()));
+            continue;
+        }
+        if !git_ok(
+            repository,
+            &["config", "--get", &format!("submodule.{module}.url")],
+        ) {
+            continue;
+        }
+        let nested = repository.join(relative);
+        if nested.is_symlink()
+            || !nested.is_dir()
+            || !crate::create_text::submodule_populated(&nested)
+        {
+            outcomes.push((
+                display,
+                "not set: initialised but missing (no checkout at this path)".to_string(),
+            ));
+            continue;
+        }
+        let (Ok(git_dir), Ok(common)) = (
+            git(&nested, &["rev-parse", "--absolute-git-dir"]),
+            git(
+                &nested,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            ),
+        ) else {
+            outcomes.push((
+                display,
+                "not set: Git cannot open this submodule".to_string(),
+            ));
+            continue;
+        };
+        let canonical = |value: &str| {
+            Path::new(value)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(value))
+        };
+        let module_dir = canonical(&git_dir);
+        if module_dir != canonical(&common)
+            || !roots.iter().any(|root| module_dir.starts_with(root))
+        {
+            outcomes.push((
+                display,
+                format!(
+                    "not set: its Git directory {} is not private to this slot",
+                    module_dir.display()
+                ),
+            ));
+            continue;
+        }
+        if let Some(error) = settings
+            .iter()
+            .find_map(|(key, value)| git(&nested, &["config", key, value]).err())
+        {
+            outcomes.push((display, format!("not set: {error}")));
+            continue;
+        }
+        outcomes.push((display.clone(), "set".to_string()));
+        submodule_authors(&nested, &format!("{display}/"), roots, settings, outcomes);
+    }
+}
+
 fn identity_value(identity: &Identity) -> Value {
     json!({
         "pid": identity.pid,
@@ -790,6 +1065,16 @@ fn create_slot_inner(
     }
     plan.sort_by(|left, right| left.name.cmp(&right.name));
     assert_target_clear(root, &cfg, &selected, &plan)?;
+    let author = configured_author(&config);
+    if author.is_some() {
+        let mut repositories = Vec::new();
+        for item in &plan {
+            let (_, repository, _) =
+                crate::active_state::stored_repository_parts(&cfg, &item.repository)?;
+            repositories.push(repository);
+        }
+        assert_author_supported(&repositories)?;
+    }
     let retained = if collect_text {
         let findings = retained_findings(root)?;
         warn_retained(&findings);
@@ -994,6 +1279,9 @@ fn create_slot_inner(
             progress += 1;
             let _ = checkout_index;
         }
+    }
+    if let Some(author) = &author {
+        apply_author(&cfg.root, &created, author, &journal_path)?;
     }
     heartbeat_at = utc_now();
     write_journal(

@@ -27,13 +27,14 @@ const REQUIRED: [&str; 7] = [
     "heartbeat_ttl_seconds",
     "liveness_command",
 ];
-const OPTIONAL: [&str; 16] = [
+const OPTIONAL: [&str; 17] = [
     "liveness_batch_command",
     "max_active_slots",
     "layout",
     "cache_globs",
     "repo_cache_globs",
     "post_provision_hooks",
+    "identity",
     "salvage_push_remotes",
     "reclaimable_ignored_paths",
     "disk_advisory_bytes",
@@ -315,6 +316,78 @@ pub(crate) fn validate_hook(value: &str) -> Result<String> {
         return Err("post-provision hooks must be non-empty shell commands".to_owned());
     }
     Ok(value.to_owned())
+}
+
+const IDENTITY_MAX_CHARS: usize = 256;
+
+fn identity_control(character: char) -> bool {
+    (character as u32) < 0x20 || character as u32 == 0x7f
+}
+
+/// Validate the `identity` section (#1096): `{name, email}`, refused
+/// exactly where the existing loader refuses it. Null when absent.
+fn identity_settings(raw: &Map<String, Value>) -> Result<Value> {
+    let label = "configuration.identity";
+    let Some(value) = raw.get("identity") else {
+        return Ok(Value::Null);
+    };
+    let Some(section) = value.as_object() else {
+        return Err(format!("{label} must be a JSON object"));
+    };
+    let mut missing: Vec<&str> = ["email", "name"]
+        .into_iter()
+        .filter(|key| !section.contains_key(*key))
+        .collect();
+    missing.sort_unstable();
+    let mut unknown: Vec<&str> = section
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !matches!(*key, "name" | "email"))
+        .collect();
+    unknown.sort_unstable();
+    if !missing.is_empty() || !unknown.is_empty() {
+        let mut details = Vec::new();
+        if !missing.is_empty() {
+            details.push(format!("missing {}", missing.join(", ")));
+        }
+        if !unknown.is_empty() {
+            details.push(format!("unknown {}", unknown.join(", ")));
+        }
+        return Err(format!(
+            "{label} has invalid fields: {}",
+            details.join("; ")
+        ));
+    }
+    let name = as_str(&section["name"], &format!("{label}.name"))?;
+    let email = as_str(&section["email"], &format!("{label}.email"))?;
+    if name.trim().is_empty()
+        || name != name.trim()
+        || name.chars().count() > IDENTITY_MAX_CHARS
+        || name.contains(['<', '>'])
+        || name.chars().any(identity_control)
+    {
+        return Err(format!(
+            "{label}.name must be a non-empty name of at most {IDENTITY_MAX_CHARS} characters, without surrounding spaces, angle brackets, or control characters"
+        ));
+    }
+    let shaped = match email.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty()
+                && !domain.is_empty()
+                && email.chars().filter(|character| *character == '@').count() == 1
+                && !email
+                    .chars()
+                    .any(|character| character.is_whitespace() || matches!(character, '<' | '>'))
+        }
+        None => false,
+    };
+    if !shaped || email.chars().count() > IDENTITY_MAX_CHARS || email.chars().any(identity_control)
+    {
+        return Err(format!(
+            "{label}.email must be one address such as agent@example.com: no spaces, angle brackets, or control characters, at most {IDENTITY_MAX_CHARS} characters"
+        ));
+    }
+    Ok(json!({"email": email, "name": name}))
 }
 
 fn validate_salvage_remote(value: &str) -> Result<String> {
@@ -1073,6 +1146,7 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
             false,
         )?,
     };
+    let identity = identity_settings(raw)?;
     let salvage = match raw.get("salvage_push_remotes") {
         None => Vec::new(),
         Some(value) => string_tuple(
@@ -1145,6 +1219,7 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         "disk_emergency_bytes": emergency,
         "disk_provisioning_floor_bytes": provisioning,
         "heartbeat_ttl_seconds": as_int(&raw["heartbeat_ttl_seconds"], "configuration.heartbeat_ttl_seconds", 1)?,
+        "identity": identity,
         "image": image_settings(raw)?,
         "layout": layout,
         "liveness_batch_command": liveness_batch,

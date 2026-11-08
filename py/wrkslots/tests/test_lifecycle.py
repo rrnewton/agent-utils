@@ -30310,6 +30310,190 @@ def test_flat_layout_refuses_more_than_one_repo_before_mutation(
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
+_SLOT_IDENTITY = {"name": "Slot Bot", "email": "slot-bot@example.invalid"}
+
+
+def _commit_identity(tree: Path, message: str) -> str:
+    """Commit in ``tree`` with no global or system Git config, and return the author."""
+
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment.update({"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"})
+    (tree / f"{message}.txt").write_text(f"{message}\n", encoding="utf-8")
+    for arguments in (["add", f"{message}.txt"], ["commit", "-q", "-m", message]):
+        subprocess.run(
+            ["git", "-C", str(tree), *arguments],
+            check=True, capture_output=True, text=True, env=environment,
+        )
+    return subprocess.run(
+        ["git", "-C", str(tree), "log", "-1", "--format=%an <%ae>"],
+        check=True, capture_output=True, text=True, env=environment,
+    ).stdout.strip()
+
+
+def _local_identity(tree: Path) -> str:
+    """The identity a checkout resolves without global or system config."""
+
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment.update({"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"})
+    values = [
+        subprocess.run(
+            ["git", "-C", str(tree), "config", "--get", key],
+            check=False, capture_output=True, text=True, env=environment,
+        ).stdout.strip()
+        for key in ("user.name", "user.email")
+    ]
+    return f"{values[0]} <{values[1]}>"
+
+
+@pytest.mark.parametrize("layout", ["nested", "flat"])
+def test_create_sets_configured_identity_slot_privately(
+    tmp_path: Path, layout: str
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees" if layout == "nested" else "worktrees/slots",
+        layout=None if layout == "nested" else "flat",
+    )
+    if layout == "nested":
+        add_recursive_submodules(tmp_path, project, repository)
+    # A sibling slot created before the field existed, and the main checkout,
+    # must keep the identity they had.
+    sibling = create(project, slot="sibling", agent="codex-2", branch="codex/sibling")
+    assert sibling.returncode == 0, sibling.stderr
+    shared_config = repository / ".git" / "config"
+    before_shared = git(repository, "config", "--file", str(shared_config), "--list").stdout
+    assert "user.email=wrkslots@example.invalid" in before_shared
+    update_configuration(project, identity=dict(_SLOT_IDENTITY))
+
+    made = create(project)
+
+    assert made.returncode == 0, made.stderr
+    expected = f"{_SLOT_IDENTITY['name']} <{_SLOT_IDENTITY['email']}>"
+    assert f"identity: checkout=product worktree config: {expected}" in made.stderr
+    tree = checkout(project)
+    assert _commit_identity(tree, "root-work") == expected
+    if layout == "nested":
+        assert "identity: checkout=product submodule=component: set" in made.stderr
+        assert "identity: checkout=product submodule=component/leaf: set" in made.stderr
+        assert _commit_identity(tree / "component", "component-work") == expected
+        assert _commit_identity(tree / "component" / "leaf", "leaf-work") == expected
+    # Only the inert extension switch reached the shared config.
+    after_shared = git(repository, "config", "--file", str(shared_config), "--list").stdout
+    assert sorted(after_shared.splitlines()) == sorted(
+        [*before_shared.splitlines(), "extensions.worktreeconfig=true"]
+    )
+    assert "slot-bot" not in after_shared
+    assert _local_identity(repository) == "Wrkslots Test <wrkslots@example.invalid>"
+    assert (
+        _local_identity(checkout(project, slot="sibling"))
+        == "Wrkslots Test <wrkslots@example.invalid>"
+    )
+    if layout == "nested":
+        assert (
+            _local_identity(checkout(project, slot="sibling") / "component")
+            != expected
+        )
+
+
+def test_create_without_identity_leaves_git_config_alone(tmp_path: Path) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    before = (repository / ".git" / "config").read_bytes()
+
+    made = create(project)
+
+    assert made.returncode == 0, made.stderr
+    assert "identity:" not in made.stderr
+    assert (repository / ".git" / "config").read_bytes() == before
+    assert not list((repository / ".git" / "worktrees").glob("*/config.worktree"))
+
+
+def test_create_reports_initialised_submodule_that_is_missing(tmp_path: Path) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    # The main checkout initialised the submodule, but no hook populates it.
+    update_configuration(project, post_provision_hooks=[], identity=dict(_SLOT_IDENTITY))
+
+    made = create(project)
+
+    assert made.returncode == 0, made.stderr
+    assert (
+        "identity: WARNING checkout=product submodule=component: not set: "
+        "initialised but missing"
+    ) in made.stderr
+    assert len(active_slots(project)) == 1
+    assert _commit_identity(checkout(project), "root-work") == (
+        f"{_SLOT_IDENTITY['name']} <{_SLOT_IDENTITY['email']}>"
+    )
+
+
+def test_create_refuses_identity_where_worktree_config_would_break_worktrees(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    git(repository, "config", "core.worktree", str(repository))
+    update_configuration(project, identity=dict(_SLOT_IDENTITY))
+    before = (repository / ".git" / "config").read_bytes()
+
+    refused = create(project)
+
+    assert refused.returncode == 3, refused.stderr
+    assert "core.worktree" in refused.stderr
+    assert "extensions.worktreeConfig" in refused.stderr
+    assert (repository / ".git" / "config").read_bytes() == before
+    assert not checkout(project).exists()
+    assert not create_journal_path(project).exists()
+
+
+def test_create_recovery_applies_identity(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    update_configuration(project, identity=dict(_SLOT_IDENTITY))
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    assert "identity:" not in interrupted.stderr
+
+    recovered = command(
+        project, "recover", "--coordinator-pid", str(os.getpid()), "--slot", "slot01"
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert "identity: checkout=product worktree config" in recovered.stderr
+    assert _commit_identity(checkout(project), "root-work") == (
+        f"{_SLOT_IDENTITY['name']} <{_SLOT_IDENTITY['email']}>"
+    )
+
+
+@pytest.mark.parametrize(
+    ("identity", "fragment"),
+    [
+        ("Slot Bot", "configuration.identity must be a JSON object"),
+        ({"name": "Slot Bot"}, "configuration.identity has invalid fields: missing email"),
+        ({**_SLOT_IDENTITY, "signing_key": "x"}, "unknown signing_key"),
+        ({**_SLOT_IDENTITY, "name": " "}, "configuration.identity.name must be"),
+        ({**_SLOT_IDENTITY, "name": "Bot <x>"}, "configuration.identity.name must be"),
+        ({**_SLOT_IDENTITY, "name": "Bot\nTwo"}, "configuration.identity.name must be"),
+        ({**_SLOT_IDENTITY, "email": "not-an-address"}, "configuration.identity.email must be"),
+        ({**_SLOT_IDENTITY, "email": "a b@example.invalid"}, "configuration.identity.email must be"),
+        ({**_SLOT_IDENTITY, "email": 7}, "configuration.identity.email must be a string"),
+    ],
+)
+def test_invalid_identity_is_refused_at_configuration_load(
+    tmp_path: Path, identity: object, fragment: str
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    update_configuration(project, identity=identity)
+
+    with pytest.raises(wrkslots.StateError) as caught:
+        wrkslots._load_config(str(project), "testhost")
+
+    assert fragment in str(caught.value)
+
+
 def test_post_provision_hooks_run_in_order_before_registration(
     tmp_path: Path,
 ) -> None:

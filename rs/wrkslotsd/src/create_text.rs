@@ -116,7 +116,7 @@ fn indexed_gitlinks(repository: &Path) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-fn submodule_populated(nested: &Path) -> bool {
+pub(crate) fn submodule_populated(nested: &Path) -> bool {
     let entry = nested.join(".git");
     if entry.is_dir() {
         return true;

@@ -222,6 +222,7 @@ def test_config_convert_json_to_yaml_matches_python(tmp_path: Path) -> None:
         "default_landed_ref": "refs/remotes/origin/main",
         "heartbeat_ttl_seconds": 60,
         "liveness_command": "live.py",
+        "identity": {"email": "slot-bot@example.invalid", "name": "Slot Bot"},
     }
     for root in (rust_root, oracle_root):
         (root / ".wrkslots.yml").write_text(json.dumps(payload, indent=2) + "\n")

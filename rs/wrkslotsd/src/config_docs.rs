@@ -16,6 +16,7 @@ pub(crate) const TOP_DOCS: &[(&str, &str)] = &[
     ("cache_globs", "Slot-relative globs of regenerable caches that `clean-caches` may delete."),
     ("repo_cache_globs", "Per-repository cache globs: repository name to a list of globs."),
     ("post_provision_hooks", "Shell commands run, in order, in every new checkout."),
+    ("identity", "Git author identity ({name, email}) that create sets privately in each new slot: `git config --worktree` in the slot's own checkout, plain `git config` in each populated submodule. Absent means create leaves the identity alone."),
     ("retire_freeze", "When set, every retirement and removal on this host refuses with code retire-freeze and this reason. Managed by `wrkslots freeze`; absent means unfrozen."),
     ("salvage_push_remotes", "Remote URLs that removal may push salvage commits to. Absent or empty allows none: uncommitted work on any other remote is kept in a verified local bundle instead."),
     ("reclaimable_ignored_paths", "Checkout-relative paths or globs of regenerable build output. A retained frozen validation checkout whose only residue is ignored regular files inside these subtrees still counts as pristine; any other ignored file, a symlink, or nested Git data keeps it preserved. Absent or empty: any ignored file keeps it preserved."),
@@ -56,6 +57,11 @@ pub(crate) const LIMIT_DOCS: &[(&str, &str)] = &[
     ("slot_cpu_quotas", "Ordered per-slot CPU ceilings: a list of {slot_prefix, cpu_quota}; the first prefix matching the slot name wins over cpu_quota."),
 ];
 
+pub(crate) const IDENTITY_DOCS: &[(&str, &str)] = &[
+    ("name", "user.name for commits made in new slots."),
+    ("email", "user.email for commits made in new slots."),
+];
+
 pub(crate) const IMAGE_DOCS: &[(&str, &str)] = &[
     ("ceiling_bytes", "Apparent size of each new slot image in bytes (default 512 GiB). Images are sparse: an upper bound, not a reservation. Raise one slot later with `wrkslots image grow`."),
     ("state_ceiling_bytes", "Apparent size of each slot's state image (its private $HOME layer) in bytes (default 128 GiB)."),
@@ -77,6 +83,7 @@ pub(crate) const OPTIONAL_KEYS: &[&str] = &[
     "cache_globs",
     "repo_cache_globs",
     "post_provision_hooks",
+    "identity",
     "retire_freeze",
     "salvage_push_remotes",
     "reclaimable_ignored_paths",
