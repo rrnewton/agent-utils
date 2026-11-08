@@ -5,7 +5,7 @@ priority: 1
 issue_type: feature
 assignee: mu-prnames
 created_at: 2026-11-08T12:56:33.951743014+00:00
-updated_at: 2026-11-08T13:03:33.588825310+00:00
+updated_at: 2026-11-08T14:19:58.743264636+00:00
 ---
 
 # Description
@@ -35,3 +35,5 @@ Coordinator conditions on approval (2026-11-08): (1) the fetcher is rate-limited
 # Notes
 
 Owner ask: chat replies 223 and 224 (2026-11-08), relayed by coordb with its spec. Builds on #227 github-link-abbrev (REPO#N for a bare address) and #187 speakable-ids-urls (spoken form). Deterministic enrichment is the mechanism; prompt reminders to agents are secondary. P2 (design to coordb first, separate commit): same enrichment on the agentctl chat bridge outbound Slack posts and agent-teams relay mirror posts, over one shared cache format/location (under ~/.local/state, never a synced path) that vibe-talk and agentctl both read; also propose the plain-text #N rule there (a per-channel default repo) since a bare number without a link does not name its repo. Note rs/agentctl changes trigger the exclusive cross-differential gate phase.
+
+P2 design (approved in principle by coordb 2026-11-08, implementation HELD pending an owner decision on native-Slack reading): one shared cache file in the P1 persisted format at the XDG state path agent-utils/pr-names-cache.json with vibe-talk as the only writer (the P1 amendment adds the [render] pr_names_cache_file key that names it). Slack enrichment belongs in the rs/chat-subscription-slack helper mrkdwn Link arm behind a --pr-names-file flag, with no rs/agentctl diff and no config schema change. Relay and mirror enrichment belongs in the visible preview only, before sanitize_preview, with signed envelope bytes untouched. Each consumer duplicates the small pure module (thread parse for thread pages, bare-reference rule, name shortening, cache reader) with test vectors copied from P1; extracting a shared crate is deferred until a third consumer appears. Full recon with file and line citations was sent to coordb 2026-11-08 and is summarized here so it survives; the hold reason is that the owner reads Slack mostly through vibe-talk, where P1 already enriches at render time, so P2 only helps native-Slack reading while costing an agentctl-component gate plus the exclusive cross-differentials.

@@ -617,6 +617,13 @@ pub struct RenderConfig {
     /// name, winning over any fetched title. Read at startup, never written by the server.
     #[serde(default)]
     pub pr_names_file: Option<PathBuf>,
+    /// Where the learned thread names persist. Absent, beside the store
+    /// (`pr-names-cache.json` next to `storage.path`), and in memory only when there is no
+    /// store. Named, it is the shared file other readers of the format look in —
+    /// conventionally `${XDG_STATE_HOME:-~/.local/state}/agent-utils/pr-names-cache.json`.
+    /// This server is its only writer, whichever place is named.
+    #[serde(default)]
+    pub pr_names_cache_file: Option<PathBuf>,
 }
 
 impl Default for RenderConfig {
@@ -626,6 +633,7 @@ impl Default for RenderConfig {
             reference_links: Vec::new(),
             pr_names: true,
             pr_names_file: None,
+            pr_names_cache_file: None,
         }
     }
 }

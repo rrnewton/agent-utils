@@ -368,6 +368,10 @@ backend = "elevenlabs"
 # Curated short names that win over fetched titles: a JSON object from "OWNER/REPO#N" to a
 # name, read at startup and never written by the server.
 # pr_names_file = "/var/lib/vibe-talk/pr-names.json"
+# Where the learned names persist, when some other place than beside the store is wanted —
+# conventionally the shared file other readers of the format look in. This server is its
+# only writer, whichever place is named.
+# pr_names_cache_file = "/home/you/.local/state/agent-utils/pr-names-cache.json"
 
 [speakable]
 # Rewrite message bodies before anything says them out loud. ON when this section is absent.

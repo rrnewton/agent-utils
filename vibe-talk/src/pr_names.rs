@@ -41,8 +41,9 @@
 //! already learned.
 //!
 //! The cache is bounded (entries and wanted both), persisted as one JSON file beside the
-//! store — `pr-names-cache.json`, as the documents fold keeps `documents-index.json` — and
-//! memory-only in a deployment with no store. Turning the whole thing off is
+//! store — `pr-names-cache.json`, as the documents fold keeps `documents-index.json` — or
+//! wherever `[render] pr_names_cache_file` names (the shared file other readers of the
+//! format look in), and memory-only in a deployment with neither. Turning the whole thing off is
 //! `[render] pr_names = false`: nothing is installed, nothing is fetched, and labels are
 //! exactly the address-derived ones of `#227 github-link-abbrev`.
 
@@ -262,21 +263,21 @@ impl Cache {
     /// closed. The visible name changing is what advances the generation.
     fn record_found(&mut self, key: &str, title: &str, closed: bool, now: u64) {
         let name = shorten_name(title);
-        let visible_before = self.visible_name(key);
         if name.is_empty() {
-            // A title with nothing showable in it is an answer too: remember asking.
-            self.entries
-                .insert(key.to_owned(), Entry::Unavailable { at: now });
-        } else {
-            self.entries.insert(
-                key.to_owned(),
-                Entry::Named {
-                    name,
-                    closed,
-                    at: now,
-                },
-            );
+            // A title with nothing showable in it teaches no name: it stands as a failure
+            // would, briefly and never erasing a name already learned.
+            self.record_unavailable(key, now);
+            return;
         }
+        let visible_before = self.visible_name(key);
+        self.entries.insert(
+            key.to_owned(),
+            Entry::Named {
+                name,
+                closed,
+                at: now,
+            },
+        );
         if self.visible_name(key) != visible_before {
             self.generation += 1;
         }
@@ -812,12 +813,22 @@ pub fn service_for(config: &crate::config::Config) -> Option<Arc<Names>> {
         Some(path) => load_curated(path),
         None => HashMap::new(),
     };
-    let path = config
+    Some(Names::load(cache_path(config), curated))
+}
+
+/// Where the learned names persist for `config`: `[render] pr_names_cache_file` when it names
+/// one — the place other readers of the shared format look, conventionally
+/// `${XDG_STATE_HOME:-~/.local/state}/agent-utils/pr-names-cache.json` — else beside the
+/// store, and nowhere (memory only) when there is no store either.
+fn cache_path(config: &crate::config::Config) -> Option<PathBuf> {
+    if let Some(path) = &config.render.pr_names_cache_file {
+        return Some(path.clone());
+    }
+    config
         .storage
         .path
         .as_ref()
-        .and_then(|store| store.parent().map(|dir| dir.join("pr-names-cache.json")));
-    Some(Names::load(path, curated))
+        .and_then(|store| store.parent().map(|dir| dir.join("pr-names-cache.json")))
 }
 
 /// The GitHub fetcher the name learner asks through: the documents fetcher's own token and
@@ -1019,6 +1030,47 @@ mod tests {
         assert_eq!(
             cache.cached_name(&thread("5")).as_deref(),
             Some("still here")
+        );
+        // Nor does a later title with nothing showable in it: it teaches no name, and the
+        // generation does not move for it either.
+        let generation = cache.generation;
+        cache.record_found(&key("5"), " \u{202e}\n", false, 400);
+        assert_eq!(
+            cache.cached_name(&thread("5")).as_deref(),
+            Some("still here")
+        );
+        assert_eq!(cache.generation, generation);
+        // With nothing held yet it is a brief failure, not a standing absence.
+        cache.record_found(&key("6"), " \u{202e}\n", false, 400);
+        assert_eq!(cache.name(&thread("6"), 401, true), (None, false));
+        assert_eq!(
+            cache.name(&thread("6"), 400 + TTL_UNAVAILABLE_SECS, true),
+            (None, true)
+        );
+    }
+
+    #[test]
+    fn the_cache_file_is_the_named_one_else_beside_the_store() {
+        let mut config = crate::testing::config();
+        config.storage.path = Some(std::path::PathBuf::from("/tmp/vibe-test/store.sqlite3"));
+        assert_eq!(
+            super::cache_path(&config),
+            Some(std::path::PathBuf::from(
+                "/tmp/vibe-test/pr-names-cache.json"
+            ))
+        );
+        config.render.pr_names_cache_file =
+            Some(std::path::PathBuf::from("/tmp/elsewhere/names.json"));
+        assert_eq!(
+            super::cache_path(&config),
+            Some(std::path::PathBuf::from("/tmp/elsewhere/names.json"))
+        );
+        config.render.pr_names_cache_file = None;
+        config.storage.path = None;
+        assert_eq!(
+            super::cache_path(&config),
+            None,
+            "no store, no file: memory only"
         );
     }
 
