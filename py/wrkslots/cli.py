@@ -405,7 +405,7 @@ _ABSENT_AGENT_JOURNAL_REQUIRED = frozenset(
     }
 )
 _ABSENT_AGENT_JOURNAL_OPTIONAL = frozenset(
-    {"branch_witnesses", "remote_containment", "submodule_salvage"}
+    {"branch_witnesses", "remote_containment", "submodule_salvage", "liveness_unverifiable"}
 )
 # Any ref a remote advertises may prove that an absent checkout's recorded HEAD
 # is already preserved there. Branches, rescue refs such as
@@ -55145,8 +55145,13 @@ def _in_initial_pid_namespace() -> bool:
         return False
 
 
-def _assert_absent_agent_registered_liveness(config: Config, record: ActiveRecord) -> None:
+def _assert_absent_agent_registered_liveness(
+    config: Config, record: ActiveRecord
+) -> str | None:
     """Refuse unless the liveness authority or the exact owner generation settles it.
+
+    Returns the authority's detail when its verdict was unverifiable but
+    archival may still proceed (see below), else None.
 
     The registered liveness authority answers about an agent NAME. It may
     report "alive" because some other live process carries that name: a
@@ -55168,15 +55173,27 @@ def _assert_absent_agent_registered_liveness(config: Config, record: ActiveRecor
     Absent validation rows already decline to treat agent-name liveness as an
     ownership authority. This keeps the authority in force and overrides only
     its "alive" verdict, and only when the exact recorded owner generation (PID,
-    start ticks and boot) is proven dead from the initial PID namespace. An
-    "unverifiable" verdict, a live or indeterminate generation, a row with no
-    usable owner, or a restricted process view still refuses. The process,
-    cgroup, mount and user-service census that follows is unchanged.
+    start ticks and boot) is proven dead from the initial PID namespace.
+
+    An "unverifiable" verdict whose detail attributes it to panes (a live
+    pane the authority cannot attribute to any registered agent) is
+    overridden the same way (#993): a pane that references nothing of
+    this slot is not evidence about this slot's agent. Any other
+    unverifiable verdict (a broken or generic answer) still refuses. The caller has already
+    proven the slot's physical storage absent, and the process, cgroup, mount
+    and user-service census that follows is scoped to this slot's own paths:
+    it refuses, naming the matching reference, when any live process still
+    uses them. So an unverifiable verdict no longer vetoes archival by
+    itself; its detail is returned so the archive entry records the
+    unverifiable attribution. A live or indeterminate recorded owner
+    generation still refuses in the caller, and while storage exists the
+    ordinary refusal stands (this path is only reached for absent rows).
+    The census that follows is unchanged.
     """
 
     state, detail = _registered_liveness_state(config, record)
     if state == "dead":
-        return
+        return None
     owner = record.owner
     if state == "alive" and owner is not None and not _owner_record_is_absent(record):
         owner_state, owner_detail = _process_state(owner)
@@ -55190,15 +55207,25 @@ def _assert_absent_agent_registered_liveness(config: Config, record: ActiveRecor
                 "continuing with the process, cgroup, mount and user-service census",
                 file=sys.stderr,
             )
-            return
+            return None
+    if state == "unverifiable" and "pane" in detail.lower():
+        print(
+            f"NOTE: registered liveness authority cannot verify agent {record.agent} "
+            f"({detail}), but agent row {record.slot}'s storage is absent, so an "
+            "unattributed pane verdict is not evidence about this row; continuing "
+            "with the process, cgroup, mount and user-service census, which refuses "
+            "if any live process still references this slot",
+            file=sys.stderr,
+        )
+        return detail
     _refuse_registered_liveness(state, detail)
 
 
 def _assert_absent_agent_liveness(
     config: Config, record: ActiveRecord, paths: Sequence[Path]
-) -> None:
+) -> str | None:
     _assert_absent_validate_row_is_local(record)
-    _assert_absent_agent_registered_liveness(config, record)
+    unverifiable_detail = _assert_absent_agent_registered_liveness(config, record)
     if record.owner is not None:
         owner_state, detail = _process_state(record.owner)
         if owner_state != "dead":
@@ -55225,6 +55252,7 @@ def _assert_absent_agent_liveness(
                     f"{record.owner.cgroup_path} for agent row {record.slot}"
                 )
     _judge_run_evidence(rows, evidence)
+    return unverifiable_detail
 
 
 def _absent_agent_rescue_ref(
@@ -56986,6 +57014,7 @@ def _absent_agent_archive_entry(
     finished_at: str,
     receipts: Sequence[Mapping[str, object]],
     submodules: Sequence[Mapping[str, object]] = (),
+    liveness_unverifiable: str | None = None,
 ) -> dict[str, object]:
     branch_receipts = ["local_branch" in receipt for receipt in receipts]
     if any(branch_receipts) and not all(branch_receipts):
@@ -57018,6 +57047,17 @@ def _absent_agent_archive_entry(
         "validation": [
             "registry reconciliation confirmed physical storage externally absent",
             f"source ACTIVE record SHA-256: {item.record_sha256}",
+            *(
+                [
+                    "registered liveness authority was unverifiable "
+                    f"({liveness_unverifiable}); slot storage was absent and "
+                    "the slot-scoped process, cgroup, mount and user-service "
+                    "census found no process referencing this slot, so the "
+                    "unverifiable attribution did not block archival"
+                ]
+                if liveness_unverifiable is not None
+                else []
+            ),
             *(
                 (
                     f"checkout {receipt['checkout']}: recorded slot HEAD "
@@ -57300,6 +57340,11 @@ def _absent_agent_journal_inputs(
     )
     finished_at = _as_str(archive_entry.get("finished_at"), "absent-agent archive.finished_at")
     _parse_timestamp(finished_at, "absent-agent archive.finished_at")
+    liveness_unverifiable = (
+        _as_str(raw["liveness_unverifiable"], "absent-agent-row journal.liveness_unverifiable")
+        if "liveness_unverifiable" in raw
+        else None
+    )
     # A journal written before rescue refs left refs/heads/ planned the legacy
     # destination and may already have pushed to it. Resume such a journal at
     # exactly the destination it recorded; never re-plan it to the new root.
@@ -57315,7 +57360,12 @@ def _absent_agent_journal_inputs(
             containment=containment,
         )
         expected_archive = _absent_agent_archive_entry(
-            record, item, finished_at, expected_receipts, submodules
+            record,
+            item,
+            finished_at,
+            expected_receipts,
+            submodules,
+            liveness_unverifiable=liveness_unverifiable,
         )
         if _json_equal(archive_entry, expected_archive):
             break
@@ -57365,6 +57415,7 @@ def _assert_absent_agent_safe(
     tuple[Path, ...],
     tuple[_AbsentAgentBranchWitness, ...],
     tuple[dict[str, object], ...],
+    str | None,
 ]:
     _assert_absent_validate_rows_not_held(config, (record,))
     paths = _assert_absent_agent_storage(config, record)
@@ -57374,7 +57425,7 @@ def _assert_absent_agent_safe(
         _slot_directory(config, record.slot, record.slot_type),
     )
     try:
-        _assert_absent_agent_liveness(config, record, paths)
+        unverifiable_detail = _assert_absent_agent_liveness(config, record, paths)
     except StateError:
         raise
     except Refusal as exc:
@@ -57395,7 +57446,7 @@ def _assert_absent_agent_safe(
         containment=containment,
         module_salvage=module_salvage,
     )
-    return paths, selected_witnesses, receipts
+    return paths, selected_witnesses, receipts, unverifiable_detail
 
 
 def _recover_absent_agent_row(
@@ -57809,8 +57860,8 @@ def _recover_absent_agent_row_item(
                 f"agent row {item.machine}/{item.slot} is neither active nor an exact prior recovery"
             )
         _validate_absent_agent_row(record, item)
-        _paths, branch_witnesses, receipts = _assert_absent_agent_safe(
-            config, record, module_salvage=None
+        _paths, branch_witnesses, receipts, liveness_unverifiable = (
+            _assert_absent_agent_safe(config, record, module_salvage=None)
         )
         # Removing a registration takes the submodule repositories Git keeps
         # for that checkout out of Git's reach, so their unpublished commits
@@ -57882,9 +57933,16 @@ def _recover_absent_agent_row_item(
             "preserved": [],
             "removed": [],
             "archive_entry": _absent_agent_archive_entry(
-                record, item, finished_at, receipts, submodules
+                record,
+                item,
+                finished_at,
+                receipts,
+                submodules,
+                liveness_unverifiable=liveness_unverifiable,
             ),
         }
+        if liveness_unverifiable is not None:
+            journal["liveness_unverifiable"] = liveness_unverifiable
         receipt_containment = _absent_agent_receipt_containment(receipts)
         if receipt_containment:
             journal["remote_containment"] = _absent_agent_containment_to_obj(

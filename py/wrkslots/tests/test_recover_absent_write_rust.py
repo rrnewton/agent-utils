@@ -275,7 +275,13 @@ def test_absent_row_neither_active_nor_recovered_refuses(tmp_path: Path) -> None
     assert "is neither active nor an exact prior recovery" in result.stderr
 
 
-def _write_journal(root: Path, record: dict[str, object], sha: str) -> None:
+def _write_journal(
+    root: Path,
+    record: dict[str, object],
+    sha: str,
+    *,
+    liveness_unverifiable: str | None = None,
+) -> None:
     record_obj = wrkslots_cli._record_from_obj(record, "fixture record")
     item = wrkslots_cli.AbsentAgentRow(MACHINE, "slot-a", 1, sha)
     witnesses = tuple(
@@ -295,7 +301,8 @@ def _write_journal(root: Path, record: dict[str, object], sha: str) -> None:
         containment=None,
     )
     entry = wrkslots_cli._absent_agent_archive_entry(
-        record_obj, item, FINISHED, receipts, ()
+        record_obj, item, FINISHED, receipts, (),
+        liveness_unverifiable=liveness_unverifiable,
     )
     journal = {
         "schema": 2,
@@ -315,10 +322,34 @@ def _write_journal(root: Path, record: dict[str, object], sha: str) -> None:
         "preserved": [],
         "removed": [],
         "archive_entry": entry,
+        **(
+            {"liveness_unverifiable": liveness_unverifiable}
+            if liveness_unverifiable is not None
+            else {}
+        ),
     }
     (root / "worktrees" / f"ACTIVE.{MACHINE}.journal").write_text(
         json.dumps(journal)
     )
+
+
+def test_absent_row_journal_with_unverifiable_liveness_would_resume(
+    tmp_path: Path,
+) -> None:
+    """#993: a journal recording an unverifiable liveness verdict (whose
+    archive entry carries the attribution note) is valid in both editions."""
+
+    rust_root, record = _fixture(tmp_path / "rust")
+    oracle_root, oracle_record = _fixture(tmp_path / "oracle")
+    sha = _record_sha(rust_root, record)
+    oracle_sha = _record_sha(oracle_root, oracle_record)
+    detail = "unverifiable agent=agent-slot-a rc=2 reason=archived-record-pane-still-occupied"
+    _write_journal(rust_root, record, sha, liveness_unverifiable=detail)
+    _write_journal(oracle_root, oracle_record, oracle_sha, liveness_unverifiable=detail)
+    assert _python_row(oracle_root, oracle_sha) == 0
+    result = _rust_row(rust_root, sha)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["outcome"] == "would-resume"
 
 
 def test_absent_row_journal_would_resume(tmp_path: Path) -> None:

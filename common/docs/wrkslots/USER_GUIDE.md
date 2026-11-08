@@ -1588,8 +1588,12 @@ answers about an agent name, and another live process carrying that name -- a re
 leaked helper -- cannot use a row whose storage is gone and whose every owner operation binds the dead
 generation. Without the exception such a row could never be recovered, and the one-slot-per-agent
 rule would refuse every new slot for that agent. An unverifiable verdict (exit `2` or any other
-failure), a live or indeterminate owner generation, a row with no usable owner, or a caller outside
-the initial PID namespace still refuses. The command then performs the same full-host process,
+failure) is overridden the same way, with a `NOTE:` on standard error: such a verdict can rest on
+live panes the authority cannot attribute to any registered agent, and a pane that references
+nothing of this slot is not evidence about this slot's agent. The authority's detail is recorded in
+the archive entry's `validation` (and in the recovery journal as `liveness_unverifiable`), so the
+unverifiable attribution stays on record. A live or indeterminate owner generation still refuses,
+and while any storage exists the ordinary refusal stands. The command then performs the same full-host process,
 cgroup, mount, and user-systemd census used for absent validation rows. It does not claim the
 vanished working tree was clean. Each recorded checkout commit must be preserved on that checkout's
 own remote before its exact stale Git worktree registration is removed, in one of two ways:

@@ -1722,6 +1722,7 @@ fn absent_archive_entry(
     finished_at: &str,
     receipts: &[Value],
     submodules: &[Value],
+    liveness_unverifiable: Option<&str>,
 ) -> Result<Value> {
     let branch_flags: Vec<bool> = receipts
         .iter()
@@ -1754,6 +1755,11 @@ fn absent_archive_entry(
             item.record_sha256
         )),
     ];
+    if let Some(detail) = liveness_unverifiable {
+        validation.push(Value::String(format!(
+            "registered liveness authority was unverifiable ({detail}); slot storage was absent and the slot-scoped process, cgroup, mount and user-service census found no process referencing this slot, so the unverifiable attribution did not block archival"
+        )));
+    }
     for receipt in receipts {
         let map = receipt
             .as_object()
@@ -2047,6 +2053,7 @@ fn absent_agent_shape(raw: &Map<String, Value>, journal_machine: &str) -> Result
             "branch_witnesses",
             "remote_containment",
             "submodule_salvage",
+            "liveness_unverifiable",
         ],
         "absent-agent-row journal",
     )?;
@@ -2229,6 +2236,12 @@ fn absent_agent_shape(raw: &Map<String, Value>, journal_machine: &str) -> Result
         "absent-agent archive.finished_at",
     )?;
     parse_timestamp(finished_at, "absent-agent archive.finished_at")?;
+    let liveness_unverifiable: Option<String> = match raw.get("liveness_unverifiable") {
+        None => None,
+        Some(value) => {
+            Some(as_str(value, "absent-agent-row journal.liveness_unverifiable")?.to_owned())
+        }
+    };
     let canonical =
         |value: &Value| crate::canonical::canonical_json(value).map_err(|error| error.to_string());
     let mut expected_receipts: Vec<Value> = Vec::new();
@@ -2242,7 +2255,14 @@ fn absent_agent_shape(raw: &Map<String, Value>, journal_machine: &str) -> Result
             Some(root),
             &containment,
         )?;
-        let expected = absent_archive_entry(&record, &item, finished_at, &planned, &submodules)?;
+        let expected = absent_archive_entry(
+            &record,
+            &item,
+            finished_at,
+            &planned,
+            &submodules,
+            liveness_unverifiable.as_deref(),
+        )?;
         if canonical(&Value::Object(archive_entry.clone()))? == canonical(&expected)? {
             expected_receipts = planned;
             matched = true;

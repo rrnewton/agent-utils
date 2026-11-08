@@ -38282,6 +38282,113 @@ def test_recover_absent_agent_row_preserves_commit_before_registry_repair(
     assert run_absent_agent_recovery(project, record, apply=True) == 0
 
 
+def absent_agent_sleeper_observation(pid: int) -> wrkslots._AbsentProcessObservation:
+    stat = wrkslots._read_process_stat(Path(f"/proc/{pid}"))
+    assert stat is not None
+    return wrkslots._AbsentProcessObservation(
+        pid, stat.start_ticks, "/user.slice/test", "mnt:[1]"
+    )
+
+
+def test_recover_absent_agent_row_archives_when_liveness_unverifiable_and_nothing_references_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#993: an unattributed-pane (unverifiable) verdict does not veto archival
+    once storage is absent and no live process references the slot."""
+
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    write_liveness_output(
+        project,
+        b"unverifiable agent=agent-gone-agent rc=2 reason=unattributed-panes: "
+        b"1 live herdr pane(s) run an agent-capable process, but no record "
+        b"claims them: w1:p1 (bash, codex)\n",
+        b"",
+        2,
+    )
+    bystander = subprocess.Popen(["sleep", "60"], cwd=tmp_path, text=True)
+    try:
+        monkeypatch.setattr(
+            wrkslots,
+            "_absent_validate_process_snapshot",
+            lambda: (absent_agent_sleeper_observation(bystander.pid),),
+        )
+        assert run_absent_agent_recovery(project, record, apply=True) == 0
+    finally:
+        bystander.kill()
+        bystander.wait()
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+    archived = wrkslots._load_archive(config).records[-1]
+    assert archived["slot"] == record.slot
+    validation = archived["validation"]
+    assert isinstance(validation, list)
+    assert any(
+        "registered liveness authority was unverifiable" in str(entry)
+        and "did not block archival" in str(entry)
+        for entry in validation
+    )
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+
+
+def test_recover_absent_agent_row_refuses_when_a_process_references_the_absent_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#993: a process the census ties to the slot still refuses, naming the reference."""
+
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    write_liveness_output(
+        project,
+        b"unverifiable agent=agent-gone-agent rc=2 reason=unattributed-panes: "
+        b"1 live herdr pane(s) run an agent-capable process, but no record "
+        b"claims them: w1:p1 (bash, codex)\n",
+        b"",
+        2,
+    )
+    user = subprocess.Popen(["sleep", "60"], cwd=tmp_path, text=True)
+    try:
+        config = wrkslots._load_config(str(project), "testhost")
+        slot_path = wrkslots._slot_directory(config, record.slot, "agent")
+        monkeypatch.setattr(
+            wrkslots,
+            "_absent_validate_process_snapshot",
+            lambda: (absent_agent_sleeper_observation(user.pid),),
+        )
+        monkeypatch.setattr(
+            wrkslots,
+            "_absent_validate_privileged_path_match",
+            lambda *_args: (user.pid, record.slot, "cwd", str(slot_path)),
+        )
+        assert run_absent_agent_recovery(project, record, apply=True) == 3
+    finally:
+        user.kill()
+        user.wait()
+    assert f"live process {user.pid}" in capsys.readouterr().err
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+
+
+def test_recover_absent_agent_row_keeps_refusal_while_storage_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#993: the unverifiable override is only for absent storage."""
+
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project, slot="present-agent", agent="agent-present-agent")
+    assert made.returncode == 0, made.stderr
+    record = mark_recorded_owner_dead(project, "present-agent")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    set_liveness(project, "unverifiable")
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+
+
 def prepare_absent_agent_row_with_submodules(
     tmp_path: Path,
     *,
@@ -59841,7 +59948,9 @@ def test_recover_absent_agent_rows_withdraws_a_prepared_journal_so_later_rows_pr
     original = wrkslots._assert_absent_agent_liveness
     calls = {"gone01": 0}
 
-    def flaky(config_: wrkslots.Config, record: wrkslots.ActiveRecord, paths: Sequence[Path]) -> None:
+    def flaky(
+        config_: wrkslots.Config, record: wrkslots.ActiveRecord, paths: Sequence[Path]
+    ) -> str | None:
         if record.slot == "gone01":
             calls["gone01"] += 1
             if calls["gone01"] == 2:
@@ -59849,7 +59958,7 @@ def test_recover_absent_agent_rows_withdraws_a_prepared_journal_so_later_rows_pr
                     "user-systemd unit population, identity, state, or jobs changed during "
                     "three bounded enumeration attempts"
                 )
-        original(config_, record, paths)
+        return original(config_, record, paths)
 
     monkeypatch.setattr(wrkslots, "_assert_absent_agent_liveness", flaky)
     returncode, stdout, stderr = run_absent_agent_rows(
