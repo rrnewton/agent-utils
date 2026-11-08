@@ -1,11 +1,11 @@
 ---
 title: 'shots-port-collision: the screenshot steps use fixed ports, so two concurrent gates fail each other'
 status: open
-priority: 2
+priority: 1
 issue_type: bug
-assignee: mu-validate
+assignee: cl-start
 created_at: 2026-11-08T01:10:00.000000000+00:00
-updated_at: 2026-11-08T01:10:00.000000000+00:00
+updated_at: 2026-11-08T01:20:00.000000000+00:00
 ---
 
 # Description
@@ -30,3 +30,5 @@ On 2026-11-07 a full gate failed exactly this way (screenshots-desks and screens
 # Notes
 
 Found while gating #624 work on 2026-11-07, the first evening with two concurrent page gates.
+
+Raised to P1 on 2026-11-07: the same collision cost reruns on both hosts the same day. Add a test that runs two screenshot shards at once.
