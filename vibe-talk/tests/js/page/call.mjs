@@ -2549,7 +2549,7 @@ test("#1040: a call started with a document open tells its agent once, ahead of 
   let card;
   for (let tries = 0; tries < 10 && !card; tries += 1) {
     await page.settle();
-    card = page.el("documents-list").children[0];
+    card = page.el("documents-list").querySelectorAll(".doc-card")[0];
   }
   assert.ok(card, `no document card was drawn (list says: ${page.el("documents-list").textContent})`);
   await card.click();
