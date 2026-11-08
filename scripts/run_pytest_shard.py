@@ -549,8 +549,7 @@ def test_block_until_cancelled():
     # A private TMPDIR: the wrapper's startup sweep must never act on the host's real one here.
     private_tmp = fixture_root / "tmp"
     private_tmp.mkdir()
-    environment = os.environ.copy()
-    environment["TMPDIR"] = str(private_tmp)
+    environment = _fixture_environment(private_tmp)
     environment["SHARD_SIGNAL_TEST_MARKER"] = str(marker)
     wrapper: subprocess.Popen[str] | None = None
     child_identity: tuple[str, int, int] | None = None
@@ -693,6 +692,19 @@ def _self_test_mounts_under() -> None:
         _remove_temp_root(fixture_root)
 
 
+def _fixture_environment(tmp: Path) -> dict[str, str]:
+    """The environment for a fixture run of this wrapper: a private TMPDIR, no timing records.
+
+    A fixture shard must not write per-case timing records into the gate's timing directory:
+    they would read as primary cases of the self-test's own step (#1093).
+    """
+    import case_timings
+
+    environment = {**os.environ, "TMPDIR": str(tmp)}
+    environment.pop(case_timings.TIMING_DIR_ENV, None)
+    return environment
+
+
 def _self_test_keep_on_failure() -> None:
     """A failed shard's basetemp is removed unless KEEP_ENV asks to keep it (#1064)."""
 
@@ -703,7 +715,7 @@ def _self_test_keep_on_failure() -> None:
     test_file.write_text("def test_fails(tmp_path):\n    assert False\n", encoding="utf-8")
     try:
         for keep in (False, True):
-            environment = {**os.environ, "TMPDIR": str(tmp)}
+            environment = _fixture_environment(tmp)
             environment.pop(KEEP_ENV, None)
             if keep:
                 environment[KEEP_ENV] = "1"
