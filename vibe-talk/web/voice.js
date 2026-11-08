@@ -20683,7 +20683,7 @@ const channelRefresh = createChannelRefresh({
   foldLateTimelinePage, renderChannelLoading, queuePlaceUnplaced,
   loadStateGeneration: () => loadState().generation, selectedChannelId,
   readModesHiding: () => readModes.hiding(), refreshQuietly,
-  configApplied: () => serverFacts.configApplied(), signIn,
+  configApplied: () => serverFacts.configApplied(), signIn: () => signIn(),
   replayStarted: () => replayLedger.started(), replayWaiting: () => replayLedger.waiting(),
   channelContextKey, readSideColumn, screensView: () => screens.view(),
   discordPollMs: DISCORD_POLL_MS, startChannelStream,
@@ -20710,7 +20710,7 @@ const liveStream = createLiveStream({
   watchAllAttached: () => watchAll.attached(),
   voiceCanSendText: () => voiceCall().canSendText(), relayMode,
   reportUnrelayed: (messages, reason) => voiceCall().reportUnrelayed(/** @type {any} */ (messages), /** @type {any} */ (reason)),
-  refreshServerSettings, onSettingsFrame, hiddenNow: () => document.hidden,
+  refreshServerSettings: async () => { await refreshServerSettings(); }, onSettingsFrame: (frame) => onSettingsFrame(frame), hiddenNow: () => document.hidden,
   noteHiddenMessage: () => hiddenStream.noteMessage(),
   relayToAgent: (message, selfPosted, replayed, arrival) => voiceCall().relayToAgent(message, selfPosted, replayed, arrival),
   refreshAfterMutation: () => refreshAfterLiveMutation(), noteChannelReadFailure,
@@ -21233,26 +21233,7 @@ function restateChannelSeam() {
 
 // --- sign-in ---------------------------------------------------------------------------------
 
-function setTokenState(text) {
-  el("token-state").textContent = text;
-}
 
-// What the sign-in screen says when there is nothing stored. It carries the INSTRUCTION, not just
-// the fact, because this is now the only place a first-time visitor is told what to do — the
-// load-time status toast that used to say it was a message over the screen that was already
-// asking. `#63 status-line-placement`.
-const NO_TOKEN_YET = "no token saved in this browser — paste your write-scope token above.";
-
-// The same fact, for the one browser that can explain WHY it is being asked. `#63
-// status-line-placement` put the instruction here rather than in a toast; this keeps it one
-// sentence and adds the cause, because "you were signed out" and "this deployment is broken" look
-// identical from the sign-in screen and only one of them is worth a message to the owner.
-const NO_TOKEN_AFTER_RENAME =
-  "this deployment was renamed, so the token saved under its old name is no longer read — " +
-  "paste your write-scope token above once and it will stick.";
-
-/** Whichever of the two sentences this browser has earned. */
-const noTokenSentence = () => (signedOutByRename() ? NO_TOKEN_AFTER_RENAME : NO_TOKEN_YET);
 
 // --- the way out to the agent's own configuration -----------------------------------------------
 //
@@ -21268,163 +21249,47 @@ const noTokenSentence = () => (signedOutByRename() ? NO_TOKEN_AFTER_RENAME : NO_
  */
 const voiceProvider = createVoiceProvider();
 
-function applyClientConfig(config) {
-  const speech = config.read_aloud;
-  const effectiveSpeech = speech || {
-    backend: "legacy",
-    label: "Voice provider",
-    playback: "audio",
-    local_only: false,
-  };
-  // Device speech is always a local browser choice. A configured server-audio provider adds the
-  // other side of the bar toggle; its label comes from the provider trait and is never guessed.
-  readAloudOwner().agentReadAloud = String(effectiveSpeech.playback) === "audio" ? effectiveSpeech : null;
-  // `#552 wit-tts-provider`. A Wit.ai backend is server audio too, but
-  // Settings names it as its own choice and offers its voice catalogue.
-  readAloudOwner().witReadAloud = String(effectiveSpeech.backend || "") === "wit" ? effectiveSpeech : null;
-  // `#563 read-aloud-fallback-chain`: the device voice is a chain's
-  // last resort only when the configured order ends with it.
-  const chainLabels = Array.isArray(effectiveSpeech.chain) ? effectiveSpeech.chain : [];
-  readAloudOwner().chainDeviceTail = chainLabels.length > 0 && chainLabels[chainLabels.length - 1] === "Device voice";
-  if (readAloudOwner().witReadAloud && !readAloudOwner().witVoice) readAloudOwner().witVoice = readAloudOwner().storedWitVoice();
-  readAloudOwner().setReadAudioSource(
-    readAloudOwner().storedReadAudioSource() || (readAloudOwner().witReadAloud ? "wit" : readAloudOwner().agentReadAloud ? "agent" : "device"), false);
-  if (readAloudOwner().witReadAloud) void readAloudOwner().loadWitVoices();
-  readAloudOwner().applyReadSpeed(readAloudOwner().readSpeed);
-  providerFacts.setThreading(config.threading_supported === true);
-  channelDirectory.setCapability("threading", providerFacts.threading());
-  // `#528 thread-card-markdown-and-cap`: whether a long first message's summary may be on its way.
-  serverFacts.setThreadNames(config.thread_names_supported === true);
-  learnProviders(config.providers);
-  whoIsWho.setDeploymentCodingAgents(config);
-  // The selected backend owns its display name. An older server leaves it unspecified, so the
-  // page stays neutral instead of guessing a platform from channel IDs or deployment details.
-  channelDirectory.setProviderName(
-    typeof config.chat_provider_name === "string" ? config.chat_provider_name.trim() : "");
-  for (const id of ["chat-provider-settings", "chat-provider-help"]) {
-    el(id).textContent = channelDirectory.providerName() || "Chat";
-  }
-  // `#408 copy-upstream-link`: the list of keys was said at first load, before any service was
-  // named; say it again now the names are known, so the link's keys name their service.
-  keyHints.render();
-  // `#343 pwa-app-name`. What this deployment calls its app. The server already wrote it into the
-  // title of the page it served; taking it from this answer as well keeps the title the name the
-  // server gives now, should the two ever differ. An older server sends none, and the title stays
-  // as served.
-  const appName = typeof config.app_name === "string" ? config.app_name.trim() : "";
-  if (appName) document.title = appName;
-  // WHO THIS BRIDGE IS, from the server, before a single message is drawn.
-  //
-  // The page used to learn this only as a side effect of the reader replying from the app, or of
-  // the live feed delivering a message this server had posted. A reader who had done neither got a
-  // channel in which NOTHING was recognised: their own words were not "me", and the bridge's own
-  // account still counted as a second bot, so the "the only bot that is not us" guess for the
-  // coding agent became a coin toss it declines to call. Every row fell through to the same
-  // third-party colour, which is exactly what the owner reported seeing.
-  if (config && config.self_author_id) {
-    noteSelfAuthor(config.self_author_id);
-  }
-  // The reader's own Discord account, if the operator has said what it is. Not derivable; see
-  // `ownerAuthorId` in web/src/core/channels/identities.ts.
-  whoIsWho.setOwnerAuthorId(config && config.owner_author_id);
-  whoIsWho.learnOwnerIds(config && config.owner_author_ids);
-  voiceProvider.learn(config && config.conversational_voice);
-  voiceCall().session.providerName = voiceProvider.current().name;
-  settingsReadouts.agentLink();
-  // `#39 channel-alias`. Both pickers are drawn from the same list and through the same naming
-  // rule, so the name in the bar and the name in Settings are one answer rather than two.
-  channelDirectory.setChannels(config.channels || []);
-  channelDirectory.setHidden(Array.isArray(config.hidden_channels) ? config.hidden_channels : []);
-  channelSettings.renderHiddenChannels();
-  channelDirectory.setRegistrationSupported(config.channel_registration_supported === true);
-  channelDirectory.setDiscoverySupported(
-    channelDirectory.registrationSupported() && config.channel_discovery_supported === true);
-  // `#232 upstream-mark-read`. Read per channel, by `upstreamClearOffered`, in the channel box —
-  // and, with the token's scope, by Settings' picker as it is filled, which offers All channels only
-  // where one channel can take Clear unread (`#351 settings-polish`). So both before the pickers.
-  channelDirectory.setCapability("upstreamClear", config.upstream_clear_supported === true);
-  serverFacts.setTokenScope(config.token_scope);
-  // `#457 settings-server-side`. Only a server that says it keeps settings is asked for
-  // them: an older one is never probed for a route it has not got.
-  settingsSync().setSupported(config.client_settings_supported === true);
-  fillChannelSelect("discord-channel");
-  // `#355 provider-grouped-channels`. The Service picker before Settings' channel picker, which lists
-  // that service's channels; the hidden list and the add form are that service's too.
-  channelSettings.fillServiceSelect();
-  fillChannelSelect("settings-channel");
-  channelSettings.renderHiddenChannels();
-  channelSettings.renderAddChannelForm();
-  // The picker has only just been given a value, and both halves of the box are scoped by it —
-  // the render at load ran against an empty picker and listed nothing whatever was stored.
-  channelSettings.renderChannelBox();
-  restoreChannelComposer();
-  // `#44 live-push`. The server says whether it is watching the channel at all, and how often
-  // (`ProviderFacts.fromConfig`): without it a quiet channel and an unwatched one look the same.
-  providerFacts.fromConfig(config);
-  channelDirectory.setCapability("upstreamReadMark", providerFacts.upstreamReadMark());
-  // `#195 send-resilience`. Read per channel, by `channelPostsOnce`, when a send fails.
-  channelDirectory.setCapability("idempotentPosts", config.idempotent_posts_supported === true);
-  // `#252 thread-button-state`. Read per channel, by `channelRepliesInThread`, for a reply's route.
-  channelDirectory.setCapability("repliesInThread", config.replies_in_thread === true);
-  summaryRows.setDisabledByServer(
-    typeof config.summaries_unavailable === "string" ? config.summaries_unavailable.trim() : "");
-  if (summaryRows.disabledByServer() && summaryRows.mode()) setSummaryMode(false);
-  // ...and back on when the server can summarise again and the owner's setting still says so.
-  else if (!summaryRows.disabledByServer() && !summaryRows.mode() && storedSummarizeCollapsed()) setSummaryMode(true);
-  renderScrollTools();
-  channelDirectory.setCapability("liveDelivery", providerFacts.liveDelivery());
-  channelDirectory.setCapability("livePollSeconds", providerFacts.livePollSeconds());
-  // The picker already holds a channel; the flags above are the deployment's, and that channel's
-  // own provider may answer differently.
-  applyChannelProvider();
-  // The clear-unread control is offered only to a token that may change it (`serverFacts.tokenScope`), on
-  // a channel whose provider can, which `applyChannelProvider` has just settled.
-  upstreamClearBox.render();
-  // `#46 conversation-replay`. What the SERVER permits, which is not the same as what the reader
-  // has asked for — and the screen has to be able to say which of the two is stopping it.
-  callResume.setAllowed(config.replay_enabled === true);
-  // `#270 voice-transcript-markers`. Records, `records=1` and the send memory's cursor go only to a
-  // server that says it takes them.
-  voiceTranscript().transcriptRecordsSupported = config.transcript_records_supported === true;
-  // ...and why replay is off where the operator turned it on, which each new conversation's line
-  // says ("recap unsupported") rather than saying nothing, and Resuming's disabled switch says
-  // beside it (`#331 resume-on-websocket`).
-  voiceTranscript().replayUnavailable = typeof config.replay_unavailable === "string" ? config.replay_unavailable : null;
-  // `#512 voice-recap-private-stack`. Whether a new call's recap rides in the profile the bridge
-  // fetches, and how the owner's own speech holds the page's messages.
-  voiceTranscript().resumeViaProfile = config.replay_via_profile === true;
-  voiceCall().speechHold = speechHoldFrom(config.speech_hold);
-  renderResumeState();
-  settingsReadouts.speechPrep(config.speech_prep_enabled);
-  noiseSettings.apply(config.noise_rules);
-  // `#264 voice-send-approval`. After `tokenScope`, which decides whether the box may be changed.
-  agentSettings.applySendSetting(config.voice_settings);
-  // `#272 voice-agent-instructions`. After `tokenScope` too, for the same reason.
-  agentSettings.applyPrompt(config.voice_prompt);
-  // `#303 voice-post-prefix`. After `tokenScope` too, for the same reason.
-  agentPrefix.apply(config.voice_post_prefix);
-  // `#208 persistent-cache`. After `tokenScope` as well: only a write token is shown the group.
-  serverCacheBox.apply(config.message_cache);
-  // `#427 server-thread-hues`: this browser's remembered colours for the channel up are offered
-  // to the server now — the token's scope is known, the picker holds its channel, and no read
-  // or stream of it has gone out yet, so the offer is issued before anything that could colour
-  // those threads itself. Not awaited: sign-in does not wait on a colour offer, and the reads
-  // that follow carry the server's answer either way (first writer wins there).
-  void seedServerThreadHues(selectedChannelId());
-  // Started here rather than when the Discord view opens: PUSH TWO is the point of it, and an
-  // arriving message has to be able to reach a call that is happening on the OTHER tab. Following
-  // only the visible view would mean the relay was off precisely while the reader was talking.
-  startChannelStream(selectedChannelId());
-  serverFacts.markConfigApplied();
-  messageCache.saveCacheShell(config);
-  // ...and the views chosen in channels it no longer lists, as their saved rows went: a thread's
-  // summary is the credential's reading too. `#205 channel-view-memory`.
-  const listed = new Set(channelDirectory.channels().map((channel) => String(channel.id)));
-  if (uiState.chosenViewsNow().some((entry) => !listed.has(entry.channel))) {
-    uiState.forgetChosen((channel) => !listed.has(channel));
-    saveUiState();
-  }
-}
+/**
+ * What the server's client-config answer puts into force: one owner in
+ * web/src/view/settings/clientconfig.ts (`createClientConfig`, `#624 voice-page-modularity`).
+ * The page destructures its act under its old name.
+ */
+const { apply: applyClientConfig } = createClientConfig({
+  el: (id) => el(id),
+  setTitle: (title) => { document.title = title; },
+  readAloud: () => readAloudOwner(),
+  providerFacts, channelDirectory, serverFacts, whoIsWho,
+  learnProviders: (providers) => learnProviders(providers),
+  noteSelfAuthor: (id) => noteSelfAuthor(id),
+  voiceProvider,
+  voiceCall: () => voiceCall(),
+  settingsReadouts,
+  channelSettings,
+  fillChannelSelect: (id) => fillChannelSelect(id),
+  restoreChannelComposer: () => restoreChannelComposer(),
+  summaryRows,
+  setSummaryMode: (on) => setSummaryMode(on),
+  storedSummarizeCollapsed: () => storedSummarizeCollapsed(),
+  renderScrollTools: () => renderScrollTools(),
+  applyChannelProvider: () => applyChannelProvider(),
+  upstreamClearBox,
+  callResume,
+  voiceTranscript: () => voiceTranscript(),
+  speechHoldFrom: (hold) => speechHoldFrom(hold),
+  renderResumeState: () => renderResumeState(),
+  noiseSettings, agentSettings, agentPrefix, serverCacheBox,
+  seedServerThreadHues: (id) => seedServerThreadHues(id),
+  selectedChannelId: () => selectedChannelId(),
+  startChannelStream: (id) => startChannelStream(id),
+  settingsSync: () => settingsSync(),
+  messageCache,
+  uiState,
+  saveUiState: () => saveUiState(),
+  keyHints,
+});
+
+
+
 
 /**
  * Prove the saved token actually works, then show the main interface.
@@ -21434,67 +21299,53 @@ function applyClientConfig(config) {
  * alone and lands on the main screen with the error visible, because bouncing to a sign-in form
  * would blame the wrong thing.
  */
-async function signIn() {
-  if (!token()) {
-    showScreen("signin");
-    return false;
-  }
-  /** @type {VibeTalk.ClientConfigResponse | null} */
-  let config = null;
-  try {
-    config = await apiDecoded("ClientConfigResponse", "/api/v1/client-config");
-  } catch (error) {
-    if (error.refused) {
-      // Whatever this credential read before, it can no longer read it.
-      forgetMessages();
-      showError(
-        error.status === 403
-          ? `That token may read but not post, and this page needs the write-scope one — ` +
-              `VIBE_TALK_WRITE_TOKEN rather than VIBE_TALK_READ_TOKEN. The server said: ` +
-              `${error.message}`
-          : `This server refused that token: ${error.message}`
-      );
-      setStatus(refusalSentence(error));
-      showScreen("signin");
-      return false;
-    }
-    showError(`Signed in, but vibe-talk did not answer: ${error.message}`);
-    showScreen("main");
-    // Saved rows stay up, and say they are saved rather than current.
-    if (loadState().freshAt) setChannelFreshness(error.network ? "offline" : "failed");
-    // The token was not refused, and no stream will attach until `/client-config` answers: the
-    // reopen's read goes now, and the poll it arms is what asks again. `#189 restore-ui-state`.
-    payReopenRead();
-    return true;
-  }
-  const drawn = { key: channelContextKey(), threading: providerFacts.threading() };
-  applyClientConfig(config);
-  reconcileChannelSnapshot(drawn);
-  clearError();
-  showScreen("main");
-  // With no saved shell there was no channel to reopen on until now; with one, the channel went up
-  // at load and has waited for this to be read. `#189 restore-ui-state`.
-  reopenSavedView();
-  payReopenRead();
-  // Short, because the invitation itself now lives in the empty transcript — the largest thing on
-  // an idle screen — rather than competing for the one strip where a phone shows text worst.
-  setStatus("Ready.");
-  setState("idle");
-  // After the screen is up, never before: restoring is a convenience, and a store that is slow or
-  // absent must not hold the interface hostage. Not awaited for the same reason.
-  voiceTranscript().loadStoredConversation();
-  // `#457 settings-server-side`. The token is proven, so the settings sync may read with it:
-  // it could not start at load, where a saved token is only a claim `/client-config` tests.
-  startSettingsSync();
-  // `#468 send-dedupe`. What this page left unconfirmed, asked of the server once per load.
-  unconfirmedSends.settleOnce();
-  return true;
-}
+
+
+/**
+ * Sign-in — the token proved, saved and forgotten: one owner in web/src/view/settings/signin.ts
+ * (`createSignIn`, `#624 voice-page-modularity`). The page destructures its acts under their old
+ * names; the Save button's own words and timer stay with its owner (`saveTokenButton`, below).
+ */
+const { signIn, saveToken, forgetToken, setTokenState, noTokenSentence } = createSignIn({
+  el: (id) => el(id),
+  field: (id) => /** @type {{value: string}} */ (/** @type {unknown} */ (el(id))),
+  token: () => token(),
+  signedOutByRename: () => signedOutByRename(),
+  config: () => apiDecoded("ClientConfigResponse", "/api/v1/client-config"),
+  applyClientConfig: (config) => applyClientConfig(config),
+  forgetMessages: () => forgetMessages(),
+  showError: (text) => showError(text),
+  setStatus: (text) => setStatus(text),
+  refusalSentence: (error) => refusalSentence(error),
+  showScreen: (name) => showScreen(name),
+  loadFreshAt: () => loadState().freshAt,
+  setChannelFreshness: (state) => setChannelFreshness(state),
+  payReopenRead: () => payReopenRead(),
+  channelContextKey: () => channelContextKey(),
+  threading: () => providerFacts.threading(),
+  reconcileChannelSnapshot: (drawn) => reconcileChannelSnapshot(drawn),
+  clearError: () => clearError(),
+  reopenSavedView: () => reopenSavedView(),
+  setState: (state) => setState(state),
+  voiceTranscript: () => voiceTranscript(),
+  startSettingsSync: () => startSettingsSync(),
+  settleUnconfirmedSends: () => unconfirmedSends.settleOnce(),
+  credentialStore: () => credentialStore(),
+  stopOutgoingSends: () => stopOutgoingSends(),
+  markSave: (label, state, busy) => markSave(label, state, busy),
+  revertSaveLater: (run, ms) => saveTokenButton.revertLater(run, ms),
+  settingsSync: () => settingsSync(),
+  deepLinks: { signOut: () => deepLinks.signOut(), noteWritten: (address) => deepLinks.noteWritten(address) },
+  clearLinkedMark: () => linkedMark.clear(),
+  forgetLinkJumps: () => linkJumps.forget(),
+  backHistory: () => backHistory(),
+  location: () => (typeof window === "object" ? window.location : null),
+  stopChannelStream: () => stopChannelStream(),
+});
 
 // A banner that says "saved" while the button looks untouched leaves two questions open at once:
 // did the click register, and did the save work? So the button itself changes — immediately on
 // click, and again on the result — and the line under it states what is stored right now.
-const SAVE_LABEL = "Save token";
 /**
  * The Save button's words, look and state, and the timer putting it back to SAVE_LABEL after a save: one
  * owner in web/src/view/settings/savetoken.ts (`#624 voice-page-modularity`).
@@ -21508,80 +21359,11 @@ const saveTokenButton = mountSaveTokenButton({
 });
 const { markSave } = saveTokenButton;
 
-async function saveToken() {
-  clearError();
-  // The box is empty once a token has signed in (`#616 composer-no-autofill`), so an empty box with a
-  // token saved is a retry of that token, as Save on the box it used to be shown in was.
-  const value = el("api-token").value.trim() || token();
-  markSave("Saving…", "", true);
-  if (!value) {
-    markSave(SAVE_LABEL, "", false);
-    setTokenState(NO_TOKEN_YET);
-    showError("There is nothing to save — paste your write-scope API token first.");
-    setStatus("nothing to save");
-    return;
-  }
-  if (value !== token()) {
-    stopOutgoingSends();
-    // Another credential may not be able to read what this one did.
-    forgetMessages();
-  }
-  credentialStore().keep(value);
-  // Read it back rather than assuming: private browsing and a full quota both make setItem throw
-  // or silently do nothing, and "saved" would then be a lie the owner only discovers later.
-  if (token() !== value) {
-    markSave(SAVE_LABEL, "", false);
-    setTokenState(NO_TOKEN_YET);
-    showError(
-      "This browser refused to store the token. Private browsing and a full storage quota both " +
-        "do this; the token was NOT saved."
-    );
-    return;
-  }
-  markSave("Saved ✓", "ok", false);
-  setTokenState("token saved in this browser");
-  setStatus("ready");
-  saveTokenButton.revertLater(() => {
-    markSave(SAVE_LABEL, "", false);
-  }, 2500);
-  // Only once the server took it: a refused token stays in the box, to be corrected, not pasted again.
-  if (await signIn()) el("api-token").value = "";
-}
+
 
 // Pairing this device from a link (`#369 pairing-link`) is `devicePairing`'s, near the top of this file.
 
-function forgetToken() {
-  // `#457 settings-server-side`. The next credential is unproven until `signIn` proves it,
-  // and the archive was agreed under this one: both go, and the settings read fresh.
-  settingsSync().forget();
-  clearError();
-  // `#462 webapp-deep-links`: signing out forgets where the reader was, address included — a
-  // reload after it must not reopen the signed-out reader's place from the query alone.
-  deepLinks.signOut();
-  linkedMark.clear();
-  // `#543 in-app-message-links`: and the jumps taken by links, whose spots are the signed-out reader's.
-  linkJumps.forget();
-  try {
-    const history = backHistory();
-    if (history && typeof window === "object" && window.location) {
-      history.replaceState(history.state, "", window.location.pathname || "/");
-      deepLinks.noteWritten(window.location.pathname || "/");
-    }
-  } catch (_error) {
-    // The address keeps its query; the token is still forgotten.
-  }
-  // Before the token goes, not after: the stream holds a bearer credential open, and a signed-out
-  // page that is still receiving one channel's messages is the leak this control exists to close.
-  stopChannelStream();
-  stopOutgoingSends();
-  forgetMessages();
-  credentialStore().forget();
-  el("api-token").value = "";
-  markSave(SAVE_LABEL, "", false);
-  setTokenState(NO_TOKEN_YET);
-  setStatus("token forgotten");
-  showScreen("signin");
-}
+
 
 // --- settings kept on the server (`#457 settings-server-side`) ----------------------------------
 //
@@ -21593,45 +21375,24 @@ function forgetToken() {
 // are kept in agreement.
 
 /**
- * The reconciler between this device's replica and the server's document (web/src/core/settings,
- * `#624 voice-page-modularity`): the synced keys, the archive, the passes and their timer. What
- * stays here is what it asks of the page: a key's value put into force (`applySyncedSetting`), and
- * the quiet word about it in Settings. Made on first use; a `var` with no initialiser, like
- * `serverApi`.
- *
- * @type {import("./src/core/settings/index.ts").SettingsSync | undefined}
+ * The settings sync's laziness and small acts: one owner in web/src/view/settings/syncglue.ts
+ * (`createSettingsSyncGlue`, `#624 voice-page-modularity`). The reconciler and its view are made
+ * on first use, as they were; the page destructures their acts under their old names.
  */
-var pageSettingsSync;
-
-/** {@link pageSettingsSync}, made if it is not yet. */
-function settingsSync() {
-  if (!pageSettingsSync) {
-    pageSettingsSync = createSettingsSync({
-      storage: deviceStorage(),
-      clock: browserPorts().clock,
-      decoded: apiDecoded,
-      token,
-      tokenScope: () => serverFacts.tokenScope(),
-      apply: applySyncedSetting,
-      status: renderSettingsSyncState,
-      landed: summariesSettingLanded,
-    });
-  }
-  return pageSettingsSync;
-}
-
-/**
- * Put one synced key's kept value into force, through the same stored-and-apply pair its own
- * control ends in, so a change from another device lands exactly as one made here would. Called
- * only after `localStorage` holds the new value. One key failing must not stop the rest.
- */
-/** The Settings adapter is constructed on first use, without reading feature owners early. */
-/** @type {import("./src/view/settings/index.ts").SettingsSyncView | undefined} */
-var pageSettingsSyncView;
-function settingsSyncView() {
-  if (!pageSettingsSyncView) pageSettingsSyncView = mountSettingsSyncView({
+const settingsSyncGlue = createSettingsSyncGlue({
+  createSync: (apply, status) => createSettingsSync({
+    storage: deviceStorage(),
+    clock: browserPorts().clock,
+    decoded: apiDecoded,
+    token,
+    tokenScope: () => serverFacts.tokenScope(),
+    apply,
+    status,
+    landed: summariesSettingLanded,
+  }),
+  mountView: (sync) => mountSettingsSyncView({
     lookup: (id) => el(id),
-    sync: () => settingsSync(),
+    sync,
     guard: (run) => guardQuietly(run),
     keys: {
       get READ_MODE_KEY() { return READ_MODE_KEY; },
@@ -21740,33 +21501,12 @@ function settingsSyncView() {
     threadCardFold: () => {
       setThreadCardFolded(threadCardFoldChoice.stored());
     },
-  });
-  return pageSettingsSyncView;
-}
-
-function applySyncedSetting(key) { settingsSyncView().apply(key); }
-
-/** Settings' quiet word about the sync: silent while it is keeping up. */
-function renderSettingsSyncState(text) { settingsSyncView().status(text); }
-
-/** Re-read the document, for the moments a missed stream frame could hide in: refocus, reconnect. */
-function refreshServerSettings() {
-  return settingsSync().refresh();
-}
-
-/**
- * One `settings` frame off either live stream: another device's change, or this one's own
- * heard back, which the archive's stamps make a no-op. Unreadable frames are dropped, as
- * every stream frame this page cannot read is.
- */
-function onSettingsFrame(frame) {
-  settingsSync().onFrame(frame);
-}
-
-/** Start keeping this device's replica and the server's document in agreement. Called from
- * `signIn` once the token is proven, never before: settings are read with the same credential
- * as everything else, and an unproven one reads nothing. */
-function startSettingsSync() { settingsSyncView().start(); }
+  }),
+});
+const {
+  settingsSync, settingsSyncView, applySyncedSetting, renderSettingsSyncState,
+  refreshServerSettings, onSettingsFrame, startSettingsSync,
+} = settingsSyncGlue;
 
 // --- wiring ------------------------------------------------------------------------------------
 

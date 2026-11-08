@@ -425,3 +425,89 @@ test("`#624 voice-page-modularity`: the channel box's listeners are mounted in t
   box.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
+
+test("`#624 voice-page-modularity`: client-config puts its facts and settings into force in the page's order", () => {
+  const { createClientConfig } = VIEW_SETTINGS;
+  const log = [];
+  const act = (name) => (...args) => { log.push(`${name}:${args.map(String).join(",")}`); };
+  const owner = (name, extra = {}) => new Proxy(extra, { get: (t, k) => (k in t ? t[k] : act(`${name}.${String(k)}`)), set: (t, k, v) => { log.push(`${name}.${String(k)}=${String(v && v.playback || v)}`); return true; } });
+  const readAloud = owner("read", { storedWitVoice: () => "wit-1", storedReadAudioSource: () => "", readSpeed: 1 });
+  const clientConfig = createClientConfig({
+    el: (id) => ({ set textContent(v) { log.push(`el ${id}=${v}`); } }),
+    setTitle: act("title"), readAloud: () => readAloud,
+    providerFacts: owner("facts"), channelDirectory: owner("directory", { providerName: () => "Slack", channels: () => [] }),
+    serverFacts: owner("server"), whoIsWho: owner("who"),
+    learnProviders: act("learnProviders"), noteSelfAuthor: act("selfAuthor"),
+    voiceProvider: owner("voiceProvider", { current: () => ({ name: "Agent" }) }),
+    voiceCall: () => owner("call", { session: {} }),
+    settingsReadouts: owner("readouts"),
+    channelSettings: owner("channelSettings"),
+    fillChannelSelect: act("fill"), restoreChannelComposer: act("restoreComposer"),
+    summaryRows: owner("summaries", { disabledByServer: () => "", mode: () => false }),
+    setSummaryMode: act("summaryMode"), storedSummarizeCollapsed: () => false,
+    renderScrollTools: act("scrollTools"), applyChannelProvider: act("applyProvider"),
+    upstreamClearBox: owner("upstream"), callResume: owner("resume"),
+    voiceTranscript: () => ({}),
+    speechHoldFrom: (h) => h, renderResumeState: act("resumeState"),
+    noiseSettings: owner("noise"), agentSettings: owner("agentSettings"), agentPrefix: owner("prefix"),
+    serverCacheBox: owner("cache"), seedServerThreadHues: act("hues"),
+    selectedChannelId: () => "C1", startChannelStream: act("stream"),
+    settingsSync: () => owner("sync"), messageCache: owner("messageCache"),
+    uiState: { chosenViewsNow: () => [], forgetChosen: act("forgetChosen") },
+    saveUiState: act("saveUi"), keyHints: owner("hints"),
+  });
+  clientConfig.apply({ threading_supported: true, channels: [{ id: "C1" }], client_settings_supported: true });
+  assert.ok(log.indexOf("facts.setThreading:true") < log.indexOf("directory.setChannels:[object Object]"), "threading settled after channels");
+  assert.ok(log.indexOf("fill:discord-channel") < log.indexOf("channelSettings.renderChannelBox:undefined") || log.includes("channelSettings.renderChannelBox:"), "pickers filled before the box");
+  assert.ok(log.indexOf("stream:C1") < log.indexOf("server.markConfigApplied:") && log.indexOf("server.markConfigApplied:") < log.indexOf("messageCache.saveCacheShell:[object Object]"), "config not marked applied after the stream, before the cache shell");
+});
+
+test("`#624 voice-page-modularity`: sign-in shows the main screen on a network failure and sign-in on a refusal", async () => {
+  const { createSignIn, SAVE_LABEL } = VIEW_SETTINGS;
+  assert.equal(SAVE_LABEL, "Save token");
+  const make = (config) => {
+    const log = [];
+    const sign = createSignIn({
+      el: () => ({ set textContent(v) { log.push(`state:${v}`); } }),
+      field: () => ({ value: "" }), token: () => "tok", signedOutByRename: () => false,
+      config, applyClientConfig: () => log.push("config"),
+      forgetMessages: () => log.push("forget"), showError: (t) => log.push(`error:${t}`),
+      setStatus: (t) => log.push(`status:${t}`), refusalSentence: (e) => `refused:${e.message}`,
+      showScreen: (n) => log.push(`screen:${n}`), loadFreshAt: () => null,
+      setChannelFreshness: (s) => log.push(`fresh:${s}`), payReopenRead: () => log.push("reopen-read"),
+      channelContextKey: () => "k", threading: () => false,
+      reconcileChannelSnapshot: () => log.push("reconcile"), clearError: () => {},
+      reopenSavedView: () => log.push("reopen"), setState: (s) => log.push(`set:${s}`),
+      voiceTranscript: () => ({ loadStoredConversation: () => log.push("stored") }),
+      startSettingsSync: () => log.push("sync"), settleUnconfirmedSends: () => log.push("settle"),
+      credentialStore: () => ({ keep() {}, forget() {} }), stopOutgoingSends: () => {},
+      markSave: () => {}, revertSaveLater: () => {},
+      settingsSync: () => ({ forget() {} }),
+      deepLinks: { signOut() {}, noteWritten() {} }, clearLinkedMark() {}, forgetLinkJumps() {},
+      backHistory: () => null, location: () => null, stopChannelStream: () => {},
+    });
+    return { sign, log };
+  };
+  const refused = make(() => Promise.reject(Object.assign(new Error("no"), { refused: true, status: 401 })));
+  assert.equal(await refused.sign.signIn(), false);
+  assert.ok(refused.log.includes("screen:signin") && refused.log.includes("forget"), "a refusal kept the main screen");
+  const down = make(() => Promise.reject(Object.assign(new Error("down"), { network: true })));
+  assert.equal(await down.sign.signIn(), true);
+  assert.ok(down.log.includes("screen:main") && down.log.includes("reopen-read"), "a network failure bounced to sign-in");
+});
+
+test("`#624 voice-page-modularity`: the settings sync glue makes neither owner until first use, and starts only through its view", () => {
+  const { createSettingsSyncGlue } = VIEW_SETTINGS;
+  const log = [];
+  const glue = createSettingsSyncGlue({
+    createSync: (apply, status) => { log.push("make sync"); return { apply, status, refresh: () => Promise.resolve(), onFrame() {}, forget() {}, setSupported() {}, agreed: () => null }; },
+    mountView: (sync) => { log.push("make view"); assert.equal(typeof sync, "function"); return { apply: (k) => log.push(`apply:${k}`), status: (t) => log.push(`status:${t}`), start: () => log.push("start") }; },
+  });
+  assert.deepStrictEqual(log, [], "an owner was made at construction");
+  glue.applySyncedSetting("READ_MODE_KEY");
+  glue.startSettingsSync();
+  assert.deepStrictEqual(log, ["make view", "apply:READ_MODE_KEY", "start"], "the view was not made first, on first use");
+  glue.settingsSync();
+  glue.settingsSync();
+  assert.deepStrictEqual(log.filter((line) => line === "make sync"), ["make sync"], "the reconciler was made twice");
+});

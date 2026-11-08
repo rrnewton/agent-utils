@@ -415,3 +415,7 @@ declare const SEARCH_OLDER_HITS: LegacyImports["SEARCH_OLDER_HITS"];
 declare const SEARCH_OLDER_TAP_MS: LegacyImports["SEARCH_OLDER_TAP_MS"];
 declare const createSearchRows: LegacyImports["createSearchRows"];
 declare const createRowLinks: LegacyImports["createRowLinks"];
+
+declare const createClientConfig: LegacyImports["createClientConfig"];
+declare const createSettingsSyncGlue: LegacyImports["createSettingsSyncGlue"];
+declare const createSignIn: LegacyImports["createSignIn"];
