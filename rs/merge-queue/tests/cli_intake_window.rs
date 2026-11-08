@@ -69,6 +69,16 @@ struct Daemon(Child);
 impl Daemon {
     /// One run (`--once`), two batches of one change each in flight at most.
     fn start(fx: &Fixture) -> Self {
+        Self::start_with(fx, None)
+    }
+
+    // As `start`, with the run's intake window shortened to `secs` seconds
+    // (`--intake-for-secs`) so a test can get past it.
+    fn start_with_intake_for(fx: &Fixture, secs: u64) -> Self {
+        Self::start_with(fx, Some(secs))
+    }
+
+    fn start_with(fx: &Fixture, intake_for_secs: Option<u64>) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_merge-queue"));
         command
             .args([
@@ -83,6 +93,9 @@ impl Daemon {
             .current_dir(fx.queue())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(secs) = intake_for_secs {
+            command.args(["--intake-for-secs", &secs.to_string()]);
+        }
         for (key, value) in IDENTITY {
             command.env(key, value);
         }
@@ -515,4 +528,124 @@ fn a_resubmission_at_the_ejected_head_is_taken_in_once_in_the_same_run() {
         !reports[0]["ejected"].as_array().unwrap().is_empty(),
         "{reports:?}"
     );
+}
+
+/// Late resubmission while one long batch drains (#1087): past its intake
+/// window a run normally takes no recorded requests in, however long its
+/// last batch runs. When exactly one batch is left in flight it takes the
+/// recorded requests in once more, planned on top of that batch, and then
+/// no more: a further submission waits for the next run even when the
+/// window has a free slot again.
+#[test]
+fn a_late_resubmission_while_one_long_batch_drains_is_taken_in_once_more() {
+    let (fx, started, gates) = setup("intake-window-late");
+    fx.branch("a", &[("tests/a", "FAIL\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    // Two files, so change 2's rebuilt candidate (3 files) has a gate of
+    // its own, distinct from change 1's (2 files).
+    fx.branch("b", &[("tests/b", "ok\n"), ("tests/b2", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    // A six-second intake window: the run is past it long before the
+    // gated batches below finish.
+    let mut daemon = Daemon::start_with_intake_for(&fx, 6);
+    wait_for("both batches to validate", Duration::from_secs(30), || {
+        started_lines(&started).len() == 2
+    });
+    // The run's intake clock started before its first validation did, so
+    // nine seconds after validations are seen running the run is past
+    // its six-second window for sure.
+    let validating_at = Instant::now();
+    // Change 1 fails and is ejected; change 2 (stacked on it) stays gated.
+    open(&gates, 1);
+    open(&gates, 2);
+    wait_for("change 1 to be ejected", Duration::from_secs(60), || {
+        status(&fx, 1) == "ejected"
+    });
+    // Change 2, stacked on the ejected batch, is rebuilt without it and
+    // validates again: exactly one batch now left in flight, still gated.
+    wait_for(
+        "change 2 to be rebuilt without change 1",
+        Duration::from_secs(60),
+        || started_lines(&started).iter().any(|line| line == "b b2 t0"),
+    );
+    while validating_at.elapsed() < Duration::from_secs(9) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Resubmit change 1 at a fixed head, past the window, while change 2
+    // drains alone: the one extra intake round plans it on top of
+    // change 2's batch in this same run. The initial stacked batch
+    // produced the same started line, so the wait counts second
+    // occurrences.
+    fx.branch("a2", &[("tests/a", "ok\n")]);
+    let out = fx.mq_ok(&["submit", "1", "--head", "a2"]);
+    assert!(out.contains("recorded #1"), "{out}");
+    wait_for(
+        "change 1 to validate again past the intake window",
+        Duration::from_secs(60),
+        || {
+            started_lines(&started)
+                .iter()
+                .filter(|line| *line == "a b b2 t0")
+                .count()
+                >= 2
+        },
+    );
+    assert!(
+        events(&fx)
+            .iter()
+            .any(|line| line.contains("taking recorded requests in once more")),
+        "events: {:?}",
+        events(&fx)
+    );
+    // A second submission after that one extra round is not taken in.
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    let out = fx.mq_ok(&["submit", "3", "--head", "c"]);
+    assert!(out.contains("recorded #3"), "{out}");
+    // Change 2 lands; change 1's late batch is still gated, so exactly
+    // one batch is in flight again with a free slot beside it. Change 3
+    // still does not start: the one extra round is spent.
+    open(&gates, 3);
+    wait_for("change 2 to land", Duration::from_secs(60), || {
+        status(&fx, 2) == "landed"
+    });
+    let count_c = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|line| line.split(' ').any(|f| f == "c"))
+            .count()
+    };
+    let before = started_lines(&started);
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(
+        count_c(&started_lines(&started)),
+        count_c(&before),
+        "started: {:?}\nevents: {:?}",
+        started_lines(&started),
+        events(&fx)
+    );
+    assert_eq!(count_c(&started_lines(&started)), 0);
+    assert_eq!(status(&fx, 1), "queued");
+    // The late batch finishes and lands after change 2; change 3 was
+    // applied at the run's end and waits queued for the next run.
+    open(&gates, 4);
+    assert_eq!(daemon.exit_code(Duration::from_secs(90)), Some(0));
+    let reports = reports(&fx);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(
+        landed(&reports[0]),
+        vec![vec![2], vec![1]],
+        "{}",
+        reports[0]
+    );
+    let intake = reports[0]["intake"].as_array().unwrap();
+    assert!(
+        intake
+            .iter()
+            .any(|line| line.as_str().unwrap().starts_with("applied submit #1")),
+        "{intake:?}"
+    );
+    assert_eq!(status(&fx, 1), "landed");
+    assert_eq!(status(&fx, 2), "landed");
+    assert_eq!(status(&fx, 3), "queued");
+    assert_eq!(count_c(&started_lines(&started)), 0);
 }

@@ -36,6 +36,18 @@ with no pending intake ends as today. No new configuration and no
 protocol change, so mixed versions are unaffected: an older binary
 simply drains as it always has.
 
+Testability (decided while implementing): the window length becomes
+`RunOptions::intake_for` (`Option<Duration>`, `INTAKE_FOR` when
+unset), plumbed from a new `serve --intake-for-secs` flag exactly as
+`intake_poll` is plumbed from `--poll-ms`; the one-shot `run` keeps
+the default. An environment-variable override was rejected: every
+timing knob on this binary is a serve flag funnelled through
+`ServeOptions` into `RunOptions`, while its environment variables
+name state and identity only, and a duration read from the ambient
+environment of a long-running daemon would be invisible in `--help`
+and the heartbeat. The flag is additive and defaults to today's two
+hours, so existing invocations and service units are unaffected.
+
 # Acceptance Criteria
 
 - A new-head resubmission recorded after the intake window closed,

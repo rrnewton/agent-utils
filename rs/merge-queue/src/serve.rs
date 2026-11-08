@@ -771,6 +771,9 @@ pub struct ServeOptions {
     pub sync_limit: u32,
     /// Override `validator.offload` for work cycles.
     pub offload: Option<String>,
+    /// How long each work cycle's run keeps taking in recorded requests
+    /// (`--intake-for-secs`; the run's two-hour default when unset).
+    pub intake_for: Option<Duration>,
 }
 
 impl Default for ServeOptions {
@@ -789,6 +792,7 @@ impl Default for ServeOptions {
             sync_every: Duration::from_secs(DEFAULT_SYNC_EVERY_SECS),
             sync_limit: DEFAULT_SYNC_LIMIT,
             offload: None,
+            intake_for: None,
         }
     }
 }
@@ -920,6 +924,7 @@ fn run_cycle(
         stopping: Some(Arc::clone(stopping)),
         // A run in progress looks for recorded requests as often as the daemon polls.
         intake_poll: Some(options.poll),
+        intake_for: options.intake_for,
         ..RunOptions::default()
     };
     let outcome = Runner::new(state, run_options)

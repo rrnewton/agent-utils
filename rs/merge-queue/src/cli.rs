@@ -1532,6 +1532,12 @@ enum Command {
         /// Seconds between `git ls-remote` base polls.
         #[arg(long, default_value_t = serve::DEFAULT_BASE_POLL_SECS)]
         base_poll_secs: u64,
+        /// Seconds each run keeps taking in requests recorded while it holds the queue
+        /// (default: 7200, two hours; after that the run finishes the batches in flight
+        /// and ends, taking recorded requests in once more only when exactly one batch
+        /// is left in flight). Mainly for tests and short-lived soak daemons.
+        #[arg(long, value_name = "SECS")]
+        intake_for_secs: Option<u64>,
         /// Run at most one work cycle, then exit (scripts and tests).
         #[arg(long)]
         once: bool,
@@ -2856,6 +2862,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     window: None,
                     stopping: None,
                     intake_poll: None,
+                    // A one-shot run keeps the standard two-hour intake window.
+                    intake_for: None,
                     // Its process ends with it: it waits for the work it left beside it.
                     wait_for_background: true,
                 },
@@ -2867,6 +2875,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
         Command::Serve {
             poll_ms,
             base_poll_secs,
+            intake_for_secs,
             once,
             shadow,
             depth,
@@ -2898,6 +2907,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 sync_every: std::time::Duration::from_secs(sync_every.max(10)),
                 sync_limit,
                 offload,
+                intake_for: intake_for_secs.map(std::time::Duration::from_secs),
             },
         ),
         Command::InstallServeUnit {

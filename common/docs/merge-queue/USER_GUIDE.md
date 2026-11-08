@@ -349,8 +349,11 @@ seconds under `run`.
   a ruling, does not: it applies at the next free slot, and the run plans the change again on
   top of the batches in flight. All requests wait during a drain, and after a run has been taking
   requests for two hours: it then finishes the batches in flight and ends, so the next run
-  reloads the configuration and the validator's tools. The run report lists what the run
-  applied under `intake`.
+  reloads the configuration and the validator's tools. One exception at the tail of such a
+  run: while exactly one batch is left in flight, the run takes recorded requests in once
+  more, planned on top of that batch, and then no further requests in that run (the run
+  log says `past the intake window with one batch left in flight; taking recorded
+  requests in once more`). The run report lists what the run applied under `intake`.
 - Two more requests apply at the next intake point even though the run set their change
   aside. A `withdraw` of a change with no running validation (held for a ruling, say)
   applies at once and the run goes on without it. And a `submit` at a *new* head for a
@@ -480,6 +483,7 @@ SIGINT or SIGTERM during a stop exits immediately. `merge-queue run` stops the s
 |---|---|---|
 | `--poll-ms N` | `250` | Idle poll interval in milliseconds: `items/` watch and heartbeat cadence (at least 10). |
 | `--base-poll-secs N` | `30` | Seconds between `git ls-remote` base polls. `0` polls the base every cycle. |
+| `--intake-for-secs N` | `7200` | Seconds each run keeps taking in requests recorded while it holds the queue, before it finishes the batches in flight and ends (with the one tail exception above). Mainly for tests and short-lived soak daemons. |
 | `--once` | off | Run at most one work cycle, then exit. For scripts and tests. |
 | `--shadow` | off | Validate for real, but land on a simulated base (the same shadow path as `run --shadow`): full plan/run/notify cycles execute, landings are recorded as shadow/simulated (`mode: shadow` in the run report, `mode: shadow` in `status`), item statuses stay queued, and the real base ref is never pushed. Daemon soak mode; also the remedy when `land.driver` is `none`. |
 | `--depth N` | the configured `depth` | Override the initial window for work cycles. |

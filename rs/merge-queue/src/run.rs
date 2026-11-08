@@ -95,6 +95,10 @@ pub struct RunOptions {
     /// How often a run with a batch in flight looks for requests recorded while it holds the
     /// queue ([`INTAKE_POLL`] when unset).
     pub intake_poll: Option<Duration>,
+    /// How long the run keeps taking in recorded requests ([`INTAKE_FOR`] when unset).
+    /// `serve --intake-for-secs` sets it; tests shorten it so the tail rule past the
+    /// window (see [`Runner::takes_intake`]) is reachable without waiting two hours.
+    pub intake_for: Option<Duration>,
     /// Wait at the end of the run for the work it left beside it: the pull requests it landed
     /// to close (see [`Closer`]) and the suspect-flake reruns it asked for
     /// ([`crate::suspect`]). A one-shot run, whose process ends with it. Under `serve` that
@@ -1305,6 +1309,9 @@ pub struct Runner<'a> {
     /// Changes already taken back in at the same head they were excluded at in this run
     /// (#1050): once per run, so a change that keeps failing is not revalidated in a loop.
     resubmitted_same_head: Mutex<BTreeSet<i64>>,
+    /// Whether the one extra intake round past the intake window has been
+    /// spent in this run (#1087; see [`Self::late_intake_round`]).
+    late_intake_taken: Mutex<bool>,
     /// The validator donor jobs published now carry: the run's starting validator, replaced
     /// at plan-intake when the config on disk changes (#1050).
     publish_validator: Mutex<crate::state::ValidatorConfig>,
@@ -1480,6 +1487,7 @@ impl<'a> Runner<'a> {
             deps: Mutex::new(BTreeMap::new()),
             excluded: Mutex::new(held),
             resubmitted_same_head: Mutex::new(BTreeSet::new()),
+            late_intake_taken: Mutex::new(false),
             publish_validator: Mutex::new(publish_validator),
             landed_heads: Mutex::new(Vec::new()),
             carried: Mutex::new(BTreeMap::new()),
@@ -5409,10 +5417,30 @@ impl<'a> Runner<'a> {
         Ok(())
     }
 
+    /// How long this run keeps taking in recorded requests: [`RunOptions::intake_for`]
+    /// when the caller set one, else [`INTAKE_FOR`].
+    fn intake_window(&self) -> Duration {
+        self.options.intake_for.unwrap_or(INTAKE_FOR)
+    }
+
     /// Whether this run may take in recorded requests now: it holds the writer lock for real
-    /// (not a shadow or dry run) and has not been taking them for [`INTAKE_FOR`] yet.
+    /// (not a shadow or dry run) and has not been taking them for its intake window yet.
     fn takes_intake(&self) -> bool {
-        self.writer.is_some() && !self.simulating() && self.started.elapsed() < INTAKE_FOR
+        self.writer.is_some() && !self.simulating() && self.started.elapsed() < self.intake_window()
+    }
+
+    /// Whether the one extra intake round past the intake window may run
+    /// now (#1087): the window has closed, exactly one batch is left in
+    /// flight (a probe beside its red batch counts as a second flight, so
+    /// the round waits out a culprit search), and the round has not been
+    /// spent yet in this run. The extension is bounded by that one round:
+    /// the next run still reloads the configuration and the tools.
+    fn late_intake_round(&self, flights: usize) -> bool {
+        flights == 1
+            && self.writer.is_some()
+            && !self.simulating()
+            && self.started.elapsed() >= self.intake_window()
+            && !*lock(&self.late_intake_taken)
     }
 
     /// The tests to run again beside the run when `candidate`'s red run `ran` is a suspect flake
@@ -6521,14 +6549,15 @@ impl<'a> Runner<'a> {
                     // in now instead of at the end of the run. The changes this run has not
                     // started are planned again on top of the last batch in flight, so a new
                     // change can fill the free slot and a prioritized one goes before batches
-                    // not started yet.
+                    // not started yet. Past the intake window the same round runs
+                    // once more when exactly one batch is left in flight (#1087).
                     if full_loaded
                         && want_more
                         && (occupied(&flights) < window
                             || self.config.value_ordering
                             || self.config.ev_planner)
                         && (!flights.is_empty() || !pending.is_empty())
-                        && self.takes_intake()
+                        && (self.takes_intake() || self.late_intake_round(flights.len()))
                     {
                         // In flight or set aside; a change a red batch sent back to `pending`
                         // is planned again with the rest, and a held change its owner retries
@@ -6549,6 +6578,14 @@ impl<'a> Runner<'a> {
                         if crate::intake::has_pending_except(self.state, &busy)
                             || self.intake_unblocks(&busy, &in_flight)
                         {
+                            if !self.takes_intake() {
+                                *lock(&self.late_intake_taken) = true;
+                                self.event(
+                                    "intake",
+                                    "past the intake window with one batch left in flight; \
+                                     taking recorded requests in once more",
+                                );
+                            }
                             let tip = match stack_top(&flights) {
                                 Some(last) => last.candidate.tip.clone(),
                                 None => self.current_base()?,
