@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-rebase-conflict-probe: the conflicts-with-base probe merge-trees even when the queue combines by rebase'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-08T10:36:49.000000000+00:00
-updated_at: 2026-11-08T10:36:49.000000000+00:00
+updated_at: 2026-11-08T13:10:18.000000000+00:00
 ---
 
 # Description
@@ -82,3 +82,34 @@ convention. The exact-item half is gap (2) from the #922
 follow-up review: same probe, same fix. The other #922 gap —
 label-driven sync cannot mark an item exact — is filed
 separately.
+
+## Resolution
+
+Landed on main as 85478f473ec8ef830ae9389537d7cd794c5f5e18
+(replay of the gated 5555c950 onto 91e4e621; tree identical).
+
+`ProbeOptions` now carries the configured combine mode and the
+exact-head set, threaded from the queue items at every ops call
+site. Under rebase the base verdict replays through the existing
+`combine_with` path (a commit whose patch is already on the base
+drops out); under merge it remains plain merge-tree; exact heads
+are never merge-probed, so a moved base reaches build's
+`lands_exactly` ejection instead of a conflicts-with-base hold.
+Exact cache rows are keyed separately so no verdict answers
+across exactness. Covered by a probe unit (rebase-clean /
+merge-conflict / real-conflict / exact cache separation) and a
+`cli_plan` pair showing the stacked change held only under merge
+combine.
+
+Gate: full shared phase on the gated tip ran 234 passed / 4
+failed, then the gate-exclusive cross differentials were stopped
+under the merge-queue waiver (diff is `rs/merge-queue` only). The
+four failures were adjudicated by one exclusive solo rerun, all
+passing: two wrkslots shards (a bounded-scan budget timeout and
+a host-state census mismatch), one vibe-talk cache race, and
+`rust.merge-queue.test` killed at the old 1200 CPU-s budget with
+no test verdict (shared profile: wall 426.490s, user 498.240 +
+sys 702.519 ≈ 1200.8 CPU-s at the kill; the exclusive rerun
+passed the whole crate clean, 557 passed / 0 failed, profile
+elapsed 459.583s at user 215.176 + sys 661.717 = 876.9 CPU-s).
+The budget itself was raised by #1051 in the meantime.
