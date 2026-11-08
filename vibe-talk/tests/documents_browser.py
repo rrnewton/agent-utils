@@ -7,6 +7,12 @@ with real touch: an unfetched row fetches (the paste command serves a local
 file) and opens the reader; a GitHub row whose fetcher cannot connect shows
 its error on the row; Fetch recent reports a result. No documents API is
 stubbed: list, fetch and render all go through the server under test.
+
+The reader steps also cover `#1038 documents-outline-popup`: the seeded paste
+is long enough to scroll several viewports, and at 393x852 (touch) and again
+at 1280x800 (mouse) the Outline button opens the pop-up, an entry tap/click
+jumps to its heading, the HERE mark follows scrolling, and the title links
+to the document's original source in a new tab.
 """
 
 import json
@@ -19,18 +25,60 @@ import urllib.request
 from pathlib import Path
 from typing import cast
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Page, Route, sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
 READ_TOKEN = "documents-check-read-token-not-a-real-credential"
 WRITE_TOKEN = "documents-check-write-token-not-a-real-credential"
-PASTE_BODY = "# Demo deployment report\n\nThe **nightly** run finished green.\n\n- one\n- two\n"
+_FILLER = (
+    "A filler paragraph long enough to take a few lines on a phone, so the "
+    "document below scrolls for several viewports and each heading can be "
+    "brought to the top of the scroller in turn.\n\n"
+)
+PASTE_BODY = (
+    "# Demo deployment report\n\nThe **nightly** run finished green.\n\n- one\n- two\n"
+    "\n## Setup\n\n" + _FILLER * 8
+    + "### Setup details\n\n" + _FILLER * 8
+    + "## Finish\n\n" + _FILLER * 10
+    + "The final line.\n"
+)
+OUTLINE_TEXTS = ["Demo deployment report", "Setup", "Setup details", "Finish"]
 
 
 def check(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def wait_heading_at_top(page: Page, heading_id: str, label: str) -> None:
+    """The heading sits in the scroller's top band and its outline entry is HERE."""
+    page.wait_for_function(
+        """([hid, label]) => {
+          const h = document.getElementById(hid);
+          const root = document.getElementById('scroll-area');
+          const b = [...document.querySelectorAll('#doc-outline button')]
+            .find((x) => x.textContent.trim() === label);
+          return !!h && !!root && !!b
+            && Math.abs(h.getBoundingClientRect().top - root.getBoundingClientRect().top) < 80
+            && b.getAttribute('aria-current') === 'true';
+        }""",
+        arg=[heading_id, label],
+        timeout=20_000,
+    )
+
+
+def wait_here_is(page: Page, label: str) -> None:
+    """The named outline entry, and only it, carries the HERE mark."""
+    page.wait_for_function(
+        """(label) => {
+          const marked = [...document.querySelectorAll('#doc-outline button')]
+            .filter((x) => x.getAttribute('aria-current') === 'true');
+          return marked.length === 1 && marked[0].textContent.trim() === label;
+        }""",
+        arg=label,
+        timeout=20_000,
+    )
 
 
 def free_port() -> int:
@@ -138,6 +186,82 @@ def main() -> int:
                 check("Demo deployment report" in (page.text_content("#doc-body") or ""),
                       "the reader did not render the fetched document")
                 check(page.locator("#control-pane").is_hidden(), "the call controls show over the reader")
+
+                # The title is the source link (#1038): href, new tab, no opener.
+                title_link = page.locator("#doc-title a")
+                check(title_link.count() == 1, "the reader title is not a link to the source")
+                check(title_link.get_attribute("href") == "https://paste.example/demo-doc",
+                      "the title link does not carry the document's original URL")
+                check(title_link.get_attribute("target") == "_blank", "the title link opens in place")
+                check("noopener" in (title_link.get_attribute("rel") or ""),
+                      "the title link keeps an opener")
+
+                # The old top-of-reader TOC is gone: the outline lives in its pop-up,
+                # closed until the Outline button opens it.
+                check(page.locator("#doc-outline-pop").is_hidden(), "the outline pop-up starts open")
+                page.tap("#doc-outline-open")
+                page.wait_for_function(
+                    "() => !document.getElementById('doc-outline-pop').hidden", timeout=20_000)
+                texts = [t.strip() for t in page.locator("#doc-outline button").all_text_contents()]
+                check(texts == OUTLINE_TEXTS, f"the outline lists {texts}, not {OUTLINE_TEXTS}")
+                indent = page.evaluate(
+                    """() => {
+                      const pads = [...document.querySelectorAll('#doc-outline button')]
+                        .map((b) => parseFloat(getComputedStyle(b).paddingLeft));
+                      return pads;
+                    }""")
+                check(indent[1] > indent[0] and indent[2] > indent[1] and indent[3] == indent[1],
+                      f"outline indentation does not follow heading levels: {indent}")
+
+                # A tap on a later entry jumps to its heading, closes the pop-up,
+                # and that entry becomes HERE.
+                page.locator("#doc-outline button", has_text="Finish").tap()
+                wait_heading_at_top(page, "doc-finish", "Finish")
+                check(page.locator("#doc-outline-pop").is_hidden(),
+                      "picking an outline entry left the pop-up open")
+
+                # Scrolling (here by scrollTop, as a swipe would move it) advances HERE.
+                page.evaluate(
+                    """() => {
+                      const root = document.getElementById('scroll-area');
+                      const h = document.getElementById('doc-setup');
+                      root.scrollTop += h.getBoundingClientRect().top - root.getBoundingClientRect().top;
+                    }""")
+                wait_here_is(page, "Setup")
+
+                # An outside tap closes the pop-up without moving the document.
+                page.tap("#doc-outline-open")
+                page.wait_for_function(
+                    "() => !document.getElementById('doc-outline-pop').hidden", timeout=20_000)
+                top_before = page.evaluate("() => document.getElementById('scroll-area').scrollTop")
+                page.touchscreen.tap(30, 700)
+                page.wait_for_function(
+                    "() => document.getElementById('doc-outline-pop').hidden", timeout=20_000)
+                top_after = page.evaluate("() => document.getElementById('scroll-area').scrollTop")
+                check(top_after == top_before, "closing the outline moved the document")
+
+                # The title link opens the source in a new page. Its route is
+                # aborted (never leaves the machine); the aborted request's URL,
+                # or the popup's where the navigation commits first, is the check.
+                source_requests: list[str] = []
+
+                def abort_source(route: Route) -> None:
+                    source_requests.append(route.request.url)
+                    route.abort()
+
+                ctx.route("https://paste.example/**", abort_source)
+                with ctx.expect_page(timeout=20_000) as popup_info:
+                    page.tap("#doc-title a")
+                popup = popup_info.value
+                deadline = time.time() + 10
+                while not source_requests and popup.url == "about:blank" and time.time() < deadline:
+                    time.sleep(0.1)
+                check(source_requests == ["https://paste.example/demo-doc"]
+                      or popup.url == "https://paste.example/demo-doc",
+                      f"the title opened {popup.url!r} (requests: {source_requests}), "
+                      "not the document source")
+                popup.close()
+
                 page.tap("#doc-back")
                 page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
 
@@ -165,8 +289,40 @@ def main() -> int:
                     "() => [...document.querySelectorAll('#documents-list .doc-card')]"
                     ".some((c) => c.textContent.includes('Could not fetch it.'))",
                     timeout=20_000)
+                ctx.close()
+
+                # The same outline flow at desktop size with a mouse: open, jump,
+                # HERE, and Escape from the keyboard inside the panel.
+                dctx = browser.new_context(viewport={"width": 1280, "height": 800})
+                dpage = dctx.new_page()
+                dpage.add_init_script(
+                    f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
+                dpage.goto(base + "/?v=docs", wait_until="load")
+                dpage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                dpage.locator("#documents-list .doc-card", has_text="demo-doc").click()
+                dpage.wait_for_selector("#doc-body h1", timeout=20_000)
+                check(dpage.locator("#doc-title a").get_attribute("href")
+                      == "https://paste.example/demo-doc",
+                      "the desktop title does not link to the source")
+                dpage.click("#doc-outline-open")
+                dpage.wait_for_function(
+                    "() => !document.getElementById('doc-outline-pop').hidden", timeout=20_000)
+                dtexts = [t.strip() for t in dpage.locator("#doc-outline button").all_text_contents()]
+                check(dtexts == OUTLINE_TEXTS, f"the desktop outline lists {dtexts}, not {OUTLINE_TEXTS}")
+                dpage.locator("#doc-outline button", has_text="Setup details").click()
+                wait_heading_at_top(dpage, "doc-setup-details", "Setup details")
+                check(dpage.locator("#doc-outline-pop").is_hidden(),
+                      "picking a desktop outline entry left the pop-up open")
+                dpage.click("#doc-outline-open")
+                dpage.wait_for_function(
+                    "() => !document.getElementById('doc-outline-pop').hidden", timeout=20_000)
+                dpage.keyboard.press("Escape")
+                dpage.wait_for_function(
+                    "() => document.getElementById('doc-outline-pop').hidden", timeout=20_000)
+                dctx.close()
                 browser.close()
-            print("documents browser check: real-server list, touch fetch, reader, and fetch error all seen")
+            print("documents browser check: real-server list, touch fetch, reader, outline pop-up, "
+                  "source link, and fetch error all seen")
             return 0
         finally:
             server.terminate()

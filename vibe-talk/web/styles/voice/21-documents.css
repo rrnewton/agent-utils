@@ -205,10 +205,75 @@
 #doc-body pre {
   overflow-x: auto;
 }
+#doc-title a {
+  color: inherit;
+}
+#doc-outline-open[hidden] {
+  display: none;
+}
+/* The outline pop-up (#1038): floated over the document against #screen-main,
+   as #search-float is, so the document never reflows for it and it never
+   scrolls away with the reader; the list scrolls inside the panel. */
+#doc-outline-pop {
+  position: absolute;
+  top: calc(4.5rem + env(safe-area-inset-top));
+  right: calc(8px + env(safe-area-inset-right));
+  width: min(20rem, calc(100vw - 16px));
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--edge, currentColor);
+  border-radius: 8px;
+  background: var(--bg, Canvas);
+  box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 35%);
+  z-index: 6;
+}
+#doc-outline-pop[hidden] {
+  display: none;
+}
 #doc-outline {
   list-style: none;
+  margin: 0;
   padding: 0;
 }
 #doc-outline button {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  text-align: left;
   cursor: pointer;
+}
+#doc-outline .doc-ol-1 {
+  padding-left: 8px;
+}
+#doc-outline .doc-ol-2 {
+  padding-left: 20px;
+}
+#doc-outline .doc-ol-3 {
+  padding-left: 32px;
+}
+#doc-outline .doc-ol-4 {
+  padding-left: 44px;
+}
+#doc-outline .doc-ol-5 {
+  padding-left: 56px;
+}
+#doc-outline .doc-ol-6 {
+  padding-left: 68px;
+}
+/* HERE: the section at the top of the scroller, in a clear distinct style. */
+#doc-outline button.doc-here {
+  font-weight: 700;
+  color: var(--accent, Highlight);
+}
+/* A jumped-to heading clears the scroller's top fade instead of hiding under
+   it — by exactly the reader's HERE slack, so the heading a jump lands on is
+   the section the outline marks current. */
+#doc-body h1,
+#doc-body h2,
+#doc-body h3,
+#doc-body h4,
+#doc-body h5,
+#doc-body h6 {
+  scroll-margin-top: 8px;
 }

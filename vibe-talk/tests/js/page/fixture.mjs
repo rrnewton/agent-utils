@@ -5154,6 +5154,10 @@ const TUNING_BANDS = {
     "how deep a document's inline formatting may nest before the rest is plain text " +
     "(documents-view-client): 0 would render no emphasis at all, and no cap would let a crafted " +
     "document nest the renderer until it overflows"],
+  HERE_SLACK_PX: [0, 32,
+    "how far below the scroller's top a document heading still counts as the current section " +
+    "(#1038 documents-outline-popup): past a line's height a heading the reader has not reached " +
+    "yet would be marked HERE in the outline pop-up"],
   BROWSER_SPEECH_CHUNK_CHARS: [60, 300,
     "device voices need short utterances to avoid mobile synthesis stalls without pausing every word"],
   BROWSER_SPEECH_SENTENCE_MIN_CHARS: [8, 60,

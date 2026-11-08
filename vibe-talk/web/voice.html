@@ -377,6 +377,14 @@
             </div>
           </div>
 
+          <!-- The Documents reader's outline pop-up (#1038 documents-outline-popup). OUTSIDE
+               #scroll-area, as #search-float is: inside the scroller it would scroll away
+               under that element's fade mask; out here it floats over the document,
+               which never reflows for it. Its list is drawn by the reader module. -->
+          <div id="doc-outline-pop" role="dialog" aria-label="Document outline" hidden>
+            <ul id="doc-outline"></ul>
+          </div>
+
           <!--
             THE one scrolling element on the page.
 
@@ -725,9 +733,9 @@
                 <div class="row docs-toolbar">
                   <button id="doc-back" type="button">Back</button>
                   <h2 id="doc-title"></h2>
+                  <button id="doc-outline-open" type="button" aria-haspopup="dialog" aria-controls="doc-outline-pop" aria-expanded="false" title="Document outline: arrow keys move, Enter jumps, Escape closes" hidden>Outline</button>
                   <button id="doc-read" type="button">Read</button>
                 </div>
-                <ul id="doc-outline"></ul>
                 <div id="doc-body"></div>
               </div>
             </div>

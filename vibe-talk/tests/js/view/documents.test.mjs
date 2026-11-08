@@ -8,6 +8,10 @@
 //      text still appears as text.
 //   3. list: refresh() renders the API's rows in order with the unfetched one dimmed; clicking the
 //      unfetched card fetches (POST) then opens; clicking the fetched card opens without fetching.
+//   4. reader (#1038 documents-outline-popup): the title links to a safe http(s) source and stays
+//      plain otherwise; the outline pop-up's entries come from the rendered headings (levels,
+//      duplicate ids), open/close together on the panel and its button, jump on a tap, mark HERE,
+//      and answer the panel's keys; currentOutlineIndex is exact at its boundaries.
 // Deterministic: no network, no timers. The list test drives the module through fake API/element
 // seams in the minimal plain-object style of the existing view tests.
 
@@ -29,6 +33,7 @@ async function load(entry) {
 const SELECTOR = await load("src/view/documents/selector.ts");
 const RENDER = await load("src/view/documents/render.ts");
 const LIST = await load("src/view/documents/list.ts");
+const READER = await load("src/view/documents/reader.ts");
 
 function requireModule(loaded, entry) {
   assert.ok(loaded.mod, `${entry} did not load: ${loaded.error ? loaded.error.message : "unknown error"}`);
@@ -303,4 +308,215 @@ test("documents list: refresh renders rows in order, unfetched dimmed; clicks fe
     if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
     if (savedFetch === undefined) delete globalThis.fetch; else globalThis.fetch = savedFetch;
   }
+});
+
+// ---- 4. reader: the outline pop-up and the source-linked title --------------------------------
+
+// A fakeElement with the few box/focus surfaces the reader measures: focus and
+// scrollIntoView recorders, a heading top the test sets, and a shallow contains.
+function readerEl(tagName = "div") {
+  const el = fakeElement(tagName);
+  el.focused = 0;
+  el.focus = () => { el.focused += 1; };
+  el.scrolls = [];
+  el.scrollIntoView = (options) => { el.scrolls.push(options); };
+  el.rectTop = 0;
+  el.getBoundingClientRect = () => ({ top: el.rectTop });
+  el.contains = (target) => target === el || el.children.includes(target)
+    || el.children.some((kid) => kid.children && kid.children.includes(target));
+  return el;
+}
+
+function headingEl(level, id, text, rectTop = 0) {
+  const el = readerEl(`h${level}`);
+  el.id = id;
+  el.textContent = text;
+  el.rectTop = rectTop;
+  return el;
+}
+
+// One opened reader over fakes: preset rendered headings, an api answering one
+// fetched document, and a createElement-only document (no addEventListener, no
+// IntersectionObserver anywhere in this runtime — the reader must not need them).
+async function withReader(options, run) {
+  const mod = requireModule(READER, "src/view/documents/reader.ts");
+  assert.equal(typeof mod.createDocumentsReader, "function", "reader does not export createDocumentsReader");
+  const els = {};
+  for (const id of ["doc-title", "doc-outline", "doc-outline-pop", "doc-outline-open",
+    "doc-back", "doc-read", "doc-body", "scroll-area"]) els[id] = readerEl("div");
+  const headings = options.headings || [];
+  els["doc-body"].querySelectorAll = () => headings;
+  els["scroll-area"].rectTop = options.rootTop ?? 0;
+  const documentRow = { title: options.title ?? "Demo deployment report" };
+  if (options.url !== undefined) documentRow.url = options.url;
+  const api = async () => ({
+    document: documentRow,
+    content: options.content ?? "# Demo deployment report\n\nBody text.\n",
+    outline: options.outline ?? [],
+  });
+  const reader = mod.createDocumentsReader({
+    api,
+    byId: (id) => {
+      assert.ok(id in els, `reader looked up an element the test did not provide: ${id}`);
+      return els[id];
+    },
+    speak: () => {},
+    onBack: () => {},
+  });
+  const savedDocument = globalThis.document;
+  globalThis.document = { createElement: (tag) => readerEl(tag) };
+  try {
+    await reader.open("demo-doc");
+    const buttons = els["doc-outline"].children.map((item) => item.children[0]);
+    await run({ reader, els, headings, buttons });
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+  }
+}
+
+function dispatchKey(el, key, target) {
+  const ev = { key, target, currentTarget: el, prevented: false, preventDefault() { ev.prevented = true; } };
+  for (const listener of [...(el.listeners.keydown || [])]) listener(ev);
+  return ev;
+}
+
+test("documents reader: the title links to the document's safe http(s) source in a new tab", async () => {
+  await withReader({ url: "https://paste.example/demo-doc" }, async ({ els }) => {
+    const title = els["doc-title"];
+    assert.equal(title.children.length, 1, "the title holds no anchor for a safe source");
+    const anchor = title.children[0];
+    assert.equal(anchor.tagName, "A");
+    assert.equal(anchor.getAttribute("href"), "https://paste.example/demo-doc");
+    assert.equal(anchor.getAttribute("target"), "_blank");
+    assert.match(anchor.getAttribute("rel") || "", /noopener/);
+    assert.match(anchor.getAttribute("rel") || "", /noreferrer/);
+    assert.equal(anchor.textContent, "Demo deployment report");
+  });
+});
+
+test("documents reader: an unsafe or missing source leaves a plain-text title", async () => {
+  for (const url of ["javascript:alert(1)", "JaVaScRiPt:alert(1)", "//example.com/x", "https://exa mple.com/x", undefined]) {
+    await withReader({ url }, async ({ els }) => {
+      const title = els["doc-title"];
+      assert.equal(title.children.length, 0, `the title linked to ${String(url)}`);
+      assert.equal(title.textContent, "Demo deployment report");
+    });
+  }
+});
+
+test("documents reader: outline entries come from the rendered headings, levels and duplicates intact", async () => {
+  const headings = [
+    headingEl(1, "doc-demo", "Demo deployment report"),
+    headingEl(2, "doc-setup", "Setup"),
+    headingEl(3, "doc-details", "Details"),
+    headingEl(2, "doc-setup-2", "Setup"),
+  ];
+  await withReader({ headings }, async ({ els, buttons }) => {
+    assert.deepEqual(buttons.map((b) => b.textContent),
+      ["Demo deployment report", "Setup", "Details", "Setup"]);
+    assert.deepEqual(buttons.map((b) => b.getAttribute("data-level")), ["1", "2", "3", "2"]);
+    assert.ok(buttons[1].className.includes("doc-ol-2"), "an h2 entry carries no level class");
+    assert.ok(buttons[2].className.includes("doc-ol-3"), "an h3 entry carries no level class");
+    assert.equal(els["doc-outline-open"].hidden, false, "the Outline button hides with headings to show");
+    // The duplicate "Setup" entry lands on its own heading, not the first one's.
+    dispatchClick(buttons[3]);
+    assert.equal(headings[3].scrolls.length, 1, "the duplicate entry did not scroll its own heading");
+    assert.equal(headings[1].scrolls.length, 0, "the duplicate entry scrolled the first same-text heading");
+  });
+});
+
+test("documents reader: the Outline button opens and closes the pop-up, said both ways", async () => {
+  const headings = [headingEl(1, "doc-demo", "Demo"), headingEl(2, "doc-setup", "Setup")];
+  await withReader({ headings }, async ({ els }) => {
+    const pop = els["doc-outline-pop"];
+    const toggle = els["doc-outline-open"];
+    assert.equal(pop.hidden, true, "the pop-up starts open");
+    assert.equal(toggle.getAttribute("aria-expanded"), "false");
+    dispatchClick(toggle);
+    assert.equal(pop.hidden, false, "the toggle did not open the pop-up");
+    assert.equal(toggle.getAttribute("aria-expanded"), "true");
+    dispatchClick(toggle);
+    assert.equal(pop.hidden, true, "the toggle did not close the pop-up");
+    assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  });
+});
+
+test("documents reader: picking an entry jumps, closes the pop-up, and returns focus", async () => {
+  const headings = [
+    headingEl(1, "doc-demo", "Demo"),
+    headingEl(2, "doc-setup", "Setup"),
+    headingEl(2, "doc-finish", "Finish"),
+  ];
+  await withReader({ headings }, async ({ els, buttons }) => {
+    dispatchClick(els["doc-outline-open"]);
+    assert.equal(els["doc-outline-pop"].hidden, false);
+    dispatchClick(buttons[2]);
+    assert.equal(headings[2].scrolls.length, 1, "the picked heading was not scrolled to");
+    assert.deepEqual(headings[2].scrolls[0], { block: "start" });
+    assert.equal(headings[0].scrolls.length + headings[1].scrolls.length, 0, "another heading scrolled");
+    assert.equal(els["doc-outline-pop"].hidden, true, "picking an entry left the pop-up open");
+    assert.ok(els["doc-outline-open"].focused >= 1, "focus did not return to the Outline button");
+  });
+});
+
+test("documents reader: currentOutlineIndex is exact at its boundaries", () => {
+  const { currentOutlineIndex } = requireModule(READER, "src/view/documents/reader.ts");
+  assert.equal(typeof currentOutlineIndex, "function", "reader does not export currentOutlineIndex");
+  assert.equal(currentOutlineIndex([], 0), -1);
+  assert.equal(currentOutlineIndex([100, 200], 0), -1, "a heading below the top counts as current");
+  assert.equal(currentOutlineIndex([8], 0), 0, "a heading exactly at rootTop + 8 is not current");
+  assert.equal(currentOutlineIndex([9], 0), -1, "a heading past rootTop + 8 counts as current");
+  assert.equal(currentOutlineIndex([-50, 0, 50], 0), 1);
+  assert.equal(currentOutlineIndex([-50, -10], 0), 1, "the last heading above the top is not current");
+  assert.equal(currentOutlineIndex([100, 108], 100), 1);
+});
+
+test("documents reader: HERE marks the section at the scroller's top", async () => {
+  const headings = [
+    headingEl(1, "doc-demo", "Demo", -200),
+    headingEl(2, "doc-setup", "Setup", 5),
+    headingEl(2, "doc-finish", "Finish", 400),
+  ];
+  await withReader({ headings, rootTop: 0 }, async ({ buttons }) => {
+    assert.equal(buttons[1].getAttribute("aria-current"), "true", "the current section carries no aria-current");
+    assert.ok(buttons[1].classList.contains("doc-here"), "the current section carries no HERE class");
+    assert.equal(buttons[0].getAttribute("aria-current"), null);
+    assert.equal(buttons[2].getAttribute("aria-current"), null);
+    assert.ok(!buttons[0].classList.contains("doc-here") && !buttons[2].classList.contains("doc-here"));
+  });
+});
+
+test("documents reader: no IntersectionObserver, still opens; arrows move and Escape closes", async () => {
+  assert.notEqual(typeof IntersectionObserver, "function",
+    "this runtime grew an IntersectionObserver; the no-observer path is no longer exercised");
+  const headings = [
+    headingEl(1, "doc-demo", "Demo"),
+    headingEl(2, "doc-setup", "Setup"),
+    headingEl(2, "doc-finish", "Finish"),
+  ];
+  await withReader({ headings }, async ({ els, buttons }) => {
+    const pop = els["doc-outline-pop"];
+    const toggle = els["doc-outline-open"];
+    dispatchClick(toggle);
+    assert.equal(pop.hidden, false, "the pop-up did not open without an IntersectionObserver");
+    dispatchKey(pop, "ArrowDown", buttons[0]);
+    assert.equal(buttons[1].focused, 1, "ArrowDown did not move to the next entry");
+    dispatchKey(pop, "ArrowDown", buttons[2]);
+    assert.ok(buttons[2].focused >= 1, "ArrowDown at the last entry did not stay clamped");
+    dispatchKey(pop, "Home", buttons[2]);
+    assert.ok(buttons[0].focused >= 1, "Home did not move to the first entry");
+    dispatchKey(pop, "Escape", buttons[0]);
+    assert.equal(pop.hidden, true, "Escape did not close the pop-up");
+    assert.ok(toggle.focused >= 1, "Escape did not return focus to the Outline button");
+  });
+});
+
+test("documents reader: a document with no headings hides the Outline button entirely", async () => {
+  await withReader({ headings: [], content: "Just a paragraph.\n" }, async ({ els, buttons }) => {
+    assert.equal(buttons.length, 0);
+    assert.equal(els["doc-outline-open"].hidden, true, "the Outline button shows for a heading-less document");
+    assert.equal(els["doc-outline-pop"].hidden, true);
+    dispatchClick(els["doc-outline-open"]);
+    assert.equal(els["doc-outline-pop"].hidden, true, "the pop-up opened with nothing to list");
+  });
 });

@@ -125,6 +125,8 @@ export interface ElementById {
   "doc-back": HTMLButtonElement;
   "doc-body": HTMLDivElement;
   "doc-outline": HTMLUListElement;
+  "doc-outline-open": HTMLButtonElement;
+  "doc-outline-pop": HTMLDivElement;
   "doc-read": HTMLButtonElement;
   "doc-title": HTMLHeadingElement;
   "dock": HTMLElement;

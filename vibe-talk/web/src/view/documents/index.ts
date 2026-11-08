@@ -4,7 +4,7 @@
 
 export { createDocumentsList } from "./list.ts";
 export type { DocumentsList, DocumentsListDependencies } from "./list.ts";
-export { createDocumentsReader } from "./reader.ts";
+export { createDocumentsReader, currentOutlineIndex } from "./reader.ts";
 export type { DocumentsReader, DocumentsReaderDependencies } from "./reader.ts";
 export { renderDocumentMarkdown, documentHeadingId } from "./render.ts";
 export { createViewSelector, nextView, otherViews, VIEW_LABELS, VIEW_ORDER } from "./selector.ts";
