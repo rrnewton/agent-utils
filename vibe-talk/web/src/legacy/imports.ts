@@ -59,24 +59,18 @@ export {
   createDraftLedger,
   createDraftRound,
   createInboxWriteLedger,
-  createOutboxPump,
   createOutboxStore,
   createOwnPosts,
   createPendingThreads,
   createReplyDrafts,
-  createSendNumbers,
   createSendUndo,
   createUnconfirmedSends,
-  editableSend as outboxEditable,
-  nextRetryAt,
   outgoingFromSaved as entryFromSaved,
-  retriesItself as outboxRetriesItself,
   retryingWrite,
   sendSnippet,
   sentReceiptRetires as receiptRetires,
   underDraft,
   unsentText,
-  waitingItsTurn as outboxWaitingItsTurn,
 } from "../core/outbox/index.ts";
 export { DEFAULT_COLLAPSED_LINES, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, createCardMaxLines, createCollapsedLines, createCredentials, createDeviceSettings, createEnterSends, createInAppLinks, createKeptSwitch, createQuoteReadPercent, createSettingsSync } from "../core/settings/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
@@ -193,5 +187,8 @@ export { createPinnedMessages, createServerSearchCopy } from "../view/channel/in
 // outbox loads, drafts and sends (#624 mu-readcore O1)
 export { createChannelSend } from "../view/composer/index.ts";
 export { createDraftQueries, createOutboxLoads } from "../core/outbox/index.ts";
+// outbox dispatch and take-back (#624 mu-readcore O2)
+export { createOutboxDispatch } from "../core/outbox/index.ts";
+export { createSendTakeBack } from "../view/channel/index.ts";
 export { createThreadList } from "../view/channel/index.ts";
 export { createOfflineCache, createReadRunLines, createThreadStrip } from "../view/channel/index.ts";

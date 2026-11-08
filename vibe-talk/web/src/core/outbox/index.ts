@@ -42,3 +42,5 @@ export { createOutboxLoads } from "./loads.ts";
 export type { LiveOutgoingEntry, OutboxLoads, OutboxLoadsDependencies } from "./loads.ts";
 export { createDraftQueries } from "./draftqueries.ts";
 export type { DraftLedgerLike, DraftQueries, DraftQueriesDependencies } from "./draftqueries.ts";
+export { createOutboxDispatch } from "./dispatch.ts";
+export type { DispatchEntry, DispatchFailure, OutboxDispatch, OutboxDispatchDependencies, OutgoingBody, OutgoingRequest, OutgoingRetryHold, SentFollow } from "./dispatch.ts";

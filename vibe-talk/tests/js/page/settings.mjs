@@ -2526,7 +2526,7 @@ test("`#351 settings-polish`: the pop-out is a modal: marked so, the page behind
   const open = await dismissedPageOf(["a message"], await brokenModule([{ file: "src/view/settings/dismissed.ts", find: "inert: inertAround(popout) }", replace: "inert: [] }" }]));
   await dismissedOpenerOf(dismissedItems(open)[0]).click();
   assert.equal(inertNow(open.el("fold-dismissed")), false, "the negative control made the page inert anyway, so the check above proves nothing");
-  const loose = await dismissedPageOf(["a message"], brokenScript('document.addEventListener("keydown", (event) => dismissedSendsView.trapTab(event));\n', ""));
+  const loose = await dismissedPageOf(["a message"], await brokenModule([{ file: "src/view/channel/takeback.ts", find: 'document.addEventListener("keydown", onTrapTab);\n', replace: "" }]));
   await dismissedOpenerOf(dismissedItems(loose)[0]).click();
   await press(loose, loose.el("dismissed-send-close"), "Tab");
   assert.equal(focused(loose), loose.el("dismissed-send-close"), "the negative control kept Tab anyway, so the check above proves nothing");

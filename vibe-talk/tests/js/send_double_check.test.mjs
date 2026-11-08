@@ -43,7 +43,9 @@ test("two ticks render gray then green, failure is not green", () => {
 });
 
 test("page asks for accepted phase then reads outcome", () => {
-  assert.match(js, /reply\?ack=accepted/);
-  assert.match(js, /payload\.state === "accepted"/);
-  assert.match(js, /askOutgoingOutcome\(entry, job, body\)/);
+  // The POST and its outcome ask are the send service's now (`#624 voice-page-modularity`).
+  const dispatch = readWeb("src/core/outbox/dispatch.ts");
+  assert.match(dispatch, /reply\?ack=accepted/);
+  assert.match(dispatch, /payload\.state === "accepted"/);
+  assert.match(dispatch, /askOutgoingOutcome\(entry, job, body\)/);
 });

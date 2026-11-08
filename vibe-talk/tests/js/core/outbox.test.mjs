@@ -633,3 +633,129 @@ test("`#624 voice-page-modularity`: loading restores a saved send as decoded and
   });
   assert.equal(queries.draftHeld({ kind: "composer", key: "k", channel: "c", at: 0 }), true);
 });
+
+test("`#624 voice-page-modularity`: dispatch arms its own retries at 3 s, 6 s, 12 s and 20 s, while a send behind it has no retry of its own", async () => {
+  const { createOutboxDispatch, createOutboxStore } = OUTBOX;
+  assert.equal(typeof createOutboxDispatch, "function", "the send service is not a module yet");
+  let now = 100000;
+  const timers = [];
+  const clock = {
+    setTimeout: (run, ms) => {
+      const timer = { run, ms, at: now + ms, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => { if (timer) timer.cleared = true; },
+  };
+  const advanceTo = (at) => {
+    now = at;
+    for (const timer of timers.filter((one) => !one.cleared && one.at <= now).sort((a, b) => a.at - b.at)) {
+      timer.cleared = true;
+      timer.run();
+    }
+  };
+  const flush = async () => { for (let i = 0; i < 30; i += 1) await Promise.resolve(); };
+  const saved = new Map();
+  const storage = {
+    getItem: (key) => saved.get(key) ?? null,
+    setItem: (key, value) => saved.set(key, value),
+    removeItem: (key) => saved.delete(key),
+  };
+  const store = createOutboxStore({ storage, makeRoom: () => {}, keepsOwnPosts: () => false });
+  const calls = [];
+  let aAttempts = 0;
+  const api = async (_path, options) => {
+    calls.push(options.body);
+    if (options.body.text === "A" && aAttempts++ < 4) {
+      return { error: "post_failed", detail: "the service did not answer" };
+    }
+    return { parts: [{ id: `${options.body.text}-1`, content: options.body.text, channel_id: "c", author_id: "me" }] };
+  };
+  let placed = 0;
+  const dispatch = createOutboxDispatch({
+    store, observations: new Map(), now: () => now, clock,
+    cancellation: { create: () => { let aborted = false; return { signal: { get aborted() { return aborted; } }, abort() { aborted = true; } }; } },
+    random: () => 0.5, api, token: () => "tok", identity: () => "me", online: () => true,
+    channelWritable: () => true, originView: () => "main", persist: () => store.save(),
+    renderOutgoing: () => {}, renderRows: () => {},
+    placeReplyTarget: async () => { placed += 1; return "thread"; },
+    postsOnce: () => true, serviceOf: () => "upstream",
+    readableFailure: (error) => String(error.message || ""), readableCause: (detail) => String(detail || ""),
+    refusalWords: () => "", redact: (text) => text, threadOf: () => null,
+    noteOwnSent: () => {}, armSentReceipt: () => {}, selectedChannel: () => "c", inDiscord: () => false,
+    followsNewest: () => false, noteSelfAuthor: () => {}, noteStartsRead: () => {}, appendPart: () => {},
+    scrollToNewest: () => {}, markSentRead: () => {}, reportColumnReply: () => {},
+    columnReplies: new Map(), quietly: (run) => run(),
+  });
+  const request = (text) => ({ channel: "c", threadId: null, replyTo: null, text, marksRead: null });
+  void dispatch.queue(request("A"));
+  await flush();
+  const [a] = [...store.values()];
+  void dispatch.queue(request("B"));
+  await flush();
+  const b = [...store.values()].find((entry) => entry.text === "B");
+  assert.deepStrictEqual(calls.map((body) => body.text), ["A"], "B went before A");
+  assert.equal(dispatch.blocker(b), a, "B was not waiting behind A");
+  assert.equal(dispatch.retryOf(b.id), undefined, "a blocked send was armed with a retry of its own");
+
+  const armedAt = [];
+  let previousAt = 100000;
+  for (const wait of [3000, 6000, 12000, 20000]) {
+    const retry = dispatch.retryOf(a.id);
+    assert.ok(retry, "A's automatic retry was not armed");
+    armedAt.push(retry.at - previousAt);
+    previousAt = retry.at;
+    assert.deepStrictEqual(calls.map((body) => body.text).filter((text) => text === "B"), [], "B went while A waited to retry");
+    advanceTo(retry.at);
+    await flush();
+    assert.equal(dispatch.retryOf(b.id), undefined, "B acquired its own retry while blocked");
+    void wait;
+  }
+  assert.deepStrictEqual(armedAt, [3000, 6000, 12000, 20000], "the automatic waits were not 3 s, 6 s, 12 s, then 20 s");
+  assert.deepStrictEqual(calls.map((body) => body.text), ["A", "A", "A", "A", "A", "B"],
+    "A did not land before the send written behind it");
+  assert.equal(placed, 0);
+});
+
+test("`#1052 post-to-main`: dispatch does not place a ticked top-level reply, and keeps its flag on the wire", async () => {
+  const { createOutboxDispatch, createOutboxStore } = OUTBOX;
+  assert.equal(typeof createOutboxDispatch, "function", "the send service is not a module yet");
+  const saved = new Map();
+  const storage = {
+    getItem: (key) => saved.get(key) ?? null,
+    setItem: (key, value) => saved.set(key, value),
+    removeItem: (key) => saved.delete(key),
+  };
+  const store = createOutboxStore({ storage, makeRoom: () => {}, keepsOwnPosts: () => false });
+  const calls = [];
+  let placed = 0;
+  const dispatch = createOutboxDispatch({
+    store, observations: new Map(), now: () => 100000,
+    clock: { setTimeout: () => ({}), clearTimeout: () => {} },
+    cancellation: { create: () => null }, random: () => 0.5,
+    api: async (_path, options) => {
+      calls.push(options.body);
+      return { parts: [{ id: "p1", content: options.body.text, channel_id: "c", author_id: "me" }] };
+    },
+    token: () => "tok", identity: () => "me", online: () => true,
+    channelWritable: () => true, originView: () => "main", persist: () => store.save(),
+    renderOutgoing: () => {}, renderRows: () => {},
+    placeReplyTarget: async () => { placed += 1; return "thread"; },
+    postsOnce: () => true, serviceOf: () => "upstream",
+    readableFailure: (error) => String(error.message || ""), readableCause: (detail) => String(detail || ""),
+    refusalWords: () => "", redact: (text) => text, threadOf: () => null,
+    noteOwnSent: () => {}, armSentReceipt: () => {}, selectedChannel: () => "c", inDiscord: () => false,
+    followsNewest: () => false, noteSelfAuthor: () => {}, noteStartsRead: () => {}, appendPart: () => {},
+    scrollToNewest: () => {}, markSentRead: () => {}, reportColumnReply: () => {},
+    columnReplies: new Map(), quietly: (run) => run(),
+  });
+  await dispatch.queue({
+    channel: "c", threadId: null, replyTo: "m1", text: "promoted", marksRead: "m1",
+    placement: "unknown", postToMain: true,
+  });
+  const [entry] = [...store.values()];
+  assert.equal(placed, 0, "a post-to-main send was placed into a thread first");
+  assert.deepStrictEqual(calls, [{ text: "promoted", reply_to: "m1", post_to_main: true, idempotency_key: entry.id }]);
+  assert.equal(entry.postToMain, true);
+  assert.equal(entry.wire.postToMain, true);
+});

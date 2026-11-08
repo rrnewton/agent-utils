@@ -177,6 +177,8 @@ export { createPinnedMessages } from "./pins.ts";
 export type { PinnedMessages, PinnedMessagesDependencies, PinsView } from "./pins.ts";
 export { createOutboxRows } from "./outboxrows.ts";
 export type { OutboxRows, OutboxRowsDependencies, OutgoingRowEntry } from "./outboxrows.ts";
+export { createSendTakeBack } from "./takeback.ts";
+export type { DismissalHold, DismissedHeld, SendTakeBack, SendTakeBackDependencies, TakeBackEntry } from "./takeback.ts";
 export { THREAD_DIRECTORY_REFRESH_MS, THREAD_SELECT_LIMIT, THREAD_TITLE_CHARS, createThreadList } from "./threadlist.ts";
 export type { ThreadList, ThreadListDependencies } from "./threadlist.ts";
 export { createOfflineCache } from "./offlinecache.ts";

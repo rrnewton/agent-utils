@@ -1350,13 +1350,10 @@ function composerState() {
 }
 
 // Local send records never enter the provider message list or its read/archive/reply machinery.
-const OUTGOING_TIMEOUT_MS = 60000;
-// `#448 send-dedupe`. After a send whose answer never came back, how long the page keeps asking
-// the server what became of it (`askOutgoingOutcome`), each ask waiting up to OUTGOING_OUTCOME_WAIT_S
-// for a post still in flight; and how often a slow send asks how far it has got.
-const OUTGOING_OUTCOME_MS = 120000;
-const OUTGOING_OUTCOME_WAIT_S = 20;
-const OUTGOING_PROGRESS_MS = 2000;
+// How long one attempt may run, how long a lost answer is asked after, and how often a slow
+// send's progress is asked (`OUTGOING_TIMEOUT_MS`, `OUTGOING_OUTCOME_MS`, `OUTGOING_PROGRESS_MS`)
+// are the send service's, in web/src/core/outbox (`createOutboxDispatch`, `#624
+// voice-page-modularity`), with every attempt, wait and automatic-retry hold it keeps.
 // `#466 reply-promotes-thread`. How long a message this page posted is kept though a page of the
 // channel does not carry it (`ownPostStands`) is web/src/core/outbox's (`OWN_POST_GRACE_MS`, `#624
 // voice-page-modularity`).
@@ -1383,23 +1380,10 @@ function outgoingFromSaved(held) {
   return entryFromSaved(held, Date.now);
 }
 
-// By entry id, the attempt in progress — a reply being placed, or a POST — and nothing else: a send
-// waiting its turn has no job. See "one destination, in the order written".
-const outgoingJobs = new Map();
-// By entry id, whoever is waiting for its next attempt to end, and the credential it was queued
-// under. Never saved. See `scheduleOutgoingMessage`.
-const outgoingWaiters = new Map();
-const outgoingQueuedUnder = new Map();
-/** One pass at a time over the outbox, a pass asked for during one going round again (web/src/core/outbox `createOutboxPump`). */
-const outgoingPump = createOutboxPump();
-/**
- * Entries waiting to go out again on their own, by id: when (`at`), or when the connection returns
- * (`offline`); whether nothing has been attempted yet (`unsent`); the credential it was armed
- * under (`identity`); and its timer. Never saved: see `planOutgoingRetry`.
- */
-const outgoingRetries = new Map();
-/** The running number in new sends' ids (web/src/core/outbox `createSendNumbers`). */
-const outgoingSequence = createSendNumbers();
+// The attempt in progress for each send, whoever waits for its attempt to end and the credential it
+// was queued under, one pass at a time over the outbox, every automatic retry's hold and timer, and
+// the running number in new sends' ids are the send service's own (web/src/core/outbox
+// `createOutboxDispatch`, made below with the outbox's other owners, `#624 voice-page-modularity`).
 /**
  * `#277 reply-in-column`. Replies sent from a column, by outbox id, and the column each was sent from:
  * every attempt at one that settles is told (`reportColumnReply`) until it is sent or leaves the
@@ -1451,7 +1435,7 @@ const dismissedSendsView = mountDismissedSends({
   styled: (tag, className, text) => styled(tag, className, text),
   writeClipboard: (text) => writeClipboardText(text),
   copyRefused: () => COPY_REFUSED,
-  putBack: (id) => putBackDismissedSend(id),
+  putBack: (id) => sendTakeBack.putBack(id),
   scheduleBackSync: () => scheduleBackSync(),
 });
 /**
@@ -1472,7 +1456,7 @@ function nextUndoAt() {
  * send if it had one, its stamp, and the chip's timer (web/src/core/outbox `createSendUndo`, `#624
  * voice-page-modularity`).
  */
-const sendUndo = createSendUndo({ clock: clockOnUse(), ended: () => renderSendUndo() });
+const sendUndo = createSendUndo({ clock: clockOnUse(), ended: () => sendTakeBack.renderUndo() });
 
 function showView(name) {
   // `#277 reply-in-column`. The call's view is one list, with no column for a reply to be open in.
@@ -2013,7 +1997,7 @@ const folding = createFolding({
   replyReturnRow,
   actionMenuOpen: () => actionMenu.open(),
   renderActionMenu: () => actionMenu.render(),
-  renderSendUndo,
+  renderSendUndo: () => renderSendUndo(),
   renderBookmarkUndo: () => renderBookmarkUndo(),
   channelOnScreen: (...args) => channelOnScreen(...args),
   rowIsRead: (row) => rowIsRead(row),
@@ -5369,7 +5353,7 @@ function replyRoute(message, bound = false) {
  * Whether a reply to a main-channel message of `channel` is posted in that message's thread, as
  * its provider's server says (`replies_in_thread`): Slack, which has no reply pointer, so its
  * server threads every reply. `#252 thread-button-state`. With several providers each channel
- * answers for its own, as in `channelPostsOnce`.
+ * answers for its own, as the send service's posts-once does.
  */
 function channelRepliesInThread(channel) {
   if (channelDirectory.providers().size) {
@@ -7744,1069 +7728,16 @@ function followPlacement() {
   saveChannelScope();
 }
 
-/**
- * Put `request` in the outbox and send it. `column` is given for a reply sent from a column, which
- * the reader is not shown the outbox row of when it goes, and so is told how it went
- * (`reportColumnReply`, `#277 reply-in-column`). Never saved: a reload shows the outbox as it is.
- *
- * @param {any} request
- * @param {ColumnFields | null} [column]
- */
-function queueOutgoingMessage(request, column = null) {
-  let id;
-  do {
-    id = `outgoing-${Date.now().toString(36)}-${outgoingSequence.next()}-${Math.random().toString(36).slice(2, 9)}`;
-  } while (outbox.has(id));
-  const entry = {
-    id, ...request, originView: selection().view, createdAt: Date.now(),
-    remaining: request.text.trim(), state: "sending", phase: "queued",
-    parts: [], observedParts: [], postedCount: 0, detail: "", keyedOnly: true, mayHavePosted: false,
-    continueIn: null,
-    // `#621 send-double-check`: two-phase durations from the Send tap, and tick states.
-    sendStartedAt: Date.now(), serverMs: null, upstreamMs: null,
-    serverTick: false, upstreamTick: false, tickFailed: false, showTimes: false,
-  };
-  outbox.add(entry);
-  if (column) columnReplies.set(id, column);
-  return scheduleOutgoingMessage(entry);
-}
-
-/**
- * Send a failed or unconfirmed entry again: because the reader tapped Retry, or — `automatic` —
- * because its wait for an automatic retry ran out.
- */
-function retryOutgoingMessage(id, automatic = false) {
-  const entry = outbox.get(id);
-  if (!entry || entry.state === "sending" || entry.state === "sent" || !entry.remaining) return;
-  cancelOutgoingRetry(id);
-  // A person deciding starts the automatic schedule again, should this attempt fail too.
-  entry.retriesUsed = automatic ? (entry.retriesUsed || 0) + 1 : 0;
-  if (knownChannel(entry.channel)?.writable === false) {
-    entry.detail = "This channel is read-only.";
-    persistOutgoingMessages();
-    renderOutgoingEverywhere();
-    return;
-  }
-  entry.state = "sending";
-  entry.phase = "queued";
-  entry.detail = "";
-  // `#621 send-double-check`: a new attempt starts its ticks and clock again.
-  entry.sendStartedAt = Date.now();
-  entry.serverMs = null;
-  entry.upstreamMs = null;
-  entry.serverTick = false;
-  entry.upstreamTick = false;
-  entry.tickFailed = false;
-  entry.showTimes = false;
-  outgoingObservations.delete(entry.id);
-  return scheduleOutgoingMessage(entry);
-}
-
-// --- one destination, in the order written ---------------------------------------------------------
+// --- sending what the outbox holds, and taking a send back ---------------------------------------
 //
-// `#277 send-order`. The owner: "when it retries it ends up sending messages OUT OF ORDER. I.e. I
-// write A then B but B lands first." Messages to one destination were serialised only while a POST
-// was on the wire: when A's POST failed and A went to wait for its automatic retry, the lane was
-// free, B went, and A's retry landed after it. Order is now kept by the outbox itself, in the order
-// its entries were written (the order of `outbox`, which is the order it is saved in, so
-// a reload keeps it):
-//
-//   * A message goes only when every earlier message to the same destination — the channel, and the
-//     thread in it or none — has been SENT. One still sending, waiting to retry, waiting for the
-//     connection, or failed and waiting for the reader holds every later one to that destination,
-//     whose row says what it is waiting behind and why. When that one is sent the queue drains in
-//     order; when it is dismissed, or edited back into its box, the next one goes.
-//   * Never two POSTs on the wire to one destination at once, whatever their order — a send put back
-//     from Dismiss waits for the one already going out.
-//   * Other destinations are not held: a thread does not wait for the main channel or another thread.
-//   * A reply whose thread is still to be found out (`placeReplyTarget`) may be bound for any
-//     destination in its channel, so whatever was written after it in that channel waits for it
-//     until it is placed, and then for its delivery only if both go to the same place. Placing it
-//     can fail — a read that timed out, on a slow bridge — and that posted nothing, but it gave up
-//     no place either: Retry may still send it anywhere in the channel, so what was written after
-//     it waits until it is placed and sent, or dismissed, or edited back into Reply. A read that
-//     failed for a moment is asked again on the automatic schedule below; nothing has been posted,
-//     so asking again cannot post anything twice. `#185 reply-new-thread`.
-//   * The rest of a post cut in parts, after a 207, goes where the server said the parts after the
-//     first went (`continueIn`, `#263 post-split-per-provider`), so it is in that thread's lane as
-//     well as its own: a message written later into that thread waits for it too.
-//   * A message with nothing left to send — a 207 that handed nothing back — can post nothing more,
-//     so it holds nothing up.
-//
-// Each entry keeps its own id and so its own idempotency key across every attempt (`#195
-// send-resilience`): waiting behind another message changes when it goes, never what it is.
+// Queueing a send in the order written, placing a reply whose thread is still to be found out, the
+// POST and what became of a lost answer, and every automatic retry are the send service's
+// (web/src/core/outbox `createOutboxDispatch`, made below with the outbox's other owners, `#624
+// voice-page-modularity`); Edit, Dismiss, Undo and putting a dismissed send back are taking a
+// send back's (web/src/view/channel `createSendTakeBack`, made there too). What stays here is
+// `placeReplyTarget` above: where a reply to a message the stream left unplaced goes is settled
+// from this page's channel store and timeline reads, which the send service asks for by that name.
 
-/** The outbox lane of one destination: a channel, and the thread in it or none. */
-function outgoingDestination(channel, threadId) {
-  return JSON.stringify([channel, threadId || null]);
-}
-
-/**
- * The lanes `entry` posts in: its own destination, and the thread the rest of it continues in where
- * that is another. Null for a reply still to be placed, which may post in any lane of its channel.
- */
-function outgoingLanes(entry) {
-  if (entry.placement === "unknown") return null;
-  const lanes = [outgoingDestination(entry.channel, entry.threadId)];
-  if (entry.continueIn && entry.continueIn !== entry.threadId) {
-    lanes.push(outgoingDestination(entry.channel, entry.continueIn));
-  }
-  return lanes;
-}
-
-/**
- * The message `entry` has to wait for before it can go, or null when it can go now: by the rules
- * above, the first earlier message in one of its lanes not yet sent, an earlier reply in its channel
- * not yet placed, or a POST in one of its lanes already on the wire. For a reply still to be placed,
- * only an earlier one not yet placed either: one read places both.
- */
-function outgoingBlocker(entry) {
-  const lanes = outgoingLanes(entry);
-  let earlier = true;
-  for (const other of outbox.values()) {
-    if (other === entry) {
-      earlier = false;
-      continue;
-    }
-    if (other.channel !== entry.channel || other.state === "sent" || !other.remaining) continue;
-    if (other.placement === "unknown") {
-      if (earlier) return other;
-      continue;
-    }
-    if (lanes === null || !outgoingLanes(other).some((lane) => lanes.includes(lane))) continue;
-    if (earlier || (other.state === "sending" && other.phase === "posting")) return other;
-  }
-  return null;
-}
-
-
-/**
- * Put `entry`, just queued or retried, in the outbox's order to go, without making the composer wait
- * for its destination. Answers a promise settled when this attempt is over — sent, failed, or no
- * longer in the outbox — which may be long after it was queued: it waits behind what was written
- * before it.
- */
-function scheduleOutgoingMessage(entry) {
-  outgoingQueuedUnder.set(entry.id, currentCredential());
-  const settled = new Promise((resolve) => {
-    outgoingWaiters.set(entry.id, [...(outgoingWaiters.get(entry.id) || []), resolve]);
-  });
-  persistOutgoingMessages();
-  renderOutgoingEverywhere();
-  pumpOutgoing();
-  return settled;
-}
-
-/** Let whoever waits for `id`'s attempt go: it is over, or it is out of the outbox. */
-function settleOutgoing(id) {
-  const waiters = outgoingWaiters.get(id) || [];
-  outgoingWaiters.delete(id);
-  outgoingQueuedUnder.delete(id);
-  for (const resolve of waiters) resolve();
-}
-
-/** Start every queued message that has nothing to wait for any more, in the order written. */
-function pumpOutgoing() {
-  // Starting one can finish it at once — signed out, offline — and that asks for a pump of its own, which
-  // makes this one go round again (`outgoingPump`).
-  outgoingPump.pump(() => {
-    for (const entry of [...outbox.values()]) {
-      if (outbox.get(entry.id) !== entry || entry.state !== "sending" ||
-          entry.phase !== "queued" || outgoingJobs.has(entry.id) || outgoingBlocker(entry)) continue;
-      startOutgoing(entry);
-    }
-  });
-}
-
-/** One attempt for a message whose turn it is: placing a reply, or the POST. */
-function startOutgoing(entry) {
-  // Under the credential it was queued under: a send made by one person is not made by another.
-  const credential = outgoingQueuedUnder.has(entry.id) ? outgoingQueuedUnder.get(entry.id) : currentCredential();
-  const job = { credential, stopped: false, cancel: null, attemptOver: false };
-  outgoingJobs.set(entry.id, job);
-  const placing = entry.placement === "unknown";
-  const over = () => {
-    if (outgoingJobs.get(entry.id) === job) outgoingJobs.delete(entry.id);
-    // An attempt that ended with no outcome is not started again, and again: only a reply it placed
-    // is still to be sent, behind whatever is ahead of it where it goes.
-    if (entry.state === "sending" && !(placing && entry.placement !== "unknown")) {
-      Object.assign(entry, { state: "failed", phase: "", detail: entry.detail || "This message was not sent." });
-      persistOutgoingMessages();
-    }
-    if (entry.state !== "sending" || outbox.get(entry.id) !== entry) settleOutgoing(entry.id);
-    pumpOutgoing();
-  };
-  (placing ? placeOutgoingMessage(entry, job) : dispatchOutgoingMessage(entry, job)).then(over, over);
-}
-
-/** The credential this page holds now, or none where its storage cannot be read. */
-function currentCredential() {
-  try {
-    return token();
-  } catch (_error) {
-    return "";
-  }
-}
-
-/**
- * Whether `entry` cannot go now, saying why on the entry: the sign-in it was queued under is gone,
- * its channel is read-only, or the device is offline — `#195 send-resilience`: held for the
- * connection instead of failed. Nothing has left the device, so sending it when the connection
- * returns cannot post it twice, through any provider, keyed or not.
- */
-function outgoingCannotGo(entry, job) {
-  if (!job.credential || currentCredential() !== job.credential) {
-    entry.state = "failed";
-    entry.detail = "Sign-in changed before this message was sent. Sign in and retry when ready.";
-    return true;
-  }
-  if (knownChannel(entry.channel)?.writable === false) {
-    entry.state = "failed";
-    entry.detail = "This channel is read-only.";
-    return true;
-  }
-  if (navigator.onLine === false) {
-    entry.state = "failed";
-    entry.detail = "This device is offline.";
-    holdOutgoingMessage(entry, { at: Date.now(), offline: true, unsent: true });
-    return true;
-  }
-  return false;
-}
-
-/**
- * Find out where a reply to a message the stream left unplaced goes (`placeReplyTarget`), and leave
- * it queued for that destination; `pumpOutgoing` posts it when its turn there comes.
- */
-async function placeOutgoingMessage(entry, job) {
-  if (job.stopped) return;
-  // When this attempt started: the next one's wait counts from here (`planOutgoingRetry`).
-  const startedAt = Date.now();
-  try {
-    if (outgoingCannotGo(entry, job)) return;
-    entry.phase = "placing";
-    persistOutgoingMessages();
-    renderOutgoingEverywhere();
-    let thread = null;
-    try {
-      thread = await placeReplyTarget(entry);
-    } catch (error) {
-      if (job.stopped) return;
-      // Nothing has been posted, so this is a plain failure the reader can retry, never the
-      // "unconfirmed" of a POST whose answer was lost.
-      entry.state = "failed";
-      // `#315 removed-reply-target`. Removed upstream: an answer, and the reader's to Edit or Dismiss.
-      if (error.removed) {
-        entry.detail = "The message you answered was removed from the channel, so this was not posted anywhere.";
-        return;
-      }
-      const cause = "The message you answered came in live, and whether it is in a thread could not " +
-        `be found out, so this was not posted anywhere: ${error.message}.`;
-      // `#277 send-order`. A read that failed for a moment — timed out, lost its connection, met the
-      // chat service's 5xx — goes again on its own, as a lost send does: posting nothing, it cannot
-      // post anything twice, and every message written after this reply in its channel waits for
-      // it. A message the read does not carry is an answer, and is left to the reader.
-      const transient = Boolean(error.network || error.timedOut || error.status >= 500 ||
-        error.status === 408 || error.gatewayStatus >= 500);
-      const again = transient && planOutgoingRetry(entry, startedAt, true);
-      entry.detail = redact(again ? cause : `${cause} Retry once the channel can be read.`);
-      return;
-    }
-    if (job.stopped) return;
-    entry.threadId = thread;
-    entry.placement = null;
-  } finally {
-    if (entry.state === "sending" && !job.stopped) entry.phase = "queued";
-    else entry.phase = "";
-    persistOutgoingMessages();
-    eachColumn(renderChannelRows);
-  }
-}
-
-/**
- * The POST of `body` for `entry`'s attempt `job`, bounded by OUTGOING_TIMEOUT_MS and stopped by
- * `job.cancel`: its answer, or, after a lost answer, the post's own answer found without posting
- * (`askOutgoingOutcome`, `#448 send-dedupe`). Null when the attempt was stopped. Throws what the
- * POST threw otherwise. `armed` is handed the timeout's handle, for the caller to clear.
- *
- * @param {any} entry
- * @param {any} job
- * @param {any} body
- * @param {AbortController | null} controller
- * @param {(handle: ReturnType<typeof setTimeout> | null) => void} armed
- */
-async function postOutgoing(entry, job, body, controller, armed) {
-  if (body.idempotency_key) watchOutgoingProgress(entry, job, body);
-  let timer = null;
-  const interruption = new Promise((_resolve, reject) => {
-    job.cancel = () => {
-      if (controller) controller.abort();
-      reject(new Error("The send was interrupted before delivery was confirmed."));
-    };
-    timer = setTimeout(() => {
-      if (controller) controller.abort();
-      const late = /** @type {ApiRequestError} */ (new Error("The send timed out before delivery was confirmed."));
-      late.timedOut = true;
-      reject(late);
-    }, OUTGOING_TIMEOUT_MS);
-  });
-  armed(timer);
-  const sendTapAt = Date.now();
-  entry.sendStartedAt = entry.sendStartedAt || sendTapAt;
-  let askedOutcome = false;
-  try {
-    const payload = await Promise.race([
-      api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/reply?ack=accepted`, {
-        method: "POST", body, ...(controller ? { signal: controller.signal } : {}),
-      }),
-      interruption,
-    ]);
-    if (job.stopped) return null;
-    // `#621 send-double-check`: phase one answered; phase two via the outcome long-poll.
-    if (payload && payload.state === "accepted") {
-      entry.serverMs = Number.isFinite(Number(payload.server_ms)) ? Number(payload.server_ms) : Date.now() - sendTapAt;
-      entry.serverTick = true;
-      entry.tickFailed = false;
-      persistOutgoingMessages();
-      renderOutgoingEverywhere();
-      const acceptedAt = Date.now();
-      askedOutcome = true;
-      const found = await askOutgoingOutcome(entry, job, body);
-      if (job.stopped) return null;
-      if (!found) {
-        const late = /** @type {any} */ (new Error("The send timed out before delivery was confirmed."));
-        late.timedOut = true;
-        throw late;
-      }
-      entry.upstreamMs = found.timing && Number.isFinite(Number(found.timing.upstream_ms))
-        ? Number(found.timing.upstream_ms) : Date.now() - acceptedAt;
-      entry.upstreamTick = !found.error;
-      if (found.timing && Number.isFinite(Number(found.timing.server_ms))) entry.serverMs = Number(found.timing.server_ms);
-      return found;
-    }
-    // Older server: one answer carried both phases; its split is unknown, so the
-    // whole elapsed time is upstream-side and the server phase stays unknown.
-    if (payload) {
-      entry.serverTick = true;
-      entry.upstreamMs = Date.now() - sendTapAt;
-      entry.upstreamTick = payload.error !== "partially_posted";
-    }
-    return payload;
-  } catch (error) {
-    clearTimeout(timer);
-    armed(null);
-    if (job.stopped) return null;
-    // `#448 send-dedupe`. The answer was lost — the page stopped waiting, the connection dropped,
-    // or something in front of the server answered for it — while the post may still be landing.
-    // The owner saw a long message "fail", pressed Retry, and it arrived twice. So the server is
-    // asked what became of it before anything is decided, posting nothing.
-    const found = !askedOutcome && body.idempotency_key && answerLost(error) ? await askOutgoingOutcome(entry, job, body) : null;
-    if (job.stopped) return null;
-    if (!found) throw error;
-    return found;
-  }
-}
-
-/** Post one outbox entry whose turn it is. */
-async function dispatchOutgoingMessage(entry, job) {
-  if (job.stopped) return;
-  let timer = null;
-  const controller = typeof AbortController === "function" ? new AbortController() : null;
-  // Whether this attempt failed in a way that could succeed later — a timeout, a lost connection,
-  // the provider's 5xx — rather than with an answer. Only such a failure goes again on its own.
-  let transient = false;
-  // When this attempt started: the next one's wait counts from here (`planOutgoingRetry`).
-  const startedAt = Date.now();
-  // The post's answer when it was found without posting (`settleFromServer`), and whether such an
-  // ask found nothing, which leaves the entry, and what was said of it, as they were.
-  let payloadFound = null;
-  let unchanged = false;
-  try {
-    if (outgoingCannotGo(entry, job)) return;
-    entry.phase = "posting";
-    persistOutgoingMessages();
-    renderOutgoingEverywhere();
-    const body = { text: entry.remaining };
-    // `#263 post-split-per-provider`. The rest of a post whose first part went to the conversation
-    // continues where the server said the parts after it went — the first part's thread, for a
-    // provider that threads a long message under its first part — and without the reply target,
-    // which only the first part carries.
-    let replyTo = entry.replyTo && !entry.continueIn ? entry.replyTo : null;
-    let threadId = entry.continueIn || entry.threadId || null;
-    // `#1052 post-to-main`: asked to land top-level, answering by edge only. The rest of a post
-    // cut in parts continues in the new root's thread as ever, so this rides only until then.
-    let postToMain = entry.postToMain === true && !entry.continueIn;
-    // `#448 send-dedupe`. Where these words go is decided by the first attempt that sends them, and
-    // every later one says the same, across reloads: the server answers a repeat under the key with
-    // the post it made, and a page that has since drawn the reply into the thread it started must
-    // not ask for it somewhere else. Only the unsent rest of a 207 is new words, placed afresh.
-    if (entry.wire && entry.wire.text === entry.remaining) {
-      ({ replyTo, threadId } = entry.wire);
-      postToMain = entry.wire.postToMain === true && !entry.continueIn;
-    } else {
-      entry.wire = { text: entry.remaining, replyTo, threadId, postToMain: entry.postToMain === true };
-    }
-    if (replyTo) body.reply_to = replyTo;
-    if (threadId) body.thread_id = threadId;
-    if (postToMain) body.post_to_main = true;
-    // The entry's id names this post on every attempt, across reloads, so the server can tell a
-    // retry from a second message. `#448 send-dedupe`: sent to every provider, since the server
-    // itself answers a repeat of a post that landed, or is landing, with that post. Only a provider
-    // that honours it upstream (`channelPostsOnce`) also covers a part whose own answer was lost,
-    // which is what an automatic retry needs; one attempt anywhere else and the entry can never
-    // again prove a retry safe.
-    if (IDEMPOTENCY_KEY.test(entry.id)) body.idempotency_key = entry.id;
-    if (!channelPostsOnce(entry.channel) || !body.idempotency_key) entry.keyedOnly = false;
-    entry.progress = null;
-    // `#468 send-dedupe`. Only asking what became of an earlier attempt (`settleFromServer`):
-    // nothing is posted, and with no record the entry is left as it was.
-    if (entry.resolveOnly) {
-      const found = body.idempotency_key ? await askOutgoingOutcome(entry, job, body) : null;
-      if (job.stopped) return;
-      if (!found) {
-        Object.assign(entry, { state: "unconfirmed", detail: entry.resolveOnly.detail });
-        unchanged = true;
-        return;
-      }
-      entry.resolveOnly = null;
-      payloadFound = found;
-    }
-    let payload = payloadFound;
-    if (!payload) payload = await postOutgoing(entry, job, body, controller, (handle) => { timer = handle; });
-    if (job.stopped) return;
-    // `#621 send-double-check`: the outcome route says the post failed upstream, with why.
-    if (payload && payload.error === "post_failed") {
-      entry.state = "unconfirmed";
-      entry.mayHavePosted = true;
-      entry.tickFailed = true;
-      entry.upstreamTick = false;
-      outgoingObservations.delete(entry.id);
-      entry.detail = redact(payload.detail
-        ? readableCause(payload.detail, chatServiceOf(entry.channel))
-        : "The remaining delivery could not be confirmed.");
-      // Only an attempt this page made retries on its own; an outcome found for an
-      // earlier attempt (`resolveOnly`) leaves the send to the reader.
-      transient = !payloadFound;
-      return;
-    }
-    if (payload && payload.error === "partially_posted") {
-      entry.postedCount += Math.max(0, Number(payload.posted) || 0);
-      // Where the unsent text belongs, when the server says: the thread the parts already posted
-      // went into. Absent means the conversation, or an older server, and changes nothing.
-      if (typeof payload.thread_id === "string" && payload.thread_id && entry.postedCount > 0 &&
-          payload.thread_id !== entry.threadId) {
-        entry.continueIn = payload.thread_id;
-      }
-      // An adapter can lose an acknowledgement after delivery. Even a 207 is not proof that the
-      // last attempted part failed to arrive; its unsent suffix is the ONLY safe retry candidate.
-      entry.remaining = typeof payload.unsent === "string" ? payload.unsent : "";
-      // `#444 send-refusal-reason`. Unless the server says the part that failed was answered, not
-      // lost (`uncertain` false): then it is certainly not in the channel, and this is a send that
-      // was not sent. Calling it unconfirmed — "Retrying cannot post it twice" — sent the owner
-      // back to Retry four times over a refusal that the same words meet every time. An older
-      // server does not say, and its 207 stays unconfirmed.
-      const answered = payload.uncertain === false;
-      entry.tickFailed = true;
-      entry.upstreamTick = false;
-      entry.state = answered ? "failed" : "unconfirmed";
-      if (!answered || entry.postedCount > 0) entry.mayHavePosted = true;
-      outgoingObservations.delete(entry.id);
-      entry.detail = redact(refusalWords(payload.refusal, chatServiceOf(entry.channel)) || (payload.detail
-        ? readableCause(payload.detail, chatServiceOf(entry.channel))
-        : "The remaining delivery could not be confirmed."));
-      // Said by the server, which knows whether the provider answered or merely failed to; an
-      // older server does not say, and its 207 is left to the reader.
-      transient = payload.retryable === true && Boolean(entry.remaining);
-      // Also the server's to say: whether sending the unsent text again repeats the part that
-      // failed as the same request, under the words and key it had. Where it does not — a code
-      // block cut across that part, a part repeated among those posted — no later attempt can be
-      // recognised as this one, so this entry can never again prove a retry safe. Not said, by an
-      // older server, is not proof either.
-      if (payload.resumable !== true) entry.keyedOnly = false;
-      return;
-    }
-    const parts = payload && Array.isArray(payload.parts) && payload.parts.length
-      ? payload.parts : payload && payload.posted ? [payload.posted] : [];
-    if (!parts.length || parts.some((part) => !part || !part.id ||
-        (part.channel_id && String(part.channel_id) !== entry.channel))) {
-      throw new Error("The server did not confirm which message was sent.");
-    }
-    entry.parts = parts.map((part) => ({
-      ...part, id: String(part.id), channel_id: entry.channel, content: String(part.content || ""),
-    }));
-    // `#430 threads-main-own-sent`. Sent from here: the read filters keep it in sight from now on.
-    ownPosts.noteSent(entry.parts.map((part) => part.id));
-    // `#263 post-split-per-provider`. The rest of a long post may have continued in its first
-    // part's thread, where it is drawn rather than here; the receipt for it says which thread.
-    if (!entry.threadId) entry.continueIn = entry.parts.slice(1).map(threadOf).find(Boolean) || entry.continueIn;
-    const observed = outgoingObservations.get(entry.id) || new Set();
-    entry.observedParts = entry.parts.filter((part) => observed.has(part.id)).map((part) => part.id);
-    outgoingObservations.set(entry.id, new Set(entry.observedParts));
-    entry.state = "sent";
-    entry.upstreamTick = true;
-    entry.tickFailed = false;
-    if (entry.upstreamMs === null) entry.upstreamMs = Math.max(0, Date.now() - (entry.sendStartedAt || Date.now()) - (entry.serverMs || 0));
-    entry.detail = "";
-    // `#500 sent-receipts-pile-up`. From now its receipt is shown for a while, then goes.
-    entry.sentAt = Date.now();
-    armSentReceipt(entry);
-    // Whether the reader follows is decided BEFORE anything this answer changes is drawn. The first
-    // message sent can tell the page who "me" is, and then every row of mine is drawn again as mine
-    // (`noteSelfAuthor`), narrower, where a line may wrap onto one more: a reader on the newest line
-    // was left that much above it, and the message they had just sent arrived below them, unseen.
-    // The reply screen's Send in tests/reply_continuity_browser.py (`#247 reply-continuity`, since
-    // replaced by Reply in the stream) caught it, on a channel whose folded rows carry the `#244
-    // elision-word-count` line. Not while a filter
-    // change holds a message in place (`#243 filter-keeps-selection`).
-    const here = entry.channel === selectedChannelId();
-    const pinned = here && screens.view() === "discord" && followsNewest(el("scroll-area"));
-    // `#229 desktop-two-column`. The right column's reader on its newest line follows it too.
-    const sidePinned = here && sideShowing() && inColumn(columns.side, () => followsNewest(el("scroll-area")));
-    noteSelfAuthor(parts[0].author_id);
-    // `#549 own-read-stored`. What he just said starts read, as the server recorded it before answering.
-    noteStartsRead(entry.parts);
-    if (here) {
-      for (const part of entry.parts) appendToColumns(part);
-      if (pinned) scrollToNewest();
-      if (sidePinned) inColumn(columns.side, scrollToNewest);
-    }
-    // `#256 reply-marks-read`. Sent, so what it marks is read: what it answers, or the root of the
-    // thread it starts (`#300 reply-marks-read`). Only here: a send that failed, or is unconfirmed,
-    // answered nothing yet.
-    if (entry.marksRead) guardQuietly(markSentRead)(entry);
-  } catch (error) {
-    if (job.stopped) return;
-    entry.tickFailed = true;
-    entry.upstreamTick = false;
-    if (entry.upstreamMs === null && entry.serverTick) entry.upstreamMs = Math.max(0, Date.now() - (entry.sendStartedAt || Date.now()) - (entry.serverMs || 0));
-    entry.state = error.status >= 400 && error.status < 500 && error.status !== 408
-      ? "failed" : "unconfirmed";
-    if (entry.state === "unconfirmed") entry.mayHavePosted = true;
-    outgoingObservations.delete(entry.id);
-    // The page's own network sentence tells the reader to retry when the connection recovers,
-    // which a row that may retry by itself must not say.
-    entry.detail = redact(error.network
-      ? "The connection to vibe-talk failed before delivery was confirmed."
-      : error.gatewayStatus >= 500 ? `vibe-talk did not answer (HTTP ${error.gatewayStatus}).`
-        : readableFailure(error, chatServiceOf(entry.channel)));
-    // Never a refusal: a 4xx is an answer, and asking again asks the same question. A gateway's
-    // own 5xx page in front of this server is as unanswered as the server's own 5xx.
-    transient = Boolean(error.network || error.timedOut || error.status >= 500 || error.status === 408 ||
-      error.gatewayStatus >= 500);
-  } finally {
-    if (timer !== null) clearTimeout(timer);
-    job.cancel = null;
-    job.attemptOver = true;
-    entry.phase = "";
-    entry.progress = null;
-    entry.confirming = false;
-    entry.resolveOnly = null;
-    if (transient && !job.stopped) planOutgoingRetry(entry, startedAt);
-    persistOutgoingMessages();
-    eachColumn(renderChannelRows);
-    // `#277 reply-in-column`. After the rows, the outbox's among them: what is said points at one. Not
-    // for a send that signing out stopped, which is the sign-in screen's to explain.
-    if (columnReplies.has(entry.id) && !job.stopped && !unchanged) reportColumnReply(entry);
-  }
-}
-
-// --- what became of a send whose answer was lost ---------------------------------------------------
-//
-// `#448 send-dedupe`. The owner sent a long message to a Slack channel, cut in three parts; it took
-// twelve seconds and the page showed it as failed: "that long message appeared to fail to send the
-// first time, and then on retry appeared to succeed, but apparently that caused message duplication."
-// The server had posted every part, under a key no Slack request carries. Now the server remembers
-// each keyed post itself (src/post_keys.rs), and:
-//
-//   * A send whose answer never came back — the page's own timeout, a dropped connection, a gateway's
-//     page in place of the server's answer — asks `POST .../reply/outcome`, which posts nothing and
-//     waits for a post still in flight. The post's own answer is then this attempt's answer: Sent, or
-//     the 207 of a post that landed in part. Only a post the server has no record of is left
-//     unconfirmed, as before, since that proves nothing either way.
-//   * Retry, by hand or on its own, carries the same key to every provider, and the server answers a
-//     repeat of a post that landed, or is landing, with that post.
-//   * While a send is slow, the row says which part is going ("Posting part 2 of 3…"), asked of the
-//     same route every OUTGOING_PROGRESS_MS, so a send that takes seconds never looks stuck.
-
-
-/** Whether `error` means the server's answer was lost rather than given. */
-function answerLost(error) {
-  // A gateway's 5xx is one whether its page is HTML (`gatewayStatus`) or JSON that is not this
-  // server's error body (`code` "error", see `api`).
-  return Boolean(error && (error.network || error.timedOut || error.gatewayStatus >= 500 ||
-    error.gatewayStatus === 408 || (error.status >= 500 && error.code === "error")));
-}
-
-/** One ask of the outcome route for `body`'s post: its answer, `202` posting, or a thrown error. */
-function outgoingOutcome(entry, body, wait, signal) {
-  return api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/reply/outcome?wait=${wait}`, {
-    method: "POST", body, ...(signal ? { signal } : {}),
-  });
-}
-
-/**
- * Ask what became of `entry`'s post until it has an answer, for at most OUTGOING_OUTCOME_MS: the
- * post's own answer (a 200's or a 207's body), or null where the server has no record of it, cannot
- * be reached, or the attempt was stopped.
- */
-async function askOutgoingOutcome(entry, job, body) {
-  const until = Date.now() + OUTGOING_OUTCOME_MS;
-  entry.confirming = true;
-  renderOutgoingEverywhere();
-  try {
-    while (!job.stopped && Date.now() < until) {
-      const controller = typeof AbortController === "function" ? new AbortController() : null;
-      let timer = null;
-      // Each ask ends: a connection gone dead under it would otherwise hold this message, and every
-      // one written after it to the same place, until the reader signed out.
-      const stop = new Promise((_resolve, reject) => {
-        const end = () => {
-          if (controller) controller.abort();
-          reject(new Error("The ask went unanswered."));
-        };
-        job.cancel = end;
-        timer = setTimeout(end, (OUTGOING_OUTCOME_WAIT_S + 10) * 1000);
-      });
-      let answer;
-      try {
-        answer = await Promise.race([
-          outgoingOutcome(entry, body, OUTGOING_OUTCOME_WAIT_S, controller && controller.signal), stop,
-        ]);
-      } catch (_error) {
-        return null;
-      } finally {
-        clearTimeout(timer);
-      }
-      if (job.stopped) return null;
-      if (answer && answer.state === "failed") {
-        return { error: "post_failed", detail: String(answer.detail || ""), timing: answer.timing || null, uncertain: true };
-      }
-      if (!answer || answer.state !== "posting") return answer;
-      noteOutgoingProgress(entry, answer);
-    }
-    return null;
-  } finally {
-    entry.confirming = false;
-  }
-}
-
-
-/**
- * Every unconfirmed send in the outbox, asked of the server once per load (`settleFromServer`): one owner
- * in web/src/core/outbox/unconfirmed.ts (`#624 voice-page-modularity`).
- *
- * @type {import("./src/core/outbox/index.ts").UnconfirmedSends}
- */
-const unconfirmedSends = createUnconfirmedSends({
-  ids: () => outbox.ids(),
-  settle: (id) => settleFromServer(id),
-});
-
-/** Take a `202` posting answer's count of parts onto `entry`'s row. */
-function noteOutgoingProgress(entry, answer) {
-  const posted = Math.max(0, Number(answer.posted) || 0);
-  const parts = Math.max(0, Number(answer.parts) || 0);
-  if (entry.progress && entry.progress.posted === posted && entry.progress.parts === parts) return;
-  entry.progress = { posted, parts };
-  renderOutgoingEverywhere();
-}
-
-/**
- * While `job`'s POST of `body` is on the wire, ask every OUTGOING_PROGRESS_MS how far it has got, one
- * ask at a time. Ends with the attempt. A failed ask changes nothing: it is only for the row's words.
- */
-function watchOutgoingProgress(entry, job, body) {
-  const tick = () => {
-    if (job.stopped || job.attemptOver || entry.confirming) return;
-    outgoingOutcome(entry, body, 0, null).then((answer) => {
-      if (!job.stopped && !job.attemptOver && answer && answer.state === "posting") noteOutgoingProgress(entry, answer);
-    }, () => {}).finally(() => {
-      if (!job.stopped && !job.attemptOver) setTimeout(tick, OUTGOING_PROGRESS_MS);
-    });
-  };
-  setTimeout(tick, OUTGOING_PROGRESS_MS);
-}
-
-// --- sending again on its own ---------------------------------------------------------------------
-//
-// `#195 send-resilience`. The incident this answers: a slow chat service timed out two sends, each
-// was left as "Delivery unconfirmed. Check history before retrying", and the same words went
-// through from the service's own app a minute later. A send whose answer was lost may or may not
-// have landed, so sending it again is only safe where the second request is recognised as the
-// first. The server says where that is (`idempotent_posts_supported`): there each entry's id goes
-// with every attempt as its idempotency key, the server binds it to each part's text, and the
-// provider posts it at most once. After a partial post that holds for the unsent remainder only
-// where the server says the remainder is `resumable` — the part that failed goes again as the same
-// words under the same key. There, and only there, a transient failure goes again after 3 s, 6 s,
-// 12 s and then every 20 s, six times in all, sooner when the connection returns or the page comes
-// back into view, and then stops and offers Retry. Everywhere else the only automatic send is one
-// that never left the device — held while it knew it was offline, or a reply whose read to find out
-// which thread it goes in failed for a moment (`#277 send-order`), which posted nothing.
-//
-// `#277 send-order`. The waits were 5 s, 15 s and 45 s, counted from when the attempt FAILED. On a
-// slow bridge that was the wrong clock twice over: an attempt it takes half a minute to fail had
-// already waited that long, and a third wait of 45 s came after a failure that took a moment, when
-// a short wait would have found the bridge answering again — and every message written behind it
-// waits as long. So each wait now counts from when the failed attempt started (an attempt that took
-// longer than the wait goes again after the floor), and none is longer than OUTGOING_RETRY_MAX_MS.
-// The row says what it is waiting for and when; a message behind it says what it waits behind.
-//
-// Never after a reload: a reopened page has no record of what its last attempt did, and a send the
-// reader did not watch go out should not go out again on a page they did not ask to send from.
-
-/** What the server accepts as an idempotency key; the outbox's own ids always are one. */
-const IDEMPOTENCY_KEY = /^[A-Za-z0-9_-]{1,64}$/;
-
-/** Whether `channel`'s provider posts a keyed message at most once, by the server's account. */
-function channelPostsOnce(channel) {
-  // With several providers each channel answers for its own; a channel the server described no
-  // provider for is not given another provider's guarantee.
-  if (channelDirectory.providers().size) {
-    const provider = providerOfChannel(channel);
-    return Boolean(provider && provider.idempotent_posts_supported === true);
-  }
-  return channelDirectory.capabilities().idempotentPosts;
-}
-
-/**
- * Whether sending `entry` again cannot post what may already have landed: every attempt so far
- * carried its key to a provider that honours it.
- *
- * Not for a remainder that starts with the reply, though. After a 207 the unsent text goes again
- * with the reply target, which makes its first part a different request from the part that failed
- * — and that part is exactly the one whose arrival nobody knows. (The server's 207 says so as well,
- * by not calling that remainder `resumable`; this does not depend on it.) A remainder continuing in
- * the first part's thread goes without the reply target, as the part that failed did, so it is not
- * one of those. `#263 post-split-per-provider`.
- */
-function retriesItself(entry) {
-  return outboxRetriesItself(entry, channelPostsOnce);
-}
-
-/**
- * After a transient failure of the attempt that started at `startedAt`: arm the next automatic
- * attempt, or leave the row to the reader. Answers whether one was armed.
- *
- * `unposted`: the attempt posted nothing — finding out where a reply goes (`placeOutgoingMessage`)
- * — so going again is safe whether or not the provider honours a key, and spends one of the same
- * OUTGOING_RETRY_ATTEMPTS. `#277 send-order`.
- */
-function planOutgoingRetry(entry, startedAt, unposted = false) {
-  const at = nextRetryAt(entry, startedAt, Date.now(), channelPostsOnce, unposted);
-  if (at === null) return false;
-  holdOutgoingMessage(entry, { at, offline: navigator.onLine === false, unsent: false });
-  return true;
-}
-
-/** Hold `entry` for an automatic send: at `at`, or when the connection returns. */
-function holdOutgoingMessage(entry, { at, offline, unsent }) {
-  cancelOutgoingRetry(entry.id);
-  const delay = Math.max(0, at - Date.now());
-  const waiting = { at, offline, unsent, identity: tokenFingerprint(token()), timer: null };
-  if (!offline) waiting.timer = setTimeout(() => fireOutgoingRetry(entry.id), delay);
-  outgoingRetries.set(entry.id, waiting);
-}
-
-function cancelOutgoingRetry(id) {
-  const waiting = outgoingRetries.get(id);
-  if (!waiting) return;
-  if (waiting.timer !== null) clearTimeout(waiting.timer);
-  outgoingRetries.delete(id);
-}
-
-/** The wait is over. Still offline: wait for the connection instead. */
-function fireOutgoingRetry(id) {
-  const waiting = outgoingRetries.get(id);
-  const entry = outbox.get(id);
-  if (!waiting || !entry) return;
-  if (waiting.timer !== null) clearTimeout(waiting.timer);
-  waiting.timer = null;
-  if (navigator.onLine === false) {
-    waiting.offline = true;
-    renderOutgoingEverywhere();
-    return;
-  }
-  // Signed in as someone else since: this is not a send that person made.
-  if (waiting.identity !== tokenFingerprint(token())) {
-    outgoingRetries.delete(id);
-    entry.detail = "Sign-in changed before this message was sent again.";
-    persistOutgoingMessages();
-    renderOutgoingEverywhere();
-    return;
-  }
-  // A hold for a connection was never an attempt, so it spends none of the automatic ones.
-  const automatic = !waiting.unsent;
-  guardQuietly(() => retryOutgoingMessage(id, automatic))();
-}
-
-/** The connection is back, or the page is in view again after its timers were held. */
-function resumeOutgoingRetries() {
-  for (const [id, waiting] of [...outgoingRetries]) {
-    const due = waiting.offline ? navigator.onLine !== false : waiting.at <= Date.now();
-    if (due) fireOutgoingRetry(id);
-  }
-}
-
-// The browser's own word that the connection is back. Guarded because a page loaded without a
-// full window — some harnesses build one by hand — has no `window.addEventListener`.
-if (typeof window.addEventListener === "function") {
-  window.addEventListener("online", () => resumeOutgoingRetries());
-}
-
-function stopOutgoingSends() {
-  // Nothing goes out on its own for a credential that is going away.
-  for (const id of [...outgoingRetries.keys()]) cancelOutgoingRetry(id);
-  // Every message on its way, and every one waiting its turn behind another (`#277 send-order`),
-  // which has no job of its own to stop.
-  for (const entry of outbox.values()) {
-    if (entry.state !== "sending") continue;
-    const job = outgoingJobs.get(entry.id);
-    if (job) job.stopped = true;
-    const attempted = entry.phase === "posting";
-    entry.state = attempted ? "unconfirmed" : "failed";
-    if (attempted) entry.mayHavePosted = true;
-    outgoingObservations.delete(entry.id);
-    entry.detail = attempted ? "Sign-in changed before delivery was confirmed."
-      : "Sign-in changed before this message was sent.";
-    if (job && job.cancel) job.cancel();
-    entry.phase = "";
-    settleOutgoing(entry.id);
-  }
-  persistOutgoingMessages();
-  renderOutgoingEverywhere();
-}
-
-// --- taking a send back -----------------------------------------------------------------------------
-//
-// `#193 compose-draft-loss`. The owner's audit asked where typing could still be lost. A send that
-// failed kept its text, but the only ways out of the outbox were Retry, and a Dismiss that threw the
-// text away with one tap and nothing to take it back. So:
-//
-//   * EDIT puts a failed send's unsent text back in the box it was written in — the channel's, the
-//     thread's, or Reply on the message it answers, with the new-thread choice it was sent with — and
-//     takes it out of the outbox. A draft already in that box is kept: the text goes under it, after
-//     a blank line, and the box says so. Asking first would put a question between the reader and
-//     their own words, and appending loses nothing that editing cannot put right. Only where none of
-//     the text can be in the channel already (`editableSend`), and only once that box's draft store
-//     holds it: where the browser refuses the write, the send stays in the outbox and nothing moves.
-//   * DISMISS can be taken back. The Undo chip names the message for SEND_UNDO_MS, and puts it back
-//     as it was, waiting to go again on its own if it was; after that a copy is still kept on this
-//     device for DISMISSED_SENDS_DAYS days, the newest DISMISSED_SENDS_LIMIT of them, under Recently
-//     dismissed in Settings, where Put back returns one to the outbox for Retry, Edit or Dismiss.
-//
-// Every draft, and this copy, is this device's alone: nothing here is synced to another device. The
-// constants and the state are with the outbox's, at the head of the file.
-
-// What a send has not delivered (`unsentText`), and whether Edit may take it back (`editableSend`) or it
-// waits its turn behind another message (`waitingItsTurn`, `#277 send-order`), are web/src/core/outbox's
-// (`#624 voice-page-modularity`); what this page adds is whether an attempt of its own is in progress.
-
-/** Whether Edit may take `entry` back (web/src/core/outbox `editableSend`). */
-function editableSend(entry) {
-  return outboxEditable(entry, outgoingJobs.has(entry.id));
-}
-
-/** Whether `entry` waits behind another message, with no attempt in progress (web/src/core/outbox `waitingItsTurn`). */
-function waitingItsTurn(entry) {
-  return outboxWaitingItsTurn(entry, outgoingJobs.has(entry.id));
-}
-
-/** Said where Edit could not save the text as a draft, and so left the send where it was. */
-const EDIT_DRAFT_REFUSED = "This browser could not save a draft, so the message stays in the outbox.";
-
-// `text` under a draft (`underDraft`) and a message's first words (`sendSnippet`) are web/src/core/outbox's.
-
-/**
- * Take an entry out of the outbox, durably, in every column — and let the next message to its
- * destination go, which was waiting behind it (`#277 send-order`).
- */
-function dropOutgoing(id) {
-  cancelOutgoingRetry(id);
-  outbox.remove(id);
-  outgoingObservations.delete(id);
-  settleOutgoing(id);
-  persistOutgoingMessages();
-  pumpOutgoing();
-  renderOutgoingEverywhere();
-}
-
-// Focusing a message box with the caret at its end (`focusAtEnd`) is web/src/view/composer's.
-
-/**
- * Edit: a failed send's unsent text back in the box it was written in, and out of the outbox. Written
- * into that box's draft store first, and taken out of the outbox only once the store holds it, so
- * there is no moment at which neither holds it; where the store refuses it, nothing moves.
- */
-async function editOutgoingMessage(id) {
-  const entry = outbox.get(id);
-  if (!entry || !editableSend(entry)) return;
-  const text = unsentText(entry);
-  if (!text.trim()) return;
-  if (entry.replyTo) {
-    editOutgoingReply(entry, text);
-    return;
-  }
-  const key = JSON.stringify([entry.channel, entry.threadId || null]);
-  // The column whose box that is now, if one is showing it: this one first, then the other.
-  const boxShown = () => String(selectedChannelId()) === entry.channel && composerState().key === key;
-  const showing = () => [columnWork.active(), columnWork.active() === columns.main ? columns.side : columns.main]
-    .find((column) => (column === columns.main || sideShowing()) && inColumn(column, boxShown)) || null;
-  // From the store, which every keystroke in the box writes, and which holds the draft of a box no
-  // column is showing.
-  const before = channelDrafts.get(key);
-  channelDrafts.set(key, underDraft(before, text));
-  if (!saveChannelDrafts()) {
-    if (before === undefined) channelDrafts.delete(key);
-    else channelDrafts.set(key, before);
-    setStatus(EDIT_DRAFT_REFUSED);
-    return;
-  }
-  noteDraft("composer", key, entry.channel, true);
-  dropOutgoing(entry.id);
-  let column = showing();
-  // A thread's message, edited from All: its box is the thread's, so the thread opens, with it.
-  if (!column && entry.threadId) {
-    await openThread(entry.threadId);
-    column = showing();
-  }
-  if (!column) {
-    setStatus("Your message is back in its message box, as a draft.");
-    return;
-  }
-  inColumn(column, () => {
-    const box = el("channel-compose-text");
-    box.value = channelDrafts.get(key) || "";
-    fitGrowingBox(box);
-    el("channel-compose-state").textContent = before && before.trim()
-      ? "Your message is back, under the draft that was already here." : "";
-    focusAtEnd(box);
-  });
-}
-
-/**
- * Edit, for a reply: the text back in Reply on the message it answers, under a draft already written
- * to it, and the new-thread choice as it was sent. The message is the row's on screen, or the store's;
- * one this page no longer holds keeps the draft for when it is drawn again (`draftMarker`).
- */
-function editOutgoingReply(entry, text) {
-  const id = String(entry.replyTo);
-  const before = replyDrafts.get(id);
-  replyDrafts.set(id, underDraft(before, text));
-  if (!replyDrafts.save()) {
-    if (before === undefined) replyDrafts.delete(id);
-    else replyDrafts.set(id, before);
-    setStatus(EDIT_DRAFT_REFUSED);
-    return;
-  }
-  noteDraft("reply", id, entry.channel, true);
-  dropOutgoing(entry.id);
-  renderDraftMarkers();
-  const row = /** @type {HTMLLIElement | null} */ ([...el("discord-log").children].find((li) => idsOf(li)[0] === id) || null);
-  const messages = row ? rowMessages(row) : [heldMessage(id)].filter(Boolean);
-  if (messages.length === 0) {
-    setStatus("Your reply is a draft again, on the message it answers: Draft on that message opens it.");
-    return;
-  }
-  // `#185 reply-new-thread`. Sent into the thread its message heads, it is bound for that thread again,
-  // as a draft kept with its tick is: ticked where the thread is still nobody's, and into it where
-  // somebody has answered it since (`replyRoute`).
-  const record = heldThreadRecord(messages[0]);
-  if (entry.threadId && record && record.is_root === true && String(record.id) === String(entry.threadId)) {
-    replyDrafts.setStartsThread(id, true);
-  }
-  openReply(messages, row);
-  el("reply-state").textContent = before && before.trim()
-    ? "Your reply is back, under the draft that was already here." : "";
-  focusAtEnd(el("reply-text"));
-}
-
-/** Dismiss: out of the outbox, into the recently dismissed, with Undo offered for a while. */
-function dismissOutgoingMessage(id) {
-  const entry = outbox.get(id);
-  if (!entry || (entry.state === "sending" && !waitingItsTurn(entry))) return;
-  // `#277 send-order`. One taken back while it waited its turn was not sent this time: kept as that,
-  // never as a send that was on its way when the page closed — and, where an earlier try of it may
-  // have landed, as unconfirmed rather than as never sent.
-  const copy = entry.state !== "sending" ? { ...entry, phase: "" }
-    : entry.mayHavePosted
-      ? { ...entry, state: "unconfirmed", phase: "",
-        detail: "Dismissed while it waited its turn to go again, after a try whose delivery was not confirmed." }
-      : { ...entry, state: "failed", phase: "", detail: "Dismissed while it waited its turn, so it was not sent." };
-  const kept = dismissedSends.add(copy);
-  // A send waiting to go again on its own, for Undo to set waiting again. Never saved, as the wait
-  // itself is not: Put back after a reload, or from Settings later, leaves it to Retry.
-  const waiting = outgoingRetries.get(id);
-  const hold = waiting ? { at: waiting.at, offline: waiting.offline, unsent: waiting.unsent,
-    identity: waiting.identity, retriesUsed: entry.retriesUsed || 0 } : null;
-  dropOutgoing(id);
-  sendUndo.offer({ id, hold, at: nextUndoAt() });
-  renderSendUndo();
-  dismissedSendsView.render();
-  setStatus(kept
-    ? "Dismissed. Undo it, or find it in Settings."
-    : "Dismissed. This browser could not keep a copy, so Undo works only until this page is reloaded.");
-}
-
-function endSendUndo() {
-  sendUndo.end();
-}
-
-/** The Undo chip: up while a Dismiss can be taken back from it, naming the message dismissed. */
-function renderSendUndo() {
-  const chip = el("undo-send-dismiss");
-  const offer = sendUndo.current();
-  const held = offer ? dismissedSends.find(offer.id) : null;
-  chip.hidden = !held || screens.view() !== "discord";
-  const label = held ? `Undo dismiss: “${sendSnippet(unsentText(held.entry))}”` : "Undo dismiss";
-  if (chip.textContent !== label) chip.textContent = label;
-}
-
-/**
- * Put a dismissed send back in the outbox: what Undo does, and Put back in Settings. Undo puts back
- * the wait for an automatic send as well, for the credential it was armed under.
- */
-function putBackDismissedSend(id) {
-  const held = dismissedSends.find(id);
-  if (!held) return;
-  const entry = outgoingFromSaved(held.entry);
-  if (entry && !outbox.has(entry.id)) {
-    // In the order it was written among the sends still there, as it was before it was dismissed.
-    outbox.putBackInOrder(entry);
-    const offer = sendUndo.current();
-    // The wait the dismissal kept, as `dismissOutgoingMessage` made it: its time, offline, unsent, identity and retries.
-    const hold = /** @type {any} */ (offer && offer.id === id ? offer.hold : null);
-    if (hold && hold.identity === tokenFingerprint(token())) {
-      /** @type {any} */ (entry).retriesUsed = hold.retriesUsed;
-      // Waiting for the connection by what the browser says now: one that came back while the send
-      // was dismissed fired its `online` with nothing waiting, and will not fire it again.
-      holdOutgoingMessage(entry, { ...hold, offline: navigator.onLine === false });
-    }
-  }
-  // The outbox holds it again before the copy goes.
-  persistOutgoingMessages();
-  dismissedSends.remove(held);
-  const offered = sendUndo.current();
-  if (offered && offered.id === id) endSendUndo();
-  renderOutgoingEverywhere();
-  dismissedSendsView.render();
-  if (!entry) return;
-  setStatus(entry.channel === String(selectedChannelId())
-    ? `Put back: “${sendSnippet(unsentText(entry))}”.`
-    : `Put back in the outbox of ${channelLabel(entry.channel)}.`);
-}
-
-/** Forget every dismissed send now, rather than when its days are up. */
-function forgetDismissedSends() {
-  dismissedSends.clear();
-  endSendUndo();
-  dismissedSendsView.render();
-  setStatus("Forgot the dismissed messages.");
-}
-
-/** What the device kept of the recently dismissed, pruned; a damaged copy is nothing. */
-function loadDismissedSends() {
-  dismissedSends.load();
-}
 
 // Settings' Recently dismissed, each send's place, age and first line, is drawn by
 // web/src/view/settings (`dismissedSendsView.render`, `#624 voice-page-modularity`).
@@ -8833,11 +7764,7 @@ function loadDismissedSends() {
 // is.
 
 // The pop-out, its dim and its trap are web/src/view/settings's (`dismissedSendsView`, `#624
-// voice-page-modularity`); it is listened to here, where it always was.
-document.addEventListener("keydown", (event) => dismissedSendsView.trapTab(event));
-el("dismissed-send-close").addEventListener("click", () => dismissedSendsView.close());
-el("dismissed-send-copy").addEventListener("click", () => dismissedSendsView.copy());
-el("dismissed-send-restore").addEventListener("click", () => dismissedSendsView.restore());
+// voice-page-modularity`); taking a send back listens to it, where the legacy script always did.
 
 
 // --- message text, as the server rendered it ------------------------------------------------
@@ -10479,7 +9406,7 @@ function ungatherButton() {
 // there would say (1) for the second the send took and then go back to nothing. Once the server has
 // acknowledged a send, its answer says: a first part that came back naming the message is that
 // reply, and the same reply as the row the acknowledgement draws, so it is counted once. A send
-// waiting to go again on its own (`outgoingRetries`) is still being sent, and still counts. One that
+// waiting to go again on its own (a retry hold, `retryPending`) is still being sent, and still counts. One that
 // failed for good posted nothing; one whose delivery is unconfirmed, and that nothing is retrying,
 // is a reply only once a read brings it.
 //
@@ -10580,7 +9507,7 @@ function heldReplies(rows) {
     const first = entry.parts[0];
     if (first) {
       if (first.reply_to && !answersOwnRoot(first)) add(String(first.reply_to), String(first.id), timeOf(first, "timestamp"));
-    } else if ((entry.state === "sending" || outgoingRetries.has(entry.id)) && entry.postedCount === 0 &&
+    } else if ((entry.state === "sending" || outboxDispatch.retryPending(entry.id)) && entry.postedCount === 0 &&
         pointers && staysPointer(entry.replyTo) && !said.has(`${entry.replyTo}\n${String(entry.text).trim()}`)) {
       add(String(entry.replyTo), `outgoing:${entry.id}`, entry.createdAt);
     }
@@ -14223,7 +13150,7 @@ function reportColumnReply(entry) {
     columnReplies.delete(entry.id);
     return;
   }
-  const waiting = outgoingRetries.get(entry.id);
+  const waiting = outboxDispatch.retryOf(entry.id);
   if (waiting) {
     setStatus(waiting.offline
       ? "Your reply is not sent yet: this device is offline. It goes when the connection is back."
@@ -14272,7 +13199,7 @@ function unseenColumnReply() {
   const id = unseenColumnReplies[columnWork.active().name];
   if (id === null) return null;
   const entry = outbox.get(id);
-  if (!entry || (entry.state !== "failed" && entry.state !== "unconfirmed") || outgoingRetries.has(id)) {
+  if (!entry || (entry.state !== "failed" && entry.state !== "unconfirmed") || outboxDispatch.retryPending(id)) {
     unseenColumnReplies[columnWork.active().name] = null;
     return null;
   }
@@ -14442,7 +13369,7 @@ async function markAnsweredDone(channel, id) {
 /**
  * Whether `channel`'s provider lets the server move its own read marker — what offers the "⋯" menu's
  * "In <service> only" — by the server's account. With several providers each channel answers for its
- * own, as in `channelPostsOnce`. `#300 reply-marks-read`.
+ * own, as the send service's posts-once does. `#300 reply-marks-read`.
  */
 function channelMarksUpstream(channel) {
   if (channelDirectory.providers().size) {
@@ -18063,19 +16990,99 @@ const { onStreamFrame, receiveLiveMessage, heldMessage, placesHeld, settleReplay
  * @type {import("./src/core/outbox/index.ts").OutboxLoads}
  */
 const outboxLoads = createOutboxLoads({
-  store: outbox, clock: clockOnUse(), blocker: outgoingBlocker,
-  credential: () => currentCredential(), noteQueuedUnder: (id) => outgoingQueuedUnder.set(id, currentCredential()), keepsOwnPosts: storeKeepsOwnPosts,
+  store: outbox, clock: clockOnUse(), blocker: (entry) => outboxDispatch.blocker(entry),
+  credential: () => outboxDispatch.credential(), noteQueuedUnder: (id) => outboxDispatch.noteQueuedUnder(id), keepsOwnPosts: storeKeepsOwnPosts,
   selectedChannel: () => String(selectedChannelId()),
   storedIn: (channel) => (channelStore.current().channel === channel
     ? new Set(channelStore.current().messages.map((held) => String(held.id))) : null),
-  schedule: (entry) => scheduleOutgoingMessage(entry),
-  retryPending: (id) => outgoingRetries.has(id),
-  testKey: (id) => IDEMPOTENCY_KEY.test(id),
+  schedule: (entry) => outboxDispatch.schedule(entry),
+  retryPending: (id) => outboxDispatch.retryPending(id),
+  testKey: (id) => outboxDispatch.testKey(id),
   observations: outgoingObservations,
   onChange: () => renderOutgoingEverywhere(),
   now: () => Date.now(),
 });
 const { persist: persistOutgoingMessages, load: loadOutgoingMessages, observe: observeOutgoingMessages, noteEcho: noteOutgoingEcho, settleFromServer, receiptRetires: sentReceiptRetires, armSentReceipt } = outboxLoads;
+/**
+ * Every unconfirmed send in the outbox, asked of the server once per load (`settleFromServer`): one owner
+ * in web/src/core/outbox/unconfirmed.ts (`#624 voice-page-modularity`).
+ *
+ * @type {import("./src/core/outbox/index.ts").UnconfirmedSends}
+ */
+const unconfirmedSends = createUnconfirmedSends({
+  ids: () => outbox.ids(),
+  settle: (id) => settleFromServer(id),
+});
+/**
+ * Sending what the outbox holds (web/src/core/outbox `createOutboxDispatch`,
+ * `#624 voice-page-modularity`): queueing in the order written, placing, the POST, what became
+ * of a lost answer, and every automatic retry. Placing a reply's target stays here
+ * (`placeReplyTarget`), settled from the channel store and timeline reads.
+ *
+ * @type {import("./src/core/outbox/index.ts").OutboxDispatch}
+ */
+const outboxDispatch = createOutboxDispatch({
+  store: outbox, observations: outgoingObservations, now: () => Date.now(), clock: clockOnUse(),
+  cancellation: { create: () => browserPorts().cancellation.create() },
+  random: () => Math.random(), api, token, identity: () => tokenFingerprint(token()),
+  online: () => navigator.onLine !== false,
+  channelWritable: (channel) => knownChannel(channel)?.writable !== false,
+  originView: () => selection().view, persist: () => persistOutgoingMessages(),
+  renderOutgoing: () => renderOutgoingEverywhere(), renderRows: () => eachColumn(renderChannelRows),
+  placeReplyTarget,
+  postsOnce: (channel) => {
+    // With several providers each channel answers for its own; a channel the server described no
+    // provider for is not given another provider's guarantee.
+    if (channelDirectory.providers().size) {
+      const provider = providerOfChannel(channel);
+      return Boolean(provider && provider.idempotent_posts_supported === true);
+    }
+    return channelDirectory.capabilities().idempotentPosts;
+  },
+  serviceOf: (channel) => chatServiceOf(channel), readableFailure, readableCause, refusalWords, redact,
+  threadOf, noteOwnSent: (ids) => ownPosts.noteSent(ids), armSentReceipt,
+  selectedChannel: () => String(selectedChannelId()),
+  inDiscord: () => screens.view() === "discord",
+  followsNewest: (side) => side
+    ? sideShowing() && inColumn(columns.side, () => followsNewest(el("scroll-area")))
+    : followsNewest(el("scroll-area")),
+  noteSelfAuthor, noteStartsRead, appendPart: (part) => appendToColumns(/** @type {any} */ (part)),
+  scrollToNewest: (side) => { if (side) inColumn(columns.side, scrollToNewest); else scrollToNewest(); },
+  markSentRead: (entry) => guardQuietly(markSentRead)(entry),
+  reportColumnReply, columnReplies, quietly: (run) => guardQuietly(run)(),
+});
+const { queue: queueOutgoingMessage, retry: retryOutgoingMessage, schedule: scheduleOutgoingMessage, blocker: outgoingBlocker, credential: currentCredential, retriesItself, editable: editableSend, waitingItsTurn, resumeRetries: resumeOutgoingRetries, stop: stopOutgoingSends } = outboxDispatch;
+// The browser's own word that the connection is back. Guarded because a page loaded without a
+// full window — some harnesses build one by hand — has no `window.addEventListener`.
+if (typeof window.addEventListener === "function") {
+  window.addEventListener("online", () => outboxDispatch.resumeRetries());
+}
+/**
+ * Taking a send back (web/src/view/channel `createSendTakeBack`, `#624 voice-page-modularity`):
+ * Edit, Dismiss and its Undo, putting a dismissed send back, and the dismissed pop-out's listeners.
+ *
+ * @type {import("./src/view/channel/index.ts").SendTakeBack}
+ */
+const sendTakeBack = createSendTakeBack({
+  el, outbox, drop: (id) => outboxDispatch.drop(id),
+  editable: (entry) => outboxDispatch.editable(/** @type {any} */ (entry)), waitingItsTurn: (entry) => outboxDispatch.waitingItsTurn(/** @type {any} */ (entry)),
+  retryOf: (id) => outboxDispatch.retryOf(id),
+  restoreHold: (entry, hold) => outboxDispatch.hold(/** @type {any} */ (entry), hold),
+  identity: () => tokenFingerprint(token()), online: () => navigator.onLine !== false,
+  fromSaved: (saved) => outgoingFromSaved(saved), unsentText, underDraft, snippet: (text) => sendSnippet(text),
+  selectedChannelId, composerKey: () => composerState().key,
+  activeColumn: () => columnWork.active(), mainColumn: columns.main, sideColumn: columns.side,
+  sideShowing, inColumn,
+  channelDrafts: { get: (key) => channelDrafts.get(key), set: (key, text) => channelDrafts.set(key, text), delete: (key) => channelDrafts.delete(key) },
+  saveChannelDrafts: () => saveChannelDrafts(), noteDraft, openThread,
+  fitBox: (box) => fitGrowingBox(box), focusAtEnd, setStatus,
+  replyDrafts: { get: (id) => replyDrafts.get(id), set: (id, text) => replyDrafts.set(id, text), delete: (id) => replyDrafts.delete(id), save: () => replyDrafts.save(), setStartsThread: (id, starts) => replyDrafts.setStartsThread(id, starts) },
+  renderDraftMarkers, idsOf, rowMessages, heldMessage, heldThreadRecord, openReply,
+  dismissed: dismissedSends, dismissedView: dismissedSendsView, undo: sendUndo, nextUndoAt,
+  persist: () => persistOutgoingMessages(), renderOutgoing: () => renderOutgoingEverywhere(),
+  channelLabel, view: () => screens.view(),
+});
+const { edit: editOutgoingMessage, dismiss: dismissOutgoingMessage, endUndo: endSendUndo, renderUndo: renderSendUndo, putBack: putBackDismissedSend, forget: forgetDismissedSends, load: loadDismissedSends } = sendTakeBack;
 /**
  * The outbox's own rows (web/src/view/channel `createOutboxRows`, `#624 voice-page-modularity`).
  *
@@ -18087,15 +17094,15 @@ const outboxRows = createOutboxRows({
   entries: () => outbox.values(),
   removeEntry: (id) => outbox.remove(id),
   forgetObservations: (id) => { outgoingObservations.delete(id); },
-  receiptRetires: /** @type {any} */ (sentReceiptRetires), blockerOf: (entry) => outgoingBlocker(entry), inPlaceDrawn: outgoingInPlaceDrawn,
-  retryOf: (id) => outgoingRetries.get(id), blockerRemoved: (entry) => entry.channel === String(selectedChannelId()) && Boolean(entry.replyTo && removedUpstream(entry.replyTo)),
-  editableOf: (entry) => editableSend(entry), canRetry: (entry) => retriesItself(entry),
+  receiptRetires: /** @type {any} */ (sentReceiptRetires), blockerOf: (entry) => /** @type {any} */ (outgoingBlocker(/** @type {any} */ (entry))), inPlaceDrawn: outgoingInPlaceDrawn,
+  retryOf: (id) => outboxDispatch.retryOf(id), blockerRemoved: (entry) => entry.channel === String(selectedChannelId()) && Boolean(entry.replyTo && removedUpstream(entry.replyTo)),
+  editableOf: (entry) => editableSend(/** @type {any} */ (entry)), canRetry: (entry) => retriesItself(/** @type {any} */ (entry)),
   snippetOf: (entry) => sendSnippet(unsentText(entry)),
   sideCardsShown, rowMessages,
   channelStore: { current: () => channelStore.current() }, threadHue, openThread,
   renderBodyInto, textBody, storageOkay: () => outbox.storageOkay(),
   knownChannel, retryOutgoingMessage, editOutgoingMessage, dismissOutgoingMessage,
-  threadCards: (summaries) => threadCards(summaries), pendingThreadTimes, sentFromThisPage, ownSentAt: (id) => ownPosts.sentAt(id), retryKnown: (id) => outgoingRetries.has(id),
+  threadCards: (summaries) => threadCards(summaries), pendingThreadTimes, sentFromThisPage, ownSentAt: (id) => ownPosts.sentAt(id), retryKnown: (id) => outboxDispatch.retryPending(id),
   renderSideCards: () => renderSideCards(), renderChannelRows,
   pinsOnly: () => pinsView().only,
   searchable,

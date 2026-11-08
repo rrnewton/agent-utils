@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 
 import { CHANNEL, CLEAR_ARMED_MS, CSS, CSS_CODE, DISCORD_POLL_MS, DONE_FLASH_FADE_MS,
-  DONE_FLASH_HOLD_MS, GLYPHS, HOLD_MS, INBOX_NOTICE, OTHER_CHANNEL, SCRIPT, SCRIPT_CODE, backlog,
+  DONE_FLASH_HOLD_MS, GLYPHS, HOLD_MS, INBOX_NOTICE, OTHER_CHANNEL, PAGE_CODE, SCRIPT, SCRIPT_CODE, backlog,
   brokenModule, brokenScript, brokenScriptEach, channelRow, chooseReadMode, conversation, cssBlock, cssRules,
   delayedReply, deliver, doneButton, elidedOf, errorResponse, focusName, focused, inboxChannel,
   inboxId, json, jumpSaysArrived, keyboardPageAtTop, listCardSays, longMessage, message, newPage,
@@ -1510,7 +1510,7 @@ test("r REPLIES with the box ready; p pins; . opens the ⋯ menu on its first it
   assert.ok(row, "the row went");
 });
 
-const ANSWERED_HOOK = "    if (entry.marksRead) guardQuietly(markSentRead)(entry);\n";
+const ANSWERED_HOOK = "      if (entry.marksRead) deps.markSentRead(entry);\n";
 
 test("`#256 reply-marks-read`: a SENT reply marks the message it answers Done — the button, the look, the server and the Undo chip agree, and Undo puts it back", async () => {
   const run = async (script) => {
@@ -1551,7 +1551,7 @@ test("`#256 reply-marks-read`: a SENT reply marks the message it answers Done �
 
   // THE CONTROL, which is the owner's report: without the reply's Done the message is dimmed as
   // answered while its button still offers Done, and nothing reaches the server.
-  const control = await run(brokenScript(ANSWERED_HOOK, ""));
+  const control = await run(await brokenModule([{ file: "src/core/outbox/dispatch.ts", find: ANSWERED_HOOK, replace: "" }]));
   await replyAndSend(control, target, "answering the open one");
   const dimmed = rowWithId(control, target);
   assert.equal(dimmed.getAttribute("data-replied"), "true", "the control did not even dim the message");
@@ -1569,10 +1569,10 @@ test("`#256 reply-marks-read`: the reply's Done is the Done button's own act, ca
     "a confirmed send's read does not begin with the reply's Done");
   assert.equal(SCRIPT_CODE.split("markAnsweredDone(").length - 1, 2, "the reply's Done is called from more than one place");
   // Once, in the send's success, after the posted parts are drawn and before anything can fail it.
-  assert.equal(SCRIPT_CODE.split("markSentRead)(").length - 1, 1, "a send's read is marked from more than one place");
-  const send = SCRIPT_CODE.slice(SCRIPT_CODE.indexOf("async function dispatchOutgoingMessage("));
+  assert.equal(PAGE_CODE.split("deps.markSentRead(entry)").length - 1, 1, "a send's read is marked from more than one place");
+  const send = PAGE_CODE.slice(PAGE_CODE.indexOf("async function dispatchOutgoingMessage("));
   const success = send.indexOf('entry.state = "sent";');
-  const call = send.indexOf("markSentRead)(entry)");
+  const call = send.indexOf("deps.markSentRead(entry)");
   assert.ok(success > 0 && call > success && call < send.indexOf("} catch (error) {", success),
     "the reply's Done is not in the send's success");
 });

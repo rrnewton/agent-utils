@@ -5001,8 +5001,8 @@ test("`#277 reply-in-column` with `#467 inline-send-in-place`: a reply sent from
   }
 
   // THE CONTROL: nothing told. The walk above sees the status line and the chip only through it.
-  const { page: control } = await tallReplyColumnsPage(brokenScript(
-    "if (columnReplies.has(entry.id) && !job.stopped && !unchanged) reportColumnReply(entry);", ""));
+  const { page: control } = await tallReplyColumnsPage(await brokenModule([{ file: "src/core/outbox/dispatch.ts",
+    find: "if (columnReplies.has(entry.id) && !job.stopped && !unchanged) deps.reportColumnReply(entry);", replace: "" }]));
   const area = control.el("scroll-area");
   area.scrollTop = 0;
   await area.dispatch("scroll");
