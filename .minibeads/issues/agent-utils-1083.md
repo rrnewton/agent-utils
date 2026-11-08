@@ -1,10 +1,11 @@
 ---
 title: 'reply-reminder-withheld: an eligible reminder never fires and says nothing, and burst messages stay unanswered'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-08T18:32:55.000000000+00:00
-updated_at: 2026-11-08T18:32:55.000000000+00:00
+updated_at: 2026-11-08T19:05:01.000000000+00:00
+closed_at: 2026-11-08T19:05:01.000000000+00:00
 ---
 
 # Description
@@ -34,4 +35,10 @@ Second, from the same bridge's owner: 11 of those 12 "unanswered" requests were 
 
 ## Resolution
 
-Pending.
+[watermelon-full-preview] Fixed by mu-spark.
+
+Withheld reminders now say so: when eligible requests exist and a check composes nothing, the bridge logs `reply reminders withheld: N eligible request(s): <reason>` once until the reason changes — prompts waiting, a queue hold, Herdr's status, a screen still showing a running turn, the slow-answer deferral, Claude Code's exact session status, or work the pre-reminder read left. Reasons already logged where they happen (failed steps, a pane that cannot be asked) are not repeated.
+
+One gate behind the silence is also fixed: the loop's screen evidence could stay "running" from a read taken before the turn ended, with nothing scheduled to refresh it while Herdr already read idle, so the idle question was never even asked. When Herdr reads idle or done and only that stale screen disagrees, the check now settles it with one fresh read; a screen still showing a running turn withholds exactly as before. The other suspect is exonerated with evidence and pinned by tests: the observed idle screen (turn done, background monitors still running) does not read as a running turn, and slow Claude answers (over the 3-second bound, deferring the next question by an idle period) delay a due reminder by one deferral and no more — `slow_idle_answers_do_not_starve_a_due_reminder` drives that geometry at production scale. Which gate held the affected bridge's night specifically will now be in its log on the first withheld check after refresh; that last confirmation is the one unverified piece, and if the line names a gate these fixes do not cover, it is a new issue with the reason attached rather than another silent night.
+
+Bursts: `reply_reminder_candidates` no longer offers an in-thread request that a later same-sender reply in the same thread answers (delivered after it; a reply to the thread's root counts). The root's own request, a later question, and another thread keep their reminders, each covered by `a_reply_in_a_thread_settles_earlier_burst_requests_from_its_sender`. The settling is at candidacy, so records are untouched and a reply later withdrawn does not leave a request wrongly closed.

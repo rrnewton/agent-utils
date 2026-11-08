@@ -4220,6 +4220,24 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_done_with_background_work_still_running_is_not_a_running_turn() {
+        // #1083 reply-reminder-withheld: the screen a coordinator with persistent monitors
+        // shows between turns, as sampled on the affected bridge. Background work still
+        // running is not a turn running, and must not read as one.
+        let screen = [
+            "● Answered in the thread; the rollout waits on the canary.",
+            "✻ Cogitated for 15s · done 6:15 AM · 3 monitors still running",
+            "────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────",
+            "  ⏵⏵ auto mode on",
+            "",
+        ]
+        .join("\n");
+        assert_eq!(running_turn(&screen), Some(false));
+    }
+
+    #[test]
     fn running_turn_words_above_the_bottom_rows_do_not_count() {
         // The marker sits `above` rows over the last row with text; blank rows below that row
         // are not counted.

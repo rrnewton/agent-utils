@@ -5593,6 +5593,12 @@ impl TurnEvidence {
         self.seen_working = self.seen_working.wrapping_add(u64::from(running));
     }
 
+    /// Only the screen still reads as working: Herdr no longer does, so one fresh read can
+    /// settle it (`#1083 reply-reminder-withheld`).
+    fn screen_blocks(&self) -> bool {
+        self.screen && !self.herdr
+    }
+
     /// How many times the agent has been seen working, as `seen_working` counts: a later value
     /// than one taken before says it has worked since.
     fn seen_working(&self) -> u64 {
@@ -21571,6 +21577,9 @@ printf '%s\n' "$request" >> "$1" || exit 4
             Arc<Mutex<std::collections::VecDeque<Result<reply_reminders::ClaudeState, String>>>>,
         /// The reply IDs whose blocks the session's transcript holds.
         printed: Arc<Mutex<BTreeSet<String>>>,
+        /// How long each answer takes, for a question slower than the slow-answer bound
+        /// (`#1083 reply-reminder-withheld`).
+        delay: Duration,
     }
 
     impl reply_reminders::ClaudeIdleSource for FakeClaude {
@@ -21580,6 +21589,9 @@ printf '%s\n' "$request" >> "$1" || exit 4
             _cancelled: &dyn Fn() -> bool,
         ) -> Result<reply_reminders::ClaudeState, String> {
             self.asked.fetch_add(1, AtomicOrdering::SeqCst);
+            if !self.delay.is_zero() {
+                thread::sleep(self.delay);
+            }
             if let Some(answer) = self.script.lock().expect("script").pop_front() {
                 return answer;
             }
@@ -21651,6 +21663,7 @@ printf '%s\n' "$request" >> "$1" || exit 4
                 asked: Arc::clone(&asked),
                 script: Arc::clone(&script),
                 printed: Arc::default(),
+                delay: Duration::ZERO,
             }),
         );
         (fixture, state, reminders, idle, asked, script)
@@ -22080,6 +22093,95 @@ has been seen working and is idle again, or for 1s if it is not seen working"),
     }
 
     #[test]
+    fn why_a_due_reminder_is_withheld_is_said_once_until_the_reason_changes() {
+        // #1083 reply-reminder-withheld: a busy answer was silent by design, so a bridge
+        // whose reminder never fired left nothing in its log saying which gate held it.
+        let (fixture, state, mut reminders, idle, _asked) = reminding_worker(false);
+        let said = Arc::clone(&reminders.said);
+        let _request = delivered_worker_request(&state);
+        fixture.client.runs.lock().expect("runs").clear();
+        let mut turn = TurnEvidence::default();
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        let lines = said.lock().expect("said").clone();
+        let withheld: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("reply reminders withheld"))
+            .collect();
+        assert_eq!(withheld.len(), 1, "{lines:?}");
+        assert!(
+            withheld[0].contains("Claude Code reports its session busy"),
+            "{withheld:?}"
+        );
+        idle.store(true, AtomicOrdering::SeqCst);
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        thread::sleep(Duration::from_millis(150));
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        assert_eq!(reminders_typed(&fixture).len(), 1);
+    }
+
+    #[test]
+    fn a_stale_screen_read_does_not_withhold_a_reminder_for_a_turn_that_is_over() {
+        // #1083 reply-reminder-withheld: the loop's last screen read predates the turn's end
+        // and still shows it running, while Herdr and the session both say idle. One fresh
+        // read settles the screen instead of withholding the reminder behind stale evidence.
+        let (fixture, state, mut reminders, _idle, _asked) = reminding_worker(true);
+        let _request = delivered_worker_request(&state);
+        fixture.client.runs.lock().expect("runs").clear();
+        *fixture.client.screen.lock().expect("screen") = Some(
+            "✻ Cogitated for 15s · done 6:15 AM · 3 monitors still running\n ❯ \n  ⏵⏵ auto mode on\n"
+                .to_owned(),
+        );
+        let mut turn = TurnEvidence::default();
+        turn.read("working on it\nesc to interrupt\n");
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        assert!(
+            reminders_typed(&fixture).is_empty(),
+            "the idle period only just began"
+        );
+        thread::sleep(Duration::from_millis(150));
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        assert_eq!(
+            reminders_typed(&fixture).len(),
+            1,
+            "the stale read withheld it"
+        );
+    }
+
+    #[test]
+    fn slow_idle_answers_do_not_starve_a_due_reminder() {
+        // #1083 reply-reminder-withheld: every answer slower than the slow-answer bound
+        // defers the next first question by one idle period. With an idle time of four
+        // seconds and answers taking longer than three, the reminder still fires once a
+        // question after the deferral finds the coordinator due.
+        let (fixture, state, _reminders, _idle, _asked) = reminding_worker(true);
+        let mut reminders = ReplyReminders::with_source(
+            Duration::from_secs(4),
+            Box::new(FakeClaude {
+                idle: Arc::new(AtomicBool::new(true)),
+                asked: Arc::default(),
+                script: Arc::default(),
+                printed: Arc::default(),
+                delay: Duration::from_millis(3_200),
+            }),
+        );
+        let _request = delivered_worker_request(&state);
+        fixture.client.runs.lock().expect("runs").clear();
+        let mut turn = TurnEvidence::default();
+        // The slow first answer starts the idle period and defers the next question.
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        assert!(reminders_typed(&fixture).is_empty());
+        thread::sleep(Duration::from_secs(5));
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        assert_eq!(
+            reminders_typed(&fixture).len(),
+            1,
+            "slow answers starved it"
+        );
+    }
+
+    #[test]
     fn claude_code_is_not_asked_again_for_an_idle_time_after_it_fails_or_lists_no_session() {
         // After a run of `claude agents --json` that fails, or lists no session in the pane, the
         // next checks do not ask again until the idle time has passed.
@@ -22225,6 +22327,7 @@ coordinator's pane",
                 asked: Arc::default(),
                 script: Arc::default(),
                 printed: Arc::clone(&printed),
+                delay: Duration::ZERO,
             }),
         );
         let said = Arc::clone(&reminders.said);

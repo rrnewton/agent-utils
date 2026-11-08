@@ -532,6 +532,11 @@ pub(crate) struct ReplyReminders {
     waiting: Option<String>,
     // The reminder last logged as waiting in the queue, and why.
     stuck: Option<(String, String)>,
+    // Why the last idle question answered not idle, for the withheld line below
+    // (#1083 reply-reminder-withheld). `None` where that answer already logs itself.
+    idle_block: Option<String>,
+    // The withheld reason last logged, so a reason that holds is said once until it changes.
+    withheld: Option<String>,
     // The requests whose reply the coordinator's transcript showed, which are never reminded: a
     // transcript only grows, so it is not read again for them.
     printed: BTreeSet<String>,
@@ -565,6 +570,8 @@ impl ReplyReminders {
             problems: BTreeMap::new(),
             waiting: None,
             stuck: None,
+            idle_block: None,
+            withheld: None,
             printed: BTreeSet::new(),
             #[cfg(test)]
             said: std::sync::Arc::default(),
@@ -623,6 +630,24 @@ status for the others)",
                 self.say(format_args!("agentctl: reply reminders wait: {reason}"));
             }
             self.waiting = reason;
+        }
+    }
+
+    /// Say once why eligible requests are not being reminded, until the reason changes
+    /// (#1083 reply-reminder-withheld). A reminder withheld for a whole night left no line
+    /// in the log at all — busy and deferred answers were silent by design — so the bridge
+    /// could not say which gate held it. Reasons already logged where they happen (a failed
+    /// step, a pane that cannot be asked) are not repeated here.
+    fn note_withheld(&mut self, eligible: usize, reason: String) {
+        if eligible == 0 {
+            self.withheld = None;
+            return;
+        }
+        if self.withheld.as_deref() != Some(reason.as_str()) {
+            self.say(format_args!(
+                "agentctl: reply reminders withheld: {eligible} eligible request(s): {reason}"
+            ));
+            self.withheld = Some(reason);
         }
     }
 
@@ -849,22 +874,52 @@ seen working and is idle again, or for {}s if it is not seen working",
             self.period.end();
             self.hold = None;
             self.withdrawals = 0;
+            self.withheld = None;
             return Ok(check);
         }
         if prompts_waiting {
+            self.note_withheld(
+                eligible.len(),
+                "request prompts are waiting to be typed".to_owned(),
+            );
             return Ok(check);
         }
         let Some(info) = self.lookup(manager, agent_name, &runtime, stop, turn)? else {
             return Ok(check);
         };
+        // Herdr no longer calls the pane working but the loop's last screen read still does:
+        // that read may predate the turn's end by a whole reconcile interval, so settle it with
+        // one fresh read before it withholds a reminder for a turn that is over
+        // (#1083 reply-reminder-withheld). A screen still showing a running turn withholds as
+        // ever; the recovery capture below remains the read answers are stored from.
+        if matches!(info.status.as_str(), "idle" | "done") && turn.screen_blocks() {
+            match manager.read_capture_with_runtime(agent_name, SNAPSHOT_LINES, &runtime) {
+                Ok(snapshot) => {
+                    self.worked("the read of the coordinator's pane");
+                    turn.read(&snapshot);
+                }
+                Err(error) if stop.is_stopped() => return Err(error.into()),
+                Err(error) => {
+                    self.failed("the read of the coordinator's pane", error);
+                    return Ok(check);
+                }
+            }
+        }
         // While a reminder taken back out of the queue holds off the next, Herdr's status still
         // ends the idle period, but Claude Code is not asked.
         if self.held(turn) {
             self.herdr_idle(&info, turn);
+            self.note_withheld(
+                eligible.len(),
+                "held after a reminder was taken back out of the queue".to_owned(),
+            );
             return Ok(check);
         }
         let frame = manager.agentterm_frame(agent_name);
         if !self.idle(&info, turn, stop, Ask::First, frame.as_ref()) {
+            if let Some(reason) = self.idle_block.take() {
+                self.note_withheld(eligible.len(), reason);
+            }
             return Ok(check);
         }
         let idle_since = self.period.idle(now);
@@ -906,6 +961,12 @@ seen working and is idle again, or for {}s if it is not seen working",
         // That capture may have typed a prompt, or left one for the coordinator, and Claude
         // Code reports a session busy only some time after text is typed: no reminder follows.
         if left_work || turn.working() || control.stopped() {
+            if !control.stopped() {
+                self.note_withheld(
+                    eligible.len(),
+                    "the read before the reminder typed a prompt or left work".to_owned(),
+                );
+            }
             return Ok(check);
         }
         let now = chat_runtime::unix_millis();
@@ -934,6 +995,9 @@ seen working and is idle again, or for {}s if it is not seen working",
         if !self.idle(&info, turn, stop, Ask::Again, frame.as_ref())
             || self.period.since_millis != Some(idle_since)
         {
+            if let Some(reason) = self.idle_block.take() {
+                self.note_withheld(due.len(), reason);
+            }
             return Ok(check);
         }
         // Right before the reminder is composed, after the answer that named the session, the
@@ -943,6 +1007,7 @@ seen working and is idle again, or for {}s if it is not seen working",
         if due.is_empty() {
             return Ok(check);
         }
+        self.withheld = None;
 
         let reminder = chat_runtime::compose_reminder(state, &due, now);
         let recorded = state.update_reply_reminders(now, Some(&candidates.retained), |record| {
@@ -1077,6 +1142,11 @@ sends that reply once the pane shows it",
         if matches!(info.status.as_str(), "idle" | "done") && !turn.working() {
             true
         } else {
+            self.idle_block = Some(if matches!(info.status.as_str(), "idle" | "done") {
+                "the screen shows a running turn".to_owned()
+            } else {
+                format!("Herdr reports the pane {}", info.status)
+            });
             self.period.end();
             false
         }
@@ -1096,6 +1166,7 @@ sends that reply once the pane shows it",
         ask: Ask,
         frame: Option<&crate::harness::agentterm::FrameState>,
     ) -> bool {
+        self.idle_block = None;
         // An agentcloud session whose history could not be read is not guessed idle (#902).
         if info.agent.as_deref() == Some("agentcloud") && info.status == "unknown" {
             self.wait_because(Some(
@@ -1110,6 +1181,10 @@ sends that reply once the pane shows it",
             return false;
         }
         if ask == Ask::First && self.claude_wait.is_some_and(|until| Instant::now() < until) {
+            self.idle_block = Some(
+                "waiting to ask Claude Code again after a failed, sessionless or slow answer"
+                    .to_owned(),
+            );
             return false;
         }
         let asked = Instant::now();
@@ -1136,9 +1211,10 @@ sends that reply once the pane shows it",
                 self.wait_because(None);
                 true
             }
-            Ok(ClaudeState::Busy(_)) => {
+            Ok(ClaudeState::Busy(status)) => {
                 self.worked("asking the coordinator's harness whether it is idle");
                 self.wait_because(None);
+                self.idle_block = Some(format!("Claude Code reports its session {status}"));
                 self.period.end();
                 false
             }

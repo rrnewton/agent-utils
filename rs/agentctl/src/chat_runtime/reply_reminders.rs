@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use super::{
     agent, current_reply_id, format_age, guard_typing, read_document, valid_key, write_document,
     BridgeState, ChatRuntimeError, CoordinatorDelivery, DrainOptions, QueueMessageState,
-    ReplyAliasRecord, RequestPhase, Result, MAX_REQUESTS,
+    ReplyAliasRecord, RequestPhase, RequestRecord, Result, MAX_REQUESTS,
 };
 
 /// The record of reply reminders in the bridge state directory.
@@ -323,13 +323,42 @@ then start again from that time",
             .as_ref()
             .map(ReplyAliasRecord::by_key)
             .unwrap_or_default();
+        // A reply in a thread answers the burst that led to it (#1083 reply-reminder-withheld):
+        // a request answered there settles earlier same-sender requests in that thread, which
+        // drew the one combined answer and would otherwise count unanswered — and be reminded
+        // about — forever. Only an answered request delivered after the candidate settles it,
+        // so a later question from the same sender keeps every protection.
+        let answered: Vec<&RequestRecord> = records
+            .iter()
+            .map(|(record, _)| record)
+            .filter(|record| record.reply_count > 0)
+            .collect();
+        let burst_settled = |candidate: &RequestRecord| {
+            let Some(delivered) = candidate.delivered_at_millis else {
+                return false;
+            };
+            if !candidate.message.thread_reply || candidate.message.sender_id.is_empty() {
+                return false;
+            }
+            answered.iter().any(|answer| {
+                answer.key != candidate.key
+                    && answer.message.channel_id == candidate.message.channel_id
+                    && answer.message.sender_id == candidate.message.sender_id
+                    && (answer.message.thread_id == candidate.message.thread_id
+                        || answer.message.message_id == candidate.message.thread_id)
+                    && answer
+                        .delivered_at_millis
+                        .is_some_and(|answered_at| delivered < answered_at)
+            })
+        };
         let mut found = ReminderCandidates::default();
-        for (record, _) in records {
+        for (record, _) in &records {
             found.retained.insert(record.key.clone());
             if record.reply_closed
                 || record.reply_count > 0
                 || record.phase != RequestPhase::Delivered
                 || left_to_previous.contains(&record.key)
+                || burst_settled(record)
             {
                 continue;
             }
@@ -340,8 +369,8 @@ then start again from that time",
                 continue;
             };
             found.candidates.push(ReminderCandidate {
-                reply_id: current_reply_id(&record, aliases.get(record.key.as_str()).copied()),
-                key: record.key,
+                reply_id: current_reply_id(record, aliases.get(record.key.as_str()).copied()),
+                key: record.key.clone(),
                 delivered_at_millis,
             });
         }
@@ -702,6 +731,56 @@ mod tests {
             .remove(0)
     }
 
+    /// Admit the owner's message number `index` in thread `thread` (its root's index), as a
+    /// thread reply when `in_thread`.
+    fn admit_in_thread(state: &BridgeState, index: u64, thread: u64, in_thread: bool) -> String {
+        let message = InboundMessage::new(
+            ChannelId::new("spaces/example").expect("channel"),
+            MessageId::new(format!("spaces/example/messages/{index}")).expect("message"),
+            ThreadId::new(format!("spaces/example/threads/{thread}")).expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            format!("request {index}"),
+            "2026-10-14T12:00:00Z",
+            in_thread,
+        )
+        .expect("message");
+        let batch = DeliveryBatch::new(
+            EventSequence::new(index).expect("sequence"),
+            ProviderCursor::new(format!("cursor-{index}")).expect("cursor"),
+            DeliveryId::new(format!("delivery-{index}")).expect("delivery"),
+            vec![CommittableEvent::message_created(message)],
+        )
+        .expect("batch");
+        state
+            .admit_batch(&batch)
+            .expect("admit")
+            .new_request_keys
+            .remove(0)
+    }
+
+    /// `admit_in_thread`, typed.
+    fn delivered_in_thread(
+        state: &BridgeState,
+        index: u64,
+        thread: u64,
+        in_thread: bool,
+    ) -> String {
+        let key = admit_in_thread(state, index, thread, in_thread);
+        assert_eq!(
+            super::super::deliver_request_with(
+                state,
+                &TypingQueue::default(),
+                &key,
+                DrainOptions::default()
+            )
+            .expect("deliver"),
+            CoordinatorDeliveryResult::Delivered
+        );
+        // Delivered stamps are wall-clock; the burst rule reads their order.
+        std::thread::sleep(Duration::from_millis(2));
+        key
+    }
+
     /// A coordinator queue for reminders, which settles each prompt as `outcome` says.
     #[derive(Default)]
     struct ReminderQueue {
@@ -994,6 +1073,61 @@ mod tests {
         assert_eq!(
             found.retained,
             [waiting, answered, open, closed].into_iter().collect()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reply_in_a_thread_settles_earlier_burst_requests_from_its_sender() {
+        // #1083 reply-reminder-withheld: several owner messages in a row in one thread drew
+        // one combined reply attached to a sibling. The earlier ones are answered by it and
+        // earn no reminder; the root, a later question, and another thread keep theirs.
+        let (root, state) = state("burst");
+        let thread_root = delivered_in_thread(&state, 1, 1, false);
+        let burst_one = delivered_in_thread(&state, 2, 1, true);
+        let burst_two = delivered_in_thread(&state, 3, 1, true);
+        let answered = delivered_in_thread(&state, 4, 1, true);
+        let after = delivered_in_thread(&state, 5, 1, true);
+        let other_thread = delivered_in_thread(&state, 6, 6, true);
+        let record = start(&state, 1);
+        let found = state.reply_reminder_candidates().expect("candidates");
+        assert_eq!(found.candidates.len(), 6, "nothing settled before a reply");
+        let reply_id = found
+            .candidates
+            .iter()
+            .find(|candidate| candidate.key == answered)
+            .expect("the answered request before its reply")
+            .reply_id
+            .clone();
+        state
+            .submit_reply(&answered, &reply_id, "one answer to the whole burst")
+            .expect("store a reply");
+        let keys: Vec<String> = state
+            .reply_reminder_candidates()
+            .expect("candidates")
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.key)
+            .collect();
+        assert!(
+            !keys.contains(&burst_one) && !keys.contains(&burst_two),
+            "the burst still counts unanswered: {keys:?}"
+        );
+        assert!(
+            keys.contains(&thread_root) && keys.contains(&after) && keys.contains(&other_thread),
+            "a genuinely unanswered request lost its reminder: {keys:?}"
+        );
+        // Eligible, too: nothing about the reminder record brings the burst back.
+        let eligible: Vec<String> = state
+            .reply_reminder_candidates()
+            .expect("candidates")
+            .eligible(&record, unix_millis())
+            .into_iter()
+            .map(|candidate| candidate.key)
+            .collect();
+        assert!(
+            !eligible.contains(&burst_one) && eligible.contains(&after),
+            "{eligible:?}"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
