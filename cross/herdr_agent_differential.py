@@ -30,10 +30,16 @@ TIMEOUT_SECONDS = 30
 
 
 def _tree_cpu_seconds(pid: int) -> float | None:
-    """User+system CPU seconds of `pid` and its live descendants, or None if gone.
+    """User+system CPU seconds of `pid` and its descendants, or None if gone.
 
     The direct child often waits on its own children (a fixture shell, git),
     so only the whole tree's CPU shows whether the call is making progress.
+    Each process contributes its own utime+stime plus the cutime+cstime of
+    children it has already waited for: a short-lived grandchild (one fake
+    Herdr spawn) otherwise vanishes from the live tree between polls and its
+    CPU — real progress — would read as idleness (#1067
+    cross-differential-load-aware). A live child's CPU is not yet in its
+    parent's waited-for total, so nothing is counted twice.
     """
     ticks_per_second = os.sysconf("SC_CLK_TCK")
     parents: dict[int, int] = {}
@@ -52,7 +58,10 @@ def _tree_cpu_seconds(pid: int) -> float | None:
         try:
             child_pid = int(entry.name)
             parents[child_pid] = int(fields[1])  # ppid after comm/state
-            cpu_ticks[child_pid] = int(fields[11]) + int(fields[12])  # utime + stime
+            # utime + stime + cutime + cstime (waited-for children included).
+            cpu_ticks[child_pid] = (
+                int(fields[11]) + int(fields[12]) + int(fields[13]) + int(fields[14])
+            )
         except (IndexError, ValueError):
             continue
     if pid not in cpu_ticks:
@@ -83,9 +92,12 @@ def run_tolerant(
 
     The budget is spent as CPU/idle time, not raw wall: a child that keeps
     burning CPU gets up to four times the wall budget, a child that makes no
-    CPU progress for `timeout_s` is hung, and either way the whole process
-    group is killed so grandchildren cannot leak and hold fixture locks
-    (the old timeout path killed only the direct child and cascaded).
+    CPU or output progress for `timeout_s` is hung, and either way the whole
+    process group is killed so grandchildren cannot leak and hold fixture
+    locks (the old timeout path killed only the direct child and cascaded).
+    A genuinely slower child still fails: burning more than twice the budget
+    in CPU, or running past four times it in wall, times out however steady
+    its progress looks (#1067 cross-differential-load-aware).
     """
     stdout_file = tempfile.TemporaryFile(mode="w+")
     stderr_file = tempfile.TemporaryFile(mode="w+")
@@ -98,12 +110,21 @@ def run_tolerant(
     started = time.monotonic()
     last_progress = started
     last_cpu = 0.0
+    last_output = 0
     timed_out = False
     while proc.poll() is None:
         now = time.monotonic()
         cpu = _tree_cpu_seconds(proc.pid)
         if cpu is not None and cpu > last_cpu + 0.05:
             last_cpu = cpu
+            last_progress = now
+        # Output growth is progress too: a child blocked writing to a slow
+        # consumer burns almost no CPU, but it is not hung. Growth refreshes
+        # only the idle leg — the CPU cap (2x) and wall cap (4x) still bound
+        # a child that merely dribbles bytes forever (#1067).
+        output = os.fstat(stdout_file.fileno()).st_size + os.fstat(stderr_file.fileno()).st_size
+        if output > last_output:
+            last_output = output
             last_progress = now
         idle = now - last_progress
         if idle > timeout_s or last_cpu > 2 * timeout_s or now - started > 4 * timeout_s:
@@ -114,7 +135,16 @@ def run_tolerant(
                 proc.kill()
             break
         time.sleep(0.1)
-    proc.wait()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        # Bounded even after the kill: an unreapable group must fail this
+        # call, never hang the whole differential behind it.
+        try:
+            os.killpg(proc.pid, 9)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        proc.wait(timeout=5)
     stdout_file.seek(0)
     stderr_file.seek(0)
     stdout = stdout_file.read()
@@ -122,6 +152,63 @@ def run_tolerant(
     if timed_out:
         raise subprocess.TimeoutExpired(list(command), timeout_s, output=stdout, stderr=stderr)
     return subprocess.CompletedProcess(list(command), proc.returncode, stdout, stderr)
+
+
+#: In-run calibration for harness-chosen micro-budgets (#1067
+#: cross-differential-load-aware). A positive startup proof needs several
+#: sequential fake-Herdr spawns — one fresh Python interpreter per call —
+#: inside one wall budget the harness picks (0.1-0.2 s today). What load
+#: inflates is the spawn, not the judged work, so the harness measures a
+#: trivial scratch-fake spawn on this host in this run and scales only
+#: those positive budgets. The cap is hard: a per-probe delay beyond
+#: cap/probes (an injected slowdown, a real extra roundtrip) still expires,
+#: and a CPU-burning regression still hits `run_tolerant`'s 2x CPU cap.
+#: Negative cases (static wrong screens, budgets meant to expire) keep
+#: their literal values — calibration must never talk an expected timeout
+#: into a success.
+CALIBRATION_SAMPLES = 5
+CALIBRATION_MARGIN = 2.0
+CALIBRATION_MAX_AGE_S = 30.0
+STARTUP_TIMEOUT_CAP_S = 5.0
+
+
+def calibrated_budget(
+    nominal_s: float, probe_seconds: Sequence[float], *, probes: int, cap_s: float
+) -> float:
+    """Scale a positive micro-budget by measured spawn latency, hard-capped.
+
+    `probe_seconds` are edition-independent trivial-spawn measurements from
+    the same run; with so few samples the worst one is the honest bound.
+    No samples (the probe itself could not run) keeps the strict nominal
+    budget: calibration failure never inflates anything.
+    """
+    if not probe_seconds or probes < 1:
+        return nominal_s
+    worst = max(probe_seconds)
+    return min(cap_s, max(nominal_s, probes * worst * CALIBRATION_MARGIN))
+
+
+def _probe_seconds(command: Sequence[str], *, samples: int, cwd: Path) -> list[float]:
+    """Wall seconds per trivial probe run, or [] when a probe cannot run."""
+    measured: list[float] = []
+    for _ in range(samples):
+        started = time.monotonic()
+        try:
+            subprocess.run(
+                list(command),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                cwd=cwd,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        measured.append(time.monotonic() - started)
+    return measured
+
+
 _MESSAGE_ID = re.compile(r"\b\d{20,}-\d+\b")
 
 
@@ -1236,6 +1323,8 @@ class Harness:
         self.rust = tuple(rust)
         self.serial = 0
         self.case_roots: list[Path] = []
+        self._probe_samples: list[float] = []
+        self._probe_measured_at = 0.0
         shell = os.path.realpath("/bin/bash")
         self.fixture_shell = subprocess.Popen(
             [shell, "--noprofile", "--norc"],
@@ -1264,7 +1353,13 @@ class Harness:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.wait(timeout=5)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # Killed but unreaped within the bound: closing the
+                    # harness must still finish; the session leader holds
+                    # no fixture state the verdicts read.
+                    pass
 
     def case(self, label: str, state: Mapping[str, object] | None = None) -> PairCase:
         self.serial += 1
@@ -1338,6 +1433,51 @@ class Harness:
             "harness/no-host-cli", not calls,
             f"{len(calls)} call(s) reached a host CLI instead of a fixture: {calls!r}",
         )
+
+    def startup_timeout(self, nominal_s: float, *, probes: int = 6) -> str:
+        """Argv value for a positive `--startup-timeout`, calibrated in-run.
+
+        Only for starts expected to succeed: the proof sequence needs about
+        `probes` sequential fake spawns inside the budget, so the nominal
+        value is scaled by this host's measured spawn latency (see
+        `calibrated_budget`). Starts expected to time out or refuse keep
+        their literal values at the call site.
+        """
+        budget = calibrated_budget(
+            nominal_s,
+            self._fake_probe_seconds(),
+            probes=probes,
+            cap_s=STARTUP_TIMEOUT_CAP_S,
+        )
+        return f"{budget:g}"
+
+    def _fake_probe_seconds(self) -> list[float]:
+        """Trivial scratch-fake spawn latencies, re-measured when stale.
+
+        The scratch fake lives outside every judged case, so probing it
+        records no calls a case later compares; `agent list` exercises the
+        same interpreter spawn plus state read/write as a judged probe.
+        """
+        now = time.monotonic()
+        if self._probe_samples and now - self._probe_measured_at < CALIBRATION_MAX_AGE_S:
+            return self._probe_samples
+        root = self.root / "calibration"
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fixture = root / "fake-herdr"
+        if not fixture.exists():
+            fixture.write_text(f"#!{sys.executable}\n{_FAKE_HERDR}", encoding="utf-8")
+            fixture.chmod(0o700)
+        (root / "state.json").write_text(
+            json.dumps(
+                {"status": "idle", "calls": [], "submitted": []}, sort_keys=True
+            ),
+            encoding="utf-8",
+        )
+        self._probe_samples = _probe_seconds(
+            [str(fixture), "agent", "list"], samples=CALIBRATION_SAMPLES, cwd=root
+        )
+        self._probe_measured_at = now
+        return self._probe_samples
 
     def invoke(self, case: PairCase, arguments: Sequence[str]) -> tuple[Outcome, Outcome]:
         return (
@@ -2258,9 +2398,23 @@ def _cross_process_serialization(harness: Harness, report: Report) -> None:
     )
     second: subprocess.Popen[str] | None = None
     try:
-        deadline = time.monotonic() + 5
+        # Await observed states, with deadlines that only bound failure
+        # (#998 shape, #1067 cross-differential-load-aware): the first
+        # sender is gated on run-release, so waiting longer for
+        # run-entered cannot change the verdict — but proceeding without
+        # it (the old silent 5 s lapse) judged an overlap that never
+        # happened, and a fixed post-launch sleep read as serialized
+        # vacuously whenever load delayed the second start past it.
+        deadline = time.monotonic() + TIMEOUT_SECONDS
         while not (root / "run-entered").exists() and time.monotonic() < deadline:
             time.sleep(0.01)
+        entered = (root / "run-entered").exists()
+
+        def call_count() -> int:
+            calls = _state(root).get("calls", [])
+            return len(calls) if isinstance(calls, list) else 0
+
+        calls_before = call_count()
         second = launch(
             harness.rust,
             (
@@ -2277,15 +2431,52 @@ def _cross_process_serialization(harness: Harness, report: Report) -> None:
             ),
             root / "tmp-b",
         )
-        time.sleep(0.25)
-        serialized = _submitted(root) == ["from pane"]
+        # Judged only once the second sender observably attempted the pane
+        # (a new fake call or CPU progress) and then either exited or
+        # blocked with flat CPU. A missing lock lets it submit and exit,
+        # which the submitted check below still catches; a second sender
+        # that never starts fails as unobserved, never as serialized.
+        deadline = time.monotonic() + TIMEOUT_SECONDS
+        attempted = False
+        progressed = False
+        flat_polls = 0
+        cpu_start = _tree_cpu_seconds(second.pid) or 0.0
+        last_cpu = cpu_start
+        while time.monotonic() < deadline:
+            cpu_now = _tree_cpu_seconds(second.pid)
+            if call_count() > calls_before or (
+                cpu_now is not None and cpu_now > cpu_start + 0.05
+            ):
+                progressed = True
+            if second.poll() is not None:
+                attempted = progressed
+                break
+            if cpu_now is not None:
+                if cpu_now <= last_cpu + 0.01:
+                    flat_polls += 1
+                else:
+                    flat_polls = 0
+                last_cpu = cpu_now
+            if progressed and flat_polls >= 4:
+                attempted = True
+                break
+            time.sleep(0.05)
+        serialized = entered and attempted and _submitted(root) == ["from pane"]
         (root / "run-release").write_text("release\n", encoding="utf-8")
-        first_out, first_err = first.communicate(timeout=10)
-        second_out, second_err = second.communicate(timeout=10)
+        timed_out = False
+        try:
+            first_out, first_err = first.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            timed_out, first_out, first_err = True, "", "TIMEOUT"
+        try:
+            second_out, second_err = second.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            timed_out, second_out, second_err = True, "", "TIMEOUT"
         report.require(
             "interop/cross-process-canonical-lock",
-            serialized and first.returncode == second.returncode == 0,
-            "mixed target forms overlapped: "
+            serialized and not timed_out and first.returncode == second.returncode == 0,
+            "mixed target forms overlapped (or the overlap was never observed): "
+            f"entered={entered} attempted={attempted} timed_out={timed_out} "
             f"state={_state(root)!r} first=({first.returncode},{first_out!r},{first_err!r}) "
             f"second=({second.returncode},{second_out!r},{second_err!r})",
         )
