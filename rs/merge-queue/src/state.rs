@@ -428,6 +428,11 @@ pub struct PriorityConfig {
     /// wildcards, as for `regenerate.paths`). `plan` suggests the label for a change touching
     /// only these paths; it never applies the label itself.
     pub ci_paths: Vec<String>,
+    /// Label that makes sync submit a pull request exact (`submit --exact`:
+    /// the submitted commit, two parents intact, fast-forward only).
+    /// Compared without regard to case; empty (or `-`) turns it off — there
+    /// is no default, because exact landing is opt-in per repository.
+    pub exact_label: String,
 }
 
 impl PriorityConfig {
@@ -438,6 +443,23 @@ impl PriorityConfig {
             "-" => None,
             label => Some(label),
         }
+    }
+
+    /// The label `sync` honours for exact submissions, or `None` when off.
+    pub fn exact_label(&self) -> Option<&str> {
+        match self.exact_label.as_str() {
+            "" | "-" => None,
+            label => Some(label),
+        }
+    }
+
+    /// Whether `labels` carry the exact label.
+    pub fn exact_labelled(&self, labels: &[String]) -> bool {
+        self.exact_label().is_some_and(|wanted| {
+            labels
+                .iter()
+                .any(|label| label.eq_ignore_ascii_case(wanted))
+        })
     }
 
     /// Whether `labels` carry the priority label.

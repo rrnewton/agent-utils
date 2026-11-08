@@ -98,6 +98,9 @@ struct Entry {
     solo: bool,
     /// Carries the priority label (or `prioritized` in a ready file).
     prioritized: bool,
+    /// Carries the exact label (or `exact` in a ready file): submit the
+    /// change exact, as `submit --exact` would.
+    exact: bool,
     title: String,
     by: String,
     notify: String,
@@ -116,7 +119,7 @@ struct Entry {
 pub type ReadyLine = (i64, Vec<(String, String)>);
 
 /// Parse a ready-list file. Each line: `PR [SHA] [head=REF] [priority=N] [after=N,N] [solo]
-/// [prioritized] [by=NAME] [notify=NAME]`; `#` starts a comment. Without `head=`, the head is
+/// [prioritized] [exact] [by=NAME] [notify=NAME]`; `#` starts a comment. Without `head=`, the head is
 /// `refs/pull/PR/head`.
 pub fn parse_ready_file(text: &str) -> Result<Vec<ReadyLine>, String> {
     let mut entries = Vec::new();
@@ -140,7 +143,7 @@ pub fn parse_ready_file(text: &str) -> Result<Vec<ReadyLine>, String> {
         for word in words {
             match word.split_once('=') {
                 Some((key, value)) => fields.push((key.to_owned(), value.to_owned())),
-                None if word == "solo" || word == "prioritized" => {
+                None if word == "solo" || word == "prioritized" || word == "exact" => {
                     fields.push((word.to_owned(), String::new()));
                 }
                 None if word.len() >= 7 && word.chars().all(|c| c.is_ascii_hexdigit()) => {
@@ -168,6 +171,7 @@ fn entries_from_file(path: &PathBuf) -> Result<Vec<Entry>, String> {
                 after: Vec::new(),
                 solo: false,
                 prioritized: false,
+                exact: false,
                 title: String::new(),
                 by: String::new(),
                 notify: String::new(),
@@ -195,6 +199,7 @@ fn entries_from_file(path: &PathBuf) -> Result<Vec<Entry>, String> {
                     }
                     "solo" => entry.solo = true,
                     "prioritized" => entry.prioritized = true,
+                    "exact" => entry.exact = true,
                     "by" => entry.by = value,
                     "notify" => entry.notify = value,
                     "notify-mode" => {
@@ -297,6 +302,7 @@ pub fn list(
                         after: Vec::new(),
                         solo: false,
                         prioritized: config.priority.labelled(&labels),
+                        exact: config.priority.exact_labelled(&labels),
                         title: pr.title,
                         by: author.clone(),
                         // Under the approval rule the author is the
@@ -406,6 +412,7 @@ pub fn reconcile(
                 && item.head.starts_with(&entry.head)
                 && item.priority == entry.priority
                 && item.prioritized == entry.prioritized
+                && item.exact == entry.exact
         });
         let settled = current.is_some_and(|item| {
             matches!(item.status, ItemStatus::Landed)
@@ -436,7 +443,7 @@ pub fn reconcile(
             after: entry.after,
             solo: entry.solo,
             prioritized: entry.prioritized,
-            exact: false,
+            exact: entry.exact,
             claim: None,
             source: tag.clone(),
             requires: Vec::new(),

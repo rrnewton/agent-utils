@@ -98,6 +98,7 @@ This command creates the state directory and writes `config.json`.
 | `--max-depth N` | `0` | The largest the adaptive window may grow: +1 per landed batch, halved per red batch whose every failure timed out or reached no verdict, never below 1. Any other red leaves it as it is. `0` keeps the window fixed at `--depth`. |
 | `--union-path PATTERN` | none | A Git attribute pattern merged with Git's `union` driver, when probing conflicts and when combining changes. Repeatable. Only for line-oriented, append-only files (see "Union merges"). |
 | `--priority-label LABEL` | `mq-priority` | The label that makes a pull request a priority change when `sync` reads it from the hosting service, compared without regard to case. `-` turns it off. See "Priority changes". |
+| `--exact-label LABEL` | off | The label that makes `sync` submit a pull request exact (as `submit --exact`: the submitted commit, two parents intact, fast-forward only). Compared without regard to case; empty or `-` turns it off. A ready-file line can use the bare word `exact` instead. |
 | `--classifier-policy PATH` | none | A test-footprint policy in the repository (version 2, such as `ci/test-footprints.json`), read at each plan's base commit. Decision-log features then take their components and a verdict from it, through the shared change classifier (`change-classify userguide`). |
 | `--ci-path PATTERN` | none | A CI or validation-infrastructure path (exact path, directory with or without a trailing slash, or `*` wildcards). `plan` suggests the priority label for a change that touches only these paths; the queue never applies the label itself. Repeatable. |
 | `--regen-path PATTERN` | none | A generated file (exact path, directory with or without a trailing slash, or `*` wildcards) whose conflicts the queue settles on the target's side and then regenerates, instead of holding the change. Repeatable. See "Generated files". |
@@ -239,10 +240,10 @@ sync listing it with an approval at its new head re-queues it.
 Priorities come from labels such as `p10` or `priority-10`, the landing planner's convention;
 lower lands first, and the default is 100. A pull request carrying the priority label
 (`mq-priority` unless `init --priority-label` names another) becomes a priority change; adding or
-removing the label resubmits it (see "Priority changes"). When `--close-prs` is set, `sync` also retries closes
+removing the label resubmits it (see "Priority changes"). Likewise, a pull request carrying the exact label (`init --exact-label` names it; off unless set) is submitted exact, and adding or removing that label resubmits it. When `--close-prs` is set, `sync` also retries closes
 that were postponed. Exit status is 1 if any submission was refused.
 
-Ready-file lines look like `PR [SHA] [head=REF] [priority=N] [after=N,N] [solo] [prioritized] [by=NAME] [notify=NAME]`, and
+Ready-file lines look like `PR [SHA] [head=REF] [priority=N] [after=N,N] [solo] [prioritized] [exact] [by=NAME] [notify=NAME]`, and
 `#` starts a comment. Without `head=`, the head is `refs/pull/PR/head`.
 
 ### `merge-queue withdraw PR`
@@ -973,7 +974,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `stack_min_pass_percent` | `0` | Build on the stack top only when the recent pass rate (green share of the last 20 decided validations) is at least this percent; below it, build a root on the base when `roots` allows. `0` always stacks. Set it with `init --stack-min-pass-percent`. |
 | `batch_min_pass_percent` | `0` | Build batches wider than one change only when the recent pass rate is at least this percent; below it, batches are one change wide whatever `max_batch` says. `0` always allows width. Set it with `init --batch-min-pass-percent`. |
 | `union_paths` | `[]` | Attribute patterns merged with Git's union driver (see "Union merges"). |
-| `priority` | absent | `{label, ci_paths}`: the priority label (absent or empty: `mq-priority`; `-`: off) and the CI path patterns for label suggestions. Left out of the file while both are defaults. See "Priority changes". |
+| `priority` | absent | `{label, ci_paths, exact_label}`: the priority label (absent or empty: `mq-priority`; `-`: off), the CI path patterns for label suggestions, and the exact label (absent, empty or `-`: off). Left out of the file while both are defaults. See "Priority changes". |
 | `regenerate` | empty | `{paths, command, when}`; see "Generated files". |
 | `generated_paths` | `[]` | Top-level spelling of `regenerate.paths` (globs naming the derived files); merged into `regenerate.paths` on load. Left out of the file while empty. |
 | `exact_sha` | `false` | The exact-commit rule. |
@@ -2084,7 +2085,7 @@ validations exist, otherwise `null`.
 A change that repairs the CI or validation infrastructure unblocks everything behind it, so it
 should not wait its turn. Mark it as a priority change: give the pull request the priority label
 (`mq-priority` by default; `init --priority-label` names another, and `sync` matches it without
-regard to case), submit it with `--prioritized`, or add `prioritized` to its ready-file line.
+regard to case), submit it with `--prioritized`, or add `prioritized` to its ready-file line. Exactness works the same way: give the pull request the exact label set by `init --exact-label`, submit with `--exact`, or add `exact` to its ready-file line.
 
 - **Planned first.** A priority change, and any change it must land after, ranks ahead of all
   other work, whatever their numeric priorities. It also wins a conflict with an ordinary change.

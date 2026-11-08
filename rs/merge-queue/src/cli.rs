@@ -941,6 +941,12 @@ enum Command {
         /// its own exact green). Compared without regard to case; `-` turns it off.
         #[arg(long, value_name = "LABEL", default_value = crate::state::DEFAULT_PRIORITY_LABEL)]
         priority_label: String,
+        /// Label that makes `sync` submit a pull request exact (the submitted
+        /// commit, two parents intact, fast-forward only, like
+        /// `submit --exact`). Compared without regard to case; empty (the
+        /// default) or `-` turns it off.
+        #[arg(long, value_name = "LABEL", default_value = "")]
+        exact_label: String,
         /// Path pattern of CI or validation infrastructure (exact path, directory, or `*`
         /// wildcards). `plan` suggests the priority label for a change touching only these
         /// paths; the queue never applies it. Repeatable.
@@ -1988,6 +1994,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             max_depth,
             union_path,
             priority_label,
+            exact_label,
             ci_path,
             classifier_policy,
             regen_path,
@@ -2105,6 +2112,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                         priority_label
                     },
                     ci_paths: ci_path,
+                    exact_label,
                 },
                 classifier: crate::state::ClassifierConfig {
                     policy: classifier_policy,

@@ -311,6 +311,62 @@ fn a_ready_file_needs_no_api_call() {
 }
 
 #[test]
+fn a_ready_file_can_mark_a_change_exact() {
+    let fx = Fixture::new("sync-file-exact");
+    fx.mq_ok(&["init"]);
+    fx.branch("a", &[("a", "a\n")]);
+    fx.branch("b", &[("b", "b\n")]);
+    let file = fx.root.join("ready.txt");
+    std::fs::write(&file, "# lanes append here\n1 head=a\n2 head=b exact\n").unwrap();
+    let out = fx.mq_ok(&["sync", "--file", file.to_str().unwrap(), "--json"]);
+    let r: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(r["submitted"], serde_json::json!([1, 2]));
+    let all = items(&fx);
+    assert_eq!(item(&all, 2)["exact"], true);
+    assert!(item(&all, 1).get("exact").is_none());
+}
+
+#[test]
+fn the_configured_exact_label_marks_a_change_exact_and_resubmits_on_change() {
+    let fx = Fixture::new("sync-exact-label");
+    let gh = stub(&fx);
+    fx.mq_ok(&[
+        "init",
+        "--github-repo",
+        "owner/name",
+        "--gh",
+        &gh.stub,
+        "--exact-label",
+        "mq-exact",
+    ]);
+    let config = std::fs::read_to_string(fx.queue().join(".git/merge-queue/config.json")).unwrap();
+    assert!(config.contains("\"mq-exact\""), "{config}");
+    let h1 = pull_request(&fx, 1, &[("one", "1\n")]);
+    let h2 = pull_request(&fx, 2, &[("two", "2\n")]);
+    std::fs::write(
+        &gh.list,
+        listing(&[(1, &h1, false, &["MQ-Exact"]), (2, &h2, false, &["ready"])]),
+    )
+    .unwrap();
+    sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
+    let all = items(&fx);
+    assert_eq!(item(&all, 1)["exact"], true);
+    assert!(item(&all, 2).get("exact").is_none());
+    // Adding the label to an unchanged head resubmits it as exact.
+    std::fs::write(
+        &gh.list,
+        listing(&[
+            (1, &h1, false, &["MQ-Exact"]),
+            (2, &h2, false, &["mq-exact"]),
+        ]),
+    )
+    .unwrap();
+    let r = sync_json(&fx, &gh, &["--all-open", "--limit", "100"]);
+    assert_eq!(r["submitted"], serde_json::json!([2]));
+    assert_eq!(item(&items(&fx), 2)["exact"], true);
+}
+
+#[test]
 fn the_configured_priority_label_puts_a_change_at_the_front_and_resubmits_on_change() {
     let fx = Fixture::new("sync-priority-label");
     let gh = stub(&fx);
