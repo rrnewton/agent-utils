@@ -53719,6 +53719,7 @@ def prepare_current_incomplete_frozen_checkout(
     *,
     nested: bool = False,
     schema_version: int = 5,
+    unpushed_target: bool = False,
 ) -> tuple[Path, Path, Path, Path, Path]:
     project, repository, _remote = make_project(tmp_path, cache_globs=("ignored",))
     (repository / ".gitignore").write_text("ignored/\n", encoding="utf-8")
@@ -53727,6 +53728,9 @@ def prepare_current_incomplete_frozen_checkout(
     if nested:
         add_recursive_submodules(tmp_path, project, repository)
     commit_validation_removal_schema(repository, schema_version=schema_version)
+    if unpushed_target:
+        # The run's target exists only locally, as a candidate commit can.
+        git(repository, "commit", "--allow-empty", "-m", "local-only validation target")
     checkout, record, target = prepare_frozen_validation_checkout(
         project, repository, monkeypatch=monkeypatch, name="current-incomplete"
     )
@@ -54054,6 +54058,250 @@ def test_reclaimable_ignored_paths_load_in_order(tmp_path: Path) -> None:
     assert wrkslots._load_config(str(project), None).reclaimable_ignored_paths == (
         "ignored/b/target", "ignored/**/out",
     )
+
+
+def run_frozen_release(
+    project: Path, source: Path, checkout: Path, record: Path, *extra: str,
+    reason: str = "the result was lost to a fixed parser defect",
+) -> int:
+    return wrkslots.main([
+        "--project-root", str(project), "release-frozen-incomplete",
+        "--coordinator-authorized", "--coordinator-pid", str(os.getpid()),
+        "--frozen-validate-checkout", str(checkout),
+        "--completed-record", record.relative_to(project).as_posix(),
+        "--repository", source.relative_to(project).as_posix(),
+        "--reason", reason, "--format", "json", *extra,
+    ])
+
+
+def frozen_release_events(project: Path) -> list[Mapping[str, object]]:
+    config = wrkslots._load_config(str(project), "testhost")
+    return [
+        event for event in wrkslots._load_events(config)
+        if event["kind"] == "ownerless-validate-path-removed"
+    ]
+
+
+def frozen_release_notes(project: Path) -> list[Path]:
+    return sorted((control_directory(project) / "wrkslots-salvage" / "frozen-releases").glob("*.md"))
+
+
+def assert_frozen_release_event(
+    project: Path, *, reason: str, salvaged: list[str]
+) -> Mapping[str, object]:
+    events = frozen_release_events(project)
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert isinstance(payload, dict)
+    release = payload["authorization"]["evidence"]["operator_release"]
+    assert release["reason"] == reason
+    assert release["operator"]["uid"] == os.getuid()
+    assert release["operator"]["coordinator_pid"] == os.getpid()
+    assert [item["repository"] for item in release["salvage"]] == salvaged
+    assert isinstance(release, dict)
+    return release
+
+
+@pytest.mark.ordinary_environment
+def test_release_frozen_incomplete_dry_run_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, source, checkout, record, _sidecar = prepare_current_incomplete_frozen_checkout(
+        tmp_path, monkeypatch, unpushed_target=True
+    )
+    before = git_metadata_snapshot(checkout)
+    assert run_frozen_release(project, source, checkout, record) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["action"] == "dry-run"
+    assert plan["target"] == git(checkout, "rev-parse", "HEAD").stdout.strip()
+    assert plan["repositories"] == [{"repository": ".", "head": plan["target"], "on_remote": False}]
+    assert plan["bytes"] > 0 and plan["files"] > 0
+    assert plan["release_id"] is None and plan["salvage"] == []
+    assert git_metadata_snapshot(checkout) == before
+    assert frozen_release_events(project) == []
+    assert frozen_release_notes(project) == []
+    assert not (control_directory(project) / "wrkslots-salvage").exists()
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("unpushed", (False, True))
+def test_release_frozen_incomplete_removes_after_salvage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], unpushed: bool,
+) -> None:
+    project, source, checkout, record, _sidecar = prepare_current_incomplete_frozen_checkout(
+        tmp_path, monkeypatch, unpushed_target=unpushed
+    )
+    target = git(checkout, "rev-parse", "HEAD").stdout.strip()
+    reason = "the result was lost to a fixed parser defect"
+    assert run_frozen_release(project, source, checkout, record, "--yes", reason=reason) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["action"] == "released"
+    assert not checkout.exists()
+    assert record.is_file()
+    release = assert_frozen_release_event(project, reason=reason, salvaged=["."] if unpushed else [])
+    notes = frozen_release_notes(project)
+    assert [note.name for note in notes] == [f"{release['release_id']}.md"]
+    text = notes[0].read_text()
+    assert f"- Reason: {reason}" in text and "- Outcome: removed at " in text
+    if unpushed:
+        salvage = release["salvage"]
+        assert isinstance(salvage, list) and isinstance(salvage[0], dict)
+        bundle = Path(salvage[0]["bundle"])
+        assert bundle.is_file() and Path(salvage[0]["receipt"]).is_file()
+        restored = tmp_path / "restored.git"
+        subprocess.run(["git", "clone", "--bare", str(bundle), str(restored)], check=True, capture_output=True)
+        assert subprocess.run(
+            ["git", "--git-dir", str(restored), "cat-file", "-t", target],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip() == "commit"
+        assert str(bundle) in text
+    else:
+        assert "none needed" in text
+    assert not wrkslots._journal_path(wrkslots._load_config(str(project), "testhost")).exists()
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize(
+    "mutation",
+    ("blank-reason", "live-process", "open-file", "live-mount", "dirty", "live-generation", "no-result-shape"),
+)
+def test_release_frozen_incomplete_refusals_preserve_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], mutation: str,
+) -> None:
+    project, source, checkout, record, _sidecar = prepare_current_incomplete_frozen_checkout(
+        tmp_path, monkeypatch, unpushed_target=True
+    )
+    reason = "the result was lost to a fixed parser defect"
+    expected = "classifies as" if mutation == "no-result-shape" else ""
+    if mutation == "blank-reason":
+        reason = "   "
+        expected = "requires --reason"
+    elif mutation in {"live-process", "open-file", "live-mount"}:
+        kind = {"live-process": "cwd", "open-file": "fd", "live-mount": "mount"}[mutation]
+        expected = f"live process {os.getpid()} uses slot"
+        stub_validate_batch_censuses(
+            monkeypatch,
+            lambda _paths: wrkslots._ProcessPathCensus((), ((os.getpid(), str(checkout), kind, str(checkout)),)),
+        )
+    elif mutation == "dirty":
+        (checkout / "notes.txt").write_text("authored investigation\n")
+        expected = "notes.txt"
+    else:
+        value = dict(wrkslots._strict_json_object(record.read_bytes(), "fixture record"))
+        if mutation == "live-generation":
+            expected = "process state is live or uncertain"
+            identity = wrkslots._read_process_identity(os.getpid())
+            value["process_identity"] = {"pid": identity.pid, "start_ticks": identity.start_ticks, "boot_id": identity.boot_id}
+        else:
+            value["executed_nodes"] = 3
+        record.write_text(json.dumps(value, sort_keys=True) + "\n")
+    before = git_metadata_snapshot(checkout)
+    assert run_frozen_release(project, source, checkout, record, "--yes", reason=reason) == 3
+    assert expected in capsys.readouterr().err
+    assert checkout.is_dir()
+    assert git_metadata_snapshot(checkout) == before
+    assert frozen_release_events(project) == []
+    assert frozen_release_notes(project) == []
+    assert not wrkslots._journal_path(wrkslots._load_config(str(project), "testhost")).exists()
+
+
+@pytest.mark.ordinary_environment
+def test_release_frozen_incomplete_with_submodules_on_their_remotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Submodule HEADs held by their own remote-tracking refs need no bundle.
+    project, source, checkout, record, _sidecar = prepare_current_incomplete_frozen_checkout(
+        tmp_path, monkeypatch, nested=True
+    )
+    assert run_frozen_release(project, source, checkout, record) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert [(row["repository"], row["on_remote"]) for row in plan["repositories"]] == [
+        (".", True), ("component", True), ("component/leaf", True),
+    ]
+    assert run_frozen_release(project, source, checkout, record, "--yes") == 0
+    capsys.readouterr()
+    assert not checkout.exists()
+    assert_frozen_release_event(project, reason="the result was lost to a fixed parser defect", salvaged=[])
+
+
+def test_release_frozen_incomplete_requires_reason(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    with pytest.raises(SystemExit) as caught:
+        wrkslots.main([
+            "--project-root", str(project), "release-frozen-incomplete",
+            "--coordinator-authorized", "--coordinator-pid", str(os.getpid()),
+            "--frozen-validate-checkout", str(tmp_path / "frozen"),
+            "--completed-record", "ignored/validate/runs/validate-x.json",
+            "--repository", "repo",
+        ])
+    assert caught.value.code == 2
+    assert "--reason" in capsys.readouterr().err
+
+
+@pytest.mark.ordinary_environment
+def test_release_frozen_incomplete_refuses_a_recorded_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    checkout, record, _frozen, _target = prepare_result_recorded_frozen_checkout(
+        project, repository, monkeypatch=monkeypatch, name="released"
+    )
+    assert run_frozen_release(project, repository, checkout, record, "--yes") == 3
+    assert "recover-ownerless-validate-batch removes it" in capsys.readouterr().err
+    assert checkout.is_dir()
+    assert frozen_release_events(project) == []
+    assert frozen_release_notes(project) == []
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize(
+    "boundary",
+    ("after-ownerless-validate-journal", "after-ownerless-validate-remove", "tampered-bundle"),
+)
+def test_release_frozen_incomplete_resumes_from_its_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], boundary: str,
+) -> None:
+    project, source, checkout, record, _sidecar = prepare_current_incomplete_frozen_checkout(
+        tmp_path, monkeypatch, unpushed_target=True
+    )
+    stop_at = "after-ownerless-validate-journal" if boundary == "tampered-bundle" else boundary
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == stop_at:
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_frozen_release(project, source, checkout, record, "--yes")
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    capsys.readouterr()
+    journal = wrkslots._journal_path(wrkslots._load_config(str(project), "testhost"))
+    release = json.loads(journal.read_text())["authorization"]["evidence"]["operator_release"]
+    assert [item["repository"] for item in release["salvage"]] == ["."]
+    assert "authorized; removal is journaled" in frozen_release_notes(project)[0].read_text()
+    if boundary == "tampered-bundle":
+        bundle = Path(release["salvage"][0]["bundle"])
+        bundle.chmod(0o644)
+        with bundle.open("ab") as stream:
+            stream.write(b"tampered")
+    resumed = wrkslots.main(["--project-root", str(project), "recover", "--coordinator-pid", str(os.getpid())])
+    if boundary == "tampered-bundle":
+        assert resumed == 3
+        assert "salvage bundle changed" in capsys.readouterr().err
+        assert checkout.is_dir() and journal.is_file()
+        assert frozen_release_events(project) == []
+        return
+    assert resumed == 0
+    assert not checkout.exists() and not journal.exists()
+    assert_frozen_release_event(project, reason="the result was lost to a fixed parser defect", salvaged=["."])
 
 
 @pytest.mark.ordinary_environment

@@ -22,6 +22,7 @@ import json
 import math
 import mmap
 import os
+import pwd
 import re
 import resource
 import selectors
@@ -21985,7 +21986,9 @@ def _archive_salvage_locally(
         archive_reason = (
             "remote-not-allowed" if remote_failure is None else "remote-refused"
         )
-    if archive_reason == _CHECKOUT_DRIFT_ARCHIVE_REASON:
+    if archive_reason == _FROZEN_RELEASE_ARCHIVE_REASON:
+        reason = f"commit {facts.commit} is not on remote {checkout.remote}"
+    elif archive_reason == _CHECKOUT_DRIFT_ARCHIVE_REASON:
         reason = (
             "the checkout differs from its recorded branch or remote"
             if drift is not None
@@ -49315,12 +49318,22 @@ def _terminal_validation_record(
     allow_historical_service_result: bool = False,
     frozen_removal_proof_supplied: bool | None = None,
     frozen_result: _FrozenResultEvidence | None = None,
+    operator_release: Mapping[str, object] | None = None,
 ) -> tuple[str, str, str | None]:
     if frozen_result is not None and (
         target_kind != "frozen-checkout" or frozen_removal_proof_supplied is not False
     ):
         raise StateError(
             "durable frozen result authority applies only to frozen cleanup without a proof"
+        )
+    if operator_release is not None and (
+        target_kind != "frozen-checkout"
+        or frozen_removal_proof_supplied is not False
+        or frozen_result is not None
+    ):
+        raise StateError(
+            "frozen operator release authority applies only to frozen cleanup without a "
+            "proof or durable result"
         )
     relative, path = _relative_inside(config.root, raw, "terminal validation record")
     if Path(relative).parent != Path("ignored/validate/runs") or path.suffix != ".json":
@@ -49352,6 +49365,7 @@ def _terminal_validation_record(
         if (
             frozen_removal_proof_supplied is False
             and frozen_result is None
+            and operator_release is None
             and not (
                 type(record.get("service_result_schema")) is int
                 and record.get("service_result_schema") in {1, 2, 3}
@@ -49405,6 +49419,15 @@ def _terminal_validation_record(
         ):
             raise Refusal(
                 "durable frozen validation result changed after removal was authorized"
+            )
+        if operator_release is not None and not (
+            _current_incomplete_frozen_result(record)
+            and _validation_record_process_is_dead(record)
+        ):
+            raise Refusal(
+                "frozen operator release applies only to an inactive current incomplete "
+                "run; this run-record has a result or a live process, so preserve the "
+                "checkout and let recover-ownerless-validate-batch handle it"
             )
     if not _validation_record_is_terminal(
         record,
@@ -50302,6 +50325,425 @@ def _current_incomplete_frozen_retention(
     return _FrozenNoProofClassification(_FrozenNoProofDisposition.CURRENT_INCOMPLETE_RETAINED)
 
 
+#: Durable notes for operator releases of incomplete frozen checkouts, one per
+#: release, under the default local salvage area (a directory every edition
+#: already treats as storage rather than as a slot).
+_FROZEN_RELEASE_DIRECTORY = "frozen-releases"
+_FROZEN_RELEASE_REASON_LIMIT = 2000
+_FROZEN_RELEASE_ARCHIVE_REASON = "frozen-incomplete-operator-release"
+_FROZEN_RELEASE_KEYS = frozenset({"release_id", "reason", "operator", "note", "salvage"})
+_FROZEN_RELEASE_OPERATOR_KEYS = frozenset({"user", "uid", "coordinator_pid"})
+_FROZEN_RELEASE_SALVAGE_KEYS = frozenset(
+    {"repository", "commit", "bundle", "bundle_sha256", "bundle_bytes", "receipt"}
+)
+
+
+def _frozen_release_reason(raw: object) -> str:
+    """Require the operator's explanation before anything is read."""
+
+    reason = raw.strip() if isinstance(raw, str) else ""
+    if not reason:
+        raise Refusal(
+            "release-frozen-incomplete requires --reason saying why this checkout holds "
+            "nothing anyone needs; nothing was read or changed"
+        )
+    if len(reason) > _FROZEN_RELEASE_REASON_LIMIT or "\x00" in reason:
+        raise Refusal(
+            f"--reason must be at most {_FROZEN_RELEASE_REASON_LIMIT} characters "
+            "without NUL bytes"
+        )
+    return reason
+
+
+def _frozen_release_note_relative(release_id: str) -> str:
+    return f"{_LOCAL_SALVAGE_DIRECTORY}/{_FROZEN_RELEASE_DIRECTORY}/{release_id}.md"
+
+
+def _frozen_operator_release_from_obj(value: object) -> dict[str, object]:
+    """Decode the operator-release evidence bound into a removal journal."""
+
+    release = _as_mapping(value, "frozen operator release")
+    _exact_keys(release, set(_FROZEN_RELEASE_KEYS), set(), "frozen operator release")
+    release_id = _as_str(release["release_id"], "frozen operator release.release_id")
+    if not re.fullmatch(r"[0-9a-f]{32}", release_id):
+        raise StateError("frozen operator release id must be 32 lowercase hex digits")
+    reason = _as_str(release["reason"], "frozen operator release.reason")
+    if reason != reason.strip() or not reason or len(reason) > _FROZEN_RELEASE_REASON_LIMIT or "\x00" in reason:
+        raise StateError("frozen operator release reason is malformed")
+    operator = _as_mapping(release["operator"], "frozen operator release.operator")
+    _exact_keys(
+        operator, set(_FROZEN_RELEASE_OPERATOR_KEYS), set(), "frozen operator release.operator"
+    )
+    _as_str(operator["user"], "frozen operator release.operator.user")
+    _as_int(operator["uid"], "frozen operator release.operator.uid", minimum=0)
+    _as_int(
+        operator["coordinator_pid"], "frozen operator release.operator.coordinator_pid", minimum=1
+    )
+    if release["note"] != _frozen_release_note_relative(release_id):
+        raise StateError("frozen operator release note path does not match its id")
+    seen: set[str] = set()
+    for index, raw_item in enumerate(_as_list(release["salvage"], "frozen operator release.salvage")):
+        label = f"frozen operator release.salvage[{index}]"
+        item = _as_mapping(raw_item, label)
+        _exact_keys(item, set(_FROZEN_RELEASE_SALVAGE_KEYS), set(), label)
+        relative = _as_str(item["repository"], f"{label}.repository")
+        parts = PurePosixPath(relative).parts
+        if relative in seen or (
+            relative != "." and (not parts or PurePosixPath(relative).is_absolute() or ".." in parts)
+        ):
+            raise StateError(f"{label}.repository is not a distinct checkout-relative path")
+        seen.add(relative)
+        if not SHA_RE.fullmatch(_as_str(item["commit"], f"{label}.commit")):
+            raise StateError(f"{label}.commit is not a full commit id")
+        for field in ("bundle", "receipt"):
+            if not Path(_as_str(item[field], f"{label}.{field}")).is_absolute():
+                raise StateError(f"{label}.{field} must be absolute")
+        if not re.fullmatch(r"[0-9a-f]{64}", _as_str(item["bundle_sha256"], f"{label}.bundle_sha256")):
+            raise StateError(f"{label}.bundle_sha256 is not a SHA-256 digest")
+        _as_int(item["bundle_bytes"], f"{label}.bundle_bytes", minimum=1)
+    return dict(release)
+
+
+def _frozen_release_requires_remote_containment(release: Mapping[str, object]) -> bool:
+    """A salvaged clone HEAD stands in for remote containment of that HEAD."""
+
+    salvage = _as_list(release["salvage"], "frozen operator release.salvage")
+    return not any(
+        _as_mapping(item, "frozen operator release salvage").get("repository") == "."
+        for item in salvage
+    )
+
+
+def _recheck_frozen_release_salvage(release: Mapping[str, object]) -> None:
+    for raw_item in _as_list(release["salvage"], "frozen operator release.salvage"):
+        item = _as_mapping(raw_item, "frozen operator release salvage")
+        bundle = Path(_as_str(item["bundle"], "frozen operator release salvage bundle"))
+        observed = _sha256_regular_file(bundle, "frozen release salvage bundle")
+        if observed != (item["bundle_sha256"], item["bundle_bytes"]):
+            raise Refusal(
+                f"frozen release salvage bundle changed after the release was authorized: "
+                f"{bundle}; preserve the checkout"
+            )
+
+
+@dataclasses.dataclass(frozen=True)
+class _FrozenReleasePlan:
+    """What one operator release would remove and what it must salvage first."""
+
+    checkout: Path
+    record: str
+    record_sha256: str
+    target: str
+    bytes: int | None
+    files: int | None
+    #: (checkout-relative repository, HEAD, whether a remote already holds HEAD)
+    repositories: tuple[tuple[str, str, bool], ...]
+
+
+def _tree_usage(path: Path) -> tuple[int | None, int | None]:
+    """Disk bytes and non-directory entries below ``path``, without following links."""
+
+    total = 0
+    files = 0
+    stack = [path]
+    try:
+        while stack:
+            with os.scandir(stack.pop()) as entries:
+                for entry in entries:
+                    info = entry.stat(follow_symlinks=False)
+                    total += info.st_blocks * 512
+                    if stat.S_ISDIR(info.st_mode):
+                        stack.append(Path(entry.path))
+                    else:
+                        files += 1
+    except OSError:
+        return None, None
+    return total, files
+
+
+def _frozen_release_classify(
+    config: Config,
+    args: argparse.Namespace,
+    processes: tuple[ProcessIdentity, ProcessIdentity, ProcessIdentity | None, int | None],
+) -> tuple[Path, _OwnerlessValidationBatchContext]:
+    """Prove one checkout is an exact, inactive, pristine current incomplete run.
+
+    This is the #1088 retention proof that recover-ownerless-validate-batch
+    applies before keeping such a checkout, run under its own fresh census
+    budget. Anything else refuses here and is left untouched.
+    """
+
+    coordinator, runner, handoff_writer, proof_fd = processes
+    with _mutation_locks(config, args.wait_lock):
+        _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
+        if _outstanding_journals(config) or _validate_batch_seal_journals(config):
+            raise Refusal(
+                "an interrupted mutation is already recorded; recover it before releasing "
+                "a frozen validation checkout"
+            )
+        _relative, target, _allowed = _validation_recovery_target(
+            config, args.frozen_validate_checkout, "frozen-checkout"
+        )
+        identity = _private_cleanup_path_identity(
+            config, target, allowed_modes={0o700},
+            managed_root=_frozen_validation_directory(config),
+        )
+    budget = _ReadOnlyCommandBudget.start(
+        timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
+        stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
+        stderr_limit=64 * 1024,
+        input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+    )
+    census = _capture_lsof_process_path_census([target], budget=budget)
+    budget.remaining_seconds()
+    batch = _OwnerlessValidationBatchContext({identity: target}, census, budget)
+    census.assert_slot_unused(target, None, ignore_current_process=False)
+    classification = _frozen_no_proof_disposition(
+        config, target, args.completed_record, args.repository, batch_cleanup=batch
+    )
+    disposition = classification.disposition
+    if disposition is _FrozenNoProofDisposition.CURRENT_TERMINAL_REMOVABLE:
+        raise Refusal(
+            "frozen validation checkout has a recorded result; "
+            "recover-ownerless-validate-batch removes it, not an operator release"
+        )
+    if disposition is not _FrozenNoProofDisposition.CURRENT_INCOMPLETE_RETAINED:
+        detail = f": {classification.detail}" if classification.detail else ""
+        raise Refusal(
+            "operator release applies only to a current incomplete frozen validation "
+            f"checkout; this one classifies as {disposition.value}{detail}; preserve it"
+        )
+    return target, batch
+
+
+def _frozen_release_plan(
+    config: Config, checkout: Path, raw_record: str, raw_repository: str
+) -> _FrozenReleasePlan:
+    """Measure the checkout and decide which HEADs no remote holds yet.
+
+    The clone's HEAD is looked up on the configured remote through the source
+    repository, as removal itself does. Initialized submodule HEADs are looked
+    up in the clone's own remote-tracking refs, without a network fetch.
+    """
+
+    record_relative, record_path = _validation_run_record_argument(config, raw_record)
+    record_sha256, _size = _sha256_regular_file(record_path, "frozen validation run-record")
+    _stored, repository = _repository_path(config, raw_repository, allow_managed=True)
+    vcs = _GitVcs()
+    remote = config.default_remote
+    target = vcs.head(checkout)
+    authority = vcs.remote_authority(repository, remote)
+    if authority.sha256 != vcs.remote_url_sha256(checkout, remote):
+        raise Refusal(
+            "frozen validation checkout remote differs from its source checkout; preserve both"
+        )
+    vcs.fetch_remote(repository, remote, _landed_ref_for_remote(config, remote), authority)
+    vcs.assert_remote_authority(repository, remote, authority)
+    repositories = [(".", target, bool(vcs.remote_refs_containing(repository, remote, target)))]
+    for relative in sorted(vcs.initialized_submodules(checkout)):
+        child = checkout / relative
+        head = vcs.head(child)
+        holders = vcs._run(
+            child, ["for-each-ref", "--format=%(refname)", "--contains", head, "refs/remotes/"]
+        ).stdout.split()
+        repositories.append((relative, head, bool(holders)))
+    usage, files = _tree_usage(checkout)
+    return _FrozenReleasePlan(
+        checkout, record_relative, record_sha256, target, usage, files, tuple(repositories)
+    )
+
+
+def _frozen_release_salvage(
+    config: Config, plan: _FrozenReleasePlan
+) -> list[dict[str, object]]:
+    """Bundle, verify and receipt every HEAD that no remote holds."""
+
+    vcs = _GitVcs()
+    remote = config.default_remote
+    salvaged: list[dict[str, object]] = []
+    for relative, head, on_remote in plan.repositories:
+        if on_remote:
+            continue
+        path = plan.checkout if relative == "." else plan.checkout / relative
+        authority = vcs.remote_authority(path, remote)
+        name = plan.checkout.name if relative == "." else f"{plan.checkout.name}/{relative}"
+        checkout = Checkout(
+            name=name, path=str(path), repository=relative, branch="", start_point=head,
+            remote=remote, remote_url_sha256=authority.sha256,
+            landed_ref=_landed_ref_for_remote(config, remote), head=head,
+        )
+        facts = _SalvageCandidate(
+            head=head, status_digest=hashlib.sha256(b"").hexdigest(), commit=head,
+            dirty=False, remote_authority=authority,
+        )
+        archived = _archive_salvage_locally(
+            config, config.machine, plan.checkout.name, None, checkout, path, facts,
+            config.control, None, vcs, archive_reason=_FROZEN_RELEASE_ARCHIVE_REASON,
+        )
+        salvaged.append({
+            "repository": relative,
+            "commit": head,
+            "bundle": archived["archive_bundle"],
+            "bundle_sha256": archived["archive_bundle_sha256"],
+            "bundle_bytes": archived["archive_bundle_bytes"],
+            "receipt": archived["archive_receipt"],
+        })
+    return salvaged
+
+
+def _frozen_release_note_text(
+    release: Mapping[str, object], plan: _FrozenReleasePlan, outcome: str
+) -> str:
+    operator = _as_mapping(release["operator"], "frozen operator release.operator")
+    lines = [
+        f"# Frozen validation checkout release {release['release_id']}",
+        "",
+        f"- Recorded: {_utc_now()}",
+        f"- Operator: {operator['user']} (uid {operator['uid']}), "
+        f"coordinator PID {operator['coordinator_pid']}",
+        f"- Reason: {release['reason']}",
+        f"- Checkout: {plan.checkout}",
+        f"- Run record: {plan.record} (sha256 {plan.record_sha256})",
+        f"- Target: {plan.target}",
+        f"- Size: {plan.bytes} bytes in {plan.files} files",
+        "- Salvage:",
+    ]
+    salvage = _as_list(release["salvage"], "frozen operator release.salvage")
+    if not salvage:
+        lines.append("  - none needed: every HEAD is already on a remote")
+    for raw_item in salvage:
+        item = _as_mapping(raw_item, "frozen operator release salvage")
+        lines.append(
+            f"  - {item['repository']} {item['commit']}: bundle {item['bundle']} "
+            f"(sha256 {item['bundle_sha256']}, {item['bundle_bytes']} bytes), "
+            f"receipt {item['receipt']}"
+        )
+    lines += [
+        f"- Outcome: {outcome}",
+        "",
+        "The ownerless-validate-path-removed event in the operation log carries the same "
+        "release id, reason and operator.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _write_frozen_release_note(
+    config: Config, release: Mapping[str, object], plan: _FrozenReleasePlan, outcome: str
+) -> Path:
+    note = config.control / _as_str(release["note"], "frozen operator release.note")
+    _prepare_local_salvage_directory(config.control, note.parent)
+    _atomic_write_bytes(note, _frozen_release_note_text(release, plan, outcome).encode("utf-8"))
+    return note
+
+
+def _frozen_release_payload(
+    plan: _FrozenReleasePlan,
+    *,
+    action: str,
+    reason: str,
+    release: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "schema": 1,
+        "action": action,
+        "checkout": str(plan.checkout),
+        "record": plan.record,
+        "record_sha256": plan.record_sha256,
+        "target": plan.target,
+        "bytes": plan.bytes,
+        "files": plan.files,
+        "reason": reason,
+        "repositories": [
+            {"repository": relative, "head": head, "on_remote": on_remote}
+            for relative, head, on_remote in plan.repositories
+        ],
+        "release_id": None if release is None else release["release_id"],
+        "note": None if release is None else release["note"],
+        "salvage": [] if release is None else list(_as_list(release["salvage"], "salvage")),
+    }
+
+
+def _cmd_release_frozen_incomplete(args: argparse.Namespace) -> int:
+    """Release one incomplete retained frozen checkout on an operator's word."""
+
+    reason = _frozen_release_reason(args.reason)
+    _require_coordinator_authorized(args, "frozen validation release")
+    config = _load_config(args.project_root, args.machine)
+    processes = _capture_remove_processes(args.coordinator_pid)
+    checkout, _batch = _frozen_release_classify(config, args, processes)
+    plan = _frozen_release_plan(config, checkout, args.completed_record, args.repository)
+    if not args.yes:
+        payload = _frozen_release_payload(plan, action="dry-run", reason=reason)
+        if args.format == "json":
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(f"DRY RUN: would release {plan.checkout} ({plan.bytes} bytes, {plan.files} files)")
+            print(f"  record={plan.record} target={plan.target}")
+            for relative, head, on_remote in plan.repositories:
+                action = "on remote" if on_remote else "would bundle"
+                print(f"  {relative} {head}: {action}")
+            print("nothing changed; rerun with --yes to salvage and remove")
+        return 0
+    try:
+        user = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        user = str(os.getuid())
+    release_id = uuid.uuid4().hex
+    release: dict[str, object] = {
+        "release_id": release_id,
+        "reason": reason,
+        "operator": {"user": user, "uid": os.getuid(), "coordinator_pid": args.coordinator_pid},
+        "note": _frozen_release_note_relative(release_id),
+        "salvage": _frozen_release_salvage(config, plan),
+    }
+    _frozen_operator_release_from_obj(release)
+    note = _write_frozen_release_note(
+        config, release, plan, "authorized; removal is journaled under this release id"
+    )
+    # Salvage can take minutes; prove the checkout again under a fresh census
+    # budget immediately before the journaled removal binds it.
+    _checkout, batch = _frozen_release_classify(config, args, processes)
+    item_args = argparse.Namespace(
+        project_root=args.project_root,
+        machine=args.machine,
+        wait_lock=args.wait_lock,
+        command="recover",
+        coordinator_pid=args.coordinator_pid,
+        coordinator_authorized=True,
+        discard_partial=False,
+        legacy_validate_checkout=None,
+        ownerless_validate_checkout=None,
+        ownerless_validate_cargo_home=None,
+        frozen_validate_checkout=args.frozen_validate_checkout,
+        completed_record=args.completed_record,
+        repository=args.repository,
+        validation_proof_manifest=None,
+        frozen_result=None,
+        operator_release=release,
+        recovery_note=None,
+        retry_running_hook=False,
+        abort_create=False,
+        abort_import=False,
+    )
+    try:
+        _cmd_recover(item_args, ownerless_batch_cleanup=batch, emit=False)
+    except (Refusal, StateError) as exc:
+        _write_frozen_release_note(config, release, plan, f"refused: {exc}")
+        raise
+    _write_frozen_release_note(config, release, plan, f"removed at {_utc_now()}")
+    payload = _frozen_release_payload(plan, action="released", reason=reason, release=release)
+    if args.format == "json":
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(f"released {plan.checkout} ({plan.bytes} bytes); note {note}")
+        for raw_item in _as_list(release["salvage"], "salvage"):
+            item = _as_mapping(raw_item, "salvage")
+            print(f"  salvaged {item['repository']} {item['commit']} -> {item['bundle']}")
+    return 0
+
+
 def _current_terminal_frozen_removal(
     config: Config,
     checkout: Path,
@@ -50994,6 +51436,25 @@ def _ownerless_validation_journal(
             "durable frozen result authority applies only to batch frozen cleanup "
             "without a proof"
         )
+    # Only release-frozen-incomplete supplies this, after its own retention
+    # proof and salvage; the recover command line has no way to name it.
+    operator_release: Mapping[str, object] | None = getattr(args, "operator_release", None)
+    if operator_release is not None:
+        if (
+            target_kind != "frozen-checkout"
+            or proof_manifest is not None
+            or batch_cleanup is None
+            or args.completed_record is None
+            or frozen_result is not None
+        ):
+            raise StateError(
+                "frozen operator release applies only to one frozen checkout without a "
+                "proof or durable result"
+            )
+        operator_release = _frozen_operator_release_from_obj(operator_release)
+        require_remote_containment = _frozen_release_requires_remote_containment(
+            operator_release
+        )
     record_path: str | None = None
     record_target: str | None = None
     if args.completed_record is not None:
@@ -51010,6 +51471,7 @@ def _ownerless_validation_journal(
                 else None
             ),
             frozen_result=frozen_result,
+            operator_release=operator_release,
         )
         evidence: Mapping[str, object] = {
             "kind": "terminal-record",
@@ -51023,6 +51485,8 @@ def _ownerless_validation_journal(
                 **evidence,
                 "frozen_result": _frozen_result_evidence_to_obj(frozen_result),
             }
+        if operator_release is not None:
+            evidence = {**evidence, "operator_release": dict(operator_release)}
         if args.recovery_note is not None:
             raise Refusal("--completed-record cannot be combined with --recovery-note")
     else:
@@ -51334,12 +51798,13 @@ def _ownerless_validation_inputs(
         raise StateError(f"unknown validation target kind {authorization.target_kind!r}")
     evidence = authorization.evidence
     kind = _as_str(evidence.get("kind"), "validation recovery evidence.kind")
+    require_remote_containment = True
     if kind == "terminal-record":
         _exact_keys(
             evidence,
             {"kind", "path", "sha256"},
             (
-                {"target", "frozen_result"}
+                {"target", "frozen_result", "operator_release"}
                 if authorization.target_kind == "frozen-checkout"
                 else set()
             ),
@@ -51355,6 +51820,19 @@ def _ownerless_validation_inputs(
         if frozen_result is not None and removal_proof is not None:
             raise StateError(
                 "frozen terminal evidence cannot combine a durable result and a proof"
+            )
+        operator_release = (
+            None
+            if "operator_release" not in evidence
+            else _frozen_operator_release_from_obj(evidence["operator_release"])
+        )
+        if operator_release is not None:
+            if frozen_result is not None or removal_proof is not None:
+                raise StateError(
+                    "frozen operator release cannot combine with a durable result or a proof"
+                )
+            require_remote_containment = _frozen_release_requires_remote_containment(
+                operator_release
             )
         if authorization.target_kind == "frozen-checkout":
             evidence_target = _as_str(
@@ -51392,7 +51870,10 @@ def _ownerless_validation_inputs(
                     else None
                 ),
                 frozen_result=frozen_result,
+                operator_release=operator_release,
             )
+            if operator_release is not None:
+                _recheck_frozen_release_salvage(operator_release)
     elif kind == "coordinator-determination":
         _exact_keys(
             evidence,
@@ -51428,6 +51909,7 @@ def _ownerless_validation_inputs(
                 batch_cleanup=batch_cleanup,
                 fresh_same_uid=fresh_same_uid,
                 standalone=authorization.target_kind == "frozen-checkout",
+                require_remote_containment=require_remote_containment,
                 live_use_recheck=live_use_recheck,
             )
         else:
@@ -52420,6 +52902,23 @@ def _recheck_excluded_validation_proof(
                 evidence["frozen_result"], target=authorization.head
             ),
         )
+        return
+    if proof is None and "operator_release" in evidence:
+        # An operator release authorizes this removal in place of a proof, so
+        # its run-record shape and salvage bundles are rebound the same way.
+        release = _frozen_operator_release_from_obj(evidence["operator_release"])
+        _terminal_validation_record(
+            config,
+            _as_str(evidence.get("path"), "terminal evidence.path"),
+            canonical_slot,
+            authorization.target_kind,
+            expected_digest=_as_str(evidence.get("sha256"), "terminal evidence.sha256"),
+            repository=repository,
+            expected_target=authorization.head,
+            frozen_removal_proof_supplied=False,
+            operator_release=release,
+        )
+        _recheck_frozen_release_salvage(release)
         return
     if proof is None:
         return
@@ -69177,6 +69676,98 @@ usage or audit gate unknown, 3 fail-closed refusal.
     recover_ownerless_batch.set_defaults(
         handler=_cmd_recover_ownerless_validate_batch
     )
+
+    release_frozen = subparsers.add_parser(
+        "release-frozen-incomplete",
+        help="release one incomplete retained frozen validation checkout on an operator's word",
+        description=(
+            "A frozen validation checkout whose run ended COULD_NOT_RUN with no result is "
+            "retained forever by recover-ownerless-validate-batch, because no result proves "
+            "it holds nothing. When an operator knows it does (for example, the result was "
+            "lost to a since-fixed defect), this command releases that ONE checkout. It "
+            "first applies the same proof the batch applies before retaining such a "
+            "checkout: an authenticated current incomplete run-record, a dead run process, "
+            "a pristine clone and submodules (reclaimable_ignored_paths applies), and no "
+            "process, open file or mount using it. A checkout with a recorded result "
+            "refuses (the batch removes those), as does any live reference. Without --yes "
+            "it only prints the plan: size, run-record digest, and which HEADs a remote "
+            "already holds. With --yes, every HEAD no remote holds (the clone's, checked "
+            "on its remote through --repository; each initialized submodule's, checked in "
+            "its own remote-tracking refs) is first saved as a verified local bundle under "
+            "<control>/wrkslots-salvage/, a note is written to "
+            "<control>/wrkslots-salvage/frozen-releases/<id>.md, and the checkout is "
+            "removed through the ordinary journaled ownerless validation removal. The "
+            "ownerless-validate-path-removed event records the reason, the operator and "
+            "the salvage. An interrupted release resumes with plain "
+            "`wrkslots recover --coordinator-pid PID`."
+        ),
+        epilog=(
+            "examples:\n"
+            "  # see what would be released\n"
+            "  wrkslots release-frozen-incomplete --coordinator-authorized \\\n"
+            "    --coordinator-pid \"$COORDINATOR_PID\" \\\n"
+            "    --frozen-validate-checkout /srv/.proj-frozen-validate/validate-fresh-abc \\\n"
+            "    --completed-record ignored/validate/runs/validate-abc.json \\\n"
+            "    --repository repo --reason \"result lost to a fixed parser defect\"\n"
+            "  # then release it\n"
+            "  wrkslots release-frozen-incomplete ... --yes"
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    release_frozen.add_argument(
+        "--frozen-validate-checkout",
+        required=True,
+        metavar="PATH",
+        help=(
+            "absolute standalone checkout directly below the exact sibling "
+            ".<project>-frozen-validate directory"
+        ),
+    )
+    release_frozen.add_argument(
+        "--completed-record",
+        required=True,
+        metavar="PATH",
+        help="the checkout's run-record, ignored/validate/runs/<unit>.json (project-relative)",
+    )
+    release_frozen.add_argument(
+        "--repository",
+        required=True,
+        metavar="PATH",
+        help="the run's source repository (project-relative); it must survive the removal",
+    )
+    release_frozen.add_argument(
+        "--reason",
+        required=True,
+        metavar="TEXT",
+        help=(
+            "why the checkout holds nothing anyone needs (required, non-blank, at most "
+            f"{_FROZEN_RELEASE_REASON_LIMIT} characters); recorded in the note and the event"
+        ),
+    )
+    release_frozen.add_argument(
+        "--yes",
+        action="store_true",
+        help="salvage and remove; without it the command is a dry run that changes nothing",
+    )
+    release_frozen.add_argument(
+        "--coordinator-authorized",
+        action="store_true",
+        help="required: the coordinator authorized this release",
+    )
+    release_frozen.add_argument(
+        "--coordinator-pid",
+        type=int,
+        required=True,
+        metavar="PID",
+        help="the live coordinator process recorded as the actor",
+    )
+    release_frozen.add_argument(
+        "--format",
+        choices=("human", "json"),
+        default="human",
+        help="output format (default: human)",
+    )
+    release_frozen.set_defaults(handler=_cmd_release_frozen_incomplete)
 
     recover = subparsers.add_parser(
         "recover",

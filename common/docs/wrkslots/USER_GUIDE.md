@@ -1606,6 +1606,47 @@ Absent or empty, the key changes nothing: any ignored file keeps the clone prese
 changes classification; the checkout stays on disk either way. Builds without the key refuse it as
 an unknown field, so upgrade every client that shares the configuration before adding it.
 
+### Release one incomplete retained frozen checkout
+
+A frozen checkout whose run ended COULD_NOT_RUN with no result stays on disk for good: the batch
+commands keep it, because nothing proves it holds no evidence. When an operator knows it holds none
+(say the result was lost to a defect that has since been fixed), release that one checkout:
+
+```sh
+wrkslots release-frozen-incomplete --coordinator-authorized \
+  --coordinator-pid "$COORDINATOR_PID" \
+  --frozen-validate-checkout /srv/.proj-frozen-validate/validate-fresh-abc \
+  --completed-record ignored/validate/runs/validate-abc.json \
+  --repository repo --reason "result lost to a fixed parser defect"
+```
+
+Without `--yes` the command only prints its plan: the checkout's size, the run-record digest, and,
+for the clone and each initialized submodule, whether a remote already holds its HEAD. Before
+printing anything it applies the same proof the batch uses to retain such a checkout: an
+authenticated current incomplete run-record, a dead run process, a pristine clone
+(`reclaimable_ignored_paths` applies), and no process, open file or mount using it. It refuses a
+checkout with a recorded result (`recover-ownerless-validate-batch` removes those), any live
+reference, and a blank `--reason`.
+
+With `--yes` it then:
+
+1. bundles every HEAD that no remote holds, verifies each bundle, and writes its receipt under
+   `<control>/wrkslots-salvage/`. It checks the clone's HEAD on the configured remote through
+   `--repository`, and each submodule's HEAD in that submodule's own remote-tracking refs;
+2. writes a note, `<control>/wrkslots-salvage/frozen-releases/<id>.md`, naming the operator, the
+   reason, the checkout, the run-record, the size and the salvage. The notes sit under the salvage
+   area, not in a new directory of their own beside it: in the nested layout the control directory
+   is also the slots directory, so any unknown directory there reads as an unregistered slot,
+   including to builds older than this command. Every build already treats `wrkslots-salvage` as
+   storage;
+3. proves the checkout again and removes it through the ordinary journaled ownerless validation
+   removal. The `ownerless-validate-path-removed` event in the operation log records the release
+   id, the reason, the operator and the salvage. The note's outcome line then says when it was
+   removed.
+
+An interrupted release resumes with plain `wrkslots recover --coordinator-pid PID`, which checks
+the run-record and every salvage bundle again before it goes on. The run-record itself is kept.
+
 ## Recover registered validation rows with absent storage
 
 If external cleanup removed disposable validation directories without retiring their ACTIVE rows,
