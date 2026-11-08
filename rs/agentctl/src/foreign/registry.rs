@@ -411,6 +411,80 @@ fn python_repr(value: &str) -> String {
 /// A process ID paired with its kernel start time and boot identity.
 pub type RunnerIdentity = ProcessIdentity;
 
+/// A durable queued turn with sequence, prompt, model, reasoning effort,
+/// and enqueue time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    /// Turn sequence number.
+    pub seq: i64,
+    /// Prompt text.
+    pub text: String,
+    /// Per-turn model override.
+    pub model: Option<String>,
+    /// Enqueue timestamp.
+    pub queued_at: String,
+    /// Per-turn reasoning effort override.
+    pub effort: Option<String>,
+}
+
+impl Message {
+    /// Load a queued turn, accepting records that omit optional model and
+    /// effort overrides (Python `Message.from_dict` shape).
+    pub fn from_dict(row: &Map<String, Value>) -> Result<Self, ForeignOwnershipError> {
+        let required = ["seq", "text", "queued_at"]
+            .into_iter()
+            .filter(|field| !row.contains_key(*field))
+            .collect::<Vec<_>>();
+        if !required.is_empty() {
+            return Err(registry_invalid(format!(
+                "queued turn missing keys: [{}]",
+                required
+                    .iter()
+                    .map(|field| python_repr(field))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        Ok(Self {
+            seq: required_int(row, "seq")?,
+            text: required_string(row, "text")?,
+            model: optional_string(row, "model")?,
+            queued_at: required_string(row, "queued_at")?,
+            effort: optional_string(row, "effort")?,
+        })
+    }
+
+    /// Read a queued turn from its message file.
+    pub fn from_path(path: &Path) -> Result<Self, ForeignOwnershipError> {
+        let bytes =
+            std::fs::read(path).map_err(|error| registry_io("read queued turn", path, &error))?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            registry_invalid(format!(
+                "queued turn {} is not valid JSON: {error}",
+                path.display()
+            ))
+        })?;
+        let Some(row) = value.as_object() else {
+            return Err(registry_invalid(format!(
+                "queued turn {} must contain a JSON object",
+                path.display()
+            )));
+        };
+        Self::from_dict(row)
+    }
+
+    /// Serialize as written to the inbox (all keys, optionals as null).
+    pub fn to_dict(&self) -> Value {
+        serde_json::json!({
+            "seq": self.seq,
+            "text": self.text,
+            "model": self.model,
+            "queued_at": self.queued_at,
+            "effort": self.effort,
+        })
+    }
+}
+
 /// One row of the registry (one live agent).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentRecord {
@@ -1751,6 +1825,23 @@ mod tests {
         child.wait().unwrap();
         assert!(!terminate_active_harness_at(&base, Path::new("/proc"), &record).unwrap());
         assert!(!path.exists(), "stale legacy record is removed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn message_round_trips_with_omitted_optionals() {
+        let base = fake_base("message");
+        let path = base.join("000000000007.json");
+        std::fs::write(
+            &path,
+            "{\"seq\": 7, \"text\": \"hello\", \"queued_at\": \"2026-11-07T00:00:00-05:00\"}\n",
+        )
+        .unwrap();
+        let msg = Message::from_path(&path).unwrap();
+        assert_eq!(msg.seq, 7);
+        assert_eq!(msg.model, None);
+        assert_eq!(msg.effort, None);
+        assert_eq!(msg.to_dict()["text"], json!("hello"));
         let _ = std::fs::remove_dir_all(&base);
     }
 

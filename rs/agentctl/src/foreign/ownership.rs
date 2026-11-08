@@ -13,10 +13,12 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -389,7 +391,10 @@ fn fd_readable(descriptor: &OwnedFd, timeout: Option<Duration>) -> bool {
             None => -1,
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX)
+                // Round up so a sub-millisecond remainder still waits out
+                // the deadline instead of polling with a zero timeout.
+                let ceil_millis = remaining.as_nanos().div_ceil(1_000_000);
+                i32::try_from(ceil_millis).unwrap_or(i32::MAX)
             }
         };
         let mut poll = libc::pollfd {
@@ -403,7 +408,10 @@ fn fd_readable(descriptor: &OwnedFd, timeout: Option<Duration>) -> bool {
             return poll.revents != 0;
         }
         if result == 0 {
-            return false;
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return false;
+            }
+            continue;
         }
         if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             return false;
@@ -436,6 +444,16 @@ impl PinnedProcess {
     /// The open pidfd.
     pub fn descriptor(&self) -> &OwnedFd {
         &self.descriptor
+    }
+
+    /// Duplicate this pin (a second pidfd for the same exact process), for a
+    /// watchdog thread that must signal while another thread waits.
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            pid: self.pid,
+            starttime: self.starttime,
+            descriptor: self.descriptor.try_clone()?,
+        })
     }
 
     /// True once the process has exited (it may still await its parent's reap).
@@ -484,7 +502,17 @@ impl PinnedProcess {
 pub struct ChildHandle {
     pid: i64,
     starttime: u64,
-    reaped: Box<dyn Fn() -> bool + Send + Sync>,
+    reaped: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl Clone for ChildHandle {
+    fn clone(&self) -> Self {
+        Self {
+            pid: self.pid,
+            starttime: self.starttime,
+            reaped: std::sync::Arc::clone(&self.reaped),
+        }
+    }
 }
 
 impl fmt::Debug for ChildHandle {
@@ -506,7 +534,7 @@ impl ChildHandle {
         Self {
             pid,
             starttime,
-            reaped: Box::new(reaped),
+            reaped: std::sync::Arc::new(reaped),
         }
     }
 
@@ -625,6 +653,15 @@ impl ProcessHandle {
         match self {
             Self::Pinned(process) => process.close(),
             Self::Child(child) => child.close(),
+        }
+    }
+
+    /// Duplicate this handle for a watchdog thread. The duplicate names the
+    /// same exact process generation as the original.
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        match self {
+            Self::Pinned(process) => Ok(Self::Pinned(process.try_clone()?)),
+            Self::Child(child) => Ok(Self::Child(child.clone())),
         }
     }
 }
@@ -2111,6 +2148,864 @@ pub fn kill_harness_tree_at(
     Ok(report)
 }
 
+/// How long spawn waits for the launch gate to publish readiness.
+const GATE_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A failed owned-harness spawn: a structured operation error, or the
+/// `OSError`/`FileNotFoundError` the Python spawn propagates unchanged.
+#[derive(Debug)]
+pub enum SpawnHarnessError {
+    /// Structured operation error (`harness_spawn_failed`, cgroup codes, …).
+    Operation(ForeignOwnershipError),
+    /// Filesystem/process error propagated as-is.
+    Io(std::io::Error),
+}
+
+impl SpawnHarnessError {
+    fn operation(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Operation(ForeignOwnershipError::new(code, message.into()))
+    }
+
+    /// The structured error code, when this is an operation error.
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::Operation(error) => Some(error.code),
+            Self::Io(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for SpawnHarnessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Operation(error) => error.fmt(f),
+            Self::Io(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for SpawnHarnessError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Operation(error) => Some(error),
+            Self::Io(error) => Some(error),
+        }
+    }
+}
+
+impl From<ForeignOwnershipError> for SpawnHarnessError {
+    fn from(error: ForeignOwnershipError) -> Self {
+        Self::Operation(error)
+    }
+}
+
+impl From<std::io::Error> for SpawnHarnessError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// A failed wait on an owned harness process.
+#[derive(Debug)]
+pub enum OwnedWaitError {
+    /// The leader did not exit within the timeout (Python `TimeoutExpired`).
+    Timeout(Duration),
+    /// Structured cleanup/ownership error from the sweep.
+    Operation(ForeignOwnershipError),
+    /// Process wait I/O error.
+    Io(std::io::Error),
+}
+
+impl fmt::Display for OwnedWaitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout(timeout) => write!(f, "timed out after {}s", format_seconds(*timeout)),
+            Self::Operation(error) => error.fmt(f),
+            Self::Io(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for OwnedWaitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Timeout(_) => None,
+            Self::Operation(error) => Some(error),
+            Self::Io(error) => Some(error),
+        }
+    }
+}
+
+impl From<ForeignOwnershipError> for OwnedWaitError {
+    fn from(error: ForeignOwnershipError) -> Self {
+        Self::Operation(error)
+    }
+}
+
+impl From<std::io::Error> for OwnedWaitError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// A harness leader whose tree is swept before the leader is reaped.
+///
+/// [`OwnedHarnessProcess::wait`] and [`OwnedHarnessProcess::poll`] first
+/// observe the leader's exit without reaping it, kill whatever else of its
+/// tree remains while the zombie leader still holds its session number, and
+/// only then reap. All signals use the leader's pidfd (or, without pidfds,
+/// the parent-pinned child handle).
+pub struct OwnedHarnessProcess {
+    child: Child,
+    proc_root: PathBuf,
+    ownership: Option<HarnessRecord>,
+    leader_handle: Option<ProcessHandle>,
+    cleanup: Option<CleanupReport>,
+    returncode: Option<ExitStatus>,
+    swept: bool,
+}
+
+impl fmt::Debug for OwnedHarnessProcess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedHarnessProcess")
+            .field("pid", &self.child.id())
+            .field("returncode", &self.returncode)
+            .field("bound", &self.ownership.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl OwnedHarnessProcess {
+    fn unbound(child: Child, proc_root: PathBuf) -> Self {
+        Self {
+            child,
+            proc_root,
+            ownership: None,
+            leader_handle: None,
+            cleanup: None,
+            returncode: None,
+            swept: false,
+        }
+    }
+
+    fn bind(&mut self, ownership: HarnessRecord, handle: ProcessHandle) {
+        self.ownership = Some(ownership);
+        self.leader_handle = Some(handle);
+        self.swept = false;
+    }
+
+    /// The leader's process number.
+    pub fn pid(&self) -> i64 {
+        i64::from(self.child.id())
+    }
+
+    /// The durable ownership record, once bound.
+    pub fn ownership(&self) -> Option<&HarnessRecord> {
+        self.ownership.as_ref()
+    }
+
+    /// Duplicate the leader handle for a watchdog thread. Reap serialization
+    /// in Rust follows from `&mut self` wait paths; the watchdog signals
+    /// only through this duplicate exact handle.
+    pub fn leader_handle_try_clone(&self) -> Option<std::io::Result<ProcessHandle>> {
+        self.leader_handle.as_ref().map(ProcessHandle::try_clone)
+    }
+
+    /// The accumulated cleanup report, when a sweep or tree kill ran.
+    pub fn cleanup(&self) -> Option<&CleanupReport> {
+        self.cleanup.as_ref()
+    }
+
+    /// The reaped exit status, once reaped.
+    pub fn returncode(&self) -> Option<ExitStatus> {
+        self.returncode
+    }
+
+    /// The leader's stdin pipe, when spawned with one.
+    pub fn stdin(&mut self) -> Option<&mut ChildStdin> {
+        self.child.stdin.as_mut()
+    }
+
+    /// Take the leader's stdin pipe.
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    /// The leader's stdout pipe.
+    pub fn stdout(&mut self) -> Option<&mut ChildStdout> {
+        self.child.stdout.as_mut()
+    }
+
+    /// Take the leader's stdout pipe.
+    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    /// The leader's stderr pipe.
+    pub fn stderr(&mut self) -> Option<&mut ChildStderr> {
+        self.child.stderr.as_mut()
+    }
+
+    /// Take the leader's stderr pipe.
+    pub fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    fn record_report(&mut self, report: CleanupReport) {
+        match &mut self.cleanup {
+            None => self.cleanup = Some(report),
+            Some(existing) => {
+                existing.killed += report.killed;
+                existing.remaining = report.remaining;
+                let mut unproven: Vec<String> = existing
+                    .unproven
+                    .iter()
+                    .chain(report.unproven.iter())
+                    .cloned()
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                unproven.sort_unstable();
+                existing.unproven = unproven;
+                existing.converged = existing.converged && report.converged;
+            }
+        }
+    }
+
+    /// True once the leader has exited, whether or not it is reaped.
+    pub fn leader_exited(&self) -> bool {
+        self.returncode.is_some()
+            || self
+                .leader_handle
+                .as_ref()
+                .is_some_and(|handle| handle.exited())
+    }
+}
+
+impl OwnedHarnessProcess {
+    /// Stop the world, then kill the whole tree (stop, timeout, protocol error).
+    /// An unbound process (only possible before spawn binds it) is refused
+    /// rather than signalled by number.
+    pub fn kill_tree(&mut self) -> Result<CleanupReport, ForeignOwnershipError> {
+        let (Some(ownership), Some(leader)) = (&self.ownership, &self.leader_handle) else {
+            return Ok(CleanupReport {
+                containment: Containment::Process,
+                killed: 0,
+                remaining: vec![format!(
+                    "pid {} (unbound harness process was not signalled)",
+                    self.pid()
+                )],
+                unproven: Vec::new(),
+                converged: true,
+            });
+        };
+        let report = kill_harness_tree_at(
+            &self.proc_root,
+            ownership,
+            Some(leader),
+            self.returncode.is_none(),
+            true,
+            None,
+        )?;
+        self.record_report(report.clone());
+        Ok(report)
+    }
+
+    fn sweep_after_exit_locked(&mut self) -> Result<Option<CleanupReport>, ForeignOwnershipError> {
+        let (Some(ownership), Some(leader)) = (&self.ownership, &self.leader_handle) else {
+            return Ok(None);
+        };
+        if self.swept || self.returncode.is_some() || !leader.exited() {
+            return Ok(None);
+        }
+        let report =
+            kill_harness_tree_at(&self.proc_root, ownership, Some(leader), true, true, None)?;
+        self.swept = report.complete();
+        self.record_report(report.clone());
+        Ok(Some(report))
+    }
+
+    /// Kill what the exited leader left behind, before it is reaped.
+    pub fn sweep_after_exit(&mut self) -> Result<Option<CleanupReport>, ForeignOwnershipError> {
+        self.sweep_after_exit_locked()
+    }
+
+    fn reap_try(&mut self) -> Result<Option<ExitStatus>, OwnedWaitError> {
+        if let Some(status) = self.returncode {
+            return Ok(Some(status));
+        }
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.returncode = status;
+        }
+        Ok(status)
+    }
+
+    /// The leader's exit status, sweeping its tree before it is reaped.
+    pub fn poll(&mut self) -> Result<Option<ExitStatus>, OwnedWaitError> {
+        if self.ownership.is_none() || self.leader_handle.is_none() {
+            return self.reap_try();
+        }
+        if self.returncode.is_some() {
+            return Ok(self.returncode);
+        }
+        if !self.leader_handle.as_ref().expect("bound leader").exited() {
+            return Ok(None);
+        }
+        self.sweep_after_exit_locked()?;
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.returncode = status;
+        }
+        Ok(status)
+    }
+
+    /// Wait for the leader, sweeping its tree before it is reaped.
+    pub fn wait(&mut self, timeout: Option<Duration>) -> Result<ExitStatus, OwnedWaitError> {
+        if self.ownership.is_none() || self.leader_handle.is_none() {
+            return self.wait_unbound(timeout);
+        }
+        if let Some(status) = self.returncode {
+            return Ok(status);
+        }
+        if !self
+            .leader_handle
+            .as_ref()
+            .expect("bound leader")
+            .wait(timeout)
+        {
+            return Err(OwnedWaitError::Timeout(timeout.unwrap_or(Duration::ZERO)));
+        }
+        if self.returncode.is_none() {
+            self.sweep_after_exit_locked()?;
+        }
+        let status = self.child.wait()?;
+        self.returncode = Some(status);
+        Ok(status)
+    }
+
+    fn wait_unbound(&mut self, timeout: Option<Duration>) -> Result<ExitStatus, OwnedWaitError> {
+        if let Some(status) = self.returncode {
+            return Ok(status);
+        }
+        match timeout {
+            None => {
+                let status = self.child.wait()?;
+                self.returncode = Some(status);
+                Ok(status)
+            }
+            Some(timeout) => {
+                let deadline = Instant::now() + timeout;
+                loop {
+                    if let Some(status) = self.reap_try()? {
+                        return Ok(status);
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(OwnedWaitError::Timeout(timeout));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    /// Read stdout/stderr to EOF while waiting (Python `communicate`
+    /// without input, or with `input` written to stdin first). Reader
+    /// threads keep the pipes draining while the sweep-before-reap wait
+    /// runs, so leftovers holding the pipes are killed by that sweep.
+    pub fn wait_with_output(
+        &mut self,
+        input: Option<&[u8]>,
+    ) -> Result<(ExitStatus, String, String), OwnedWaitError> {
+        if let Some(input) = input {
+            if let Some(stdin) = self.child.stdin.as_mut() {
+                match stdin.write_all(input) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        drop(self.child.stdin.take());
+        let stdout_thread = self.child.stdout.take().map(|mut stdout| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                stdout.read_to_string(&mut text).map(|_| text)
+            })
+        });
+        let stderr_thread = self.child.stderr.take().map(|mut stderr| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                stderr.read_to_string(&mut text).map(|_| text)
+            })
+        });
+        let status = self.wait(None);
+        let stdout = match stdout_thread {
+            Some(thread) => thread
+                .join()
+                .map_err(|_| std::io::Error::other("stdout reader thread panicked"))??,
+            None => String::new(),
+        };
+        let stderr = match stderr_thread {
+            Some(thread) => thread
+                .join()
+                .map_err(|_| std::io::Error::other("stderr reader thread panicked"))??,
+            None => String::new(),
+        };
+        Ok((status?, stdout, stderr))
+    }
+
+    /// Signal the leader through its verified handle; unbound refuses.
+    pub fn send_signal(&self, signum: i32) -> Result<(), ForeignOwnershipError> {
+        let Some(handle) = &self.leader_handle else {
+            return Err(ForeignOwnershipError::new(
+                "harness_not_bound",
+                "an unbound harness process has no verified handle to signal through".to_owned(),
+            ));
+        };
+        if self.returncode.is_none() {
+            handle.send(signum);
+        }
+        Ok(())
+    }
+
+    /// Ask the leader to exit (SIGTERM through its verified handle).
+    pub fn terminate(&self) -> Result<(), ForeignOwnershipError> {
+        self.send_signal(libc::SIGTERM)
+    }
+
+    /// Kill the leader (SIGKILL through its verified handle).
+    pub fn kill(&self) -> Result<(), ForeignOwnershipError> {
+        self.send_signal(libc::SIGKILL)
+    }
+
+    /// After the turn: true when the tree is gone and its record may be removed.
+    pub fn finish(&mut self) -> bool {
+        let Some(ownership) = &self.ownership else {
+            return true;
+        };
+        let complete = self.cleanup.as_ref().is_none_or(|report| report.complete());
+        if self.returncode.is_none() {
+            return false;
+        }
+        if let Some(cgroup) = &ownership.cgroup {
+            let populated = matches!(cgroup_populated(cgroup), Ok(Some(true)));
+            if populated {
+                return false;
+            }
+            remove_cgroup(cgroup);
+        }
+        if let Some(handle) = self.leader_handle.take() {
+            handle.close();
+        }
+        complete
+    }
+}
+
+fn resolve_executable(
+    argv: &[String],
+    path_env: Option<&str>,
+    cwd: &Path,
+) -> Result<(), SpawnHarnessError> {
+    let executable = argv.first().ok_or_else(|| {
+        SpawnHarnessError::operation("harness_spawn_failed", "the harness argv is empty")
+    })?;
+    let is_executable_file = |candidate: &Path| {
+        std::fs::metadata(candidate)
+            .map(|metadata| !metadata.is_dir() && metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+    if executable.contains(std::path::MAIN_SEPARATOR) {
+        let candidate = if Path::new(executable).is_absolute() {
+            PathBuf::from(executable)
+        } else {
+            cwd.join(executable)
+        };
+        if is_executable_file(&candidate) {
+            return Ok(());
+        }
+    } else {
+        let default_path = "/bin:/usr/bin";
+        for directory in path_env.unwrap_or(default_path).split(':') {
+            let candidate = if directory.is_empty() {
+                PathBuf::from(executable)
+            } else {
+                Path::new(directory).join(executable)
+            };
+            if is_executable_file(&candidate) {
+                return Ok(());
+            }
+        }
+    }
+    Err(std::io::Error::from_raw_os_error(libc::ENOENT).into())
+}
+
+fn wait_gate_ready(
+    readiness: OwnedFd,
+    handle: &ProcessHandle,
+) -> Result<(), ForeignOwnershipError> {
+    let spawn_failed =
+        |message: &str| ForeignOwnershipError::new("harness_spawn_failed", message.to_owned());
+    let deadline = Instant::now() + GATE_READY_TIMEOUT;
+    loop {
+        if fd_readable(&readiness, Some(Duration::from_millis(50))) {
+            break;
+        }
+        if handle.exited() {
+            return Err(spawn_failed(
+                "the harness launch gate exited before it was ready",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(spawn_failed("the harness launch gate did not become ready"));
+        }
+    }
+    let mut file = std::fs::File::from(readiness);
+    let mut bytes = [0_u8; 2];
+    let read = file.read(&mut bytes).unwrap_or(0);
+    if bytes[..read] != *b"1" {
+        return Err(spawn_failed(
+            "the harness launch gate published invalid readiness",
+        ));
+    }
+    Ok(())
+}
+
+fn create_cgroup_at(proc_root: &Path, generation: &str) -> std::io::Result<PathBuf> {
+    let parent = own_cgroup_directory_at(proc_root).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the cgroup v2 hierarchy is not mounted",
+        )
+    })?;
+    let path = parent.join(format!("{CGROUP_PREFIX}{generation}"));
+    std::fs::DirBuilder::new().mode(0o755).create(&path)?;
+    Ok(path)
+}
+
+fn enter_cgroup_at(proc_root: &Path, path: &Path, pid: i64) -> std::io::Result<()> {
+    std::fs::write(path.join("cgroup.procs"), format!("{pid}\n"))?;
+    let expected = cgroup_relative_at(proc_root, path);
+    if expected.is_none() || cgroup_of_at(proc_root, &pid.to_string()) != expected {
+        return Err(std::io::Error::other(format!(
+            "pid {pid} did not enter {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn pipe_pair() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut descriptors = [0_i32; 2];
+    // SAFETY: pipe2 writes two fresh descriptors into the array.
+    if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: pipe2 returned two fresh descriptors owned here.
+    Ok(unsafe {
+        (
+            OwnedFd::from_raw_fd(descriptors[0]),
+            OwnedFd::from_raw_fd(descriptors[1]),
+        )
+    })
+}
+
+fn random_generation() -> std::io::Result<String> {
+    let mut bytes = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn cleanup_failed_spawn(
+    child: &mut Child,
+    handle: Option<ProcessHandle>,
+    activation_write: Option<OwnedFd>,
+    cgroup: Option<PathBuf>,
+) {
+    // Closing activation makes an inert gate exit 125; kill it anyway,
+    // through the exact handle while it is unreaped. No handle yet means
+    // the gate is still inert and closing activation is what ends it.
+    drop(activation_write);
+    if let Some(handle) = &handle {
+        handle.send(libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) if Instant::now() >= deadline => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    drop(child.stdin.take());
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+    if let Some(handle) = handle {
+        handle.close();
+    }
+    if let Some(cgroup) = &cgroup {
+        remove_cgroup(cgroup);
+    }
+}
+
+/// Options for [`spawn_owned_harness_at`].
+#[derive(Debug, Clone)]
+pub struct SpawnOwnedHarnessOptions {
+    /// Launch-gate argv prefix; spawn appends
+    /// `parent_pid activation_fd readiness_fd --` then the harness argv.
+    /// The default is this executable's `--chat-launch-gate` entry.
+    pub gate_prefix: Vec<String>,
+}
+
+impl Default for SpawnOwnedHarnessOptions {
+    fn default() -> Self {
+        let executable = std::env::current_exe()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "agentctl".to_owned());
+        Self {
+            gate_prefix: vec![executable, "--chat-launch-gate".to_owned()],
+        }
+    }
+}
+
+/// Start one turn's harness behind the launch gate and return it owned.
+///
+/// The gate is inert until the runner has a pidfd on it (its own unreaped
+/// child, so the pidfd is exact), has moved it into this turn's cgroup when
+/// one is used, and has made `record` durable. Only then may it exec the
+/// harness, so no harness process exists without a durable ownership
+/// record, and a runner that dies first takes the gate with it
+/// (parent-death signal).
+pub fn spawn_owned_harness(
+    argv: &[String],
+    cwd: &Path,
+    stdin: bool,
+    runner: &ProcessIdentity,
+    record: impl FnMut(&HarnessRecord) -> Result<(), SpawnHarnessError>,
+    on_cgroup_fallback: Option<&mut dyn FnMut(&str)>,
+) -> Result<OwnedHarnessProcess, SpawnHarnessError> {
+    spawn_owned_harness_at(
+        Path::new(PROC),
+        &SpawnOwnedHarnessOptions::default(),
+        argv,
+        cwd,
+        stdin,
+        runner,
+        record,
+        on_cgroup_fallback,
+    )
+}
+
+/// [`spawn_owned_harness`] against explicit procfs and gate options.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_owned_harness_at(
+    proc_root: &Path,
+    options: &SpawnOwnedHarnessOptions,
+    argv: &[String],
+    cwd: &Path,
+    stdin: bool,
+    runner: &ProcessIdentity,
+    mut record: impl FnMut(&HarnessRecord) -> Result<(), SpawnHarnessError>,
+    on_cgroup_fallback: Option<&mut dyn FnMut(&str)>,
+) -> Result<OwnedHarnessProcess, SpawnHarnessError> {
+    let mode = cgroup_mode()?;
+    let generation = random_generation()?;
+    resolve_executable(argv, std::env::var("PATH").ok().as_deref(), cwd)?;
+    if options.gate_prefix.is_empty() {
+        return Err(SpawnHarnessError::operation(
+            "harness_spawn_failed",
+            "the launch gate argv is empty",
+        ));
+    }
+    let (activation_read, activation_write) = pipe_pair()?;
+    let (readiness_read, readiness_write) = pipe_pair()?;
+    let activation_read_fd = activation_read.as_raw_fd();
+    let readiness_write_fd = readiness_write.as_raw_fd();
+    let parent_pid = std::process::id();
+    let mut builder = Command::new(&options.gate_prefix[0]);
+    builder
+        .args(&options.gate_prefix[1..])
+        .args([
+            parent_pid.to_string(),
+            activation_read_fd.to_string(),
+            readiness_write_fd.to_string(),
+            "--".to_owned(),
+        ])
+        .args(argv)
+        .current_dir(cwd)
+        .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env(GENERATION_ENV, &generation);
+    // SAFETY (pre_exec): clear close-on-exec only on the two gate
+    // descriptors named in the arguments, then become a session leader.
+    // Everything else closes at exec.
+    unsafe {
+        builder.pre_exec(move || {
+            for descriptor in [activation_read_fd, readiness_write_fd] {
+                if libc::fcntl(descriptor, libc::F_SETFD, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = builder.spawn()?;
+    drop(activation_read);
+    drop(readiness_write);
+    let mut activation_write = Some(activation_write);
+    let mut handle: Option<ProcessHandle> = None;
+    let mut cgroup: Option<PathBuf> = None;
+
+    macro_rules! attempt {
+        ($expr:expr) => {
+            match $expr {
+                Ok(value) => value,
+                Err(error) => {
+                    cleanup_failed_spawn(&mut child, handle, activation_write, cgroup);
+                    return Err(error.into());
+                }
+            }
+        };
+    }
+
+    let spawned_pid = i64::from(child.id());
+    let stat = attempt!(read_stat_at(proc_root, spawned_pid).map_err(SpawnHarnessError::from));
+    let Some(stat) = stat.filter(|stat| {
+        stat.ppid == i64::from(parent_pid)
+            && stat.session == spawned_pid
+            && !DEAD_STATES.contains(&stat.state.as_str())
+    }) else {
+        cleanup_failed_spawn(&mut child, handle, activation_write, cgroup);
+        return Err(SpawnHarnessError::operation(
+            "harness_spawn_failed",
+            "the harness launch gate has no stable identity",
+        ));
+    };
+    if pidfds_supported() {
+        let descriptor = match open_pidfd(spawned_pid) {
+            Ok(Some(descriptor)) => descriptor,
+            Ok(None) => {
+                cleanup_failed_spawn(&mut child, handle, activation_write, cgroup);
+                return Err(SpawnHarnessError::operation(
+                    "harness_spawn_failed",
+                    "the harness launch gate exited before it was pinned",
+                ));
+            }
+            Err(error) => {
+                cleanup_failed_spawn(&mut child, handle, activation_write, cgroup);
+                return Err(error.into());
+            }
+        };
+        handle = Some(ProcessHandle::Pinned(PinnedProcess {
+            pid: spawned_pid,
+            starttime: stat.starttime,
+            descriptor,
+        }));
+    } else {
+        handle = Some(ProcessHandle::Child(ChildHandle::new(
+            spawned_pid,
+            stat.starttime,
+            // The child is reaped only by this spawn's error cleanup or the
+            // returned process's wait paths, both after binding; until then
+            // it is unreaped by construction. After binding, returncode
+            // tracking in OwnedHarnessProcess is the reaped proof its wait
+            // paths consult first.
+            || false,
+        )));
+    }
+    let leader = handle.as_ref().expect("handle just bound");
+    attempt!(wait_gate_ready(readiness_read, leader).map_err(SpawnHarnessError::from));
+    let after = attempt!(read_stat_at(proc_root, spawned_pid).map_err(SpawnHarnessError::from));
+    if !after.is_some_and(|after| after.starttime == stat.starttime) || leader.exited() {
+        cleanup_failed_spawn(&mut child, handle, activation_write, cgroup);
+        return Err(SpawnHarnessError::operation(
+            "harness_spawn_failed",
+            "the harness launch gate changed before activation",
+        ));
+    }
+    let mut containment = Containment::Process;
+    if mode != CgroupMode::Off {
+        let entered = create_cgroup_at(proc_root, &generation).and_then(|path| {
+            cgroup = Some(path.clone());
+            enter_cgroup_at(proc_root, &path, spawned_pid)
+        });
+        match entered {
+            Ok(()) => containment = Containment::Cgroup,
+            Err(error) => {
+                if let Some(path) = &cgroup {
+                    remove_cgroup(path);
+                    cgroup = None;
+                }
+                if mode == CgroupMode::Require {
+                    cleanup_failed_spawn(&mut child, handle, activation_write, cgroup);
+                    return Err(SpawnHarnessError::operation(
+                        "harness_cgroup_unavailable",
+                        format!("{CGROUP_MODE_ENV}=require but no per-turn cgroup: {error}"),
+                    ));
+                }
+                if let Some(callback) = on_cgroup_fallback {
+                    callback(&format!(
+                        "per-turn cgroup unavailable ({error}); using process containment"
+                    ));
+                }
+            }
+        }
+    }
+    let boot = attempt!(current_boot_id_at(proc_root).map_err(SpawnHarnessError::from));
+    let ownership = HarnessRecord {
+        runner: runner.clone(),
+        leader: ProcessIdentity::new(spawned_pid, Some(stat.starttime.to_string()), Some(boot)),
+        process_group: Some(spawned_pid),
+        generation: Some(generation),
+        containment,
+        cgroup: cgroup.clone(),
+    };
+    attempt!(record(&ownership));
+    let mut process = OwnedHarnessProcess::unbound(child, proc_root.to_path_buf());
+    process.bind(ownership, handle.expect("handle just bound"));
+    // Activate: one byte, retrying only on interruption.
+    let mut activation = std::fs::File::from(activation_write.take().expect("activation held"));
+    let written = loop {
+        match activation.write(b"1") {
+            Ok(written) => break Ok(written),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => break Err(error),
+        }
+    };
+    match written {
+        Ok(1) => Ok(process),
+        Ok(_) => {
+            let OwnedHarnessProcess {
+                child: mut inner,
+                leader_handle,
+                ownership,
+                ..
+            } = process;
+            let cgroup_path = ownership.and_then(|record| record.cgroup);
+            cleanup_failed_spawn(&mut inner, leader_handle, None, cgroup_path);
+            Err(SpawnHarnessError::operation(
+                "harness_spawn_failed",
+                "the harness launch gate was not activated",
+            ))
+        }
+        Err(error) => {
+            let OwnedHarnessProcess {
+                child: mut inner,
+                leader_handle,
+                ownership,
+                ..
+            } = process;
+            let cgroup_path = ownership.and_then(|record| record.cgroup);
+            cleanup_failed_spawn(&mut inner, leader_handle, None, cgroup_path);
+            Err(error.into())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2836,6 +3731,211 @@ mod tests {
         assert!(description.contains(&format!("pid {pid}")), "{description}");
         reap(&mut child);
         assert_eq!(tree_alive(&record).unwrap(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn gate_double(test: &str) -> (PathBuf, SpawnOwnedHarnessOptions) {
+        // The production gate is this binary's `--chat-launch-gate` entry,
+        // which a unit-test binary cannot be. This double implements the
+        // same parent-death/readiness/activation protocol as a tiny Rust
+        // program (an interpreter launcher that forks would break the
+        // exact-parent proof the gate exists to provide).
+        let root =
+            std::env::temp_dir().join(format!("agentctl-b3-6-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("gate.rs");
+        std::fs::write(
+            &source,
+            "use std::fs::File;\n\
+             use std::io::{Read, Write};\n\
+             use std::os::fd::FromRawFd;\n\
+             use std::os::unix::process::CommandExt;\n\
+             extern \"C\" { fn prctl(option: i32, a2: usize, a3: usize, a4: usize, a5: usize) -> i32; fn getppid() -> i32; }\n\
+             fn fail(message: String) -> ! { let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.join(\"gate-error.log\"))); if let Some(path) = dir { let _ = std::fs::write(path, message); } std::process::exit(125); }\n\
+             fn main() {\n\
+                 let args: Vec<String> = std::env::args().collect();\n\
+                 if args.len() < 6 || args[4] != \"--\" { fail(format!(\"bad argv: {args:?}\")); }\n\
+                 let parent: i32 = args[1].parse().unwrap_or_else(|_| fail(\"bad parent\".into()));\n\
+                 let act: i32 = args[2].parse().unwrap_or_else(|_| fail(\"bad activation fd\".into()));\n\
+                 let ready: i32 = args[3].parse().unwrap_or_else(|_| fail(\"bad readiness fd\".into()));\n\
+                 if unsafe { getppid() } != parent { fail(format!(\"ppid {} != parent {parent}\", unsafe { getppid() })); }\n\
+                 if unsafe { prctl(1, 9, 0, 0, 0) } != 0 { fail(\"prctl failed\".into()); }\n\
+                 if unsafe { getppid() } != parent { fail(\"ppid changed\".into()); }\n\
+                 let mut ready_file = unsafe { File::from_raw_fd(ready) };\n\
+                 if ready_file.write_all(b\"1\").is_err() { fail(\"readiness write failed\".into()); }\n\
+                 drop(ready_file);\n\
+                 let mut act_file = unsafe { File::from_raw_fd(act) };\n\
+                 let mut activation = [0_u8; 2];\n\
+                 let read = act_file.read(&mut activation).unwrap_or(0);\n\
+                 drop(act_file);\n\
+                 if &activation[..read] != b\"1\" || unsafe { getppid() } != parent { fail(format!(\"bad activation {activation:?}\")); }\n\
+                 let error = std::process::Command::new(&args[5]).args(&args[6..]).exec();\n\
+                 fail(format!(\"exec failed: {error}\"));\n\
+             }\n",
+        )
+        .unwrap();
+        let binary = root.join("gate");
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
+        let compiled = std::process::Command::new(&rustc)
+            .args(["--edition", "2021", "-O"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .expect("compile gate double");
+        assert!(
+            compiled.status.success(),
+            "gate double compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let options = SpawnOwnedHarnessOptions {
+            gate_prefix: vec![binary.to_string_lossy().into_owned()],
+        };
+        (root, options)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_owned_harness_records_then_runs_and_sweeps_leftovers() {
+        use std::os::unix::process::ExitStatusExt as _;
+        if !pidfds_supported() {
+            return;
+        }
+        let (root, options) = gate_double("sweep");
+        let leftover_file = root.join("leftover-pid");
+        let argv: Vec<String> = [
+            "bash",
+            "-c",
+            "sleep 10 & echo $! > \"$1\"; echo hello; exit 7",
+            "bash",
+            leftover_file.to_string_lossy().as_ref(),
+        ]
+        .iter()
+        .map(|item| item.to_string())
+        .collect();
+        let runner = identity_of(i64::from(std::process::id()));
+        let recorded = std::cell::RefCell::new(Vec::new());
+        let started = Instant::now();
+        let mut proc = spawn_owned_harness_at(
+            Path::new("/proc"),
+            &options,
+            &argv,
+            &root,
+            false,
+            &runner,
+            |record| {
+                recorded.borrow_mut().push(record.clone());
+                Ok(())
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(recorded.borrow().len(), 1);
+        let ownership = proc.ownership().unwrap().clone();
+        assert_eq!(recorded.borrow()[0], ownership);
+        assert!(valid_generation(ownership.generation.as_deref().unwrap()));
+        assert_eq!(ownership.leader.pid, proc.pid());
+        let (status, stdout, _stderr) = proc.wait_with_output(None).unwrap();
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(status.signal(), None);
+        assert_eq!(stdout, "hello\n");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "leftover kept the turn open"
+        );
+        let leftover: i64 = std::fs::read_to_string(&leftover_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(wait_gone(leftover), "leftover pid {leftover} was not swept");
+        assert!(proc.finish());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_owned_harness_never_runs_when_recording_fails() {
+        let (root, options) = gate_double("record-fails");
+        let marker = root.join("ran");
+        let argv: Vec<String> = [
+            "bash",
+            "-c",
+            "echo ran > \"$1\"",
+            "bash",
+            marker.to_string_lossy().as_ref(),
+        ]
+        .iter()
+        .map(|item| item.to_string())
+        .collect();
+        let runner = identity_of(i64::from(std::process::id()));
+        let err = spawn_owned_harness_at(
+            Path::new("/proc"),
+            &options,
+            &argv,
+            &root,
+            false,
+            &runner,
+            |_record| {
+                Err(SpawnHarnessError::Operation(ForeignOwnershipError {
+                    code: "harness_identity_unknown",
+                    message: "disk full".to_owned(),
+                }))
+            },
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), Some("harness_identity_unknown"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!marker.exists(), "harness ran without a durable record");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_owned_harness_echoes_stdin_and_refuses_missing_executables() {
+        let (root, options) = gate_double("echo");
+        let runner = identity_of(i64::from(std::process::id()));
+        let argv = vec!["cat".to_owned()];
+        let mut proc = spawn_owned_harness_at(
+            Path::new("/proc"),
+            &options,
+            &argv,
+            &root,
+            true,
+            &runner,
+            |_record| Ok(()),
+            None,
+        )
+        .unwrap();
+        let cloned = proc.leader_handle_try_clone().unwrap().unwrap();
+        assert_eq!(cloned.pid(), proc.pid());
+        drop(cloned);
+        let (status, stdout, _stderr) = proc.wait_with_output(Some(b"hello\n")).unwrap();
+        assert!(status.success());
+        assert_eq!(stdout, "hello\n");
+        assert!(proc.finish());
+
+        let missing = vec!["definitely-not-an-installed-harness".to_owned()];
+        let err = spawn_owned_harness_at(
+            Path::new("/proc"),
+            &options,
+            &missing,
+            &root,
+            false,
+            &runner,
+            |_record| Ok(()),
+            None,
+        )
+        .unwrap_err();
+        match err {
+            SpawnHarnessError::Io(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound)
+            }
+            other => panic!("expected NotFound io error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(target_os = "linux")]
