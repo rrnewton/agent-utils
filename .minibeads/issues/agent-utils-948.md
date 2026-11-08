@@ -1,10 +1,11 @@
 ---
 title: 'agentctl-muse-native-session-missing: a Muse lane started after #916 had no native session recorded, so revive refused'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-06T18:16:13.000000000+00:00
-updated_at: 2026-11-06T18:16:13.000000000+00:00
+updated_at: 2026-11-08T01:57:51.000000000+00:00
+closed_at: 2026-11-08T01:57:51.000000000+00:00
 ---
 
 # Description
@@ -38,3 +39,7 @@ Two pid-keyed sources recovered all three lanes by hand today, and neither needs
 Fix plan. (1) Capture: add pid-keyed discovery beside the fd-held source: scan a bounded window of the dated lock tree and the runtime session jsons for the record's runtime pid (pinned pid or a descendant running the harness), union with fd-held ids, keep the exactly-one rule (several still become native_session_unknown listing candidates), and run the #928 guard so a healed capture cannot double-bind a live record's session. Also re-run this capture for a live muse or codex record that names no session when status or probe already loads the record, saving only when it changes something, so a start miss heals while the lane lives. (2) Revive fallback: when a dead record has no native id, scan the muse session store for sessions whose journal records the record's cwd (or slot path): exactly one match is recorded as observed through the normal bind path and the revive result says it was recovered from the session store by cwd; zero matches refuse with no candidate; several refuse listing the candidate ids and the bind-session remedy. (3) Visibility: status and doctor flag a live muse record with no native session, distinguishing never-captured from unknown-with-candidates, naming the bind-session remedy.
 
 Tests (fixtures already exist in revive.rs tests via HELD_FILES and CLAUDE_CONFIG_ROOTS thread-locals; extend with lock-content and runtime-json fixtures): start capture that misses fd-held but finds the pid-keyed lock records the session; a status heal binds it, and stays unknown naming the owner when another live record holds it (#928 interplay); revive of a record with no native id succeeds on a single cwd match and refuses zero and several matches with candidates listed; the doctor flag appears for a live muse record naming none and not otherwise. Sequencing: implement only after #928 lands, and re-read the capture sites first if #920 changed revive.rs.
+
+## Resolution
+
+[watermelon-full-preview mu-salvage] Landed on github/main as 2955a4cb, e50018df and a5847f4a (replayed onto 2a62654d). Capture now also asks the Muse store (runtime session jsons and dated lock contents keyed by the pinned runtime pid), start captures even without a brief, revive falls back to the single store journal naming the record cwd and refuses several with every candidate named plus the bind-session/anchor remedies, anchor --session-id and bind-session set the top-level native_session, restart/restore/re-pin/revive read effective_native_session, restore and restart_team report refusals per lane with refused_lanes (restore exits a documented 74 when it completed except for refused lanes), and status (Rust and both Python editions) and doctor flag a live muse or codex record with no native session, doctor adding native-session-ambiguous. Clean full gate on the final commit: preflight passed, shared 55/55, exclusive 6/6, validate OK. Unverified: the live status/probe healing variant considered in the design was not implemented (start-time capture plus the doctor pre-check cover the gap), and no live reboot recovery was run against a real registry; the behaviour is covered by fixture tests only.
