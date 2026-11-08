@@ -4269,8 +4269,8 @@ const cardLinesOwner = createCardLines({
   pendingInto,
   heldMessages: () => channelStore.current().messages,
   threadOf,
-  threadWords,
-  threadName,
+  threadWords: (choice) => threadWords(/** @type {any} */ (choice)),
+  threadName: (choice, chars) => threadName(/** @type {any} */ (choice), chars),
   setTimer: (run, ms) => setTimeout(run, ms),
   clearTimer: (timer) => clearTimeout(/** @type {any} */ (timer)),
   guardQuietly,
@@ -4849,8 +4849,8 @@ function renderSideFreshness() {
       [loadState().freshness, staleWords(loadState().freshness, loadState().freshAt, loadState().refreshing, "messages", () => chatServiceOf(selectedChannelId()))]);
   } else if (sideColumnUp()) {
     const channel = String(selectedChannelId());
-    state = threadListFailures.get(channel) || "fresh";
-    const at = threadListLandedAt.get(channel) || inColumn(columns.main, () => loadState().freshAt);
+    state = threadList.threadListFailure(channel) || "fresh";
+    const at = threadList.threadListLandedAt(channel) || inColumn(columns.main, () => loadState().freshAt);
     // With no time to give, the state alone, rather than a time nothing was read at.
     text = state === "fresh" ? "" : at ? staleWords(state, at, false, "threads", () => chatServiceOf(selectedChannelId()))
       : state === "offline" ? "Offline" : "Refresh failed";
@@ -6265,422 +6265,86 @@ function entryLandingHolds() {
   return holds;
 }
 
-// --- thread selector ----------------------------------------------------------------------------
-//
-// `gchat-thread-selector`. The owner's specification: a thread dropdown immediately right of the
-// channel picker, at the bottom, always shown, with Main and All as extra options. The threads it
-// offers come from the channel's store — summaries read earlier and the thread roots among the
-// messages already loaded — so opening it costs no request. Touching it also asks for the
-// channel's thread list in the background, at most once a minute, so the next look is complete.
-//
-// `#194 thread-picker-polish`. It lists one screenful. And a thread is called the same thing
-// everywhere it is named — see `threadName`.
-//
-// `#281 view-keys`. It is the VIEW picker now: Main, All, the thread list and, where the window draws
-// them, two columns, in the order Ctrl+1 to Ctrl+4 choose them, then the screenful of threads. The
-// "… Older threads" that closed the list opened a Threads screen of its own, a second list of threads
-// beside the right column's cards; the thread list, which is those cards across the window, replaced
-// both, and pages back through older threads where it stands (`loadOlderThreads`).
-
-/** How long a background read of one channel's thread list is reused by the selector. */
-const THREAD_DIRECTORY_REFRESH_MS = 60000;
-/**
- * How many threads the selector lists, newest activity first: ABOUT ONE PHONE SCREEN. `#194
- * thread-picker-polish`. The owner, of the forty it used to list: "It should show only about one
- * screen worth". A phone's native picker draws each option as a row about a thumb high, and with
- * Main, All and the thread list above (on a phone two columns are not offered), eight threads is what
- * fills one screen of it without the sheet scrolling. Every thread past them is in the thread list.
- */
-const THREAD_SELECT_LIMIT = 8;
-/**
- * Longest name the selector shows, in characters. Short on purpose: a phone's native picker draws
- * its options large, and a sentence per option was unreadable. The heading over an open thread and
- * the thread list's cards have the room, and show the same name less shortened.
- */
-const THREAD_TITLE_CHARS = 28;
-
-const threadDirectoryReadAt = new Map();
-/** The channel whose thread directory is being read, one at a time (web/src/core/sync `createChannelInFlight`). */
-const threadDirectoryInFlight = createChannelInFlight();
-/**
- * `#231 two-column-polish`. By channel, how the thread list's newest read failed, "offline" or
- * "failed", until one lands; and when the newest that landed did. What the right column's line says
- * over its cards (`renderSideFreshness`): a failed read of the list behind them used to say nothing.
- *
- * @type {Map<string, string>}
- */
-const threadListFailures = new Map();
-/** @type {Map<string, number>} */
-const threadListLandedAt = new Map();
-
-/** The thread list's newest page for `channel` landed: current from now, whatever failed before. */
-function noteThreadListLanded(channel) {
-  threadListFailures.delete(channel);
-  threadListLandedAt.set(channel, Date.now());
-}
-
-// `namedRecord` is web/src/core/channels's (`#624 voice-page-modularity`).
-
-/**
- * The summariser's name and sentence for thread `choice`, trimmed: from its thread list copy, else
- * from its root's own record (`#528 thread-card-markdown-and-cap`), which a page of Main brings with
- * the root, before any read of the thread list. `said` is "" unless one source gives both.
- *
- * @returns {{named: string, said: string}}
- */
-function threadWords(choice) {
-  let named = "";
-  // The root's record only by the rule the server serves names by (`#484`, `#522`): one kept on a copy
-  // the stream or an older read left, of a thread under the threshold now, is not shown.
-  const fromRoot = choice && choice.named && rootNamesShown(choice) ? choice.named : null;
-  for (const source of [choice && choice.summary, fromRoot]) {
-    const name = source && typeof source.display_name === "string" ? source.display_name.trim() : "";
-    const said = source && typeof source.summary === "string" ? source.summary.trim() : "";
-    if (name && said) return { named: name, said };
-    if (!named) named = name;
-  }
-  return { named, said: "" };
-}
-
-/**
- * Whether thread `choice`'s root may show its record's name, by the server's rule: three messages,
- * or two under a root longer than a card shows (src/threads.rs `thread_summary_shown`).
- */
-function rootNamesShown(choice) {
-  const record = choice.named;
-  if (record && record.reply_count_exact === false) return true;
-  const replies = Math.max(typeof choice.count === "number" ? choice.count : 0,
-    record && typeof record.reply_count === "number" ? record.reply_count : 0);
-  return replies + 1 >= (rootOverflowsCard(choice.root) ? 2 : 3);
-}
-
-/**
- * THE NAME A THREAD GOES BY, and the only place one is made: the selector's option, the heading
- * over an open thread, the thread list's cards and the seam over a thread all ask
- * this, from the store, each time they draw.
- *
- * `#194 thread-picker-polish`. The owner found the heading over an open thread calling it one thing
- * and the selector another. Each made its own name: the heading printed the `title` of whatever
- * object opened the thread — the provider's raw title, the selector's already-shortened name, or
- * nothing at all from a tag, so "Thread" — and never looked again, while the selector preferred the
- * summariser's display name, which usually arrives after the thread is open.
- *
- * In order: the summariser's display name, the provider's title unless it is the neutral "Thread"
- * placeholder, the first line of the first message. `chars` only shortens; it never changes the
- * source, so the selector's name is always a prefix of the heading's.
- */
-function threadName(choice, chars = THREAD_TITLE_CHARS) {
-  const summary = choice ? choice.summary : null;
-  const named = choice ? threadWords(choice).named : "";
-  const title = summary && typeof summary.title === "string" && summary.title.trim() !== "Thread"
-    ? summary.title : "";
-  // The first message by what it SAYS, so a root that opens with `**Plan**` is named "Plan".
-  for (const source of [named, title, choice && choice.root ? messageText(choice.root) : ""]) {
-    const name = firstLineOf(source, chars);
-    if (name) return name;
-  }
-  return "Thread";
-}
-
-/** Age, replies, name: the two short facts first, because a phone's picker cuts the end off. */
-function threadLabel(choice, chars = THREAD_TITLE_CHARS) {
-  return [threadFacts(choice), threadName(choice, chars)].filter((part) => part !== "").join(" · ");
-}
-
-/** Every thread this channel's store knows, by id: its summaries, and the roots among its messages. */
-function threadIndex() {
-  /** @type {Map<string, ReturnType<typeof threadChoice>>} */
-  const byId = new Map();
-  if (!providerFacts.threading() || channelStore.current().channel !== String(selectedChannelId())) return byId;
-  // `#466 reply-promotes-thread`. The threads sends in the outbox are going into, and when the newest
-  // was written: a root a send answers is a thread to read, as new as that send. And so is one whose
-  // reply the store holds, whatever its count still says: the reply just sent, before any read says so.
-  const pending = pendingThreadTimes();
-  const answered = new Set(channelStore.current().messages.filter((held) => threadOf(held) && held.thread.is_root !== true)
-    .map((held) => String(held.thread.id)));
-  for (const summary of channelStore.current().threads) {
-    const id = String(summary.id);
-    if (id !== channelStore.current().scope) byId.set(id, threadChoice(id, summary));
-  }
-  for (const message of channelStore.current().messages) {
-    const id = threadOf(message);
-    if (!id || id === channelStore.current().scope) continue;
-    const at = timeOf(message, "timestamp");
-    const root = message.thread.is_root ? message : null;
-    const known = byId.get(id);
-    if (!known) {
-      // A root nobody has answered is not offered as a thread to read, as the server's own thread
-      // list leaves it out: on a provider that names a thread for every message, that would be
-      // every recent message. Opened from its tag on All, it is still offered while it is open.
-      if (root && (root.thread.reply_count !== 0 || pending.has(id) || answered.has(id))) {
-        byId.set(id, threadChoice(id, null, root));
-      }
-      continue;
-    }
-    if (Number.isFinite(at)) known.at = Number.isFinite(known.at) ? Math.max(known.at, at) : at;
-    // `#528 thread-card-markdown-and-cap`. The store's copy of the root over the thread list's: it is
-    // the copy the rows under the card draw, so the card and its continuation are cut from one body.
-    if (root) known.root = root;
-    if (namedRecord(root)) known.named = root.thread;
-    if (root && !Number.isFinite(known.started)) known.started = at;
-  }
-  for (const [id, at] of pending) {
-    const known = byId.get(id);
-    if (known) known.at = Number.isFinite(known.at) ? Math.max(known.at, at) : at;
-  }
-  return byId;
-}
-
-/** The threads this channel's store knows, newest activity first — all of them. */
-function threadChoices() {
-  const when = (choice) => (Number.isFinite(choice.at) ? choice.at : 0);
-  return [...threadIndex().values()].sort((a, b) => when(b) - when(a));
-}
-
-/**
- * The thread on screen, named from the store like any other — or, before the store knows it, from
- * the summary it was opened with. Null outside a thread.
- *
- * `#252 thread-button-state`. A thread nobody has answered is in no list of threads, and opened from
- * its grey tag it has no summary either: it goes by its message, as a new thread does on the reply
- * screen, rather than by the bare word "Thread".
- */
-function openThreadChoice() {
-  if (selection().view !== "thread" || !selection().threadId) return null;
-  return knownThreadChoice(String(selection().threadId), selection().thread);
-}
-
-/**
- * Thread `id` as the store knows it, or — a thread in no list of threads, as one nobody has answered
- * is — by `summary` and its root message, when the store holds that.
- *
- * @param {string} id
- * @param {any} summary
- */
-function knownThreadChoice(id, summary) {
-  const listed = threadIndex().get(id);
-  if (listed) return listed;
-  const root = channelStore.current().channel === String(selectedChannelId())
-    ? channelStore.current().messages.find((message) => threadOf(message) === id && message.thread.is_root === true) : null;
-  return threadChoice(id, summary, root || null);
-}
-
-/** What the seam over an open thread calls it: the selector's name, until there is none to give. */
-function openThreadName() {
-  const open = openThreadChoice();
-  const name = open ? threadName(open) : "Thread";
-  return name === "Thread" ? "this thread" : name;
-}
-
-/** Whether the server has said this channel has threads older than the ones read so far. */
-function olderThreadsOnServer() {
-  if (channelStore.current().channel !== String(selectedChannelId())) return false;
-  const cover = channelStore.current().views.get(viewKey("threads"));
-  return Boolean(cover && cover.more);
-}
-
-/**
- * The views the picker offers first, in the order Ctrl+1 to Ctrl+4 (Cmd on an Apple keyboard) choose
- * them, with what it calls each. `#281 view-keys`: the thread list and two columns joined Main and All
- * there, so that the one control that says which view is up says it for all four, and chooses them.
- */
-const VIEW_CHOICES = [["main", "Main"], ["flat", "All"], ["threads", "Thread list"], ["columns", "Two columns"]];
-
-/** What the picker's value is for the view on screen: one of `VIEW_CHOICES`, or `thread:<id>`. */
-function viewChoiceOnScreen() {
-  if (layoutShown.columns()) return "columns";
-  if (layoutShown.threadList()) return "threads";
-  if (selection().view === "thread" && selection().threadId) return `thread:${selection().threadId}`;
-  return selection().view === "flat" ? "flat" : "main";
-}
-
-/**
- * Main, All, the thread list, two columns where this window can draw them, then a screenful of threads,
- * with the view on screen selected.
- */
-function renderThreadSelect() {
-  const select = el("thread-select");
-  /** @type {Array<[string, string]>} */
-  const options = [["main", "Main"]];
-  if (providerFacts.threading()) {
-    options.push(["flat", "All"]);
-    // `#281 view-keys`. The thread list, and two columns, are of a channel that has threads to list.
-    // Two columns only where this window draws them (`layoutShown.fit()`): a phone is offered none.
-    if (threadListOffered()) {
-      options.push(["threads", "Thread list"]);
-      if (layoutShown.fit()) options.push(["columns", "Two columns"]);
-    }
-    const choices = threadChoices();
-    const shown = choices.slice(0, THREAD_SELECT_LIMIT);
-    for (const choice of shown) options.push([`thread:${choice.id}`, threadLabel(choice)]);
-    // The thread on screen is always offered, so the selector can say which one it is — even when
-    // it is older than the first screenful, as one opened from the thread list often is.
-    const open = openThreadChoice();
-    if (open && !shown.some((choice) => choice.id === open.id)) {
-      options.push([`thread:${open.id}`, threadLabel(open)]);
-    }
-  }
-  const current = viewChoiceOnScreen();
-  // Rebuilt only when what it offers changed, so a redraw while it is open does not close it.
-  const signature = JSON.stringify(options);
-  if (select.getAttribute("data-options") !== signature) {
-    select.replaceChildren(...options.map(([value, label]) => {
-      const option = document.createElement("option");
-      option.value = value;
-      option.textContent = label;
-      return option;
-    }));
-    select.setAttribute("data-options", signature);
-  }
-  // Every redraw puts it back on the view on screen: a choice the window could not honour — two
-  // columns in a window too narrow for them — is not left standing as if it had been.
-  select.value = current;
-  // A provider without threads has nothing to choose; the picker stays, saying so by being inert.
-  select.disabled = !providerFacts.threading();
-  const why = providerFacts.threading()
-    ? "Which view of the channel to read: Main, All, the thread list, two columns, or one thread."
-    : "This channel's chat service does not offer threads here, so Main is the whole channel.";
-  // `#406 command-bar-one-row`. On a desk a name too long for the bar ends in an ellipsis, and the
-  // option itself is cut at `THREAD_TITLE_CHARS`: the tooltip names the open thread whole.
-  const shownThread = current.startsWith("thread:") ? openThreadChoice() : null;
-  const title = shownThread ? `${threadName(shownThread, Infinity)}\n${why}` : why;
-  if (select.title !== title) select.title = title;
-  // Its description says why it is inert, when it is; a picker that chooses needs none.
-  setTextIfChanged(leftEl("thread-select-note"), providerFacts.threading() ? "" : why);
-  // The right column's heading and cards name threads from the same store.
-  if (sideColumnUp()) renderSideColumn();
-}
-
-/**
- * The heading over a thread open across the window: the thread's card (`#298 thread-card-header`), as
- * the thread list and the top of the right column draw it — its words, its colour, how long since it
- * moved, its replies and unread — and the X, whose tooltip says where it goes. Redrawn with the
- * selector, so a summary or a name that arrives after the thread opened is drawn on the card at once;
- * the picker's option still names the thread in its own words (`#194 thread-picker-polish`). Always
- * the left column's, whichever column asks.
- */
-function renderThreadHeading() {
-  if (columnWork.side()) return inColumn(columns.main, renderThreadHeading);
-  if (selection().view !== "thread") return undefined;
-  paintThreadCard(leftEl("thread-card"), openThreadChoice(), replyTally());
-  const back = leftEl("thread-back");
-  const says = threadBackTitle();
-  if (back.getAttribute("title") !== says) back.setAttribute("title", says);
-  return undefined;
-}
-
-/**
- * Where the X on a thread across the window goes, as its tooltip says it (`closeThread`): back to the
- * thread list for a thread opened from it, else to the view the thread was opened from.
- */
-function threadBackTitle() {
-  const to = selection().origin === "list" && !threadListOffered() ? defaultChannelView() : selection().origin;
-  if (to === "list") return "Back to the thread list";
-  if (to === "flat") return "Back to All";
-  if (to === "threads") return "Back to the Threads list";
-  return "Back to Main";
-}
-
-/** The reader picked one of the four views, or a thread. */
-function onThreadSelect() {
-  const value = String(el("thread-select").value);
-  if (VIEW_CHOICES.some(([view]) => view === value)) {
-    chooseView(/** @type {"main" | "flat" | "threads" | "columns"} */ (value));
-    // The picker keeps the focus a choice made from it leaves there, unless the column it is in went.
-    return undefined;
-  }
-  if (!value.startsWith("thread:")) return undefined;
-  const id = value.slice("thread:".length);
-  if (!layoutShown.columns() && !layoutShown.threadList() && selection().view === "thread" && String(selection().threadId) === id) return undefined;
-  // The store's summary when it has one. Never the option's own words: the heading names the
-  // thread from the store, and a shortened name handed in here would be shortened twice.
-  const summary = channelStore.current().threads.find((held) => String(held.id) === id) || null;
-  // From the thread list, as a card opens it: across the window, Esc back to the list. `#281 view-keys`.
-  if (layoutShown.threadList()) return openThreadFromList(id, summary);
-  const opened = openThread(id, summary);
-  // In two columns the thread is selected on the right, and the picker goes on saying two columns.
-  renderThreadSelect();
-  return opened;
-}
-
-/** Read the channel's thread list in the background, so the selector names every thread. */
-async function refreshThreadDirectory() {
-  const channel = String(selectedChannelId());
-  if (!providerFacts.threading() || !channel || channelStore.current().scope) return;
-  if (threadDirectoryInFlight.isFor(channel)) return;
-  if (Date.now() - (threadDirectoryReadAt.get(channel) || 0) < THREAD_DIRECTORY_REFRESH_MS) return;
-  threadDirectoryInFlight.begin(channel);
-  threadDirectoryReadAt.set(channel, Date.now());
-  // `remote-ops-audit`: the right column's list of threads, read beside Main (`readSideColumn`).
-  const base = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}` +
-    "&reason=side";
-  // `#203 incremental-refresh`. With the thread list's forward cursor, only the threads that moved,
-  // under the same rule as the poll's: a list a complete delta keeps current needs no full read.
-  const cover = channelStore.current().channel === channel ? channelStore.current().views.get(viewKey("threads")) : null;
-  let sent = cover && cover.live && cover.newest && channelStore.current().complete !== false &&
-    Date.now() - (cover.fullAt || 0) < TIMELINE_RECONCILE_MS ? cover.newest : null;
-  try {
-    let payload;
-    try {
-      payload = await apiDecoded("TimelineResponse", sent ? `${base}&after=${encodeURIComponent(sent)}` : base);
-    } catch (error) {
-      if (!sent || !isCursorRefusal(error)) throw error;
-      if (cover.newest === sent) cover.newest = null;
-      sent = null;
-      payload = await apiDecoded("TimelineResponse", base);
-    }
-    if (String(selectedChannelId()) !== channel) return;
-    if (sent && payload.delta) {
-      if (!foldTimelineDelta(payload, sent, "threads", null)) return;
-    } else {
-      foldTimelinePage(payload, false, "threads", null);
-      // The way back from the newest page, for "Older threads…" over the cards. `#281 view-keys`.
-      // Not from the server's own copy when it has none: the way back already known still holds.
-      if (!refreshFailed(payload) || payload.next_before) noteNewestThreadPage(channel, payload);
-    }
-    noteThreadListLanded(channel);
-    // `#528 thread-card-markdown-and-cap`: kept, so a reload draws the names it brought at once.
-    saveChannelScope();
-    renderThreadSelect();
-    renderThreadHeading();
-    // Its summaries carry counts Main's roots are kept and counted by (`#222 unread-replies`).
-    syncUnreadReplies();
-  } catch (error) {
-    // The selector keeps offering what the store already knew; the next touch may ask again — in
-    // two columns the next poll, the right column's line saying meanwhile that the cards are as
-    // they were. `#231 two-column-polish`.
-    threadDirectoryReadAt.delete(channel);
-    if (String(selectedChannelId()) === channel) {
-      threadListFailures.set(channel, error && error.network ? "offline" : "failed");
-      renderSideFreshness();
-    }
-  } finally {
-    threadDirectoryInFlight.end(channel);
-  }
-}
-
-function openThread(id, summary = null) {
-  if (!providerFacts.threading() || !id) return;
-  // `#229 desktop-two-column`. In two columns a thread is selected on the right, and Main stays.
-  if (layoutShown.columns()) return selectSideThread(String(id), summary);
-  // `#281 view-keys`. From the thread list on its own, across the window, with the way back to it.
-  if (layoutShown.threadList()) return openThreadFromList(String(id), summary);
-  return changeChannelView("thread", String(id), summary);
-}
-
-function closeThread() {
-  // In two columns, leaving the thread on the right is its X. `#229 desktop-two-column`. The thread
-  // list on its own shows cards only, never a thread, so from it there is none to leave. `#281 view-keys`.
-  if (columnWork.side()) return layoutShown.columns() ? closeSideThread() : undefined;
-  if (selection().view !== "thread") return;
-  // `#281 view-keys`. A thread opened from the thread list goes back to the list — or, where the
-  // channel has none to show any more, to the view it opens in.
-  if (selection().origin === "list") {
-    if (threadListOffered()) return setLayout("list", true);
-    return changeChannelView(defaultChannelView());
-  }
-  return changeChannelView(selection().origin);
-}
+// The thread selector and older threads are web/src/view/channel's now (`createThreadList`,
+// `#624 voice-page-modularity`): what threads the store knows and what they are called, the
+// view picker and heading, opening and closing a thread, the walk back, the cards, and a row's
+// thread decoration. Changing the view and the selection stay the page's, injected; the
+// unanswered-thread group stays here until the reply-counts move.
+const threadList = createThreadList({
+  byId: el,
+  leftById: leftEl,
+  inThisColumn,
+  inColumn,
+  side: () => columnWork.side(),
+  threading: () => providerFacts.threading(),
+  currentCanon: () => channelStore.current(),
+  selectedChannelId,
+  selection: () => selection(),
+  pendingThreadTimes,
+  messageText: (m) => messageText(m),
+  timeOf: (m) => timeOf(m, "timestamp"),
+  sideColumnUp: () => sideColumnUp(),
+  renderSideColumn,
+  threadListOffered,
+  layoutFit: () => layoutShown.fit(),
+  layoutColumns: () => layoutShown.columns(),
+  layoutThreadList: () => layoutShown.threadList(),
+  changeChannelView,
+  defaultChannelView,
+  chooseView,
+  openThreadFromList,
+  selectSideThread,
+  closeSideThread,
+  setLayout,
+  paintCard: (row, choice, tally) => paintThreadCard(row, choice, /** @type {any} */ (tally)),
+  fetchTimeline: (path) => apiDecoded("TimelineResponse", path),
+  foldTimelineDelta: (p, sent, view, thread) => foldTimelineDelta(/** @type {any} */ (p), sent, view, /** @type {any} */ (thread)),
+  foldTimelinePage: (p, o, view, thread) => foldTimelinePage(/** @type {any} */ (p), o, view, /** @type {any} */ (thread)),
+  isCursorRefusal,
+  refreshFailed,
+  saveChannelScope,
+  syncUnreadReplies,
+  renderSideFreshness,
+  sideCardReplies,
+  sideCardUnread,
+  threadIsRead,
+  cardOpener,
+  toggleLitCard,
+  paintLitCard,
+  enterCard,
+  cardMessageCount,
+  searchable,
+  threadHue,
+  threadReplyCount,
+  threadCount,
+  repliesOf: (message) => threadReplies(message.id, message),
+  paintThreadBadge,
+  unansweredRoot,
+  startThread,
+  openReply: (messages, row) => openReply(messages, row),
+  openReplyFromRow: (row) => openReply(rowMessages(row), row),
+  sayRowShortcut,
+  guardQuietly,
+  toggleGathered,
+  rootOverflowsCard: (root) => rootOverflowsCard(root),
+  threadsViewKey: () => viewKey("threads"),
+  setTextIfChanged,
+  mainColumn: () => columns.main,
+  replyTally,
+  pageLimit: DISCORD_PAGE_LIMIT,
+  currentComplete: () => channelStore.current().complete,
+  reconcileMs: () => TIMELINE_RECONCILE_MS,
+  withPendingThreads: (summaries) => withPendingThreads(/** @type {any} */ (summaries)),
+  cardView: (choice) => cardView(choice),
+  threadReplies: (id, message) => threadReplies(id, message),
+});
+const {
+  noteThreadListLanded, threadWords, threadName, threadChoices, openThreadChoice,
+  knownThreadChoice, openThreadName, olderThreadsOnServer, renderThreadSelect,
+  renderThreadHeading, onThreadSelect, refreshThreadDirectory, openThread, closeThread,
+  olderThreadsToRead, loadOlderThreads, olderThreadsFailure, threadCards, addThreadDecoration, gatherCount,
+  noteNewestThreadPage,
+} = threadList;
 
 // --- older threads, from the thread list ---------------------------------------------------------
 //
@@ -6696,136 +6360,6 @@ function closeThread() {
  * The walk back through one channel's thread list: the server's `next_before` for the next older page
  * (null with none known yet, or none left), whether a read is out, and how the last one failed.
  */
-const threadPages = { channel: "", cursor: /** @type {string | null} */ (null), loading: false, failed: false, error: "", generation: 0 };
-
-/** The walk back's state, reset for `channel` when it was another channel's. */
-function threadPagesFor(channel) {
-  if (threadPages.channel !== channel) {
-    Object.assign(threadPages, { channel, cursor: null, loading: false, failed: false, error: "" });
-    threadPages.generation += 1;
-  }
-  return threadPages;
-}
-
-/**
- * A newest page of `channel`'s thread list landed: its `next_before` is where the walk back starts,
- * unless the walk has already gone further back than that, whose pages are still in the store.
- */
-function noteNewestThreadPage(channel, payload) {
-  const pages = threadPagesFor(channel);
-  const next = payload.has_more === true ? payload.next_before || null : null;
-  if (!pages.cursor || !next) pages.cursor = next;
-}
-
-/** Whether there are older threads to read from "Older threads…": the server said so, or a cursor says it. */
-function olderThreadsToRead() {
-  const channel = String(selectedChannelId());
-  return olderThreadsOnServer() || (threadPages.channel === channel && threadPages.cursor !== null);
-}
-
-/**
- * "Older threads…": the next page back of the channel's thread list, folded into the store, the cards
- * drawn again with the reader kept on the card they were on (`renderSideCards`). With no cursor yet —
- * the newest read was a delta, or the cards came from this device's snapshot — the newest page is read
- * first for one. A failure keeps the cards, which are still true, and says so over them; the button
- * stays, to try again.
- */
-async function loadOlderThreads() {
-  const channel = String(selectedChannelId());
-  if (!providerFacts.threading() || !channel || channelStore.current().scope) return;
-  const pages = threadPagesFor(channel);
-  if (pages.loading) return;
-  const generation = ++pages.generation;
-  Object.assign(pages, { loading: true, failed: false, error: "" });
-  renderSideColumn();
-  const base = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}`;
-  const stale = () => generation !== pages.generation || String(selectedChannelId()) !== channel;
-  try {
-    if (!pages.cursor) {
-      // `remote-ops-audit`: the thread list's newest page, read for its cursor, says "threads"; the step back "older".
-      const newest = await apiDecoded("TimelineResponse", `${base}&reason=threads`);
-      if (stale()) return;
-      foldTimelinePage(newest, false, "threads", null);
-      threadDirectoryReadAt.set(channel, Date.now());
-      noteThreadListLanded(channel);
-      noteNewestThreadPage(channel, newest);
-    }
-    if (pages.cursor) {
-      const older = await apiDecoded("TimelineResponse", `${base}&reason=older&before=${encodeURIComponent(pages.cursor)}`);
-      if (stale()) return;
-      foldTimelinePage(older, true, "threads", null);
-      pages.cursor = older.has_more === true ? older.next_before || null : null;
-    }
-  } catch (error) {
-    if (stale()) return;
-    pages.failed = true;
-    pages.error = (error && (error.detail || error.message)) || "the server did not answer";
-  } finally {
-    if (!stale()) pages.loading = false;
-  }
-  if (stale()) return;
-  renderThreadSelect();
-  renderThreadHeading();
-  renderSideColumn();
-}
-
-/** What the cards say of the walk back's last read, when it failed; else "". */
-function olderThreadsFailure() {
-  if (threadPages.channel !== String(selectedChannelId()) || !threadPages.failed) return "";
-  return `Could not load older threads: ${threadPages.error.replace(/[.\s]+$/, "")}.`;
-}
-
-/** The Threads list's cards for `summaries`, their unread replies counted once for them all. */
-function threadCards(summaries) {
-  const tally = replyTally();
-  // `#466 reply-promotes-thread`: and the threads sends in the outbox are starting.
-  return withPendingThreads(summaries).map((summary) => threadCard(summary, tally));
-}
-
-/**
- * A card of the Threads list. `#277 thread-card-focus`: as the right column's cards are (`sideCard`).
- * Its button, the thread's name, highlights it, and shows under the name what the thread is about —
- * its summary, else its first message's words — which the card keeps to itself otherwise; the button
- * beside it, "3 replies · 2 unread", goes into the thread.
- */
-function threadCard(summary, tally) {
-  const id = String(summary.id);
-  const choice = threadChoice(id, summary);
-  const row = document.createElement("li");
-  row.className = "thread-card";
-  row.setAttribute("data-context-id", id);
-  row.style.setProperty("--thread-hue", threadHue(summary.id));
-  const button = document.createElement("button");
-  button.className = "thread-open";
-  button.setAttribute("type", "button");
-  const title = document.createElement("strong");
-  // `#194 thread-picker-polish`: the name the selector and the heading use, given the card's room.
-  title.textContent = threadName(choice, Infinity);
-  const said = threadWords(choice).said;
-  // `#489 card-root-lines`: its lines, as a list card's are; `#522 thread-card-max-lines`: K of them at most.
-  const view = cardView(choice);
-  const first = view.mode === "name" ? "" : view.text;
-  const about = document.createElement("span");
-  about.className = "thread-card-text";
-  about.textContent = said || (first.replace(/\s+/g, " ") === title.textContent ? "" : first);
-  button.append(title, about);
-  button.addEventListener("click", () => toggleLitCard(id, row));
-  const unread = sideCardUnread(choice, tally);
-  // `#483 thread-card-read-style`: read whole, this card recedes as the Threads view's cards do.
-  if (threadIsRead(choice, unread)) row.setAttribute("data-thread-read", "");
-  const open = cardOpener("thread-card", sideCardReplies(choice, tally), unread,
-    inThisColumn(() => guardQuietly(() => enterCard(id, summary, row))()));
-  row.append(button, open);
-  // `#439 search-unmatched-separators`. What a gap among these cards counts for this whole thread.
-  const size = cardMessageCount(choice, tally);
-  /** @type {any} */ (row).cardMessages = size.messages;
-  /** @type {any} */ (row).cardMessagesExact = size.exact;
-  paintLitCard(row, id);
-  // `#129 message-search`. A thread card is what stands in this list where messages stand in the
-  // others, so the filter has to reach it or searching on the threads tab silently does nothing.
-  searchable(row, title.textContent);
-  return row;
-}
 
 /**
  * Say that a read is on the wire, or that none is. `quiet` is a read behind rows already on screen
@@ -6880,81 +6414,6 @@ function backgroundRead(options) {
   return reasons.every((reason) => ["poll", "live", "visible", "replay", "mutation"].includes(String(reason)));
 }
 
-function addThreadDecoration(meta, message, row, everyThread = false) {
-  const id = threadOf(message);
-  // The scope is the channel itself: its root opens nothing it is not already showing.
-  if (!providerFacts.threading() || !id || (selection().view === "thread" && !everyThread) || id === channelStore.current().scope) return;
-  // THE WAY INTO A THREAD, on every row of one that is not already inside it: in All, on every
-  // message, coloured by its thread; in Main, on the roots, which are the only rows of a thread Main
-  // shows; and on a row of the Pinned filter, which mixes every view's messages, whichever view is
-  // underneath (`#206 pin-message`). `#215 reply-coalesce` brought it to Main: the N replies chip
-  // used to be the way in there, and it gathers the replies now, so without this a thread could not
-  // be opened from its own root.
-  const badge = document.createElement("button");
-  badge.className = "thread-badge";
-  badge.setAttribute("type", "button");
-  // The reply count tells two tags apart at a glance, as their colours do. NOT A ZERO: a provider
-  // can name a thread nobody has answered yet — every Google Chat message heads one — and
-  // "Thread 0" on such a row read as a broken count. `#185 reply-new-thread`.
-  //
-  // `#215 reply-coalesce`: "Thread(12)", at the owner's word. The parentheses make the number read
-  // as a count belonging to the word rather than as the thread's number, which is what "Thread 12"
-  // was taken for. Only the chip says it: the picker and the heading over an open thread name a
-  // thread, and give its count among its facts ("13h · 12 · name"), so the `#194` rule that the
-  // heading matches the picker is about the NAME and is untouched by this.
-  //
-  // `#252 thread-button-state`: a thread nobody has answered is not one yet, and its tag is grey and
-  // starts it (`paintThreadBadge`). The pass over the rows that follows every redraw paints it again
-  // with the replies the store holds (`drawThreadChips`), which is what turns it into the coloured
-  // chip when the first reply arrives.
-  const replies = threadReplyCount(id, message);
-  paintThreadBadge(badge, id, replies, unansweredRoot(message, replies, 0, null));
-  // What the tag does is read when it is pressed, so a tag painted again since it was drawn does
-  // what it now says.
-  badge.addEventListener("click", inThisColumn(() => guardQuietly(() => {
-    // `#419 threads-view-main-messages`. A main-channel message among the Threads view's cards is made a
-    // thread where it is: the reply opens under it, bound for its new thread, the view left as it is.
-    if (row.hasAttribute("data-main-row")) return openReply(rowMessages(row), row);
-    return badge.getAttribute("data-thread-state") === "start" ? startThread(id) : openThread(id);
-  })()));
-  // `#224 keyboard-shortcuts`. → on the selected message presses it.
-  sayRowShortcut(badge, "thread-badge");
-  meta.append(badge);
-  // `#261 two-column-connectors`. Held on the row, as its reply button is, so that the link from a root
-  // to its card leaves level with its tag without the row's parts being walked.
-  /** @type {any} */ (row).threadBadge = badge;
-  if (message.thread.is_root) {
-    // A thread with no replies gets no chip at all — "0 replies" offered to gather nothing.
-    const { count, exact } = gatherCount(id, message);
-    if (count === 0) return;
-    // `#215 reply-coalesce`. NOT the way into the thread any more — the badge above is, and the two
-    // said the same thing. It gathers the thread's replies under this message in All, and while
-    // they are gathered it is pressed and puts them back. `renderReplyLinks` keeps its state.
-    const gather = document.createElement("button");
-    gather.className = "thread-replies";
-    gather.setAttribute("type", "button");
-    gather.setAttribute("title", "Gather this message's replies under it");
-    gather.setAttribute("aria-pressed", "false");
-    gather.style.setProperty("--thread-hue", threadHue(id));
-    gather.textContent = threadCount(count, exact);
-    gather.addEventListener("click", inThisColumn(() => guardQuietly(() => toggleGathered(String(message.id), row))()));
-    row.append(gather);
-  }
-}
-
-/**
- * The count a root's N replies chip gives: the root's own, as it always was, unless it has none to
- * give: then the summary's. With `held`, never fewer than the replies the store holds — a reply that
- * came in on the stream is one more than the count the root was last read with (`#222
- * unread-replies`), and "1 reply" over two would read as a broken count.
- */
-function gatherCount(id, message, held = 0) {
-  const own = message.thread;
-  const { count, exact } = typeof own.reply_count === "number" && own.reply_count > 0
-    ? { count: own.reply_count, exact: own.reply_count_exact }
-    : threadReplies(id, message);
-  return typeof count === "number" ? { count: Math.max(count, held), exact } : { count: held || null, exact: true };
-}
 
 // --- the Thread button before there is a thread ---------------------------------------------------
 //
@@ -7227,7 +6686,7 @@ function holdsUnreadReplies(message, tally) {
  * default, or one unpacked under its card (`unpackBlock`, `#407 unpack-row-parity`), which keeps what
  * the thread would.
  *
- * @param {ReturnType<typeof threadChoice> | null} [thread]
+ * @param {import("./src/present/rows/index.ts").ThreadChoice | null} [thread]
  * @returns {(message: any) => boolean}
  */
 function readFilterKeeps(thread = selection().view === "thread" ? openThreadChoice() : null) {
@@ -12078,6 +11537,7 @@ const serverSearchCopy = createServerSearchCopy({
 const serverSearchOwner = serverSearchCopy.owner;
 const gathering = serverSearchCopy.gathering;
 const repliesWalks = serverSearchCopy.repliesWalks;
+const threadDirectoryReadAt = threadList.directoryReadAt;
 const { serverCopyOpen, searchFurtherRunning, stopRepliesWalk, repliesControlPressed, sideCardsShown, cardsFound } = serverSearchCopy;
 
 // --- pulling the channel down to refresh it -----------------------------------------------------
@@ -16703,7 +16163,7 @@ function renderSideCards() {
     });
   }
   // `#281 view-keys`. It reads where it stands now, and says so while it does.
-  const loading = threadPages.loading && threadPages.channel === String(selectedChannelId());
+  const loading = threadList.threadPagesLoading();
   setTextIfChanged(button, loading ? "Loading older threads…" : "Older threads…");
   if (button.disabled !== loading) button.disabled = loading;
   // `#491 threads-view-sent-receipt`. A sent reply these cards now draw takes its receipt away: the
@@ -17686,7 +17146,7 @@ const threadCardsDrawn = new Map();
  * Whether thread `choice` is one nobody has answered, by the rule its grey Thread tag is drawn by
  * (`unansweredRoot`): no colour is spent on it.
  *
- * @param {ReturnType<typeof threadChoice>} choice
+ * @param {import("./src/present/rows/index.ts").ThreadChoice} choice
  * @param {ReplyTally} tally
  */
 function threadUnanswered(choice, tally) {
@@ -17704,7 +17164,7 @@ function threadUnanswered(choice, tally) {
  * Written only when what it would draw has changed.
  *
  * @param {HTMLElement} card
- * @param {ReturnType<typeof threadChoice> | null} choice
+ * @param {import("./src/present/rows/index.ts").ThreadChoice | null} choice
  * @param {ReplyTally} tally
  */
 function paintThreadCard(card, choice, tally) {
