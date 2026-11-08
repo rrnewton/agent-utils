@@ -23,6 +23,8 @@ def _env(tmp_path: Path) -> dict[str, str]:
     return {**os.environ, "GATE_ADMISSION_DIR": str(tmp_path / "admission"),
             "GATE_LEDGER": str(tmp_path / "ledger.jsonl"), "GATE_PRUNE_TARGETS": "off",
             "GATE_SLOTS_CONFIG": str(tmp_path / "gate-slots.toml"),
+            # A lane may run the suite under GATE_SLOTS=1; the tests assume the default.
+            "GATE_SLOTS": "2",
             # The real preflight runs validation steps; these tests give it a stand-in.
             "GATE_PREFLIGHT_COMMAND": "true"}
 
