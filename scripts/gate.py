@@ -630,7 +630,6 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     try:
         for sig in _ABORT_SIGNALS:
             signal.signal(sig, _raise_aborted)
-        group = {"process_group": 0} if sys.version_info >= (3, 11) else {"preexec_fn": os.setpgrp}
         proc = subprocess.Popen(
             command,
             env={**os.environ, "GATE_ADMISSION_RUN_ID": run_id},
@@ -639,7 +638,8 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             text=True,
             errors="replace",
             bufsize=1,
-            **group,  # type: ignore[arg-type]
+            # Its own process group, so an abort can stop the whole tree.
+            preexec_fn=os.setpgrp,
         )
         assert proc.stdout is not None
         for line in proc.stdout:
