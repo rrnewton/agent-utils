@@ -13571,17 +13571,23 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             // The text to store: the transcript's, when it pairs this screen block with one the
             // request does not hold either.
             let mut body = &block.body;
+            let mut paired = false;
             if let Some(clean) = transcript.clean.get(&block.body) {
                 if known.find(self, key, &ReplyIdentity::of(clean))?.is_some() {
                     continue;
                 }
                 body = clean;
+                paired = true;
             }
             // A block that reads, once rendered, like a reply the request holds is that reply
             // again: a transcript block of a reply stored from the screen before the transcript
             // held it, or a screen rendering of a reply that `chat reply` stored with its source
             // text, whose table the identity checks above cannot match, so it was posted twice
-            // (#783 chat-reply-capture-miss).
+            // (#783 chat-reply-capture-miss). So is an unpaired screen block that reads as part
+            // of a stored reply, a paragraph short: the pane scrolled or redrew a reply the
+            // transcript already stored and settled, in a form the pairing cannot match whole
+            // (#1046 chat-bridge-duplicate-reply). Only the screen copy is judged that way: a
+            // transcript block is the reply as written, never a partial drawing of one.
             if stored_bodies.is_none() {
                 let mut bodies = Vec::new();
                 for ordinal in 1..request.next_reply_ordinal {
@@ -13599,6 +13605,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                     same_rendered_text(earlier, body)
                 } else {
                     same_reply_rendered(earlier, body)
+                        || (!paired && rendered_paragraph_subset(earlier, body))
                 }
             }) {
                 continue;
@@ -18872,6 +18879,75 @@ fn same_reply_rendered(earlier: &str, later: &str) -> bool {
         && (same_rendered_text(earlier, later)
             || rendered_equivalent(earlier, later)
             || rendered_equivalent(later, earlier))
+}
+
+/// The rendered keys of `text`'s paragraphs, in order: blank-line-separated groups, each as
+/// [`same_reply_rendered`] keys a whole reply.
+fn paragraph_keys(text: &str) -> Vec<[String; 2]> {
+    use agent_harness::replies::{label_key, rendered_key};
+    let mut paragraphs: Vec<Vec<&str>> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if paragraphs
+                .last()
+                .is_some_and(|last: &Vec<&str>| !last.is_empty())
+            {
+                paragraphs.push(Vec::new());
+            }
+        } else {
+            match paragraphs.last_mut() {
+                Some(current) => current.push(line),
+                None => paragraphs.push(vec![line]),
+            }
+        }
+    }
+    paragraphs
+        .iter()
+        .map(|lines| {
+            let joined = lines.join("\n");
+            [rendered_key(&joined), label_key(&joined)]
+        })
+        .filter(|keys| keys.iter().any(|key| !key.is_empty()))
+        .collect()
+}
+
+/// Whether `later` reads as part of the reply `earlier` is: every paragraph of `later`, in
+/// order, reads as a paragraph of `earlier`, the last of them perhaps cut short, and `later`
+/// is shorter in all (#1046 chat-bridge-duplicate-reply). A pane that scrolls or redraws a
+/// stored reply shows it a paragraph short, in a form no fuller pairing matches; a genuinely
+/// second reply is not built only from an earlier one's paragraphs, in their order. The cut
+/// paragraph must still read long enough to be this reply's and no other's, as a text judged
+/// visible elsewhere must ([`MIN_VISIBLE_KEY_CHARS`]).
+fn rendered_paragraph_subset(earlier: &str, later: &str) -> bool {
+    let earlier_paras = paragraph_keys(earlier);
+    let later_paras = paragraph_keys(later);
+    if earlier_paras.is_empty() || later_paras.is_empty() {
+        return false;
+    }
+    let total =
+        |paras: &[[String; 2]]| -> usize { paras.iter().map(|keys| keys[0].chars().count()).sum() };
+    let later_total = total(&later_paras);
+    if later_total < MIN_VISIBLE_KEY_CHARS || later_total >= total(&earlier_paras) {
+        return false;
+    }
+    let mut from = 0;
+    for (index, later_keys) in later_paras.iter().enumerate() {
+        let cut_short = index + 1 == later_paras.len();
+        let Some(position) = earlier_paras[from..].iter().position(|earlier_keys| {
+            earlier_keys
+                .iter()
+                .any(|key| !key.is_empty() && later_keys.contains(key))
+                || (cut_short
+                    && earlier_keys.iter().zip(later_keys).any(|(whole, part)| {
+                        part.chars().count() >= MIN_VISIBLE_KEY_CHARS
+                            && whole.starts_with(part.as_str())
+                    }))
+        }) else {
+            return false;
+        };
+        from += position + 1;
+    }
+    true
 }
 
 /// The most transcript blocks remembered as settled before the memory starts over.
@@ -32436,6 +32512,98 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
             .expect("command reply");
         assert!(matches!(stored, ReplyStoreOutcome::Stored(_)), "{stored:?}");
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The reply as written, in four paragraphs, and two partial screen copies of it for
+    /// #1046 chat-bridge-duplicate-reply: one missing its second paragraph, one missing its
+    /// third (about three quarters as long once rendered, as the posted duplicate measured).
+    const QUEUE_WRITTEN: &str = "**Update on the queue.** The overnight builds are held by one \
+                                 wedged runner and nothing has shipped since the small hours.\n\n\
+                                 What we know: the runner accepted a job, printed its startup \
+                                 lines, and then stopped reporting progress entirely while the \
+                                 other runners sit idle.\n\nNext step: capture a thread dump \
+                                 first, then restart it, accepting that the build cache will \
+                                 be cold and the first builds slower.\n\nYesterday's release is \
+                                 unaffected and stays available throughout.";
+    const QUEUE_DRAWN_NO_SECOND: &str = "Update on the queue. The overnight builds are held by \
+                                         one wedged runner and nothing has shipped since the \
+                                         small hours.\n\nNext step: capture a thread dump first, \
+                                         then restart it, accepting that the build cache will \
+                                         be cold and the first builds slower.\n\nYesterday's \
+                                         release is unaffected and stays available throughout.";
+    const QUEUE_DRAWN_NO_THIRD: &str = "Update on the queue. The overnight builds are held by \
+                                        one wedged runner and nothing has shipped since the \
+                                        small hours.\n\nWhat we know: the runner accepted a job, \
+                                        printed its startup lines, and then stopped reporting \
+                                        progress entirely while the other runners sit \
+                                        idle.\n\nYesterday's release is unaffected and stays \
+                                        available throughout.";
+
+    /// #1046 chat-bridge-duplicate-reply: a reply stored from the transcript (and so settled)
+    /// is read again from the screen a paragraph short, in a form the pairing cannot match to
+    /// its transcript block. Past the screen-fallback wait it must still post exactly once,
+    /// and a genuinely second reply under the same ID must still post.
+    #[test]
+    fn a_partial_screen_copy_of_a_settled_transcript_reply_is_not_stored_again() {
+        for (name, drawn) in [
+            ("settled-partial-second", QUEUE_DRAWN_NO_SECOND),
+            ("settled-partial-third", QUEUE_DRAWN_NO_THIRD),
+        ] {
+            let (state, key, nonce, root) = open_request(name);
+            let id = format!("{nonce}_1");
+            let later = Some(unix_millis() + 1_000);
+            let state =
+                with_followed_transcript(&state, vec![transcript_block(&id, QUEUE_WRITTEN, later)]);
+            // The transcript alone stores the reply, and the capture settles its block.
+            let capture = state.capture_snapshot("").expect("transcript capture");
+            assert_eq!(capture.replies, [(key.clone(), vec![1])], "{name}");
+            assert_eq!(
+                state.read_reply(&key, 1).expect("reply").body,
+                QUEUE_WRITTEN,
+                "{name}"
+            );
+            // The pane later shows the same block a paragraph short. Held at first, as any
+            // unpaired screen block is, and still not stored past the wait.
+            let capture = state
+                .capture_snapshot(&reply_block(&id, drawn))
+                .expect("partial copy, held");
+            assert!(capture.replies.is_empty(), "{name}: {capture:?}");
+            state.age_screen_holds(SCREEN_FALLBACK_AFTER);
+            let capture = state
+                .capture_snapshot(&reply_block(&id, drawn))
+                .expect("partial copy, past the wait");
+            assert!(
+                capture.replies.is_empty(),
+                "{name}: the partial copy was stored again: {capture:?}"
+            );
+            assert!(capture.refused.is_empty(), "{name}: {capture:?}");
+            assert_eq!(
+                state
+                    .read_request(&key)
+                    .expect("request")
+                    .next_reply_ordinal,
+                2,
+                "{name}: exactly one reply is stored"
+            );
+            // A second, different reply under the same ID is still a reply: held like any
+            // unpaired screen block, then stored past the wait.
+            let capture = state
+                .capture_snapshot(&reply_block(
+                    &id,
+                    "The runner is back and the queue drained.",
+                ))
+                .expect("second reply, held");
+            assert!(capture.replies.is_empty(), "{name}: {capture:?}");
+            state.age_screen_holds(SCREEN_FALLBACK_AFTER);
+            let capture = state
+                .capture_snapshot(&reply_block(
+                    &id,
+                    "The runner is back and the queue drained.",
+                ))
+                .expect("second reply");
+            assert_eq!(capture.replies, [(key.clone(), vec![2])], "{name}");
+            fs::remove_dir_all(root).expect("cleanup");
+        }
     }
 
     #[test]

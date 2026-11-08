@@ -6,7 +6,9 @@
 //! there are any, follows the coordinator's idle time: Herdr must report the pane `idle` or
 //! `done`, none of the loop's own evidence may show a running turn, and Claude Code itself, asked
 //! through `claude agents --json` exactly as `agentctl inbox watch` asks
-//! (`crate::inbox::claude_sessions_by_pane`), must say the session in the pane is `idle`. Herdr's
+//! (`crate::inbox::claude_sessions_by_pane`), must say the session in the pane is `idle`, or
+//! `shell` — at its prompt with a background shell task still running, which is where a
+//! coordinator with persistent background work sits between turns. Herdr's
 //! word alone is not enough: its screen rules can report a working Claude Code pane as idle. An
 //! idle period starts at the first check that finds all three and ends at the first that does
 //! not. A request is due once the coordinator has been idle for the configured time since both
@@ -372,7 +374,12 @@ impl ClaudeIdleSource for ClaudeAgents {
             })
         });
         Ok(match session.and_then(|session| session.status()) {
-            Some("idle") => ClaudeState::Idle,
+            // `shell` is the session at its prompt — its turn over — with a background shell
+            // task still running (#1046 chat-bridge-duplicate-reply). A coordinator that keeps
+            // persistent background work (monitors, watch loops) reports `shell` after every
+            // turn and `idle` never, so counting it as busy silenced every reminder for such a
+            // coordinator, with nothing in the log to say why.
+            Some("idle" | "shell") => ClaudeState::Idle,
             Some(other) => ClaudeState::Busy(other.to_owned()),
             None => ClaudeState::NoSession,
         })
@@ -1615,12 +1622,15 @@ mod tests {
         );
         fs::remove_dir_all(directory).expect("cleanup");
 
-        // Any state other than `idle`, such as a background shell, counts as busy.
+        // `shell` is the session at its prompt with a background shell task still running:
+        // its turn is over, so it counts as idle. Counting it as busy silenced every reminder
+        // for a coordinator that keeps persistent background work, which never reports plain
+        // `idle` between turns (#1046 chat-bridge-duplicate-reply).
         let (directory, source) =
             claude_fixture("shell", r#"[{"pid":101,"sessionId":"s","status":"shell"}]"#);
         assert_eq!(
             source.state(&pane("claude", "w:coordinator"), &|| false),
-            Ok(ClaudeState::Busy("shell".to_owned()))
+            Ok(ClaudeState::Idle)
         );
         fs::remove_dir_all(directory).expect("cleanup");
 

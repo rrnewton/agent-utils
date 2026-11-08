@@ -1,10 +1,11 @@
 ---
 title: 'chat-bridge-duplicate-reply: a settled transcript reply is posted twice, and a fenceless turn earns no reminder'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-08T06:22:31.000000000+00:00
-updated_at: 2026-11-08T06:22:31.000000000+00:00
+updated_at: 2026-11-08T06:46:31.000000000+00:00
+closed_at: 2026-11-08T06:46:31.000000000+00:00
 ---
 
 # Description
@@ -33,4 +34,12 @@ Second, from the same evening: requests answered in plain text with no reply fen
 
 ## Resolution
 
-Pending.
+[watermelon-full-preview] Fixed by mu-spark.
+
+Duplicate re-post: capture now also recognises an unpaired screen block as a stored reply when every paragraph of it reads, in order, as a paragraph of that reply once rendered (the last perhaps cut short) — `rendered_paragraph_subset` beside `same_reply_rendered` in `rs/agentctl/src/chat_runtime.rs`, applied only to screen copies, never to transcript blocks. The alternative, never falling back to the screen for a settled identifier, was rejected: it would also drop a genuinely second screen-only reply under that ID while the transcript lags, and multi-reply requests are real. The subset rule drops only copies built solely from the stored reply's own paragraphs. Regression test `a_partial_screen_copy_of_a_settled_transcript_reply_is_not_stored_again` covers a copy missing its second paragraph and one missing its third at the observed length ratio — each stored a duplicate before, each posts exactly once now — and proves a distinct second reply under the same ID still posts past the fallback wait.
+
+Missing reminder: the cause was the idle mapping, found live by hands. After a turn, Claude Code reports a session with background shell tasks still running as `shell`, not `idle` (observed turning `busy` to `shell` two seconds after turn end, never `idle` while persistent monitors run). `ClaudeAgents::state` counted everything but `idle` as busy, busy is not logged, and the idle period therefore never began for such a co-ordinator: no reminder could ever become due, however long it then sat at its prompt (the affected bridge's last reminded request predates the incident by days, with eligible fenceless turns since). `shell` now counts as idle — the turn is over; only background tasks run. The mapping test that asserted the old reading now asserts this one, and `a_turn_that_ends_without_a_fence_or_a_command_reply_is_reminded_once_it_is_idle` covers the incident sequence end to end: busy while the turn runs, exactly one reminder once idle, recorded reminded.
+
+Follow-up, deliberately not in this change: `rs/agentctl/src/inbox/watch.rs` likewise maps only session `idle` authoritatively, with `shell` falling back to the Herdr state there. The impact differs (worker observation, not reminder gating) and it needs its own look before anyone aligns it.
+
+Unverified here: the refreshed bridges in service (picking this up is the co-ordinator's refresh) and reminder timing on a saturated host, where the idle query itself can be slow; the shipped waits and retry holds are unchanged.

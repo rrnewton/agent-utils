@@ -22040,6 +22040,46 @@ has been seen working and is idle again, or for 1s if it is not seen working"),
     }
 
     #[test]
+    fn a_turn_that_ends_without_a_fence_or_a_command_reply_is_reminded_once_it_is_idle() {
+        // #1046 chat-bridge-duplicate-reply: the coordinator worked on the request and ended
+        // its turn with a plain-text answer — no fence, no `chat reply`, so nothing was ever
+        // stored for it. While the turn runs no reminder is composed; once the session sits
+        // idle at its prompt, exactly one reminder follows and the request is recorded
+        // reminded, so no later check sends another.
+        let (fixture, state, mut reminders, _idle, _asked, script) =
+            scripted_reminding_worker(true);
+        let (key, _) = delivered_worker_request(&state);
+        fixture.client.runs.lock().expect("runs").clear();
+        script.lock().expect("script").extend([
+            Ok(reply_reminders::ClaudeState::Busy("busy".to_owned())),
+            Ok(reply_reminders::ClaudeState::Busy("busy".to_owned())),
+        ]);
+        let mut turn = TurnEvidence::default();
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        assert!(
+            reminders_typed(&fixture).is_empty(),
+            "no reminder while the turn runs"
+        );
+        // The turn is over; the idle period begins, and the request is due after it.
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        assert!(
+            reminders_typed(&fixture).is_empty(),
+            "the idle period only just began"
+        );
+        thread::sleep(Duration::from_millis(150));
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        assert_eq!(reminders_typed(&fixture).len(), 1, "the reminder fired");
+        let record = state
+            .update_reply_reminders(chat_runtime::unix_millis(), None, |_| (false, ()))
+            .expect("record")
+            .0;
+        assert!(record.reminded(&key), "{record:?}");
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        assert_eq!(reminders_typed(&fixture).len(), 1, "and only once");
+    }
+
+    #[test]
     fn claude_code_is_not_asked_again_for_an_idle_time_after_it_fails_or_lists_no_session() {
         // After a run of `claude agents --json` that fails, or lists no session in the pane, the
         // next checks do not ask again until the idle time has passed.
