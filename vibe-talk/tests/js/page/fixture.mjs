@@ -5230,6 +5230,14 @@ const TUNING_BANDS = {
     "how far below the scroller's top a document heading still counts as the current section " +
     "(#1038 documents-outline-popup): past a line's height a heading the reader has not reached " +
     "yet would be marked HERE in the outline pop-up"],
+  NOTICE_OUTLINE_CAP: [5, 100,
+    "outline entries named in the voice agent's open-document notice (#1040 " +
+    "documents-voice-agent): fewer hides the sections a question is most likely about, far " +
+    "more spends the call's opening turn reciting a table of contents nobody asked to hear"],
+  NOTICE_WORDS: [50, 1000,
+    "plain words of the document quoted in that notice (#1040 documents-voice-agent): fewer " +
+    "leaves the agent guessing what the document is before it asks, far more pays the whole " +
+    "document's prefill on every call whether or not the reader says yes"],
   BROWSER_SPEECH_CHUNK_CHARS: [60, 300,
     "device voices need short utterances to avoid mobile synthesis stalls without pausing every word"],
   BROWSER_SPEECH_SENTENCE_MIN_CHARS: [8, 60,
