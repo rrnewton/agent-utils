@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-1078-cd11ff5986b",
+    "issue_id": "agent-utils-1078",
+    "author": "devbig014",
+    "body": "[watermelon-full-preview] mu-layout browser evidence (real Chromium, shipped bundle, 360/412/1280 in dark and light, 131 checks): bottom bar and switcher rects identical across Voice, Channel and Documents on phones (dock floor identical on desktop, switcher corner identical), hiding the reader moves neither, tab row steps Voice to Channel to Documents and settles away, Outline in the bar while scrolled with dark bordered rows. Tab row at 412 dark: https://pxl.cl/kjwXC Reader outline at 412 dark: https://pxl.cl/kjx1j Reader outline at 412 light (dark overlay kept): https://pxl.cl/kjx74 Full set in /tmp/mu-layout-shots on devbig014. Commits 01da2238 (this issue) then 085e5826 for #1079 documents-chronological; gate and landing follow.",
+    "created_at": "2026-11-08T19:29:04.219467726Z",
+    "updated_at": "2026-11-08T19:29:04.219467726Z"
+  }
+]

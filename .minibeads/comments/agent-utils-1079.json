@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-1079-c2fdc8268ba",
+    "issue_id": "agent-utils-1079",
+    "author": "devbig014",
+    "body": "[watermelon-full-preview] mu-layout browser evidence (real Chromium, shipped bundle, 360/412/1280 in dark and light): list runs oldest at top to newest at bottom and opens scrolled to the bottom, drag up parked at the bottom issues a real refresh, computed overscroll-behavior is contain on the shared scroller and none on html/body at every size. Documents list at 412 dark (newest doc-8 at the foot): https://pxl.cl/kjxb3 Full set in /tmp/mu-layout-shots on devbig014. Native stretch pixels do not render in headless Chromium and no Android device is attached to this host (adb lists none), so the stretch itself is verified by configuration only; iOS runs in Safari by design and its bounce is the browser own. Commit 085e5826 after #1078 bottom-bar-switcher; gate and landing follow.",
+    "created_at": "2026-11-08T19:29:14.440943170Z",
+    "updated_at": "2026-11-08T19:29:14.440943170Z"
+  }
+]
