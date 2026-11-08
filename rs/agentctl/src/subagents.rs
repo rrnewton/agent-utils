@@ -25,10 +25,11 @@ use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target
 use crate::client::{
     muse_editor_rows_empty, muse_startup_metadata, muse_trust_prompt, muse_verified_pane_status,
     muse_verified_process_editor_draft, muse_verified_process_editor_rows,
-    muse_verified_process_idle_composer, muse_verified_process_paste_in_composer,
-    muse_verified_process_paste_is_exact_composer, muse_verified_process_prompt_queued_count,
-    muse_verified_process_prompt_transcript_count, AgentIdentity, AgentPaneInfo,
-    CustomProcessIdentity, HerdrClient, Pane, PaneShellProof, ProcessLiveness, ReexecutedCommand,
+    muse_verified_process_idle_composer, muse_verified_process_paste_drawn,
+    muse_verified_process_paste_in_composer, muse_verified_process_paste_is_exact_composer,
+    muse_verified_process_prompt_queued_count, muse_verified_process_prompt_transcript_count,
+    AgentIdentity, AgentPaneInfo, CustomProcessIdentity, HerdrClient, MusePasteDrawn, Pane,
+    PaneShellProof, ProcessLiveness, ReexecutedCommand,
 };
 use crate::error::{AdapterError, AdapterErrorKind};
 use crate::submission::{GuardedInput, GuardedPrompt, Submission};
@@ -2648,13 +2649,18 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     /// passes is taken back out of the editor and reported as not typed, so it stays pending and
     /// is retried; if that fails, or the prompt left the editor without either proof, the
     /// outcome is unknown and the caller treats the prompt as possibly submitted.
+    ///
+    /// A paste Muse has not drawn by the stage deadline, or has drawn only the start of, is
+    /// left alone, with no clearing key, and the prompt is stranded as not delivered
+    /// ([`muse_input_stalled`]): Muse is not taking terminal input, and keys sent now would act
+    /// later on whatever the editor holds then (#1085 muse-send-staged-unsubmitted).
     fn muse_followup(
         &self,
         pane_id: &str,
         text: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<Submission> {
-        use crate::submission::{FIRST_RETRY, MAX_RETRY, POLL, STAGE_TIMEOUT, SUBMIT_TIMEOUT};
+        use crate::submission::{POLL, STAGE_TIMEOUT};
         *self
             .goal_objective
             .lock()
@@ -2671,8 +2677,17 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             )))
         };
         let started = runtime.monotonic();
+        // The last screen read since the paste, for what a cancelled delivery leaves behind.
+        let mut last: Option<String> = None;
         let staged = loop {
             if runtime.cancelled() {
+                // A paste Muse has not drawn yet is still on its way: it is left alone and
+                // stranded, exactly as one that outlasts the stage window (#1085).
+                if let Some(stalled) = last.as_deref().and_then(|screen| {
+                    muse_input_stalled(pane_id, screen, text, "the delivery was cancelled")
+                }) {
+                    return Ok(Submission::NotStaged(stalled));
+                }
                 return unknown("delivery was cancelled after the prompt was pasted");
             }
             let screen = self.verified_muse_screen(pane_id, runtime)?;
@@ -2680,21 +2695,52 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 break screen;
             }
             if runtime.monotonic().saturating_sub(started) >= STAGE_TIMEOUT {
+                let waited = format!("within {}s", STAGE_TIMEOUT.as_secs());
+                // Muse has drawn none of the paste, or only its start: it is not taking terminal
+                // input, and the rest is still on its way. A clearing key sent now would act
+                // only after the paste, on whatever the editor then holds (it cut a prompt
+                // down to its sender header and glued the next prompt onto it, #1085
+                // muse-send-staged-unsubmitted), so nothing is sent and the prompt is stranded.
+                if let Some(stalled) = muse_input_stalled(pane_id, &screen, text, &waited) {
+                    return Ok(Submission::NotStaged(stalled));
+                }
                 return Err(self.withdraw_unverified_muse_paste(
                     &guarded,
                     pane_id,
                     &format!(
-                        "the pasted prompt was not observed as the whole Muse editor within {}s; \
-                         Enter was not sent",
-                        STAGE_TIMEOUT.as_secs()
+                        "the pasted prompt was not observed as the whole Muse editor {waited}; \
+                         Enter was not sent"
                     ),
                     runtime,
                 ));
             }
+            last = Some(screen);
             runtime.sleep(POLL);
         };
-        let prior = muse_verified_process_prompt_transcript_count(&staged, text);
-        let prior_queued = muse_verified_process_prompt_queued_count(&staged, text);
+        self.muse_followup_submit(&guarded, pane_id, text, &staged, started, runtime)
+    }
+
+    /// Press Enter on `text`, which `staged` shows as the whole Muse editor, and prove from the
+    /// screen or Muse's journal that Muse took it: the second half of [`Self::muse_followup`],
+    /// which a stranded retry ([`Self::muse_stranded_retry`]) shares. `started` is when the
+    /// delivery began, for the receipt.
+    fn muse_followup_submit(
+        &self,
+        guarded: &dyn GuardedInput,
+        pane_id: &str,
+        text: &str,
+        staged: &str,
+        started: Duration,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Submission> {
+        use crate::submission::{FIRST_RETRY, MAX_RETRY, POLL, SUBMIT_TIMEOUT};
+        let unknown = |detail: &str| {
+            Err(AdapterError::unavailable(format!(
+                "pane {pane_id}: {detail}; the outcome is unknown"
+            )))
+        };
+        let prior = muse_verified_process_prompt_transcript_count(staged, text);
+        let prior_queued = muse_verified_process_prompt_queued_count(staged, text);
         let mut journal = self.muse_journal();
         guarded.send_keys(pane_id, "Enter")?;
         let pressed = runtime.monotonic();
@@ -2732,7 +2778,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                     presses,
                 );
             }
-            let evidence = if screen != staged
+            let evidence = if screen != *staged
                 && left_editor
                 && muse_verified_process_prompt_transcript_count(&screen, text) > prior
             {
@@ -2778,7 +2824,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 // so it is always taken back out and retried later (#678 muse-bridge-latency).
                 if still_staged {
                     let withdrawn = self.withdraw_muse_followup(
-                        &guarded,
+                        guarded,
                         pane_id,
                         text,
                         prior,
@@ -2813,6 +2859,107 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 wait = (wait * 2).min(MAX_RETRY);
                 next_press = now.saturating_add(wait);
             }
+        }
+    }
+
+    /// Deliver a prompt that an earlier pass pasted into this Muse pane and left stranded because
+    /// Muse never drew the paste (#1085 muse-send-staged-unsubmitted): it is never typed again.
+    ///
+    /// Enter is pressed once the editor shows the whole paste, with the proof of
+    /// [`Self::muse_followup_submit`], so the prompt is submitted exactly once. An empty editor
+    /// below a user turn or queued input of the prompt is delivery (a readiness wait may have
+    /// submitted the late-drawn draft already). An editor still empty, or showing only the
+    /// start of the paste, keeps the prompt stranded and every later prompt waiting; once the
+    /// late-paste window has passed without the whole paste showing, the paste is reported lost,
+    /// still never typed again.
+    fn muse_stranded_retry(
+        &self,
+        pane_id: &str,
+        text: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Submission> {
+        use crate::submission::{LATE_PASTE_LOST, STAGE_GRACE, STAGE_TIMEOUT};
+        let started = runtime.monotonic();
+        let screen = self.verified_muse_screen(pane_id, runtime)?;
+        let drawn = muse_verified_process_paste_drawn(&crate::harness_tui::plain(&screen), text);
+        if drawn == MusePasteDrawn::Whole {
+            let guarded = self.guarded(runtime)?;
+            return self.muse_followup_submit(&guarded, pane_id, text, &screen, started, runtime);
+        }
+        let queued = muse_verified_process_prompt_queued_count(&screen, text);
+        if drawn == MusePasteDrawn::Nothing
+            && (queued > 0 || muse_verified_process_prompt_transcript_count(&screen, text) > 0)
+        {
+            return Ok(Submission::Verified(crate::submission::SubmissionReceipt {
+                key: "Enter",
+                key_presses: 0,
+                elapsed: Duration::ZERO,
+                evidence: if queued > 0 {
+                    "the stranded prompt is in Muse's queued input (`◆ Queued input`)".to_owned()
+                } else {
+                    "the stranded prompt appeared above the Muse editor as a user turn".to_owned()
+                },
+                printed: true,
+                settled: true,
+                queued: queued > 0,
+            }));
+        }
+        let waited = runtime
+            .stranded_since()
+            .map_or(0.0, |since| (unix_seconds() - since).max(0.0));
+        let window = (STAGE_TIMEOUT + STAGE_GRACE).as_secs_f64();
+        if waited >= window {
+            return Ok(Submission::NotStaged(format!(
+                "{LATE_PASTE_LOST}: pane {pane_id}: the paste an earlier pass typed never showed \
+                 as the whole Muse editor in {window:.0}s; it was lost, and the prompt is never \
+                 typed again"
+            )));
+        }
+        let shows = match drawn {
+            MusePasteDrawn::Nothing => "its editor is still empty",
+            MusePasteDrawn::Part => "its editor shows only the start of the prompt",
+            MusePasteDrawn::Other => "its editor holds other text",
+            MusePasteDrawn::Whole | MusePasteDrawn::Unreadable => "no Muse editor is recognisable",
+        };
+        Ok(Submission::NotStaged(format!(
+            "{}: {}: late_paste: pane {pane_id}: the paste an earlier pass typed has not shown as \
+             the whole Muse editor after {waited:.0}s ({shows}); waiting for it, never typing it \
+             again, and typing nothing else into this pane",
+            crate::unknown_harness::STRANDED_PROMPT_KIND,
+            crate::submission::INPUT_STALLED_KIND,
+        )))
+    }
+
+    /// After an idle Muse's short paste window, wait out a paste it has drawn none of, or only
+    /// the start of, for the rest of [`crate::submission::STAGE_TIMEOUT`] (#1085
+    /// muse-send-staged-unsubmitted): `Some(screen)` once the editor shows the whole paste;
+    /// `None` when `screen` shows something else (or no editor), which the caller takes back out
+    /// as before; a [`muse_input_stalled`] `NotStaged` refusal when Muse still has not drawn it,
+    /// with no key sent, so the prompt is stranded rather than cleared.
+    fn await_late_muse_paste(
+        &self,
+        pane_id: &str,
+        text: &str,
+        before: &str,
+        screen: String,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Option<String>> {
+        use crate::submission::{POLL, STAGE_TIMEOUT};
+        let started = runtime.monotonic();
+        let mut screen = screen;
+        loop {
+            if screen != before && muse_verified_process_paste_is_exact_composer(&screen, text) {
+                return Ok(Some(screen));
+            }
+            let waited = format!("within {}s", STAGE_TIMEOUT.as_secs());
+            let Some(stalled) = muse_input_stalled(pane_id, &screen, text, &waited) else {
+                return Ok(None);
+            };
+            if runtime.cancelled() || runtime.monotonic().saturating_sub(started) >= STAGE_TIMEOUT {
+                return Err(AdapterError::not_staged(stalled));
+            }
+            runtime.sleep(POLL);
+            screen = self.verified_muse_screen(pane_id, runtime)?;
         }
     }
 
@@ -3683,6 +3830,33 @@ const DRAFT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(15);
 const MUSE_STEER_SETTLE: Duration = Duration::from_secs(3);
 /// Most presses of Enter for a prompt typed into an idle Muse that stays the whole editor.
 const MUSE_IDLE_PRESSES: u32 = 4;
+
+/// The refusal that strands a prompt whose paste a pinned Muse pane has not drawn (#1085
+/// muse-send-staged-unsubmitted), or `None` when `screen` shows the whole paste, other text, or
+/// no editor.
+///
+/// Muse drew none of it, or only its start, `waited` (`within 60s`, say): it is not taking
+/// terminal input, and the rest of the paste is still on its way to it. Nothing is sent, not
+/// even a clearing key, which would act only after the paste. The prompt is NOT delivered yet:
+/// it stays pending and is never typed again; a later pass presses Enter only once the editor
+/// shows the whole paste ([`WorkspaceClient::muse_stranded_retry`]), and every prompt queued
+/// after it waits ([`crate::submission::INPUT_STALLED_KIND`]).
+fn muse_input_stalled(pane_id: &str, screen: &str, text: &str, waited: &str) -> Option<String> {
+    let shows = match muse_verified_process_paste_drawn(&crate::harness_tui::plain(screen), text) {
+        MusePasteDrawn::Nothing => "its editor is still empty",
+        MusePasteDrawn::Part => "its editor shows only the start of the prompt",
+        MusePasteDrawn::Whole | MusePasteDrawn::Other | MusePasteDrawn::Unreadable => return None,
+    };
+    Some(format!(
+        "{}: {}: late_paste: pane {pane_id}: Muse has not drawn the pasted prompt {waited} \
+         ({shows}), so it is not taking terminal input; no key was sent and the editor was left \
+         untouched. NOT delivered yet: the prompt is never typed again, Enter is pressed only \
+         once the whole prompt shows in the editor, and nothing else is typed into this pane \
+         until then",
+        crate::unknown_harness::STRANDED_PROMPT_KIND,
+        crate::submission::INPUT_STALLED_KIND,
+    ))
+}
 
 #[cfg(test)]
 thread_local! {
@@ -4917,6 +5091,14 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 return self.submit_goal_command(pane_id, text, argument, runtime);
             }
         }
+        // A prompt an earlier pass pasted into a Muse pane that never drew it is never typed
+        // again, whether the pane is idle or working now (#1085 muse-send-staged-unsubmitted).
+        if self.uses_muse_composer()
+            && runtime.stranded_retry()
+            && !text.trim_start().starts_with('/')
+        {
+            return self.muse_stranded_retry(pane_id, text, runtime);
+        }
         // A queue drain that found the pane working passes a follow-up key; a Muse pane then
         // takes an ordinary prompt by steering its running turn (#505 agentctl-muse-followup).
         // An idle Muse takes the idle path, whose proof the Python edition shares.
@@ -5388,6 +5570,11 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 break screen;
             }
             if Instant::now() >= deadline {
+                if let Some(staged) =
+                    self.await_late_muse_paste(pane_id, text, &before, screen, &runtime)?
+                {
+                    break staged;
+                }
                 return Err(self.withdraw_unverified_muse_paste(
                     &guarded,
                     pane_id,
@@ -5621,6 +5808,11 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 break screen;
             }
             if Instant::now() >= deadline {
+                if let Some(staged) =
+                    self.await_late_muse_paste(pane_id, text, &before, screen, runtime)?
+                {
+                    break staged;
+                }
                 return Err(self.withdraw_unverified_muse_paste(
                     &guarded,
                     pane_id,

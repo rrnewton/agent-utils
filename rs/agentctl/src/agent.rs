@@ -134,6 +134,12 @@ pub struct QueueStatus {
     /// recorded `delivery_error` detail. Empty for every other session.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub composer_unreadable: Vec<ComposerUnreadablePending>,
+    /// Pending prompts whose paste the pane has not drawn (an
+    /// [`crate::submission::INPUT_STALLED_KIND`] refusal, #1085
+    /// muse-send-staged-unsubmitted): the harness is not taking terminal input, the prompt is
+    /// not delivered, and every prompt queued after it waits. Empty for every other session.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub input_stalled: Vec<InputStalledPending>,
     /// Prompt identifiers behind the durable injection-intent barrier.
     pub inflight: Vec<String>,
     /// Prompt identifiers retained after malformed or ambiguous delivery.
@@ -150,6 +156,17 @@ pub struct ComposerUnreadablePending {
     /// Stable prompt identifier, also in `pending`.
     pub message_id: String,
     /// The recorded `delivery_error` detail (kind `composer_unreadable`).
+    pub delivery_error: String,
+}
+
+/// One pending prompt whose paste the pane has not drawn: see [`QueueStatus::input_stalled`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct InputStalledPending {
+    /// Stable prompt identifier, also in `pending`.
+    pub message_id: String,
+    /// When its paste was typed and first found undrawn (Unix seconds), when recorded.
+    pub stranded_at: Option<u64>,
+    /// The recorded `delivery_error` detail.
     pub delivery_error: String,
 }
 
@@ -1185,6 +1202,30 @@ impl AgentRuntime for BatchTrackingRuntime<'_> {
 /// never typed again at any pass count (#884 item 4).
 const MAX_LOST_PASTE_PASSES: u64 = 3;
 
+/// The pending prompt, other than `identifier`, whose stranded paste the pane has not drawn
+/// (its record carries `stranded_at` and an [`crate::submission::INPUT_STALLED_KIND`] refusal),
+/// with that refusal; `None` when there is none (#1085 muse-send-staged-unsubmitted). A paste
+/// reported lost no longer holds the queue.
+fn input_stalled_by(directories: &QueueDirectories, identifier: &str) -> Option<(String, String)> {
+    pending_in_queue_order(directories)
+        .ok()?
+        .into_iter()
+        .find_map(|path| {
+            let document = load_message(&path).ok()?;
+            let id = document
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| message_id_from_path(&path).ok())?;
+            let detail = document.get("delivery_error").and_then(Value::as_str)?;
+            (id != identifier
+                && document.contains_key("stranded_at")
+                && crate::submission::is_input_stalled(detail)
+                && !crate::submission::is_late_paste_lost(detail))
+            .then(|| (id, detail.to_owned()))
+        })
+}
+
 /// Record on a pending item that its prompt was left stranded at the bottom of a TUI's screen
 /// (#850 unknown-harness-mode): when that was first seen, how many passes found it so, and the
 /// text left there, which later passes flush with Enter and never type again. Logged on every
@@ -1877,6 +1918,20 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             .collect(),
         None => owner_first(pending_in_queue_order(&directories)?),
     };
+    // A prompt stranded because the pane never drew its paste goes first, ahead of the owner's:
+    // until it shows or is reported lost, every other prompt waits behind it (#1085
+    // muse-send-staged-unsubmitted), so it must be looked at before they are.
+    let (stalled, others): (Vec<PathBuf>, Vec<PathBuf>) =
+        pending_paths.into_iter().partition(|path| {
+            load_message(path).is_ok_and(|document| {
+                document.contains_key("stranded_at")
+                    && document
+                        .get("delivery_error")
+                        .and_then(Value::as_str)
+                        .is_some_and(crate::submission::is_input_stalled)
+            })
+        });
+    let pending_paths: Vec<PathBuf> = stalled.into_iter().chain(others).collect();
     // Prompts a working-pane batch already typed as one combined prompt.
     let mut batched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     'message: for path_ref in &pending_paths {
@@ -1989,6 +2044,28 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 atomic_json(&path, &Value::Object(document))?;
                 blocked = Some(detail);
                 break 'message;
+            }
+            // A pane that has not drawn a paste agentctl typed is not taking terminal input, and
+            // that paste is still on its way: a new prompt pasted now would land behind or on top
+            // of it. Every prompt but the stranded one waits in the queue, untyped, until the
+            // pane draws input again or that paste is reported lost (#1085
+            // muse-send-staged-unsubmitted). An urgent or owner prompt waits too.
+            if !document.contains_key("stranded_at") {
+                if let Some((other, why)) = input_stalled_by(&directories, &identifier) {
+                    let detail = format!(
+                        "{}: pane input stalled: queued behind message {other}, whose paste the \
+                         pane has not drawn; this prompt was not typed and waits until the pane \
+                         takes input again: {why}",
+                        crate::submission::INPUT_STALLED_KIND
+                    );
+                    document.insert("delivery_state".to_owned(), json!("pending"));
+                    document.insert("delivery_error".to_owned(), json!(detail));
+                    document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));
+                    atomic_json(&path, &Value::Object(document))?;
+                    blocked = Some(detail);
+                    // On to the next prompt, which may be the stranded one, retried in its turn.
+                    continue 'message;
+                }
             }
 
             // A slash command opens a harness menu rather than reaching the composer, so it is
@@ -3176,6 +3253,8 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
     // Surface why an unreadable composer holds its prompts: the recorded
     // `delivery_error` of each pending prompt that carries the kind.
     let mut composer_unreadable = Vec::new();
+    // And a pane that has not drawn a paste agentctl typed (#1085).
+    let mut input_stalled = Vec::new();
     if let Ok(paths) = pending_in_queue_order(&directories) {
         for path in paths {
             let Ok(document) = load_message(&path) else {
@@ -3184,7 +3263,10 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
             let Some(detail) = document.get("delivery_error").and_then(Value::as_str) else {
                 continue;
             };
-            if !crate::submission::is_composer_unreadable(detail) {
+            let stalled = document.contains_key("stranded_at")
+                && crate::submission::is_input_stalled(detail)
+                && !crate::submission::is_late_paste_lost(detail);
+            if !stalled && !crate::submission::is_composer_unreadable(detail) {
                 continue;
             }
             let Ok(filename_id) = message_id_from_path(&path) else {
@@ -3194,6 +3276,17 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
                 .get("id")
                 .and_then(Value::as_str)
                 .map_or(filename_id, str::to_owned);
+            if stalled {
+                input_stalled.push(InputStalledPending {
+                    message_id,
+                    stranded_at: document
+                        .get("stranded_at")
+                        .and_then(Value::as_f64)
+                        .map(|seconds| seconds.max(0.0) as u64),
+                    delivery_error: detail.to_owned(),
+                });
+                continue;
+            }
             composer_unreadable.push(ComposerUnreadablePending {
                 message_id,
                 delivery_error: detail.to_owned(),
@@ -3211,6 +3304,7 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
         cwd: info.cwd,
         pending: identifiers_if_directory(&directories.inbox)?,
         composer_unreadable,
+        input_stalled,
         inflight: identifiers_if_directory(&directories.inflight)?,
         // A digest item that itself landed in failed/ is not a failed
         // message: never list it as one (#903 follow-up).

@@ -361,6 +361,19 @@ def test_captured_launch_overrides_frames_carry_the_delivery_proofs() -> None:
     staged = frames["launch-overrides-placeholder"]
     assert "[Pasted Content 3214 chars]" in staged
     assert client_module._muse_paste_length(brief) == 3214
+    # Muse counts a tab as 4 and drops other C0 controls and DEL (#1085
+    # muse-send-staged-unsubmitted), as the Rust edition does.
+    body = "x" * 1700
+    for text, shown in [
+        ("\t" + body, 1704),
+        ("a\tb\t" + body, 1710),
+        (body + "\r\nq", 1702),
+        (body + "\rq", 1702),
+        (body + "\x0cq", 1701),
+        (body + "\x07q", 1701),
+        (body + "\x7fq", 1701),
+    ]:
+        assert client_module._muse_paste_length(text) == shown
     assert muse_verified_process_paste_is_exact_composer(staged, brief)
     assert muse_verified_process_paste_in_composer(staged, brief)
     # The literal-text proofs cannot see a collapsed paste.

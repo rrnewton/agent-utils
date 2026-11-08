@@ -459,8 +459,23 @@ _MUSE_PASTE_PLACEHOLDER = re.compile(r"\[Pasted Content ([0-9]+) chars\]")
 
 
 def _muse_paste_length(text: str) -> int:
-    """The character count Muse shows for a paste of ``text``: code points, CRLF as one."""
-    return len(text.replace("\r\n", "\n"))
+    """The character count Muse shows for a paste of ``text``.
+
+    Code points, CRLF as one, each tab as the four spaces Muse expands it to, and no other C0
+    control or DEL, which Muse drops (measured on Muse 1.4.15, #1085
+    muse-send-staged-unsubmitted).
+    """
+    counted = 0
+    for value in text.replace("\r\n", "\n"):
+        if value == "\t":
+            counted += 4
+        elif value in "\n\r":
+            counted += 1
+        elif value < " " or value == "\x7f":
+            continue
+        else:
+            counted += 1
+    return counted
 
 
 def _muse_editor_holds_paste(editor: str, text: str) -> bool:

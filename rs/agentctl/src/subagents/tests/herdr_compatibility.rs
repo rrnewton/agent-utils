@@ -33,8 +33,8 @@ pub(super) struct MuseEditor {
     pub(super) approval: bool,
     /// Muse's peer-approval dialog takes the editor's place (#974).
     pub(super) peer_approval: bool,
-    /// A staged paste draws with its last character missing, so it never shows as the exact
-    /// prompt, as a wrap the proof cannot read once did.
+    /// A staged paste draws with its first character missing, so it never shows as the exact
+    /// prompt, or as a start of it, as a wrap the proof cannot read once did.
     pub(super) garble: bool,
     /// The goal set, if any, as Muse 1.4.15 keeps one: `/goal OBJECTIVE` with another goal set
     /// asks whether to replace it.
@@ -55,6 +55,23 @@ pub(super) struct MuseEditor {
     failing: Option<(String, u32)>,
     /// Presses of Enter that Muse misses entirely, leaving the prompt staged.
     pub(super) missed_enters: usize,
+    /// Muse is not reading its terminal (#1085 muse-send-staged-unsubmitted): a paste draws only
+    /// its first this-many characters, and the rest of it, and every key after it, waits in
+    /// `held` until [`Self::release`].
+    pub(super) stalled: Option<usize>,
+    /// Input a stalled Muse has not read yet, in the order it was typed.
+    held: Vec<Held>,
+}
+
+/// Input a stalled Muse has not read yet.
+#[derive(Clone, Debug)]
+enum Held {
+    /// The rest of a paste.
+    Paste(String),
+    /// A key other than Enter.
+    Key(String),
+    /// Enter.
+    Enter,
 }
 
 impl Default for MuseEditor {
@@ -78,6 +95,8 @@ impl Default for MuseEditor {
             steer_fails_after_reads: 3,
             failing: None,
             missed_enters: 0,
+            stalled: None,
+            held: Vec::new(),
         }
     }
 }
@@ -93,8 +112,9 @@ impl MuseEditor {
     }
 
     pub(super) fn screen(&self) -> String {
-        // Muse counts code points, CRLF as one (rs/agentctl/testdata/muse-frames.json).
-        let length = |text: &str| text.chars().count() - text.matches("\r\n").count();
+        // Muse counts code points, CRLF as one, a tab as four (rs/agentctl/testdata/muse-frames.json,
+        // #1085 muse-send-staged-unsubmitted).
+        let length = crate::client::muse_paste_length;
         let collapsed = self
             .staged
             .as_deref()
@@ -121,7 +141,7 @@ impl MuseEditor {
                 .to_owned(),
             (Some(text), _) => format!("❯ [Pasted Content {} chars]", length(text)),
             (None, Some(text)) if self.garble => {
-                format!("❯ {}", &text[..text.len().saturating_sub(1)])
+                format!("❯ {}", text.chars().skip(1).collect::<String>())
             }
             (None, Some(text)) => format!("❯ {text}"),
             (None, None) => "❯".to_owned(),
@@ -158,7 +178,36 @@ impl MuseEditor {
             self.staged.is_none(),
             "test input must target an empty editor"
         );
+        if let Some(drawn) = self.stalled {
+            let cut = prompt
+                .char_indices()
+                .nth(drawn)
+                .map_or(prompt.len(), |(index, _)| index);
+            if cut > 0 {
+                self.staged = Some(prompt[..cut].to_owned());
+            }
+            self.held.push(Held::Paste(prompt[cut..].to_owned()));
+            return;
+        }
         self.staged = Some(prompt.to_owned());
+    }
+
+    /// The stalled Muse reads its terminal again: everything it held is applied in order.
+    pub(super) fn release(&mut self) -> Vec<String> {
+        self.stalled = None;
+        let mut submitted = Vec::new();
+        for input in std::mem::take(&mut self.held) {
+            match input {
+                Held::Paste(rest) => {
+                    let mut staged = self.staged.take().unwrap_or_default();
+                    staged.push_str(&rest);
+                    self.staged = (!staged.is_empty()).then_some(staged);
+                }
+                Held::Key(key) => self.key(&key),
+                Held::Enter => submitted.extend(self.enter()),
+            }
+        }
+        submitted
     }
 
     /// One screen read passes: a failing steer comes closer to returning to the editor.
@@ -191,6 +240,10 @@ impl MuseEditor {
     }
 
     pub(super) fn enter(&mut self) -> Option<String> {
+        if self.stalled.is_some() {
+            self.held.push(Held::Enter);
+            return None;
+        }
         if self.ignore_enter || self.approval {
             return None;
         }
@@ -234,6 +287,10 @@ impl MuseEditor {
 
     /// `ctrl+u` deletes the editor's one row of text; `backspace` on an empty row does nothing.
     pub(super) fn key(&mut self, key: &str) {
+        if self.stalled.is_some() {
+            self.held.push(Held::Key(key.to_owned()));
+            return;
+        }
         if let Some((command, _, selected)) = self.question.as_mut() {
             match key {
                 "Up" => *selected = 1,

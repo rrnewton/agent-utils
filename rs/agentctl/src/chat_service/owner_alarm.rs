@@ -180,6 +180,8 @@ pub(crate) struct OwnerAlarm {
 pub(crate) fn reason_kind(reason: &str, disagreement: bool) -> &'static str {
     if disagreement {
         "status-disagreement"
+    } else if crate::submission::is_input_stalled(reason) {
+        "input-stalled"
     } else if reason.contains("did not type") || reason.contains("last status=staged") {
         "foreign-draft"
     } else if reason.contains("unsent draft") {

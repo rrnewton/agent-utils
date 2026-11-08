@@ -3897,6 +3897,8 @@ fn held_kind(reason: &str) -> Option<&'static str> {
         || reason.contains("composer_unreadable")
     {
         Some("composer-unreadable")
+    } else if crate::submission::is_input_stalled(reason) {
+        Some("input-stalled")
     } else if reason.contains("refusing input") {
         Some("input-refused")
     } else if reason.contains("did not type")
@@ -3919,6 +3921,14 @@ fn held_hint(agent: &str, kind: &str, reason: &str) -> String {
              (`agentctl attach {agent}`); if it stays blank, the harness has likely stopped \
              drawing (a redraw key did not help in the case seen): restart it on the same \
              session in that pane, then run `agentctl anchor {agent} --replace`. "
+        ),
+        "input-stalled" => format!(
+            "{agent}'s harness has not drawn a prompt agentctl pasted into it, so it is not \
+             taking terminal input. agentctl sends it no key and types nothing else into it; it \
+             presses Enter on that prompt only once the whole prompt shows in the editor, and \
+             the queued messages follow. Look at the pane (`agentctl attach {agent}`) without \
+             typing; if it stays frozen, restart the harness on the same session (stop, then \
+             start --resume). "
         ),
         "input-refused" if reason.contains("--replace") => format!(
             "{agent}'s pane runs a new process that agentctl will not type into until someone \
@@ -4093,6 +4103,12 @@ fn owner_wait_hint(agent: &str, reason: &str) -> String {
         format!(
             "agentctl could not submit a draft it typed into {agent}'s editor; press Enter in the \
              pane (`agentctl attach {agent}`), and delivery resumes. "
+        )
+    } else if crate::submission::is_input_stalled(reason) {
+        format!(
+            "{agent}'s harness has not drawn a prompt agentctl pasted into it (it is not taking \
+             terminal input); nothing else is typed into it until that prompt shows. Restart the \
+             harness on the same session if it stays frozen. "
         )
     } else {
         "`agentctl chat status --registry REGISTRY --bridge-state DIR` shows the requests. "
@@ -6244,6 +6260,55 @@ mod tests {
         let report = watch_agents_once(&mut probe, &mut notifier, &mut fresh, 1_200.0, &check);
         assert_eq!(report["held"][0]["due"], true, "{report}");
         assert_eq!(notifier.sent.len(), 1);
+    }
+
+    #[test]
+    fn a_queue_held_behind_a_paste_the_pane_never_drew_is_reported_input_stalled() {
+        // #1085 muse-send-staged-unsubmitted: Muse stopped reading its terminal; the stranded
+        // prompt and every prompt behind it wait, and the coordinator is told why, once.
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let mut probe = HeldProbe {
+            agent: "mu-lane".to_owned(),
+            oldest_seconds: 900,
+            blocked: Some(
+                "stranded_prompt: input_stalled: late_paste: pane w1:p2: Muse has not drawn \
+                 the pasted prompt within 60s (its editor shows only the start of the prompt), \
+                 so it is not taking terminal input; no key was sent and the editor was left \
+                 untouched. NOT delivered yet"
+                    .to_owned(),
+            ),
+            senders: vec![sender("01a", "coordinator", "agentctl")],
+        };
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
+        assert_eq!(report["held"][0]["kind"], "input-stalled", "{report}");
+        assert_eq!(
+            report["held"][0]["told"],
+            json!(["coordinator"]),
+            "{report}"
+        );
+        let (to, text, _) = &notifier.sent[0];
+        assert_eq!(to, "coordinator");
+        assert!(text.contains("messages to mu-lane are held"), "{text}");
+        assert!(text.contains("not taking terminal input"), "{text}");
+        assert!(text.contains("sends it no key"), "{text}");
+        // The same hold is not told again on the next pass.
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_100.0, &options);
+        assert_eq!(report["held"][0]["reported"], true, "{report}");
+        assert_eq!(notifier.sent.len(), 1);
+        // A prompt queued behind it carries the same kind.
+        assert_eq!(
+            held_kind("input_stalled: pane input stalled: queued behind message 01a, whose paste"),
+            Some("input-stalled")
+        );
+        assert_eq!(
+            crate::chat_service::owner_alarm::reason_kind(
+                "input_stalled: pane input stalled: queued behind message 01a",
+                false
+            ),
+            "input-stalled"
+        );
     }
 
     /// A probe whose only finding is a scripted wait for the coordinator's lifecycle lock.

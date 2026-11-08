@@ -62,6 +62,11 @@ pub(crate) const RECENT_DELIVERIES: usize = 5;
 /// The queue phases that hold prompts agentctl typed, or may have typed, before the one being
 /// delivered now.
 const TYPED_PHASES: [&str; 2] = ["processed", "failed"];
+/// Pending lanes whose prompts may have been typed too: one a pass left stranded (its record
+/// carries `stranded_at`) was pasted and is never typed again, so a draft that is its paste,
+/// drawn late, is agentctl's (#1085 muse-send-staged-unsubmitted). Other pending prompts
+/// were never typed and vouch for nothing.
+const STRANDED_PHASES: [&str; 2] = ["inbox", "inbox.v2"];
 
 /// Which typed prompts may vouch for a draft: see the module documentation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -265,9 +270,16 @@ pub(crate) fn fragment_matches(draft: &str, candidate: &str) -> bool {
     draft.len() < candidate.len() && candidate.contains(&draft)
 }
 
-/// The character count Muse and Codex show for a paste of `text`: code points, CRLF as one.
+/// The character count Codex shows for a paste of `text`: code points, CRLF as one.
 fn paste_length(text: &str) -> usize {
     text.chars().count() - text.matches("\r\n").count()
+}
+
+/// Whether `length` is the count a `[Pasted Content N chars]` placeholder shows for a paste of
+/// `text`: Codex's count, or Muse's, which expands tabs and drops other controls (#1085
+/// muse-send-staged-unsubmitted).
+fn shows_paste_length(text: &str, length: usize) -> bool {
+    paste_length(text) == length || crate::client::muse_paste_length(text) == length
 }
 
 /// Line count a placeholder label shows, for `submission`'s stranded check.
@@ -295,7 +307,7 @@ fn placeholder_matches_q(
 ) -> bool {
     match draft {
         Draft::Text(_) => false,
-        Draft::Placeholder(length) => paste_length(text) == *length,
+        Draft::Placeholder(length) => shows_paste_length(text, *length),
         Draft::PastedLines(label) => {
             // The exact recorded label is the strongest proof (#808): a
             // record holding a different label names a different paste. A
@@ -377,7 +389,7 @@ fn recent_cancelled_digests(queue: &Path, now: SystemTime, lookback: Duration) -
 /// [`MAX_RECORDS`] of them, most recently changed first.
 fn recent_records(queue: &Path, now: SystemTime, lookback: Duration) -> Vec<PathBuf> {
     let mut found: Vec<(SystemTime, PathBuf)> = Vec::new();
-    for phase in TYPED_PHASES {
+    for phase in TYPED_PHASES.iter().chain(&STRANDED_PHASES) {
         let Ok(entries) = fs::read_dir(queue.join(phase)) else {
             continue;
         };
@@ -433,7 +445,18 @@ pub(crate) fn find(
             Ok(Value::Object(document))
                 if document.get("probable_misroute") != Some(&Value::Bool(true)) =>
             {
-                let at = document.get("inflight_at").and_then(Value::as_f64)?;
+                let pending = path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|phase| STRANDED_PHASES.iter().any(|lane| phase == *lane));
+                // A stranded prompt is back in its inbox without `inflight_at`; it was typed
+                // when it was stranded.
+                let at = if pending {
+                    document.get("stranded_at")
+                } else {
+                    document.get("inflight_at")
+                }
+                .and_then(Value::as_f64)?;
                 Some((at, path, document))
             }
             _ => None,
@@ -637,7 +660,7 @@ fn composite_match(records: &[Record], rows: &str, vouching: Vouching) -> Option
                                 }))
                     }
                     Segment::Chars(length) => {
-                        paste_length(text) == *length
+                        shows_paste_length(text, *length)
                             && (vouching == Vouching::Recent || quarantined)
                     }
                     Segment::Literal(literal) => {
@@ -784,6 +807,44 @@ mod tests {
         let path = directory.join(format!("{id}.json"));
         crate::agent::atomic_json(&path, document).unwrap();
         path
+    }
+
+    #[test]
+    fn a_stranded_pending_prompt_vouches_for_its_late_drawn_paste_and_others_do_not() {
+        // #1085 muse-send-staged-unsubmitted: a paste Muse drew only after its pass had left the
+        // prompt stranded (back in the inbox, never to be typed again) is agentctl's own draft.
+        let directory = Scratch::new("stranded");
+        let queue = directory.0.as_path();
+        let stranded = format!("{HEADER}\nhold both heads byte-exact\tpending review");
+        record(
+            queue,
+            "inbox",
+            "stranded",
+            &json!({"text": stranded, "stranded_at": 300.0,
+                    "delivery_error": "stranded_prompt: input_stalled: late_paste: ..."}),
+        );
+        let untyped = format!("{HEADER}\nnever typed yet");
+        record(
+            queue,
+            "inbox",
+            "untyped",
+            &json!({"text": untyped, "queued_at": 301.0}),
+        );
+        let now = SystemTime::now();
+        assert_eq!(
+            find(queue, &Draft::Text(stranded.clone()), Vouching::Recent, now)
+                .map(|found| found.id),
+            Some("stranded".to_owned())
+        );
+        // Its placeholder, with the tab counted as Muse counts it.
+        let shown = crate::client::muse_paste_length(&stranded);
+        assert_ne!(shown, paste_length(&stranded));
+        assert_eq!(
+            find(queue, &Draft::Placeholder(shown), Vouching::Recent, now).map(|found| found.id),
+            Some("stranded".to_owned())
+        );
+        // A pending prompt no pass has typed vouches for nothing.
+        assert!(find(queue, &Draft::Text(untyped), Vouching::Recent, now).is_none());
     }
 
     #[test]

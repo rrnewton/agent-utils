@@ -68,6 +68,20 @@ pub fn in_lock_timeouts() -> SubmitTimeouts {
 /// passes (#884 item 4).
 pub const LATE_PASTE_LOST: &str = "late_paste_lost";
 
+/// The kind a refusal names when a pane has not drawn a paste agentctl typed into it, so the
+/// harness is not taking terminal input (#1085 muse-send-staged-unsubmitted). The paste is
+/// still on its way, so nothing is typed into that pane (no clearing key, no other prompt)
+/// until it shows or the late-paste window passes: the prompt is stranded, and every prompt
+/// queued after it waits. `agentctl status` lists such prompts under `input_stalled`, and
+/// `watch-agents` reports a queue held by one.
+pub const INPUT_STALLED_KIND: &str = "input_stalled";
+
+/// Whether `detail` names an input-stalled pane: see [`INPUT_STALLED_KIND`].
+#[must_use]
+pub fn is_input_stalled(detail: &str) -> bool {
+    detail.contains(&format!("{INPUT_STALLED_KIND}:"))
+}
+
 /// Whether `detail` is the refusal of a stranded retry whose earlier paste was lost.
 #[must_use]
 pub fn is_late_paste_lost(detail: &str) -> bool {

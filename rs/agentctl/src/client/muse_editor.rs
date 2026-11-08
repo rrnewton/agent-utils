@@ -462,9 +462,23 @@ pub(crate) fn muse_verified_process_prompt_in_composer(screen: &str, text: &str)
     muse_prompt_in_composer_region(screen, text, false, false)
 }
 
-/// The character count Muse shows for a paste of `text`: code points, CRLF as one.
-fn muse_paste_length(text: &str) -> usize {
-    text.chars().count() - text.matches("\r\n").count()
+/// The character count Muse shows for a paste of `text`: code points, CRLF as one, each tab as
+/// the four spaces Muse expands it to, and no other C0 control or DEL, which Muse drops.
+///
+/// Measured on Muse 1.4.15 (#1085 muse-send-staged-unsubmitted): a tab adds 4 wherever it sits
+/// in its line, and form feed, vertical tab, bell and DEL add nothing. A count that ignored the
+/// tabs never matched a brief that held one, so every such paste timed out unsubmitted.
+pub(crate) fn muse_paste_length(text: &str) -> usize {
+    let counted = text
+        .chars()
+        .map(|value| match value {
+            '\t' => 4,
+            '\n' | '\r' => 1,
+            '\u{0}'..='\u{1f}' | '\u{7f}' => 0,
+            _ => 1,
+        })
+        .sum::<usize>();
+    counted - text.matches("\r\n").count()
 }
 
 /// Whether the editor is exactly Muse's collapsed placeholder for a paste of `text`.
@@ -493,6 +507,65 @@ pub(crate) fn muse_verified_process_paste_is_exact_composer(screen: &str, text: 
     muse_composer_regions(screen, false).is_some_and(|(_, editor)| {
         muse_editor_matches(&editor, text, true) || muse_editor_holds_paste(&editor, text)
     })
+}
+
+/// How much of a paste of `text` a pinned Muse pane's editor shows (#1085
+/// muse-send-staged-unsubmitted), for a delivery deciding what to do once its paste has not
+/// shown as the whole editor in time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MusePasteDrawn {
+    /// The editor is empty: Muse has drawn none of the paste.
+    Nothing,
+    /// The editor holds the start of the paste, but not all of it: Muse is still taking it in.
+    Part,
+    /// The editor holds the whole paste, as text or as its placeholder.
+    Whole,
+    /// The editor holds something that is not this paste or a start of it.
+    Other,
+    /// The screen shows no recognisable Muse editor.
+    Unreadable,
+}
+
+/// Classify what a pinned Muse pane's editor shows of a paste of `text`.
+///
+/// A Muse that is slow to read its terminal draws a paste late, and can draw it a piece at a
+/// time; the pieces are literal rows, each joining the last as [`muse_editor_matches`] allows, so
+/// a start of the prompt that ends at a row boundary or inside a row counts as [`Part`]. A
+/// placeholder only ever stands for a whole paste, so one with another count is [`Other`].
+///
+/// [`Part`]: MusePasteDrawn::Part
+/// [`Other`]: MusePasteDrawn::Other
+pub(crate) fn muse_verified_process_paste_drawn(screen: &str, text: &str) -> MusePasteDrawn {
+    let Some((_, editor)) = muse_composer_regions(screen, false) else {
+        return MusePasteDrawn::Unreadable;
+    };
+    let Some(segments) = muse_editor_segments(&editor) else {
+        return MusePasteDrawn::Unreadable;
+    };
+    if segments.is_empty() {
+        return MusePasteDrawn::Nothing;
+    }
+    if muse_editor_matches(&editor, text, true) || muse_editor_holds_paste(&editor, text) {
+        return MusePasteDrawn::Whole;
+    }
+    let wanted = normalize(text);
+    let mut prefixes = BTreeSet::from([String::new()]);
+    for (index, segment) in segments.iter().enumerate() {
+        let separators: &[&str] = if index == 0 { &[""] } else { &[" ", ""] };
+        prefixes = prefixes
+            .iter()
+            .flat_map(|prefix| {
+                separators
+                    .iter()
+                    .map(move |separator| format!("{prefix}{separator}{segment}"))
+            })
+            .filter(|rendered| wanted.starts_with(rendered.as_str()))
+            .collect();
+        if prefixes.is_empty() {
+            return MusePasteDrawn::Other;
+        }
+    }
+    MusePasteDrawn::Part
 }
 
 /// Detect this paste retained in the editor, as text or as its placeholder.
@@ -1275,6 +1348,116 @@ mod tests {
         }
         let echo = format!("Goal (paused)\n{idle}");
         assert_eq!(muse_verified_pane_status("done", &echo), "idle");
+    }
+
+    #[test]
+    fn the_paste_count_expands_tabs_and_drops_controls_as_muse_does() {
+        // Measured on Muse 1.4.15 with a 1700-character body (#1085 muse-send-staged-unsubmitted):
+        // a tab shows as 4 wherever it sits, CR, CRLF and LF as 1, FF, VT, BEL and DEL as 0.
+        let body = "x".repeat(1700);
+        for (text, shown) in [
+            (body.clone(), 1700),
+            (format!("\t{body}"), 1704),
+            (format!("abc\t{body}"), 1707),
+            (format!("a\tb\t{body}"), 1710),
+            (format!("{body}\nab\tc"), 1708),
+            (format!("{body}\rq"), 1702),
+            (format!("{body}\r\nq"), 1702),
+            (format!("{body}\u{1F600}"), 1701),
+            (format!("{body}\u{0c}q"), 1701),
+            (format!("{body}\u{0b}q"), 1701),
+            (format!("{body}\u{07}q"), 1701),
+            (format!("{body}\u{7f}q"), 1701),
+        ] {
+            assert_eq!(
+                muse_paste_length(&text),
+                shown,
+                "{:?}",
+                &text[1690.min(text.len())..]
+            );
+        }
+        // The placeholder of a brief holding a tab is that brief's paste, and nothing else's.
+        let divider = "─".repeat(40);
+        let brief =
+            format!("[from lead via agentctl · reply: agentctl send lead]\nstep\t1\n{body}");
+        let staged = format!(
+            "old\n{divider}\n❯ [Pasted Content {} chars]\n{divider}\nm · xhigh · /w · YOLO\n",
+            brief.chars().count() + 3
+        );
+        assert!(muse_verified_process_paste_is_exact_composer(
+            &staged, &brief
+        ));
+        assert!(!muse_verified_process_paste_is_exact_composer(
+            &staged,
+            &brief.replace('\t', " ")
+        ));
+    }
+
+    #[test]
+    fn what_a_stalled_muse_has_drawn_of_a_paste_is_classified() {
+        let divider = "─".repeat(40);
+        let frame = |editor: &str| {
+            format!("◇ Thinking (3m 27s · esc to interrupt)\n{divider}\n{editor}\n{divider}\nm · xhigh · /w · YOLO\n")
+        };
+        let prompt = "[from coordinator via agentctl · reply: agentctl send coordinator]\n\
+                      Lead approved the change, part one only, as your next task after the\n\
+                      current one lands.";
+        let drawn = |editor: &str| muse_verified_process_paste_drawn(&frame(editor), prompt);
+        assert_eq!(drawn("❯"), MusePasteDrawn::Nothing);
+        // The incident's partial draws: the sender header alone, then a row cut mid-word.
+        assert_eq!(
+            drawn("❯ [from coordinator via agentctl · reply: agentctl send coordinator]"),
+            MusePasteDrawn::Part
+        );
+        assert_eq!(
+            drawn("❯ [from coordinator via agentctl · reply: agentctl send coordinator]\n  Lead approved the ch"),
+            MusePasteDrawn::Part
+        );
+        assert_eq!(
+            drawn("❯ [from coordinator via agentctl · reply: agentctl send coordinator]\n  Lead approved the change, part one only, as your next task after the\n  current one lands."),
+            MusePasteDrawn::Whole
+        );
+        // What late clearing keys left behind, and the next prompt glued onto it, are neither
+        // this paste nor a start of it.
+        assert_eq!(
+            drawn("❯ [from coordinator via agentctl · reply: agentctl send coordinator][from coordinator via agentctl · reply: agentctl send coordinator]\n  Lead approved"),
+            MusePasteDrawn::Other
+        );
+        assert_eq!(drawn("❯ an operator's own draft"), MusePasteDrawn::Other);
+        // A placeholder stands only for a whole paste: another count is not this paste.
+        assert_eq!(drawn("❯ [Pasted Content 12 chars]"), MusePasteDrawn::Other);
+        assert_eq!(
+            muse_verified_process_paste_drawn("no editor here\n", prompt),
+            MusePasteDrawn::Unreadable
+        );
+    }
+
+    #[test]
+    fn a_long_brief_drawn_in_part_then_whole_is_classified_at_each_step() {
+        // A real-sized coordinator brief: several KB over many lines, literal while Muse is
+        // still taking it in, then its placeholder.
+        let divider = "─".repeat(40);
+        let line = "- Gate: COMMIT FIRST, then run the selected gate, never piped; no edits while it runs.";
+        let brief = format!(
+            "[from coordinator via agentctl · reply: agentctl send coordinator]\n{}",
+            vec![line; 60].join("\n")
+        );
+        assert!(brief.len() > 5000);
+        let frame =
+            |editor: &str| format!("{divider}\n{editor}\n{divider}\nm · xhigh · /w · YOLO\n");
+        let part = format!(
+            "❯ {}",
+            brief.lines().take(7).collect::<Vec<_>>().join("\n  ")
+        );
+        assert_eq!(
+            muse_verified_process_paste_drawn(&frame(&part), &brief),
+            MusePasteDrawn::Part
+        );
+        let whole = format!("❯ [Pasted Content {} chars]", muse_paste_length(&brief));
+        assert_eq!(
+            muse_verified_process_paste_drawn(&frame(&whole), &brief),
+            MusePasteDrawn::Whole
+        );
     }
 
     #[test]
