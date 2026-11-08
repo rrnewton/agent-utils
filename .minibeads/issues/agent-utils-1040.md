@@ -29,3 +29,21 @@ Today starting the voice agent while a document is open gives the agent no docum
 # Notes
 
 [watermelon-full-preview] mu-docreader, thread 214 batch C. Sibling work: #1038 documents-outline-popup, #1039 documents-read-parity.
+
+## Resolution (partial — latency, 2026-11-07 night, mu-vdesign)
+
+[watermelon-full-preview] Tool round-trip measured in-process through the real
+router (direct JSON-RPC `tools/call`, seeded cached 3,835-word document, debug
+build, n=20 after one warm call; throwaway probe kept outside the tree):
+`fetch_document` p50 2.08 ms / p90 2.28 ms (result 12,661 chars — the 12 KiB
+cap with continuation tail), `fetch_document_section` p50 1.53 ms / p90
+1.61 ms (3,414 chars). The tool is not the ingest cost: a whole-document fetch
+hands the voice model ~3.2k tokens (one section ~0.85k), so yes-to-first-audio
+will be dominated by model prefill + first-token time, not by this server.
+End-to-end yes→first-audio is NOT yet measured: nothing in-repo proves the
+private S2S bridge attaches `/mcp` and emits tool calls, so that number needs
+one live session on the deployed stack (post-deploy). The harness for it
+landed with this work: `voice-read-acceptance.py` document mode
+(`--document-notice-file` + `--prompt-file` as the answer, `--document-arm`
+whole/section/prefix-only; typed T0, spoken-yes recognition not modelled),
+reporting notice/answer first-audio median+p90 over ≥5 trials per arm.
