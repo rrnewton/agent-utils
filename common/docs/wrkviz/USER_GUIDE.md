@@ -661,6 +661,24 @@ always shows full-team coverage. The run receipt and `summarize_state.json` reco
 `"agent_scope": "coordinator"`. The default, `--agent-scope all`, writes exactly what it wrote
 before the option existed.
 
+Calendar rollups stop at the team. `wrkviz summarize-project` adds one level above them: a
+project weekly written from the named teams' own weekly technical rollups, run through the same
+weekly prompt, followed by a plain-language weekly written from that result.
+
+```bash
+wrkviz summarize-project --output ./archive --name example-project \
+  --team team-a --team team-b --week 2026-W45 --agent-scope coordinator \
+  --timezone America/New_York
+```
+
+It reads nothing but those rollups, so it adds no evidence of its own, and every output lists
+its inputs (team, rollup path, input hash). A named team with no weekly rollup for the week in
+the selected scope is refused by name; summarize it with `--rollup-kind weekly` first, or leave
+it out. Output goes under `summary_scopes/<scope>/project/<name>/`: its own cache,
+`rollups/weekly/<week>.json`, Markdown under `summaries/weekly/`, and a record of each run under
+`runs/`. `--plan` lists the inputs and whether the weekly is already cached, and makes no model
+call.
+
 To summarize through the Codex CLI instead:
 
 ```bash

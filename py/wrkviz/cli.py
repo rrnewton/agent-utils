@@ -20,6 +20,7 @@ from wrkviz.build_store import (
     migrate_build_state,
 )
 from wrkviz.agent_scope import AGENT_SCOPES, ALL_AGENTS
+from wrkviz.project_rollup import plan_project_weekly, summarize_project_weekly
 from wrkviz.archive import as_array, as_object, read_json
 from wrkviz.archive_gc import collect, format_gc_report
 from wrkviz.claude import ClaudeParseError
@@ -96,7 +97,7 @@ from wrkviz.snapshot_store import (
     pointer_summary,
 )
 from wrkviz.summarize import SummaryError
-from wrkviz.token_usage import TokenUsage
+from wrkviz.token_usage import TokenUsage, resolve_service_tier
 from wrkviz.transcript_export import TranscriptExportReport
 from wrkviz.window import DateWindow, parse_date_window
 
@@ -744,6 +745,104 @@ def _parser() -> argparse.ArgumentParser:
     )
     summarize.set_defaults(handler="summarize")
 
+    summarize_project = sub.add_parser(
+        "summarize-project",
+        help="roll several teams' weekly summaries into one project weekly",
+        description=(
+            "Write one project weekly (technical and plain-language) from the named teams' "
+            "own weekly technical rollups, through the same weekly prompt. Nothing else is "
+            "read, so it adds no evidence of its own; a named team without a weekly rollup "
+            "for the week is refused by name. Run `summarize --rollup-kind weekly` for each "
+            "team first. Output goes under summary_scopes/<scope>/project/<name>/."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "example:\n"
+            "  wrkviz summarize-project --output ./archive --name example-project \\\n"
+            "    --team team-a --team team-b --week 2026-W45 --agent-scope coordinator \\\n"
+            "    --timezone America/New_York"
+        ),
+    )
+    summarize_project.add_argument(
+        "--output", required=True, help="archive directory holding the team rollups"
+    )
+    summarize_project.add_argument(
+        "--name", required=True, help="slug for this project rollup, for example example-project"
+    )
+    summarize_project.add_argument(
+        "--team",
+        action="append",
+        required=True,
+        help="team whose weekly technical rollup is an input; repeat for each team",
+    )
+    summarize_project.add_argument(
+        "--week", required=True, help="ISO week key of the rollups to combine, e.g. 2026-W45"
+    )
+    summarize_project.add_argument(
+        "--agent-scope",
+        choices=AGENT_SCOPES,
+        default=ALL_AGENTS,
+        help=(
+            "which team rollups to read: 'all' reads teams/<slug>/summary_data/, "
+            "'coordinator' reads teams/<slug>/summary_scopes/coordinator/ "
+            "(default: %(default)s)"
+        ),
+    )
+    summarize_project.add_argument(
+        "--timezone",
+        default="UTC",
+        help="IANA timezone for times in the Markdown (default: %(default)s)",
+    )
+    summarize_project.add_argument(
+        "--backend",
+        choices=("muse", "codex", "claude", "heuristic"),
+        default="muse",
+        help="summary backend, as for summarize (default: %(default)s)",
+    )
+    summarize_project.add_argument(
+        "--model",
+        default=None,
+        help="backend model; with --rollup-model unset it selects the rollup model as in summarize",
+    )
+    summarize_project.add_argument(
+        "--rollup-model",
+        default=None,
+        help=(
+            "model that writes the project weekly (default: as for summarize's calendar "
+            f"rollups; muse without --model uses {DEFAULT_MUSE_ROLLUP_MODEL!r})"
+        ),
+    )
+    summarize_project.add_argument(
+        "--reasoning-effort",
+        default=DEFAULT_REASONING_EFFORT,
+        help="backend reasoning effort, recorded in cache provenance (default: %(default)s)",
+    )
+    summarize_project.add_argument(
+        "--service-tier", default=None, help="Codex service tier, as for summarize"
+    )
+    summarize_project.add_argument(
+        "--codex-command", default="codex", help="Codex executable (primarily for testing)"
+    )
+    summarize_project.add_argument(
+        "--claude-command", default="claude", help="Claude executable (primarily for testing)"
+    )
+    summarize_project.add_argument(
+        "--muse-command", default="muse", help="Muse executable (primarily for testing)"
+    )
+    summarize_project.add_argument(
+        "--backend-timeout",
+        type=float,
+        default=DEFAULT_BACKEND_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help="stop one backend call after this many seconds (default: %(default)s)",
+    )
+    summarize_project.add_argument(
+        "--plan",
+        action="store_true",
+        help="list the inputs and whether the weekly is cached, then exit without a model call",
+    )
+    summarize_project.set_defaults(handler="summarize_project")
+
     build = sub.add_parser("build", help="regenerate Markdown/site from cached data; zero tokens", description="regenerate Markdown/site from cached data; zero tokens")
     _add_archive(build)
     build.add_argument("--phase-minutes", type=int, default=30)
@@ -1365,6 +1464,65 @@ def _summary_models(backend: str, raw_model: object, raw_rollup: object) -> tupl
         if not rollup_model:
             raise ValueError("--rollup-model must not be empty")
     return model, rollup_model
+
+
+def _summarize_project(ns: argparse.Namespace, command: Sequence[str]) -> int:
+    backend = str(ns.backend)
+    _, rollup_model = _summary_models(backend, ns.model, ns.rollup_model)
+    backend_timeout = float(ns.backend_timeout)
+    if not backend_timeout > 0:
+        raise ValueError("--backend-timeout must be a positive number of seconds")
+    archive = _path(str(ns.output))
+    teams = _string_list(ns.team, "--team")
+    service_tier = resolve_service_tier(
+        backend, None if ns.service_tier is None else str(ns.service_tier)
+    )
+    if bool(ns.plan):
+        inputs, cached = plan_project_weekly(
+            archive,
+            str(ns.name),
+            teams,
+            str(ns.week),
+            backend,
+            rollup_model,
+            agent_scope=str(ns.agent_scope),
+            reasoning_effort=str(ns.reasoning_effort),
+            service_tier=service_tier,
+        )
+        print(f"project weekly plan for {ns.name} {ns.week} ({ns.agent_scope} scope):")
+        for item in inputs:
+            print(f"  input {item.team_slug}: {item.rollup_path}")
+        print(
+            f"  technical weekly: {'cached' if cached else 'to generate'}; plain-language "
+            f"weekly follows it; backend={backend} model={rollup_model}"
+        )
+        return 0
+    report = summarize_project_weekly(
+        archive,
+        str(ns.name),
+        teams,
+        str(ns.week),
+        backend,
+        rollup_model,
+        agent_scope=str(ns.agent_scope),
+        display_timezone=str(ns.timezone),
+        reasoning_effort=str(ns.reasoning_effort),
+        service_tier=service_tier,
+        codex_command=(str(ns.codex_command),),
+        claude_command=(str(ns.claude_command),),
+        muse_command=(str(ns.muse_command),),
+        backend_timeout_seconds=backend_timeout,
+        command=command,
+    )
+    print(
+        f"project weekly {report.name} {report.week}: {len(report.inputs)} team inputs; "
+        f"{report.cache_hits} cache hits, {report.cache_misses} misses, "
+        f"{report.backend_batches} backend calls"
+    )
+    for path in (report.rollup_path, report.technical_markdown, report.plain_markdown):
+        print(f"wrote: {path}")
+    print(f"run metadata: {report.run_path}")
+    return 0
 
 
 def _summary_call(ns: argparse.Namespace) -> SummarizeReport | None:
@@ -2111,6 +2269,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             ), end="")
             return 0
         except (OSError, ValueError) as error:
+            print(f"{PROG}: {error}", file=sys.stderr)
+            return 2
+    if handler == "summarize_project":
+        try:
+            return _summarize_project(ns, [PROG, *args])
+        except (OSError, ValueError, BudgetError, SummaryError) as error:
             print(f"{PROG}: {error}", file=sys.stderr)
             return 2
     if handler == "discover_agents":

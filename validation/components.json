@@ -517,6 +517,7 @@
         "py/tests/test_timeline_periods.py",
         "py/tests/test_timeline_phases.py",
         "py/tests/test_timeline_pipeline.py",
+        "py/tests/test_timeline_project_rollup.py",
         "py/tests/test_timeline_query.py",
         "py/tests/test_timeline_query_schema_3.py",
         "py/tests/test_timeline_query_stats.py",
