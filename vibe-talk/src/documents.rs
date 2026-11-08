@@ -744,6 +744,8 @@ pub struct Fetched {
     pub fetched_ms: i64,
     /// Headings, in order, for the outline.
     pub outline: Vec<String>,
+    /// Where the document lives now, when a moved fetch found it elsewhere.
+    pub moved_to: Option<String>,
 }
 
 /// Why a fetch or freshness check failed.
@@ -804,6 +806,8 @@ pub struct FetchedRaw {
     pub content: String,
     /// The source's own version (an ETag or blob id), when it gives one.
     pub version: Option<String>,
+    /// Where the document lives now, when it had moved from the linked path.
+    pub moved_to: Option<String>,
 }
 
 /// Fetches one document kind. Implemented by the GitHub and paste sources,
@@ -907,6 +911,16 @@ pub struct GithubFetcher {
     client: reqwest::Client,
     token: TokenSource,
     raw_base: String,
+    api_base: String,
+    trees: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<String>)>>,
+}
+
+/// How long a repository tree listing is reused for moved-document lookups.
+const TREE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether `r#ref` names one commit (40 hex digits), not a branch.
+fn is_commit_ref(r#ref: &str) -> bool {
+    r#ref.len() == 40 && r#ref.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 impl GithubFetcher {
@@ -927,7 +941,104 @@ impl GithubFetcher {
                 .unwrap_or_else(|| "https://raw.githubusercontent.com".to_owned())
                 .trim_end_matches('/')
                 .to_owned(),
+            api_base: "https://api.github.com".to_owned(),
+            trees: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Fetch from an API host other than GitHub's (a fake in tests).
+    #[must_use]
+    pub fn with_api_base(mut self, api_base: String) -> Self {
+        self.api_base = api_base.trim_end_matches('/').to_owned();
+        self
+    }
+
+    /// Every blob path in `owner/repo` at `r#ref`, cached per repo/ref.
+    async fn tree_paths(
+        &self,
+        owner: &str,
+        repo: &str,
+        r#ref: &str,
+    ) -> Result<Vec<String>, FetchError> {
+        let key = format!("{owner}/{repo}@{ref}");
+        if let Some((at, paths)) = self
+            .trees
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            if at.elapsed() < TREE_CACHE_TTL {
+                return Ok(paths);
+            }
+        }
+        let url = format!(
+            "{}/repos/{owner}/{repo}/git/trees/{ref}?recursive=1",
+            self.api_base
+        );
+        let mut response = self.send_get(&url).await?;
+        if !response.status().is_success() {
+            return Err(FetchError::Failed(format!(
+                "GitHub answered {}",
+                response.status()
+            )));
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| FetchError::Failed(e.to_string()))?
+        {
+            if bytes.len() + chunk.len() > 8 * MAX_DOCUMENT_BYTES {
+                return Err(FetchError::Failed("repository tree too large".to_owned()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| FetchError::Failed(e.to_string()))?;
+        let paths: Vec<String> = parsed
+            .get("tree")
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| e.get("type").and_then(serde_json::Value::as_str) == Some("blob"))
+                    .filter_map(|e| {
+                        e.get("path")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.trees
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key, (std::time::Instant::now(), paths.clone()));
+        Ok(paths)
+    }
+
+    /// The one path in the tree with `entry`'s file name, when exactly one matches.
+    async fn moved_path(&self, entry: &Entry) -> Option<String> {
+        let (owner, repo, r#ref) = (
+            entry.locator.owner.as_deref()?,
+            entry.locator.repo.as_deref()?,
+            entry.locator.ref_name.as_deref()?,
+        );
+        if is_commit_ref(r#ref) {
+            return None;
+        }
+        let paths = self.tree_paths(owner, repo, r#ref).await.ok()?;
+        let name = entry.file_name.as_str();
+        let mut matches = paths
+            .iter()
+            .filter(|path| path.rsplit('/').next().is_some_and(|last| last == name))
+            .cloned();
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first)
     }
 
     fn url(&self, entry: &Entry) -> Result<String, FetchError> {
@@ -967,15 +1078,10 @@ impl GithubFetcher {
         unreachable!("the retry loop always returns");
     }
 
-    async fn get(&self, entry: &Entry) -> Result<FetchedRaw, FetchError> {
-        let url = self.url(entry)?;
-        let mut response = self.send_get(&url).await?;
-        if !response.status().is_success() {
-            return Err(FetchError::Failed(format!(
-                "GitHub answered {}",
-                response.status()
-            )));
-        }
+    async fn read_body(
+        &self,
+        mut response: reqwest::Response,
+    ) -> Result<(String, Option<String>), FetchError> {
         let etag = response
             .headers()
             .get(reqwest::header::ETAG)
@@ -993,10 +1099,50 @@ impl GithubFetcher {
             }
             bytes.extend_from_slice(&chunk);
         }
-        let content = String::from_utf8_lossy(&bytes).into_owned();
+        Ok((String::from_utf8_lossy(&bytes).into_owned(), etag))
+    }
+
+    async fn get(&self, entry: &Entry) -> Result<FetchedRaw, FetchError> {
+        let url = self.url(entry)?;
+        let response = self.send_get(&url).await?;
+        if response.status().as_u16() == 404 {
+            // A moved document on a branch: find its file name in the tree and
+            // fetch it from its new home; otherwise say where it was lost.
+            let moved = self.moved_path(entry).await;
+            let Some(new_path) = moved else {
+                return Err(FetchError::Failed(format!(
+                    "not found at {} (moved or deleted)",
+                    entry.locator.path
+                )));
+            };
+            let mut moved_entry = entry.clone();
+            moved_entry.locator.path = new_path.clone();
+            let moved_url = self.url(&moved_entry)?;
+            let moved_response = self.send_get(&moved_url).await?;
+            if !moved_response.status().is_success() {
+                return Err(FetchError::Failed(format!(
+                    "not found at {} (moved or deleted)",
+                    entry.locator.path
+                )));
+            }
+            let (content, etag) = self.read_body(moved_response).await?;
+            return Ok(FetchedRaw {
+                version: etag.or_else(|| Some(version_of(&content))),
+                content,
+                moved_to: Some(new_path),
+            });
+        }
+        if !response.status().is_success() {
+            return Err(FetchError::Failed(format!(
+                "GitHub answered {}",
+                response.status()
+            )));
+        }
+        let (content, etag) = self.read_body(response).await?;
         Ok(FetchedRaw {
             version: etag.or_else(|| Some(version_of(&content))),
             content,
+            moved_to: None,
         })
     }
 
@@ -1106,7 +1252,11 @@ impl Fetcher for PasteFetcher {
         }
         let content = String::from_utf8_lossy(&bytes).into_owned();
         let version = Some(version_of(&content));
-        Ok(FetchedRaw { content, version })
+        Ok(FetchedRaw {
+            content,
+            version,
+            moved_to: None,
+        })
     }
 
     async fn current_version(&self, entry: &Entry) -> Result<Option<String>, FetchError> {
@@ -1357,6 +1507,16 @@ impl Service {
         }
     }
 
+    /// How many fetched copies the cache holds.
+    #[must_use]
+    pub fn cache_len(&self) -> usize {
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .docs
+            .len()
+    }
+
     /// Drop every fetched copy (a storage purge).
     pub fn clear_cache(&self) {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -1407,6 +1567,7 @@ impl Service {
             fetched_ms: crate::cache::wall_ms(),
             outline,
             content: raw.content,
+            moved_to: raw.moved_to,
         };
         self.put(fetched.clone());
         Ok(fetched)

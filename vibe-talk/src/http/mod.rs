@@ -194,6 +194,10 @@ fn routes(state: AppState) -> Router {
             "/api/v1/documents/fetch-recent",
             post(api::fetch_recent_documents),
         )
+        .route(
+            "/api/v1/documents/cache",
+            axum::routing::delete(api::clear_documents_cache),
+        )
         .route("/api/v1/documents/{key}", get(api::get_document))
         .route(
             "/api/v1/documents/{key}/freshness",

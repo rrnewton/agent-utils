@@ -9,7 +9,9 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::Value;
 use tower::ServiceExt as _;
-use vibe_talk::documents::{Entry, FetchError, FetchedRaw, Fetcher, Index, Service};
+use vibe_talk::documents::{
+    Entry, FetchError, FetchedRaw, Fetcher, GithubFetcher, Index, Service, TokenSource,
+};
 use vibe_talk::http::router;
 use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
 use vibe_talk::testing::{self, READ_CHANNEL, READ_TOKEN, WRITE_TOKEN};
@@ -52,6 +54,7 @@ impl Fetcher for FakeGithub {
         Ok(FetchedRaw {
             content,
             version: self.versions.lock().expect("lock").get(&entry.key).cloned(),
+            moved_to: None,
         })
     }
 
@@ -420,5 +423,111 @@ async fn bounded_cache_evicts_oldest() {
             .cached("github:octo/widgets@main:docs/d0.md")
             .is_none(),
         "the oldest fetched document was evicted"
+    );
+}
+
+// --- moved-document fallback, against a fake GitHub over HTTP ----------------
+
+/// A one-thread HTTP GitHub: raw paths and one tree answer, both canned.
+struct FakeHttpGithub {
+    port: u16,
+    tree_hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn fake_http_github(tree_paths: Vec<&str>) -> FakeHttpGithub {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let tree_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits = tree_hits.clone();
+    let tree = serde_json::json!({
+        "tree": tree_paths.iter().map(|p| serde_json::json!({"path": p, "type": "blob"})).collect::<Vec<_>>()
+    })
+    .to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            use std::io::{Read as _, Write as _};
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let path = request
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            let (status, body) = if path.contains("/git/trees/") {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (200, tree.clone())
+            } else if path.ends_with("/reports/old.md") {
+                (200, "# Moved report\n\nbody\n".to_owned())
+            } else {
+                (404, "not found".to_owned())
+            };
+            let reason = if status == 200 { "OK" } else { "Not Found" };
+            let _ = stream.write_all(
+                format!("HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())
+                    .as_bytes(),
+            );
+        }
+    });
+    FakeHttpGithub { port, tree_hits }
+}
+
+fn http_fetcher(fake: &FakeHttpGithub) -> GithubFetcher {
+    let base = format!("http://127.0.0.1:{}", fake.port);
+    GithubFetcher::new(TokenSource::None, Some(base.clone()), None).with_api_base(base)
+}
+
+fn old_entry(r#ref: &str) -> Entry {
+    let text = format!("https://github.com/octo/widgets/blob/{ref}/docs/old.md");
+    let index = Index::new(Vec::new());
+    index.apply_message("c", "m1", Some(1_000), "agent", None, &text);
+    index
+        .get(&format!("github:octo/widgets@{ref}:docs/old.md"))
+        .expect("entry")
+}
+
+#[tokio::test]
+async fn a_moved_document_fetches_from_its_new_home() {
+    let fake = fake_http_github(vec!["docs/other.md", "reports/old.md"]);
+    let fetched = http_fetcher(&fake)
+        .fetch(&old_entry("main"))
+        .await
+        .expect("moved fetch");
+    assert!(fetched.content.contains("Moved report"));
+    assert_eq!(fetched.moved_to.as_deref(), Some("reports/old.md"));
+}
+
+#[tokio::test]
+async fn a_missing_or_ambiguous_document_says_not_found() {
+    for paths in [vec!["docs/other.md"], vec!["a/old.md", "b/old.md"]] {
+        let fake = fake_http_github(paths);
+        let error = http_fetcher(&fake)
+            .fetch(&old_entry("main"))
+            .await
+            .expect_err("must not fetch");
+        let FetchError::Failed(detail) = error else {
+            panic!("wrong failure: {error}");
+        };
+        assert_eq!(detail, "not found at docs/old.md (moved or deleted)");
+    }
+}
+
+#[tokio::test]
+async fn a_commit_ref_never_looks_in_the_tree() {
+    let fake = fake_http_github(vec!["reports/old.md"]);
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let error = http_fetcher(&fake)
+        .fetch(&old_entry(sha))
+        .await
+        .expect_err("must not fetch");
+    assert!(matches!(error, FetchError::Failed(_)));
+    assert_eq!(
+        fake.tree_hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a commit ref looked in the tree"
     );
 }

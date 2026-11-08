@@ -124,6 +124,7 @@ fn inventory() -> Vec<Route> {
             Write,
             Json(r#"{"limit":5}"#),
         ),
+        route("DELETE", "/api/v1/documents/cache", Write, Nothing),
         route("GET", "/api/v1/documents/{key}", Read, Nothing),
         route("GET", "/api/v1/documents/{key}/freshness", Write, Nothing),
         route("GET", "/api/v1/channels", Read, Nothing),

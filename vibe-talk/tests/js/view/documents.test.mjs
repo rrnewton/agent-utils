@@ -193,9 +193,9 @@ test("documents list: refresh renders rows in order, unfetched dimmed; clicks fe
     `list exports no list factory (found: ${Object.keys(mod).join(", ") || "none"})`);
 
   const rows = [
-    { key: "doc-alpha", id: "doc-alpha", url: "https://example.com/alpha.md", title: "Alpha doc", file_name: "alpha.md", mention_count: 1, kind: "github_markdown", fetched: true },
+    { key: "doc-alpha", id: "doc-alpha", url: "https://example.com/alpha.md", title: "Alpha doc", file_name: "alpha.md", mention_count: 1, kind: "github_markdown", fetched: true, fetched_ms: 1000, moved_to: null },
     // Unfetched: the server's title can carry the linking message's words; the card names the file.
-    { key: "doc-beta", id: "doc-beta", url: "https://example.com/beta.md", title: "a whole linking message, not the document", file_name: "beta.md", mention_count: 2, kind: "github_markdown", fetched: false },
+    { key: "doc-beta", id: "doc-beta", url: "https://example.com/beta.md", title: "a whole linking message, not the document", file_name: "beta.md", mention_count: 2, kind: "github_markdown", fetched: false, fetched_ms: null, moved_to: null },
   ];
   // One payload readable as a bare array or under documents/rows/items, whichever the module reads.
   const listPayload = () => { const out = [...rows]; out.documents = rows; out.rows = rows; out.items = rows; return out; };
@@ -231,7 +231,7 @@ test("documents list: refresh renders rows in order, unfetched dimmed; clicks fe
     open: onOpen,
     onSelect: onOpen,
     createElement: (tag) => fakeElement(tag),
-    document: { createElement: (tag) => fakeElement(tag), createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }) },
+    document: { createElement: (tag) => fakeElement(tag), createElementNS: (_ns, tag) => fakeElement(tag), createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }) },
     byId: () => container,
   };
 

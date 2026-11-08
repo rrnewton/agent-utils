@@ -7274,6 +7274,8 @@ pub struct DocumentRow {
     pub version: Option<String>,
     /// When the cached copy was fetched, in Unix milliseconds.
     pub fetched_ms: Option<i64>,
+    /// Where the document lives now, when a moved fetch found it elsewhere.
+    pub moved_to: Option<String>,
     /// How many messages link this document.
     pub mention_count: usize,
     /// First mention, in Unix milliseconds, when known.
@@ -7297,6 +7299,7 @@ fn document_row(state: &AppState, entry: &crate::documents::Entry) -> DocumentRo
         fetched: cached.is_some(),
         version: cached.as_ref().map(|c| c.version.clone()),
         fetched_ms: cached.as_ref().map(|c| c.fetched_ms),
+        moved_to: cached.as_ref().and_then(|c| c.moved_to.clone()),
         mention_count: entry.mentions.len(),
         first_mentioned_ms: entry.first_mentioned_ms(),
         last_mentioned_ms: entry.last_mentioned_ms(),
@@ -7485,4 +7488,15 @@ pub async fn document_freshness(
     }
     let freshness = state.documents.freshness(&key).await.map_err(fetch_error)?;
     Ok(Json(freshness).into_response())
+}
+
+/// `DELETE /api/v1/documents/cache` — drop every fetched copy (the index of
+/// linked documents stays). WRITE scope. Answers how many were held.
+pub async fn clear_documents_cache(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+) -> Result<Response, ApiError> {
+    let cleared = state.documents.cache_len();
+    state.documents.clear_cache();
+    Ok(Json(serde_json::json!({ "cleared": cleared })).into_response())
 }

@@ -112,10 +112,12 @@ def main() -> int:
                 check("demo-doc" in (page.locator("#documents-list").text_content() or ""),
                       "the list does not name its document")
 
-                # Fetch recent: a visible result (fetched count or the reason none arrived).
-                page.tap("#docs-fetch-recent")
+                # The bar's Fetch drop-up: Fetch visible, with a result said.
+                page.tap("#docs-fetch")
+                page.wait_for_selector("#docs-fetch-menu", state="visible", timeout=20_000)
+                page.tap("#docs-fetch-menu >> text=Fetch visible")
                 page.wait_for_function(
-                    "() => !document.getElementById('docs-fetch-recent').disabled", timeout=20_000)
+                    "() => !document.getElementById('docs-fetch').disabled", timeout=20_000)
 
                 # The paste row: a real touch fetches it from the server and opens the reader.
                 paste_card = page.locator("#documents-list .doc-card", has_text="demo-doc")

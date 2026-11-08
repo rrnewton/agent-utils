@@ -1222,10 +1222,11 @@ test("Ctrl+( and Ctrl+) step the collapsed lines and say the count, stop at 0 an
   assert.equal(collapsedOf(page), "7");
   await press(page, page.el("scroll-area"), ")", { code: "Digit9", ctrlKey: true, shiftKey: true });
   assert.equal(collapsedOf(page), "8", "a typed ) on the 9 key was read by its place as ( instead");
-  // Without Shift the digit keys are the browser's, untouched.
+  // Without Shift, Ctrl+9 is the Documents view's now (owner, thread 214), not the browser's.
   event = await press(page, page.el("scroll-area"), "9", { code: "Digit9", ctrlKey: true, shiftKey: false });
-  assert.equal(event.defaulted, true, "Ctrl+9 without Shift was taken");
-  assert.equal(collapsedOf(page), "8");
+  assert.equal(event.defaulted, false, "Ctrl+9 without Shift was left to the browser");
+  assert.equal(page.tab(), "docs", "Ctrl+9 did not open Documents");
+  assert.equal(collapsedOf(page), "8", "Ctrl+9 stepped the collapsed lines on its way");
 
   // In a text field the chord is the field's: not taken, nothing stepped, the draft as it was.
   await page.el("channel-compose-text").setValue("a draft (with brackets)");
