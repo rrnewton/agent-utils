@@ -1525,6 +1525,32 @@ diagnosis, not permission to mutate. During a larger deliberate migration, the g
 `--allow-existing-unregistered-worktrees` flag may accompany the exact cleanup command; it retains
 all other paths.
 
+### Build output in retained frozen checkouts
+
+`classify-ownerless-validate-batch` and `recover-ownerless-validate-batch` keep a current frozen
+checkout whose run produced no result only when the clone and every initialized submodule are
+pristine. Git reports a fully ignored directory as one `! dir/` line, so a build that writes its
+target directory inside the checkout makes every such clone read as not pristine, and it blocks
+admission. Name that output in the `reclaimable_ignored_paths` configuration key, as
+checkout-relative paths or globs (the same rules as `cache_globs`: a literal first component, no
+`..`, never `.git`):
+
+```yaml
+reclaimable_ignored_paths:
+  - ignored/split/target
+  - 'ignored/**/out'
+```
+
+When every status line is an ignored path, wrkslots walks it and accepts the clone as pristine only
+if each ignored entry is a regular file or directory inside a named subtree, or a directory on the
+way to one that holds nothing else. Any other ignored file, a symlink, a special file, a nested
+`.git`, or a file-system crossing still keeps the clone preserved. The walk stops after 500,000
+entries or 20 seconds, and never runs past the batch's shared census deadline. Hitting either bound
+refuses that one checkout (it is kept and blocks admission) and the rest of the batch carries on.
+Absent or empty, the key changes nothing: any ignored file keeps the clone preserved. The key only
+changes classification; the checkout stays on disk either way. Builds without the key refuse it as
+an unknown field, so upgrade every client that shares the configuration before adding it.
+
 ## Recover registered validation rows with absent storage
 
 If external cleanup removed disposable validation directories without retiring their ACTIVE rows,

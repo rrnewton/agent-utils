@@ -1,10 +1,11 @@
 ---
 title: 'frozen-reclaimable-build-output: a frozen validation checkout with only ignored build output reads as not pristine'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-11-08T20:35:00.000000000+00:00
-updated_at: 2026-11-08T20:35:00.000000000+00:00
+updated_at: 2026-11-08T20:42:45.000000000+00:00
+closed_at: 2026-11-08T20:42:45.000000000+00:00
 ---
 
 # Description
@@ -32,3 +33,14 @@ A consumer's agent wrote a fix (branch `musejanitor/frozen-split-target-residue`
 # Notes
 
 Requested by the lead (devbig014) on 2026-11-08 for review and landing on the consumer's behalf. Medium priority: it blocks reclaiming tens of GB per frozen checkout on devbig014.
+
+## Resolution
+
+Landed by cl-reclaim, based on a fix by a consumer agent (that fix hard-coded the consumer's path; this one reads it from configuration).
+
+- New optional key `reclaimable_ignored_paths`: checkout-relative paths or globs, validated with the `cache_globs` rules (literal first component, no `..`, never `.git`, `**` only as a whole component). Absent or empty changes nothing.
+- `_pristine_frozen_validation_state` passes it, with the clone root, to `_retained_validation_git_state`. When every status record is an ignored (`! `) record, `_only_reclaimable_ignored_output` walks each one: a configured subtree may hold only regular files and directories, and an ancestor of one may hold nothing else. A stray file, marker, sibling directory, symlink, special file, nested `.git`, device crossing or quoted path still preserves the clone. It applies to the root and to initialized submodules, with paths relative to the clone root.
+- The walk is bounded at 500,000 entries and 20 s, and never runs past the batch's shared census deadline (`census_budget`, 120 s). Hitting a bound refuses that one checkout (kept, entry blocked) and the batch carries on. A 30,515-file target walks in about 0.3 s warm.
+- Tests (`py/wrkslots/tests/test_lifecycle.py`): the consumer's residue test adapted to the key (literal and two glob forms; red before, green after); variants that still preserve (a stray log beside the subtree, a marker in its parent, an unrelated ignored file, a symlink, a nested `.git`, a FIFO); no key, or a key naming another subtree, keeps the old refusal; both walk bounds preserve the checkout; config validation and loading.
+- Documented in the literate configuration comments (`CONFIG_KEY_DOCS`) and in the user guide, "Build output in retained frozen checkouts".
+- Rust parity: `wrkslotsd validate-config` accepts, validates and reports the key, and `config convert` documents it (`config_validate.rs`, `config_docs.rs`; covered by `test_config_validate_rust.py`). Frozen batch classification itself is still Python-only (`classify_ownerless_validate_batch` in `recover_cache_write.rs` refuses), so there is no Rust behaviour to mirror. Whoever ports that classification (the Rust wrkslots owner) must port this check and its bounds with it.

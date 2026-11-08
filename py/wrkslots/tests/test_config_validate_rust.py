@@ -60,6 +60,7 @@ def _expected(root: Path) -> dict[str, object]:
         "machine": config.machine,
         "max_active_slots": config.max_active_slots,
         "post_provision_hooks": list(config.post_provision_hooks),
+        "reclaimable_ignored_paths": list(config.reclaimable_ignored_paths),
         "repo_cache_globs": [[name, list(globs)] for name, globs in config.repo_cache_globs],
         "retire_freeze": config.retire_freeze,
         "root": str(config.root),
@@ -89,7 +90,11 @@ def _rust(root: Path) -> subprocess.CompletedProcess[str]:
 
 
 def test_validate_config_matches_python(tmp_path: Path) -> None:
-    root = _root(tmp_path, "max_active_slots: 3\ncache_globs: [target/**, 'node_modules/**']\n")
+    root = _root(
+        tmp_path,
+        "max_active_slots: 3\ncache_globs: [target/**, 'node_modules/**']\n"
+        "reclaimable_ignored_paths: [ignored/split/target, 'ignored/**/out']\n",
+    )
     result = _rust(root)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == _expected(root)
@@ -114,6 +119,7 @@ def test_validate_config_with_sections_matches_python(tmp_path: Path) -> None:
         ("default_landed_ref: main\n", "invalid full default landed ref"),
         ("disk_advisory_bytes: 5\n", "must supply advisory"),
         ("sandbox: {isolation: namespace}\n", "namespace was renamed userns"),
+        ("reclaimable_ignored_paths: ['../out']\n", "configuration.reclaimable_ignored_paths: cache glob must stay inside"),
     ],
 )
 def test_validate_config_refusals_name_the_same_problem(tmp_path: Path, extra: str, fragment: str) -> None:

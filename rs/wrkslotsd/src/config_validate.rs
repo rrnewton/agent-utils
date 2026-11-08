@@ -27,7 +27,7 @@ const REQUIRED: [&str; 7] = [
     "heartbeat_ttl_seconds",
     "liveness_command",
 ];
-const OPTIONAL: [&str; 15] = [
+const OPTIONAL: [&str; 16] = [
     "liveness_batch_command",
     "max_active_slots",
     "layout",
@@ -35,6 +35,7 @@ const OPTIONAL: [&str; 15] = [
     "repo_cache_globs",
     "post_provision_hooks",
     "salvage_push_remotes",
+    "reclaimable_ignored_paths",
     "disk_advisory_bytes",
     "disk_provisioning_floor_bytes",
     "disk_emergency_bytes",
@@ -301,6 +302,12 @@ fn string_tuple(
         result.push(validated);
     }
     Ok(result)
+}
+
+/// Reclaimable build-output paths follow the cache-glob rules.
+fn validate_reclaimable_ignored_path(value: &str) -> Result<String> {
+    validate_cache_glob(value)
+        .map_err(|error| format!("configuration.reclaimable_ignored_paths: {error}"))
 }
 
 pub(crate) fn validate_hook(value: &str) -> Result<String> {
@@ -1075,6 +1082,15 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
             true,
         )?,
     };
+    let reclaimable = match raw.get("reclaimable_ignored_paths") {
+        None => Vec::new(),
+        Some(value) => string_tuple(
+            value,
+            "configuration.reclaimable_ignored_paths",
+            validate_reclaimable_ignored_path,
+            true,
+        )?,
+    };
     let disk_keys = [
         "disk_advisory_bytes",
         "disk_provisioning_floor_bytes",
@@ -1136,6 +1152,7 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         "machine": machine,
         "max_active_slots": cap,
         "post_provision_hooks": hooks,
+        "reclaimable_ignored_paths": reclaimable,
         "repo_cache_globs": repo_cache_globs.iter().map(|(name, globs)| json!([name, globs])).collect::<Vec<_>>(),
         "retire_freeze": raw.get("retire_freeze").cloned().unwrap_or(Value::Null),
         "root": root.to_string_lossy(),

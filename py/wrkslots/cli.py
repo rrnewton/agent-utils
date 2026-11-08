@@ -538,6 +538,7 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "repo_cache_globs",
         "post_provision_hooks",
         "salvage_push_remotes",
+        "reclaimable_ignored_paths",
         "disk_advisory_bytes",
         "disk_provisioning_floor_bytes",
         "disk_emergency_bytes",
@@ -606,6 +607,12 @@ CONFIG_KEY_DOCS: dict[str, str] = {
     "salvage_push_remotes": (
         "Remote URLs that removal may push salvage commits to. Absent or empty allows none: "
         "uncommitted work on any other remote is kept in a verified local bundle instead."
+    ),
+    "reclaimable_ignored_paths": (
+        "Checkout-relative paths or globs of regenerable build output. A retained frozen "
+        "validation checkout whose only residue is ignored regular files inside these "
+        "subtrees still counts as pristine; any other ignored file, a symlink, or nested "
+        "Git data keeps it preserved. Absent or empty: any ignored file keeps it preserved."
     ),
     "disk_advisory_bytes": (
         "Free-space level (bytes) below which create warns. The three disk_* keys are set "
@@ -879,6 +886,12 @@ _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
 # bound stays finite.
 _VALIDATE_REMOVE_BATCH_CENSUS_SECONDS = 120.0
 _VALIDATE_REMOVE_BATCH_ITEM_CENSUS_SECONDS = 60.0
+# One walk of configured reclaimable build output (reclaimable_ignored_paths)
+# in a retained frozen checkout. A 30,515-file Cargo target walked in about
+# 0.3 s warm on 2026-11-08; the walk also stops at the batch census deadline it
+# shares. Hitting either bound refuses that one checkout, which preserves it.
+_RECLAIMABLE_OUTPUT_WALK_ENTRY_LIMIT = 500_000
+_RECLAIMABLE_OUTPUT_WALK_SECONDS = 20.0
 # The same batch budget also bounds the census commands' combined stderr.  Under
 # process churn, find reports each process that exits during the scan on
 # stderr, and the census parses those lines to classify the vanished process.
@@ -1101,6 +1114,8 @@ class Config:
     post_provision_hooks: tuple[str, ...] = ()
     #: Remote URLs salvage may push to; every other remote gets a local bundle.
     salvage_push_remotes: tuple[str, ...] = ()
+    #: Checkout-relative build-output subtrees that leave a frozen clone pristine.
+    reclaimable_ignored_paths: tuple[str, ...] = ()
     disk_advisory_bytes: int | None = None
     disk_provisioning_floor_bytes: int | None = None
     disk_emergency_bytes: int | None = None
@@ -1853,6 +1868,15 @@ def _validate_cache_glob(value: str) -> str:
             "cache glob's first path component must be literal so it cannot match source broadly"
         )
     return normalized
+
+
+def _validate_reclaimable_ignored_path(value: str) -> str:
+    """Hold reclaimable build-output paths to the cache-glob rules."""
+
+    try:
+        return _validate_cache_glob(value)
+    except Refusal as error:
+        raise Refusal(f"configuration.reclaimable_ignored_paths: {error}") from None
 
 
 @functools.lru_cache(maxsize=None)
@@ -3787,6 +3811,8 @@ def _canonical_config_payload(value: Mapping[str, object]) -> dict[str, object]:
         canonical.pop("post_provision_hooks")
     if canonical.get("salvage_push_remotes") == []:
         canonical.pop("salvage_push_remotes")
+    if canonical.get("reclaimable_ignored_paths") == []:
+        canonical.pop("reclaimable_ignored_paths")
     if canonical.get("slot_representation") == "worktree":
         canonical.pop("slot_representation")
     return canonical
@@ -4017,6 +4043,15 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             _validate_salvage_push_remote,
         )
     )
+    reclaimable_ignored_paths = (
+        ()
+        if "reclaimable_ignored_paths" not in raw
+        else _string_tuple(
+            raw["reclaimable_ignored_paths"],
+            "configuration.reclaimable_ignored_paths",
+            _validate_reclaimable_ignored_path,
+        )
+    )
     disk_keys = (
         "disk_advisory_bytes",
         "disk_provisioning_floor_bytes",
@@ -4068,6 +4103,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         repo_cache_globs=repo_cache_globs,
         post_provision_hooks=post_provision_hooks,
         salvage_push_remotes=salvage_push_remotes,
+        reclaimable_ignored_paths=reclaimable_ignored_paths,
         disk_advisory_bytes=disk_values[0],
         disk_provisioning_floor_bytes=disk_values[1],
         disk_emergency_bytes=disk_values[2],
@@ -49640,10 +49676,124 @@ class _RetainedValidationGitState:
     directories: tuple[tuple[int, int, int], ...]
 
 
+def _glob_may_match_below(pattern: str, parts: tuple[str, ...]) -> bool:
+    """Whether some path strictly below directory ``parts`` can match ``pattern``."""
+
+    pattern_parts = _glob_pattern_parts(pattern)
+
+    def below(pattern_index: int, path_index: int) -> bool:
+        if path_index == len(parts):
+            return pattern_index < len(pattern_parts)
+        if pattern_index == len(pattern_parts):
+            return False
+        part = pattern_parts[pattern_index]
+        if part == "**":
+            return below(pattern_index + 1, path_index) or below(pattern_index, path_index + 1)
+        return (
+            fnmatch.fnmatchcase(parts[path_index], part)
+            and below(pattern_index + 1, path_index + 1)
+        )
+
+    return below(0, 0)
+
+
+def _only_reclaimable_ignored_output(
+    checkout: Path,
+    repository: Path,
+    status: str,
+    reclaimable: Sequence[str],
+    *,
+    deadline: float | None = None,
+) -> bool:
+    """True when every status record is ignored output inside ``reclaimable``.
+
+    Git collapses a fully ignored directory to one ``! dir/`` record, so the
+    status text alone cannot tell regenerable build output from a stray log
+    or receipt beside it; the tree itself is walked. A directory is accepted
+    when a configured pattern names it or one of its parents (a reclaimable
+    subtree, which may hold only regular files and directories), or when it is
+    an ancestor of such a subtree and holds nothing else. A symlink, special
+    file, nested ``.git``, device crossing, quoted path or any other record
+    keeps the checkout preserved.
+
+    The walk is bounded by ``_RECLAIMABLE_OUTPUT_WALK_ENTRY_LIMIT`` entries and
+    ``_RECLAIMABLE_OUTPUT_WALK_SECONDS`` (or ``deadline``, if sooner); past
+    either it refuses, so the checkout is preserved rather than walked on.
+    """
+
+    if not reclaimable or not status:
+        return False
+    entry_limit = _RECLAIMABLE_OUTPUT_WALK_ENTRY_LIMIT
+    bound = time.monotonic() + _RECLAIMABLE_OUTPUT_WALK_SECONDS
+    if deadline is not None:
+        bound = min(bound, deadline)
+    visited = 0
+    prefix = repository.relative_to(checkout).parts
+    try:
+        device = os.lstat(checkout).st_dev
+    except OSError:
+        return False
+    stack: list[tuple[tuple[str, ...], bool]] = []
+    for record in status.splitlines():
+        if not record.startswith("! ") or record.startswith('! "'):
+            return False
+        parts = (*prefix, *(part for part in record[2:].split("/") if part))
+        if len(parts) == len(prefix) or any(part in {".", ".."} for part in parts):
+            return False
+        stack.append((parts, False))
+    while stack:
+        visited += 1
+        if visited > entry_limit:
+            raise Refusal(
+                "retained validation ignored output exceeds the reclaimable walk bound "
+                f"of {entry_limit} entries; preserve it"
+            )
+        if visited % 1024 == 1 and time.monotonic() >= bound:
+            raise Refusal(
+                "retained validation ignored output walk reached its time bound "
+                f"after {visited - 1} entries; preserve it"
+            )
+        parts, inside = stack.pop()
+        path = checkout.joinpath(*parts)
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return False
+        if parts[-1] == ".git" or info.st_dev != device:
+            return False
+        if not inside:
+            relative = "/".join(parts)
+            inside = any(_cache_glob_contains_path(pattern, relative) for pattern in reclaimable)
+        if stat.S_ISREG(info.st_mode) and inside:
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            return False
+        if not inside and not any(_glob_may_match_below(pattern, parts) for pattern in reclaimable):
+            return False
+        try:
+            names = os.listdir(path)
+        except OSError:
+            return False
+        stack.extend(((*parts, name), inside) for name in names)
+    return True
+
+
 def _retained_validation_git_state(
-    repository: Path, *, pristine: bool, cache_globs: Sequence[str] = ()
+    repository: Path,
+    *,
+    pristine: bool,
+    cache_globs: Sequence[str] = (),
+    checkout: Path | None = None,
+    reclaimable_ignored_paths: Sequence[str] = (),
+    walk_deadline: float | None = None,
 ) -> _RetainedValidationGitState:
-    """Observe a repository without refreshing its index or changing its files."""
+    """Observe a repository without refreshing its index or changing its files.
+
+    ``reclaimable_ignored_paths`` (relative to ``checkout``, the repository
+    itself when omitted) lets a pristine check accept ignored build output
+    that lies wholly inside those subtrees; ``walk_deadline`` (monotonic)
+    caps the walk that proves it.
+    """
 
     vcs = _GitVcs()
     if vcs.repository_root(repository) != repository.absolute():
@@ -49679,7 +49829,10 @@ def _retained_validation_git_state(
          "--ignored=matching", "--ignore-submodules=none", "--", *pathspecs],
         env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
     ).stdout
-    if pristine and status:
+    if pristine and status and not _only_reclaimable_ignored_output(
+        repository if checkout is None else checkout, repository, status,
+        reclaimable_ignored_paths, deadline=walk_deadline,
+    ):
         raise Refusal(f"retained validation checkout is not pristine ({status.splitlines()[0]}); preserve it")
     return _RetainedValidationGitState(
         head, common, git_directory, index, index_identity, status,
@@ -49692,9 +49845,18 @@ def _retained_validation_git_state(
 
 
 def _pristine_frozen_validation_state(
-    checkout: Path, *, expected_head: str
+    checkout: Path,
+    *,
+    expected_head: str,
+    reclaimable_ignored_paths: Sequence[str] = (),
+    walk_deadline: float | None = None,
 ) -> tuple[object, ...]:
-    """Bind every initialized gitlink and refuse content hidden by a parent index."""
+    """Bind every initialized gitlink and refuse content hidden by a parent index.
+
+    Ignored output wholly inside ``reclaimable_ignored_paths`` (checkout-
+    relative, from configuration) does not make a repository non-pristine.
+    ``walk_deadline`` is the caller's monotonic deadline for proving that.
+    """
 
     vcs = _GitVcs()
     initialized = tuple(sorted(vcs.initialized_submodules(checkout)))
@@ -49710,7 +49872,11 @@ def _pristine_frozen_validation_state(
         repository = checkout / relative
         _ensure_no_symlink_components(checkout, repository, "retained validation submodule")
         _ensure_no_mount_components(checkout, repository, "retained validation submodule")
-        state = _retained_validation_git_state(repository, pristine=True)
+        state = _retained_validation_git_state(
+            repository, pristine=True, checkout=checkout,
+            reclaimable_ignored_paths=reclaimable_ignored_paths,
+            walk_deadline=walk_deadline,
+        )
         if relative == "." and state.head != expected_head:
             raise Refusal("retained validation checkout HEAD differs from its recorded target")
         if not _path_is_within(state.common, checkout):
@@ -49784,7 +49950,11 @@ def _current_incomplete_frozen_retention(
         require_remote_containment=False,
     )
     vcs = _GitVcs()
-    before_clone = _pristine_frozen_validation_state(checkout, expected_head=target)
+    before_clone = _pristine_frozen_validation_state(
+        checkout, expected_head=target,
+        reclaimable_ignored_paths=config.reclaimable_ignored_paths,
+        walk_deadline=batch_cleanup.census_budget.deadline,
+    )
     before_source = _retained_validation_git_state(
         repository, pristine=False, cache_globs=config.cache_globs
     )
@@ -49818,7 +49988,11 @@ def _current_incomplete_frozen_retention(
         _assert_regular_file_identity(identity, rebound_identity, "current frozen validation evidence")
         if rebound != contents:
             raise Refusal("current frozen validation evidence changed during classification")
-    if (before_clone != _pristine_frozen_validation_state(checkout, expected_head=target)
+    if (before_clone != _pristine_frozen_validation_state(
+                checkout, expected_head=target,
+                reclaimable_ignored_paths=config.reclaimable_ignored_paths,
+                walk_deadline=batch_cleanup.census_budget.deadline,
+            )
             or before_source != _retained_validation_git_state(
                 repository, pristine=False, cache_globs=config.cache_globs
             )

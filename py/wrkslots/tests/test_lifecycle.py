@@ -53589,6 +53589,145 @@ def test_current_incomplete_frozen_requires_pristine_recursive_checkout(
     assert git_metadata_snapshot(checkout) == before
 
 
+def add_reclaimable_build_output(checkout: Path) -> Path:
+    """Write ignored build output the way a split build leaves it in a checkout."""
+    target = checkout / "ignored/split/target/debug"
+    target.mkdir(parents=True)
+    (target / "build-output").write_text("build residue\n")
+    (target / "deps").mkdir()
+    (target / "deps" / "artifact.rlib").write_text("build residue\n")
+    return target
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("action", ("recover", "classify"))
+@pytest.mark.parametrize("pattern", ("ignored/split/target", "ignored/*/target", "ignored/**/target"))
+def test_current_incomplete_frozen_allows_configured_reclaimable_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], action: str, pattern: str,
+) -> None:
+    # Git collapses the fully ignored ignored/ directory to one "! ignored/"
+    # record; output wholly inside a configured subtree is still pristine.
+    # Based on a test by a consumer agent (#1088 frozen-reclaimable-build-output).
+    project, source, checkout, record, _sidecar = prepare_current_incomplete_frozen_checkout(tmp_path, monkeypatch)
+    update_configuration(project, reclaimable_ignored_paths=[pattern])
+    target = add_reclaimable_build_output(checkout)
+    assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
+    row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
+    assert row["blocks_entry"] is False, row
+    if action == "classify":
+        assert row["state"] == "current-incomplete-retained"
+    assert "no-result remain retained" in str(row["reason"])
+    assert (target / "build-output").read_text() == "build residue\n"
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("action", ("recover", "classify"))
+@pytest.mark.parametrize("configured", ((), ("ignored/other/target",)))
+def test_current_incomplete_frozen_without_matching_reclaimable_paths_preserves_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], action: str, configured: tuple[str, ...],
+) -> None:
+    # No setting (or one naming another subtree) keeps the old behaviour:
+    # any ignored file preserves the checkout.
+    project, source, checkout, record, _sidecar = prepare_current_incomplete_frozen_checkout(tmp_path, monkeypatch)
+    if configured:
+        update_configuration(project, reclaimable_ignored_paths=list(configured))
+    target = add_reclaimable_build_output(checkout)
+    assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
+    row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
+    assert row["blocks_entry"] is True, row
+    assert "not pristine (! ignored/)" in str(row["reason"]), row
+    assert (target / "build-output").read_text() == "build residue\n"
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("action", ("recover", "classify"))
+@pytest.mark.parametrize(
+    "extra",
+    ("ignored/stray.log", "ignored/split/cargo-home-marker", "ignored/other/run.log",
+     "symlink", "nested-git", "fifo"),
+)
+def test_current_incomplete_frozen_preserves_ignored_content_beside_reclaimable_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], action: str, extra: str,
+) -> None:
+    # Anything other than plain files and directories inside the configured
+    # subtree may be evidence; it keeps the checkout preserved.
+    project, source, checkout, record, _sidecar = prepare_current_incomplete_frozen_checkout(tmp_path, monkeypatch)
+    update_configuration(project, reclaimable_ignored_paths=["ignored/split/target"])
+    target = add_reclaimable_build_output(checkout)
+    if extra == "symlink":
+        (target / "link").symlink_to("build-output")
+    elif extra == "nested-git":
+        (target / "vendored" / ".git").mkdir(parents=True)
+        (target / "vendored" / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    elif extra == "fifo":
+        os.mkfifo(target / "pipe")
+    else:
+        extra_path = checkout / extra
+        extra_path.parent.mkdir(parents=True, exist_ok=True)
+        extra_path.write_text("possible evidence\n")
+    assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
+    row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
+    assert row["blocks_entry"] is True, row
+    assert "not pristine" in str(row["reason"]), row
+    assert checkout.is_dir()
+    assert (target / "build-output").read_text() == "build residue\n"
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("action", ("recover", "classify"))
+@pytest.mark.parametrize("bound", ("entries", "seconds"))
+def test_current_incomplete_frozen_reclaimable_walk_bound_preserves_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], action: str, bound: str,
+) -> None:
+    # The walk shares the batch's time budget; past its own bound it refuses
+    # that checkout (kept, entry blocked) and the batch still completes.
+    project, source, checkout, record, _sidecar = prepare_current_incomplete_frozen_checkout(tmp_path, monkeypatch)
+    update_configuration(project, reclaimable_ignored_paths=["ignored/split/target"])
+    target = add_reclaimable_build_output(checkout)
+    if bound == "entries":
+        monkeypatch.setattr(wrkslots, "_RECLAIMABLE_OUTPUT_WALK_ENTRY_LIMIT", 3)
+    else:
+        monkeypatch.setattr(wrkslots, "_RECLAIMABLE_OUTPUT_WALK_SECONDS", 0.0)
+    assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
+    row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
+    assert row["blocks_entry"] is True, row
+    expected = "bound of 3 entries" if bound == "entries" else "reached its time bound"
+    assert expected in str(row["reason"]), row
+    assert (target / "build-output").read_text() == "build residue\n"
+
+
+@pytest.mark.parametrize(
+    ("entry", "fragment"),
+    (
+        ("../outside", "must stay inside each checkout"),
+        ("*/target", "first path component must be literal"),
+        ("ignored/.git", "never name Git administrative data"),
+        (".", "must not name the checkout root"),
+    ),
+)
+def test_reclaimable_ignored_paths_are_validated_like_cache_globs(
+    tmp_path: Path, entry: str, fragment: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    update_configuration(project, reclaimable_ignored_paths=[entry])
+    with pytest.raises(wrkslots.Refusal, match="configuration.reclaimable_ignored_paths") as caught:
+        wrkslots._load_config(str(project), None)
+    assert fragment in str(caught.value)
+
+
+def test_reclaimable_ignored_paths_load_in_order(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert wrkslots._load_config(str(project), None).reclaimable_ignored_paths == ()
+    update_configuration(project, reclaimable_ignored_paths=["ignored/b/target", "ignored/**/out"])
+    assert wrkslots._load_config(str(project), None).reclaimable_ignored_paths == (
+        "ignored/b/target", "ignored/**/out",
+    )
+
+
 @pytest.mark.ordinary_environment
 @pytest.mark.parametrize("action", ("recover", "classify"))
 @pytest.mark.parametrize("mutation", ("sidecar", "sidecar-replace", "schema", "record", "child-index", "child-file", "child-head", "source-head", "source-index", "source-remote"))
@@ -53782,6 +53921,7 @@ def test_current_incomplete_frozen_binds_initial_facts_to_recursive_snapshot(
     changed = False
     def observe(
         repository: Path, *, pristine: bool, cache_globs: Sequence[str] = (),
+        **reclaimable: object,
     ) -> wrkslots._RetainedValidationGitState:
         nonlocal changed
         if repository == checkout and not changed:
@@ -53791,7 +53931,7 @@ def test_current_incomplete_frozen_binds_initial_facts_to_recursive_snapshot(
             else:
                 for path in (checkout, source):
                     git(path, "remote", "set-url", "origin", str(tmp_path / "changed.git"))
-        return original(repository, pristine=pristine, cache_globs=cache_globs)
+        return original(repository, pristine=pristine, cache_globs=cache_globs, **reclaimable)  # type: ignore[arg-type]
     monkeypatch.setattr(wrkslots, "_retained_validation_git_state", observe)
     assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
     row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
