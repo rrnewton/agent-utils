@@ -1,10 +1,12 @@
 ---
 title: 'agentctl-goal-wait-unbounded: agentctl goal can wait forever, ignore SIGTERM and outlive its target'
-status: open
+status: closed
 priority: 2
 issue_type: bug
+assignee: cl-start
 created_at: 2026-11-08T17:30:00.000000000+00:00
-updated_at: 2026-11-08T17:30:00.000000000+00:00
+updated_at: 2026-11-08T22:32:34.000000000+00:00
+closed_at: 2026-11-08T22:32:34.000000000+00:00
 ---
 
 # Description
@@ -51,3 +53,7 @@ Tests are in `rs/agentctl/tests/goal_bounds.rs`:
 - the help documents `--deadline` and its default;
 - SIGTERM during a hung Herdr command ends `goal` within 2 s and leaves no process behind;
 - SIGKILL during a hung Herdr command leaves no supervisor behind.
+
+## Resolution
+
+Landed as b324d32d. `goal` takes the agent's lifecycle lock under the send deadline and has `--deadline` (default `send_deadline_seconds`, else 600 s). A goal waiting behind an archive exits with `unknown agent` once the lock is released. SIGTERM and SIGKILL during a hung Herdr command leave nothing behind, given #1061's supervisor fix (d83ae91c). The reported 32 h process was that pre-d83ae91c orphaned supervisor; consumers must run an agentctl that includes d83ae91c. Tests: `rs/agentctl/tests/goal_bounds.rs`, 5 cases. Gate on 67933774: all but repository.format.rust passed. The rewrap amend ed8deb7b passed a solo rerun of format and rust.agentctl.test (2406 cases).
