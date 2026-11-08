@@ -202,7 +202,9 @@ a.search-hit-link {
   align-items: center;
   justify-content: center;
   min-height: 2.25rem;
-  padding: 0.2rem 0.65rem;
+  /* Trimmed with the wider word below (`#1078`): the fixed box's width comes partly from
+     here, so the strip's other members keep their room. */
+  padding: 0.2rem 0.35rem;
   background: var(--bg);
   border: 1px solid var(--edge);
   border-radius: 999px;

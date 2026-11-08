@@ -5233,6 +5233,20 @@ const TUNING_BANDS = {
     "how far below the scroller's top a document heading still counts as the current section " +
     "(#1038 documents-outline-popup): past a line's height a heading the reader has not reached " +
     "yet would be marked HERE in the outline pop-up"],
+  VIEW_CARDS_SETTLE_MS: [300, 1500,
+    "how long the view switcher's tab row stays up after the last press (#1078 " +
+    "bottom-bar-switcher): shorter goes before the highlighted cell can be read as the taps " +
+    "land; longer leaves the row standing over the pane's controls after the choice is made"],
+  REFRESH_PULL_PX: [24, 200,
+    "how far past the bottom a drag up has to travel before releasing refreshes the Documents " +
+    "list (#1079 documents-chronological), the channel pull's arm by the same reasoning as " +
+    "PULL_ARM_PX: below a couple of dozen pixels an ordinary flick refreshes by accident; " +
+    "above a couple of hundred it is further than a thumb travels in one stroke"],
+  FOLLOW_SLACK_PX: [0, 96,
+    "how close to the bottom counts as following the newest document across a refresh " +
+    "(#1079 documents-chronological): at zero only an exactly parked reader follows, so a " +
+    "fractional pixel strands them above the newest card; past a card's height a reader who " +
+    "scrolled up to read is pulled back down by a refresh they did not ask to move them"],
   NOTICE_OUTLINE_CAP: [5, 100,
     "outline entries named in the voice agent's open-document notice (#1040 " +
     "documents-voice-agent): fewer hides the sections a question is most likely about, far " +

@@ -32,6 +32,12 @@
 .view-cards[hidden] {
   display: none;
 }
+/* While a call can be hung up the row is a signpost only: it hangs over the pane's row, and
+   the way out of sound is never under it, even in the settle after a switch press. Choosing
+   a view from a cell remains where no call is live. */
+:root:has(#hang-up:not([hidden])) .view-cards {
+  pointer-events: none;
+}
 .view-card {
   flex: 1 1 0;
   min-width: 0;

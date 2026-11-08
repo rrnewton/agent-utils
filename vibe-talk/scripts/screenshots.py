@@ -2782,7 +2782,7 @@ def _act_typed_turn(driver: Driver) -> None:
     conversation a first send with nothing open starts.
 
     This scene is about the TRANSCRIPT — that a typed turn lands in it beside the spoken ones, with
-    the box under it and the bar, switch and all, still above the big controls rather than over
+    the box under it and the bar, switch and all, below the big controls rather than over
     them. What the box looks like at idle, focused, is `26-voice-composer`.
     """
     driver.click("talk")
@@ -2865,13 +2865,14 @@ def _act_canned_prompts(driver: Driver) -> None:
 
 NO_HANGUP = ("Hang up is absent, not merely dimmed", "!window.__visible('hang-up')")
 
-# `#58 control-bar` put the bar directly ABOVE the big buttons, and three states measure that.
+# `#58 control-bar` put the bar directly above the big buttons; `#1078 bottom-bar-switcher`
+# stands the pane over the bar instead, and three states measure that.
 # `#218 desktop-dock` lays the dock on a desk out as one wrapping row, where the bar and the pane's
 # buttons share a row when they fit: there the claim is that the bar is BESIDE the pane, to its left.
 # Either way the bar is never over the controls, which is the defect those measurements exist for.
 # `b` and `p` are the bar's and the pane's boxes; the desktop query is the one web/voice.css uses.
 BAR_CLEAR_OF_PANE_JS = (
-    "(b.bottom <= p.top + 1 || (matchMedia('(min-width: 900px) and (pointer: fine)').matches "
+    "(p.bottom <= b.top + 1 || (matchMedia('(min-width: 900px) and (pointer: fine)').matches "
     "&& b.right <= p.left + 1 && b.bottom > p.top && b.top < p.bottom))"
 )
 
@@ -4884,7 +4885,7 @@ SCENES: tuple[Scene, ...] = (
             # is not "it looks cramped" -- it is the box under the dock, or the bar overlapping the
             # controls the reader is trying to hit. Measured, not eyeballed.
             (
-                "the box sits above the big controls, and the bar, switch and all, above them too "
+                "the box sits above the big controls, and the bar, switch and all, below them "
                 "(on a desk, beside them), not over them",
                 "(() => { const b = document.getElementById('control-bar').getBoundingClientRect(); "
                 "const p = document.getElementById('control-pane').getBoundingClientRect(); "
@@ -4925,15 +4926,15 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="25-control-bar-bottom",
-        what="the default: the control bar in the dock, directly above the big buttons",
+        what="the default: the control bar in the dock, below the big buttons at the very bottom",
         act=_act_control_bar_bottom,
         expect=(
             # THE claim, and the half of it that is easy to get wrong. "Bottom" is not "below the
             # big buttons" and not "pinned to the viewport floor": it is the band BETWEEN the
             # transcript and the controls. Only a browser can measure that.
             (
-                "the bar sits below the transcript and directly above the big buttons (on a desk, "
-                "beside them)",
+                "the bar sits below the transcript and below the big buttons, at the very bottom "
+                "(on a desk, beside them)",
                 "(() => { const b = document.getElementById('control-bar').getBoundingClientRect(); "
                 "const s = document.getElementById('scroll-area').getBoundingClientRect(); "
                 "const p = document.getElementById('control-pane').getBoundingClientRect(); "

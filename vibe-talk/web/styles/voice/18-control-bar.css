@@ -16,7 +16,10 @@
 #control-bar {
   display: flex;
   align-items: center;
-  gap: 0.4rem;
+  /* A step tighter since `#1078 bottom-bar-switcher`: the switch holds its widest word in
+     every view, and the room that takes comes back here and in the switch's own padding, so
+     the channel's name keeps the room it had. */
+  gap: 0.3rem;
   min-width: 0;
   /* What the prompts tray is positioned against. On the bar itself rather than on either mount,
      because the bar is the element that moves between them — anchoring to a mount would mean the
@@ -35,7 +38,7 @@
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 0.4rem;
+  gap: 0.3rem;
   overflow-x: auto;
   scrollbar-width: none;
 }
@@ -56,9 +59,11 @@
    line on the owner's iPhone would eat the gear. The bar is the dock's LAST row now (`#1078
    bottom-bar-switcher`, the pane stands above it), so its bottom padding owns the home
    indicator's clearance the pane used to keep — the same value the reader-hidden rule already
-   gave it for the case where the pane was gone, so putting the pane away cannot move the bar. */
+   gave it for the case where the pane was gone, so putting the pane away cannot move the bar.
+   The top padding is small: the pane above supplies the separation, exactly as this bar's
+   bottom once did for the pane, so the dock is no taller for the flip. */
 #control-bar[data-placement="bottom"] {
-  padding: 0.35rem calc(0.6rem + env(safe-area-inset-right))
+  padding: 0.1rem calc(0.6rem + env(safe-area-inset-right))
     calc(0.35rem + env(safe-area-inset-bottom))
     calc(0.6rem + env(safe-area-inset-left));
 }

@@ -1082,8 +1082,10 @@ test("THE BLOCK BEING READ IS LIT and the row counts it, 'reading 1 of 3', with 
   page.audioStreams[0].controller.drop();
   await page.settle();
   assert.equal(litBlock(row), "p:The run finished.", "the light moved before the next block was heard");
-  // Block 1 is due where block 0 ends, 0.6 s from now.
-  assert.equal(page.expireTimers(600), 1, "nothing waited for block 1 to be heard");
+  // Block 1 is due where block 0 ends, 0.6 s from now. Exactly two 600ms waits are armed:
+  // block 1's, and the view switcher's tab-row settle from the switch into this channel
+  // (`#1078 bottom-bar-switcher`), which expiring here only puts that row away.
+  assert.equal(page.expireTimers(600), 2, "nothing waited for block 1 to be heard (speech + tab-row settle)");
   await page.settle();
   assert.equal(litBlock(row), "li:the budget landed");
   assert.equal(page.el("read-steer-count").text(), "2 of 3");
