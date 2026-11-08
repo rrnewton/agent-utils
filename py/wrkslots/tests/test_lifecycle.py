@@ -57739,7 +57739,7 @@ def test_remove_agent_batch_refuses_an_item_whose_budget_runs_out_after_its_fenc
     assert reason.endswith(
         "nothing in the slot was deleted and the slot was kept; retry it later, or "
         "remove it alone with 'wrkslots remove --no-lock-budget', which has no such "
-        "budget"
+        "budget (budget phase when it ran out: process census)"
     )
     assert payload["recovery_required"] is False
     assert checkout(project, "slot01").is_dir()
@@ -57748,6 +57748,65 @@ def test_remove_agent_batch_refuses_an_item_whose_budget_runs_out_after_its_fenc
     assert registry_journals(project) == []
     removed_rows = cast(list[Mapping[str, object]], payload["removed"])
     assert cast(float, removed_rows[0]["seconds_before_deletion"]) < 60
+
+
+def test_item_budget_scales_with_salvage_units() -> None:
+    """#954: the per-item budget grows with the submodule salvage work."""
+
+    assert wrkslots._agent_remove_batch_item_seconds(1, 0) == 60.0
+    assert wrkslots._agent_remove_batch_item_seconds(1, 5) == 135.0
+    assert wrkslots._agent_remove_batch_item_seconds(3, 2) == 120.0
+    assert (
+        wrkslots._agent_remove_batch_item_seconds(1, 1000)
+        == wrkslots._AGENT_REMOVE_BATCH_ITEM_MAX_SECONDS
+    )
+
+
+def test_item_budget_refusal_names_the_phase() -> None:
+    """#954: a budget refusal names the phase in progress when it ran out."""
+
+    context = wrkslots._AgentRemoveBatchContext({}, item_seconds=0.01)
+    with wrkslots._agent_batch_item_deadline(context):
+        wrkslots._set_item_phase("salvage")
+        time.sleep(0.05)
+        with pytest.raises(wrkslots.Refusal) as caught:
+            wrkslots._item_seconds_left("a git command")
+    assert "(budget phase when it ran out: salvage)" in str(caught.value)
+
+
+def test_remove_agent_batch_removes_a_slot_with_nested_submodules_within_scaled_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#954: slow salvage Git work that would exhaust the flat budget
+    succeeds once the budget is scaled by the submodule count."""
+
+    project, repository, slots = dead_agent_batch_project(tmp_path, count=1)
+    # Give the batch slot the recursive component+leaf submodule pair:
+    # rebuild its repository with the pair and recreate the slot.
+    add_recursive_submodules(tmp_path, project, repository)
+    made = create(
+        project, slot="slot02", agent="codex-9", branch="codex/slot02"
+    )
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project, "slot02"), "codex/slot02")
+    handed_off = finish(project, "slot02", "codex-9")
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project, slot="slot02")
+    slots = ["slot02"]
+    real_run = wrkslots._GitVcs._run
+
+    def slow_submodule_git(repository, args, **kwargs):  # type: ignore[no-untyped-def]
+        if args and args[0] == "submodule":
+            time.sleep(0.4)
+        return real_run(repository, args, **kwargs)
+
+    monkeypatch.setattr(wrkslots._GitVcs, "_run", staticmethod(slow_submodule_git))
+    monkeypatch.setattr(wrkslots, "_AGENT_REMOVE_BATCH_ITEM_SECONDS", 2.0)
+
+    returncode, payload, stderr = in_process_agent_batch(project, slots)
+
+    assert returncode == 0, (stderr, payload)
+    assert batch_slots(payload, "removed") == ["slot02"]
 
 
 def test_remove_agent_batch_refuses_an_item_whose_budget_is_spent_before_its_fence(

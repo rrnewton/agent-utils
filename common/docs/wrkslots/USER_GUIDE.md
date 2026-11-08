@@ -1030,7 +1030,8 @@ held. `lsof +D` walks the whole slot and every open descriptor on the machine, s
 one such check of a large slot takes many seconds: on a 33 GB slot of 68,888 entries, at load
 average about 260, one took 9 to 18 seconds. Default `remove` of one agent slot is therefore a batch
 of one, as described below: its one `lsof +D` runs before the lock is taken, and its work before the
-first deletion has the same 60-second budget as each batch slot, with the same exceptions (listed
+first deletion has the same per-slot budget as each batch slot (60 seconds, scaled by the slot's
+salvage work as described below), with the same exceptions (listed
 below). A batch of one refuses, without salvaging or removing anything, when its `lsof` scan is more
 than 300 seconds old at its first process-use check under the lock. A slot that the invoking
 `wrkslots` process itself holds open, for example through an inherited descriptor, is refused as
@@ -1118,7 +1119,11 @@ JSON report counts those checks in `image_lsof_checks`, with their total time in
 
 Each slot's work before its first deletion is limited to 60 seconds, counted from when the slot
 takes the registry lock, so that other clients waiting for the lock are not kept waiting past their
-own limits. Each Git command, the registered liveness command, each nested-repository check, each
+own limits. The limit scales with the salvage work the slot carries: each initialized submodule
+(and each recorded checkout beyond the first) adds 15 seconds, up to a 600-second cap, because
+salvage must visit each of them with its own Git commands. A budget refusal names the phase in
+progress when the budget ran out (for example `budget phase when it ran out: salvage`), as well
+as the exact step. Each Git command, the registered liveness command, each nested-repository check, each
 `/proc` scan, and `lsof` receive at most the time that remains. A command still running when the
 limit is reached receives SIGTERM, then SIGKILL 5 seconds later if it has not exited, and is then
 waited for up to 5 more seconds. The slot is refused and left in place, with its path fence rolled

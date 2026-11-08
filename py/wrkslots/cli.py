@@ -936,6 +936,28 @@ _AGENT_REMOVE_BATCH_YIELD_SECONDS = 0.25
 # took 6.7 to 10.1 seconds and the lsof +D it replaces took 34 to 53 seconds;
 # deleting that tree with shutil.rmtree took 10.8 seconds.
 _AGENT_REMOVE_BATCH_ITEM_SECONDS = 60.0
+# Each initialized submodule salvage has to visit adds this much to an
+# item's budget (#954): a slot carrying several nested submodules used
+# up the flat 60 s in salvage Git work before any census ran. The base
+# stays the budget for a slot with no submodules, and the scaled total
+# is capped so one item cannot hold the registry lock without bound.
+_AGENT_REMOVE_BATCH_ITEM_PER_SUBMODULE_SECONDS = 15.0
+_AGENT_REMOVE_BATCH_ITEM_MAX_SECONDS = 600.0
+
+
+def _agent_remove_batch_item_seconds(
+    checkout_count: int, submodule_count: int
+) -> float:
+    """One item's pre-deletion budget, scaled by its salvage work (#954)."""
+
+    base = _AGENT_REMOVE_BATCH_ITEM_SECONDS
+    if base <= 0:
+        return base
+    extra_units = max(0, checkout_count - 1) + max(0, submodule_count)
+    return min(
+        _AGENT_REMOVE_BATCH_ITEM_MAX_SECONDS,
+        base + _AGENT_REMOVE_BATCH_ITEM_PER_SUBMODULE_SECONDS * extra_units,
+    )
 # Removal decides whether a clean checkout's HEAD is already published by
 # asking which of the remote's branches contain it (_GitVcs.remote_heads_
 # containing).  That question used to be answered by fetching every branch the
@@ -11863,6 +11885,7 @@ class _ItemDeadline:
     started_at: float
     state: str = "active"
     seconds_before_deletion: float | None = None
+    phase: str = "pre-deletion checks"
 
     @property
     def expires_at(self) -> float:
@@ -11994,14 +12017,29 @@ def _remote_containment_scope() -> Iterator[None]:
         _REMOTE_CONTAINMENT_MEMO.reset(token)
 
 
+def _set_item_phase(phase: str) -> None:
+    """Name the phase the current item budget is being spent on (#954).
+
+    The clock ran out where it ran out, which is not necessarily what
+    spent it, so a budget refusal names the phase in progress when it
+    expired as well as the exact step.
+    """
+
+    deadline = _ITEM_DEADLINE.get()
+    if deadline is not None and deadline.state in ("active", "paused"):
+        deadline.phase = phase
+
+
 def _item_budget_refusal(what: str) -> Refusal:
     deadline = _ITEM_DEADLINE.get()
     seconds = _AGENT_REMOVE_BATCH_ITEM_SECONDS if deadline is None else deadline.seconds
+    phase = "pre-deletion checks" if deadline is None else deadline.phase
     return Refusal(
         f"this remove-agent-batch item used its {seconds:g}-second budget for work "
         f"before deletion at {what}; nothing in the slot was deleted and the slot "
         "was kept; retry it later, or remove it alone with 'wrkslots remove "
-        "--no-lock-budget', which has no such budget"
+        "--no-lock-budget', which has no such budget "
+        f"(budget phase when it ran out: {phase})"
     )
 
 
@@ -24313,6 +24351,7 @@ def _salvage_agent_slot(
     checkout refuses exactly as before.
     """
 
+    _set_item_phase("salvage")
     candidates: list[tuple[Checkout, Path, bool, _CheckoutDrift | None, bool]] = []
     self_sourced_names: set[str] = set()
     for checkout in record.checkouts:
@@ -42517,6 +42556,28 @@ def _cmd_remove(
         )
 
 
+def _salvage_submodule_count(config: Config, record: ActiveRecord, vcs: _GitVcs) -> int:
+    """How many initialized submodules salvage must visit for ``record`` (#954).
+
+    ``initialized_submodules`` already lists recursively, so this is
+    one count per recorded checkout. Any error counts as zero: the
+    unscaled base budget then applies, and salvage itself reports the
+    defect under the lock.
+    """
+
+    try:
+        return sum(
+            len(
+                vcs.initialized_submodules(
+                    _stored_path(config, checkout.path, "checkout path")
+                )
+            )
+            for checkout in record.checkouts
+        )
+    except Exception:
+        return 0
+
+
 def _prefetch_remote_containment(
     config: Config,
     slot: str,
@@ -45395,6 +45456,7 @@ class _AgentRemoveBatchContext:
                 f"slot directory {check_path} is not the directory this batch's "
                 "shared process census covered"
             )
+        _set_item_phase("process census")
         self.census.assert_slot_unused(canonical_path, None)
         started = time.monotonic()
         self.fresh_scan_count += 1
@@ -45561,7 +45623,13 @@ def _single_remove_agent_batch(
             return None
     except Refusal:
         return None
-    context = _AgentRemoveBatchContext({slot_path: identity})
+    context = _AgentRemoveBatchContext(
+        {slot_path: identity},
+        item_seconds=_agent_remove_batch_item_seconds(
+            len(record.checkouts),
+            _salvage_submodule_count(config, record, _GitVcs()),
+        ),
+    )
     context.capture([slot_path])
     return context
 
@@ -45806,6 +45874,14 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
                 # Waiters poll the registry lock every 50 ms; leave them a window
                 # between items so a batch never starves heartbeats.
                 time.sleep(_AGENT_REMOVE_BATCH_YIELD_SECONDS)
+            item_record = records.get(slot)
+            if item_record is not None:
+                # Scale this item's budget by the salvage work it
+                # carries (#954); counted here, before the lock.
+                context.item_seconds = _agent_remove_batch_item_seconds(
+                    len(item_record.checkouts),
+                    _salvage_submodule_count(config, item_record, _GitVcs()),
+                )
             item_args = argparse.Namespace(**vars(args))
             item_args.command = "remove"
             item_args.slot = slot
