@@ -540,3 +540,81 @@ def test_resumed_and_forked_transcripts_count_each_record_once(tmp_path: Path) -
 def test_forked_copy_with_different_content_still_refuses(tmp_path: Path) -> None:
     with pytest.raises(ClaudeParseError, match="conflicting duplicate UUID root-user-1"):
         load_claude_team(_fork_fixture(tmp_path, conflicting=True), "claude-fixture", "UTC")
+
+
+def _file_read_fixture(
+    tmp_path: Path,
+    repeat_content: str,
+    *,
+    repeat_file: dict[str, object] | None = None,
+    repeat_message: dict[str, object] | None = None,
+) -> Path:
+    """A root that reads a file, then a resume re-appending that result with its text changed."""
+
+    live = tmp_path / "live"
+    shutil.copytree(FIXTURE_ROOT, live)
+    root = _session(live)
+    records = [json.loads(line) for line in root.read_text(encoding="utf-8").splitlines()]
+    first_user = next(record for record in records if record["uuid"] == "root-user-1")
+    read_file: dict[str, object] = {
+        "filePath": "/work/guide.md",
+        "content": "# Guide\n\nThe whole file.\n",
+        "numLines": 3,
+        "startLine": 1,
+        "totalLines": 3,
+    }
+    read_result = dict(
+        first_user,
+        uuid="root-read-result",
+        toolUseResult={"type": "text", "file": read_file},
+    )
+    repeat = dict(
+        read_result,
+        slug="quiet-river",
+        promptId="resumed-prompt",
+        toolUseResult={
+            "type": "text",
+            "file": dict(read_file, content=repeat_content, **(repeat_file or {})),
+        },
+    )
+    if repeat_message is not None:
+        repeat["message"] = repeat_message
+    with root.open("a", encoding="utf-8") as handle:
+        handle.write(_jsonl([read_result, repeat]))
+    return root
+
+
+def test_resumed_file_read_with_elided_text_is_the_same_record(tmp_path: Path) -> None:
+    team = load_claude_team(_file_read_fixture(tmp_path, ""), "claude-fixture", "UTC")
+    baseline = load_claude_team(_session(), "claude-fixture", "UTC")
+
+    assert [event.text for event in team.events].count("Build the release report.") == [
+        event.text for event in baseline.events
+    ].count("Build the release report.") + 1
+
+
+@pytest.mark.parametrize(
+    ("content", "file_change", "message"),
+    [
+        # Different text that is not blanked is a different read.
+        ("# Guide\n\nA different file.\n", None, None),
+        # Blanked, but not the same file, or not the same slice of it.
+        ("", {"filePath": "/work/other.md"}, None),
+        ("", {"numLines": 4}, None),
+        ("", {"startLine": 2}, None),
+        ("", {"totalLines": 9}, None),
+        # Blanked, but what the model was shown differs.
+        ("", None, {"role": "user", "content": "A different request."}),
+    ],
+)
+def test_resumed_file_read_that_is_not_only_elided_still_refuses(
+    tmp_path: Path,
+    content: str,
+    file_change: dict[str, object] | None,
+    message: dict[str, object] | None,
+) -> None:
+    root = _file_read_fixture(
+        tmp_path, content, repeat_file=file_change, repeat_message=message
+    )
+    with pytest.raises(ClaudeParseError, match="conflicting duplicate UUID root-read-result"):
+        load_claude_team(root, "claude-fixture", "UTC")

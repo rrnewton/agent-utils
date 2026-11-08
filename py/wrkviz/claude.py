@@ -516,9 +516,33 @@ def _record_identity(value: Mapping[str, object]) -> dict[str, object]:
     return identity
 
 
+def _elided_file_read(identity: Mapping[str, object]) -> dict[str, object] | None:
+    """*identity* with a file read's text blanked, or ``None`` when it records no file read."""
+
+    result = identity.get("toolUseResult")
+    file = result.get("file") if isinstance(result, dict) else None
+    if not isinstance(result, dict) or not isinstance(file, dict) or "content" not in file:
+        return None
+    return dict(identity, toolUseResult=dict(result, file=dict(file, content="")))
+
+
 def _same_record(left: _Record, right: _Record) -> bool:
-    return left.raw == right.raw or _record_identity(left.value) == _record_identity(
-        right.value
+    if left.raw == right.raw:
+        return True
+    earlier, repeat = _record_identity(left.value), _record_identity(right.value)
+    if earlier == repeat:
+        return True
+    # A resumed session can also re-append a file read with the file's text dropped from its
+    # `toolUseResult` (the UI-side copy; the model-facing `message` is unchanged). The earlier,
+    # complete copy is the one kept, so only a repeat that is blank there is the same record.
+    blanked = _elided_file_read(earlier)
+    repeat_result = repeat.get("toolUseResult")
+    repeat_file = repeat_result.get("file") if isinstance(repeat_result, dict) else None
+    return (
+        blanked is not None
+        and isinstance(repeat_file, dict)
+        and repeat_file.get("content") == ""
+        and blanked == repeat
     )
 
 
