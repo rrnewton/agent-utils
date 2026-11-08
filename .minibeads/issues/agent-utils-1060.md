@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-recount-refusals: recount names only the first undeclared decrease and refuses every pin removal'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-11-08T13:11:07.000000000+00:00
-updated_at: 2026-11-08T13:11:07.000000000+00:00
+updated_at: 2026-11-08T16:47:43.000000000+00:00
 ---
 
 # Description
@@ -117,3 +117,23 @@ referred to generically here, per repository convention. Queued
 behind #1053 merge-queue-rebase-conflict-probe. Gate as a product
 change under the merge-queue rules (full shared gate phase;
 exclusive phase waived for a merge-queue-only diff).
+
+## Resolution
+
+Landed on main as 7e13f97fb48d7f7a7896c29cbb696402192bdb34 (commits gated recount commit d3ecddaf replayed as 7e13f97f, in the same push as plan-intake d3f107ad).
+
+`check_decreases` collects every problem — undeclared decreases and
+amount mismatches — into one refusal in delta order, each undeclared
+decrease with its ready-to-paste trailer; the single-problem wording
+is unchanged. Whole-name removals are accepted with a
+`Count-Pin-Removed:` trailer (exact name with optional entry count,
+or a glob whose exact removed-entry count must match), honoured
+removals are recorded like decreases (`count-pin-removed`,
+`pin_removals`), and undeclared removals are all named in one
+refusal. Partial occurrence-count shrinks and added occurrences of
+an existing name stay refused (positional identity); a count the
+base also changed since the merge base stays ambiguous and refused.
+Covered by recount unit tests (trailer parsing, glob honours,
+all-at-once naming, count mismatch, partial shrink, append refusal)
+and cli_recount tests (declared mass removal lands and is recorded;
+undeclared mass removal names every pin). Gate: full shared phase on the combined stack passed clean (dagrun 238 passed / 0 failed; merge-queue step 563 passed / 0 failed, wall 525.437s at user 514.481 + sys 691.853 CPU-s under the raised 2400 budget); the gate-exclusive cross differentials were stopped under the coordinator waiver for this merge-queue-only diff; the combined replay onto the then-current main was patch-identical with fmt/clippy and the recount/disjoint/confirm/plan suites green.

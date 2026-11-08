@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-plan-intake-parent: the plan-intake event claims every batch sits on the in-flight tip'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-11-08T14:22:59.000000000+00:00
-updated_at: 2026-11-08T14:22:59.000000000+00:00
+updated_at: 2026-11-08T16:47:43.000000000+00:00
 ---
 
 # Description
@@ -72,3 +72,20 @@ Reported by a consuming project's merge queue from a live run's
 event log; consumers are referred to generically here, per
 repository convention. Queued after the recount refusals work;
 may share its gate if ready together.
+
+## Resolution
+
+Landed on main as d3f107ade521b6ef663d4bc6295df5c197330ce3 (same stack as the recount refusals
+change; one gate covered both, exclusive phase waived for the
+merge-queue-only diff).
+
+The plan-intake event names each planned batch's parent as the fill
+loop will choose it — root on the base, stacked on a named
+candidate, waiting for dependencies, or parent decided at launch —
+computed by simulating the fill decision (dependency, stale-green
+stacking/rooting, disjoint-root rule, green-root deferral, root-slot
+and window limits) over a window snapshot threaded from both
+pipeline intake sites. It never claims a batch sits on a candidate
+it will not be built on. Covered by a k-wide disjoint-roots CLI test
+(both intakes named roots on the base; no "on top of" text remains)
+and the updated cli_confirm intake assertion.
