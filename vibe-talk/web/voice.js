@@ -12310,7 +12310,7 @@ const { insertSanitizedHtml, plainParagraphs, messageBody, styled, textBody, anc
  */
 const rowDress = createRowDress({
   outboxEntries: () => outbox.values(),
-  drawThreadChips, drawDoneFlash, drawRowPin, whoBucket: (authorId, bot, viewing) => whoIsWho.bucketFor(authorId, bot, viewing),
+  drawThreadChips, drawDoneFlash, drawRowPin: (row) => drawRowPin(row), whoBucket: (authorId, bot, viewing) => whoIsWho.bucketFor(authorId, bot, viewing),
   archivedIds: () => doneState().archived, isNoise, notNoiseButtonOf,
   readAloudNow: () => { const owner = readAloudOwner(); return { nowPlaying: owner.nowPlaying, pendingRead: owner.pendingRead, readingLabel: () => owner.readingLabel(), markReadingBlock: (row) => owner.markReadingBlock(row) }; },
   unpackOnScreen: () => unpackOnScreen(), inColumn, replyTally, selectedChannelId, idsOf, rowMessages, columns, leftEl,
@@ -12357,8 +12357,8 @@ const channelRows = createChannelRows({
   guardQuietly,
   markReadUpstream,
   storedSlackOpen: () => deviceSettings().get(DEVICE_SETTINGS.slackOpen),
-  isPinnedId,
-  togglePin,
+  isPinnedId: (id) => isPinnedId(id),
+  togglePin: (messages) => togglePin(messages),
   toggleBookmarkAt,
   copyDeepLink,
   toggleArchived,
@@ -12584,289 +12584,74 @@ const plainReach = createPlainReach();
 
 
 
-// --- the server's copy, searched (`#605`, `#607` and `#608 server-side-search`) ----------------------
-//
-// The owner, 2026-10-27: search the server's own copy first; upstream search is deferred, so the line
-// says "no upstream search"; and it says exactly what was searched — "No upstream search · this page:
-// back to DATE · server: back to DATE (complete / still expanding) · N messages searched". Hits the
-// server holds older than what this page has loaded come alone (question 9), each with "Show in
-// channel", the in-app jump (`#543`); "All channels" widens the server's search to every channel the
-// server answers for (question 8; the current channel by default).
-//
-// THE SERVER ANSWERS ONLY FROM WHAT IT MAY HAND OUT. Its copy is searched under the rules a served read
-// keeps (src/server_search.rs): a channel it may not answer for says why, and the line says so rather
-// than claiming a search that did not happen. The page asks only where client-config says a copy is
-// open, and it asks once per search, a moment after the typing pauses; a change of search, channel or
-// the box asks again, and an answer to an older question is dropped.
-
-// The search sent to the server — its key, ticket, hits, scopes, how much it examined and where it
-// resumes, the rest it waits for (SERVER_SEARCH_DELAY_MS), and whether it covers every channel
-// (`#search-all-channels`, for this page's life) — is web/src/core/search's
-// (`createServerSearch`, `#624 voice-page-modularity`); which search is on screen, its request and
-// drawing what came back are here.
-const serverSearchOwner = createServerSearch({
-  clock: browserPorts().clock,
-  pathFor: (more, resume) => {
-    const channel = String(selectedChannelId() || "");
-    const zone = readerZone();
-    const below = more ? resume : serverSearchOwner.allChannels() ? null : oldestLoadedMs();
-    const params = [`q=${encodeURIComponent(searchField.query())}`, ...(zone ? [`tz=${encodeURIComponent(zone)}`] : []),
-      ...(below !== null && below !== undefined ? [`below=${below}`] : [])].join("&");
-    return serverSearchOwner.allChannels() ? `/api/v1/search?${params}`
-      : `/api/v1/channels/${encodeURIComponent(channel)}/search?${params}`;
-  },
+// The server's copy, searched, is web/src/view/channel's now (`createServerSearchCopy`,
+// `#624 voice-page-modularity`): which search is on screen and its request, gathering older
+// history on request, and searching the threads' replies further back over the cards. Drawing
+// what came back stays olderwalks'.
+const serverSearchCopy = createServerSearchCopy({
+  factories: { createServerSearch, createGathering, createRepliesWalk },
+  clock: () => browserPorts().clock,
+  byId: el,
+  leftById: leftEl,
+  selectedChannelId,
+  query: () => searchField.query(),
+  oldestLoadedMs: () => oldestLoadedMs(),
   fetchAnswer: (path) => apiDecoded("SearchResponse", path),
-  render: () => renderServerSearch(),
-  guard: (fn) => guardQuietly(fn)(),
-});
-
-/** Whether the server keeps a copy this page may search: an open cache, and not the read-only token. */
-const serverCopyOpen = () => serverCacheBox.open() && serverFacts.tokenScope() !== "read";
-
-
-
-/** This browser's time zone, which the server resolves `before:` and `after:` in. */
-function readerZone() {
-  try {
-    return String(Intl.DateTimeFormat().resolvedOptions().timeZone || "");
-  } catch (_error) {
-    return "";
-  }
-}
-
-
-
-
-
-
-// `#608 server-side-search`. "Search further back": the server is asked to gather this channel's older
-// history next (`#602 history-settings-and-limits`' prioritize, POST .../history/prioritize), at its
-// own pace under the chat service's limits; the page asks how far it has got every few seconds, says
-// so on the line, and searches the server's copy again each time it holds older messages. Stop takes
-// the request back (DELETE). Never automatic: the owner chose a button over background scans.
-
-// Gathering the channel's older history — the ask, its run, the walk's state, why it failed and the
-// poll (SEARCH_FURTHER_POLL_MS) — is web/src/core/search's (`createGathering`, `#624
-// voice-page-modularity`); its requests and drawing it are here.
-const gathering = createGathering({
-  clock: browserPorts().clock,
+  renderServerSearch: () => renderServerSearch(),
+  guardQuietly,
+  cacheOpen: () => serverCacheBox.open(),
+  tokenScope: () => serverFacts.tokenScope(),
   prioritize: (channel) => apiDecoded("ChannelHistoryState",
     `/api/v1/channels/${encodeURIComponent(channel)}/history/prioritize`, { method: "POST" }),
-  fetchState: (channel) => apiDecoded("ChannelHistoryState", `/api/v1/channels/${encodeURIComponent(channel)}/history`),
-  render: () => renderServerSearch(),
-  grew: () => {
-    serverSearchOwner.forget();
-    scheduleServerSearch();
-  },
-  guard: (fn) => guardQuietly(fn)(),
-});
-
-/** Whether a gathering this page asked for is under way in the channel on screen. */
-const searchFurtherRunning = () => gathering.state().channel !== "" &&
-  gathering.state().channel === String(selectedChannelId() || "");
-
-
-
-
-
-
-// --- searching the threads' replies further back ----------------------------------------------------
-//
-// `#262 search-load-older`, the cards' half. The owner's search found nothing in two columns, and the
-// walk above was not enough to find it there: their left column is Main, which holds a thread's first
-// message and none of its replies, and the cards on the right were searched by the replies the page
-// already held (`filterSideCards`) with no way to read any further back. Measured in the page suite, a
-// word said only in older replies was found nowhere in two columns, nor over the thread list, however
-// far back Main was walked, where one column on All walks back and finds every one.
-//
-// So WHILE A SEARCH IS TYPED OVER THE CARDS — in two columns, or the thread list on its own at any
-// width, a phone's included — the head of the cards says "Search replies before Oct 3": the day All's
-// pages reach back to, every reply since then being held. A tap on it, or Enter in the search field
-// where the cards have the keys (`searchOlderFromField`), reads All's older pages, which hold every
-// thread's replies, into the channel's store, drawing them in no list; the cards are searched again by
-// the replies held, a card found by them says "in replies" (`markReplyMatch`), and its thread opened
-// shows what was found. Where All has no cursor of its own — never drawn, or saved on this device —
-// its newest page is read first, behind the rows as a read of All behind Main is, and is not counted.
-// The bounds are the walk's above, in threads: at most `SEARCH_OLDER_PAGES` pages, within
-// `SEARCH_OLDER_MS`, ending at the end of the page that brings `SEARCH_OLDER_HITS` threads. Meanwhile
-// the control says "Fetching… 50 older messages · Stop", and a tap on it stops the read on the wire.
-//
-// WHAT IT FOUND is the threads whose cards the filters show now and did not when it started, among those
-// a page it read brought a message of: a thread arriving live meanwhile is shown, but is not the walk's
-// find, nor ends it. Said once under the control until the search changes, with how far back the replies
-// now reach. A reply it read that says every word, in a thread with no card — not in the threads loaded,
-// its first message older than All reaches — is said too, so that "back to" claims no more than was
-// searched. It says how it ended whatever it found: stopped, at the start of the channel, out of time,
-// or with nothing more.
-// Once All reaches the start of the channel no walk is offered, and a list the search empties says all
-// of it is loaded (`sideListState`). Any change to the search, a thread selected on the right, the
-// cards leaving the screen or another channel ends a walk where it is; one walk at a time on the page,
-// with the columns' (`searchOlder`), each ending the other.
-//
-// THE PAGE ONLY. It reads All's older pages as a step back in All does; nothing on the server is new.
-
-// The cards' walk under way and what the last one found, and the walk itself: one owner in
-// web/src/core/search/replies.ts (`#624 voice-page-modularity`), made below where its parts are.
-
-
-/** Whether the right column's cards are on screen: two columns with no thread on the right, or the thread list. */
-const sideCardsShown = () => cardsOnScreen() === leftEl("side-cards");
-
-
-
-
-/** The cards the search and the read mode show now, by thread id. */
-const cardsFound = () => /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
-  .filter((row) => row.hasAttribute("data-card") && rowShown(row))
-  .map((row) => String(row.getAttribute("data-id")));
-
-
-
-
-/**
- * One page of the cards' walk into the channel's store, as one of All's own goes in: an older page as a
- * step back in All folds one (`applyTimelinePage`), All's cover reaching back with it and keeping its
- * cursor for All's own step back where this page is where that cover now ends; All's newest page, read
- * for a cursor, as a read of All behind Main is (`foldLateTimelinePage`), from the store's copies as it
- * was sent (`held`). Main's counts follow the replies it brings, and the cards are drawn and searched
- * again from the store.
- *
- * @param {VibeTalk.TimelineResponse} payload
- * @param {boolean} newest
- * @param {Map<string, any> | null} held
- * @param {{channel: string, canon: any}} walk
- */
-function foldRepliesPage(payload, newest, held, walk) {
-  if (channelStore.current() !== walk.canon || String(selectedChannelId()) !== walk.channel) return;
-  if (newest) {
-    const number = sentNumberOf(payload);
-    const read = { context: JSON.stringify([walk.channel, "flat", null]), channel: walk.channel, view: "flat",
-      thread: null, canon: walk.canon, held };
-    if (!newerPage(channelStore.current(), "flat", number)) foldLateTimelinePage(payload, read);
-    else if (placeFromPage(payload, walk.canon, number, held)) followPlacement();
-  } else {
-    foldTimelinePage(payload, true, "flat", null);
-    const cover = channelStore.current().views.get(viewKey("flat"));
-    const edge = timeOf((payload.messages || [])[0], "timestamp");
-    if (cover && cover.more === true && Number.isFinite(edge) && cover.floor === edge) {
-      cover.cursor = payload.next_before || null;
-    }
-    inColumn(columns.main, syncUnreadReplies);
-    saveChannelScope();
-  }
-  renderSideColumn();
-}
-
-/**
- * What a cards' walk that has ended says under its control: see the head of this section. And after it,
- * the matching replies it read in threads with no card (`repliesUnlisted`).
- */
-function repliesWalkNote(walk, reason, failure = null) {
-  const said = repliesEndNote(walk, reason, failure);
-  const unlisted = repliesUnlisted(walk);
-  if (unlisted === 0) return said;
-  const more = olderThreadsToRead() ? ": Older threads… loads more" : "";
-  return `${said} ${unlisted} more thread${unlisted === 1 ? " with a matching reply is" : "s with a matching reply are"} ` +
-    `not among the threads loaded${more}.`;
-}
-
-/** How many threads with a reply cards' walk `walk` read saying every word have no card. */
-function repliesUnlisted(walk) {
-  const carded = new Set([...leftEl("side-cards").children].filter((row) => row.hasAttribute("data-card"))
-    .map((row) => String(row.getAttribute("data-id"))));
-  return [...walk.matched].filter((id) => !carded.has(id)).length;
-}
-
-/**
- * How cards' walk `walk` ended, and what it found: see the head of this section, and web/src/present/notices
- * `repliesWalkWords`; from this page's service name, budget and All's reach.
- *
- * @param {any} walk
- * @param {string} reason
- * @param {unknown} [failure] what the read that failed threw, with `reason` "failed"
- */
-function repliesEndNote(walk, reason, failure = null) {
-  return repliesWalkWords(walk, reason, {
-    service: serviceWords(),
-    budgetSeconds: Math.round(SEARCH_OLDER_MS / 1000),
-    floor: repliesFloor(),
-    failure: () => failureWords(failure),
-  });
-}
-
-/**
- * The cards' walk back through All's older pages for the search, while one is under way, and what the last
- * one found (web/src/core/search `createRepliesWalk`, `#624 voice-page-modularity`): the bounds at the head
- * of this section, the reads, and how it ended. Reading a page, folding it and drawing the control are here.
- */
-const repliesWalks = createRepliesWalk({
-  now: () => Date.now(),
-  pages: SEARCH_OLDER_PAGES,
-  budgetMs: SEARCH_OLDER_MS,
-  hits: SEARCH_OLDER_HITS,
-  tapMs: SEARCH_OLDER_TAP_MS,
-  offered: () => repliesSearchOffered(),
-  endOthers: () => {
-    const others = [endSearchWalk(columns.main), endSearchWalk(columns.side)].filter((one) => one !== null);
-    endFilterWalk();
-    return others;
-  },
-  cursor: () => {
-    const cover = allCover();
-    return cover && cover.live && cover.more === true ? cover.cursor || null : null;
-  },
-  key: () => repliesKey(),
+  fetchHistoryState: (channel) => apiDecoded("ChannelHistoryState", `/api/v1/channels/${encodeURIComponent(channel)}/history`),
+  scheduleServerSearch: () => scheduleServerSearch(),
+  cardsOnScreen,
+  inColumn,
+  syncUnreadReplies,
+  saveChannelScope,
+  renderSideColumn,
+  serviceWords: () => serviceWords(),
+  failureWords,
+  repliesFloor: () => repliesFloor(),
+  olderThreadsToRead,
+  searchOlderPages: SEARCH_OLDER_PAGES,
+  searchOlderMs: SEARCH_OLDER_MS,
+  searchOlderHits: SEARCH_OLDER_HITS,
+  searchOlderTapMs: SEARCH_OLDER_TAP_MS,
+  repliesOffered: () => repliesSearchOffered(),
+  endSearchWalk: (column) => endSearchWalk(/** @type {any} */ (column)),
+  endFilterWalk,
+  mainColumn: () => columns.main,
+  sideColumn: () => columns.side,
+  allCover: () => allCover(),
+  repliesKey: () => repliesKey(),
   canon: () => channelStore.current(),
-  channel: () => String(selectedChannelId()),
-  cardsFound: () => cardsFound(),
-  controller: () => (typeof AbortController === "function" ? new AbortController() : null),
-  matcher: () => {
-    const node = searchParsed(searchField.query()).node;
-    return (message) => node !== null && messageMatches(node, message);
-  },
-  threadOf: (message) => threadOf(message),
-  isRoot: (message) => /** @type {any} */ (message).thread.is_root,
+  currentCanon: () => channelStore.current(),
+  heldNow: (canon) => heldNow(/** @type {any} */ (canon)),
+  readTimeline: (path, options) => timelineReader.readTimeline(path, options),
+  pageLimit: DISCORD_PAGE_LIMIT,
+  newerPage,
+  foldLateTimelinePage: (p, r) => foldLateTimelinePage(/** @type {any} */ (p), /** @type {any} */ (r)),
+  placeFromPage: (p, c, n, h) => placeFromPage(/** @type {any} */ (p), /** @type {any} */ (c), n, /** @type {any} */ (h)),
+  followPlacement,
+  foldTimelinePage: (p, o, view, thread) => foldTimelinePage(/** @type {any} */ (p), o, view, /** @type {any} */ (thread)),
+  heldViews: () => channelStore.current().views,
+  flatViewKey: () => viewKey("flat"),
+  sentNumberOf,
+  setStatus,
+  searchParsed,
+  messageMatches,
+  threadOf,
+  sideMode: () => columns.side.mode,
+  sideUp: () => sideColumnUp(),
   allLoaded: () => allLoaded(),
-  holds: (walk) => repliesKey() === walk.key && channelStore.current() === walk.canon &&
-    sideColumnUp() && columns.side.mode === "list",
-  heldNow: () => heldNow(channelStore.current()),
-  read: (channel, before, signal) => timelineReader.readTimeline(
-    `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}` +
-    `${before === null ? "" : `&before=${encodeURIComponent(before)}`}&reason=search`,
-    // The signal of the `AbortController` made by `controller` above.
-    signal ? { signal: /** @type {AbortSignal} */ (signal) } : undefined),
-  // The page read is the timeline response `read` brought (`readTimeline`).
-  fold: (page, newest, held, walk) => foldRepliesPage(/** @type {VibeTalk.TimelineResponse} */ (page), newest,
-    /** @type {any} */ (held), walk),
-  render: () => renderRepliesSearch(),
-  failed: () => setStatus("Could not search further back — try again."),
-  ending: (walk, reason, failure) => repliesWalkNote(walk, reason, failure),
+  timeOfFirst: (payload) => timeOf((/** @type {any} */ (payload).messages || [])[0], "timestamp"),
+  renderRepliesSearch: () => renderRepliesSearch(),
 });
-
-
-/** Stop the cards' walk at the end of the read on the wire, which is aborted; its control says "Stopping…". */
-function stopRepliesWalk() {
-  repliesWalks.stop();
-}
-
-/** The cards' control pressed: Stop while a walk is under way (not in its first moments), else a walk. */
-function repliesControlPressed() {
-  return repliesWalks.pressed();
-}
-
-
-/**
- * The step back under way, or null: a column's `olderPages().step`.
- *
- * `#204 reply-arrow`. A second caller while a step is in flight is handed THAT step rather than
- * turned away. The automatic trigger and the button never notice the difference — they asked for
- * a step, and one is coming — but the walk a reply's arrow makes counts the pages it reads, and
- * one turned away would have counted a page it never saw and looked for its message too early.
- */
-
-
-
-
+const serverSearchOwner = serverSearchCopy.owner;
+const gathering = serverSearchCopy.gathering;
+const repliesWalks = serverSearchCopy.repliesWalks;
+const { serverCopyOpen, searchFurtherRunning, stopRepliesWalk, repliesControlPressed, sideCardsShown, cardsFound } = serverSearchCopy;
 
 // --- pulling the channel down to refresh it -----------------------------------------------------
 //
@@ -14570,222 +14355,61 @@ function setReadMode(mode) {
   requestVisibleSummaries();
 }
 
-// --- pinned messages ------------------------------------------------------------------------------
-//
-// `#206 pin-message`. The owner: "I'd like to have our own concept of 'pin message' and put a toggle
-// for pinned (a filter) next to the magnifying glass when the search bar is open." Not the chat
-// service's pinned messages, and not the place marker, which is one reader's one place in one
-// browser: a pin is kept by THIS server, so it outlives a restart and shows on every device, and a
-// channel may have many.
-//
-// THREE THINGS ON THIS PAGE, AND ONE RECORD BEHIND THEM. The ⋯ menu pins and unpins; a pinned row
-// says so in words in its meta line and down its edge; and the Pinned filter beside the search glass
-// shows the channel's pins and nothing else. All three read `pins`: the server's list for the
-// channel on screen, with whatever this page has asked to change and not yet heard back about laid
-// over it, so a tap shows at once and a list read meanwhile cannot take it back.
-//
-// KEPT CURRENT CHEAPLY. Every channel read — a newest page or a delta, `#203 incremental-refresh`'s
-// common case included — carries the list's revision, and the list itself is read only when that is
-// not the revision of the list held: on entering a channel, after a change made here, and when
-// another device changed it. A refresh that changed nothing costs exactly what it did before.
-//
-// A PIN OUTLIVES THE LOADED HISTORY, which is why the server keeps a snapshot of each. The filter
-// draws the message itself wherever this page has it loaded, so an edit since the pin shows, and the
-// snapshot only where it has not — and the chip on such a row says that is what it is.
-//
-// OFFLINE IS SAID, NOT QUEUED. Unlike a send there is no outbox to fit a pin into, and a pin that
-// lands an hour later on another device's say-so is not one the owner could reason about; the tap
-// is refused out loud and the row is left as it was.
-
-/**
- * This channel's pins as the server listed them, with this page's unanswered changes laid over, its
- * channel, revision and limit, why the list could not be read, and the read in flight
- * (web/src/core/annotations `createPins`, `#624 voice-page-modularity`): private to the owner. Here
- * where the variables it replaces stood.
- */
-const pinStore = createPins();
-/**
- * A column's own record of its Pinned filter (`#624 voice-page-modularity`, plan step 15, as
- * `freshOlderPages`): `only`, whether the filter is on (only while the search bar is open: closing it
- * turns this off); `drawn`, what the filter's list was last drawn from, so it is rebuilt only when
- * that changes.
- *
- * @returns {{only: boolean, drawn: string}}
- */
-function freshPinsView() {
-  return { only: false, drawn: "" };
-}
-
-/** The column being worked on's record of its Pinned filter (`freshPinsView`). */
-function pinsView() {
-  return columnWork.active().pins;
-}
-/**
- * Keeping this channel's pins current and changing them, what a pin keeps of a message, and the rows drawn
- * from what a pin kept (web/src/view/channel `createPinSync`, `#624 voice-page-modularity`).
- */
-const pinSync = createPinSync({
-  pins: pinStore,
-  channel: () => currentChannelId(),
-  forget: (channel) => forgetPins(channel),
-  read: (channel) => apiDecoded("PinsResponse", `/api/v1/channels/${encodeURIComponent(channel)}/pins`),
-  write: (channel, id, request) => queueInboxWrite(() => apiDecoded("PinChangeResponse",
-    `/api/v1/channels/${encodeURIComponent(channel)}/pins/${encodeURIComponent(id)}`,
-    request ? { method: "PUT", body: request() } : { method: "DELETE" })),
-  drawn: () => renderPins(),
-  guard: (run) => guardQuietly(run)(),
-  online: () => navigator.onLine !== false,
-  status: (text) => setStatus(text),
-  service: () => channelDirectory.providerName() || "the chat service",
-  now: () => Date.now(),
-});
-/**
- * Whether `syncPinnedList` is building the filter's rows, or `mainRows` Main's rows among the cards, so
- * `discordNode` gives each one the way into its thread: flags, one owner in web/src/view/channel/rowdrawing.ts
- * (`#624 voice-page-modularity`), which says why they are not parameters.
- */
+// Pinned messages are web/src/view/channel's now (`createPinnedMessages`, `#624
+// voice-page-modularity`): the held list, the sync over it, every row's chip, the filter's
+// list and its toggle. The list itself is core/annotations'.
 const rowDrawing = createRowDrawing();
 
 const currentChannelId = () => String(selectedChannelId() || "");
 
-/** Whether this message is pinned in the channel on screen. */
-function isPinnedId(id) {
-  return pinStore.isPinned(currentChannelId(), id);
+function freshPinsView() {
+  return { only: false, drawn: "" };
 }
 
-/** Forget the held list: another channel, or another credential. */
-function forgetPins(channel = "") {
-  pinStore.forget(channel);
-  pinsView().drawn = "";
-}
-
-/** A read said what revision this channel's pins are at: read the list when the one held is not at it (`PinSync.noteRevision`). */
-function notePinsRevision(revision) {
-  pinSync.noteRevision(revision);
-}
-
-/** Read the list now if this channel's has never been read: the filter is about to show it (`PinSync.ensure`). */
-function ensurePins() {
-  pinSync.ensure();
-}
-
-/** Every row's chip and Pin item, and the filter's list, re-derived from `pins`. */
-/** Draw pin state on any message row, including rows held among the thread cards. */
-function drawRowPin(row) {
-  // `#206 pin-message`. Pinned when ANY message the row stands for is — the `every` reading would
-  // hide a pin behind its row's unpinned half — and Unpin then acts on every one of them. The
-  // chip says it in words, and says when what is shown is the copy the pin kept.
-  const isPinned = idsOf(row).some(isPinnedId);
-  setAttributeIfChanged(row, "data-pinned", isPinned ? "true" : "false");
-  const chip = childByClass(row, "pin-chip");
-  if (chip) {
-    setHiddenIfChanged(chip, !isPinned);
-    setAttributeIfChanged(
-      chip,
-      "title",
-      rowMessages(row).some((message) => pinSync.isKept(message))
-        ? "Pinned on this server. This is the copy kept when it was pinned; the message is older " +
-            "than what is loaded."
-        : "Pinned on this server, for every device. The chat service's own pins are not changed."
-    );
-  }
-  const pinItem = childByClass(row, "row-pin-button");
-  if (pinItem) setTextIfChanged(pinItem, isPinned ? "Unpin message" : "Pin message");
-}
-
-function renderPins() {
-  // In every column: a pin is the message's. `#229 desktop-two-column`.
-  eachColumn(() => {
-    preservingScroll(renderChannelRows);
-    renderScrollTools();
-  });
-  // The cards keep their message rows across ordinary channel redraws. Dress their pins from
-  // the same optimistic store immediately, including rollback, without replacing the rows.
-  for (const row of leftEl("side-cards").children) {
-    if (row.hasAttribute("data-main-row") || row.hasAttribute("data-unpack-thread")) drawRowPin(row);
-  }
-  // Pins landing under a Pinned filter turned on before they had: the pin nearest the message the
-  // reader was on is put in its place now. `#243 filter-keeps-selection`.
-  if (pinsView().only) settlePendingFilterPlace();
-}
-
-/**
- * The Pinned filter's messages: every pin in this channel, in the order the messages were sent.
- * The message itself where this page holds it — from any view, and whether or not it is Done,
- * because a pin outranks both — and what the pin kept where it does not.
- */
-function pinnedMessages() {
-  const channel = currentChannelId();
-  if (pinStore.channel() !== channel || pinStore.size() === 0) return [];
-  const held = new Map();
-  const loaded = providerFacts.threading() && channelStore.current().channel === channel
-    ? [...channelStore.current().threads.map((summary) => summary.root).filter(Boolean), ...channelStore.current().messages, ...timelineRows().messages]
-    : [...el("discord-log").children].flatMap(rowMessages);
-  for (const message of loaded) held.set(String(message.id), message);
-  return inTimeOrder(pinStore.entries().map(([id, pin]) => held.get(id) || pinSync.kept(pin, channel)), "timestamp");
-}
-
-/**
- * Draw the filter's list, or take it down. Rebuilt only when what it is drawn from changed: it is
- * called on every redraw of the channel, and rebuilding a row closes its fold and its ⋯ menu.
- */
-function syncPinnedList() {
-  const list = el("pinned-log");
-  if (!pinsView().only) {
-    if (list.children.length > 0) list.replaceChildren();
-    pinsView().drawn = "";
-    return;
-  }
-  const messages = pinnedMessages();
-  // The heading too (`#242 rich-headers`): a plain body's HTML is "" with or without one, and a paren
-  // tag confirmed by a later read brings a heading to a message whose text has not changed. And its
-  // own address in its service (`#409 open-upstream-link`): a later read can form one for a message
-  // drawn without one, and its row gains the link only by being drawn again.
-  const drawn = JSON.stringify([combineSwitch.on(), hideEmptySwitch.on(), channelStore.current().scope, providerFacts.threading(),
-    ...messages.map((m) => [m.id, m.timestamp, m.content, renderedHtmlOf(m), m.author, threadOf(m), isNoise(m),
-      pinSync.isKept(m), reactionsDrawn(m), m.heading || null, editedDrawn(m), upstreamUrlOf(m)])]);
-  if (drawn === pinsView().drawn) return;
-  pinsView().drawn = drawn;
-  rowDrawing.whilePinned(() => list.replaceChildren(...glom(messages).map(discordNode)));
-}
-
-/**
- * Turn the Pinned filter on or off. On, the channel's list steps aside for this channel's pins; off,
- * it comes back. Either way the reader's message stays where it is on the screen (`#243
- * filter-keeps-selection`): a pin selected in the Pinned list is where it was in the channel's list
- * once the filter is off — walked back to, when it is older than anything loaded — and turned on, the
- * pin nearest the message the reader was on is in its place. A reader on the newest line stays on it.
- *
- * `keepPlace` false is for a view switch, which takes the filter off on its way to a view it places
- * the reader in by its own rules.
- */
-function setPinnedOnly(on, keepPlace = true) {
-  if (on === pinsView().only) return;
-  const change = () => {
-    pinsView().only = on;
-    el("pinned-filter").setAttribute("aria-pressed", on ? "true" : "false");
-    if (on) el("pane-discord").setAttribute("data-pinned-only", "");
-    else el("pane-discord").removeAttribute("data-pinned-only");
-    renderChannelNavigation();
-    renderOlderControl();
-    renderChannelRows();
-    // The list's filters applied BEFORE the reader is placed — Links draws each row's links, which
-    // changes its height — so the place is measured on the list as it will be shown.
-    renderScrollTools();
-    if (on) ensurePins();
-  };
-  if (keepPlace) keepingFilterPlace(change);
-  else change();
-  requestVisibleSummaries();
-}
-
-/**
- * Pin a row, or unpin it — every message it stands for (`PinSync.toggle`). Shown at once and rolled back,
- * with a sentence saying why, if the server refuses; refused out loud, and not queued, when offline.
- */
-function togglePin(messages) {
-  return pinSync.toggle(messages);
-}
+const pinnedMessagesOwner = createPinnedMessages({
+  byId: el,
+  leftById: leftEl,
+  currentChannelId,
+  activePins: () => columnWork.active().pins,
+  readPins: (channel) => apiDecoded("PinsResponse", `/api/v1/channels/${encodeURIComponent(channel)}/pins`),
+  writePin: (channel, id, request) => queueInboxWrite(() => apiDecoded("PinChangeResponse",
+    `/api/v1/channels/${encodeURIComponent(channel)}/pins/${encodeURIComponent(id)}`,
+    request ? { method: "PUT", body: request() } : { method: "DELETE" })),
+  guard: (run) => guardQuietly(run)(),
+  providerName: () => channelDirectory.providerName(),
+  eachColumn,
+  preservingScroll,
+  renderChannelRows,
+  renderScrollTools,
+  threading: () => providerFacts.threading(),
+  heldThreads: () => channelStore.current().threads,
+  heldMessages: () => channelStore.current().messages,
+  timelineMessages: () => timelineRows().messages,
+  combineOn: () => combineSwitch.on(),
+  hideEmptyOn: () => hideEmptySwitch.on(),
+  scope: () => channelStore.current().scope,
+  isNoise,
+  renderedHtmlOf,
+  headingOf,
+  editedDrawn,
+  upstreamUrlOf,
+  glom,
+  discordNode,
+  whilePinned: (fn) => rowDrawing.whilePinned(fn),
+  keepingFilterPlace,
+  renderChannelNavigation,
+  renderOlderControl: () => renderOlderControl(),
+  requestVisibleSummaries,
+  setStatus,
+  online: () => navigator.onLine !== false,
+  settlePendingFilterPlace,
+  currentStoreChannel: () => channelStore.current().channel,
+  reactionsDrawn,
+});
+const {
+  pinStore, pinsView, isPinnedId, forgetPins, notePinsRevision, ensurePins,
+  drawRowPin, renderPins, syncPinnedList, setPinnedOnly, togglePin,
+} = pinnedMessagesOwner;
 
 // --- messages read automatically ------------------------------------------------------------------
 //

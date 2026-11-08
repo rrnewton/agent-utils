@@ -171,3 +171,7 @@ export { createSpeakers } from "./speakers.ts";
 export type { IdentitiesLike, Speakers, SpeakersDependencies } from "./speakers.ts";
 export { createReadingBookmark } from "./bookmark.ts";
 export type { BookmarkAnchorLike, ReadingBookmark, ReadingBookmarkDependencies } from "./bookmark.ts";
+export { createServerSearchCopy } from "./serversearch.ts";
+export type { ServerSearch, ServerSearchDependencies } from "./serversearch.ts";
+export { createPinnedMessages } from "./pins.ts";
+export type { PinnedMessages, PinnedMessagesDependencies, PinsView } from "./pins.ts";

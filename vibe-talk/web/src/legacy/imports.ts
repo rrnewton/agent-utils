@@ -25,7 +25,7 @@ export { speechHoldFrom } from "../core/speech/index.ts";
 export { createApi, createServerFacts, isSlowFailure, readableFailure } from "../core/api/index.ts";
 
 export { allReachesThread, answerUnplaced, answeredThread, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createPlainReach, createProviderFacts, createRemovals, createThreadPresence, createTodoView, createUnpackReads, emptyTally, exactReplyCount, heldAsSent, heldNow, inTimeOrder, markDoneIn, namedRecord, newerPage, noteReplyGapsIn, placeFromPageIn, refreshFailed, replyTallyOf, savedTimelineOf, settleDoneIn, tallyRecord, threadOf, timeOf, unplacedToAsk, unseenRepliesIn, upsertThreadSummary } from "../core/channels/index.ts";
-export { createPins, createReadLedger } from "../core/annotations/index.ts";
+export { createReadLedger } from "../core/annotations/index.ts";
 export { REOPENED_VIEWS, UI_STATE_CHARS, UI_STATE_KEY, UI_STATE_VERSION, createBackStack, createDeepLinks, createLayoutChoice, createLinkJumps, createNavigation, createUiState, createViewPlaces, createVisits, deepLinkQuery, visitKey } from "../core/navigation/index.ts";
 export {
   DISCORD_POLL_MS,
@@ -93,10 +93,9 @@ export {
   nodeWithin,
   pressedBySpace,
   scrollsItself,
-  setAttributeIfChanged,
-  setClassWord,
   setHiddenIfChanged,
   setTextIfChanged,
+  setClassWord,
   shownNode,
 } from "../view/dom/index.ts";
 export { SCREEN_TITLES, createActionMenu, createChipsOverComposer, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createUndoOffer, createUndoStamps, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow } from "../view/shell/index.ts";
@@ -120,9 +119,9 @@ export { createSerialQueue, sentenceStart } from "../foundation/index.ts";
 
 export { briefAge, fullLocalAt, fullLocalTime, stamp } from "../present/time/index.ts";
 
-export { doneReadWords, failureWords, fmtDuration, localReadWords, messagesWords, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, repliesWalkWords, searchMomentWords, serviceReadWords } from "../present/notices/index.ts";
+export { doneReadWords, failureWords, fmtDuration, localReadWords, messagesWords, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, searchMomentWords, serviceReadWords } from "../present/notices/index.ts";
 export { LINK_KINDS_KEY, READ_MODES, READ_MODE_KEY, READ_MODE_SAID, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, cardGapWords, cardRunText, collapsedLinesWords, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, createReadRuns, createThreadOrder, editedDrawn, firstLineOf, forgetElisionCounts, gapWords, inThreadOrder, isNoise, mainRunsAmong, messageLook, quoteBlock, rawTextOf, reactionsDrawn, readRunText, renderedHtmlOf, replyMarkerName, rowEdited, savedReadMode, threadChoice, threadFacts, threadOrderAfter, undoLabel, undoName, upstreamUrlOf } from "../present/rows/index.ts";
-export { COLUMN_IDS, DAY_TITLED, PULL_WAIT_MS, QUOTE_REPLY_TITLE, anchorOfRow, authorPasses, cardRunIds, createArming, createCardFlight, createCardPlaces, createCardsDrawn, createColumnLinks, createColumnWork, createColumns, createFilterChanges, createFootRooms, createLayoutShown, createLinkedMark, createPackSlides, createPinSync, createPullToRefresh, createQuoting, createReplyState, createRowDrawing, createRowGestures, createScrollKeeping, createThreadHues, createUnderLists, createUnpackWatch, fillCardText, foldedTextLine, freshenDayTitle, fromGatheredThread, gutterPiece, idsOf, isMessageRow, markCardLayout, messageTop, mountChannelViewControls, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, pointerOn, quoteLabelFits, renderedText, rowIn, rowMessages, rowShown, rowTimeTabStop, sameCardPlace, setArrowReach, setMarkerLift, shownRowFor, stackUnder, standingRow } from "../view/channel/index.ts";
+export { COLUMN_IDS, DAY_TITLED, PULL_WAIT_MS, QUOTE_REPLY_TITLE, anchorOfRow, authorPasses, cardRunIds, createArming, createCardFlight, createCardPlaces, createCardsDrawn, createColumnLinks, createColumnWork, createColumns, createFilterChanges, createFootRooms, createLayoutShown, createLinkedMark, createPackSlides, createPullToRefresh, createQuoting, createReplyState, createRowDrawing, createRowGestures, createScrollKeeping, createThreadHues, createUnderLists, createUnpackWatch, fillCardText, foldedTextLine, freshenDayTitle, fromGatheredThread, gutterPiece, idsOf, isMessageRow, markCardLayout, messageTop, mountChannelViewControls, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, pointerOn, quoteLabelFits, renderedText, rowIn, rowMessages, rowShown, rowTimeTabStop, sameCardPlace, setArrowReach, setMarkerLift, shownRowFor, stackUnder, standingRow } from "../view/channel/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
 
@@ -192,3 +191,4 @@ export { SEARCH_OLDER_HITS, SEARCH_OLDER_MS, SEARCH_OLDER_PAGES, SEARCH_OLDER_TA
 export { createRowLinks } from "../view/channel/index.ts";
 export { headingLength, headingOf } from "../present/rows/index.ts";
 export { createCardLines, createReadingBookmark, createSpeakers } from "../view/channel/index.ts";
+export { createPinnedMessages, createServerSearchCopy } from "../view/channel/index.ts";

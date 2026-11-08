@@ -6,9 +6,12 @@
 // web/src/core/annotations `createPins`; drawing the rows and the filter is the page's.
 
 import type { Message, Pin, PinChangeResponse, PinsResponse } from "../../contract/index.ts";
+import { createPins } from "../../core/annotations/index.ts";
 import type { Pins } from "../../core/annotations/index.ts";
-import { threadOf } from "../../core/channels/index.ts";
+import { inTimeOrder, threadOf } from "../../core/channels/index.ts";
 import { renderedHtmlOf } from "../../present/rows/index.ts";
+import { childByClass, setAttributeIfChanged, setHiddenIfChanged, setTextIfChanged } from "../dom/index.ts";
+import { idsOf, rowMessages } from "./rows.ts";
 
 /** A message as a pin keeps it. */
 type PinnedMessage = Pick<Message, "id" | "author" | "author_id" | "author_is_bot" | "content" | "content_html" |
@@ -245,5 +248,208 @@ export function createPinSync(deps: PinSyncDependencies): PinSync {
     },
     kept: keptMessage,
     isKept: (message) => typeof message === "object" && message !== null && keptByPin.has(message),
+  };
+}
+
+// The pinned messages themselves on the page (`#206 pin-message`; `#624 voice-page-modularity`,
+// moved from the legacy script into view/channel): the held list, each column's filter record,
+// the sync instantiated over them, every row's chip, the filter's list and its toggle. The list
+// itself is core/annotations' (`createPins`); keeping it current is PinSync above.
+
+
+/** A column's record of its Pinned filter. */
+export interface PinsView {
+  only: boolean;
+  drawn: string;
+}
+
+/** What the pinned messages ask of the page. */
+export interface PinnedMessagesDependencies {
+  byId(id: string): HTMLElement;
+  leftById(id: string): HTMLElement;
+  currentChannelId(): string | null;
+  activePins(): PinsView;
+  readPins(channel: string): Promise<unknown>;
+  writePin(channel: string, id: string, request: (() => object) | null): Promise<unknown>;
+  guard(run: () => Promise<void>): void;
+  providerName(): string;
+  eachColumn(fn: () => void): void;
+  preservingScroll(fn: () => void): void;
+  renderChannelRows(): void;
+  renderScrollTools(): void;
+  threading(): boolean;
+  heldThreads(): Array<{ root?: Message | null }>;
+  heldMessages(): Message[];
+  timelineMessages(): Message[];
+  combineOn(): boolean;
+  hideEmptyOn(): boolean;
+  scope(): string;
+  isNoise(message: Message): boolean;
+  renderedHtmlOf(message: Message): string;
+  headingOf(message: Message): unknown;
+  editedDrawn(message: Message): unknown;
+  upstreamUrlOf(message: Message): string | null;
+  glom(messages: Message[]): Message[][];
+  discordNode(messages: Message[]): HTMLElement;
+  whilePinned<T>(fn: () => T): T;
+  keepingFilterPlace<T>(fn: () => T): T;
+  renderChannelNavigation(): void;
+  renderOlderControl(): void;
+  requestVisibleSummaries(): void;
+  setStatus(text: string): void;
+  online(): boolean;
+  settlePendingFilterPlace(): void;
+  currentStoreChannel(): string;
+  reactionsDrawn(message: Message): unknown;
+}
+
+/** The pinned messages' commands and questions. */
+export interface PinnedMessages {
+  readonly pinStore: Pins;
+  freshPinsView(): PinsView;
+  pinsView(): PinsView;
+  isPinnedId(id: unknown): boolean;
+  forgetPins(channel?: string): void;
+  notePinsRevision(revision: unknown): void;
+  ensurePins(): void;
+  drawRowPin(row: Element): void;
+  renderPins(): void;
+  pinnedMessages(): Message[];
+  syncPinnedList(): void;
+  setPinnedOnly(on: boolean, keepPlace?: boolean): void;
+  togglePin(messages: Message[]): Promise<unknown>;
+}
+
+/** No pins read, filter off. */
+export function createPinnedMessages(deps: PinnedMessagesDependencies): PinnedMessages {
+  const el = deps.byId;
+  const leftEl = deps.leftById;
+
+  const pinStore: Pins = createPins() as Pins;
+
+  function freshPinsView(): PinsView {
+    return { only: false, drawn: "" };
+  }
+
+  function pinsView(): PinsView {
+    return deps.activePins();
+  }
+
+  const pinSync: PinSync = createPinSync({
+    pins: pinStore,
+    channel: () => currentChannelId(),
+    forget: (channel: string) => forgetPins(channel),
+    read: (channel: string) => deps.readPins(channel) as never,
+    write: (channel: string, id: string, request: (() => object) | null) => deps.writePin(channel, id, request) as never,
+    drawn: () => renderPins(),
+    guard: (run: () => Promise<void>) => deps.guard(run),
+    online: () => deps.online(),
+    status: (text: string) => deps.setStatus(text),
+    service: () => deps.providerName() || "the chat service",
+    now: () => Date.now(),
+  });
+
+  const currentChannelId = (): string => String(deps.currentChannelId() || "");
+
+  function isPinnedId(id: unknown): boolean {
+    return (pinStore as { isPinned(channel: string, id: unknown): boolean }).isPinned(currentChannelId(), id);
+  }
+
+  function forgetPins(channel: string = ""): void {
+    (pinStore as { forget(channel: string): void }).forget(channel);
+    pinsView().drawn = "";
+  }
+
+  function notePinsRevision(revision: unknown): void {
+    (pinSync as { noteRevision(revision: unknown): void }).noteRevision(revision);
+  }
+
+  function ensurePins(): void {
+    (pinSync as { ensure(): void }).ensure();
+  }
+
+  function drawRowPin(row: Element): void {
+    const isPinned = idsOf(row).some(isPinnedId);
+    setAttributeIfChanged(row as never, "data-pinned", isPinned ? "true" : "false");
+    const chip = childByClass(row as never, "pin-chip") as HTMLElement | null;
+    if (chip) {
+      setHiddenIfChanged(chip as never, !isPinned);
+      setAttributeIfChanged(
+        chip as never,
+        "title",
+        rowMessages(row).some((message) => (pinSync as { isKept(m: Message): boolean }).isKept(message))
+          ? "Pinned on this server. This is the copy kept when it was pinned; the message is older " +
+              "than what is loaded."
+          : "Pinned on this server, for every device. The chat service's own pins are not changed."
+      );
+    }
+    const pinItem = childByClass(row as never, "row-pin-button") as HTMLElement | null;
+    if (pinItem) setTextIfChanged(pinItem as never, isPinned ? "Unpin message" : "Pin message");
+  }
+
+  function renderPins(): void {
+    deps.eachColumn(() => {
+      deps.preservingScroll(deps.renderChannelRows);
+      deps.renderScrollTools();
+    });
+    for (const row of leftEl("side-cards").children) {
+      if (row.hasAttribute("data-main-row") || row.hasAttribute("data-unpack-thread")) drawRowPin(row);
+    }
+    if (pinsView().only) deps.settlePendingFilterPlace();
+  }
+
+  function pinnedMessages(): Message[] {
+    const channel = currentChannelId();
+    const store = pinStore as { channel(): string; size(): number; entries(): Array<[string, unknown]> };
+    if (store.channel() !== channel || store.size() === 0) return [];
+    const held = new Map<string, Message>();
+    const loaded = deps.threading() && deps.currentStoreChannel() === channel
+      ? [...deps.heldThreads().map((summary) => summary.root).filter(Boolean) as Message[], ...deps.heldMessages(), ...deps.timelineMessages()]
+      : [...el("discord-log").children].flatMap((row) => rowMessages(row));
+    for (const message of loaded) held.set(String(message.id), message);
+    return inTimeOrder(store.entries().map(([id, pin]) => held.get(id) || (pinSync as { kept(pin: unknown, channel: string): Message }).kept(pin, channel)) as never, "timestamp" as never) as Message[];
+  }
+
+  function syncPinnedList(): void {
+    const list = el("pinned-log");
+    if (!pinsView().only) {
+      if (list.children.length > 0) list.replaceChildren();
+      pinsView().drawn = "";
+      return;
+    }
+    const messages = pinnedMessages();
+    const drawn = JSON.stringify([deps.combineOn(), deps.hideEmptyOn(), deps.scope(), deps.threading(),
+      ...messages.map((m) => [m.id, (m as { timestamp?: unknown }).timestamp, m.content, deps.renderedHtmlOf(m), m.author, threadOf(m as never), deps.isNoise(m),
+        (pinSync as { isKept(m: Message): boolean }).isKept(m), deps.reactionsDrawn(m), (m as { heading?: unknown }).heading || null, deps.editedDrawn(m), deps.upstreamUrlOf(m)])]);
+    if (drawn === pinsView().drawn) return;
+    pinsView().drawn = drawn;
+    deps.whilePinned(() => list.replaceChildren(...deps.glom(messages).map(deps.discordNode)));
+  }
+
+  function setPinnedOnly(on: boolean, keepPlace: boolean = true): void {
+    if (on === pinsView().only) return;
+    const change = (): void => {
+      pinsView().only = on;
+      el("pinned-filter").setAttribute("aria-pressed", on ? "true" : "false");
+      if (on) el("pane-discord").setAttribute("data-pinned-only", "");
+      else el("pane-discord").removeAttribute("data-pinned-only");
+      deps.renderChannelNavigation();
+      deps.renderOlderControl();
+      deps.renderChannelRows();
+      deps.renderScrollTools();
+      if (on) ensurePins();
+    };
+    if (keepPlace) deps.keepingFilterPlace(change);
+    else change();
+    deps.requestVisibleSummaries();
+  }
+
+  function togglePin(messages: Message[]): Promise<unknown> {
+    return (pinSync as { toggle(messages: Message[]): Promise<unknown> }).toggle(messages);
+  }
+
+  return {
+    pinStore, freshPinsView, pinsView, isPinnedId, forgetPins, notePinsRevision, ensurePins,
+    drawRowPin, renderPins, pinnedMessages, syncPinnedList, setPinnedOnly, togglePin,
   };
 }
