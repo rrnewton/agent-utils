@@ -292,6 +292,204 @@ pub(crate) fn listing_signature(root: &Path) -> Vec<(String, String, u64)> {
     signature
 }
 
+// ------------------------------------------------------------- ops (S6)
+//
+// Privileged btrfs/mount argv construction, mirroring Python
+// `worktreesimage._run` (`sudo -n` prefix, failure string naming the
+// whole command). Effects go through `image_ops::PrivilegedRunner`;
+// tests use a recording fake and no command ever runs here.
+
+use crate::image_ops::{CommandSpec, PrivilegedRunner};
+use std::time::Duration;
+
+fn sudo_argv(argv: &[String]) -> Vec<String> {
+    let mut out = vec!["sudo".to_string(), "-n".to_string()];
+    out.extend(argv.iter().cloned());
+    out
+}
+
+fn spec(argv: Vec<String>) -> CommandSpec {
+    CommandSpec::new(argv, Duration::from_secs(120))
+}
+
+/// Run specs in order through the runner, mirroring Python `_run`'s
+/// failure: `"<whole command> failed: <stderr or stdout>"`.
+pub(crate) fn run_sequence(
+    runner: &impl PrivilegedRunner,
+    specs: &[CommandSpec],
+) -> Result<Vec<String>, String> {
+    let mut stdouts = Vec::new();
+    for item in specs {
+        let outcome = runner.run(item)?;
+        if outcome.returncode != 0 {
+            let detail = if outcome.stderr.trim().is_empty() {
+                outcome.stdout.trim()
+            } else {
+                outcome.stderr.trim()
+            };
+            return Err(format!("{} failed: {detail}", item.argv.join(" ")));
+        }
+        stdouts.push(outcome.stdout);
+    }
+    Ok(stdouts)
+}
+
+/// The format steps of `create_image` (the caller creates the
+/// zero-byte file first and truncates after NOCOW, as the oracle's
+/// load-bearing order requires): `chattr +C`, then `mkfs.btrfs`.
+pub(crate) fn create_format_plan(image_file: &Path) -> Vec<CommandSpec> {
+    let file = image_file.to_string_lossy().into_owned();
+    vec![
+        spec(vec!["chattr".to_string(), "+C".to_string(), file.clone()]),
+        spec(sudo_argv(&[
+            "mkfs.btrfs".to_string(),
+            "-f".to_string(),
+            "-m".to_string(),
+            "single".to_string(),
+            "-d".to_string(),
+            "single".to_string(),
+            "-L".to_string(),
+            "wrkslots-worktrees".to_string(),
+            file,
+        ])),
+    ]
+}
+
+/// Whether mounting may proceed, mirroring `mount_image`'s refusals.
+pub(crate) fn mount_refusal(state: &str, mount_point: &Path) -> Option<String> {
+    match state {
+        MOUNTED => None,
+        WRONG_MOUNT | NOT_EMPTY_UNMOUNTED => Some(format!(
+            "refusing to mount over {}: state is {state}; inspect the directory and any existing mount first",
+            mount_point.display()
+        )),
+        _ => None,
+    }
+}
+
+/// The mount steps: `mount -o loop,...` then `btrfs quota enable`.
+pub(crate) fn mount_plan(image_file: &Path, mount_point: &Path) -> Vec<CommandSpec> {
+    let point = mount_point.to_string_lossy().into_owned();
+    vec![
+        spec(sudo_argv(&[
+            "mount".to_string(),
+            "-o".to_string(),
+            "loop,compress=zstd:3,noatime".to_string(),
+            image_file.to_string_lossy().into_owned(),
+            point.clone(),
+        ])),
+        spec(sudo_argv(&[
+            "btrfs".to_string(),
+            "quota".to_string(),
+            "enable".to_string(),
+            point,
+        ])),
+    ]
+}
+
+pub(crate) fn unmount_plan(mount_point: &Path) -> Vec<CommandSpec> {
+    vec![spec(sudo_argv(&[
+        "umount".to_string(),
+        mount_point.to_string_lossy().into_owned(),
+    ]))]
+}
+
+pub(crate) fn trim_plan(mount_point: &Path) -> Vec<CommandSpec> {
+    vec![spec(sudo_argv(&[
+        "fstrim".to_string(),
+        "-v".to_string(),
+        mount_point.to_string_lossy().into_owned(),
+    ]))]
+}
+
+/// Loop devices holding `image_file`, parsed from `losetup -j`
+/// output lines (`/dev/loopN: [..]:..`), for the grow refresh.
+pub(crate) fn losetup_devices(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.split(':').next())
+        .map(|device| device.trim().to_string())
+        .filter(|device| !device.is_empty())
+        .collect()
+}
+
+/// The grow refresh steps after the caller truncates: one
+/// `losetup -c` per holder, then `btrfs filesystem resize max`.
+pub(crate) fn grow_plan(devices: &[String], mount_point: &Path) -> Vec<CommandSpec> {
+    let mut specs: Vec<CommandSpec> = devices
+        .iter()
+        .map(|device| {
+            spec(sudo_argv(&[
+                "losetup".to_string(),
+                "-c".to_string(),
+                device.clone(),
+            ]))
+        })
+        .collect();
+    specs.push(spec(sudo_argv(&[
+        "btrfs".to_string(),
+        "filesystem".to_string(),
+        "resize".to_string(),
+        "max".to_string(),
+        mount_point.to_string_lossy().into_owned(),
+    ])));
+    specs
+}
+
+/// The grow ceiling refusal, mirroring `grow_image`.
+pub(crate) fn grow_refusal(current_bytes: u64, new_size_bytes: u64) -> Option<String> {
+    if new_size_bytes <= current_bytes {
+        Some(format!(
+            "new size {new_size_bytes} does not exceed current apparent size {current_bytes}"
+        ))
+    } else {
+        None
+    }
+}
+
+/// `btrfs subvolume create` plus `chown`, and the optional qgroup
+/// limit, mirroring `create_slot_subvolume`.
+pub(crate) fn subvolume_plan(
+    path: &Path,
+    quota_bytes: Option<i64>,
+    uid: u32,
+    gid: u32,
+) -> Vec<CommandSpec> {
+    let target = path.to_string_lossy().into_owned();
+    let mut specs = vec![
+        spec(sudo_argv(&[
+            "btrfs".to_string(),
+            "subvolume".to_string(),
+            "create".to_string(),
+            target.clone(),
+        ])),
+        spec(sudo_argv(&[
+            "chown".to_string(),
+            format!("{uid}:{gid}"),
+            target.clone(),
+        ])),
+    ];
+    if let Some(quota) = quota_bytes {
+        specs.push(spec(sudo_argv(&[
+            "btrfs".to_string(),
+            "qgroup".to_string(),
+            "limit".to_string(),
+            quota.to_string(),
+            target,
+        ])));
+    }
+    specs
+}
+
+pub(crate) fn bind_plan(source: &Path, target: &Path) -> Vec<CommandSpec> {
+    vec![spec(sudo_argv(&[
+        "mount".to_string(),
+        "--bind".to_string(),
+        source.to_string_lossy().into_owned(),
+        target.to_string_lossy().into_owned(),
+    ]))]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,5 +563,59 @@ mod tests {
         assert!(signature.contains(&("sub".to_string(), "dir".to_string(), 0)));
         assert!(signature.contains(&("sub/file.txt".to_string(), "file".to_string(), 3)));
         std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn ops_plans_match_python_argv() {
+        use crate::image_ops::RunOutcome;
+        use std::cell::RefCell;
+
+        struct Fake {
+            calls: RefCell<Vec<Vec<String>>>,
+            returncode: i32,
+        }
+        impl PrivilegedRunner for Fake {
+            fn run(&self, spec: &CommandSpec) -> Result<RunOutcome, String> {
+                self.calls.borrow_mut().push(spec.argv.clone());
+                Ok(RunOutcome {
+                    returncode: self.returncode,
+                    stdout: String::new(),
+                    stderr: "boom".to_string(),
+                })
+            }
+        }
+
+        let file = Path::new("/proj/wt.img");
+        let point = Path::new("/proj/worktrees/.slots-image");
+        let format = create_format_plan(file);
+        assert_eq!(format[0].argv, ["chattr", "+C", "/proj/wt.img"]);
+        assert_eq!(format[1].argv[0..3], ["sudo", "-n", "mkfs.btrfs"]);
+        let mount = mount_plan(file, point);
+        assert!(mount[0]
+            .argv
+            .contains(&"loop,compress=zstd:3,noatime".to_string()));
+        assert_eq!(mount[1].argv[2], "btrfs");
+        assert!(mount_refusal(WRONG_MOUNT, point).is_some());
+        assert!(mount_refusal(MOUNTED, point).is_none());
+        assert_eq!(
+            losetup_devices("/dev/loop3: [0806]:1 (/x)\n/dev/loop4: [0806]:2 (/x)\n"),
+            ["/dev/loop3", "/dev/loop4"]
+        );
+        let grow = grow_plan(&["/dev/loop3".to_string()], point);
+        assert_eq!(grow.len(), 2);
+        assert!(grow_refusal(10, 10).is_some());
+
+        let fake = Fake {
+            calls: RefCell::new(Vec::new()),
+            returncode: 0,
+        };
+        run_sequence(&fake, &mount).expect("sequence");
+        assert_eq!(fake.calls.borrow().len(), 2);
+        let failing = Fake {
+            calls: RefCell::new(Vec::new()),
+            returncode: 1,
+        };
+        let error = run_sequence(&failing, &mount).expect_err("failure string");
+        assert!(error.contains("failed: boom"), "{error}");
     }
 }

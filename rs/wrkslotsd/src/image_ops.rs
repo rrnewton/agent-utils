@@ -10,7 +10,7 @@
 //! recording fake. Nothing in this module executes a command, and
 //! no test mounts, formats, or touches a live image.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::image_record::ImageRecord;
@@ -249,6 +249,73 @@ pub(crate) fn grow_plan(
         .collect()
 }
 
+/// The conversion staging directory name, mirroring Python's
+/// `.{slot}.convert-<hex8>` (lowercase hex, exactly 8 chars).
+pub(crate) fn convert_staging_name(slot: &str, hex8: &str) -> Option<String> {
+    if hex8.len() == 8
+        && hex8
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+    {
+        Some(format!(".{slot}.convert-{hex8}"))
+    } else {
+        None
+    }
+}
+
+/// Whether a convert is a no-op, mirroring `_cmd_image_convert`'s
+/// already-target outcome (`"<type>/<slot> is already <target>-backed"`).
+pub(crate) fn convert_already(current: &str, target: &str) -> bool {
+    current == target
+}
+
+/// The copy step of `convert`, mirroring `slotimage.copy_tree`'s
+/// command (contents of source into the existing destination).
+pub(crate) fn copy_tree_spec(source: &Path, destination: &Path) -> CommandSpec {
+    CommandSpec::new(
+        vec![
+            "cp".to_string(),
+            "-a".to_string(),
+            "--reflink=auto".to_string(),
+            format!("{}/.", source.display()),
+            format!("{}/", destination.display()),
+        ],
+        Duration::from_secs(24 * 3600),
+    )
+}
+
+/// Canonicalize one `tree_listing` row set the way Python
+/// `slotimage.tree_listing` does: directory sizes become `-`,
+/// mtimes truncate to whole seconds, rows sorted. Input rows are
+/// the already-collected `find -printf '%P\t%y\t%s\t%m\t%T@\t%l'`
+/// lines (collection is the caller's `find` step, never run here).
+pub(crate) fn canonical_listing(rows: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let fields: Vec<&str> = row.split('\t').collect();
+            if fields.len() == 6 {
+                let size = if fields[1] == "d" { "-" } else { fields[2] };
+                let mtime = fields[4].split('.').next().unwrap_or(fields[4]);
+                format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    fields[0], fields[1], size, fields[3], mtime, fields[5]
+                )
+            } else {
+                row.clone()
+            }
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The kept-original name for `convert --keep-original`, mirroring
+/// `_convert_to_image`'s `pre-image-original` sibling.
+pub(crate) fn pre_image_original_name() -> &'static str {
+    "pre-image-original"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +382,25 @@ mod tests {
         assert!(routed.contains(&"--service-type=exec".to_string()));
         assert_eq!(routed.last().map(String::as_str), Some("x"));
         assert!(host_argv(&tools, &["x".to_string()], BoxKind::Slot, true).is_err());
+    }
+
+    #[test]
+    fn convert_helpers_match_python() {
+        assert_eq!(
+            convert_staging_name("slot-a", "0123abcd").as_deref(),
+            Some(".slot-a.convert-0123abcd")
+        );
+        assert_eq!(convert_staging_name("slot-a", "0123ABCD"), None);
+        assert!(convert_already("image", "image"));
+        let rows = vec![
+            "sub\tf\t3\t644\t1700000000.5\t".to_string(),
+            "sub\td\t4096\t755\t1700000001.9\t".to_string(),
+        ];
+        let canonical = canonical_listing(&rows);
+        assert_eq!(canonical[0], "sub\td\t-\t755\t1700000001\t");
+        assert_eq!(canonical[1], "sub\tf\t3\t644\t1700000000\t");
+        let copy = copy_tree_spec(Path::new("/a"), Path::new("/b"));
+        assert_eq!(copy.argv, ["cp", "-a", "--reflink=auto", "/a/.", "/b/"]);
     }
 
     #[test]
