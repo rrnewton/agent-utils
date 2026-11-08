@@ -375,28 +375,79 @@ fn wait_for(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
+/// Run directories holding an events file, sorted.
+fn run_dirs(fx: &Fixture) -> Vec<PathBuf> {
+    let runs = fx.queue().join(".git/merge-queue/runs");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(runs)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.join("events.jsonl").is_file())
+                .collect()
+        })
+        .unwrap_or_default();
+    dirs.sort();
+    dirs
+}
+
+/// Events of the first run started after `prior` was snapshot, once it
+/// has created its run directory. That directory is created only after
+/// the run holds the writer lock, so observing it also proves a later
+/// `submit` records an intake request instead of racing the run for
+/// the lock. The seed run's events must never satisfy these waits:
+/// they already contain validations before the spawned run starts.
+fn spawned_events(fx: &Fixture, prior: &[PathBuf]) -> Option<String> {
+    let dir = run_dirs(fx).into_iter().find(|dir| !prior.contains(dir))?;
+    std::fs::read_to_string(dir.join("events.jsonl")).ok()
+}
+
+/// Like `wait_for`, but fail at once if the spawned run exits: its
+/// events will never advance, and waiting out the timeout only hides
+/// why it died.
+fn wait_for_run(what: &str, timeout: Duration, run: &mut Child, mut check: impl FnMut() -> bool) {
+    wait_for(what, timeout, || {
+        if let Ok(Some(status)) = run.try_wait() {
+            panic!("spawned run exited ({status}) while waiting for {what}");
+        }
+        check()
+    });
+}
+
 #[test]
 fn a_prioritized_stale_green_roots_instead_of_stacking_under_a_plain_head() {
     // Change 2 arrives by intake, prioritized, and validates slowly as a
-    // root; change 3 lands meanwhile, so change 2 comes back green on a
-    // stale base. Disjoint from the stack head (change 4, not
-    // prioritized, still validating), it must rebuild as its own root
-    // on the new base, never stacked under change 4's candidate.
+    // root; change 1 lands meanwhile, so change 2 comes back green on a
+    // stale base. Change 4 is submitted only after change 1 lands,
+    // so its candidate sits on the new base as the plain stack head
+    // (not prioritized, still validating) behind change 2 in flight
+    // order. Disjoint from that
+    // head, change 2 must rebuild as its own root on the new base,
+    // never stacked under change 4's candidate.
     let fx = seeded("stale-green-prioritized");
     let path = config_path(&fx);
     let mut value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     // Gate-driven, not sleep-driven: candidates holding tests/p or
     // tests/b wait for `release`; candidates holding tests/d wait for
-    // `release-d`, so the ordering below holds at any host speed.
+    // `release-d`; candidates holding tests/a wait for `release-a`,
+    // so change 1 cannot land (and move the base) before batch #2 has
+    // launched on the original base. Trees built on a base that
+    // already carries tests/a pass at once once `release-a` exists.
+    // Depth 4 (not the seeded three): a run takes intake only while
+    // a window slot is free, so the two gated first-wave flights
+    // plus batch #2 would fill a window of three and block change
+    // 4's intake until a landing. The fourth slot lets both intake
+    // batches launch while every earlier flight is still gated.
     let gates = fx.root.join("gates");
     std::fs::create_dir_all(&gates).unwrap();
     value["validator"]["run"] = serde_json::json!(format!(
         r#"gates='{gates}'
-if [ -f tests/d ]; then gate="$gates/release-d"; elif [ -f tests/p ] || [ -f tests/b ]; then gate="$gates/release"; else gate=""; fi
+if [ -f tests/d ]; then gate="$gates/release-d"; elif [ -f tests/a ]; then gate="$gates/release-a"; elif [ -f tests/p ] || [ -f tests/b ]; then gate="$gates/release"; else gate=""; fi
 if [ -n "$gate" ]; then i=0; while [ ! -e "$gate" ] && [ $i -lt 12000 ]; do sleep 0.05; i=$((i+1)); done; [ -e "$gate" ] || exit 1; fi
 ok=1; for f in tests/*; do [ -f "$f" ] || continue; if grep -qx FAIL "$f"; then echo "{{\"id\":\"x\",\"outcome\":\"fail\"}}" >> "$MQ_RESULTS"; ok=0; fi; done; [ $ok -eq 1 ]"#,
         gates = gates.display()
     ));
+    value["depth"] = serde_json::json!(4);
     std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
     fx.branch("a", &[("tests/a", "ok\n")]);
     fx.branch("b", &[("tests/b", "ok\n")]);
@@ -404,28 +455,90 @@ ok=1; for f in tests/*; do [ -f "$f" ] || continue; if grep -qx FAIL "$f"; then 
     fx.branch("p", &[("tests/p", "ok\n")]);
     fx.mq_ok(&["submit", "1", "--head", "a"]);
     fx.mq_ok(&["submit", "3", "--head", "b"]);
-    fx.mq_ok(&["submit", "4", "--head", "d"]);
-    let run = spawn_run(&fx);
-    // Both first validations are out; only then does the prioritized
-    // change arrive, so it cannot front the first wave.
-    wait_for("the first validations", Duration::from_secs(240), || {
-        events(&fx).matches("\"kind\":\"validate\"").count() >= 2
-    });
+    let prior_runs = run_dirs(&fx);
+    let mut run = spawn_run(&fx);
+    // Both first validations of the spawned run are out; only then does
+    // the prioritized change arrive, so it cannot front the first wave.
+    // Reading only the spawned run's events also proves it already
+    // holds the writer lock, so the submit below records an intake
+    // request rather than taking the lock from under the starting run
+    // (whose fail-fast lock attempt would exit it before its run
+    // directory exists, leaving every later wait to time out).
+    wait_for_run(
+        "the first validations",
+        Duration::from_secs(240),
+        &mut run,
+        || {
+            spawned_events(&fx, &prior_runs)
+                .is_some_and(|e| e.matches("\"kind\":\"validate\"").count() >= 2)
+        },
+    );
     let recorded = fx.mq(&["submit", "2", "--head", "p", "--prioritized"]);
-    // Change 3 and the prioritized change are both gated out; release
-    // them together: change 3 lands first and moves the base under the
-    // prioritized change's candidate.
-    wait_for(
+    assert!(
+        recorded.status.success(),
+        "submit 2 by intake: {recorded:?}"
+    );
+    // The intake replans change 2 into the free fourth window slot;
+    // its validation launches on the original base while changes 1,
+    // 3 and 4 are still gated in flight.
+    wait_for_run(
+        "the intake replan",
+        Duration::from_secs(240),
+        &mut run,
+        || spawned_events(&fx, &prior_runs).is_some_and(|e| e.contains("\"kind\":\"plan-intake\"")),
+    );
+    wait_for_run(
         "the prioritized validation",
         Duration::from_secs(240),
-        || events(&fx).contains("batch #2 on"),
+        &mut run,
+        || spawned_events(&fx, &prior_runs).is_some_and(|e| e.contains("batch #2 on")),
+    );
+    // Now release change 1 so it lands and moves the base under the
+    // prioritized change's candidate; only then release changes 2
+    // and 3, so their greens come back on the stale base.
+    std::fs::write(gates.join("release-a"), "").unwrap();
+    wait_for_run(
+        "change 1 to land",
+        Duration::from_secs(240),
+        &mut run,
+        || {
+            spawned_events(&fx, &prior_runs).is_some_and(|e| {
+                e.lines()
+                    .any(|line| line.contains("\"kind\":\"landed\"") && line.contains("#1 at"))
+            })
+        },
+    );
+    // Only now does change 4 arrive (also by intake): its candidate
+    // builds on the new base, so it is the plain stack head change 2
+    // could stack on, and its flight sits behind change 2's, so
+    // change 2's stale decision cannot be blocked behind it and no
+    // landing after change 1's can move the base a second time
+    // before that decision.
+    let submitted4 = fx.mq(&["submit", "4", "--head", "d"]);
+    assert!(
+        submitted4.status.success(),
+        "submit 4 by intake: {submitted4:?}"
+    );
+    wait_for_run(
+        "change 4 to validate",
+        Duration::from_secs(240),
+        &mut run,
+        || spawned_events(&fx, &prior_runs).is_some_and(|e| e.contains("batch #4 on")),
     );
     std::fs::write(gates.join("release"), "").unwrap();
     // Once the prioritized change is requeued as a stale green, let the
     // stack head (change 4) finish; the rebuild must not wait for it.
-    wait_for("the stale requeue", Duration::from_secs(240), || {
-        events(&fx).contains("stale-root-green")
-    });
+    wait_for_run(
+        "the stale requeue",
+        Duration::from_secs(240),
+        &mut run,
+        || {
+            spawned_events(&fx, &prior_runs).is_some_and(|e| {
+                e.lines()
+                    .any(|line| line.contains("stale-root-green") && line.contains("#2 was green"))
+            })
+        },
+    );
     std::fs::write(gates.join("release-d"), "").unwrap();
     let out = run.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{out:?}");
@@ -435,7 +548,7 @@ ok=1; for f in tests/*; do [ -f "$f" ] || continue; if grep -qx FAIL "$f"; then 
     assert_eq!(status(&fx, 2), "landed", "{r}");
     assert_eq!(status(&fx, 3), "landed", "{r}");
     assert_eq!(status(&fx, 4), "landed", "{r}");
-    let events = events(&fx);
+    let events = spawned_events(&fx, &prior_runs).expect("spawned run events");
     assert!(
         events.lines().any(|line| {
             serde_json::from_str::<Value>(line).is_ok_and(|e| {
