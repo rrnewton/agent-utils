@@ -463,6 +463,7 @@ impl BridgeState {
         let snapshot = {
             let lock = agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
             lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+            let _lock = agent_queue::fsio::HeldLock::new(lock);
             let mut document = self.read_rejection_reactions_locked()?;
             let Some(record) = document
                 .records
@@ -507,6 +508,7 @@ impl BridgeState {
         };
         let lock = agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _lock = agent_queue::fsio::HeldLock::new(lock);
         let mut document = self.read_rejection_reactions_locked()?;
         if let Some(record) = document.records.iter_mut().find(|record| {
             record.key == key

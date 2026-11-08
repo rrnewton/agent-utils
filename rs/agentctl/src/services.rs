@@ -349,6 +349,8 @@ pub fn refresh(
         })?;
         refresh::reap_check_units(host);
     }
+    // Unlocked explicitly when this returns (#1032); unlocking a file never locked is harmless.
+    let _lock = agent_queue::fsio::HeldLock::new(lock);
     let (services, unreadable) = discover::discover(host, tables, registry)?;
     let mut report = refresh::refresh(host, &services, options)?;
     for (unit, error) in &unreadable {

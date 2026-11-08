@@ -4096,8 +4096,8 @@ pub(crate) fn validate_target_authority(target: &Target) -> AgentResult<()> {
 /// old process still exclude each other. Both are taken in that fixed order by every new
 /// process, and an old process takes only the `/tmp` file, so the two orders cannot deadlock.
 pub(crate) struct TargetLock {
-    _account: File,
-    _legacy: File,
+    _account: agent_queue::fsio::HeldLock,
+    _legacy: agent_queue::fsio::HeldLock,
 }
 
 /// The lock files for one target name, in acquisition order: account state, then `/tmp`.
@@ -4121,8 +4121,11 @@ fn lock_target_with(
     mut wait: impl FnMut(&File, &Path) -> AgentResult<()>,
 ) -> AgentResult<TargetLock> {
     let [account_path, legacy_path] = target_lock_paths(name)?;
-    let account = lock_current_file(&account_path, purpose, &mut wait)?;
-    let legacy = lock_current_file(&legacy_path, purpose, &mut wait)?;
+    // Held as soon as taken, so a failure on the second file releases the first (#1032).
+    let account =
+        agent_queue::fsio::HeldLock::new(lock_current_file(&account_path, purpose, &mut wait)?);
+    let legacy =
+        agent_queue::fsio::HeldLock::new(lock_current_file(&legacy_path, purpose, &mut wait)?);
     if let (Some(account_directory), Some(legacy_directory)) =
         (account_path.parent(), legacy_path.parent())
     {

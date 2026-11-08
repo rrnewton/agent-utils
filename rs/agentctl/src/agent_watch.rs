@@ -4493,7 +4493,7 @@ pub fn watch_agents(
                     lock_path.display()
                 ))
             })?;
-            Some(lock)
+            Some(agent_queue::fsio::HeldLock::new(lock))
         }
         None => None,
     };

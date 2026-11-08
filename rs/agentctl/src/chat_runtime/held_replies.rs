@@ -157,6 +157,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let records = self.request_records()?;
         // When each thread last had a reply sent, and by the request admitted when.
         let mut answered: BTreeMap<String, u64> = BTreeMap::new();
@@ -250,6 +251,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut held = self.read_held_locked()?;
         let position = held
             .iter()
@@ -266,6 +268,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut held = self.read_held_locked()?;
         let position = held
             .iter()

@@ -200,6 +200,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         FileExt::lock_exclusive(&state_lock).map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let envelope = self.read_grant_configuration_locked()?;
         if duration_seconds > envelope.config.max_grant_seconds {
             return Err(ChatRuntimeError::invalid(format!(
@@ -270,6 +271,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         FileExt::lock_exclusive(&state_lock).map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let envelope = self.read_grant_configuration_locked()?;
         for sender in ids {
             if envelope.config.allowed_senders.contains(sender) {
@@ -308,6 +310,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         FileExt::lock_exclusive(&state_lock).map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut envelope = self.read_grant_configuration_locked()?;
         envelope.config.max_grant_seconds = seconds;
         envelope.config.validate()?;
@@ -351,6 +354,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         FileExt::lock_exclusive(&state_lock).map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let now = unix_millis();
         let mut grants = self.read_grants_locked()?;
         let mut expired = Vec::new();

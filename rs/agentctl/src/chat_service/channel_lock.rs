@@ -30,7 +30,7 @@ pub const CHANNEL_LOCK_DIR_ENV: &str = "AGENTCTL_CHAT_CHANNEL_LOCK_DIR";
 /// The channel locks one `chat run` holds until it drops them, at exit.
 #[derive(Debug)]
 pub(super) struct ChannelLocks {
-    _files: Vec<File>,
+    _files: Vec<agent_queue::fsio::HeldLock>,
 }
 
 /// The directory of channel locks: `AGENTCTL_CHAT_CHANNEL_LOCK_DIR` when set, else
@@ -119,6 +119,8 @@ pub(super) fn acquire_in(
             }
             return Err(refusal(channel, &path, &mut file, &state));
         }
+        // Held as soon as taken, so a refusal of a later channel releases this one (#1032).
+        let file = agent_queue::fsio::HeldLock::new(file);
         let holder = json!({
             "pid": std::process::id(),
             "bridge_state": state.display().to_string(),
@@ -127,8 +129,8 @@ pub(super) fn acquire_in(
             "started_at_millis": crate::chat_runtime::unix_millis(),
         });
         file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(format!("{holder}\n").as_bytes())?;
+        (&*file).seek(SeekFrom::Start(0))?;
+        (&*file).write_all(format!("{holder}\n").as_bytes())?;
         files.push(file);
     }
     Ok(ChannelLocks { _files: files })

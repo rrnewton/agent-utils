@@ -8,7 +8,7 @@
 //! held; it must type into an empty composer and confirm submission before
 //! returning (see `submission::submit_verified`).
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -94,9 +94,9 @@ fn now_epoch() -> Duration {
         .unwrap_or_default()
 }
 
-/// Held for the whole admission; dropping releases the flock.
+/// Held for the whole admission; dropping unlocks the flock (#1032).
 pub struct PaneAdmission {
-    _lock: File,
+    _lock: agent_queue::fsio::HeldLock,
     dir: PathBuf,
 }
 
@@ -141,6 +141,7 @@ impl PaneAdmission {
                 }
             }
         }
+        let lock = agent_queue::fsio::HeldLock::new(lock);
         // Pace while holding the lock so starts are serialised at >= interval.
         let stamp = dir.join("last-admission");
         let last = std::fs::read_to_string(&stamp)

@@ -141,29 +141,16 @@ pub(crate) struct LifecycleLock {
     _files: HeldLocks,
 }
 
-/// Lock files whose flock locks this process holds, released explicitly when dropped.
-///
-/// A flock lock belongs to the open file description, not the descriptor, and a child that any
-/// thread forks shares every descriptor until its exec closes them. Closing our descriptor
-/// alone therefore leaves the lock held for as long as such a child sits between fork and exec,
-/// and an observer that tries the lock right after it was dropped finds it busy (under load, in
-/// about 5% of attempts beside a thread spawning processes). Unlocking releases it for every
-/// copy at once.
+/// Lock files whose flock locks this process holds, each unlocked explicitly when dropped: a
+/// child forked by any thread shares the descriptors until its exec, so closing alone can leave
+/// a lock held after its guard is gone.
 #[must_use]
 #[derive(Debug, Default)]
-pub(crate) struct HeldLocks(Vec<File>);
+pub(crate) struct HeldLocks(Vec<agent_queue::fsio::HeldLock>);
 
 impl HeldLocks {
     pub(crate) fn push(&mut self, file: File) {
-        self.0.push(file);
-    }
-}
-
-impl Drop for HeldLocks {
-    fn drop(&mut self) {
-        for file in self.0.iter().rev() {
-            let _ = FileExt::unlock(file);
-        }
+        self.0.push(agent_queue::fsio::HeldLock::new(file));
     }
 }
 
@@ -6301,7 +6288,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 first_path,
             )? {
                 return Ok(LifecycleLock {
-                    _files: HeldLocks(files.into_iter().map(|(file, _)| file).collect()),
+                    _files: HeldLocks(
+                        files
+                            .into_iter()
+                            .map(|(file, _)| agent_queue::fsio::HeldLock::new(file))
+                            .collect(),
+                    ),
                 });
             }
         }
@@ -6566,13 +6558,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
     }
 
-    fn identity_lock(&self) -> Result<File> {
+    fn identity_lock(&self) -> Result<agent_queue::fsio::HeldLock> {
         agent::create_private_directory(&self.registry, "agent registry", true, true)?;
         let file =
             agent::open_private_lock(&self.registry.join(".identity.lock"), "agent identity lock")?;
         file.lock_exclusive()
             .map_err(|error| fail(error.to_string()))?;
-        Ok(file)
+        Ok(agent_queue::fsio::HeldLock::new(file))
     }
 
     fn pane_lock(&self, pane_id: &str) -> Result<agent::TargetLock> {

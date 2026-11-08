@@ -32,7 +32,7 @@
 //! is logged with its full refusal text.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
@@ -1916,7 +1916,7 @@ fn previous_ended_uncleanly(events_dir: &Path, generation: u64) -> bool {
 }
 
 /// Take the agent's headless lock without waiting; `None` when another wrapper holds it.
-pub fn try_lock(agent_directory: &Path) -> Result<Option<File>> {
+pub fn try_lock(agent_directory: &Path) -> Result<Option<agent_queue::fsio::HeldLock>> {
     let path = agent_directory.join(LOCK_FILE);
     let file = OpenOptions::new()
         .create(true)
@@ -1928,7 +1928,7 @@ pub fn try_lock(agent_directory: &Path) -> Result<Option<File>> {
     let mut attempts = 0;
     loop {
         match file.try_lock_exclusive() {
-            Ok(()) => return Ok(Some(file)),
+            Ok(()) => return Ok(Some(agent_queue::fsio::HeldLock::new(file))),
             Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
                 return Ok(None)
             }

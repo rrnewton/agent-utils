@@ -6332,6 +6332,7 @@ impl BridgeState {
         // inspection must not create lock authority, even before the first batch arrives.
         let state_lock = agent::open_private_lock(&root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let envelope = ConfigurationEnvelope {
             version: STATE_VERSION,
             config: config.clone(),
@@ -6958,6 +6959,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         for directory in [
             self.root.clone(),
             self.root.join("requests"),
@@ -7316,6 +7318,7 @@ impl BridgeState {
         let _runner = RunnerLease { file: runner };
         let state_lock = open_existing_private_state_lock(&self.root.join(".state.lock"))?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let checkpoint_bytes = read_artifact_bytes(&self.root.join("checkpoint.json"), 1 << 20)?;
         let configuration_bytes = read_artifact_bytes(&self.root.join("bridge.json"), 1 << 20)?;
         if bytes_sha256(&checkpoint_bytes) != request.expected_checkpoint_sha256
@@ -7739,6 +7742,7 @@ impl BridgeState {
         }
         let state_lock = open_existing_private_state_lock(&self.root.join(".state.lock"))?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let gap_bytes = read_artifact_bytes(&self.root.join("gap.json"), MAX_GAP_DIAGNOSTIC_BYTES)?;
         let checkpoint_bytes = read_artifact_bytes(&self.root.join("checkpoint.json"), 1 << 20)?;
         let configuration_bytes = read_artifact_bytes(&self.root.join("bridge.json"), 1 << 20)?;
@@ -8271,6 +8275,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let sender_grants = self.read_grants_locked()?;
         // A provider may have reduced a newly granted sender's message to a checkpoint using
         // its old allowlist. Check under the grant writers' lock before advancing any cursor,
@@ -9040,6 +9045,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut checkpoint = self.read_checkpoint()?;
         self.repair_boundary_commit_locked(&mut checkpoint)?;
         if checkpoint.host_batch_sequence != admission.host_batch_sequence
@@ -9486,6 +9492,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         self.update_provider_health_locked(change)
     }
 
@@ -9697,6 +9704,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let (mut record, readable) = match self.read_service_health() {
             Ok(record) => (record, true),
             Err(_) => (
@@ -9797,6 +9805,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         self.note_send_outcome_locked(outcome, explanation)
     }
 
@@ -9860,6 +9869,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let directory = self.root.join(RECEIPT_REACTION_DIRECTORY);
         let mut prepared = false;
         let mut saves = ReceiptSaves::default();
@@ -10196,6 +10206,7 @@ impl BridgeState {
             let state_lock =
                 agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
             state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+            let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
             self.finish_receipt_reaction_refusal_locked()?;
             match self.read_receipt_reaction(key)? {
                 Some(record) => record,
@@ -10243,6 +10254,7 @@ impl BridgeState {
                 let state_lock =
                     agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
                 state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+                let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
                 if let Some(mut record) = self.read_receipt_reaction(key)? {
                     if record.request_id == snapshot.request_id {
                         let detail = bounded_detail(&detail, MAX_RECEIPT_REACTION_ERROR_BYTES);
@@ -10285,6 +10297,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         if self
             .read_receipt_reaction(key)?
             .is_some_and(|record| record.request_id == snapshot.request_id)
@@ -10403,6 +10416,7 @@ impl BridgeState {
         }
         let state_lock = open_existing_private_state_lock(&self.root.join(".state.lock"))?;
         FileExt::lock_shared(&state_lock).map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let request = self.read_request(key)?;
         let mut replies = Vec::with_capacity(
             usize::try_from(request.reply_count).unwrap_or(MAX_REQUEST_REPLIES as usize),
@@ -10495,6 +10509,7 @@ impl BridgeState {
         };
         let state_lock = open_existing_private_state_lock(&self.root.join(".state.lock"))?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut request = self.read_request(&key)?;
         if request.settlement.is_some() {
             return Err(ChatRuntimeError::invalid(format!(
@@ -11449,6 +11464,7 @@ and the replies captured for them. The provider's own thread is the complete rec
     pub(crate) fn fold_latency_summaries(&self) -> Result<usize> {
         let lock = open_existing_private_state_lock(&self.root.join(".state.lock"))?;
         fs2::FileExt::lock_exclusive(&lock).map_err(ChatRuntimeError::Io)?;
+        let _lock = agent_queue::fsio::HeldLock::new(lock);
         let keys: Vec<String> = self
             .request_records()?
             .into_iter()
@@ -11581,6 +11597,7 @@ and the replies captured for them. The provider's own thread is the complete rec
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         // As in `reply_route_entries`: a retirement left partway can have replaced a slot of the
         // retired-route ring that the checkpoint still names.
         let mut checkpoint = self.read_checkpoint()?;
@@ -11909,6 +11926,7 @@ and the replies captured for them. The provider's own thread is the complete rec
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let Ok(mut record) = self.read_reply_aliases() else {
             return Ok(());
         };
@@ -12042,6 +12060,7 @@ and the replies captured for them. The provider's own thread is the complete rec
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut record = self.read_fence_feedback()?;
         if queued {
             record.pending = Some(PendingFenceFeedback {
@@ -12075,6 +12094,7 @@ and the replies captured for them. The provider's own thread is the complete rec
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut record = self.read_fence_feedback()?;
         if !record.cover(covered, unnamed) {
             return Ok(());
@@ -12283,6 +12303,7 @@ still skipped, but a block under an old number that is out of view then could re
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut record = self.read_reply_aliases()?;
         if let Some(alias) = record.alias_of(key) {
             return Ok(alias);
@@ -12597,6 +12618,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut checkpoint = self.read_checkpoint()?;
         self.complete_pending_retirement_locked(&mut checkpoint)?;
         let alias_record = self.read_reply_aliases().ok();
@@ -12683,6 +12705,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut checkpoint = self.read_checkpoint()?;
         self.complete_pending_retirement_locked(&mut checkpoint)?;
         let mut request = match self.read_request(key) {
@@ -12749,6 +12772,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let request = match self.read_request(key) {
             Ok(request) => request,
             Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
@@ -13256,6 +13280,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             let state_lock =
                 agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
             state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+            let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
             let mut checkpoint = self.read_checkpoint()?;
             self.complete_pending_retirement_locked(&mut checkpoint)?;
             let mut request = match self.read_request(key) {
@@ -13318,6 +13343,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 let state_lock =
                     agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
                 state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+                let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
                 // Bookkeeping only, as in `publish_one`.
                 let _ = self.note_send_outcome_locked(Err(&error), explanation);
                 let mut request = self.read_request(key)?;
@@ -13346,6 +13372,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let _ = self.note_send_outcome_locked(Ok(()), None);
         let mut request = self.read_request(key)?;
         if request.ack_request_id != request_snapshot.ack_request_id {
@@ -13393,6 +13420,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let request = self.read_request(key)?;
         if request.reply_closed {
             return Ok(ReplyCapture::default());
@@ -13901,6 +13929,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             let state_lock =
                 agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
             state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+            let state_lock = agent_queue::fsio::HeldLock::new(state_lock);
             let mut checkpoint = self.read_checkpoint()?;
             self.complete_pending_retirement_locked(&mut checkpoint)?;
             let mut request = match self.read_request(key) {
@@ -13956,7 +13985,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             // Release the lock itself before the provider call, not only by closing this
             // descriptor: a child process that another thread forked meanwhile holds a copy of
             // the descriptor until it executes, and that copy would keep the lock held.
-            FileExt::unlock(&state_lock).map_err(ChatRuntimeError::Io)?;
+            FileExt::unlock(&*state_lock).map_err(ChatRuntimeError::Io)?;
             (request, reply)
         };
 
@@ -14045,6 +14074,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let _ = self.note_send_outcome_locked(Ok(()), None);
         let mut current = self.read_reply(key, reply.ordinal)?;
         if current.body != reply.body || current.send_request_id != reply.send_request_id {
@@ -14091,6 +14121,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut reply = self.read_reply(key, ordinal)?;
         reply.send_attempts = reply.send_attempts.saturating_add(1);
         reply.last_send_failure_code = Some(bounded_detail(&failure.code, 200));
@@ -14119,6 +14150,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut reply = self.read_reply(key, ordinal)?;
         reply.send_attempts = reply.send_attempts.saturating_add(1);
         reply.last_send_failure_code = Some(bounded_detail(&failure.code, 200));
@@ -14238,6 +14270,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let record = self.read_request(key)?;
         self.set_delivery_phase_locked(record, phase, detail)
     }
@@ -14322,6 +14355,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut record = self.read_request(key)?;
         record.uncertain_reported_at_millis = Some(unix_millis());
         record.delivery_error = Some(bounded_detail(detail, 2_000));
@@ -14338,6 +14372,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let record = self.read_request(key)?;
         if !matches!(
             record.phase,
@@ -14414,6 +14449,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut checkpoint = self.read_checkpoint()?;
         let _ = self.retire_if_eligible_locked(&mut checkpoint, key)?;
         self.persist_checkpoint(&mut checkpoint)
@@ -14604,6 +14640,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut bindings = self.thread_bindings()?;
         for binding in &mut bindings {
             if binding.thread_id == thread_id {
@@ -14630,6 +14667,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut bindings = self.thread_bindings()?;
         let mut ended = false;
         for binding in &mut bindings {
@@ -14820,9 +14858,10 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         Ok(routes)
     }
 
-    fn lock_state_snapshot(&self) -> Result<File> {
+    fn lock_state_snapshot(&self) -> Result<agent_queue::fsio::HeldLock> {
         let lock = open_existing_private_state_lock(&self.root.join(".state.lock"))?;
         FileExt::lock_shared(&lock).map_err(ChatRuntimeError::Io)?;
+        let lock = agent_queue::fsio::HeldLock::new(lock);
         Ok(lock)
     }
 
@@ -15390,6 +15429,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         agent::cleanup_atomic_json_temporaries(&self.root.join("retirements"))?;
         self.migrate_legacy_retirements_locked()?;
         let mut checkpoint = self.read_checkpoint()?;
@@ -15433,6 +15473,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         agent::cleanup_atomic_json_temporaries(&self.root.join("requests"))?;
         agent::cleanup_atomic_json_temporaries(&self.root.join("replies"))?;
         let records = self.request_records()?;

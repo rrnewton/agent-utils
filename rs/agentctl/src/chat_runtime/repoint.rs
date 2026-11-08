@@ -227,6 +227,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         FileExt::lock_exclusive(&state_lock).map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let envelope = self.read_grant_configuration_locked()?;
         let mut document = self.read_target_locked()?;
         let request = RepointRequest {
@@ -548,6 +549,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let record = match self.read_request(key) {
             Ok(record) => record,
             Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
@@ -571,6 +573,7 @@ impl BridgeState {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         FileExt::lock_exclusive(&state_lock).map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         outcome.applied_at_millis = unix_millis();
         if outcome.changed_target() {
             let mut envelope = self.read_grant_configuration_locked()?;

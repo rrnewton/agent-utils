@@ -2039,6 +2039,8 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         println!("pump: another pump is running on this state directory; nothing done");
         return Ok(0);
     }
+    // Unlocked explicitly when the pump returns, not only closed (#1032).
+    let _lock = agent_queue::fsio::HeldLock::new(lock_file);
     // Stranger alarms repeat on their timer whenever pump runs; under the
     // lock, so two pumps never post the same alarm or race the quarantine.
     let _ = crate::relay::raise_due_alarms(&globals.state, now_unix_ms());

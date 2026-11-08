@@ -164,6 +164,39 @@ pub fn open_private_lock(path: &Path, purpose: &str) -> Result<File> {
     Ok(file)
 }
 
+/// A lock file this process holds a `flock` on, unlocked explicitly when dropped.
+///
+/// A `flock` belongs to the open file description, and a child process forked by any thread
+/// shares every descriptor until its exec closes them. A holder that releases only by closing
+/// its descriptor therefore keeps the lock held for as long as such a child sits between fork and
+/// exec, and a caller that tries the lock without waiting right after the release finds it busy.
+/// Unlocking releases it for every copy of the descriptor at once. Wrap a file in this as soon as
+/// its lock is taken.
+#[derive(Debug)]
+pub struct HeldLock(File);
+
+impl HeldLock {
+    /// Hold `file`, whose lock the caller has just taken, until this value is dropped.
+    #[must_use]
+    pub fn new(file: File) -> Self {
+        Self(file)
+    }
+}
+
+impl std::ops::Deref for HeldLock {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 /// Take an exclusive `flock` on `lock`, polling every 10 ms through `waiter` until it is free or
 /// the waiter is cancelled.
 pub fn lock_exclusive(lock: &File, path: &Path, purpose: &str, waiter: &dyn Waiter) -> Result<()> {
@@ -612,6 +645,26 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    #[test]
+    fn a_dropped_held_lock_is_free_while_a_forked_copy_of_its_descriptor_lives() {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-queue-held-lock-{}-{}",
+            std::process::id(),
+            TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        create_private_directory(&directory, "test directory", true, false).unwrap();
+        let path = directory.join("held.lock");
+        let file = open_private_lock(&path, "test lock").unwrap();
+        FileExt::try_lock_exclusive(&file).unwrap();
+        // A child forked by another thread holds a copy of the descriptor until its exec.
+        let forked = file.try_clone().unwrap();
+        drop(HeldLock::new(file));
+        let other = open_private_lock(&path, "test lock").unwrap();
+        FileExt::try_lock_exclusive(&other).expect("the lock is free once its holder is dropped");
+        drop((forked, other));
+        fs::remove_dir_all(&directory).unwrap();
+    }
 
     #[test]
     fn a_priority_waiter_takes_the_lock_before_ordinary_waiters_that_came_first() {

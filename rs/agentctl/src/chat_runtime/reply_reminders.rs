@@ -284,6 +284,7 @@ then start again from that time",
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         fs2::FileExt::lock_exclusive(&state_lock).map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let (mut record, created) = match self.read_reply_reminders()? {
             Some(record) => (record, false),
             None => (ReplyReminderRecord::new(now_millis), true),
