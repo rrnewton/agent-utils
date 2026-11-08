@@ -1436,9 +1436,253 @@ fn after_separator() -> Vec<String> {
     }
 }
 
+/// Python command spellings whose wrkslotsd command has another name.
+const PY_RENAMED: &[(&str, &str)] = &[
+    ("status", "status-text"),
+    ("doctor", "doctor-text"),
+    ("audit", "audit-text"),
+    ("unpushed", "unpushed-text"),
+    ("create", "create-text"),
+    (
+        "recover-absent-agent-rows",
+        "recover-absent-agent-rows-text",
+    ),
+    (
+        "recover-absent-validate-rows",
+        "recover-absent-validate-rows-text",
+    ),
+    (
+        "recover-ownerless-validate-batch",
+        "recover-ownerless-validate-batch-text",
+    ),
+    (
+        "classify-ownerless-validate-batch",
+        "classify-ownerless-validate-batch-text",
+    ),
+];
+
+/// Python spellings the Rust edition already serves under the same name.
+const PY_IDENTITY: &[&str] = &[
+    "adopt",
+    "classify-create-journals",
+    "config",
+    "finish",
+    "freeze",
+    "heartbeat",
+    "hold",
+    "quickstart",
+    "read-handoff",
+    "reap-stray-worktrees",
+    "reclaim-orphan-state",
+    "recover",
+    "recover-absent-agent-row",
+    "recover-ownerless-agent-cache",
+    "recover-ownerless-agent-clone",
+    "recover-ownerless-agent-worktree",
+    "recover-unbound-owner",
+    "register",
+    "release",
+    "remove",
+    "retirement-queue",
+    "shell-command",
+    "supersede-handoff",
+    "transfer-owner",
+    "unhold",
+    "write-handoff",
+];
+
+/// Python commands with no Rust port yet; compat mode refuses them by name.
+const PY_ONLY: &[&str] = &[
+    "box",
+    "clean-caches",
+    "image",
+    "import-existing",
+    "init",
+    "limits",
+    "migrate",
+    "relocate-repository",
+    "remove-agent-batch",
+    "remove-validate-batch",
+    "retire-pending",
+    "run",
+    "sandbox",
+    "worktrees-image",
+];
+
+type PyCompatTranslation = Option<(Vec<String>, Option<String>)>;
+
+fn py_flag_present(head: &[String], flag: &str) -> bool {
+    head.iter()
+        .any(|arg| arg == flag || arg.starts_with(&format!("{flag}=")))
+}
+
+/// Whether this invocation speaks the Python CLI: routed as the
+/// wrkslots Rust edition, leading Python globals, or a spelling no
+/// working native call can mean.
+fn py_compat_triggered(rest: &[String], leading_globals: bool, routed: bool) -> bool {
+    if routed || leading_globals {
+        return true;
+    }
+    let Some(cmd) = rest.first().map(String::as_str) else {
+        return false;
+    };
+    match cmd {
+        "doctor" | "audit" => true,
+        "status" => !py_flag_present(rest, "--index"),
+        "create"
+        | "unpushed"
+        | "recover-absent-agent-rows"
+        | "recover-absent-validate-rows"
+        | "recover-ownerless-validate-batch"
+        | "classify-ownerless-validate-batch" => py_flag_present(rest, "--format"),
+        _ => false,
+    }
+}
+
+/// Translate exact Python-CLI argv to wrkslotsd argv (#562 P10).
+/// `Ok(None)` keeps the native wrkslotsd surface unchanged; a covered
+/// Python spelling returns the translated argv plus any `--wait-lock`
+/// value for `WRKSLOTS_WAIT_LOCK`; unported spellings refuse by name.
+fn translate_python_argv(args: Vec<String>) -> Result<PyCompatTranslation, String> {
+    let routed = std::env::var_os("WRKSLOTS_PYCOMPAT").is_some();
+    translate_python_argv_routed(args, routed)
+}
+
+fn translate_python_argv_routed(
+    args: Vec<String>,
+    routed: bool,
+) -> Result<PyCompatTranslation, String> {
+    let mut project_root: Option<String> = None;
+    let mut machine: Option<String> = None;
+    let mut wait_lock: Option<String> = None;
+    let mut allow_existing = false;
+    let mut userguide = false;
+    let mut i = 1usize;
+    while i < args.len() {
+        let token = args[i].clone();
+        let (slot, inline): (&str, Option<String>) =
+            if let Some(v) = token.strip_prefix("--project-root=") {
+                ("root", Some(v.to_string()))
+            } else if token == "--project-root" {
+                ("root", None)
+            } else if let Some(v) = token.strip_prefix("--machine=") {
+                ("machine", Some(v.to_string()))
+            } else if token == "--machine" {
+                ("machine", None)
+            } else if let Some(v) = token.strip_prefix("--wait-lock=") {
+                ("wait", Some(v.to_string()))
+            } else if token == "--wait-lock" {
+                ("wait", None)
+            } else if token == "--allow-existing-unregistered-worktrees" {
+                allow_existing = true;
+                i += 1;
+                continue;
+            } else if token == "--userguide" {
+                userguide = true;
+                i += 1;
+                continue;
+            } else {
+                break;
+            };
+        let value = match inline {
+            Some(value) => {
+                i += 1;
+                value
+            }
+            None => {
+                if i + 1 >= args.len() {
+                    return Ok(None);
+                }
+                let value = args[i + 1].clone();
+                i += 2;
+                value
+            }
+        };
+        match slot {
+            "root" => project_root = Some(value),
+            "machine" => machine = Some(value),
+            _ => wait_lock = Some(value),
+        }
+    }
+    let rest: Vec<String> = args[i..].to_vec();
+    if !py_compat_triggered(&rest, i > 1, routed) {
+        return Ok(None);
+    }
+    if userguide {
+        return Err("--userguide stays with the Python edition in this slice".to_string());
+    }
+    if allow_existing {
+        return Err(
+            "--allow-existing-unregistered-worktrees stays with the Python edition in this slice"
+                .to_string(),
+        );
+    }
+    let Some(cmd) = rest.first().cloned() else {
+        return Ok(None);
+    };
+    if PY_ONLY.contains(&cmd.as_str()) {
+        return Err(format!(
+            "'{cmd}' stays with the Python edition in this slice"
+        ));
+    }
+    let renamed = PY_RENAMED
+        .iter()
+        .find(|(py, _)| *py == cmd)
+        .map(|(_, rust)| (*rust).to_string());
+    if renamed.is_none() && !PY_IDENTITY.contains(&cmd.as_str()) {
+        return Ok(None);
+    }
+    let tail: Vec<String> = rest[1..].to_vec();
+    let split = tail
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(tail.len());
+    let (head, separator_tail) = tail.split_at(split);
+    if cmd == "status" && py_flag_present(head, "--verbose") {
+        return Err("status --verbose stays with the Python edition in this slice".to_string());
+    }
+    for flag in ["--image-ceiling-gib", "--image-state-ceiling-gib"] {
+        if cmd == "create" && py_flag_present(head, flag) {
+            return Err(format!(
+                "create {flag} stays with the Python edition in this slice"
+            ));
+        }
+    }
+    let mut out: Vec<String> = vec![args[0].clone(), renamed.unwrap_or(cmd.clone())];
+    out.extend(head.iter().cloned());
+    if cmd != "quickstart" {
+        if let Some(root) = project_root {
+            out.push("--root".to_string());
+            out.push(root);
+        }
+        if let Some(machine) = machine {
+            out.push("--machine".to_string());
+            out.push(machine);
+        }
+    }
+    out.extend(separator_tail.iter().cloned());
+    Ok(Some((out, wait_lock)))
+}
+
 /// Parse process arguments, print one JSON summary, and return a process code.
 pub fn run() -> u8 {
-    let command = Cli::parse().command;
+    let argv: Vec<String> = std::env::args().collect();
+    let command = match translate_python_argv(argv) {
+        Ok(Some((translated, wait_lock))) => {
+            if let Some(wait) = wait_lock {
+                std::env::set_var("WRKSLOTS_WAIT_LOCK", wait);
+            }
+            match Cli::try_parse_from(translated) {
+                Ok(cli) => cli.command,
+                Err(error) => error.exit(),
+            }
+        }
+        Ok(None) => Cli::parse().command,
+        Err(error) => {
+            eprintln!("wrkslotsd: {error}");
+            return 1;
+        }
+    };
     let result: Result<serde_json::Value, crate::ObserverError> = match command {
         Command::Writers(inner) => match inner {
             Writers::Rebuild {
@@ -3137,4 +3381,121 @@ pub fn run() -> u8 {
 fn encode_value(value: &impl Serialize) -> Result<serde_json::Value, crate::ObserverError> {
     serde_json::to_value(value)
         .map_err(|error| crate::ObserverError::with_source("cannot encode command output", error))
+}
+
+#[cfg(test)]
+mod py_compat_tests {
+    use super::translate_python_argv_routed;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        std::iter::once("wrkslotsd".to_string())
+            .chain(parts.iter().map(|part| part.to_string()))
+            .collect()
+    }
+
+    fn translated(parts: &[&str], routed: bool) -> Option<Vec<String>> {
+        translate_python_argv_routed(argv(parts), routed)
+            .unwrap()
+            .map(|(out, _wait)| out)
+    }
+
+    #[test]
+    fn globals_and_renamed_status_translate() {
+        let out = translated(
+            &[
+                "--project-root",
+                "/p",
+                "--machine=node-a",
+                "status",
+                "--format",
+                "json",
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            argv(&[
+                "status-text",
+                "--format",
+                "json",
+                "--root",
+                "/p",
+                "--machine",
+                "node-a"
+            ])
+        );
+    }
+
+    #[test]
+    fn native_status_with_index_and_create_without_format_pass_through() {
+        assert!(translated(&["status", "--index", "/tmp/i.db"], false).is_none());
+        assert!(translated(&["create", "slot-b"], false).is_none());
+        assert!(translated(&["parse-state"], false).is_none());
+    }
+
+    #[test]
+    fn format_and_routed_create_rename() {
+        assert_eq!(
+            translated(&["create", "slot-b", "--format", "json"], false).unwrap()[1],
+            "create-text"
+        );
+        assert_eq!(
+            translated(&["create", "slot-b"], true).unwrap()[1],
+            "create-text"
+        );
+        assert_eq!(translated(&["doctor"], false).unwrap()[1], "doctor-text");
+    }
+
+    #[test]
+    fn unported_and_flag_corners_refuse_by_name() {
+        let err = translate_python_argv_routed(argv(&["init", "."]), true).unwrap_err();
+        assert!(err.contains("'init' stays with the Python edition"));
+        let err = translate_python_argv_routed(argv(&["status", "--verbose"]), false).unwrap_err();
+        assert!(err.contains("status --verbose"));
+        let err = translate_python_argv_routed(
+            argv(&[
+                "create",
+                "s",
+                "--format",
+                "json",
+                "--image-ceiling-gib",
+                "2",
+            ]),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("--image-ceiling-gib"));
+    }
+
+    #[test]
+    fn separator_tail_is_untouched_and_quickstart_drops_root() {
+        let out = translated(
+            &[
+                "--machine",
+                "node-a",
+                "shell-command",
+                "slot-b",
+                "--",
+                "echo",
+                "--machine",
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            argv(&[
+                "shell-command",
+                "slot-b",
+                "--machine",
+                "node-a",
+                "--",
+                "echo",
+                "--machine"
+            ])
+        );
+        let out = translated(&["--project-root", "/p", "quickstart"], false).unwrap();
+        assert_eq!(out, argv(&["quickstart"]));
+    }
 }

@@ -180,6 +180,11 @@ case "$ENGINE" in
         fi
         echo "[$TOOL] engine=rust (tracked Cargo launcher: ${TARGET#"$ROOT"/})" >&2
         unset AGENT_UTILS_RS_ENSURE_ONLY
+        if [[ "$TOOL" == "wrkslots" ]]; then
+            # Routed as the wrkslots Rust edition: wrkslotsd translates
+            # exact Python spellings in this mode (#562 P10).
+            export WRKSLOTS_PYCOMPAT=1
+        fi
         exec "$TARGET" "$@"
         ;;
     *)
