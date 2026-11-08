@@ -4,12 +4,16 @@
 //! so every recorded identity is the triple `(boot_id, pid, start ticks)`.
 //!
 //! This module covers record types and read/validate: [`ProcessIdentity`],
-//! [`HarnessRecord`], [`parse_harness_record`], and [`HarnessRecord::document`].
-//! Process pinning via pidfds, harness-tree cleanup, and cgroup containment
-//! live elsewhere.
+//! [`HarnessRecord`], [`parse_harness_record`], and [`HarnessRecord::document`],
+//! plus the kernel evidence those records are checked against:
+//! [`current_boot_id`], [`read_stat`], and [`scan_processes`]. Process pinning
+//! via pidfds, harness-tree cleanup, and cgroup containment live elsewhere.
 
 use std::fmt;
-use std::path::{Component, PathBuf};
+use std::io::Read as _;
+use std::path::{Component, Path, PathBuf};
+
+use super::procstat::{parse_process_stat, ProcessStat};
 
 /// Env var carrying a turn's harness generation into the harness process.
 pub const GENERATION_ENV: &str = "AGENTCTL_HARNESS_GENERATION";
@@ -34,6 +38,13 @@ impl ForeignOwnershipError {
         Self {
             code: "harness_identity_unknown",
             message: format!("malformed active harness identity: {detail}"),
+        }
+    }
+
+    fn runner_identity_unknown(message: String) -> Self {
+        Self {
+            code: "runner_identity_unknown",
+            message,
         }
     }
 }
@@ -170,6 +181,107 @@ pub fn valid_ticks(value: &str) -> bool {
         return false;
     }
     value.len() == 1 || !value.starts_with('0')
+}
+
+/// The procfs root the kernel-evidence readers use by default.
+const PROC: &str = "/proc";
+/// A boot identity file longer than this is malformed evidence, as in Python.
+const MAX_BOOT_ID_BYTES: usize = 128;
+
+/// Return the canonical Linux boot UUID, refusing unreadable evidence.
+pub fn current_boot_id() -> Result<String, ForeignOwnershipError> {
+    current_boot_id_at(Path::new(PROC))
+}
+
+/// [`current_boot_id`] against an explicit procfs root (for tests).
+pub fn current_boot_id_at(proc_root: &Path) -> Result<String, ForeignOwnershipError> {
+    let path = proc_root.join("sys/kernel/random/boot_id");
+    // Read at most one byte past the limit: anything longer is malformed.
+    let mut raw = Vec::new();
+    let read = std::fs::File::open(&path).and_then(|file| {
+        file.take((MAX_BOOT_ID_BYTES + 1) as u64)
+            .read_to_end(&mut raw)
+    });
+    if let Err(error) = read {
+        return Err(ForeignOwnershipError::runner_identity_unknown(format!(
+            "cannot read the Linux boot identity: {error}"
+        )));
+    }
+    let value = String::from_utf8_lossy(&raw).trim().to_owned();
+    if raw.is_empty() || raw.len() > MAX_BOOT_ID_BYTES || !valid_boot_id(&value) {
+        return Err(ForeignOwnershipError::runner_identity_unknown(
+            "the Linux boot identity is malformed".to_owned(),
+        ));
+    }
+    Ok(value)
+}
+
+/// Return one process's identity fields, or `None` only for positive
+/// disappearance. Unreadable or malformed procfs evidence is not a death
+/// certificate and must not authorize later process signalling.
+pub fn read_stat(pid: i64) -> Result<Option<ProcessStat>, ForeignOwnershipError> {
+    read_stat_at(Path::new(PROC), pid)
+}
+
+/// [`read_stat`] against an explicit procfs root (for tests).
+pub fn read_stat_at(
+    proc_root: &Path,
+    pid: i64,
+) -> Result<Option<ProcessStat>, ForeignOwnershipError> {
+    let raw = match std::fs::read(proc_root.join(pid.to_string()).join("stat")) {
+        Ok(raw) => raw,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(ForeignOwnershipError::runner_identity_unknown(format!(
+                "cannot read runner process {pid} identity: {error}"
+            )));
+        }
+    };
+    match parse_process_stat(&raw) {
+        Some(parsed) if parsed.pid == pid => Ok(Some(parsed)),
+        _ => Err(ForeignOwnershipError::runner_identity_unknown(format!(
+            "cannot parse runner process {pid} identity"
+        ))),
+    }
+}
+
+fn quiet_stat_at(proc_root: &Path, pid: i64) -> Option<ProcessStat> {
+    read_stat_at(proc_root, pid).ok().flatten()
+}
+
+/// List every process procfs shows; vanished or unreadable ones are skipped.
+pub fn scan_processes() -> Result<Vec<ProcessStat>, ForeignOwnershipError> {
+    scan_processes_at(Path::new(PROC))
+}
+
+/// [`scan_processes`] against an explicit procfs root (for tests).
+pub fn scan_processes_at(proc_root: &Path) -> Result<Vec<ProcessStat>, ForeignOwnershipError> {
+    let entries = std::fs::read_dir(proc_root).map_err(|error| {
+        ForeignOwnershipError::runner_identity_unknown(format!(
+            "cannot list {}: {error}",
+            proc_root.display()
+        ))
+    })?;
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(pid) = name.parse::<i64>() else {
+            continue;
+        };
+        if let Some(parsed) = quiet_stat_at(proc_root, pid) {
+            found.push(parsed);
+        }
+    }
+    Ok(found)
 }
 
 fn process_number(value: Option<&serde_json::Value>) -> Option<i64> {
@@ -458,5 +570,103 @@ mod tests {
     #[test]
     fn rejects_process_containment_with_cgroup() {
         assert!(parse_harness_record(&v1(json!({"cgroup": "/sys/fs/cgroup/x"}))).is_err());
+    }
+
+    fn fake_proc(test: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("agentctl-b3-2-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sys/kernel/random")).unwrap();
+        root
+    }
+
+    fn stat_record(pid: i64, starttime: u64) -> String {
+        let mut tail: Vec<String> = vec![
+            "S".to_owned(),
+            "10".to_owned(),
+            "20".to_owned(),
+            "20".to_owned(),
+        ];
+        tail.extend(std::iter::repeat_n("0".to_owned(), 15));
+        tail.push(starttime.to_string());
+        tail.extend(std::iter::repeat_n("0".to_owned(), 30));
+        format!("{pid} (fake proc) {}\n", tail.join(" "))
+    }
+
+    fn write_stat(root: &Path, dir_pid: i64, record: &str) {
+        let dir = root.join(dir_pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stat"), record).unwrap();
+    }
+
+    #[test]
+    fn current_boot_id_reads_only_canonical_evidence() {
+        let root = fake_proc("boot");
+        let boot_file = root.join("sys/kernel/random/boot_id");
+        std::fs::write(&boot_file, format!("{BOOT}\n")).unwrap();
+        assert_eq!(current_boot_id_at(&root).unwrap(), BOOT);
+
+        std::fs::write(&boot_file, "not-a-uuid\n").unwrap();
+        let err = current_boot_id_at(&root).unwrap_err();
+        assert_eq!(err.code, "runner_identity_unknown");
+        assert!(err.message.contains("malformed"), "{}", err.message);
+
+        // Over the byte limit is malformed even when the text would parse.
+        std::fs::write(&boot_file, format!("{BOOT}{}\n", " ".repeat(200))).unwrap();
+        assert!(current_boot_id_at(&root).is_err());
+
+        std::fs::remove_file(&boot_file).unwrap();
+        let err = current_boot_id_at(&root).unwrap_err();
+        assert!(err.message.contains("cannot read"), "{}", err.message);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_stat_distinguishes_gone_from_malformed() {
+        let root = fake_proc("stat");
+        write_stat(&root, 4242, &stat_record(4242, 987654));
+        let stat = read_stat_at(&root, 4242).unwrap().unwrap();
+        assert_eq!(stat.pid, 4242);
+        assert_eq!(stat.starttime, 987654);
+
+        // Positive disappearance is the only `None`.
+        assert_eq!(read_stat_at(&root, 7777).unwrap(), None);
+
+        write_stat(&root, 5555, "garbage");
+        let err = read_stat_at(&root, 5555).unwrap_err();
+        assert_eq!(err.code, "runner_identity_unknown");
+        assert!(err.message.contains("cannot parse"), "{}", err.message);
+
+        // A record naming a different pid is malformed evidence, not `None`.
+        write_stat(&root, 6666, &stat_record(9999, 1));
+        assert!(read_stat_at(&root, 6666).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_processes_skips_the_unreadable() {
+        let root = fake_proc("scan");
+        write_stat(&root, 4242, &stat_record(4242, 987654));
+        write_stat(&root, 99, "garbage");
+        std::fs::create_dir_all(root.join("55")).unwrap();
+        std::fs::create_dir_all(root.join("self")).unwrap();
+        let found = scan_processes_at(&root).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].pid, 4242);
+
+        let err = scan_processes_at(&root.join("missing")).unwrap_err();
+        assert!(err.message.contains("cannot list"), "{}", err.message);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_procfs_evidence_names_this_process() {
+        let boot = current_boot_id().unwrap();
+        assert!(valid_boot_id(&boot));
+        let own = i64::from(std::process::id());
+        let stat = read_stat(own).unwrap().unwrap();
+        assert_eq!(stat.pid, own);
+        assert!(scan_processes().unwrap().iter().any(|s| s.pid == own));
     }
 }
