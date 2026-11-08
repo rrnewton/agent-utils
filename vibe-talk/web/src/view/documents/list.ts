@@ -51,7 +51,10 @@ const ICON_PATHS: Record<string, string[]> = {
 };
 
 function iconFor(kind: string): SVGSVGElement {
-  const svg = document.createElement("svg") as unknown as SVGSVGElement;
+  // The SVG namespace from any icon the page already draws (no address is named here).
+  const anySvg = typeof document.querySelector === "function" ? document.querySelector("svg") : null;
+  const ns = anySvg ? anySvg.namespaceURI : "";
+  const svg = (ns ? document.createElementNS(ns, "svg") : document.createElement("svg")) as unknown as SVGSVGElement;
   svg.setAttribute("viewBox", "0 0 24 24");
   svg.setAttribute("class", "doc-icon-svg");
   svg.setAttribute("aria-hidden", "true");
@@ -62,7 +65,7 @@ function iconFor(kind: string): SVGSVGElement {
   svg.setAttribute("stroke-linejoin", "round");
   const paths = kind.startsWith("github") ? ICON_PATHS.github : kind === "paste" ? ICON_PATHS.paste : ICON_PATHS.file;
   for (const d of paths ?? []) {
-    const path = document.createElement("path") as unknown as SVGPathElement;
+    const path = (ns ? document.createElementNS(ns, "path") : document.createElement("path")) as unknown as SVGPathElement;
     path.setAttribute("d", d);
     svg.appendChild(path);
   }
