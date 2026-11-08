@@ -1377,6 +1377,12 @@ const outbox = createOutboxStore({
   keepsOwnPosts: (channel) => storeKeepsOwnPosts(channel),
 });
 const outgoingObservations = new Map();
+
+/** A saved entry as the live outbox holds it (web/src/core/outbox `outgoingFromSaved`). */
+function outgoingFromSaved(held) {
+  return entryFromSaved(held, Date.now);
+}
+
 // By entry id, the attempt in progress — a reply being placed, or a POST — and nothing else: a send
 // waiting its turn has no job. See "one destination, in the order written".
 const outgoingJobs = new Map();
@@ -3080,9 +3086,6 @@ const composerKeys = createComposerKeys({ now: () => Date.now(), enterSends: () 
  * @param {any} [box] the box the key was pressed in: its own listener says, as `event.target` would
  * @returns {unknown}
  */
-function onComposerKey(event, send, box = event && event.target) {
-  return composerKeys.onKey(event, send, box);
-}
 
 // How long after a paste an Enter is part of it (`PASTE_ENTER_MS`), when each box last took one, each
 // box's new-line key (`NEWLINE_KEYS`) and putting a new line in a box (`insertNewline`) are
@@ -5277,9 +5280,6 @@ function channelContextKey() {
   return JSON.stringify(columnWork.side() ? [...key, "side"] : key);
 }
 
-function channelComposerKey() {
-  return JSON.stringify([selectedChannelId(), selection().threadId]);
-}
 
 /**
  * The thread record the page holds for a message: the store's copy's, the row's own, or — for a
@@ -5528,41 +5528,7 @@ function renderColumnLists() {
   renderOutgoingMessages();
 }
 
-/** Write the boxes' drafts to the device (`channelDrafts`); whether it kept them. */
-function saveChannelDrafts() {
-  return channelDrafts.save();
-}
 
-function rememberChannelDraft() {
-  if (!composerState().key) return;
-  const text = el("channel-compose-text").value;
-  const before = channelDrafts.get(composerState().key) || "";
-  // `#846 draft-chip-honest`. Blank words are no draft, and are not kept.
-  if (text.trim()) channelDrafts.set(composerState().key, text);
-  else channelDrafts.delete(composerState().key);
-  if (!saveChannelDrafts()) {
-    el("channel-compose-state").textContent = CHANNEL_DRAFT_REFUSED;
-  }
-  // `#819 voice-page-quoted-reply-and-draft-chip`. Found again by the Draft chip; no newer for being unchanged.
-  if (text !== before) noteDraft("composer", composerState().key, String(selectedChannelId() || ""), Boolean(text.trim()));
-}
-
-function restoreChannelComposer() {
-  composerState().key = channelComposerKey();
-  const channel = selectedChannelId();
-  const readOnly = knownChannel(channel)?.writable === false;
-  el("channel-compose-text").value = channelDrafts.get(composerState().key) || "";
-  el("channel-compose-state").textContent = readOnly
-    ? "This channel is read-only."
-    : "";
-  el("channel-compose-text").disabled = false;
-  el("channel-send").disabled = !channel || readOnly;
-  renderChannelNavigation();
-  // `#340 composer-grow-box`. The draft put back is the box's height too.
-  fitGrowingBox(el("channel-compose-text"));
-  // `#819 voice-page-quoted-reply-and-draft-chip`. Another channel's drafts, or this one's again.
-  renderDraftChip();
-}
 
 function rememberChannelContext() {
   syncCanonDismissed();
@@ -7927,110 +7893,10 @@ function noteFreshRead(payload) {
   noteBookmark(payload);
 }
 
-/** Save before clearing an editor; storage refusal never prevents an intentional send (`outbox`). */
-function persistOutgoingMessages() {
-  return outbox.save();
-}
 
-/**
- * An outbox entry as it was saved — in the outbox, or among the recently dismissed (`#193
- * compose-draft-loss`) — or null for anything that is not one (web/src/core/outbox
- * `outgoingFromSaved`, `#624 voice-page-modularity`). Typed loosely here: the outbox's entries gain
- * fields as they are sent (`retriesUsed`, and others) that a saved one does not carry.
- *
- * @returns {any}
- */
-function outgoingFromSaved(held) {
-  return entryFromSaved(held, Date.now);
-}
 
-function loadOutgoingMessages() {
-  try {
-    const saved = outbox.saved();
-    if (!Array.isArray(saved)) return;
-    const queued = [];
-    let confirmed = false;
-    for (const held of saved) {
-      const entry = outgoingFromSaved(held);
-      if (!entry) continue;
-      // `#500 sent-receipts-pile-up`. Nor a confirmed send saved by an earlier build, which did not say
-      // when it was confirmed, or past the grace (`sentReceiptRetires`): the owner's pile of "Sent."
-      // receipts, all of them posted long before, goes on the first load.
-      if (entry.state === "sent" && !(Date.now() - entry.sentAt < OWN_POST_GRACE_MS)) {
-        confirmed = true;
-        continue;
-      }
-      outbox.add(entry);
-      if (entry.state === "sent") armSentReceipt(entry, OWN_POST_GRACE_MS);
-      if (held.state === "sending" && held.phase === "queued") queued.push(entry);
-    }
-    // `#277 send-order`. A message that was waiting behind an earlier one to the same place still
-    // is: it never left the device, and it goes once that one has — after a Retry on this page, or
-    // a Dismiss or Edit. So does a reply still to be placed that was waiting behind another. One
-    // with nothing ahead of it any more is NOT sent on its own: nobody asked this page to send it,
-    // so it is left to Retry, as before. In order, so a message restored to the queue holds the ones
-    // written after it.
-    for (const entry of queued) {
-      Object.assign(entry, { state: "sending", phase: "queued", detail: "" });
-      if (outgoingBlocker(entry)) {
-        outgoingQueuedUnder.set(entry.id, currentCredential());
-      } else {
-        Object.assign(entry, { state: "failed", phase: "", detail: "This page closed before this message was sent." });
-      }
-    }
-    // In particular, never replay a POST merely because Android reopened this page.
-    if (outbox.size() || confirmed) persistOutgoingMessages();
-  } catch (_error) {
-    outbox.refused();
-  }
-}
 
-function outgoingInView(entry) {
-  if (entry.channel !== selectedChannelId()) return false;
-  // `#466 reply-promotes-thread`: the thread it goes into, which a reply to a message on Slack is too.
-  if (selection().view === "thread") return outgoingThreadOf(entry) === String(selection().threadId);
-  if (selection().view === "flat") return true;
-  // A reply opened from a root in the main view needs a visible receipt when Reply closes.
-  return !entry.threadId || entry.originView === "main";
-}
 
-function outgoingStatus(entry) {
-  if (entry.state === "sending") {
-    if (entry.phase === "queued") {
-      const ahead = outgoingBlocker(entry);
-      return ahead ? `Waiting to send… ${waitingBehind(ahead)}` : "Waiting to send…";
-    }
-    if (entry.phase === "placing") return "Finding out which thread the message you answered is in…";
-    // `#448 send-dedupe`. A slow send says what it is doing, so it never looks stuck: which part is
-    // going, for a post cut in several, and after a lost answer, that it is finding out.
-    const progress = entry.progress;
-    if (progress && progress.parts > 1) {
-      return `Posting part ${Math.min(progress.posted + 1, progress.parts)} of ${progress.parts}…`;
-    }
-    return entry.confirming ? "Sending… Slack is slow to confirm…" : "Sending…";
-  }
-  if (entry.state === "sent") return "Sent.";
-  const prefix = entry.postedCount > 0
-    ? `${entry.postedCount} part${entry.postedCount === 1 ? "" : "s"} confirmed. ` : "";
-  // `#195 send-resilience`. Waiting to go again on its own: say so, and when, so a row that is
-  // about to fix itself does not read as a failure the reader has to act on.
-  const waiting = outgoingRetries.get(entry.id);
-  if (waiting && waiting.offline) {
-    return waiting.unsent ? `${prefix}Offline. Will send when online.` : `${prefix}Sending… Will retry when online.`;
-  }
-  if (waiting) {
-    const seconds = Math.max(1, Math.round((waiting.at - Date.now()) / 1000));
-    // The cause is often a provider's clause without a full stop; another sentence follows it here.
-    const cause = entry.detail && !/[.!?…]$/.test(entry.detail.trim()) ? `${entry.detail.trim()}.` : entry.detail;
-    return `${prefix}Sending… ${cause} Retrying in ${seconds} s.`.replace(/\s+/g, " ");
-  }
-  if (entry.state === "unconfirmed") {
-    return retriesItself(entry)
-      ? `${prefix}Delivery unconfirmed. Retrying cannot post it twice. ${entry.detail}`
-      : `${prefix}Delivery unconfirmed. Check history before retrying to avoid a duplicate. ${entry.detail}`;
-  }
-  return `${prefix}Not sent. ${entry.detail}`;
-}
 
 /**
  * `#430 threads-main-own-sent`. The messages this page has sent, by id, for as long as it is open. The
@@ -8127,218 +7993,9 @@ function storeKeepsOwnPosts(channel) {
  * @param {any} entry
  * @param {Set<string>} drawn the ids of the selected channel's messages drawn in this column
  */
-function sentReceiptRetires(entry, drawn) {
-  return receiptRetires(entry, drawn, {
-    now: () => Date.now(),
-    keepsOwnPosts: storeKeepsOwnPosts,
-    selectedChannel: () => String(selectedChannelId()),
-    storedIn: (channel) => (channelStore.current().channel === channel
-      ? new Set(channelStore.current().messages.map((held) => String(held.id))) : null),
-  });
-}
 
-/**
- * `#500 sent-receipts-pile-up`. Draw the outbox again when `entry`'s receipt, just confirmed, comes due
- * to retire (`sentReceiptRetires`): after its showing, and if that leaves it, at the end of the grace.
- *
- * @param {any} entry
- * @param {number} [due] how long after confirmation to draw again
- */
-function armSentReceipt(entry, due = SENT_RECEIPT_MS) {
-  setTimeout(() => {
-    if (outbox.get(entry.id) !== entry || entry.state !== "sent") return;
-    // Timers can fire before the wall-clock deadline. Retry that deadline instead of
-    // postponing a still-visible receipt straight to the ten-minute fallback.
-    if (Date.now() - entry.sentAt < due) {
-      armSentReceipt(entry, due);
-      return;
-    }
-    renderOutgoingEverywhere();
-    if (outbox.get(entry.id) === entry && due < OWN_POST_GRACE_MS) armSentReceipt(entry, OWN_POST_GRACE_MS);
-  }, Math.max(1, due - (Date.now() - entry.sentAt)));
-}
 
-/** Only provider history/stream observations retire receipts; appending an ACK is not a read. */
-function observeOutgoingMessages(messages) {
-  let changed = false;
-  for (const entry of outbox.values()) {
-    if (entry.state !== "sending" && entry.state !== "sent") continue;
-    if (entry.state === "sending" && entry.phase !== "posting") continue;
-    const seen = outgoingObservations.get(entry.id) || new Set(entry.observedParts);
-    const partIds = new Set(entry.parts.map((part) => part.id));
-    for (const message of messages) {
-      const id = String(message.id);
-      if (String(message.channel_id) === entry.channel &&
-          (entry.state === "sending" || partIds.has(id))) seen.add(id);
-    }
-    outgoingObservations.set(entry.id, seen);
-    const observed = entry.parts.filter((part) => seen.has(part.id)).map((part) => part.id);
-    if (observed.length !== entry.observedParts.length) {
-      entry.observedParts = observed;
-      changed = true;
-    }
-  }
-  if (changed) persistOutgoingMessages();
-}
 
-function renderOutgoingMessages() {
-  const host = el("outgoing-log");
-  const channel = selectedChannelId();
-  // `#491 threads-view-sent-receipt`. And the rows among the Threads view's cards, where that view
-  // draws a reply sent from it: the owner, 2026-10-23, "After it sent there was still a card on the
-  // bottom AND it rendered as a card under the thread. The same message is on the screen twice."
-  const drawnRows = [...el("discord-log").children];
-  if (sideCardsShown()) {
-    drawnRows.push(.../** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
-      .filter((li) => li.hasAttribute("data-unpack-thread") || li.hasAttribute("data-main-row")));
-  }
-  const visibleIds = new Set(drawnRows.flatMap(rowMessages)
-    .filter((message) => String(message.channel_id) === channel).map((message) => String(message.id)));
-  let retired = false;
-  const rows = [];
-  for (const entry of outbox.values()) {
-    // An ACK can render as an ordinary, actionable provider row immediately; its receipt, drawn
-    // only where the message is not, goes by `sentReceiptRetires` (`#500 sent-receipts-pile-up`).
-    const unseen = entry.channel === channel
-      ? entry.parts.filter((part) => !visibleIds.has(part.id)) : entry.parts;
-    if (sentReceiptRetires(entry, visibleIds)) {
-      outbox.remove(entry.id);
-      outgoingObservations.delete(entry.id);
-      retired = true;
-      continue;
-    }
-    if (!outgoingInView(entry)) continue;
-    if (entry.state === "sent" && entry.parts.length && !unseen.length) continue;
-    const row = document.createElement("li");
-    row.className = "outgoing-message";
-    row.setAttribute("data-outgoing-id", entry.id);
-    const waiting = outgoingRetries.has(entry.id);
-    // `#277 send-order`. Waiting its turn is neither sending nor failing.
-    const queued = entry.state === "sending" && entry.phase === "queued";
-    row.setAttribute("data-send-state", waiting ? "retrying" : queued ? "queued" : entry.state);
-    row.setAttribute("data-who", "me");
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.textContent = entry.replyTo ? "You · Reply" : "You";
-    // Never for the scope: a reply in a single-conversation channel is on Main already. The thread
-    // a long post continued in counts too (`#263 post-split-per-provider`).
-    const placedIn = entry.threadId || entry.continueIn;
-    if (placedIn && selection().view !== "thread" && placedIn !== channelStore.current().scope) {
-      const thread = document.createElement("button");
-      thread.className = "thread-badge";
-      thread.setAttribute("type", "button");
-      thread.style.setProperty("--thread-hue", threadHue(placedIn));
-      thread.textContent = "Thread";
-      thread.addEventListener("click", inThisColumn(guardQuietly(() => openThread(placedIn))));
-      meta.append(thread);
-    }
-    const body = document.createElement("div");
-    body.className = "msg-text";
-    const acknowledged = entry.state === "sent" && unseen.length > 0;
-    const text = acknowledged
-      ? unseen.map(rawTextOf).join("\n\n")
-      : entry.postedCount ? entry.remaining : entry.text;
-    // The parts the server acknowledged are drawn as it rendered them; text still on its way is
-    // the reader's own draft, drawn as plain paragraphs until a read brings it back rendered.
-    if (acknowledged) {
-      renderBodyInto(body, unseen);
-    } else {
-      body.append(textBody(text));
-    }
-    const status = document.createElement("div");
-    status.className = "outgoing-status";
-    status.setAttribute("role", "status");
-    if (entry.state === "sending" && !queued) {
-      const spinner = document.createElement("span");
-      spinner.className = "outgoing-spinner";
-      spinner.setAttribute("aria-hidden", "true");
-      status.append(spinner);
-    }
-    const label = document.createElement("span");
-    label.textContent = outgoingStatus(entry) + (outbox.storageOkay() ? "" :
-      " This browser could not save this message. Keep this page open; reloading may lose its text or delivery status.");
-    status.append(label);
-    // `#621 send-double-check`: two very small ticks right after the ellipsis.
-    if (entry.state === "sending" || entry.state === "sent" || entry.tickFailed) {
-      const ticks = document.createElement("span");
-      ticks.className = "send-ticks";
-      ticks.setAttribute("title", sendTimingText(entry));
-      const first = document.createElement("span");
-      first.className = `send-tick${entry.serverTick ? " ok" : ""}`;
-      first.textContent = "✓";
-      first.setAttribute("data-tick", "server");
-      const second = document.createElement("span");
-      second.className = `send-tick${entry.tickFailed ? " bad" : entry.upstreamTick ? " ok" : ""}`;
-      second.textContent = entry.tickFailed ? "✗" : "✓";
-      second.setAttribute("data-tick", "upstream");
-      ticks.append(first, second);
-      ticks.addEventListener("click", () => {
-        entry.showTimes = !entry.showTimes;
-        renderOutgoingEverywhere();
-      });
-      status.append(ticks);
-      if (entry.showTimes) {
-        const times = document.createElement("span");
-        times.className = "send-times";
-        times.textContent = ` ${sendTimingText(entry)}`;
-        status.append(times);
-      }
-    }
-    row.append(meta, body, status);
-    // `#277 send-order`. A message waiting its turn behind another has not left the device: it can be
-    // taken back, Edit and Dismiss, but there is no Retry to send it out of turn.
-    if (entry.state === "failed" || entry.state === "unconfirmed" || queued) {
-      const actions = document.createElement("div");
-      actions.className = "outgoing-actions";
-      const retry = document.createElement("button");
-      retry.className = "outgoing-retry";
-      retry.setAttribute("type", "button");
-      retry.textContent = waiting ? "Retry now" : entry.postedCount ? "Retry unsent text" : "Retry";
-      retry.disabled = !entry.remaining || knownChannel(entry.channel)?.writable === false;
-      retry.addEventListener("click", inThisColumn(guardQuietly(() => retryOutgoingMessage(entry.id))));
-      // `#193 compose-draft-loss`. Back into the box it was written in, and out of the outbox: only
-      // where none of it can be in the channel already (`editableSend`).
-      const edit = document.createElement("button");
-      edit.className = "outgoing-edit";
-      edit.setAttribute("type", "button");
-      edit.textContent = "Edit";
-      edit.setAttribute("title", entry.replyTo
-        ? "Put this text back in Reply on the message it answers, and take it out of the outbox."
-        : "Put this text back in the message box it came from, and take it out of the outbox.");
-      edit.disabled = !unsentText(entry).trim();
-      edit.addEventListener("click", inThisColumn(guardQuietly(() => editOutgoingMessage(entry.id))));
-      const dismiss = document.createElement("button");
-      dismiss.className = "outgoing-dismiss";
-      dismiss.setAttribute("type", "button");
-      dismiss.textContent = "Dismiss";
-      dismiss.setAttribute("title",
-        "Take this out of the outbox. This does not delete a message from the chat service. Undo " +
-          `brings it back, and Settings keeps it under Recently dismissed for ${DISMISSED_SENDS_DAYS} days.`);
-      dismiss.addEventListener("click", inThisColumn(() => dismissOutgoingMessage(entry.id)));
-      actions.append(...(queued ? [] : [retry]), ...(editableSend(entry) ? [edit, dismiss] : [dismiss]));
-      row.append(actions);
-    }
-    // `#129 message-search`. What the reader WROTE, under the word the row prints for them: a
-    // message you sent is a message you look for, and it is sitting in the same list as the ones
-    // you received.
-    searchable(row, "You", text);
-    // `#211 link-filter`. A message you sent can hold a link like any other.
-    row.linkText = String(text);
-    /** @type {any} */ (row).outgoingEntry = entry;
-    rows.push(row);
-  }
-  if (retired) persistOutgoingMessages();
-  // `#467 inline-send-in-place`. A reply sent from the box in the stream stays where the box was.
-  const foot = placeOutgoingInPlace(rows);
-  host.replaceChildren(...foot);
-  // Nor over the Pinned filter, which shows pinned messages and nothing else. `#206 pin-message`.
-  host.hidden = foot.length === 0 || pinsView().only;
-  // `#228 reply-visible`. A reply of the owner's counts on the Reply of the message it answers from
-  // the moment it is queued, and that count changes as it lands, fails or is dismissed: counted
-  // again when the outbox's replies have changed since the counts were drawn. Not on a pass over
-  // the rows, which has just counted them.
-  if (outgoingReplyKey() !== listState().outgoingKey) renderReplyCounts();
-}
 
 // --- a reply's row where its box was ----------------------------------------------------------------
 //
@@ -8366,11 +8023,6 @@ const outgoingInPlaceDrawn = new Map();
 /** The row each list drawn in place is named to, for `outgoingRoomWatch`. */
 const outgoingRoomAnchors = new WeakMap();
 
-/** The room under `anchor`: the height of `group`, drawn there, in px. */
-function fitOutgoingRoom(group, anchor) {
-  const room = `${Math.ceil(group.getBoundingClientRect().height || 0)}px`;
-  if (anchor.style.getPropertyValue("--outgoing-room") !== room) anchor.style.setProperty("--outgoing-room", room);
-}
 
 /** Keeps each row's room as tall as what is drawn under it through a resize or a reflow, as the box's is. */
 const outgoingRoomWatch = typeof window.ResizeObserver === "function"
@@ -8382,95 +8034,7 @@ const outgoingRoomWatch = typeof window.ResizeObserver === "function"
   })
   : null;
 
-/**
- * Put each of `rows` — the outbox's rows for the column being worked on — whose entry was sent from the
- * box in the stream under the row that box was under, and answer the rest, for the foot.
- *
- * @param {HTMLElement[]} rows
- * @returns {HTMLElement[]}
- */
-function placeOutgoingInPlace(rows) {
-  const drawn = outgoingInPlaceDrawn.get(columnWork.active()) || { anchors: [], groups: [] };
-  for (const anchor of drawn.anchors) {
-    anchor.removeAttribute("data-outgoing-anchor");
-    anchor.style.removeProperty("anchor-name");
-    anchor.style.removeProperty("--outgoing-room");
-  }
-  for (const group of drawn.groups) {
-    if (outgoingRoomWatch) outgoingRoomWatch.unobserve(group);
-    if (group.parentNode) group.parentNode.removeChild(group);
-  }
-  // Not under the Pinned filter, which shows pinned messages and nothing else (`#206 pin-message`): the
-  // rows go to the foot, which is hidden there.
-  if (pinsView().only) {
-    outgoingInPlaceDrawn.set(columnWork.active(), { anchors: [], groups: [] });
-    return rows;
-  }
-  // `#500 sent-receipts-pile-up`. Or the Threads view's cards, over the left column's list: a reply sent
-  // from the box under an unpacked row (`#407 unpack-row-parity`) stays under that row, not at the foot
-  // of the cards, until it is drawn there or its receipt goes; never under the same message in Main.
-  const cards = columnWork.active() === columns.main && sideCardsShown() ? [leftEl("side-cards")] : [];
-  /** @type {Map<HTMLElement, {list: HTMLElement, rows: HTMLElement[]}>} */
-  const under = new Map();
-  /** @type {HTMLElement[]} */
-  const foot = [];
-  for (const row of rows) {
-    const entry = /** @type {any} */ (row).outgoingEntry;
-    let found = null;
-    if (entry && entry.inPlace) {
-      for (const list of entry.inCards ? cards : [el("discord-log")]) {
-        const anchor = shownNode(list) ? anchorUnder(list, String(entry.inPlace)) : null;
-        if (anchor) {
-          found = { list, anchor };
-          break;
-        }
-      }
-    }
-    if (!found || found.anchor === replyState.anchor || found.anchor.hasAttribute("data-inline-reply")) {
-      foot.push(row);
-      continue;
-    }
-    const held = under.get(found.anchor) || { list: found.list, rows: [] };
-    held.rows.push(row);
-    under.set(found.anchor, held);
-  }
-  const next = { anchors: [], groups: [] };
-  let n = 0;
-  for (const [anchor, { list, rows: placed }] of under) {
-    const name = `--outgoing-${columnWork.active() === columns.side ? "side" : "main"}-${n++}`;
-    const group = document.createElement("ol");
-    group.className = "messages outgoing-inplace";
-    group.setAttribute("aria-label", "Outgoing reply");
-    group.style.setProperty("position-anchor", name);
-    group.append(...placed);
-    // Straight after the list: where it is drawn without anchor positioning, the list's foot.
-    /** @type {HTMLElement} */ (list.parentNode).insertBefore(group, list.nextSibling);
-    anchor.setAttribute("data-outgoing-anchor", "");
-    anchor.style.setProperty("anchor-name", name);
-    fitOutgoingRoom(group, anchor);
-    outgoingRoomAnchors.set(group, anchor);
-    if (outgoingRoomWatch) outgoingRoomWatch.observe(group);
-    next.anchors.push(anchor);
-    next.groups.push(group);
-  }
-  outgoingInPlaceDrawn.set(columnWork.active(), next);
-  return foot;
-}
 
-/** The outbox's rows in every column showing messages: what the outbox did is no one column's. `#229`. */
-function renderOutgoingEverywhere() {
-  // `#466 reply-promotes-thread`. A send going into a thread, or gone from the outbox, changes that
-  // thread's count and whether the Threads view has a card for it: every row, and the cards, again.
-  if (!pendingThreads.noteDrawn()) {
-    eachColumn(renderOutgoingMessages);
-    return;
-  }
-  eachColumn(() => {
-    renderChannelRows();
-    if (selection().view === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
-  });
-  if (sideColumnUp() && columns.side.mode !== "thread") renderSideCards();
-}
 
 // --- the thread a send goes into, before it is there ------------------------------------------------
 //
@@ -8526,54 +8090,7 @@ function pendingThreadTimes() {
   return pendingThreads.times();
 }
 
-/**
- * The stream has shown this server's copy of a post made for entry `id` (its `client_key`): the store
- * holds it now and counts it in its thread, so the entry no longer does (`pendingThreads`). Not saved:
- * a reload asks the server instead (`unconfirmedSends`).
- */
-function noteOutgoingEcho(id) {
-  const entry = outbox.get(id);
-  if (!entry || entry.state === "sent" || entry.echoed) return;
-  entry.echoed = true;
-  outbox.touch();
-  renderOutgoingEverywhere();
-}
 
-/**
- * `summaries`, with a card for every thread a send in the outbox goes into that they lack, whose root
- * the store holds: the newest first, before the rest, as a thread just answered is the newest.
- *
- * @param {any[]} summaries
- */
-function withPendingThreads(summaries) {
-  const listed = new Set(summaries.map((summary) => String(summary.id)));
-  const viewing = String(selectedChannelId());
-  /** @type {Map<string, any>} */
-  const added = new Map();
-  // The threads sends are going into, and those a reply sent from here is held in, before a read of the
-  // Threads list names them.
-  /** @type {Array<[string, number]>} */
-  const starting = [...pendingThreadTimes()];
-  if (channelStore.current().channel === viewing) {
-    for (const held of channelStore.current().messages) {
-      if (threadOf(held) && held.thread.is_root !== true && sentFromThisPage(held)) {
-        starting.push([String(held.thread.id), ownPosts.sentAt(String(held.id)) || timeOf(held, "timestamp")]);
-      }
-    }
-  }
-  starting.sort((a, b) => b[1] - a[1]);
-  for (const [thread, at] of starting) {
-    if (listed.has(thread) || added.has(thread)) continue;
-    const root = channelStore.current().messages.find((held) => threadOf(held) === thread && held.thread.is_root === true);
-    if (!root) continue;
-    added.set(thread, {
-      id: thread, title: "", root, display_name: null, summary: null, hue: root.thread.hue ?? null,
-      reply_count: null, reply_count_exact: false, complete: false,
-      updated_at: new Date(at || Date.now()).toISOString(),
-    });
-  }
-  return added.size ? [...added.values(), ...summaries] : summaries;
-}
 
 /**
  * Settle where a reply to an unplaced message goes, before anything is posted, and answer the
@@ -9086,33 +8603,6 @@ function outgoingBlocker(entry) {
   return null;
 }
 
-/** Why a queued message is waiting, after "Waiting to send…": what it waits behind, and for what. */
-function waitingBehind(ahead) {
-  const which = `“${sendSnippet(unsentText(ahead))}” goes first`;
-  if (ahead.state === "sending") {
-    return ahead.placement === "unknown" ? `${which}, once it is known which thread it goes in.`
-      : ahead.phase === "queued" ? `${which}, and is waiting its turn too.` : `${which}, and is still sending.`;
-  }
-  const waiting = outgoingRetries.get(ahead.id);
-  if (waiting && waiting.offline) return `${which}, when this device is online.`;
-  if (waiting) {
-    const seconds = Math.max(1, Math.round((waiting.at - Date.now()) / 1000));
-    return `${which}, and goes again in ${seconds} s.`;
-  }
-  // Only the actions its row offers, so the reader is never sent to a button that is not there.
-  const actions = ["Retry", ...(editableSend(ahead) ? ["Edit"] : [])];
-  const choice = `${actions.join(", ")} or Dismiss it to let this one go.`;
-  if (ahead.state === "unconfirmed") return `${which}, and its delivery is unconfirmed. ${choice}`;
-  // `#315 removed-reply-target`. Refused, not undecided: Retry sends it nowhere either.
-  if (ahead.placement === "unknown" && ahead.replyTo && ahead.channel === String(selectedChannelId()) &&
-      removedUpstream(ahead.replyTo)) {
-    return `${which}, and was not sent: the message it answers was removed. ` +
-      `${editableSend(ahead) ? "Edit or Dismiss" : "Dismiss"} it to let this one go.`;
-  }
-  return ahead.placement === "unknown"
-    ? `${which}, and was not sent: which thread it goes in is not known yet. ${choice}`
-    : `${which}, and was not sent. ${choice}`;
-}
 
 /**
  * Put `entry`, just queued or retried, in the outbox's order to go, without making the composer wait
@@ -9557,16 +9047,6 @@ async function dispatchOutgoingMessage(entry, job) {
 //   * While a send is slow, the row says which part is going ("Posting part 2 of 3…"), asked of the
 //     same route every OUTGOING_PROGRESS_MS, so a send that takes seconds never looks stuck.
 
-/** Durations from the Send tap, never absolute times. `#621 send-double-check`. */
-function sendTimingText(entry) {
-  const service = (typeof chatServiceOf === "function" && chatServiceOf(entry.channel)) || "upstream";
-  const server = entry.serverMs;
-  const upstream = entry.upstreamMs;
-  const total = server !== null && server !== undefined && upstream !== null && upstream !== undefined ? server + upstream
-    : Math.max(0, Date.now() - (entry.sendStartedAt || entry.createdAt || Date.now()));
-  const up = upstream === null ? "…" : `+${fmtDuration(upstream)}`;
-  return `server ${fmtDuration(server)} · ${service} ${up} · total ${fmtDuration(total)}`;
-}
 
 /** Whether `error` means the server's answer was lost rather than given. */
 function answerLost(error) {
@@ -9629,22 +9109,6 @@ async function askOutgoingOutcome(entry, job, body) {
   }
 }
 
-/**
- * `#468 send-dedupe`. Ask the server what became of entry `id`, unconfirmed, without posting: the
- * stream has shown this server's copy of a post made under its key, or the page has just loaded with
- * it unconfirmed. Found, it is settled as the post's own answer would have settled it; not found, it
- * is left as it was, for the reader. Goes in the outbox's order like any attempt, under the sign-in it
- * was queued under, and never while it waits to go again on its own (which carries its key anyway).
- */
-function settleFromServer(id) {
-  const entry = outbox.get(id);
-  if (!entry || entry.state !== "unconfirmed" || !IDEMPOTENCY_KEY.test(entry.id) || outgoingRetries.has(id) ||
-      !currentCredential()) return;
-  entry.resolveOnly = { detail: entry.detail };
-  entry.state = "sending";
-  entry.phase = "queued";
-  scheduleOutgoingMessage(entry);
-}
 
 /**
  * Every unconfirmed send in the outbox, asked of the server once per load (`settleFromServer`): one owner
@@ -10031,7 +9495,7 @@ function putBackDismissedSend(id) {
     // The wait the dismissal kept, as `dismissOutgoingMessage` made it: its time, offline, unsent, identity and retries.
     const hold = /** @type {any} */ (offer && offer.id === id ? offer.hold : null);
     if (hold && hold.identity === tokenFingerprint(token())) {
-      entry.retriesUsed = hold.retriesUsed;
+      /** @type {any} */ (entry).retriesUsed = hold.retriesUsed;
       // Waiting for the connection by what the browser says now: one that came back while the send
       // was dismissed fired its `online` with nothing waiting, and will not fire it again.
       holdOutgoingMessage(entry, { ...hold, offline: navigator.onLine === false });
@@ -10094,32 +9558,6 @@ el("dismissed-send-close").addEventListener("click", () => dismissedSendsView.cl
 el("dismissed-send-copy").addEventListener("click", () => dismissedSendsView.copy());
 el("dismissed-send-restore").addEventListener("click", () => dismissedSendsView.restore());
 
-async function sendChannelMessage() {
-  const key = composerState().key;
-  const channel = selectedChannelId();
-  const text = el("channel-compose-text").value;
-  if (knownChannel(channel)?.writable === false) {
-    el("channel-compose-state").textContent = "This channel is read-only.";
-    return;
-  }
-  if (!text.trim() || !channel) return;
-  rememberChannelDraft();
-  // `#300 reply-marks-read`. The first reply in a thread nobody has answered marks its root, as Reply
-  // on the root would; a later one marks nothing, and the main channel's box never does.
-  const completion = queueOutgoingMessage({
-    channel, threadId: selection().threadId, replyTo: null, text,
-    marksRead: rootThisStarts(channel, selection().threadId),
-  });
-  channelDrafts.delete(key);
-  // A failed outbox write leaves the previous durable draft available as a last resort.
-  if (outbox.storageOkay()) saveChannelDrafts();
-  noteDraft("composer", key, String(channel), false);
-  el("channel-compose-text").value = "";
-  fitGrowingBox(el("channel-compose-text"));
-  el("channel-compose-state").textContent = "";
-  scrollToNewest();
-  await completion;
-}
 
 // --- message text, as the server rendered it ------------------------------------------------
 //
@@ -11869,22 +11307,6 @@ function heldReplies(rows) {
   return { replies, held };
 }
 
-/**
- * What of the outbox the Reply counts on the channel on screen are drawn from: each reply's
- * entry, how far its send has got, and what the server said it posted. `renderOutgoingMessages`
- * counts again only when this has changed since the last count. `#228 reply-visible`.
- */
-function outgoingReplyKey() {
-  const viewing = String(selectedChannelId());
-  const parts = [viewing];
-  for (const entry of outbox.values()) {
-    if (entry.channel !== viewing || !entry.replyTo) continue;
-    const first = entry.parts[0];
-    parts.push(`${entry.id}:${entry.state}:${entry.postedCount}:${outgoingRetries.has(entry.id)}:` +
-      `${first ? String(first.id) : ""}`);
-  }
-  return parts.join(" ");
-}
 
 // `outgoingReplyKey` as it stood when the Reply counts were last drawn. Kept per column: `listState().outgoingKey` (`freshListState`, `#624 voice-page-modularity`).
 
@@ -14690,62 +14112,8 @@ function noteDraft(kind, key, channel, written) {
   if (!written || had !== draftLedger.has(kind, key)) renderDraftChip();
 }
 
-/**
- * Whether `draft` still holds words in its store.
- *
- * @param {import("./src/core/outbox/index.ts").DraftEntry} draft
- */
-function draftHeld(draft) {
-  const store = draft.kind === "composer" ? channelDrafts : draft.kind === "reply" ? replyDrafts : quickDrafts;
-  return Boolean((store.get(draft.key) || "").trim());
-}
 
-/**
- * Whether the chip offers `draft`: it holds words, and its message, for a reply or a quick reply, is not one
- * removed from the channel, which leaves nothing to answer (the draft is kept, and not offered).
- *
- * @param {import("./src/core/outbox/index.ts").DraftEntry} draft
- */
-function draftLive(draft) {
-  if (!draftHeld(draft)) return false;
-  if (draft.kind === "composer") return true;
-  const message = draft.kind === "reply" ? draft.key : quoteOwner.quickDraftMessage(draft.key);
-  return !(channelStore.current().channel === draft.channel && channelStore.current().removed.has(message));
-}
 
-/**
- * The drafts of the channel on screen, newest first: the ledger's, then any its stores hold that it does not
- * know of — written before it, or put back by an edit — oldest.
- *
- * @returns {import("./src/core/outbox/index.ts").DraftEntry[]}
- */
-function draftsHere() {
-  const channel = String(selectedChannelId() || "");
-  if (!channel) return [];
-  const known = draftLedger.inChannel(channel, draftLive);
-  const seen = new Set(known.map(draftIdentity));
-  /** @type {import("./src/core/outbox/index.ts").DraftEntry[]} */
-  const more = [];
-  const add = (kind, key) => {
-    const draft = { kind, key, channel, at: 0 };
-    if (!seen.has(draftIdentity(draft)) && draftLive(draft)) more.push(draft);
-  };
-  for (const key of channelDrafts.keys()) {
-    let parts = null;
-    try {
-      parts = JSON.parse(key);
-    } catch (_error) {
-      parts = null;
-    }
-    if (Array.isArray(parts) && String(parts[0]) === channel) add("composer", key);
-  }
-  for (const key of quickDrafts.keys()) if (key.startsWith(`${channel}\n`)) add("quick", key);
-  if (channelStore.current().channel === channel) {
-    const held = new Set(channelStore.current().messages.map((message) => String(message.id)));
-    for (const id of replyDrafts.ids()) if (held.has(id)) add("reply", id);
-  }
-  return [...known, ...more];
-}
 
 /**
  * Whether `node` is shown, drawn, and — given the list `area` it scrolls in — has any of itself inside what
@@ -18966,10 +18334,10 @@ const timelineView = createTimelineView({
   liveSeen: (channel) => liveEvents.seen(channel), liveNews: (channel) => liveEvents.news(channel),
   readsAsked: () => readOrder.asked(), readOrderNow: () => readOrder.now(), sentNumberOf, refreshFailed, within,
   clock: clockOnUse(), discordNode, threadCards, glom, idsOf, rowMessages, hiddenEmpty,
-  hidingRead, readFilterKeeps, gatheredParent, observeOutgoingMessages, noteArchived,
+  hidingRead, readFilterKeeps, gatheredParent, observeOutgoingMessages: (messages) => observeOutgoingMessages(messages), noteArchived,
   noteFreshRead, noteChannelReadFailure, renderChannelLoading, backgroundRead,
   renderChannelNavigation, renderChannelSeam, renderOlderControl: () => renderOlderControl(), renderScrollTools,
-  renderTodoControls, renderChannelRows, setChannelFreshness, renderOutgoingMessages,
+  renderTodoControls, renderChannelRows, setChannelFreshness, renderOutgoingMessages: () => renderOutgoingMessages(),
   channelSummary, channelName, clearChannelScreen, holdingReplyArrows, holdingScrollTools,
   renderChannelFreshness, preservingScroll, columnWork, catchUpHeldView, catchUpFromAll, syncUnreadReplies, followInOtherColumn, keepEntryLanding,
   entryLandingMark, payThreadEntry, saveChannelScope, requestVisibleSummaries,
@@ -19524,17 +18892,101 @@ const liveStream = createLiveStream({
   relayToAgent: (message, selfPosted, replayed, arrival) => voiceCall().relayToAgent(message, selfPosted, replayed, arrival),
   refreshAfterMutation: () => refreshAfterLiveMutation(), noteChannelReadFailure,
   foldLiveMessage: timelineView.foldLiveMessage, appendChannelRow: timelineView.appendChannelRow,
-  appendToColumns: timelineView.appendToColumns, renderOutgoingEverywhere, noteServerThreadHuesIn,
+  appendToColumns: timelineView.appendToColumns, renderOutgoingEverywhere: () => renderOutgoingEverywhere(), noteServerThreadHuesIn,
   threadOf, loadCanon,
   replayLedger,
   replaysWaiting: () => replayLedger.waiting(), readLedgerEpoch: () => readLedger.epoch(),
-  buildCopyOn, noteRemoved, liveFollow, noteOutgoingEcho, settleFromServer, noteSelfAuthor,
+  buildCopyOn, noteRemoved, liveFollow, noteOutgoingEcho: (id) => noteOutgoingEcho(id), settleFromServer: (id) => settleFromServer(id), noteSelfAuthor,
   loadState, renderChannelFreshness, channelReads, columns, queueDiscordLoad,
   noteStartsRead, hiddenStream: { noteMessage: () => hiddenStream.noteMessage(), noteMutation: () => hiddenStream.noteMutation() },
-  followReplyStore, followPlacement, inSideThread, inColumn, el, idsOf, renderOutgoingMessages, ownPosts, liveEvents, entryLandingHolds, sideShowing, hiddenEmpty, listStateNewestId: (id) => { listState().newestId = id; }, scrollToNewest, setJumpNewest, renderScrollTools, requestVisibleSummaries, saveChannelScope, mutationRefresh,
+  followReplyStore, followPlacement, inSideThread, inColumn, el, idsOf, renderOutgoingMessages: () => renderOutgoingMessages(), ownPosts, liveEvents, entryLandingHolds, sideShowing, hiddenEmpty, listStateNewestId: (id) => { listState().newestId = id; }, scrollToNewest, setJumpNewest, renderScrollTools, requestVisibleSummaries, saveChannelScope, mutationRefresh,
   screens, followsNewest,
 });
 const { onStreamFrame, receiveLiveMessage, heldMessage, placesHeld, settleReplays, liveFollowers, refreshAfterLiveMutation } = liveStream;
+/**
+ * Loading what a previous page left unsent (web/src/core/outbox `createOutboxLoads`,
+ * `#624 voice-page-modularity`). Entries are stored as `saved.ts` decoded them; this layer filters no fields.
+ *
+ * @type {import("./src/core/outbox/index.ts").OutboxLoads}
+ */
+const outboxLoads = createOutboxLoads({
+  store: outbox, clock: clockOnUse(), blocker: outgoingBlocker,
+  credential: () => currentCredential(), noteQueuedUnder: (id) => outgoingQueuedUnder.set(id, currentCredential()), keepsOwnPosts: storeKeepsOwnPosts,
+  selectedChannel: () => String(selectedChannelId()),
+  storedIn: (channel) => (channelStore.current().channel === channel
+    ? new Set(channelStore.current().messages.map((held) => String(held.id))) : null),
+  schedule: (entry) => scheduleOutgoingMessage(entry),
+  retryPending: (id) => outgoingRetries.has(id),
+  testKey: (id) => IDEMPOTENCY_KEY.test(id),
+  observations: outgoingObservations,
+  onChange: () => renderOutgoingEverywhere(),
+  now: () => Date.now(),
+});
+const { persist: persistOutgoingMessages, load: loadOutgoingMessages, observe: observeOutgoingMessages, noteEcho: noteOutgoingEcho, settleFromServer, receiptRetires: sentReceiptRetires, armSentReceipt } = outboxLoads;
+/**
+ * The outbox's own rows (web/src/view/channel `createOutboxRows`, `#624 voice-page-modularity`).
+ *
+ * @type {import("./src/view/channel/index.ts").OutboxRows}
+ */
+const outboxRows = createOutboxRows({
+  el, leftEl, selectedChannelId,
+  outgoingThreadOf: (entry) => outgoingThreadOf(entry),
+  entries: () => outbox.values(),
+  removeEntry: (id) => outbox.remove(id),
+  forgetObservations: (id) => { outgoingObservations.delete(id); },
+  receiptRetires: /** @type {any} */ (sentReceiptRetires), blockerOf: (entry) => outgoingBlocker(entry), inPlaceDrawn: outgoingInPlaceDrawn,
+  retryOf: (id) => outgoingRetries.get(id), blockerRemoved: (entry) => entry.channel === String(selectedChannelId()) && Boolean(entry.replyTo && removedUpstream(entry.replyTo)),
+  editableOf: (entry) => editableSend(entry), canRetry: (entry) => retriesItself(entry),
+  snippetOf: (entry) => sendSnippet(unsentText(entry)),
+  sideCardsShown, rowMessages,
+  channelStore: { current: () => channelStore.current() }, threadHue, openThread,
+  renderBodyInto, textBody, storageOkay: () => outbox.storageOkay(),
+  knownChannel, retryOutgoingMessage, editOutgoingMessage, dismissOutgoingMessage,
+  threadCards: (summaries) => threadCards(summaries), pendingThreadTimes, sentFromThisPage, ownSentAt: (id) => ownPosts.sentAt(id), retryKnown: (id) => outgoingRetries.has(id),
+  renderSideCards: () => renderSideCards(), renderChannelRows,
+  pinsOnly: () => pinsView().only,
+  searchable,
+  listState: () => listState(), renderReplyCounts, columnWork,
+  roomWatch: outgoingRoomWatch, roomAnchors: outgoingRoomAnchors, selection,
+  serviceOf: (entry) => (typeof chatServiceOf === "function" && chatServiceOf(entry.channel)) || "upstream",
+  nowMs: () => Date.now(), dismissedDays: DISMISSED_SENDS_DAYS,
+  unsentText: (entry) => unsentText(entry),
+  anchorUnder, columns, eachColumn, edit: (id) => editOutgoingMessage(id), guardQuietly,
+  inThisColumn, now: () => Date.now(), pendingThreads, persist: () => persistOutgoingMessages(),
+  replyState: /** @type {any} */ (replyState), retry: (id) => retryOutgoingMessage(id), shownNode, sideColumnUp, timelineRows,
+});
+const { outgoingInView, renderOutgoingMessages, renderOutgoingEverywhere, withPendingThreads, outgoingReplyKey, fitOutgoingRoom } = outboxRows;
+/**
+ * Sending from the channel's message box (web/src/view/composer `createChannelSend`,
+ * `#624 voice-page-modularity`).
+ *
+ * @type {import("./src/view/composer/index.ts").ChannelSend}
+ */
+const channelSend = createChannelSend({
+  composerState, composerKeys: /** @type {any} */ (composerKeys), el: /** @type {any} */ (el), selectedChannelId, selectionThreadId: () => selection().threadId,
+  knownWritable: (channel) => knownChannel(channel)?.writable !== false,
+  rootThisStarts, queueOutgoingMessage,
+  channelDrafts: { get: (key) => channelDrafts.get(key), set: (key, text) => channelDrafts.set(key, text), delete: (key) => channelDrafts.delete(key), save: () => channelDrafts.save() },
+  storageOkay: () => outbox.storageOkay(), noteDraft, fitBox: (box) => fitGrowingBox(box),
+  draftRefusedWords: CHANNEL_DRAFT_REFUSED, scrollToNewest, renderChannelNavigation, renderDraftChip,
+});
+const { sendChannelMessage, rememberChannelDraft, restoreChannelComposer, saveChannelDrafts, channelComposerKey, onComposerKey } = channelSend;
+/**
+ * Which drafts are held, and whether one is live (web/src/core/outbox `createDraftQueries`,
+ * `#624 voice-page-modularity`). Writing the ledger stays with each writer.
+ *
+ * @type {import("./src/core/outbox/index.ts").DraftQueries}
+ */
+const draftQueries = createDraftQueries({
+  ledger: draftLedger,
+  composerDraft: (key) => channelDrafts.get(key), composerDraftKeys: () => channelDrafts.keys(),
+  replyDraft: (key) => replyDrafts.get(key), replyDraftIds: () => replyDrafts.ids(),
+  quickDraft: (key) => quickDrafts.get(key), quickDraftKeys: () => quickDrafts.keys(),
+  quickDraftMessage: (key) => quoteOwner.quickDraftMessage(key),
+  storeNow: () => ({ channel: channelStore.current().channel, removed: channelStore.current().removed, messages: channelStore.current().messages }),
+  selectedChannelId,
+});
+const { draftHeld, draftLive, draftsHere } = draftQueries;
 
 
 

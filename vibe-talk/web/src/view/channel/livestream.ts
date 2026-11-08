@@ -76,8 +76,8 @@ export interface LiveStreamDependencies {
   renderOutgoingMessages(): void;
   screens: { view(): string; screen(): string };
   followsNewest(area: HTMLElement): boolean;
-  noteOutgoingEcho(message: Message): void;
-  settleFromServer(message: Message): void;
+  noteOutgoingEcho(id: string): void;
+  settleFromServer(id: string): void;
   noteSelfAuthor(authorId: unknown): void;
   loadState(): { freshness: string; freshAt: number; generation: number };
   renderChannelFreshness(): void;

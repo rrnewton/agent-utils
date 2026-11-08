@@ -587,3 +587,44 @@ test("`#892 voice-page-optimistic-done`: a write the server never answered goes 
   await assert.rejects(retryingWrite(async () => { throw Object.assign(new Error("refused"), failures.shift()); },
     { wait: async () => {}, waiting: () => {} }), /refused/, "the server's refusal was not thrown");
 });
+
+test("`#624 voice-page-modularity`: loading restores a saved send as decoded and never replays it, from the module alone", () => {
+  const { createOutboxLoads, createDraftQueries, createOutboxStore } = OUTBOX;
+  const saved = new Map([["vibe-talk.outgoing-messages", JSON.stringify([{
+      id: "key-1", channel: "c", threadId: null, placement: null, replyTo: null, marksRead: null,
+      originView: "main", text: "hello", remaining: "hello", state: "failed", phase: "",
+      createdAt: 1, postedCount: 0, parts: [], observedParts: [], keyedOnly: true,
+      mayHavePosted: false, continueIn: null, wire: null, sentAt: 0, sendStartedAt: 0,
+      serverMs: null, upstreamMs: null, postToMain: true, futureField: { keep: 1 },
+    }])]]);
+  const storage = {
+    getItem: (key) => saved.get(key) ?? null,
+    setItem: (key, value) => saved.set(key, value),
+    removeItem: (key) => saved.delete(key),
+  };
+  const store = createOutboxStore({ storage, makeRoom: () => {}, keepsOwnPosts: () => true });
+  let scheduled = 0;
+  const loads = createOutboxLoads({
+    store, now: () => 1000, clock: { setTimeout: () => 0, clearTimeout: () => {} },
+    blocker: () => null, credential: () => "cred", noteQueuedUnder: () => {}, keepsOwnPosts: () => true,
+    selectedChannel: () => "c", storedIn: () => new Set(),
+    schedule: () => { scheduled += 1; }, retryPending: () => false,
+    testKey: (id) => id.startsWith("key-"), onChange: () => {},
+    observations: new Map(),
+  });
+  loads.load();
+  const [entry] = [...store.values()];
+  assert.equal(entry.state, "failed");
+  // Unknown saved fields are saved.ts decode's business (#1052 extends it for postToMain);
+  // loading itself stores the decoded entry as-is and only touches state/phase/detail.
+  assert.equal(scheduled, 0, "loading must never replay a POST");
+  const queries = createDraftQueries({
+    ledger: { inChannel: () => [] },
+    composerDraft: () => "words", composerDraftKeys: () => [],
+    replyDraft: () => undefined, replyDraftIds: () => [],
+    quickDraft: () => undefined, quickDraftKeys: () => [],
+    quickDraftMessage: () => "", storeNow: () => ({ channel: "c", removed: new Set(), messages: [] }),
+    selectedChannelId: () => "c",
+  });
+  assert.equal(queries.draftHeld({ kind: "composer", key: "k", channel: "c", at: 0 }), true);
+});

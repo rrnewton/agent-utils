@@ -27,3 +27,5 @@ export { mountKeyboardListeners } from "./keyboardlisteners.ts";
 export type { KeyboardListeners, KeyboardListenersDependencies } from "./keyboardlisteners.ts";
 export { mountQuickReplyListeners } from "./quickreply.ts";
 export type { QuickReplyListeners, QuickReplyListenersDependencies } from "./quickreply.ts";
+export { createChannelSend } from "./send.ts";
+export type { ChannelSend, ChannelSendDependencies } from "./send.ts";

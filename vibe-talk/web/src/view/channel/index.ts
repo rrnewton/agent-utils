@@ -175,3 +175,5 @@ export { createServerSearchCopy } from "./serversearch.ts";
 export type { ServerSearch, ServerSearchDependencies } from "./serversearch.ts";
 export { createPinnedMessages } from "./pins.ts";
 export type { PinnedMessages, PinnedMessagesDependencies, PinsView } from "./pins.ts";
+export { createOutboxRows } from "./outboxrows.ts";
+export type { OutboxRows, OutboxRowsDependencies, OutgoingRowEntry } from "./outboxrows.ts";

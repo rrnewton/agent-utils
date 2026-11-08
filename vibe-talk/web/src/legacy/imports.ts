@@ -53,9 +53,7 @@ export {
 } from "../core/sync/index.ts";
 export {
   DISMISSED_SENDS_DAYS,
-  OWN_POST_GRACE_MS,
   QUICK_DRAFTS_KEY,
-  SENT_RECEIPT_MS,
   createChannelDrafts,
   createDismissedSends,
   createDraftLedger,
@@ -69,7 +67,6 @@ export {
   createSendNumbers,
   createSendUndo,
   createUnconfirmedSends,
-  draftIdentity,
   editableSend as outboxEditable,
   nextRetryAt,
   outgoingFromSaved as entryFromSaved,
@@ -119,7 +116,7 @@ export { createSerialQueue, sentenceStart } from "../foundation/index.ts";
 
 export { briefAge, fullLocalAt, fullLocalTime, stamp } from "../present/time/index.ts";
 
-export { doneReadWords, failureWords, fmtDuration, localReadWords, messagesWords, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, searchMomentWords, serviceReadWords } from "../present/notices/index.ts";
+export { doneReadWords, failureWords, localReadWords, messagesWords, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, searchMomentWords, serviceReadWords } from "../present/notices/index.ts";
 export { LINK_KINDS_KEY, READ_MODES, READ_MODE_KEY, READ_MODE_SAID, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, cardGapWords, cardRunText, collapsedLinesWords, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, createReadRuns, createThreadOrder, editedDrawn, firstLineOf, forgetElisionCounts, gapWords, inThreadOrder, isNoise, mainRunsAmong, messageLook, quoteBlock, rawTextOf, reactionsDrawn, readRunText, renderedHtmlOf, replyMarkerName, rowEdited, savedReadMode, threadChoice, threadFacts, threadOrderAfter, undoLabel, undoName, upstreamUrlOf } from "../present/rows/index.ts";
 export { COLUMN_IDS, DAY_TITLED, PULL_WAIT_MS, QUOTE_REPLY_TITLE, anchorOfRow, authorPasses, cardRunIds, createArming, createCardFlight, createCardPlaces, createCardsDrawn, createColumnLinks, createColumnWork, createColumns, createFilterChanges, createFootRooms, createLayoutShown, createLinkedMark, createPackSlides, createPullToRefresh, createQuoting, createReplyState, createRowDrawing, createRowGestures, createScrollKeeping, createThreadHues, createUnderLists, createUnpackWatch, fillCardText, foldedTextLine, freshenDayTitle, fromGatheredThread, gutterPiece, idsOf, isMessageRow, markCardLayout, messageTop, mountChannelViewControls, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, pointerOn, quoteLabelFits, renderedText, rowIn, rowMessages, rowShown, rowTimeTabStop, sameCardPlace, setArrowReach, setMarkerLift, shownRowFor, stackUnder, standingRow } from "../view/channel/index.ts";
 
@@ -187,8 +184,12 @@ export { createTimelineView } from "../view/channel/index.ts";
 export { COLLAPSE_OVER_CHARS, FOLD_LESS, FOLD_LISTS, FOLD_MORE, createFolding } from "../view/channel/index.ts";
 export { DISMISS_BATCH, createChannelRows } from "../view/channel/index.ts";
 export { createSearchRows } from "../view/channel/index.ts";
-export { SEARCH_OLDER_HITS, SEARCH_OLDER_MS, SEARCH_OLDER_PAGES, SEARCH_OLDER_TAP_MS, createCardGaps, createChannelRefresh, createLiveStream, createMessageBodies, createPackControls, createRowDress, createUnpackBlock, mountOlderWalks } from "../view/channel/index.ts";
+export { SEARCH_OLDER_HITS, SEARCH_OLDER_MS, SEARCH_OLDER_PAGES, SEARCH_OLDER_TAP_MS, createCardGaps, createChannelRefresh, createLiveStream, createMessageBodies, createOutboxRows, createPackControls, createRowDress, createUnpackBlock, mountOlderWalks } from "../view/channel/index.ts";
 export { createRowLinks } from "../view/channel/index.ts";
 export { headingLength, headingOf } from "../present/rows/index.ts";
 export { createCardLines, createReadingBookmark, createSpeakers } from "../view/channel/index.ts";
 export { createPinnedMessages, createServerSearchCopy } from "../view/channel/index.ts";
+
+// outbox loads, drafts and sends (#624 mu-readcore O1)
+export { createChannelSend } from "../view/composer/index.ts";
+export { createDraftQueries, createOutboxLoads } from "../core/outbox/index.ts";

@@ -18,3 +18,5 @@ export { doneReadWords, localReadWords, serviceReadWords } from "./marks.ts";
 export type { ServiceReadMark } from "./marks.ts";
 export { messagesWords, reachBackWords, reachClause, repliesWalkWords, searchMomentWords, searchWalkProgress, searchWalkWords } from "./search.ts";
 export type { EndedWalk, HistoryReach, RepliesWalkFacts, WalkFacts } from "./search.ts";
+export { outgoingStatusWords, sendTimingTextWords, waitingBehindWords } from "./outgoing.ts";
+export type { OutgoingRetryHold, OutgoingStatusEntry } from "./outgoing.ts";

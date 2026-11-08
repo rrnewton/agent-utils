@@ -13,13 +13,12 @@ const css = readWeb("voice.css");
 const NOTICES = await moduleForTests("src/present/notices/index.ts");
 
 function loadHelpers() {
-  const start = js.indexOf("function sendTimingText");
-  const end = js.indexOf("/** Whether `error` means the server's answer was lost");
-  assert.ok(start > 0 && end > start, "duration helpers present");
-  const ctx = { chatServiceOf: () => "Slack", fmtDuration: NOTICES.fmtDuration };
-  vm.createContext(ctx);
-  vm.runInContext(js.slice(start, end), ctx);
-  return ctx;
+  // sendTimingText moved to present/notices as sendTimingTextWords (`#624 voice-page-modularity`).
+  assert.ok(typeof NOTICES.sendTimingTextWords === "function" && typeof NOTICES.fmtDuration === "function", "duration helpers present");
+  return {
+    fmtDuration: NOTICES.fmtDuration,
+    sendTimingText: (entry) => NOTICES.sendTimingTextWords(entry, "Slack", entry.sendStartedAt),
+  };
 }
 
 test("duration readout shows deltas from Send, never absolute times", () => {
@@ -32,10 +31,12 @@ test("duration readout shows deltas from Send, never absolute times", () => {
 });
 
 test("two ticks render gray then green, failure is not green", () => {
-  assert.match(js, /data-tick", "server"/);
-  assert.match(js, /data-tick", "upstream"/);
-  assert.match(js, /entry\.serverTick \? " ok"/);
-  assert.match(js, /entry\.tickFailed \? " bad"/);
+  // The ticks are drawn by web/src/view/channel/outboxrows.ts now (`#624 voice-page-modularity`).
+  const rows = readWeb("src/view/channel/outboxrows.ts");
+  assert.match(rows, /data-tick", "server"/);
+  assert.match(rows, /data-tick", "upstream"/);
+  assert.match(rows, /entry\.serverTick \? " ok"/);
+  assert.match(rows, /entry\.tickFailed \? " bad"/);
   assert.match(css, /\.send-tick \{[^}]*font-size: 9px/);
   assert.match(css, /\.send-tick\.ok \{[^}]*color: #1a9e54/);
   assert.match(css, /\.send-tick\.bad \{[^}]*color: #c0392b/);

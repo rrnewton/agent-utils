@@ -5126,7 +5126,8 @@ async function writeInThread(page, text, side = false) {
   await page.settle();
 }
 
-/** The rule's own line in `sendChannelMessage`, taken out for a negative control. */
+/** The rule's own line in `sendChannelMessage` (web/src/view/composer/send.ts since
+ * `#624 voice-page-modularity`), taken out for a negative control. */
 const STARTS_THREAD = "    marksRead: rootThisStarts(channel, selection().threadId),\n";
 
 test("`#300 reply-marks-read`: the first reply written in a thread nobody has answered marks its root read, here and at the provider; the next marks nothing", async () => {
@@ -5154,7 +5155,7 @@ test("`#300 reply-marks-read`: the first reply written in a thread nobody has an
 
   // THE CONTROL, which is the owner's report: without the rule the first reply in the thread marks
   // nothing, where Reply on the same message would have.
-  const { page: control } = await markerPage(brokenScript(STARTS_THREAD, "    marksRead: null,\n"));
+  const { page: control } = await markerPage(await brokenModule([{ file: "src/view/composer/send.ts", find: STARTS_THREAD, replace: "    marksRead: null,\n" }]));
   await pickThread(control, "main");
   await threadBadge(rowOf(control, "210")).click();
   await control.settle();

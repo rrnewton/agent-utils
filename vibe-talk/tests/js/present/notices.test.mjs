@@ -93,3 +93,11 @@ test("`#624 voice-page-modularity`: the cards' walk says how it ended in threads
   assert.match(repliesWalkWords(walk(2, 100, 2), "budget", facts()), /^Found 2 threads in 100 older messages fetched from Slack in 20 s\.$/);
   assert.match(repliesWalkWords(walk(2, 100, 0), "done", facts(Date.UTC(2026, 9, 3, 9, 2))), /^No more threads match in 100 older messages fetched from Slack, back to .+\.$/);
 });
+
+test("`#624 voice-page-modularity`: what an unsent row says, from the module alone", () => {
+  const { outgoingStatusWords, waitingBehindWords } = NOTICES;
+  const entry = { id: "a", channel: "c", state: "failed", text: "hello world this is long", parts: [], observedParts: [], detail: "the chat service refused it" };
+  assert.equal(outgoingStatusWords({ ...entry, state: "sent" }, null, undefined, undefined, false, 0, true, () => true, ""), "Sent.");
+  assert.match(outgoingStatusWords(entry, null, undefined, undefined, false, 0, true, () => false, ""), /Not sent/);
+  assert.match(waitingBehindWords(entry, undefined, false, 0, true, "hello"), /goes first/);
+});

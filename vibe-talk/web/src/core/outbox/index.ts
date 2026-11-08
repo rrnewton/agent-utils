@@ -38,3 +38,7 @@ export { SEND_UNDO_MS, createSendUndo } from "./sendundo.ts";
 export type { SendDismissal, SendUndo, SendUndoDependencies } from "./sendundo.ts";
 export { createUnconfirmedSends } from "./unconfirmed.ts";
 export type { UnconfirmedSends, UnconfirmedSendsDependencies } from "./unconfirmed.ts";
+export { createOutboxLoads } from "./loads.ts";
+export type { LiveOutgoingEntry, OutboxLoads, OutboxLoadsDependencies } from "./loads.ts";
+export { createDraftQueries } from "./draftqueries.ts";
+export type { DraftLedgerLike, DraftQueries, DraftQueriesDependencies } from "./draftqueries.ts";
