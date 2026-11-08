@@ -1,11 +1,12 @@
 ---
 title: 'standalone-journal-busy: a standalone recovery journal mismatch during an in-flight slot operation refuses hard instead of reporting retryable busy'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-wrkslots
 created_at: 2026-11-08T00:20:00.000000000+00:00
-updated_at: 2026-11-08T00:25:00.000000000+00:00
+updated_at: 2026-11-08T13:20:05.000000000+00:00
+closed_at: 2026-11-08T13:20:05.000000000+00:00
 ---
 
 # Description
@@ -39,3 +40,7 @@ Order for mu-wrkslots: after #993, ahead of #1029 clean-caches-skip-running-gate
 - The concurrent mutation was a wrkslots reclaim/finish of one of the consumer's slots, EVENTS 43965-43977: prepared 00:02:28Z, fenced 00:02:44-00:03:09Z, removed 00:03:11Z, completed 00:03:21Z (2026-11-08 UTC). The refusal window overlaps the prepared-to-fenced span.
 - The standalone journal compared mid-flight was worktrees/ACTIVE.<machine>.journal (cli.py _journal_path), live for that reclaim. By 00:04:30Z it was absent and classify said NONBLOCKING, journals=0.
 - Repro suggestion: run a slot reclaim (prepare -> fence -> remove) concurrently with classify-create-journals.
+
+## Resolution
+
+[watermelon-full-preview mu-salvage] Landed on github/main as 953bbb4c. Classify in both editions now reports a standalone journal mismatch as retryable busy only with real in-flight proof: the registry writer lock is held (read from /proc/locks, with a descriptor scan fallback for boxed steps), or a task scope the journal carries still verifies for its recorded owner. A merely live slot owner or coordinator no longer counts, so the hard refusal stands when nothing is in flight, including for a tampered legacy create journal. Parity tests hold the writer lock over a mismatched standalone journal (busy, exit 75, both editions) and keep the hard refusal with no live operation. Gate on the final commit: 62/63 selected steps in the full gate, with python.wrkslots.shard-6 passing in its exclusive rerun. Unverified: no live reclaim was raced against classify on a production registry; the race is covered by the lock-held fixture in both editions.
