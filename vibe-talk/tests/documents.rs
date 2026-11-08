@@ -12,8 +12,10 @@ use tower::ServiceExt as _;
 use vibe_talk::documents::{
     Entry, FetchError, FetchedRaw, Fetcher, GithubFetcher, Index, Service, TokenSource,
 };
+use vibe_talk::elevenlabs::fake::FakeElevenLabs;
 use vibe_talk::http::router;
 use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
+use vibe_talk::speech_tickets::SpeechTickets;
 use vibe_talk::testing::{self, READ_CHANNEL, READ_TOKEN, WRITE_TOKEN};
 
 const KEY: &str = "github:octo/widgets@main:docs/report.md";
@@ -92,7 +94,20 @@ fn message(id: &str, at_ms: i64, text: &str) -> Message {
 /// A router whose documents service indexes two mentions of one report, plus a
 /// second document, fetching from the fake GitHub.
 fn harness() -> (axum::Router, Arc<FakeGithub>) {
-    let (mut state, _discord) = testing::state();
+    let (app, github, _tickets, _elevenlabs) = speech_harness();
+    (app, github)
+}
+
+/// [`harness`], plus the speech tickets it mints into and the fake vendor it
+/// speaks through: what a document speech ticket holds, and what the vendor
+/// was actually told to say (`#1039 documents-read-parity`).
+fn speech_harness() -> (
+    axum::Router,
+    Arc<FakeGithub>,
+    Arc<SpeechTickets>,
+    Arc<FakeElevenLabs>,
+) {
+    let (mut state, _discord, elevenlabs) = testing::state_parts();
     let github = Arc::new(FakeGithub::default());
     github.put(KEY, "# Real Title\n\nbody\n\n## Part\n", "v1");
     let index = Arc::new(Index::new(Vec::new()));
@@ -118,7 +133,8 @@ fn harness() -> (axum::Router, Arc<FakeGithub>) {
         "https://github.com/octo/widgets/blob/main/docs/other.md",
     );
     state.documents = Arc::new(Service::new(index, github.clone(), 100, 1 << 20));
-    (router(state), github)
+    let tickets = Arc::clone(&state.speech_tickets);
+    (router(state), github, tickets, elevenlabs)
 }
 
 async fn call(
@@ -151,6 +167,45 @@ async fn call(
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
+}
+
+/// [`call`] for an answer that is audio, not JSON: what a ticket plays.
+async fn call_bytes(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::empty()).expect("request"))
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (status, bytes.to_vec())
+}
+
+/// Fetch the report into the cache, as the page's fetch does before a read.
+async fn cache_report(app: &axum::Router) {
+    let (status, body) = call(
+        app,
+        "POST",
+        "/api/v1/documents/fetch",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "key": KEY })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 fn encoded(key: &str) -> String {
@@ -530,4 +585,178 @@ async fn a_commit_ref_never_looks_in_the_tree() {
         0,
         "a commit ref looked in the tree"
     );
+}
+/// `#1039 documents-read-parity`: a cached document prepares like a channel
+/// message — one ticket naming the server's cached words, its blocks listed,
+/// each block playable through the same ticket URL. Text a caller puts in
+/// the request is never what is spoken.
+#[tokio::test]
+async fn document_speech_prepare_mints_a_ticket_from_cached_content() {
+    let (app, github, _tickets, elevenlabs) = speech_harness();
+    github.put(
+        KEY,
+        "First paragraph of the report says hello to the reader.\n\n\
+         Second paragraph of the report says goodbye to the reader.\n",
+        "v1",
+    );
+    cache_report(&app).await;
+
+    // The percent-encoded key, as the page sends it, at read scope. The
+    // decoy text rides along to prove it is not what gets spoken.
+    let uri = format!("/api/v1/documents/{}/speech/prepare", encoded(KEY));
+    let (status, body) = call(
+        &app,
+        "POST",
+        &uri,
+        Some(READ_TOKEN),
+        Some(serde_json::json!({
+            "text": "caller supplied words that must never be spoken"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["expires_in_seconds"], 600, "{body}");
+    let prepared = body["prepared"].as_array().expect("prepared");
+    assert_eq!(prepared.len(), 1, "{body}");
+    assert_eq!(prepared[0]["message_id"], KEY, "{body}");
+    let url = prepared[0]["url"].as_str().expect("url").to_owned();
+    assert!(url.starts_with("/api/v1/speech/"), "{url}");
+    let blocks = prepared[0]["blocks"].as_array().expect("blocks listed");
+    assert_eq!(blocks.len(), 2, "{body}");
+    assert_eq!(blocks[0]["kind"], "paragraph", "{body}");
+    assert_eq!(blocks[0]["spoken"], true, "{body}");
+    assert!(blocks[0]["chars"].as_u64().expect("chars") > 0, "{body}");
+    assert_eq!(blocks[0]["element"], 0, "{body}");
+    assert_eq!(blocks[0]["piece"], 0, "{body}");
+    assert_eq!(blocks[0]["pieces"], 1, "{body}");
+    assert_eq!(blocks[1]["element"], 1, "{body}");
+
+    // Block 0 plays from the ticket, with no bearer token, as an
+    // `<audio src>` asks; the vendor is told the cached paragraph.
+    let (status, audio) = call_bytes(
+        &app,
+        "GET",
+        &format!("{url}?selection=doc-read&block=0"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!audio.is_empty(), "no audio came back for block 0");
+    let spoken = elevenlabs.spoken().join("\n");
+    assert!(spoken.contains("First paragraph"), "{spoken}");
+    assert!(
+        !spoken.contains("caller supplied"),
+        "caller text was spoken: {spoken}"
+    );
+
+    // A block the preparation never listed is not there to play.
+    let (status, body) = call(
+        &app,
+        "GET",
+        &format!("{url}?selection=doc-read&block=99"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "unknown_speech_block", "{body}");
+}
+
+/// `#1039 documents-read-parity`: an unknown key is the documents 404; a
+/// known document nobody has fetched prepares nothing, and asking does not
+/// fetch it.
+#[tokio::test]
+async fn document_speech_prepare_unknown_is_404_and_uncached_is_empty() {
+    let (app, github) = harness();
+
+    let uri = format!(
+        "/api/v1/documents/{}/speech/prepare",
+        encoded("github:octo/widgets@main:docs/nope.md")
+    );
+    let (status, body) = call(
+        &app,
+        "POST",
+        &uri,
+        Some(READ_TOKEN),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "unknown_document", "{body}");
+
+    // Indexed by the harness's third message, never fetched.
+    let uri = format!(
+        "/api/v1/documents/{}/speech/prepare",
+        encoded("github:octo/widgets@main:docs/other.md")
+    );
+    let fetches_before = *github.fetches.lock().expect("lock");
+    let (status, body) = call(
+        &app,
+        "POST",
+        &uri,
+        Some(READ_TOKEN),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["prepared"], serde_json::json!([]), "{body}");
+    assert_eq!(body["expires_in_seconds"], 600, "{body}");
+    assert_eq!(
+        *github.fetches.lock().expect("lock"),
+        fetches_before,
+        "preparing speech fetched the document"
+    );
+}
+
+/// `#1039 documents-read-parity`: pace and voice are kept on the ticket the
+/// way channel preparation keeps them — the pace clamped to the spoken
+/// range, the voice trimmed, a voice of only blank space none at all.
+#[tokio::test]
+async fn document_speech_prepare_keeps_clamped_speed_and_trimmed_voice() {
+    let (app, _github, tickets, _elevenlabs) = speech_harness();
+    cache_report(&app).await;
+    let uri = format!("/api/v1/documents/{}/speech/prepare", encoded(KEY));
+    let claim = |body: &Value| {
+        let url = body["prepared"][0]["url"].as_str().expect("url");
+        let ticket = url.strip_prefix("/api/v1/speech/").expect("ticket url");
+        tickets.claim(ticket).expect("the minted ticket is held")
+    };
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        &uri,
+        Some(READ_TOKEN),
+        Some(serde_json::json!({ "speed": 99.0, "voice": "  some-voice  " })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let prepared = claim(&body);
+    assert_eq!(prepared.channel, "", "a document has no channel");
+    assert_eq!(prepared.message, KEY);
+    assert_eq!(prepared.speed, Some(2.0), "the pace was not clamped");
+    assert_eq!(
+        prepared.voice.as_deref(),
+        Some("some-voice"),
+        "the voice was not trimmed"
+    );
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        &uri,
+        Some(READ_TOKEN),
+        Some(serde_json::json!({ "speed": 0.01, "voice": "   " })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let prepared = claim(&body);
+    assert_eq!(prepared.speed, Some(0.5), "the pace was not clamped");
+    assert_eq!(prepared.voice, None, "a blank voice names no voice");
+
+    // And a ticket minted this way still plays whole.
+    let url = body["prepared"][0]["url"].as_str().expect("url");
+    let (status, audio) = call_bytes(&app, "GET", url, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!audio.is_empty(), "no audio came back");
 }

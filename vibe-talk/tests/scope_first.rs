@@ -127,6 +127,12 @@ fn inventory() -> Vec<Route> {
         route("DELETE", "/api/v1/documents/cache", Write, Nothing),
         route("GET", "/api/v1/documents/{key}", Read, Nothing),
         route("GET", "/api/v1/documents/{key}/freshness", Write, Nothing),
+        route(
+            "POST",
+            "/api/v1/documents/{key}/speech/prepare",
+            Read,
+            Json(r#"{}"#),
+        ),
         route("GET", "/api/v1/channels", Read, Nothing),
         route(
             "GET",

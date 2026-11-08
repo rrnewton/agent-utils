@@ -5903,8 +5903,20 @@ fn spoken_blocks(
     now: i64,
     zone: &crate::clock::Zone,
 ) -> Vec<SpokenBlock> {
+    spoken_blocks_for(&message.content, markup, &message.mentions, now, zone)
+}
+
+/// [`spoken_blocks`] for text that is not a channel message: a cached document's
+/// Markdown, with no mentions to name. `#1039 documents-read-parity`.
+fn spoken_blocks_for(
+    content: &str,
+    markup: crate::render::Markup,
+    mentions: &[crate::model::MentionName],
+    now: i64,
+    zone: &crate::clock::Zone,
+) -> Vec<SpokenBlock> {
     use crate::render::BlockKind;
-    let blocks = crate::render::source_blocks(&message.content, markup, &message.mentions);
+    let blocks = crate::render::source_blocks(content, markup, mentions);
     // `read-chunk-balance`: a message that is one block is cut finer than a block of a longer one.
     let alone = blocks.len() == 1;
     let cut: Vec<(BlockKind, Vec<String>)> = blocks
@@ -5943,7 +5955,7 @@ fn spoken_blocks(
             let said = crate::speakable::for_speech_with(
                 &crate::speakable::with_mention_names(
                     crate::render::piece_source(&source),
-                    &message.mentions,
+                    mentions,
                 ),
                 now,
                 zone,
@@ -7512,4 +7524,104 @@ pub async fn clear_documents_cache(
     let cleared = state.documents.cache_len();
     state.documents.clear_cache();
     Ok(Json(serde_json::json!({ "cleared": cleared })).into_response())
+}
+
+/// What document read-aloud asks for, beside the key in its path.
+#[derive(Debug, Deserialize)]
+pub struct PrepareDocumentSpeechRequest {
+    /// The pace the reader has chosen, if they have chosen one.
+    pub speed: Option<f64>,
+    /// The voice the reader has chosen in Settings, for a provider with a
+    /// catalogue. `#552 wit-tts-provider`.
+    pub voice: Option<String>,
+}
+
+/// `POST /api/v1/documents/{key}/speech/prepare` — mint a speech ticket for a
+/// cached document, as [`prepare_speech`] mints one per channel message.
+/// READ scope; the key is percent-decoded by the router, as in [`get_document`].
+///
+/// The text spoken is the server's cached copy, never anything the caller
+/// sends: a ticket names text this server chose, which is what keeps a
+/// caller's arbitrary text from spending the vendor through the ticket. A
+/// document this server has not fetched, or one with nothing speakable in it,
+/// is simply absent from `prepared`, as an unresolved message id is;
+/// preparing never fetches. `#1039 documents-read-parity`.
+pub async fn prepare_document_speech(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+    Path(key): Path<String>,
+    Json(request): Json<PrepareDocumentSpeechRequest>,
+) -> Result<Json<PrepareSpeechResponse>, ApiError> {
+    let preparation_began = std::time::Instant::now();
+    if state.speech.describe().playback == crate::speech::Playback::Browser {
+        return Err(SpeechError::BrowserPlaybackRequired.into());
+    }
+    if state.documents.index.get(&key).is_none() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_document",
+            "no such document",
+        ));
+    }
+    // Best effort, as channel preparation: transport and session readiness
+    // move ahead of the tap, and a failure still belongs to playback.
+    let _warm_up_started = state
+        .read_ahead
+        .start_warm_up(std::sync::Arc::clone(&state.speech));
+    let Some(cached) = state.documents.cached(&key) else {
+        return Ok(Json(PrepareSpeechResponse {
+            prepared: Vec::new(),
+            expires_in_seconds: crate::speech_tickets::TICKET_TTL.as_secs(),
+        }));
+    };
+    let now = jiff::Timestamp::now().as_millisecond();
+    let said = crate::speakable::for_speech(&cached.content, now, &state.config.timezone);
+    if said.trim().is_empty() {
+        return Ok(Json(PrepareSpeechResponse {
+            prepared: Vec::new(),
+            expires_in_seconds: crate::speech_tickets::TICKET_TTL.as_secs(),
+        }));
+    }
+    let blocks = spoken_blocks_for(
+        &cached.content,
+        crate::render::Markup::default(),
+        &[],
+        now,
+        &state.config.timezone,
+    );
+    let preparation_ms = millis(preparation_began.elapsed());
+    let described = blocks
+        .iter()
+        .map(|block| PreparedBlock {
+            kind: block.kind,
+            spoken: !block.said.trim().is_empty(),
+            chars: block.said.trim().chars().count(),
+            element: block.element,
+            piece: block.piece,
+            pieces: block.pieces,
+        })
+        .collect();
+    let ticket = state.speech_tickets.mint(crate::speech_tickets::Prepared {
+        channel: String::new(),
+        message: key.clone(),
+        said,
+        blocks: blocks.into_iter().map(|block| block.said).collect(),
+        speed: crate::speech::clamp_speed(request.speed),
+        voice: request
+            .voice
+            .as_deref()
+            .map(str::trim)
+            .filter(|voice| !voice.is_empty())
+            .map(str::to_owned),
+        observation: crate::speech_tickets::fresh_observation(),
+        preparation_ms,
+    });
+    Ok(Json(PrepareSpeechResponse {
+        prepared: vec![PreparedSpeech {
+            message_id: key,
+            url: format!("/api/v1/speech/{ticket}"),
+            blocks: described,
+        }],
+        expires_in_seconds: crate::speech_tickets::TICKET_TTL.as_secs(),
+    }))
 }

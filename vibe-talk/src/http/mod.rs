@@ -203,6 +203,10 @@ fn routes(state: AppState) -> Router {
             "/api/v1/documents/{key}/freshness",
             get(api::document_freshness),
         )
+        .route(
+            "/api/v1/documents/{key}/speech/prepare",
+            post(api::prepare_document_speech),
+        )
         .route("/api/v1/channels", get(api::list_channels))
         // `#190 voice-agent-tools`. READ scope: every listed channel's last few hours in one call,
         // the route behind the `recent_activity` tool. It reads what `/digest` reads, once per
