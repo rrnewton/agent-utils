@@ -526,18 +526,17 @@ ok=1; for f in tests/*; do [ -f "$f" ] || continue; if grep -qx FAIL "$f"; then 
         || spawned_events(&fx, &prior_runs).is_some_and(|e| e.contains("batch #4 on")),
     );
     std::fs::write(gates.join("release"), "").unwrap();
-    // Once the prioritized change is requeued as a stale green, let the
-    // stack head (change 4) finish; the rebuild must not wait for it.
+    // Wait for the stale rebuild itself to launch (the second batch #2)
+    // before letting the stack head (change 4) finish: rooted vs stacked
+    // is decided when that rebuild is built, while change 4 is still in
+    // flight. Releasing change 4 on the stale requeue alone can let it
+    // land first (its root is promotable), dissolving the stale decision
+    // into an ordinary root rebuild on the new base.
     wait_for_run(
-        "the stale requeue",
+        "the stale rebuild to launch",
         Duration::from_secs(240),
         &mut run,
-        || {
-            spawned_events(&fx, &prior_runs).is_some_and(|e| {
-                e.lines()
-                    .any(|line| line.contains("stale-root-green") && line.contains("#2 was green"))
-            })
-        },
+        || spawned_events(&fx, &prior_runs).is_some_and(|e| e.matches("batch #2 on").count() >= 2),
     );
     std::fs::write(gates.join("release-d"), "").unwrap();
     let out = run.wait_with_output().unwrap();
