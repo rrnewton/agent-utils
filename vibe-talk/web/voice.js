@@ -2007,13 +2007,13 @@ const folding = createFolding({
   bottomSlackPx: BOTTOM_SLACK_PX,
   unseenReplies: unseenColumnReplies,
   unseenReply: unseenColumnReply,
-  listEmptied,
+  listEmptied: () => listEmptied(),
   draftBelowView: () => voiceTranscript().draftBelowView(),
   renderJumpBookmark,
   refreshReadingJump: () => readingJump.refresh(),
   visibleList,
   shownChannelList,
-  applySearch,
+  applySearch: () => applySearch(),
   placeBookmarkLine,
   keepSelection: (...args) => keepSelection(...args),
   replyReturnRow,
@@ -2045,28 +2045,10 @@ const {
   holdingScrollTools, renderScrollTools, setAllFolded, foldStepFromKeyboard,
 } = folding;
 
-// --- searching what is on screen --------------------------------------------------------------
-//
-// `#129 message-search`. A magnifying glass floating at the top corner of the list (in the header
-// until `#197 floating-search`), and a field that hides every row it does not match — in BOTH
-// lists, because they sit one switch apart and a reader moves between them without thinking about
-// which one they are in.
-//
-// IT FILTERS, IT DOES NOT FETCH, and that distinction got sharper the moment `#128
-// transcript-history` landed: what is on screen is now a bounded suffix of a much longer record,
-// so "no matches" and "not said" are different answers and the control has to be able to tell
-// them apart out loud. That is what the count is for, and why it names its denominator.
-//
-// The matching is deliberately the least clever thing that answers the request: terms split on
-// whitespace, a double-quoted run kept whole, every term required, case-insensitive substring. No
-// regular expressions from the field and no fuzzy matching — a reader who types `read new` is
-// looking for a row with both words in it, and anything smarter is a second thing to learn.
-
-/**
- * Whether the field is open, what is in it, the text whose hits are drawn once the typing pauses, and that
- * pause (`SEARCH_MARK_DELAY_MS`) are web/src/core/search's (`createSearchField`, `#624
- * voice-page-modularity`); filtering the rows and drawing the marks are here.
- */
+// Searching what is on screen, and the lines between rows, are web/src/view/channel's now
+// (`createSearchRows`, `#624 voice-page-modularity`): the language on the page, the filter's
+// pass, the hits drawn, and the seams. The field itself stays instantiated here, where the
+// shell mounts wire its marks.
 const searchField = createSearchField({
   clock: clockOnUse(),
   // The reader stays on what they were reading — the message the keystroke's own change held, while it
@@ -2082,1026 +2064,96 @@ const searchField = createSearchField({
   },
 });
 
-/** Mark the hits of what is typed once the typing pauses: each key puts it off again. */
-function markSearchSoon() {
-  searchField.markSoon();
-}
-
-/** Mark the hits of what is typed now (`#249 search-highlight`): at once on Enter. */
-function markSearchNow() {
-  searchField.markNow();
-}
-
-/**
- * The lists a filter may touch, in document order.
- *
- * Every list of MESSAGES, including the ones that are not on screen at the moment. Filtering all
- * of them rather than only the visible one is what makes the view switch honest: a reader who
- * searches on the call view and then switches to the channel is looking at the same query, not at
- * an unfiltered list that will re-filter on the next unrelated redraw.
- */
-const SEARCH_LISTS = ["transcript", "thread-list", "discord-log", "pinned-log", "outgoing-log"];
-
-/** What the empty search's sentence adds in Main, where a thread stands for its replies. `#606 server-side-search`. */
-const MAIN_REPLIES_SEARCHED = "Main shows a thread when a reply held here matches; All may hold more replies.";
-
-/** What `#search-empty` says over a list that has rows and none of them match. */
-const SEARCH_EMPTY_LOADED = "Nothing in the messages loaded so far matches that search.";
-
-// THE SEARCH LANGUAGE (`#521 server-side-search`), the page's twin of src/search_query.rs, is a module
-// now: web/src/core/search/ (`#624 voice-page-modularity`). This script takes the names it uses
-// from the page build's prelude (web/src/legacy/imports.ts); what follows is the language on the page.
-
-// --- the language on the page (`#606 server-side-search`) -----------------------------------------
-//
-// The owner, 2026-10-27, question 2 of `#521 server-side-search`: in Main (Cmd-1) a thread stands for
-// all its children, so any hit in a thread keeps its row; in All (Cmd-2) threads are unpacked inline and
-// every message is a candidate on its own; over the cards a thread with any hit is chosen, and unpacking
-// it shows only the hits, with folded lines between them. So the page matches MESSAGES, by the shared
-// language (web/src/core/search/), each folded once (`messageSubject`); a row of several messages
-// shows when any of them matches, and a row that holds no message (a turn of the call, a card) is
-// matched by the text it declares (`data-search`).
-
-/** The query parsed, and the words to mark, for the last text asked about: one parse per change (web/src/core/search). */
-const parsedQueries = createParsedQueries();
-
-/** `query` parsed by the shared language: its tree (null for no search) and its words to mark. */
-function searchParsed(query) {
-  return parsedQueries.parsed(query);
-}
-
-/** Whether `query` is a search at all: some term, not only spaces or operators. */
-const searchTyped = (query) => searchParsed(query).node !== null;
-
-/** What identifies a search, for a walk or an opened run that belongs to one: its parsed tree. */
-const searchIdentity = (query) => JSON.stringify(searchQueryTree(searchParsed(query).node));
-
-/** The start of a calendar day in this browser's zone, for `before:` and `after:`. */
-const searchDayStart = (/** @type {{year: number, month: number, day: number}} */ day) =>
-  new Date(day.year, day.month - 1, day.day).getTime();
-
-/** Each copy of a message folded once for matching: a new copy, as an edit brings, is folded again. */
-const subjectByMessage = new WeakMap();
-
-/** A message as the matcher sees it: its author, the text it draws and its links' addresses. */
-function messageSubject(message) {
-  let subject = subjectByMessage.get(message);
-  if (!subject) {
-    subject = searchSubject({
-      author: String(message.author || ""),
-      authorId: String(message.author_id || ""),
-      text: messageText(message),
-      links: messageLinks(message).map((link) => String(link.href)),
-      createdMs: Date.parse(message.timestamp) || 0,
-      inThread: Boolean(message.thread && message.thread.is_root === false),
-    });
-    subjectByMessage.set(message, subject);
-  }
-  return subject;
-}
-
-/** Whether one message matches the parsed query `node`. */
-const messageMatches = (node, message) => searchQueryMatches(node, messageSubject(message), searchDayStart);
-
-/**
- * Whether a row matches the parsed query `node`: any of the messages it holds, or for a row that holds
- * none, the text it declares (`text`, its `data-search`).
- */
-function rowMatches(row, node, text) {
-  const messages = rowMessages(row);
-  if (messages.length > 0) return messages.some((message) => messageMatches(node, message));
-  return text !== null && searchQueryMatches(node, searchSubject({ text }), searchDayStart);
-}
-
-/**
- * The threads of the channel on screen with a reply the parsed query `node` matches, among the replies
- * the page holds: in Main a root stands for its thread, and over the cards a thread with any hit is
- * chosen.
- */
-function threadsWithHits(node) {
-  /** @type {Set<string>} */
-  const hits = new Set();
-  if (!node || !providerFacts.threading() || channelStore.current().channel !== String(selectedChannelId())) return hits;
-  for (const message of channelStore.current().messages) {
-    const id = threadOf(message);
-    if (id && message.thread.is_root === false && messageMatches(node, message)) hits.add(String(id));
-  }
-  return hits;
-}
-
-/** Whether a row of Main heads a thread that `hits` (`threadsWithHits`) names. */
-const rowHeadsHitThread = (row, hits) => rowMessages(row).some((message) => {
-  const id = threadOf(message);
-  return Boolean(id) && message.thread.is_root === true && hits.has(String(id));
+const searchRows = createSearchRows({
+  searchField,
+  language: {
+    parsedQueries: createParsedQueries(),
+    openedGaps: createOpenedGaps(),
+    searchSubject,
+    searchQueryMatches,
+    searchQueryTree,
+  },
+  byId: el,
+  leftById: leftEl,
+  view: () => screens.view(),
+  screen: () => screens.screen(),
+  side: () => columnWork.side(),
+  sideShowing: () => sideShowing(),
+  sideColumnUp: () => sideColumnUp(),
+  inColumn,
+  inThisColumn,
+  mainColumn: () => columns.main,
+  mainColumnRecord: () => columns.main,
+  sideColumnRecord: () => columns.side,
+  setSearched: (count) => { columnWork.active().searched = count; },
+  searchWalkHeld: () => Boolean(columnWork.active().searchWalk),
+  preservingScroll,
+  applyReadRuns: () => applyReadRuns(),
+  threading: () => providerFacts.threading(),
+  heldMessages: () => channelStore.current().messages,
+  currentChannel: () => channelStore.current().channel,
+  selectedChannelId,
+  threadOf,
+  messageText,
+  messageLinks,
+  selectionView: () => selection().view,
+  authorChoosing: () => authorChoosing(),
+  authorPasses,
+  authorEmptySentence,
+  gatheredParent,
+  putRepliesBack,
+  pinsOnly: () => pinsView().only,
+  showRowLinks,
+  takeDownRowLinks,
+  heldLinks: (row) => heldLinks(row),
+  hiddenKindNames,
+  renderLinkKindCounts,
+  drawCardGaps,
+  openedCardGaps,
+  openUnpackGap,
+  openCardGap,
+  renderReplyLinks,
+  renderOlderControl: () => renderOlderControl(),
+  scheduleServerSearch: () => scheduleServerSearch(),
+  placeInlineReply,
+  placeRowsInPlaceAgain,
+  replyDocked: () => replyState.docked,
+  changeChannelView,
+  channelViewWords: () => channelViewWords(),
+  historyReach: () => historyReach(),
+  historyReadToStart,
+  messagesWords,
+  searchMomentWords,
+  reachBackWords,
+  reachClause,
+  oldestLoadedMs: () => oldestLoadedMs(),
+  holdsWholeHistory: () => serverCacheBox.holdsWholeHistory(),
+  hidingRead: () => readModes.hiding(),
+  threadListOnScreen: () => threadListOnScreen(),
+  cardCount: () => cardsDrawn.count(),
+  pinProblem: () => pinStore.problem(),
+  pinRevision: () => pinStore.revision(),
+  pinChannel: () => pinStore.channel(),
+  currentChannelId: () => currentChannelId(),
+  isFolded,
+  readRunsSuspended: () => readRunsSuspended(),
+  searchKey: () => searchKey(),
+  viewKey: () => viewKey(),
+  runDaysOf: (row) => runDaysOf(row),
+  placeInReadRun,
+  readRunCount: (row) => readRunCount(row),
+  changing: () => filterChanges.changing(),
+  currentFilterHold,
+  keepFilterHold,
+  visibleList,
 });
-
-/**
- * Declare what a row is findable by.
- *
- * ON THE ROW, as an attribute, rather than in a map beside it. Every one of these lists is rebuilt
- * from scratch by something — the channel poll, the outgoing render, a step back through the
- * record — and a structure keyed by row identity would have to be pruned by whichever of them ran
- * last. An attribute is born and dies with the node that carries it.
- *
- * Lower-cased once here rather than on every keystroke, and it holds the AUTHOR as well as the
- * words: "everything by the bot" is a search a reader actually performs, and the name is on the
- * row in front of them.
- */
-function searchable(row, ...parts) {
-  row.setAttribute("data-search", parts.filter(Boolean).join(" ").toLowerCase());
-}
-
-/** The lists the reader can actually see right now, which is what a count may speak for. */
-function searchScope() {
-  return SEARCH_LISTS.filter(
-    (id) => !el(id).hidden && (id === "transcript") === (screens.view() === "voice")
-  );
-}
-
-/**
- * Hide every row that does not match, and say how many are left.
- *
- * Called from `renderScrollTools` — the function every bulk render of either list already ends
- * with — and from the two places that put ONE row on the end of the live transcript without going
- * through it. That is deliberately as few call sites as the page allows: a filter re-applied from
- * its own scattered set of them is a filter that misses the one somebody adds next, and the
- * failure mode — a row arriving unfiltered into a filtered list — reads as a search that quietly
- * stopped working.
- *
- * `#211 link-filter` hangs the Links filter off the same pass, for the same reason: a row a poll
- * redrew, or a turn that just arrived, gets its links drawn here or not at all. It is one more
- * condition on every row, so the filters in force are ANDed — the search text, Links, and the
- * Pinned list the rows came from — and the count speaks for what is left after all of them.
- *
- * `#212 link-filter`: and the kinds of link the reader has turned off under Links. A row whose
- * links are all of those kinds has none left to show, and goes as a row with no link does.
- */
-function applySearch() {
-  // `#221 read-modes`. FIRST: a filter choosing rows opens every collapsed run, so no match is
-  // hidden behind a line, and closing it collapses them again.
-  applyReadRuns();
-  // `#606 server-side-search`. The query in the shared language, matched message by message.
-  const node = searchField.open() ? searchParsed(searchField.query()).node : null;
-  const typed = node !== null;
-  // `#249 search-highlight`. Where the hits are drawn: what was typed when the typing paused.
-  const marking = searchField.open() ? searchParsed(searchField.marked()).terms : [];
-  // In Main a root stands for its thread, and among the Threads list's cards a thread with any hit is
-  // chosen: the threads whose held replies match.
-  const replyHits = typed && providerFacts.threading() && (selection().view === "main" || selection().view === "threads")
-    ? threadsWithHits(node) : null;
-  const links = searchField.open() && searchField.links();
-  // `#251 author-filter`. Whose messages, ANDed with the rest.
-  const author = authorChoosing();
-  // `#215 reply-coalesce`. A filter that takes rows away shows a subset of the channel in time order,
-  // and gathered replies go back to theirs before it does: a bridge to rows it hides would be a
-  // bridge to nothing. See the section on gathering replies.
-  if (gatheredParent() !== null && (typed || links || pinsView().only || author !== "everyone")) putRepliesBack();
-  const scope = searchScope();
-  let matched = 0;
-  let loaded = 0;
-  // Under Links: the rows holding a link of any kind, the rows with one still shown once the kinds
-  // turned off are out, and the rows the text matches that hold one of any kind — three different
-  // answers when the list is empty, see `linksEmptySentence` — and how many links of each kind there
-  // are in all of them, and in what the text matches: the second is the number on each kind's
-  // button, and both say which hidden kinds really took something away.
-  const tally = {
-    linked: 0,
-    kept: 0,
-    saidLinked: 0,
-    everywhere: new Map(LINK_KINDS.map(({ kind }) => [kind, 0])),
-    matching: new Map(LINK_KINDS.map(({ kind }) => [kind, 0])),
-  };
-  // `#439 search-unmatched-separators`. The runs the reader has opened under these very searches:
-  // shown where they stand, never counted as matched, and forgotten with any change of filter.
-  const opened = openedGapIds(false);
-  const openedCards = openedCardGaps(false);
-  for (const id of SEARCH_LISTS) {
-    // The call's transcript is the left column's. `#229 desktop-two-column`.
-    if (columnWork.side() && id === "transcript") continue;
-    const list = el(id);
-    const counts = scope.includes(id);
-    for (const row of list.children) {
-      const text = row.getAttribute("data-search");
-      // How many links the row is showing in place of its text: none unless the filter is on, and
-      // never on a row that is not a message.
-      const shown = links && text !== null ? showRowLinks(row) : takeDownRowLinks(row);
-      // A row with nothing declared is not a message — a seam, a date rule, the notice at the head
-      // of the channel. It goes away while a filter is on, because it explains a neighbour that is
-      // no longer beside it, and it is never counted either way.
-      const said = !typed || (text !== null && (rowMatches(row, node, text) || (replyHits !== null &&
-        (id === "thread-list" ? replyHits.has(String(row.getAttribute("data-context-id")))
-          : id === "discord-log" && rowHeadsHitThread(row, replyHits)))));
-      const hit = said && (!links || shown > 0) && authorPasses(row, author);
-      const revealed = !hit && text !== null && (id === "thread-list"
-        ? openedCards !== null && openedCards.threads.has(String(row.getAttribute("data-context-id")))
-        : inOpenedGap(row, opened));
-      setClassWord(row, "search-hidden", !(hit || revealed));
-      // `#249 search-highlight`. Where each term is, in the rows it lets through.
-      markSearchHits(row, hit && text !== null ? marking : []);
-      // A spoken yes drawn into the card it sent (`#269 approval-card-inline`) is not on screen, and
-      // the card speaks for it.
-      if (counts && text !== null && !row.hasAttribute("data-absorbed")) {
-        // `#262 search-load-older`. In messages, as the lines between the rows count them (`seamsFor`):
-        // a combined row is every message it holds, all of them on screen when it is, and a row with
-        // no message of the channel's own — a turn of the call, one still being sent — is one. So what
-        // is shown and the lines' counts add up to what is loaded.
-        const weight = Math.max(1, idsOf(row).length);
-        loaded += weight;
-        const held = links ? heldLinks(row) : [];
-        if (held.length > 0) {
-          tally.linked += 1;
-        }
-        if (shown > 0) {
-          tally.kept += 1;
-        }
-        if (said && held.length > 0) {
-          tally.saidLinked += 1;
-        }
-        // `#266 link-filter-kinds`. Every link is of exactly one kind, so these add up to every link held.
-        for (const link of held) {
-          tally.everywhere.set(link.kind, tally.everywhere.get(link.kind) + 1);
-          if (said) tally.matching.set(link.kind, tally.matching.get(link.kind) + 1);
-        }
-        if (hit) {
-          matched += weight;
-        }
-      }
-    }
-  }
-  // `#249 search-highlight`. The lines between the rows of the channel's lists, from what the pass
-  // above has just shown — before the arrows, which reach across them.
-  drawSeams(el("discord-log"));
-  drawSeams(el("pinned-log"));
-  // `#439 search-unmatched-separators`. And among this column's thread cards, counting whole threads.
-  drawCardGaps(el("thread-list"));
-  // `#214 reply-arrow`. What the reader can see directly above a reply is what its arrow is drawn
-  // against, and the pass above has just decided that.
-  renderReplyLinks();
-  // `#206 pin-message`. Over the Pinned filter the denominator is the channel's PINS, all of them.
-  const pinned = pinsView().only && screens.view() === "discord";
-  columnWork.active().searched = { matched, loaded, tally, pinned };
-  renderSearchCount(typed, links, author !== "everyone");
-  // `#262 search-load-older`. The step back offers to search further back while a filter chooses rows,
-  // and a walk that the change of filter just made nobody's ends here, before anything below says what
-  // it found. And in one column on Main, a search nothing matches offers All, which has the replies.
-  if (screens.view() === "discord") renderOlderControl();
-  if (!columnWork.side()) renderSearchInAll();
-  // `#605 server-side-search`. The server's copy, asked again when the search wanted has changed.
-  if (!columnWork.side()) scheduleServerSearch();
-  if (pinned) {
-    const sentence = pinnedEmptySentence(loaded, matched, typed, links ? tally : null, author);
-    el("search-empty").textContent = sentence;
-    el("search-empty").hidden = sentence === "";
-    return;
-  }
-  // Nothing matched is a RESULT, and it has to be stated where the messages were. Every row is
-  // still in the list, so neither pane's own empty state fires, and without this the reader gets
-  // a blank screen whose only explanation is a 0.75rem count at the far end of the search bar.
-  // Not raised over a list that was empty to begin with: there the pane already says why. Each
-  // column says it over its own list (`#229 desktop-two-column`).
-  if (links) {
-    const sentence = linksEmptySentence(loaded, tally, matched, author);
-    el("search-empty").textContent = sentence;
-    el("search-empty").hidden = sentence === "";
-    return;
-  }
-  if (author !== "everyone") {
-    const sentence = screens.view() === "discord" && selection().view === "threads"
-      ? "This is a list of threads, and who wrote what is in their messages — open a thread to see it."
-      : matched > 0 || loaded === 0 ? "" : authorEmptySentence(author, typed, false);
-    el("search-empty").textContent = sentence;
-    el("search-empty").hidden = sentence === "";
-    return;
-  }
-  const empty = !typed || matched > 0 || loaded === 0;
-  // `#262 search-load-older`. How far back the search has looked, and what it cannot see. Not rewritten
-  // while a walk reads older pages, so a status says it once, when the walk is over, and not per page.
-  if (!columnWork.active().searchWalk) setTextIfChanged(el("search-empty"), empty ? SEARCH_EMPTY_LOADED : searchEmptySentence(loaded));
-  el("search-empty").hidden = empty;
-  // `#410 inline-reply-editor`. A reply open in the stream: under its row while the search shows it.
-  if (replyState.docked) placeInlineReply();
-  // `#467 inline-send-in-place`. And a reply's row where its box was, while the search shows that row.
-  else placeRowsInPlaceAgain();
-}
-
-/**
- * `#262 search-load-older`. Whether "Search All — thread replies too" is offered: one column, on Main,
- * where a search for words alone matches nothing of what is loaded. Main holds a thread's first message
- * and none of its replies, and All has them. From what the left column's last pass of the search
- * counted (`searched`) and the layout and view now, so it is asked in the left column.
- *
- * @param {SearchCount | null} searched
- */
-function searchInAllOffered(searched) {
-  return searched !== null && !searched.pinned && searched.matched === 0 && searched.loaded > 0 && searchField.open() &&
-    !searchField.links() && authorChoosing() === "everyone" && searchTyped(searchField.query()) &&
-    screens.view() === "discord" && providerFacts.threading() && !sideColumnUp() && selection().view === "main";
-}
-
-/**
- * Show or take away "Search All — thread replies too" (`searchInAllOffered`). After every pass of the
- * search in the left column, and whenever two columns come or go: that changes whether it is one column
- * on Main without changing a row, so no pass of the search follows it when the left column was Main
- * already, and the button would be left as the other layout had it.
- */
-function renderSearchInAll() {
-  inColumn(columns.main, () => {
-    const all = leftEl("search-in-all");
-    const offered = searchInAllOffered(columns.main.searched);
-    if (all.hidden === offered) all.hidden = !offered;
-  });
-}
-
-/**
- * The press of "Search All — thread replies too": All, with the search kept. Only where it is offered
- * now — never in two columns, whose left column is Main by the layout (`#229 desktop-two-column`); a
- * button left up by some change nobody foresaw is taken away instead.
- */
-function searchInAll() {
-  if (!inColumn(columns.main, () => searchInAllOffered(columns.main.searched))) {
-    renderSearchInAll();
-    return undefined;
-  }
-  return inColumn(columns.main, () => changeChannelView("flat"));
-}
-
-/**
- * What `#search-empty` says over a channel's list whose loaded messages the search text matches none
- * of: how many it searched, and where — in this browser — and how far back with no gaps, in the
- * owner's terms (`historyReach`, `#578 search-status-clarity`): "Searched 82 messages in this browser, a
- * complete history back to Oct 26, 3:14 PM (no gaps), plus 4 scattered older ones. None match." On
- * Main, that thread replies are not in it; and on a chat service without threads under Hide read, how
- * to search what Hide read leaves out. `#262 search-load-older`. Over the call's transcript, what it
- * always said.
- *
- * @param {number} loaded How many messages are loaded in this column, as the count says it.
- */
-function searchEmptySentence(loaded) {
-  if (screens.view() !== "discord" || selection().view === "threads") return SEARCH_EMPTY_LOADED;
-  const view = channelViewWords();
-  const reach = historyReach();
-  let said;
-  if (reach.whole && historyReadToStart()) {
-    said = `Searched all ${messagesWords(loaded)} of ${view} in this browser, back to the first one` +
-      `${reach.from === null ? "" : ` (${searchMomentWords(reach.from)})`}. None match.`;
-  } else if (reach.saved) {
-    said = `Searched ${messagesWords(loaded)} saved on this device${reachBackWords(reach.from)}, not yet checked ` +
-      "for gaps. None match.";
-  } else if (reach.proven) {
-    said = `Searched ${messagesWords(reach.dense)} in this browser${reach.topLevel ? ":" : ","} ${reachClause(reach)}. None match.`;
-  } else {
-    said = `Searched the ${messagesWords(loaded)} loaded in this browser${reachBackWords(oldestLoadedMs())}. None match.`;
-  }
-  // `#595 cache-full-history`. When the browser's own search finds nothing, that the server holds
-  // every message of the channel is worth saying: a search there would be complete.
-  if (serverCacheBox.holdsWholeHistory()) {
-    said += " This server holds the complete history of this channel, which this search does not reach yet.";
-  }
-  // Main holds a thread's first message and nothing of the rest, and the cards on the right, or All,
-  // are where a reply is found. Most of why a search on the left of two columns finds nothing.
-  // `#606 server-side-search`: a thread stands for its replies in Main, so the replies held here were
-  // searched; the ones All has not brought were not.
-  if (providerFacts.threading() && selection().view === "main") return `${said} ${MAIN_REPLIES_SEARCHED}`;
-  if (readModes.hiding() && !providerFacts.threading()) return `${said} Hide read is on — press h for Show read to search older messages.`;
-  return said;
-}
-
-/**
- * The count at the end of the search bar, and the count on each kind of link under Links, from what
- * each column's last pass counted. `#229 desktop-two-column`: there is one bar, so it speaks for both
- * columns while two are up. Over the Pinned filter it speaks for the pins: the left column's list.
- */
-function renderSearchCount(typed, links, author = false) {
-  // `#281 view-keys`. Over the thread list on its own, the bar speaks for the cards.
-  if (threadListOnScreen()) {
-    sayCardCount();
-    return;
-  }
-  const left = columns.main.searched;
-  if (!left) return;
-  const counted = [left, ...(sideShowing() && columns.side.searched && !left.pinned ? [columns.side.searched] : [])];
-  if (links) {
-    renderLinkKindCounts(new Map(LINK_KINDS.map(({ kind }) =>
-      [kind, counted.reduce((sum, one) => sum + (one.tally.matching.get(kind) || 0), 0)])));
-  }
-  const matched = counted.reduce((sum, one) => sum + one.matched, 0);
-  const loaded = counted.reduce((sum, one) => sum + one.loaded, 0);
-  // "of N loaded", never "of N". The denominator is what this page has, not what the server has,
-  // and after `#128 transcript-history` those are routinely different numbers. Links is a filter
-  // in force with nothing typed, so it is counted with nothing typed, as Pinned is — which says its
-  // count even before anything is typed: the filter is in force, and the bar is where it says so.
-  // `#251 author-filter`: and so is whose messages.
-  const filtering = typed || links || author;
-  el("search-count").textContent = left.pinned
-    ? (!filtering ? `${loaded} pinned` : `${matched} of ${loaded} pinned`)
-    : (!filtering ? "" : `${matched} of ${loaded} loaded`);
-}
-
-/** The count in the bar again, from what each column last counted: for a change of layout that redrew no row. */
-function refreshSearchCount() {
-  renderSearchCount(searchField.open() && searchTyped(searchField.query()), searchField.open() && searchField.links(),
-    authorChoosing() !== "everyone");
-}
-
-/**
- * The bar's count over the thread list on its own: how many cards the text matches, of how many, while
- * something is typed. `#281 view-keys`. Links and whose messages are not offered over cards, which
- * hold neither.
- */
-function sayCardCount() {
-  const typed = searchField.open() && searchTyped(searchField.query());
-  const { cards, shown } = cardsDrawn.count();
-  setTextIfChanged(el("search-count"), typed ? `${shown} of ${cards} thread${cards === 1 ? "" : "s"}` : "");
-}
-
-/**
- * What the Pinned filter says where its rows would be, or "" when its rows say it. `#206
- * pin-message`. An empty list here is never left blank: a channel with no pins, a list that could
- * not be read, one still on its way, and a search that matches none of the pins are four different
- * answers, and a reader shown nothing would take any of them for the page having broken.
- *
- * `tally` is what the Links filter counted while it is on (see `applySearch`), and null while it is
- * off. `#211 link-filter`: "none of the pins has a link" and "none of the pins with a link matches
- * what you typed" are two more answers, and neither is "no pins". `#212 link-filter`: nor is "the
- * pins' links are all of the kinds turned off", which says how to bring them back.
- */
-function pinnedEmptySentence(loaded, matched, searching, tally = null, author = "everyone") {
-  if (loaded > 0) {
-    if (tally !== null && tally.linked === 0) return "None of this channel's pinned messages has a link.";
-    if (tally !== null && tally.kept === 0) {
-      return `None of this channel's pinned messages has a link left once ${hiddenKindNames(tally.everywhere)} ` +
-        "are hidden — turn them back on under the Links button.";
-    }
-    if (matched > 0) return "";
-    // `#251 author-filter`. Whose they are is the filter that emptied the list unless text is typed
-    // or Links is on, which keep their own sentences.
-    if (author !== "everyone" && tally === null) return authorEmptySentence(author, searching, true);
-    if (!searching) return "";
-    if (tally === null) return "None of this channel's pinned messages match that search.";
-    return tally.saidLinked > 0
-      ? "None of this channel's pinned messages with a link match that search once " +
-        `${hiddenKindNames(tally.matching)} are hidden.`
-      : "None of this channel's pinned messages with a link match that search.";
-  }
-  if (pinStore.problem()) return `This channel's pinned messages could not be loaded: ${pinStore.problem()}`;
-  if (pinStore.revision() === null || pinStore.channel() !== currentChannelId()) return "Loading this channel's pinned messages…";
-  return "No pinned messages in this channel yet — pin one from its ⋯ menu.";
-}
-
-/**
- * What the Links filter says where its rows would be, or "" when its rows say it. `#211
- * link-filter`. "loaded" for the reason the count says it: what is on screen is a bounded suffix
- * of a longer record, and "nobody posted a link" is a claim this page cannot make.
- *
- * `#212 link-filter`. With kinds of link turned off there are two more ways to have nothing left,
- * and both say which kinds did it, because the reader turned those off on some earlier day and the
- * page remembered: every link loaded is of those kinds, or every message the text matches links
- * only to them. The first says where the buttons are that bring them back.
- */
-function linksEmptySentence(loaded, tally, matched, author = "everyone") {
-  // The Threads list is a list of THREADS. Its rows have no text of their own to hold a link, so an
-  // empty list there is not "no links" — it is the wrong list to look in, and the reader is told
-  // where the links are.
-  if (screens.view() === "discord" && selection().view === "threads") {
-    return "This is a list of threads, and links are in their messages — open a thread to see its links.";
-  }
-  // An empty list explains itself in the pane's own words.
-  if (loaded === 0) return "";
-  if (tally.linked === 0) return "No links in the messages loaded so far.";
-  if (tally.kept === 0) {
-    return `No links left once ${hiddenKindNames(tally.everywhere)} are hidden — turn them back on under the Links button.`;
-  }
-  if (matched > 0) return "";
-  // `#251 author-filter`. With nothing typed, a link is still shown and none is left: whose messages
-  // took them away.
-  if (author !== "everyone" && !searchTyped(searchField.query())) {
-    return author === "mine" ? "None of your messages loaded so far has a link." :
-      "None of the messages from anyone else loaded so far has a link.";
-  }
-  // Some link is still shown, so this is the text: what it matched links only to hidden kinds, or
-  // holds no link at all.
-  return tally.saidLinked > 0
-    ? `None of the loaded messages with a link match that search once ${hiddenKindNames(tally.matching)} are hidden.`
-    : "None of the loaded messages with a link match that search.";
-}
-
-/** Whether the filters have emptied the list on screen, and `#search-empty` is saying why. */
-function listEmptied() {
-  return !el("search-empty").hidden;
-}
-
-// --- the hits, drawn where they are ----------------------------------------------------------------
-//
-// `#249 search-highlight`. The owner: "if I search for the word "engine" let's say, it's still weird
-// that we don't highlight where the word hits within the filtered messages that have the word." So
-// every hit of every term is drawn, in each message the search lets through, where it is.
-//
-// IN THE PAGE, because the search is the page's own: what it matches is the text each row declared
-// (`searchable`), and the same words are drawn in the row. A hit is marked by splitting the text node
-// it is in and putting the hit in a `<mark>` — built with `createElement` and `createTextNode`, never
-// from a string, so `insertSanitizedHtml` stays the one place this page parses HTML, and a message
-// holding "<b>" holds those three characters, marked or not. The marks change no character: copy,
-// speech and every count read the same text.
-//
-//   * WHERE: the words the reader reads — the message's text (code included, which the search
-//     matches too), a rich header's tag, title and time, each on its own, and under Links the links
-//     drawn in its place. Never a button, a time or a chip. The author's name is lit whole, by an
-//     attribute, because the pass that says who wrote a row writes its name again on every redraw.
-//   * HOW: case-insensitive, as the match is; across the pieces one block of text is drawn in, so a
-//     word half in bold is lit whole, but never across two blocks, which the search never joins
-//     either. Where two terms' hits overlap they are one mark. A term found only in a link's address,
-//     which is matched but not drawn, outlines that link instead.
-//   * A FOLDED MESSAGE WHOSE HIT IS BEYOND ITS FOLD says so under it: the hits in a line of their
-//     own, each with a few words either side, and how many more there are — rather than opening
-//     every match as the reader types, which would turn a common word into a wall and move the list
-//     under every keystroke. A tap opens it, as a tap on the row does.
-//   * ONCE A ROW, PER QUERY: each row keeps what it was marked for, so a redraw that changes nothing
-//     writes nothing (`#226 page-energy-profile`), and a row a read rebuilds is new and marked once.
-
-/** The class of a hit drawn in a row's text. */
-const SEARCH_HIT_CLASS = "search-hit";
-
-/** The class on a link whose address alone holds a term. */
-const SEARCH_HIT_LINK_CLASS = "search-hit-link";
-
-/** How many characters of a message's first paragraph are surely inside its fold at any width. */
-const EXCERPT_SURELY_SHOWN = 60;
-
-/** How many characters a hit is shown with either side of it, in the line under a folded message. */
-const EXCERPT_CONTEXT = 30;
-
-/** How many places the line under a folded message shows before it says how many more there are. */
-const EXCERPT_PLACES = 3;
-
-/** A `<mark>` holding `text`, as a hit. */
-function hitMark(text) {
-  const mark = document.createElement("mark");
-  mark.className = SEARCH_HIT_CLASS;
-  mark.textContent = text;
-  return mark;
-}
-
-/**
- * Mark every hit of `terms` in `part`, and answer the marks made. Each run of text is matched as one,
- * and each piece of a hit is marked in the text node it is in.
- *
- * ONE WALK over a run's pieces and its hits together, both in order: a hit is visited once for each
- * piece it reaches into, so a paragraph drawn in many pieces costs its pieces plus its hits, never
- * the one times the other. And each text node is split IN PLACE — the pieces put in before it, then
- * it taken out — so nothing else in the paragraph is moved: a link beside it that holds the focus,
- * or the reader's selection, is where it was. (`replaceChildren` with the same children back takes
- * every one of them out of the document first, and the browser drops the focus and the selection
- * of whatever it takes out.)
- */
-function markHitsIn(part, terms) {
-  const marks = [];
-  for (const run of textRunsOf(part)) {
-    const texts = run.map((piece) => String(piece.node.textContent));
-    const ranges = textHits(texts.join(""), terms);
-    if (ranges.length === 0) continue;
-    let from = 0;
-    // The first hit that does not end before the piece being split.
-    let next = 0;
-    run.forEach((piece, index) => {
-      const text = texts[index];
-      const to = from + text.length;
-      while (next < ranges.length && ranges[next][1] <= from) next += 1;
-      const pieces = [];
-      let cursor = 0;
-      for (let at = next; at < ranges.length && ranges[at][0] < to; at += 1) {
-        const a = Math.max(ranges[at][0], from) - from;
-        const b = Math.min(ranges[at][1], to) - from;
-        if (a > cursor) pieces.push(document.createTextNode(text.slice(cursor, a)));
-        const mark = hitMark(text.slice(a, b));
-        pieces.push(mark);
-        marks.push(mark);
-        cursor = b;
-      }
-      from = to;
-      if (pieces.length === 0) return;
-      if (cursor < text.length) pieces.push(document.createTextNode(text.slice(cursor)));
-      if (piece.own) {
-        piece.node.replaceChildren(...pieces);
-        return;
-      }
-      const parent = piece.node.parentNode;
-      for (const made of pieces) parent.insertBefore(made, piece.node);
-      parent.removeChild(piece.node);
-    });
-  }
-  return marks;
-}
-
-/**
- * Put back the text the marks in `marks` split: each mark becomes its text again, and the text nodes
- * either side of it are one again — or, where that leaves an element holding nothing but text, the
- * element holds it as its text, as it did. In place, node by node, for the reason `markHitsIn` is.
- */
-function unmarkHits(marks) {
-  const parents = new Set();
-  for (const mark of marks) {
-    const parent = mark.parentNode;
-    if (!parent) continue;
-    parents.add(parent);
-    parent.replaceChild(document.createTextNode(String(mark.textContent)), mark);
-  }
-  for (const parent of parents) {
-    const kids = [...parent.childNodes];
-    if (kids.every((kid) => kid.nodeType === 3)) {
-      // Text and nothing else: no element in it to keep in place.
-      const text = kids.map((kid) => kid.textContent).join("");
-      parent.replaceChildren();
-      parent.textContent = text;
-      continue;
-    }
-    // Each text node after another joins it, and goes.
-    let joined = null;
-    for (const kid of kids) {
-      if (kid.nodeType !== 3) {
-        joined = null;
-      } else if (joined === null) {
-        joined = kid;
-      } else {
-        joined.textContent = `${joined.textContent}${kid.textContent}`;
-        parent.removeChild(kid);
-      }
-    }
-  }
-}
-
-/** What the line under a folded message is read from: its messages' text, or a turn's. */
-function excerptSource(row) {
-  const messages = rowMessages(row);
-  if (messages.length) return messages.map(messageText).join("\n");
-  return typeof row.linkText === "string" ? row.linkText : "";
-}
-
-/**
- * The line under a folded message with a hit beyond its fold, or null: up to `EXCERPT_PLACES` places,
- * each the hits with `EXCERPT_CONTEXT` characters either side cut at a word's edge, and how many hits
- * are in the rest. A hit inside the first `EXCERPT_SURELY_SHOWN` characters of the first paragraph is
- * on screen at every width, and is not repeated here.
- */
-function searchExcerpt(text, terms) {
-  const hits = textHits(text, terms);
-  const firstBreak = text.indexOf("\n");
-  const shown = Math.min(firstBreak < 0 ? text.length : firstBreak, EXCERPT_SURELY_SHOWN);
-  const late = hits.filter(([, end]) => end > shown);
-  if (late.length === 0) return null;
-  // A place starts and ends at a word's edge, within a few characters of where the context would.
-  const edge = (at, step) => {
-    let to = at;
-    for (let moved = 0; moved < 12 && to > 0 && to < text.length && !/\s/.test(text[step < 0 ? to - 1 : to]); moved += 1) {
-      to += step;
-    }
-    return /\s/.test(text[step < 0 ? to - 1 : to] || " ") ? to : at;
-  };
-  const places = [];
-  for (const [start, end] of late) {
-    const from = start - EXCERPT_CONTEXT <= 0 ? 0 : edge(start - EXCERPT_CONTEXT, -1);
-    const to = end + EXCERPT_CONTEXT >= text.length ? text.length : edge(end + EXCERPT_CONTEXT, 1);
-    const last = places[places.length - 1];
-    if (last && from <= last.to) last.to = Math.max(last.to, to);
-    else places.push({ from, to });
-  }
-  const line = document.createElement("div");
-  line.className = "search-excerpt";
-  const lead = document.createElement("span");
-  lead.className = "sr-only";
-  lead.textContent = "Further down: ";
-  line.append(lead);
-  places.slice(0, EXCERPT_PLACES).forEach((place, index) => {
-    if (index > 0) line.append(document.createTextNode(" · "));
-    const words = text.slice(place.from, place.to).replace(/\s+/g, " ");
-    const said = document.createElement("span");
-    said.className = "search-excerpt-place";
-    said.textContent = `${place.from > 0 ? "…" : ""}${words.trim()}${place.to < text.length ? "…" : ""}`;
-    line.append(said);
-  });
-  const more = places.slice(EXCERPT_PLACES).reduce((sum, place) =>
-    sum + hits.filter(([start, end]) => start >= place.from && end <= place.to).length, 0);
-  if (more > 0) {
-    const tail = document.createElement("span");
-    tail.className = "search-excerpt-more";
-    tail.textContent = ` +${more} more`;
-    line.append(tail);
-  }
-  for (const said of [...line.children].filter((kid) => classWords(kid).includes("search-excerpt-place"))) {
-    markHitsIn(said, terms);
-  }
-  return line;
-}
-
-/**
- * Draw the hits of `terms` in `row`, or take them away when `terms` is empty. Kept on the row as
- * `searchMarks`: the terms it was marked for, the links drawn under Links that it marked, and what it
- * made. The same again writes nothing.
- */
-function markSearchHits(row, terms) {
-  const key = terms.join("\u0000");
-  const links = row.linkView && row.linkView.node && row.linkView.node.parentNode === row ? row.linkView.node : null;
-  const held = row.searchMarks;
-  if (held ? held.key === key && held.links === links : key === "") return;
-  if (held) {
-    unmarkHits(held.marks);
-    for (const anchor of held.outlined) setClassWord(anchor, SEARCH_HIT_LINK_CLASS, false);
-    if (held.author && held.author.hasAttribute("data-search-hit")) held.author.removeAttribute("data-search-hit");
-    if (held.excerpt && held.excerpt.parentNode === row) row.removeChild(held.excerpt);
-    row.searchMarks = null;
-  }
-  if (key === "") return;
-  const { parts, author } = findableParts(row);
-  // The addresses the search matched and the screen does not show: their links are outlined. Read
-  // before any text is split.
-  const outlined = anchorsAmong(parts).filter((anchor) => {
-    const href = String(anchor.getAttribute("href") || "").toLowerCase();
-    const words = (anchor.childNodes.length ? renderedText(anchor) : String(anchor.textContent)).toLowerCase();
-    return terms.some((term) => href.includes(term) && !words.includes(term));
-  });
-  for (const anchor of outlined) setClassWord(anchor, SEARCH_HIT_LINK_CLASS, true);
-  const marks = parts.flatMap((part) => markHitsIn(part, terms));
-  const named = author && terms.some((term) => String(author.textContent).toLowerCase().includes(term)) ? author : null;
-  if (named) named.setAttribute("data-search-hit", "");
-  // The line under a folded message, after its text and #244's count of what the fold hides.
-  const entry = row.foldEntry;
-  const excerpt = entry ? searchExcerpt(excerptSource(row), terms) : null;
-  if (excerpt) {
-    excerpt.hidden = !isFolded(entry);
-    const after = [...row.children].find((kid) => classWords(kid).includes("elided")) || entry.body;
-    row.insertBefore(excerpt, after.nextSibling);
-  }
-  row.searchMarks = { key, links, marks, outlined, author: named, excerpt };
-}
-
-// --- the lines between rows -----------------------------------------------------------------------
-//
-// `#249 search-highlight`. The owner, of a search: "as we filter out all the other messages I would
-// like to use the same idiom as the "4 read messages" collapsed indicators. We should show gaps and
-// say "N unmatched messages"." So where a filter choosing rows — the search text, Links, whose
-// messages — takes messages out from between two it shows, a line stands in the gap, the collapsed
-// run's line in shape: "… 12 unmatched messages …", counting messages as a run does.
-//
-// ONE PASS DRAWS EVERY SUCH LINE, `drawSeams`, at the end of the search's pass and after the read
-// runs, which decide what is shown; the bookmark's line is placed after it. It looks at each row
-// shown and at the STRETCH before it: the messages hidden between it and the row shown before. A
-// stretch is either a collapsed run — drawn on the run's own first row, as `#221 read-modes` draws it
-// — or, while a filter chooses rows, an unmatched gap, drawn above the row after it. The two never
-// meet: a filter choosing rows opens every run. Nor does a gap meet the bookmark, which is not drawn
-// while a filter chooses rows.
-//
-// DRAWN AS THE BOOKMARK'S LINE IS: a child of the row it stands above (`.row-seam`), placed in a
-// margin that row keeps above its tile, so the list still holds nothing but messages and every walk
-// over its rows walks only messages. A gap after the last row shown is drawn below that row. The
-// margins are fixed heights in the stylesheet, so nothing is measured (`#226`), and each row keeps
-// the words it was drawn with, so a pass that changes nothing writes nothing.
-//
-// IN THE CHANNEL'S LISTS — Main, All, a thread, in either column, and the Pinned list — which are
-// in time order. Not the call's transcript, whose turns stand at its two sides; not the messages
-// still being sent.
-//
-// `#439 search-unmatched-separators`. A gap's line is a control, as a collapsed run's is: a tap on
-// it shows that run where it stands, the search kept, until any filter that chose the rows changes
-// — shown, not matched, so the bar's count does not move. And the same line stands among the thread
-// cards, in the Threads list and in two columns (`drawCardGaps`): there a card is a whole thread,
-// so its gap counts the messages in the threads it stands for, "… 15 unmatched messages in 3
-// threads …".
-//
-// ONE RULE WHEN A READ MODE AND THE SEARCH ARE BOTH ON: the search's. While a filter chooses rows
-// the read runs stand suspended as they always have (`readRunsSuspended`, `hidingRead`) — Fold
-// read opens every run and Hide read steps aside on a service with threads — so a run that is both
-// read and unmatched is ONE line, the unmatched one, because the search is why it is not shown.
-// Opening it shows those messages, the read ones greyed as in Show read; closing the search puts
-// the read mode back. On a service without threads Hide read is a read of its own and stays: the
-// read messages are not in the list at all, and a gap counts what is loaded, as the bar does.
-
-/** Whether a filter is choosing rows: the search text, Links, or whose messages. */
-const rowsChosen = () => readRunsSuspended();
-
-// `#439 search-unmatched-separators`. The unmatched runs the reader has opened, in each view, as the
-// ids of their messages: as a collapsed run's opened state is kept (`readRuns`), because the
-// rows are rebuilt under the reader. Held under the searches that chose the rows (`searchKey`) and
-// forgotten the moment any filter changes: an opened run is an act on THIS search's list, and a new
-// word typed is a new list. The thread cards keep theirs beside them (`openedCardGaps`). One owner keeps
-// both, in web/src/core/search/opened.ts (`#624 voice-page-modularity`).
-const openedGaps = createOpenedGaps();
-
-/**
- * This column's view's set of opened messages, or null when it has none and `create` does not ask
- * for one. Read on every pass of the search; empty almost always, and the pass is then as it was.
- *
- * @param {boolean} create
- * @returns {Set<string> | null}
- */
-function openedGapIds(create) {
-  return openedGaps.ids(searchKey(), JSON.stringify([viewKey(), columnWork.side(), String(selectedChannelId())]), create);
-}
-
-// The lines themselves, made once on their row and kept, are web/src/view/channel's (`createSeamLines`,
-// `#624 voice-page-modularity`); what a press of a gap's line opens is here.
-const { seamLineOf, seamDrawn, placeSeam } = createSeamLines({
-  gapListener: (row, below, line) => inThisColumn((event) => {
-    // The row's own tap would select or open it; this tap is the line's alone, as a run's is.
-    if (event) event.stopPropagation();
-    const focused = document.activeElement === line && line.matches(":focus-visible");
-    const first = line.gapUnpack ? openUnpackGap(row, below)
-      : line.gapCards ? openCardGap(row, below) : openSearchGap(row, below);
-    if (focused && first) {
-      first.setAttribute("tabindex", "-1");
-      first.focus({ preventScroll: true });
-    }
-  }),
-});
-
-/** Whether `row` stands in an opened run: every message it holds was in one the reader opened. */
-function inOpenedGap(row, opened) {
-  if (!opened || opened.size === 0) return false;
-  const held = idsOf(row);
-  return held.length > 0 && held.every((id) => opened.has(id));
-}
-
-/**
- * Open the unmatched run a gap's line on `row` stands for: above it (`below` false) the messages
- * hidden before it, below it the ones hidden after it. The rows are the list's messages as
- * `seamsFor` walks them. Returns the first row shown, for a keyboard's focus to land on, or null.
- */
-function openSearchGap(row, below) {
-  const list = row.parentNode;
-  if (!list) return null;
-  const rows = /** @type {any[]} */ ([...list.children]).filter((one) => isMessageRow(one) && !one.hasAttribute("data-card"));
-  const at = rows.indexOf(row);
-  if (at < 0) return null;
-  const opened = openedGapIds(true);
-  if (!opened) return null;
-  let first = null;
-  const take = (one) => {
-    for (const id of idsOf(one)) opened.add(id);
-    if (first === null || !below) first = one;
-  };
-  if (below) {
-    for (let next = at + 1; next < rows.length && !rowShown(rows[next]); next += 1) take(rows[next]);
-  } else {
-    for (let next = at - 1; next >= 0 && !rowShown(rows[next]); next -= 1) take(rows[next]);
-  }
-  if (first === null) return null;
-  // The reader keeps their place, as opening a collapsed run keeps it: rows growth above them is
-  // the list's, not a jump in it. Only where this list is the one on screen.
-  if (screens.screen() === "main" && screens.view() === "discord") preservingScroll(applySearch);
-  else applySearch();
-  return first;
-}
-
-// `#250 date-separators`. The owner: "It would also be good to have temporal markers, intelligently.
-// We could have more horizontal rule separators, not for collapsed messages but just for date
-// separators. "---- Oct 3, Mon ----" for a day separator at midnight. If you filter down to sparse
-// hits, consecutive separators should collapse "Oct 3 - 5"."
-//
-// THE SAME PASS DRAWS THE DAYS. A row's day is the device's own calendar day of its first message (a
-// combined row is glommed within seconds). For each row shown, the days it brings — its own, and its
-// stretch's — later than the last day already said are said once, as one range, from the first of
-// them to the row's own:
-//
-//   * with a stretch, on the stretch's line: "… 12 unmatched messages · Oct 3 – 5 …", or on a
-//     collapsed run's, "… 12 read messages · Oct 3 – 5 …";
-//   * with none, as a day rule of its own above the row: "Oct 3, Mon".
-//
-// So a day boundary inside a stretch is never a second line, and days a filter skips are one range,
-// never a stack of rules: the owner's "consecutive separators should collapse". The first row shown
-// always says its day, so the reader always knows which day they are in. A gap after the last row
-// shown says the days it reaches. Gathered replies (`#215 reply-coalesce`), drawn out of time order,
-// and a row whose time cannot be read say no day and move none.
-//
-// ONE DAY IS SAID IN THE OWNER'S WORDS, `dayLabel`'s: "Today, Oct 12, Mon", "Yesterday, Oct 11, Sun",
-// "Oct 9, Fri", and "Oct 9, 2025, Thu" for another year's. A RANGE stays compact, with no weekdays —
-// "Oct 9 – 11", "Sep 29 – Oct 2", "Dec 30, 2025 – Jan 2" — and names its last day Today or Yesterday,
-// "Oct 9 – Today", so a gap's line still fits a phone. The device's own zone, by the local calendar
-// getters — never arithmetic on milliseconds, which a change of clocks or a flight would break — and
-// "today" read once a pass. A refresh that brings nothing draws nothing (`#226`), so when the day has
-// turned since the lines were drawn it draws them again (`seamsAfterMidnight`): a channel nobody
-// writes in past midnight says Yesterday where it said Today.
-
-// --- which day ------------------------------------------------------------------------------------
-//
-// `dayLabel` is the page's one wording of a single day, in the owner's words, and a day rule says
-// exactly what it does: web/src/present/time, with `dayRangeWords` for a run of days.
-
-/** The day of `row`'s first message on this device, or null: none readable, or a gathered reply. */
-function rowDay(row) {
-  const gathered = row.getAttribute("data-coalesce");
-  if ((gathered !== null && gathered !== "parent") || row.hasAttribute("data-stack-under")) return null;
-  const sent = rowSentMs(row);
-  return Number.isFinite(sent) ? dayKeyOf(new Date(sent)) : null;
-}
-
-/**
- * The rows of `list` that lines are drawn between; what each shown row has above and below it,
- * `{above, below}`, each `{kind, words}` or null; and what each collapsed run's line says of its days.
- *
- * @typedef {{kind: string, words: string}} Seam
- */
-function seamsFor(list) {
-  // Rows of the page's own making, which carry what was drawn on them (`seamLine`, `runDays`).
-  const rows = /** @type {any[]} */ ([...list.children]).filter((row) => isMessageRow(row) && !row.hasAttribute("data-card"));
-  const gaps = rowsChosen();
-  const clock = dayClock();
-  // What the lines say is web/src/present/rows' `seamPlan`, from what each row is.
-  const plan = seamPlan(rows.map((row) => ({
-    role: row.getAttribute("data-read-run"), shown: rowShown(row), day: rowDay(row), count: idsOf(row).length,
-  })), gaps, clock);
-  /** @type {Map<any, {above: Seam | null, below: Seam | null}>} */
-  const wanted = new Map();
-  for (const [at, lines] of plan.wanted) wanted.set(rows[at], lines);
-  /** @type {Map<any, string>} */
-  const runDays = new Map();
-  for (const [at, days] of plan.runDays) runDays.set(rows[at], days);
-  return { rows, wanted, runDays, today: clock.today };
-}
-
-/** The day each list's lines were last drawn on, as `dayKeyOf` says it (`seamsAfterMidnight`). */
-const seamsDrawnOn = new WeakMap();
-
-/** The day each list's row times were last worded on, as `dayKeyOf` says it (`rewordRowTimes`). */
-const timesWordedOn = new WeakMap();
-
-/**
- * `#729 vt-older-message-dates`. Word every row time of `list` again once the day has turned since they
- * were worded: a row is drawn once and kept (`#226 page-energy-profile`), and yesterday's "03:23 PM"
- * must say "Sun 03:23 PM" the morning after, as the lines between the rows say Yesterday. Asked
- * wherever the lines are, so a quiet channel's refresh past midnight does it too (`seamsAfterMidnight`).
- *
- * @param {Element} list
- * @param {Element[]} rows
- * @param {number} today
- */
-function rewordRowTimes(list, rows, today) {
-  const was = timesWordedOn.get(list);
-  timesWordedOn.set(list, today);
-  if (was === undefined || was === today) return;
-  for (const row of rows) {
-    const node = rowTime(row);
-    if (node) setTextIfChanged(node, messageTimeLabel({ timestamp: node.getAttribute("datetime") }));
-  }
-}
-
-/**
- * Draw the lines between the rows of `list`, and take away every one no longer wanted. Under
- * `preservingScroll` for the list on screen, as the bookmark's line is, outside a filter change, which
- * places the reader itself once the list is drawn (`keepingFilterPlace`).
- */
-function drawSeams(list) {
-  const { rows, wanted, runDays, today } = seamsFor(list);
-  seamsDrawnOn.set(list, today);
-  rewordRowTimes(list, rows, today);
-  const none = { above: null, below: null };
-  // `#250 date-separators`. A collapsed run's line says the days it brings, as its words go.
-  const changed = rows.some((row) => {
-    const want = wanted.get(row) || none;
-    return !seamDrawn(row, want.above, false) || !seamDrawn(row, want.below, true) ||
-      (runDays.has(row) && runDaysOf(row) !== runDays.get(row));
-  });
-  if (!changed) return;
-  const apply = () => {
-    for (const row of rows) {
-      const want = wanted.get(row) || none;
-      placeSeam(row, want.above, false);
-      placeSeam(row, want.below, true);
-      if (runDays.has(row) && runDaysOf(row) !== runDays.get(row)) {
-        row.runDays = runDays.get(row);
-        placeInReadRun(row, "head", readRunCount(row));
-      }
-    }
-  };
-  if (!columnWork.side() && !filterChanges.changing() && screens.screen() === "main" && screens.view() === "discord" && list === visibleList()) {
-    // While a filter change holds a message in place (`#243 filter-keeps-selection`), the hold places
-    // the reader, not this: the held message goes back where the change put it, as after every other
-    // redraw around it (`keepFilterHold`) — kept where it happens to be in the middle of a redraw, it
-    // would be left wherever the redraw had moved it. One the redraw took out of the list is placed by
-    // what the redraw does next, as it always was.
-    const held = currentFilterHold();
-    if (held !== null) {
-      apply();
-      if (held.row !== null) keepFilterHold();
-    } else {
-      preservingScroll(apply);
-    }
-  } else {
-    apply();
-  }
-}
-
-/**
- * Draw the lines between rows again in the column being worked on, if the device's day has turned
- * since they were last drawn — and nothing otherwise. For the refresh that brings nothing and so
- * draws nothing (`#226 page-energy-profile`): without it a channel nobody writes in past midnight
- * goes on saying "Today" of yesterday until something else redraws it, which on a quiet evening is
- * the next poll that brings a message, or never.
- */
-function seamsAfterMidnight() {
-  const today = dayClock().today;
-  for (const list of [el("discord-log"), el("pinned-log")]) {
-    const drawn = seamsDrawnOn.get(list);
-    if (drawn !== undefined && drawn !== today) drawSeams(list);
-  }
-}
+const {
+  markSearchSoon, markSearchNow, searchParsed, searchTyped, searchIdentity, searchable,
+  applySearch, searchInAll, renderSearchInAll, renderSearchCount, refreshSearchCount,
+  listEmptied, drawSeams, seamsAfterMidnight, openSearchGap, inOpenedGap,
+  rowsChosen, rowDay, markSearchHits, messageMatches, threadsWithHits, rowMatches,
+  sayCardCount, openedGaps, placeSeam, seamDrawn,
+} = searchRows;
 
 // --- a filter changed: the reader's message stays where it is on the screen ----------------------
 //

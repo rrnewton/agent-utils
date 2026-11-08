@@ -147,3 +147,5 @@ export { DISMISS_BATCH, createChannelRows } from "./channelrows.ts";
 export type { ChannelRows, ChannelRowsDependencies } from "./channelrows.ts";
 export { SEARCH_OLDER_HITS, SEARCH_OLDER_MS, SEARCH_OLDER_PAGES, SEARCH_OLDER_TAP_MS, mountOlderWalks } from "./olderwalks.ts";
 export type { OlderWalkColumn, OlderWalks, OlderWalksDependencies, SearchWalk } from "./olderwalks.ts";
+export { SEARCH_LISTS, createSearchRows } from "./searchrows.ts";
+export type { SearchCount, SearchFieldLike, SearchRows, SearchRowsDependencies } from "./searchrows.ts";

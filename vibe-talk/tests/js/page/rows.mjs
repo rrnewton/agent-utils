@@ -3743,7 +3743,7 @@ test("`#729 vt-older-message-dates`: past midnight a page left open words its ke
   const { text, want } = await run(SCRIPT);
   assert.equal(text, want, "a page left open past midnight still gave this morning's time alone");
   // THE CONTROL: with the times never worded again, the row goes on saying the time alone.
-  const control = await run(brokenScript("  rewordRowTimes(list, rows, today);\n", ""));
+  const control = await run(await brokenModule([{ file: "src/view/channel/searchrows.ts", find: "    rewordRowTimes(list, rows, today);\n", replace: "" }]));
   assert.notEqual(control.text, control.want, "with the times never worded again the row changed anyway, so this test cannot see it");
 });
 
@@ -5137,7 +5137,7 @@ test("`#250 date-separators`: a redraw that changes nothing writes no rule, and 
   const drawn = await run(SCRIPT);
   assert.equal(drawn.written, 0, "a redraw that changed nothing wrote the days again");
   // The same redraw with no lines drawn at all reads exactly as much of the layout.
-  const bare = await run(brokenScript("function drawSeams(list) {\n", "function drawSeams(list) {\n  if (list) return;\n"));
+  const bare = await run(await brokenModule([{ file: "src/view/channel/searchrows.ts", find: "  function drawSeams(list: HTMLElement): void {\n", replace: "  function drawSeams(list: HTMLElement): void {\n    if (list) return;\n" }]));
   assert.equal(drawn.measured, bare.measured, `the lines read ${drawn.measured - bare.measured} rows' layout on a redraw`);
 });
 
@@ -5216,9 +5216,13 @@ test("`#250 date-separators`: one day is said in the owner's words by `dayLabel`
 test("`#250 date-separators`: a range stays compact — across a year, within a month of a past year, and ending Today or Yesterday", async () => {
   const page = newPage();
   const range = PRESENT_TIME.dayRangeWords;
-  const clockNow = page.preludeBinding("dayClock");
+  const clockFor = (at) => ({
+    now: at, today: PRESENT_TIME.dayKeyOf(at),
+    yesterday: PRESENT_TIME.dayKeyOf(new Date(at.getFullYear(), at.getMonth(), at.getDate() - 1, 12)),
+    year: at.getFullYear(),
+  });
   clockAt(page, 10, 12);
-  const now = clockNow();
+  const now = clockFor(new Date(2026, 9, 12, 12));
   const cases = [
     [20261007, 20261009, "Oct 7 – 9"],
     [20260929, 20261002, "Sep 29 – Oct 2"],
@@ -5237,7 +5241,7 @@ test("`#250 date-separators`: a range stays compact — across a year, within a 
   for (const [from, to, want] of cases) assert.equal(range(from, to, now), want, `${from} to ${to}`);
   // New Year's Day: the days before it are another year's, and the last of them is Yesterday.
   page.setClock(new Date(2026, 0, 1, 9, 0).getTime());
-  const newYear = clockNow();
+  const newYear = clockFor(new Date(2026, 0, 1, 9, 0));
   assert.equal(range(20251229, 20251231, newYear), "Dec 29, 2025 – Yesterday");
   assert.equal(range(20251231, 20251231, newYear), "Yesterday, Dec 31, 2025, Wed");
   assert.equal(range(20251231, 20260101, newYear), "Yesterday – Today");
@@ -5386,9 +5390,9 @@ test("`#249 search-highlight` x `#250 date-separators`: a line drawn above a row
   const seam = await focusAcross(await brokenModule([{ file: "src/view/channel/seams.ts",
     find: "      else row.insertBefore(line, row.firstChild);", replace: "      else row.replaceChildren(line, ...row.children);" }]));
   assert.equal(seam.kept.seam, false, "the control drew the line above the row and kept the focus, so the check proves nothing");
-  const marks = await focusAcross(brokenScript(
-    "      for (const made of pieces) parent.insertBefore(made, piece.node);\n      parent.removeChild(piece.node);",
-    "      parent.replaceChildren(...[...parent.childNodes].flatMap((kid) => (kid === piece.node ? pieces : [kid])));"));
+  const marks = await focusAcross(await brokenModule([{ file: "src/view/channel/searchrows.ts",
+    find: "        for (const made of pieces) parent.insertBefore(made, piece.node);\n        parent.removeChild(piece.node);",
+    replace: "        parent.replaceChildren(...[...parent.childNodes].flatMap((kid) => (kid === piece.node ? pieces : [kid])));" }]));
   assert.equal(marks.kept.marks, false, "the control marked the hits and kept the focus, so the check proves nothing");
   const bookmark = await focusAcross(await brokenModule([{ file: "src/view/channel/bookmark.ts",
     find: "      row.insertBefore(line, first !== null && first === row.seamLine ? first.nextSibling : first);",
