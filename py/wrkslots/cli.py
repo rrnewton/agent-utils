@@ -49384,8 +49384,53 @@ class _RetainedValidationGitState:
     directories: tuple[tuple[int, int, int], ...]
 
 
+#: The hermetic split build's Cargo target inside a validation checkout
+#: (ci/hermetic/run-in-pinned-root.sh bind-mounts <checkout>/ignored/
+#: hermetic/split/target at /src/target). It is regenerable build output,
+#: never authored content or run evidence.
+_FROZEN_VALIDATION_BUILD_RESIDUE = Path("ignored/hermetic/split/target")
+
+
+def _only_frozen_build_residue(repository: Path) -> bool:
+    """True when ``ignored/`` holds nothing outside the split Cargo target.
+
+    Git collapses a fully ignored directory to one ``! ignored/`` status
+    line, so the status text alone cannot tell build residue from a stray
+    log or receipt beside it; the tree itself must be walked. Anything
+    else -- a file, directory or symlink outside the target, or a symlink
+    at or above it -- keeps the checkout preserved.
+    """
+
+    ignored = repository / _FROZEN_VALIDATION_BUILD_RESIDUE.parts[0]
+    if ignored.is_symlink() or not ignored.is_dir():
+        return False
+    residue = _FROZEN_VALIDATION_BUILD_RESIDUE.parts
+    stack = [repository / residue[0]]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            return False
+        for entry in entries:
+            parts = Path(entry.path).relative_to(repository).parts
+            if parts == residue:
+                continue
+            if len(parts) < len(residue) and residue[: len(parts)] == parts:
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        return False
+                except OSError:
+                    return False
+                stack.append(Path(entry.path))
+                continue
+            return False
+    return True
+
+
 def _retained_validation_git_state(
-    repository: Path, *, pristine: bool, cache_globs: Sequence[str] = ()
+    repository: Path, *, pristine: bool, cache_globs: Sequence[str] = (),
+    build_residue: bool = False,
 ) -> _RetainedValidationGitState:
     """Observe a repository without refreshing its index or changing its files."""
 
@@ -49424,7 +49469,14 @@ def _retained_validation_git_state(
         env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
     ).stdout
     if pristine and status:
-        raise Refusal(f"retained validation checkout is not pristine ({status.splitlines()[0]}); preserve it")
+        if (
+            build_residue
+            and all(line.startswith("! ") for line in status.splitlines())
+            and _only_frozen_build_residue(repository)
+        ):
+            status = ""
+        else:
+            raise Refusal(f"retained validation checkout is not pristine ({status.splitlines()[0]}); preserve it")
     return _RetainedValidationGitState(
         head, common, git_directory, index, index_identity, status,
         (
@@ -49454,7 +49506,9 @@ def _pristine_frozen_validation_state(
         repository = checkout / relative
         _ensure_no_symlink_components(checkout, repository, "retained validation submodule")
         _ensure_no_mount_components(checkout, repository, "retained validation submodule")
-        state = _retained_validation_git_state(repository, pristine=True)
+        state = _retained_validation_git_state(
+            repository, pristine=True, build_residue=relative == "."
+        )
         if relative == "." and state.head != expected_head:
             raise Refusal("retained validation checkout HEAD differs from its recorded target")
         if not _path_is_within(state.common, checkout):
