@@ -3348,7 +3348,7 @@ for (const mode of ["delta", "newest"]) {
 
     // THE CONTROL: without the read that places it, the reply stays on Main (a delta), or goes
     // nowhere (a newest page of Main), and its thread does not have it.
-    const control = await run(brokenScript("  queuePlaceUnplaced();\n}", "}"));
+    const control = await run(await brokenModule([{ file: "src/view/channel/refresh.ts", find: "  queuePlaceUnplaced();\n}", replace: "}" }]));
     if (mode === "delta") {
       assert.deepStrictEqual(shownIds(control.page), ["200", "201", "203", "300"],
         "without the placing read the reply still left Main, so this test cannot see it");
@@ -3395,7 +3395,7 @@ test("`#308 live-reply-in-main`: THE OWNER'S CASE — reads failing as the reply
   assert.deepStrictEqual(shownIds(page), ["201", "202", "300"], "the reply is not in its thread");
 
   // THE CONTROL, which is the owner's report: Main's read lands and the reply is still not in its thread.
-  const control = await run(brokenScript("  queuePlaceUnplaced();\n}", "}"));
+  const control = await run(await brokenModule([{ file: "src/view/channel/refresh.ts", find: "  queuePlaceUnplaced();\n}", replace: "}" }]));
   control.page.timeline = control.standard;
   await pollOnce(control.page);
   await control.page.settle();
@@ -3435,8 +3435,8 @@ for (const kind of ["replayed copy", "edit", "second copy"]) {
 
     // THE CONTROL: a copy that places nothing leaves the reply where the threadless one drew it.
     const control = await run(kind === "edit"
-      ? brokenScript("      placeFromEdit(payload.message);\n", "")
-      : brokenScript("    const places = placesHeld(message);\n", "    const places = false;\n"));
+      ? await brokenModule([{ file: "src/view/channel/livestream.ts", find: "      placeFromEdit(payload.message);\n", replace: "" }])
+      : await brokenModule([{ file: "src/view/channel/livestream.ts", find: "    const places = placesHeld(message);\n", replace: "    const places = false;\n" }]));
     if (kind === "second copy") {
       // The copy itself still replaces the store's, and the row on Main stays until a read redraws it.
       assert.ok(shownIds(control.page).includes("300"), "without the placement the reply still left Main, so this test cannot see it");
@@ -3533,7 +3533,7 @@ test("`#308 live-reply-in-main`: in two columns the reply leaves Main on the lef
   assert.deepStrictEqual(sideIds(page), ["201", "202", "300"], "the reply did not reach its thread on the right");
   assert.equal(threadButton(rowWithId(page, "201")).textContent, "2 replies", "Main's root did not count the reply");
 
-  const control = await run(brokenScript("  queuePlaceUnplaced();\n}", "}"));
+  const control = await run(await brokenModule([{ file: "src/view/channel/refresh.ts", find: "  queuePlaceUnplaced();\n}", replace: "}" }]));
   assert.ok(!sideIds(control.page).includes("300"),
     "without the placing read the reply still reached the right column, so this test cannot see it");
 });
@@ -4189,9 +4189,8 @@ for (const hidden of [false, true]) {
 
     // THE CONTROL, as round 2 did: the replayed copy folded in whole.
     const control = await run(hidden
-      ? brokenScript("        if (held) takeThreadRecord(message);\n        else foldLiveMessage(message, true, replayed);\n",
-        "        foldLiveMessage(message, true, replayed);\n")
-      : brokenScript("    } else if (places) {\n      takeThreadRecord(message);\n", "    } else if (places) {\n      foldLiveMessage(message, true, replayed);\n"));
+      ? await brokenModule([{ file: "src/view/channel/livestream.ts", find: "        if (held) takeThreadRecord(message);\n        else foldLiveMessage(message, true, replayed);\n", replace: "        foldLiveMessage(message, true, replayed);\n" }])
+      : await brokenModule([{ file: "src/view/channel/livestream.ts", find: "    } else if (places) {\n      takeThreadRecord(message);\n", replace: "    } else if (places) {\n      foldLiveMessage(message, true, replayed);\n" }]));
     assert.equal(savedMessage(control.page, "200").content, "main channel announcement",
       "the store kept its own copy anyway, so this test cannot see it");
   });
@@ -4390,8 +4389,7 @@ for (const placing of ["newest", "delta"]) {
         const kept = savedMessage(control.page, "300");
         return Boolean(kept && kept.thread && kept.thread.id === control.first.id);
       };
-      const unplaced = await run(brokenScript("  if (channelStore.current().channel !== String(channel)) return;\n  noteRemoved(channelStore.current(), String(id), observedMs);\n",
-        "  if (channelStore.current().channel !== String(channel)) return;\n"));
+      const unplaced = await run(await brokenModule([{ file: "src/view/channel/livestream.ts", find: "  if (channelStore.current().channel !== String(channel)) return;\n  noteRemoved(channelStore.current(), String(id), observedMs);\n", replace: "  if (channelStore.current().channel !== String(channel)) return;\n" }]));
       assert.ok(inThread(unplaced), "the reply stayed gone anyway, so this test cannot see it");
       if (placing === "delta") {
         // And a placing delta folded whatever the stream removed since it was sent, its copy of the reply
@@ -5606,7 +5604,7 @@ test("`#310 stale-live-read-flicker`: All's newest page brings a bridge's finish
 
   // THE CONTROL: the thread record the stream put on stamped as new as the moment it went in, All's page,
   // sent before then, refuses its copy, and the polls after never bring the finished text.
-  const control = await run(brokenScript("    buildCopyOn(placed, held);\n", "    orderCopy(placed, readOrder.now());\n"));
+  const control = await run(await brokenModule([{ file: "src/view/channel/livestream.ts", find: "    buildCopyOn(placed, held);\n", replace: "    orderCopy(placed, readOrder.now());\n" }]));
   assert.equal(control.landed.saved, "the bridge's answer, in the first discussion",
     "All's page brought the finished answer anyway, so this test cannot see it");
   assert.deepStrictEqual(control.polls, Array(3).fill("the bridge's answer, in the first discussion"));

@@ -2917,8 +2917,7 @@ test("`#459 pack-keeps-card-still`: up the list a packed card stays where it is 
   };
   assert.deepStrictEqual(await run(SCRIPT), { packedAll: true, moved: 0, room: true });
   // THE CONTROL. Pack all keeping the reader's place as any change does: at the foot, the foot, and the card moves.
-  const placeOnly = await run(brokenScript("  if (still !== null) keepingCardStill(still, renderSideColumn);\n  else keepingCardPlace(renderSideColumn);",
-    "  keepingCardPlace(renderSideColumn);"));
+  const placeOnly = await run(await brokenModule([{ file: "src/view/channel/packcontrols.ts", find: "  if (still !== null) keepingCardStill(still, renderSideColumn);\n  else keepingCardPlace(renderSideColumn);", replace: "  keepingCardPlace(renderSideColumn);" }]));
   assert.ok(placeOnly.moved !== 0, "the control: Pack all keeping only the reader's place left the card where it was");
 });
 

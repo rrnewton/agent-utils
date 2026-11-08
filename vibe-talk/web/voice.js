@@ -2119,10 +2119,10 @@ const searchRows = createSearchRows({
   heldLinks: (row) => heldLinks(row),
   hiddenKindNames,
   renderLinkKindCounts,
-  drawCardGaps,
-  openedCardGaps,
-  openUnpackGap,
-  openCardGap,
+  drawCardGaps: (list) => drawCardGaps(list),
+  openedCardGaps: (create) => openedCardGaps(create),
+  openUnpackGap: (row, below) => /** @type {any} */ (openUnpackGap(/** @type {any} */ (row), below)),
+  openCardGap: (row, below) => /** @type {any} */ (openCardGap(/** @type {any} */ (row), below)),
   renderReplyLinks,
   renderOlderControl: () => renderOlderControl(),
   scheduleServerSearch: () => scheduleServerSearch(),
@@ -19543,234 +19543,12 @@ function filterSideCards() {
 // with no search choosing. The line is the channel gap's own (`.row-seam`, on the card after its
 // run), and a tap opens its run the same way: shown, not matched, until the search changes.
 
-/**
- * The opened card runs under the searches as they stand — thread ids, and the ids of Main's
- * messages among the cards — or null when there are none and `create` does not ask for them.
- * The read mode is in `searchKey`, since it chooses cards beside the words.
- *
- * @param {boolean} create
- * @returns {{threads: Set<string>, ids: Set<string>} | null}
- */
-function openedCardGaps(create) {
-  // Forgotten the moment any filter changes, as among messages (`openedGapIds`).
-  return openedGaps.cards(JSON.stringify([searchKey(), String(selectedChannelId())]), create);
-}
 
-/**
- * The blocks of messages unpacked under the cards of `list`, each as its card and its rows in order.
- * `#606 server-side-search`.
- *
- * @param {HTMLElement} list
- */
-function unpackBlocks(list) {
-  /** @type {Map<string, {card: any, rows: any[]}>} */
-  const blocks = new Map();
-  let card = null;
-  for (const row of /** @type {any[]} */ ([...list.children])) {
-    const thread = row.getAttribute("data-unpack-thread");
-    if (thread === null) {
-      card = row.hasAttribute("data-card") ? row : null;
-      continue;
-    }
-    if (!blocks.has(thread)) blocks.set(thread, { card: card && String(cardThread(card)) === thread ? card : null, rows: [] });
-    /** @type {{card: any, rows: any[]}} */ (blocks.get(thread)).rows.push(row);
-  }
-  return [...blocks.values()];
-}
 
-/**
- * `#606 server-side-search`. In each thread unpacked under its card while a search is typed, a line
- * for each run of its messages the search leaves out: "… 3 unmatched messages …" above the hit after
- * the run, or below the last hit for a run at the end, or below the card for a run before the first
- * hit — above that hit instead when the cards' own line for the threads after it holds the card's
- * place below (`drawCardGaps` draws first), so neither line takes the other's. A block the read mode
- * or the search hides is skipped; every line comes down with the search. A tap opens its run
- * (`openUnpackGap`), as among the channel's messages.
- *
- * @param {HTMLElement} list
- * @param {boolean} searching
- */
-function drawUnpackGaps(list, searching) {
-  for (const { card, rows } of unpackBlocks(list)) {
-    /** @type {Map<any, {above: any, below: any}>} */
-    const wanted = new Map();
-    // The cards' own line for the threads after this one, on the card's place below.
-    const cardBusy = Boolean(card && card.hasAttribute("data-seam-below") && card.seamBelowLine &&
-      !card.seamBelowLine.gapUnpack);
-    if (searching) {
-      let run = 0;
-      let last = null;
-      const line = (count) => ({ kind: "gap", unpack: true, words: gapWords(count) });
-      for (const row of rows) {
-        if (row.hidden) continue;
-        if (!rowShown(row)) {
-          run += Math.max(1, idsOf(row).length);
-          continue;
-        }
-        const onCard = run > 0 && last === null && card && !cardBusy;
-        wanted.set(row, { above: run > 0 && (last !== null || !onCard) ? line(run) : null, below: null });
-        if (onCard) wanted.set(card, { above: null, below: line(run) });
-        run = 0;
-        last = row;
-      }
-      if (run > 0) {
-        if (last !== null) /** @type {{above: any, below: any}} */ (wanted.get(last)).below = line(run);
-        else if (card && rowShown(card) && !cardBusy) wanted.set(card, { above: null, below: line(run) });
-      }
-    }
-    for (const row of rows) {
-      const want = wanted.get(row) || { above: null, below: null };
-      if (!row.hidden || row.hasAttribute("data-seam") || row.hasAttribute("data-seam-below")) {
-        placeSeam(row, want.above, false);
-        placeSeam(row, want.below, true);
-      }
-    }
-    // The card's line below it is the block's alone while the block wants one; the cards' own runs
-    // put theirs above the next card shown, so the two never meet on one card.
-    if (card) {
-      const own = wanted.get(card);
-      const held = card.seamBelowLine;
-      if (own) placeSeam(card, own.below, true);
-      else if (held && held.gapUnpack) placeSeam(card, null, true);
-    }
-  }
-}
 
-/**
- * Open the run of an unpacked thread's messages a line on `row` stands for: above it, the messages the
- * search hid before it; below it (or below the card, `row` being the card), those after it. Returns the
- * first row shown, for a keyboard's focus. `#606 server-side-search`.
- */
-function openUnpackGap(row, below) {
-  const list = row.parentNode;
-  if (!list) return null;
-  const thread = row.getAttribute("data-unpack-thread") ?? String(cardThread(row));
-  const block = unpackBlocks(list).find((one) => one.rows.length > 0 &&
-    String(one.rows[0].getAttribute("data-unpack-thread")) === String(thread));
-  const opened = openedCardGaps(true);
-  if (!block || !opened) return null;
-  const rows = block.rows.filter((one) => !one.hidden);
-  const at = row.hasAttribute("data-unpack-thread") ? rows.indexOf(row) : -1;
-  let first = null;
-  const take = (one) => {
-    for (const id of idsOf(one)) opened.ids.add(id);
-    if (first === null || !below) first = one;
-  };
-  if (below) {
-    for (let next = at + 1; next < rows.length && !rowShown(rows[next]); next += 1) take(rows[next]);
-  } else {
-    for (let next = at - 1; next >= 0 && !rowShown(rows[next]); next -= 1) take(rows[next]);
-  }
-  if (first === null) return null;
-  keepingCardPlace(filterSideCards);
-  return first;
-}
 
-/**
- * Draw a line in each run the search leaves among `list`'s cards, and take away every one no
- * longer wanted: `drawSeams` for a list of threads. Each card keeps the words it was drawn with
- * (`placeSeam`), so a pass that changes nothing writes nothing, as among messages.
- */
-function drawCardGaps(list) {
-  if (!list) return;
-  const searching = searchField.open() && searchTyped(searchField.query());
-  if (!searching) {
-    // No grouping to do: only lines a closed search left behind come down, and on most passes
-    // there are none — an attribute each, asked on the way past.
-    for (const row of list.children) {
-      if (row.hasAttribute("data-seam")) placeSeam(row, null, false);
-      if (row.hasAttribute("data-seam-below")) placeSeam(row, null, true);
-    }
-    return;
-  }
-  const groups = cardGapGroups(list);
-  /** @type {Map<any, {above: any, below: any}>} */
-  const wanted = new Map();
-  let run = null;
-  let last = null;
-  const line = (tally) => ({ kind: "gap", cards: true, words: cardGapWords(tally.messages, tally.threads, tally.exact, tally.onlyCards) });
-  for (const group of groups) {
-    if (group.other) {
-      run = null;
-      continue;
-    }
-    if (!rowShown(group.head)) {
-      const one = cardGapTally(group);
-      const was = run;
-      if (was === null) run = one;
-      else run = {
-        messages: was.messages + one.messages, threads: was.threads + one.threads,
-        exact: was.exact && one.exact, onlyCards: was.onlyCards && one.onlyCards,
-      };
-      continue;
-    }
-    wanted.set(group.head, { above: searching && run !== null ? line(run) : null, below: null });
-    run = null;
-    last = group.head;
-  }
-  if (last !== null && searching && run !== null) wanted.get(last).below = line(run);
-  const none = { above: null, below: null };
-  for (const group of groups) {
-    const want = wanted.get(group.head) || none;
-    placeSeam(group.head, want.above, false);
-    placeSeam(group.head, want.below, true);
-  }
-  // `#606 server-side-search`. Then the lines inside the threads unpacked under the cards: a card's
-  // line below it is the block's while the block wants one.
-  drawUnpackGaps(list, searching);
-}
 
-/**
- * Open the run a card gap's line on `row` stands for, as `openSearchGap` opens a run of messages:
- * its threads remembered, the cards filtered again where they stand. Returns its first card.
- */
-function openCardGap(row, below) {
-  const list = row.parentNode;
-  if (!list) return null;
-  const groups = cardGapGroups(list);
-  const at = groups.findIndex((group) => group.head === row);
-  if (at < 0) return null;
-  const opened = openedCardGaps(true);
-  if (!opened) return null;
-  let first = null;
-  const take = (group) => {
-    if (group.card) opened.threads.add(cardThread(group.head));
-    else for (const id of idsOf(group.head)) opened.ids.add(id);
-    if (first === null || !below) first = group.head;
-  };
-  if (below) {
-    for (let next = at + 1; next < groups.length && !groups[next].other && !rowShown(groups[next].head); next += 1) take(groups[next]);
-  } else {
-    for (let next = at - 1; next >= 0 && !groups[next].other && !rowShown(groups[next].head); next -= 1) take(groups[next]);
-  }
-  if (first === null) return null;
-  if (list === leftEl("side-cards")) keepingCardPlace(filterSideCards);
-  else applySearch();
-  return first;
-}
 
-/**
- * Say on card `row`, or stop saying, that the search found it only with its thread's replies: "in
- * replies", at the end of its facts, made when it is wanted and gone when it is not.
- *
- * @param {HTMLElement & {cardFacts?: HTMLElement, replyHint?: HTMLElement | null}} row
- * @param {boolean} on
- */
-function markReplyMatch(row, on) {
-  if (Boolean(row.replyHint) === on || !row.cardFacts) return;
-  if (on) {
-    const hint = document.createElement("span");
-    hint.className = "side-card-hint";
-    hint.textContent = "in replies";
-    row.cardFacts.append(hint);
-    row.replyHint = hint;
-    row.setAttribute("data-search-in", "replies");
-  } else if (row.replyHint) {
-    row.cardFacts.removeChild(row.replyHint);
-    row.replyHint = null;
-    row.removeAttribute("data-search-in");
-  }
-}
 
 /**
  * What the right column says over its cards, or "" while it shows some: none in the channel, none
@@ -19847,16 +19625,6 @@ const cardPacking = createCardPacking({ storage: () => deviceStorage() });
 /** Whether the cards on screen are the Threads view's, where each thread is packed or unpacked from its card. */
 const cardsCycle = () => threadListOnScreen() && columns.side.mode === "list";
 
-/**
- * Thread `choice`'s card as the Threads view draws it: its own choice, else Unpack's (`read`, by
- * `threadIsRead`). Collapsed everywhere else.
- */
-function cardState(choice, read) {
-  if (!cardsCycle()) return "collapsed";
-  const own = cardPacking.choiceOf(String(selectedChannelId()), choice.id);
-  if (own) return own;
-  return cardPacking.mode() === "all" || (cardPacking.mode() === "unread" && !read) ? "unpacked" : "collapsed";
-}
 
 /**
  * The reads unpacking owes the threads — each read once, again only once its thread has grown past what
@@ -19910,293 +19678,27 @@ const cardIsSummarized = (choice) => {
 const unpackOnScreen = () => cardsCycle() && (cardPacking.mode() !== "packed" ||
   cardPacking.unpackedIn(String(selectedChannelId())));
 
-/** The Unpack chip: offered over the Threads view's cards, saying its state; `mixed` for Unpack unread. */
-function renderUnpackToggle() {
-  const button = leftEl("side-unpack");
-  const offered = columns.side.mode === "list" && layoutShown.threadList();
-  if (button.hidden === offered) button.hidden = !offered;
-  const unpackMode = cardPacking.mode();
-  const pressed = unpackMode === "all" ? "true" : unpackMode === "unread" ? "mixed" : "false";
-  if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
-  setTextIfChanged(button, UNPACK_MODE_NAMES[unpackMode]);
-  const next = UNPACK_MODE_NAMES[cardPacking.nextMode()];
-  const title = `${UNPACK_MODE_NAMES[unpackMode]}. Press for ${next.toLowerCase()}`;
-  if (button.title !== title) button.title = title;
-}
-
-/**
- * The reader pressed Unpack, or u: its next state, kept, every thread of the channel given
- * back to it (their own choices let go), and the cards drawn again where the reader is.
- */
-function setUnpackMode(mode) {
-  cardPacking.setMode(mode, String(selectedChannelId()));
-  renderUnpackToggle();
-  cardsDrawn.forget();
-  if (!sideColumnUp()) return;
-  // `#459 pack-keeps-card-still`. The card the reader is plainly on held still, as one packed by itself is;
-  // with none, their place kept as for any change to the cards.
-  const still = stillCardOnScreen();
-  if (still !== null) keepingCardStill(still, renderSideColumn);
-  else keepingCardPlace(renderSideColumn);
-}
-
-/**
- * The card the reader is plainly on in the cards: the highlighted one (`#277 thread-card-focus`), else the
- * selected one, while it is on screen. Null for none, as with the selection on an unpacked row.
- */
-function stillCardOnScreen() {
-  if (!sideColumnUp() || columns.side.mode !== "list") return null;
-  const area = leftEl("side-scroll");
-  const top = area.getBoundingClientRect().top;
-  const foot = top + (area.clientHeight || 0);
-  const mark = markOf(sidePane);
-  for (const id of [litCard(), mark && mark.card ? mark.id : null]) {
-    const row = id === null ? null : cardRow(id);
-    if (!row || !rowShown(row)) continue;
-    const box = row.getBoundingClientRect();
-    if (box.bottom > top && box.top < foot) return id;
-  }
-  return null;
-}
-
-/** u, over the Threads view: Unpack's next state. Elsewhere, nothing. */
-function unpackFromKeyboard() {
-  if (!cardsCycle()) return false;
-  setUnpackMode(cardPacking.nextMode());
-  setStatus(UNPACK_MODE_SAID[cardPacking.mode()]);
-  return true;
-}
-
-/**
- * Thread `id` drawn `state` by its own choice, outranking Unpack until it is pressed again, kept on this
- * device; the cards drawn again with its card held exactly where it is on the screen, past the foot of
- * the list where that is what it takes (`keepingCardStill`, `#459 pack-keeps-card-still`).
- */
-function setCardState(id, state) {
-  cardPacking.choose(String(selectedChannelId()), id, state);
-  // `#460 pack-gap-slide`: what is below the thread slides into its new place.
-  keepingCardStill(id, () => {
-    cardsDrawn.forget();
-    renderSideColumn();
-    // The card is drawn anew: the selection, its Tab stop and its focus go to the new one.
-    keepSelection();
-  }, true);
-}
-
-/** Thread `id`'s card in the cards on screen, or null. */
-function cardRow(id) {
-  return /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
-    .find((one) => one.hasAttribute("data-card") && one.getAttribute("data-id") === id) || null;
-}
-
-/**
- * A press on the Threads view's card `row` of thread `choice`, or Enter or o on it: its next state, round
- * collapsed, whole and unpacked; a summarized card, the same whole and collapsed, round two.
- */
-function cycleCardState(choice, row) {
-  // `#528`: and a card waiting for its summary, which says no more whole; a clamped card still opens to K lines.
-  const order = ["summary", "pending"].includes(cardView(choice).mode) ? ["collapsed", "unpacked"] : CARD_STATES;
-  const now = String(row.getAttribute("data-card-state") || "collapsed");
-  const at = order.indexOf(now);
-  const next = at < 0 ? "unpacked" : order[(at + 1) % order.length];
-  setCardState(choice.id, next);
-  setStatus(next === "unpacked" ? "Thread unpacked under its card." : next === "expanded" ? "Card shown whole." : "Thread packed.");
-}
-
-/**
- * Pack thread `id` into its card, from its triangle or ^: collapsed, its card held where it is. Whether
- * there was one to pack.
- */
-function packThread(id) {
-  if (!cardRow(id)) return false;
-  setCardState(id, "collapsed");
-  setStatus("Thread packed.");
-  return true;
-}
-
-/** ^, over the Threads view: pack the thread of the selected card or unpacked row. Elsewhere, nothing. */
-function packFromKeyboard(target) {
-  if (!cardsCycle()) return false;
-  const { row } = keyContext(target);
-  const id = row ? row.getAttribute("data-card") !== null ? row.getAttribute("data-id") : row.getAttribute("data-unpack-thread") : null;
-  if (!id) return false;
-  return packThread(id);
-}
-
-/** The up triangle in a thread's first unpacked row's gutter, where All's bridge has its X: packs the thread. */
-function packButton(id) {
-  const button = document.createElement("button");
-  button.className = "reply-ungather unpack-pack";
-  button.setAttribute("type", "button");
-  button.setAttribute("aria-label", "Pack thread");
-  button.setAttribute("title", "Pack this thread's messages back into its card (^)");
-  const mark = document.createElement("span");
-  mark.className = "reply-ungather-mark unpack-pack-mark";
-  mark.setAttribute("aria-hidden", "true");
-  button.append(mark);
-  button.addEventListener("click", (event) => {
-    // The row's own tap would fold the message or read it aloud; this tap is the triangle's.
-    if (event) event.stopPropagation();
-    packThread(id);
-  });
-  return button;
-}
 
 
 
-/** Whether thread `choice` still owes unpacking a read: held replies short of its count, uncovered. */
-function unpackNeedsRead(choice, held) {
-  const replies = held.filter((message) => !isThreadRoot(message, choice)).length;
-  return unpackReadQueue.owed(choice, replies, channelStore.current().views.get(viewKey("thread", choice.id)));
-}
-
-/**
- * Place the runs of thread `choice`'s unpacked message rows `rows`, in order: Fold read's runs of read
- * messages and the messages folded away one by one (`readRunPlan`), the root under a summarized card
- * never in one. For a block being built (`unpackBlock`), and again on a block already drawn when only
- * what was folded away changed (`redrawUnpackBlock`).
- *
- * @param {ReturnType<typeof threadChoice>} choice
- * @param {HTMLElement[]} rows
- */
-function placeUnpackRuns(choice, rows) {
-  const key = viewKey("thread", choice.id);
-  const forced = foldedOneIds(key);
-  const placed = (readModes.mode() === "fold" || forced.size > 0) && !readRunsSuspended()
-    ? readRunPlan(rows, key, (row) => !row.hasAttribute("data-root-child") &&
-      ((readModes.mode() === "fold" && rowIsRead(row)) || idsOf(row).some((id) => forced.has(id))), idsOf, forced)
-    : new Map();
-  for (const row of rows) {
-    const { role, count } = placed.get(row) || { role: null, count: 0 };
-    placeInReadRun(row, role, count);
-  }
-}
-
-/**
- * `#532 shift-o-latency`. Thread `choice`'s block as drawn, `drawn` its rows, brought into line where only
- * its messages' read state or what is folded away changed: each message row dressed again
- * (`dressChannelRow`), as a row built now would be, and the runs placed again (`placeUnpackRuns`). A Done,
- * an e, a put back or a Shift+O drawn on the rows already there, in the frame of the key, rather than the
- * block built again. Its loading or end line is not a message row.
- *
- * @param {ReturnType<typeof threadChoice>} choice
- * @param {HTMLElement[]} drawn
- * @param {ReplyTally} tally
- */
-function redrawUnpackBlock(choice, drawn, tally) {
-  const rows = drawn.filter((row) => row.hasAttribute("data-id"));
-  const viewing = String(selectedChannelId());
-  const pass = { tally, answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
-  for (const row of rows) dressChannelRow(row, pass);
-  placeUnpackRuns(choice, rows);
-}
-
-/** What one block would draw, as a signature, so a pass that changes nothing rebuilds nothing. */
-function unpackSignature(choice, held) {
-  const opened = readRuns.opened(viewKey("thread", choice.id));
-  const cover = channelStore.current().views.get(viewKey("thread", choice.id));
-  const view = cardView(choice);
-  return JSON.stringify([choice.id, readModes.mode(), readRunsSuspended(), hideEmptySwitch.on(), combineSwitch.on(),
-    view.mode, view.cut ? view.cut.head : 0, view.cut && choice.root ? renderedHtmlOf(choice.root) || rawTextOf(choice.root) : "",
-    held.map(messageLook), hidingRead() ? unpackReadSignature(held, channelStore.current().dismissed, unpackFilter) : "",
-    opened ? [...opened].sort() : [], unpackReadQueue.state(choice.id) || "", readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.id : "", readAloudOwner().pendingRead,
-    // `#532 shift-o-latency`: what decides its loading or end line (`unpackNeedsRead`, the cover), which
-    // a block kept from the last pass would otherwise never ask again.
-    typeof choice.count === "number" ? choice.count : null, cover ? cover.more !== false : null]);
-}
 
 
 
-/**
- * Thread `choice`'s unpacked block: its message rows under its card, bridged. They are the rows a
- * thread draws, built, dressed and folded by the code that draws a thread (`#407 unpack-row-parity`):
- * `discordNode` over `glom`, the dress of every channel row (`dressChannelRow`), what Hide read keeps
- * of a thread (`readFilterKeeps`) and the runs Fold read folds (`readRunPlan`), each opened as in
- * the thread. Built in the right column (`renderSideCards`), whose list the keys and the mouse move
- * through here (`sidePane`), so a key on a row and a press of its own button act in the same column.
- * Under a summarized card the root is the first child, kept under every read mode and never in a run
- * (`#405 root-under-summary`); under a raw card the replies alone, the card already being the root.
- * A thread still owed a read ends in its loading line, observed.
- *
- * @param {ReturnType<typeof threadChoice>} choice
- * @param {ReplyTally} tally
- * @returns {HTMLElement[]}
- */
-function unpackBlock(choice, tally) {
-  const held = unpackHeldMessages(channelStore.current(), choice, channelStore.current().channel === String(selectedChannelId()));
-  // `#528 thread-card-markdown-and-cap`: and under a card waiting for its summary, or one clamped.
-  const summarized = rootInward(choice);
-  // `#522 thread-card-max-lines`. Under a split card the root's continuation is the first child: the
-  // root's own row, alone in it, never joined to a reply by the same author.
-  const split = summarized ? null : cardSplit(choice);
-  const messages = unpackMessages(choice, held, summarized || split !== null, unpackFilter);
-  const root = split ? messages.find((message) => isThreadRoot(message, choice)) || null : null;
-  const groups = root
-    ? [[continuationOf(root, split)], ...glom(messages.filter((message) => message !== root))]
-    : glom(messages);
-  const rows = groups.map((group, at) => {
-    const row = discordNode(group);
-    row.setAttribute("data-unpack-thread", choice.id);
-    row.className = `${row.className} unpack-row`;
-    if (summarized && group.some((message) => isThreadRoot(message, choice))) row.setAttribute("data-root-child", "");
-    if (root && at === 0) {
-      row.setAttribute("data-root-child", "");
-      row.setAttribute("data-root-continuation", "");
-      row.setAttribute("title", "The rest of the first message, continued from its card");
-      // Drawn from its cut words, it acts as the root whole: the row's messages, and the list every
-      // act drawn on it was given, become the root itself — what a copy copies, a reply answers and
-      // reading aloud reads.
-      group.splice(0, 1, root);
-    }
-    return row;
-  });
-  const viewing = String(selectedChannelId());
-  const pass = { tally, answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
-  rows.forEach((row, at) => {
-    dressChannelRow(row, pass);
-    const place = rows.length === 1 ? "only" : at === 0 ? "first" : at === rows.length - 1 ? "last" : "middle";
-    row.setAttribute("data-coalesce", place);
-    row.setAttribute("data-stack-under", "third");
-    row.style.setProperty("--thread-hue", threadHue(choice.id));
-    // `#440 thread-card-pack-toggle`. The first row's gutter holds the triangle that packs the thread,
-    // where All's bridge holds its X.
-    row.replaceChildren(...(at === 0 ? [packButton(choice.id)] : []), bridgePiece(row), ...row.children);
-  });
-  placeUnpackRuns(choice, rows);
-  const cover = channelStore.current().views.get(viewKey("thread", choice.id));
-  if (unpackReadQueue.state(choice.id) === "failed") {
-    const failed = document.createElement("li");
-    failed.className = "unpack-row unpack-loading hint";
-    failed.setAttribute("data-unpack-thread", choice.id);
-    failed.textContent = "Could not load this thread.";
-    rows.push(failed);
-  } else if (unpackNeedsRead(choice, held)) {
-    const loading = document.createElement("li");
-    loading.className = "unpack-row unpack-loading hint";
-    loading.setAttribute("data-unpack-thread", choice.id);
-    loading.textContent = "Loading thread…";
-    rows.push(loading);
-    watchUnpackBlock(loading, choice.id);
-  } else if (cover && cover.more) {
-    const older = document.createElement("li");
-    older.className = "unpack-row unpack-older hint";
-    older.setAttribute("data-unpack-thread", choice.id);
-    older.textContent = "Older messages are in the thread.";
-    rows.push(older);
-  }
-  return rows;
-}
 
 
-/** Read thread `id` for its block as `row` nears the screen; at once where nothing can watch. */
-function watchUnpackBlock(row, id) {
-  unpackWatch.watch(row, id);
-}
 
-/** Queue thread `id`'s newest page for its block, `UNPACK_READS_AT_ONCE` at a time. */
-function queueUnpackRead(id) {
-  unpackReadQueue.queue(id);
-}
+
+
+
+
+
+
+
+
+
+
+
+
 
 // --- the main channel's messages among the cards (#419 threads-view-main-messages) -------------------
 //
@@ -20476,107 +19978,7 @@ function foldCardRuns(list) {
   say();
 }
 
-/**
- * One card. Every string is text; nothing from the chat service is parsed as markup.
- *
- * `#277 thread-card-focus`. The row is the card, edged in its thread's colour. Its first button, what
- * the thread is about, highlights it (`toggleLitCard`), and so does a press anywhere else on the card
- * but the button under it, which goes into the thread and says how many replies it has and how many of
- * them are unread (`cardOpener`). Beside that, how long since the thread moved.
- */
-function sideCard({ choice, view = cardView(choice), text, summarized, root, age, replies, unread, read, state = "collapsed", size }) {
-  const row = document.createElement("li");
-  row.className = "side-card-row";
-  // `data-id` and `data-card`: the keys move through the cards as through messages, and know them apart.
-  row.setAttribute("data-id", choice.id);
-  row.setAttribute("data-card", "");
-  // `#428 summary-cards-full`. The stylesheet draws such a card's text whole, at every
-  // collapsed-lines count: the summary is not raw text and is never clamped.
-  if (summarized) row.setAttribute("data-summarised-card", "");
-  // `#522 thread-card-max-lines`. A root split for the card, its words already K card lines and "…".
-  // `#528 thread-card-markdown-and-cap`: or held to K lines by the stylesheet, its root inward whole;
-  // or saying its root's first lines while its summary is on its way.
-  markCardLayout(row, view.mode, view.cut);
-  row.style.setProperty("--thread-hue", threadHue(choice.id));
-  const button = document.createElement("button");
-  button.className = "side-card";
-  button.setAttribute("type", "button");
-  const body = document.createElement("span");
-  body.className = "side-card-text";
-  fillCardText(body, view, text);
-  button.append(body);
-  // `#440 thread-card-pack-toggle`. In the Threads view a press goes round the card's states; in two
-  // columns it highlights the card, as it always did (`#277 thread-card-focus`).
-  // `#532 shift-o-latency`: the thread as last drawn (`cardChoice`), the card being kept across passes.
-  /** @type {any} */ (row).cardChoice = choice;
-  const now = () => /** @type {any} */ (row).cardChoice;
-  // `#540 read-aloud-desktop`: in reading mode a press reads the thread's first message aloud.
-  const press = () => (readAloudOwner().readingMode ? readAloudOwner().readCardAloud(row)
-    : cardsCycle() ? cycleCardState(now(), row) : toggleLitCard(now().id, row));
-  button.addEventListener("click", press);
-  sayRowShortcut(button, "side-card");
-  row.setAttribute("data-card-state", state);
-  const facts = document.createElement("span");
-  facts.className = "side-card-facts";
-  facts.textContent = age;
-  // `#479 message-time-full-date`. Hovering a card's age says the day it last moved, whole.
-  const lastMoved = Number.isFinite(choice.at) ? choice.at : choice.started;
-  if (Number.isFinite(lastMoved)) facts.setAttribute("title", fullLocalAt(new Date(lastMoved)));
-  // `#259 thread-list-unread-filter`: the card's "N unread" or "N new".
-  if (unread) row.setAttribute("data-unread", "");
-  // `#432 read-mode-unify`. Read: every message of its thread, root and replies, as the read modes see it.
-  if (read) row.setAttribute("data-thread-read", "");
-  const open = cardOpener("side-card", replies, unread, () => guardQuietly(() => enterCard(now().id, now().summary, row))());
-  row.append(button, facts, open);
-  // A press on the card's facts, or on its edge round the buttons, is a press on the card. Its two
-  // buttons answer their own.
-  row.addEventListener("click", (event) => {
-    const at = event && event.target;
-    if (at && at !== row && !nodeWithin(facts, at)) return;
-    press();
-  });
-  // Where the search says it found the card in its replies (`markReplyMatch`).
-  /** @type {any} */ (row).cardFacts = facts;
-  // The thread's first message, which a copy of the card copies (`#296 copy-highlighted-message`). The
-  // cards are drawn again whenever what they say changes, a first message arriving included.
-  /** @type {any} */ (row).cardRoot = choice.root;
-  // `#439 search-unmatched-separators`. What a gap among the cards counts for this whole thread.
-  /** @type {any} */ (row).cardMessages = size ? size.messages : 1;
-  /** @type {any} */ (row).cardMessagesExact = size ? size.exact : false;
-  paintLitCard(row, choice.id);
-  readAloudOwner().markReadingCard(row);
-  // `#129 message-search`. A card stands in this list where messages stand in the others, so the
-  // search reaches it, as it reaches the cards of the Threads list; and by its first message's words
-  // where the card says a summary of them. `#262 search-load-older`.
-  searchable(row, text, threadName(choice, Infinity), root);
-  // `#890 voice-page-linked-highlight`. A card whose first message is the linked one is marked as its row is.
-  linkedMark.drawOn(row);
-  return row;
-}
 
-/**
- * `#532 shift-o-latency`. Card `row`, drawn by `sideCard`, brought up to date where only what it counts has
- * changed (`CardParts`): how long since its thread moved, its replies and unread, whether it is read, and
- * the size a gap among the cards counts for it. In place, as `sideCard` would draw them.
- *
- * @param {HTMLElement} row
- * @param {{choice: any, age: string, replies: string, unread: string, read: boolean, size: {messages: number, exact: boolean}}} card
- */
-function countSideCard(row, { choice, age, replies, unread, read, size }) {
-  /** @type {any} */ (row).cardChoice = choice;
-  const facts = /** @type {any} */ (row).cardFacts;
-  if (facts) {
-    setTextIfChanged(facts, age);
-    const lastMoved = Number.isFinite(choice.at) ? choice.at : choice.started;
-    if (Number.isFinite(lastMoved)) setAttributeIfChanged(facts, "title", fullLocalAt(new Date(lastMoved)));
-  }
-  if (row.hasAttribute("data-unread") !== Boolean(unread)) row.toggleAttribute("data-unread", Boolean(unread));
-  if (row.hasAttribute("data-thread-read") !== Boolean(read)) row.toggleAttribute("data-thread-read", Boolean(read));
-  const was = childByClass(row, "side-card-open");
-  if (was) was.replaceWith(cardOpener("side-card", replies, unread, () => guardQuietly(() => enterCard(choice.id, choice.summary, row))()));
-  /** @type {any} */ (row).cardMessages = size ? size.messages : 1;
-  /** @type {any} */ (row).cardMessagesExact = size ? size.exact : false;
-}
 
 // --- one card highlighted ------------------------------------------------------------------------
 //
@@ -21464,44 +20866,6 @@ const abandonedReads = createAbandonedReads({
 });
 
 
-/**
- * The late answer of a timeline read given up on, which nothing has replaced (`abandonRead`): into the
- * store, and onto the screen when its view is up, as a refresh that keeps the reader's place is. A
- * delta lands only where it still continues the view's cover and needs no page after it.
- *
- * @param {VibeTalk.TimelineResponse} payload
- * @param {{context: string, channel: string, view: string, thread: any, canon: any, column: ColumnFields,
- *   sent: string | null, held: Map<string, any>}} read
- */
-function landAbandonedTimelineRead(payload, read) {
-  inColumn(read.column, () => {
-    const delta = Boolean(read.sent && payload.delta);
-    if (delta && (payload.delta.more || !foldTimelineDelta(payload, read.sent, read.view, read.thread))) return;
-    if (read.context !== channelContextKey()) {
-      if (delta) {
-        channelStore.current().views.get(viewKey(read.view, read.thread)).landedHidden = true;
-        if (read.view === "flat") catchUpFromAll();
-        syncUnreadReplies();
-        followInOtherColumn();
-        saveChannelScope();
-      } else {
-        foldLateTimelinePage(payload, read);
-      }
-      return;
-    }
-    const area = el("scroll-area");
-    const at = landedReadPosition(area, true, false);
-    holdingScrollTools(() => {
-      const messages = applyTimelinePage(payload, false, false, delta, null, read.held);
-      settleAfterRead(messages, { area, ...at });
-      noteFreshRead(payload);
-      saveChannelScope();
-      renderScrollTools();
-    });
-    requestVisibleSummaries();
-    followInOtherColumn();
-  });
-}
 
 /**
  * The poll's timer — armed after each poll, held while the page is hidden and taken up when it is shown,
@@ -21551,10 +20915,10 @@ const timelineView = createTimelineView({
   selectedChannelId, channelContextKey, channelStore, providerFacts, messageCache,
   restoreSavedBookmark, noteServerThreadHuesIn, knownChannel, viewKey,
   reader: timelineReader, timelineDeltaPages: TIMELINE_DELTA_PAGES, isCursorRefusal,
-  abandonedReads, channelReads, queueDiscordLoad, finishDiscordLoad,
-  replayLedger, columnReadsSent, landAbandonedTimelineRead,
+  abandonedReads, channelReads, queueDiscordLoad: (options) => queueDiscordLoad(options), finishDiscordLoad: (column) => finishDiscordLoad(column),
+  replayLedger, columnReadsSent, landAbandonedTimelineRead: (payload, read) => landAbandonedTimelineRead(payload, /** @type {any} */ (read)),
   queuePlaceUnplaced, prepareSpeech: () => readAloudOwner().prepareSpeech(), guardQuietly: (fn) => guardQuietly(fn),
-  settleReplays, setStatus,
+  settleReplays: (read, answer) => settleReplays(read, answer), setStatus,
   liveSeen: (channel) => liveEvents.seen(channel), liveNews: (channel) => liveEvents.news(channel),
   readsAsked: () => readOrder.asked(), readOrderNow: () => readOrder.now(), sentNumberOf, refreshFailed, within,
   clock: clockOnUse(), discordNode, threadCards, glom, idsOf, rowMessages, hiddenEmpty,
@@ -21571,7 +20935,7 @@ const timelineView = createTimelineView({
   heldUnansweredRoot, copyLedger, removalRecord, removedAfterRead, ownPostStands,
   foldReadState, noteReplyGaps, noteServerPageBuild, renderColumns,
   threadPresenceNote: (hasThreads, inThread) => threadPresence.note(hasThreads, inThread),
-  screenBelongsToToken, readModes, readLedger, api, currentDiscordLoad,
+  screenBelongsToToken, readModes, readLedger, api, currentDiscordLoad: (generation, channel, readingTodo) => currentDiscordLoad(generation, channel, readingTodo),
   get noChannelWords() { return NO_CHANNEL_TO_READ; }, notePinsRevision, noteBookmark, plainReach, todoView,
   noiseRenderCount: () => noiseSettings.renderCount(), foldedOneIds, foldedOnes, readRuns, setReadMode,
   setJumpNewest, scrollToNewest, keepFilterHold, inThisColumn: (fn) => inThisColumn(fn), pinsView, searchOffered: () => searchOffered(),
@@ -21608,6 +20972,58 @@ const olderWalks = mountOlderWalks({
   replyJumpCurrent: () => replyJumpTicket.current(), idsOf, rowMessages, plainReach, replyTally, providerOfChannel, channelDirectoryName: () => channelDirectory.providerName(),
 });
 const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField, searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk, renderSearchOlderNote, historyReach, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, renderServerSearch, scheduleServerSearch, channelViewWords, oldestLoadedMs, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk } = olderWalks;
+
+/**
+ * The gaps a search opens in the cards and in an unpacked thread's block (web/src/view/channel
+ * `createCardGaps`, `#624 voice-page-modularity`).
+ *
+ * @type {import("./src/view/channel/index.ts").CardGaps}
+ */
+const cardGaps = createCardGaps({
+  leftEl, selectedChannelId, searchKey, rowShown, placeSeam, gapWords, cardGapWords,
+  keepingCardPlace, filterSideCards, applySearch, searchField, searchTyped, cardThread, idsOf,
+  openedCards: (key, create) => openedGaps.cards(key, create),
+});
+const { openedCardGaps, unpackBlocks, drawUnpackGaps, openUnpackGap, drawCardGaps, openCardGap, markReplyMatch } = cardGaps;
+/**
+ * A thread unpacked under its card (web/src/view/channel `createUnpackBlock`,
+ * `#624 voice-page-modularity`).
+ *
+ * @type {import("./src/view/channel/index.ts").UnpackBlock}
+ */
+const unpackBlockOwner = createUnpackBlock({
+  channelStore, selectedChannelId, selection, viewKey, discordNode, glom, dressChannelRow,
+  answeredBy, readRunPlan, placeInReadRun, foldedOneIds, unpackFilter, unpackHeldMessages,
+  unpackMessages, unpackReadSignature, isThreadRoot, cardView, cardSplit, rootInward,
+  continuationOf, messageLook, readModes, readRunsSuspended: timelineView.readRunsSuspended,
+  rowIsRead: timelineView.rowIsRead, idsOf,
+  hideEmptyOn: () => hideEmptySwitch.on(), combineOn: () => combineSwitch.on(),
+  hidingRead, readRunsOpened: (key) => readRuns.opened(key),
+  readAloudNow: () => { const owner = readAloudOwner(); return { id: owner.nowPlaying ? owner.nowPlaying.id : null, pending: owner.pendingRead }; },
+  unpackReadQueue, unpackWatch: (row, id) => unpackWatch.watch(row, id),
+  threadHue, bridgePiece,
+  packButton: (id) => packControls.packButton(id),
+});
+const { unpackBlock, unpackNeedsRead, queueUnpackRead, redrawUnpackBlock, unpackSignature } = unpackBlockOwner;
+/**
+ * The threads column's cards packed and unpacked (web/src/view/channel `createPackControls`,
+ * `#624 voice-page-modularity`).
+ *
+ * @type {import("./src/view/channel/index.ts").PackControls}
+ */
+const packControls = createPackControls({
+  leftEl, selectedChannelId, cardPacking, cardView, cardsCycle,
+  keepingCardPlace, keepSelection, setStatus,
+  threadHue, readAloudNow: () => ({ readingMode: readAloudOwner().readingMode }),
+  readCardAloud: (row) => readAloudOwner().readCardAloud(row), toggleLitCard, sayRowShortcut,
+  fullLocalAt, columnsSideMode: () => columns.side.mode, layoutThreadList: () => layoutShown.threadList(),
+  cardsDrawnForget: () => cardsDrawn.forget(), sideColumnUp, keepingCardStill, renderSideColumn,
+  markOf, sidePaneValue: sidePane, litCard, cardOpener,
+  guard: (fn) => guardQuietly(fn), enterCard, paintLitCard,
+  markReadingCard: (row) => readAloudOwner().markReadingCard(row),
+  linkedMarkDrawOn: (row) => linkedMark.drawOn(row), searchable, threadName, keyContext,
+});
+const { renderUnpackToggle, setUnpackMode, setCardState, cycleCardState, packThread, packFromKeyboard, unpackFromKeyboard, cardRow, sideCard, countSideCard, cardState, packButton } = packControls;
 // The page's re-read by name, for the walks and captures that call and wrap it in the page
 // (scripts/screenshots.py, energy_profile.py): a global declaration, as it always was, so a
 // wrapper on window.loadDiscord still sees every read this script asks for. The read itself
@@ -21630,79 +21046,11 @@ async function loadDiscord(options) { return timelineView.loadDiscord(options); 
  *
  * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[], readAs?: string}} [options]
  */
-function queueDiscordLoad(options) {
-  // Every reason kept, the newest options otherwise, `quiet` from either (web/src/core/sync `joinQueuedReads`).
-  channelReads.queue(columnWork.active(), options);
-}
 
-/**
- * Release the fetch lock, then perform the newest read that was requested while it was held: the
- * left column's first, in its own column. `column` is the column of the read that has just ended,
- * whose loading line goes when nothing is queued behind it.
- */
-async function finishDiscordLoad(column = columnWork.active()) {
-  const queued = channelReads.release([columns.main, columns.side]);
-  if (queued) {
-    const next = queued.column;
-    await inColumn(next, () => loadDiscord(/** @type {any} */ (queued.options)));
-    // The read handed on may not have gone at all: a poll put off while the server still reads one
-    // given up on (`readHeld`, `remote-ops-audit` W7). Then no read is out, and its column's loading
-    // line, which nothing else would take down, goes here.
-    if (!channelReads.busy()) inColumn(next, () => renderChannelLoading(false));
-    return;
-  }
-  inColumn(column, () => renderChannelLoading(false));
-  // The channel's reads have gone quiet: what the stream left unplaced and they did not place is
-  // read for now. `#308 live-reply-in-main`.
-  queuePlaceUnplaced();
-}
 
-/** Whether a completed read still describes the channel and mode currently selected. */
-function currentDiscordLoad(generation, channel, readingTodo) {
-  return (
-    generation === loadState().generation &&
-    String(channel) === String(selectedChannelId()) &&
-    readingTodo === readModes.hiding()
-  );
-}
 
-/** Stop the poll, and forget a wait held for the page to be shown. */
-function stopDiscordPolling() {
-  channelPoll.stop();
-}
 
-/**
- * Arm the next poll of the channel on screen after `delay`, held while the page is hidden
- * (web/src/core/sync `ChannelPoll.schedule`, which says why it reschedules itself).
- *
- * @param {number} [delay]
- */
-function scheduleDiscordPoll(delay = DISCORD_POLL_MS) {
-  channelPoll.schedule(delay);
-}
 
-/** One poll of the channel on screen, which arms the next. */
-function pollDiscord() {
-  refreshQuietly(async () => {
-    // A failed poll is the case polling exists for — the network comes back — so the next one
-    // is armed whatever this one did. A page that opened offline never heard `/client-config`
-    // either, and it asks again first.
-    let refused = false;
-    try {
-      refused = !serverFacts.configApplied() && !(await signIn());
-      const since = replayLedger.started();
-      if (!refused) await loadDiscord({ keepPosition: true, reason: "poll" });
-      // `#229 desktop-two-column`. And the right column's thread, or its list of threads: another
-      // view, one delta, never Main's again — nor the thread's again, when it was selected under
-      // Main's read and read for that (`#231 two-column-polish`).
-      if (!refused) await readSideColumn("poll", since);
-    } finally {
-      if (screens.view() === "discord" && !refused) {
-        scheduleDiscordPoll();
-      }
-    }
-  })();
-}
 
 // --- a hidden page -------------------------------------------------------------------------------
 //
@@ -21741,62 +21089,9 @@ const hiddenStream = createHiddenStream({
   stop: () => stopChannelStream(),
 });
 
-/** The page went out of sight: stop what can wait for it to come back. */
-function pauseWhileHidden() {
-  channelPoll.pause();
-  hiddenStream.hide();
-}
 
-/** Follow the stream let go while hidden again, from its last event, unless something else has since. */
-function resumeLiveStream(resume) {
-  if (resume === null || resume.generation !== liveFollow.generation() || liveFollow.channel() !== null) return;
-  if (String(selectedChannelId()) !== resume.channel || !token()) return;
-  startChannelStream(resume.channel, resume.from);
-}
 
-/**
- * Take up the poll a hidden page paused: now, a whole wait, or the rest of the one it was in
- * (web/src/core/sync `ChannelPoll.resume`).
- *
- * @param {"now" | "fresh" | "rest"} how
- */
-function resumePolling(how) {
-  channelPoll.resume(how);
-}
 
-/**
- * Back in sight: draw what the stream put in the store while the page was hidden, as a read would
- * have drawn it. Answers what is still owed a read — "mutation" for an edit or a removal, "live" for
- * a message, which the server places (its thread, its counts) — or null for nothing.
- */
-function catchUpHiddenArrivals() {
-  const { mutation, arrived } = hiddenStream.takeArrivals(() => replayLedger.waiting() > 0);
-  if (arrived && screens.view() === "discord" && providerFacts.threading() &&
-      channelStore.current().channel === String(selectedChannelId()) && channelStore.current().views.has(viewKey())) {
-    const area = el("scroll-area");
-    const position = channelReadPosition(area);
-    if (catchUpHeldView()) {
-      const keeps = readFilterKeeps();
-      settleAfterRead(timelineRows().messages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message))),
-        { keepPosition: true, area, ...position });
-    } else {
-      // Nothing of this view's own, but a reply on Main is one more on its root's chip.
-      syncUnreadReplies();
-    }
-    // ...and in the thread on the right. `#229 desktop-two-column`.
-    inOtherColumn(() => {
-      const there = el("scroll-area");
-      const place = channelReadPosition(there);
-      if (catchUpHeldView()) {
-        const keeps = readFilterKeeps();
-        settleAfterRead(timelineRows().messages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message))),
-          { keepPosition: true, area: there, ...place });
-      }
-    });
-    saveChannelScope();
-  }
-  return mutation ? "mutation" : arrived ? "live" : null;
-}
 
 // --- resuming an earlier conversation ------------------------------------------------------------
 //
@@ -22124,93 +21419,6 @@ function startChannelStream(channelId, resumeFrom = null) {
 // One SSE frame, as fields (`parseEventFrame`), is web/src/core/sync's, with the reading
 // (`readEventStream`, `#624 voice-page-modularity`).
 
-/** One frame of the channel's stream, its cursor already taken down by `liveFollow`. */
-function onStreamFrame(frame) {
-  if (frame.event === "reset") {
-    // The server is saying this subscriber fell further behind than its replay tail, so there IS a
-    // gap and it cannot be filled from the stream. Re-read the channel rather than carrying on
-    // short: a missing message the page does not know about is the one failure mode a live feed
-    // must not have. The cursor is dropped with it (`liveFollow`) — resuming from an id on the far
-    // side of a gap would ask the server to replay what it has already said it cannot.
-    // `#337 voice-relay-silent`. The re-read puts the channel right; whether a call heard what fell
-    // into the gap cannot be known, so it is said — unless the stream of every channel, which
-    // carries this channel too, is what the call is hearing from.
-    if (!watchAll.attached() && voiceCall().canSendText() && relayMode() !== "off") voiceCall().reportUnrelayed([], "gap");
-    setStatus("the live feed fell behind — re-reading the channel.");
-    refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "reset" }))();
-    // `#457 settings-server-side`. The same gap could hide a settings frame: re-read.
-    refreshServerSettings().catch(() => {});
-    return;
-  }
-  // `#457 settings-server-side`. A settings change from another device, carried on this
-  // stream between messages: it is about no channel and carries no cursor of its own.
-  if (frame.event === "settings") {
-    onSettingsFrame(frame);
-    return;
-  }
-  if (!frame.data) {
-    return;
-  }
-  let payload = null;
-  try {
-    payload = JSON.parse(frame.data);
-  } catch (_error) {
-    return; // a frame this page cannot read is not a reason to tear the stream down.
-  }
-  // `remote-ops-audit` W7. Whatever it is about, an event for a channel says the service is answering
-  // for it (`noteLiveEvent`), unless it is the replay tail's.
-  if (payload && typeof payload === "object" &&
-      ["message", "message_update", "message_delete"].includes(frame.event)) {
-    const about = payload.message && typeof payload.message === "object" ? payload.message.channel_id : payload.channel_id;
-    abandonedReads.noteLiveEvent(about, payload.from_tail === true);
-  }
-  if (frame.event === "message_update" || frame.event === "message_delete") {
-    // `#308 live-reply-in-main`. An edit is a copy too: one that names the thread of a message the
-    // store holds without one places it at once, whatever the read below brings.
-    if (providerFacts.threading() && frame.event === "message_update" && VibeTalkContract.is("LiveMessageEvent", payload) &&
-        placesHeld(payload.message)) {
-      placeFromEdit(payload.message);
-    }
-    // ...and a removal says the message is gone upstream, whatever the read below brings: no answer
-    // sent before it may put the message back.
-    if (providerFacts.threading() && frame.event === "message_delete" && VibeTalkContract.is("LiveDeleteEvent", payload)) {
-      noteLiveRemoval(payload.channel_id, payload.message_id,
-        typeof payload.observed_ms === "number" ? payload.observed_ms : null);
-    }
-    // An edit or removal out of the replay tail is on every page read begun after the attach, so
-    // it waits for such a read rather than making its own. The page's copy of the message says
-    // nothing about which edit it has seen, so no page can answer for it sooner.
-    // `#43 replay-burst-double-read`.
-    if (providerFacts.threading() && payload && payload.from_tail === true) {
-      const message = payload.message || {};
-      const id = frame.event === "message_update" ? message.id : payload.message_id;
-      const channel = frame.event === "message_update" ? message.channel_id : payload.channel_id;
-      awaitReplayRead(`${frame.event}:${id}`, String(channel), replayLedger.attachedAfter());
-      return;
-    }
-    // A fetched row may combine several messages and the update may change whether they still
-    // combine. Re-reading the authoritative page is safer than trying to patch that derived DOM
-    // structure in place, and `keepPosition` preserves where the reader was.
-    refreshAfterLiveMutation();
-    return;
-  }
-  if (frame.event !== "message") {
-    return;
-  }
-  // Checked against the contract before any of it is believed. A malformed event cannot be
-  // rendered, but it still says the channel changed, so the answer is the authoritative re-read an
-  // edit gets — never silently dropping what may be a real message.
-  if (!VibeTalkContract.is("LiveMessageEvent", payload)) {
-    refreshAfterLiveMutation();
-    return;
-  }
-  receiveLiveMessage(payload.message, payload.self_posted, payload.replayed, payload.from_tail);
-  // `#468 send-dedupe`. This server's copy of a post it made for one of this page's keys.
-  if (payload.self_posted && typeof payload.client_key === "string") {
-    noteOutgoingEcho(payload.client_key);
-    settleFromServer(payload.client_key);
-  }
-}
 
 // Whether a re-read for live edits is owed or running, and the loop that waits out a read in flight and
 // reads again for edits arriving during it: web/src/core/sync/coalesce.ts (`#624 voice-page-modularity`).
@@ -22220,262 +21428,79 @@ const mutationRefresh = createMutationRefresh({
   read: async () => {
     const since = replayLedger.started();
     await loadDiscord({ keepPosition: true, reason: "mutation" });
+
+
     // An edit may be in the thread on the right. `#229 desktop-two-column`.
     await readSideColumn("mutation", since);
   },
   launch: (run) => refreshQuietly(run)(),
 });
-
-/** Coalesce a burst of edits/deletes into authoritative re-reads without leaving a stale tail. */
-function refreshAfterLiveMutation() {
-  // `#226 page-energy-profile`. Not for a hidden page: the read that coming back makes answers it.
-  if (providerFacts.threading() && document.hidden) {
-    hiddenStream.noteMutation();
-    return;
-  }
-  mutationRefresh.request();
-}
-
 /**
- * A message has arrived. Put it on screen, then decide whether the agent hears about it.
+ * Keeping the channel on screen current (web/src/view/channel `createChannelRefresh`,
+ * `#624 voice-page-modularity`): the read queue's release, the poll, the hidden page.
+ * Reads asked for go through this script's own `loadDiscord` name above.
  *
- * De-duplicated against the rows that are actually rendered rather than against a set this file
- * keeps: `loadDiscord` replaces every child of the log, so a private set would go stale exactly
- * when it mattered — after a refresh, which is the moment a replayed message is most likely to
- * arrive twice.
+ * @type {import("./src/view/channel/index.ts").ChannelRefresh}
  */
-function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
-  // `#337 voice-relay-silent`. How it came, for whether a call that may have missed it hears it.
-  const arrival = { fromTail: fromTail === true, resumed: liveFollow.resumed() };
-  // `#466 reply-promotes-thread`. Not a read's observation, which retires a sent receipt at once: the
-  // read the stream's copy asks for may be answered from older state. The copy goes into the store,
-  // which keeps the page's own post against such a read (`ownPostStands`), and the receipt goes after
-  // its showing (`sentReceiptRetires`, `#500 sent-receipts-pile-up`).
-  // The other free way to learn which account is ours: the server marks what IT posted, so the
-  // author of a self-posted message is this bridge by construction. Done before the channel guard
-  // below, because the fact is true regardless of which channel the reader happens to be looking
-  // at. `#85 voice-desktop-review`.
-  if (selfPosted) {
-    noteSelfAuthor(message.author_id);
-  }
-  if (String(message.channel_id) !== String(selectedChannelId())) {
-    renderOutgoingEverywhere();
-    return;
-  }
-  // A live message for this channel is proof the list is current as of now. Only a list already
-  // current moves its stamp: saved or failed rows stay labelled until a read replaces them.
-  if (!replayed && loadState().freshness === "fresh" && loadState().freshAt) {
-    loadState().freshAt = Date.now();
-    renderChannelFreshness();
-  }
-  if (!providerFacts.threading() && channelReads.busy()) {
-    // This event is newer evidence than a read already on the wire. Invalidate that snapshot
-    // even when the event's ID is already visible from a POST acknowledgement; otherwise it
-    // could erase the row after this event retired its durable send receipt.
-    ++loadState().generation;
-    if (!channelReads.queued(columns.main)) queueDiscordLoad({ keepPosition: true, readAs: "live" });
-  }
-  if (providerFacts.threading()) {
-    // A replayed copy is from when it was published, so the store's copy is at least as new — its
-    // reply count, its edits — and is the one kept. Asked before the row is folded in, which would
-    // make every message look already held. A held message is already in the view drawn from the
-    // store, or deliberately not when the to-do filter hides it, so it is not appended again.
-    const held = replayed ? heldMessage(message.id) : null;
-    // `#308 live-reply-in-main`. A copy naming the thread of a message the store holds without one
-    // places it, replayed or not: it leaves Main for its thread now, not at the next read that can say.
-    // A replayed copy gives the store its thread record and nothing else: the rest of it is older.
-    const places = placesHeld(message);
-    // `#549 own-read-stored`. One of his, new here, is drawn as it starts: read, when he said so.
-    if (!replayed) noteStartsRead([message]);
-    if (document.hidden) {
-      // `#226 page-energy-profile`. Into the store, for coming back to draw and read behind; no row
-      // and no read for a page nobody can see. A call's agent is told as ever.
-      if (!held || places) {
-        if (held) takeThreadRecord(message);
-        else foldLiveMessage(message, true, replayed);
-        hiddenStream.noteMessage();
-        followReplyStore();
-      }
-      renderOutgoingEverywhere();
-      voiceCall().relayToAgent(message, selfPosted, replayed, arrival);
-      return;
-    }
-    // `#185 reply-new-thread`. An open Reply follows the store as the rows do, before the read below
-    // and whether or not it lands: a reply in the thread it offers to start turns the row's tag into
-    // Thread(1) at once, and the offer has to go with it.
-    if (!held) {
-      // `#280 scroll-stability`. Whether each column's reader is on its newest line is asked BEFORE
-      // the row goes in, which is what changes the answer — as the channel without threads below
-      // asks it, and as a send does (`#229`). Asked after, by the read below, a reader on the newest
-      // line was a row short of it by then and was never followed: the message arrived out of sight
-      // under them, and the jump offered to take them to it.
-      const pinned = liveFollowers();
-      appendToColumns(message, true, replayed);
-      followLiveArrival(pinned);
-      followReplyStore();
-    } else if (places) {
-      takeThreadRecord(message);
-    }
-    if (places) followPlacement();
-    renderOutgoingEverywhere();
-    voiceCall().relayToAgent(message, selfPosted, replayed, arrival);
-    // The server owns thread membership, counts and activity ordering. Re-read the active
-    // context instead of dropping a reply from another thread into the visible conversation.
-    // `#229 desktop-two-column`: a reply in the thread on the right is read as that thread, which
-    // brings its root's count with it; anything else as Main. One read, never one per column.
-    if (!replayed) {
-      const column = inSideThread(heldMessage(String(message.id)) || message) ? columns.side : columns.main;
-      refreshQuietly(() => inColumn(column, () => loadDiscord({ keepPosition: true, reason: "live" })))();
-    } else if (!held) {
-      awaitReplayRead(String(message.id), String(message.channel_id),
-        fromTail ? replayLedger.attachedAfter() : replayLedger.started());
-    }
-    return;
-  }
-  const list = el("discord-log");
-  const id = String(message.id);
-  // Against EVERY id on screen: a message already combined into a row is on screen, and a dedupe
-  // that only looked at row identities would add a second copy of it.
-  const already = [...list.children].some((li) => idsOf(li).includes(id));
-  if (already) {
-    renderOutgoingMessages();
-    return;
-  }
-  // The SAME constructor the fetched rows go through, so the untrusted-content boundary is
-  // identical on both paths. A live feed is not a reason to relax element construction.
-  const area = el("scroll-area");
-  // Not while a filter change holds a message in place: nothing but the reader moves it. `#243`.
-  const wasAtNewest = screens.view() === "discord" && followsNewest(area);
-  // `#549 own-read-stored`. One of his is drawn as it starts: read, when he said so.
-  if (!replayed) noteStartsRead([message]);
-  appendChannelRow(message, true);
-  listState().newestId = id;
-  if (wasAtNewest) {
-    scrollToNewest();
-  } else if (!isNoise(message) && !hiddenEmpty(message)) {
-    // Somewhere else in the history, or looking at the call. Offer the jump; never take it.
-    // Never for a placeholder the server reads automatically (`#196 auto-read-noise`): an offer to
-    // go and look at "Working…" is the interruption the owner asked to be rid of.
-    setJumpNewest(true, "discord", 1);
-  }
-  renderScrollTools();
-  // A row that arrived because the SERVER said so is a row like any other: if it is long and the
-  // reader is looking at it, it gets a summary. `#49 cached-summaries`.
-  requestVisibleSummaries();
-  voiceCall().relayToAgent(message, selfPosted, replayed, arrival);
-}
-
+const channelRefresh = createChannelRefresh({
+  channelReads: /** @type {any} */ (channelReads), channelPoll, hiddenStream: /** @type {any} */ (hiddenStream), columnWork, columns, inColumn,
+  loadDiscord: (options) => loadDiscord(options), loadTimeline,
+  foldLateTimelinePage, renderChannelLoading, queuePlaceUnplaced,
+  loadStateGeneration: () => loadState().generation, selectedChannelId,
+  readModesHiding: () => readModes.hiding(), refreshQuietly,
+  configApplied: () => serverFacts.configApplied(), signIn,
+  replayStarted: () => replayLedger.started(), replayWaiting: () => replayLedger.waiting(),
+  channelContextKey, readSideColumn, screensView: () => screens.view(),
+  discordPollMs: DISCORD_POLL_MS, startChannelStream,
+  renderChannelNavigation, applySearch,
+  el, channelStore, viewKey, channelReadPosition: timelineView.channelReadPosition,
+  landedReadPosition: timelineView.landedReadPosition, settleAfterRead: timelineView.settleAfterRead,
+  applyTimelinePage, foldTimelineDelta, holdingScrollTools, noteFreshRead, saveChannelScope,
+  renderScrollTools, requestVisibleSummaries, followInOtherColumn, catchUpFromAll, catchUpHeldView,
+  readFilterKeeps, hiddenEmpty, hidingRead, timelineRows, syncUnreadReplies, inOtherColumn,
+  providerFacts, liveFollow, token,
+});
+const { queueDiscordLoad, finishDiscordLoad, currentDiscordLoad, stopDiscordPolling, scheduleDiscordPoll, pollDiscord, pauseWhileHidden, resumeLiveStream, resumePolling, catchUpHiddenArrivals, landAbandonedTimelineRead } = channelRefresh;
 /**
- * Which columns' readers follow a message arriving now: each one on the newest line of its list, on
- * the main screen in the channel's view. Not one a filter change holds in place (`followsNewest`),
- * nor one just landed on a thread's first unread who has not moved since, whom the landing outranks
- * (`entryLandingHolds`). Asked BEFORE the message goes in. `#280 scroll-stability`.
+ * The live stream's frames as the page takes them (web/src/view/channel `createLiveStream`,
+ * `#624 voice-page-modularity`).
  *
- * @returns {{main: boolean, side: boolean}}
+ * @type {import("./src/view/channel/index.ts").LiveStream}
  */
-function liveFollowers() {
-  const follows = () => screens.screen() === "main" && screens.view() === "discord" &&
-    !entryLandingHolds() && followsNewest(el("scroll-area"));
-  return {
-    main: inColumn(columns.main, follows),
-    side: sideShowing() && inColumn(columns.side, follows),
-  };
-}
+const liveStream = createLiveStream({
+  channelStore, selectedChannelId, providerFacts,
+  loadDiscord: (options) => loadDiscord(options), refreshQuietly, setStatus,
+  noteLiveEvent: (channel, fromTail) => abandonedReads.noteLiveEvent(channel, fromTail),
+  contractIs: (name, value) => VibeTalkContract.is(/** @type {any} */ (name), value),
+  watchAllAttached: () => watchAll.attached(),
+  voiceCanSendText: () => voiceCall().canSendText(), relayMode,
+  reportUnrelayed: (messages, reason) => voiceCall().reportUnrelayed(/** @type {any} */ (messages), /** @type {any} */ (reason)),
+  refreshServerSettings, onSettingsFrame, hiddenNow: () => document.hidden,
+  noteHiddenMessage: () => hiddenStream.noteMessage(),
+  relayToAgent: (message, selfPosted, replayed, arrival) => voiceCall().relayToAgent(message, selfPosted, replayed, arrival),
+  refreshAfterMutation: () => refreshAfterLiveMutation(), noteChannelReadFailure,
+  foldLiveMessage: timelineView.foldLiveMessage, appendChannelRow: timelineView.appendChannelRow,
+  appendToColumns: timelineView.appendToColumns, renderOutgoingEverywhere, noteServerThreadHuesIn,
+  threadOf, loadCanon,
+  replayLedger,
+  replaysWaiting: () => replayLedger.waiting(), readLedgerEpoch: () => readLedger.epoch(),
+  buildCopyOn, noteRemoved, liveFollow, noteOutgoingEcho, settleFromServer, noteSelfAuthor,
+  loadState, renderChannelFreshness, channelReads, columns, queueDiscordLoad,
+  noteStartsRead, hiddenStream: { noteMessage: () => hiddenStream.noteMessage(), noteMutation: () => hiddenStream.noteMutation() },
+  followReplyStore, followPlacement, inSideThread, inColumn, el, idsOf, renderOutgoingMessages, ownPosts, liveEvents, entryLandingHolds, sideShowing, hiddenEmpty, listStateNewestId: (id) => { listState().newestId = id; }, scrollToNewest, setJumpNewest, renderScrollTools, requestVisibleSummaries, saveChannelScope, mutationRefresh,
+  screens, followsNewest,
+});
+const { onStreamFrame, receiveLiveMessage, heldMessage, placesHeld, settleReplays, liveFollowers, refreshAfterLiveMutation } = liveStream;
 
-/**
- * Keep each reader `liveFollowers` found on the newest line on it, now that the message is in. The
- * rest are not moved at all; the read behind the message offers them the jump (`settleAfterRead`).
- *
- * @param {{main: boolean, side: boolean}} pinned
- */
-function followLiveArrival(pinned) {
-  if (pinned.main) inColumn(columns.main, scrollToNewest);
-  if (pinned.side && sideShowing()) inColumn(columns.side, scrollToNewest);
-}
 
-/**
- * The store's copy of a message in the selected channel, or null.
- *
- * `#43 replay-burst-double-read`. A replayed message the store holds needs no read. The replayed
- * copy is the message as first published, and every later change to it reaches the store as an
- * edit event or a read, so the store's copy is at least as new. The stream replays its tail in a
- * burst on every reload, so re-reading for each frame cost a warm reload two identical reads of the
- * newest page — one of them on the voice pane, where nothing refreshes a channel nobody is looking
- * at.
- */
-function heldMessage(id) {
-  const channel = String(selectedChannelId());
-  if (channelStore.current().channel !== channel) loadCanon(channel);
-  return channelStore.current().messages.find((held) => String(held.id) === String(id)) || null;
-}
 
-/**
- * Whether `message`, a copy from the stream, names the thread of a message the selected channel's
- * store holds without one: the copy that places it. `#308 live-reply-in-main`.
- */
-function placesHeld(message) {
-  if (!threadOf(message) || String(message.channel_id) !== String(selectedChannelId())) return false;
-  const held = heldMessage(message.id);
-  return held !== null && !threadOf(held);
-}
 
-/**
- * An edit from the stream whose copy names the thread of a message the store holds without one: that
- * record is the store's from now on, and the message moves into its thread (`followPlacement`). Only
- * the record. What the message says is still the read's to bring, as for every edit. `#308`.
- *
- * @param {any} message
- */
-function placeFromEdit(message) {
-  takeThreadRecord(message);
-  if (document.hidden) hiddenStream.noteMessage();
-  else followPlacement();
-}
 
-/**
- * The thread record of `message`, a copy from the stream that places a message the store holds
- * (`placesHeld`), into the store's copy, which keeps everything else it has: an edit's copy says
- * nothing of which edits the store has seen, and a replayed copy is from when the message was
- * published. The message is placed. `#308 live-reply-in-main`.
- *
- * @param {any} message
- */
-function takeThreadRecord(message) {
-  const id = String(message.id);
-  channelStore.current().messages = channelStore.current().messages.map((held) => {
-    if (String(held.id) !== id) return held;
-    const placed = { ...held, thread: message.thread };
-    // As new as the store's copy, the record aside (`copyBuiltOn`, `#310 stale-live-read-flicker`).
-    buildCopyOn(placed, held);
-    return placed;
-  });
-  channelStore.current().unplaced.delete(id);
-}
 
-/**
- * A removal from the stream, of message `id` in `channel`: the message is gone upstream. The store
- * keeps it until the read the removal asks for lands, as for every removal; but it is no longer left
- * unplaced (`forgetUnplaced`), so no answer of All sent before the removal puts it back as a thread
- * reply (`placeFromPage`), and a placing read out as it arrived is not folded (`landPlacingRead`).
- * `#308 live-reply-in-main`.
- *
- * @param {string} channel
- * @param {string} id
- * @param {number | null} [observedMs] when the server observed the removal (`removalsObserved`)
- */
-function noteLiveRemoval(channel, id, observedMs = null) {
-  liveEvents.noteRemoval(String(channel));
-  // `#466 reply-promotes-thread`. Heard of in any channel: a post of this page's removed upstream is no
-  // longer kept against reads that do not carry it (`ownPostStands`).
-  // `#500 sent-receipts-pile-up`: nor on the device, whichever of its windows sent it.
-  ownPosts.removed(String(id));
-  if (channelStore.current().channel !== String(channel)) return;
-  noteRemoved(channelStore.current(), String(id), observedMs);
-  // `#315 removed-reply-target`. A reply open on it says so now, not when the read behind this lands,
-  // and so does one after a reload before that read has landed.
-  followReplyStore();
-  saveChannelScope();
-}
+
+
+
+
 
 /**
  * One read merges a replayed event the store cannot answer for, and the rest of its burst.
@@ -22496,38 +21521,7 @@ function noteLiveRemoval(channel, id, observedMs = null) {
  * @param {string} channel
  * @param {number} arrivedAfter
  */
-function awaitReplayRead(key, channel, arrivedAfter) {
-  // `#203 incremental-refresh`. An edit or removal is answered only by a read that carries them:
-  // a newest page, or a complete delta. A delta of additions says nothing about either.
-  if (replayLedger.awaitRead(key, channel, arrivedAfter)) return;
-  // `#226 page-energy-profile`. A hidden page leaves it waiting for the read coming back makes.
-  if (!channelReads.busy() && screens.view() === "discord" && !document.hidden) {
-    refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "replay" }))();
-  }
-}
 
-/**
- * Timeline read number `read` has landed with `page`, or with null if it failed: forget the
- * replayed events it answers for, and queue one more read if any arrived while it was out and its
- * page did not have them. Asked of the page, not the store, which the frame itself has already put
- * the message in. A read that started after an event arrived answers for it even when its page
- * lacks it — a reply in another thread is not on the main view's page — so no event can cost more
- * than that one read. A read that failed answers for nothing and queues nothing: the event waits
- * for the next read, the poll's or the one entering the channel makes, so a server that keeps
- * failing is not asked again for every frame.
- *
- * @param {number} read
- * @param {{messages: VibeTalk.Message[], threads: VibeTalk.ThreadSummary[],
- *          delta: {complete: boolean} | null} | null} page what the read's landed pages carried,
- *   and — when every one of them was a delta — whether all of those were complete
- */
-function settleReplays(read, page) {
-  replayLedger.settle(read, page, String(selectedChannelId()));
-  // The stream's replay is answered by a read of the left column's view. `#229 desktop-two-column`.
-  if (page && replayLedger.waiting() && screens.view() === "discord" && !channelReads.queued(columns.main)) {
-    inColumn(columns.main, () => queueDiscordLoad({ keepPosition: true, reason: "replay" }));
-  }
-}
 
 // `canSendText` and `sendClientEvent` used to be defined a second time HERE, shadowing the pair
 // near `startCapture`. They are declared once now, where the long note about the send path already

@@ -5297,7 +5297,7 @@ test("`#315 removed-reply-target`: a reply open on a message as it is removed up
   assert.deepStrictEqual(page.repliesPosted, [], "the reply was posted");
 
   // THE CONTROL: a removal that does not tell the open reply leaves it saying where it would go.
-  const control = await run(brokenScript("  followReplyStore();\n  saveChannelScope();\n}", "  saveChannelScope();\n}"));
+  const control = await run(await brokenModule([{ file: "src/view/channel/livestream.ts", find: "  followReplyStore();\n  saveChannelScope();\n}", replace: "  saveChannelScope();\n}" }]));
   assert.match(control.after, /not known yet/, "the open reply followed the removal anyway, so this test cannot see it");
 });
 
