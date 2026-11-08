@@ -1,11 +1,12 @@
 ---
 title: 'newest-count-chip: the Newest chip counts the messages below the reading position'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-refactor
-created_at: 2026-11-08T12:55:00.000000000+00:00
-updated_at: 2026-11-08T12:55:00.000000000+00:00
+created_at: 2026-11-08T12:55:00+00:00
+updated_at: 2026-11-08T13:26:59.382270743+00:00
+closed_at: 2026-11-08T13:26:59.382270633+00:00
 ---
 
 # Description
@@ -32,3 +33,11 @@ The owner (2026-11-08) uses the reading bookmark to jump back into the All messa
 # Notes
 
 Owner request, chat reply 225 (2026-11-08), relayed by the lead with its spec. Ships to the next vibe-talk deploy slot once landed.
+
+## Resolution
+
+[muse watermelon-full-preview] The jump chip reads "Newest (N)": N counted from the pane's rows below the last row wholly on screen, so a reply drawn as its own row in All counts and one folded under its root in Main does not; counted at most once per animation frame as the reader scrolls (the count's geometry is scrollkeeping's, the words the chip owner's in folding). Arrivals keep their words first: "3 new (N)"; the voice transcript, whose turns are no pane's rows, keeps its plain wording.
+
+The "N+" case had to be read against this page's paging, which is older-ward only: every read above the reader loads older messages and nothing loads a newer page, so the foot of the list is always the newest as of the last landed read and no loaded-state says newer-than-the-foot is not held. The one state where the held rows are known to be a floor is arrivals the page could not count (more arrived than one read holds), and that is where the chip says "New (N+)".
+
+Covered by page tests (top/middle/at the newest, All vs Main, the combined label, the floor, once-a-frame), a unit test of the counting geometry, and the bookmark real-browser walk counting rows below at two sizes.

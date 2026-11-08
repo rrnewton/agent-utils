@@ -4935,7 +4935,8 @@ test("`#277 reply-in-column` with `#467 inline-send-in-place`: a reply sent from
   await control.el("reply-send").click();
   await control.settle();
   assert.doesNotMatch(control.el("status").textContent, /reply/i, "the control told the reader, so this test cannot tell");
-  assert.equal(control.el("jump-newest-label").textContent, "Newest");
+  assert.match(control.el("jump-newest-label").textContent, /^Newest( \(\d+\))?$/,
+    "the control's chip is the plain way down, with its count, naming no reply");
 });
 
 test("`#277 reply-in-column`: a reply sent from a column that the page sends by itself later says it is waiting and leaves the chip alone; sent, nothing more is said of it", async () => {

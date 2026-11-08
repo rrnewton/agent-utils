@@ -13,7 +13,7 @@ import { BOTTOM_SLACK_PX, CHANNEL, CHARS_PER_LINE, CSS_CODE, CSS_UNCONDITIONAL, 
   errorResponse, fillTranscript, focused, foldButton, gate, helpEntry, holdChannelReads,
   inTwoColumns, json, jumpSaysArrived, jumpShown, longMessage, manyThreadColumns, markupHolds,
   markupPlace, message, newPage, outgoingRetry, outgoingRows, pagedChannel, parkMidway, passTime,
-  press, pullDown, reReadChannel, readerOn, relayed, reopenedChannel, replyButton, replyInStream,
+  pickThread, press, pullDown, reReadChannel, readerOn, relayed, reopenedChannel, replyButton, replyInStream,
   rowWithId, savedOutgoing, scrollToGap, sentWithoutKey, setReadNew, settingsGroup, showDiscord,
   shownIds, sideAtFoot, signIn, sourceCalls, sourceConstant, speakRelay, sseMessage, sseUpdate, startTalking,
   tallChannel, test, threadPage, touchAt, upstreamReadButton, withLiveChannel, youSay } from "./fixture.mjs";
@@ -2129,8 +2129,9 @@ test("a poll that returns the SAME messages does not offer to jump anywhere", as
   await page.settle();
 
   assert.equal(page.reads, 2);
-  // Up the list, so the way down is offered (`#207 scrollback-jump`), and offered as nothing more.
-  assert.equal(page.el("jump-newest-label").textContent, "Newest");
+  // Up the list, so the way down is offered (`#207 scrollback-jump`) with its count of what stands
+  // below (`#1057 newest-count-chip`) — and offered as nothing more: no arrival is claimed.
+  assert.equal(page.el("jump-newest-label").textContent, "Newest (11)");
   assert.equal(
     jumpSaysArrived(page),
     false,
@@ -2194,7 +2195,7 @@ test("THE JUMP IS UP WHENEVER THE CHANNEL IS SCROLLED BACK, and gone at the newe
 
   await scrollToGap(page, halfway(page));
   assert.equal(jumpShown(page), true, "a reader halfway up the channel was offered no way back");
-  assert.equal(jumpWords(page), "Newest / Jump to the newest message");
+  assert.equal(jumpWords(page), "Newest (6) / Jump to the newest message, 6 below");
   assert.equal(jumpSaysArrived(page), false, "nothing arrived, and the jump says something did");
 
   await scrollToGap(page, 0);
@@ -2314,7 +2315,8 @@ test("the channel counts what arrived on the stream and in a poll, and says New 
   await scrollToGap(live, halfway(live));
   await deliver(live, stream, sseMessage(message({ id: "200", content: "the first of two" })));
   await deliver(live, stream, sseMessage(message({ id: "201", content: "and the second" })));
-  assert.equal(jumpWords(live), "2 new / Jump to the newest message, 2 new");
+  // Arrivals first, then all that stands below, the two among them (`#1057 newest-count-chip`).
+  assert.equal(jumpWords(live), "2 new (8) / Jump to the newest message, 2 new, 8 below");
 
   const polled = newPage();
   await signIn(polled);
@@ -2325,12 +2327,12 @@ test("the channel counts what arrived on the stream and in a poll, and says New 
   polled.messages = channelOf(12, 3);
   polled.expireTimers(DISCORD_POLL_MS);
   await polled.settle();
-  assert.equal(jumpWords(polled), "3 new / Jump to the newest message, 3 new");
+  assert.equal(jumpWords(polled), "3 new (9) / Jump to the newest message, 3 new, 9 below");
   // A count that runs past what the chip spells out says so rather than growing the chip.
   polled.messages = channelOf(12, 3 + JUMP_COUNT_MAX);
   polled.expireTimers(DISCORD_POLL_MS);
   await polled.settle();
-  assert.equal(polled.el("jump-newest-label").textContent, `${JUMP_COUNT_MAX}+ new`);
+  assert.equal(polled.el("jump-newest-label").textContent, `${JUMP_COUNT_MAX}+ new (108)`);
 
   // The message that was newest is not in the next read at all — more arrived than one read holds,
   // or it went — so how many is unknown, and the jump says only that something is there.
@@ -2344,8 +2346,99 @@ test("the channel counts what arrived on the stream and in a poll, and says New 
     message({ id: String(500 + i), content: longMessage(`later ${i}`) }));
   lost.expireTimers(DISCORD_POLL_MS);
   await lost.settle();
-  assert.equal(jumpWords(lost), "New / Jump to the newest message, something new below");
+  // The rows held below are then a floor — more arrived than one read holds is this same case — so
+  // the count says at least that many (`#1057 newest-count-chip`).
+  assert.equal(jumpWords(lost), "New (6+) / Jump to the newest message, something new, at least 6 below");
   assert.equal(jumpSaysArrived(lost), true);
+});
+
+// --- the jump counts the rows below the reader (`#1057 newest-count-chip`) ----------------------
+//
+// The owner, reading back up a long All feed from a bookmark, could tell from the scrollbar only
+// vaguely how far back they were. The chip is in a stable place as they scroll, so it carries the
+// count: "Newest (N)", N the rows below the last row wholly on screen — how much reading is left
+// to catch up. Tall rows here are a screenful short of three in the fixture's measure, so at the
+// very top exactly the first row is wholly on screen.
+
+test("the jump counts the rows below the reader at the top and halfway, and is gone at the newest", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, tallChannel(12));
+  const area = page.el("scroll-area");
+  assert.equal(jumpShown(page), false, "the premise: at the newest, with nothing below to count");
+
+  const maxGap = area.scrollHeight - area.clientHeight;
+  await scrollToGap(page, maxGap);
+  assert.equal(jumpWords(page), "Newest (11) / Jump to the newest message, 11 below",
+    "at the top only the first of the twelve rows is wholly on screen");
+
+  // One row further reads one fewer below: the count moves as the reader scrolls, not once.
+  const rowGap = Math.round(page.el("discord-log").children[0].getBoundingClientRect().height);
+  await scrollToGap(page, maxGap - rowGap);
+  assert.equal(jumpWords(page), "Newest (10) / Jump to the newest message, 10 below");
+
+  await scrollToGap(page, halfway(page));
+  assert.equal(jumpWords(page), "Newest (6) / Jump to the newest message, 6 below");
+
+  await scrollToGap(page, 0);
+  assert.equal(jumpShown(page), false, "a reader on the newest keeps no count of nothing below");
+});
+
+test("the count is of the rows the view shows: a reply counts in All, folded under Main it does not", async () => {
+  const thread = { id: "spaces/A/threads/build", root_message_id: "2", is_root: true,
+    reply_count: 3, reply_count_exact: true };
+  const messages = Array.from({ length: 12 }, (_, i) => {
+    const id = String(i + 1);
+    const extra = id === "2" ? { thread } : ["3", "4", "5"].includes(id) ? { thread: { ...thread, is_root: false } } : {};
+    return message({ id, content: longMessage(`message ${id}`), ...extra });
+  });
+  const page = newPage();
+  page.threadingSupported = true;
+  page.threads = [{ id: thread.id, root: messages[1], title: "Nightly build", reply_count: 3,
+    reply_count_exact: true, updated_at: messages[4].timestamp }];
+  await signIn(page);
+  await showDiscord(page, messages); // opens in All, where each reply is a row of its own
+  const area = page.el("scroll-area");
+  const toTop = async () => {
+    area.scrollTop = 0;
+    await area.dispatch("scroll");
+    await page.settle();
+  };
+
+  await toTop();
+  assert.equal(jumpWords(page), "Newest (11) / Jump to the newest message, 11 below",
+    "All draws the three replies as rows, and the count is of rows");
+
+  await pickThread(page, "main");
+  await toTop();
+  assert.equal(jumpWords(page), "Newest (8) / Jump to the newest message, 8 below",
+    "Main folds those replies under their root: nine rows stand, eight of them below");
+});
+
+test("the count is remade at most once a frame while the reader scrolls", async () => {
+  const page = newPage(new Map(), SCRIPT, (p) => p.enableAnimationFrames());
+  await signIn(page);
+  await showDiscord(page, tallChannel(12));
+  const area = page.el("scroll-area");
+  const maxGap = area.scrollHeight - area.clientHeight;
+  const rowGap = Math.round(page.el("discord-log").children[0].getBoundingClientRect().height);
+  await page.nextFrame();
+  await scrollToGap(page, maxGap);
+  // The count held from the list's landing stands for the rest of that frame; the next frame
+  // recounts it where the reader now stands. At rest at the top it reads eleven below.
+  await page.nextFrame();
+  assert.equal(page.el("jump-newest-label").textContent, "Newest (11)",
+    "the premise: at the top, settled, eleven rows stand below");
+
+  // Two scrolls before any frame runs: the count stands as it was, one recount already asked for.
+  await scrollToGap(page, halfway(page));
+  await scrollToGap(page, maxGap - rowGap);
+  assert.equal(page.el("jump-newest-label").textContent, "Newest (11)",
+    "scrolling inside a frame remade the count off the scroll events themselves");
+
+  // The frame settles it at where the reader came to rest.
+  await page.nextFrame();
+  assert.equal(page.el("jump-newest-label").textContent, "Newest (10)");
 });
 
 test("a restore that lands up the history shows the jump at once; one that lands on the newest never does", async () => {
@@ -2379,7 +2472,7 @@ test("a restore that lands up the history shows the jump at once; one that lands
   await page.settle();
   assert.equal(area.scrollTop, parked, "the premise: coming back keeps the reader's place");
   assert.equal(jumpShown(page), true, "coming back to a place up the channel showed no way back");
-  assert.equal(jumpWords(page), "Newest / Jump to the newest message");
+  assert.equal(jumpWords(page), "Newest (6) / Jump to the newest message, 6 below");
 
   // Off the main screen there is no list to jump in; back on it, the place is put back and so is it.
   await page.el("open-settings").click();
@@ -2569,7 +2662,7 @@ test("each list has its own jump: scrolled back in the channel, the transcript s
   await page.settle();
   assert.equal(page.tab(), "discord");
   await scrollToGap(page, halfway(page));
-  assert.equal(jumpWords(page), "Newest / Jump to the newest message", "the premise: up the channel");
+  assert.equal(jumpWords(page), "Newest (6) / Jump to the newest message, 6 below", "the premise: up the channel");
 
   await page.el("view-switch").click(); // to the transcript, through Documents
   await page.settle();
@@ -2585,7 +2678,7 @@ test("each list has its own jump: scrolled back in the channel, the transcript s
 
   await page.el("view-switch").click(); // the channel: its own place, its own words
   await page.settle();
-  assert.equal(jumpWords(page), "Newest / Jump to the newest message", "the transcript's arrival followed the reader to the channel");
+  assert.equal(jumpWords(page), "Newest (6) / Jump to the newest message, 6 below", "the transcript's arrival followed the reader to the channel");
   assert.equal(jumpShown(page), true);
   await page.el("view-switch").click(); // and back: the transcript's arrival is still waiting there
   await page.settle();

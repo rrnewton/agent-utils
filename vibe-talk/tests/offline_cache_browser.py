@@ -2758,7 +2758,10 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             shot("4b2-jump-scrolled-back")
             check(bool(back["shown"]) and float(back["gap"]) > 100,
                   f"{label}: halfway up the channel there is no jump to the newest message: {back}")
-            check(back["label"] == "Newest", f"{label}: the jump says {back['label']!r} with nothing new below")
+            # `#1057 newest-count-chip`: the plain offer now carries its count of rows below, still
+            # claiming no arrival with nothing new there.
+            check(re.fullmatch(r"Newest( \(\d+\))?", str(back["label"])) is not None,
+                  f"{label}: the jump says {back['label']!r} with nothing new below")
             check(not back["problems"], f"{label}, the jump halfway up the channel: {back['problems']}")
             crowd = page.add_style_tag(content="#scroll-tools .chip[hidden] { display: inline-flex !important; }")
             for size in ("100%", "150%"):

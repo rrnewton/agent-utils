@@ -47,6 +47,41 @@ export interface ScrollKeepingDependencies {
   setJumpNewest(on: boolean, view: string, turns: number): void;
 }
 
+/**
+ * How many of `rows` — one list's, in their order — stand below the reading position: below the
+ * last row wholly on screen between `head` and `foot`, the edges of the list's window as its
+ * caller reads them. What the jump to the newest counts (`#1057 newest-count-chip`): how
+ * much reading is left between here and the newest line, in the rows this view draws.
+ *
+ * Rows stand in list order, so their tops do not decrease: a binary search finds the first row
+ * starting at or below `foot`, and only the rows on screen around it are measured — a count asked
+ * for as the reader scrolls never measures the whole of a long history.
+ */
+export function rowsBelowReadingPosition(rows: readonly HTMLElement[], head: number, foot: number): number {
+  let lo = 0;
+  let hi = rows.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((rows[mid] as HTMLElement).getBoundingClientRect().top < foot) lo = mid + 1;
+    else hi = mid;
+  }
+  let at = -1;
+  for (let i = lo - 1; i >= 0; i -= 1) {
+    const box = (rows[i] as HTMLElement).getBoundingClientRect();
+    if (box.bottom <= head) break;
+    if (box.top >= head - 1 && box.bottom <= foot + 1) {
+      at = i;
+      break;
+    }
+  }
+  if (at < 0) {
+    // Nothing stands wholly on screen — a row taller than the room, most likely. The reader is on
+    // the last row any of which shows, and what follows it is below them.
+    at = lo > 0 && (rows[lo - 1] as HTMLElement).getBoundingClientRect().bottom > head ? lo - 1 : -1;
+  }
+  return rows.length - 1 - at;
+}
+
 /** The keeper's commands and questions. */
 export interface ScrollKeeping {
   /** The list the reader is actually looking at. Both panes share one scrolling element. */

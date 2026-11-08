@@ -13,6 +13,7 @@ import {
 } from "../../present/rows/index.ts";
 import type { ClockPort } from "../../ports/index.ts";
 import { foldedTextLine } from "./fold.ts";
+import { rowsBelowReadingPosition } from "./scrollkeep.ts";
 
 /** Past this many characters a message is worth folding (`foldable`); shorter gets no control. */
 export const COLLAPSE_OVER_CHARS = 280;
@@ -379,6 +380,81 @@ export function createFolding(deps: FoldingDependencies): Folding {
 
   const JUMP_COUNT_MAX = 99;
 
+  /**
+   * `#1057 newest-count-chip`. The rows below the reading position in the list this column's jump
+   * is over, as last counted: which list (its column, view and context), and the count — null for
+   * a list with no rows to count, as the call's transcript, whose turns are no pane's rows, and
+   * the Threads cards in the main column. The count is of the pane's rows, the rows the view
+   * draws: a reply drawn as its own row in All counts, one folded under its root in Main does
+   * not, and a collapsed run of read messages is the one line it stands on screen as.
+   */
+  let belowHeld: { key: string; count: number | null } | null = null;
+  /** Whether a recount of the rows below is already asked for in the next frame. */
+  let belowDue = false;
+  /** Whether the jump is being drawn again by that recount, which asks for no further one. */
+  let belowFresh = false;
+
+  function belowPane(): FoldPane {
+    return deps.side() ? deps.sidePane() : deps.channelPane();
+  }
+
+  function belowKey(): string {
+    return `${deps.activeName()}|${deps.view()}|${belowPane().context()}`;
+  }
+
+  function recountBelow(key: string): number | null {
+    const pane = belowPane();
+    const rows = deps.paneRows(pane);
+    if (rows.length === 0) {
+      belowHeld = { key, count: null };
+      return null;
+    }
+    // The list window's own edges, not the room clear of what floats over it: a status line
+    // coming and going, or the chip row's height moving as its own words change, would move the
+    // count under a reader who never moved.
+    const area = pane.scroller();
+    const head = area.getBoundingClientRect().top;
+    const count = rowsBelowReadingPosition(rows, head, head + (area.clientHeight || 0));
+    belowHeld = { key, count };
+    return count;
+  }
+
+  /**
+   * Count the rows below again in the next frame, and draw the jump again where the count moved:
+   * scroll events arrive oftener than frames, and one count a frame is all a changing number can
+   * show. In this column, captured now — a frame later, the page works on another.
+   */
+  function scheduleBelow(): void {
+    if (belowDue) return;
+    belowDue = true;
+    const again = deps.inThisColumn(() => {
+      belowDue = false;
+      const before = belowHeld === null ? null : belowHeld.count;
+      if (recountBelow(belowKey()) === before) return;
+      belowFresh = true;
+      try {
+        renderJumpNewest();
+      } finally {
+        belowFresh = false;
+      }
+    });
+    requestAnimationFrame(() => again());
+  }
+
+  /**
+   * The rows below the reading position for the jump's label: counted now where the list is not
+   * the one last counted, held between frames where it is — and, where there are no frames to
+   * wait for, counted now there too.
+   */
+  function belowForJump(): number | null {
+    const key = belowKey();
+    if (belowHeld === null || belowHeld.key !== key) return recountBelow(key);
+    if (belowFresh) return belowHeld.count;
+    if (typeof requestAnimationFrame !== "function") return recountBelow(key);
+    scheduleBelow();
+    return belowHeld.count;
+  }
+
   function renderJumpNewest(): void {
     const button = el("jump-newest");
     let shown = false;
@@ -403,15 +479,24 @@ export function createFolding(deps: FoldingDependencies): Folding {
     const many = count > JUMP_COUNT_MAX ? `${JUMP_COUNT_MAX}+` : String(count);
     const failed = unsent !== null && unsent.state === "failed";
     const draft = unsent === null && shown && deps.draftBelowView();
+    // `#1057 newest-count-chip`. The offer to go to the newest says how much stands below the
+    // reader — "Newest (11)", arrivals first where there are any ("3 new (9)") — on the one
+    // control, after the words it already said. An arrival the page could not count (`arrived`
+    // true: more arrived than one read holds, `#207 scrollback-jump`) leaves the held rows a
+    // floor, said as "New (6+)". A reply of the reader's own or a draft at the foot is another
+    // offer, and says neither.
+    const below = shown && unsent === null && !draft ? belowForJump() : null;
+    const suffix = below !== null && below > 0 ? ` (${below}${arrived === true ? "+" : ""})` : "";
+    const belowWords = below !== null && below > 0 ? `${arrived === true ? "at least " : ""}${below} below` : null;
     const label = unsent !== null ? (failed ? "Reply not sent" : "Reply unconfirmed")
-      : draft ? "Draft to send" : arrived === false ? "Newest" : count ? `${many} new` : "New";
+      : draft ? "Draft to send" : arrived === false ? `Newest${suffix}` : count ? `${many} new${suffix}` : `New${suffix}`;
     const name = unsent !== null
       ? `Jump to your reply, which ${failed ? "was not sent" : "may not have been posted"}, at the foot of the list`
       : draft
         ? "Jump to the draft waiting to be sent"
         : arrived === false
-          ? "Jump to the newest message"
-          : `Jump to the newest message, ${count ? `${many} new` : "something new below"}`;
+          ? belowWords === null ? "Jump to the newest message" : `Jump to the newest message, ${belowWords}`
+          : `Jump to the newest message, ${count ? `${many} new` : belowWords === null ? "something new below" : "something new"}${belowWords === null ? "" : `, ${belowWords}`}`;
     if (button.hidden === shown) button.hidden = !shown;
     if (el("jump-newest-label").textContent !== label) el("jump-newest-label").textContent = label;
     if (button.getAttribute("aria-label") !== name) button.setAttribute("aria-label", name);

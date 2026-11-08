@@ -296,6 +296,8 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
 
 
 # Where the line, its row, the row above, the chips and the floating pill are, measured by the engine.
+# `belowRows`/`newestLabel` (`#1057 newest-count-chip`): the rows below the last one wholly in the
+# list's window, counted here from the drawn boxes, and what the Newest chip says of them.
 MEASURE_JS = """(marked) => {
   const box = (node) => {
     if (!node || !node.getClientRects().length) return null;
@@ -358,6 +360,26 @@ MEASURE_JS = """(marked) => {
     accent,
     floating,
     atEnd: area.scrollTop >= area.scrollHeight - area.clientHeight - 2,
+    belowRows: (() => {
+      const head = area.getBoundingClientRect().top;
+      const foot = head + area.clientHeight;
+      const shown = rows.filter((li) => !li.hidden && !li.classList.contains('search-hidden'));
+      let at = -1;
+      for (let i = 0; i < shown.length; i += 1) {
+        const r = shown[i].getBoundingClientRect();
+        if (r.top >= head - 1 && r.bottom <= foot + 1) at = i;
+        else if (r.top >= foot) break;
+      }
+      if (at < 0) {
+        for (let i = shown.length - 1; i >= 0; i -= 1) {
+          const r = shown[i].getBoundingClientRect();
+          if (r.bottom > head && r.top < foot) { at = i; break; }
+          if (r.bottom <= head) break;
+        }
+      }
+      return shown.length - 1 - at;
+    })(),
+    newestLabel: document.getElementById('jump-newest-label').textContent,
     chips,
     direction: document.getElementById('jump-bookmark').getAttribute('data-direction'),
     selected: document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.id || null : null,
@@ -511,6 +533,7 @@ def bookmark_walk(walk: Walk) -> None:
                   "the chip did not come up with the line scrolled away")
     m = walk.measure(marked)
     walk.check(m.found["direction"] == "up", f"the chip points {m.found['direction']}, away from the line")
+    walk.check(m.chip("jump-newest") is None, "at the newest message Newest still counts rows below")
     walk.scroll("area.scrollTop = Math.round(area.scrollHeight * 0.55);")
     walk.wait_for("() => !document.getElementById('jump-newest').hidden && !document.getElementById('jump-bookmark').hidden",
                   "part way back, Newest and the Bookmark chip are not both up")
@@ -527,8 +550,25 @@ def bookmark_walk(walk: Walk) -> None:
             walk.check(other["right"] <= mine["left"] or mine["right"] <= other["left"]
                        or other["bottom"] <= mine["top"] or mine["bottom"] <= other["top"],
                        f"a chip overlaps the two jumps: {other} {mine}")
+    # `#1057 newest-count-chip`: Newest says how many rows stand below where the reader is, and
+    # more of them from the very top of the forty than from part way back.
+    below = m.found["belowRows"]
+    walk.check(isinstance(below, int) and 0 < below < COUNT,
+               f"part way back, the rows below measure {below!r} of {COUNT}, so this proves nothing")
+    walk.check(m.text("newestLabel") == f"Newest ({below})",
+               f"part way back Newest says {m.text('newestLabel')!r} over {below} rows below")
+    walk.scroll("area.scrollTop = 0;")
+    walk.wait_for("() => !document.getElementById('jump-newest').hidden",
+                  "at the top, Newest is not up")
+    top = walk.measure(marked)
+    top_below = top.found["belowRows"]
+    walk.check(isinstance(top_below, int) and isinstance(below, int) and top_below > below,
+               f"from the top only {top_below!r} rows stand below, against {below} part way back")
+    walk.check(top.text("newestLabel") == f"Newest ({top_below})",
+               f"at the top Newest says {top.text('newestLabel')!r} over {top_below} rows below")
     walk.shot("2-chips")
     walk.notes.append("Newest and the Bookmark chip side by side on the bottom line")
+    walk.notes.append(f"Newest counts the rows below: {below} part way back, {top_below} at the top")
 
     def jump(why: str) -> Measured:
         if walk.touch:

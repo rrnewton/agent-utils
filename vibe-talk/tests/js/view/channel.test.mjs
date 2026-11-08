@@ -518,6 +518,24 @@ test("`#624 voice-page-modularity`: the reader is left on the message their eye 
   assert.equal(calls.at(-1), "newest");
 });
 
+test("`#1057 newest-count-chip`: the rows below the reading position, from the last row wholly on screen", () => {
+  const { rowsBelowReadingPosition } = CHANNEL_VIEW;
+  const row = (top, bottom) => ({ getBoundingClientRect: () => ({ top, bottom }) });
+  // Head at 0, foot at 100: the first row is scrolled off, the next two stand wholly on screen,
+  // the fourth is cut at the foot and the fifth is below it.
+  const rows = [row(-40, 0), row(0, 40), row(40, 80), row(80, 120), row(120, 160)];
+  assert.equal(rowsBelowReadingPosition(rows, 0, 100), 2, "the cut row and the one under it stand below");
+  assert.equal(rowsBelowReadingPosition(rows.slice(0, 3), 0, 100), 0, "the last row on screen wholly is the foot");
+  assert.equal(rowsBelowReadingPosition([], 0, 100), 0);
+  // Within a pixel of either edge still stands wholly on screen, as the keys read it.
+  assert.equal(rowsBelowReadingPosition([row(-1, 101), row(101, 141)], 0, 100), 1);
+  // Nothing wholly on screen — one row taller than the room: the reader is on it, and what
+  // follows it is below.
+  assert.equal(rowsBelowReadingPosition([row(-50, 150), row(150, 190), row(190, 230)], 0, 100), 2);
+  // Wholly below the room keeps every row below.
+  assert.equal(rowsBelowReadingPosition([row(200, 240), row(240, 280)], 0, 100), 2);
+});
+
 test("`#624 voice-page-modularity`: the card at the top of a thread moves up from its card, and each part ends with its own animation", () => {
   const { createCardFlight } = CHANNEL_VIEW;
   const node = (top) => {
