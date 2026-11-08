@@ -2549,3 +2549,85 @@ fn a_cap_of_zero_drains_without_exiting_and_clearing_it_resumes_and_a_malformed_
         );
     }
 }
+
+/// A validator change on disk mid-run reaches donor jobs published from
+/// the next plan-intake on (#1050): the earlier job keeps the old
+/// validator, the later job carries the new one, and the run records a
+/// `config-reload` event. No batch mixes validators because jobs are
+/// published per batch.
+#[test]
+fn a_validator_change_mid_run_reaches_later_donor_jobs() {
+    let fx = Fixture::new("donor-config-reload");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "decide",
+    ]);
+    fx.branch("a", &[("a.txt", "a\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let clone = donor_clone(&fx, "donor-host");
+    let run = spawn_run(&fx, &[]);
+    wait_for("the first published job", Duration::from_secs(30), || {
+        jobs(&fx).len() == 1
+    });
+    // Change the validator on disk, then submit a second change so the
+    // run takes intake in and reloads the config.
+    set_config(&fx, |config| {
+        config["validator"]["run"] = serde_json::json!("exit 0 # v2");
+    });
+    fx.branch("b", &[("b.txt", "b\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    wait_for("a second published job", Duration::from_secs(60), || {
+        jobs(&fx).len() >= 2
+    });
+    // Read the job files directly: `donor status` does not carry the
+    // validator each job was published with.
+    let jobs_dir = state_dir(&fx).join("donor").join("jobs");
+    let published: Vec<Value> = std::fs::read_dir(&jobs_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| serde_json::from_str(&std::fs::read_to_string(entry.path()).unwrap()).unwrap())
+        .collect();
+    let runs: Vec<String> = published
+        .iter()
+        .map(|job| job["validator"]["run"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        runs.iter().any(|run| run == "exit 0") && runs.iter().any(|run| run == "exit 0 # v2"),
+        "jobs carry both validators: {runs:?}"
+    );
+    let digests: Vec<&str> = published
+        .iter()
+        .map(|job| job["tool"]["validator_digest"].as_str().unwrap())
+        .collect();
+    assert!(
+        digests.iter().any(|d| *d != digests[0]),
+        "the later job's digest must differ: {digests:?}"
+    );
+    let out = donor(&fx, &clone, "d1", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (code, report, stderr) = finish(run);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        report["landed"].as_array().map(Vec::len),
+        Some(2),
+        "{report}"
+    );
+    // The run recorded the reload in its events.
+    let runs_dir = state_dir(&fx).join("runs");
+    let mut events = String::new();
+    for entry in std::fs::read_dir(&runs_dir).unwrap().flatten() {
+        if let Ok(text) = std::fs::read_to_string(entry.path().join("events.jsonl")) {
+            events.push_str(&text);
+        }
+    }
+    assert!(events.contains("config-reload"), "{events}");
+}

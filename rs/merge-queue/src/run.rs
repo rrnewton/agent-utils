@@ -150,8 +150,9 @@ pub const INTAKE_FOR: Duration = Duration::from_secs(2 * 3600);
 struct Donors {
     store: crate::donor::Store,
     mode: crate::state::Offload,
-    /// Tool identity computed on this host when the run started.
-    tool: crate::donor::ToolIdentity,
+    /// Tool identity computed on this host when the run started; replaced
+    /// when the validator is reloaded at plan-intake (#1050).
+    tool: Mutex<crate::donor::ToolIdentity>,
     /// Jobs this run published and has not settled yet: (job id, candidate commit).
     published: Mutex<Vec<(String, String)>>,
 }
@@ -1277,6 +1278,12 @@ pub struct Runner<'a> {
     deps: Mutex<BTreeMap<i64, BTreeSet<i64>>>,
     /// Changes ejected or set aside in this run; never rebuilt into a candidate again.
     excluded: Mutex<BTreeSet<i64>>,
+    /// Changes already taken back in at the same head they were excluded at in this run
+    /// (#1050): once per run, so a change that keeps failing is not revalidated in a loop.
+    resubmitted_same_head: Mutex<BTreeSet<i64>>,
+    /// The validator donor jobs published now carry: the run's starting validator, replaced
+    /// at plan-intake when the config on disk changes (#1050).
+    publish_validator: Mutex<crate::state::ValidatorConfig>,
     /// Heads of changes landed (or simulated as landed) in this run.
     landed_heads: Mutex<Vec<String>>,
     /// Changes whose rebased copies a candidate built in this run carries, by the candidate's
@@ -1329,6 +1336,7 @@ impl<'a> Runner<'a> {
     /// Prepare a run: load config, items and validator, and allocate the run directory.
     pub fn new(state: &'a State, options: RunOptions) -> Result<Self, String> {
         let config = state.config()?;
+        let publish_validator = config.validator.clone();
         let validator = from_config(&config.validator)?;
         let offload = crate::state::Offload::parse(
             options
@@ -1367,7 +1375,7 @@ impl<'a> Runner<'a> {
                     Some(Donors {
                         store,
                         mode: offload,
-                        tool,
+                        tool: Mutex::new(tool),
                         published: Mutex::new(Vec::new()),
                     })
                 }
@@ -1447,6 +1455,8 @@ impl<'a> Runner<'a> {
             items: Mutex::new(items),
             deps: Mutex::new(BTreeMap::new()),
             excluded: Mutex::new(held),
+            resubmitted_same_head: Mutex::new(BTreeSet::new()),
+            publish_validator: Mutex::new(publish_validator),
             landed_heads: Mutex::new(Vec::new()),
             carried: Mutex::new(BTreeMap::new()),
             solo: Mutex::new(BTreeSet::new()),
@@ -4296,8 +4306,8 @@ impl<'a> Runner<'a> {
             &base,
             &job.selection,
             &job.extra,
-            &self.config.validator,
-            &donors.tool,
+            &lock(&self.publish_validator).clone(),
+            &lock(&donors.tool).clone(),
             job.rooted,
             prioritized,
             plan_index,
@@ -5564,10 +5574,13 @@ impl<'a> Runner<'a> {
         }
         // A submit at a NEW head for a change this run set aside (ejected,
         // most often) applies at this intake point too: the exclusion was
-        // for the old head, never for the change. A submit at the same
-        // excluded head keeps waiting (status names why). In-flight
-        // changes are untouched: their validation finishes first.
+        // for the old head, never for the change. A submit at the SAME
+        // excluded head also applies, once per run per change (#1050):
+        // the operator who resubmits an ejected head has usually fixed
+        // the validator, not the change. In-flight changes are
+        // untouched: their validation finishes first.
         let mut resubmitted: BTreeSet<i64> = BTreeSet::new();
+        let mut resubmitted_same: BTreeSet<i64> = BTreeSet::new();
         for (pr, head) in crate::intake::pending_submissions(self.state) {
             if head.is_empty() || !busy.contains(&pr) || in_flight.contains(&pr) {
                 continue;
@@ -5576,9 +5589,17 @@ impl<'a> Runner<'a> {
                 .get(&pr)
                 .map(|item| item.head.clone())
                 .unwrap_or_default();
-            if !excluded_head.is_empty() && head != excluded_head {
+            if excluded_head.is_empty() {
+                continue;
+            }
+            if head != excluded_head {
                 busy.remove(&pr);
                 resubmitted.insert(pr);
+            } else if lock(&self.excluded).contains(&pr)
+                && !lock(&self.resubmitted_same_head).contains(&pr)
+            {
+                busy.remove(&pr);
+                resubmitted_same.insert(pr);
             }
         }
         let applied = match crate::intake::apply_except(self.state, &self.config, writer, &busy) {
@@ -5636,7 +5657,21 @@ impl<'a> Runner<'a> {
                     ),
                 );
             }
+            if resubmitted_same.contains(&one.pr) && one.request.starts_with("submit") {
+                lock(&self.excluded).remove(&one.pr);
+                lock(&self.resubmitted_same_head).insert(one.pr);
+                self.event(
+                    "resubmit",
+                    &format!(
+                        "#{pr}: resubmitted at the same head it was set aside at; planned \
+                         again in this run (once per run per change; the earlier ejection \
+                         stays on record)",
+                        pr = one.pr
+                    ),
+                );
+            }
         }
+        self.refresh_publish_validator();
         if let Err(error) = self.plan_intake(tip, busy, max_batch, pending, view) {
             self.event(
                 "plan-intake",
@@ -5663,13 +5698,65 @@ impl<'a> Runner<'a> {
         crate::intake::pending_submissions(self.state)
             .into_iter()
             .any(|(pr, head)| {
-                !head.is_empty()
-                    && busy.contains(&pr)
-                    && !in_flight.contains(&pr)
-                    && lock(&self.items)
-                        .get(&pr)
-                        .is_some_and(|item| !item.head.is_empty() && item.head != head)
+                if head.is_empty() || !busy.contains(&pr) || in_flight.contains(&pr) {
+                    return false;
+                }
+                let item_head = lock(&self.items)
+                    .get(&pr)
+                    .map(|item| item.head.clone())
+                    .unwrap_or_default();
+                if item_head.is_empty() {
+                    return false;
+                }
+                // A new head always unblocks; the same head unblocks once
+                // per run for a change this run excluded (#1050).
+                head != item_head
+                    || (lock(&self.excluded).contains(&pr)
+                        && !lock(&self.resubmitted_same_head).contains(&pr))
             })
+    }
+
+    /// Reload the queue config for donor jobs published from now on
+    /// (#1050): if the validator on disk differs from the one jobs
+    /// currently carry, swap it in and record the change. Jobs are
+    /// published per batch, so a batch never mixes two validators;
+    /// local validations keep the validator this run started with.
+    fn refresh_publish_validator(&self) {
+        let Ok(fresh) = self.state.config() else {
+            return;
+        };
+        let Ok(new_digest) = crate::donor::validator_digest(&fresh.validator) else {
+            return;
+        };
+        let mut current = lock(&self.publish_validator);
+        let Ok(old_digest) = crate::donor::validator_digest(&current) else {
+            return;
+        };
+        if new_digest == old_digest {
+            return;
+        }
+        *current = fresh.validator.clone();
+        drop(current);
+        // The tool identity donors must match is recomputed for the new
+        // validator; if that fails, keep the old identity and say so.
+        if let Some(donors) = &self.donors {
+            match crate::donor::tool_identity(&fresh.validator, &fresh.repo) {
+                Ok(tool) => *lock(&donors.tool) = tool,
+                Err(error) => self.event(
+                    "config-reload",
+                    &format!("cannot recompute the donor tool identity for the new validator: {error}; published jobs keep the old identity"),
+                ),
+            }
+        }
+        self.event(
+            "config-reload",
+            &format!(
+                "validator config changed on disk ({} -> {}); donor jobs published from now \
+                 on carry the new validator, in-flight and already-published jobs keep theirs",
+                short(&old_digest),
+                short(&new_digest)
+            ),
+        );
     }
 
     /// The changes this run holds until their owner's `retry` (escalated, or held for a ruling)

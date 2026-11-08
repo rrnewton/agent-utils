@@ -348,7 +348,8 @@ pub fn has_pending(state: &State) -> bool {
 /// Waiting submissions as `(change, head it names)`: the submission's own
 /// head when it names one, else the head its ref resolved to when the
 /// request was recorded. A run compares this with the head it set a change
-/// aside at: a different head may apply at once, the same head may not.
+/// aside at: a different head may apply at once, and the same head may
+/// too, once per run per change (#1050).
 pub fn pending_submissions(state: &State) -> Vec<(i64, String)> {
     pending_entries(state)
         .into_iter()
@@ -666,7 +667,8 @@ pub fn pending(state: &State) -> Vec<Pending> {
                 && (pending.head.is_empty() || pending.head == item.head)
             {
                 pending.wait = format!(
-                    "waits for the run end: excluded this run (ejected at {})",
+                    "excluded this run (ejected at {}); a resubmission at this head is \
+                     taken in once per run at its next intake point",
                     short(&item.head)
                 );
             }

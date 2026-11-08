@@ -695,6 +695,14 @@ in a run exits when the run ends.
 
 With no daemon running, `drain-for-upgrade` exits 1: there is nothing to drain.
 
+To change the validator itself, the same drain is the operator tool: it finishes the
+validations in flight, starts no new one, and exits so the next run loads the new config.
+Donor jobs do not have to wait for that: at each plan-intake a run reloads the config on
+disk, and donor jobs published from then on carry the new validator (the run records a
+`config-reload` event naming both digests). Jobs are published per batch, so a batch never
+mixes two validators; in-flight and already-published jobs keep theirs, and local
+validations keep the validator the run started with until the next run.
+
 ### `merge-queue donor`
 
 Donor validators (see "Donor validators"). `donor run` is the donor daemon, run on any host with

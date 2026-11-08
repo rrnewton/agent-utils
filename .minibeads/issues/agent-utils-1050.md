@@ -1,6 +1,6 @@
 ---
 title: 'merge-queue-mid-run-intake-config: a same-head resubmission joins the run that ejected it, and a validator change reaches donor jobs at plan-intake'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-08T08:20:00.000000000+00:00
@@ -73,3 +73,39 @@ operator does while it is open.
 # Notes
 
 ## Resolution
+
+Implemented as designed. A same-head resubmission of a change a run
+excluded applies at the next intake point once per run per change
+(`resubmitted_same_head` guard in the run; the ejection stays on
+record, and a second same-head resubmission waits for the next run).
+At plan-intake the run reloads the config: a changed validator digest
+swaps the validator donor jobs are published with and recomputes the
+donor tool identity, recording a `config-reload` event naming both
+digests; local validations keep the run-start validator. No new drain
+verb was added: `drain-for-upgrade` already finishes in-flight work,
+starts nothing new and exits for a fresh-config run, and the user
+guide now points validator changes at it and at the plan-intake
+reload.
+
+Tests: `a_resubmission_at_the_ejected_head_is_taken_in_once_in_the_same_run`
+(cli_intake_window, rewritten from the old same-head-wait test) and
+`a_validator_change_mid_run_reaches_later_donor_jobs` (cli_donor: the
+earlier job keeps the old validator and digest, a job published after
+the on-disk change carries the new validator and a different digest,
+and the run records `config-reload`). The donor test caught a real
+half of the change the first version missed: jobs carried the new
+validator but the run-start tool digest, so donors would have
+mismatched every reloaded job; the tool identity is now recomputed
+at reload. Focused suites pass: cli_intake_window 6/6, cli_intake
+8/8, cli_drain 5/5, cli_donor 35/35.
+
+Gate note (added at landing): the first full gate on 9ac15fe0 failed
+only `rust.merge-queue.test` (gate-ledger ticket
+1794139030020563692-dd16a648, failed_steps exactly that one; the
+exclusive phase passed) — the old 1200 CPU-s budget of #1051. The
+change was rebased onto main containing #1051 (2400 CPU-s) as
+5a4af5aa (one conflict in plan_intake's new `view` argument, keeping
+both sides) and `rust.merge-queue.test` was rerun alone through
+gate.py --rerun: PASS, 574 cases, 572 passed, 0 failed, 657.8 CPU-s
+(user 456.3 + sys 119.3 in the step profile; 503 s wall), ledger
+verdict pass for 5a4af5aa6149bbddf0993cff74f569e8adfa220a.

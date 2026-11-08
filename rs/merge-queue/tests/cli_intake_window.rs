@@ -142,6 +142,26 @@ fn status(fx: &Fixture, pr: i64) -> String {
 }
 
 /// The reports of every run, oldest first.
+fn events(fx: &Fixture) -> Vec<String> {
+    let runs = fx.queue().join(".git/merge-queue/runs");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(runs)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join("events.jsonl").is_file())
+        .collect();
+    dirs.sort();
+    dirs.iter()
+        .flat_map(|dir| {
+            std::fs::read_to_string(dir.join("events.jsonl"))
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 fn reports(fx: &Fixture) -> Vec<Value> {
     let runs = fx.queue().join(".git/merge-queue/runs");
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(runs)
@@ -397,10 +417,13 @@ fn an_ejected_change_resubmitted_at_a_new_head_is_validated_in_the_same_run() {
     );
 }
 
-/// A resubmission at the SAME head a run ejected keeps waiting for the run
-/// to end, and the pending request says why.
+/// A resubmission at the SAME head a run ejected is taken in once per
+/// run (#1050): the operator who resubmits an ejected head has usually
+/// fixed the validator, not the change, so the run plans it again
+/// instead of making them wait for the run to end. The ejection stays
+/// on record.
 #[test]
-fn a_resubmission_at_the_ejected_head_waits_and_status_names_why() {
+fn a_resubmission_at_the_ejected_head_is_taken_in_once_in_the_same_run() {
     let (fx, started, gates) = setup("intake-resubmit-same-head");
     fx.branch("a", &[("tests/a", "FAIL\n")]);
     fx.mq_ok(&["submit", "1", "--head", "a"]);
@@ -426,19 +449,70 @@ fn a_resubmission_at_the_ejected_head_waits_and_status_names_why() {
     );
     let out = fx.mq_ok(&["submit", "1", "--head", "a"]);
     assert!(out.contains("recorded #1"), "{out}");
-    // Nothing new validates for change 1 while the run goes on, and the
-    // pending request names the reason.
-    let before = started_lines(&started).len();
-    std::thread::sleep(Duration::from_millis(1500));
-    assert_eq!(started_lines(&started).len(), before);
-    let list = fx.mq_ok(&["list", "--json"]);
-    assert!(
-        list.contains("waits for the run end: excluded this run (ejected at"),
-        "{list}"
+    // The same-head resubmission validates change 1 again in this run,
+    // stacked on change 2's rebuilt batch (3 test files, gate already
+    // open), so it fails the same way at once. The initial stacked batch
+    // produced the same started line and the first ejection left the
+    // status at ejected, so both waits count second occurrences.
+    wait_for(
+        "change 1 to validate again at the same head",
+        Duration::from_secs(60),
+        || {
+            started_lines(&started)
+                .iter()
+                .filter(|line| *line == "a b b2 t0")
+                .count()
+                >= 2
+        },
     );
+    // Its candidate has four test files; open that gate so it fails the
+    // same way. A second same-head resubmission, recorded while that
+    // revalidation is still in flight, is not taken in again this run:
+    // the one-per-run allowance is already spent.
+    open(&gates, 4);
+    let out = fx.mq_ok(&["submit", "1", "--head", "a"]);
+    assert!(out.contains("recorded #1"), "{out}");
+    // No further validation of change 1 starts while the run goes on:
+    // the one-per-run allowance is spent. Change 2 is still gated, so
+    // the run is alive and could take change 1 in if the rule allowed.
+    let count_a = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|line| line.split(' ').any(|f| f == "a"))
+            .count()
+    };
+    let before = count_a(&started_lines(&started));
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(
+        count_a(&started_lines(&started)),
+        before,
+        "started: {:?}\nevents: {:?}",
+        started_lines(&started),
+        events(&fx)
+    );
+    // The second resubmission is recorded for the next run: the change
+    // is queued again, but this run does not plan it.
+    assert_eq!(status(&fx, 1), "queued");
     open(&gates, 3);
     assert_eq!(daemon.exit_code(Duration::from_secs(90)), Some(0));
-    // Applied at the run's end: queued again for the next run.
+    // The revalidation failed the same way and was ejected again.
+    assert!(
+        events(&fx)
+            .iter()
+            .filter(|line| line.contains("\"kind\":\"eject\""))
+            .count()
+            >= 2,
+        "events: {:?}",
+        events(&fx)
+    );
+    // The second resubmission applies at the next run: queued again.
     assert_eq!(status(&fx, 1), "queued");
     assert_eq!(status(&fx, 2), "landed");
+    // The ejection and the same-run revalidation are both on record.
+    let reports = reports(&fx);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(
+        !reports[0]["ejected"].as_array().unwrap().is_empty(),
+        "{reports:?}"
+    );
 }
