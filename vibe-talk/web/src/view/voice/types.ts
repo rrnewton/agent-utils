@@ -81,6 +81,7 @@ export interface CallSession {
   agentSaid: Map<string, {words: string[]; atMs: number}>;
   echoExposedAt: number;
   sessionStarts: number;
+  documentNoticeSent: boolean;
   pendingResume: Resume | null;
   recapAck: string | null;
   recapSeam: Element | null;

@@ -2532,6 +2532,71 @@ test("a typed call's greeting is judged as an ordinary turn and is not timed", a
   assert.deepStrictEqual(page.healthPosts, [], "one silent typed turn was reported as a silent greeting");
 });
 
+test("#1040: a call started with a document open tells its agent once, ahead of the first typed message", async () => {
+  const page = newPage();
+  page.documents = [{
+    key: "paste:demo-doc",
+    title: "Demo deployment report",
+    content: "# Demo deployment report\n\nAlpha body words here.\n\n## Results\n\nBeta results follow.\n",
+    outline: ["Demo deployment report", "Results"],
+  }];
+  await signIn(page);
+  await page.el("view-switch").click();
+  await page.settle();
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.tab(), "docs", "the switch did not reach Documents");
+  let card;
+  for (let tries = 0; tries < 10 && !card; tries += 1) {
+    await page.settle();
+    card = page.el("documents-list").children[0];
+  }
+  assert.ok(card, `no document card was drawn (list says: ${page.el("documents-list").textContent})`);
+  await card.click();
+  await page.settle();
+  assert.equal(page.el("docs-reader").hidden, false, "the reader did not open");
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.tab(), "voice", "the switch did not return to Voice");
+  page.setFetch(async () =>
+    json(200, {
+      websocket_url: "wss://example.invalid/private-voice",
+      protocol: "vibe-talk-v1",
+      provider: "Internal voice preview",
+      input_sample_rate: 24000,
+      output_sample_rate: 24000,
+    })
+  );
+  await compose(page, "hello");
+  await page.el("send-text").click();
+  await page.settle();
+  const socket = page.sockets[0];
+  socket.onopen();
+  socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+  await page.settle();
+  const sent = promptsSent(socket);
+  assert.equal(sent.length, 1, `expected only the document notice on the wire, got ${JSON.stringify(sent)}`);
+  assert.match(sent[0], /document_key: paste:demo-doc/, "the first prompt is not the document notice");
+  assert.match(sent[0], /Demo deployment report/);
+  assert.match(sent[0], /Alpha body words/);
+  // The held typed message waits behind the notice's turn, then goes.
+  agentTurn(page, socket, 0, { text: "Should I read the whole document, or just answer questions about it?" });
+  assert.deepStrictEqual(promptsSent(socket).slice(1), ["hello"], "the typed message did not follow the notice");
+  // Exactly once: a replacement session in the same call is not told again.
+  socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+  await page.settle();
+  assert.equal(
+    promptsSent(socket).filter((text) => text.includes("document_key:")).length, 1,
+    "the document notice was queued twice in one call",
+  );
+});
+
+test("#1040: with no document open, a call starts exactly as it did", async () => {
+  const page = newPage();
+  const socket = await startTypedNeutralCall(page, false);
+  assert.deepStrictEqual(promptsSent(socket), ["hello"]);
+});
+
 test("a typed call holds a prompt behind a reply it did not ask for that is already arriving", async () => {
   // Sent into a reply that is still arriving, a prompt's own reply could not be told from it: that
   // reply's turn_complete would be taken as the prompt's and release the next prompt early. Since

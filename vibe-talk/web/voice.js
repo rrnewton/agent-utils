@@ -584,6 +584,7 @@ function voiceCall() {
     get hiddenEmpty() { return hiddenEmpty; },
     get startWatchAll() { return startWatchAll; },
     get stopWatchAll() { return stopWatchAll; },
+    get openDocumentNotice() { return () => documentsView.documentNotice(); },
   });
   return pageVoiceCall;
 }

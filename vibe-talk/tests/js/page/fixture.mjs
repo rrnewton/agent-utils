@@ -1171,6 +1171,12 @@ class FakeElement {
    * so "the bar is in the top mount and not in the bottom one" would be satisfied by an
    * implementation that never moved anything, and the placement test would certify nothing.
    */
+  /** One child, appended and returned, as the DOM names it (`#1040`: the documents list builds its cards this way). */
+  appendChild(kid) {
+    this.append(kid);
+    return kid;
+  }
+
   append(...kids) {
     for (const kid of kids) {
       if (kid.parentNode) {
@@ -1204,6 +1210,33 @@ class FakeElement {
       kid.parentNode = this;
     }
     this.children = [...kids];
+  }
+
+  /**
+   * Descendants matching a comma list of tag names (`h1, h2`) or single classes
+   * (`.doc-card`) — the only selector shapes the page asks an element for
+   * (`#1040`: the documents reader's heading scan). Anything else throws, as an
+   * unknown element id does: a selector this fixture cannot mean must not
+   * silently match nothing and certify a broken page as empty-but-fine.
+   */
+  querySelectorAll(selector) {
+    const parts = String(selector).split(",").map((part) => part.trim()).filter(Boolean);
+    const matches = (el) => parts.some((part) => {
+      if (/^[a-z][a-z0-9]*$/i.test(part)) return el.tagName.toLowerCase() === part.toLowerCase();
+      if (/^\.[A-Za-z0-9_-]+$/.test(part)) {
+        return String(el.className || "").split(/\s+/).includes(part.slice(1));
+      }
+      throw new Error(`querySelectorAll: unsupported selector ${JSON.stringify(part)} in this fixture`);
+    });
+    const found = [];
+    const walk = (el) => {
+      for (const kid of el.children) {
+        if (matches(kid)) found.push(kid);
+        walk(kid);
+      }
+    };
+    walk(this);
+    return found;
   }
 
   /** The first child, text included, or null, as the DOM names it. */
@@ -2493,6 +2526,12 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     readAloud: { backend: "provider", label: "Voice provider", playback: "audio", local_only: false },
     /** The conversational provider description comes from the backend trait. */
     voiceProviderName: "Example voice provider",
+    /**
+     * Documents the fake server holds (`#1040 documents-voice-agent`): entries
+     * `{key, title, content, outline, url?, fetched?}`; the list/get routes below
+     * synthesize the wire rows around them. Empty unless a test names documents.
+     */
+    documents: [],
     agentSettingsUrl: "https://provider.example/agents/agent_test",
     /** The account this bridge posts as, as the server reads it out of its own bot token. */
     selfAuthorId: "1000000000000000009",
@@ -3456,6 +3495,39 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           !((options && options.method) || "GET").match(/^(POST|PUT|DELETE)$/) &&
           !PAGE_READ_REASONS.includes(new URL(String(path), "http://fixture.test").searchParams.get("reason"))) {
         unexplainedReads.push(String(path));
+      }
+      if (String(path).startsWith("/api/v1/documents")) {
+        // `#1040 documents-voice-agent`. The Documents list and one document, from
+        // `page.documents`; fetch POSTs just mark the named document fetched.
+        const rows = page.documents.map((doc) => ({
+          key: doc.key,
+          kind: "paste",
+          url: doc.url ?? "https://paste.example/demo",
+          file_name: "demo.md",
+          title: doc.title,
+          fetched: doc.fetched ?? true,
+          version: "v1",
+          fetched_ms: 1,
+          moved_to: null,
+          mention_count: 1,
+          first_mentioned_ms: null,
+          last_mentioned_ms: null,
+          mentions: [],
+        }));
+        if (String(path).startsWith("/api/v1/documents?")) {
+          return json(200, { documents: rows, total: rows.length, revision: 1 });
+        }
+        const one = /^\/api\/v1\/documents\/([^/?]+)$/.exec(String(path));
+        if (one && ((options && options.method) || "GET") === "GET") {
+          const doc = page.documents.find((entry) => entry.key === decodeURIComponent(one[1]));
+          if (!doc) return json(404, { error: "unknown_document", detail: "no such document" });
+          return json(200, {
+            document: { title: doc.title, url: doc.url ?? "https://paste.example/demo", moved_to: null },
+            content: doc.content,
+            outline: doc.outline ?? [],
+          });
+        }
+        return json(200, {});
       }
       if (String(path).startsWith("/api/v1/voice-session")) {
         return page.mint(path, options);

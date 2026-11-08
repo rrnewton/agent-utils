@@ -4,8 +4,8 @@
 
 export { createDocumentsList } from "./list.ts";
 export type { DocumentsList, DocumentsListDependencies } from "./list.ts";
-export { createDocumentsReader, currentOutlineIndex } from "./reader.ts";
-export type { DocumentsReader, DocumentsReaderDependencies } from "./reader.ts";
+export { createDocumentsReader, currentOutlineIndex, openDocumentNotice } from "./reader.ts";
+export type { DocumentsReader, DocumentsReaderDependencies, OpenDocument } from "./reader.ts";
 export { renderDocumentMarkdown, documentHeadingId } from "./render.ts";
 export { createViewSelector, nextView, otherViews, VIEW_LABELS, VIEW_ORDER } from "./selector.ts";
 export type { DocViewName, ViewSelector, ViewSelectorDependencies } from "./selector.ts";
@@ -13,7 +13,8 @@ export type { DocumentMention, DocumentRow, DocumentsListAnswer } from "./types.
 
 import { createListening } from "../dom/index.ts";
 import { createDocumentsList } from "./list.ts";
-import { createDocumentsReader } from "./reader.ts";
+import { createDocumentsReader, openDocumentNotice } from "./reader.ts";
+import type { OpenDocument } from "./reader.ts";
 
 /** What the Documents view needs from the page. */
 export interface DocumentsViewDependencies {
@@ -36,6 +37,10 @@ export interface DocumentsView {
   showList(): void;
   /** Whether the reader (rather than the list) is up. */
   reading(): boolean;
+  /** The document open in the reader while it is up, else null (`#1040`). */
+  current(): OpenDocument | null;
+  /** The voice notice for the open document, or null where none is open. */
+  documentNotice(): string | null;
   /** Take down every listener the view added. */
   unmount(): void;
 }
@@ -211,6 +216,13 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     },
     showList,
     reading: () => readingNow,
+    current(): OpenDocument | null {
+      return readingNow ? reader.current() : null;
+    },
+    documentNotice(): string | null {
+      const doc = readingNow ? reader.current() : null;
+      return doc === null ? null : openDocumentNotice(doc);
+    },
     unmount(): void {
       if (liveTimer !== 0) clearTimeout(liveTimer);
       liveTimer = 0;

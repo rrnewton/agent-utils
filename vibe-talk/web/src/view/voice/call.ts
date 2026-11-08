@@ -109,6 +109,7 @@ export interface VoiceCallDependencies {
   REPLAY_ANSWER_WAIT_MS: number;
   noteReplacedV1Session: () => void;
   offerReplayAtSessionStart: (message: VibeTalk.VibeTalkV1ServerFrame) => void;
+  openDocumentNotice?: () => string | null;
   noteReplayAck: (message: VibeTalk.VibeTalkV1ServerFrame) => void;
   noteTurnCompleteForSpokenYes: (interrupted: boolean, turn?: number | null) => void;
   judgeAnswerAtTurnEnd: (turn: number | null) => void;
@@ -293,6 +294,9 @@ const session: CallSession = {
   echoExposedAt: 0,
   // How many times the provider said this socket's session started; a second is a replacement.
   sessionStarts: 0,
+  // `#1040 documents-voice-agent`. Whether this call already told its agent about the open
+  // document: once per call, at its first session start, never again on a reconnect.
+  documentNoticeSent: false,
   // `#331 resume-on-websocket`. On `vibe-talk-v1`, the record fetched for this call and not yet
   // offered: it goes at the first `session_started`, and only to a session that lists `replay`.
   pendingResume: null,
@@ -385,6 +389,29 @@ function sendClientEvent(event: { type: string; text?: string; }, kind: "typed" 
   if (event.type === "user_message") session.lastTextAt = Date.now();
   session.socket!.send(JSON.stringify(event));
   return true;
+}
+
+
+/**
+ * `#1040 documents-voice-agent`. Tell this call's agent, once, that a document is open in the
+ * reader: the page's notice (title, document_key, outline, fenced opening words), read lazily
+ * through `openDocumentNotice` at the first session start — never at construction, when no
+ * document is open yet, and never again on a reconnect's replacement session. On
+ * `vibe-talk-v1` it queues as a `notice` prompt (it waits behind a greeting like any page word,
+ * and ahead of a held first typed message, so the context lands before the question it answers);
+ * on the hosted protocol the same text goes silently as a `contextual_update`, the frame the
+ * recap already uses there. No document open, no notice: the call is exactly as it was.
+ */
+function offerDocumentAtSessionStart() {
+  if (session.documentNoticeSent) return;
+  const notice = deps.openDocumentNotice?.();
+  if (!notice) return;
+  session.documentNoticeSent = true;
+  if (session.protocol === "vibe-talk-v1") {
+    sendClientEvent({ type: "user_message", text: notice }, "notice");
+  } else {
+    sendClientEvent({ type: "contextual_update", text: notice });
+  }
 }
 
 
@@ -1851,6 +1878,7 @@ async function openConversation(options: {chat?: boolean} | undefined) {
   session.agentSaid = new Map();
   session.echoExposedAt = 0;
   session.sessionStarts = 0;
+  session.documentNoticeSent = false;
   session.lastTextAt = 0;
   session.lastAudioEndAt = 0;
   session.lastInterruptAt = 0;
@@ -2285,6 +2313,8 @@ function handle(socket: WebSocket, message: HostedFrame) {
       // `#270 voice-transcript-markers`. Before the held message is filed below: the conversation's
       // first record is its start marker.
       deps.noteConversationNamed(previous);
+      // `#1040`. The open document's context, silent on this protocol, before the held message.
+      offerDocumentAtSessionStart();
       // The vendor has accepted the conversation, and named it: the message the box held for it
       // goes now, filed under that name. Before the format is read, which throws for a format this
       // page cannot PLAY — a reason to say so, not to swallow a typed message.
@@ -3757,6 +3787,9 @@ function handleVibeTalk(message: VibeTalk.VibeTalkV1ServerFrame) {
       } else {
         deps.offerReplayAtSessionStart(message);
       }
+      // `#1040`. Ahead of any held first message below: the open document's context
+      // goes before the question it is context for.
+      offerDocumentAtSessionStart();
       if (session.chat) {
         // A typed call does not wait for a promised greeting: the protocol does not say whether a
         // server greets a client that never sends `audio_start`, nor which turn number a greeting
@@ -4366,6 +4399,7 @@ function teardown() {
   session.agentSaid = new Map();
   session.echoExposedAt = 0;
   session.sessionStarts = 0;
+  session.documentNoticeSent = false;
   // `#352 voice-reconnect-on-bridge-error`. A reconnect in progress stops at its next step.
   // `#512 voice-recap-private-stack`. A recap armed for a session this call no longer has goes back,
   // so no later session is handed it unasked: one being asked about, one waiting for this call's
