@@ -22,6 +22,8 @@ use super::procstat::{parse_process_stat, ProcessStat};
 pub const GENERATION_ENV: &str = "AGENTCTL_HARNESS_GENERATION";
 /// Schema tag written into `active-harness.json`.
 pub const HARNESS_SCHEMA: &str = "agentctl-headless-harness/v1";
+/// Schema tag written into `runner-identity.json`.
+pub const RUNNER_SCHEMA: &str = "agentctl-headless-runner/v1";
 /// Directory-name prefix for per-turn cgroup v2 containment.
 pub const CGROUP_PREFIX: &str = "agentctl-harness-";
 
