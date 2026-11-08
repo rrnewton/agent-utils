@@ -1587,8 +1587,10 @@ pub(crate) fn remove_slot(
             // The held-reference census (assert_slot_unused, below)
             // and the argv/environ naming scan here are that scoped
             // proof; every other guard still runs unchanged.
-            let pane_scoped =
-                answer.state == "unverifiable" && answer.detail.to_lowercase().contains("pane");
+            let lower_detail = answer.detail.to_lowercase();
+            let pane_scoped = answer.state == "unverifiable"
+                && lower_detail.contains("pane")
+                && !lower_detail.contains("archived-record-pane");
             if !pane_scoped {
                 return Err(format!(
                     "registered liveness authority is {}: {}; unknown ownership is not a free slot",

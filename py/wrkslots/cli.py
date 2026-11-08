@@ -43129,7 +43129,11 @@ def _cmd_remove_in_scope(
                             "time-to-live, process-use, Git and salvage checks "
                             "still run"
                         )
-                    if answer.state == "unverifiable" and "pane" in answer.detail.lower():
+                    if (
+                        answer.state == "unverifiable"
+                        and "pane" in answer.detail.lower()
+                        and "archived-record-pane" not in answer.detail.lower()
+                    ):
                         # #993 (criteria 1-2): a verdict that rests on panes
                         # the authority cannot attribute to any registered
                         # agent vetoes this removal only if a live process
