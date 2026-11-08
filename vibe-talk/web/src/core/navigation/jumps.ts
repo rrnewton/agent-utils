@@ -18,6 +18,7 @@ export interface LinkSpot {
   readonly focus: DeepLinkRef | null;
   /** Taken from the call's view, which a return goes back to. */
   readonly call?: boolean;
+  readonly docs?: boolean;
 }
 
 /** A jump taken: where it was taken from, the levels open under it, and the levels open when it landed (null while under way). */

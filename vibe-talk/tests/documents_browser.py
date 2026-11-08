@@ -153,13 +153,9 @@ def main() -> int:
                 mention.tap()
                 page.wait_for_function("() => !document.getElementById('pane-discord').hidden", timeout=20_000)
                 page.go_back()
-                # The jump's Back lands on the call view (its sent-jump spot);
-                # the list is two switch presses away, kept as it was.
-                page.wait_for_function("() => document.getElementById('view-switch-label').textContent === 'Voice'", timeout=20_000)
-                page.tap("#view-switch")
-                page.tap("#view-switch")
+                # Back from the jump returns to the Documents list it started from.
                 page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
-                check(page.locator("#pane-docs").is_visible(), "the Documents list did not come back")
+                check(page.locator("#pane-docs").is_visible(), "Back from the mention jump left the Documents view")
 
                 # The GitHub row: its fetcher cannot connect (raw base is a closed
                 # port), and the row says why instead of doing nothing.

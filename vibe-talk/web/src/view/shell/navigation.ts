@@ -125,6 +125,7 @@ export interface NavLinkSpot {
   readonly offset: number;
   readonly focus: DeepLinkRef | null;
   readonly call?: boolean;
+  readonly docs?: boolean;
 }
 
 /** A jump taken (structural twin of `core/navigation`'s `LinkJump`). */
@@ -1118,11 +1119,14 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
    */
   async function jumpToSentMessage(ref: MessageLinkRef): Promise<void> {
     if (deps.screens().screen() !== "main") return undefined;
-    const fromCall = deps.screens().view() !== "discord";
-    const spot: NavLinkSpot = fromCall
-      ? { place: null, column: "main", pinned: false, anchor: null, offset: 0, focus: deepLinks.focus(), call: true }
-      : linkJumpSpot();
-    const enter = fromCall ? async (): Promise<void> => {
+    const fromDocs = deps.screens().view() === "docs";
+    const fromCall = deps.screens().view() !== "discord" && !fromDocs;
+    const spot: NavLinkSpot = fromDocs
+      ? { place: null, column: "main", pinned: false, anchor: null, offset: 0, focus: deepLinks.focus(), docs: true }
+      : fromCall
+        ? { place: null, column: "main", pinned: false, anchor: null, offset: 0, focus: deepLinks.focus(), call: true }
+        : linkJumpSpot();
+    const enter = fromCall || fromDocs ? async (): Promise<void> => {
       deps.settleUiState();
       deps.showView("discord");
       // A channel the jump changes to is read as it is chosen; the one already chosen is read here.
@@ -1223,6 +1227,15 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
    */
   async function returnToLinkSpot(spot: NavLinkSpot): Promise<void> {
     const ticket = linkJumps.nextTicket();
+    // A jump from the Documents list goes back to it, at its scroll place (kept per view).
+    if (spot.docs) {
+      if (deps.screens().screen() !== "main" || deps.screens().view() === "docs") return;
+      deps.settleUiState();
+      deps.showView("docs");
+      deps.stopDiscordPolling();
+      deps.setStatus("Back on the Documents list.");
+      return;
+    }
     // `#580 open-in-chat-jump`. A jump from the call's view goes back to it, where the reader was.
     if (spot.call) {
       if (deps.screens().screen() !== "main" || deps.screens().view() === "voice") return;
