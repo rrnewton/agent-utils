@@ -73,7 +73,10 @@ Remaining wrkviz work, ordered:
    both by name with exit 2. A recurring coordinator-only weekly run
    breaks at the A3 default flip unless these are ported first, or that
    run pins `WRKVIZ_ENGINE=python`: M, summary tree plumbing plus
-   differentials.
+   differentials. Tracked as #1077 rust-wrkviz-agent-scope-port.
+   Related, both editions: #1076 site-weekly-item-stamps (the site's
+   week-level rollup pages still print invented times of day; pages for
+   a narrowed scope already stamp the date only).
 3. `--userguide` divergence (invalid-args subcommand after
    `--userguide`): S, ~50-150 LOC.
 4. Accepted gaps (non-finite/oversized-int JSON, lone surrogates,
