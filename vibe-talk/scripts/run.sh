@@ -118,11 +118,14 @@
 #
 #                  It starts its OWN throwaway server, native (not a container), with
 #                  --fake-discord, on port 18091 by default — never 8080, and it refuses to use it.
-#                  The mock vendor takes 18092 and 18093 beside it. When any of those is taken, it
-#                  takes three free ports the kernel picks instead. --port, or the environment
-#                  variable VIBE_TALK_SHOTS_PORT when --port is absent, moves all three (P, P+1,
-#                  P+2), and a port asked for that way is refused when taken, so several checkouts
-#                  can photograph at once. It never touches the running
+#                  The mock vendor takes 18092 and 18093 beside it. When any of those is taken, or
+#                  claimed by another run, it takes three free ports the kernel picks instead.
+#                  Each run claims its three ports (lock files under
+#                  ${XDG_RUNTIME_DIR:-/tmp}/vibe-talk-shots-ports) for as long as it runs, so runs
+#                  that start together, from one checkout or several, never pick the same ones.
+#                  --port, or the environment variable VIBE_TALK_SHOTS_PORT when --port is absent,
+#                  moves all three (P, P+1, P+2), and a port asked for that way is refused when
+#                  taken or claimed. It never touches the running
 #                  vibe-talk, or its config, or its logs. BOTH processes are stopped again when the
 #                  run ends, including on failure.
 #
@@ -414,52 +417,86 @@ if [ "$SCREENSHOTS" = 1 ]; then
     [ -x "$SHOTS_SCRIPT" ] || die "the screenshot harness is missing or not executable: $SHOTS_SCRIPT"
 
     SHOTS_PORT="${PORT_OVERRIDE:-${VIBE_TALK_SHOTS_PORT:-}}"
-    # No port asked for: 18091 to 18093 when all three are free, else three consecutive free ones,
-    # the first picked by the kernel (bound to port 0), the next two proved free by binding them
-    # too. The fixed default alone failed whenever anything else held it -- a test stack left
-    # running, a second gate photographing at the same time -- and that failed the whole
-    # validation run over a port nobody had asked for (#887 vibe-talk-screenshots-port). A port
-    # the caller chose is still refused below when taken.
-    if [ -z "$SHOTS_PORT" ]; then
-        SHOTS_PORT="$(python3 - <<'PY'
+    # A run CLAIMS its three ports (P for the server, P+1 and P+2 for the mock) before it binds
+    # them, and holds the claims until it ends (#1037 shots-port-collision). Proving a port free
+    # and then releasing it until the server binds let two runs that start together -- two
+    # checkouts' gates, or one gate's screenshot shards -- choose the same ports, and the second
+    # died with "already listening". A claim is a lock on one file per port under
+    # $SHOTS_LOCK_DIR (shared by every checkout of this user), held on fds 7-9, which the server,
+    # the mock and the browser inherit, so a claim lasts as long as anything this run started.
+    #
+    # No port asked for: 18091 to 18093 when all three are unclaimed and free, else three
+    # consecutive ones the kernel picks the first of (bound to port 0), claimed and proved free the
+    # same way. The fixed default alone failed whenever anything else held it -- a test stack left
+    # running, a second gate photographing at the same time (#887 vibe-talk-screenshots-port). A
+    # port the caller chose is claimed too, and refused when another run holds it or it is taken.
+    SHOTS_LOCK_DIR="${XDG_RUNTIME_DIR:-/tmp}/vibe-talk-shots-ports"
+    shots_claim() {
+        exec 7>"$SHOTS_LOCK_DIR/$1.lock" 8>"$SHOTS_LOCK_DIR/$(($1 + 1)).lock" \
+            9>"$SHOTS_LOCK_DIR/$(($1 + 2)).lock" || { shots_release; return 1; }
+        if flock -n 7 && flock -n 8 && flock -n 9; then
+            return 0
+        fi
+        shots_release
+        return 1
+    }
+    shots_release() {
+        exec 7>&- 8>&- 9>&-
+    }
+    command -v flock >/dev/null 2>&1 || die "--screenshots needs flock (util-linux) to claim its
+ports, so that runs starting together never pick the same ones, and it is not on PATH."
+    mkdir -p "$SHOTS_LOCK_DIR" || die "--screenshots cannot create $SHOTS_LOCK_DIR, where runs
+claim their ports."
+    if [ -n "$SHOTS_PORT" ]; then
+        case "$SHOTS_PORT" in
+            ''|*[!0-9]*) die "--port must be a number, got: $SHOTS_PORT" ;;
+        esac
+        if ! shots_claim "$SHOTS_PORT"; then
+            die "another screenshot run holds port $SHOTS_PORT or one of the two above it (its claims
+are under $SHOTS_LOCK_DIR). Choose another port with --port, or leave it off to use free ones."
+        fi
+    else
+        shots_candidates="$(python3 - <<'PY'
 import socket
 
-
-def free(run):
-    held = []
-    try:
-        for port in run:
-            sock = socket.socket()
-            held.append(sock)
-            sock.bind(("127.0.0.1", port))
-    except OSError:
-        return False
-    finally:
-        for sock in held:
-            sock.close()
-    return True
-
-
-if free((18091, 18092, 18093)):
-    print(18091)
-    raise SystemExit
+print(18091)
 for _ in range(64):
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         first = probe.getsockname()[1]
     run = (first, first + 1, first + 2)
-    if run[-1] > 65535 or {8080, 18081} & set(run) or not free(run):
-        continue
-    print(first)
-    break
+    if run[-1] <= 65535 and not {8080, 18081} & set(run):
+        print(first)
 PY
-)" || SHOTS_PORT=""
-        [ -n "$SHOTS_PORT" ] || die "--screenshots found no three consecutive free ports on
-127.0.0.1 in 64 tries. Pass one with --port or VIBE_TALK_SHOTS_PORT."
+)" || shots_candidates=""
+        for shots_candidate in $shots_candidates; do
+            shots_claim "$shots_candidate" || continue
+            if python3 - "$shots_candidate" <<'PY'
+import socket
+import sys
+
+base = int(sys.argv[1])
+held = []
+try:
+    for port in (base, base + 1, base + 2):
+        sock = socket.socket()
+        held.append(sock)
+        sock.bind(("127.0.0.1", port))
+except OSError:
+    raise SystemExit(1)
+finally:
+    for sock in held:
+        sock.close()
+PY
+            then
+                SHOTS_PORT="$shots_candidate"
+                break
+            fi
+            shots_release
+        done
+        [ -n "$SHOTS_PORT" ] || die "--screenshots found no three consecutive free, unclaimed ports
+on 127.0.0.1 in 64 tries. Pass one with --port or VIBE_TALK_SHOTS_PORT."
     fi
-    case "$SHOTS_PORT" in
-        ''|*[!0-9]*) die "--port must be a number, got: $SHOTS_PORT" ;;
-    esac
     # Named, not merely "in use". 8080 serves the owner's live agent and 18081 is the unrelated
     # vibe-talk:ci container; a screenshot run that bound either would take down something real to
     # photograph something fake. The refusal says which one and why, because "port in use" would

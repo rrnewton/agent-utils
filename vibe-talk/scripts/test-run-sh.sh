@@ -693,6 +693,38 @@ fi
 [ -z "$shots_holder" ] || kill "$shots_holder" 2>/dev/null || true
 wait "$shots_holder" 2>/dev/null || true
 
+# #1037 shots-port-collision: runs that start together never pick the same ports. Each run claims
+# its three ports before it binds them. A claim held here on 18092 is the window in which another
+# run has claimed its ports but its server has not bound them yet: the ports still look free, and
+# before claims both runs picked 18091 and the second died with "already listening". The claim
+# must be passed over, and a port asked for that another run has claimed refused by name.
+shots_lock_dir="${XDG_RUNTIME_DIR:-/tmp}/vibe-talk-shots-ports"
+mkdir -p "$shots_lock_dir"
+flock -n "$shots_lock_dir/18092.lock" sleep 60 &
+shots_claimer=$!
+sleep 0.3
+kill -0 "$shots_claimer" 2>/dev/null || fail "could not hold a claim on 18092 for the test"
+rc=0; out="$(run_sh --screenshots --dry-run)" || rc=$?
+[ "$rc" -eq 0 ] || fail "--screenshots --dry-run failed while another run claimed 18092: $out"
+grep -Eq '127\.0\.0\.1:1809[0-3]([^0-9]|$)' <<< "$out" \
+    && fail "--screenshots --dry-run planned ports another run has claimed: $out"
+grep -Eq '127\.0\.0\.1:[0-9]+' <<< "$out" \
+    || fail "--screenshots --dry-run names no port while 18092 is claimed: $out"
+ok "--screenshots passes over ports another run has claimed but not yet bound"
+rc=0; out="$(SHOTS_PORT_FOR_RUN=18091 run_sh --screenshots --dry-run)" || rc=$?
+[ "$rc" -ne 0 ] || fail "--screenshots took port 18091 although another run claimed 18092: $out"
+grep -q 'another screenshot run holds port 18091' <<< "$out" \
+    || fail "--screenshots does not say another run holds the port it was told to use: $out"
+ok "--screenshots refuses a port it was told to use when another run has claimed it"
+kill "$shots_claimer" 2>/dev/null || true
+wait "$shots_claimer" 2>/dev/null || true
+# And the validation graph leaves the choice to run.sh: a fixed port there is what collided when two
+# gates photographed at once.
+if grep -nE 'VIBE_TALK_SHOTS_PORT=[0-9]|run\.sh --screenshots.*--port[ =][0-9]' "$SCRIPT_DIR/../tests.dag.yaml"; then
+    fail "tests.dag.yaml gives a screenshot step a fixed port"
+fi
+ok "the screenshot steps in tests.dag.yaml let run.sh claim free ports"
+
 # The override is honoured: the plan uses exactly the port given.
 shots_free="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
 out="$(SHOTS_PORT_FOR_RUN="$shots_free" run_sh --screenshots --dry-run)"

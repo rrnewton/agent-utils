@@ -32,9 +32,11 @@
 # each check serves the page and its fake API on a port the kernel picks (bound to port 0, or for
 # the two that start the real server, send-order and pwa-installability, probed free just before),
 # launches Chromium in a fresh temporary profile, and keeps its state in temporary directories. The
-# screenshot harness's server and mock take 18091 to 18093 (VIBE_TALK_SHOTS_PORT moves them), or,
-# when any of those is held and no port was asked for, three free ports the kernel picks: until #887
-# vibe-talk-screenshots-port a held default failed the whole run. It also writes its PNGs under
+# screenshot harness's server and mock take 18091 to 18093, or, when any of those is held or claimed
+# by another run, three free ports the kernel picks: until #887 vibe-talk-screenshots-port a held
+# default failed the whole run. Each run claims its ports for as long as it runs, so the screenshot
+# shards and another checkout's gate never pick the same ones; the steps name no port, because a
+# fixed one per shard collided whenever two gates photographed at once (#1037 shots-port-collision). It also writes its PNGs under
 # vibe-talk/debug/screenshots/, a new stamped directory each run. The lane at 1 and at 4 was compared check by check.
 #
 # HOW TO RUN IT
@@ -2464,7 +2466,7 @@ steps:
     job: screenshots-phones
     desc: the screenshot harness on the phone profiles — a real server and a real browser
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && VIBE_TALK_SHOTS_PORT=18091 ./scripts/run.sh --screenshots --theme dark --profiles iphone15,iphone-se,android-412
+    cmd: cd vibe-talk && ./scripts/run.sh --screenshots --theme dark --profiles iphone15,iphone-se,android-412
     jobs_flag: ""
     deps: [build.release, setup.contract-tools]
     # Wall, not only CPU: a browser waiting on a page that never loads burns no CPU at all, so a
@@ -2475,9 +2477,9 @@ steps:
       # One browser slot per profile shard: the six device profiles walk in parallel steps
       # instead of one step holding every browser slot for the whole walk. Together the
       # three shards photograph every profile, exactly as the single step did.
-      # Each shard names its own server port base (VIBE_TALK_SHOTS_PORT, +1/+2 for the
-      # mock): the default free-port probe races when shards start together, and two
-      # walks on one server photograph each other's conversation.
+      # run.sh claims each shard's three ports (server, +1/+2 for the mock) before binding
+      # them, so shards and other checkouts' gates starting together get distinct ports; a
+      # fixed port per shard collided whenever two gates photographed at once (#1037).
       resources: {browser: 1}
       est_duration_s: 120
       classification: latency-bound
@@ -2489,7 +2491,7 @@ steps:
     job: screenshots-desks
     desc: the screenshot harness on the desk profiles — a real server and a real browser
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && VIBE_TALK_SHOTS_PORT=18291 ./scripts/run.sh --screenshots --theme dark --profiles desktop,laptop-1280
+    cmd: cd vibe-talk && ./scripts/run.sh --screenshots --theme dark --profiles desktop,laptop-1280
     jobs_flag: ""
     deps: [build.release, setup.contract-tools]
     # Wall, not only CPU: a browser waiting on a page that never loads burns no CPU at all, so a
@@ -2500,9 +2502,9 @@ steps:
       # One browser slot per profile shard: the six device profiles walk in parallel steps
       # instead of one step holding every browser slot for the whole walk. Together the
       # three shards photograph every profile, exactly as the single step did.
-      # Each shard names its own server port base (VIBE_TALK_SHOTS_PORT, +1/+2 for the
-      # mock): the default free-port probe races when shards start together, and two
-      # walks on one server photograph each other's conversation.
+      # run.sh claims each shard's three ports (server, +1/+2 for the mock) before binding
+      # them, so shards and other checkouts' gates starting together get distinct ports; a
+      # fixed port per shard collided whenever two gates photographed at once (#1037).
       resources: {browser: 1}
       est_duration_s: 150
       classification: latency-bound
@@ -2514,7 +2516,7 @@ steps:
     job: screenshots-wide
     desc: the screenshot harness on the 1920-wide desk profile — a real server and a real browser
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && VIBE_TALK_SHOTS_PORT=18491 ./scripts/run.sh --screenshots --theme dark --profiles desk-1920
+    cmd: cd vibe-talk && ./scripts/run.sh --screenshots --theme dark --profiles desk-1920
     jobs_flag: ""
     deps: [build.release, setup.contract-tools]
     # Wall, not only CPU: a browser waiting on a page that never loads burns no CPU at all, so a
@@ -2525,9 +2527,9 @@ steps:
       # One browser slot per profile shard: the six device profiles walk in parallel steps
       # instead of one step holding every browser slot for the whole walk. Together the
       # three shards photograph every profile, exactly as the single step did.
-      # Each shard names its own server port base (VIBE_TALK_SHOTS_PORT, +1/+2 for the
-      # mock): the default free-port probe races when shards start together, and two
-      # walks on one server photograph each other's conversation.
+      # run.sh claims each shard's three ports (server, +1/+2 for the mock) before binding
+      # them, so shards and other checkouts' gates starting together get distinct ports; a
+      # fixed port per shard collided whenever two gates photographed at once (#1037).
       resources: {browser: 1}
       est_duration_s: 90
       classification: latency-bound

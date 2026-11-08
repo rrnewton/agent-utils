@@ -193,18 +193,29 @@ def test_screenshot_shards_cover_every_profile_once() -> None:
     }
     assert shards, "no screenshot shard steps"
     covered: list[str] = []
-    ports: list[str] = []
     for tag, step in shards.items():
         assert step.hint.resources.get("browser") == 1, tag
         named = _flag_values(step.cmd, "--profiles")
         assert len(named) == 1, f"{tag} passes --profiles {named}, not one list"
         covered += named[0].split(",")
-        port = re.search(r"VIBE_TALK_SHOTS_PORT=(\d+)", step.cmd)
-        assert port is not None, f"{tag} names no server port base"
-        ports.append(port.group(1))
     assert sorted(covered) == sorted(profiles), \
         f"shards cover {sorted(covered)}, the harness has {sorted(profiles)}"
-    assert len(set(ports)) == len(ports), f"shard port bases collide: {ports}"
+
+
+def test_no_step_listens_on_a_fixed_port_unless_it_runs_alone() -> None:
+    # #1037 shots-port-collision: two gates run at once, each its own dagrun, so no resource
+    # cap serializes a port between them. A step that names a fixed port collides with the
+    # same step of another gate; ports are chosen at run time (bound to port 0, or claimed by
+    # run.sh --screenshots). Only a gate-exclusive step, which runs alone, may name one.
+    import re
+
+    fixed = re.compile(r"\b[A-Z_]*PORT=\d+|--(?:[a-z]+-)?port[= ]\d+")
+    offenders = {
+        tag: fixed.findall(step.cmd)
+        for tag, step in dag_from_path(REPO_ROOT / "validation.dag.yaml").by_tag().items()
+        if "gate-exclusive" not in step.labels and fixed.search(step.cmd)
+    }
+    assert not offenders, f"steps name fixed listening ports: {offenders}"
 
 
 def test_wrkslots_shards_cover_eight_way_partition() -> None:
