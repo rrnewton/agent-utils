@@ -797,6 +797,69 @@ fn a_donor_whose_validator_ran_a_stale_tree_is_refused_as_identity_mismatch() {
 }
 
 #[test]
+fn a_donor_without_identity_lines_is_accepted_unattested_by_default() {
+    // #1049: the validator prints no merge-queue-tool-identity line at all
+    // (a consumer that has not taught it to yet). With
+    // require_tool_identity_lines off (the default) the receipt still
+    // lands, recorded as unattested on the job and the receipt.
+    let fx = Fixture::new("donor-unattested");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "decide",
+        "--tool-identity",
+        "ci-hub=git -C tool rev-parse origin/main:ci-hub",
+        "--tool-refresh",
+        "ci-hub=git -C tool fetch -q origin",
+    ]);
+    two_changes(&fx);
+    let clone = donor_clone(&fx, "donor-host");
+    let _v1_tree = tool_clones(&fx, &clone);
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let out = donor(&fx, &clone, "d1", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (code, report, _) = finish(run);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        report["landed"][0]["prs"],
+        serde_json::json!([1, 2]),
+        "{report}"
+    );
+    let job = &jobs(&fx)[0];
+    assert_eq!(job["state"], "done", "{job}");
+    assert_eq!(
+        job["tool_identity_unattested"].as_array().map(Vec::len),
+        Some(1),
+        "{job}"
+    );
+    assert!(
+        job["tool_identity_unattested"][0]
+            .as_str()
+            .unwrap()
+            .contains("tool_identity_unattested"),
+        "{job}"
+    );
+    assert!(
+        job["receipt"]["tool_warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("tool_identity_unattested"),
+        "{job}"
+    );
+}
+
+#[test]
 fn a_bundle_over_the_limit_is_refused_and_the_donor_declines() {
     let fx = Fixture::new("donor-bundle-limit");
     fx.mq_ok(&[

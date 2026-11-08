@@ -120,6 +120,15 @@ pub struct ValidatorConfig {
     /// claim time, so stamps do not go stale while every donor is busy.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub tool_refresh: std::collections::BTreeMap<String, String>,
+    /// Refuse a donor receipt whose validator printed no
+    /// `merge-queue-tool-identity` line for a full-hex tool stamp (#1045),
+    /// instead of accepting it with a recorded `tool_identity_unattested`
+    /// warning (#1049). Off by default, and serialized only when on, so
+    /// existing configurations and their validator digests are unchanged
+    /// until a consumer opts in — after its validator prints the lines.
+    /// A printed line that mismatches is refused either way.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub require_tool_identity_lines: bool,
     /// Times a change may be deferred because validation did not run (an admission refusal, a
     /// validator that cannot execute, a probe that could not run, donors that could not run)
     /// before it is escalated to its owner and held until `merge-queue retry` (0 = 3).

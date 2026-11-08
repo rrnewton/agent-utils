@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-unattested-receipts: identity lines are opt-in until validators print them'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-11-08T07:58:31.000000000+00:00
-updated_at: 2026-11-08T07:58:31.000000000+00:00
+updated_at: 2026-11-08T08:16:00.000000000+00:00
 ---
 
 # Description
@@ -65,3 +65,13 @@ optional and has been corrected — print-first ordering above
 is safe under both behaviours. Filed by mu-archive; #1048 is
 reserved locally by the parked merge-queue-terminal-verdict
 issue commit, hence this issue numbers after it.
+
+Landed by mu-archive in the commit closing this issue:
+`require_tool_identity_lines` on `ValidatorConfig` (+
+`init --require-tool-identity-lines`), donor `tool_warnings` on
+the receipt, queue-re-derived `tool_identity_unattested`
+counted on the job and alarmed by the run, strict missing-line
+refusal only when opted in. Tests: missing+default accepted
+with note/counter, missing+strict refused, present+mismatch
+refused in both modes, present+match accepted, serialized
+config omits the key until enabled.

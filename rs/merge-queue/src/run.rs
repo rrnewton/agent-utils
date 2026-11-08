@@ -4217,6 +4217,7 @@ impl<'a> Runner<'a> {
         let claim_timeout = Duration::from_secs(self.config.donors.claim_timeout());
         let mut waiting_since = Instant::now();
         let mut could_not_run = 0;
+        let mut unattested = 0;
         let started = Instant::now();
         let stopped = |cancelled: bool, interrupted: Option<String>| Ran {
             results: TestResults::default(),
@@ -4267,6 +4268,18 @@ impl<'a> Runner<'a> {
                 self.event("donor", &alarm);
             }
             could_not_run = record.could_not_run.len();
+            for entry in record.tool_identity_unattested.iter().skip(unattested) {
+                // Accepted, but the tree that ran is unattested (#1049): the
+                // operator watches this reach zero before opting into
+                // `require_tool_identity_lines`.
+                let alarm = format!(
+                    "v{id}: ALARM: donor job {published}: {entry}; accepted unattested \
+                     (require_tool_identity_lines is off)"
+                );
+                eprintln!("merge-queue: {alarm}");
+                self.event("donor", &alarm);
+            }
+            unattested = record.tool_identity_unattested.len();
             match record.state {
                 crate::donor::JobState::Done => {
                     let receipt = record.receipt.ok_or_else(|| {

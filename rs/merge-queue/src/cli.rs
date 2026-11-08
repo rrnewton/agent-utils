@@ -1230,6 +1230,13 @@ enum Command {
         /// Without one, a donor whose answer differs gives the job back.
         #[arg(long, value_name = "NAME=COMMAND")]
         tool_refresh: Vec<String>,
+        /// Refuse a donor receipt whose validator printed no `merge-queue-tool-identity`
+        /// line for a full-hex --tool-identity stamp. Off (the default) the receipt is
+        /// accepted with a recorded `tool_identity_unattested` warning, so a consumer can
+        /// teach its validator to print the lines before opting in. A printed line that
+        /// mismatches is refused either way.
+        #[arg(long)]
+        require_tool_identity_lines: bool,
         /// Delete ignored files (build caches) from reused checkouts before each validation.
         #[arg(long)]
         clean_ignored: bool,
@@ -2036,6 +2043,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             offload,
             tool_identity,
             tool_refresh,
+            require_tool_identity_lines,
             clean_ignored,
             land,
             land_command,
@@ -2197,6 +2205,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     },
                     tool_identity,
                     tool_refresh,
+                    require_tool_identity_lines,
                     pre_claim_check: String::new(),
                     pre_claim_timeout_secs: 0,
                 },

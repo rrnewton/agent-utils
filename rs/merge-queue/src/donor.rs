@@ -237,6 +237,13 @@ pub struct Job {
     /// `donor: detail`, oldest first. None is a verdict: each re-queued the job.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub could_not_run: Vec<String>,
+    /// Accepted receipts whose validator printed no identity line for a
+    /// full-hex stamped tool, as `donor: detail` (#1049): counted in
+    /// `donor status` like `could_not_run`, so an operator can watch a
+    /// consumer's unattested count reach zero before enabling
+    /// `require_tool_identity_lines`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_identity_unattested: Vec<String>,
     /// A duplicate published for compare-only donors (`donors.compare_only`): only they may
     /// claim it, and its receipt is a comparison, never the verdict.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -406,10 +413,18 @@ pub struct Receipt {
     /// Tool trees the validator attested from inside the run (its
     /// `merge-queue-tool-identity:` lines, #1045): tool name -> every value
     /// printed. Receipts written before this field existed parse with it
-    /// empty — and a validation that ran then owes an attestation it cannot
-    /// show, so the queue refuses it as identity-mismatch.
+    /// empty. A validation that ran owes a line per full-hex stamped tool:
+    /// under `require_tool_identity_lines` the queue refuses a missing one
+    /// as identity-mismatch; by default (#1049) it accepts and records the
+    /// gap (see `tool_warnings`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ran_tools: BTreeMap<String, Vec<String>>,
+    /// Donor-recorded tool warnings, e.g. `tool_identity_unattested: ...`
+    /// for a full-hex stamped tool the validator printed no identity line
+    /// for (#1049). Warnings never carry a verdict by themselves; the
+    /// queue re-derives the same fact in `tool_check`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_warnings: Vec<String>,
     /// The donor's merge-queue version.
     pub merge_queue_version: String,
     /// Selection actually run, when the runner collapsed the requested one.
@@ -775,6 +790,32 @@ pub const LEGACY_MISMATCH_DECLINE: &str = "this donor's tools differ from the qu
 /// Most first-parent commits searched for a job's stamped tool tree when proving a
 /// donor's newer tree descends from it (bounded descendant acceptance, #1005).
 pub const TOOL_WALK_BOUND: usize = 1024;
+
+/// Warnings for full-hex stamped tools the validator printed no
+/// `merge-queue-tool-identity` line for (#1049): the donor records these
+/// on its receipt, and the queue re-derives the same list in
+/// [`Store::tool_check`] (a receipt cannot talk its way out of, or into,
+/// an attestation by editing its own warnings).
+fn unattested_warnings(
+    stamped: &BTreeMap<String, String>,
+    printed: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    stamped
+        .iter()
+        .filter(|(name, stamp)| {
+            full_hex(stamp)
+                && !printed
+                    .get(*name)
+                    .is_some_and(|values| values.iter().any(|value| !value.is_empty()))
+        })
+        .map(|(name, _)| {
+            format!(
+                "tool_identity_unattested: tool {name} printed no {} line",
+                crate::validate::TOOL_IDENTITY_MARKER
+            )
+        })
+        .collect()
+}
 
 /// Whether `value` is a full-length hex object name (SHA-1 or SHA-256).
 fn full_hex(value: &str) -> bool {
@@ -1216,6 +1257,7 @@ impl Store {
             comparison: None,
             candidate_gone: None,
             could_not_run: Vec::new(),
+            tool_identity_unattested: Vec::new(),
             compare_only: false,
             rooted,
             prioritized,
@@ -1523,7 +1565,12 @@ impl Store {
     /// descend from it in [`Store::tool_repo`] (bounded descendant acceptance,
     /// #1005). Without a tool repository the tools must match exactly. The same
     /// rule then binds the trees the validator attested from inside the run
-    /// (`ran_tools`, #1045): a full-hex stamp owes exactly one attested tree.
+    /// (`ran_tools`, #1045): a full-hex stamp owes exactly one attested tree,
+    /// except that a MISSING line refuses only under
+    /// `require_tool_identity_lines`; by default (#1049) it is accepted and
+    /// recorded here as a `tool_identity_unattested` note (and counted on
+    /// the job by [`Store::report`]). A present line is held to the rule in
+    /// both modes.
     fn tool_check(&self, job: &Job, receipt: &Receipt) -> (Option<String>, Vec<String>) {
         if receipt.tool.validator_digest != job.tool.validator_digest {
             return (
@@ -1616,7 +1663,7 @@ impl Store {
                 }
                 if full_hex(stamp) {
                     match printed.as_slice() {
-                        [] => {
+                        [] if job.validator.require_tool_identity_lines => {
                             return (
                                 Some(format!(
                                     "identity-mismatch: the receipt's validator printed no \
@@ -1625,6 +1672,17 @@ impl Store {
                                 )),
                                 Vec::new(),
                             );
+                        }
+                        [] => {
+                            // #1049: absent is not wrong until the consumer opts
+                            // into strictness; record it and accept. `report`
+                            // also counts it on the job from the same fact.
+                            notes.push(format!(
+                                "tool_identity_unattested: tool {name} printed no {} \
+                                 line; accepted unattested (require_tool_identity_lines \
+                                 is off)",
+                                crate::validate::TOOL_IDENTITY_MARKER
+                            ));
                         }
                         [value] if *value == stamp => {}
                         [value] if full_hex(value) => {
@@ -1860,6 +1918,14 @@ impl Store {
         }
         for note in &tool_notes {
             job.history.push(format!("{}: {note}", now()));
+        }
+        // Count the acceptance's unattested tools on the job itself (#1049),
+        // re-derived here so a receipt's own `tool_warnings` cannot talk its
+        // way out of the count. Under strictness this list is empty at this
+        // point: a missing line already refused above.
+        for warning in unattested_warnings(&job.tool.tools, &receipt.ran_tools) {
+            job.tool_identity_unattested
+                .push(format!("{}: {warning}", receipt.donor.name));
         }
         job.state = JobState::Done;
         job.lease = None;
@@ -3493,6 +3559,11 @@ impl Worker<'_> {
                     merge_queue: revision.clone(),
                 },
                 ran_tools: ran.printed_tool_identity.clone(),
+                tool_warnings: if ran.refused {
+                    Vec::new()
+                } else {
+                    unattested_warnings(&job.tool.tools, &ran.printed_tool_identity)
+                },
                 merge_queue_version: env!("CARGO_PKG_VERSION").to_owned(),
                 effective_selection: ran.effective_selection.clone(),
                 exit: ran.exit,
@@ -5157,9 +5228,11 @@ mod unit {
         let (repo, _c1, t1, c2, t2, unrelated) = tool_repo("receipt-ran-tools");
         git_in(&repo, &["update-ref", "refs/remotes/origin/main", &c2]).unwrap();
         let validator = git_validator();
-        let publish_git = |store: &Store, stamp: &str| {
+        let mut strict = git_validator();
+        strict.require_tool_identity_lines = true;
+        let publish_git = |store: &Store, validator: &ValidatorConfig, stamp: &str| {
             let tool = ToolIdentity {
-                validator_digest: validator_digest(&validator).unwrap(),
+                validator_digest: validator_digest(validator).unwrap(),
                 tools: [("ci-hub".to_owned(), stamp.to_owned())].into(),
                 merge_queue: Some(crate::build_info::Revision {
                     commit: "a".repeat(40),
@@ -5173,7 +5246,7 @@ mod unit {
                     "base0",
                     &Selection::of([TestId::step("a")]),
                     &BTreeSet::new(),
-                    &validator,
+                    validator,
                     &tool,
                     false,
                     false,
@@ -5181,11 +5254,34 @@ mod unit {
                 )
                 .unwrap()
         };
-        // Stamp t1 (the older tree): missing, unrelated and extra attestations
-        // refuse; a descendant attestation accepts.
+        // Default (not strict, #1049): a missing attestation is accepted but
+        // recorded, never silent — an upgrading consumer whose validator does
+        // not print the lines yet must keep working.
+        let mut store = Store::new(&temp("receipt-unattested-store"));
+        store.tool_repo = Some(repo.clone());
+        let job = publish_git(&store, &validator, &t1);
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        let mut missing = receipt(&claimed, "d1");
+        missing.ran_tools.clear();
+        store.report(&job.id, &token, missing).unwrap();
+        let done = store.read(&job.id).unwrap();
+        assert_eq!(done.state, JobState::Done, "{done:?}");
+        assert_eq!(done.tool_identity_unattested.len(), 1, "{done:?}");
+        assert!(
+            done.tool_identity_unattested[0].contains("ci-hub"),
+            "{done:?}"
+        );
+        assert!(
+            done.history.join("\n").contains("tool_identity_unattested"),
+            "{:?}",
+            done.history
+        );
+        // Stamp t1 (the older tree) under strict: missing, unrelated and extra
+        // attestations refuse; a descendant attestation accepts.
         let mut store = Store::new(&temp("receipt-ran-tools-store"));
         store.tool_repo = Some(repo.clone());
-        let job = publish_git(&store, &t1);
+        let job = publish_git(&store, &strict, &t1);
         let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
         let token = claimed.lease.as_ref().unwrap().token.clone();
         let mut missing = receipt(&claimed, "d1");
@@ -5213,7 +5309,7 @@ mod unit {
         let mut store = Store::new(&temp("receipt-ran-stale-store"));
         store.tool_repo = Some(repo);
         store.could_not_run_limit = 99;
-        let job = publish_git(&store, &t2);
+        let job = publish_git(&store, &validator, &t2);
         let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
         let token = claimed.lease.as_ref().unwrap().token.clone();
         let mut stale = receipt(&claimed, "d1");
@@ -5227,6 +5323,32 @@ mod unit {
         refused.ran_tools.clear();
         let error = store.report(&job.id, &token, refused).unwrap_err();
         assert!(!error.contains("identity-mismatch"), "{error}");
+    }
+
+    #[test]
+    fn unattested_warnings_name_only_missing_full_hex_tools() {
+        // #1049: the donor-side receipt warning mirrors the queue's rule —
+        // full-hex stamps with no printed line warn; version stamps and
+        // attested tools do not.
+        let stamped: BTreeMap<String, String> = [
+            ("ci-hub".to_owned(), "a".repeat(40)),
+            ("toolchain".to_owned(), "1.90".to_owned()),
+            ("other".to_owned(), "b".repeat(40)),
+        ]
+        .into();
+        let printed: BTreeMap<String, Vec<String>> =
+            [("other".to_owned(), vec!["b".repeat(40)])].into();
+        let warnings = unattested_warnings(&stamped, &printed);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("tool_identity_unattested"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("ci-hub"), "{warnings:?}");
+        // The opt-in key stays out of serialized configs until enabled, so an
+        // existing consumer's validator digest cannot move under it.
+        let text = serde_json::to_string(&git_validator()).unwrap();
+        assert!(!text.contains("require_tool_identity_lines"), "{text}");
     }
 
     /// Publish a job with claim order and a controlled id (age), returning it.

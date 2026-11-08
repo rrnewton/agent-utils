@@ -1010,6 +1010,11 @@ An **item record** (`items/<pr>.json`) has these fields:
   answer differs from a job's (see "Tool identity and receipts"). It must update what `run`
   loads, not only what the identity command reads: a fetch-only refresh under a
   working-tree-loading validator identifies one tree and runs another.
+- `require_tool_identity_lines`: refuse a receipt whose validator printed no
+  `merge-queue-tool-identity` line for a full-hex `tool_identity` stamp, instead of accepting
+  it with a recorded `tool_identity_unattested` warning (default `false`; absent means off, so
+  existing configurations are byte-identical until a consumer opts in — after its validator
+  prints the lines).
 - `max_deferrals`: deferrals before a change is escalated to its owner (absent or `0`: `3`).
 - `red_without_probe`: `hold` holds a red change whose probe cannot run for its owner; absent
   (the default) ejects it.
@@ -1557,13 +1562,20 @@ Because only the validator knows what it loaded, it attests from inside the run:
 one line per configured tool, `merge-queue-tool-identity: <tool> <40-hex value>`, naming the
 tree it actually executed. Print the lines before running tests, so a run stopped early still
 attests. The donor records them on the receipt as `ran_tools`, beside the pre-run answers,
-and the queue holds them to the same rule as those answers: each attested tree must equal
-the job's stamp or provably descend from it, and a missing, malformed, extra, conflicting,
-stale-ancestor or unrelated attestation refuses the receipt as `identity-mismatch` (the job
-stays leased; nothing lands on that receipt). A tool stamped with a non-hex answer (a
-version string) cannot descend: an attestation line for it is optional and must then equal
-the stamp. A refused run (validation never ran) owes no attestation. With no
-`validator.tool_identity` configured there is nothing to attest.
+and the queue holds a PRINTED line to the same rule as those answers in every mode: each
+attested tree must equal the job's stamp or provably descend from it, and a malformed,
+extra, conflicting, stale-ancestor or unrelated attestation refuses the receipt as
+`identity-mismatch` (the job stays leased; nothing lands on that receipt). A MISSING line
+is compat-relaxed by default: the receipt is accepted, with a `tool_identity_unattested`
+warning on the receipt, counted on the job in `donor status` and alarmed by the run — an
+upgrading consumer whose validator does not print the lines yet keeps working. Set
+`validator.require_tool_identity_lines` (`init --require-tool-identity-lines`) to make a
+missing line refuse as identity-mismatch too. The safe rollout order is: teach the
+validator to print the lines first (an older merge-queue ignores them), swap queue and donor
+binaries, watch the unattested count reach zero, then enable the strict key. A tool stamped
+with a non-hex answer (a version string) cannot descend: an attestation line for it is
+optional in both modes and must then equal the stamp. A refused run (validation never ran)
+owes no attestation. With no `validator.tool_identity` configured there is nothing to attest.
 
 A queued job is re-stamped with the queue host's current answers at every claim (when the
 queue host can answer them), so every queued job carries the same stamp. Before answering,
