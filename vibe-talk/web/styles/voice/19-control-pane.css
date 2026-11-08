@@ -20,7 +20,15 @@
      overlay now, so the separation from the dock's own border has to be stated. */
   padding: 0.6rem calc(0.6rem + env(safe-area-inset-right)) 0.6rem
     calc(0.6rem + env(safe-area-inset-left));
-  /* Clear of the home indicator on a phone that has one, and zero on one that does not. */
+  /* The bar below owns the home indicator's clearance now (`#1078 bottom-bar-switcher`): this
+     row stands above it, and keeping the inset here as well would count it twice. */
+  padding-bottom: 0.6rem;
+}
+
+/* With the bar moved up into the header this pane is the dock's only row again, and the edge
+   clearance is its own once more. The desktop block takes this back: there the dock's own
+   padding carries the row. */
+#dock:not(:has(#control-bar)) #control-pane {
   padding-bottom: calc(0.6rem + env(safe-area-inset-bottom));
 }
 

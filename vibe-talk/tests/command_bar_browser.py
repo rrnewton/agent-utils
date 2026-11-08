@@ -18,7 +18,8 @@ wider) the same. And the widest the pane gets, the call view after a call with i
 24px default font at 900x700 and 1280x800: nothing drawn over anything, the pane wrapping its own
 buttons as a last resort once the bar is at its floor.
 
-The negative control, a 393x852 phone: the bar is one row above the pane's tile, the dock spans the
+The negative control, a 393x852 phone: the pane's tile is one row above the bar (`#1078
+bottom-bar-switcher`: the bar is the dock's last row), the dock spans the
 window, and the dock is the same height whichever view is chosen. With --baseline-web-root DIR (a copy
 of the page from before the change) the phone's dock is measured under that page too, and every
 control's box must be the same to the pixel.
@@ -450,8 +451,10 @@ def phone_boxes(browser: Browser, url: str, shots: Path | None, tag: str) -> dic
                                                           "clear-view", "hang-up", "talk")]
         centres = [(number(one, "top") + number(one, "bottom")) / 2 for one in bar]
         check(max(centres) - min(centres) <= 6, f"393x852 {key}: the phone's bar is more than one row: {bar}")
-        check(number(state["pane"], "top") >= number(state["bar"], "bottom") - 1,
-              f"393x852 {key}: the pane is no longer under the bar: {state['pane']} {state['bar']}")
+        check(number(state["pane"], "bottom") <= number(state["bar"], "top") + 1,
+              f"393x852 {key}: the pane is no longer over the bar: {state['pane']} {state['bar']}")
+        check(number(state["bar"], "bottom") >= number(state["dock"], "bottom") - 1,
+              f"393x852 {key}: the bar is not the dock's last row: {state['bar']} {state['dock']}")
         check(number(state["dock"], "left") <= 0.5 and number(state["dock"], "right") >= 392.5,
               f"393x852 {key}: the phone's dock does not span the window: {state['dock']}")
         found[key] = [{**one, "dock": number(state["dock"], "height")} for one in drawn]
@@ -525,10 +528,10 @@ def main() -> int:
                 baseline = phone_boxes(browser, urls[1], args.screenshots, "baseline")
                 check(phone == baseline, f"393x852: the phone's dock differs from the baseline page's:\n{phone}\n"
                       f"{baseline}")
-                notes.append("393x852 phone: bar one row above the pane's tile, each control's box the same as the "
+                notes.append("393x852 phone: pane one row above the bar, each control's box the same as the "
                              "baseline page's in Main, All, Thread list and the long thread")
             else:
-                notes.append("393x852 phone: bar one row above the pane's tile, the dock spanning the window and the "
+                notes.append("393x852 phone: pane one row above the bar, the dock spanning the window and the "
                              "same height in Main, All, Thread list and the long thread")
             long_url = f"http://127.0.0.1:{long_server.server_port}/"
             action_menu(browser, long_url, 393, 852, True, args.screenshots, notes)

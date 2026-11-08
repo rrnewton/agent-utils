@@ -6,9 +6,10 @@
 // status) is set as text. Construction does nothing: no element is looked up, no
 // listener is added, and nothing is fetched until `open` is called.
 //
-// The outline is a pop-up (`#1038 documents-outline-popup`): the toolbar's Outline
-// button opens a floating panel (outside the scroller, so it never scrolls away
-// or reflows the document) whose entries come from the headings as rendered in
+// The outline is a pop-up (`#1038 documents-outline-popup`): the control bar's
+// Outline button (`#1078 bottom-bar-switcher`) opens a floating panel (outside
+// the scroller, so it never scrolls away or reflows the document) whose entries
+// come from the headings as rendered in
 // the body — their real anchor ids and levels, not a re-derivation. While the
 // document scrolls, the entry for the section at the top is marked HERE. The
 // title is a link to the document's original source where that address is a safe
@@ -95,8 +96,13 @@ function safeSourceHref(value: unknown): string | null {
   return null;
 }
 
-/** How far below the scroller's top a heading still counts as the current one, in px. */
-const HERE_SLACK_PX = 8;
+/**
+ * How far below the scroller's top a heading still counts as the current one, in px: the
+ * headings' scroll margin (8px in the stylesheet, where a jump lands them) plus a few px for
+ * fractional layout — measured tops land a fraction past the margin, and a slack of exactly
+ * the margin left the jumped-to heading unmarked by under a pixel (`#1078`).
+ */
+const HERE_SLACK_PX = 12;
 
 /**
  * Which outline entry is current: the last whose heading top is at or above the
@@ -242,8 +248,9 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     setOutlineOpen(false);
     if (refocus) {
       const toggle = deps.byId("doc-outline-open");
-      // Without preventScroll the focus scrolls the toolbar (at the document's
-      // top) into view, undoing the very jump the reader just picked.
+      // Without preventScroll the focus could scroll the document to the button,
+      // undoing the very jump the reader just picked. The button lives in the
+      // fixed bar now, but the jump must hold either way.
       if (typeof toggle.focus === "function") toggle.focus({ preventScroll: true });
     }
   }

@@ -740,7 +740,8 @@
                 <div class="row docs-toolbar">
                   <button id="doc-back" type="button">Back</button>
                   <h2 id="doc-title"></h2>
-                  <button id="doc-outline-open" type="button" aria-haspopup="dialog" aria-controls="doc-outline-pop" aria-expanded="false" title="Document outline: arrow keys move, Enter jumps, Escape closes" hidden>Outline</button>
+                  <!-- Outline is in the control bar now (`#1078 bottom-bar-switcher`), under the
+                       thumb however far this toolbar has scrolled away; see #doc-outline-open. -->
                   <button id="doc-read" type="button">Read</button>
                 </div>
                 <div id="doc-body"></div>
@@ -3842,10 +3843,14 @@
         exactly that reason: a mount point that is empty until script moves something into it is a
         control that does not exist on a page whose script died.
 
-        DIRECTLY ABOVE THE BIG BUTTON BAR, which is what the owner asked for and is not the same
-        thing as "at the bottom": below #control-pane would put small icons under the thumb that is
-        reaching for Talk, and pinning it to the viewport floor would put it in the corner
-        curvature that ate the first word of the status line on the owner's iPhone.
+        Declared above #control-pane, and DRAWN BELOW it since `#1078 bottom-bar-switcher`: the
+        stylesheet stands the pane over this bar (15-dock.css), so the bar is the dock's last row
+        at the viewport floor in every view and hiding the pane cannot move it. The markup order
+        stays, because it is the reading order and the order the desktop regime lays its one row
+        out in. An earlier placement of this bar directly above the big buttons kept small icons
+        from under the thumb reaching for Talk; the owner has since asked for the switch itself
+        under that thumb, at the very lower right, which is what the flip gives him — the bar's
+        own safe-area padding keeps it clear of the corner curvature.
 
         The order inside the bar is the owner's too, and it is a right-handed thumb argument rather
         than a symmetry one:
@@ -3853,9 +3858,11 @@
           * the GEAR is leftmost — the control you least want to hit by accident, so it is the one
             furthest from where the thumb rests;
           * #bar-pack takes the space between them and is where every later button goes;
-          * the Voice/Discord SWITCH is rightmost, under the thumb, because it is the one you
-            actually flick;
-          * the action menu's hamburger is directly left of it (`#880 voice-page-menu-placement`).
+          * the Voice/Discord SWITCH is last, rightmost at the lower right, under the thumb,
+            because it is the one you actually flick (`#1078`);
+          * the action menu's hamburger stands left of it (`#880 voice-page-menu-placement`) —
+            directly left in the call and channel views; in Documents the Outline and Fetch
+            buttons stand between them, so the switch stays last there too.
       -->
       <div id="control-bar-bottom">
         <div id="control-bar" data-placement="bottom">
@@ -4121,10 +4128,12 @@
             float, as they answer what just happened. A toggle, as the prompts' opener is, and Escape and
             the back gesture close it.
 
-            `#880 voice-page-menu-placement`. IMMEDIATELY LEFT OF THE VIEW BUTTON, out of the pack, on a
+            `#880 voice-page-menu-placement`. LEFT OF THE VIEW BUTTON, out of the pack, on a
             phone and on a desk: the owner, 2026-11-05, "Originally I asked for this hamburger icon just
             to the left of the channel voice view toggle." Out of the pack, so it never scrolls out of
-            reach, and on the main screen in both views (`renderControlBar`).
+            reach, and on the main screen in both views (`renderControlBar`). Immediately left in the
+            call and channel views; in Documents, Outline and Fetch stand between it and the switch
+            (`#1078 bottom-bar-switcher`), which stays the bar's last button there as everywhere.
           -->
           <button id="action-menu-open" class="bar-button" type="button" aria-expanded="false"
                   aria-controls="action-menu" aria-label="Actions"
@@ -4134,13 +4143,27 @@
             </svg>
           </button>
 
+          <!-- The open document's outline (`#1038 documents-outline-popup`, here since `#1078
+               bottom-bar-switcher`): in the bar rather than the reader's toolbar, so it is under
+               the thumb however far the document is scrolled. Shown only while the reader is up
+               with headings to list (the reader owns `hidden`; the stylesheet owns the rest);
+               it opens the same #doc-outline-pop. -->
+          <button id="doc-outline-open" class="bar-button" type="button" aria-haspopup="dialog" aria-controls="doc-outline-pop" aria-expanded="false" title="Document outline: arrow keys move, Enter jumps, Escape closes" hidden>Outline</button>
+          <!-- Fetching documents (`documents-view-client` batch A): on the bar in the
+               Documents view, with a drop-up of what to fetch or refresh. Left of the switch
+               since `#1078`: the switch is the bar's last button in every view. -->
+          <button id="docs-fetch" class="bar-button" type="button" hidden
+                  aria-haspopup="menu" aria-expanded="false">Fetch</button>
+
           <!-- ONE button, not two labels. `#820 voice-page-action-menu`: a smaller real button where a
                switch with a sliding knob was, its word the view you are in (Voice or Channel); a press
                shows the other view. `#845 voice-toggle-colours`: pressed, lit in the accent, on the
                call's view, and the darker quiet one on the channel's; the owner: "I want the channel
                view to be the darker one. And the voice view to be the lit up blue one". Its name for a
                screen reader stays "Voice view", pressed or not, as a toggle's name must: a name that
-               changed with it would hear "Channel, not pressed" as the channel being off. -->
+               changed with it would hear "Channel, not pressed" as the channel being off.
+               LAST in the bar (`#1078 bottom-bar-switcher`), at the lower right in every view, so
+               tapping through Voice, Channel and Documents never moves the thumb. -->
           <button
             id="view-switch"
             class="switch"
@@ -4151,14 +4174,11 @@
           >
             <span id="view-switch-label" class="switch-word">Voice</span>
           </button>
-          <!-- The selector's two cards (`documents-view-client`): drawn stacked directly above
-               the switch (the stylesheet lifts them there), naming the two views that are not
-               showing, in the order rotating reaches them; the selector fills and wires them. -->
+          <!-- The selector's tab row (`documents-view-client`, `#1078 bottom-bar-switcher`):
+               three cells, Voice | Channel | Documents, hung off the switch while the reader
+               taps through, the landed view's cell lit; the selector fills and wires them and
+               takes the row away shortly after the last press. -->
           <div id="view-cards" class="view-cards" hidden></div>
-          <!-- Fetching documents (`documents-view-client` batch A): on the bar in the
-               Documents view, with a drop-up of what to fetch or refresh. -->
-          <button id="docs-fetch" class="bar-button" type="button" hidden
-                  aria-haspopup="menu" aria-expanded="false">Fetch</button>
           <div id="docs-fetch-menu" class="docs-menu" role="menu" hidden>
             <button id="docs-fetch-visible" type="button" data-act="visible">Fetch visible</button>
             <button id="docs-fetch-since" type="button" data-act="since">Fetch since…</button>

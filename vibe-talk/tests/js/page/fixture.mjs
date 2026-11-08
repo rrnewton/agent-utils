@@ -586,8 +586,11 @@ const FIXTURE_TREE = {
   // ...and the bar itself, in markup order, because "the gear is leftmost and the switch
   // rightmost" is an ordering claim and a fixture that held the members in a flat list could not
   // check it. It is also what `barPlacement.set` (web/src/view/settings) re-parents, so the move has something real to move.
-  // `#880 voice-page-menu-placement`: the action menu's hamburger out of the pack, directly before the switch.
-  "control-bar": ["open-settings", "bar-pack", "prompts-tray", "action-menu-open", "view-switch"],
+  // `#880 voice-page-menu-placement`: the action menu's hamburger out of the pack, before the switch.
+  // `#1078 bottom-bar-switcher`: Outline and Fetch stand between the hamburger and the switch in
+  // Documents, and the switch is last in every view. The trays, menus and tab row hang off the bar
+  // out of its flow and stay out of this list, as the fetch menu always has.
+  "control-bar": ["open-settings", "bar-pack", "prompts-tray", "action-menu-open", "doc-outline-open", "docs-fetch", "view-switch"],
   // `#410 inline-reply-editor`. The reply's box, kept in the left column's place while no reply is open
   // and moved into the stream of a column and back, so what is inside it goes with it: whether the focus
   // is in the reply's box is a question of where that box is.

@@ -71,6 +71,89 @@ test("documents selector: VIEW_LABELS are Voice/Channel/Documents", () => {
   assert.equal(label("docs"), "Documents");
 });
 
+// The switcher's tab row (#1078 bottom-bar-switcher): three cells in rotation order, the current
+// one marked, shown on a press and taken away 600ms after the LAST press. Timers are injected so
+// the test drives the settle itself.
+function selectorFixture(start = "voice") {
+  const doc = { createElement: (tag) => fakeElement(tag) };
+  const button = fakeElement("button");
+  button.ownerDocument = doc;
+  const label = fakeElement("span");
+  const cards = fakeElement("div");
+  cards.hidden = true;
+  const byId = (id) => ({ "view-switch": button, "view-switch-label": label, "view-cards": cards })[id];
+  let current = start;
+  const chosen = [];
+  let nextTimer = 1;
+  const timers = new Map();
+  const scheduler = {
+    setTimer: (run, ms) => { const id = nextTimer; nextTimer += 1; timers.set(id, { run, ms }); return id; },
+    clearTimer: (id) => timers.delete(id),
+    fire: () => { const pending = [...timers.values()]; timers.clear(); for (const one of pending) one.run(); },
+    delays: () => [...timers.values()].map((one) => one.ms),
+  };
+  const deps = {
+    byId,
+    current: () => current,
+    choose: (view) => { chosen.push(view); current = view; },
+    setTimer: scheduler.setTimer,
+    clearTimer: scheduler.clearTimer,
+  };
+  return { button, label, cards, chosen, scheduler, deps, setCurrent: (view) => { current = view; } };
+}
+
+test("documents selector: a press shows Voice/Channel/Documents cells with the landed view current", () => {
+  const { createViewSelector, VIEW_CARDS_SETTLE_MS } = requireModule(SELECTOR, "src/view/documents/selector.ts");
+  assert.equal(typeof createViewSelector, "function", "selector does not export createViewSelector");
+  assert.equal(VIEW_CARDS_SETTLE_MS, 600, "the settle delay is not today's 600ms");
+  const fx = selectorFixture("voice");
+  const selector = createViewSelector(fx.deps);
+  selector.cycle();
+  assert.deepEqual(fx.chosen, ["discord"], "a press did not rotate to the channel");
+  assert.equal(fx.cards.hidden, false, "the tab row stayed hidden after a press");
+  assert.deepEqual(fx.cards.children.map((cell) => cell.textContent), ["Voice", "Channel", "Documents"]);
+  assert.deepEqual(fx.cards.children.map((cell) => cell.getAttribute("data-view")), ["voice", "discord", "docs"]);
+  const currents = fx.cards.children.filter((cell) => cell.getAttribute("aria-current") === "true");
+  assert.equal(currents.length, 1, "exactly one cell is current");
+  assert.equal(currents[0].getAttribute("data-view"), "discord", "the landed view is not the current cell");
+  assert.ok(currents[0].className.split(/\s+/).includes("view-card-current"), "the current cell wears no highlight class");
+  assert.equal(fx.button.getAttribute("aria-expanded"), "true", "the switch does not say the row is up");
+  assert.deepEqual(fx.scheduler.delays(), [600], "no single 600ms settle was armed");
+  // Tapping on steps the highlight right and re-arms the settle from the last press.
+  selector.cycle();
+  assert.deepEqual(fx.chosen, ["discord", "docs"]);
+  assert.equal(fx.cards.children.find((cell) => cell.getAttribute("aria-current") === "true")?.getAttribute("data-view"), "docs");
+  assert.deepEqual(fx.scheduler.delays(), [600], "the settle was not re-armed as one timer from the last press");
+  // Wrapping lands back on the leftmost cell.
+  selector.cycle();
+  assert.equal(fx.cards.children.find((cell) => cell.getAttribute("aria-current") === "true")?.getAttribute("data-view"), "voice");
+  // The settle takes the row away and says so on the switch.
+  fx.scheduler.fire();
+  assert.equal(fx.cards.hidden, true, "the row stayed up after the settle");
+  assert.equal(fx.button.getAttribute("aria-expanded"), "false", "the switch still says the row is up after the settle");
+  selector.unmount();
+});
+
+test("documents selector: choosing a cell directly lands there and puts the row away at once", () => {
+  const { createViewSelector } = requireModule(SELECTOR, "src/view/documents/selector.ts");
+  const fx = selectorFixture("voice");
+  const selector = createViewSelector(fx.deps);
+  selector.cycle();
+  const docsCell = fx.cards.children.find((cell) => cell.getAttribute("data-view") === "docs");
+  dispatchClick(docsCell);
+  assert.deepEqual(fx.chosen, ["discord", "docs"], "the cell did not choose its view");
+  assert.equal(fx.cards.hidden, true, "the row stayed up after a direct choice");
+  assert.deepEqual(fx.scheduler.delays(), [], "a settle was left armed after a direct choice");
+  // The current cell only dismisses: no second choice is recorded.
+  selector.cycle();
+  const before = fx.chosen.length;
+  const currentCell = fx.cards.children.find((cell) => cell.getAttribute("aria-current") === "true");
+  dispatchClick(currentCell);
+  assert.equal(fx.chosen.length, before, "the current cell chose the view it already shows");
+  assert.equal(fx.cards.hidden, true, "the current cell did not dismiss the row");
+  selector.unmount();
+});
+
 // ---- 2. render -------------------------------------------------------------------------------
 
 // What the renderer answers, as HTML text: a string as-is, an { html } shape, or a node's markup.
@@ -464,8 +547,8 @@ test("documents reader: currentOutlineIndex is exact at its boundaries", () => {
   assert.equal(typeof currentOutlineIndex, "function", "reader does not export currentOutlineIndex");
   assert.equal(currentOutlineIndex([], 0), -1);
   assert.equal(currentOutlineIndex([100, 200], 0), -1, "a heading below the top counts as current");
-  assert.equal(currentOutlineIndex([8], 0), 0, "a heading exactly at rootTop + 8 is not current");
-  assert.equal(currentOutlineIndex([9], 0), -1, "a heading past rootTop + 8 counts as current");
+  assert.equal(currentOutlineIndex([12], 0), 0, "a heading exactly at rootTop + 12 is not current");
+  assert.equal(currentOutlineIndex([13], 0), -1, "a heading past rootTop + 12 counts as current");
   assert.equal(currentOutlineIndex([-50, 0, 50], 0), 1);
   assert.equal(currentOutlineIndex([-50, -10], 0), 1, "the last heading above the top is not current");
   assert.equal(currentOutlineIndex([100, 108], 100), 1);

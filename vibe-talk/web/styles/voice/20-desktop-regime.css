@@ -113,10 +113,18 @@
     --bar-floor: 8rem;
     position: relative;
     display: flex;
+    /* One row here, not the phone's flipped stack (`#1078 bottom-bar-switcher`): the bar and
+       the pane stand side by side in markup order, which the phone's reversed column undoes. */
+    flex-direction: row;
     flex-wrap: nowrap;
     align-items: end;
     gap: 0.4rem 0.5rem;
     padding: 0.4rem var(--dock-inset);
+  }
+
+  /* The pane's phone edge clearance for a bar in the header (19) is the dock's padding here. */
+  #dock:not(:has(#control-bar)) #control-pane {
+    padding-bottom: 0;
   }
 
   /* The bar takes what the pane leaves, so its pack can give the pickers their names. Its floor is the
@@ -192,6 +200,13 @@
 
   /* ...and with the reader's row hidden, the bar keeps that room itself: it takes the row, short of the corner. */
   :root[data-reader="hidden"]:has(#pane-discord:not([hidden])) #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-bar-bottom:has(#view-switch:not([hidden])) {
+    margin-right: calc(var(--dock-switch) + var(--dock-menu) + 0.8rem);
+  }
+
+  /* In Documents the pane is away altogether, so the bar keeps the corner's room there too
+     (`#1078 bottom-bar-switcher`): without it the bar takes the whole row and Fetch and
+     Outline slide under the switch in its corner, untappable. */
+  :root:has(#pane-docs:not([hidden])) #control-bar-bottom:has(#view-switch:not([hidden])) {
     margin-right: calc(var(--dock-switch) + var(--dock-menu) + 0.8rem);
   }
 

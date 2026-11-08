@@ -224,8 +224,12 @@ a.search-hit-link {
   color: #fff;
 }
 
+/* Wide enough for the longest word, "Documents", so the switch is ONE box in every view
+   (`#1078 bottom-bar-switcher`): priced from the word alone it grew leftward from its fixed
+   right edge as the word lengthened, and a thumb tapping through met a moving target — the
+   defect the desk's fixed switch width already answers. Shorter words centre in the box. */
 .switch-word {
-  min-width: 3.6rem;
+  min-width: 5.5rem;
   text-align: center;
   font-size: 0.85rem;
   font-weight: 600;

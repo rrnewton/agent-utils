@@ -7,7 +7,7 @@ export type { DocumentsList, DocumentsListDependencies } from "./list.ts";
 export { createDocumentsReader, currentOutlineIndex, openDocumentNotice } from "./reader.ts";
 export type { DocumentsReader, DocumentsReaderDependencies, OpenDocument } from "./reader.ts";
 export { renderDocumentMarkdown, documentHeadingId } from "./render.ts";
-export { createViewSelector, nextView, otherViews, VIEW_LABELS, VIEW_ORDER } from "./selector.ts";
+export { createViewSelector, nextView, otherViews, VIEW_CARDS_SETTLE_MS, VIEW_LABELS, VIEW_ORDER } from "./selector.ts";
 export type { DocViewName, ViewSelector, ViewSelectorDependencies } from "./selector.ts";
 export type { DocumentMention, DocumentRow, DocumentsListAnswer } from "./types.ts";
 

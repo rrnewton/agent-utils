@@ -14,7 +14,7 @@ import { BASE_CSS, CANNED, CONVAI_WRITE, CSS, CSS_CODE, CSS_UNCONDITIONAL, DESKT
   SEAM_DETAIL_MAX_WORDS, SEAM_DETAIL_MIN_WORDS, SEARCH_LANGUAGE, assertMarkupContains, barSlice,
   bigCardData, brokenModule, brokenScript, channelSummaryText, compose, cssBlock, cssBlockIn, cssBlockOutside,
   cssRules, cssRulesElsewhere, cssWithout, errorResponse, forwardTimeline, freshness, json,
-  longMessage, markupHolds, markupPlace, mediaBody, message, newPage, pagedChannel, pickThread,
+  longMessage, markupHolds, markupPlace, mediaBody, message, newPage, pagedChannel, passTime, pickThread,
   press, reReadChannel, replyButton, replyInStream, seamDetail, searchLanguage, secondOfSpeech,
   session_lines, showDiscord, signIn, speech, startNeutralCall, startTalking, state, storedTexts,
   test, threadData, threadPage, turnDone, withoutStrings, words } from "./fixture.mjs";
@@ -279,10 +279,17 @@ test("the transcript is the one thing that scrolls, and the control pane is a gr
     "the pane holds its place by being a grid row, not by being pinned"
   );
   assert.doesNotMatch(pane, /overflow-y:\s*(auto|scroll)/, "the pane must never scroll");
+  // `#1078 bottom-bar-switcher`: the bar is the dock's last row and owns the clearance; the pane
+  // keeps it only for the bar's header home, where it is the dock's only row again.
   assert.match(
-    pane,
-    /padding-bottom:\s*calc\([^)]*env\(safe-area-inset-bottom\)/,
+    cssBlock('#control-bar[data-placement="bottom"]'),
+    /padding-bottom:\s*calc\([^)]*env\(safe-area-inset-bottom\)|padding:\s*[^;]*env\(safe-area-inset-bottom\)/,
     "the controls must clear the home indicator"
+  );
+  assert.match(
+    cssBlock("#dock:not(:has(#control-bar)) #control-pane"),
+    /padding-bottom:\s*calc\([^)]*env\(safe-area-inset-bottom\)/,
+    "with the bar in the header the pane must clear the home indicator itself"
   );
 });
 
@@ -473,12 +480,17 @@ test("the view control is a real button: pressed on the call's view, filled in t
   assert.doesNotMatch(cssBlock(".switch"), /var\(--accent\)/);
 });
 
-test("`#880 voice-page-menu-placement`: the hamburger is IMMEDIATELY LEFT of the view button, out of the pack", async () => {
+test("`#880 voice-page-menu-placement`: the hamburger is LEFT of the view button, out of the pack; the switch is last (`#1078`)", async () => {
   // The owner, 2026-11-05: "Originally I asked for this hamburger icon just to the left of the channel voice
   // view toggle." `#820 voice-page-action-menu` had put it left of the channel picker, inside the pack.
+  // `#1078 bottom-bar-switcher` puts Outline and Fetch between it and the switch in Documents, so
+  // the switch is the bar's last button in every view; immediately left holds where they are absent.
   const beforeSwitch = HTML_CODE.slice(0, HTML_CODE.indexOf('id="view-switch"'));
-  assert.equal([...beforeSwitch.matchAll(/\bid="([^"]+)"/g)].at(-1)[1], "action-menu-open",
-    "the markup has something between the hamburger and the view button");
+  assert.deepStrictEqual(
+    [...beforeSwitch.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]).slice(-3),
+    ["action-menu-open", "doc-outline-open", "docs-fetch"],
+    "the markup between the hamburger and the view button is not Outline then Fetch"
+  );
   assertMarkupContains("control-bar", "action-menu-open");
   assert.equal(markupHolds("bar-pack", "action-menu-open"), false, "the hamburger is in the pack, which scrolls");
   const page = newPage();
@@ -487,10 +499,44 @@ test("`#880 voice-page-menu-placement`: the hamburger is IMMEDIATELY LEFT of the
   assert.deepStrictEqual(order().slice(-2), ["action-menu-open", "view-switch"], "the call's bar ends otherwise");
   await showDiscord(page, [message({ content: "hi" })]);
   assert.deepStrictEqual(order().slice(-2), ["action-menu-open", "view-switch"], "the channel's bar ends otherwise");
+  await page.el("view-switch").click();
+  assert.deepStrictEqual(order().slice(-2), ["docs-fetch", "view-switch"], "the Documents bar does not end Fetch, switch");
   // On the main screen only, as the switch is.
   await page.el("open-settings").click();
   await page.settle();
   assert.equal(page.el("action-menu-open").hidden, true, "the hamburger is on Settings");
+});
+
+test("`#1078 bottom-bar-switcher`: the pane stands over the bar, Outline is in the bar, and taps step the tab row", async () => {
+  // The flip and the moved button, as declarations: one reversed column on a phone, Outline in
+  // the bar's markup and out of the reader's toolbar, dark bordered outline rows.
+  assert.match(cssBlock("#dock"), /flex-direction:\s*column-reverse/, "the pane is not drawn over the bar");
+  assertMarkupContains("control-bar", "doc-outline-open");
+  const toolbar = HTML_CODE.slice(HTML_CODE.indexOf('id="docs-reader"'), HTML_CODE.indexOf('id="doc-body"'));
+  assert.ok(!toolbar.includes('id="doc-outline-open"'), "Outline is still in the reader's toolbar");
+  const row = cssBlock("#doc-outline button");
+  assert.match(row, /border:\s*1px solid #[0-9a-f]/i, "outline rows have no stated border");
+  assert.match(row, /background:\s*#[0-9a-f]/i, "outline rows have no stated dark ground");
+  assert.doesNotMatch(row, /var\(--accent\)/, "outline rows are filled from the accent again");
+  assert.match(cssBlock("#doc-outline-pop"), /background:\s*#[0-9a-f]/i, "the outline panel has no stated dark ground");
+  // Tapping through: the row shows all three views as tabs, the highlight steps right and
+  // wraps, and 600ms after the last tap the row goes and the switch says so.
+  const page = newPage();
+  await signIn(page);
+  const cells = () => [...page.el("view-cards").children];
+  const current = () => cells().find((cell) => cell.getAttribute("aria-current") === "true")?.getAttribute("data-view");
+  await page.el("view-switch").click();
+  assert.equal(page.el("view-cards").hidden, false, "the tab row did not show on a press");
+  assert.deepStrictEqual(cells().map((cell) => cell.textContent), ["Voice", "Channel", "Documents"]);
+  assert.equal(current(), "discord", "the first press did not land on Channel");
+  assert.equal(page.el("view-switch").getAttribute("aria-expanded"), "true", "the switch does not say the row is up");
+  await page.el("view-switch").click();
+  assert.equal(current(), "docs", "the second press did not step to Documents");
+  await page.el("view-switch").click();
+  assert.equal(current(), "voice", "the highlight did not wrap back to Voice");
+  await passTime(page, 600);
+  assert.equal(page.el("view-cards").hidden, true, "the tab row stayed up after the settle");
+  assert.equal(page.el("view-switch").getAttribute("aria-expanded"), "false", "the switch still says the row is up");
 });
 
 test("`#880 voice-page-menu-placement`: Hide reader takes the channel's row of big buttons away, keeps its keys, and is kept", async () => {
@@ -1066,6 +1112,21 @@ test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW", async () => {
   assert.ok(channel.shown.includes("discord-channel"), "this is not the channel view's bar");
   assert.ok(channel.cost <= budget, report("the channel view", channel));
 
+  // The Documents view (`#1078 bottom-bar-switcher`): an empty pack, Fetch, and the switch last.
+  // The reader's bar adds Outline beside Fetch; it is priced here as arithmetic on the list's
+  // bar rather than by opening a document, which is the browser suite's ground.
+  await page.el("view-switch").click();
+  const docs = barCostPx(page);
+  assert.ok(docs.shown.includes("docs-fetch"), "this is not the Documents view's bar");
+  assert.equal(docs.shown.at(-1), "view-switch", "the switch is not the Documents bar's last button");
+  assert.ok(docs.cost <= budget, report("the Documents view", docs));
+  const withOutline = docs.cost + memberPx("doc-outline-open") + lengthPx(cssValue(cssBlock("#control-bar"), "gap"));
+  assert.ok(
+    withOutline <= budget,
+    `the Documents reader: ${[...docs.shown, "doc-outline-open"].join(" + ")} need ${withOutline.toFixed(1)}px of ` +
+      `the ${budget.toFixed(1)}px a ${PHONE_PX}px phone leaves, so Outline pushes the switch off the edge`
+  );
+
   // `#241 voice-composer`. There is no second mode to price any more: writing to the agent happens
   // in a box in the transcript, and the bar is the same strip while you write as before.
 
@@ -1636,7 +1697,10 @@ test("the desktop dock leaves the phone's declarations as they were", () => {
   // And the selectors it overrides still say what they said for everybody: two bands, a 3x2 tile
   // of large buttons, a captioned icon, and a picker capped narrow — the dock the phone has.
   const everybody = (selector) => cssRules(CSS_UNCONDITIONAL, selector).join("\n");
-  assert.doesNotMatch(everybody("#dock"), /display:|flex-wrap/, "the phone's dock became a flex row");
+  // `#1078 bottom-bar-switcher`: the phone's dock is one reversed column (pane drawn over bar),
+  // never the desk's row.
+  assert.match(everybody("#dock"), /flex-direction:\s*column-reverse/, "the phone's dock does not stand the pane over the bar");
+  assert.doesNotMatch(everybody("#dock"), /flex-wrap|flex-direction:\s*row(?!-)/, "the phone's dock became a flex row");
   assert.match(everybody("#control-pane"), /display:\s*grid/);
   assert.match(everybody("#control-pane"), /grid-template-columns:\s*3\.5rem 1fr 1fr/);
   assert.match(everybody(".control"), /flex-direction:\s*column/);

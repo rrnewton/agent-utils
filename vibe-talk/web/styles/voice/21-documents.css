@@ -1,48 +1,56 @@
 /* ------------------------------------------------------- the Documents view --------- */
 /*
  * `documents-view-client`: the third view's list and reader, and the view selector's
- * cards. The cards stack directly above the switch so the switch reads as a triple
- * button: the two views that are not showing, in the order rotating reaches them.
+ * tab row. The row hangs directly off the switch so tapping through reads as moving
+ * between tabs: Voice | Channel | Documents, the landed view's cell lit (`#1078
+ * bottom-bar-switcher`). It is a moment's signpost, never a cover over the list: the
+ * selector takes it away 600ms after the last press, and says so on the switch.
  */
 
-/* The two not-current views, stacked above the switch. */
+/* The three views as one horizontal row, off the switch's edge of the bar. */
 #control-bar {
   position: relative;
 }
 .view-cards {
   position: absolute;
   bottom: calc(100% + 6px);
-  /* Inside the viewport, right-aligned with the switch, as wide as it (polish on
+  /* Inside the viewport, right-aligned with the switch (polish on
      #1022 documents-view-client: on a phone the stack ran off the right edge). */
   right: 8px;
-  width: min(10.5rem, calc(100vw - 16px));
+  width: min(26rem, calc(100vw - 16px));
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   gap: 4px;
   z-index: 5;
+}
+/* With the bar in the header the row opens downward, as the trays do: upward there
+   would put it off the top of the screen. */
+#control-bar[data-placement="top"] .view-cards {
+  top: calc(100% + 6px);
+  bottom: auto;
 }
 .view-cards[hidden] {
   display: none;
 }
-/* Shown cards take themselves away: a moment's signpost, never a cover over the
-   list (and no timer on the page's clock for it). */
-.view-cards:not([hidden]) {
-  animation: view-cards-away 0s linear 600ms forwards;
-}
-@keyframes view-cards-away {
-  to {
-    visibility: hidden;
-  }
-}
 .view-card {
-  padding: 4px 10px;
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 6px 4px;
   font-size: 0.85em;
-  border: 1px solid;
+  border: 1px solid var(--edge, currentColor);
   border-radius: 8px;
-  background: var(--bg, Canvas);
+  background: var(--panel, Canvas);
+  color: var(--ink, CanvasText);
   white-space: nowrap;
   text-align: center;
   cursor: pointer;
+}
+/* The view the last press landed on, lit as the switch is lit on the call's view. */
+.view-card-current {
+  background: var(--accent, Highlight);
+  border-color: var(--accent, Highlight);
+  color: #fff;
+  font-weight: 700;
 }
 .view-card:focus-visible {
   outline: 2px solid var(--accent, Highlight);
@@ -156,6 +164,11 @@
 .docs-since[hidden] {
   display: none;
 }
+/* With the bar in the header the drop-up opens downward instead, as the trays do. */
+#control-bar[data-placement="top"] .docs-menu {
+  top: calc(100% + 6px);
+  bottom: auto;
+}
 .docs-since {
   position: static;
   flex-direction: row;
@@ -211,22 +224,44 @@
 #doc-outline-open[hidden] {
   display: none;
 }
+/* Outline lives in the control bar (`#1078 bottom-bar-switcher`), under the thumb
+   however far the document is scrolled. The reader still owns its `hidden` for "no
+   headings"; this gate is the other half — the button belongs to the open reader
+   alone, never to the list or another view. Its bar dress is `.bar-button`'s. */
+#doc-outline-open {
+  display: none;
+}
+body:has(#pane-docs:not([hidden]) #docs-reader:not([hidden])) #doc-outline-open:not([hidden]) {
+  display: flex;
+}
 /* The outline pop-up (#1038): floated over the document against #screen-main,
    as #search-float is, so the document never reflows for it and it never
-   scrolls away with the reader; the list scrolls inside the panel. */
+   scrolls away with the reader; the list scrolls inside the panel. It stands on
+   the dock, by the button that opens it; with the bar moved to the header it
+   hangs from the top instead. ALWAYS DARK, in either colour scheme (`#1078`):
+   light text on a dark ground with a border on every row, a step away from the
+   main window's dress so it reads as an overlay. The colours are stated, not
+   taken from the scheme's variables, because in the light scheme the variables
+   would make it light — the filled accent buttons it replaces came from the
+   generic `button` rule wearing through for want of a row rule here. */
 #doc-outline-pop {
   position: absolute;
-  top: calc(4.5rem + env(safe-area-inset-top));
+  bottom: 8px;
   right: calc(8px + env(safe-area-inset-right));
   width: min(20rem, calc(100vw - 16px));
   max-height: 60vh;
   overflow-y: auto;
   padding: 6px;
-  border: 1px solid var(--edge, currentColor);
+  border: 1px solid #3d4452;
   border-radius: 8px;
-  background: var(--bg, Canvas);
+  background: #1f232b;
+  color: #e7e9ee;
   box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 35%);
   z-index: 6;
+}
+body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
+  top: calc(4.5rem + env(safe-area-inset-top));
+  bottom: auto;
 }
 #doc-outline-pop[hidden] {
   display: none;
@@ -235,6 +270,9 @@
   list-style: none;
   margin: 0;
   padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 #doc-outline button {
   display: block;
@@ -242,6 +280,18 @@
   padding: 6px 8px;
   text-align: left;
   cursor: pointer;
+  background: #262c36;
+  color: #e7e9ee;
+  border: 1px solid #3d4452;
+  border-radius: 6px;
+  font: inherit;
+}
+#doc-outline button:hover {
+  background: #2b323e;
+}
+#doc-outline button:focus-visible {
+  outline: 2px solid #7ab3e3;
+  outline-offset: 1px;
 }
 #doc-outline .doc-ol-1 {
   padding-left: 8px;
@@ -261,14 +311,19 @@
 #doc-outline .doc-ol-6 {
   padding-left: 68px;
 }
-/* HERE: the section at the top of the scroller, in a clear distinct style. */
+/* HERE: the section at the top of the scroller, unmistakable on the dark rows:
+   a lighter ground, an accent border and bar, and bold — colour alone would
+   leave it to hue, and its `aria-current` says it where colour cannot. */
 #doc-outline button.doc-here {
   font-weight: 700;
-  color: var(--accent, Highlight);
+  color: #fff;
+  background: #2e3d52;
+  border-color: #5b9dd9;
+  box-shadow: inset 3px 0 0 #5b9dd9;
 }
 /* A jumped-to heading clears the scroller's top fade instead of hiding under
-   it — by exactly the reader's HERE slack, so the heading a jump lands on is
-   the section the outline marks current. */
+   it. The reader's HERE slack covers this margin plus fractional layout, so
+   the heading a jump lands on is the section the outline marks current. */
 #doc-body h1,
 #doc-body h2,
 #doc-body h3,

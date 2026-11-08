@@ -1,8 +1,18 @@
 /* ---------------------------------------------------------------------------- the dock ----- */
 
+/* `#1078 bottom-bar-switcher`. VISUALLY the control pane stands ABOVE the control bar, so the
+   bar — and with it the view switcher at its right end — is the dock's last row, at the same
+   place in every view: hiding the pane (the reader's row put away, the Documents view) then
+   cannot move it, because nothing under it comes or goes. The markup keeps its order (bar, then
+   pane): that order is the reading order a screen reader walks and the order the desktop regime
+   lays its one row out in, and the flip the owner asked for is where the thumb lands, not which
+   control is announced first. One reversed column does it, with no per-row ordering for a later
+   row to get wrong; the desktop block (20) lays the dock out as its row instead. */
 #dock {
   background: var(--dock);
   border-top: 1px solid var(--edge);
+  display: flex;
+  flex-direction: column-reverse;
 }
 
 /* THE status line, and the only one. The same fact used to be stated under the header and again
