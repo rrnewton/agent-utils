@@ -3152,6 +3152,12 @@ async fn a_deletion_made_while_the_server_was_down_is_never_vouched_for() {
     } = upstream(true, 8);
     fake.delete(&ids[2]);
     let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    let cache = state.message_cache.cache().expect("installed");
+    // Each ask below is judged on what the writer has applied, and its evaluation waits only
+    // briefly for the writer (`shadow::BARRIER`): what the sweep, the whole-channel read and
+    // the push offer is written before the ask that rests on it, so a loaded host counts the
+    // verdict and never the wait. `#1068 message-cache-deletion-flake`.
+    assert!(cache.quiesce_blocking(WAIT), "the first sweep landed");
     clock.advance(MINUTE);
     let by_id =
         |id: &MessageId| format!("/api/v1/channels/{READ_CHANNEL}/messages/{}", id.as_str());
@@ -3172,6 +3178,7 @@ async fn a_deletion_made_while_the_server_was_down_is_never_vouched_for() {
     // cache-coverage-races` (g)): an adapter that never connects delivers no deletion, so
     // twenty-five silent hours leave the message stale, exactly as the downtime did.
     get(&state, &flat_page()).await;
+    assert!(cache.quiesce_blocking(WAIT));
     clock.advance(25 * HOUR);
     let status = call_as(&state, &by_id(&ids[3]), testing::READ_TOKEN).await;
     assert_eq!(status, StatusCode::OK);
@@ -3194,6 +3201,7 @@ async fn a_deletion_made_while_the_server_was_down_is_never_vouched_for() {
         ingest(&state, pushed("still-here", "create", &alive)).await,
         StatusCode::ACCEPTED
     );
+    assert!(cache.quiesce_blocking(WAIT));
     let status = call_as(&state, &by_id(&ids[3]), testing::READ_TOKEN).await;
     assert_eq!(status, StatusCode::OK);
     let counted = shadow_of(&state, "message_by_id").await;
